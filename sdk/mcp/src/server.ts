@@ -248,6 +248,30 @@ export function createServer(client = new Client()): McpServer {
   );
 
   server.registerTool(
+    "ttc_quarantine",
+    {
+      description: "Disconnect a branch from TTC-managed external networking while preserving its internal state.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target }) => commandResponse(await client.quarantine(target)),
+  );
+
+  server.registerTool(
+    "ttc_unquarantine",
+    {
+      description: "Reconnect a quarantined branch to TTC-managed external networking.",
+      inputSchema: {
+        target: z.string().describe("Full container@branch selector"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ target }) => commandResponse(await client.unquarantine(target)),
+  );
+
+  server.registerTool(
     "ttc_fork",
     {
       description: "Live-fork a running TTC container branch.",

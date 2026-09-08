@@ -510,6 +510,14 @@ class Client:
     def resume(self, target: str) -> Result:
         return self.command(["resume", target])
 
+    def quarantine(self, target: str) -> Result:
+        """Disconnect a branch's runtime-managed external network edge."""
+        return self.command(["quarantine", target])
+
+    def unquarantine(self, target: str) -> Result:
+        """Reconnect a quarantined branch to TTC-managed external networking."""
+        return self.command(["unquarantine", target])
+
     def dehydrate(self, target: str) -> Result:
         return self.command(["dehydrate", target])
 

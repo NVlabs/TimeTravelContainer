@@ -24,6 +24,8 @@ console.log(await ttc.ping());
 (await ttc.run("alpine:3.20", ["sleep", "infinity"],
                ["-d", "--name", "demo"])).check();
 (await ttc.fork("demo@main", "experiment")).check();
+(await ttc.quarantine("demo@experiment")).check();
+(await ttc.unquarantine("demo@experiment")).check();
 (await ttc.dehydrate("demo@experiment")).check();
 (await ttc.rehydrate("demo@experiment")).check();
 

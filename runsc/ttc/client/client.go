@@ -164,9 +164,9 @@ var commands = map[string]struct{}{
 	"attach": {}, "checkpoint": {}, "commit": {}, "container": {}, "cp": {}, "create": {},
 	"dehydrate": {}, "diff": {}, "events": {}, "exec": {}, "fork": {}, "image": {}, "images": {},
 	"inspect": {}, "kill": {}, "load": {}, "logs": {}, "ls": {}, "migrate": {}, "node": {},
-	"pause": {}, "port": {}, "ps": {}, "pull": {}, "rehydrate": {}, "rename": {}, "restart": {},
+	"pause": {}, "port": {}, "ps": {}, "pull": {}, "quarantine": {}, "rehydrate": {}, "rename": {}, "restart": {},
 	"restore": {}, "resume": {}, "rm": {}, "rmi": {}, "run": {}, "save": {}, "start": {},
-	"stats": {}, "stop": {}, "top": {}, "tty": {}, "unpause": {}, "volume": {}, "wait": {},
+	"stats": {}, "stop": {}, "top": {}, "tty": {}, "unpause": {}, "unquarantine": {}, "volume": {}, "wait": {},
 }
 
 func knownCommand(command string) bool {
@@ -186,7 +186,8 @@ Commands:
   run, create, start, stop, restart, rm, exec, attach, logs, cp
   images, image, pull, load, save, commit, rmi
   ls, ps, inspect, top, stats, diff, events, wait
-  fork, migrate, pause, resume, dehydrate, rehydrate, checkpoint, restore
+  fork, migrate, pause, resume, quarantine, unquarantine
+  dehydrate, rehydrate, checkpoint, restore
   port, volume, node, tty, rename, kill
   daemon start|status|stop|requests|request
   completion bash|zsh|fish
@@ -207,6 +208,7 @@ var commandHelp = map[string]string{
 	"save": "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]", "commit": "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
 	"fork": "Usage: ttc fork [--paused] [--quarantine] [--target NODE] CONTAINER@BRANCH DEST...", "migrate": "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
 	"pause": "Usage: ttc pause TARGET...", "resume": "Usage: ttc resume TARGET...", "unpause": "Usage: ttc unpause TARGET...",
+	"quarantine": "Usage: ttc quarantine CONTAINER@BRANCH...", "unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
 	"dehydrate": "Usage: ttc dehydrate TARGET...", "rehydrate": "Usage: ttc rehydrate TARGET...",
 	"checkpoint": "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE", "restore": "Usage: ttc restore [--name NAME] FILE",
 	"ls": "Usage: ttc ls [--tree|--json]", "ps": "Usage: ttc ps [OPTIONS]", "inspect": "Usage: ttc inspect [OPTIONS] CONTAINER...",
@@ -645,7 +647,7 @@ func commandCanRetry(args []string) bool {
 		args = args[1:]
 	}
 	switch args[0] {
-	case "create", "rmi", "rm", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "restore", "migrate":
+	case "create", "rmi", "rm", "pause", "resume", "unpause", "quarantine", "unquarantine", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls"

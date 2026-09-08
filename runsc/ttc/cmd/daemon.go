@@ -80,6 +80,7 @@ var daemonAPIFeatures = []string{
 	"elastic-cluster",
 	"filesystem-range-paging",
 	"named-exec",
+	"network-quarantine",
 	"storage-status",
 	"tty-observation",
 }
@@ -313,6 +314,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
 		Peer: peer, VisibleBranchID: targetBranch.ID, FilesystemBranch: targetBranch.FilesystemBranch,
+		Quarantined:   targetBranch.Quarantined,
 		MetadataBytes: session.MetadataBytes, MaxTransferBytes: session.MaxTransferBytes,
 		MaxParallel: tx.Negotiated.PagingPolicy.MaxConcurrency, Timeout: 30 * time.Second, RetryLimit: 2,
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
@@ -3645,7 +3647,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove-now", "_purge-runtime", "pause", "resume", "unpause", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove-now", "_purge-runtime", "pause", "resume", "unpause", "quarantine", "unquarantine", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls" && args[1] != "_planner-resources"

@@ -157,6 +157,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none, ttc. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	ttcNetworkNAT := flagSet.Bool("ttc-network-nat", false, "enable rootless user-mode TCP/UDP NAT for --network=ttc")
+	flagSet.Bool("ttc-network-quarantine", false, "start with the TTC runtime-owned external network edge disconnected")
 	ttcNetworkIP := flagSet.String("ttc-network-ip", "", "IPv4 address for the --network=ttc virtual NIC (default 10.0.2.15)")
 	ttcNetworkMAC := flagSet.String("ttc-network-mac", "", "MAC address for the --network=ttc virtual NIC")
 	// Keep old low-level runsc arguments working for bundles and launchers

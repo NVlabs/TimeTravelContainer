@@ -434,7 +434,10 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := injectLiveForkFailure(opts, LiveForkStageVDSOPrivatized); err != nil {
 			return err
 		}
-		child.liveForkQuarantine = opts.Quarantine
+		// Quarantine is inherited. A child cannot regain an external edge merely
+		// by forking a quarantined source; it may be explicitly unquarantined by
+		// a later branch operation.
+		child.liveForkQuarantine = k.liveForkQuarantine || opts.Quarantine
 		if err := child.restoreLiveForkNetworkStacks(k.rootNetworkNamespace.Stack()); err != nil {
 			return err
 		}
@@ -937,6 +940,38 @@ func (k *Kernel) restoreReconfiguredNetworkStacks(configureRoot func(inet.Stack)
 			}
 		}
 	}
+	return nil
+}
+
+// LiveForkQuarantine reports whether this Kernel's runtime-managed external
+// network edge is quarantined.
+func (k *Kernel) LiveForkQuarantine() bool {
+	return k.liveForkQuarantine
+}
+
+// SetLiveForkQuarantine changes quarantine for a paused Kernel. It changes
+// only the runtime-owned root link; all Sentry-owned network state remains in
+// place. Callers are responsible for pausing and resuming tasks.
+func (k *Kernel) SetLiveForkQuarantine(quarantine bool) error {
+	if k.liveForkQuarantine == quarantine {
+		return nil
+	}
+	if k.rootNetworkNamespace == nil || k.rootNetworkNamespace.Stack() == nil {
+		k.liveForkQuarantine = quarantine
+		return nil
+	}
+	stack := k.rootNetworkNamespace.Stack()
+	controller, ok := stack.(inet.LiveForkQuarantineController)
+	if !ok {
+		return fmt.Errorf("network stack %T cannot change TTC quarantine", stack)
+	}
+	stack.Pause()
+	err := controller.SetLiveForkQuarantineState(quarantine)
+	stack.Resume()
+	if err != nil {
+		return err
+	}
+	k.liveForkQuarantine = quarantine
 	return nil
 }
 

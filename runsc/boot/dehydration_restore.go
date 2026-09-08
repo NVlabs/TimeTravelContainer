@@ -47,6 +47,7 @@ type DurableDehydrationRestoreArgs struct {
 	ID               string
 	ParentID         string
 	FilesystemBranch string
+	Quarantined      bool
 	Resume           bool
 	ExecSessions     []ExecSessionInfo
 	// NetworkArgs reconstructs target-local links after the saved netstack has
@@ -226,6 +227,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	fdmapOwned = false // Kernel load and VFS CompleteRestore consume descriptors.
 	loadOptions := kernel.DurableDehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+		Quarantined: args.Quarantined, OverrideQuarantine: true,
 		SparseBranch:               args.FilesystemBranch,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: restoreMnts.fdmap,
 		ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
@@ -442,6 +444,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		// second platform here can collide with the active platform's mappings.
 		loadOptions := kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			SparseBranch:        args.FilesystemBranch,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
@@ -618,6 +621,7 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resum
 	b := &sandboxBranch{
 		id: id, parentID: parentID, filesystemBranch: filesystemBranch,
 		k: child, watchdog: dog, state: state, createdAt: time.Now().UTC(), execSessions: newSessions,
+		quarantined: child.LiveForkQuarantine(),
 	}
 	f.branches[id] = b
 	f.stateChanged.Broadcast()

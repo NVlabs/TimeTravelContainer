@@ -41,7 +41,7 @@ not need access to the daemon's storage roots.
 The server provides tools for daemon status, listing and inspection, image
 pull, run/start/exec, durable named exec sessions, local or remote batch fork,
 elastic node listing/migration/drain/rebalance, pause/resume,
-dehydrate/rehydrate, Docker-style image load/save and commit,
+quarantine/unquarantine, dehydrate/rehydrate, Docker-style image load/save and commit,
 resource accounting, filesystem diff, copy, synchronous terminal observation, checkpoint/restore,
 stop/restart, signal, wait, and removal. Tool names use the `ttc_` prefix, for
 example `ttc_fork_many`, `ttc_exec_logs`, `ttc_stats`, `ttc_diff`,

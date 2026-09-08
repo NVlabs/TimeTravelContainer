@@ -240,6 +240,8 @@ Commands:
   rename CONTAINER@BRANCH NAME    Give a branch another name
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
+  quarantine TARGET...            Disconnect branches from external networking
+  unquarantine TARGET...          Reconnect branches to external networking
   dehydrate TARGET...             Dehydrate branches or whole container families
   rehydrate TARGET...             Reconstruct one or more dehydrated branches
   unpause TARGET...               Resume branches (Docker alias)
@@ -272,29 +274,31 @@ set; omitting DEST generates a branch ID.
 func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 	if len(args) == 2 && args[1] == "--help" {
 		usage := map[string]string{
-			"container":  "Usage: ttc container COMMAND",
-			"image":      "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
-			"load":       "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
-			"save":       "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
-			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
-			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon":     "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
-			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
-			"pause":      "Usage: ttc pause TARGET [TARGET...]",
-			"rename":     "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
-			"resume":     "Usage: ttc resume TARGET [TARGET...]",
-			"dehydrate":  "Usage: ttc dehydrate TARGET [TARGET...]",
-			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
-			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
-			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
-			"stats":      "Usage: ttc stats [--json] CONTAINER@BRANCH",
-			"tty":        "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
-			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
-			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
-			"migrate":    "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
-			"node":       "Usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE",
-			"restore":    "Usage: ttc restore [--name NAME] FILE",
+			"container":    "Usage: ttc container COMMAND",
+			"image":        "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
+			"load":         "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
+			"save":         "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
+			"commit":       "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
+			"port":         "Usage: ttc port publish|ls|unpublish [OPTIONS]",
+			"completion":   "Usage: ttc completion bash|zsh|fish",
+			"daemon":       "Usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request",
+			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
+			"pause":        "Usage: ttc pause TARGET [TARGET...]",
+			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
+			"resume":       "Usage: ttc resume TARGET [TARGET...]",
+			"quarantine":   "Usage: ttc quarantine CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"dehydrate":    "Usage: ttc dehydrate TARGET [TARGET...]",
+			"rehydrate":    "Usage: ttc rehydrate TARGET [TARGET...]",
+			"unpause":      "Usage: ttc unpause TARGET [TARGET...]",
+			"top":          "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+			"stats":        "Usage: ttc stats [--json] CONTAINER@BRANCH",
+			"tty":          "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
+			"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
+			"checkpoint":   "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
+			"migrate":      "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
+			"node":         "Usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE",
+			"restore":      "Usage: ttc restore [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
 			fmt.Fprintln(stdout, text)
@@ -402,6 +406,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume", "unpause":
 		err = runPauseResume(args[1:], stdout, backend, false)
+	case "quarantine":
+		err = runQuarantine(args[1:], stdout, backend, true)
+	case "unquarantine":
+		err = runQuarantine(args[1:], stdout, backend, false)
 	case "dehydrate":
 		err = runDehydrateRehydrate(args[1:], stdout, backend, true)
 	case "rehydrate":
@@ -4283,6 +4291,31 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 	return nil
 }
 
+func runQuarantine(args []string, stdout io.Writer, backend backend, enabled bool) error {
+	if len(args) == 0 {
+		command := "quarantine"
+		if !enabled {
+			command = "unquarantine"
+		}
+		return fmt.Errorf("usage: ttc %s CONTAINER@BRANCH [CONTAINER@BRANCH...]", command)
+	}
+	qb, ok := backend.(quarantineBackend)
+	if !ok {
+		return errors.New("this backend does not support quarantine")
+	}
+	for _, value := range args {
+		target, err := parseSelector(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
+		}
+		if err := qb.setQuarantine(target, enabled); err != nil {
+			return fmt.Errorf("updating %s quarantine: %w", target, err)
+		}
+		fmt.Fprintln(stdout, target)
+	}
+	return nil
+}
+
 func runRename(args []string, stdout io.Writer, backend backend) error {
 	if len(args) != 2 {
 		return errors.New("usage: ttc rename CONTAINER@BRANCH NEW_BRANCH")
@@ -4864,6 +4897,7 @@ func (s selector) String() string {
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
 	ID                       string    `json:"id"`
+	Quarantined              bool      `json:"quarantined,omitempty"`
 	NodeID                   string    `json:"node_id,omitempty"`
 	ParentID                 string    `json:"parent,omitempty"`
 	State                    string    `json:"state"`
@@ -5262,6 +5296,10 @@ type backend interface {
 type dehydrationBackend interface {
 	dehydrate(target selector) error
 	rehydrate(target selector) error
+}
+
+type quarantineBackend interface {
+	setQuarantine(target selector, enabled bool) error
 }
 
 type consoleSidecarOwner interface {
@@ -6314,7 +6352,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("creating branch bootstrap runtime ID: %w", err)
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
-	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := b.configuredRunscArgsForBranch(info, branch)
 	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, runtimeID)
 	if err != nil {
 		return fmt.Errorf("creating paused bootstrap for %s: %w", target, err)
@@ -8430,6 +8468,14 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	return args
 }
 
+func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) []string {
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	if branch.Quarantined {
+		args = append(args, "--ttc-network-quarantine=true")
+	}
+	return args
+}
+
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
 	return b.runConfiguredCommandForNetwork("none", args...)
 }
@@ -8606,7 +8652,11 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 
 func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (int, error) {
 	name := info.ID
-	configuredArgs := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return 1, err
+	}
+	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
 	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, err
@@ -8674,6 +8724,13 @@ func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding)
 }
 
 func (b *runtimeBackend) ensurePublishedPortsForBranch(info ttcbundle.ContainerInfo, branch string) error {
+	record, err := persistentBranchInfo(info, branch)
+	if err != nil {
+		return err
+	}
+	if record.Quarantined {
+		return nil
+	}
 	for _, binding := range info.PublishedPorts {
 		if binding.Branch() != branch {
 			continue
@@ -8793,6 +8850,16 @@ func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBind
 		return err
 	}
 	info.PublishedPorts = append(info.PublishedPorts, binding)
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		_ = store.RemovePortBinding(target.container, binding)
+		return err
+	}
+	if branch.Quarantined {
+		// Keep the desired binding in branch metadata. Unquarantine activates
+		// it, without opening an external listener while the flag is set.
+		return nil
+	}
 	if err := b.ensurePublishedPort(info, binding); err != nil {
 		rollbackErr := store.RemovePortBinding(target.container, binding)
 		if rollbackErr != nil {
@@ -9622,6 +9689,7 @@ type runscBranchInfo struct {
 	InitPID          int32     `json:"InitPID"`
 	InitState        string    `json:"InitState"`
 	SharesMemory     bool      `json:"SharesMemory"`
+	Quarantined      bool      `json:"Quarantined"`
 	ForkMetrics      struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
@@ -9647,7 +9715,7 @@ func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch
 		nodeID = fallbackNode
 	}
 	return Branch{
-		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
+		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
 		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
 		StorageManifest: info.StorageManifest,
 		StorageRetryAt:  info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
@@ -9750,6 +9818,7 @@ func branchView(info runscBranchInfo) Branch {
 	return Branch{
 		ID:               info.ID,
 		ParentID:         info.ParentID,
+		Quarantined:      info.Quarantined,
 		State:            normalizeLifecycleState(info.State),
 		CreatedAt:        info.CreatedAt,
 		InitPID:          info.InitPID,
@@ -9798,10 +9867,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		return nil, err
 	}
 	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
-		if quarantine {
-			return nil, errors.New("a dehydrated branch cannot be forked into quarantine: it has no connections to keep and nothing to ask")
-		}
-		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused)
+		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
@@ -9835,7 +9901,8 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		for i, branch := range branches {
 			records[i] = ttcbundle.BranchInfo{
 				ID: branch.ID, ParentID: branch.ParentID, FilesystemBranch: infos[i].FilesystemBranch,
-				State: branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
+				Quarantined: branch.Quarantined,
+				State:       branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 			}
 		}
@@ -9908,7 +9975,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 // state. The source remains process-free and its dehydration image is never
 // consumed. Filesystem metadata and sparse-memory manifests are immutable, so
 // preparing any number of siblings does not copy file or memory data.
-func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused bool) (_ []Branch, retErr error) {
+func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused, quarantined bool) (_ []Branch, retErr error) {
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
 	}
@@ -9970,7 +10037,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
 		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, CreatedAt: createdAt}
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
 		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
@@ -10061,7 +10128,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		if capture.Resume && !paused {
 			state = "running"
 		}
-		result = append(result, Branch{ID: child.branch.ID, ParentID: source.branch, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
+		result = append(result, Branch{ID: child.branch.ID, ParentID: source.branch, Quarantined: child.branch.Quarantined, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
 	}
 	return result, nil
 }
@@ -10090,6 +10157,89 @@ func (b *runtimeBackend) resume(target selector) error {
 		err = b.containerStore().UpdateBranchState(target.container, target.branch, "running")
 	}
 	return err
+}
+
+func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	if branch.Quarantined == enabled {
+		return nil
+	}
+	state := normalizeLifecycleState(branch.State)
+	live := state == "running" || state == "paused"
+	for i := range info.Branches {
+		if info.Branches[i].ID == target.branch {
+			info.Branches[i].Quarantined = enabled
+			break
+		}
+	}
+	if enabled && live {
+		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
+			return fmt.Errorf("closing published ports before quarantining %s: %w", target, err)
+		}
+	}
+	transitionRuntime := func(value bool) error {
+		if !live {
+			return nil
+		}
+		action := "quarantine"
+		if !value {
+			action = "unquarantine"
+		}
+		_, err := b.command("timetravel", target.container, action, target.branch)
+		return err
+	}
+	if live {
+		if err := transitionRuntime(enabled); err != nil {
+			if enabled {
+				_ = b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch)
+			}
+			return err
+		}
+	}
+	if !enabled && live {
+		if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
+			_ = b.stopPublishedPortsForBranch(info, target.branch)
+			_ = transitionRuntime(true)
+			return fmt.Errorf("opening published ports after unquarantining %s: %w", target, err)
+		}
+	}
+	if b.dataRoot == "" {
+		return nil
+	}
+	if err := b.containerStore().UpdateBranchQuarantine(target.container, target.branch, enabled); err != nil {
+		var rollbackErr error
+		if !enabled && live {
+			rollbackErr = errors.Join(rollbackErr, b.stopPublishedPortsForBranch(info, target.branch))
+		}
+		rollbackErr = errors.Join(rollbackErr, transitionRuntime(branch.Quarantined))
+		if enabled && live {
+			rollbackErr = errors.Join(rollbackErr, b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch))
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("persisting quarantine: %w; restoring runtime state: %v", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
+}
+
+func infoWithBranchQuarantine(info ttcbundle.ContainerInfo, branchID string, quarantined bool) ttcbundle.ContainerInfo {
+	info.Branches = append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	for i := range info.Branches {
+		if info.Branches[i].ID == branchID {
+			info.Branches[i].Quarantined = quarantined
+			break
+		}
+	}
+	return info
 }
 
 // renameBranch gives a live branch another name.
@@ -11009,7 +11159,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -11170,7 +11320,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
 		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse,
-		ReusePeerApplicationMemoryFile: sparse,
+		ReusePeerApplicationMemoryFile: sparse, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {

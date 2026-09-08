@@ -189,6 +189,15 @@ type LiveForkQuarantinable interface {
 	SetLiveForkQuarantine(bool)
 }
 
+// LiveForkQuarantineController changes whether a runtime-managed network link
+// is connected to its external proxy. The owning Kernel must be paused while
+// this operation runs. Entering quarantine preserves guest socket state and
+// sends packets into a black hole; leaving quarantine recreates the external
+// link and resets flows whose peer-side history is no longer valid.
+type LiveForkQuarantineController interface {
+	SetLiveForkQuarantineState(bool) error
+}
+
 // LiveForkDanglingEndpointOwner identifies globally tracked transport
 // endpoints that belong to one stack. The ordinary checkpoint path assumes one
 // Kernel per Sentry, but live fork keeps multiple Kernels in one process and

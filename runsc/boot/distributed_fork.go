@@ -47,6 +47,7 @@ type DistributedForkRestoreArgs struct {
 	SessionID           string
 	FamilyID            string
 	TargetBranchID      string
+	Quarantined         bool
 	Address             string
 	SnapshotToken       ttcremote.SnapshotToken
 	MetadataBytes       uint64
@@ -360,6 +361,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
 	loadOpts := kernel.DistributedForkLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+		Quarantined: args.Quarantined, OverrideQuarantine: true,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
 		LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
@@ -384,6 +386,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, durableMetadata,
 			memoryFiles, sparseRepository, kernel.DurableDehydrationLoadOptions{
 				Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+				Quarantined: args.Quarantined, OverrideQuarantine: true,
 				SparseBranch:               args.SparseBranch,
 				RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 				ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
@@ -639,6 +642,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 			// during an in-Sentry restore. TargetBranchID is the immutable remote
 			// transaction identity and is deliberately not a repository branch.
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.FilesystemBranch,
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			FilesystemResources: resources, DemandOnly: true,
 			PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
 			LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork,
@@ -754,6 +758,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 		consumed = true
 		child, err := kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, durable, memories, sparseRepository, kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			SparseBranch: args.SparseBranch, FilesystemResources: resources,
 			ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
 		})

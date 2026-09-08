@@ -617,6 +617,14 @@ export class Client {
     return this.command(["resume", target]);
   }
 
+  quarantine(target: string): Promise<Result> {
+    return this.command(["quarantine", target]);
+  }
+
+  unquarantine(target: string): Promise<Result> {
+    return this.command(["unquarantine", target]);
+  }
+
   dehydrate(target: string): Promise<Result> {
     return this.command(["dehydrate", target]);
   }

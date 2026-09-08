@@ -909,6 +909,11 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 	l.destroyCtx = l.k.SupervisorContext()
+	if args.Conf.TimeTravelNetworkQuarantine {
+		if err := l.k.SetLiveForkQuarantine(true); err != nil {
+			return nil, fmt.Errorf("setting initial TTC quarantine: %w", err)
+		}
+	}
 
 	// Create a watchdog.
 	dogOpts := watchdog.DefaultOpts
@@ -1109,7 +1114,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 					return fmt.Errorf("removing restored TTC interface: %v", err)
 				}
 			}
-			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false)
+			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, k.LiveForkQuarantine())
 		}
 		return nil
 	}
@@ -1121,7 +1126,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 		return err
 	}
 	if networkArgs.TimeTravel != nil {
-		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false); err != nil {
+		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, k.LiveForkQuarantine()); err != nil {
 			return err
 		}
 	}

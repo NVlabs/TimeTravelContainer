@@ -56,6 +56,45 @@ func TestCompareAndSwapNodeID(t *testing.T) {
 	}
 }
 
+func TestUpdateBranchQuarantinePersistsIndependentlyOfLifecycle(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "container-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: bundleDir,
+		Branches: []BranchInfo{{ID: "main", State: "dehydrated"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	if err := store.UpdateBranchQuarantine("example", "main", true); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Branches[0].Quarantined || info.Branches[0].State != "dehydrated" {
+		t.Fatalf("updated branch=%+v", info.Branches[0])
+	}
+	if err := store.UpdateBranchQuarantine("example", "main", false); err != nil {
+		t.Fatal(err)
+	}
+	info, err = store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Branches[0].Quarantined {
+		t.Fatalf("quarantine flag remained set: %+v", info.Branches[0])
+	}
+}
+
 func TestCompareAndSwapBranchNodeIDClaimsUnplacedBranch(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "container-id")

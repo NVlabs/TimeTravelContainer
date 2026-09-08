@@ -174,6 +174,56 @@ func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
 	}
 }
 
+func TestTimeTravelNetworkQuarantineCanBeChangedAtRuntime(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	s := newTimeTravelNetworkTestStack(t, true)
+
+	s.Pause()
+	err = s.SetLiveForkQuarantineState(true)
+	s.Resume()
+	if err != nil {
+		t.Fatalf("enter quarantine: %v", err)
+	}
+	if !s.LiveForkQuarantine() {
+		t.Fatal("quarantine bit is not set")
+	}
+	if conn, err := dialTimeTravelGateway(t, s, port, 200*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("quarantined network reached host listener")
+	}
+
+	s.Pause()
+	err = s.SetLiveForkQuarantineState(false)
+	s.Resume()
+	if err != nil {
+		t.Fatalf("leave quarantine: %v", err)
+	}
+	if s.LiveForkQuarantine() {
+		t.Fatal("quarantine bit remained set")
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := dialTimeTravelGateway(t, s, port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial after leaving quarantine: %v", err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("host accept after leaving quarantine: %v", err)
+	}
+}
+
 func TestTimeTravelNetworkUDPNATAndHostAlias(t *testing.T) {
 	hostAddress := net.IPv4(127, 0, 0, 53)
 	hostConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: hostAddress})

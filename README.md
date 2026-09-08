@@ -88,6 +88,8 @@ ttc ls --tree
 # Suspend cheaply, or release memory for longer idle periods.
 ttc pause agent@approach-a
 ttc resume agent@approach-a
+ttc quarantine agent@approach-a
+ttc unquarantine agent@approach-a
 ttc dehydrate agent@approach-b
 ttc cp agent@approach-b:/workspace/result.patch ./result.patch
 ttc rehydrate agent@approach-b
@@ -106,7 +108,7 @@ Common workflows include:
 | Manage branches | `ttc fork`, `ttc pause`, `ttc resume`, `ttc rm` |
 | Persist live state | `ttc dehydrate`, `ttc rehydrate`, `ttc checkpoint`, `ttc restore` |
 | Inspect CoW state | `ttc stats`, `ttc diff`, `ttc tty stat` |
-| Manage networking | `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
+| Manage networking | `ttc quarantine`, `ttc unquarantine`, `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
 | Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 
 The [end-user guide](g3doc/user_guide/timetravelcontainer.md) covers daemon

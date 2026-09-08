@@ -331,6 +331,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 type DistributedForkLoadOptions struct {
 	Clocks                     sentrytime.Clocks
 	ChildBranchID              string
+	Quarantined                bool
+	OverrideQuarantine         bool
 	RestoreOptions             vfs.CompleteRestoreOptions
 	FilesystemResources        vfs.LiveForkFilesystemResources
 	RestoreFilesystemResources vfs.RestoreFilesystemResources
@@ -457,6 +459,9 @@ func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetM
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
 		referenceTransaction.Abort()
 		return nil, fmt.Errorf("loading sparse distributed Kernel metadata: %w", err)
+	}
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
 	}
 	if err := referenceTransaction.Commit(); err != nil {
 		return nil, err
@@ -586,6 +591,9 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
 		return nil, fmt.Errorf("loading distributed Kernel metadata: %w", err)
 	}
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	child.remotePageLoad = pages
 	child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), loadRanges...)
 	loaded = true
@@ -694,6 +702,9 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
 		references.Abort()
 		return nil, fmt.Errorf("loading relocated distributed Kernel metadata: %w", err)
+	}
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
 	}
 	if err := references.Commit(); err != nil {
 		return nil, err

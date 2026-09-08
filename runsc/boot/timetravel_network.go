@@ -494,6 +494,23 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			}
 			return resetTimeTravelChildConnections(child, guestAddress)
 		},
+		SetQuarantine: func(current *sentrynetstack.Stack, quarantine bool) error {
+			if _, ok := current.Interfaces()[int32(timeTravelNICID)]; ok {
+				if err := current.Stack.RemoveNIC(timeTravelNICID); err != nil {
+					return fmt.Errorf("removing TTC interface while changing quarantine: %v", err)
+				}
+			}
+			if err := configureTimeTravelNetwork(current, cfg, false, quarantine); err != nil {
+				return err
+			}
+			if !quarantine {
+				// Packets emitted while quarantined never reached the real peer.
+				// Existing external flows therefore cannot be continued honestly;
+				// reset them while leaving internal-only flows untouched.
+				return resetTimeTravelChildConnections(current, guestAddress)
+			}
+			return nil
+		},
 		Close: realm.close,
 	}
 	dst.SetLiveForkNetworkHooks(hooks)

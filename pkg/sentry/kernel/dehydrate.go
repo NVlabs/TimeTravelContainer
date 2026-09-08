@@ -92,10 +92,12 @@ type DehydrationCaptureOptions struct {
 
 // DehydrationLoadOptions controls reconstruction of a dehydrated Kernel.
 type DehydrationLoadOptions struct {
-	Clocks           sentrytime.Clocks
-	BranchID         string
-	RestoreOptions   vfs.CompleteRestoreOptions
-	ConfigureNetwork func(*Kernel, inet.Stack) error
+	Clocks             sentrytime.Clocks
+	BranchID           string
+	Quarantined        bool
+	OverrideQuarantine bool
+	RestoreOptions     vfs.CompleteRestoreOptions
+	ConfigureNetwork   func(*Kernel, inet.Stack) error
 }
 
 // DurableDehydrationLoadMemory pairs one newly-created target MemoryFile with
@@ -110,6 +112,8 @@ type DurableDehydrationLoadMemory struct {
 type DurableDehydrationLoadOptions struct {
 	Clocks                     sentrytime.Clocks
 	BranchID                   string
+	Quarantined                bool
+	OverrideQuarantine         bool
 	RestoreOptions             vfs.CompleteRestoreOptions
 	FilesystemResources        vfs.LiveForkFilesystemResources
 	RestoreFilesystemResources vfs.RestoreFilesystemResources
@@ -529,6 +533,9 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
 			return errors.New("dehydrated network stack requires a configurator")
@@ -641,6 +648,9 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
 			return errors.New("durable dehydration network configurator was not provided")
@@ -804,6 +814,9 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
 		if opts.ConfigureNetwork == nil {
 			return errors.New("sparse dehydrated network configurator was not provided")

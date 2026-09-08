@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["-d", "--name", "demo"],
     )?.check()?;
     ttc.fork("demo@main", "experiment", false)?.check()?;
+    ttc.quarantine("demo@experiment")?.check()?;
+    ttc.unquarantine("demo@experiment")?.check()?;
     ttc.dehydrate("demo@experiment")?.check()?;
     ttc.rehydrate("demo@experiment")?.check()?;
 

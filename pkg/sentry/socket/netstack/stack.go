@@ -78,7 +78,11 @@ type LiveForkNetworkHooks struct {
 	Validate   func(*Stack) error
 	Clone      func(dst *Stack) error
 	ResetChild func(*Stack) error
-	Close      func()
+	// SetQuarantine replaces only the runtime-owned external edge. Guest-owned
+	// NICs, routes, namespaces, filters, and internal connections remain in the
+	// Sentry graph.
+	SetQuarantine func(*Stack, bool) error
+	Close         func()
 }
 
 // SetLiveForkNetworkHooks installs runtime-only contained-network hooks. Any
@@ -99,6 +103,34 @@ func (s *Stack) SetLiveForkQuarantine(quarantine bool) {
 // LiveForkQuarantine reports whether this stack is a quarantined child.
 func (s *Stack) LiveForkQuarantine() bool {
 	return s.liveForkQuarantine
+}
+
+// SetLiveForkQuarantineState changes quarantine on a live, paused stack.
+func (s *Stack) SetLiveForkQuarantineState(quarantine bool) error {
+	if s.liveForkQuarantine == quarantine {
+		return nil
+	}
+	hooks := s.liveForkNetwork
+	if hooks == nil {
+		// A netstack without a runtime-owned external edge (for example,
+		// --network=none) needs no link replacement. Keep the semantic bit so
+		// that later forks and restores continue to inherit it.
+		s.liveForkQuarantine = quarantine
+		return nil
+	}
+	if hooks.SetQuarantine == nil {
+		return fmt.Errorf("network stack does not support changing TTC quarantine")
+	}
+	previous := s.liveForkQuarantine
+	s.liveForkQuarantine = quarantine
+	if err := hooks.SetQuarantine(s, quarantine); err != nil {
+		s.liveForkQuarantine = previous
+		if rollbackErr := hooks.SetQuarantine(s, previous); rollbackErr != nil {
+			return fmt.Errorf("changing TTC quarantine: %w; restoring previous link: %v", err, rollbackErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // NewStack creates a new netstack.Stack which wraps the given tcpip.Stack.

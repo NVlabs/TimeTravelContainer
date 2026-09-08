@@ -158,6 +158,9 @@ const (
 	// ContMgrResumeBranch resumes one in-memory branch.
 	ContMgrResumeBranch = "containerManager.ResumeBranch"
 
+	// ContMgrSetBranchQuarantine changes one branch's external-connectivity bit.
+	ContMgrSetBranchQuarantine = "containerManager.SetBranchQuarantine"
+
 	// ContMgrDehydrateBranch hibernates one live branch.
 	ContMgrDehydrateBranch = "containerManager.DehydrateBranch"
 	// ContMgrExportDehydratedBranch persists a dehydrated branch's packed memory.
@@ -1236,6 +1239,14 @@ func (cm *containerManager) PauseBranch(args *BranchArgs, _ *struct{}) error {
 // ResumeBranch resumes one branch.
 func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Resume(args.ID)
+}
+
+// SetBranchQuarantine changes one branch's external-connectivity bit.
+func (cm *containerManager) SetBranchQuarantine(args *BranchQuarantineArgs, _ *struct{}) error {
+	if args == nil || args.ID == "" {
+		return errors.New("missing branch quarantine arguments")
+	}
+	return cm.l.family.SetQuarantine(args.ID, args.Enabled)
 }
 
 // DehydrateBranch hibernates one branch and releases its live Kernel graph.

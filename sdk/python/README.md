@@ -38,6 +38,8 @@ ttc.pull("alpine:3.20").check()
 ttc.run("alpine:3.20", ["sleep", "infinity"],
         options=["-d", "--name", "demo"]).check()
 ttc.fork("demo@main", "experiment").check()
+ttc.quarantine("demo@experiment").check()
+ttc.unquarantine("demo@experiment").check()
 ttc.dehydrate("demo@experiment").check()
 ttc.rehydrate("demo@experiment").check()
 

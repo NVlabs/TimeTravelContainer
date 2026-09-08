@@ -410,6 +410,10 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	if err != nil {
 		return "", err
 	}
+	sourceBranch, err := persistentBranchInfo(manifest.Container, manifest.SourceBranch)
+	if err != nil {
+		return "", fmt.Errorf("reading checkpoint source branch state: %w", err)
+	}
 	repositories := make([]ttcbundle.RestoreRepository, 0, len(manifest.Repositories))
 	for _, repository := range manifest.Repositories {
 		repositories = append(repositories, ttcbundle.RestoreRepository{
@@ -473,6 +477,9 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		return "", fmt.Errorf("starting restored console drain: %w", err)
 	}
 	store := b.containerStore()
+	if err := store.UpdateBranchQuarantine(id, defaultBranchID, sourceBranch.Quarantined); err != nil {
+		return "", fmt.Errorf("restoring quarantine state: %w", err)
+	}
 	if err := store.UpdateState(id, "running", nil); err != nil {
 		return "", err
 	}

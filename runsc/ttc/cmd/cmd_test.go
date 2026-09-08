@@ -115,6 +115,29 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 	}
 }
 
+func TestQuarantineCommandsAddressBranchState(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"quarantine", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("quarantine status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.quarantineTarget, (selector{container: "web", branch: "child"}); got != want || !b.quarantineEnabled {
+		t.Fatalf("quarantine call=(%v, %t), want (%v, true)", got, b.quarantineEnabled, want)
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("quarantine output=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"unquarantine", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("unquarantine status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.quarantineTarget != (selector{container: "web", branch: "child"}) || b.quarantineEnabled {
+		t.Fatalf("unquarantine call=(%v, %t)", b.quarantineTarget, b.quarantineEnabled)
+	}
+}
+
 func TestMigrateCommand(t *testing.T) {
 	backend := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
@@ -4428,6 +4451,8 @@ type fakeBackend struct {
 	unpublishedBinding  ttcbundle.PortBinding
 	paused              selector
 	resumed             selector
+	quarantineTarget    selector
+	quarantineEnabled   bool
 	preparedStop        selector
 	preparedStops       []selector
 	discarded           selector
@@ -4714,6 +4739,12 @@ func (b *fakeBackend) pause(target selector) error {
 
 func (b *fakeBackend) resume(target selector) error {
 	b.resumed = target
+	return b.err
+}
+
+func (b *fakeBackend) setQuarantine(target selector, enabled bool) error {
+	b.quarantineTarget = target
+	b.quarantineEnabled = enabled
 	return b.err
 }
 

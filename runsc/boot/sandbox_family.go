@@ -80,6 +80,7 @@ type BranchInfo struct {
 	InitPID          kernel.ThreadID
 	InitState        string
 	SharesMemory     bool
+	Quarantined      bool
 	// ForkMetrics is populated for branches created by Fork.
 	ForkMetrics SandboxForkMetrics
 }
@@ -123,6 +124,12 @@ type ForkBranchesArgs struct {
 	Paused bool
 	// Quarantine cuts every new branch off from outside the sandbox.
 	Quarantine bool
+}
+
+// BranchQuarantineArgs changes the external-connectivity quarantine bit.
+type BranchQuarantineArgs struct {
+	ID      string
+	Enabled bool
 }
 
 // DistributedForkCaptureArgs starts a remotely readable snapshot session.
@@ -520,6 +527,7 @@ type sandboxBranch struct {
 	state            BranchState
 	createdAt        time.Time
 	metrics          SandboxForkMetrics
+	quarantined      bool
 
 	execSessions map[string]*execSession
 	consoleWaits map[*consoleWaitLease]struct{}
@@ -668,6 +676,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 				watchdog:         opts.LoaderWatchdog,
 				state:            kernelBranchState(k),
 				createdAt:        createdAt,
+				quarantined:      k.LiveForkQuarantine(),
 				execSessions:     make(map[string]*execSession),
 			},
 		},
@@ -1194,6 +1203,9 @@ func (f *SandboxFamily) injectExecFailure(stage SandboxExecStage) error {
 }
 
 func kernelBranchState(k *kernel.Kernel) BranchState {
+	if k == nil || k.TaskSet() == nil {
+		return BranchRunning
+	}
 	if k.IsPaused() {
 		return BranchPaused
 	}
@@ -1252,6 +1264,7 @@ func (f *SandboxFamily) ReplaceLoaderBranchFromDehydration(id, parentID, filesys
 			watchdog:         dog,
 			state:            BranchPaused,
 			createdAt:        createdAt,
+			quarantined:      k.LiveForkQuarantine(),
 			execSessions:     execSessions,
 		},
 	}
@@ -1512,6 +1525,7 @@ func (f *SandboxFamily) List() []BranchInfo {
 			InitPID:          initPID,
 			InitState:        initState,
 			SharesMemory:     b.k != nil && liveKernels > 1,
+			Quarantined:      b.quarantined,
 			ForkMetrics:      b.metrics,
 		})
 	}
@@ -1520,7 +1534,7 @@ func (f *SandboxFamily) List() []BranchInfo {
 }
 
 func branchInitStatus(b *sandboxBranch) (kernel.ThreadID, string) {
-	if b.k == nil {
+	if b.k == nil || b.k.TaskSet() == nil || b.k.RootPIDNamespace() == nil {
 		return 0, "not-started"
 	}
 	if b.k.RootPIDNamespace().ThreadGroupWithID(1) != nil {
@@ -1597,6 +1611,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			filesystemBranch: f.volumeBranchID(id),
 			state:            BranchCreating,
 			createdAt:        time.Now().UTC(),
+			quarantined:      source.quarantined || args.Quarantine,
 			execSessions:     make(map[string]*execSession),
 		}
 	}
@@ -1803,6 +1818,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			FilesystemBranch: childBranch.filesystemBranch,
 			State:            childBranch.state,
 			CreatedAt:        childBranch.createdAt,
+			Quarantined:      childBranch.quarantined,
 			ForkMetrics:      metrics[i],
 		}
 	}
@@ -1899,6 +1915,49 @@ func (f *SandboxFamily) Resume(id string) error {
 	}
 	f.mu.Lock()
 	b.state = kernelBranchState(b.k)
+	f.mu.Unlock()
+	return nil
+}
+
+// SetQuarantine changes the external-connectivity quarantine bit. Live
+// branches briefly pause while their runtime-owned link is replaced;
+// dehydrated branches only update the bit used by rehydration.
+func (f *SandboxFamily) SetQuarantine(id string, enabled bool) error {
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state == BranchDehydrated {
+		b.quarantined = enabled
+		f.mu.Unlock()
+		return nil
+	}
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, cannot change quarantine", id, state)
+	}
+	wasPaused := b.state == BranchPaused
+	k := b.k
+	f.mu.Unlock()
+	if !wasPaused {
+		k.Pause()
+	}
+	changeErr := k.SetLiveForkQuarantine(enabled)
+	if !wasPaused {
+		k.Unpause()
+		if err := control.PostResume(k, nil); changeErr == nil {
+			changeErr = err
+		}
+	}
+	if changeErr != nil {
+		return changeErr
+	}
+	f.mu.Lock()
+	b.quarantined = enabled
 	f.mu.Unlock()
 	return nil
 }
@@ -2131,6 +2190,7 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 	}
 	child, err := kernel.LoadDehydration(context.Background(), d.platform, d.image, kernel.DehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+		Quarantined: b.quarantined, OverrideQuarantine: true,
 		ConfigureNetwork: f.configureNetwork,
 	})
 	if err != nil {

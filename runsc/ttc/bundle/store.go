@@ -381,6 +381,9 @@ type DistributedForkOptions struct {
 // BranchInfo is branch display lineage plus its last known lifecycle state.
 type BranchInfo struct {
 	ID string `json:"id"`
+	// Quarantined disconnects the branch's runtime-managed external network
+	// edge while preserving its Sentry-owned network and socket state.
+	Quarantined bool `json:"quarantined,omitempty"`
 	// NodeID overrides the legacy family-wide owner for elastic placements.
 	// Empty inherits ContainerInfo.NodeID.
 	NodeID string `json:"node_id,omitempty"`
@@ -444,6 +447,7 @@ func MemoryBranchKey(branch BranchInfo) string {
 // into an already-running target family.
 type DistributedForkImport struct {
 	BranchID                 string    `json:"branch_id"`
+	Quarantined              bool      `json:"quarantined,omitempty"`
 	ParentID                 string    `json:"parent_id,omitempty"`
 	FilesystemBranch         string    `json:"filesystem_branch"`
 	State                    string    `json:"state"`
@@ -1376,6 +1380,13 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err != nil {
 		return Prepared{}, err
 	}
+	sourceQuarantined := false
+	for _, branch := range source.Branches {
+		if branch.ID == opts.ParentBranch {
+			sourceQuarantined = branch.Quarantined
+			break
+		}
+	}
 	globalFamilyID := source.DistributedFamilyID
 	if globalFamilyID == "" {
 		globalFamilyID = source.ID
@@ -1440,7 +1451,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 				}
 			}
 			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-				BranchID: opts.VisibleBranch, ParentID: opts.ParentBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
+				BranchID: opts.VisibleBranch, ParentID: opts.ParentBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
 				State: "created", CreatedAt: time.Now().UTC(), SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
 			}
 			existing = *current
@@ -1547,7 +1558,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, State: "created", StorageState: "local", SourceNode: opts.SourceNode, CreatedAt: now}}
+	target.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode, CreatedAt: now}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
@@ -2819,6 +2830,7 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
 					}
 					branch.FilesystemBranch = pending.FilesystemBranch
+					branch.Quarantined = pending.Quarantined
 					branch.NodeID = pending.TargetNode
 					branch.State = pending.State
 					branch.StorageState = "local"
@@ -2843,8 +2855,9 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 				}
 				current.Branches = append(current.Branches, BranchInfo{
 					ID: pending.BranchID, ParentID: pending.ParentID, FilesystemBranch: pending.FilesystemBranch,
-					NodeID: pending.TargetNode,
-					State:  pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
+					Quarantined: pending.Quarantined,
+					NodeID:      pending.TargetNode,
+					State:       pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
 					DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
 					DistributedForkTransactionID: transactionID,
 					DistributedSparseRepository:  pending.SparseRepository,
@@ -3311,6 +3324,23 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 			}
 			info.Branches[i].State = state
 			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// UpdateBranchQuarantine changes the durable external-connectivity flag.
+func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			if info.Branches[i].ID != branchID {
+				continue
+			}
+			if info.Branches[i].Quarantined == quarantined {
+				return false, nil
+			}
+			info.Branches[i].Quarantined = quarantined
 			return true, nil
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)

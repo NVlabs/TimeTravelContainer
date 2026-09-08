@@ -330,6 +330,8 @@ Manage branches independently:
 ```shell
 ttc pause web@test-a
 ttc resume web@test-a
+ttc quarantine web@test-a
+ttc unquarantine web@test-a
 ttc kill --signal TERM web@test-a
 ttc wait web@test-a
 ttc rm web@test-a
@@ -340,6 +342,15 @@ not remove surviving peers. Use `-f` to remove a running or paused branch.
 
 `ttc rm web` removes the whole family and requires all live branches to be
 exited unless `--force` is used.
+
+Quarantine is an independent per-branch flag, not a lifecycle state. It can be
+changed while a branch is running, paused, dehydrated, or exited. A quarantined
+branch retains its virtual NIC, internal sockets, and guest network
+configuration, but TTC disconnects its runtime-managed external edge and does
+not expose its published ports. The flag survives local and remote forks,
+migration, dehydration, rehydration, stop/start, and checkpoint/restore.
+Unquarantining recreates the external edge and published-port listeners;
+external connections that could not remain valid while disconnected are reset.
 
 Starting or restarting an exited branch does not require its peers to stop.
 TTC starts only the selected branch in a short-lived paused bootstrap, imports

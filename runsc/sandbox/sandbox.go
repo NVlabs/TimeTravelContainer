@@ -2322,6 +2322,15 @@ func (s *Sandbox) ResumeBranch(id string) error {
 	return nil
 }
 
+// SetBranchQuarantine changes one branch's external-connectivity bit.
+func (s *Sandbox) SetBranchQuarantine(id string, enabled bool) error {
+	args := boot.BranchQuarantineArgs{ID: id, Enabled: enabled}
+	if err := s.call(boot.ContMgrSetBranchQuarantine, &args, nil); err != nil {
+		return fmt.Errorf("setting branch %q quarantine to %t: %w", id, enabled, err)
+	}
+	return nil
+}
+
 // DehydrateBranch hibernates one branch.
 func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.BranchDehydrateInfo, error) {
 	args := &boot.BranchDehydrateArgs{ID: id}

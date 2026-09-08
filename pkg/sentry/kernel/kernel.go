@@ -186,7 +186,7 @@ type Kernel struct {
 	// destroyed: its links are rebuilt with nothing on the other end, so that
 	// neither its own programs nor anything outside the sandbox can tell it
 	// was ever there.
-	liveForkQuarantine bool `state:"nosave"`
+	liveForkQuarantine bool
 	// remoteLoadRanges retain the packed-stream layout while remotePageLoad may
 	// be handed from a live source to shared sparse chunks.
 	remoteLoadRanges []pgalloc.RemoteLoadRange `state:"nosave"`

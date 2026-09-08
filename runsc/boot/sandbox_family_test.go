@@ -208,7 +208,7 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	info, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
 		SessionID: "tx-1", FamilyID: "family-1", TargetBranchID: "remote-1",
 		ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10,
@@ -309,7 +309,7 @@ func TestSandboxFamilyDistributedForkCaptureMany(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	infos, err := family.CaptureDistributedForkMany(&DistributedForkCaptureManyArgs{
 		FamilyID: "family-many", MaxTransferBytes: 64 << 10,
 		Children: []DistributedForkCaptureChildArgs{
@@ -360,7 +360,7 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	defer func() {
 		family.DestroyNonLoaderBranches()
 		parent.Pause()
@@ -495,7 +495,7 @@ func TestDestroyLoaderPrefersLivePeerOverExitedPeer(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	if _, err := family.Fork(&ForkBranchArgs{ID: "a-exited", Paused: true}); err != nil {
 		t.Fatalf("Fork exited candidate: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	replacement := &kernel.Kernel{}
 	if err := family.ReplaceDefaultKernel(replacement); err != nil {
 		t.Fatal(err)
@@ -604,6 +604,7 @@ func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 			injected := errors.New("injected sandbox-family fork failure")
 			failOnce := true
 			family := NewSandboxFamily(parent, SandboxFamilyOptions{
+				LiveForkEligible: true,
 				TestOnlyForkFailureInjector: func(completed SandboxForkStage) error {
 					if failOnce && completed == stage {
 						failOnce = false
@@ -663,7 +664,7 @@ func TestSandboxFamilyConsoleWaitReadinessAndLifecycleIndependence(t *testing.T)
 		}
 		_ = parent.RemoveInternalConsole(parent.SupervisorContext(), consoleID)
 	}()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	var timeoutResult ConsoleWaitResult
 	if err := family.ConsoleWait(&ConsoleWaitArgs{
@@ -792,7 +793,7 @@ func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	child, err := family.Fork(&ForkBranchArgs{ID: "exec-target"})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)
@@ -892,7 +893,7 @@ func TestSandboxFamilyPausedManagementControlPreservesPause(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	childInfo, err := family.Fork(&ForkBranchArgs{ID: "paused-copy", Paused: true})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)
@@ -948,7 +949,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	parent.Unpause()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	initialBranches := family.List()
 	if len(initialBranches) != 1 || initialBranches[0].State != BranchRunning || parent.IsPaused() {
 		branches := initialBranches
@@ -1088,7 +1089,7 @@ func TestSandboxFamilyForkMany(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	infos, err := family.ForkMany(&ForkBranchesArgs{
 		IDs:    []string{"sibling-a", "sibling-b", "sibling-c"},
@@ -1142,7 +1143,7 @@ func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	// Exclude one-time source-side lazy initialization from the leak baseline.
 	// A retained branch reference would continue growing after this warm-up.
 	if _, err := family.Fork(&ForkBranchArgs{ID: "warm-up", Paused: true}); err != nil {
@@ -1208,6 +1209,66 @@ func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 	parent.Release()
 }
 
+func TestSandboxFamilyQuarantineIsIndependentInheritedBranchState(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		parent.Release()
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		for _, info := range family.List() {
+			if info.ID != DefaultBranchID {
+				_ = family.Destroy(info.ID)
+			}
+		}
+		parent.Pause()
+		parent.Release()
+	}()
+
+	if err := family.SetQuarantine(DefaultBranchID, true); err != nil {
+		t.Fatalf("quarantine source: %v", err)
+	}
+	child, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true})
+	if err != nil {
+		t.Fatalf("fork quarantined source: %v", err)
+	}
+	if !child.Quarantined {
+		t.Fatalf("child did not inherit quarantine: %+v", child)
+	}
+	if err := family.SetQuarantine("child", false); err != nil {
+		t.Fatalf("unquarantine child: %v", err)
+	}
+	var sourceSeen, childSeen bool
+	for _, info := range family.List() {
+		switch info.ID {
+		case DefaultBranchID:
+			sourceSeen = true
+			if !info.Quarantined {
+				t.Fatal("unquarantining child changed source")
+			}
+		case "child":
+			childSeen = true
+			if info.Quarantined {
+				t.Fatal("child remained quarantined")
+			}
+			if info.State != BranchPaused {
+				t.Fatalf("changing quarantine changed child lifecycle to %s", info.State)
+			}
+		}
+	}
+	if !sourceSeen || !childSeen {
+		t.Fatalf("family branches after quarantine transitions: %+v", family.List())
+	}
+}
+
 func BenchmarkSandboxFamilyFork(b *testing.B) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -1220,7 +1281,7 @@ func BenchmarkSandboxFamilyFork(b *testing.B) {
 		b.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	var totals SandboxForkMetrics
 	b.ResetTimer()

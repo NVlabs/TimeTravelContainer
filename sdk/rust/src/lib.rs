@@ -715,6 +715,14 @@ impl Client {
         self.command(["resume", target])
     }
 
+    pub fn quarantine(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["quarantine", target])
+    }
+
+    pub fn unquarantine(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["unquarantine", target])
+    }
+
     pub fn dehydrate(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["dehydrate", target])
     }
