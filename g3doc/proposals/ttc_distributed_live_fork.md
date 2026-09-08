@@ -615,8 +615,10 @@ budget selected below.
   revision, rejects stale writers, reloads after restart, and permits deletion
   only after a terminal state.
 * The control plane uses plaintext TCP on a trusted private cluster network.
-  `TTC_CLUSTER_TOKEN` optionally authenticates HTTP control requests and Raft
-  streams. Its bounded JSON API supports idempotent hidden-target reservation,
+  HTTP control requests and Raft streams share one advertised port; a reserved
+  Raft wire preface routes each accepted connection before either protocol
+  authenticates it. `TTC_CLUSTER_TOKEN` optionally authenticates both
+  protocols. The bounded JSON API supports idempotent hidden-target reservation,
   reconnect-safe status, and revisioned cancellation; per-target active
   transaction quotas are enforced before reservation. `ttc daemon start`
   exposes a small bootstrap/join interface while cluster-wide transport policy

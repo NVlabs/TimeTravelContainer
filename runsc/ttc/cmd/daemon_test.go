@@ -1062,7 +1062,7 @@ func TestSimpleClusterOptions(t *testing.T) {
 	if err := resolveSimpleClusterOptions(&opts, roots); err != nil {
 		t.Fatal(err)
 	}
-	if !opts.RaftBootstrap || opts.NodeID != "node-a" || opts.MemoryTarget != 8<<30 || opts.RaftListen != "127.0.0.1:7444" || opts.RaftAdvertise != "node-a.example:7444" || opts.RepositoryID == "" {
+	if !opts.RaftBootstrap || opts.NodeID != "node-a" || opts.MemoryTarget != 8<<30 || opts.Listen != "127.0.0.1:7443" || opts.Advertise != "node-a.example:7443" || opts.RepositoryID == "" {
 		t.Fatalf("simple cluster options=%+v", opts)
 	}
 

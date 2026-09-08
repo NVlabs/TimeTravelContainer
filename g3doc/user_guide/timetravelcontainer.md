@@ -408,8 +408,9 @@ ttc daemon start --cluster-join node-a.example:7443 --node node-b \
 ```
 
 Only one seed is needed. Membership and leader discovery come from Raft after
-admission. TTC derives its internal Raft listener automatically; page-transfer
-listeners are ephemeral per operation. Cluster-wide paging, lease,
+admission. HTTP control requests and Raft streams share the single TCP port
+named by `--listen` and `--advertise`; page-transfer listeners are ephemeral
+per operation. Cluster-wide paging, lease,
 transaction, and automatic-rebalance policy is created once by the bootstrap
 node and adopted by joiners. Node names, addresses, local memory targets, and
 capacity-provider hooks remain node-local settings.

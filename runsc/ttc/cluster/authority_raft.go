@@ -49,6 +49,7 @@ type AuthorityRaftOptions struct {
 	NodeID        string
 	LocalDir      string
 	ListenAddress string
+	Listener      net.Listener
 	AdvertiseHost string
 	ServerName    string
 	ServerTLS     *tls.Config
@@ -242,6 +243,9 @@ func writeRaftToken(w io.Writer, token string) error {
 	if len(token) > 4096 {
 		return errors.New("cluster authentication token is too long")
 	}
+	if _, err := io.WriteString(w, raftWireMagic); err != nil {
+		return err
+	}
 	var size [2]byte
 	binary.BigEndian.PutUint16(size[:], uint16(len(token)))
 	if _, err := w.Write(size[:]); err != nil {
@@ -252,6 +256,13 @@ func writeRaftToken(w io.Writer, token string) error {
 }
 
 func readRaftToken(r io.Reader, want string) error {
+	var magic [len(raftWireMagic)]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil {
+		return err
+	}
+	if string(magic[:]) != raftWireMagic {
+		return errors.New("invalid TTC Raft protocol preface")
+	}
 	var size [2]byte
 	if _, err := io.ReadFull(r, size[:]); err != nil {
 		return err
@@ -292,7 +303,7 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	if options.LocalDir == "" || !filepath.IsAbs(options.LocalDir) {
 		return nil, errors.New("Raft local directory must be an absolute node-local path")
 	}
-	if options.ListenAddress == "" || options.AdvertiseHost == "" {
+	if (options.ListenAddress == "" && options.Listener == nil) || options.AdvertiseHost == "" {
 		return nil, errors.New("Raft listen and advertise addresses are required")
 	}
 	if (options.ServerTLS == nil) != (options.ClientTLS == nil) {
@@ -301,9 +312,15 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	if err := os.MkdirAll(options.LocalDir, 0700); err != nil {
 		return nil, err
 	}
-	plainListener, err := net.Listen("tcp", options.ListenAddress)
-	if err != nil {
-		return nil, fmt.Errorf("listening for Raft: %w", err)
+	plainListener := options.Listener
+	var err error
+	if plainListener == nil {
+		plainListener, err = net.Listen("tcp", options.ListenAddress)
+		if err != nil {
+			return nil, fmt.Errorf("listening for Raft: %w", err)
+		}
+	} else if options.ServerTLS != nil {
+		return nil, errors.New("an externally multiplexed Raft listener cannot use TLS")
 	}
 	advertiseHost := options.AdvertiseHost
 	if host, port, splitErr := net.SplitHostPort(advertiseHost); splitErr == nil && port == "0" {

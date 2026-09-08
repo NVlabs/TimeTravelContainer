@@ -109,6 +109,14 @@ cluster-administrator trust. Admission
 checks repository identity, exact TTC build, architecture, base-page size, and
 required protocol features.
 
+Each daemon exposes one plaintext cluster TCP socket. Connections beginning
+with TTC's reserved Raft preface are handed to the authenticated Raft stream
+layer; every other connection is handed to the HTTP server with the inspected
+bytes replayed. Consequently a node has one control address for admission,
+commands, consensus, and replication. The preface is only protocol framing,
+not an authentication mechanism; `TTC_CLUSTER_TOKEN`, when configured, is
+validated independently by both HTTP and Raft.
+
 The node is first added as a non-voting learner. It receives the log or a
 snapshot before admission. The first three members are promoted to voters;
 additional elastic compute nodes remain learners, so a large worker fleet does

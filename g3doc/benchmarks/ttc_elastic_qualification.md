@@ -111,6 +111,23 @@ was repeated from a fresh root after all three fixes. The surviving daemon was
 then stopped with `ttc node stop node-a --stop-all`, and all temporary runtimes
 and storage were removed.
 
+### Single-port control/Raft multiplexing and member reuse
+
+On 2026-09-08, the same qualification was repeated after HTTP control and Raft
+were collapsed onto one TCP listener. Node A advertised and listened only on
+port 17643 and node B only on port 17653; `node ls --json` reported each exact
+port as both `control_url` and `raft_address`, and no adjacent listener existed.
+A join with the wrong `TTC_CLUSTER_TOKEN` failed before admission.
+
+A continuously updating BusyBox branch was migrated away while retiring the
+Raft leader. Its counter continued advancing on the survivor, the retired
+listener disappeared, and the retired node's local Raft database was removed.
+That node then rejoined through the survivor on its original single port, took
+the branch back during a second node retirement, and preserved the advancing
+counter. The test exposed and fixed a lifecycle defect in which a cleanly
+removed member retained obsolete local Raft state and could not later rejoin.
+Both retirement directions and all test storage and processes were cleaned up.
+
 ## Pressure placement and cleanup
 
 ### Three-node fixed-terminal retirement

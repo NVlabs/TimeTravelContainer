@@ -26,6 +26,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,7 +89,7 @@ const repositoryMaintenanceInterval = 5 * time.Minute
 
 const (
 	daemonRootFormatVersion        = 1
-	daemonClusterRootFormatVersion = 3
+	daemonClusterRootFormatVersion = 4
 )
 
 var (
@@ -289,9 +290,6 @@ type daemonClusterOptions struct {
 	PageListen      string
 	PageAdvertise   string
 	Peers           []string
-	RaftListen      string
-	RaftAdvertise   string
-	RaftServerName  string
 	RaftBootstrap   bool
 	PagingPolicy    ttcpolicy.Policy
 }
@@ -304,20 +302,23 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 }
 
 type daemonClusterRuntime struct {
-	listen        string
-	authToken     string
-	controlPlane  *cluster.ControlPlane
-	source        *distributedSourceRuntime
-	directory     cluster.NodeCatalog
-	placements    cluster.PlacementCatalog
-	transactions  cluster.TransactionCatalog
-	raft          *cluster.AuthorityRaftNode
-	raftCatalog   *cluster.RaftCatalog
-	nodeRecord    cluster.NodeRecord
-	lease         time.Duration
-	clusterID     string
-	autoRebalance bool
-	capacitySink  elasticCapacitySink
+	listen          string
+	authToken       string
+	mux             *cluster.ProtocolMux
+	controlListener net.Listener
+	controlPlane    *cluster.ControlPlane
+	source          *distributedSourceRuntime
+	directory       cluster.NodeCatalog
+	placements      cluster.PlacementCatalog
+	transactions    cluster.TransactionCatalog
+	raft            *cluster.AuthorityRaftNode
+	raftLocalDir    string
+	raftCatalog     *cluster.RaftCatalog
+	nodeRecord      cluster.NodeRecord
+	lease           time.Duration
+	clusterID       string
+	autoRebalance   bool
+	capacitySink    elasticCapacitySink
 }
 
 type daemonTargetRuntime struct {
@@ -2091,38 +2092,23 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 			return errors.New("joining a cluster requires an initialized shared TTC_ROOT")
 		}
 	}
-	host, port, err := net.SplitHostPort(opts.Listen)
+	_, port, err := net.SplitHostPort(opts.Listen)
 	if err != nil {
 		return fmt.Errorf("invalid --listen %q: %w", opts.Listen, err)
 	}
-	advertiseHost, advertisePort := "", port
 	if opts.Advertise == "" {
-		advertiseHost, err = os.Hostname()
+		advertiseHost, err := os.Hostname()
 		if err != nil || advertiseHost == "" {
 			return errors.New("cannot derive cluster advertise hostname; set --advertise")
 		}
 		opts.Advertise = net.JoinHostPort(advertiseHost, port)
 	} else {
-		advertiseHost, advertisePort, err = net.SplitHostPort(opts.Advertise)
+		_, _, err = net.SplitHostPort(opts.Advertise)
 		if err != nil {
 			return fmt.Errorf("invalid --advertise %q: %w", opts.Advertise, err)
 		}
 	}
-	if opts.RaftListen == "" {
-		opts.RaftListen = net.JoinHostPort(host, adjacentPort(port))
-	}
-	if opts.RaftAdvertise == "" {
-		opts.RaftAdvertise = net.JoinHostPort(advertiseHost, adjacentPort(advertisePort))
-	}
 	return nil
-}
-
-func adjacentPort(port string) string {
-	value, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || value == 0 || value == 65535 {
-		return "0"
-	}
-	return strconv.FormatUint(value+1, 10)
 }
 
 // daemonRootsFromEnvironment is the only source of daemon storage paths.
@@ -2343,8 +2329,6 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		"--cluster-capacity-command": &opts.CapacityCommand,
 		"--cluster-capacity-webhook": &opts.CapacityWebhook,
 		"--cluster-page-listen":      &opts.PageListen, "--cluster-page-advertise": &opts.PageAdvertise,
-		"--cluster-raft-listen":    &opts.RaftListen,
-		"--cluster-raft-advertise": &opts.RaftAdvertise,
 	} {
 		if consumed, err := setString(name, dst); consumed != 0 || err != nil {
 			if consumed != 0 {
@@ -2506,9 +2490,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, and repository ID")
 	}
 	opts.AuthToken = os.Getenv("TTC_CLUSTER_TOKEN")
-	if opts.RaftListen == "" || opts.RaftAdvertise == "" {
-		return nil, errors.New("cluster mode requires --cluster-raft-listen and --cluster-raft-advertise")
-	}
 	raftLocalDir := filepath.Join(localRoot, "cluster", "raft")
 	_, localRaftErr := os.Stat(filepath.Join(raftLocalDir, "raft.db"))
 	localRaftState := localRaftErr == nil
@@ -2595,13 +2576,32 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		}
 		clients[nodeID] = client
 	}
-	raftHost, _, err := parseClusterRaftAdvertise(opts.RaftAdvertise)
+	sharedListener, err := net.Listen("tcp", opts.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("listening for cluster control and Raft on %s: %w", opts.Listen, err)
+	}
+	protocolMux, err := cluster.NewProtocolMux(sharedListener)
+	if err != nil {
+		sharedListener.Close()
+		return nil, err
+	}
+	closeMux := true
+	defer func() {
+		if closeMux {
+			_ = protocolMux.Close()
+		}
+	}()
+	advertiseURL, err = resolveClusterAdvertise(advertiseURL, protocolMux.Addr().String())
 	if err != nil {
 		return nil, err
 	}
+	parsedAdvertise, err := url.Parse(advertiseURL)
+	if err != nil || parsedAdvertise.Host == "" {
+		return nil, fmt.Errorf("resolving shared cluster advertise address %q", advertiseURL)
+	}
 	raftNode, err := cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
 		NodeID: opts.NodeID, LocalDir: raftLocalDir,
-		ListenAddress: opts.RaftListen, AdvertiseHost: raftHost,
+		Listener: protocolMux.RaftListener(), AdvertiseHost: parsedAdvertise.Host,
 		AuthToken: opts.AuthToken, Bootstrap: opts.RaftBootstrap,
 	})
 	if err != nil {
@@ -2699,14 +2699,16 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		return source.peerForRecord(record)
 	})
 	closeRaft = false
+	closeMux = false
 	return &daemonClusterRuntime{
-		listen: opts.Listen, authToken: opts.AuthToken,
+		listen: protocolMux.Addr().String(), authToken: opts.AuthToken,
+		mux: protocolMux, controlListener: protocolMux.HTTPListener(),
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
 			Authority: &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID}, AuthToken: opts.AuthToken,
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
-		raft: raftNode, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
+		raft: raftNode, raftLocalDir: raftLocalDir, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
 		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink,
 	}, nil
 }
@@ -2892,13 +2894,6 @@ func transactionIDPatternForDaemon(value string) bool {
 	return true
 }
 
-func parseClusterRaftAdvertise(value string) (host, serverName string, err error) {
-	if _, _, err := net.SplitHostPort(value); err != nil {
-		return "", "", fmt.Errorf("invalid Raft advertise address %q: %w", value, err)
-	}
-	return value, "", nil
-}
-
 func requireEphemeralClusterPagePort(option, address string) error {
 	_, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -3017,6 +3012,23 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 }
 
 func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+	removeRetiredRaftState := false
+	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
+		// This defer is intentionally registered before raft.Close below, so it
+		// runs afterward. A cleanly retired node must rejoin as a fresh Raft
+		// member; retaining the removed member's Bolt state leaves it waiting
+		// forever for a configuration in which it no longer participates.
+		defer func() {
+			if removeRetiredRaftState {
+				if err := os.RemoveAll(clusterRuntime.raftLocalDir); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: removing retired Raft state: %v\n", err)
+				}
+			}
+		}()
+	}
+	if clusterRuntime != nil && clusterRuntime.mux != nil {
+		defer clusterRuntime.mux.Close()
+	}
 	if clusterRuntime != nil && clusterRuntime.raft != nil {
 		defer clusterRuntime.raft.Close()
 	}
@@ -3117,8 +3129,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}
 			if server.cleanStop.Load() {
 				if intent, err := loadElasticDrainIntent(dataRoot, elasticRecord.NodeID); err == nil && intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
-					if err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation); err != nil && stderr != nil {
-						fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
+					if err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation); err != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
+						}
+					} else {
+						removeRetiredRaftState = true
 					}
 				}
 				if err := removeCompletedElasticDrainIntent(dataRoot, elasticRecord.NodeID); err != nil && stderr != nil {
@@ -3151,18 +3167,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
-		clusterListener, err := net.Listen("tcp", clusterRuntime.listen)
-		if err != nil {
-			return fmt.Errorf("listening for cluster peers on %s: %w", clusterRuntime.listen, err)
+		clusterListener := clusterRuntime.controlListener
+		if clusterListener == nil {
+			return errors.New("cluster protocol multiplexer has no HTTP listener")
 		}
-		clusterRuntime.listen = clusterListener.Addr().String()
 		if clusterRuntime.directory != nil {
-			resolved, err := resolveClusterAdvertise(clusterRuntime.nodeRecord.ControlURL, clusterRuntime.listen)
-			if err != nil {
-				clusterListener.Close()
-				return err
-			}
-			clusterRuntime.nodeRecord.ControlURL = resolved
 			// Serve Raft authority traffic before this member registers and
 			// reconciles placements. During a simultaneous cluster restart,
 			// followers may already know this member is the leader and must be
@@ -4607,8 +4616,6 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, a
 			"--cluster-lease", clusterOpts.LeaseDuration.String(),
 			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 			"--cluster-page-listen", clusterOpts.PageListen,
-			"--cluster-raft-listen", clusterOpts.RaftListen,
-			"--cluster-raft-advertise", clusterOpts.RaftAdvertise,
 			"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
 			"--cluster-max-outstanding-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.MaxOutstandingBytes, 10),
 			"--cluster-max-parallel", strconv.Itoa(clusterOpts.PagingPolicy.MaxConcurrency),
