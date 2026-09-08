@@ -4972,10 +4972,10 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	now := time.Now().UTC()
 	merged := mergeBranchHistory(
-		[]Branch{{ID: "child", ParentID: "", State: "running", CreatedAt: now}},
+		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now}},
 		[]Branch{{ID: "child", ParentID: "removed-parent", State: "paused", CreatedAt: now}},
 	)
-	if len(merged) != 1 || merged[0].ParentID != "" || merged[0].State != "paused" {
+	if len(merged) != 1 || merged[0].ParentID != "" || !merged[0].Quarantined || merged[0].State != "paused" {
 		t.Fatalf("merged branch=%+v, want persisted parent and live state", merged)
 	}
 }

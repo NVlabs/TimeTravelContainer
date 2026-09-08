@@ -262,6 +262,15 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if err != nil {
 		return nil, err
 	}
+	// Treat the durable branch record as authoritative. The serialized Kernel
+	// contains the value captured at dehydration time, but the user may change
+	// quarantine while the branch is process-free.
+	if child.LiveForkQuarantine() != args.Quarantined {
+		if err := child.SetLiveForkQuarantine(args.Quarantined); err != nil {
+			child.Release()
+			return nil, fmt.Errorf("applying dehydration-time quarantine override: %w", err)
+		}
+	}
 	childOwned := true
 	defer func() {
 		if childOwned {
@@ -513,21 +522,21 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 	if args == nil || args.ID == "" || load == nil {
 		return errors.New("durable peer restore is missing arguments")
 	}
-	return f.restorePeer(args.ID, args.ParentID, args.FilesystemBranch, args.Resume, args.ExecSessions, load)
+	return f.restorePeer(args.ID, args.ParentID, args.FilesystemBranch, args.Quarantined, args.Resume, args.ExecSessions, load)
 }
 
 // RestoreDistributedPeer imports a remotely captured branch into the existing
 // Sentry and application MemoryFile. BranchID is the user-visible identity;
 // filesystemBranch is the globally unique repository branch prepared by the
 // source transaction.
-func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, quarantined bool, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	if branchID == "" || filesystemBranch == "" || load == nil {
 		return errors.New("distributed peer restore is missing branch, filesystem, or loader")
 	}
-	return f.restorePeer(branchID, "", filesystemBranch, false, nil, load)
+	return f.restorePeer(branchID, "", filesystemBranch, quarantined, false, nil, load)
 }
 
-func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quarantined, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	f.mu.Lock()
 	if _, ok := f.branches[id]; ok {
 		f.mu.Unlock()
@@ -621,7 +630,7 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, resum
 	b := &sandboxBranch{
 		id: id, parentID: parentID, filesystemBranch: filesystemBranch,
 		k: child, watchdog: dog, state: state, createdAt: time.Now().UTC(), execSessions: newSessions,
-		quarantined: child.LiveForkQuarantine(),
+		quarantined: quarantined,
 	}
 	f.branches[id] = b
 	f.stateChanged.Broadcast()

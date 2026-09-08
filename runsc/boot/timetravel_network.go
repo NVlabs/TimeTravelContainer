@@ -430,43 +430,42 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			return fmt.Errorf("pinning the quarantined gateway address: %v", err)
 		}
 		realm.close()
-		return nil
-	}
-
-	gateway := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-		Clock: dst.Stack.Clock(),
-	})
-	realm.gateway = gateway
-	const gatewayNICID = tcpip.NICID(1)
-	if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
-		return fmt.Errorf("creating TTC proxy NIC: %v", err)
-	}
-	if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   gatewayAddress,
-			PrefixLen: 24,
-		},
-	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("adding TTC proxy address: %v", err)
-	}
-	if err := gateway.SetPromiscuousMode(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTC proxy promiscuous mode: %v", err)
-	}
-	if err := gateway.SetSpoofing(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTC proxy spoofing: %v", err)
-	}
-	gateway.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: gatewayNICID}})
-	if cfg.NAT {
-		realm.installTCPForwarder(gateway)
-		realm.installUDPForwarder(gateway)
+	} else {
+		gateway := stack.New(stack.Options{
+			NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{
+				tcp.NewProtocol,
+				udp.NewProtocol,
+				icmp.NewProtocol4,
+				icmp.NewProtocol6,
+			},
+			Clock: dst.Stack.Clock(),
+		})
+		realm.gateway = gateway
+		const gatewayNICID = tcpip.NICID(1)
+		if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
+			return fmt.Errorf("creating TTC proxy NIC: %v", err)
+		}
+		if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
+			Protocol: ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   gatewayAddress,
+				PrefixLen: 24,
+			},
+		}, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("adding TTC proxy address: %v", err)
+		}
+		if err := gateway.SetPromiscuousMode(gatewayNICID, true); err != nil {
+			return fmt.Errorf("enabling TTC proxy promiscuous mode: %v", err)
+		}
+		if err := gateway.SetSpoofing(gatewayNICID, true); err != nil {
+			return fmt.Errorf("enabling TTC proxy spoofing: %v", err)
+		}
+		gateway.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: gatewayNICID}})
+		if cfg.NAT {
+			realm.installTCPForwarder(gateway)
+			realm.installUDPForwarder(gateway)
+		}
 	}
 
 	hooks := &sentrynetstack.LiveForkNetworkHooks{
@@ -513,6 +512,7 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		},
 		Close: realm.close,
 	}
+	dst.SetLiveForkQuarantine(quarantine)
 	dst.SetLiveForkNetworkHooks(hooks)
 	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil

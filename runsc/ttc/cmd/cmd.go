@@ -9772,6 +9772,10 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			// parent itself was already process-free, so it is not authoritative
 			// for lineage reconciliation.
 			branch.ParentID = recorded.ParentID
+			// Quarantine is user-controlled durable policy. In particular, it can
+			// change while a process-free branch remains listed by a live peer's
+			// Sentry, whose cached BranchInfo is not authoritative.
+			branch.Quarantined = recorded.Quarantined
 			branch.NodeID = recorded.NodeID
 			branch.StorageState = recorded.StorageState
 			branch.StorageGeneration = recorded.StorageGeneration
@@ -10169,11 +10173,40 @@ func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
 	if err != nil {
 		return err
 	}
+	if enabled && info.NetworkMode == "host" {
+		return fmt.Errorf("container %q uses host networking, which cannot be quarantined", info.Name)
+	}
 	if branch.Quarantined == enabled {
 		return nil
 	}
 	state := normalizeLifecycleState(branch.State)
 	live := state == "running" || state == "paused"
+	runtimeMutable := live
+	if state == "dehydrated" {
+		// A dehydrated branch may still have a process-free record in a Sentry
+		// that owns live siblings. Keep that cache coherent when it exists; an
+		// entirely cold family has no control server and needs only the durable
+		// update below.
+		if output, listErr := b.command("timetravel", info.ID, "branches"); listErr == nil {
+			var runtimeBranches []runscBranchInfo
+			if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+				return fmt.Errorf("decoding runtime branches before changing quarantine: %w", err)
+			}
+			for _, runtimeBranch := range runtimeBranches {
+				if runtimeBranch.ID == target.branch {
+					runtimeMutable = true
+					break
+				}
+			}
+		} else {
+			for _, sibling := range info.Branches {
+				state := normalizeLifecycleState(sibling.State)
+				if state == "running" || state == "paused" {
+					return fmt.Errorf("checking the live family before changing dehydrated branch quarantine: %w", listErr)
+				}
+			}
+		}
+	}
 	for i := range info.Branches {
 		if info.Branches[i].ID == target.branch {
 			info.Branches[i].Quarantined = enabled
@@ -10186,7 +10219,7 @@ func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
 		}
 	}
 	transitionRuntime := func(value bool) error {
-		if !live {
+		if !runtimeMutable {
 			return nil
 		}
 		action := "quarantine"
@@ -10196,7 +10229,7 @@ func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
 		_, err := b.command("timetravel", target.container, action, target.branch)
 		return err
 	}
-	if live {
+	if runtimeMutable {
 		if err := transitionRuntime(enabled); err != nil {
 			if enabled {
 				_ = b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch)
@@ -10967,6 +11000,15 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		if !present {
 			return b.rehydrateCold(target, info, *persistentBranch, true)
 		}
+		// The durable record is authoritative across daemon crashes. Reconcile
+		// the process-free runtime record before it recreates the Kernel.
+		action := "unquarantine"
+		if persistentBranch.Quarantined {
+			action = "quarantine"
+		}
+		if _, err := b.command("timetravel", info.ID, action, target.branch); err != nil {
+			return fmt.Errorf("reconciling dehydration-time quarantine for %s: %w", target, err)
+		}
 	}
 	_, err = b.command("timetravel", target.container, "rehydrate", target.branch)
 	if err != nil || b.dataRoot == "" {
@@ -11075,6 +11117,20 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return fmt.Errorf("materializing immutable image cache: %w", err)
 	}
 	info = refreshed
+	// RefreshContainerImageRoot reloads the authoritative container record.
+	// Do not keep using the BranchInfo snapshot supplied by a merged runtime
+	// view: quarantine may have changed while this branch was process-free.
+	foundBranch := false
+	for _, current := range info.Branches {
+		if current.ID == branch.ID {
+			branch = current
+			foundBranch = true
+			break
+		}
+	}
+	if !foundBranch {
+		return fmt.Errorf("branch %q disappeared before cold rehydration", branch.ID)
+	}
 	localImageBefore := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	_, localImageErr := os.Stat(localImageBefore)
 	needsColdMaterialization := errors.Is(localImageErr, os.ErrNotExist)

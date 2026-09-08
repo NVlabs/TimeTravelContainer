@@ -3893,8 +3893,12 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	if err != nil {
 		return
 	}
+	quarantineReconciled := true
 	for _, family := range families {
 		container, containerErr := backend.containerStore().LoadContainer(family.ID)
+		if containerErr != nil {
+			quarantineReconciled = false
+		}
 		for _, branch := range family.Branches {
 			if branch.State != "running" && branch.State != "paused" {
 				continue
@@ -3902,6 +3906,20 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			target := selector{container: family.ID, branch: branch.ID}
 			_, _ = backend.ensureConsoleDrain(target, false)
 			if containerErr == nil {
+				if durable, branchErr := persistentBranchInfo(container, branch.ID); branchErr == nil {
+					action := "unquarantine"
+					if durable.Quarantined {
+						action = "quarantine"
+					}
+					// Recover a daemon crash between changing the live link and
+					// committing the durable policy bit. Kernel-side transitions are
+					// idempotent, so durable metadata always wins.
+					if _, err := backend.command("timetravel", family.ID, action, branch.ID); err != nil {
+						quarantineReconciled = false
+					}
+				} else {
+					quarantineReconciled = false
+				}
 				_ = backend.ensurePublishedPortsForBranch(container, branch.ID)
 			}
 			sessions, err := backend.execSessions(target)
@@ -3920,7 +3938,9 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	// state has been refreshed, and fail conservatively inside the helper.
 	_ = backend.reconcileClusterSparseMemoryRoots()
 	_ = backend.reconcilePlacementCatalog()
-	s.reconciled[key] = true
+	if quarantineReconciled {
+		s.reconciled[key] = true
+	}
 }
 
 func writeDaemonFrame(writer io.Writer, mu *sync.Mutex, typ byte, payload []byte) error {

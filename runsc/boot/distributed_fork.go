@@ -624,7 +624,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 	}()
 	var child *kernel.Kernel
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		// The live target filesystem records its node-local repository ID, while
 		// the incoming Kernel was serialized against the source repository ID.
 		// Both identities refer to the same imported generation. Make the source
@@ -745,7 +745,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			_ = sparseRepository.Close()
 		}
 	}()
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
 		// LoadSparseDurableDehydration consumes one ownership reference for
 		// every MemoryFile. Application memory is shared with the active family,
