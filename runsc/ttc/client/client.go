@@ -319,13 +319,70 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ttc: usage: ttc daemon stop [--dehydrate-all|--stop-all|--migrate-all]")
 			return 2
 		}
-		return exchangeControl(opts.socket, request{Action: "stop", ManageStop: true, Args: args[1:]}, stdout, stderr)
+		return stopDaemon(opts.socket, args[1:], stdout, stderr)
 	case "requests", "request":
 		return exchangeControl(opts.socket, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "mutation-control", Args: args}, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "ttc: unknown daemon command %q\n", args[0])
 		return 2
 	}
+}
+
+// stopDaemon keeps daemon shutdown available while upgrading from daemons
+// that predate the version-independent stop action. Current daemons accept the
+// first request without checking Version or ClientBuildID. A legacy daemon may
+// reject it before dispatch and report its own API version; retrying the exact
+// same stop action with that version is safe because the rejected request made
+// no state change.
+func stopDaemon(socket string, args []string, stdout, stderr io.Writer) int {
+	req := request{Version: daemonAPIVersion, Action: "stop", ManageStop: true, Args: append([]string(nil), args...)}
+	status, out, diagnostic, err := exchangeControlCapture(socket, req)
+	if err != nil {
+		fmt.Fprintf(stderr, "ttc: %v\n", err)
+		return 1
+	}
+	if status != 0 {
+		if legacyVersion, ok := reportedDaemonAPIVersion(string(diagnostic)); ok && legacyVersion != req.Version {
+			req.Version = legacyVersion
+			status, out, diagnostic, err = exchangeControlCapture(socket, req)
+			if err != nil {
+				fmt.Fprintf(stderr, "ttc: retrying daemon stop with API version %d: %v\n", legacyVersion, err)
+				return 1
+			}
+		}
+	}
+	_, _ = stdout.Write(out)
+	_, _ = stderr.Write(diagnostic)
+	return status
+}
+
+func exchangeControlCapture(socket string, req request) (int, []byte, []byte, error) {
+	conn, err := connect(socket)
+	if err != nil {
+		return 1, nil, nil, err
+	}
+	defer conn.Close()
+	var stdout, stderr bytes.Buffer
+	status, err := exchange(conn, req, strings.NewReader(""), &stdout, &stderr)
+	return status, stdout.Bytes(), stderr.Bytes(), err
+}
+
+func reportedDaemonAPIVersion(diagnostic string) (int, bool) {
+	const marker = "(server uses "
+	start := strings.LastIndex(diagnostic, marker)
+	if start < 0 {
+		return 0, false
+	}
+	value := diagnostic[start+len(marker):]
+	end := strings.IndexByte(value, ')')
+	if end < 0 {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value[:end]))
+	if err != nil || parsed <= 0 || parsed > 1<<16 {
+		return 0, false
+	}
+	return parsed, true
 }
 
 func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {

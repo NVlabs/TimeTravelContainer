@@ -4,11 +4,17 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -59,6 +65,97 @@ func TestTTCSocketAndOverride(t *testing.T) {
 	opts, rest, done, err := parseGlobal([]string{"--daemon-socket", "/tmp/from-flag.sock", "ps"}, os.Stdout)
 	if err != nil || done || opts.socket != "/tmp/from-flag.sock" || len(rest) != 1 || rest[0] != "ps" {
 		t.Fatalf("parseGlobal=(%+v, %q, %t, %v)", opts, rest, done, err)
+	}
+}
+
+func TestDaemonStopRetriesReportedLegacyAPI(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "ttcd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	requests := make(chan request, 2)
+	serverErr := make(chan error, 1)
+	go func() {
+		for attempt := 0; attempt < 2; attempt++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			header, err := bufio.NewReader(conn).ReadBytes('\n')
+			if err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			var req request
+			if err := json.Unmarshal(header, &req); err != nil {
+				conn.Close()
+				serverErr <- err
+				return
+			}
+			requests <- req
+			var writeMu sync.Mutex
+			status := 1
+			if attempt == 0 {
+				err = writeFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: unsupported API version 5 (server uses 4)\n"))
+			} else {
+				status = 0
+				err = writeFrame(conn, &writeMu, daemonFrameStdout, []byte("stopped\n"))
+			}
+			var encodedStatus [4]byte
+			binary.BigEndian.PutUint32(encodedStatus[:], uint32(status))
+			if err == nil {
+				err = writeFrame(conn, &writeMu, daemonFrameStatus, encodedStatus[:])
+			}
+			conn.Close()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	var stdout, stderr bytes.Buffer
+	if status := stopDaemon(socket, []string{"--stop-all"}, &stdout, &stderr); status != 0 {
+		t.Fatalf("stopDaemon status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "stopped\n" || stderr.Len() != 0 {
+		t.Fatalf("stop output stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	first, second := <-requests, <-requests
+	if first.Version != daemonAPIVersion || second.Version != 4 {
+		t.Fatalf("stop request versions=(%d, %d), want (%d, 4)", first.Version, second.Version, daemonAPIVersion)
+	}
+	for index, req := range []request{first, second} {
+		if req.Action != "stop" || req.ClientBuildID != "" || !req.ManageStop || len(req.Args) != 1 || req.Args[0] != "--stop-all" {
+			t.Fatalf("stop request %d=%+v", index, req)
+		}
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReportedDaemonAPIVersion(t *testing.T) {
+	for _, test := range []struct {
+		diagnostic string
+		want       int
+		ok         bool
+	}{
+		{"ttcd: unsupported API version 5 (server uses 4)\n", 4, true},
+		{"ttcd: unsupported API version", 0, false},
+		{"ttcd: unsupported API version 5 (server uses 0)", 0, false},
+		{fmt.Sprintf("ttcd: unsupported API version 5 (server uses %d)", 1<<16+1), 0, false},
+	} {
+		got, ok := reportedDaemonAPIVersion(test.diagnostic)
+		if got != test.want || ok != test.ok {
+			t.Errorf("reportedDaemonAPIVersion(%q)=(%d, %t), want (%d, %t)", test.diagnostic, got, ok, test.want, test.ok)
+		}
 	}
 }
 
