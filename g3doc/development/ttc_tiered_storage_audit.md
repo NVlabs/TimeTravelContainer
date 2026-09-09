@@ -51,9 +51,9 @@ in exactly one of these classes:
 
 | Class | May be the only copy? | May be evicted? | Required protection |
 |---|---:|---:|---|
-| Read cache | No | Yes, at any time when not open | Immutable identity and checksum |
-| Active writable authority | Yes, while leased | No | Raft owner/incarnation and storage generation |
-| Sealed publication staging | Yes, temporarily | No | Durable local intent and generation fence |
+| Read cache | No | Yes, at any time when not open | Immutable object identity and structural bounds |
+| Active writable authority | Yes, while leased | No | Raft owner/incarnation and branch mutation fence |
+| Sealed publication staging | Yes, temporarily | No | Durable local intent and snapshot identity |
 | Replicated control log | Yes on one member, replicated by Raft | No while member is active | Raft durability rules |
 
 Anything else under `TTC_LOCAL_ROOT` is residue. Once a branch's durable roots
@@ -64,6 +64,13 @@ Shared storage should contain immutable content-addressed data, committed
 manifests, and a small number of low-frequency roots. Guest reads and writes,
 per-page updates, per-command event fsyncs, and whole-cluster scans must not be
 normal shared-filesystem traffic.
+
+Checksums must not substitute for protocol correctness. TTC assumes reliable
+host storage rather than attempting to detect latent disk corruption. Immutable
+snapshot UUIDs, exact lengths, atomic publication, and Raft-fenced pointer
+updates should establish correctness. OCI-mandated digests and checks internal
+to third-party protocols may remain, but TTC should not hash bulk data on its
+write or read path merely to validate its own synchronization.
 
 ## Current placement inventory
 
@@ -167,7 +174,7 @@ shared filesystem can delay daemon shutdown, cancellation, unrelated
 publications, and node retirement.
 
 Required invariant: transfer progress must be restartable at independently
-checksummed extents; cancellation must stop scheduling new I/O promptly; local
+committed extents; cancellation must stop scheduling new I/O promptly; local
 sealed authority must remain valid until a committed manifest makes all extents
 reachable elsewhere.
 
@@ -454,8 +461,9 @@ count, lease, last-access signal, or eviction ordering across these classes.
 - Live resident application memory is anonymous and remains page-CoW; it is not
   bound to disk throughput.
 - Active TTC volume writes occur on `TTC_LOCAL_ROOT`, not the shared filesystem.
-- Filesystem and memory generations have immutable identities, checksums, and
-  generation-fenced publication roots.
+- Filesystem and memory captures already have immutable identities and
+  generation-fenced publication roots, although the identity and fencing roles
+  should be separated in the replacement design.
 - The local publication intent is fsynced before lifecycle commands return, and
   ready captures are retried after daemon restart.
 - Remote memory and regular-file data paths already support 1 MiB demand fetch
@@ -496,11 +504,12 @@ continuous tests rather than one-off demonstrations:
    publisher at every boundary. No old worker may change the active branch's
    owner, lifecycle, generation, or visible bytes.
 3. **Cold stopped start:** stop and make durable, delete the original local
-   root, start elsewhere, and checksum untouched, sparse, zero-filled, hardlink,
-   xattr, and modified files before and after random reads/writes.
+   root, start elsewhere, and compare known contents of untouched, sparse,
+   zero-filled, hardlink, xattr, and modified files before and after random
+   reads/writes.
 4. **Chained migration:** execute `A -> B -> C -> D` without waiting for
    independence. Kill or retire each obsolete source as soon as the protocol
-   permits and continuously checksum memory and filesystem state.
+   permits and continuously compare guest-visible memory and filesystem state.
 5. **Interrupted transfers:** kill source daemon, target daemon, Raft leader,
    and shared-FS client during every extent/publish/manifest boundary. Resume
    without retransmitting already committed extents and end with zero residue.
