@@ -461,6 +461,9 @@ type DistributedForkImport struct {
 	Migration                bool      `json:"migration,omitempty"`
 	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string  `json:"memory_roots,omitempty"`
+	MemoryRootObjects        []string  `json:"memory_root_objects,omitempty"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
@@ -2888,6 +2891,9 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					branch.DistributedSparseRepository = pending.SparseRepository
 					branch.DistributedSparseBranch = pending.SparseBranch
 					branch.DistributedMigration = true
+					branch.SnapshotID = pending.SnapshotID
+					branch.MemoryRoots = append([]string(nil), pending.MemoryRoots...)
+					branch.MemoryRootObjects = append([]string(nil), pending.MemoryRootObjects...)
 					found = true
 					break
 				}
@@ -2909,6 +2915,8 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					DistributedForkTransactionID: transactionID,
 					DistributedSparseRepository:  pending.SparseRepository,
 					DistributedSparseBranch:      pending.SparseBranch,
+					SnapshotID:                   pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
+					MemoryRootObjects: append([]string(nil), pending.MemoryRootObjects...),
 				})
 			}
 			delete(current.DistributedForkImports, transactionID)
@@ -2998,6 +3006,56 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 			recomputeContainerState(current)
 		}
 		return true, nil
+	})
+}
+
+// UpdateDistributedForkMemoryGraph records the immutable graph roots selected
+// by a hidden or published distributed target. Target-local logical names are
+// derived from its immutable filesystem-branch identity, not its visible name.
+func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID uint64, objects []string) error {
+	if snapshotID == 0 || len(objects) == 0 || len(objects) > 4096 {
+		return errors.New("distributed graph memory identity is incomplete")
+	}
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return err
+	}
+	makeRoots := func(filesystemBranch string) []string {
+		roots := make([]string, len(objects))
+		for index := range roots {
+			roots[index] = fmt.Sprintf("memory/branch/%s/resource-%04x", filesystemBranch, index)
+		}
+		return roots
+	}
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID == transactionID {
+			if len(current.Branches) != 1 {
+				return false, errors.New("hidden distributed target has invalid branch cardinality")
+			}
+			branch := &current.Branches[0]
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
+			return true, nil
+		}
+		if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.SnapshotID = snapshotID
+			pending.MemoryRoots = makeRoots(pending.FilesystemBranch)
+			pending.MemoryRootObjects = append([]string(nil), objects...)
+			current.DistributedForkImports[transactionID] = pending
+			return true, nil
+		}
+		for index := range current.Branches {
+			branch := &current.Branches[index]
+			if branch.DistributedForkTransactionID != transactionID {
+				continue
+			}
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
+			return true, nil
+		}
+		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 	})
 }
 

@@ -1000,11 +1000,16 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	for _, run := range decodedGraphManifest.Runs {
 		streamBytes += uint64(run.Pages) * 4096
 	}
+	rootObjects := make([]string, len(capture.MemoryRoots))
+	for index, root := range capture.MemoryRoots {
+		rootObjects[index] = root.Root
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: advertise, SnapshotToken: hex.EncodeToString(filesystemToken[:]),
 		MetadataBytes: uint64(len(encodedMetadata)), StreamBytes: streamBytes,
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
 		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
+		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
 		DurableDehydration: true, FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)

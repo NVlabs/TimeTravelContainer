@@ -75,6 +75,16 @@ root retain/release operations. Each batch is journaled atomically at the
 provider, identifies roots by immutable object ID and stable logical slot, and
 is idempotent across lost responses. Descendant edges and object counts remain
 entirely in the provider's graph ledger rather than entering HTTP or Raft.
+Distributed graph sessions now carry the selected snapshot ID and ordered
+immutable root-object IDs as control metadata. Targets persist fresh logical
+root names derived from their filesystem-branch identity for both new-family
+and existing-family imports, so later fork, dehydration, removal, and ledger
+operations no longer lose the restored branch's graph identity.
+In a fresh two-node test, a shared snapshot-1 branch imported on node B kept
+its root object in `ls --json`, forked a running local sibling from that root,
+and then dehydrated into snapshot 2 while the sibling continued to reference
+snapshot 1. This verifies identity continuity across import, local fork, and a
+new capture origin.
 
 ## Goals
 

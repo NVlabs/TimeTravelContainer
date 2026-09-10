@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -192,6 +193,10 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err := store.UpdateDistributedForkSparseRoot("tx-import", "cluster/memory-chunks", "memory-root"); err != nil {
 		t.Fatal(err)
 	}
+	graphObjects := []string{"0000000000000007-03-0000000000000001", "0000000000000006-03-0000000000000002"}
+	if err := store.UpdateDistributedForkMemoryGraph("tx-import", 7, graphObjects); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.UpdateDistributedForkTargetState("tx-import", "paused"); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +207,9 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !peer || branch.State != "paused" || branch.NodeID != "node-b" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 {
+	if !peer || branch.State != "paused" || branch.NodeID != "node-b" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 ||
+		branch.SnapshotID != 7 || !slices.Equal(branch.MemoryRootObjects, graphObjects) || len(branch.MemoryRoots) != 2 ||
+		branch.MemoryRoots[0] != fmt.Sprintf("memory/branch/%s/resource-0000", branch.FilesystemBranch) {
 		t.Fatalf("published peer=%t branch=%+v family=%+v", peer, branch, info.Branches)
 	}
 	if err := store.RemoveDistributedForkTarget("tx-import"); err != nil {

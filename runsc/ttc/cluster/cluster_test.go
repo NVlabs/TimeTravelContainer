@@ -171,7 +171,8 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 	base := RemoteSessionDescriptor{
 		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
 		SharedMetadata: "cluster/memory-metadata/tx.state",
-		GraphManifest:  "cluster/memory-manifests/tx.manifest", DurableDehydration: true,
+		GraphManifest:  "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
+		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"}, DurableDehydration: true,
 	}
 	if err := base.validate(negotiated); err != nil {
 		t.Fatalf("valid graph metadata descriptor: %v", err)
@@ -182,6 +183,8 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 		func(d *RemoteSessionDescriptor) { d.DurableDehydration = false },
 		func(d *RemoteSessionDescriptor) { d.SparseRepository = "cluster/chunks" },
 		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
+		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
+		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
 	} {
 		invalid := base
 		mutate(&invalid)

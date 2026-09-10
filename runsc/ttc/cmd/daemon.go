@@ -434,6 +434,13 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 	}
 	if restoreArgs.GraphSparse {
+		rootNames := graphMemoryRootNames(targetBranch.FilesystemBranch, len(session.GraphRootObjects))
+		if err := validateGraphRootObjects(session.GraphSnapshot, rootNames, session.GraphRootObjects); err != nil {
+			return fmt.Errorf("validating distributed graph memory identity: %w", err)
+		}
+		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects); err != nil {
+			return fmt.Errorf("recording distributed graph memory identity: %w", err)
+		}
 		restoreArgs.GraphRemote = true
 		if _, err := rand.Read(restoreArgs.GraphRemoteToken[:]); err != nil {
 			return fmt.Errorf("generating graph restore token: %w", err)

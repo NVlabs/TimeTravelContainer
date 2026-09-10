@@ -141,6 +141,11 @@ type RemoteSessionDescriptor struct {
 	// Bulk objects remain in their authoritative provider or shared pack and
 	// are populated into the target cache only when faulted.
 	GraphManifest string `json:"graph_manifest,omitempty"`
+	// GraphSnapshot and GraphRootObjects preserve the immutable memory
+	// identity selected by GraphManifest. Root names are target-local handles
+	// reconstructed from the target filesystem-branch identity.
+	GraphSnapshot    uint64   `json:"graph_snapshot,omitempty"`
+	GraphRootObjects []string `json:"graph_root_objects,omitempty"`
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
@@ -207,6 +212,11 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if s.SharedSnapshot != "" || s.SparseRepository != "" {
 			return errors.New("graph, packed, and legacy sparse snapshots are mutually exclusive")
 		}
+		if s.GraphSnapshot == 0 || len(s.GraphRootObjects) == 0 || len(s.GraphRootObjects) > 4096 {
+			return errors.New("graph memory restore requires bounded immutable root identities")
+		}
+	} else if s.GraphSnapshot != 0 || len(s.GraphRootObjects) != 0 {
+		return errors.New("graph memory identity requires a graph manifest")
 	}
 	if (s.SparseRepository == "") != (s.SparseManifest == "") ||
 		(s.SparseRepository == "") != (s.SparseBranch == "") {
@@ -561,8 +571,8 @@ type ControlPlane struct {
 	// unique volatile origin owner. Object and descendant counts never enter
 	// the control plane or Raft.
 	SnapshotReferences SnapshotReferenceProvider
-	operationMu      sync.Mutex // serializes reservation/quota accounting
-	transactionMu    sync.Map   // transaction ID -> *sync.Mutex
+	operationMu        sync.Mutex // serializes reservation/quota accounting
+	transactionMu      sync.Map   // transaction ID -> *sync.Mutex
 }
 
 // ImmutableObjectProvider opens one complete immutable object after checking
