@@ -10763,9 +10763,6 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 	if err != nil {
 		return err
 	}
-	if err := b.snapshotData.VerifyReferenced(b.snapshotGraph); err != nil {
-		return err
-	}
 	reclaimedObjects, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
 	if err != nil {
 		return err
