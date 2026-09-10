@@ -11641,6 +11641,18 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err != nil {
 		return err
 	}
+	var graphRestore *graphMemoryRestore
+	if graphSparse {
+		graphRestore, err = b.openGraphMemoryRestore(capture)
+		if err != nil {
+			return err
+		}
+		defer graphRestore.close()
+		if graphRestore.remote != nil {
+			restoreArgs.GraphRemote = true
+			restoreArgs.GraphRemoteToken = graphRestore.token
+		}
+	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
 		return err
@@ -11662,18 +11674,16 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	if sparse {
 		if graphSparse {
-			manifest, objects, graphErr := b.openGraphMemoryRestore(capture)
-			if graphErr != nil {
-				configReader.Close()
-				return graphErr
-			}
-			defer manifest.Close()
-			defer objects.Close()
 			manifestFD := 3 + len(files)
-			files = append(files, manifest)
+			files = append(files, graphRestore.manifest)
 			objectsFD := 3 + len(files)
-			files = append(files, objects)
+			files = append(files, graphRestore.objects)
 			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+			if graphRestore.remote != nil {
+				remoteFD := 3 + len(files)
+				files = append(files, graphRestore.remote)
+				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
+			}
 		} else {
 			repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 			repository, err := os.Open(repositoryPath)
@@ -11758,16 +11768,51 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	return nil
 }
 
-func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*os.File, *os.File, error) {
+type graphMemoryRestore struct {
+	manifest *os.File
+	objects  *os.File
+	remote   *os.File
+	token    ttcsnapshot.ObjectRelayToken
+}
+
+func (restore *graphMemoryRestore) close() {
+	if restore == nil {
+		return
+	}
+	for _, file := range []*os.File{restore.manifest, restore.objects, restore.remote} {
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+}
+
+type graphRestoreObjectSource struct {
+	resolver *ttcsnapshot.Resolver
+	objects  map[ttcsnapshot.ObjectID]ttcsnapshot.Object
+}
+
+func (source graphRestoreObjectSource) Fetch(ctx context.Context, id ttcsnapshot.ObjectID) (io.ReadCloser, uint64, error) {
+	object, ok := source.objects[id]
+	if !ok {
+		return nil, 0, os.ErrNotExist
+	}
+	file, err := source.resolver.ResolveKnown(ctx, object)
+	if err != nil {
+		return nil, 0, err
+	}
+	return file, object.BulkLength, nil
+}
+
+func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*graphMemoryRestore, error) {
 	if b.snapshotData == nil || len(capture.MemoryRoots) == 0 || capture.SnapshotID == 0 {
-		return nil, nil, errors.New("graph-native dehydration roots are unavailable")
+		return nil, errors.New("graph-native dehydration roots are unavailable")
 	}
 	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
 	localRoots := b.snapshotGraph != nil
 	for index, recorded := range capture.MemoryRoots {
 		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
 		if err != nil {
-			return nil, nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
+			return nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
 		}
 		if localRoots {
 			current, ok := b.snapshotGraph.Root(recorded.Name)
@@ -11783,67 +11828,87 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	} else {
 		immutable, err := b.immutableSnapshotCatalog(context.Background(), ttcsnapshot.SnapshotID(capture.SnapshotID), "")
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
+			return nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
 		}
 		catalog = immutable
 	}
 	adapted, err := ttcchunk.BuildGraphManifest(catalog, roots)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// The Sentry currently receives a descriptor for the node-local complete-
-	// object cache. Fill only the chunks reached by this branch. A later relay
-	// milestone will move these ResolveKnown calls onto Sentry page faults so
-	// target execution need not wait for all chunks.
+	objectCatalog, ok := catalog.(interface {
+		Object(ttcsnapshot.ObjectID) (ttcsnapshot.Object, bool)
+	})
+	if !ok {
+		return nil, errors.New("graph memory catalog cannot describe bulk objects")
+	}
+	missing := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
 	for _, objectID := range adapted.Chunks {
 		if file, err := b.snapshotData.Open(objectID, ttcsnapshot.MemoryChunkBytes); err == nil {
 			file.Close()
 			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("opening local memory chunk %s: %w", objectID, err)
 		}
-		if b.snapshotResolver == nil {
-			return nil, nil, fmt.Errorf("memory chunk %s is not local and no distributed resolver is configured", objectID)
-		}
-		var object ttcsnapshot.Object
-		var ok bool
-		if localRoots {
-			object, ok = b.snapshotGraph.Object(objectID)
-		} else {
-			object, ok = catalog.(*ttcsnapshot.ImmutableCatalog).Object(objectID)
-		}
+		object, ok := objectCatalog.Object(objectID)
 		if !ok {
-			return nil, nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
+			return nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
 		}
-		file, err := b.snapshotResolver.ResolveKnown(context.Background(), object)
-		if err != nil {
-			return nil, nil, fmt.Errorf("materializing memory chunk %s: %w", objectID, err)
+		if object.BulkLength != ttcsnapshot.MemoryChunkBytes {
+			return nil, fmt.Errorf("memory chunk %s has length %d, want %d", objectID, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
 		}
-		if err := file.Close(); err != nil {
-			return nil, nil, err
-		}
+		missing[objectID] = object
 	}
 	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	manifestFD, err := memutil.CreateMemFD("ttc-graph-memory-manifest", 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	manifest := os.NewFile(uintptr(manifestFD), "ttc-graph-memory-manifest")
 	if _, err := manifest.Write(encoded); err != nil {
 		manifest.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	if _, err := manifest.Seek(0, io.SeekStart); err != nil {
 		manifest.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	objects, err := os.Open(filepath.Join(b.activeDataRoot(), "objects"))
 	if err != nil {
 		manifest.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return manifest, objects, nil
+	restore := &graphMemoryRestore{manifest: manifest, objects: objects}
+	if len(missing) == 0 {
+		return restore, nil
+	}
+	if b.snapshotResolver == nil {
+		restore.close()
+		return nil, errors.New("graph memory has non-local chunks and no distributed resolver")
+	}
+	if _, err := rand.Read(restore.token[:]); err != nil {
+		restore.close()
+		return nil, err
+	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		restore.close()
+		return nil, err
+	}
+	server := os.NewFile(uintptr(fds[0]), "ttc-graph-memory-server")
+	restore.remote = os.NewFile(uintptr(fds[1]), "ttc-graph-memory-client")
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(missing))
+	for id, object := range missing {
+		allowed[id] = object.BulkLength
+	}
+	go func() {
+		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: b.snapshotResolver, objects: missing}, allowed)
+		b.reportColdRelayError("graph memory", err)
+	}()
+	return restore, nil
 }
 
 func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File, needsColdMaterialization bool) error {
@@ -11907,6 +11972,18 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		return err
 	}
 	restoreArgs.NetworkArgs = networkArgs
+	var graphRestore *graphMemoryRestore
+	if graphSparse {
+		graphRestore, err = b.openGraphMemoryRestore(capture)
+		if err != nil {
+			return err
+		}
+		defer graphRestore.close()
+		if graphRestore.remote != nil {
+			restoreArgs.GraphRemote = true
+			restoreArgs.GraphRemoteToken = graphRestore.token
+		}
+	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
 		return err
@@ -11929,16 +12006,17 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	targetStartFD := 5 + len(snapshots)
 	if sparse {
 		if graphSparse {
-			manifest, objects, graphErr := b.openGraphMemoryRestore(capture)
-			if graphErr != nil {
-				configReader.Close()
-				return graphErr
+			manifestFD := 3 + len(files)
+			files = append(files, graphRestore.manifest)
+			objectsFD := 3 + len(files)
+			files = append(files, graphRestore.objects)
+			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+			if graphRestore.remote != nil {
+				remoteFD := 3 + len(files)
+				files = append(files, graphRestore.remote)
+				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
 			}
-			defer manifest.Close()
-			defer objects.Close()
-			files = append(files, manifest, objects)
-			targetStartFD = 7
-			commandArgs = append(commandArgs, "--dehydration-graph-manifest-fd=5", "--dehydration-memory-repository-fd=6")
+			targetStartFD = 3 + len(files)
 		} else {
 			repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
 			repository, err := os.Open(repositoryPath)

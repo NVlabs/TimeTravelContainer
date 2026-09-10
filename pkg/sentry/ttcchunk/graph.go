@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"sort"
 	"sync"
 
@@ -385,7 +387,9 @@ func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot
 type GraphChunkReader struct {
 	data    *ttcsnapshot.LocalDataStore
 	chunks  []ttcsnapshot.ObjectID
+	remote  *ttcsnapshot.ObjectRelayClient
 	ownData bool
+	fetchMu sync.Mutex
 	mu      sync.RWMutex
 	closed  bool
 }
@@ -393,21 +397,37 @@ type GraphChunkReader struct {
 // NewGraphChunkReader constructs a demand reader without materializing a
 // compatibility chunk repository.
 func NewGraphChunkReader(data *ttcsnapshot.LocalDataStore, chunkObjects map[ID]ttcsnapshot.ObjectID, installed []InstalledChunk, ownData bool) (*GraphChunkReader, error) {
+	return NewGraphChunkReaderWithRelay(data, chunkObjects, installed, nil, ownData)
+}
+
+// NewGraphChunkReaderWithRelay constructs a demand reader that populates
+// missing immutable chunks through remote. The relay is adopted and closed
+// with the reader.
+func NewGraphChunkReaderWithRelay(data *ttcsnapshot.LocalDataStore, chunkObjects map[ID]ttcsnapshot.ObjectID, installed []InstalledChunk, remote *ttcsnapshot.ObjectRelayClient, ownData bool) (*GraphChunkReader, error) {
+	fail := func(err error) (*GraphChunkReader, error) {
+		if remote != nil {
+			err = errors.Join(err, remote.Close())
+		}
+		if ownData && data != nil {
+			err = errors.Join(err, data.Close())
+		}
+		return nil, err
+	}
 	if data == nil {
-		return nil, errors.New("nil TTC graph memory data store")
+		return fail(errors.New("nil TTC graph memory data store"))
 	}
 	chunks := make([]ttcsnapshot.ObjectID, len(installed))
 	for index, chunk := range installed {
 		if chunk.StreamOffset != uint64(index)*pgalloc.SparseChunkBytes || chunk.Target.Length() != pgalloc.SparseChunkBytes {
-			return nil, fmt.Errorf("invalid graph installed chunk %d: %+v", index, chunk)
+			return fail(fmt.Errorf("invalid graph installed chunk %d: %+v", index, chunk))
 		}
 		object, ok := chunkObjects[chunk.Object]
 		if !ok || object.Kind != ttcsnapshot.ObjectKindMemoryChunk {
-			return nil, fmt.Errorf("graph installed chunk %s has no bulk object", chunk.Object)
+			return fail(fmt.Errorf("graph installed chunk %s has no bulk object", chunk.Object))
 		}
 		chunks[index] = object
 	}
-	return &GraphChunkReader{data: data, chunks: chunks, ownData: ownData}, nil
+	return &GraphChunkReader{data: data, chunks: chunks, remote: remote, ownData: ownData}, nil
 }
 
 // Close prevents future reads and releases a donated data directory.
@@ -418,10 +438,37 @@ func (r *GraphChunkReader) Close() error {
 		return nil
 	}
 	r.closed = true
-	if r.ownData {
-		return r.data.Close()
+	var remoteErr error
+	if r.remote != nil {
+		remoteErr = r.remote.Close()
 	}
-	return nil
+	if r.ownData {
+		return errors.Join(remoteErr, r.data.Close())
+	}
+	return remoteErr
+}
+
+func (r *GraphChunkReader) openChunk(id ttcsnapshot.ObjectID) (*os.File, error) {
+	const length = int64(pgalloc.SparseChunkBytes)
+	file, err := r.data.Open(id, length)
+	if err == nil || r.remote == nil || !errors.Is(err, fs.ErrNotExist) {
+		return file, err
+	}
+	// Multiple asynchronous MemoryFile readers may fault the same chunk. Only
+	// one may relay and atomically install it; later readers observe the cache.
+	r.fetchMu.Lock()
+	defer r.fetchMu.Unlock()
+	if file, err = r.data.Open(id, length); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		return file, err
+	}
+	data, err := r.remote.Fetch(id, uint64(length))
+	if err != nil {
+		return nil, err
+	}
+	if err := r.data.Install(id, bytes.NewReader(data), length); err != nil {
+		return nil, err
+	}
+	return r.data.Open(id, length)
 }
 
 // ReadAt reads each touched chunk completely before exposing any of its bytes
@@ -443,7 +490,7 @@ func (r *GraphChunkReader) ReadAt(dst []byte, off int64) (int, error) {
 	for len(dst) != 0 && uint64(off) < total {
 		index := int(uint64(off) / pgalloc.SparseChunkBytes)
 		within := uint64(off) % pgalloc.SparseChunkBytes
-		file, err := r.data.Open(r.chunks[index], int64(pgalloc.SparseChunkBytes))
+		file, err := r.openChunk(r.chunks[index])
 		if err != nil {
 			return written, err
 		}

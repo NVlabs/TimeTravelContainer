@@ -757,7 +757,7 @@ type sparseDehydrationSource struct {
 
 // LoadGraphDurableDehydration reconstructs a paused Kernel directly from
 // graph-native 1 MiB objects donated through data. It consumes data.
-func LoadGraphDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest ttcchunk.Manifest, chunks map[ttcchunk.ID]ttcsnapshot.ObjectID, data *ttcsnapshot.LocalDataStore, opts DurableDehydrationLoadOptions) (*Kernel, error) {
+func LoadGraphDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest ttcchunk.Manifest, chunks map[ttcchunk.ID]ttcsnapshot.ObjectID, data *ttcsnapshot.LocalDataStore, remote *ttcsnapshot.ObjectRelayClient, opts DurableDehydrationLoadOptions) (*Kernel, error) {
 	if data == nil || len(manifest.Runs) == 0 || len(chunks) == 0 {
 		for _, mf := range memoryFiles {
 			if mf != nil {
@@ -767,12 +767,15 @@ func LoadGraphDurableDehydration(ctx context.Context, p platform.Platform, image
 		if data != nil {
 			_ = data.Close()
 		}
+		if remote != nil {
+			_ = remote.Close()
+		}
 		return nil, errors.New("graph durable dehydration load is missing required memory state")
 	}
 	source := sparseDehydrationSource{
 		manifest: manifest,
 		newReader: func(installed []ttcchunk.InstalledChunk) (sparseDehydrationReader, error) {
-			return ttcchunk.NewGraphChunkReader(data, chunks, installed, true)
+			return ttcchunk.NewGraphChunkReaderWithRelay(data, chunks, installed, remote, true)
 		},
 		close: data.Close,
 	}

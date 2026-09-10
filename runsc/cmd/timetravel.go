@@ -609,9 +609,9 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
 			defer repository.Close()
-			if restoreArgs.SparseRemote {
+			if restoreArgs.SparseRemote || restoreArgs.GraphRemote {
 				if t.dehydrationMemoryRemoteFD < 0 {
-					util.Fatalf("sparse remote dehydration restore requires a cold memory stream")
+					util.Fatalf("remote dehydration restore requires a cold memory stream")
 				}
 				remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "dehydration-restore-memory-remote")
 				if remote == nil {

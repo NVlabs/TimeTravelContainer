@@ -16,6 +16,7 @@ package ttcchunk
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -42,6 +43,16 @@ import (
 type remoteReaderFunc func(ID) ([]byte, error)
 
 func (f remoteReaderFunc) ReadMemoryChunk(id ID) ([]byte, error) { return f(id) }
+
+type graphRelaySource map[ttcsnapshot.ObjectID][]byte
+
+func (source graphRelaySource) Fetch(_ context.Context, id ttcsnapshot.ObjectID) (io.ReadCloser, uint64, error) {
+	data, ok := source[id]
+	if !ok {
+		return nil, 0, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), uint64(len(data)), nil
+}
 
 func TestRemoteChunkFetchedAndCachedOnFirstRead(t *testing.T) {
 	logical := pgalloc.LogicalChunkID{Allocator: pgalloc.LogicalAllocatorID{1}, Sequence: 7}
@@ -283,6 +294,53 @@ func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
 	file.Close()
 	if err != nil || !bytes.Equal(raw[:hostarch.PageSize], chunk.Pages[0].Data) {
 		t.Fatalf("graph chunk payload bytes=%d err=%v", len(raw), err)
+	}
+}
+
+func TestGraphChunkReaderRelaysMissingObject(t *testing.T) {
+	data, err := ttcsnapshot.OpenLocalDataStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunk ID
+	chunk[0] = 1
+	object := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMemoryChunk, Ordinal: 3}
+	want := bytes.Repeat([]byte{0x6d}, pgalloc.SparseChunkBytes)
+	server, client := net.Pipe()
+	var token ttcsnapshot.ObjectRelayToken
+	token[0] = 9
+	done := make(chan error, 1)
+	go func() {
+		done <- ttcsnapshot.ServeObjectRelay(server, token, graphRelaySource{object: want}, map[ttcsnapshot.ObjectID]uint64{object: uint64(len(want))})
+	}()
+	remote, err := ttcsnapshot.NewObjectRelayClient(client, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewGraphChunkReaderWithRelay(data, map[ID]ttcsnapshot.ObjectID{chunk: object}, []InstalledChunk{{
+		Object: chunk,
+		Target: memmap.FileRange{End: pgalloc.SparseChunkBytes},
+	}}, remote, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if _, err := reader.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want[:len(got)]) {
+		t.Fatal("relayed graph chunk bytes differ")
+	}
+	if file, err := data.Open(object, int64(len(want))); err != nil {
+		t.Fatalf("relayed graph chunk was not installed: %v", err)
+	} else {
+		file.Close()
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
 	}
 }
 
