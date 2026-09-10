@@ -52,6 +52,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -5450,6 +5451,7 @@ type runtimeBackend struct {
 	// guest. Detached commands release the lock when the command returns.
 	lifecycleReady   func()
 	publicationQueue *ttcstorage.Queue
+	snapshotGraph    *ttcsnapshot.Store
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool

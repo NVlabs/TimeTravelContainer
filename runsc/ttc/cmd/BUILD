@@ -37,6 +37,7 @@ go_library(
         "//pkg/sentry/ttcchunk",
         "//pkg/sentry/ttcremote",
         "//pkg/ttcremote",
+        "//pkg/ttcsnapshot",
 		"//pkg/ttcpack",
         "//pkg/ttcvolume",
         "//runsc/boot",

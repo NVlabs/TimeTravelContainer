@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -247,6 +248,7 @@ type daemonServer struct {
 	clusterDirectory      cluster.NodeCatalog
 	clusterPlacements     cluster.PlacementCatalog
 	publicationQueue      *ttcstorage.Queue
+	snapshotGraph         *ttcsnapshot.Store
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -1525,6 +1527,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.volumeCopyMode = s.volumeCapability.Mode
 	backend.publicationQueue = s.publicationQueue
+	backend.snapshotGraph = s.snapshotGraph
 }
 
 type daemonStopTarget struct {
@@ -3147,6 +3150,11 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 }
 
 func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
+	if err != nil {
+		return fmt.Errorf("opening TTC snapshot graph: %w", err)
+	}
+	defer snapshotGraph.Close()
 	removeRetiredRaftState := false
 	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
 		// This defer is intentionally registered before raft.Close below, so it
@@ -3210,6 +3218,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		root:                  root,
 		runsc:                 runsc,
 		volumeCapability:      volumeCapability,
+		snapshotGraph:         snapshotGraph,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
