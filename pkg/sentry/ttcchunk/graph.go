@@ -78,6 +78,16 @@ func (r *MemoryRepository) ImportSnapshotGraph(graph *ttcsnapshot.Store, data *t
 	if err != nil {
 		return GraphImportResult{}, err
 	}
+	return importSnapshotGraph(graph, data, origin, manifest, rootPrefix, r.chunks.Get)
+}
+
+// importSnapshotGraph installs manifest and its immutable source chunks into
+// graph. getChunk deliberately abstracts the compatibility repository away so
+// new-format callers can stream a capture directly from the Sentry.
+func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, getChunk func(ID) (Chunk, error)) (_ GraphImportResult, retErr error) {
+	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || getChunk == nil {
+		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
+	}
 	inspection := graph.Inspect()
 	for name := range inspection.Roots {
 		if name == rootPrefix || len(name) > len(rootPrefix) && name[:len(rootPrefix)+1] == rootPrefix+"/" {
@@ -131,7 +141,7 @@ func (r *MemoryRepository) ImportSnapshotGraph(graph *ttcsnapshot.Store, data *t
 	}()
 
 	for objectIndex, use := range uses {
-		chunk, err := r.chunks.Get(use.id)
+		chunk, err := getChunk(use.id)
 		if err != nil {
 			return GraphImportResult{}, fmt.Errorf("reading memory chunk %s: %w", use.id, err)
 		}

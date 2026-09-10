@@ -10879,62 +10879,36 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		sparseRepositoryPath = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-		memoryRepository, err = ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
-		if err != nil {
-			return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
-		}
-		defer memoryRepository.Close()
-		previousSparseRoot, err = memoryRepository.Branch(capture.FilesystemBranch)
-		if err == nil {
-			hadPreviousSparseRoot = true
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("reading previous sparse dehydration branch root: %w", err)
-		}
-		repositoryDir, err := os.Open(sparseRepositoryPath)
-		if err != nil {
-			return err
-		}
-		exportArgs := []string{"timetravel", "--dehydration-memory-repository-fd=3", target.container, "dehydrate-export", target.branch}
-		exportOutput, exportErr := b.commandWithFiles([]*os.File{repositoryDir}, exportArgs...)
-		_ = repositoryDir.Close()
-		if exportErr != nil {
-			return fmt.Errorf("persisting dehydration memory: %w", exportErr)
-		}
-		var exportInfo boot.BranchDehydrationExportInfo
-		if err := json.Unmarshal(exportOutput, &exportInfo); err != nil {
-			return fmt.Errorf("decoding sparse dehydration root: %w", err)
-		}
-		if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
-			return errors.New("sparse dehydration export returned an empty manifest ID")
-		}
-		sparseFilesystemBranch = capture.FilesystemBranch
-		// Root the published manifest immediately. Publish deliberately leaves a
-		// transaction fence until SetBranch commits reachability; delaying this
-		// until after the control-directory rename leaked transactions and chunks
-		// whenever a later metadata step failed. The deferred rollback restores
-		// the previous root (or deletes this one), so this early commit remains
-		// atomic from the branch lifecycle's point of view.
-		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
-			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
-		}
-		sparseRootChanged = true
-		capture.SparseManifest = exportInfo.Manifest
-		// Standalone roots use the daemon's authoritative graph directly. A
-		// clustered daemon must first obtain the origin from Raft, which is wired
-		// in the distributed data-plane phase rather than allocating a conflicting
-		// node-local ID here.
 		if b.snapshotGraph != nil && b.snapshotData != nil && b.nodeID == "" {
 			origin, err := b.snapshotGraph.AllocateWorking()
 			if err != nil {
 				return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
 			}
 			prefix := fmt.Sprintf("memory/%016x", uint64(origin))
-			imported, err := memoryRepository.ImportSnapshotGraph(b.snapshotGraph, b.snapshotData, origin, exportInfo.Manifest, prefix)
+			reader, writer, err := os.Pipe()
 			if err != nil {
-				return fmt.Errorf("importing graph-native dehydration memory: %w", err)
+				return fmt.Errorf("creating graph dehydration stream: %w", err)
 			}
-			for _, root := range imported.Roots {
+			type graphImportOutcome struct {
+				result ttcchunk.GraphImportResult
+				err    error
+			}
+			imported := make(chan graphImportOutcome, 1)
+			go func() {
+				result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+				_ = reader.Close()
+				imported <- graphImportOutcome{result: result, err: importErr}
+			}()
+			_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", target.container, "dehydrate-export", target.branch)
+			_ = writer.Close()
+			outcome := <-imported
+			if exportErr != nil {
+				return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
+			}
+			if outcome.err != nil {
+				return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
+			}
+			for _, root := range outcome.result.Roots {
 				capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
 					ResourceID: root.ResourceID,
 					Name:       root.Name,
@@ -10947,10 +10921,42 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			}
 			capture.SnapshotID = uint64(origin)
 			graphMemorySnapshot = uint64(origin)
-			// The new-format standalone control image resolves memory solely
-			// through graph roots. The compatibility repository remains rooted
-			// only until every graph/control transaction below has committed.
 			capture.SparseManifest = ttcchunk.ManifestID{}
+		} else {
+			sparseRepositoryPath = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
+			memoryRepository, err = ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
+			if err != nil {
+				return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
+			}
+			defer memoryRepository.Close()
+			previousSparseRoot, err = memoryRepository.Branch(capture.FilesystemBranch)
+			if err == nil {
+				hadPreviousSparseRoot = true
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("reading previous sparse dehydration branch root: %w", err)
+			}
+			repositoryDir, err := os.Open(sparseRepositoryPath)
+			if err != nil {
+				return err
+			}
+			exportOutput, exportErr := b.commandWithFiles([]*os.File{repositoryDir}, "timetravel", "--dehydration-memory-repository-fd=3", target.container, "dehydrate-export", target.branch)
+			_ = repositoryDir.Close()
+			if exportErr != nil {
+				return fmt.Errorf("persisting dehydration memory: %w", exportErr)
+			}
+			var exportInfo boot.BranchDehydrationExportInfo
+			if err := json.Unmarshal(exportOutput, &exportInfo); err != nil {
+				return fmt.Errorf("decoding sparse dehydration root: %w", err)
+			}
+			if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
+				return errors.New("sparse dehydration export returned an empty manifest ID")
+			}
+			sparseFilesystemBranch = capture.FilesystemBranch
+			if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
+				return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
+			}
+			sparseRootChanged = true
+			capture.SparseManifest = exportInfo.Manifest
 		}
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)

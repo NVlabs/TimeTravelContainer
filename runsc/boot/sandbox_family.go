@@ -284,9 +284,10 @@ type BranchMemoryRoot struct {
 // exact order reported by BranchDehydrateInfo.
 type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
-	ID        string
-	AllowCopy bool
-	Sparse    bool
+	ID          string
+	AllowCopy   bool
+	Sparse      bool
+	GraphStream bool
 }
 
 // BranchDehydrationExportInfo identifies a published sparse memory root.
@@ -2154,6 +2155,15 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 	}
 	image := b.dehydration.image
 	f.mu.Unlock()
+	if args.GraphStream {
+		if args.Sparse || len(args.FilePayload.Files) != 1 {
+			return nil, fmt.Errorf("graph dehydration export has %d stream descriptors, want 1", len(args.FilePayload.Files))
+		}
+		if err := image.PublishGraphStream(args.FilePayload.Files[0]); err != nil {
+			return nil, err
+		}
+		return &BranchDehydrationExportInfo{}, nil
+	}
 	if !args.Sparse {
 		return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
 	}

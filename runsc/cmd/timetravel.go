@@ -81,6 +81,7 @@ type TimeTravel struct {
 	dehydrationSnapshotsCount     int
 	dehydrationSnapshotAllowCopy  bool
 	dehydrationMemoryRepositoryFD int
+	dehydrationGraphStreamFD      int
 	dehydrationGraphManifestFD    int
 	dehydrationMemoryRemoteFD     int
 	dehydrationTargetsStartFD     int
@@ -176,6 +177,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
 	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
 	f.IntVar(&t.dehydrationMemoryRepositoryFD, "dehydration-memory-repository-fd", -1, "inherited sparse dehydration memory repository directory")
+	f.IntVar(&t.dehydrationGraphStreamFD, "dehydration-graph-stream-fd", -1, "inherited graph-native dehydration capture stream")
 	f.IntVar(&t.dehydrationGraphManifestFD, "dehydration-graph-manifest-fd", -1, "inherited graph-native dehydration memory manifest")
 	f.IntVar(&t.dehydrationMemoryRemoteFD, "dehydration-memory-remote-fd", -1, "inherited cold memory chunk stream")
 	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
@@ -518,6 +520,20 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
 	case "dehydrate-export":
+		if t.dehydrationGraphStreamFD >= 0 {
+			if t.dehydrationMemoryRepositoryFD >= 0 || t.dehydrationSnapshotsCount != 0 {
+				util.Fatalf("graph dehydration stream cannot be combined with another export destination")
+			}
+			stream := os.NewFile(uintptr(t.dehydrationGraphStreamFD), "dehydration-graph-stream")
+			if stream == nil {
+				util.Fatalf("invalid dehydration graph stream FD")
+			}
+			defer stream.Close()
+			output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
+				FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, ID: f.Arg(2), GraphStream: true,
+			})
+			break
+		}
 		if t.dehydrationMemoryRepositoryFD >= 0 {
 			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-memory-repository")
 			if repository == nil {

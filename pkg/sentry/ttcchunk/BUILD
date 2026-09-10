@@ -14,6 +14,7 @@ go_library(
         "chunk.go",
         "donated.go",
         "graph.go",
+		"graph_stream.go",
         "install.go",
         "lifecycle.go",
         "manifest.go",

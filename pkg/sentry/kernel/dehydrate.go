@@ -364,6 +364,29 @@ func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository
 	return manifest, nil
 }
 
+// PublishGraphStream sends the exact branch-reachable memory graph to the
+// daemon without creating a persistent compatibility repository. The daemon
+// is the sole writer of the authoritative snapshot graph.
+func (d *DehydrationCapture) PublishGraphStream(writer io.Writer) error {
+	if d == nil || d.consumed || d.SparseSnapshot == nil || writer == nil {
+		return errors.New("graph dehydration publication is unavailable")
+	}
+	if err := ttcchunk.WriteGraphCapture(writer, d.SparseSnapshot, d.SparseBindings); err != nil {
+		return err
+	}
+	if err := d.SparseSnapshot.Close(); err != nil {
+		return err
+	}
+	d.SparseSnapshot = nil
+	d.SparseManifest = ttcchunk.ManifestID{}
+	if d.metadataFile != nil {
+		if err := writeDehydrationMetadata(d.metadataFile, d.DurableMetadata()); err != nil {
+			return fmt.Errorf("updating graph dehydration metadata: %w", err)
+		}
+	}
+	return nil
+}
+
 // CaptureDehydration serializes Kernel metadata and pins each used allocator
 // range once. Page bytes remain in their existing MemoryFiles and are not
 // copied into the metadata stream.

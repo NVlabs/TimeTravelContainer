@@ -271,6 +271,78 @@ func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
 	}
 }
 
+func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
+	chunk := testChunk()
+	encoded, chunkID, err := Encode(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)}
+	stored := []StoredBinding{
+		{Binding: pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
+		{Binding: pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
+	}
+	var stream bytes.Buffer
+	if err := writeGraphCapture(&stream, []Object{{ID: chunkID, Logical: chunk.Logical, Data: encoded}}, stored); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ImportGraphCapture(bytes.NewReader(stream.Bytes()), graph, data, origin, "stream/main/memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Chunks != 1 || result.Pages != 2 || len(result.Roots) != 1 {
+		t.Fatalf("graph stream import=%+v, want one chunk, two mappings, and one root", result)
+	}
+	first, ok, err := graph.MemoryPage(result.Roots[0].Root, 0)
+	if err != nil || !ok {
+		t.Fatalf("first page=(%s,%t,%v)", first, ok, err)
+	}
+	second, ok, err := graph.MemoryPage(result.Roots[0].Root, 1)
+	if err != nil || !ok || second != first {
+		t.Fatalf("aliased page=(%s,%t,%v), want %s", second, ok, err, first)
+	}
+
+	for name, input := range map[string][]byte{
+		"truncated": stream.Bytes()[:len(stream.Bytes())-1],
+		"trailing":  append(append([]byte(nil), stream.Bytes()...), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			otherGraph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherGraph.Close()
+			otherData, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(t.TempDir(), "objects"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherData.Close()
+			otherOrigin, err := otherGraph.AllocateWorking()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ImportGraphCapture(bytes.NewReader(input), otherGraph, otherData, otherOrigin, "bad/memory"); err == nil {
+				t.Fatal("malformed graph capture stream imported successfully")
+			}
+		})
+	}
+}
+
 func TestStoreConcurrentIdempotentPutAndCorruption(t *testing.T) {
 	root := t.TempDir()
 	store, err := OpenStore(root)
