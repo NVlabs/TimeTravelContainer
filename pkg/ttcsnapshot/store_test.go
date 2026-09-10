@@ -318,3 +318,56 @@ func TestPersistentBTreeSplitsAndHardlinks(t *testing.T) {
 		}
 	}
 }
+
+func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := store.CreateObject(origin, "build/file", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInode := InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}
+	regular := InodeRecord{Number: 2, Type: "regular", Mode: 0640, UID: 1000, GID: 1000, Nlink: 2, Size: 7, File: file, Xattrs: map[string]string{"user.test": "value"}}
+	root, err := store.ApplyFilesystem(origin, "branch/main/filesystem", []FilesystemOperation{
+		{PutInode: &rootInode},
+		{PutInode: &regular},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "first", Inode: 2}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "second", Inode: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("build/file"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := store.FilesystemInode(root, 2); err != nil || !ok || got.File != file || got.Xattrs["user.test"] != "value" {
+		t.Fatalf("inode=(%+v,%t,%v)", got, ok, err)
+	}
+	entries, err := store.FilesystemDirectory(root, 1)
+	if err != nil || len(entries) != 2 || entries[0].Name != "first" || entries[1].Name != "second" {
+		t.Fatalf("directory=(%+v,%v)", entries, err)
+	}
+	root, err = store.ApplyFilesystem(origin, "branch/main/filesystem", []FilesystemOperation{
+		{DeleteEntry: &DirectoryEntryRecord{Parent: 1, Name: "first"}},
+		{DeleteEntry: &DirectoryEntryRecord{Parent: 1, Name: "second"}},
+		{DeleteInode: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := store.FilesystemLookup(root, 1, "first"); err != nil || ok {
+		t.Fatalf("deleted entry lookup=(%t,%v), want (false,nil)", ok, err)
+	}
+	if _, ok, err := store.FilesystemInode(root, 2); err != nil || ok {
+		t.Fatalf("deleted inode lookup=(%t,%v), want (false,nil)", ok, err)
+	}
+	if _, err := store.Collect(10000); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Verify(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -195,6 +195,16 @@ func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
 	}
 	mutation.state.Roots[name] = id
 	mutation.state.Snapshots[snapshotKey(mutation.snapshot.ID)] = mutation.snapshot
+	// A multi-operation transaction may path-copy the same tree more than
+	// once. Intermediate immutable nodes were never published as roots; queue
+	// them for ordinary cascading GC in the same atomic commit.
+	for key := range mutation.touched {
+		object := mutation.state.Objects[key]
+		if object.Refs == 0 {
+			object.State = ObjectReclaiming
+			mutation.state.Objects[key] = object
+		}
+	}
 	return validateGraphState(&mutation.state)
 }
 
@@ -286,6 +296,51 @@ func (builder *bTreeBuilder) insert(current ObjectID, key []byte, value ObjectID
 	return []ObjectID{leftID, rightID}, [][]byte{append([]byte(nil), left.keys[0]...), append([]byte(nil), right.keys[0]...)}, nil
 }
 
+func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []byte, bool, error) {
+	object, ok := builder.mutation.state.Objects[current.key()]
+	if !ok {
+		return ObjectID{}, nil, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
+	}
+	node, err := decodeBTreeNode(object, builder.kind)
+	if err != nil {
+		return ObjectID{}, nil, false, err
+	}
+	if node.leaf {
+		index := sort.Search(len(node.keys), func(i int) bool { return bytes.Compare(node.keys[i], key) >= 0 })
+		if index == len(node.keys) || !bytes.Equal(node.keys[index], key) {
+			return current, append([]byte(nil), node.keys[0]...), false, nil
+		}
+		node.keys = append(node.keys[:index], node.keys[index+1:]...)
+		node.children = append(node.children[:index], node.children[index+1:]...)
+	} else {
+		index := bTreePosition(node.keys, key)
+		child, minimum, changed, err := builder.remove(node.children[index], key)
+		if err != nil || !changed {
+			return current, append([]byte(nil), node.keys[0]...), changed, err
+		}
+		if child.IsZero() {
+			node.keys = append(node.keys[:index], node.keys[index+1:]...)
+			node.children = append(node.children[:index], node.children[index+1:]...)
+		} else {
+			node.keys[index] = minimum
+			node.children[index] = child
+		}
+	}
+	if len(node.keys) == 0 {
+		return ObjectID{}, nil, true, nil
+	}
+	if !node.leaf && len(node.keys) == 1 {
+		childObject := builder.mutation.state.Objects[node.children[0].key()]
+		childNode, err := decodeBTreeNode(childObject, builder.kind)
+		if err != nil {
+			return ObjectID{}, nil, false, err
+		}
+		return node.children[0], append([]byte(nil), childNode.keys[0]...), true, nil
+	}
+	id, err := builder.makeNode(node)
+	return id, append([]byte(nil), node.keys[0]...), true, err
+}
+
 // BTreeSet path-copies a bounded-fanout inode or directory tree and atomically
 // swaps rootName. value is an inode object for an inode tree, or an inode
 // object referenced by a directory entry tree.
@@ -333,6 +388,61 @@ func (s *Store) BTreeSet(origin SnapshotID, rootName string, kind ObjectKind, ke
 		return ObjectID{}, err
 	}
 	return root, nil
+}
+
+// BTreeDelete path-copies and removes key. It reports false without changing
+// the graph if key is absent. An empty result removes rootName.
+func (s *Store) BTreeDelete(origin SnapshotID, rootName string, kind ObjectKind, key []byte) (bool, error) {
+	if err := validateRootName(rootName); err != nil {
+		return false, err
+	}
+	if !validBTreeKind(kind) || len(key) == 0 || len(key) > bTreeMaxKeyBytes {
+		return false, errors.New("invalid TTC B-tree deletion")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldRoot, ok := s.state.Roots[rootName]
+	if !ok {
+		return false, nil
+	}
+	mutation, err := newGraphMutation(s, origin)
+	if err != nil {
+		return false, err
+	}
+	builder := bTreeBuilder{mutation: mutation, kind: kind}
+	root, _, changed, err := builder.remove(oldRoot, key)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if root.IsZero() {
+		old, err := releaseObject(mutation.state.Objects[oldRoot.key()])
+		if err != nil {
+			return false, err
+		}
+		mutation.state.Objects[oldRoot.key()] = old
+		mutation.touched[oldRoot.key()] = struct{}{}
+		delete(mutation.state.Roots, rootName)
+		mutation.state.Snapshots[snapshotKey(origin)] = mutation.snapshot
+		if err := validateGraphState(&mutation.state); err != nil {
+			return false, err
+		}
+		keys := make([]string, 0, len(mutation.touched))
+		for key := range mutation.touched {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		ops := make([]journalOp, 0, len(keys)+2)
+		for _, key := range keys {
+			object := mutation.state.Objects[key]
+			ops = append(ops, journalOp{PutObject: &object})
+		}
+		ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, DeleteRoot: true})
+		return true, s.commitLocked(ops)
+	}
+	if err := mutation.setRoot(rootName, root); err != nil {
+		return false, err
+	}
+	return true, mutation.commit(rootName, root)
 }
 
 // InodeKey returns the canonical big-endian key used by inode trees.

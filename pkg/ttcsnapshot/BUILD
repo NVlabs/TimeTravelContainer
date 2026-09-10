@@ -9,6 +9,7 @@ go_library(
     name = "ttcsnapshot",
     srcs = [
         "btree.go",
+        "filesystem.go",
         "memory.go",
         "store.go",
         "types.go",
