@@ -934,8 +934,33 @@ func TestRemoveBranchKeepsMain(t *testing.T) {
 	if _, err := repository.Branch(MainBranch); err != nil {
 		t.Fatalf("main branch was removed: %v", err)
 	}
-	if err := repository.RemoveBranch(MainBranch); err == nil {
-		t.Fatal("RemoveBranch accepted main")
+	if err := repository.RemoveBranch(MainBranch); !errors.Is(err, ErrFinalBranch) {
+		t.Fatalf("RemoveBranch(main)=%v, want ErrFinalBranch", err)
+	}
+}
+
+func TestManagerRemovePrivateFinalRepository(t *testing.T) {
+	manager := openTestManager(t)
+	parent := filepath.Join(manager.root, "families")
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(filepath.Join(parent, "rootfs"), "rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemovePrivate(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed private repository stat=%v, want not exist", err)
+	}
+	if err := manager.RemovePrivate(manager.root); err == nil {
+		t.Fatal("RemovePrivate accepted manager root")
 	}
 }
 

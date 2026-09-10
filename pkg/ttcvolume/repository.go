@@ -46,6 +46,12 @@ const (
 	rootInode     = uint64(1)
 )
 
+// ErrFinalBranch indicates that deleting a branch would leave a repository
+// without an authoritative root. Family-private repository owners may respond
+// by removing the repository itself; shared named-volume callers must retain
+// its final branch.
+var ErrFinalBranch = errors.New("cannot remove the repository's final branch")
+
 // MainBranch is the initial persistent volume branch.
 const MainBranch = mainBranch
 
@@ -477,6 +483,18 @@ func (m *Manager) Remove(nameOrID string) error {
 	repository.Close()
 	if path == "" || filepath.Dir(path) != m.volumes {
 		return errors.New("invalid volume repository path")
+	}
+	return os.RemoveAll(path)
+}
+
+// RemovePrivate removes a repository addressed by a trusted path beneath this
+// manager's root. The caller is responsible for proving that the repository is
+// family-private rather than a named volume.
+func (m *Manager) RemovePrivate(path string) error {
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(m.root, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("private repository path %q is outside data root %q", path, m.root)
 	}
 	return os.RemoveAll(path)
 }
@@ -943,7 +961,7 @@ func (r *Repository) RemoveBranch(id string) error {
 				}
 			}
 			if branchPointers <= 1 {
-				return errors.New("cannot remove the repository's final branch")
+				return ErrFinalBranch
 			}
 		}
 		if err := r.unlink(filepath.Join("branches", id+".json")); err != nil {

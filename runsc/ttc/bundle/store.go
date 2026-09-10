@@ -3983,8 +3983,14 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		if errors.Is(removeErr, fs.ErrNotExist) {
 			removeErr = nil
 		}
+		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) && repositoryCanonicalBranchBelongsToFamily(config)
+		if removeRepository {
+			removeErr = nil
+		}
 		if removeErr == nil {
-			removeErr = repository.GarbageCollect()
+			if !removeRepository {
+				removeErr = repository.GarbageCollect()
+			}
 		}
 		closeErr := repository.Close()
 		if removeErr != nil {
@@ -3992,6 +3998,11 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		}
 		if closeErr != nil {
 			return fmt.Errorf("closing repository %q: %w", config.Source, closeErr)
+		}
+		if removeRepository {
+			if err := manager.RemovePrivate(path); err != nil {
+				return fmt.Errorf("removing final private repository %q: %w", config.Source, err)
+			}
 		}
 	}
 	return nil
