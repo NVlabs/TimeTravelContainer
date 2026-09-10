@@ -145,6 +145,11 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 		if err != nil {
 			return GraphImportResult{}, fmt.Errorf("reading memory chunk %s: %w", use.id, err)
 		}
+		for _, run := range use.runs {
+			if run.Logical != chunk.Logical {
+				return GraphImportResult{}, fmt.Errorf("memory chunk %s has logical coordinate %+v, manifest references %+v", use.id, chunk.Logical, run.Logical)
+			}
+		}
 		references := make(map[uint8]uint64)
 		for _, run := range use.runs {
 			for delta := uint16(0); delta < run.Pages; delta++ {

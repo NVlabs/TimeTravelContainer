@@ -15,16 +15,19 @@
 package ttcchunk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-var graphCaptureMagic = [16]byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H', 'C', 'A', 'P', 'T', 'U', 'R', 'E', 1}
+var graphCaptureMagic = [16]byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H', 'C', 'A', 'P', 'T', 'U', 'R', 'E', 2}
 
 const (
 	maxGraphCaptureManifestBytes = 256 << 20
@@ -38,14 +41,59 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if w == nil || snapshot == nil {
 		return errors.New("graph memory capture requires a writer and snapshot")
 	}
-	objects, stored, err := ReadSnapshot(snapshot, bindings)
+	groups, stored, err := planGraphCapture(bindings)
 	if err != nil {
 		return err
 	}
-	return writeGraphCapture(w, objects, stored)
+	if err := writeGraphCaptureHeader(w, stored, len(groups)); err != nil {
+		return err
+	}
+	zeroPage := make([]byte, hostarch.PageSize)
+	for _, group := range groups {
+		chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(group.bindings))}
+		for _, binding := range group.bindings {
+			data := make([]byte, hostarch.PageSize)
+			n, err := snapshot.CopyStreamAt(data, int64(binding.StreamOffset))
+			if err != nil || n != len(data) {
+				if err == nil {
+					err = io.ErrUnexpectedEOF
+				}
+				return fmt.Errorf("reading captured page at stream offset %#x: %w", binding.StreamOffset, err)
+			}
+			page := Page{Slot: binding.Slot, Version: binding.Version}
+			if bytes.Equal(data, zeroPage) {
+				page.Zero = true
+			} else {
+				page.Data = data
+			}
+			chunk.Pages = append(chunk.Pages, page)
+		}
+		encoded, _, err := Encode(chunk)
+		if err != nil {
+			return err
+		}
+		if err := writeGraphCaptureObject(w, group.id, encoded); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeGraphCapture(w io.Writer, objects []Object, stored []StoredBinding) error {
+	if err := writeGraphCaptureHeader(w, stored, len(objects)); err != nil {
+		return err
+	}
+	objects = append([]Object(nil), objects...)
+	sort.Slice(objects, func(i, j int) bool { return bytes.Compare(objects[i].ID[:], objects[j].ID[:]) < 0 })
+	for _, object := range objects {
+		if err := writeGraphCaptureObject(w, object.ID, object.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeGraphCaptureHeader(w io.Writer, stored []StoredBinding, objectCount int) error {
 	manifest, err := CompactBindings(stored)
 	if err != nil {
 		return err
@@ -63,27 +111,105 @@ func writeGraphCapture(w io.Writer, objects []Object, stored []StoredBinding) er
 	if err := writeGraphCaptureUint64(w, uint64(len(manifestData))); err != nil {
 		return err
 	}
-	if err := writeGraphCaptureUint64(w, uint64(len(objects))); err != nil {
+	if err := writeGraphCaptureUint64(w, uint64(objectCount)); err != nil {
 		return err
 	}
 	if err := writeGraphCaptureBytes(w, manifestData); err != nil {
 		return err
 	}
-	for _, object := range objects {
-		if len(object.Data) == 0 || len(object.Data) > maxGraphCaptureObjectBytes {
-			return fmt.Errorf("graph memory object %s has invalid size %d", object.ID, len(object.Data))
-		}
-		if err := writeGraphCaptureBytes(w, object.ID[:]); err != nil {
-			return err
-		}
-		if err := writeGraphCaptureUint64(w, uint64(len(object.Data))); err != nil {
-			return err
-		}
-		if err := writeGraphCaptureBytes(w, object.Data); err != nil {
-			return err
-		}
-	}
 	return nil
+}
+
+func writeGraphCaptureObject(w io.Writer, id ID, data []byte) error {
+	if len(data) == 0 || len(data) > maxGraphCaptureObjectBytes {
+		return fmt.Errorf("graph memory object %s has invalid size %d", id, len(data))
+	}
+	if err := writeGraphCaptureBytes(w, id[:]); err != nil {
+		return err
+	}
+	if err := writeGraphCaptureUint64(w, uint64(len(data))); err != nil {
+		return err
+	}
+	return writeGraphCaptureBytes(w, data)
+}
+
+type graphCaptureGroup struct {
+	id       ID
+	logical  pgalloc.LogicalChunkID
+	bindings []pgalloc.CapturedPageBinding
+	used     [32]byte
+}
+
+func graphCaptureObjectID(sequence uint64) ID {
+	var id ID
+	copy(id[:16], []byte("TTCGRAPHSTREAM02"))
+	binary.BigEndian.PutUint64(id[24:], sequence)
+	return id
+}
+
+// planGraphCapture assigns transport-local object IDs using metadata only.
+// It performs no page reads, which lets the manifest precede a bounded stream
+// of one-chunk payloads.
+func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGroup, []StoredBinding, error) {
+	ordered := append([]pgalloc.CapturedPageBinding(nil), bindings...)
+	sort.Slice(ordered, func(i, j int) bool {
+		left, right := &ordered[i], &ordered[j]
+		if cmp := compareAllocator(left.Chunk.Allocator, right.Chunk.Allocator); cmp != 0 {
+			return cmp < 0
+		}
+		if left.Chunk.Sequence != right.Chunk.Sequence {
+			return left.Chunk.Sequence < right.Chunk.Sequence
+		}
+		if left.Slot != right.Slot {
+			return left.Slot < right.Slot
+		}
+		if cmp := compareAllocator(left.Version.Allocator, right.Version.Allocator); cmp != 0 {
+			return cmp < 0
+		}
+		if left.Version.Sequence != right.Version.Sequence {
+			return left.Version.Sequence < right.Version.Sequence
+		}
+		return left.OldOffset < right.OldOffset
+	})
+	groupsByLogical := make(map[pgalloc.LogicalChunkID][]int)
+	groups := make([]graphCaptureGroup, 0)
+	stored := make([]StoredBinding, 0, len(ordered))
+	seenVersions := make(map[struct {
+		page    pgalloc.LogicalPageID
+		version pgalloc.PageVersionID
+	}]struct{}, len(ordered))
+	for _, binding := range ordered {
+		chunk, slot := binding.Page.Chunk()
+		if binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
+			return nil, nil, fmt.Errorf("invalid captured page binding: %+v", binding)
+		}
+		versionKey := struct {
+			page    pgalloc.LogicalPageID
+			version pgalloc.PageVersionID
+		}{binding.Page, binding.Version}
+		if _, exists := seenVersions[versionKey]; exists {
+			return nil, nil, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
+		}
+		seenVersions[versionKey] = struct{}{}
+		groupIndex := -1
+		for _, candidate := range groupsByLogical[binding.Chunk] {
+			if !hasBit(&groups[candidate].used, binding.Slot) {
+				groupIndex = candidate
+				break
+			}
+		}
+		if groupIndex < 0 {
+			groupIndex = len(groups)
+			id := graphCaptureObjectID(uint64(groupIndex + 1))
+			groups = append(groups, graphCaptureGroup{id: id, logical: binding.Chunk})
+			groupsByLogical[binding.Chunk] = append(groupsByLogical[binding.Chunk], groupIndex)
+		}
+		group := &groups[groupIndex]
+		setBit(&group.used, binding.Slot)
+		group.bindings = append(group.bindings, binding)
+		stored = append(stored, StoredBinding{Binding: binding, Object: group.id})
+	}
+	return groups, stored, nil
 }
 
 func writeGraphCaptureUint64(w io.Writer, value uint64) error {
@@ -154,46 +280,51 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 	if objectCount != uint64(len(wanted)) {
 		return GraphImportResult{}, fmt.Errorf("graph memory capture has %d objects, manifest references %d", objectCount, len(wanted))
 	}
-	chunks := make(map[ID]Chunk, len(wanted))
-	for i := uint64(0); i < objectCount; i++ {
+	objectIndex := uint64(0)
+	readObject := func(expected ID) (Chunk, error) {
+		if objectIndex >= objectCount {
+			return Chunk{}, fmt.Errorf("graph memory object %s is missing", expected)
+		}
 		var id ID
 		if _, err := io.ReadFull(r, id[:]); err != nil {
-			return GraphImportResult{}, fmt.Errorf("reading graph memory object %d identity: %w", i, err)
+			return Chunk{}, fmt.Errorf("reading graph memory object %d identity: %w", objectIndex, err)
 		}
-		if _, ok := wanted[id]; !ok {
-			return GraphImportResult{}, fmt.Errorf("graph memory stream contains unreferenced object %s", id)
-		}
-		if _, exists := chunks[id]; exists {
-			return GraphImportResult{}, fmt.Errorf("graph memory stream repeats object %s", id)
+		if id != expected {
+			return Chunk{}, fmt.Errorf("graph memory object %d is %s, want %s", objectIndex, id, expected)
 		}
 		length, err := readGraphCaptureUint64(r)
 		if err != nil {
-			return GraphImportResult{}, fmt.Errorf("reading graph memory object %d length: %w", i, err)
+			return Chunk{}, fmt.Errorf("reading graph memory object %d length: %w", objectIndex, err)
 		}
 		if length == 0 || length > maxGraphCaptureObjectBytes {
-			return GraphImportResult{}, fmt.Errorf("graph memory object %s length %d is invalid", id, length)
+			return Chunk{}, fmt.Errorf("graph memory object %s length %d is invalid", id, length)
 		}
 		encoded := make([]byte, int(length))
 		if _, err := io.ReadFull(r, encoded); err != nil {
-			return GraphImportResult{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
+			return Chunk{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
 		}
-		chunk, err := Decode(encoded, &id)
+		chunk, err := Decode(encoded, nil)
 		if err != nil {
-			return GraphImportResult{}, fmt.Errorf("decoding graph memory object %s: %w", id, err)
+			return Chunk{}, fmt.Errorf("decoding graph memory object %s: %w", id, err)
 		}
-		chunks[id] = chunk
-	}
-	var trailing [1]byte
-	if n, err := r.Read(trailing[:]); n != 0 || err == nil {
-		return GraphImportResult{}, errors.New("graph memory capture has trailing data")
-	} else if !errors.Is(err, io.EOF) {
-		return GraphImportResult{}, fmt.Errorf("finishing graph memory capture: %w", err)
-	}
-	return importSnapshotGraph(graph, data, origin, manifest, rootPrefix, func(id ID) (Chunk, error) {
-		chunk, ok := chunks[id]
-		if !ok {
-			return Chunk{}, fmt.Errorf("graph memory object %s is missing", id)
+		objectIndex++
+		if objectIndex == objectCount {
+			var trailing [1]byte
+			if n, err := r.Read(trailing[:]); n != 0 || err == nil {
+				return Chunk{}, errors.New("graph memory capture has trailing data")
+			} else if !errors.Is(err, io.EOF) {
+				return Chunk{}, fmt.Errorf("finishing graph memory capture: %w", err)
+			}
 		}
 		return chunk, nil
-	})
+	}
+	if objectCount == 0 {
+		var trailing [1]byte
+		if n, err := r.Read(trailing[:]); n != 0 || err == nil {
+			return GraphImportResult{}, errors.New("empty graph memory capture has trailing data")
+		} else if !errors.Is(err, io.EOF) {
+			return GraphImportResult{}, fmt.Errorf("finishing empty graph memory capture: %w", err)
+		}
+	}
+	return importSnapshotGraph(graph, data, origin, manifest, rootPrefix, readObject)
 }
