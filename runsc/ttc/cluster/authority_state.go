@@ -287,7 +287,13 @@ func removeVolatileDependency(dependencies []VolatileDependency, transactionID s
 
 func authorityCommandDigest(command AuthorityCommand) (string, error) {
 	copy := command
+	// Request identity binds semantic input, not the leader-generated envelope.
+	// A proposal whose committed response was lost may be retried after time has
+	// advanced or leadership changed; both retries must resolve to the original
+	// result without being mistaken for request-ID reuse with a new operation.
 	copy.RequestID = ""
+	copy.IssuedAt = time.Time{}
+	copy.LeaderTerm = 0
 	data, err := json.Marshal(copy)
 	if err != nil {
 		return "", err

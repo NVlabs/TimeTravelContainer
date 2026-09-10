@@ -97,6 +97,13 @@ func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 	if first.Revision != second.Revision || state.Revision != first.Revision {
 		t.Fatalf("idempotent retry advanced revision: first=%d second=%d state=%d", first.Revision, second.Revision, state.Revision)
 	}
+	reenveloped := command
+	reenveloped.IssuedAt = command.IssuedAt.Add(time.Minute)
+	reenveloped.LeaderTerm++
+	third := state.Apply(reenveloped)
+	if first.Revision != third.Revision || state.Revision != first.Revision {
+		t.Fatalf("re-enveloped retry advanced revision: first=%d third=%d state=%d", first.Revision, third.Revision, state.Revision)
+	}
 	payload.LeaseUntil = at.Add(30 * time.Second)
 	changed, _ := NewAuthorityCommand("register-a", at, AuthorityNodeRegister, payload)
 	result := state.Apply(changed)
