@@ -241,6 +241,7 @@ func TestFileCloneAutomaticallyFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer repo.Close()
 	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
