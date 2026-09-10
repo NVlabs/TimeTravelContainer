@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 )
@@ -1336,5 +1337,247 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "objects", "files", snapshotKey(origin))); !os.IsNotExist(err) {
 		t.Fatalf("empty snapshot data directory survived reclaim: %v", err)
+	}
+}
+
+func TestLocalDataStoreInstallCrashBoundaries(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(filepath.Join(dir, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := graph.ReserveObjects(origin, []ObjectKind{ObjectKindFile, ObjectKindFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, abandoned := ids[0], ids[1]
+	contents := bytes.Repeat([]byte("complete immutable bytes"), 1024)
+	if err := data.Install(committed, bytes.NewReader(contents), int64(len(contents))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(committed, "build/committed", uint64(len(contents)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Install(abandoned, bytes.NewReader(contents), int64(len(contents))); err != nil {
+		t.Fatal(err)
+	}
+
+	// A crash before link(2) can leave only a hidden temporary. It is never
+	// authoritative, even if its byte length happens to be complete.
+	abandonedPath, err := data.objectPath(abandoned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(filepath.Dir(abandonedPath), ".object-crash-boundary")
+	if err := os.WriteFile(temporary, contents[:17], 0600); err != nil {
+		t.Fatal(err)
+	}
+	committedPath, err := data.objectPath(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{filepath.Dir(committedPath), filepath.Dir(abandonedPath)} {
+		if err := os.WriteFile(filepath.Join(directory, ".foreign"), []byte("unknown"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := data.VerifyReferenced(graph); err != nil {
+		t.Fatalf("complete committed object failed validation: %v", err)
+	}
+	removed, quarantined, err := data.ReclaimUnreferenced(graph)
+	if err != nil || removed != 2 || quarantined != 2 {
+		t.Fatalf("reclaim crash residue=(%d,%d,%v), want (2,2,nil)", removed, quarantined, err)
+	}
+	if _, err := os.Stat(abandonedPath); !os.IsNotExist(err) {
+		t.Fatalf("uncommitted published bytes survived: %v", err)
+	}
+	if _, err := os.Stat(temporary); !os.IsNotExist(err) {
+		t.Fatalf("unpublished temporary survived: %v", err)
+	}
+	quarantine, err := os.ReadDir(filepath.Join(dir, "objects", "quarantine"))
+	if err != nil || len(quarantine) != 2 {
+		t.Fatalf("quarantine entries=%d err=%v, want 2", len(quarantine), err)
+	}
+	if err := os.Truncate(committedPath, int64(len(contents)-1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := data.VerifyReferenced(graph); err == nil {
+		t.Fatal("truncated referenced object passed validation")
+	}
+}
+
+func assertGraphReferenceModel(t *testing.T, store *Store) {
+	t.Helper()
+	inspection := store.Inspect()
+	want := make(map[string]uint64, len(inspection.Objects))
+	objects := make(map[string]Object, len(inspection.Objects))
+	for _, object := range inspection.Objects {
+		objects[object.ID.key()] = object
+		want[object.ID.key()] = 0
+	}
+	retain := func(id ObjectID, source string) {
+		if _, ok := objects[id.key()]; !ok {
+			t.Fatalf("%s references missing object %s", source, id.key())
+		}
+		want[id.key()]++
+	}
+	for name, id := range inspection.Roots {
+		retain(id, "root "+name)
+	}
+	for name, id := range inspection.Pins {
+		retain(id, "pin "+name)
+	}
+	for _, object := range inspection.Objects {
+		for _, edge := range object.Children {
+			retain(edge.Child, "object "+object.ID.key())
+		}
+	}
+	for key, object := range objects {
+		if object.Refs != want[key] {
+			t.Fatalf("object %s refs=%d, independently computed %d", key, object.Refs, want[key])
+		}
+		wantState := ObjectLive
+		if want[key] == 0 {
+			wantState = ObjectReclaiming
+		}
+		if object.State != wantState {
+			t.Fatalf("object %s state=%q, want %q for %d refs", key, object.State, wantState, want[key])
+		}
+	}
+	if err := store.Verify(); err != nil {
+		t.Fatalf("graph verification: %v", err)
+	}
+}
+
+func TestRandomGraphReferenceAndReplayModel(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var random uint64 = 0x7c4a7f19d2e85b61
+	nextRandom := func(limit int) int {
+		random ^= random << 13
+		random ^= random >> 7
+		random ^= random << 17
+		return int(random % uint64(limit))
+	}
+	names := func(values map[string]ObjectID) []string {
+		result := make([]string, 0, len(values))
+		for name := range values {
+			result = append(result, name)
+		}
+		sort.Strings(result)
+		return result
+	}
+	liveObjects := func() []ObjectID {
+		var result []ObjectID
+		for _, object := range store.Inspect().Objects {
+			if object.State == ObjectLive {
+				result = append(result, object.ID)
+			}
+		}
+		return result
+	}
+
+	for step := 0; step < 1000; step++ {
+		inspection := store.Inspect()
+		live := liveObjects()
+		switch nextRandom(8) {
+		case 0, 1:
+			children := make([]Edge, 0, 3)
+			if len(live) != 0 {
+				for slot, count := 0, nextRandom(4); slot < count; slot++ {
+					children = append(children, Edge{Slot: uint16(slot), Child: live[nextRandom(len(live))]})
+				}
+			}
+			if _, err := store.CreateObject(origin, fmt.Sprintf("construction/%04d", step), ObjectKindMetadata, []byte{byte(step)}, children); err != nil {
+				t.Fatalf("step %d create: %v", step, err)
+			}
+		case 2:
+			if len(live) != 0 {
+				if err := store.SetRoot(fmt.Sprintf("branch/%02d", nextRandom(32)), live[nextRandom(len(live))]); err != nil {
+					t.Fatalf("step %d set root: %v", step, err)
+				}
+			}
+		case 3:
+			rootNames := names(inspection.Roots)
+			if len(rootNames) != 0 {
+				if err := store.DeleteRoot(rootNames[nextRandom(len(rootNames))]); err != nil {
+					t.Fatalf("step %d delete root: %v", step, err)
+				}
+			}
+		case 4:
+			if len(live) != 0 {
+				if err := store.SetPin(fmt.Sprintf("open/%02d", nextRandom(32)), live[nextRandom(len(live))]); err != nil {
+					t.Fatalf("step %d set pin: %v", step, err)
+				}
+			}
+		case 5:
+			pinNames := names(inspection.Pins)
+			if len(pinNames) != 0 {
+				if err := store.DeletePin(pinNames[nextRandom(len(pinNames))]); err != nil {
+					t.Fatalf("step %d delete pin: %v", step, err)
+				}
+			}
+		case 6:
+			if _, err := store.Collect(1 + nextRandom(8)); err != nil {
+				t.Fatalf("step %d collect: %v", step, err)
+			}
+		case 7:
+			if err := store.Checkpoint(); err != nil {
+				t.Fatalf("step %d checkpoint: %v", step, err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("step %d close: %v", step, err)
+			}
+			store, err = Open(dir)
+			if err != nil {
+				t.Fatalf("step %d reopen: %v", step, err)
+			}
+		}
+		assertGraphReferenceModel(t, store)
+	}
+
+	inspection := store.Inspect()
+	for _, name := range names(inspection.Roots) {
+		if err := store.DeleteRoot(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection = store.Inspect()
+	for _, name := range names(inspection.Pins) {
+		if err := store.DeletePin(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for store.Stats().Objects != 0 {
+		collected, err := store.Collect(64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			t.Fatal("unreachable objects remained but collection made no progress")
+		}
+	}
+	assertGraphReferenceModel(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

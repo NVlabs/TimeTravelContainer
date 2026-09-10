@@ -1107,9 +1107,12 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 	if err := validateObject(object); err != nil {
 		return ObjectID{}, err
 	}
-	ops := make([]journalOp, 0, len(children)+3)
+	touched := make(map[string]Object, len(children))
 	for _, edge := range object.Children {
-		child, ok := s.state.Objects[edge.Child.key()]
+		child, ok := touched[edge.Child.key()]
+		if !ok {
+			child, ok = s.state.Objects[edge.Child.key()]
+		}
 		if !ok {
 			return ObjectID{}, fmt.Errorf("child object %s does not exist", edge.Child.key())
 		}
@@ -1117,6 +1120,16 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 			return ObjectID{}, fmt.Errorf("child object %s cannot be retained", edge.Child.key())
 		}
 		child.Refs++
+		touched[edge.Child.key()] = child
+	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	ops := make([]journalOp, 0, len(keys)+3)
+	for _, key := range keys {
+		child := touched[key]
 		ops = append(ops, journalOp{PutObject: &child})
 	}
 	ops = append(ops, journalOp{PutObject: &object}, journalOp{PutSnapshot: &snapshot}, journalOp{PinName: pin, PutPin: &id})

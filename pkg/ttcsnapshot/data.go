@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -499,6 +500,49 @@ func (store *LocalDataStore) Remove(id ObjectID) error {
 	return nil
 }
 
+// VerifyReferenced rejects graph metadata that names missing, truncated, or
+// non-regular bulk data. Install publishes bulk bytes before the graph WAL can
+// reference them, so any failure here indicates storage loss or a violated
+// transaction boundary and must not be hidden by graph recovery.
+func (store *LocalDataStore) VerifyReferenced(graph *Store) error {
+	if graph == nil {
+		return errors.New("TTC snapshot graph is nil")
+	}
+	for _, object := range graph.Inspect().Objects {
+		if object.BulkLength == 0 {
+			continue
+		}
+		if object.BulkLength > math.MaxInt64 {
+			return fmt.Errorf("validating referenced TTC bulk object %s: length %d exceeds host file limit", object.ID.key(), object.BulkLength)
+		}
+		file, err := store.Open(object.ID, int64(object.BulkLength))
+		if err != nil {
+			return fmt.Errorf("validating referenced TTC bulk object %s: %w", object.ID.key(), err)
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("closing referenced TTC bulk object %s: %w", object.ID.key(), err)
+		}
+	}
+	return nil
+}
+
+func quarantineDataFile(path, quarantine string) error {
+	if err := os.MkdirAll(quarantine, 0700); err != nil {
+		return err
+	}
+	for attempts := 0; attempts < 100; attempts++ {
+		destination := filepath.Join(quarantine, fmt.Sprintf("unknown-%016x-%s", dataTemporarySequence.Add(1), filepath.Base(path)))
+		if err := os.Rename(path, destination); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("allocating quarantine name for unknown TTC object %q", path)
+}
+
 // ReclaimUnreferenced removes complete bulk objects absent from graph and
 // quarantines unknown names. Callers serialize it with graph/data commits.
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {
@@ -519,17 +563,21 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				}
 				return nil
 			}
-			if strings.HasPrefix(entry.Name(), ".") {
+			if strings.HasPrefix(entry.Name(), ".object-") || strings.HasPrefix(entry.Name(), ".clone-") {
+				// Install and Clone publish with link(2) only after the temporary
+				// file is complete and durable. A named temporary is therefore
+				// never authoritative and is safe to remove while reconciliation
+				// excludes active graph/data transactions.
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+				removed++
 				return nil
 			}
 			name := strings.TrimSuffix(entry.Name(), ".data")
 			id, parseErr := ParseObjectID(name)
 			if parseErr != nil || name == entry.Name() {
-				if err := os.MkdirAll(quarantine, 0700); err != nil {
-					return err
-				}
-				destination := filepath.Join(quarantine, fmt.Sprintf("%d-%s", quarantined, entry.Name()))
-				if err := os.Rename(path, destination); err != nil {
+				if err := quarantineDataFile(path, quarantine); err != nil {
 					return err
 				}
 				quarantined++
