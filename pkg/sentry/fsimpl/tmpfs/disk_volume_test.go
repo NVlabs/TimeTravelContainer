@@ -28,7 +28,7 @@ import (
 )
 
 func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 }
 
 func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 }
 
 func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
 }
 
 func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

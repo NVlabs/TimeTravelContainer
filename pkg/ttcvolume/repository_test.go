@@ -31,7 +31,7 @@ import (
 
 func openTestManager(t *testing.T) *Manager {
 	t.Helper()
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +240,8 @@ func TestActualReflinkPathSucceedsOrFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Exercise ioctl(FICLONE) even when OpenManager selected the explicitly
-	// allowed full-copy fallback for this test filesystem.
+	// Exercise ioctl(FICLONE) even when OpenManager automatically selected the
+	// full-copy fallback for this test filesystem.
 	repo.copyMode = CopyModeReflink
 	n, cloned, writeErr := repo.WriteAt("child", ino, []byte("CH"), 0)
 	switch manager.Capability().Mode {
@@ -346,7 +346,7 @@ func TestHardLinksTrackBranchLocalInodeObject(t *testing.T) {
 
 func TestRepositoryReopensWithoutImport(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +361,7 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 	write(t, repo, "main", ino, "persisted", 0)
 	id := repo.Info().ID
 
-	manager, err = OpenManager(root, true)
+	manager, err = OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestRepositoryOperatesThroughDonatedDirectoryFD(t *testing.T) {
 }
 
 func TestForkTransactionAbortRestoresSource(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +471,7 @@ func TestForkTransactionAbortRestoresSource(t *testing.T) {
 }
 
 func TestForkTransactionCommitRetainsBranches(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +506,7 @@ func TestForkTransactionCommitRetainsBranches(t *testing.T) {
 }
 
 func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +658,7 @@ func TestMetadataUsesJournalWithoutPerEntryFiles(t *testing.T) {
 
 func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +701,7 @@ func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 	}
 	repo.Close()
 
-	manager, err = OpenManager(root, true)
+	manager, err = OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,7 +718,7 @@ func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 
 func TestPrivateRepositoryIsDurableAndNotCatalogued(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}

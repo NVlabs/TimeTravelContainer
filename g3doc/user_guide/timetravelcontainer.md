@@ -70,17 +70,11 @@ so an apparently healthy daemon cannot defer this error until container launch.
 Directly launching `ttcd` performs the same preflight.
 
 The daemon also probes the node-local volume object store under `TTC_ROOT`
-(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`. It fails
-startup if the backing filesystem lacks working reflinks.
-To explicitly trade first-write performance for compatibility, use:
-
-```shell
-ttc daemon start --allow-slow-volume-copy
-```
-
-This fallback copies a complete shared file on its first write after a fork.
-It is never selected silently. `ttc daemon status` reports the fixed
-`volume_copy_mode`, data root, backing device, and filesystem type.
+(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`. Working
+reflinks are used automatically. When they are unavailable, TTC transparently
+copies a complete shared file on its first write after a fork. `ttc daemon
+status` reports the selected `volume_copy_mode`, data root, backing device, and
+filesystem type.
 
 For trusted local testing only, start the daemon with
 `--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
@@ -886,9 +880,8 @@ filesystem performs extent CoW. Stop/start reopens the same repository; there
 is no tar export/import. `ttc rm -v` also removes anonymous volumes, while
 named volumes remain until `ttc volume rm`.
 
-The daemon requires `FICLONE` by default. On a host without reflinks, starting
-it with `--allow-slow-volume-copy` explicitly selects whole-file copying on
-the first write after each fork. See the
+The daemon uses `FICLONE` when available and otherwise automatically selects
+whole-file copying on the first write after each fork. See the
 [disk-backed volume design](../proposals/ttc_disk_backed_volumes.md).
 
 One named volume may have one writable container family at a time. TTC rejects

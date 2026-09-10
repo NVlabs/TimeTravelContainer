@@ -390,7 +390,7 @@ func TestCommittedWhiteoutsSurviveSaveLoadAndMaterialize(t *testing.T) {
 	}
 	store.close()
 
-	manager, err := ttcvolume.OpenManager(filepath.Join(t.TempDir(), "volumes"), true)
+	manager, err := ttcvolume.OpenManager(filepath.Join(t.TempDir(), "volumes"))
 	if err != nil {
 		t.Fatal(err)
 	}

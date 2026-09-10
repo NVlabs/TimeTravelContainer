@@ -86,7 +86,6 @@ type options struct {
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
-	allowSlowVolumeCopy   bool
 	daemonSocket          string
 	direct                bool
 }
@@ -251,7 +250,6 @@ Commands:
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--unsafe-no-host-isolation]
-               [--allow-slow-volume-copy]
                [--cluster-init | --cluster-join HOST:PORT]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
@@ -5435,7 +5433,6 @@ type runtimeBackend struct {
 	runtimePlatform       string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
-	allowSlowVolumeCopy   bool
 	volumeCopyMode        ttcvolume.CopyMode
 	clientTERM            string
 	progressTerminal      bool
@@ -6021,7 +6018,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 }
 
 func (b *runtimeBackend) volumeManager() (*ttcvolume.Manager, error) {
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -6522,7 +6519,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 		exportFiles = append(exportFiles, file)
 	}
 	exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(exportFiles))}
-	if b.allowSlowVolumeCopy {
+	if b.volumeCopyMode == ttcvolume.CopyModeFull {
 		exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
 	}
 	exportArgs = append(exportArgs, runtimeID, "dehydrate-export", branchID)

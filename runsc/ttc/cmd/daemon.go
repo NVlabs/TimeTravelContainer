@@ -56,7 +56,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 5
+	daemonAPIVersion       = 6
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -88,8 +88,12 @@ var daemonAPIFeatures = []string{
 const repositoryMaintenanceInterval = 5 * time.Minute
 
 const (
-	daemonRootFormatVersion        = 1
-	daemonClusterRootFormatVersion = 4
+	daemonRootSchema                  = "snapshot-graph-v1"
+	daemonStandaloneRootFormatVersion = 2
+	daemonClusterRootFormatVersion    = 5
+	daemonRootRoleStandaloneAuthority = "standalone-authority"
+	daemonRootRoleClusterShared       = "cluster-shared"
+	daemonRootRoleClusterLocal        = "cluster-local"
 )
 
 var (
@@ -1509,7 +1513,6 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		runtimePlatform:       opts.runtimePlatform,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		disableHostGSO:        opts.disableHostGSO,
-		allowSlowVolumeCopy:   opts.allowSlowVolumeCopy,
 		clientTERM:            os.Getenv("TERM"),
 		progressTerminal:      progressTerminal,
 		progressWidth:         progressWidth,
@@ -1521,7 +1524,6 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 
 func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.volumeCopyMode = s.volumeCapability.Mode
-	backend.allowSlowVolumeCopy = s.volumeCapability.Mode == ttcvolume.CopyModeFull
 	backend.publicationQueue = s.publicationQueue
 }
 
@@ -1900,7 +1902,6 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	socket := defaultDaemonSocket()
 	runtimePlatform := defaultRuntimePlatform
 	unsafeNoHostIsolation := false
-	allowSlowVolumeCopy := false
 	clusterOpts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
 		switch {
@@ -1912,9 +1913,6 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			args = args[1:]
 		case args[0] == "--unsafe-no-host-isolation":
 			unsafeNoHostIsolation = true
-			args = args[1:]
-		case args[0] == "--allow-slow-volume-copy":
-			allowSlowVolumeCopy = true
 			args = args[1:]
 		case args[0] == "--platform":
 			if len(args) < 2 || args[1] == "" {
@@ -1947,6 +1945,20 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
+	}
+	sharedRole := daemonRootRoleStandaloneAuthority
+	if clusterOpts.Configured {
+		sharedRole = daemonRootRoleClusterShared
+	}
+	if err := inspectDaemonStorageRoot(roots.shared, sharedRole); err != nil {
+		fmt.Fprintf(stderr, "ttcd: validating TTC_ROOT: %v\n", err)
+		return 1
+	}
+	if clusterOpts.Configured {
+		if err := inspectDaemonStorageRoot(roots.local, daemonRootRoleClusterLocal); err != nil {
+			fmt.Fprintf(stderr, "ttcd: validating TTC_LOCAL_ROOT: %v\n", err)
+			return 1
+		}
 	}
 	if clusterOpts.Configured {
 		if err := resolveSimpleClusterOptions(&clusterOpts, roots); err != nil {
@@ -1989,12 +2001,12 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
-	if err := prepareDaemonStorageRoot(roots.shared, "shared", clusterOpts.RepositoryID, ""); err != nil {
+	if err := prepareDaemonStorageRoot(roots.shared, sharedRole, clusterOpts.RepositoryID, ""); err != nil {
 		fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
 		return 1
 	}
 	if clusterOpts.Configured {
-		if err := prepareDaemonStorageRoot(roots.local, "local", clusterOpts.RepositoryID, clusterOpts.NodeID); err != nil {
+		if err := prepareDaemonStorageRoot(roots.local, daemonRootRoleClusterLocal, clusterOpts.RepositoryID, clusterOpts.NodeID); err != nil {
 			fmt.Fprintf(stderr, "ttcd: preparing TTC_LOCAL_ROOT: %v\n", err)
 			return 1
 		}
@@ -2009,7 +2021,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: preparing node-local runtime storage: %v\n", err)
 		return 1
 	}
-	manager, err := ttcvolume.OpenManager(roots.local, allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(roots.local)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: initializing disk-backed volumes: %v\n", err)
 		return 1
@@ -2148,6 +2160,17 @@ func daemonRootsFromEnvironment(clustered bool) (daemonRoots, error) {
 }
 
 func pathsReferToSameLocation(first, second string) (bool, error) {
+	firstInfo, firstErr := os.Stat(first)
+	secondInfo, secondErr := os.Stat(second)
+	if firstErr == nil && secondErr == nil && os.SameFile(firstInfo, secondInfo) {
+		return true, nil
+	}
+	if firstErr != nil && !errors.Is(firstErr, os.ErrNotExist) {
+		return false, fmt.Errorf("stating storage root %q: %w", first, firstErr)
+	}
+	if secondErr != nil && !errors.Is(secondErr, os.ErrNotExist) {
+		return false, fmt.Errorf("stating storage root %q: %w", second, secondErr)
+	}
 	resolve := func(path string) (string, error) {
 		if resolved, err := filepath.EvalSymlinks(path); err == nil {
 			return resolved, nil
@@ -2168,28 +2191,125 @@ func pathsReferToSameLocation(first, second string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return a == b, nil
+	if a == b {
+		return true, nil
+	}
+	if filepath.Base(a) != filepath.Base(b) {
+		return false, nil
+	}
+	firstParent, firstParentErr := os.Stat(filepath.Dir(a))
+	secondParent, secondParentErr := os.Stat(filepath.Dir(b))
+	return firstParentErr == nil && secondParentErr == nil && os.SameFile(firstParent, secondParent), nil
 }
 
 type daemonRootMarker struct {
 	Version      int    `json:"version"`
-	Kind         string `json:"kind"`
+	Schema       string `json:"schema"`
+	Role         string `json:"role"`
 	RepositoryID string `json:"repository_id,omitempty"`
 	NodeID       string `json:"node_id,omitempty"`
 }
 
-func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
+const daemonRootMarkerTemporaryPrefix = ".ttc-root-format.tmp-"
+
+func freshDaemonRootEntryAllowed(entry os.DirEntry) bool {
+	return entry.Name() == "lost+found" || strings.HasPrefix(entry.Name(), daemonRootMarkerTemporaryPrefix) && entry.Type().IsRegular()
+}
+
+func daemonRootMarkerFor(role, repositoryID, nodeID string) (daemonRootMarker, error) {
+	version := daemonStandaloneRootFormatVersion
+	switch role {
+	case daemonRootRoleStandaloneAuthority:
+		if repositoryID != "" || nodeID != "" {
+			return daemonRootMarker{}, errors.New("standalone TTC root cannot name a cluster repository or node")
+		}
+	case daemonRootRoleClusterShared:
+		version = daemonClusterRootFormatVersion
+		if repositoryID == "" || nodeID != "" {
+			return daemonRootMarker{}, errors.New("cluster shared root requires a repository ID and no node ID")
+		}
+	case daemonRootRoleClusterLocal:
+		version = daemonClusterRootFormatVersion
+		if repositoryID == "" || nodeID == "" {
+			return daemonRootMarker{}, errors.New("cluster local root requires repository and node IDs")
+		}
+	default:
+		return daemonRootMarker{}, fmt.Errorf("unknown TTC root role %q", role)
+	}
+	return daemonRootMarker{Version: version, Schema: daemonRootSchema, Role: role, RepositoryID: repositoryID, NodeID: nodeID}, nil
+}
+
+func daemonRootVersionForRole(role string) (int, error) {
+	switch role {
+	case daemonRootRoleStandaloneAuthority:
+		return daemonStandaloneRootFormatVersion, nil
+	case daemonRootRoleClusterShared, daemonRootRoleClusterLocal:
+		return daemonClusterRootFormatVersion, nil
+	default:
+		return 0, fmt.Errorf("unknown TTC root role %q", role)
+	}
+}
+
+// inspectDaemonStorageRoot validates an existing root without modifying it.
+// Daemon startup performs this before platform probes, worker creation, Raft
+// admission, or opening the daemon socket.
+func inspectDaemonStorageRoot(root, role string) error {
+	wantVersion, err := daemonRootVersionForRole(role)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%q is not a directory", root)
+	}
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	data, err := os.ReadFile(markerPath)
+	if err == nil {
+		var got daemonRootMarker
+		if err := json.Unmarshal(data, &got); err != nil {
+			return fmt.Errorf("invalid root marker: %w", err)
+		}
+		if got.Version != wantVersion {
+			return fmt.Errorf("TTC root uses incompatible format %d; this build requires snapshot-graph format %d and does not migrate existing roots; select an empty root", got.Version, wantVersion)
+		}
+		if got.Schema != daemonRootSchema || got.Role != role {
+			return fmt.Errorf("TTC root marker schema/role %q/%q does not match required %q/%q", got.Schema, got.Role, daemonRootSchema, role)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !freshDaemonRootEntryAllowed(entry) {
+			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
+		}
+	}
+	return nil
+}
+
+func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
+	if err := inspectDaemonStorageRoot(root, role); err != nil {
+		return err
+	}
+	want, err := daemonRootMarkerFor(role, repositoryID, nodeID)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return err
 	}
 	markerPath := filepath.Join(root, ".ttc-root-format")
-	formatVersion := daemonRootFormatVersion
-	if repositoryID != "" {
-		// Version 2 makes the single cluster-wide Raft authority mandatory for
-		// clustered roots. There is deliberately no mixed shared-JSON/Raft mode.
-		formatVersion = daemonClusterRootFormatVersion
-	}
-	want := daemonRootMarker{Version: formatVersion, Kind: kind, RepositoryID: repositoryID, NodeID: nodeID}
 	data, err := os.ReadFile(markerPath)
 	if err == nil {
 		var got daemonRootMarker
@@ -2209,7 +2329,7 @@ func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
 		return err
 	}
 	for _, entry := range entries {
-		if entry.Name() != "lost+found" {
+		if !freshDaemonRootEntryAllowed(entry) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
 	}
@@ -2217,7 +2337,24 @@ func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
 	if err != nil {
 		return err
 	}
-	marker, err := os.OpenFile(markerPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	temporary, err := os.CreateTemp(root, daemonRootMarkerTemporaryPrefix)
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	err = os.Link(temporaryPath, markerPath)
 	if errors.Is(err, os.ErrExist) {
 		// Another node may have initialized a shared root concurrently. Validate
 		// what it published instead of replacing its marker.
@@ -2237,17 +2374,15 @@ func prepareDaemonStorageRoot(root, kind, repositoryID, nodeID string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := marker.Write(append(data, '\n')); err != nil {
-		marker.Close()
-		_ = os.Remove(markerPath)
+	if err := os.Remove(temporaryPath); err != nil {
 		return err
 	}
-	if err := marker.Sync(); err != nil {
-		marker.Close()
-		_ = os.Remove(markerPath)
+	directory, err := os.Open(root)
+	if err != nil {
 		return err
 	}
-	return marker.Close()
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func lockDaemonLocalRoot(root string) (*os.File, error) {
@@ -4580,7 +4715,7 @@ func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
 }
 
-func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, allowSlowVolumeCopy bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
+func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return "", nil, fmt.Errorf("creating daemon directory: %w", err)
 	}
@@ -4604,9 +4739,6 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation, a
 	commandArgs := []string{"--socket", socket, "--platform", runtimePlatform}
 	if unsafeNoHostIsolation {
 		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
-	}
-	if allowSlowVolumeCopy {
-		commandArgs = append(commandArgs, "--allow-slow-volume-copy")
 	}
 	if clusterOpts.Configured {
 		commandArgs = append(commandArgs,
@@ -4726,9 +4858,6 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			case startArgs[0] == "--unsafe-no-host-isolation":
 				opts.unsafeNoHostIsolation = true
 				startArgs = startArgs[1:]
-			case startArgs[0] == "--allow-slow-volume-copy":
-				opts.allowSlowVolumeCopy = true
-				startArgs = startArgs[1:]
 			default:
 				consumed, err := consumeDaemonClusterOption(startArgs, &clusterOpts)
 				if err != nil {
@@ -4791,7 +4920,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		if opts.unsafeNoHostIsolation {
 			fmt.Fprintln(stderr, "ttc: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
 		}
-		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, opts.allowSlowVolumeCopy, clusterOpts)
+		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, clusterOpts)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1

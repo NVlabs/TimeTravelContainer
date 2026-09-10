@@ -969,7 +969,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	}()
 	rootfsUpperID := ""
 	if !opts.ReadonlyRootfs {
-		manager, err := ttcvolume.OpenManager(s.activeRoot(), opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+		manager, err := ttcvolume.OpenManager(s.activeRoot())
 		if err != nil {
 			return Prepared{}, fmt.Errorf("opening rootfs upper store: %w", err)
 		}
@@ -1128,7 +1128,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		if keep {
 			return
 		}
-		if manager, err := ttcvolume.OpenManager(s.activeRoot(), true); err == nil {
+		if manager, err := ttcvolume.OpenManager(s.activeRoot()); err == nil {
 			for _, volumeID := range importedVolumeIDs {
 				_ = manager.Remove(volumeID)
 			}
@@ -1163,7 +1163,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		}
 		snapshotBySource[snapshot.Source] = snapshot.SnapshotPath
 	}
-	manager, err := ttcvolume.OpenManager(s.activeRoot(), opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1705,7 +1705,7 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	if len(volumes) == 0 {
 		return nil, nil
 	}
-	manager, err := ttcvolume.OpenManager(s.activeRoot(), opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -1763,7 +1763,7 @@ func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptio
 	if opts == nil {
 		return errors.New("missing host mount options")
 	}
-	manager, err := ttcvolume.OpenManager(s.activeRoot(), opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return err
 	}
@@ -3831,7 +3831,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 			persistentBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
 		}
 	}
-	manager, err := ttcvolume.OpenManager(s.activeRoot(), true)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return err
 	}
@@ -3875,7 +3875,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 // GC shares the mutation flock with Sentry, so this is safe while containers
 // are running.
 func (s Store) GarbageCollectRepositories() (int, error) {
-	manager, err := ttcvolume.OpenManager(s.activeRoot(), true)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return 0, err
 	}

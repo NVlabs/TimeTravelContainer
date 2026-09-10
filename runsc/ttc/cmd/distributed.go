@@ -514,7 +514,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 	if err != nil {
 		return 0, err
 	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
 		return 0, err
 	}
@@ -616,7 +616,7 @@ func (b *runtimeBackend) exportDistributedSnapshot(containerID, transactionID st
 		}
 	}()
 	args := []string{"timetravel", "--distributed-snapshot-fd=3"}
-	if b.allowSlowVolumeCopy {
+	if b.volumeCopyMode == ttcvolume.CopyModeFull {
 		args = append(args, "--distributed-snapshot-allow-copy")
 	}
 	args = append(args, containerID, "distributed-export", transactionID)

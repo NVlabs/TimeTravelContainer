@@ -434,7 +434,7 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	manifest.Xattrs["var/lib/app/nested/payload"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
 	manifest.Xattrs["var/lib/app/hardlink"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
 
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 }
 
 func TestSeedCopiedHostMountDirectoryAndFile(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2285,7 +2285,7 @@ func TestRemoveObsoleteApplicationMemoryFiles(t *testing.T) {
 
 func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	root := t.TempDir()
-	manager, err := ttcvolume.OpenManager(root, true)
+	manager, err := ttcvolume.OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2568,7 +2568,7 @@ func TestCommitActiveRepositoryRestoreIDsAdvancesOneShotAlias(t *testing.T) {
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := ttcvolume.OpenManager(local, true)
+	manager, err := ttcvolume.OpenManager(local)
 	if err != nil {
 		t.Fatal(err)
 	}

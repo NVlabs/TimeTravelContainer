@@ -21,7 +21,6 @@ TTC=${TTC:-}
 TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
-TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 
 fail() {
@@ -75,9 +74,6 @@ trap cleanup EXIT HUP INT TERM
 set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
-fi
-if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
-  set -- "$@" --allow-slow-volume-copy
 fi
 ttc "$@"
 

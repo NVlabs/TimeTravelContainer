@@ -16,7 +16,9 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -225,7 +227,6 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 	status := RunDaemon([]string{
 		"--socket", socket,
 		"--unsafe-no-host-isolation",
-		"--allow-slow-volume-copy",
 	}, &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires Linux 3.17 or newer") {
 		t.Fatalf("unsupported kernel: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
@@ -237,23 +238,24 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 
 func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
 	original := daemonKernelRelease
+	originalProbe := createDaemonRootlessProbe
+	originalEUID := daemonEffectiveUID
 	defer func() {
 		daemonKernelRelease = original
+		createDaemonRootlessProbe = originalProbe
+		daemonEffectiveUID = originalEUID
 	}()
 	daemonKernelRelease = func() (string, error) {
 		return "4.14.76-legacy", nil
 	}
+	daemonEffectiveUID = func() int { return 1000 }
+	createDaemonRootlessProbe = func() error { return errors.New("fixture stops startup after kernel warning") }
 
-	dataRoot := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(dataRoot, []byte("fixture"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	dataRoot := t.TempDir()
 	t.Setenv("TTC_ROOT", dataRoot)
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{
 		"--socket", filepath.Join(t.TempDir(), "runtime", "ttcd.sock"),
-		"--unsafe-no-host-isolation",
-		"--allow-slow-volume-copy",
 	}, &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 {
 		t.Fatalf("old kernel startup fixture: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
@@ -495,6 +497,17 @@ func TestDaemonRootsRequireExplicitFreshEnvironment(t *testing.T) {
 	if roots, err := daemonRootsFromEnvironment(true); err != nil || roots.shared != shared || roots.local != local || roots.runtime != filepath.Join(local, "runtime", "runsc") {
 		t.Fatalf("cluster roots=%+v err=%v", roots, err)
 	}
+	if err := os.MkdirAll(shared, 0700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "shared-alias")
+	if err := os.Symlink(shared, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TTC_LOCAL_ROOT", alias)
+	if _, err := daemonRootsFromEnvironment(true); err == nil || !strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("symlink-aliased cluster roots error=%v", err)
+	}
 }
 
 func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
@@ -502,18 +515,30 @@ func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(old, "containers"), []byte("legacy"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepareDaemonStorageRoot(old, "shared", "", ""); err == nil || !strings.Contains(err.Error(), "not a fresh TTC root") {
+	if err := prepareDaemonStorageRoot(old, daemonRootRoleStandaloneAuthority, "", ""); err == nil || !strings.Contains(err.Error(), "not a fresh TTC root") {
 		t.Fatalf("old root error=%v", err)
 	}
 	fresh := filepath.Join(t.TempDir(), "fresh")
-	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-a"); err != nil {
+	if err := prepareDaemonStorageRoot(fresh, daemonRootRoleClusterLocal, "repo", "node-a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-a"); err != nil {
+	if err := prepareDaemonStorageRoot(fresh, daemonRootRoleClusterLocal, "repo", "node-a"); err != nil {
 		t.Fatalf("reopening matching root: %v", err)
 	}
-	if err := prepareDaemonStorageRoot(fresh, "local", "repo", "node-b"); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err := prepareDaemonStorageRoot(fresh, daemonRootRoleClusterLocal, "repo", "node-b"); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched node marker error=%v", err)
+	}
+	markerData, err := os.ReadFile(filepath.Join(fresh, ".ttc-root-format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker daemonRootMarker
+	if err := json.Unmarshal(markerData, &marker); err != nil {
+		t.Fatal(err)
+	}
+	want := daemonRootMarker{Version: daemonClusterRootFormatVersion, Schema: daemonRootSchema, Role: daemonRootRoleClusterLocal, RepositoryID: "repo", NodeID: "node-a"}
+	if marker != want {
+		t.Fatalf("root marker=%+v, want %+v", marker, want)
 	}
 	first, err := lockDaemonLocalRoot(fresh)
 	if err != nil {
@@ -523,6 +548,80 @@ func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
 	if second, err := lockDaemonLocalRoot(fresh); err == nil {
 		second.Close()
 		t.Fatal("local root was locked by two daemons")
+	}
+}
+
+func TestDaemonStorageRootRejectsOldMarkerWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version int
+		role    string
+	}{
+		{name: "standalone-v1", version: 1, role: daemonRootRoleStandaloneAuthority},
+		{name: "cluster-v4", version: 4, role: daemonRootRoleClusterShared},
+		{name: "future", version: daemonClusterRootFormatVersion + 1, role: daemonRootRoleClusterShared},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			markerPath := filepath.Join(root, ".ttc-root-format")
+			original := []byte(fmt.Sprintf("{\"version\":%d,\"kind\":\"shared\"}\n", test.version))
+			if err := os.WriteFile(markerPath, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := inspectDaemonStorageRoot(root, test.role)
+			if err == nil || !strings.Contains(err.Error(), "does not migrate existing roots") {
+				t.Fatalf("inspect old root error=%v", err)
+			}
+			after, readErr := os.ReadFile(markerPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !bytes.Equal(after, original) {
+				t.Fatalf("old marker changed from %q to %q", original, after)
+			}
+		})
+	}
+}
+
+func TestDaemonStorageRootRejectsWrongRole(t *testing.T) {
+	root := t.TempDir()
+	if err := prepareDaemonStorageRoot(root, daemonRootRoleStandaloneAuthority, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectDaemonStorageRoot(root, daemonRootRoleClusterShared); err == nil || !strings.Contains(err.Error(), "incompatible format") {
+		t.Fatalf("wrong root role error=%v", err)
+	}
+}
+
+func TestDaemonRejectsOldRootBeforePlatformProbe(t *testing.T) {
+	root := t.TempDir()
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	original := []byte("{\"version\":1,\"kind\":\"shared\"}\n")
+	if err := os.WriteFile(markerPath, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TTC_ROOT", root)
+	oldPreflight := daemonPlatformPreflight
+	t.Cleanup(func() { daemonPlatformPreflight = oldPreflight })
+	preflightCalls := 0
+	daemonPlatformPreflight = func(string) error {
+		preflightCalls++
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{"--socket", filepath.Join(t.TempDir(), "ttcd.sock"), "--unsafe-no-host-isolation"}, &stdout, &stderr)
+	if status != 1 || !strings.Contains(stderr.String(), "does not migrate existing roots") {
+		t.Fatalf("old-root startup: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	if preflightCalls != 0 {
+		t.Fatalf("old-root startup ran %d platform probes, want zero", preflightCalls)
+	}
+	after, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("old marker changed from %q to %q", original, after)
 	}
 }
 

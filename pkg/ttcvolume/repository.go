@@ -67,7 +67,7 @@ type CopyMode string
 const (
 	// CopyModeReflink uses FICLONE and leaves extent CoW to the host filesystem.
 	CopyModeReflink CopyMode = "reflink"
-	// CopyModeFull copies the complete file after explicit daemon opt-in.
+	// CopyModeFull copies the complete file when FICLONE is unavailable.
 	CopyModeFull CopyMode = "full-copy"
 )
 
@@ -85,8 +85,10 @@ type Manager struct {
 	capability Capability
 }
 
-// OpenManager creates the volume store and verifies its file-copy policy.
-func OpenManager(dataRoot string, allowSlowCopy bool) (*Manager, error) {
+// OpenManager creates the volume store and detects its file-copy policy.
+// FICLONE is an optimization only; filesystems that do not support it use
+// whole-file copies without requiring daemon configuration.
+func OpenManager(dataRoot string) (*Manager, error) {
 	if dataRoot == "" {
 		return nil, errors.New("volume manager data root must not be empty")
 	}
@@ -94,7 +96,7 @@ func OpenManager(dataRoot string, allowSlowCopy bool) (*Manager, error) {
 	if err := os.MkdirAll(volumes, 0700); err != nil {
 		return nil, fmt.Errorf("creating volume object store: %w", err)
 	}
-	capability, err := probeCapability(volumes, allowSlowCopy)
+	capability, err := probeCapability(volumes)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +108,7 @@ func (m *Manager) Capability() Capability {
 	return m.capability
 }
 
-func probeCapability(root string, allowSlowCopy bool) (Capability, error) {
+func probeCapability(root string) (Capability, error) {
 	var statfs unix.Statfs_t
 	if err := unix.Statfs(root, &statfs); err != nil {
 		return Capability{}, fmt.Errorf("stating volume backing filesystem: %w", err)
@@ -145,11 +147,8 @@ func probeCapability(root string, allowSlowCopy bool) (Capability, error) {
 	defer os.Remove(cloneName)
 	defer clone.Close()
 	if err := unix.IoctlFileClone(int(clone.Fd()), int(source.Fd())); err != nil {
-		if allowSlowCopy {
-			capability.Mode = CopyModeFull
-			return capability, nil
-		}
-		return Capability{}, fmt.Errorf("volume backing filesystem does not support FICLONE: %w; move --data-root to a reflink-capable filesystem or explicitly start ttcd with --allow-slow-volume-copy", err)
+		capability.Mode = CopyModeFull
+		return capability, nil
 	}
 	if _, err := clone.WriteAt([]byte("branch"), 0); err != nil {
 		return Capability{}, fmt.Errorf("writing reflink probe clone: %w", err)

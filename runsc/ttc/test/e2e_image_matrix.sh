@@ -106,10 +106,10 @@ ttc() {
 
 ttc_daemon_start() {
   if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-    ttc daemon start --unsafe-no-host-isolation --allow-slow-volume-copy
+    ttc daemon start --unsafe-no-host-isolation
     return
   fi
-  ttc daemon start --allow-slow-volume-copy
+  ttc daemon start
 }
 
 ttc_daemon_crash() {
@@ -554,7 +554,7 @@ while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
 done
 
 echo "== daemon restart reconciliation =="
-ttc daemon status | grep -q '"version":5' || fail "ttcd did not report API version 5"
+ttc daemon status | grep -q '"version":6' || fail "ttcd did not report API version 6"
 ttc_daemon_crash
 if ttc daemon status >/dev/null 2>&1; then
   fail "ttcd remained reachable after crash"
@@ -562,7 +562,7 @@ fi
 ttc_daemon_start
 [ "$(ttc inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
   fail "restarted ttcd did not reconcile the running container"
-ttc daemon status | grep -q '"version":5' || fail "ttcd did not restart"
+ttc daemon status | grep -q '"version":6' || fail "ttcd did not restart"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"

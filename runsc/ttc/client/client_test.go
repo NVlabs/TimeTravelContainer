@@ -101,7 +101,7 @@ func TestDaemonStopRetriesReportedLegacyAPI(t *testing.T) {
 			var writeMu sync.Mutex
 			status := 1
 			if attempt == 0 {
-				err = writeFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: unsupported API version 5 (server uses 4)\n"))
+				err = writeFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: unsupported API version 6 (server uses 4)\n"))
 			} else {
 				status = 0
 				err = writeFrame(conn, &writeMu, daemonFrameStdout, []byte("stopped\n"))
@@ -147,10 +147,10 @@ func TestReportedDaemonAPIVersion(t *testing.T) {
 		want       int
 		ok         bool
 	}{
-		{"ttcd: unsupported API version 5 (server uses 4)\n", 4, true},
+		{"ttcd: unsupported API version 6 (server uses 4)\n", 4, true},
 		{"ttcd: unsupported API version", 0, false},
-		{"ttcd: unsupported API version 5 (server uses 0)", 0, false},
-		{fmt.Sprintf("ttcd: unsupported API version 5 (server uses %d)", 1<<16+1), 0, false},
+		{"ttcd: unsupported API version 6 (server uses 0)", 0, false},
+		{fmt.Sprintf("ttcd: unsupported API version 6 (server uses %d)", 1<<16+1), 0, false},
 	} {
 		got, ok := reportedDaemonAPIVersion(test.diagnostic)
 		if got != test.want || ok != test.ok {

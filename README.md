@@ -190,9 +190,9 @@ Host requirements are deliberately small:
 - (Optional) An unprivileged user namespace for normal rootless isolation. No subordinate
   UID/GID ranges or `newuidmap` helpers are required. Trusted environments that
   prohibit user namespaces can explicitly use `--unsafe-no-host-isolation`.
-- A data root on a filesystem with (optional) reflink support for efficient persistent
-  file CoW. `--allow-slow-volume-copy` enables a compatible whole-file-copy
-  fallback.
+- A data root on any supported local filesystem. TTC uses reflinks when
+  available and otherwise transparently falls back to whole-file copying on
+  the first write after a fork.
 - (optional) A delegated cgroup v2 subtree only when hard host CPU or memory limits are
   requested.
 

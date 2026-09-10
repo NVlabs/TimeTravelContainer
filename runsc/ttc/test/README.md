@@ -201,8 +201,8 @@ TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 ```
 
 Use `TTC_UNSAFE_NO_HOST_ISOLATION=1` only on a trusted host that cannot create
-unprivileged user namespaces. Set `TTC_ALLOW_SLOW_VOLUME_COPY=1` when the
-test's data root is on a filesystem without `FICLONE`.
+unprivileged user namespaces. Filesystems without `FICLONE` are supported
+automatically through whole-file copying.
 
 ## Terminal and live-fork integration
 

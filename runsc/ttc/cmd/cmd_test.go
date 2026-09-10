@@ -5039,7 +5039,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		notWant string
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
-		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--allow-slow-volume-copy", "--platform", "--unsafe-no-host-isolation"}},
+		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--platform", "--unsafe-no-host-isolation"}},
 		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: []string{"kvm", "systrap"}},
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},

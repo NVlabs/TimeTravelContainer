@@ -743,7 +743,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err != nil {
 		return err
 	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
 		return err
 	}
@@ -896,7 +896,7 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 	if err != nil {
 		return err
 	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot(), b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
 		return err
 	}

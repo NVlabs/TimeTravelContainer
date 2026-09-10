@@ -60,9 +60,8 @@ non-forkable for its entire lifetime.
   upper; use `:copy` for a view detached from later host changes.
 - A managed volume cannot be attached writable to unrelated container
   families at the same time.
-- Efficient persistent file CoW requires filesystem reflinks. The
-  `--allow-slow-volume-copy` fallback can copy a complete shared file on its
-  first write.
+- Efficient persistent file CoW requires filesystem reflinks. Without them,
+  TTC automatically copies a complete shared file on its first write.
 - Virtual networking and published ports are currently IPv4-only, and
   published ports currently support TCP.
 - Linux 3.17 through 4.14.76 is supported with host GSO disabled
