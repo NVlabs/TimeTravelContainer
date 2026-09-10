@@ -479,6 +479,85 @@ func (s *Store) Seal(id SnapshotID, state SnapshotState) error {
 	return s.commitLocked([]journalOp{{PutSnapshot: &snapshot}})
 }
 
+// SealAndFork atomically seals source, copies named logical roots, and
+// allocates fresh working origins for every resumed source/destination branch.
+// copies maps destination root names to existing source root names.
+func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[string]string, workingOrigins int) ([]SnapshotID, error) {
+	if state != SnapshotSealedLocal && state != SnapshotSealedVolatile {
+		return nil, fmt.Errorf("invalid seal target %q", state)
+	}
+	if len(copies) == 0 || workingOrigins <= 0 {
+		return nil, errors.New("TTC snapshot fork requires roots and fresh working origins")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.state.Snapshots[snapshotKey(source)]
+	if !ok || snapshot.State != SnapshotWorking {
+		return nil, fmt.Errorf("snapshot %d is not working", source)
+	}
+	destinations := make([]string, 0, len(copies))
+	for destination, sourceName := range copies {
+		if err := validateRootName(destination); err != nil {
+			return nil, err
+		}
+		if err := validateRootName(sourceName); err != nil {
+			return nil, err
+		}
+		if _, exists := s.state.Roots[destination]; exists {
+			return nil, fmt.Errorf("destination root %q already exists", destination)
+		}
+		if _, exists := s.state.Roots[sourceName]; !exists {
+			return nil, fmt.Errorf("source root %q does not exist", sourceName)
+		}
+		destinations = append(destinations, destination)
+	}
+	if uint64(workingOrigins) > math.MaxUint64-uint64(s.state.NextSnapshot) {
+		return nil, errors.New("TTC snapshot ID space exhausted")
+	}
+	sort.Strings(destinations)
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(copies)*2+workingOrigins+2)
+	for _, destination := range destinations {
+		id := s.state.Roots[copies[destination]]
+		object, ok := touched[id.key()]
+		if !ok {
+			object = s.state.Objects[id.key()]
+		}
+		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
+			return nil, fmt.Errorf("fork root object %s cannot be retained", id.key())
+		}
+		object.Refs++
+		touched[id.key()] = object
+		ops = append(ops, journalOp{RootName: destination, PutRoot: &id})
+	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	objectOps := make([]journalOp, 0, len(keys))
+	for _, key := range keys {
+		object := touched[key]
+		objectOps = append(objectOps, journalOp{PutObject: &object})
+	}
+	ops = append(objectOps, ops...)
+	snapshot.State = state
+	ops = append(ops, journalOp{PutSnapshot: &snapshot})
+	allocated := make([]SnapshotID, workingOrigins)
+	next := s.state.NextSnapshot
+	for index := range allocated {
+		allocated[index] = next
+		working := Snapshot{ID: next, State: SnapshotWorking, NextOrdinal: 1}
+		ops = append(ops, journalOp{PutSnapshot: &working})
+		next++
+	}
+	ops = append(ops, journalOp{SetNextSnapshot: &next})
+	if err := s.commitLocked(ops); err != nil {
+		return nil, err
+	}
+	return allocated, nil
+}
+
 // CreateObject creates an object and a named construction pin. Every child
 // edge is activated in the same bounded transaction, so recovery can derive
 // every reference from durable graph structure.

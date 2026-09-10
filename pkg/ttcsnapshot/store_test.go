@@ -202,6 +202,44 @@ func TestSealIsConstantGraphMutation(t *testing.T) {
 	}
 }
 
+func TestSealAndBatchForkIsOneTransaction(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.CreateObject(origin, "build/page", ObjectKindPage, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.SetMemoryPage(origin, "family/main/memory", 7, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("build/page"); err != nil {
+		t.Fatal(err)
+	}
+	copies := make(map[string]string)
+	for i := 0; i < 20; i++ {
+		copies[fmt.Sprintf("family/child-%d/memory", i)] = "family/main/memory"
+	}
+	before := store.Stats().Sequence
+	working, err := store.SealAndFork(origin, SnapshotSealedLocal, copies, 21)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(working) != 21 || working[0] != origin+1 || working[20] != origin+21 {
+		t.Fatalf("fresh working origins=%v", working)
+	}
+	if got := store.Stats().Sequence - before; got != 1 {
+		t.Fatalf("batch seal/fork used %d journal records, want 1", got)
+	}
+	object, _ := store.Object(root)
+	if object.Refs != 21 {
+		t.Fatalf("shared root references=%d, want 21", object.Refs)
+	}
+}
+
 func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
