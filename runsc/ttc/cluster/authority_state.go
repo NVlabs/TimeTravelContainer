@@ -31,8 +31,9 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 3
+	AuthorityFormatVersion = 4
 	maxRememberedRequests  = 65536
+	maxSharedGCLease       = 30 * time.Second
 )
 
 // AuthorityCommandKind identifies one deterministic state-machine mutation.
@@ -74,6 +75,9 @@ const (
 	AuthorityBranchRemoveCorrupted AuthorityCommandKind = "branch-remove-corrupted"
 	AuthoritySnapshotAllocate      AuthorityCommandKind = "snapshot-allocate"
 	AuthoritySnapshotPublish       AuthorityCommandKind = "snapshot-publish"
+	AuthoritySharedGCAcquire       AuthorityCommandKind = "shared-gc-acquire"
+	AuthoritySharedGCRenew         AuthorityCommandKind = "shared-gc-renew"
+	AuthoritySharedGCRelease       AuthorityCommandKind = "shared-gc-release"
 )
 
 // AuthorityCommand is the sole replicated mutation envelope. IssuedAt is
@@ -150,6 +154,17 @@ type SnapshotAllocation struct {
 	Count uint32 `json:"count"`
 }
 
+// SharedGCLease gives exactly one live daemon authority to mutate shared
+// snapshot packs and the reference ledger rebuilt from them. Expiry stops
+// collection; it never transfers object authority or permits another daemon
+// to continue a previous holder's local collection plan.
+type SharedGCLease struct {
+	NodeID      string    `json:"node_id"`
+	Incarnation string    `json:"incarnation"`
+	Generation  uint64    `json:"generation"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
 // BranchAuthority is the cluster-wide authority record that is not already
 // represented by PlacementRecord.
 type BranchAuthority struct {
@@ -207,9 +222,10 @@ type PublicationRecord struct {
 // AuthorityState is snapshotted by Raft. Maps are keyed by stable logical
 // identities, never local paths.
 type AuthorityState struct {
-	Version        int    `json:"version"`
-	Revision       uint64 `json:"revision"`
-	NextSnapshotID uint64 `json:"next_snapshot_id"`
+	Version                int    `json:"version"`
+	Revision               uint64 `json:"revision"`
+	NextSnapshotID         uint64 `json:"next_snapshot_id"`
+	NextSharedGCGeneration uint64 `json:"next_shared_gc_generation"`
 	// LeaderObservedAt is populated only on a linearizable read response. It is
 	// zero in the replicated FSM and snapshots, and lets remote readers convert
 	// lease deadlines without assuming wall-clock synchronization.
@@ -220,13 +236,14 @@ type AuthorityState struct {
 	Branches         map[string]BranchAuthority         `json:"branches,omitempty"`
 	Publications     map[string]PublicationRecord       `json:"publications,omitempty"`
 	VolatileOrigins  map[uint64]SnapshotOriginProvider  `json:"volatile_origins,omitempty"`
+	SharedGC         SharedGCLease                      `json:"shared_gc,omitempty"`
 	Requests         map[string]appliedAuthorityRequest `json:"requests,omitempty"`
 	RequestOrder     []string                           `json:"request_order,omitempty"`
 }
 
 // NewAuthorityState creates an empty cluster state.
 func NewAuthorityState() *AuthorityState {
-	state := &AuthorityState{Version: AuthorityFormatVersion, NextSnapshotID: 1}
+	state := &AuthorityState{Version: AuthorityFormatVersion, NextSnapshotID: 1, NextSharedGCGeneration: 1}
 	state.initMaps()
 	return state
 }
@@ -252,6 +269,9 @@ func (s *AuthorityState) initMaps() {
 	}
 	if s.NextSnapshotID == 0 {
 		s.NextSnapshotID = 1
+	}
+	if s.NextSharedGCGeneration == 0 {
+		s.NextSharedGCGeneration = 1
 	}
 	if s.Requests == nil {
 		s.Requests = make(map[string]appliedAuthorityRequest)
@@ -400,6 +420,8 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Publications = cloneAuthorityMap(s.Publications)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
+		// SharedGC is copied by value with AuthorityState.
 	}
 }
 
@@ -507,6 +529,12 @@ type AuthoritySnapshotPayload struct {
 	SnapshotID          uint64
 }
 
+type AuthoritySharedGCPayload struct {
+	NodeID, Incarnation string
+	Generation          uint64
+	Lease               time.Duration
+}
+
 // AuthorityMigrationCutoverPayload joins the transaction and placement CASes
 // that used to be committed separately. The target runtime is already paused
 // and locally published when this command is proposed; applying it makes that
@@ -563,8 +591,62 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyBranch(command)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
 		return s.applySnapshot(command)
+	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
+		return s.applySharedGC(command)
 	default:
 		return nil, fmt.Errorf("unknown authority command %q", command.Kind)
+	}
+}
+
+func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessage, error) {
+	p, err := decodeAuthorityPayload[AuthoritySharedGCPayload](command)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		return nil, err
+	}
+	switch command.Kind {
+	case AuthoritySharedGCAcquire:
+		if p.Generation != 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease {
+			return nil, errors.New("invalid shared GC lease acquisition")
+		}
+		if !s.SharedGC.ExpiresAt.IsZero() && command.IssuedAt.Before(s.SharedGC.ExpiresAt) &&
+			(s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation) {
+			return nil, errors.New("shared GC lease is owned by another daemon")
+		}
+		generation := s.NextSharedGCGeneration
+		if generation == 0 || generation == math.MaxUint64 {
+			return nil, errors.New("shared GC lease generation exhausted")
+		}
+		s.NextSharedGCGeneration++
+		s.SharedGC = SharedGCLease{
+			NodeID: p.NodeID, Incarnation: p.Incarnation, Generation: generation,
+			ExpiresAt: command.IssuedAt.Add(p.Lease),
+		}
+		return authorityValue(s.SharedGC)
+	case AuthoritySharedGCRenew:
+		if p.Generation == 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease ||
+			s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation || s.SharedGC.Generation != p.Generation ||
+			!command.IssuedAt.Before(s.SharedGC.ExpiresAt) {
+			return nil, errors.New("shared GC lease is not renewable")
+		}
+		s.SharedGC.ExpiresAt = command.IssuedAt.Add(p.Lease)
+		return authorityValue(s.SharedGC)
+	case AuthoritySharedGCRelease:
+		if p.Lease != 0 || p.Generation == 0 {
+			return nil, errors.New("invalid shared GC lease release")
+		}
+		if s.SharedGC.NodeID == "" {
+			return authorityValue(SharedGCLease{})
+		}
+		if s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation || s.SharedGC.Generation != p.Generation {
+			return nil, errors.New("shared GC lease release is stale")
+		}
+		s.SharedGC = SharedGCLease{}
+		return authorityValue(s.SharedGC)
+	default:
+		panic("unreachable")
 	}
 }
 
@@ -1516,6 +1598,9 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	if state.Version != AuthorityFormatVersion {
 		return nil, fmt.Errorf("authority snapshot version is %d, want %d", state.Version, AuthorityFormatVersion)
 	}
+	if state.NextSnapshotID == 0 || state.NextSharedGCGeneration == 0 {
+		return nil, errors.New("authority snapshot has invalid monotonic allocator state")
+	}
 	state.initMaps()
 	for _, node := range state.Nodes {
 		if err := node.Validate(); err != nil {
@@ -1535,13 +1620,19 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 			return nil, err
 		}
 	}
-	if state.NextSnapshotID == 0 {
-		return nil, errors.New("authority snapshot has invalid next snapshot ID")
-	}
 	for id, provider := range state.VolatileOrigins {
 		if id == 0 || id >= state.NextSnapshotID || provider.SnapshotID != id || provider.NodeID == "" {
 			return nil, errors.New("authority snapshot has invalid volatile origin")
 		}
+	}
+	if lease := state.SharedGC; lease.NodeID != "" {
+		node, ok := state.Nodes[lease.NodeID]
+		if !ok || lease.Incarnation == "" || node.Incarnation != lease.Incarnation || lease.Generation == 0 ||
+			lease.Generation >= state.NextSharedGCGeneration || lease.ExpiresAt.IsZero() {
+			return nil, errors.New("authority snapshot has invalid shared GC lease")
+		}
+	} else if lease.Incarnation != "" || lease.Generation != 0 || !lease.ExpiresAt.IsZero() {
+		return nil, errors.New("authority snapshot has incomplete shared GC lease")
 	}
 	if len(state.RequestOrder) != len(state.Requests) {
 		return nil, errors.New("authority request index is inconsistent")

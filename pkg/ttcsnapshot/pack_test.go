@@ -157,3 +157,61 @@ func TestSharedPackManifestLastAndTruncation(t *testing.T) {
 		t.Fatal("truncated authoritative pack was accepted")
 	}
 }
+
+func TestSharedPackRetireWaitsForReaders(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := filepath.Join(directory, "shared")
+	shared, err := OpenSharedPackStore(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, _ := graph.AllocateWorking()
+	id, _ := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	data := bytes.Repeat([]byte{0xa5}, 1<<20)
+	if err := local.Install(id, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(id, "chunk", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {
+		t.Fatal(err)
+	}
+	reader, _, err := shared.Fetch(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.Retire(origin); err != nil || !busy {
+		t.Fatalf("Retire with reader = (busy=%t, err=%v), want busy", busy, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.Retire(origin); err != nil || busy {
+		t.Fatalf("Retire after close = (busy=%t, err=%v)", busy, err)
+	}
+	if _, err := shared.Manifest(origin); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired manifest error=%v, want not-exist", err)
+	}
+	err = filepath.WalkDir(filepath.Join(sharedRoot, "snapshots"), func(path string, entry os.DirEntry, err error) error {
+		if err == nil && len(entry.Name()) > 4 && entry.Name()[:4] == ".nfs" {
+			t.Errorf("unexpected NFS tombstone %q", path)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

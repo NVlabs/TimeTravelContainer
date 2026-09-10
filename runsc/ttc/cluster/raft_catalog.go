@@ -233,6 +233,48 @@ func (c *RaftCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOrig
 	return provider, found, nil
 }
 
+// AcquireSharedGCLease becomes the sole shared-pack mutator for at most lease.
+// A new acquisition always receives a fresh generation, including after an
+// explicit release by the same daemon.
+func (c *RaftCatalog) AcquireSharedGCLease(node, incarnation string, lease time.Duration) (SharedGCLease, error) {
+	value, err := applyRaftValue[SharedGCLease](c, time.Now().UTC(), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: node, Incarnation: incarnation, Lease: lease,
+	})
+	if err != nil {
+		return SharedGCLease{}, err
+	}
+	return *value, nil
+}
+
+// RenewSharedGCLease extends an unexpired generation owned by this daemon.
+func (c *RaftCatalog) RenewSharedGCLease(lease SharedGCLease, duration time.Duration) (SharedGCLease, error) {
+	value, err := applyRaftValue[SharedGCLease](c, time.Now().UTC(), AuthoritySharedGCRenew, AuthoritySharedGCPayload{
+		NodeID: lease.NodeID, Incarnation: lease.Incarnation, Generation: lease.Generation, Lease: duration,
+	})
+	if err != nil {
+		return SharedGCLease{}, err
+	}
+	return *value, nil
+}
+
+// ReleaseSharedGCLease relinquishes one exact generation. A stale holder can
+// never release a successor's lease.
+func (c *RaftCatalog) ReleaseSharedGCLease(lease SharedGCLease) error {
+	return applyRaftNoValue(c, time.Now().UTC(), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
+		NodeID: lease.NodeID, Incarnation: lease.Incarnation, Generation: lease.Generation,
+	})
+}
+
+// SharedGCLease returns the current replicated lease. Callers must still
+// compare ExpiresAt with the normalized local observation time.
+func (c *RaftCatalog) SharedGCLease() (SharedGCLease, error) {
+	state, err := c.state()
+	if err != nil {
+		return SharedGCLease{}, err
+	}
+	return state.SharedGC, nil
+}
+
 func publicationOperationID(generation uint64) string {
 	return "publication-" + time.Unix(int64(generation), 0).UTC().Format("20060102T150405")
 }

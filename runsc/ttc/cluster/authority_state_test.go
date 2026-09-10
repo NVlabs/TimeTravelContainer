@@ -151,6 +151,56 @@ func TestAuthoritySnapshotOriginAllocationAndPublish(t *testing.T) {
 	}
 }
 
+func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {
+	at := time.Unix(1700, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at.Add(-time.Second))
+
+	first := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "gc-acquire-a", at, AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Lease: 10 * time.Second,
+	}))
+	if first.Generation != 1 || first.NodeID != "node-a" || !first.ExpiresAt.Equal(at.Add(10*time.Second)) {
+		t.Fatalf("first lease = %+v", first)
+	}
+	contender, err := NewAuthorityCommand("gc-acquire-b-early", at.Add(time.Second), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Lease: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(contender); result.Err() == nil {
+		t.Fatal("contender acquired an unexpired lease")
+	}
+	renewed := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "gc-renew-a", at.Add(2*time.Second), AuthoritySharedGCRenew, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Generation: first.Generation, Lease: 12 * time.Second,
+	}))
+	if renewed.Generation != first.Generation || !renewed.ExpiresAt.Equal(at.Add(14*time.Second)) {
+		t.Fatalf("renewed lease = %+v", renewed)
+	}
+	second := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "gc-acquire-b-expired", at.Add(14*time.Second), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Lease: 10 * time.Second,
+	}))
+	if second.Generation != first.Generation+1 || second.NodeID != "node-b" {
+		t.Fatalf("successor lease = %+v", second)
+	}
+	staleRelease, err := NewAuthorityCommand("gc-release-a-stale", at.Add(15*time.Second), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Generation: first.Generation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(staleRelease); result.Err() == nil {
+		t.Fatal("stale owner released successor lease")
+	}
+	applyAuthorityForTest(t, state, "gc-release-b", at.Add(16*time.Second), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation,
+	})
+	if state.SharedGC.NodeID != "" || state.NextSharedGCGeneration != 3 {
+		t.Fatalf("released state = %+v, next=%d", state.SharedGC, state.NextSharedGCGeneration)
+	}
+}
+
 func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	at := time.Unix(2000, 0).UTC()
 	state := NewAuthorityState()

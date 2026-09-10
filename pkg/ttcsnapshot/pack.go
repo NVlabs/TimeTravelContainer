@@ -28,6 +28,8 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"syscall"
+	"time"
 )
 
 const (
@@ -417,6 +419,7 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 type extentReadCloser struct {
 	reader io.Reader
 	files  []*os.File
+	lease  *os.File
 }
 
 func (reader *extentReadCloser) Read(destination []byte) (int, error) {
@@ -429,7 +432,41 @@ func (reader *extentReadCloser) Close() error {
 		result = errors.Join(result, file.Close())
 	}
 	reader.files = nil
+	if reader.lease != nil {
+		result = errors.Join(result, syscall.Flock(int(reader.lease.Fd()), syscall.LOCK_UN), reader.lease.Close())
+		reader.lease = nil
+	}
 	return result
+}
+
+// acquireSnapshotLease locks the snapshot directory itself rather than a
+// regular lock file. This matters on NFS: removing an open regular lock file
+// creates a .nfs tombstone. An open directory can be renamed and removed after
+// the lock is released without creating hidden files.
+func (store *SharedPackStore) acquireSnapshotLease(snapshot SnapshotID, operation int) (*os.File, error) {
+	directory, err := os.Open(store.snapshotDirectory(snapshot))
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(directory.Fd()), operation); err != nil {
+		directory.Close()
+		return nil, err
+	}
+	return directory, nil
+}
+
+func (store *SharedPackStore) acquireSnapshotReadLease(ctx context.Context, snapshot SnapshotID) (*os.File, error) {
+	for {
+		lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_SH|syscall.LOCK_NB)
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return lease, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 // Fetch opens a complete immutable object by stable ID. Only the manifest and
@@ -438,14 +475,22 @@ func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCl
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
+	lease, err := store.acquireSnapshotReadLease(ctx, id.Snapshot)
+	if err != nil {
+		return nil, 0, err
+	}
 	manifest, err := store.Manifest(id.Snapshot)
 	if err != nil {
+		syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		lease.Close()
 		return nil, 0, err
 	}
 	index := sort.Search(len(manifest.Objects), func(index int) bool {
 		return manifest.Objects[index].Object.ID.key() >= id.key()
 	})
 	if index == len(manifest.Objects) || manifest.Objects[index].Object.ID != id {
+		syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		lease.Close()
 		return nil, 0, os.ErrNotExist
 	}
 	packed := manifest.Objects[index]
@@ -457,10 +502,60 @@ func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCl
 			for _, opened := range files {
 				opened.Close()
 			}
+			syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+			lease.Close()
 			return nil, 0, err
 		}
 		files = append(files, file)
 		readers = append(readers, io.NewSectionReader(file, extent.Offset, extent.Length))
 	}
-	return &extentReadCloser{reader: io.MultiReader(readers...), files: files}, packed.Object.BulkLength, nil
+	return &extentReadCloser{reader: io.MultiReader(readers...), files: files, lease: lease}, packed.Object.BulkLength, nil
+}
+
+// Retire removes one unreachable committed snapshot pack without racing a
+// cooperating reader. The caller must hold the current Raft shared-GC lease
+// and must have proved that no authoritative shared root or immutable edge
+// references this origin. busy=true means a reader still has an extent open.
+func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error) {
+	if snapshot == 0 {
+		return false, errors.New("cannot retire snapshot zero")
+	}
+	lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	directory := store.snapshotDirectory(snapshot)
+	if _, err := os.Stat(filepath.Join(directory, sharedManifestName)); err != nil {
+		syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		lease.Close()
+		return false, err
+	}
+	parent := filepath.Dir(directory)
+	var retired string
+	for attempt := 0; attempt != 16; attempt++ {
+		retired = filepath.Join(parent, fmt.Sprintf(".retired-%s-%d-%d-%d", snapshotKey(snapshot), os.Getpid(), time.Now().UnixNano(), attempt))
+		if err = os.Rename(directory, retired); err == nil {
+			break
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			break
+		}
+	}
+	unlockErr := syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+	closeErr := lease.Close()
+	if err != nil {
+		return false, errors.Join(err, unlockErr, closeErr)
+	}
+	if err := syncDirectory(parent); err != nil {
+		return false, errors.Join(err, unlockErr, closeErr)
+	}
+	removeErr := os.RemoveAll(retired)
+	syncErr := syncDirectory(parent)
+	store.mu.Lock()
+	delete(store.manifests, snapshot)
+	store.mu.Unlock()
+	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
 }
