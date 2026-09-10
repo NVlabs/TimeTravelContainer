@@ -11,6 +11,7 @@ go_library(
         "btree.go",
         "data.go",
         "filesystem.go",
+		"hosttree.go",
         "memory.go",
 		"pack.go",
         "resolver.go",
@@ -25,6 +26,7 @@ go_test(
     name = "ttcsnapshot_test",
     size = "small",
     srcs = [
+		"hosttree_test.go",
 		"pack_test.go",
         "resolver_test.go",
         "store_test.go",

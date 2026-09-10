@@ -369,7 +369,7 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	rootInode := InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}
-	regular := InodeRecord{Number: 2, Type: "regular", Mode: 0640, UID: 1000, GID: 1000, Nlink: 2, Size: 7, File: file, Xattrs: map[string]string{"user.test": "value"}}
+	regular := InodeRecord{Number: 2, Type: "regular", Mode: 0640, UID: 1000, GID: 1000, Nlink: 2, Size: 7, File: file, Xattrs: map[string][]byte{"user.test": []byte("value")}}
 	root, err := store.ApplyFilesystem(origin, "branch/main/filesystem", []FilesystemOperation{
 		{PutInode: &rootInode},
 		{PutInode: &regular},
@@ -382,7 +382,7 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 	if err := store.DeletePin("build/file"); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, err := store.FilesystemInode(root, 2); err != nil || !ok || got.File != file || got.Xattrs["user.test"] != "value" {
+	if got, ok, err := store.FilesystemInode(root, 2); err != nil || !ok || got.File != file || string(got.Xattrs["user.test"]) != "value" {
 		t.Fatalf("inode=(%+v,%t,%v)", got, ok, err)
 	}
 	entries, err := store.FilesystemDirectory(root, 1)

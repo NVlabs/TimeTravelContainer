@@ -44,7 +44,7 @@ type InodeRecord struct {
 	BtimeNsec   int64
 	CtimeNsec   int64
 	MtimeNsec   int64
-	Xattrs      map[string]string
+	Xattrs      map[string][]byte
 }
 
 // DirectoryEntryRecord maps one name in Parent to a stable guest inode.
@@ -220,6 +220,9 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			key, err := directoryKey(entry.Parent, entry.Name)
 			if err != nil || entry.Inode == 0 {
 				return ObjectID{}, errors.New("invalid TTC directory entry record")
+			}
+			if _, exists, lookupErr := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(entry.Inode)); lookupErr != nil || !exists {
+				return ObjectID{}, fmt.Errorf("looking up directory entry inode %d: %w", entry.Inode, lookupErr)
 			}
 			parentID, ok, err := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(entry.Parent))
 			if err != nil || !ok {

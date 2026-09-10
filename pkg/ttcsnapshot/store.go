@@ -612,61 +612,126 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 // A crash may leave an unused ordinal, but IDs are never reused and no graph
 // reference exists until CommitReservedObject succeeds.
 func (s *Store) ReserveObject(origin SnapshotID, kind ObjectKind) (ObjectID, error) {
-	if !kind.valid() {
-		return ObjectID{}, fmt.Errorf("invalid TTC object kind %d", kind)
+	ids, err := s.ReserveObjects(origin, []ObjectKind{kind})
+	if err != nil {
+		return ObjectID{}, err
+	}
+	return ids[0], nil
+}
+
+// ReserveObjects durably allocates a consecutive group of object IDs in one
+// journal transaction. This keeps image import and dehydration metadata work
+// proportional to batches rather than the number of pages or files.
+func (s *Store) ReserveObjects(origin SnapshotID, kinds []ObjectKind) ([]ObjectID, error) {
+	if len(kinds) == 0 {
+		return nil, errors.New("cannot reserve an empty TTC object batch")
+	}
+	for _, kind := range kinds {
+		if !kind.valid() {
+			return nil, fmt.Errorf("invalid TTC object kind %d", kind)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
 	if !ok || snapshot.State != SnapshotWorking {
-		return ObjectID{}, fmt.Errorf("snapshot %d is not working", origin)
+		return nil, fmt.Errorf("snapshot %d is not working", origin)
 	}
-	if snapshot.NextOrdinal == 0 || snapshot.NextOrdinal == math.MaxUint64 {
-		return ObjectID{}, fmt.Errorf("snapshot %d object ordinal space exhausted", origin)
+	if snapshot.NextOrdinal == 0 || uint64(len(kinds)) > math.MaxUint64-snapshot.NextOrdinal {
+		return nil, fmt.Errorf("snapshot %d object ordinal space exhausted", origin)
 	}
-	id := ObjectID{Snapshot: origin, Ordinal: snapshot.NextOrdinal, Kind: kind}
-	snapshot.NextOrdinal++
+	ids := make([]ObjectID, len(kinds))
+	for index, kind := range kinds {
+		ids[index] = ObjectID{Snapshot: origin, Ordinal: snapshot.NextOrdinal + uint64(index), Kind: kind}
+	}
+	snapshot.NextOrdinal += uint64(len(kinds))
 	if err := s.commitLocked([]journalOp{{PutSnapshot: &snapshot}}); err != nil {
-		return ObjectID{}, err
+		return nil, err
 	}
-	return id, nil
+	return ids, nil
+}
+
+// ReservedObject describes one already-installed immutable bulk object.
+type ReservedObject struct {
+	ID         ObjectID
+	Pin        string
+	BulkLength uint64
+	Data       []byte
+	Children   []Edge
 }
 
 // CommitReservedObject makes a reserved ID reachable through pin. Bulk data
 // must already have been atomically installed before this call.
 func (s *Store) CommitReservedObject(id ObjectID, pin string, bulkLength uint64, data []byte, children []Edge) error {
-	if err := id.validate(); err != nil {
-		return err
-	}
-	if err := validateRootName(pin); err != nil {
-		return fmt.Errorf("invalid construction pin: %w", err)
+	return s.CommitReservedObjects([]ReservedObject{{ID: id, Pin: pin, BulkLength: bulkLength, Data: data, Children: children}})
+}
+
+// CommitReservedObjects publishes a batch of installed objects and their
+// construction pins in one journal transaction.
+func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
+	if len(reserved) == 0 {
+		return errors.New("cannot commit an empty TTC object batch")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(id.Snapshot)]
-	if !ok || snapshot.State != SnapshotWorking || id.Ordinal >= snapshot.NextOrdinal {
-		return fmt.Errorf("object ID %s is not reserved in a working snapshot", id.key())
-	}
-	if _, ok := s.state.Objects[id.key()]; ok {
-		return fmt.Errorf("object %s already exists", id.key())
-	}
-	if _, ok := s.state.Pins[pin]; ok {
-		return fmt.Errorf("construction pin %q already exists", pin)
-	}
-	object := Object{ID: id, State: ObjectLive, Refs: 1, BulkLength: bulkLength, Data: append([]byte(nil), data...), Children: append([]Edge(nil), children...)}
-	if err := validateObject(object); err != nil {
-		return err
-	}
-	ops := make([]journalOp, 0, len(children)+2)
-	for _, edge := range object.Children {
-		child, ok := s.state.Objects[edge.Child.key()]
-		if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
-			return fmt.Errorf("child object %s cannot be retained", edge.Child.key())
+	next := cloneGraphState(s.state)
+	touchedChildren := make(map[string]Object)
+	ops := make([]journalOp, 0, len(reserved)*2)
+	seenIDs := make(map[string]struct{}, len(reserved))
+	seenPins := make(map[string]struct{}, len(reserved))
+	for _, item := range reserved {
+		if err := item.ID.validate(); err != nil {
+			return err
 		}
-		child.Refs++
+		if err := validateRootName(item.Pin); err != nil {
+			return fmt.Errorf("invalid construction pin: %w", err)
+		}
+		snapshot, ok := next.Snapshots[snapshotKey(item.ID.Snapshot)]
+		if !ok || snapshot.State != SnapshotWorking || item.ID.Ordinal >= snapshot.NextOrdinal {
+			return fmt.Errorf("object ID %s is not reserved in a working snapshot", item.ID.key())
+		}
+		if _, duplicate := seenIDs[item.ID.key()]; duplicate {
+			return fmt.Errorf("object batch repeats %s", item.ID.key())
+		}
+		seenIDs[item.ID.key()] = struct{}{}
+		if _, exists := next.Objects[item.ID.key()]; exists {
+			return fmt.Errorf("object %s already exists", item.ID.key())
+		}
+		if _, duplicate := seenPins[item.Pin]; duplicate {
+			return fmt.Errorf("object batch repeats construction pin %q", item.Pin)
+		}
+		seenPins[item.Pin] = struct{}{}
+		if _, exists := next.Pins[item.Pin]; exists {
+			return fmt.Errorf("construction pin %q already exists", item.Pin)
+		}
+		object := Object{ID: item.ID, State: ObjectLive, Refs: 1, BulkLength: item.BulkLength, Data: append([]byte(nil), item.Data...), Children: append([]Edge(nil), item.Children...)}
+		if err := validateObject(object); err != nil {
+			return err
+		}
+		next.Objects[item.ID.key()] = object
+		next.Pins[item.Pin] = item.ID
+		for _, edge := range object.Children {
+			child, ok := next.Objects[edge.Child.key()]
+			if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
+				return fmt.Errorf("child object %s cannot be retained", edge.Child.key())
+			}
+			child.Refs++
+			next.Objects[edge.Child.key()] = child
+			touchedChildren[edge.Child.key()] = child
+		}
+		objectCopy := object
+		idCopy := item.ID
+		ops = append(ops, journalOp{PutObject: &objectCopy}, journalOp{PinName: item.Pin, PutPin: &idCopy})
+	}
+	keys := make([]string, 0, len(touchedChildren))
+	for key := range touchedChildren {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		child := touchedChildren[key]
 		ops = append(ops, journalOp{PutObject: &child})
 	}
-	ops = append(ops, journalOp{PutObject: &object}, journalOp{PinName: pin, PutPin: &id})
 	return s.commitLocked(ops)
 }
 
@@ -756,24 +821,57 @@ func releaseObject(object Object) (Object, error) {
 
 // DeletePin removes a named transaction/open/cache pin.
 func (s *Store) DeletePin(name string) error {
-	if err := validateRootName(name); err != nil {
-		return err
+	return s.DeletePins([]string{name})
+}
+
+// DeletePins removes construction/transaction pins in one journal record.
+func (s *Store) DeletePins(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	for _, name := range names {
+		if err := validateRootName(name); err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id, ok := s.state.Pins[name]
-	if !ok {
-		return os.ErrNotExist
+	next := cloneGraphState(s.state)
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(names)*2)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("pin batch repeats %q", name)
+		}
+		seen[name] = struct{}{}
+		id, ok := next.Pins[name]
+		if !ok {
+			return os.ErrNotExist
+		}
+		object, ok := next.Objects[id.key()]
+		if !ok {
+			return fmt.Errorf("object %s does not exist", id.key())
+		}
+		object, err := releaseObject(object)
+		if err != nil {
+			return err
+		}
+		next.Objects[id.key()] = object
+		delete(next.Pins, name)
+		touched[id.key()] = object
+		ops = append(ops, journalOp{PinName: name, DeletePin: true})
 	}
-	object, ok := s.state.Objects[id.key()]
-	if !ok {
-		return fmt.Errorf("object %s does not exist", id.key())
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
 	}
-	object, err := releaseObject(object)
-	if err != nil {
-		return err
+	sort.Strings(keys)
+	for _, key := range keys {
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
 	}
-	return s.commitLocked([]journalOp{{PinName: name, DeletePin: true}, {PutObject: &object}})
+	return s.commitLocked(ops)
 }
 
 // SetRoot atomically replaces a named root and its reference.
