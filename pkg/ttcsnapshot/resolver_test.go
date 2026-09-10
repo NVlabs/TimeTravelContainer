@@ -152,3 +152,44 @@ func TestResolverUsesSharedForPublishedOrigin(t *testing.T) {
 		t.Fatalf("fetch calls shared=%d peer=%d", shared.calls.Load(), peer.calls.Load())
 	}
 }
+
+func TestResolverUsesReadOnlyCatalogMetadata(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(dir + "/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	cache, err := OpenLocalDataStore(dir + "/cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("catalog-only shared object")
+	object := Object{
+		ID:    ObjectID{Snapshot: 91, Kind: ObjectKindFile, Ordinal: 7},
+		State: ObjectLive, Refs: 1, BulkLength: uint64(len(data)),
+	}
+	shared := &testObjectSource{data: data}
+	resolver, err := NewResolver(graph, cache, testOriginLocator{}, testPeerSource{node: "unused", source: &testObjectSource{}}, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Object(object.ID); ok {
+		t.Fatal("catalog object unexpectedly exists in authoritative graph")
+	}
+	file, err := resolver.ResolveKnown(context.Background(), object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("resolved catalog bytes=%q err=%v", got, err)
+	}
+	if shared.calls.Load() != 1 {
+		t.Fatalf("shared fetch count=%d, want 1", shared.calls.Load())
+	}
+	if _, ok := graph.Object(object.ID); ok {
+		t.Fatal("cache resolution claimed reference authority")
+	}
+}

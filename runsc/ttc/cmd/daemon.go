@@ -251,6 +251,7 @@ type daemonServer struct {
 	snapshotGraph         *ttcsnapshot.Store
 	snapshotData          *ttcsnapshot.LocalDataStore
 	snapshotResolver      *ttcsnapshot.Resolver
+	snapshotShared        *ttcsnapshot.SharedPackStore
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -1532,6 +1533,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotGraph = s.snapshotGraph
 	backend.snapshotData = s.snapshotData
 	backend.snapshotResolver = s.snapshotResolver
+	backend.snapshotShared = s.snapshotShared
 }
 
 type daemonStopTarget struct {
@@ -3303,11 +3305,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
-		clusterRuntime.controlPlane.ObjectProvider = &graphObjectProvider{
+		graphProvider := &graphObjectProvider{
 			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.raftCatalog,
 			transactions: clusterRuntime.transactions, nodeID: clusterRuntime.nodeRecord.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation,
 		}
+		clusterRuntime.controlPlane.ObjectProvider = graphProvider
+		clusterRuntime.controlPlane.SnapshotProvider = graphProvider
 		sharedObjects, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(dataRoot, "snapshot-packs"))
 		if err != nil {
 			return fmt.Errorf("opening shared snapshot packs: %w", err)
@@ -3319,6 +3323,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("opening distributed snapshot resolver: %w", err)
 		}
 		server.snapshotResolver = resolver
+		server.snapshotShared = sharedObjects
 		targetBackend := directBackend(options{
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,

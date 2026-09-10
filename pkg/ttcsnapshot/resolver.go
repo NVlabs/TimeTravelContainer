@@ -80,6 +80,24 @@ func (resolver *Resolver) Resolve(ctx context.Context, id ObjectID) (*os.File, e
 	if !ok || object.State != ObjectLive {
 		return nil, os.ErrNotExist
 	}
+	return resolver.resolveObject(ctx, object)
+}
+
+// ResolveKnown resolves an object described by a structurally validated
+// immutable catalog. It avoids importing cache metadata into the authoritative
+// local reference-count graph.
+func (resolver *Resolver) ResolveKnown(ctx context.Context, object Object) (*os.File, error) {
+	if err := validateObject(object); err != nil {
+		return nil, err
+	}
+	if object.State != ObjectLive {
+		return nil, os.ErrNotExist
+	}
+	return resolver.resolveObject(ctx, object)
+}
+
+func (resolver *Resolver) resolveObject(ctx context.Context, object Object) (*os.File, error) {
+	id := object.ID
 	length, err := objectLength(object)
 	if err != nil {
 		return nil, err

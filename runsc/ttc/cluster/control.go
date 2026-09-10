@@ -43,6 +43,7 @@ const (
 	controlForkPrefix         = "/v1/forks/"
 	controlProxyPath          = "/v1/daemon"
 	controlObjectPrefix       = "/v1/objects/"
+	controlSnapshotPrefix     = "/v1/snapshots/"
 	maxControlBody            = 1 << 20
 	controlNodeHeader         = "X-TTC-Node"
 	controlObjectLengthHeader = "X-TTC-Object-Length"
@@ -536,14 +537,22 @@ type ControlPlane struct {
 	// ObjectProvider serves immutable graph objects owned by this node. Reads
 	// are fenced by the provider's current Raft authority and transaction.
 	ObjectProvider ImmutableObjectProvider
-	operationMu    sync.Mutex // serializes reservation/quota accounting
-	transactionMu  sync.Map   // transaction ID -> *sync.Mutex
+	// SnapshotProvider serves immutable graph metadata without transferring
+	// reference-count authority to the requesting cache.
+	SnapshotProvider ImmutableSnapshotProvider
+	operationMu      sync.Mutex // serializes reservation/quota accounting
+	transactionMu    sync.Map   // transaction ID -> *sync.Mutex
 }
 
 // ImmutableObjectProvider opens one complete immutable object after checking
 // that this daemon still owns its snapshot origin.
 type ImmutableObjectProvider interface {
 	OpenObject(context.Context, string, string, string) (io.ReadCloser, uint64, error)
+}
+
+// ImmutableSnapshotProvider opens the exact metadata catalog for one origin.
+type ImmutableSnapshotProvider interface {
+	OpenSnapshot(context.Context, string, uint64, string) (io.ReadCloser, uint64, error)
 }
 
 func (c *ControlPlane) lockTransaction(id string) func() {
@@ -576,6 +585,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, controlObjectPrefix) {
 		c.serveObject(w, r, peer)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, controlSnapshotPrefix) {
+		c.serveSnapshot(w, r, peer)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
@@ -667,6 +680,43 @@ func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer 
 	}
 	// At this point headers are committed. Closing the response early is the
 	// protocol error signal; the target installs nothing until exact EOF.
+	_ = copyErr
+}
+
+func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, peer string) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "immutable snapshot fetch requires GET")
+		return
+	}
+	if c.SnapshotProvider == nil {
+		writeControlError(w, http.StatusNotImplemented, "immutable snapshot provider is unavailable")
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, controlSnapshotPrefix)
+	text, suffix, ok := strings.Cut(remainder, "/")
+	if !ok || suffix != "catalog" {
+		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot path")
+		return
+	}
+	snapshot, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || snapshot == 0 || strconv.FormatUint(snapshot, 10) != text {
+		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot ID")
+		return
+	}
+	reader, length, err := c.SnapshotProvider.OpenSnapshot(r.Context(), peer, snapshot, r.URL.Query().Get("transaction"))
+	if err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	defer reader.Close()
+	w.Header().Set(controlObjectLengthHeader, strconv.FormatUint(length, 10))
+	w.Header().Set("Content-Length", strconv.FormatUint(length, 10))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	written, copyErr := io.CopyN(w, reader, int64(length))
+	if copyErr == nil && uint64(written) != length {
+		copyErr = io.ErrUnexpectedEOF
+	}
 	_ = copyErr
 }
 
@@ -1266,6 +1316,46 @@ func (c *Client) FetchObject(ctx context.Context, objectID, transaction string) 
 	if err != nil || response.ContentLength < 0 || uint64(response.ContentLength) != length {
 		response.Body.Close()
 		return nil, 0, errors.New("immutable object provider returned an invalid exact length")
+	}
+	return response.Body, length, nil
+}
+
+// FetchSnapshot opens a provider-fenced immutable metadata catalog. The
+// caller validates its schema and graph closure before using it.
+func (c *Client) FetchSnapshot(ctx context.Context, snapshot uint64, transaction string) (io.ReadCloser, uint64, error) {
+	if snapshot == 0 {
+		return nil, 0, errors.New("invalid immutable snapshot ID")
+	}
+	endpoint := c.BaseURL + controlSnapshotPrefix + strconv.FormatUint(snapshot, 10) + "/catalog"
+	if transaction != "" {
+		endpoint += "?transaction=" + url.QueryEscape(transaction)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	c.authenticate(request)
+	client := c.streamHTTP
+	if client == nil {
+		client = c.HTTP
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		var failure controlError
+		if err := json.NewDecoder(io.LimitReader(response.Body, maxControlBody)).Decode(&failure); err != nil || failure.Error == "" {
+			return nil, 0, fmt.Errorf("immutable snapshot provider returned %s", response.Status)
+		}
+		return nil, 0, errors.New(failure.Error)
+	}
+	lengthText := response.Header.Get(controlObjectLengthHeader)
+	length, err := strconv.ParseUint(lengthText, 10, 64)
+	if err != nil || length == 0 || length > maxAuthoritySnapshotBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
+		response.Body.Close()
+		return nil, 0, errors.New("immutable snapshot provider returned an invalid exact length")
 	}
 	return response.Body, length, nil
 }

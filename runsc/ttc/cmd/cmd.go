@@ -5454,6 +5454,7 @@ type runtimeBackend struct {
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
 	snapshotResolver *ttcsnapshot.Resolver
+	snapshotShared   *ttcsnapshot.SharedPackStore
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool
@@ -11674,24 +11675,67 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 }
 
 func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*os.File, *os.File, error) {
-	if b.snapshotGraph == nil || len(capture.MemoryRoots) == 0 {
+	if b.snapshotData == nil || len(capture.MemoryRoots) == 0 || capture.SnapshotID == 0 {
 		return nil, nil, errors.New("graph-native dehydration roots are unavailable")
 	}
 	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
+	localRoots := b.snapshotGraph != nil
 	for index, recorded := range capture.MemoryRoots {
 		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
 		}
-		current, ok := b.snapshotGraph.Root(recorded.Name)
-		if !ok || current != id {
-			return nil, nil, fmt.Errorf("graph memory root %q is no longer authoritative", recorded.Name)
+		if localRoots {
+			current, ok := b.snapshotGraph.Root(recorded.Name)
+			if !ok || current != id {
+				localRoots = false
+			}
 		}
 		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
 	}
-	adapted, err := ttcchunk.BuildGraphManifest(b.snapshotGraph, roots)
+	var catalog ttcsnapshot.MemoryCatalog
+	if localRoots {
+		catalog = b.snapshotGraph
+	} else {
+		immutable, err := b.immutableSnapshotCatalog(context.Background(), ttcsnapshot.SnapshotID(capture.SnapshotID), "")
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
+		}
+		catalog = immutable
+	}
+	adapted, err := ttcchunk.BuildGraphManifest(catalog, roots)
 	if err != nil {
 		return nil, nil, err
+	}
+	// The Sentry currently receives a descriptor for the node-local complete-
+	// object cache. Fill only the chunks reached by this branch. A later relay
+	// milestone will move these ResolveKnown calls onto Sentry page faults so
+	// target execution need not wait for all chunks.
+	for _, objectID := range adapted.Chunks {
+		if file, err := b.snapshotData.Open(objectID, ttcsnapshot.MemoryChunkBytes); err == nil {
+			file.Close()
+			continue
+		}
+		if b.snapshotResolver == nil {
+			return nil, nil, fmt.Errorf("memory chunk %s is not local and no distributed resolver is configured", objectID)
+		}
+		var object ttcsnapshot.Object
+		var ok bool
+		if localRoots {
+			object, ok = b.snapshotGraph.Object(objectID)
+		} else {
+			object, ok = catalog.(*ttcsnapshot.ImmutableCatalog).Object(objectID)
+		}
+		if !ok {
+			return nil, nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
+		}
+		file, err := b.snapshotResolver.ResolveKnown(context.Background(), object)
+		if err != nil {
+			return nil, nil, fmt.Errorf("materializing memory chunk %s: %w", objectID, err)
+		}
+		if err := file.Close(); err != nil {
+			return nil, nil, err
+		}
 	}
 	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
