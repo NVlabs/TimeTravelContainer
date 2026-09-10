@@ -30,6 +30,15 @@ func TestPackRoundTripAndRangeIndex(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, "empty"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(filepath.Join(source, "a", "b", "large"), 0440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(source, "a", "b"), 0550); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(source, "a", "b"), 0750)
+	})
 	repository := filepath.Join(root, "repository")
 	id, err := WriteDirectory(source, repository)
 	if err != nil {
@@ -53,12 +62,21 @@ func TestPackRoundTripAndRangeIndex(t *testing.T) {
 		t.Fatalf("large file has %d extents, want multiple", extents)
 	}
 	destination := filepath.Join(root, "destination")
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(destination, "a", "b"), 0750)
+	})
 	if err := Materialize(repository, id, destination); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(destination, "a", "b", "large"))
 	if err != nil || !bytes.Equal(got, contents) {
 		t.Fatalf("round trip mismatch: err=%v len=%d", err, len(got))
+	}
+	if info, err := os.Stat(filepath.Join(destination, "a", "b")); err != nil || info.Mode().Perm() != 0550 {
+		t.Fatalf("restrictive directory mode = %v, %v; want 0550", info, err)
+	}
+	if info, err := os.Stat(filepath.Join(destination, "a", "b", "large")); err != nil || info.Mode().Perm() != 0440 {
+		t.Fatalf("restrictive file mode = %v, %v; want 0440", info, err)
 	}
 	first, _ := os.Stat(filepath.Join(destination, "a", "b", "large"))
 	second, _ := os.Stat(filepath.Join(destination, "hardlink"))

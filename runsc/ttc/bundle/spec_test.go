@@ -34,6 +34,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
@@ -597,7 +598,8 @@ func TestSeedCopiedHostMountDirectoryAndFile(t *testing.T) {
 }
 
 func TestBuildSpecDonatesPersistentRootfsUpper(t *testing.T) {
-	rootfs := t.TempDir()
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
 	repository := filepath.Join(t.TempDir(), "rootfs-upper")
 	spec, err := BuildSpec(
 		ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}},
@@ -2184,6 +2186,100 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	if _, err := store.RemoveImageRoots(""); err == nil {
 		t.Fatal("RemoveImageRoots accepted an empty digest")
 	}
+}
+
+func TestSharedImagePackRoundTrip(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.MkdirAll(filepath.Join(rootfs, "usr", "bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Repeat("image payload\n", 100000)
+	if err := os.WriteFile(filepath.Join(rootfs, "usr", "bin", "tool"), []byte(payload), 0555); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manifest.Entries["usr/bin/tool"] = ownership.Owner{UID: 123, GID: 456}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), manifest); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{
+		Reference: "docker.io/library/test:latest", ConfigDigest: "sha256:" + strings.Repeat("a", 64),
+		Platform: "linux/amd64", LayerCount: 2,
+	}
+	key := imageRootKey("sha256:"+strings.Repeat("b", 64), info.Platform)
+	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+		t.Fatalf("publishSharedImagePack: %v", err)
+	}
+	destination := t.TempDir()
+	gotInfo, found, err := store.materializeSharedImagePack(key, destination)
+	if err != nil || !found {
+		t.Fatalf("materializeSharedImagePack = (%+v, %t, %v), want found", gotInfo, found, err)
+	}
+	if !reflect.DeepEqual(gotInfo, info) {
+		t.Fatalf("materialized info = %+v, want %+v", gotInfo, info)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "rootfs", "usr", "bin", "tool"))
+	if err != nil || string(got) != payload {
+		t.Fatalf("materialized payload length=%d err=%v", len(got), err)
+	}
+	owners, err := ownership.Read(ownership.ManifestPath(filepath.Join(destination, "rootfs")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := owners.Entries["usr/bin/tool"]; owner.UID != 123 || owner.GID != 456 {
+		t.Fatalf("materialized owner = %+v", owner)
+	}
+	entries, err := os.ReadDir(filepath.Join(store.sharedImagePackRoot(), "packs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("shared packs = %d, %v, want one", len(entries), err)
+	}
+}
+
+func TestSharedImagePackPublicationIsIdempotent(t *testing.T) {
+	shared := t.TempDir()
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.Mkdir(rootfs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "payload"), []byte("same immutable bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), owners); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{ConfigDigest: "sha256:" + strings.Repeat("c", 64), Platform: "linux/amd64"}
+	key := imageRootKey("sha256:"+strings.Repeat("d", 64), info.Platform)
+	for i := 0; i < 2; i++ {
+		store := Store{Root: shared, ActiveRoot: t.TempDir()}
+		if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+			t.Fatalf("publication %d: %v", i, err)
+		}
+	}
+	loaded, err := loadSharedImagePackManifest(Store{Root: shared}.sharedImagePackManifestPath(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := ttcpack.ParseID(loaded.Pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := ttcpack.Open(sharedImagePackRootForTest(shared), id)
+	if err != nil {
+		t.Fatalf("opening published pack: %v", err)
+	}
+	file.Close()
+}
+
+func sharedImagePackRootForTest(root string) string {
+	return Store{Root: root}.sharedImagePackRoot()
 }
 
 func TestPruneImageRoots(t *testing.T) {

@@ -40,6 +40,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -4919,6 +4920,22 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 		}
 	}()
 	rootfs := filepath.Join(tempDir, "rootfs")
+	if s.activeRoot() != s.Root {
+		if packed, found, err := s.materializeSharedImagePack(key, tempDir); err != nil {
+			return images.RootFSInfo{}, "", fmt.Errorf("materializing shared image pack: %w", err)
+		} else if found {
+			if err := writeJSON(filepath.Join(tempDir, "image.json"), &packed); err != nil {
+				return images.RootFSInfo{}, "", fmt.Errorf("writing image-root metadata: %w", err)
+			}
+			if err := os.Rename(tempDir, finalDir); err != nil {
+				if existing, loadErr := loadImageRoot(finalDir); loadErr == nil {
+					return existing, filepath.Join(finalDir, "rootfs"), nil
+				}
+				return images.RootFSInfo{}, "", fmt.Errorf("publishing image root: %w", err)
+			}
+			return packed, filepath.Join(finalDir, "rootfs"), nil
+		}
+	}
 	rootOptions := images.RootFSOptions{
 		StoreRoot: s.Root,
 		Reference: pulled.Reference,
@@ -4938,6 +4955,11 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 	if err := ensureNetworkMountpoints(rootfs); err != nil {
 		return images.RootFSInfo{}, "", err
 	}
+	if s.activeRoot() != s.Root {
+		if err := s.publishSharedImagePack(key, tempDir, info); err != nil {
+			return images.RootFSInfo{}, "", fmt.Errorf("publishing shared image pack: %w", err)
+		}
+	}
 	if err := writeJSON(filepath.Join(tempDir, "image.json"), &info); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("writing image-root metadata: %w", err)
 	}
@@ -4948,6 +4970,142 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 		return images.RootFSInfo{}, "", fmt.Errorf("publishing image root: %w", err)
 	}
 	return info, filepath.Join(finalDir, "rootfs"), nil
+}
+
+const sharedImagePackFormat = 1
+
+type sharedImagePackManifest struct {
+	Format int               `json:"format"`
+	Pack   string            `json:"pack"`
+	Image  images.RootFSInfo `json:"image"`
+}
+
+func (s Store) sharedImagePackRoot() string {
+	return filepath.Join(s.Root, "image-packs")
+}
+
+func (s Store) sharedImagePackManifestPath(key string) string {
+	return filepath.Join(s.sharedImagePackRoot(), "manifests", key+".json")
+}
+
+func (s Store) publishSharedImagePack(key, imageDir string, info images.RootFSInfo) error {
+	root := s.sharedImagePackRoot()
+	manifestPath := s.sharedImagePackManifestPath(key)
+	if existing, err := loadSharedImagePackManifest(manifestPath); err == nil {
+		if existing.Image.ConfigDigest != info.ConfigDigest || existing.Image.Platform != info.Platform {
+			return fmt.Errorf("published image pack %q identifies different image contents", key)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	pack, err := ttcpack.WriteDirectory(imageDir, root)
+	if err != nil {
+		return err
+	}
+	manifest := sharedImagePackManifest{Format: sharedImagePackFormat, Pack: pack.String(), Image: info}
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		return err
+	}
+	installed, err := installSharedImagePackManifest(manifestPath, manifest)
+	if err != nil {
+		return err
+	}
+	if !installed {
+		existing, err := loadSharedImagePackManifest(manifestPath)
+		if err != nil {
+			return fmt.Errorf("reading concurrently published image pack: %w", err)
+		}
+		if existing.Pack != manifest.Pack || existing.Image.ConfigDigest != info.ConfigDigest || existing.Image.Platform != info.Platform {
+			return fmt.Errorf("concurrent image pack publication for %q disagrees with immutable contents", key)
+		}
+	}
+	dir, err := os.Open(filepath.Dir(manifestPath))
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+// installSharedImagePackManifest publishes manifest exactly once. Hard-linking
+// a complete temporary file gives POSIX and NFS an atomic create-if-absent;
+// unlike rename, it cannot silently replace another node's authoritative
+// pointer.
+func installSharedImagePackManifest(path string, manifest sharedImagePackManifest) (_ bool, retErr error) {
+	data, err := json.MarshalIndent(&manifest, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	data = append(data, '\n')
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".image-pack-manifest.tmp-")
+	if err != nil {
+		return false, err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		if err := os.Remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return false, err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return false, err
+	}
+	if err := temporary.Sync(); err != nil {
+		return false, err
+	}
+	if err := temporary.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Link(temporaryPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func loadSharedImagePackManifest(path string) (sharedImagePackManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	var manifest sharedImagePackManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	if manifest.Format != sharedImagePackFormat || manifest.Pack == "" || manifest.Image.ConfigDigest == "" || manifest.Image.Platform == "" {
+		return sharedImagePackManifest{}, fmt.Errorf("shared image pack manifest is incomplete or uses unsupported format %d", manifest.Format)
+	}
+	if _, err := ttcpack.ParseID(manifest.Pack); err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (s Store) materializeSharedImagePack(key, destinationImageDir string) (images.RootFSInfo, bool, error) {
+	manifest, err := loadSharedImagePackManifest(s.sharedImagePackManifestPath(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return images.RootFSInfo{}, false, nil
+	}
+	if err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	pack, err := ttcpack.ParseID(manifest.Pack)
+	if err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	if err := ttcpack.Materialize(s.sharedImagePackRoot(), pack, destinationImageDir); err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	if _, err := ownership.Read(ownership.ManifestPath(filepath.Join(destinationImageDir, "rootfs"))); err != nil {
+		return images.RootFSInfo{}, false, fmt.Errorf("materialized ownership manifest is invalid: %w", err)
+	}
+	return manifest.Image, true, nil
 }
 
 func (s Store) withImageRootLock(fn func() error) error {

@@ -760,6 +760,7 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 	}
 	created := make(map[string]bool)
 	preexisting := make(map[string]bool)
+	finalModes := make(map[string]os.FileMode)
 	buffer := make([]byte, MaxDataExtent)
 	for _, entry := range index.Entries {
 		if err := validateRelative(entry.Path); err != nil {
@@ -789,15 +790,22 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 		}
 		switch entry.Kind {
 		case "directory":
-			if err := os.MkdirAll(path, os.FileMode(entry.Mode).Perm()); err != nil {
+			// Keep directories searchable and writable until every descendant has
+			// been installed. Image and snapshot modes such as 0550 and 0000 are
+			// guest-visible final metadata, not extraction permissions.
+			if err := os.MkdirAll(path, 0700); err != nil {
 				return err
 			}
+			if err := os.Chmod(path, 0700); err != nil {
+				return err
+			}
+			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "file":
 			flags := os.O_WRONLY
 			if !created[entry.Path] {
 				flags |= os.O_CREATE | os.O_EXCL
 			}
-			out, err := os.OpenFile(path, flags, os.FileMode(entry.Mode).Perm())
+			out, err := os.OpenFile(path, flags, 0600)
 			if err != nil {
 				return err
 			}
@@ -810,10 +818,12 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 				return err
 			}
 			created[entry.Path] = true
+			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "hardlink":
 			if err := os.Link(filepath.Join(destination, filepath.FromSlash(entry.Hardlink)), path); err != nil {
 				return err
 			}
+			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "symlink":
 			if err := os.Symlink(entry.Link, path); err != nil {
 				return err
@@ -822,10 +832,12 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 			if err := unix.Mkfifo(path, entry.Mode&07777); err != nil {
 				return err
 			}
+			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "device":
 			if err := unix.Mknod(path, entry.Mode, int(entry.Device)); err != nil {
 				return err
 			}
+			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "xattr":
 			n, err := ReadEntry(file, entry, buffer)
 			if err != nil {
@@ -838,14 +850,25 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 			return fmt.Errorf("unknown pack entry kind %q", entry.Kind)
 		}
 		if entry.Kind != "xattr" && (entry.Kind != "file" || entry.FileOffset == 0) {
-			if entry.Kind != "symlink" {
-				_ = os.Chmod(path, os.FileMode(entry.Mode).Perm())
-			}
 			for name, value := range entry.Xattrs {
 				if err := unix.Lsetxattr(path, name, value, 0); err != nil && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) {
 					return err
 				}
 			}
+		}
+	}
+	// Restore children before directories so restrictive parent permissions do
+	// not prevent metadata restoration below them.
+	paths := make([]string, 0, len(finalModes))
+	for path := range finalModes {
+		paths = append(paths, path)
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return strings.Count(paths[i], string(filepath.Separator)) > strings.Count(paths[j], string(filepath.Separator))
+	})
+	for _, path := range paths {
+		if err := os.Chmod(path, finalModes[path]); err != nil {
+			return err
 		}
 	}
 	return nil
