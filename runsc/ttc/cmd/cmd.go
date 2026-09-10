@@ -11086,6 +11086,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err != nil {
 		return err
 	}
+	if b.snapshotGraph == nil || b.snapshotData == nil {
+		return errors.New("new-format daemon has no graph-native memory store")
+	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
 		return fmt.Errorf("settling remote branches before dehydrating %s: %w", target, err)
 	}
@@ -11101,12 +11104,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	captured := false
 	var stagingDir, finalDir string
 	finalPublished := false
-	sparseRootChanged := false
-	hadPreviousSparseRoot := false
-	var previousSparseRoot ttcchunk.ManifestID
-	var sparseRepositoryPath string
-	var sparseFilesystemBranch string
-	var memoryRepository *ttcchunk.MemoryRepository
 	var graphMemoryRoots []string
 	var graphMemoryRootObjects []string
 	var graphMemorySnapshot uint64
@@ -11121,27 +11118,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		if transitionPublished {
 			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
-		}
-		if sparseRootChanged {
-			if repository, openErr := ttcchunk.OpenMemoryRepository(sparseRepositoryPath); openErr == nil {
-				if hadPreviousSparseRoot {
-					openErr = repository.SetBranch(sparseFilesystemBranch, previousSparseRoot)
-				} else {
-					openErr = repository.DeleteBranch(sparseFilesystemBranch)
-					if errors.Is(openErr, os.ErrNotExist) {
-						openErr = nil
-					}
-				}
-				if openErr == nil {
-					_, openErr = repository.CollectGarbage(ttcchunk.GCOptions{})
-				}
-				_ = repository.Close()
-				if openErr != nil && b.stderr != nil {
-					fmt.Fprintf(b.stderr, "ttc: warning: rolling back sparse memory root for %s: %v\n", target, openErr)
-				}
-			} else if b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: opening sparse memory repository to roll back %s: %v\n", target, openErr)
-			}
 		}
 		if graphMemoryRecorded {
 			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects)
@@ -11228,87 +11204,50 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		if b.snapshotGraph != nil && b.snapshotData != nil {
-			origin, sealState, err := b.allocateGraphSnapshotOrigin()
-			if err != nil {
-				return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
-			}
-			graphMemorySnapshot = uint64(origin)
-			graphMemorySealState = sealState
-			prefix := fmt.Sprintf("memory/%016x", uint64(origin))
-			reader, writer, err := os.Pipe()
-			if err != nil {
-				return fmt.Errorf("creating graph dehydration stream: %w", err)
-			}
-			type graphImportOutcome struct {
-				result ttcchunk.GraphImportResult
-				err    error
-			}
-			imported := make(chan graphImportOutcome, 1)
-			go func() {
-				result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
-				_ = reader.Close()
-				imported <- graphImportOutcome{result: result, err: importErr}
-			}()
-			_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", target.container, "dehydrate-export", target.branch)
-			_ = writer.Close()
-			outcome := <-imported
-			if exportErr != nil {
-				return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
-			}
-			if outcome.err != nil {
-				return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
-			}
-			for _, root := range outcome.result.Roots {
-				capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
-					ResourceID: root.ResourceID,
-					Name:       root.Name,
-					Root:       root.Root.String(),
-				})
-				graphMemoryRoots = append(graphMemoryRoots, root.Name)
-				graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
-			}
-			if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
-				return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
-			}
-			capture.SnapshotID = uint64(origin)
-			capture.SparseManifest = ttcchunk.ManifestID{}
-		} else {
-			sparseRepositoryPath = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-			memoryRepository, err = ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
-			if err != nil {
-				return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
-			}
-			defer memoryRepository.Close()
-			previousSparseRoot, err = memoryRepository.Branch(capture.FilesystemBranch)
-			if err == nil {
-				hadPreviousSparseRoot = true
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("reading previous sparse dehydration branch root: %w", err)
-			}
-			repositoryDir, err := os.Open(sparseRepositoryPath)
-			if err != nil {
-				return err
-			}
-			exportOutput, exportErr := b.commandWithFiles([]*os.File{repositoryDir}, "timetravel", "--dehydration-memory-repository-fd=3", target.container, "dehydrate-export", target.branch)
-			_ = repositoryDir.Close()
-			if exportErr != nil {
-				return fmt.Errorf("persisting dehydration memory: %w", exportErr)
-			}
-			var exportInfo boot.BranchDehydrationExportInfo
-			if err := json.Unmarshal(exportOutput, &exportInfo); err != nil {
-				return fmt.Errorf("decoding sparse dehydration root: %w", err)
-			}
-			if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
-				return errors.New("sparse dehydration export returned an empty manifest ID")
-			}
-			sparseFilesystemBranch = capture.FilesystemBranch
-			if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
-				return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
-			}
-			sparseRootChanged = true
-			capture.SparseManifest = exportInfo.Manifest
+		origin, sealState, err := b.allocateGraphSnapshotOrigin()
+		if err != nil {
+			return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
 		}
+		graphMemorySnapshot = uint64(origin)
+		graphMemorySealState = sealState
+		prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return fmt.Errorf("creating graph dehydration stream: %w", err)
+		}
+		type graphImportOutcome struct {
+			result ttcchunk.GraphImportResult
+			err    error
+		}
+		imported := make(chan graphImportOutcome, 1)
+		go func() {
+			result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+			_ = reader.Close()
+			imported <- graphImportOutcome{result: result, err: importErr}
+		}()
+		_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", target.container, "dehydrate-export", target.branch)
+		_ = writer.Close()
+		outcome := <-imported
+		if exportErr != nil {
+			return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
+		}
+		if outcome.err != nil {
+			return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
+		}
+		for _, root := range outcome.result.Roots {
+			capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+				ResourceID: root.ResourceID,
+				Name:       root.Name,
+				Root:       root.Root.String(),
+			})
+			graphMemoryRoots = append(graphMemoryRoots, root.Name)
+			graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
+		}
+		if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
+			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+		}
+		capture.SnapshotID = uint64(origin)
+		capture.SparseManifest = ttcchunk.ManifestID{}
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
 		}
@@ -11359,18 +11298,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	}
 	if err := b.queueBranchPublication(target, "dehydrate"); err != nil {
 		return fmt.Errorf("queueing durable dehydration publication: %w", err)
-	}
-	if graphMemorySnapshot != 0 && memoryRepository != nil {
-		if err := memoryRepository.DeleteBranch(sparseFilesystemBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("releasing compatibility dehydration root: %w", err)
-		}
-		if _, err := memoryRepository.CollectGarbage(ttcchunk.GCOptions{}); err != nil {
-			return fmt.Errorf("reclaiming compatibility dehydration objects: %w", err)
-		}
-		if err := os.RemoveAll(sparseRepositoryPath); err != nil {
-			return fmt.Errorf("removing compatibility dehydration repository: %w", err)
-		}
-		sparseRootChanged = false
 	}
 	dehydrated = true
 	graphMemoryRoots = nil
@@ -11748,6 +11675,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
 		return errors.New("dehydration control state is incomplete")
+	}
+	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 || capture.SparseManifest != (ttcchunk.ManifestID{}) {
+		return errors.New("new-format dehydration control state is not graph-native")
 	}
 	graphSparse := len(capture.MemoryRoots) != 0
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{}) || graphSparse
