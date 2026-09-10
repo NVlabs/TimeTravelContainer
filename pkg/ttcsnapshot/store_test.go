@@ -17,6 +17,7 @@ package ttcsnapshot
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -436,6 +437,168 @@ func TestCheckpointAndTruncatedTailRecovery(t *testing.T) {
 	}
 	if info, err := os.Stat(journal); err != nil || info.Size() != int64(len(journalHeader)) {
 		t.Fatalf("journal after recovery: info=%v err=%v", info, err)
+	}
+}
+
+func TestCheckpointHeadPublicationBoundary(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if store.generation != 2 {
+		t.Fatalf("baseline generation=%d, want 2", store.generation)
+	}
+	checkpoint, err := json.Marshal(store.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	baseline := readGraphTestFiles(t, dir)
+
+	nextCheckpoint := append(checkpoint, '\n')
+	nextJournal := []byte(journalHeader)
+	nextHead, err := json.Marshal(graphHead{Version: formatVersion, Generation: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextHead = append(nextHead, '\n')
+
+	tests := []struct {
+		name       string
+		files      map[string][]byte
+		remove     []string
+		wantError  bool
+		wantGen    uint64
+		wantNextID SnapshotID
+	}{
+		{
+			name:       "checkpoint prepared",
+			files:      map[string][]byte{graphCheckpointName(3): nextCheckpoint},
+			wantGen:    2,
+			wantNextID: first + 1,
+		},
+		{
+			name: "checkpoint and journal prepared",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				graphJournalName(3):    nextJournal,
+			},
+			wantGen:    2,
+			wantNextID: first + 1,
+		},
+		{
+			name: "head temp prepared",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				graphJournalName(3):    nextJournal,
+				".graph-head-deadbeef": nextHead,
+			},
+			wantGen:    2,
+			wantNextID: first + 1,
+		},
+		{
+			name: "head published",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				graphJournalName(3):    nextJournal,
+				headFileName:           nextHead,
+			},
+			wantGen:    3,
+			wantNextID: first + 1,
+		},
+		{
+			name: "old generation retired",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				graphJournalName(3):    nextJournal,
+				headFileName:           nextHead,
+			},
+			remove:     []string{graphCheckpointName(2), graphJournalName(2)},
+			wantGen:    3,
+			wantNextID: first + 1,
+		},
+		{
+			name: "published head missing checkpoint",
+			files: map[string][]byte{
+				graphJournalName(3): nextJournal,
+				headFileName:        nextHead,
+			},
+			wantError: true,
+		},
+		{
+			name: "published head missing journal",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				headFileName:           nextHead,
+			},
+			wantError: true,
+		},
+		{
+			name: "published head truncated checkpoint",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint[:len(nextCheckpoint)/2],
+				graphJournalName(3):    nextJournal,
+				headFileName:           nextHead,
+			},
+			wantError: true,
+		},
+		{
+			name: "truncated published head",
+			files: map[string][]byte{
+				graphCheckpointName(3): nextCheckpoint,
+				graphJournalName(3):    nextJournal,
+				headFileName:           nextHead[:len(nextHead)/2],
+			},
+			wantError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			caseDir := t.TempDir()
+			writeGraphTestFiles(t, caseDir, baseline)
+			writeGraphTestFiles(t, caseDir, test.files)
+			for _, name := range test.remove {
+				if err := os.Remove(filepath.Join(caseDir, name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recovered, err := Open(caseDir)
+			if test.wantError {
+				if err == nil {
+					recovered.Close()
+					t.Fatal("Open accepted an incomplete published generation")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			if recovered.generation != test.wantGen {
+				t.Fatalf("generation=%d, want %d", recovered.generation, test.wantGen)
+			}
+			if _, ok := recovered.Snapshot(first); !ok {
+				t.Fatalf("snapshot %d disappeared", first)
+			}
+			next, err := recovered.AllocateWorking()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if next != test.wantNextID {
+				t.Fatalf("next snapshot=%d, want %d", next, test.wantNextID)
+			}
+		})
 	}
 }
 
