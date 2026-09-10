@@ -3466,7 +3466,7 @@ func TestRetainRehydrationPageSource(t *testing.T) {
 
 			var stderr bytes.Buffer
 			b := &runtimeBackend{dataRoot: dataRoot, stderr: &stderr}
-			branch := ttcbundle.BranchInfo{ID: test.branch}
+			branch := ttcbundle.BranchInfo{ID: test.branch, FilesystemBranch: test.branch}
 			argument := sourceDir
 			if !test.transient {
 				argument = ""

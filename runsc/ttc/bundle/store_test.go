@@ -16,10 +16,52 @@ package bundle
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestMarkedRootRejectsLegacyContainerMetadata(t *testing.T) {
+	root := t.TempDir()
+	marker, err := json.Marshal(map[string]any{"version": 2, "schema": "ttc-root", "role": "standalone-authority"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ttc-root-format"), marker, 0600); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", "container-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	info := ContainerInfo{ID: "container-id", Name: "example", BundleDir: bundleDir, State: "created"}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("marked root synthesized a missing legacy branch")
+	}
+	info.Branches = []BranchInfo{{ID: "main", State: "created", StorageState: "local"}}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("marked root synthesized a missing filesystem identity")
+	}
+	info.Branches[0].FilesystemBranch = "main"
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("marked root synthesized omitted live-fork eligibility")
+	}
+}
 
 func TestCompareAndSwapNodeID(t *testing.T) {
 	root := t.TempDir()
@@ -233,7 +275,7 @@ func TestRenameBranchPromotesStableMemoryAndConsoleState(t *testing.T) {
 	}
 }
 
-func TestRemoveBranchArtifactsRemovesStableAndLegacyMemory(t *testing.T) {
+func TestRemoveBranchArtifactsRemovesStableMemory(t *testing.T) {
 	root := t.TempDir()
 	containerID := "container-id"
 	containerDir := filepath.Join(root, "containers", containerID)
@@ -258,14 +300,17 @@ func TestRemoveBranchArtifactsRemovesStableAndLegacyMemory(t *testing.T) {
 	stableKey := MemoryBranchKey(branch)
 	legacyKey := hex.EncodeToString([]byte(branch.ID))
 	for _, kind := range []string{"active", "dehydrated"} {
-		for _, key := range []string{stableKey, legacyKey} {
-			path := filepath.Join(containerDir, "memory", kind, key)
-			if err := os.MkdirAll(path, 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(path, "control.json"), []byte("{}"), 0600); err != nil {
-				t.Fatal(err)
-			}
+		path := filepath.Join(containerDir, "memory", kind, stableKey)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "control.json"), []byte("{}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// An unknown old-layout entry is not interpreted as branch state in the
+		// current format and must not widen branch removal's ownership scope.
+		if err := os.MkdirAll(filepath.Join(containerDir, "memory", kind, legacyKey), 0700); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -274,10 +319,11 @@ func TestRemoveBranchArtifactsRemovesStableAndLegacyMemory(t *testing.T) {
 		t.Fatalf("RemoveBranchArtifacts: %v", err)
 	}
 	for _, kind := range []string{"active", "dehydrated"} {
-		for _, key := range []string{stableKey, legacyKey} {
-			if _, err := os.Lstat(filepath.Join(containerDir, "memory", kind, key)); !os.IsNotExist(err) {
-				t.Errorf("%s/%s remains after removal: %v", kind, key, err)
-			}
+		if _, err := os.Lstat(filepath.Join(containerDir, "memory", kind, stableKey)); !os.IsNotExist(err) {
+			t.Errorf("%s/%s remains after removal: %v", kind, stableKey, err)
+		}
+		if _, err := os.Lstat(filepath.Join(containerDir, "memory", kind, legacyKey)); err != nil {
+			t.Errorf("unknown %s/%s was unexpectedly removed: %v", kind, legacyKey, err)
 		}
 	}
 }

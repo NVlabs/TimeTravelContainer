@@ -9787,19 +9787,11 @@ func memoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.Branch
 	return filepath.Join(dataRoot, "containers", containerID, "memory", kind, ttcbundle.MemoryBranchKey(branch))
 }
 
-// existingMemoryBranchDir accepts the visible-name layout written by older
-// TTC versions. New writes and any branch rename use the stable filesystem
-// identity instead.
+// existingMemoryBranchDir returns the only memory layout accepted by the
+// current root format. Older visible-name layouts are rejected at the root
+// boundary and must never be consulted from a new-format root.
 func existingMemoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.BranchInfo) string {
-	stable := memoryBranchDir(dataRoot, containerID, kind, branch)
-	if _, err := os.Lstat(stable); err == nil || !os.IsNotExist(err) {
-		return stable
-	}
-	legacy := filepath.Join(dataRoot, "containers", containerID, "memory", kind, hex.EncodeToString([]byte(branch.ID)))
-	if _, err := os.Lstat(legacy); err == nil || !os.IsNotExist(err) {
-		return legacy
-	}
-	return stable
+	return memoryBranchDir(dataRoot, containerID, kind, branch)
 }
 
 func mergeBranchHistory(history, live []Branch) []Branch {

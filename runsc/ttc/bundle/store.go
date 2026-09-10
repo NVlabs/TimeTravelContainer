@@ -434,15 +434,11 @@ func (c ContainerInfo) BranchNodeID(branchID string) string {
 }
 
 // MemoryBranchKey returns the stable directory key used for a branch's
-// dehydration metadata and legacy active page sources. It deliberately uses
+// dehydration metadata and active page sources. It deliberately uses
 // the filesystem branch identity rather than the user-visible branch name so
 // renaming a branch never changes where its durable memory is stored.
 func MemoryBranchKey(branch BranchInfo) string {
-	identity := branch.FilesystemBranch
-	if identity == "" {
-		identity = branch.ID
-	}
-	return hex.EncodeToString([]byte(identity))
+	return hex.EncodeToString([]byte(branch.FilesystemBranch))
 }
 
 // DistributedForkImport is a reserved but not yet visible branch imported
@@ -473,11 +469,8 @@ type PortBinding struct {
 	BranchID      string `json:"branch_id,omitempty"`
 }
 
-// Branch returns the branch targeted by p, normalizing legacy main bindings.
+// Branch returns the branch targeted by p.
 func (p PortBinding) Branch() string {
-	if p.BranchID == "" {
-		return "main"
-	}
 	return p.BranchID
 }
 
@@ -2251,7 +2244,6 @@ func samePortBinding(a, b PortBinding) bool {
 }
 
 // LoadContainer resolves an exact name, full ID, or unambiguous ID prefix.
-// Legacy name-keyed records are returned with ID set to their directory key.
 func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	if err := validateName(identifier); err != nil {
 		return ContainerInfo{}, err
@@ -2384,7 +2376,11 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if err := json.Unmarshal(data, &info); err != nil {
 		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", key, err)
 	}
-	if info.ID == "" {
+	strict, err := s.currentFormatRoot()
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("validating TTC root format for container %q: %w", key, err)
+	}
+	if info.ID == "" && !strict {
 		info.ID = key
 	}
 	if info.ID != key || info.Name == "" || info.BundleDir == "" {
@@ -2394,10 +2390,16 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	if info.State == "" {
+		if strict {
+			return ContainerInfo{}, fmt.Errorf("container %q has no lifecycle state", key)
+		}
 		info.State = "created"
 	}
 	if len(info.Branches) == 0 {
-		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, CreatedAt: info.CreatedAt}}
+		if strict {
+			return ContainerInfo{}, fmt.Errorf("container %q has no branch metadata", key)
+		}
+		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, StorageState: "local", CreatedAt: info.CreatedAt}}
 	}
 	seenBranches := make(map[string]struct{}, len(info.Branches))
 	for i := range info.Branches {
@@ -2413,6 +2415,9 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		}
 		seenBranches[branch.ID] = struct{}{}
 		if branch.FilesystemBranch == "" {
+			if strict {
+				return ContainerInfo{}, fmt.Errorf("container %q branch %q has no filesystem identity", key, branch.ID)
+			}
 			if branch.ID == "main" {
 				branch.FilesystemBranch = ttcvolume.MainBranch
 			} else {
@@ -2420,6 +2425,9 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 			}
 		}
 		if branch.StorageState == "" {
+			if strict {
+				return ContainerInfo{}, fmt.Errorf("container %q branch %q has no storage state", key, branch.ID)
+			}
 			if branch.State == "dehydrated" {
 				branch.StorageState = "shared"
 			} else {
@@ -2430,7 +2438,11 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	seenPortEndpoints := make(map[string]struct{}, len(info.PublishedPorts))
 	bindings := info.PublishedPorts[:0]
 	for i := range info.PublishedPorts {
-		binding, err := normalizePortBinding(info.PublishedPorts[i])
+		candidate := info.PublishedPorts[i]
+		if candidate.BranchID == "" && !strict {
+			candidate.BranchID = "main"
+		}
+		binding, err := normalizePortBinding(candidate)
 		if err != nil {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
 		}
@@ -2451,11 +2463,7 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
-	// Metadata predating the immutable eligibility property omitted both fields.
-	// Existing contained-network families were created under TTC's forkable
-	// configuration, while legacy host-network families necessarily remain
-	// ineligible.
-	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+	if !strict && !info.LiveForkEligible && info.LiveForkWaiver == "" {
 		if networkMode == "host" {
 			info.LiveForkWaiver = "legacy host network configuration"
 		} else {
@@ -2506,6 +2514,32 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}
 	return info, nil
+}
+
+// currentFormatRoot reports whether Store is operating inside a daemon root
+// that has crossed TTC's destructive format boundary. Unit-level bundle users
+// without a daemon marker retain fixture normalization, but a marked root must
+// never synthesize missing legacy metadata.
+func (s Store) currentFormatRoot() (bool, error) {
+	data, err := os.ReadFile(filepath.Join(s.Root, ".ttc-root-format"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var marker struct {
+		Version int    `json:"version"`
+		Schema  string `json:"schema"`
+		Role    string `json:"role"`
+	}
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return false, fmt.Errorf("decoding .ttc-root-format: %w", err)
+	}
+	if marker.Version == 0 || marker.Schema == "" || marker.Role == "" {
+		return false, errors.New(".ttc-root-format is incomplete")
+	}
+	return true, nil
 }
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
@@ -3989,20 +4023,11 @@ func (s Store) RemoveBranchArtifacts(name string, branch BranchInfo) error {
 	}
 	containerDir := s.activeContainerDir(info.ID)
 	// Current memory images are keyed by the stable filesystem identity so a
-	// visible branch rename doesn't move a potentially large image. Remove that
-	// key as well as the visible-name key used by older TTC versions. Omitting
-	// the stable key leaks a dehydration image across branch-name reuse and the
-	// next dehydration fails with "image already exists".
-	memoryKeys := []string{MemoryBranchKey(branch)}
-	legacyKey := hex.EncodeToString([]byte(branch.ID))
-	if legacyKey != memoryKeys[0] {
-		memoryKeys = append(memoryKeys, legacyKey)
-	}
+	// visible branch rename doesn't move a potentially large image.
+	memoryKey := MemoryBranchKey(branch)
 	for _, kind := range []string{"active", "dehydrated"} {
-		for _, key := range memoryKeys {
-			if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, key)); err != nil {
-				return err
-			}
+		if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, memoryKey)); err != nil {
+			return err
 		}
 	}
 	consoleDir := filepath.Join(containerDir, "console")
