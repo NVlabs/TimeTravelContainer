@@ -1463,6 +1463,66 @@ func (s *Store) SetRoot(name string, id ObjectID) error {
 	return s.commitLocked(ops)
 }
 
+// RetainRoots atomically installs externally named root references. Replaying
+// the same name-to-object bindings is a no-op; reusing an existing name for a
+// different object is rejected. This is the bounded transaction used by a
+// distributed origin owner to activate a remote branch or operation root
+// without traversing the immutable graph below it.
+func (s *Store) RetainRoots(roots map[string]ObjectID) error {
+	if len(roots) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(roots))
+	for name, id := range roots {
+		if err := validateRootName(name); err != nil {
+			return err
+		}
+		if err := id.validate(); err != nil {
+			return err
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(roots)*2)
+	for _, name := range names {
+		id := roots[name]
+		if previous, exists := s.state.Roots[name]; exists {
+			if previous != id {
+				return fmt.Errorf("root %q already retains %s, cannot retain %s", name, previous.key(), id.key())
+			}
+			continue
+		}
+		object, ok := touched[id.key()]
+		if !ok {
+			object, ok = s.state.Objects[id.key()]
+		}
+		if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
+			return fmt.Errorf("root object %s cannot be retained", id.key())
+		}
+		object.Refs++
+		touched[id.key()] = object
+		ops = append(ops, journalOp{RootName: name, PutRoot: &id})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	objectOps := make([]journalOp, 0, len(keys))
+	for _, key := range keys {
+		object := touched[key]
+		objectOps = append(objectOps, journalOp{PutObject: &object})
+	}
+	return s.commitLocked(append(objectOps, ops...))
+}
+
 // CloneRoots atomically gives each destination a reference to the object
 // named by its source root. Destinations must not already exist. Work is
 // proportional only to the number of logical roots, never to the number of

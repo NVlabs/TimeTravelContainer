@@ -500,6 +500,77 @@ func TestSealAndBatchForkIsOneTransaction(t *testing.T) {
 	}
 }
 
+func TestRetainRootsIsAtomicAndIdempotent(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.CreateObject(origin, "build/first-root", ObjectKindMetadata, []byte("first"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateObject(origin, "build/second-root", ObjectKindMetadata, []byte("second"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := store.Stats().Sequence
+	bindings := map[string]ObjectID{
+		"remote/operation-a/root-0": first,
+		"remote/operation-a/root-1": first,
+		"remote/operation-a/root-2": second,
+	}
+	if err := store.RetainRoots(bindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins([]string{"build/first-root", "build/second-root"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Stats().Sequence - before; got != 2 {
+		t.Fatalf("RetainRoots plus construction-pin handoff used %d journal records, want 2", got)
+	}
+	firstObject, _ := store.Object(first)
+	secondObject, _ := store.Object(second)
+	if firstObject.Refs != 2 || secondObject.Refs != 1 {
+		t.Fatalf("retained refs=(%d,%d), want (2,1)", firstObject.Refs, secondObject.Refs)
+	}
+
+	before = store.Stats().Sequence
+	if err := store.RetainRoots(bindings); err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if got := store.Stats().Sequence; got != before {
+		t.Fatalf("idempotent replay advanced sequence from %d to %d", before, got)
+	}
+	if err := store.RetainRoots(map[string]ObjectID{
+		"remote/operation-a/root-0": second,
+		"remote/operation-b/root-0": second,
+	}); err == nil {
+		t.Fatal("mismatched replay replaced an authoritative root")
+	}
+	if _, ok := store.Root("remote/operation-b/root-0"); ok {
+		t.Fatal("failed batch left a partial root")
+	}
+	secondObject, _ = store.Object(second)
+	if secondObject.Refs != 1 {
+		t.Fatalf("failed batch changed second refs to %d", secondObject.Refs)
+	}
+
+	if err := store.ReleaseRoots([]string{
+		"remote/operation-a/root-0", "remote/operation-a/root-1", "remote/operation-a/root-2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseRoots([]string{
+		"remote/operation-a/root-0", "remote/operation-a/root-1", "remote/operation-a/root-2",
+	}); err != nil {
+		t.Fatalf("idempotent release: %v", err)
+	}
+	if collected, err := store.Collect(8); err != nil || collected != 2 {
+		t.Fatalf("Collect()=(%d,%v), want (2,nil)", collected, err)
+	}
+}
+
 func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
