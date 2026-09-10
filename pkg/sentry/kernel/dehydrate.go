@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 // DehydrationCapture is a metadata-only saved Kernel whose page ownership is
@@ -676,9 +677,89 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 // the zero ResourceID and every private MemoryFile named by the manifest. The
 // function consumes all MemoryFiles on success and failure.
 func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, repository *ttcchunk.MemoryRepository, opts DurableDehydrationLoadOptions) (*Kernel, error) {
+	if repository == nil || image.SparseManifest == (ttcchunk.ManifestID{}) {
+		for _, mf := range memoryFiles {
+			if mf != nil {
+				mf.Destroy()
+			}
+		}
+		return nil, errors.New("sparse durable dehydration load is missing its repository or manifest")
+	}
+	manifest, err := repository.LoadManifest(image.SparseManifest)
+	if err != nil {
+		for _, mf := range memoryFiles {
+			if mf != nil {
+				mf.Destroy()
+			}
+		}
+		return nil, fmt.Errorf("loading sparse dehydration manifest: %w", err)
+	}
+	source := sparseDehydrationSource{
+		manifest: manifest,
+		newReader: func(installed []ttcchunk.InstalledChunk) (sparseDehydrationReader, error) {
+			if opts.OwnSparseRepository && opts.SparseBranch != "" {
+				return ttcchunk.NewOwnedConsumingChunkReader(repository, installed, opts.SparseBranch, image.SparseManifest)
+			}
+			if opts.OwnSparseRepository {
+				return ttcchunk.NewOwnedChunkReader(repository, installed)
+			}
+			return ttcchunk.NewChunkReader(repository, installed)
+		},
+	}
+	if opts.OwnSparseRepository {
+		source.close = repository.Close
+	}
+	if opts.SparseBranch != "" {
+		source.markConsumed = func(objects []ttcchunk.ID) {
+			_ = repository.MarkConsumed(opts.SparseBranch, image.SparseManifest, objects)
+		}
+	}
+	return loadSparseDurableDehydration(ctx, p, image, memoryFiles, source, opts)
+}
+
+type sparseDehydrationReader interface {
+	AsyncReader(int) stateio.AsyncReader
+	RangeLoaded(uint64, uint64)
+	ActivateConsumption([]ttcchunk.ID)
+	AbortConsumption()
+	Close() error
+}
+
+type sparseDehydrationSource struct {
+	manifest     ttcchunk.Manifest
+	newReader    func([]ttcchunk.InstalledChunk) (sparseDehydrationReader, error)
+	close        func() error
+	markConsumed func([]ttcchunk.ID)
+}
+
+// LoadGraphDurableDehydration reconstructs a paused Kernel directly from
+// graph-native 1 MiB objects donated through data. It consumes data.
+func LoadGraphDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest ttcchunk.Manifest, chunks map[ttcchunk.ID]ttcsnapshot.ObjectID, data *ttcsnapshot.LocalDataStore, opts DurableDehydrationLoadOptions) (*Kernel, error) {
+	if data == nil || len(manifest.Runs) == 0 || len(chunks) == 0 {
+		for _, mf := range memoryFiles {
+			if mf != nil {
+				mf.Destroy()
+			}
+		}
+		if data != nil {
+			_ = data.Close()
+		}
+		return nil, errors.New("graph durable dehydration load is missing required memory state")
+	}
+	source := sparseDehydrationSource{
+		manifest: manifest,
+		newReader: func(installed []ttcchunk.InstalledChunk) (sparseDehydrationReader, error) {
+			return ttcchunk.NewGraphChunkReader(data, chunks, installed, true)
+		},
+		close: data.Close,
+	}
+	return loadSparseDurableDehydration(ctx, p, image, memoryFiles, source, opts)
+}
+
+func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, source sparseDehydrationSource, opts DurableDehydrationLoadOptions) (*Kernel, error) {
 	applicationID := checkpoint.ResourceID{}
 	application := memoryFiles[applicationID]
-	if p == nil || application == nil || repository == nil || opts.Clocks == nil || opts.BranchID == "" || len(image.KernelMetadata) == 0 || image.SparseManifest == (ttcchunk.ManifestID{}) {
+	if p == nil || application == nil || opts.Clocks == nil || opts.BranchID == "" || len(image.KernelMetadata) == 0 || source.newReader == nil {
 		for _, mf := range memoryFiles {
 			if mf != nil {
 				mf.Destroy()
@@ -694,11 +775,7 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 			}
 		}
 	}()
-	manifest, err := repository.LoadManifest(image.SparseManifest)
-	if err != nil {
-		return nil, fmt.Errorf("loading sparse dehydration manifest: %w", err)
-	}
-	installation, err := repository.InstallManifestSet(memoryFiles, manifest, usage.Anonymous, 0)
+	installation, err := ttcchunk.InstallManifestSet(memoryFiles, source.manifest, usage.Anonymous, 0)
 	if err != nil {
 		return nil, fmt.Errorf("installing sparse dehydration manifest: %w", err)
 	}
@@ -710,7 +787,7 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 	}()
 
 	var pages *pgalloc.AsyncPagesFileLoad
-	var chunkReader *ttcchunk.ChunkReader
+	var chunkReader sparseDehydrationReader
 	consumptionActivated := false
 	defer func() {
 		if chunkReader != nil && !consumptionActivated {
@@ -718,13 +795,7 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		}
 	}()
 	if len(installation.Chunks) != 0 {
-		if opts.OwnSparseRepository && opts.SparseBranch != "" {
-			chunkReader, err = ttcchunk.NewOwnedConsumingChunkReader(repository, installation.Chunks, opts.SparseBranch, image.SparseManifest)
-		} else if opts.OwnSparseRepository {
-			chunkReader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
-		} else {
-			chunkReader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
-		}
+		chunkReader, err = source.newReader(installation.Chunks)
 		if err != nil {
 			return nil, err
 		}
@@ -746,10 +817,10 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		}
 		pages.MemoryFilesDone()
 	}
-	repositoryOwned := len(installation.Chunks) == 0 && opts.OwnSparseRepository
+	repositoryOwned := len(installation.Chunks) == 0 && source.close != nil
 	defer func() {
 		if repositoryOwned {
-			_ = repository.Close()
+			_ = source.close()
 		}
 	}()
 	pagesOwned := pages != nil
@@ -836,8 +907,8 @@ func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 	if chunkReader != nil {
 		chunkReader.ActivateConsumption(installation.ResidentObjects())
 		consumptionActivated = true
-	} else if opts.SparseBranch != "" {
-		_ = repository.MarkConsumed(opts.SparseBranch, image.SparseManifest, installation.Objects)
+	} else if source.markConsumed != nil {
+		source.markConsumed(installation.Objects)
 	}
 	child.Pause()
 	return child, nil

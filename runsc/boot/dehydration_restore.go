@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -64,9 +66,11 @@ type DurableDehydrationRestoreArgs struct {
 	// This lets siblings restored from the same durable manifest share the
 	// same resident host pages and retain 4 KiB CoW behavior.
 	ReusePeerApplicationMemoryFile bool
-	// Sparse uses Files as metadata, memory repository, and (for peer import)
-	// one empty target file per metadata MemoryFile.
+	// Sparse uses Files as metadata and a memory source. GraphSparse selects an
+	// ephemeral manifest followed by the graph bulk-object directory; legacy
+	// sparse restore selects one compatibility repository directory.
 	Sparse            bool
+	GraphSparse       bool
 	SparseRemote      bool
 	SparseRemoteToken ttcchunk.RemoteToken
 	// FilesystemConnections is the number of donated, fenced range streams at
@@ -130,7 +134,9 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		if got, want := len(payloadMemoryFiles)-1, len(metadata.Memories); got != want {
 			return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
 		}
-	} else if len(payloadMemoryFiles) != 2+boolInt(args.SparseRemote) || metadata.SparseManifest == (ttcchunk.ManifestID{}) {
+	} else if args.GraphSparse && (len(payloadMemoryFiles) != 3 || args.SparseRemote) {
+		return nil, errors.New("graph sparse dehydration restore requires metadata, manifest, and object directory")
+	} else if !args.GraphSparse && (len(payloadMemoryFiles) != 2+boolInt(args.SparseRemote) || metadata.SparseManifest == (ttcchunk.ManifestID{})) {
 		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
 	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
@@ -236,26 +242,46 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	}
 	var child *kernel.Kernel
 	if args.Sparse {
-		repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
-		if openErr != nil {
-			for _, mf := range memoryFiles {
-				mf.Destroy()
+		if args.GraphSparse {
+			manifestData, readErr := io.ReadAll(payloadMemoryFiles[1])
+			if readErr != nil {
+				return nil, fmt.Errorf("reading graph memory manifest: %w", readErr)
 			}
-			return nil, openErr
+			manifest, decodeErr := ttcchunk.DecodeManifest(manifestData, nil)
+			if decodeErr != nil {
+				return nil, fmt.Errorf("decoding graph memory manifest: %w", decodeErr)
+			}
+			chunks, chunksErr := ttcchunk.GraphChunkObjects(manifest)
+			if chunksErr != nil {
+				return nil, chunksErr
+			}
+			data, openErr := ttcsnapshot.OpenLocalDataStoreFD(payloadMemoryFiles[2])
+			if openErr != nil {
+				return nil, openErr
+			}
+			child, err = kernel.LoadGraphDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, manifest, chunks, data, loadOptions)
+		} else {
+			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
+			if openErr != nil {
+				for _, mf := range memoryFiles {
+					mf.Destroy()
+				}
+				return nil, openErr
+			}
+			if args.SparseRemote {
+				fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+				if dupErr != nil {
+					_ = repository.Close()
+					return nil, dupErr
+				}
+				if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
+					_ = repository.Close()
+					return nil, attachErr
+				}
+			}
+			loadOptions.OwnSparseRepository = true
+			child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
 		}
-		if args.SparseRemote {
-			fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
-			if dupErr != nil {
-				_ = repository.Close()
-				return nil, dupErr
-			}
-			if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
-				_ = repository.Close()
-				return nil, attachErr
-			}
-		}
-		loadOptions.OwnSparseRepository = true
-		child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
 	} else {
 		child, err = kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, loadOptions)
 	}

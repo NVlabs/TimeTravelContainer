@@ -81,6 +81,7 @@ type TimeTravel struct {
 	dehydrationSnapshotsCount     int
 	dehydrationSnapshotAllowCopy  bool
 	dehydrationMemoryRepositoryFD int
+	dehydrationGraphManifestFD    int
 	dehydrationMemoryRemoteFD     int
 	dehydrationTargetsStartFD     int
 	dehydrationTargetsCount       int
@@ -175,6 +176,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
 	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
 	f.IntVar(&t.dehydrationMemoryRepositoryFD, "dehydration-memory-repository-fd", -1, "inherited sparse dehydration memory repository directory")
+	f.IntVar(&t.dehydrationGraphManifestFD, "dehydration-graph-manifest-fd", -1, "inherited graph-native dehydration memory manifest")
 	f.IntVar(&t.dehydrationMemoryRemoteFD, "dehydration-memory-remote-fd", -1, "inherited cold memory chunk stream")
 	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
 	f.IntVar(&t.dehydrationTargetsCount, "dehydration-targets-count", 0, "number of inherited dehydration target memory files")
@@ -574,8 +576,16 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
 		defer metadata.Close()
 		if restoreArgs.Sparse {
-			if t.dehydrationMemoryRepositoryFD < 0 || t.dehydrationSnapshotsCount != 0 {
+			if t.dehydrationMemoryRepositoryFD < 0 || t.dehydrationSnapshotsCount != 0 || (restoreArgs.GraphSparse != (t.dehydrationGraphManifestFD >= 0)) {
 				util.Fatalf("sparse dehydration restore requires a repository and no packed snapshots")
+			}
+			if restoreArgs.GraphSparse {
+				manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "dehydration-restore-graph-manifest")
+				if manifest == nil {
+					util.Fatalf("invalid dehydration graph manifest FD")
+				}
+				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, manifest)
+				defer manifest.Close()
 			}
 			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-restore-memory-repository")
 			if repository == nil {

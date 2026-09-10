@@ -431,6 +431,7 @@ go_library(
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
 		"//pkg/sentry/ttcchunk",
+		"//pkg/ttcsnapshot",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",

@@ -267,6 +267,41 @@ func graphChunkResidencyID(chunk ttcsnapshot.ObjectID) ID {
 	return id
 }
 
+func graphChunkObjectID(id ID) (ttcsnapshot.ObjectID, error) {
+	if !bytes.Equal(id[:8], []byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H'}) {
+		return ttcsnapshot.ObjectID{}, errors.New("invalid graph memory residency identity")
+	}
+	object := ttcsnapshot.ObjectID{
+		Snapshot: ttcsnapshot.SnapshotID(binary.BigEndian.Uint64(id[8:16])),
+		Kind:     ttcsnapshot.ObjectKind(id[16]),
+		Ordinal:  binary.BigEndian.Uint64(id[17:25]),
+	}
+	if object.Kind != ttcsnapshot.ObjectKindMemoryChunk {
+		return ttcsnapshot.ObjectID{}, errors.New("residency identity is not a graph memory chunk")
+	}
+	if _, err := ttcsnapshot.ParseObjectID(object.String()); err != nil {
+		return ttcsnapshot.ObjectID{}, err
+	}
+	if id[25] != 0 || id[26] != 0 || id[27] != 0 || id[28] != 0 || id[29] != 0 || id[30] != 0 || id[31] != 0 {
+		return ttcsnapshot.ObjectID{}, errors.New("graph memory residency identity has trailing data")
+	}
+	return object, nil
+}
+
+// GraphChunkObjects derives the authoritative bulk object map from an
+// ephemeral graph manifest. The opaque IDs encode coordinates, not hashes.
+func GraphChunkObjects(manifest Manifest) (map[ID]ttcsnapshot.ObjectID, error) {
+	result := make(map[ID]ttcsnapshot.ObjectID)
+	for _, run := range manifest.Runs {
+		object, err := graphChunkObjectID(run.Object)
+		if err != nil {
+			return nil, err
+		}
+		result[run.Object] = object
+	}
+	return result, nil
+}
+
 // BuildGraphManifest enumerates graph roots for rehydration. Enumeration is
 // intentionally an O(mapped pages) rehydrate operation; fork and lookup share
 // roots directly and never call it.
@@ -425,3 +460,13 @@ func (r *GraphChunkReader) AsyncReader(parallel int) stateio.AsyncReader {
 	}
 	return stateio.NewIOReader(r, pgalloc.SparseChunkBytes, 16, parallel)
 }
+
+// RangeLoaded is a no-op: graph roots, rather than per-reader consumption
+// files, retain authoritative chunks.
+func (*GraphChunkReader) RangeLoaded(uint64, uint64) {}
+
+// ActivateConsumption is a no-op for graph-owned lifetime tracking.
+func (*GraphChunkReader) ActivateConsumption([]ID) {}
+
+// AbortConsumption is a no-op for graph-owned lifetime tracking.
+func (*GraphChunkReader) AbortConsumption() {}

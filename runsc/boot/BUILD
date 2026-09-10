@@ -154,6 +154,7 @@ go_library(
         "//pkg/waiter",
         "//pkg/timing",
         "//pkg/ttcvolume",
+        "//pkg/ttcsnapshot",
         "//pkg/unet",
         "//pkg/urpc",
         "//pkg/usermem",

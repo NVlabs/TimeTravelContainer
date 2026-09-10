@@ -129,6 +129,12 @@ func (r *InstallResult) Abort() error { return r.transaction.Abort() }
 // restore. Newly allocated ranges remain zero until Chunks are attached to an
 // asynchronous ChunkReader.
 func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
+	return InstallManifest(mf, manifest, kind, memCgID)
+}
+
+// InstallManifest installs an already-loaded immutable manifest. It is shared
+// by legacy repositories and graph-native memory sources.
+func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
 	if mf == nil {
 		return InstallResult{}, fmt.Errorf("installing manifest into nil MemoryFile")
 	}
@@ -247,6 +253,12 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 // InstallManifestSet installs manifest into the MemoryFile selected by each
 // run's ResourceID. One immutable object may belong to only one MemoryFile.
 func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallSetResult, error) {
+	return InstallManifestSet(memoryFiles, manifest, kind, memCgID)
+}
+
+// InstallManifestSet installs an already-loaded manifest into its selected
+// MemoryFiles without requiring a pathname-backed repository.
+func InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallSetResult, error) {
 	if len(memoryFiles) == 0 {
 		return InstallSetResult{}, errors.New("sparse manifest destination set is empty")
 	}
@@ -280,7 +292,7 @@ func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.Resourc
 	}()
 	for _, resource := range resources {
 		submanifest := Manifest{Runs: runsByResource[resource]}
-		installed, err := r.InstallManifest(memoryFiles[resource], submanifest, kind, memCgID)
+		installed, err := InstallManifest(memoryFiles[resource], submanifest, kind, memCgID)
 		if err != nil {
 			return InstallSetResult{}, err
 		}

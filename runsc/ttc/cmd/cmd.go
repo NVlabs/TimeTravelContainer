@@ -11365,6 +11365,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return errors.New("dehydration control state is incomplete")
 	}
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
+	graphSparse := sparse && b.nodeID == "" && len(capture.MemoryRoots) != 0
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
 		return fmt.Errorf("opening dehydration metadata: %w", err)
@@ -11427,7 +11428,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse, Quarantined: branch.Quarantined,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse, GraphSparse: graphSparse, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -11465,19 +11466,34 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
 	if sparse {
-		repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-		repository, err := os.Open(repositoryPath)
-		if err != nil {
-			configReader.Close()
-			return fmt.Errorf("opening sparse dehydration repository: %w", err)
-		}
-		defer repository.Close()
-		files = append(files, repository)
-		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
-		if relays != nil && relays.memoryClient != nil {
-			memoryRemoteFD := 3 + len(files)
-			files = append(files, relays.memoryClient)
-			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
+		if graphSparse {
+			manifest, objects, graphErr := b.openGraphMemoryRestore(capture)
+			if graphErr != nil {
+				configReader.Close()
+				return graphErr
+			}
+			defer manifest.Close()
+			defer objects.Close()
+			manifestFD := 3 + len(files)
+			files = append(files, manifest)
+			objectsFD := 3 + len(files)
+			files = append(files, objects)
+			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+		} else {
+			repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
+			repository, err := os.Open(repositoryPath)
+			if err != nil {
+				configReader.Close()
+				return fmt.Errorf("opening sparse dehydration repository: %w", err)
+			}
+			defer repository.Close()
+			files = append(files, repository)
+			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
+			if relays != nil && relays.memoryClient != nil {
+				memoryRemoteFD := 3 + len(files)
+				files = append(files, relays.memoryClient)
+				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
+			}
 		}
 	} else {
 		files = append(files, snapshots...)
@@ -11545,6 +11561,51 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return fmt.Errorf("restoring published ports: %w", err)
 	}
 	return nil
+}
+
+func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*os.File, *os.File, error) {
+	if b.snapshotGraph == nil || len(capture.MemoryRoots) == 0 {
+		return nil, nil, errors.New("graph-native dehydration roots are unavailable")
+	}
+	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
+	for index, recorded := range capture.MemoryRoots {
+		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
+		}
+		current, ok := b.snapshotGraph.Root(recorded.Name)
+		if !ok || current != id {
+			return nil, nil, fmt.Errorf("graph memory root %q is no longer authoritative", recorded.Name)
+		}
+		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
+	}
+	adapted, err := ttcchunk.BuildGraphManifest(b.snapshotGraph, roots)
+	if err != nil {
+		return nil, nil, err
+	}
+	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestFD, err := memutil.CreateMemFD("ttc-graph-memory-manifest", 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifest := os.NewFile(uintptr(manifestFD), "ttc-graph-memory-manifest")
+	if _, err := manifest.Write(encoded); err != nil {
+		manifest.Close()
+		return nil, nil, err
+	}
+	if _, err := manifest.Seek(0, io.SeekStart); err != nil {
+		manifest.Close()
+		return nil, nil, err
+	}
+	objects, err := os.Open(filepath.Join(b.activeDataRoot(), "objects"))
+	if err != nil {
+		manifest.Close()
+		return nil, nil, err
+	}
+	return manifest, objects, nil
 }
 
 func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File, needsColdMaterialization bool) error {
