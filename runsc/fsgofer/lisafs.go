@@ -78,6 +78,18 @@ type Config struct {
 	// VirtualOwners overrides host UID/GID values for an immutable TTC image
 	// root. It is nil for ordinary gofer mounts.
 	VirtualOwners *ownership.Manifest
+
+	// LazyFiles supplies immutable whole-file data for a skeleton rootfs.
+	// Ensure must complete before a regular file descriptor is exposed to the
+	// client; Metadata supplies the size/mode while its host placeholder is
+	// still empty and writable.
+	LazyFiles LazyFileProvider
+}
+
+// LazyFileProvider mediates pack-backed immutable regular files.
+type LazyFileProvider interface {
+	Metadata(virtualPath string) (size int64, mode uint32, ok bool)
+	Ensure(virtualPath string) error
 }
 
 var procSelfFD *rwfd.FD
@@ -121,6 +133,13 @@ func (i *connectionImpl) stat(hostFD int, virtualPath string) (lisafs.Statx, err
 	stat, err := fstatTo(hostFD)
 	if err != nil {
 		return lisafs.Statx{}, err
+	}
+	if i.config.LazyFiles != nil {
+		if size, mode, ok := i.config.LazyFiles.Metadata(virtualPath); ok {
+			stat.Mask |= unix.STATX_SIZE | unix.STATX_MODE
+			stat.Size = uint64(size)
+			stat.Mode = stat.Mode&unix.S_IFMT | uint16(mode&07777)
+		}
 	}
 	if owner, ok := i.config.VirtualOwners.Lookup(virtualPath); ok {
 		stat.Mask |= unix.STATX_UID | unix.STATX_GID
@@ -568,6 +587,11 @@ var (
 func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 	ftype := fd.FileType()
 	impl := fd.Conn().Impl().(*connectionImpl)
+	if ftype == unix.S_IFREG && impl.config.LazyFiles != nil {
+		if err := impl.config.LazyFiles.Ensure(fd.virtualPath); err != nil {
+			return nil, -1, err
+		}
+	}
 	switch ftype {
 	case unix.S_IFIFO:
 		if !impl.config.HostFifo.AllowOpen() {

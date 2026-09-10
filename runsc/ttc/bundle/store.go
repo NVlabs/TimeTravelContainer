@@ -4590,6 +4590,13 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 
 var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)
 
+// nodeLocalImageCacheGrace closes the short interval between publishing a
+// freshly materialized image root and publishing the active container that
+// pins it. Image-root construction and pruning share a lock, but the container
+// record is deliberately created outside that lock. A young unreferenced cache
+// is retained for one maintenance interval and reconsidered later.
+const nodeLocalImageCacheGrace = time.Minute
+
 // PruneImageRoots removes materialized image roots that are no longer usable
 // by either the current image catalog or a persistent container. In
 // particular, this collects roots left behind when imageRootFormatVersion is
@@ -4609,11 +4616,21 @@ func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 
 func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo) (int, error) {
 	keep := make(map[string]struct{}, len(stored)+len(containers))
-	for _, image := range stored {
-		keep[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+	if s.activeRoot() == s.Root {
+		for _, image := range stored {
+			keep[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+		}
 	}
 	imagesDir := s.imageRootDir()
 	for _, container := range containers {
+		if s.activeRoot() != s.Root {
+			if _, err := os.Stat(s.activeContainerDir(container.ID)); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return 0, err
+			}
+		}
 		if container.Digest != "" && container.Platform != "" {
 			keep[imageRootKey(container.Digest, container.Platform)] = struct{}{}
 			continue
@@ -4645,6 +4662,15 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 			if _, referenced := keep[entry.Name()]; referenced && !strings.Contains(entry.Name(), ".tmp-") {
 				continue
 			}
+			if s.activeRoot() != s.Root {
+				info, err := entry.Info()
+				if err != nil {
+					return err
+				}
+				if time.Since(info.ModTime()) < nodeLocalImageCacheGrace {
+					continue
+				}
+			}
 			if err := removeImageRoot(filepath.Join(imagesDir, entry.Name())); err != nil {
 				return fmt.Errorf("removing unreferenced image root %q: %w", entry.Name(), err)
 			}
@@ -4656,6 +4682,78 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 		return removed, err
 	}
 	return removed, nil
+}
+
+// PruneSharedImagePacks removes manifests no longer referenced by an image tag
+// or container, then collects old packs unreachable from the remaining
+// manifests. Newly completed but not-yet-published packs receive a one-hour
+// recovery grace so a concurrent slow publisher cannot lose its data object.
+func (s Store) PruneSharedImagePacks(ctx context.Context) (int, int, error) {
+	if s.activeRoot() == s.Root {
+		return 0, 0, nil
+	}
+	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
+	if err != nil {
+		return 0, 0, err
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return 0, 0, err
+	}
+	keepKeys := make(map[string]struct{}, len(stored)+len(containers))
+	for _, image := range stored {
+		keepKeys[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+	}
+	for _, container := range containers {
+		if container.Digest != "" && container.Platform != "" {
+			keepKeys[imageRootKey(container.Digest, container.Platform)] = struct{}{}
+		}
+	}
+	manifestsDir := filepath.Join(s.sharedImagePackRoot(), "manifests")
+	entries, err := os.ReadDir(manifestsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	removedManifests := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(entry.Name(), ".json")
+		if !imageRootDirectoryPattern.MatchString(key) {
+			continue
+		}
+		if _, ok := keepKeys[key]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(manifestsDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removedManifests, 0, err
+		}
+		removedManifests++
+	}
+	remaining, err := os.ReadDir(manifestsDir)
+	if err != nil {
+		return removedManifests, 0, err
+	}
+	keepPacks := make(map[ttcpack.ID]struct{}, len(remaining))
+	for _, entry := range remaining {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		manifest, err := loadSharedImagePackManifest(filepath.Join(manifestsDir, entry.Name()))
+		if err != nil {
+			// Unknown or malformed operator files are reported but never make a
+			// valid pack look unreachable.
+			return removedManifests, 0, fmt.Errorf("reading retained image pack manifest %q: %w", entry.Name(), err)
+		}
+		id, _ := ttcpack.ParseID(manifest.Pack)
+		keepPacks[id] = struct{}{}
+	}
+	removedPacks, err := ttcpack.Collect(s.sharedImagePackRoot(), keepPacks, time.Now().Add(-time.Hour).UnixNano())
+	return removedManifests, removedPacks, err
 }
 
 // RemoveImageRoots removes every platform-specific immutable root for digest.
@@ -5099,11 +5197,15 @@ func (s Store) materializeSharedImagePack(key, destinationImageDir string) (imag
 	if err != nil {
 		return images.RootFSInfo{}, false, err
 	}
-	if err := ttcpack.Materialize(s.sharedImagePackRoot(), pack, destinationImageDir); err != nil {
+	if err := ttcpack.MaterializeSkeleton(s.sharedImagePackRoot(), pack, destinationImageDir, []string{ownership.ManifestName}); err != nil {
 		return images.RootFSInfo{}, false, err
 	}
-	if _, err := ownership.Read(ownership.ManifestPath(filepath.Join(destinationImageDir, "rootfs"))); err != nil {
+	rootfs := filepath.Join(destinationImageDir, "rootfs")
+	if _, err := ownership.Read(ownership.ManifestPath(rootfs)); err != nil {
 		return images.RootFSInfo{}, false, fmt.Errorf("materialized ownership manifest is invalid: %w", err)
+	}
+	if err := ttcpack.WriteLazyDescriptor(rootfs, s.sharedImagePackRoot(), pack, "rootfs"); err != nil {
+		return images.RootFSInfo{}, false, fmt.Errorf("writing lazy image descriptor: %w", err)
 	}
 	return manifest.Image, true, nil
 }

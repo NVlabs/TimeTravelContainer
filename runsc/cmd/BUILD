@@ -63,6 +63,7 @@ go_library(
         "//pkg/cpuid",
         "//pkg/lisafs",
         "//pkg/log",
+        "//pkg/ttcpack",
         "//pkg/metric",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",

@@ -6028,6 +6028,9 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 		if _, err := store.RemoveImageRoots(digest); err != nil {
 			return result, err
 		}
+		if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: pruning shared image packs: %v\n", err)
+		}
 	}
 	return result, nil
 }

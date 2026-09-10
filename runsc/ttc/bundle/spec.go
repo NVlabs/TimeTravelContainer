@@ -31,6 +31,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -693,6 +694,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		annotations[ownership.Annotation] = ownerManifest
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("loading rootfs ownership: %w", err)
+	}
+	if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
+		annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("loading lazy rootfs image descriptor: %w", err)
 	}
 	entrypointJSON, err := json.Marshal(entrypoint)
 	if err != nil {

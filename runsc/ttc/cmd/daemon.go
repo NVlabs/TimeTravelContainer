@@ -2119,6 +2119,9 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: pruning stale image roots: %v\n", err)
 		return 1
 	}
+	if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil {
+		fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
+	}
 	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
@@ -3749,6 +3752,12 @@ func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Q
 		}
 		if _, err := store.GarbageCollectRepositories(); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
+		}
+		if _, err := store.PruneImageRoots(context.Background()); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: pruning node-local image cache: %v\n", err)
+		}
+		if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
 		}
 		if err := collectSparseMemoryRepositories(dataRoot, localRoot); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)

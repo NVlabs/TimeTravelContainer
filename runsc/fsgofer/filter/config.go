@@ -65,6 +65,7 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(unix.F_ADD_SEALS),
 		},
 	},
+	unix.SYS_FLOCK: seccomp.MatchAll{},
 	unix.SYS_STATX: seccomp.PerArg{
 		seccomp.NonNegativeFD{},
 		seccomp.AnyValue{},

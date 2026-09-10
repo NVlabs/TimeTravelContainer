@@ -10,11 +10,15 @@ go_test(
     size = "small",
     srcs = ["pack_test.go"],
     library = ":ttcpack",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )
 
 go_library(
     name = "ttcpack",
-    srcs = ["pack.go"],
+    srcs = [
+        "lazy.go",
+        "pack.go",
+    ],
     visibility = ["//visibility:public"],
     deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

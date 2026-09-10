@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -241,7 +242,7 @@ func WriteDirectory(source, repository string) (ID, error) {
 			_ = os.Remove(temporaryName)
 		}
 	}()
-	writer := &writer{file: temporary, hardlinks: make(map[fileIdentity]string)}
+	writer := &writer{file: temporary, hash: sha256.New(), hardlinks: make(map[fileIdentity]string)}
 	if err := writer.writeBlock(packHeader{Magic: headerMagic, Version: formatVersion}); err != nil {
 		return zero, err
 	}
@@ -253,10 +254,10 @@ func WriteDirectory(source, repository string) (ID, error) {
 	if err != nil {
 		return zero, err
 	}
-	if _, err := temporary.Write(indexData); err != nil {
+	if err := writer.writeBytes(indexData); err != nil {
 		return zero, err
 	}
-	if err := padFile(temporary); err != nil {
+	if err := writer.pad(); err != nil {
 		return zero, err
 	}
 	indexDigest := sha256.Sum256(indexData)
@@ -266,14 +267,7 @@ func WriteDirectory(source, repository string) (ID, error) {
 	if err := temporary.Sync(); err != nil {
 		return zero, err
 	}
-	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
-		return zero, err
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, temporary); err != nil {
-		return zero, err
-	}
-	copy(zero[:], hash.Sum(nil))
+	copy(zero[:], writer.hash.Sum(nil))
 	if err := temporary.Close(); err != nil {
 		return ID{}, err
 	}
@@ -312,6 +306,7 @@ type fileIdentity struct{ dev, ino uint64 }
 
 type writer struct {
 	file      *os.File
+	hash      hash.Hash
 	entries   []Entry
 	hardlinks map[fileIdentity]string
 }
@@ -453,10 +448,10 @@ func (w *writer) record(entry Entry, data []byte) error {
 	if err := w.writeBlock(recordHeader{Magic: recordMagic, Entry: entry}); err != nil {
 		return err
 	}
-	if _, err := w.file.Write(data); err != nil {
+	if err := w.writeBytes(data); err != nil {
 		return err
 	}
-	if err := padFile(w.file); err != nil {
+	if err := w.pad(); err != nil {
 		return err
 	}
 	w.entries = append(w.entries, entry)
@@ -474,14 +469,21 @@ func (w *writer) writeBlock(value any) error {
 	block := make([]byte, Alignment)
 	copy(block, data)
 	block[len(data)] = '\n'
-	_, err = w.file.Write(block)
+	return w.writeBytes(block)
+}
+
+func (w *writer) writeBytes(data []byte) error {
+	if n, err := w.file.Write(data); err != nil {
+		return err
+	} else if n != len(data) {
+		return io.ErrShortWrite
+	}
+	_, err := w.hash.Write(data)
 	return err
 }
 
-func align(value int64) int64 { return (value + Alignment - 1) &^ (Alignment - 1) }
-
-func padFile(file *os.File) error {
-	offset, err := file.Seek(0, io.SeekCurrent)
+func (w *writer) pad() error {
+	offset, err := w.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
@@ -489,9 +491,10 @@ func padFile(file *os.File) error {
 	if padding == 0 {
 		return nil
 	}
-	_, err = file.Write(make([]byte, padding))
-	return err
+	return w.writeBytes(make([]byte, padding))
 }
+
+func align(value int64) int64 { return (value + Alignment - 1) &^ (Alignment - 1) }
 
 func validateRelative(path string) error {
 	if path == "" {
@@ -582,50 +585,64 @@ func open(repository string, id ID, verifyContent bool) (*os.File, Index, error)
 			return fail(errors.New("pack content digest mismatch"))
 		}
 	}
+	index, err := ReadIndex(file)
+	if err != nil {
+		return fail(err)
+	}
+	return file, index, nil
+}
+
+// ReadIndex validates and reads pack metadata from an already-open pack. The
+// caller owns file and is responsible for retaining any reader lease or lock.
+func ReadIndex(file *os.File) (Index, error) {
 	var header packHeader
 	if err := readJSONBlock(file, 0, &header); err != nil || header.Magic != headerMagic || header.Version != formatVersion {
-		return fail(fmt.Errorf("invalid pack header: %w", err))
+		return Index{}, fmt.Errorf("invalid pack header: %w", err)
+	}
+	stat, err := file.Stat()
+	if err != nil || stat.Size() < 2*Alignment || stat.Size()%Alignment != 0 {
+		return Index{}, fmt.Errorf("invalid pack size: %w", err)
 	}
 	var tail trailer
 	if err := readJSONBlock(file, stat.Size()-Alignment, &tail); err != nil || tail.Magic != trailerMagic || tail.Version != formatVersion {
-		return fail(fmt.Errorf("invalid pack trailer: %w", err))
+		return Index{}, fmt.Errorf("invalid pack trailer: %w", err)
 	}
 	if tail.IndexOffset < Alignment || tail.IndexLength < 0 || tail.IndexOffset+tail.IndexLength > stat.Size()-Alignment {
-		return fail(errors.New("pack index range is invalid"))
+		return Index{}, errors.New("pack index range is invalid")
 	}
 	indexData := make([]byte, tail.IndexLength)
 	if _, err := file.ReadAt(indexData, tail.IndexOffset); err != nil {
-		return fail(err)
+		return Index{}, err
 	}
 	digest := sha256.Sum256(indexData)
 	if hex.EncodeToString(digest[:]) != tail.IndexSHA256 {
-		return fail(errors.New("pack index checksum mismatch"))
+		return Index{}, errors.New("pack index checksum mismatch")
 	}
 	var index Index
 	if err := json.Unmarshal(indexData, &index); err != nil {
-		return fail(err)
+		return Index{}, err
 	}
 	if len(index.Entries) != tail.RecordCount {
-		return fail(errors.New("pack record count mismatch"))
+		return Index{}, errors.New("pack record count mismatch")
 	}
 	for _, entry := range index.Entries {
 		if entry.RecordOffset < Alignment || entry.RecordOffset%Alignment != 0 ||
 			entry.StoredLength < Alignment || entry.StoredLength%Alignment != 0 ||
 			entry.RecordOffset > tail.IndexOffset-entry.StoredLength {
-			return fail(fmt.Errorf("pack record %q has an invalid extent", entry.Path))
+			return Index{}, fmt.Errorf("pack record %q has an invalid extent", entry.Path)
 		}
 		if entry.Length < 0 || entry.Length > MaxDataExtent ||
 			entry.Length > entry.StoredLength-Alignment {
-			return fail(fmt.Errorf("pack record %q has an invalid payload length", entry.Path))
+			return Index{}, fmt.Errorf("pack record %q has an invalid payload length", entry.Path)
 		}
 		if entry.Length != 0 {
 			checksum, err := hex.DecodeString(entry.Checksum)
 			if err != nil || len(checksum) != sha256.Size {
-				return fail(fmt.Errorf("pack record %q has an invalid checksum", entry.Path))
+				return Index{}, fmt.Errorf("pack record %q has an invalid checksum", entry.Path)
 			}
 		}
 	}
-	return file, index, nil
+	return index, nil
 }
 
 // Collect removes old packs absent from keep. Open readers hold shared locks,
@@ -728,28 +745,43 @@ func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 // resolution is unavailable; pack readers can instead call ReadEntry on
 // demand and cache individual 1 MiB ranges.
 func Materialize(repository string, id ID, destination string) error {
-	return materialize(repository, id, destination, false)
+	return materialize(repository, id, destination, false, nil)
 }
 
 // MaterializeMissing overlays only paths absent from destination. It is used
 // to fill content objects from ancestor packs after the newest delta has
 // installed authoritative metadata.
 func MaterializeMissing(repository string, id ID, destination string) error {
-	return materialize(repository, id, destination, true)
+	return materialize(repository, id, destination, true, nil)
+}
+
+// MaterializeSkeleton reconstructs directory entries and non-regular objects,
+// but leaves ordinary files as empty writable placeholders unless their path
+// occurs in eagerPaths. A LazyDirectory must mediate access to the resulting
+// root until every placeholder has been populated.
+func MaterializeSkeleton(repository string, id ID, destination string, eagerPaths []string) error {
+	eager := make(map[string]bool, len(eagerPaths))
+	for _, path := range eagerPaths {
+		if err := validateRelative(path); err != nil {
+			return err
+		}
+		eager[filepath.ToSlash(path)] = true
+	}
+	return materialize(repository, id, destination, false, eager)
 }
 
 // MaterializeMetadata reconstructs metadata while omitting regular-file data
 // below omitPrefix. The omitted files are created later as sparse local cache
 // objects by the repository importer.
 func MaterializeMetadata(repository string, id ID, destination, omitPrefix string) error {
-	return materializeFiltered(repository, id, destination, false, filepath.ToSlash(strings.TrimSuffix(omitPrefix, "/"))+"/")
+	return materializeFiltered(repository, id, destination, false, filepath.ToSlash(strings.TrimSuffix(omitPrefix, "/"))+"/", nil)
 }
 
-func materialize(repository string, id ID, destination string, missingOnly bool) error {
-	return materializeFiltered(repository, id, destination, missingOnly, "")
+func materialize(repository string, id ID, destination string, missingOnly bool, eager map[string]bool) error {
+	return materializeFiltered(repository, id, destination, missingOnly, "", eager)
 }
 
-func materializeFiltered(repository string, id ID, destination string, missingOnly bool, omitFilePrefix string) error {
+func materializeFiltered(repository string, id ID, destination string, missingOnly bool, omitFilePrefix string, eager map[string]bool) error {
 	file, index, err := OpenIndexed(repository, id)
 	if err != nil {
 		return err
@@ -801,6 +833,7 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 			}
 			finalModes[path] = os.FileMode(entry.Mode).Perm()
 		case "file":
+			lazy := eager != nil && !eager[entry.Path]
 			flags := os.O_WRONLY
 			if !created[entry.Path] {
 				flags |= os.O_CREATE | os.O_EXCL
@@ -809,21 +842,28 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 			if err != nil {
 				return err
 			}
-			n, err := ReadEntry(file, entry, buffer)
-			if err == nil && n != 0 {
-				_, err = out.WriteAt(buffer[:n], entry.FileOffset)
+			var n int
+			if !lazy {
+				n, err = ReadEntry(file, entry, buffer)
+				if err == nil && n != 0 {
+					_, err = out.WriteAt(buffer[:n], entry.FileOffset)
+				}
 			}
 			err = errors.Join(err, out.Close())
 			if err != nil {
 				return err
 			}
 			created[entry.Path] = true
-			finalModes[path] = os.FileMode(entry.Mode).Perm()
+			if !lazy {
+				finalModes[path] = os.FileMode(entry.Mode).Perm()
+			}
 		case "hardlink":
 			if err := os.Link(filepath.Join(destination, filepath.FromSlash(entry.Hardlink)), path); err != nil {
 				return err
 			}
-			finalModes[path] = os.FileMode(entry.Mode).Perm()
+			if eager == nil || eager[entry.Hardlink] {
+				finalModes[path] = os.FileMode(entry.Mode).Perm()
+			}
 		case "symlink":
 			if err := os.Symlink(entry.Link, path); err != nil {
 				return err

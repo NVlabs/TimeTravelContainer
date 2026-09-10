@@ -2223,7 +2223,28 @@ func TestSharedImagePackRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(gotInfo, info) {
 		t.Fatalf("materialized info = %+v, want %+v", gotInfo, info)
 	}
-	got, err := os.ReadFile(filepath.Join(destination, "rootfs", "usr", "bin", "tool"))
+	target := filepath.Join(destination, "rootfs", "usr", "bin", "tool")
+	if stat, err := os.Stat(target); err != nil || stat.Size() != 0 {
+		t.Fatalf("lazy placeholder size = %v, %v; want zero", stat, err)
+	}
+	descriptor, err := ttcpack.ReadLazyDescriptor(filepath.Join(destination, "rootfs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy, err := ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size, mode, ok := lazy.Metadata("usr/bin/tool"); !ok || size != int64(len(payload)) || mode&0777 != 0555 {
+		t.Fatalf("lazy metadata = (%d, %#o, %t)", size, mode, ok)
+	}
+	if err := lazy.Ensure("usr/bin/tool"); err != nil {
+		t.Fatalf("populating lazy file: %v", err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
 	if err != nil || string(got) != payload {
 		t.Fatalf("materialized payload length=%d err=%v", len(got), err)
 	}
@@ -2348,6 +2369,90 @@ func TestPruneImageRoots(t *testing.T) {
 		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
 	); err != nil || removed != 0 {
 		t.Errorf("second pruneImageRoots = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
+func TestClusterImageCacheKeepsOnlyNodeLocalContainers(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	digest := "sha256:" + strings.Repeat("e", 64)
+	platform := "linux/amd64"
+	key := imageRootKey(digest, platform)
+	root := filepath.Join(local, "images", key, "rootfs")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(filepath.Dir(root), "image.json"), &ttcimages.RootFSInfo{ConfigDigest: digest, Platform: platform}); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(root), owners); err != nil {
+		t.Fatal(err)
+	}
+	containers := []ContainerInfo{{ID: "remote", Digest: digest, Platform: platform}}
+	if removed, err := store.pruneImageRoots([]ttcimages.Info{{Digest: digest, Platform: platform}}, containers); err != nil || removed != 0 {
+		t.Fatalf("prune newly-created remote-only cache = (%d, %v), want (0, nil)", removed, err)
+	}
+	old := time.Now().Add(-2 * nodeLocalImageCacheGrace)
+	if err := os.Chtimes(filepath.Dir(root), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := store.pruneImageRoots([]ttcimages.Info{{Digest: digest, Platform: platform}}, containers); err != nil || removed != 1 {
+		t.Fatalf("prune remote-only cache = (%d, %v), want (1, nil)", removed, err)
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(filepath.Dir(root), "image.json"), &ttcimages.RootFSInfo{ConfigDigest: digest, Platform: platform}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ownership.Write(ownership.ManifestPath(root), owners); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.activeContainerDir("local"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	containers = []ContainerInfo{{ID: "local", Digest: digest, Platform: platform}}
+	if removed, err := store.pruneImageRoots(nil, containers); err != nil || removed != 0 {
+		t.Fatalf("prune locally-used cache = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
+func TestPruneUnreferencedSharedImagePack(t *testing.T) {
+	shared := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: t.TempDir()}
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.Mkdir(rootfs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "payload"), []byte("unused image"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), owners); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{ConfigDigest: "sha256:" + strings.Repeat("f", 64), Platform: "linux/amd64"}
+	key := imageRootKey("sha256:"+strings.Repeat("1", 64), info.Platform)
+	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := loadSharedImagePackManifest(store.sharedImagePackManifestPath(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := ttcpack.ParseID(manifest.Pack)
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(ttcpack.Path(store.sharedImagePackRoot(), id), old, old); err != nil {
+		t.Fatal(err)
+	}
+	manifests, packs, err := store.PruneSharedImagePacks(context.Background())
+	if err != nil || manifests != 1 || packs != 1 {
+		t.Fatalf("PruneSharedImagePacks = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
 	}
 }
 
