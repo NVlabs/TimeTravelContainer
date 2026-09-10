@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"time"
@@ -30,7 +31,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 1
+	AuthorityFormatVersion = 2
 	maxRememberedRequests  = 65536
 )
 
@@ -71,6 +72,8 @@ const (
 	AuthorityBranchCorrupt         AuthorityCommandKind = "branch-mark-corrupted"
 	AuthorityBranchInherit         AuthorityCommandKind = "branch-inherit-dependencies"
 	AuthorityBranchRemoveCorrupted AuthorityCommandKind = "branch-remove-corrupted"
+	AuthoritySnapshotAllocate      AuthorityCommandKind = "snapshot-allocate"
+	AuthoritySnapshotPublish       AuthorityCommandKind = "snapshot-publish"
 )
 
 // AuthorityCommand is the sole replicated mutation envelope. IssuedAt is
@@ -132,6 +135,20 @@ type DurableRoots struct {
 	ObjectSetDigest string `json:"object_set_digest,omitempty"`
 }
 
+// SnapshotOriginProvider is the sole routing entry for an origin that is not
+// yet fully authoritative in shared storage. Absence means readers resolve
+// through the committed shared manifest.
+type SnapshotOriginProvider struct {
+	SnapshotID uint64 `json:"snapshot_id"`
+	NodeID     string `json:"node_id"`
+}
+
+// SnapshotAllocation is the stable result of one Raft allocation request.
+type SnapshotAllocation struct {
+	First uint64 `json:"first"`
+	Count uint32 `json:"count"`
+}
+
 // BranchAuthority is the cluster-wide authority record that is not already
 // represented by PlacementRecord.
 type BranchAuthority struct {
@@ -189,8 +206,9 @@ type PublicationRecord struct {
 // AuthorityState is snapshotted by Raft. Maps are keyed by stable logical
 // identities, never local paths.
 type AuthorityState struct {
-	Version  int    `json:"version"`
-	Revision uint64 `json:"revision"`
+	Version        int    `json:"version"`
+	Revision       uint64 `json:"revision"`
+	NextSnapshotID uint64 `json:"next_snapshot_id"`
 	// LeaderObservedAt is populated only on a linearizable read response. It is
 	// zero in the replicated FSM and snapshots, and lets remote readers convert
 	// lease deadlines without assuming wall-clock synchronization.
@@ -200,13 +218,14 @@ type AuthorityState struct {
 	Transactions     map[string]Transaction             `json:"transactions,omitempty"`
 	Branches         map[string]BranchAuthority         `json:"branches,omitempty"`
 	Publications     map[string]PublicationRecord       `json:"publications,omitempty"`
+	VolatileOrigins  map[uint64]SnapshotOriginProvider  `json:"volatile_origins,omitempty"`
 	Requests         map[string]appliedAuthorityRequest `json:"requests,omitempty"`
 	RequestOrder     []string                           `json:"request_order,omitempty"`
 }
 
 // NewAuthorityState creates an empty cluster state.
 func NewAuthorityState() *AuthorityState {
-	state := &AuthorityState{Version: AuthorityFormatVersion}
+	state := &AuthorityState{Version: AuthorityFormatVersion, NextSnapshotID: 1}
 	state.initMaps()
 	return state
 }
@@ -226,6 +245,12 @@ func (s *AuthorityState) initMaps() {
 	}
 	if s.Publications == nil {
 		s.Publications = make(map[string]PublicationRecord)
+	}
+	if s.VolatileOrigins == nil {
+		s.VolatileOrigins = make(map[uint64]SnapshotOriginProvider)
+	}
+	if s.NextSnapshotID == 0 {
+		s.NextSnapshotID = 1
 	}
 	if s.Requests == nil {
 		s.Requests = make(map[string]appliedAuthorityRequest)
@@ -366,6 +391,8 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
+	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
+		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
 	}
 }
 
@@ -467,6 +494,12 @@ type AuthorityBranchInheritPayload struct {
 	BranchGeneration             uint64
 }
 
+type AuthoritySnapshotPayload struct {
+	NodeID, Incarnation string
+	Count               uint32
+	SnapshotID          uint64
+}
+
 // AuthorityMigrationCutoverPayload joins the transaction and placement CASes
 // that used to be committed separately. The target runtime is already paused
 // and locally published when this command is proposed; applying it makes that
@@ -521,8 +554,53 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyPublication(command)
 	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchRemoveCorrupted:
 		return s.applyBranch(command)
+	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
+		return s.applySnapshot(command)
 	default:
 		return nil, fmt.Errorf("unknown authority command %q", command.Kind)
+	}
+}
+
+func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessage, error) {
+	p, err := decodeAuthorityPayload[AuthoritySnapshotPayload](command)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireNodeIncarnation(p.NodeID, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+		return nil, err
+	}
+	switch command.Kind {
+	case AuthoritySnapshotAllocate:
+		if p.Count == 0 || p.Count > 4096 {
+			return nil, errors.New("snapshot allocation count is outside 1..4096")
+		}
+		if s.NextSnapshotID == 0 || uint64(p.Count) > math.MaxUint64-s.NextSnapshotID {
+			return nil, errors.New("cluster snapshot ID space exhausted")
+		}
+		allocation := SnapshotAllocation{First: s.NextSnapshotID, Count: p.Count}
+		for offset := uint64(0); offset < uint64(p.Count); offset++ {
+			id := s.NextSnapshotID + offset
+			s.VolatileOrigins[id] = SnapshotOriginProvider{SnapshotID: id, NodeID: p.NodeID}
+		}
+		s.NextSnapshotID += uint64(p.Count)
+		return authorityValue(allocation)
+	case AuthoritySnapshotPublish:
+		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
+			return nil, errors.New("invalid snapshot publication request")
+		}
+		provider, ok := s.VolatileOrigins[p.SnapshotID]
+		if !ok {
+			// Idempotent retries after a committed node-to-shared handoff see the
+			// same absence that readers interpret as shared authority.
+			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+		}
+		if provider.NodeID != p.NodeID {
+			return nil, errors.New("snapshot origin is owned by another provider")
+		}
+		delete(s.VolatileOrigins, p.SnapshotID)
+		return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+	default:
+		panic("unreachable")
 	}
 }
 
@@ -1445,6 +1523,14 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 		}
 		if err := tx.Identity.Validate(); err != nil {
 			return nil, err
+		}
+	}
+	if state.NextSnapshotID == 0 {
+		return nil, errors.New("authority snapshot has invalid next snapshot ID")
+	}
+	for id, provider := range state.VolatileOrigins {
+		if id == 0 || id >= state.NextSnapshotID || provider.SnapshotID != id || provider.NodeID == "" {
+			return nil, errors.New("authority snapshot has invalid volatile origin")
 		}
 	}
 	if len(state.RequestOrder) != len(state.Requests) {

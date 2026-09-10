@@ -108,6 +108,42 @@ func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 	}
 }
 
+func TestAuthoritySnapshotOriginAllocationAndPublish(t *testing.T) {
+	at := time.Unix(1500, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	payload := AuthoritySnapshotPayload{NodeID: "node-a", Incarnation: "incarnation-a", Count: 3}
+	command, err := NewAuthorityCommand("allocate-snapshots", at, AuthoritySnapshotAllocate, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := state.Apply(command)
+	if err := first.Err(); err != nil {
+		t.Fatal(err)
+	}
+	allocation := decodeAuthorityResultForTest[SnapshotAllocation](t, first)
+	if allocation.First != 1 || allocation.Count != 3 || state.NextSnapshotID != 4 {
+		t.Fatalf("allocation=%+v next=%d", allocation, state.NextSnapshotID)
+	}
+	if retry := state.Apply(command); retry.Revision != first.Revision || state.NextSnapshotID != 4 {
+		t.Fatalf("idempotent allocation changed state: first=%+v retry=%+v next=%d", first, retry, state.NextSnapshotID)
+	}
+	for id := uint64(1); id <= 3; id++ {
+		if provider := state.VolatileOrigins[id]; provider.SnapshotID != id || provider.NodeID != "node-a" {
+			t.Fatalf("provider %d=%+v", id, provider)
+		}
+	}
+	applyAuthorityForTest(t, state, "publish-snapshot-2", at.Add(time.Second), AuthoritySnapshotPublish, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", SnapshotID: 2,
+	})
+	if _, ok := state.VolatileOrigins[2]; ok {
+		t.Fatal("published snapshot retained a volatile provider")
+	}
+	if provider := state.VolatileOrigins[1]; provider.NodeID != "node-a" {
+		t.Fatal("publishing one origin changed another")
+	}
+}
+
 func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	at := time.Unix(2000, 0).UTC()
 	state := NewAuthorityState()

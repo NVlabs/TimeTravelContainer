@@ -199,6 +199,40 @@ func (c *RaftCatalog) state() (*AuthorityState, error) {
 	return c.linearizableState(context.Background())
 }
 
+// AllocateSnapshotOrigins allocates globally monotonic IDs and records this
+// node as their exact volatile provider in one Raft command.
+func (c *RaftCatalog) AllocateSnapshotOrigins(node, incarnation string, count uint32) (SnapshotAllocation, error) {
+	value, err := applyRaftValue[SnapshotAllocation](c, time.Now().UTC(), AuthoritySnapshotAllocate, AuthoritySnapshotPayload{
+		NodeID: node, Incarnation: incarnation, Count: count,
+	})
+	if err != nil {
+		return SnapshotAllocation{}, err
+	}
+	return *value, nil
+}
+
+// PublishSnapshotOrigin commits the final provider-to-shared authority switch.
+// The caller must durably install and validate the shared manifest first.
+func (c *RaftCatalog) PublishSnapshotOrigin(node, incarnation string, snapshotID uint64) error {
+	return applyRaftNoValue(c, time.Now().UTC(), AuthoritySnapshotPublish, AuthoritySnapshotPayload{
+		NodeID: node, Incarnation: incarnation, SnapshotID: snapshotID,
+	})
+}
+
+// SnapshotProvider returns the exact volatile provider. found=false means the
+// origin must resolve from its committed shared manifest.
+func (c *RaftCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOriginProvider, found bool, err error) {
+	state, err := c.state()
+	if err != nil {
+		return SnapshotOriginProvider{}, false, err
+	}
+	if snapshotID == 0 || snapshotID >= state.NextSnapshotID {
+		return SnapshotOriginProvider{}, false, os.ErrNotExist
+	}
+	provider, found = state.VolatileOrigins[snapshotID]
+	return provider, found, nil
+}
+
 func publicationOperationID(generation uint64) string {
 	return "publication-" + time.Unix(int64(generation), 0).UTC().Format("20060102T150405")
 }
