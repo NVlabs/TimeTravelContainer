@@ -1149,7 +1149,7 @@ func (s *Store) Object(id ObjectID) (Object, bool) {
 // mutable bulk object. Bytes may change in-place only while their origin is
 // working; sealing freezes both content and length.
 func (s *Store) UpdateWorkingBulkLength(id ObjectID, length uint64) error {
-	if id.Kind != ObjectKindFile && id.Kind != ObjectKindPage {
+	if id.Kind != ObjectKindFile && id.Kind != ObjectKindPage && id.Kind != ObjectKindMemoryChunk {
 		return fmt.Errorf("object %s is not bulk data", id.key())
 	}
 	s.mu.Lock()

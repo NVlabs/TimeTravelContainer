@@ -49,6 +49,8 @@ func objectKindName(kind ObjectKind) (string, error) {
 	switch kind {
 	case ObjectKindPage:
 		return "pages", nil
+	case ObjectKindMemoryChunk:
+		return "memory-chunks", nil
 	case ObjectKindFile:
 		return "files", nil
 	default:
@@ -238,7 +240,7 @@ func (store *LocalDataStore) Remove(id ObjectID) error {
 // quarantines unknown names. Callers serialize it with graph/data commits.
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {
 	quarantine := filepath.Join(store.root, "quarantine")
-	for _, kind := range []string{"pages", "files"} {
+	for _, kind := range []string{"pages", "memory-chunks", "files"} {
 		base := filepath.Join(store.root, kind)
 		var directories []string
 		walkErr := filepath.WalkDir(base, func(path string, entry fs.DirEntry, walkErr error) error {

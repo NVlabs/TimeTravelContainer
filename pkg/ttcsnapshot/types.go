@@ -45,10 +45,11 @@ const (
 	ObjectKindInodeNode
 	ObjectKindDirectoryNode
 	ObjectKindMetadata
+	ObjectKindMemoryChunk
 )
 
 func (k ObjectKind) valid() bool {
-	return k >= ObjectKindPage && k <= ObjectKindMetadata
+	return k >= ObjectKindPage && k <= ObjectKindMemoryChunk
 }
 
 // ObjectID is stable across physical relocation and compaction. Ordinals are
@@ -71,6 +72,7 @@ func ParseObjectID(value string) (ObjectID, error) {
 
 // Typed IDs prevent callers from confusing bulk objects at API boundaries.
 type PageID ObjectID
+type MemoryChunkID ObjectID
 type FileID ObjectID
 type InodeID ObjectID
 type MetadataID ObjectID
@@ -81,6 +83,14 @@ func AsPageID(id ObjectID) (PageID, error) {
 		return PageID{}, fmt.Errorf("object %s is not a page", id.key())
 	}
 	return PageID(id), nil
+}
+
+// AsMemoryChunkID checks and converts id to a cold memory chunk ID.
+func AsMemoryChunkID(id ObjectID) (MemoryChunkID, error) {
+	if id.Kind != ObjectKindMemoryChunk {
+		return MemoryChunkID{}, fmt.Errorf("object %s is not a memory chunk", id.key())
+	}
+	return MemoryChunkID(id), nil
 }
 
 // AsFileID checks and converts id to a file ID.
@@ -217,8 +227,11 @@ func validateObject(object Object) error {
 	if len(object.Data) > maxObjectDataBytes {
 		return fmt.Errorf("object %s has %d metadata bytes, limit is %d", object.ID.key(), len(object.Data), maxObjectDataBytes)
 	}
-	if object.BulkLength != 0 && object.ID.Kind != ObjectKindPage && object.ID.Kind != ObjectKindFile {
+	if object.BulkLength != 0 && object.ID.Kind != ObjectKindPage && object.ID.Kind != ObjectKindFile && object.ID.Kind != ObjectKindMemoryChunk {
 		return fmt.Errorf("metadata object %s declares bulk data", object.ID.key())
+	}
+	if object.ID.Kind == ObjectKindMemoryChunk && object.BulkLength > MemoryChunkBytes {
+		return fmt.Errorf("memory chunk %s has %d bytes, limit is %d", object.ID.key(), object.BulkLength, MemoryChunkBytes)
 	}
 	if len(object.Children) > maxObjectEdges {
 		return fmt.Errorf("object %s has %d edges, limit is %d", object.ID.key(), len(object.Children), maxObjectEdges)

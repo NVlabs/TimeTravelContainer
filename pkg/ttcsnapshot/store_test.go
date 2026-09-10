@@ -505,6 +505,58 @@ func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
 	}
 }
 
+func TestMemoryChunkCreatesOneSharedRadixPath(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := store.ReserveObject(origin, ObjectKindMemoryChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitReservedObject(chunk, "build/chunk", MemoryChunkBytes, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	slots := make([]uint8, pagesPerChunk)
+	for index := range slots {
+		slots[index] = uint8(index)
+	}
+	before := store.Stats()
+	root, pages, err := store.SetMemoryChunk(origin, "branch/main/memory", 0x1234500, chunk, slots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pages) != pagesPerChunk {
+		t.Fatalf("page IDs=%d, want %d", len(pages), pagesPerChunk)
+	}
+	after := store.Stats()
+	if got := after.Objects - before.Objects; got != pagesPerChunk+memoryTreeLevels {
+		t.Fatalf("chunk install created %d objects, want %d pages plus %d shared radix nodes", got, pagesPerChunk, memoryTreeLevels)
+	}
+	for _, slot := range []uint8{0, 1, 127, 255} {
+		page, ok, err := store.MemoryPage(root, 0x1234500+uint64(slot))
+		if err != nil || !ok {
+			t.Fatalf("resolving slot %d: page=%s ok=%t err=%v", slot, page, ok, err)
+		}
+		gotChunk, offset, err := store.MemoryPageOffset(page)
+		if err != nil || ObjectID(gotChunk) != chunk || offset != uint32(slot)*memoryPageBytes {
+			t.Fatalf("slot %d backing=(%s,%d,%v), want (%s,%d,nil)", slot, ObjectID(gotChunk), offset, err, chunk, uint32(slot)*memoryPageBytes)
+		}
+	}
+	chunkObject, _ := store.Object(chunk)
+	if chunkObject.Refs != pagesPerChunk+1 {
+		t.Fatalf("chunk refs=%d, want %d page edges plus construction pin", chunkObject.Refs, pagesPerChunk)
+	}
+	if err := store.DeletePin("build/chunk"); err != nil {
+		t.Fatal(err)
+	}
+	chunkObject, _ = store.Object(chunk)
+	if chunkObject.Refs != pagesPerChunk {
+		t.Fatalf("chunk refs after unpin=%d, want %d", chunkObject.Refs, pagesPerChunk)
+	}
+}
+
 func TestPersistentBTreeSplitsAndHardlinks(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
