@@ -3231,21 +3231,22 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
-	publisher := &branchPublisher{sharedRoot: dataRoot, localRoot: localRoot}
-	publisher.event = func(event DaemonEvent) { server.recordEvent(dataRoot, event) }
+	var publicationQueue *ttcstorage.Queue
 	if clusterRuntime != nil {
+		publisher := &branchPublisher{sharedRoot: dataRoot, localRoot: localRoot}
+		publisher.event = func(event DaemonEvent) { server.recordEvent(dataRoot, event) }
 		publisher.nodeID = clusterRuntime.nodeRecord.NodeID
 		publisher.incarnation = clusterRuntime.nodeRecord.Incarnation
 		publisher.placements = clusterRuntime.placements
 		publisher.transactions = clusterRuntime.transactions
 		publisher.authority = clusterRuntime.raftCatalog
-	}
-	publicationQueue, err := ttcstorage.Open(localRoot, publisher)
-	if err != nil {
-		return fmt.Errorf("opening durable publication queue: %w", err)
+		publicationQueue, err = ttcstorage.Open(localRoot, publisher)
+		if err != nil {
+			return fmt.Errorf("opening durable publication queue: %w", err)
+		}
+		defer publicationQueue.Close()
 	}
 	server.publicationQueue = publicationQueue
-	defer publicationQueue.Close()
 	// Recover namespace-atomic deletions before announcing readiness. Failure
 	// to physically remove one tombstone is non-fatal: it is outside the active
 	// container namespace and periodic maintenance will retry it.

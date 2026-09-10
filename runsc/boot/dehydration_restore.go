@@ -393,7 +393,14 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	n := len(metadata.Memories)
 	wantFiles := 1 + 2*n
 	if args.Sparse {
-		wantFiles = 2 + n + boolInt(args.SparseRemote)
+		memorySources := 1
+		if args.GraphSparse {
+			if args.SparseRemote {
+				return nil, errors.New("graph dehydration peer restore cannot use a legacy sparse remote")
+			}
+			memorySources = 2
+		}
+		wantFiles = 1 + memorySources + n + boolInt(args.SparseRemote)
 		if args.ReusePeerApplicationMemoryFile {
 			wantFiles--
 		}
@@ -427,6 +434,9 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		targetStart := 1 + n
 		if args.Sparse {
 			targetStart = 2 + boolInt(args.SparseRemote)
+			if args.GraphSparse {
+				targetStart = 3
+			}
 		}
 		targetIndex := targetStart + i
 		if args.Sparse && args.ReusePeerApplicationMemoryFile {
@@ -488,24 +498,53 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		var child *kernel.Kernel
 		var err error
 		if args.Sparse {
-			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
-			if openErr != nil {
-				return nil, openErr
-			}
-			if args.SparseRemote {
-				fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
-				if dupErr != nil {
-					_ = repository.Close()
-					return nil, dupErr
+			var repository *ttcchunk.MemoryRepository
+			var graphManifest ttcchunk.Manifest
+			var graphChunks map[ttcchunk.ID]ttcsnapshot.ObjectID
+			var graphData *ttcsnapshot.LocalDataStore
+			if args.GraphSparse {
+				manifestData, readErr := io.ReadAll(args.FilePayload.Files[1])
+				if readErr != nil {
+					return nil, fmt.Errorf("reading graph peer memory manifest: %w", readErr)
 				}
-				if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-peer-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
-					_ = repository.Close()
-					return nil, attachErr
+				graphManifest, readErr = ttcchunk.DecodeManifest(manifestData, nil)
+				if readErr != nil {
+					return nil, fmt.Errorf("decoding graph peer memory manifest: %w", readErr)
+				}
+				graphChunks, readErr = ttcchunk.GraphChunkObjects(graphManifest)
+				if readErr != nil {
+					return nil, readErr
+				}
+				graphData, readErr = ttcsnapshot.OpenLocalDataStoreFD(args.FilePayload.Files[2])
+				if readErr != nil {
+					return nil, readErr
+				}
+			} else {
+				var openErr error
+				repository, openErr = ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
+				if openErr != nil {
+					return nil, openErr
+				}
+				if args.SparseRemote {
+					fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+					if dupErr != nil {
+						_ = repository.Close()
+						return nil, dupErr
+					}
+					if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-peer-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
+						_ = repository.Close()
+						return nil, attachErr
+					}
 				}
 			}
 			if args.ReusePeerApplicationMemoryFile {
 				if source.MemoryFile() == nil {
-					_ = repository.Close()
+					if repository != nil {
+						_ = repository.Close()
+					}
+					if graphData != nil {
+						_ = graphData.Close()
+					}
 					return nil, errors.New("active peer has no application MemoryFile")
 				}
 				source.MemoryFile().IncOwner()
@@ -517,8 +556,12 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 				loadMemories[i].MemoryFile = nil
 			}
 			consumed = true
-			loadOptions.OwnSparseRepository = true
-			child, err = kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, repository, loadOptions)
+			if args.GraphSparse {
+				child, err = kernel.LoadGraphDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, graphManifest, graphChunks, graphData, loadOptions)
+			} else {
+				loadOptions.OwnSparseRepository = true
+				child, err = kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, repository, loadOptions)
+			}
 		} else {
 			consumed = true
 			child, err = kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, loadOptions)
