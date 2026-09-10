@@ -13,6 +13,7 @@ go_library(
         "completion.go",
         "cp.go",
 		"elastic_capacity.go",
+		"graph_provider.go",
         "daemon.go",
         "daemon_requests.go",
         "daemon_stdin_lease.go",

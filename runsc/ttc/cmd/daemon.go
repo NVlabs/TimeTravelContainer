@@ -3155,6 +3155,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
 	}
 	defer snapshotGraph.Close()
+	snapshotData, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(localRoot, "objects"))
+	if err != nil {
+		return fmt.Errorf("opening TTC snapshot object store: %w", err)
+	}
 	removeRetiredRaftState := false
 	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
 		// This defer is intentionally registered before raft.Close below, so it
@@ -3293,6 +3297,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
 	if clusterRuntime != nil {
+		clusterRuntime.controlPlane.ObjectProvider = &graphObjectProvider{
+			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.raftCatalog,
+			transactions: clusterRuntime.transactions, nodeID: clusterRuntime.nodeRecord.NodeID,
+			incarnation: clusterRuntime.nodeRecord.Incarnation,
+		}
 		targetBackend := directBackend(options{
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,
