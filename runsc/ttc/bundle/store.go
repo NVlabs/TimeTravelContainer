@@ -2562,7 +2562,7 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 			case repositories[i].Source == specutils.TTCRootfsUpperSource:
 				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), rootfsUpperRepositoryDir)
 			case strings.HasPrefix(repositories[i].Source, "/run/ttc/volumes/"):
-				repositories[i].Path = filepath.Join(s.activeRoot(), "volumes-v2", filepath.Base(repositories[i].Source))
+				repositories[i].Path = filepath.Join(s.activeRoot(), "filesystems", "volumes", filepath.Base(repositories[i].Source))
 			case repositories[i].Private:
 				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), hostMountRepositoryDir, filepath.Base(repositories[i].Path))
 			default:
@@ -3885,7 +3885,7 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 		return 0, err
 	}
 	for _, volume := range volumes {
-		paths[filepath.Join(s.activeRoot(), "volumes-v2", volume.ID)] = struct{}{}
+		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
 	}
 	containers, err := s.listContainers(true)
 	if err != nil {

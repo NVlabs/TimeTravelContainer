@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	formatVersion = 2
+	formatVersion = 3
 	mainBranch    = "main"
 	rootInode     = uint64(1)
 )
@@ -92,7 +92,7 @@ func OpenManager(dataRoot string) (*Manager, error) {
 	if dataRoot == "" {
 		return nil, errors.New("volume manager data root must not be empty")
 	}
-	volumes := filepath.Join(dataRoot, "volumes-v2")
+	volumes := filepath.Join(dataRoot, "filesystems", "volumes")
 	if err := os.MkdirAll(volumes, 0700); err != nil {
 		return nil, fmt.Errorf("creating volume object store: %w", err)
 	}
@@ -393,7 +393,7 @@ func (m *Manager) OpenPrivate(path string) (*Repository, error) {
 	return m.openPath(path, info)
 }
 
-// List returns all valid v2 volumes.
+// List returns all valid snapshot-graph-era volumes.
 func (m *Manager) List() ([]VolumeInfo, error) {
 	entries, err := os.ReadDir(m.volumes)
 	if err != nil {

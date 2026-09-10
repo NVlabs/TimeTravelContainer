@@ -375,7 +375,7 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 	if got := readAll(t, repo, "main", ino); got != "persisted" {
 		t.Fatalf("reopened data=%q", got)
 	}
-	if matches, err := filepath.Glob(filepath.Join(root, "volumes-v2", id, "*.tar")); err != nil || len(matches) != 0 {
+	if matches, err := filepath.Glob(filepath.Join(root, "filesystems", "volumes", id, "*.tar")); err != nil || len(matches) != 0 {
 		t.Fatalf("unexpected tar persistence: matches=%v err=%v", matches, err)
 	}
 }

@@ -2314,7 +2314,7 @@ func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	}
 	countObjects := func() int {
 		count := 0
-		objects := filepath.Join(root, "volumes-v2")
+		objects := filepath.Join(root, "filesystems", "volumes")
 		if err := filepath.WalkDir(objects, func(path string, entry fs.DirEntry, err error) error {
 			if err == nil && !entry.IsDir() && strings.Contains(path, string(filepath.Separator)+"objects"+string(filepath.Separator)) {
 				count++
