@@ -31,9 +31,9 @@ import (
 )
 
 const (
-	referenceLedgerHeader    = "TTCRL1\n"
+	referenceLedgerHeader    = "TTCRL2\n"
 	maxReferenceLedgerRecord = 8 << 20
-	referenceLedgerVersion   = 1
+	referenceLedgerVersion   = 2
 )
 
 type referenceLedgerCheckpoint struct {
@@ -61,13 +61,14 @@ type appliedReference struct {
 }
 
 type referenceLedgerState struct {
-	Origins      map[SnapshotID]struct{}
-	Objects      map[string]Object
-	References   map[string]ObjectID
-	Applied      map[string]appliedReference
-	Outbox       []OutboundReference
-	NextSequence uint64
-	Acknowledged uint64
+	Origins       map[SnapshotID]struct{}
+	Objects       map[string]Object
+	References    map[string]ObjectID
+	Applied       map[string]appliedReference
+	Outbox        []OutboundReference
+	NextSequence  uint64
+	Acknowledged  uint64
+	HandoffCursor map[SnapshotID]uint64
 }
 
 type ledgerImportRecord struct {
@@ -83,11 +84,18 @@ type ledgerReferenceRecord struct {
 	Retain    bool
 }
 
+type ledgerHandoffRecord struct {
+	Origin    SnapshotID
+	From      uint64
+	Mutations []SnapshotReferenceMutation
+}
+
 type referenceLedgerRecord struct {
 	Version   int
 	Sequence  uint64
 	Import    *ledgerImportRecord
 	Reference *ledgerReferenceRecord
+	Handoff   *ledgerHandoffRecord
 	Ack       *uint64
 	Collect   *int
 	Collected int
@@ -97,6 +105,7 @@ func newReferenceLedgerState() referenceLedgerState {
 	return referenceLedgerState{
 		Origins: make(map[SnapshotID]struct{}), Objects: make(map[string]Object),
 		References: make(map[string]ObjectID), Applied: make(map[string]appliedReference), NextSequence: 1,
+		HandoffCursor: make(map[SnapshotID]uint64),
 	}
 }
 
@@ -104,6 +113,9 @@ func cloneReferenceLedgerState(state referenceLedgerState) referenceLedgerState 
 	result := newReferenceLedgerState()
 	result.NextSequence = state.NextSequence
 	result.Acknowledged = state.Acknowledged
+	for origin, cursor := range state.HandoffCursor {
+		result.HandoffCursor[origin] = cursor
+	}
 	for origin := range state.Origins {
 		result.Origins[origin] = struct{}{}
 	}
@@ -291,6 +303,13 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 			return err
 		}
 	}
+	if record.Handoff != nil {
+		set++
+		h := record.Handoff
+		if err := ledger.ApplyHandoff(h.Origin, h.From, h.Mutations); err != nil {
+			return err
+		}
+	}
 	if record.Ack != nil {
 		set++
 		if err := ledger.AcknowledgeOutbound(*record.Ack); err != nil {
@@ -353,12 +372,15 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 }
 
 func validateReferenceLedgerState(state referenceLedgerState) error {
-	if state.Origins == nil || state.Objects == nil || state.References == nil || state.Applied == nil || state.NextSequence == 0 {
+	if state.Origins == nil || state.Objects == nil || state.References == nil || state.Applied == nil || state.HandoffCursor == nil || state.NextSequence == 0 {
 		return errors.New("reference ledger checkpoint has nil or invalid state")
 	}
 	for origin := range state.Origins {
 		if origin == 0 {
 			return errors.New("reference ledger owns zero origin")
+		}
+		if _, ok := state.HandoffCursor[origin]; !ok {
+			return fmt.Errorf("owned origin %d has no handoff cursor", origin)
 		}
 	}
 	for key, object := range state.Objects {
@@ -404,6 +426,11 @@ func validateReferenceLedgerState(state referenceLedgerState) error {
 	for operation, applied := range state.Applied {
 		if operation == "" || validateReferenceName(applied.Name) != nil || applied.Object.IsZero() {
 			return fmt.Errorf("invalid applied reference operation %q", operation)
+		}
+	}
+	for origin := range state.HandoffCursor {
+		if _, ok := state.Origins[origin]; !ok {
+			return fmt.Errorf("handoff cursor names unowned origin %d", origin)
 		}
 	}
 	return nil
@@ -601,10 +628,11 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	if _, exists := ledger.state.Origins[origin]; exists {
-		return fmt.Errorf("snapshot origin %d is already owned", origin)
+		return nil
 	}
 	next := cloneReferenceLedgerState(ledger.state)
 	next.Origins[origin] = struct{}{}
+	next.HandoffCursor[origin] = 0
 	for _, input := range objects {
 		object := cloneObject(input)
 		if object.ID.Snapshot != origin {
@@ -682,6 +710,75 @@ func (ledger *ReferenceLedger) ApplyReference(operation, name string, object Obj
 	return ledger.commitLocked(referenceLedgerRecord{Reference: &ledgerReferenceRecord{
 		Operation: operation, Name: name, Object: object, Retain: retain,
 	}}, next)
+}
+
+// ApplyHandoff atomically advances one provider-to-owner catch-up cursor.
+// Mutations must be contiguous and are individually idempotent by operation
+// identity. Retrying an already committed prefix succeeds without another WAL
+// write; skipping or reordering any mutation is rejected.
+func (ledger *ReferenceLedger) ApplyHandoff(origin SnapshotID, from uint64, mutations []SnapshotReferenceMutation) error {
+	if ledger == nil || origin == 0 {
+		return errors.New("invalid reference-ledger handoff")
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if _, ok := ledger.state.Origins[origin]; !ok {
+		return fmt.Errorf("snapshot origin %d is not owned", origin)
+	}
+	current := ledger.state.HandoffCursor[origin]
+	if from < current {
+		// The caller may retry a previously committed whole batch. It is safe
+		// only when that batch ends no later than the durable cursor.
+		if uint64(len(mutations)) > math.MaxUint64-from || from+uint64(len(mutations)) > current {
+			return fmt.Errorf("snapshot origin %d handoff overlaps cursor %d", origin, current)
+		}
+		want := from + 1
+		for _, mutation := range mutations {
+			if mutation.Sequence != want || mutation.Object.Snapshot != origin {
+				return fmt.Errorf("snapshot origin %d retried handoff mutation %d, want %d", origin, mutation.Sequence, want)
+			}
+			applied := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
+			if previous, ok := ledger.state.Applied[mutation.Operation]; !ok || previous != applied {
+				return fmt.Errorf("snapshot origin %d handoff retry does not match mutation %d", origin, mutation.Sequence)
+			}
+			want++
+		}
+		return nil
+	}
+	if from != current {
+		return fmt.Errorf("snapshot origin %d handoff starts at %d, want %d", origin, from, current)
+	}
+	if len(mutations) == 0 {
+		return nil
+	}
+	next := cloneReferenceLedgerState(ledger.state)
+	want := from + 1
+	for _, mutation := range mutations {
+		if mutation.Sequence != want || mutation.Object.Snapshot != origin {
+			return fmt.Errorf("snapshot origin %d handoff mutation %d, want %d", origin, mutation.Sequence, want)
+		}
+		applied := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
+		if previous, ok := next.Applied[mutation.Operation]; ok {
+			if previous != applied {
+				return fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+			}
+		} else {
+			var err error
+			if mutation.Retain {
+				err = next.retain(mutation.Name, mutation.Object)
+			} else {
+				err = next.release(mutation.Name, mutation.Object)
+			}
+			if err != nil {
+				return err
+			}
+			next.Applied[mutation.Operation] = applied
+		}
+		want++
+	}
+	next.HandoffCursor[origin] = want - 1
+	record := ledgerHandoffRecord{Origin: origin, From: from, Mutations: append([]SnapshotReferenceMutation(nil), mutations...)}
+	return ledger.commitLocked(referenceLedgerRecord{Handoff: &record}, next)
 }
 
 // PendingOutbound returns the ordered, unacknowledged cross-owner mutations.
@@ -777,6 +874,7 @@ type ReferenceLedgerInspection struct {
 	References        map[string]ObjectID
 	PendingOutbound   []OutboundReference
 	AppliedOperations int
+	HandoffCursors    map[SnapshotID]uint64
 }
 
 // Inspect reports exact owner-local counts without exposing mutable maps.
@@ -788,6 +886,7 @@ func (ledger *ReferenceLedger) Inspect() ReferenceLedgerInspection {
 		References:        make(map[string]ObjectID, len(ledger.state.References)),
 		PendingOutbound:   append([]OutboundReference(nil), ledger.state.Outbox...),
 		AppliedOperations: len(ledger.state.Applied),
+		HandoffCursors:    make(map[SnapshotID]uint64, len(ledger.state.HandoffCursor)),
 	}
 	for origin := range ledger.state.Origins {
 		result.Origins = append(result.Origins, origin)
@@ -798,6 +897,9 @@ func (ledger *ReferenceLedger) Inspect() ReferenceLedgerInspection {
 	}
 	for name, object := range ledger.state.References {
 		result.References[name] = object
+	}
+	for origin, cursor := range ledger.state.HandoffCursor {
+		result.HandoffCursors[origin] = cursor
 	}
 	return result
 }

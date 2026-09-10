@@ -182,6 +182,58 @@ func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerHandoffCursorIsAtomicAndDurable(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := ledgerObject(12, 1, ObjectKindMemoryChunk)
+	second := ledgerObject(12, 2, ObjectKindMemoryChunk)
+	baseline := map[string]ObjectID{"root/branch": first.ID, "pin/next": second.ID}
+	if err := ledger.ImportOrigin(12, []Object{first, second}, baseline); err != nil {
+		t.Fatal(err)
+	}
+	// The manifest-backed origin import is idempotent across a lost response.
+	if err := ledger.ImportOrigin(12, []Object{first, second}, baseline); err != nil {
+		t.Fatalf("retrying origin import: %v", err)
+	}
+	mutations := []SnapshotReferenceMutation{
+		{Sequence: 1, Operation: "handoff-12-1", Name: "root/branch", Object: first.ID, Retain: false},
+		{Sequence: 2, Operation: "handoff-12-2", Name: "root/branch", Object: second.ID, Retain: true},
+		{Sequence: 3, Operation: "handoff-12-3", Name: "pin/next", Object: second.ID, Retain: false},
+	}
+	if err := ledger.ApplyHandoff(12, 0, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyHandoff(12, 0, mutations); err != nil {
+		t.Fatalf("retrying handoff batch: %v", err)
+	}
+	bad := append([]SnapshotReferenceMutation(nil), mutations[:2]...)
+	bad[1].Object = first.ID
+	if err := ledger.ApplyHandoff(12, 0, bad); err == nil {
+		t.Fatal("accepted a conflicting committed handoff prefix")
+	}
+	if err := ledger.ApplyHandoff(12, 4, nil); err == nil {
+		t.Fatal("accepted a skipped handoff cursor")
+	}
+	if got := ledger.Inspect().HandoffCursors[12]; got != 3 {
+		t.Fatalf("handoff cursor=%d, want 3", got)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	inspection := reopened.Inspect()
+	if inspection.HandoffCursors[12] != 3 || inspection.References["root/branch"] != second.ID {
+		t.Fatalf("replayed handoff=%+v", inspection)
+	}
+}
+
 func TestReferenceLedgerCheckpointAndOldWALCrashPrefix(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "ledger")
 	ledger, err := OpenReferenceLedger(directory)
