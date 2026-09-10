@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -582,6 +583,63 @@ func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
 	}
 	if collected, err := store.Collect(16); err != nil || collected != 2 {
 		t.Fatalf("Collect()=(%d,%v), want (2,nil)", collected, err)
+	}
+}
+
+func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	data, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveMemoryChunk(origin, "build/memory-0", []uint8{0, 7, 255})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x5a}, MemoryChunkBytes)
+	if err := data.Install(ObjectID(reservation.Chunk), bytes.NewReader(payload), MemoryChunkBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Object(ObjectID(reservation.Chunk)); ok {
+		t.Fatal("bulk object became visible before graph commit")
+	}
+	if err := store.CommitMemoryChunk(reservation); err != nil {
+		t.Fatal(err)
+	}
+	pages := make(map[uint64]ObjectID, len(reservation.Pages))
+	for slot, page := range reservation.Pages {
+		pages[0x1000+uint64(slot)] = ObjectID(page)
+	}
+	root, err := store.SetMemoryPages(origin, "branch/main/memory", pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(reservation.Pins); err != nil {
+		t.Fatal(err)
+	}
+	for slot, want := range reservation.Pages {
+		got, ok, err := store.MemoryPage(root, 0x1000+uint64(slot))
+		if err != nil || !ok || got != ObjectID(want) {
+			t.Fatalf("slot %d lookup=(%s,%t,%v), want %s", slot, got, ok, err, ObjectID(want))
+		}
+	}
+	file, err := data.Open(ObjectID(reservation.Chunk), MemoryChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(loaded, payload) {
+		t.Fatalf("cold chunk load bytes=%d err=%v", len(loaded), err)
 	}
 }
 

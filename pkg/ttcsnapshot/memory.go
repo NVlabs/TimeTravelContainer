@@ -32,6 +32,15 @@ const (
 	pagesPerChunk    = MemoryChunkBytes / memoryPageBytes
 )
 
+// MemoryChunkReservation allocates stable IDs before cold bytes are installed.
+// Pins are removed only after every branch memory root referencing Pages is
+// committed.
+type MemoryChunkReservation struct {
+	Chunk MemoryChunkID
+	Pages map[uint8]PageID
+	Pins  []string
+}
+
 func memorySlot(pageIndex uint64, level int) uint16 {
 	return uint16((pageIndex >> (8 * level)) & 0xff)
 }
@@ -85,6 +94,81 @@ func (s *Store) MemoryPageOffset(page ObjectID) (MemoryChunkID, uint32, error) {
 		return MemoryChunkID{}, 0, fmt.Errorf("page %s has invalid chunk offset %d", page.key(), offset)
 	}
 	return MemoryChunkID(object.Children[0].Child), offset, nil
+}
+
+// ReserveMemoryChunk allocates one bulk chunk ID and one PageID per selected
+// slot in a single journal transaction. Slots are canonicalized so retries
+// and callers have deterministic page ordering.
+func (s *Store) ReserveMemoryChunk(origin SnapshotID, pinPrefix string, slots []uint8) (MemoryChunkReservation, error) {
+	if err := validateRootName(pinPrefix); err != nil {
+		return MemoryChunkReservation{}, err
+	}
+	if len(slots) == 0 || len(slots) > pagesPerChunk {
+		return MemoryChunkReservation{}, errors.New("invalid TTC memory chunk slots")
+	}
+	ordered := append([]uint8(nil), slots...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for index := 1; index < len(ordered); index++ {
+		if ordered[index] == ordered[index-1] {
+			return MemoryChunkReservation{}, fmt.Errorf("memory chunk repeats page slot %d", ordered[index])
+		}
+	}
+	pins := make([]string, 0, len(ordered)+1)
+	pins = append(pins, pinPrefix+"/chunk")
+	for _, slot := range ordered {
+		pins = append(pins, fmt.Sprintf("%s/page-%02x", pinPrefix, slot))
+	}
+	for _, pin := range pins {
+		if err := validateRootName(pin); err != nil {
+			return MemoryChunkReservation{}, err
+		}
+	}
+	kinds := make([]ObjectKind, len(ordered)+1)
+	kinds[0] = ObjectKindMemoryChunk
+	for index := range ordered {
+		kinds[index+1] = ObjectKindPage
+	}
+	ids, err := s.ReserveObjects(origin, kinds)
+	if err != nil {
+		return MemoryChunkReservation{}, err
+	}
+	reservation := MemoryChunkReservation{
+		Chunk: MemoryChunkID(ids[0]),
+		Pages: make(map[uint8]PageID, len(ordered)),
+		Pins:  pins,
+	}
+	for index, slot := range ordered {
+		reservation.Pages[slot] = PageID(ids[index+1])
+	}
+	return reservation, nil
+}
+
+// CommitMemoryChunk publishes an already-installed fixed-size chunk and all
+// of its page-to-offset records atomically under temporary construction pins.
+func (s *Store) CommitMemoryChunk(reservation MemoryChunkReservation) error {
+	chunk := ObjectID(reservation.Chunk)
+	if chunk.Kind != ObjectKindMemoryChunk || len(reservation.Pages) == 0 || len(reservation.Pins) != len(reservation.Pages)+1 {
+		return errors.New("invalid TTC memory chunk reservation")
+	}
+	slots := make([]int, 0, len(reservation.Pages))
+	for slot := range reservation.Pages {
+		slots = append(slots, int(slot))
+	}
+	sort.Ints(slots)
+	objects := make([]ReservedObject, 0, len(slots)+1)
+	objects = append(objects, ReservedObject{ID: chunk, Pin: reservation.Pins[0], BulkLength: MemoryChunkBytes})
+	for index, slot := range slots {
+		page := ObjectID(reservation.Pages[uint8(slot)])
+		if page.Kind != ObjectKindPage {
+			return fmt.Errorf("reserved memory slot %d has non-page object %s", slot, page.key())
+		}
+		objects = append(objects, ReservedObject{
+			ID: page, Pin: reservation.Pins[index+1],
+			Data:     encodeMemoryPageOffset(uint32(slot) * memoryPageBytes),
+			Children: []Edge{{Slot: 0, Child: chunk}},
+		})
+	}
+	return s.CommitReservedObjects(objects)
 }
 
 // MemoryPage resolves pageIndex through root without following snapshot
