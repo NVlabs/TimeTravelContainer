@@ -1541,6 +1541,20 @@ func TestRandomGraphReferenceAndReplayModel(t *testing.T) {
 				t.Fatalf("step %d collect: %v", step, err)
 			}
 		case 7:
+			rootNames := names(inspection.Roots)
+			if len(rootNames) != 0 {
+				source := rootNames[nextRandom(len(rootNames))]
+				working, forkErr := store.SealAndFork(origin, SnapshotSealedLocal, map[string]string{
+					fmt.Sprintf("fork/%04d", step): source,
+				}, 1)
+				if forkErr != nil {
+					t.Fatalf("step %d fork: %v", step, forkErr)
+				}
+				origin = working[0]
+			}
+		}
+		assertGraphReferenceModel(t, store)
+		if step%113 == 112 {
 			if err := store.Checkpoint(); err != nil {
 				t.Fatalf("step %d checkpoint: %v", step, err)
 			}
@@ -1551,8 +1565,8 @@ func TestRandomGraphReferenceAndReplayModel(t *testing.T) {
 			if err != nil {
 				t.Fatalf("step %d reopen: %v", step, err)
 			}
+			assertGraphReferenceModel(t, store)
 		}
-		assertGraphReferenceModel(t, store)
 	}
 
 	inspection := store.Inspect()
