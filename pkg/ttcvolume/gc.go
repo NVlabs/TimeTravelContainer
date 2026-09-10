@@ -75,9 +75,6 @@ func (r *Repository) garbageCollectLocked() error {
 	}
 	r.metadataMu.Unlock()
 
-	if err := r.graph.ReloadForWrite(); err != nil {
-		return err
-	}
 	for {
 		collected, err := r.graph.Collect(1024)
 		if err != nil {
@@ -94,5 +91,5 @@ func (r *Repository) garbageCollectLocked() error {
 	if err != nil {
 		return err
 	}
-	return nil
+	return r.graph.CheckpointExternallyCoordinated()
 }

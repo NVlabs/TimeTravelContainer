@@ -24,14 +24,22 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 )
 
 const (
-	journalHeader        = "TTCSGJ1\n"
+	journalHeader        = "TTCSGJ2\n"
 	maxJournalRecordSize = 8 << 20
+	headFileName         = "graph.head"
 )
+
+type graphHead struct {
+	Version    int    `json:"version"`
+	Generation uint64 `json:"generation"`
+}
 
 type graphState struct {
 	Version      int
@@ -80,6 +88,7 @@ type Store struct {
 	dir        string
 	lock       *os.File
 	journal    *os.File
+	generation uint64
 	state      graphState
 	poisoned   error
 	journalEnd int64
@@ -104,14 +113,99 @@ func OpenExternallyCoordinated(dir string) (*Store, error) {
 	return open(dir, true)
 }
 
+func decodeHead(data []byte) (graphHead, error) {
+	var head graphHead
+	if err := json.Unmarshal(data, &head); err != nil {
+		return graphHead{}, fmt.Errorf("decoding TTC snapshot graph head: %w", err)
+	}
+	if head.Version != formatVersion || head.Generation == 0 {
+		return graphHead{}, fmt.Errorf("unsupported TTC snapshot graph head version %d generation %d", head.Version, head.Generation)
+	}
+	return head, nil
+}
+
+func validGenerationFile(name, suffix string) bool {
+	if !strings.HasPrefix(name, "graph-") || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	middle := strings.TrimSuffix(strings.TrimPrefix(name, "graph-"), suffix)
+	if len(middle) != 16 {
+		return false
+	}
+	_, err := strconv.ParseUint(middle, 16, 64)
+	return err == nil
+}
+
+func preflightGraphDirectory(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	hasHead := false
+	for _, entry := range entries {
+		if entry.Name() == headFileName {
+			hasHead = true
+			break
+		}
+	}
+	if !hasHead {
+		for _, entry := range entries {
+			if entry.Name() != "graph.lock" {
+				return false, fmt.Errorf("unmarked or legacy TTC snapshot graph contains %q", entry.Name())
+			}
+		}
+		return false, nil
+	}
+	headInfo, err := os.Lstat(filepath.Join(dir, headFileName))
+	if err != nil || !headInfo.Mode().IsRegular() {
+		return false, errors.New("TTC snapshot graph head is not a regular file")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, headFileName))
+	if err != nil {
+		return false, err
+	}
+	if _, err := decodeHead(data); err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		known := name == headFileName || name == "graph.lock" ||
+			validGenerationFile(name, ".checkpoint") || validGenerationFile(name, ".journal") ||
+			strings.HasPrefix(name, ".graph-head-") || strings.HasPrefix(name, ".graph-checkpoint-") || strings.HasPrefix(name, ".graph-journal-")
+		if !known {
+			return false, fmt.Errorf("TTC snapshot graph contains unknown entry %q", name)
+		}
+	}
+	lockInfo, err := os.Lstat(filepath.Join(dir, "graph.lock"))
+	if err != nil || !lockInfo.Mode().IsRegular() {
+		return false, errors.New("marked TTC snapshot graph has no regular graph.lock")
+	}
+	return true, nil
+}
+
 func open(dir string, externallyCoordinated bool) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("TTC snapshot graph directory is empty")
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	marked, err := preflightGraphDirectory(dir)
+	if err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(filepath.Join(dir, "graph.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	lockFlags := os.O_RDWR
+	if !marked {
+		lockFlags |= os.O_CREATE
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "graph.lock"), lockFlags, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -122,17 +216,14 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 		}
 	}
 	store := &Store{dir: dir, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated}
-	if err := store.loadCheckpoint(); err != nil {
-		store.Close()
-		return nil, err
+	if externallyCoordinated {
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+			store.Close()
+			return nil, err
+		}
+		defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	}
-	journal, err := os.OpenFile(filepath.Join(dir, "graph.journal"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		store.Close()
-		return nil, err
-	}
-	store.journal = journal
-	if err := store.replayJournal(); err != nil {
+	if err := store.loadCurrentGeneration(!externallyCoordinated); err != nil {
 		store.Close()
 		return nil, err
 	}
@@ -140,8 +231,9 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 }
 
 // Reload discards process-local graph state and replays the durable
-// checkpoint and journal. For externally-coordinated stores, callers must
-// hold the enclosing repository's cross-process lock. Reload is harmless for
+// checkpoint and journal. Externally-coordinated stores take a shared graph
+// lock while selecting and loading the published generation, so readers do
+// not need the enclosing repository's writer lock. Reload is harmless for
 // exclusive stores and is useful in tests and recovery tooling.
 func (s *Store) Reload() error {
 	s.mu.Lock()
@@ -150,6 +242,16 @@ func (s *Store) Reload() error {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
 	if s.externallyCoordinated {
+		if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
+			return err
+		}
+		defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	}
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	if head.Generation == s.generation && s.journal != nil {
 		info, err := s.journal.Stat()
 		if err != nil {
 			return err
@@ -158,15 +260,7 @@ func (s *Store) Reload() error {
 			return nil
 		}
 	}
-	state := newGraphState()
-	s.state = state
-	if err := s.loadCheckpoint(); err != nil {
-		return err
-	}
-	if _, err := s.journal.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return s.replayJournal()
+	return s.loadGeneration(head, false)
 }
 
 // ReloadForWrite reloads and repairs an incomplete journal tail while the
@@ -180,24 +274,24 @@ func (s *Store) ReloadForWrite() error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	info, err := s.journal.Stat()
+	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	head, err := s.readHead()
 	if err != nil {
 		return err
 	}
-	if s.journalEnd == info.Size() {
-		return nil
+	if head.Generation == s.generation && s.journal != nil {
+		info, err := s.journal.Stat()
+		if err != nil {
+			return err
+		}
+		if s.journalEnd == info.Size() {
+			return nil
+		}
 	}
-	s.state = newGraphState()
-	if err := s.loadCheckpoint(); err != nil {
-		return err
-	}
-	if _, err := s.journal.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	s.externallyCoordinated = false
-	err = s.replayJournal()
-	s.externallyCoordinated = true
-	return err
+	return s.loadGeneration(head, true)
 }
 
 // Close releases the store lock.
@@ -223,13 +317,124 @@ func (s *Store) Close() error {
 	return err
 }
 
-func (s *Store) loadCheckpoint() error {
-	data, err := os.ReadFile(filepath.Join(s.dir, "graph.checkpoint"))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+func graphCheckpointName(generation uint64) string {
+	return fmt.Sprintf("graph-%016x.checkpoint", generation)
+}
+
+func graphJournalName(generation uint64) string {
+	return fmt.Sprintf("graph-%016x.journal", generation)
+}
+
+func writeFileAtomically(directory, destination, prefix string, data []byte) error {
+	temporary, err := os.CreateTemp(directory, prefix)
 	if err != nil {
 		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, filepath.Join(directory, destination))
+}
+
+func syncGraphDirectory(directory string) error {
+	file, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func (s *Store) writeHead(head graphHead) error {
+	data, err := json.Marshal(head)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := writeFileAtomically(s.dir, headFileName, ".graph-head-", data); err != nil {
+		return err
+	}
+	return syncGraphDirectory(s.dir)
+}
+
+func (s *Store) initializeGeneration() error {
+	state := newGraphState()
+	checkpoint, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	checkpoint = append(checkpoint, '\n')
+	if err := writeFileAtomically(s.dir, graphCheckpointName(1), ".graph-checkpoint-", checkpoint); err != nil {
+		return err
+	}
+	if err := writeFileAtomically(s.dir, graphJournalName(1), ".graph-journal-", []byte(journalHeader)); err != nil {
+		return err
+	}
+	if err := syncGraphDirectory(s.dir); err != nil {
+		return err
+	}
+	return s.writeHead(graphHead{Version: formatVersion, Generation: 1})
+}
+
+func (s *Store) readHead() (graphHead, error) {
+	data, err := os.ReadFile(filepath.Join(s.dir, headFileName))
+	if err != nil {
+		return graphHead{}, err
+	}
+	return decodeHead(data)
+}
+
+func (s *Store) loadCurrentGeneration(repairTail bool) error {
+	head, err := s.readHead()
+	if errors.Is(err, os.ErrNotExist) {
+		entries, readErr := os.ReadDir(s.dir)
+		if readErr != nil {
+			return readErr
+		}
+		for _, entry := range entries {
+			if entry.Name() != "graph.lock" {
+				return fmt.Errorf("unmarked or legacy TTC snapshot graph contains %q", entry.Name())
+			}
+		}
+		if err := s.initializeGeneration(); err != nil {
+			return err
+		}
+		head = graphHead{Version: formatVersion, Generation: 1}
+	} else if err != nil {
+		return err
+	}
+	return s.loadGeneration(head, repairTail)
+}
+
+func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
+	checkpointPath := filepath.Join(s.dir, graphCheckpointName(head.Generation))
+	journalPath := filepath.Join(s.dir, graphJournalName(head.Generation))
+	for _, path := range []string{checkpointPath, journalPath} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("validating selected TTC snapshot graph file %q: %w", filepath.Base(path), err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("selected TTC snapshot graph file %q is not regular", filepath.Base(path))
+		}
+	}
+	data, err := os.ReadFile(checkpointPath)
+	if err != nil {
+		return fmt.Errorf("reading TTC snapshot graph generation %d checkpoint: %w", head.Generation, err)
 	}
 	var state graphState
 	if err := json.Unmarshal(data, &state); err != nil {
@@ -238,7 +443,29 @@ func (s *Store) loadCheckpoint() error {
 	if err := validateGraphState(&state); err != nil {
 		return fmt.Errorf("invalid TTC snapshot graph checkpoint: %w", err)
 	}
+	journal, err := os.OpenFile(journalPath, os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening TTC snapshot graph generation %d journal: %w", head.Generation, err)
+	}
+	previous := s.journal
+	previousState := s.state
+	previousGeneration := s.generation
+	previousEnd := s.journalEnd
 	s.state = state
+	s.journal = journal
+	s.generation = head.Generation
+	s.journalEnd = 0
+	if err := s.replayJournal(repairTail); err != nil {
+		s.journal = previous
+		s.state = previousState
+		s.generation = previousGeneration
+		s.journalEnd = previousEnd
+		journal.Close()
+		return err
+	}
+	if previous != nil {
+		_ = previous.Close()
+	}
 	return nil
 }
 
@@ -311,7 +538,7 @@ func snapshotKey(id SnapshotID) string {
 	return fmt.Sprintf("%016x", uint64(id))
 }
 
-func (s *Store) replayJournal() error {
+func (s *Store) replayJournal(repairTail bool) error {
 	info, err := s.journal.Stat()
 	if err != nil {
 		return err
@@ -344,7 +571,7 @@ func (s *Store) replayJournal() error {
 			return err
 		}
 		if n != len(lengthBuffer) {
-			if s.externallyCoordinated {
+			if !repairTail {
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}
@@ -361,7 +588,7 @@ func (s *Store) replayJournal() error {
 			return err
 		}
 		if n != len(data) {
-			if s.externallyCoordinated {
+			if !repairTail {
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}
@@ -1306,61 +1533,101 @@ func (s *Store) Checkpoint() error {
 	if s.externallyCoordinated {
 		return errors.New("externally-coordinated TTC graph checkpoint requires repository-level compaction")
 	}
-	return s.checkpointLocked()
+	return s.compactGenerationLocked()
 }
 
-func (s *Store) checkpointLocked() error {
+// CheckpointExternallyCoordinated creates a new immutable checkpoint/journal
+// generation while the caller holds the enclosing repository writer lock.
+// graph.head is the sole publication point. Readers lock graph.lock only while
+// selecting and loading a generation, so old generation names can be removed
+// immediately after head publication without invalidating already-open files.
+func (s *Store) CheckpointExternallyCoordinated() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.externallyCoordinated {
+		return errors.New("graph is not externally coordinated")
+	}
+	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	info, err := s.journal.Stat()
+	if err != nil {
+		return err
+	}
+	if head.Generation != s.generation || info.Size() != s.journalEnd {
+		if err := s.loadGeneration(head, true); err != nil {
+			return err
+		}
+	}
+	return s.compactGenerationLocked()
+}
+
+func (s *Store) compactGenerationLocked() error {
+	if s.generation == math.MaxUint64 {
+		return errors.New("TTC snapshot graph generation space exhausted")
+	}
+	nextGeneration := s.generation + 1
 	data, err := json.Marshal(s.state)
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(s.dir, ".graph-checkpoint-")
+	if err := writeFileAtomically(s.dir, graphCheckpointName(nextGeneration), ".graph-checkpoint-", append(data, '\n')); err != nil {
+		return err
+	}
+	if err := writeFileAtomically(s.dir, graphJournalName(nextGeneration), ".graph-journal-", []byte(journalHeader)); err != nil {
+		return err
+	}
+	if err := syncGraphDirectory(s.dir); err != nil {
+		return err
+	}
+	journal, err := os.OpenFile(filepath.Join(s.dir, graphJournalName(nextGeneration)), os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0600); err != nil {
-		temporary.Close()
+	if _, err := journal.Seek(0, io.SeekEnd); err != nil {
+		journal.Close()
 		return err
 	}
-	if _, err := temporary.Write(append(data, '\n')); err != nil {
-		temporary.Close()
+	if err := s.writeHead(graphHead{Version: formatVersion, Generation: nextGeneration}); err != nil {
+		journal.Close()
 		return err
 	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, filepath.Join(s.dir, "graph.checkpoint")); err != nil {
-		return err
-	}
-	directory, err := os.Open(s.dir)
-	if err != nil {
-		return err
-	}
-	if err := directory.Sync(); err != nil {
-		directory.Close()
-		return err
-	}
-	if err := directory.Close(); err != nil {
-		return err
-	}
-	if err := s.journal.Truncate(0); err != nil {
-		return err
-	}
-	if _, err := s.journal.WriteAt([]byte(journalHeader), 0); err != nil {
-		return err
-	}
-	if err := s.journal.Sync(); err != nil {
-		return err
-	}
+	previous := s.journal
+	s.journal = journal
+	s.generation = nextGeneration
 	s.journalEnd = int64(len(journalHeader))
-	_, err = s.journal.Seek(0, io.SeekEnd)
-	return err
+	if previous != nil {
+		_ = previous.Close()
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	currentCheckpoint := graphCheckpointName(nextGeneration)
+	currentJournal := graphJournalName(nextGeneration)
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == currentCheckpoint || name == currentJournal || name == headFileName || name == "graph.lock" {
+			continue
+		}
+		if strings.HasPrefix(name, "graph-") && (strings.HasSuffix(name, ".checkpoint") || strings.HasSuffix(name, ".journal")) {
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(name, ".graph-head-") || strings.HasPrefix(name, ".graph-checkpoint-") || strings.HasPrefix(name, ".graph-journal-") {
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return syncGraphDirectory(s.dir)
 }
 
 // Stats summarizes authoritative graph state.

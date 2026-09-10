@@ -182,9 +182,6 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	if len(ops) == 0 {
 		return nil
 	}
-	if err := r.graph.ReloadForWrite(); err != nil {
-		return err
-	}
 	graphOps := make([]ttcsnapshot.FilesystemOperation, 0, len(ops))
 	for _, op := range ops {
 		switch op.Kind {

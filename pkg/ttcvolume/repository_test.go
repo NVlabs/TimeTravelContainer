@@ -40,6 +40,18 @@ func openTestManager(t *testing.T) *Manager {
 	return manager
 }
 
+func graphJournalPath(t *testing.T, repositoryPath string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(repositoryPath, "graph", "graph-*.journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("graph journals=%v, want exactly one", matches)
+	}
+	return matches[0]
+}
+
 func readAll(t *testing.T, repo *Repository, branch string, ino uint64) string {
 	t.Helper()
 	inode, err := repo.Inode(branch, ino)
@@ -155,7 +167,7 @@ func TestJournalDiscardsTornTailBeforeNextTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(repo.path, "graph", "graph.journal")
+	journal := graphJournalPath(t, repo.path)
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +574,7 @@ func TestMutationAndForkAppendBoundedGraphTransactions(t *testing.T) {
 	}
 	journalSize := func() int64 {
 		t.Helper()
-		info, err := os.Stat(filepath.Join(repo.path, "graph", "graph.journal"))
+		info, err := os.Stat(graphJournalPath(t, repo.path))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -607,8 +619,8 @@ func TestMetadataUsesGraphWithoutPerEntryFiles(t *testing.T) {
 		names = append(names, entry.Name())
 	}
 	sort.Strings(names)
-	if got, want := strings.Join(names, ","), "graph.journal,graph.lock"; got != want {
-		t.Fatalf("snapshot graph entries=%q, want %q", got, want)
+	if len(names) != 4 || names[0] != "graph-0000000000000001.checkpoint" || names[1] != "graph-0000000000000001.journal" || names[2] != "graph.head" || names[3] != "graph.lock" {
+		t.Fatalf("snapshot graph entries=%q, want one selected checkpoint/journal generation", strings.Join(names, ","))
 	}
 }
 
@@ -1138,6 +1150,9 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	}
 	if stats := repository.graph.Stats(); stats.Roots != 2 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
 		t.Fatalf("graph after churn=%+v, want current+diff roots, at most two live origins, and no reclaiming objects", stats)
+	}
+	if info, err := os.Stat(graphJournalPath(t, repository.path)); err != nil || info.Size() != int64(len("TTCSGJ2\n")) {
+		t.Fatalf("compacted graph journal: info=%v err=%v", info, err)
 	}
 	repository.metadataMu.Lock()
 	metadataEntries := len(repository.metadata)

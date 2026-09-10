@@ -702,6 +702,11 @@ func (r *Repository) withLock(fn func() error) error {
 		return err
 	}
 	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)
+	if r.graph != nil {
+		if err := r.graph.ReloadForWrite(); err != nil {
+			return err
+		}
+	}
 	return fn()
 }
 
@@ -764,9 +769,6 @@ func (r *Repository) writeBranch(branch Branch) error {
 // sealed origins are never reopened or reused.
 func (r *Repository) recoverGraphState() error {
 	return r.withLock(func() error {
-		if err := r.graph.ReloadForWrite(); err != nil {
-			return err
-		}
 		branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
 		if err != nil {
 			return err
@@ -930,9 +932,6 @@ func (r *Repository) RemoveBranch(id string) error {
 		if err := r.syncDirectory("branches"); err != nil {
 			return err
 		}
-		if err := r.graph.ReloadForWrite(); err != nil {
-			return err
-		}
 		roots := []string{graphRootName(id)}
 		if branch.BaseRoot != "" {
 			roots = append(roots, graphBaseRootName(id))
@@ -1030,9 +1029,6 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 			return err
 		}
 		tx.source = sourceBranch
-		if err := r.graph.ReloadForWrite(); err != nil {
-			return err
-		}
 		working, err := r.graph.SealAndFork(
 			ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
 			ttcsnapshot.SnapshotSealedLocal,
@@ -2528,9 +2524,6 @@ func mapsEqual(a, b map[string]string) bool {
 func (r *Repository) createObject(origin uint64, source string) (string, error) {
 	if origin == 0 {
 		return "", errors.New("cannot create a file without a working snapshot")
-	}
-	if err := r.graph.ReloadForWrite(); err != nil {
-		return "", err
 	}
 	id, err := r.graph.ReserveObject(ttcsnapshot.SnapshotID(origin), ttcsnapshot.ObjectKindFile)
 	if err != nil {

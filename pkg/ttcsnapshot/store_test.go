@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -68,6 +69,28 @@ func TestSnapshotIDsNeverReuse(t *testing.T) {
 	}
 	if third != 3 {
 		t.Fatalf("snapshot ID after reopen=%d, want 3", third)
+	}
+}
+
+func TestOpenRejectsUnmarkedLegacyGraphWithoutModification(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "graph.journal")
+	contents := []byte("legacy graph data")
+	if err := os.WriteFile(legacy, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("Open accepted an unmarked legacy graph")
+	}
+	got, err := os.ReadFile(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Fatalf("legacy graph changed from %q to %q", contents, got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, headFileName)); !os.IsNotExist(err) {
+		t.Fatalf("failed open created graph head: %v", err)
 	}
 }
 
@@ -130,6 +153,128 @@ func TestExternallyCoordinatedStoresReload(t *testing.T) {
 	}
 	if _, ok := first.Snapshot(two); !ok {
 		t.Fatalf("first store did not observe snapshot %d after reload", two)
+	}
+}
+
+func TestExternallyCoordinatedCheckpointSwitchesGeneration(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	origin, err := writer.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.CheckpointExternallyCoordinated(); err != nil {
+		t.Fatal(err)
+	}
+	if writer.generation != 2 {
+		t.Fatalf("checkpoint generation=%d, want 2", writer.generation)
+	}
+	if _, err := os.Stat(filepath.Join(dir, graphJournalName(1))); !os.IsNotExist(err) {
+		t.Fatalf("retired generation journal survived: %v", err)
+	}
+	if err := reader.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if reader.generation != 2 {
+		t.Fatalf("reader generation=%d, want 2", reader.generation)
+	}
+	if _, ok := reader.Snapshot(origin); !ok {
+		t.Fatalf("reader lost snapshot %d across generation switch", origin)
+	}
+	if err := reader.ReloadForWrite(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := reader.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != origin+1 {
+		t.Fatalf("snapshot after generation switch=%d, want %d", next, origin+1)
+	}
+	if err := writer.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := writer.Snapshot(next); !ok {
+		t.Fatalf("writer did not observe post-checkpoint snapshot %d", next)
+	}
+}
+
+func TestExternalReaderSurvivesConcurrentAppendAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	const snapshots = 200
+	done := make(chan struct{})
+	errorsCh := make(chan error, 1)
+	var wait sync.WaitGroup
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if err := reader.Reload(); err != nil {
+				select {
+				case errorsCh <- err:
+				default:
+				}
+				return
+			}
+			if err := reader.Verify(); err != nil {
+				select {
+				case errorsCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	for index := 0; index < snapshots; index++ {
+		if err := writer.ReloadForWrite(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.AllocateWorking(); err != nil {
+			t.Fatal(err)
+		}
+		if index%7 == 6 {
+			if err := writer.CheckpointExternallyCoordinated(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	close(done)
+	wait.Wait()
+	select {
+	case err := <-errorsCh:
+		t.Fatal(err)
+	default:
+	}
+	if err := reader.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := reader.Stats().Snapshots; got != snapshots {
+		t.Fatalf("reader snapshots=%d, want %d", got, snapshots)
 	}
 }
 
@@ -212,10 +357,10 @@ func TestCheckpointAndTruncatedTailRecovery(t *testing.T) {
 	if err := store.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
+	journal := store.journal.Name()
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(dir, "graph.journal")
 	file, err := os.OpenFile(journal, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
