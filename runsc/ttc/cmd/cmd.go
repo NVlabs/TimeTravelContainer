@@ -11679,38 +11679,13 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 || capture.SparseManifest != (ttcchunk.ManifestID{}) {
 		return errors.New("new-format dehydration control state is not graph-native")
 	}
-	graphSparse := len(capture.MemoryRoots) != 0
-	sparse := capture.SparseManifest != (ttcchunk.ManifestID{}) || graphSparse
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
 		return fmt.Errorf("opening dehydration metadata: %w", err)
 	}
 	defer metadata.Close()
-	snapshots := make([]*os.File, 0, len(capture.Memories))
-	defer func() {
-		for _, file := range snapshots {
-			_ = file.Close()
-		}
-	}()
-	for i := range capture.Memories {
-		if sparse {
-			break
-		}
-		file, err := os.Open(filepath.Join(imageDir, fmt.Sprintf("memory-%04d.snapshot", i)))
-		if err != nil {
-			return fmt.Errorf("opening dehydration memory image %d: %w", i, err)
-		}
-		if stat, err := file.Stat(); err != nil {
-			file.Close()
-			return err
-		} else if uint64(stat.Size()) != capture.Memories[i].StreamBytes {
-			file.Close()
-			return fmt.Errorf("dehydration memory image %d is %d bytes, want %d", i, stat.Size(), capture.Memories[i].StreamBytes)
-		}
-		snapshots = append(snapshots, file)
-	}
 	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots, needsColdMaterialization)
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, nil, needsColdMaterialization)
 	}
 	var relays *coldFilesystemRelays
 	if needsColdMaterialization {
@@ -11743,7 +11718,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse, GraphSparse: graphSparse, Quarantined: branch.Quarantined,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: true, GraphSparse: true, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -11752,26 +11727,19 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if relays != nil {
 		restoreArgs.FilesystemConnections = len(relays.clients)
 		restoreArgs.FilesystemToken = relays.token
-		if relays.memoryClient != nil {
-			restoreArgs.SparseRemote = true
-			restoreArgs.SparseRemoteToken = relays.memoryToken
-		}
 	}
 	restoreArgs.NetworkArgs, err = dehydrationNetworkArgs(info)
 	if err != nil {
 		return err
 	}
-	var graphRestore *graphMemoryRestore
-	if graphSparse {
-		graphRestore, err = b.openGraphMemoryRestore(capture)
-		if err != nil {
-			return err
-		}
-		defer graphRestore.close()
-		if graphRestore.remote != nil {
-			restoreArgs.GraphRemote = true
-			restoreArgs.GraphRemoteToken = graphRestore.token
-		}
+	graphRestore, err := b.openGraphMemoryRestore(capture)
+	if err != nil {
+		return err
+	}
+	defer graphRestore.close()
+	if graphRestore.remote != nil {
+		restoreArgs.GraphRemote = true
+		restoreArgs.GraphRemoteToken = graphRestore.token
 	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
@@ -11792,37 +11760,15 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
-	if sparse {
-		if graphSparse {
-			manifestFD := 3 + len(files)
-			files = append(files, graphRestore.manifest)
-			objectsFD := 3 + len(files)
-			files = append(files, graphRestore.objects)
-			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
-			if graphRestore.remote != nil {
-				remoteFD := 3 + len(files)
-				files = append(files, graphRestore.remote)
-				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
-			}
-		} else {
-			repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-			repository, err := os.Open(repositoryPath)
-			if err != nil {
-				configReader.Close()
-				return fmt.Errorf("opening sparse dehydration repository: %w", err)
-			}
-			defer repository.Close()
-			files = append(files, repository)
-			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
-			if relays != nil && relays.memoryClient != nil {
-				memoryRemoteFD := 3 + len(files)
-				files = append(files, relays.memoryClient)
-				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
-			}
-		}
-	} else {
-		files = append(files, snapshots...)
-		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
+	manifestFD := 3 + len(files)
+	files = append(files, graphRestore.manifest)
+	objectsFD := 3 + len(files)
+	files = append(files, graphRestore.objects)
+	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+	if graphRestore.remote != nil {
+		remoteFD := 3 + len(files)
+		files = append(files, graphRestore.remote)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
 	}
 	if relays != nil {
 		filesystemStartFD := 3 + len(files)
@@ -12045,19 +11991,18 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if relays != nil {
 		defer relays.close()
 	}
-	graphSparse := len(capture.MemoryRoots) != 0
-	sparse := capture.SparseManifest != (ttcchunk.ManifestID{}) || graphSparse
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
 		for _, file := range targets {
 			_ = file.Close()
 		}
 	}()
+	graphSparse := len(capture.MemoryRoots) != 0
 	firstTarget := 0
-	if sparse {
-		// Sparse peer restores install application chunks into the family's
-		// existing MemoryFile. Only private filesystem MemoryFiles need new
-		// donated backing files.
+	if graphSparse {
+		// Graph restores install application chunks into the family's existing
+		// MemoryFile. Only private filesystem MemoryFiles need new donated backing
+		// files.
 		firstTarget = 1
 	}
 	for i := firstTarget; i < len(capture.Memories); i++ {
@@ -12074,8 +12019,8 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse, GraphSparse: graphSparse,
-		ReusePeerApplicationMemoryFile: sparse, Quarantined: branch.Quarantined,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: graphSparse, GraphSparse: graphSparse,
+		ReusePeerApplicationMemoryFile: graphSparse, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -12084,10 +12029,6 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if relays != nil {
 		restoreArgs.FilesystemConnections = len(relays.clients)
 		restoreArgs.FilesystemToken = relays.token
-		if relays.memoryClient != nil {
-			restoreArgs.SparseRemote = true
-			restoreArgs.SparseRemoteToken = relays.memoryToken
-		}
 	}
 	networkArgs, err := dehydrationNetworkArgs(info)
 	if err != nil {
@@ -12125,42 +12066,22 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
-	targetStartFD := 5 + len(snapshots)
-	if sparse {
-		if graphSparse {
-			manifestFD := 3 + len(files)
-			files = append(files, graphRestore.manifest)
-			objectsFD := 3 + len(files)
-			files = append(files, graphRestore.objects)
-			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
-			if graphRestore.remote != nil {
-				remoteFD := 3 + len(files)
-				files = append(files, graphRestore.remote)
-				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
-			}
-			targetStartFD = 3 + len(files)
-		} else {
-			repositoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-			repository, err := os.Open(repositoryPath)
-			if err != nil {
-				configReader.Close()
-				return err
-			}
-			defer repository.Close()
-			files = append(files, repository)
-			targetStartFD = 6
-			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
-			if relays != nil && relays.memoryClient != nil {
-				memoryRemoteFD := 3 + len(files)
-				files = append(files, relays.memoryClient)
-				commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", memoryRemoteFD))
-				targetStartFD++
-			}
+	if graphSparse {
+		manifestFD := 3 + len(files)
+		files = append(files, graphRestore.manifest)
+		objectsFD := 3 + len(files)
+		files = append(files, graphRestore.objects)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+		if graphRestore.remote != nil {
+			remoteFD := 3 + len(files)
+			files = append(files, graphRestore.remote)
+			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
 		}
 	} else {
 		files = append(files, snapshots...)
 		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
 	}
+	targetStartFD := 3 + len(files)
 	files = append(files, targets...)
 	commandArgs = append(commandArgs,
 		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),

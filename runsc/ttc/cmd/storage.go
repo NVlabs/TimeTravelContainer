@@ -19,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -36,31 +35,10 @@ func (r coldPackObjectReader) ReadObjectRange(object string, destination []byte,
 	return r.directory.ReadAt("objects/"+object, destination, offset)
 }
 
-type coldPackMemoryReader struct{ directory *ttcpack.Directory }
-
-func (r coldPackMemoryReader) ReadMemoryChunk(id ttcchunk.ID) ([]byte, error) {
-	path := filepath.ToSlash(filepath.Join("chunks", id.String()[:4], id.String()+".chunk"))
-	size, err := r.directory.Size(path)
-	if err != nil {
-		return nil, err
-	}
-	data := make([]byte, size)
-	n, err := r.directory.ReadAt(path, data, 0)
-	if err != nil {
-		return nil, err
-	}
-	if n != len(data) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	return data, nil
-}
-
 type coldFilesystemRelays struct {
-	token        ttcvolume.RemoteToken
-	clients      []*os.File
-	done         []<-chan error
-	memoryToken  ttcchunk.RemoteToken
-	memoryClient *os.File
+	token   ttcvolume.RemoteToken
+	clients []*os.File
+	done    []<-chan error
 }
 
 func (b *runtimeBackend) reportColdRelayError(kind string, err error) {
@@ -78,9 +56,6 @@ func (r *coldFilesystemRelays) close() {
 	}
 	for _, file := range r.clients {
 		_ = file.Close()
-	}
-	if r.memoryClient != nil {
-		_ = r.memoryClient.Close()
 	}
 }
 
@@ -240,53 +215,6 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	return ttcstorage.Result{Manifest: path}, nil
-}
-
-func (p *branchPublisher) inheritedMemoryObjectIDs(manifestPath string) (map[ttcchunk.ID]struct{}, error) {
-	result := make(map[ttcchunk.ID]struct{})
-	seen := make(map[string]struct{})
-	for manifestPath != "" {
-		if err := validateColdManifestPath(p.sharedRoot, manifestPath); err != nil {
-			return nil, err
-		}
-		if _, ok := seen[manifestPath]; ok {
-			return nil, errors.New("cold manifest parent cycle")
-		}
-		seen[manifestPath] = struct{}{}
-		manifest, err := readColdBranchManifest(manifestPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, reference := range manifest.Packs {
-			if reference.Source != "memory-chunks" {
-				continue
-			}
-			id, err := ttcpack.ParseID(reference.Pack)
-			if err != nil {
-				return nil, err
-			}
-			file, index, err := ttcpack.OpenIndexed(filepath.Join(p.sharedRoot, "cold"), id)
-			if err != nil {
-				return nil, err
-			}
-			if err := file.Close(); err != nil {
-				return nil, err
-			}
-			for _, entry := range index.Entries {
-				parts := strings.Split(filepath.ToSlash(entry.Path), "/")
-				if len(parts) != 3 || parts[0] != "chunks" || !strings.HasSuffix(parts[2], ".chunk") {
-					continue
-				}
-				object, err := ttcchunk.ParseID(strings.TrimSuffix(parts[2], ".chunk"))
-				if err != nil {
-					return nil, fmt.Errorf("cold memory pack %s contains invalid chunk %q: %w", id, entry.Path, err)
-				}
-				result[object] = struct{}{}
-			}
-		}
-		manifestPath = manifest.Parent
-	}
-	return result, nil
 }
 
 func (p *branchPublisher) inheritedObjectIDs(manifestPath, source string) (map[string]struct{}, error) {
@@ -528,7 +456,8 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 // dehydration image independently of the user-visible local image. Regular
 // files are hard-linked within TTC_LOCAL_ROOT and copied only if the backing
 // filesystem rejects links. The sparse memory payload is rooted separately in
-// ttcchunk, so this tree normally contains only metadata and control JSON.
+// the graph object store, so this tree normally contains only metadata and
+// control JSON.
 func snapshotImmutableTree(source, destination string) error {
 	if err := os.RemoveAll(destination); err != nil {
 		return err
@@ -1179,7 +1108,7 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 	}
 	if manifest.MemorySnapshot != 0 {
 		// Graph-native memory is resolved independently through the snapshot
-		// origin resolver. Only legacy dehydration images need a ttcchunk relay.
+		// origin resolver.
 		return relays, nil
 	}
 	return fail(errors.New("new-format cold manifest omits graph-native memory snapshot"))
