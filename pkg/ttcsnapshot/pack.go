@@ -1,0 +1,448 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ttcsnapshot
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+)
+
+const (
+	sharedPackVersion   = 1
+	sharedPackAlignment = int64(4096)
+	sharedPackExtent    = int64(1 << 20)
+	sharedPackMagic     = "TTCSGPK1"
+	sharedManifestName  = "manifest.json"
+)
+
+// PackExtent is one independently range-readable portion of an immutable
+// object. Extents are at most 1 MiB and begin at a 4 KiB-aligned pack offset.
+type PackExtent struct {
+	Pack   uint32 `json:"pack"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
+}
+
+// PackedObject binds graph metadata to its bulk extents. Metadata-only graph
+// objects have no extents.
+type PackedObject struct {
+	Object  Object       `json:"object"`
+	Extents []PackExtent `json:"extents,omitempty"`
+}
+
+// PackInfo describes one immutable physical pack.
+type PackInfo struct {
+	Number uint32 `json:"number"`
+	Size   int64  `json:"size"`
+}
+
+// SnapshotManifest is the sole authority pointer for a published snapshot.
+// Pack files without this manifest are uncommitted staging residue.
+type SnapshotManifest struct {
+	Version  int            `json:"version"`
+	Snapshot SnapshotID     `json:"snapshot"`
+	Packs    []PackInfo     `json:"packs"`
+	Objects  []PackedObject `json:"objects"`
+}
+
+// SharedPackStore stores immutable snapshot-origin packs. It intentionally
+// uses no content checksums: durability and authority come from sync followed
+// by manifest-last publication, not from treating corruption as a protocol.
+type SharedPackStore struct {
+	root string
+
+	mu        sync.Mutex
+	manifests map[SnapshotID]*SnapshotManifest
+}
+
+// OpenSharedPackStore opens a shared pack repository.
+func OpenSharedPackStore(root string) (*SharedPackStore, error) {
+	if !filepath.IsAbs(root) {
+		return nil, errors.New("TTC shared pack directory must be absolute")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "snapshots"), 0700); err != nil {
+		return nil, err
+	}
+	return &SharedPackStore{root: root, manifests: make(map[SnapshotID]*SnapshotManifest)}, nil
+}
+
+func (store *SharedPackStore) snapshotDirectory(id SnapshotID) string {
+	return filepath.Join(store.root, "snapshots", snapshotKey(id))
+}
+
+func packName(number uint32) string { return fmt.Sprintf("pack-%08x.data", number) }
+
+func alignPack(value int64) int64 {
+	return (value + sharedPackAlignment - 1) &^ (sharedPackAlignment - 1)
+}
+
+func writePackHeader(file *os.File, snapshot SnapshotID, number uint32) error {
+	header := make([]byte, sharedPackAlignment)
+	copy(header, sharedPackMagic)
+	binary.LittleEndian.PutUint32(header[8:12], sharedPackVersion)
+	binary.LittleEndian.PutUint64(header[16:24], uint64(snapshot))
+	binary.LittleEndian.PutUint32(header[24:28], number)
+	_, err := file.Write(header)
+	return err
+}
+
+func validatePackHeader(file *os.File, snapshot SnapshotID, number uint32, expectedSize int64) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != expectedSize || info.Size() < sharedPackAlignment || info.Size()%sharedPackAlignment != 0 {
+		return fmt.Errorf("shared pack %d has size %d, want %d", number, info.Size(), expectedSize)
+	}
+	header := make([]byte, sharedPackAlignment)
+	if _, err := file.ReadAt(header, 0); err != nil {
+		return err
+	}
+	if !bytes.Equal(header[:8], []byte(sharedPackMagic)) ||
+		binary.LittleEndian.Uint32(header[8:12]) != sharedPackVersion ||
+		SnapshotID(binary.LittleEndian.Uint64(header[16:24])) != snapshot ||
+		binary.LittleEndian.Uint32(header[24:28]) != number {
+		return fmt.Errorf("shared pack %d has an invalid header", number)
+	}
+	return nil
+}
+
+func writePadding(file *os.File) error {
+	offset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	padding := alignPack(offset) - offset
+	if padding == 0 {
+		return nil
+	}
+	_, err = file.Write(make([]byte, padding))
+	return err
+}
+
+// Publish writes every object allocated by snapshot into a range-readable
+// pack and commits the manifest last. Retrying an already committed snapshot
+// is idempotent and never replaces its authority.
+func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource) error {
+	if graph == nil || source == nil || snapshot == 0 {
+		return errors.New("invalid shared snapshot publication")
+	}
+	objects, err := graph.SnapshotObjects(snapshot)
+	if err != nil {
+		return err
+	}
+	if existing, err := store.Manifest(snapshot); err == nil {
+		return validatePublishedObjects(existing, objects)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	directory := store.snapshotDirectory(snapshot)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".pack-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	const packNumber = uint32(0)
+	if err := writePackHeader(temporary, snapshot, packNumber); err != nil {
+		temporary.Close()
+		return err
+	}
+	manifest := SnapshotManifest{Version: sharedPackVersion, Snapshot: snapshot}
+	buffer := make([]byte, sharedPackExtent)
+	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			temporary.Close()
+			return err
+		}
+		packed := PackedObject{Object: object}
+		if object.BulkLength != 0 {
+			reader, length, err := source.Fetch(ctx, object.ID)
+			if err != nil {
+				temporary.Close()
+				return fmt.Errorf("fetching %s for publication: %w", object.ID.key(), err)
+			}
+			if length != object.BulkLength {
+				reader.Close()
+				temporary.Close()
+				return fmt.Errorf("object %s source length is %d, want %d", object.ID.key(), length, object.BulkLength)
+			}
+			remaining := int64(length)
+			for remaining != 0 {
+				amount := min(remaining, sharedPackExtent)
+				offset, _ := temporary.Seek(0, io.SeekCurrent)
+				n, copyErr := io.ReadFull(reader, buffer[:amount])
+				if copyErr != nil {
+					reader.Close()
+					temporary.Close()
+					return fmt.Errorf("reading object %s: %w", object.ID.key(), copyErr)
+				}
+				if _, err := temporary.Write(buffer[:n]); err != nil {
+					reader.Close()
+					temporary.Close()
+					return err
+				}
+				packed.Extents = append(packed.Extents, PackExtent{Pack: packNumber, Offset: offset, Length: int64(n)})
+				remaining -= int64(n)
+				if err := writePadding(temporary); err != nil {
+					reader.Close()
+					temporary.Close()
+					return err
+				}
+			}
+			if extra := make([]byte, 1); true {
+				n, readErr := reader.Read(extra)
+				if n != 0 || (readErr != nil && !errors.Is(readErr, io.EOF)) {
+					reader.Close()
+					temporary.Close()
+					return fmt.Errorf("object %s source exceeds declared length", object.ID.key())
+				}
+			}
+			if err := reader.Close(); err != nil {
+				temporary.Close()
+				return err
+			}
+		}
+		manifest.Objects = append(manifest.Objects, packed)
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	info, err := temporary.Stat()
+	if err != nil {
+		temporary.Close()
+		return err
+	}
+	manifest.Packs = []PackInfo{{Number: packNumber, Size: info.Size()}}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	destination := filepath.Join(directory, packName(packNumber))
+	if err := os.Rename(temporaryPath, destination); err != nil {
+		return err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return err
+	}
+	if err := writeAtomicJSON(filepath.Join(directory, sharedManifestName), manifest); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	store.manifests[snapshot] = cloneManifest(&manifest)
+	store.mu.Unlock()
+	return nil
+}
+
+func validatePublishedObjects(manifest *SnapshotManifest, objects []Object) error {
+	if len(manifest.Objects) != len(objects) {
+		return errors.New("committed snapshot manifest disagrees with graph object count")
+	}
+	for index := range objects {
+		if manifest.Objects[index].Object.ID != objects[index].ID ||
+			manifest.Objects[index].Object.BulkLength != objects[index].BulkLength {
+			return fmt.Errorf("committed snapshot manifest disagrees at object %d", index)
+		}
+	}
+	return nil
+}
+
+func writeAtomicJSON(path string, value any) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".manifest-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	encoder := json.NewEncoder(temporary)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Link(temporaryPath, path); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	return syncDirectory(directory)
+}
+
+func cloneManifest(manifest *SnapshotManifest) *SnapshotManifest {
+	if manifest == nil {
+		return nil
+	}
+	copy := *manifest
+	copy.Packs = append([]PackInfo(nil), manifest.Packs...)
+	copy.Objects = make([]PackedObject, len(manifest.Objects))
+	for index, object := range manifest.Objects {
+		copy.Objects[index] = PackedObject{Object: cloneObject(object.Object), Extents: append([]PackExtent(nil), object.Extents...)}
+	}
+	return &copy
+}
+
+// Manifest opens and structurally validates an authoritative manifest and its
+// pack headers without reading bulk data.
+func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, error) {
+	store.mu.Lock()
+	if manifest := store.manifests[snapshot]; manifest != nil {
+		result := cloneManifest(manifest)
+		store.mu.Unlock()
+		return result, nil
+	}
+	store.mu.Unlock()
+	data, err := os.ReadFile(filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName))
+	if err != nil {
+		return nil, err
+	}
+	var manifest SnapshotManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("decoding shared snapshot manifest: %w", err)
+	}
+	if err := store.validateManifest(&manifest); err != nil {
+		return nil, err
+	}
+	store.mu.Lock()
+	store.manifests[snapshot] = cloneManifest(&manifest)
+	store.mu.Unlock()
+	return cloneManifest(&manifest), nil
+}
+
+func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error {
+	if manifest.Version != sharedPackVersion || manifest.Snapshot == 0 {
+		return errors.New("invalid shared snapshot manifest header")
+	}
+	packs := make(map[uint32]PackInfo, len(manifest.Packs))
+	for _, pack := range manifest.Packs {
+		if pack.Size < sharedPackAlignment || pack.Size%sharedPackAlignment != 0 {
+			return fmt.Errorf("shared pack %d has invalid declared size", pack.Number)
+		}
+		if _, exists := packs[pack.Number]; exists {
+			return fmt.Errorf("shared manifest repeats pack %d", pack.Number)
+		}
+		packs[pack.Number] = pack
+		file, err := os.Open(filepath.Join(store.snapshotDirectory(manifest.Snapshot), packName(pack.Number)))
+		if err != nil {
+			return err
+		}
+		err = validatePackHeader(file, manifest.Snapshot, pack.Number, pack.Size)
+		file.Close()
+		if err != nil {
+			return err
+		}
+	}
+	seen := make(map[string]struct{}, len(manifest.Objects))
+	for _, packed := range manifest.Objects {
+		if err := validateObject(packed.Object); err != nil {
+			return err
+		}
+		if packed.Object.ID.Snapshot != manifest.Snapshot {
+			return fmt.Errorf("object %s is in the wrong snapshot manifest", packed.Object.ID.key())
+		}
+		if _, exists := seen[packed.Object.ID.key()]; exists {
+			return fmt.Errorf("shared manifest repeats object %s", packed.Object.ID.key())
+		}
+		seen[packed.Object.ID.key()] = struct{}{}
+		var length uint64
+		for _, extent := range packed.Extents {
+			pack, ok := packs[extent.Pack]
+			if !ok || extent.Offset < sharedPackAlignment || extent.Offset%sharedPackAlignment != 0 ||
+				extent.Length <= 0 || extent.Length > sharedPackExtent || extent.Offset > pack.Size-extent.Length {
+				return fmt.Errorf("object %s has an invalid pack extent", packed.Object.ID.key())
+			}
+			length += uint64(extent.Length)
+		}
+		if length != packed.Object.BulkLength {
+			return fmt.Errorf("object %s extents total %d, want %d", packed.Object.ID.key(), length, packed.Object.BulkLength)
+		}
+	}
+	sort.Slice(manifest.Objects, func(i, j int) bool {
+		return manifest.Objects[i].Object.ID.key() < manifest.Objects[j].Object.ID.key()
+	})
+	return nil
+}
+
+type extentReadCloser struct {
+	reader io.Reader
+	files  []*os.File
+}
+
+func (reader *extentReadCloser) Read(destination []byte) (int, error) {
+	return reader.reader.Read(destination)
+}
+
+func (reader *extentReadCloser) Close() error {
+	var result error
+	for _, file := range reader.files {
+		result = errors.Join(result, file.Close())
+	}
+	reader.files = nil
+	return result
+}
+
+// Fetch opens a complete immutable object by stable ID. Only the manifest and
+// requested extents are read; unrelated objects remain untouched.
+func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCloser, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	manifest, err := store.Manifest(id.Snapshot)
+	if err != nil {
+		return nil, 0, err
+	}
+	index := sort.Search(len(manifest.Objects), func(index int) bool {
+		return manifest.Objects[index].Object.ID.key() >= id.key()
+	})
+	if index == len(manifest.Objects) || manifest.Objects[index].Object.ID != id {
+		return nil, 0, os.ErrNotExist
+	}
+	packed := manifest.Objects[index]
+	readers := make([]io.Reader, 0, len(packed.Extents))
+	files := make([]*os.File, 0, len(packed.Extents))
+	for _, extent := range packed.Extents {
+		file, err := os.Open(filepath.Join(store.snapshotDirectory(id.Snapshot), packName(extent.Pack)))
+		if err != nil {
+			for _, opened := range files {
+				opened.Close()
+			}
+			return nil, 0, err
+		}
+		files = append(files, file)
+		readers = append(readers, io.NewSectionReader(file, extent.Offset, extent.Length))
+	}
+	return &extentReadCloser{reader: io.MultiReader(readers...), files: files}, packed.Object.BulkLength, nil
+}

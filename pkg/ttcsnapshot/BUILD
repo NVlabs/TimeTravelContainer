@@ -12,6 +12,7 @@ go_library(
         "data.go",
         "filesystem.go",
         "memory.go",
+		"pack.go",
         "resolver.go",
         "store.go",
         "types.go",
@@ -24,6 +25,7 @@ go_test(
     name = "ttcsnapshot_test",
     size = "small",
     srcs = [
+		"pack_test.go",
         "resolver_test.go",
         "store_test.go",
     ],

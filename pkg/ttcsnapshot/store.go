@@ -678,6 +678,26 @@ func (s *Store) Object(id ObjectID) (Object, bool) {
 	return cloneObject(object), ok
 }
 
+// SnapshotObjects returns a stable copy of every graph object whose immutable
+// identity was allocated by snapshot. It does not walk roots or ancestry.
+func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.state.Snapshots[snapshotKey(snapshot)]; !ok {
+		return nil, os.ErrNotExist
+	}
+	objects := make([]Object, 0)
+	for _, object := range s.state.Objects {
+		if object.ID.Snapshot == snapshot {
+			objects = append(objects, cloneObject(object))
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].ID.key() < objects[j].ID.key()
+	})
+	return objects, nil
+}
+
 // Root returns a named root.
 func (s *Store) Root(name string) (ObjectID, bool) {
 	s.mu.RLock()

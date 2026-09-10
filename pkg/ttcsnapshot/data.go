@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -187,6 +188,30 @@ func (store *LocalDataStore) Open(id ObjectID, length int64) (*os.File, error) {
 		return nil, fmt.Errorf("TTC bulk object %s has length %d, want %d", id.key(), info.Size(), length)
 	}
 	return file, nil
+}
+
+// Fetch implements ObjectSource for authoritative standalone objects and
+// node-local caches. The graph-independent source API intentionally carries
+// the length with the reader so callers can reject incomplete providers.
+func (store *LocalDataStore) Fetch(_ context.Context, id ObjectID) (io.ReadCloser, uint64, error) {
+	path, err := store.objectPath(id)
+	if err != nil {
+		return nil, 0, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, 0, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, 0, fmt.Errorf("TTC bulk object %s is not a regular file", id.key())
+	}
+	return file, uint64(info.Size()), nil
 }
 
 // Remove deletes an object whose authoritative graph record was reclaimed.
