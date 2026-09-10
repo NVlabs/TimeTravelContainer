@@ -8374,6 +8374,25 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := b.releaseDistributedSparseRoot(info); err != nil {
 		return fmt.Errorf("releasing distributed sparse memory: %w", err)
 	}
+	graphRoots := make([]string, 0)
+	seenGraphRoots := make(map[string]struct{})
+	for _, branch := range info.Branches {
+		for _, root := range branch.MemoryRoots {
+			if _, exists := seenGraphRoots[root]; exists {
+				continue
+			}
+			seenGraphRoots[root] = struct{}{}
+			graphRoots = append(graphRoots, root)
+		}
+	}
+	if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
+		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
+	}
+	for _, branch := range info.Branches {
+		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, branch)); err != nil {
+			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
+		}
+	}
 	if b.publicationQueue != nil {
 		for _, branch := range info.Branches {
 			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {

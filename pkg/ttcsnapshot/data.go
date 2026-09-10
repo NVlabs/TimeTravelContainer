@@ -601,6 +601,9 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				return removed, quarantined, err
 			}
 		}
+		if err := os.Remove(base); err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, unix.ENOTEMPTY) {
+			return removed, quarantined, err
+		}
 	}
 	return removed, quarantined, nil
 }

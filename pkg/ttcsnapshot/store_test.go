@@ -1374,6 +1374,9 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "objects", "files", snapshotKey(origin))); !os.IsNotExist(err) {
 		t.Fatalf("empty snapshot data directory survived reclaim: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "objects", "files")); !os.IsNotExist(err) {
+		t.Fatalf("empty object-kind directory survived reclaim: %v", err)
+	}
 }
 
 func TestLocalDataStoreInstallCrashBoundaries(t *testing.T) {

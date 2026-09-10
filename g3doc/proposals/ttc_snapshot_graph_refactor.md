@@ -125,6 +125,11 @@ not permit an unfenced lease takeover. All test daemons and roots were removed.
 The shared-pack reader/retirement race test also passed directly on the local
 NFSv4.2 mount (including a live 1 MiB extent reader, namespace retirement,
 crash-residue replay, and an explicit scan finding no `.nfs*` tombstone).
+A fresh standalone end-to-end run subsequently exercised dehydrate, rehydrate,
+local fork, branch reads, whole-family removal, and daemon shutdown. It exposed
+and fixed a family-removal omission that left every branch's graph roots live;
+the repeated run reclaimed all payload objects and empty origin/shard/kind
+directories.
 
 ## Goals
 
