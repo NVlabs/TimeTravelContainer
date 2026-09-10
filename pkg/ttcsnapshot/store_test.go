@@ -557,6 +557,34 @@ func TestMemoryChunkCreatesOneSharedRadixPath(t *testing.T) {
 	}
 }
 
+func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk, ObjectKindPage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitReservedObjects([]ReservedObject{
+		{ID: ids[0], Pin: "build/chunk", BulkLength: MemoryChunkBytes},
+		{ID: ids[1], Pin: "build/page", Data: encodeMemoryPageOffset(0), Children: []Edge{{Slot: 0, Child: ids[0]}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	chunk, _ := store.Object(ids[0])
+	if chunk.Refs != 2 {
+		t.Fatalf("chunk refs=%d, want construction pin plus page edge", chunk.Refs)
+	}
+	if err := store.DeletePins([]string{"build/chunk", "build/page"}); err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := store.Collect(16); err != nil || collected != 2 {
+		t.Fatalf("Collect()=(%d,%v), want (2,nil)", collected, err)
+	}
+}
+
 func TestPersistentBTreeSplitsAndHardlinks(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()

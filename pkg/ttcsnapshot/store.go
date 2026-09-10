@@ -1076,9 +1076,14 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := cloneGraphState(s.state)
-	touchedChildren := make(map[string]Object)
-	ops := make([]journalOp, 0, len(reserved)*2)
+	touched := make(map[string]Object, len(reserved)*2)
+	getObject := func(id ObjectID) (Object, bool) {
+		if object, ok := touched[id.key()]; ok {
+			return object, true
+		}
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	}
 	seenIDs := make(map[string]struct{}, len(reserved))
 	seenPins := make(map[string]struct{}, len(reserved))
 	for _, item := range reserved {
@@ -1088,7 +1093,7 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 		if err := validateRootName(item.Pin); err != nil {
 			return fmt.Errorf("invalid construction pin: %w", err)
 		}
-		snapshot, ok := next.Snapshots[snapshotKey(item.ID.Snapshot)]
+		snapshot, ok := s.state.Snapshots[snapshotKey(item.ID.Snapshot)]
 		if !ok || snapshot.State != SnapshotWorking || item.ID.Ordinal >= snapshot.NextOrdinal {
 			return fmt.Errorf("object ID %s is not reserved in a working snapshot", item.ID.key())
 		}
@@ -1096,43 +1101,43 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 			return fmt.Errorf("object batch repeats %s", item.ID.key())
 		}
 		seenIDs[item.ID.key()] = struct{}{}
-		if _, exists := next.Objects[item.ID.key()]; exists {
+		if _, exists := getObject(item.ID); exists {
 			return fmt.Errorf("object %s already exists", item.ID.key())
 		}
 		if _, duplicate := seenPins[item.Pin]; duplicate {
 			return fmt.Errorf("object batch repeats construction pin %q", item.Pin)
 		}
 		seenPins[item.Pin] = struct{}{}
-		if _, exists := next.Pins[item.Pin]; exists {
+		if _, exists := s.state.Pins[item.Pin]; exists {
 			return fmt.Errorf("construction pin %q already exists", item.Pin)
 		}
 		object := Object{ID: item.ID, State: ObjectLive, Refs: 1, BulkLength: item.BulkLength, Data: append([]byte(nil), item.Data...), Children: append([]Edge(nil), item.Children...)}
 		if err := validateObject(object); err != nil {
 			return err
 		}
-		next.Objects[item.ID.key()] = object
-		next.Pins[item.Pin] = item.ID
+		touched[item.ID.key()] = object
 		for _, edge := range object.Children {
-			child, ok := next.Objects[edge.Child.key()]
+			child, ok := getObject(edge.Child)
 			if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
 				return fmt.Errorf("child object %s cannot be retained", edge.Child.key())
 			}
 			child.Refs++
-			next.Objects[edge.Child.key()] = child
-			touchedChildren[edge.Child.key()] = child
+			touched[edge.Child.key()] = child
 		}
-		objectCopy := object
-		idCopy := item.ID
-		ops = append(ops, journalOp{PutObject: &objectCopy}, journalOp{PinName: item.Pin, PutPin: &idCopy})
 	}
-	keys := make([]string, 0, len(touchedChildren))
-	for key := range touchedChildren {
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	ops := make([]journalOp, 0, len(keys)+len(reserved))
 	for _, key := range keys {
-		child := touchedChildren[key]
-		ops = append(ops, journalOp{PutObject: &child})
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
+	}
+	for _, item := range reserved {
+		id := item.ID
+		ops = append(ops, journalOp{PinName: item.Pin, PutPin: &id})
 	}
 	return s.commitLocked(ops)
 }
@@ -1276,7 +1281,6 @@ func (s *Store) DeletePins(names []string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := cloneGraphState(s.state)
 	touched := make(map[string]Object)
 	ops := make([]journalOp, 0, len(names)*2)
 	seen := make(map[string]struct{}, len(names))
@@ -1285,11 +1289,14 @@ func (s *Store) DeletePins(names []string) error {
 			return fmt.Errorf("pin batch repeats %q", name)
 		}
 		seen[name] = struct{}{}
-		id, ok := next.Pins[name]
+		id, ok := s.state.Pins[name]
 		if !ok {
 			return os.ErrNotExist
 		}
-		object, ok := next.Objects[id.key()]
+		object, ok := touched[id.key()]
+		if !ok {
+			object, ok = s.state.Objects[id.key()]
+		}
 		if !ok {
 			return fmt.Errorf("object %s does not exist", id.key())
 		}
@@ -1297,8 +1304,6 @@ func (s *Store) DeletePins(names []string) error {
 		if err != nil {
 			return err
 		}
-		next.Objects[id.key()] = object
-		delete(next.Pins, name)
 		touched[id.key()] = object
 		ops = append(ops, journalOp{PinName: name, DeletePin: true})
 	}
