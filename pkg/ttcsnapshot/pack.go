@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -558,4 +559,36 @@ func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error)
 	delete(store.manifests, snapshot)
 	store.mu.Unlock()
 	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
+}
+
+// CompleteRetirement idempotently finishes physical deletion after Raft has
+// permanently retired snapshot. It also removes directories left after a
+// crash between the namespace rename and RemoveAll.
+func (store *SharedPackStore) CompleteRetirement(snapshot SnapshotID) (busy bool, err error) {
+	if snapshot == 0 {
+		return false, errors.New("cannot complete retirement of snapshot zero")
+	}
+	parent := filepath.Join(store.root, "snapshots")
+	prefix := ".retired-" + snapshotKey(snapshot) + "-"
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(parent, entry.Name())); err != nil {
+			return false, err
+		}
+	}
+	if _, err := os.Stat(store.snapshotDirectory(snapshot)); errors.Is(err, fs.ErrNotExist) {
+		store.mu.Lock()
+		delete(store.manifests, snapshot)
+		store.mu.Unlock()
+		return false, syncDirectory(parent)
+	} else if err != nil {
+		return false, err
+	}
+	return store.Retire(snapshot)
 }

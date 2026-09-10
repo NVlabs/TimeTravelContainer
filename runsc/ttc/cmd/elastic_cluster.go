@@ -39,6 +39,7 @@ import (
 	"time"
 
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -2988,8 +2989,8 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 // reference accounting and pack mutation. Actual collection additionally
 // validates the lease generation at every retirement boundary; merely holding
 // this lease never makes a pack reclaimable.
-func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, nodeID, incarnation string, stderr io.Writer, done <-chan struct{}) {
-	if authority == nil || nodeID == "" || incarnation == "" {
+func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, nodeID, incarnation string, stderr io.Writer, done <-chan struct{}) {
+	if authority == nil || packs == nil || nodeID == "" || incarnation == "" {
 		return
 	}
 	const duration = 15 * time.Second
@@ -3023,6 +3024,23 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, nodeID, incarna
 			default:
 				if acquired, err := authority.AcquireSharedGCLease(nodeID, incarnation, duration); err == nil {
 					held = acquired
+				}
+			}
+		}
+		if held.Generation != 0 && time.Now().Before(held.ExpiresAt) {
+			retirements, err := authority.RetiredSharedSnapshots()
+			if err == nil {
+				for _, retirement := range retirements {
+					if !time.Now().Before(held.ExpiresAt) {
+						break
+					}
+					busy, err := packs.CompleteRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
+					if err != nil && stderr != nil {
+						fmt.Fprintf(stderr, "ttcd: warning: completing retirement of shared snapshot %d: %v\n", retirement.SnapshotID, err)
+					}
+					if busy {
+						continue
+					}
 				}
 			}
 		}

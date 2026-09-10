@@ -205,6 +205,19 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	if _, err := shared.Manifest(origin); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retired manifest error=%v, want not-exist", err)
 	}
+	crashResidue := filepath.Join(sharedRoot, "snapshots", ".retired-"+snapshotKey(origin)+"-crash")
+	if err := os.MkdirAll(crashResidue, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crashResidue, "pack.data"), []byte("residue"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.CompleteRetirement(origin); err != nil || busy {
+		t.Fatalf("CompleteRetirement = (busy=%t, err=%v)", busy, err)
+	}
+	if _, err := os.Stat(crashResidue); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retirement residue stat error=%v, want not-exist", err)
+	}
 	err = filepath.WalkDir(filepath.Join(sharedRoot, "snapshots"), func(path string, entry os.DirEntry, err error) error {
 		if err == nil && len(entry.Name()) > 4 && entry.Name()[:4] == ".nfs" {
 			t.Errorf("unexpected NFS tombstone %q", path)

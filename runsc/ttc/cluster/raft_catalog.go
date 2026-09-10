@@ -293,6 +293,21 @@ func (c *RaftCatalog) SharedGCLease() (SharedGCLease, error) {
 	return state.SharedGC, nil
 }
 
+// RetiredSharedSnapshots returns permanently fenced origins in stable order.
+// Coordinators use this to resume physical deletion after a crash.
+func (c *RaftCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, error) {
+	state, err := c.state()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SharedPackRetirement, 0, len(state.RetiredOrigins))
+	for _, retirement := range state.RetiredOrigins {
+		result = append(result, retirement)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].SnapshotID < result[j].SnapshotID })
+	return result, nil
+}
+
 func publicationOperationID(generation uint64) string {
 	return "publication-" + time.Unix(int64(generation), 0).UTC().Format("20060102T150405")
 }

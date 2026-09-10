@@ -3534,7 +3534,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			sharedGCStopped = gcStopped
 			go func() {
 				defer close(gcStopped)
-				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
+				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
 			}()
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})
