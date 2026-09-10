@@ -37,7 +37,7 @@ waive that phase's remaining migration or qualification work.
 | 1: version/API/config cleanup | in progress | Standalone format 2 and clustered format 5 are enforced; writable repositories moved behind repository format 3 in `90b336ae9`; reflink is optional with automatic whole-file fallback. | Finish schema audit and prove every removed legacy option/API is absent from client, daemon, SDKs, and MCP. |
 | 2: common graph | in progress | Persistent IDs/journal/reference engine (`8f5b5c821`), immutable filesystem roots (`0429be25f`), standalone data store (`9bfae5618`), daemon graph (`a4b47356b`), O(1) batch fork (`3f9acf50c`), origin resolver (`448af1144`), graph packs (`5cf9a74de`), generation-selected WAL compaction (`0e414a808`), and graph-native 1 MiB memory records (`061371505`) are present. Memory radix mutations use bounded touched-object overlays instead of cloning the full graph. | Complete the crash matrix and exact residue tests. |
 | 3: standalone filesystem/images | in progress | Directory import (`2e3ec8092`), managed/rootfs repository graph conversion (`8da8fc220`), ancestry-independent direct lookup with authoritative diff roots (`edf392cb9`), and Sentry-safe descriptor-relative graph/object mutation (`2146eaff3`) have landed. | Remove remaining legacy filesystem data paths and qualify OCI commit/save/load, mounts, FUSE, NFS deletion, and whole-file CoW. |
-| 4: standalone memory/lifecycle | in progress | Dehydration writes cold state into 1 MiB graph objects with independent 4 KiB page identities and versions (`061371505`); direct graph reads (`a72e461e4`) and standalone graph-root rehydration (`1c570928f`) are active; live and dehydrated forks clone only radix-root references. Standalone control roots and persistent cold data are graph-only, including peer rehydration and dehydrated fork, and standalone no longer runs the clustered publication/cache layer (`0790edf2c`). | Replace the remaining transient compatibility export inside dehydration, then qualify every lifecycle transition and residue gate. |
+| 4: standalone memory/lifecycle | in progress | Dehydration writes cold state into 1 MiB graph objects with independent 4 KiB page identities and versions (`061371505`); direct graph reads (`a72e461e4`) and standalone graph-root rehydration (`1c570928f`) are active; live and dehydrated forks clone only radix-root references. Standalone control roots and persistent cold data are graph-only, including peer rehydration and dehydrated fork, and standalone no longer runs the clustered publication/cache layer (`0790edf2c`). Direct daemon/Sentry graph capture (`8d464de75`) removes the transient compatibility repository. | Qualify every lifecycle transition, crash boundary, and residue gate. |
 | 5: distributed provider protocol | in progress | Raft snapshot allocation (`8ed3d29fa`), provider fencing (`3409e38d2`), transport (`819c907b0`), publication fencing (`ca619de37`), and resolver initialization (`de71aeefa`) are foundations. | Make every remote fork/migration/rehydration data path graph-native and pass interruption/retry tests. |
 | 6: shared images/cache | not started | None. | Random-access image packs, background/on-demand whole-file materialization, cache eviction, and cold-start gates. |
 | 7: peer data/publication | not started | Immutable object transport is available as a primitive. | Peer filesystem/memory range service, asynchronous publication, dependency accounting, and repeated migration gates. |
@@ -47,14 +47,13 @@ waive that phase's remaining migration or qualification work.
 
 ### Current milestone
 
-Graph roots are now the sole persistent standalone dehydration source, and
-descriptor-donated Sentries can mutate graph metadata and whole-file objects
-without reopening host paths. Standalone TTC creates no cold packs,
-publication queue, `application.mem`, or persistent compatibility chunk
-repository. The active milestone replaces the remaining transient
-compatibility export/import during dehydration with a direct graph capture
-stream. Resident memory remains anonymous and 4 KiB CoW; only cold snapshot
-data is written to the graph store.
+Graph roots are now the sole standalone dehydration source, and the Sentry
+streams a bounded capture directly to the daemon that owns the graph. No
+compatibility chunk repository is created. Standalone TTC also creates no cold
+packs, publication queue, or `application.mem`; resident memory remains
+anonymous and 4 KiB CoW, while cold data uses exact 1 MiB graph objects. The
+active milestone bounds graph metadata growth and verifies exact reclamation
+across repeated fork, dehydration, rehydration, and removal cycles.
 
 ## Goals
 
