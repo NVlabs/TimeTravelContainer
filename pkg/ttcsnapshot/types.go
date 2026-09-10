@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	formatVersion      = 2
+	formatVersion      = 3
 	maxObjectDataBytes = 4 << 20
 	maxObjectEdges     = 256
 )

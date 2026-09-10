@@ -279,3 +279,73 @@ func TestSnapshotLedgerCapturesForeignParentEdges(t *testing.T) {
 		t.Fatalf("imported child references=%d, want pin+foreign parent=2", got)
 	}
 }
+
+func TestSnapshotLedgerFinalBarrierIsDurableAndOriginScoped(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "graph")
+	graph, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := graph.CreateObject(first, "build/child", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/first", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(first, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, references, err := graph.FreezeSnapshotLedger(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || references["root/branch/first"] != child || !graph.SnapshotLedgerFrozen(first) {
+		t.Fatalf("frozen baseline objects=%+v references=%+v", objects, references)
+	}
+	if err := graph.DeleteRoot("branch/first"); err == nil {
+		t.Fatal("deleted a root through a frozen handoff barrier")
+	}
+	second, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(second, "build/foreign-parent", ObjectKindInode, nil, []Edge{{Slot: 1, Child: child}}); err == nil {
+		t.Fatal("created an incoming edge through a frozen handoff barrier")
+	}
+	independent, err := graph.CreateObject(second, "build/independent", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatalf("unrelated origin mutation was blocked: %v", err)
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if !reopened.SnapshotLedgerFrozen(first) {
+		t.Fatal("final barrier was lost across reopen")
+	}
+	if err := reopened.MarkShared(first); err != nil {
+		t.Fatalf("authority state transition was blocked by reference barrier: %v", err)
+	}
+	if err := reopened.UnfreezeSnapshotLedger(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteRoot("branch/first"); err != nil {
+		t.Fatalf("reference mutation remained blocked after cancellation: %v", err)
+	}
+	if _, ok := reopened.Object(independent); !ok {
+		t.Fatal("unrelated origin object disappeared")
+	}
+}

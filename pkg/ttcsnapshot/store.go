@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	journalHeader        = "TTCSGJ2\n"
+	journalHeader        = "TTCSGJ3\n"
 	maxJournalRecordSize = 8 << 20
 	headFileName         = "graph.head"
 )
@@ -52,6 +52,7 @@ type graphState struct {
 	Objects      map[string]Object
 	Roots        map[string]ObjectID
 	Pins         map[string]ObjectID
+	Frozen       map[string]bool
 }
 
 func newGraphState() graphState {
@@ -62,21 +63,24 @@ func newGraphState() graphState {
 		Objects:      make(map[string]Object),
 		Roots:        make(map[string]ObjectID),
 		Pins:         make(map[string]ObjectID),
+		Frozen:       make(map[string]bool),
 	}
 }
 
 type journalOp struct {
-	PutSnapshot     *Snapshot
-	DeleteSnapshot  SnapshotID
-	PutObject       *Object
-	DeleteObject    string
-	RootName        string
-	PutRoot         *ObjectID
-	DeleteRoot      bool
-	PinName         string
-	PutPin          *ObjectID
-	DeletePin       bool
-	SetNextSnapshot *SnapshotID
+	PutSnapshot      *Snapshot
+	DeleteSnapshot   SnapshotID
+	PutObject        *Object
+	DeleteObject     string
+	RootName         string
+	PutRoot          *ObjectID
+	DeleteRoot       bool
+	PinName          string
+	PutPin           *ObjectID
+	DeletePin        bool
+	SetNextSnapshot  *SnapshotID
+	FreezeSnapshot   SnapshotID
+	UnfreezeSnapshot SnapshotID
 }
 
 type journalRecord struct {
@@ -544,7 +548,7 @@ func validateGraphState(state *graphState) error {
 	if state == nil || state.Version != formatVersion || state.NextSnapshot == 0 {
 		return errors.New("invalid graph state header")
 	}
-	if state.Snapshots == nil || state.Objects == nil || state.Roots == nil || state.Pins == nil {
+	if state.Snapshots == nil || state.Objects == nil || state.Roots == nil || state.Pins == nil || state.Frozen == nil {
 		return errors.New("graph state has nil maps")
 	}
 	for key, snapshot := range state.Snapshots {
@@ -565,6 +569,19 @@ func validateGraphState(state *graphState) error {
 		snapshot, ok := state.Snapshots[snapshotKey(object.ID.Snapshot)]
 		if !ok || object.ID.Ordinal >= snapshot.NextOrdinal {
 			return fmt.Errorf("object %s has invalid snapshot origin", key)
+		}
+	}
+	for key, frozen := range state.Frozen {
+		if !frozen {
+			return fmt.Errorf("snapshot reference barrier %q is false", key)
+		}
+		id, err := strconv.ParseUint(key, 16, 64)
+		if err != nil || snapshotKey(SnapshotID(id)) != key {
+			return fmt.Errorf("invalid snapshot reference barrier %q", key)
+		}
+		snapshot, ok := state.Snapshots[key]
+		if !ok || snapshot.State == SnapshotWorking {
+			return fmt.Errorf("snapshot reference barrier %q does not select an immutable origin", key)
 		}
 	}
 	expected := make(map[string]uint64, len(state.Objects))
@@ -745,6 +762,10 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			delete(state.Pins, op.PinName)
 		case op.SetNextSnapshot != nil:
 			state.NextSnapshot = *op.SetNextSnapshot
+		case op.FreezeSnapshot != 0:
+			state.Frozen[snapshotKey(op.FreezeSnapshot)] = true
+		case op.UnfreezeSnapshot != 0:
+			delete(state.Frozen, snapshotKey(op.UnfreezeSnapshot))
 		default:
 			return errors.New("empty TTC snapshot graph journal operation")
 		}
@@ -810,6 +831,12 @@ func validateJournalRecord(record journalRecord) error {
 				return errors.New("invalid next snapshot ID")
 			}
 		}
+		if op.FreezeSnapshot != 0 {
+			selectors++
+		}
+		if op.UnfreezeSnapshot != 0 {
+			selectors++
+		}
 		if selectors != 1 {
 			return errors.New("invalid TTC snapshot graph journal operation selector")
 		}
@@ -824,6 +851,7 @@ func cloneGraphState(state graphState) graphState {
 		Objects:   make(map[string]Object, len(state.Objects)),
 		Roots:     make(map[string]ObjectID, len(state.Roots)),
 		Pins:      make(map[string]ObjectID, len(state.Pins)),
+		Frozen:    make(map[string]bool, len(state.Frozen)),
 	}
 	for key, value := range state.Snapshots {
 		next.Snapshots[key] = value
@@ -837,7 +865,75 @@ func cloneGraphState(state graphState) graphState {
 	for key, value := range state.Pins {
 		next.Pins[key] = value
 	}
+	for key, value := range state.Frozen {
+		next.Frozen[key] = value
+	}
 	return next
+}
+
+func snapshotReferences(state graphState, snapshot SnapshotID) map[string]ObjectID {
+	references := make(map[string]ObjectID)
+	for name, object := range state.Roots {
+		if object.Snapshot == snapshot {
+			references["root/"+name] = object
+		}
+	}
+	for name, object := range state.Pins {
+		if object.Snapshot == snapshot {
+			references["pin/"+name] = object
+		}
+	}
+	for _, parent := range state.Objects {
+		if parent.ID.Snapshot == snapshot {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
+			}
+		}
+	}
+	return references
+}
+
+func sameObjectReferences(left, right map[string]ObjectID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name, object := range left {
+		if right[name] != object {
+			return false
+		}
+	}
+	return true
+}
+
+func validateFrozenSnapshotMutation(previous, next graphState, ops []journalOp) error {
+	for key := range previous.Frozen {
+		parsed, err := strconv.ParseUint(key, 16, 64)
+		if err != nil {
+			return err
+		}
+		snapshot := SnapshotID(parsed)
+		if !sameObjectReferences(snapshotReferences(previous, snapshot), snapshotReferences(next, snapshot)) {
+			return fmt.Errorf("snapshot %d references are frozen for authority handoff", snapshot)
+		}
+		for _, op := range ops {
+			if op.PutObject != nil && op.PutObject.ID.Snapshot == snapshot {
+				return fmt.Errorf("snapshot %d objects are frozen for authority handoff", snapshot)
+			}
+			if op.DeleteObject != "" {
+				id, err := parseObjectKey(op.DeleteObject)
+				if err != nil {
+					return err
+				}
+				if id.Snapshot == snapshot {
+					return fmt.Errorf("snapshot %d objects are frozen for authority handoff", snapshot)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func cloneObject(object Object) Object {
@@ -852,6 +948,13 @@ func (s *Store) commitLocked(ops []journalOp) error {
 	}
 	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops}
 	if err := validateJournalRecord(record); err != nil {
+		return err
+	}
+	next := cloneGraphState(s.state)
+	if err := applyJournalRecord(&next, record); err != nil {
+		return err
+	}
+	if err := validateFrozenSnapshotMutation(s.state, next, ops); err != nil {
 		return err
 	}
 	data, err := json.Marshal(record)
@@ -1353,7 +1456,11 @@ func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {
 func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	record, ok := s.state.Snapshots[snapshotKey(snapshot)]
+	return snapshotLedger(s.state, snapshot)
+}
+
+func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
+	record, ok := state.Snapshots[snapshotKey(snapshot)]
 	if !ok {
 		return nil, nil, os.ErrNotExist
 	}
@@ -1361,33 +1468,13 @@ func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]Object
 		return nil, nil, fmt.Errorf("snapshot %d is still working", snapshot)
 	}
 	objects := make([]Object, 0)
-	for _, object := range s.state.Objects {
+	for _, object := range state.Objects {
 		if object.ID.Snapshot == snapshot {
 			objects = append(objects, cloneObject(object))
 		}
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
-	references := make(map[string]ObjectID)
-	for name, object := range s.state.Roots {
-		if object.Snapshot == snapshot {
-			references["root/"+name] = object
-		}
-	}
-	for name, object := range s.state.Pins {
-		if object.Snapshot == snapshot {
-			references["pin/"+name] = object
-		}
-	}
-	for _, parent := range s.state.Objects {
-		if parent.ID.Snapshot == snapshot {
-			continue
-		}
-		for _, edge := range parent.Children {
-			if edge.Child.Snapshot == snapshot {
-				references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
-			}
-		}
-	}
+	references := snapshotReferences(state, snapshot)
 	counts := make(map[string]uint64, len(objects))
 	for _, parent := range objects {
 		for _, edge := range parent.Children {
@@ -1405,6 +1492,49 @@ func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]Object
 		}
 	}
 	return objects, references, nil
+}
+
+// FreezeSnapshotLedger durably installs the final provider-to-owner handoff
+// barrier and returns its exact reference baseline. While the barrier exists,
+// no root, pin, foreign parent edge, or object owned by snapshot may change;
+// unrelated origins remain writable. Repeating the call after a crash returns
+// the same baseline.
+func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	objects, references, err := snapshotLedger(s.state, snapshot)
+	if err != nil {
+		return nil, nil, err
+	}
+	key := snapshotKey(snapshot)
+	if s.state.Frozen[key] {
+		return objects, references, nil
+	}
+	if err := s.commitLocked([]journalOp{{FreezeSnapshot: snapshot}}); err != nil {
+		return nil, nil, err
+	}
+	return objects, references, nil
+}
+
+// UnfreezeSnapshotLedger cancels a failed authority handoff. It must not be
+// used after another owner has accepted the baseline; successful handoff
+// instead replaces local reference authority with the routed owner ledger.
+func (s *Store) UnfreezeSnapshotLedger(snapshot SnapshotID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := snapshotKey(snapshot)
+	if !s.state.Frozen[key] {
+		return nil
+	}
+	return s.commitLocked([]journalOp{{UnfreezeSnapshot: snapshot}})
+}
+
+// SnapshotLedgerFrozen reports whether an origin is held at its durable final
+// handoff barrier.
+func (s *Store) SnapshotLedgerFrozen(snapshot SnapshotID) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Frozen[snapshotKey(snapshot)]
 }
 
 // Root returns a named root.
