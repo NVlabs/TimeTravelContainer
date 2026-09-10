@@ -5075,6 +5075,29 @@ func TestGraphReferenceRootsPreserveLogicalSlots(t *testing.T) {
 	}
 }
 
+func TestGroupGraphRootBindingsByInheritedOrigin(t *testing.T) {
+	groups, err := groupGraphRootBindings([]string{
+		"000000000000002a-03-0000000000000001",
+		"0000000000000011-03-0000000000000009",
+		"000000000000002a-03-0000000000000007",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("origin groups=%+v, want two", groups)
+	}
+	if got := groups[42]; len(got) != 2 || got[0].Slot != 0 || got[1].Slot != 2 {
+		t.Fatalf("origin 42 bindings=%+v", got)
+	}
+	if got := groups[17]; len(got) != 1 || got[0].Slot != 1 {
+		t.Fatalf("origin 17 bindings=%+v", got)
+	}
+	if _, err := groupGraphRootBindings([]string{"000000000000002a-01-0000000000000001"}); err == nil {
+		t.Fatal("non-memory root was accepted")
+	}
+}
+
 func TestCompletionScripts(t *testing.T) {
 	for _, shell := range []string{"bash", "zsh", "fish"} {
 		t.Run(shell, func(t *testing.T) {

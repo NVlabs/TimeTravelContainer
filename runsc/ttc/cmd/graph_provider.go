@@ -189,8 +189,17 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		if err != nil {
 			return err
 		}
-		if transaction.Identity.SourceNodeID != p.nodeID || transaction.Identity.TargetNodeID != peer {
-			return errors.New("snapshot transaction does not authorize this provider/requester pair")
+		// An immutable root may have been inherited through any number of local
+		// and remote forks. Its provider is therefore not necessarily the source
+		// node of the transaction that is currently fetching or retaining it.
+		// Raft's snapshot-origin mapping above proves that this node is the unique
+		// provider; the transaction must prove only that the authenticated caller
+		// is its target. Exact object IDs then bound the requested authority.
+		if transaction.Identity.TargetNodeID != peer {
+			return errors.New("snapshot transaction does not authorize this requester")
+		}
+		if transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed {
+			return fmt.Errorf("snapshot transaction is %s", transaction.State)
 		}
 	}
 	return nil
@@ -246,6 +255,30 @@ func graphReferenceRoots(snapshot ttcsnapshot.SnapshotID, operation string, bind
 		result[name] = id
 	}
 	return result, nil
+}
+
+// groupGraphRootBindings partitions a branch's bounded logical roots by their
+// immutable origin. Fork remains O(number of memory resources), not O(pages):
+// every provider receives only the radix roots it owns and accounts all
+// descendants through the graph's lazy edge references.
+func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]cluster.SnapshotRootBinding, error) {
+	if len(objects) == 0 || len(objects) > 4096 {
+		return nil, errors.New("invalid graph root binding count")
+	}
+	groups := make(map[ttcsnapshot.SnapshotID][]cluster.SnapshotRootBinding)
+	for slot, encoded := range objects {
+		id, err := ttcsnapshot.ParseObjectID(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("parsing graph root slot %d: %w", slot, err)
+		}
+		if id.Snapshot == 0 || id.Kind != ttcsnapshot.ObjectKindMemoryNode {
+			return nil, fmt.Errorf("graph root slot %d selects non-memory-root object %s", slot, id)
+		}
+		groups[id.Snapshot] = append(groups[id.Snapshot], cluster.SnapshotRootBinding{
+			Slot: uint32(slot), Object: id.String(),
+		})
+	}
+	return groups, nil
 }
 
 // RetainSnapshotRoots activates one transaction-fenced root batch in the
