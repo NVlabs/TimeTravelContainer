@@ -634,7 +634,7 @@ func (s *Store) ReserveObject(origin SnapshotID, kind ObjectKind) (ObjectID, err
 
 // CommitReservedObject makes a reserved ID reachable through pin. Bulk data
 // must already have been atomically installed before this call.
-func (s *Store) CommitReservedObject(id ObjectID, pin string, data []byte, children []Edge) error {
+func (s *Store) CommitReservedObject(id ObjectID, pin string, bulkLength uint64, data []byte, children []Edge) error {
 	if err := id.validate(); err != nil {
 		return err
 	}
@@ -653,7 +653,7 @@ func (s *Store) CommitReservedObject(id ObjectID, pin string, data []byte, child
 	if _, ok := s.state.Pins[pin]; ok {
 		return fmt.Errorf("construction pin %q already exists", pin)
 	}
-	object := Object{ID: id, State: ObjectLive, Refs: 1, Data: append([]byte(nil), data...), Children: append([]Edge(nil), children...)}
+	object := Object{ID: id, State: ObjectLive, Refs: 1, BulkLength: bulkLength, Data: append([]byte(nil), data...), Children: append([]Edge(nil), children...)}
 	if err := validateObject(object); err != nil {
 		return err
 	}

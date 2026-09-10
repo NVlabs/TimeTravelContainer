@@ -434,7 +434,7 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	if err := data.Install(source, bytes.NewReader(contents), int64(len(contents))); err != nil {
 		t.Fatal(err)
 	}
-	if err := graph.CommitReservedObject(source, "build/source", nil, nil); err != nil {
+	if err := graph.CommitReservedObject(source, "build/source", uint64(len(contents)), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	clone, err := graph.ReserveObject(origin, ObjectKindFile)
@@ -444,7 +444,7 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	if err := data.Clone(source, clone); err != nil {
 		t.Fatal(err)
 	}
-	if err := graph.CommitReservedObject(clone, "build/clone", nil, nil); err != nil {
+	if err := graph.CommitReservedObject(clone, "build/clone", uint64(len(contents)), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	clonePath, err := data.objectPath(clone)

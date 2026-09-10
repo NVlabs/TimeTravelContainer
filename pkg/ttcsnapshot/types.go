@@ -196,11 +196,12 @@ type Edge struct {
 // Object is graph metadata. Bulk page and file bytes live in a backend selected
 // by the object's typed ID and are not stored here.
 type Object struct {
-	ID       ObjectID
-	State    ObjectState
-	Refs     uint64
-	Data     []byte
-	Children []Edge
+	ID         ObjectID
+	State      ObjectState
+	Refs       uint64
+	BulkLength uint64
+	Data       []byte
+	Children   []Edge
 }
 
 func validateObject(object Object) error {
@@ -215,6 +216,9 @@ func validateObject(object Object) error {
 	}
 	if len(object.Data) > maxObjectDataBytes {
 		return fmt.Errorf("object %s has %d metadata bytes, limit is %d", object.ID.key(), len(object.Data), maxObjectDataBytes)
+	}
+	if object.BulkLength != 0 && object.ID.Kind != ObjectKindPage && object.ID.Kind != ObjectKindFile {
+		return fmt.Errorf("metadata object %s declares bulk data", object.ID.key())
 	}
 	if len(object.Children) > maxObjectEdges {
 		return fmt.Errorf("object %s has %d edges, limit is %d", object.ID.key(), len(object.Children), maxObjectEdges)
