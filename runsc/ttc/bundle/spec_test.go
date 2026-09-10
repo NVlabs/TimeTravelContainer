@@ -2215,7 +2215,10 @@ func TestSharedImagePackRoundTrip(t *testing.T) {
 	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
 		t.Fatalf("publishSharedImagePack: %v", err)
 	}
-	destination := t.TempDir()
+	destination := filepath.Join(local, "images", key)
+	if err := os.MkdirAll(destination, 0700); err != nil {
+		t.Fatal(err)
+	}
 	gotInfo, found, err := store.materializeSharedImagePack(key, destination)
 	if err != nil || !found {
 		t.Fatalf("materializeSharedImagePack = (%+v, %t, %v), want found", gotInfo, found, err)
@@ -2226,6 +2229,9 @@ func TestSharedImagePackRoundTrip(t *testing.T) {
 	target := filepath.Join(destination, "rootfs", "usr", "bin", "tool")
 	if stat, err := os.Stat(target); err != nil || stat.Size() != 0 {
 		t.Fatalf("lazy placeholder size = %v, %v; want zero", stat, err)
+	}
+	if usage, present, err := store.ImageCacheUsage("sha256:"+strings.Repeat("b", 64), info.Platform); err != nil || !present || usage.CompleteBytes != 0 || usage.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("initial image cache usage = (%+v, %t, %v)", usage, present, err)
 	}
 	descriptor, err := ttcpack.ReadLazyDescriptor(filepath.Join(destination, "rootfs"))
 	if err != nil {
@@ -2243,6 +2249,9 @@ func TestSharedImagePackRoundTrip(t *testing.T) {
 	}
 	if err := lazy.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if usage, present, err := store.ImageCacheUsage("sha256:"+strings.Repeat("b", 64), info.Platform); err != nil || !present || usage.CompleteBytes != uint64(len(payload)) || usage.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("populated image cache usage = (%+v, %t, %v)", usage, present, err)
 	}
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != payload {

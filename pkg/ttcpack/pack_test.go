@@ -268,6 +268,9 @@ func TestLazyDirectoryPopulatesWholeFileAfterCrashAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopening inherited lazy image descriptors: %v", err)
 	}
+	if usage := lazy.Usage(); usage.CompleteFiles != 0 || usage.TotalFiles != 1 || usage.CompleteBytes != 0 || usage.TotalBytes != uint64(len(contents)) {
+		t.Fatalf("initial lazy cache usage = %+v", usage)
+	}
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
 	for i := 0; i < 8; i++ {
@@ -301,5 +304,12 @@ func TestLazyDirectoryPopulatesWholeFileAfterCrashAndConcurrency(t *testing.T) {
 	right, _ := os.Stat(filepath.Join(rootfs, "alias"))
 	if !os.SameFile(left, right) {
 		t.Fatal("lazy population broke hardlink identity")
+	}
+	usage, err := InspectLazyCache(rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.CompleteFiles != 1 || usage.TotalFiles != 1 || usage.CompleteBytes != uint64(len(contents)) || usage.TotalBytes != uint64(len(contents)) {
+		t.Fatalf("populated lazy cache usage = %+v", usage)
 	}
 }

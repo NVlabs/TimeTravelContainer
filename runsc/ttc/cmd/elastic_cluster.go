@@ -848,6 +848,8 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		merged.FilesystemUniqueBytes += local.FilesystemUniqueBytes
 		merged.DependentMemoryBytes += local.DependentMemoryBytes
 		merged.DependentFilesystemBytes += local.DependentFilesystemBytes
+		merged.ImageCacheBytes += local.ImageCacheBytes
+		merged.ImageCacheTotalBytes += local.ImageCacheTotalBytes
 	}
 	sort.Slice(merged.Branches, func(i, j int) bool { return merged.Branches[i].Target < merged.Branches[j].Target })
 	var output bytes.Buffer

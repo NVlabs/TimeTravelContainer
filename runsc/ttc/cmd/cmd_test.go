@@ -193,6 +193,7 @@ func TestTTYStatHumanOutputIncludesCausalFields(t *testing.T) {
 func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	backend := &fakeBackend{resourceStatsResult: FamilyResourceStats{
 		Container: "demo", ResidentMemoryUniqueBytes: 4096, FilesystemUniqueBytes: 8192,
+		ImageCacheBytes: 16384, ImageCacheTotalBytes: 32768,
 		Branches: []BranchResourceStats{{Target: "demo@main", State: "running", ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096}}},
 	}}
 	var stdout bytes.Buffer
@@ -206,7 +207,7 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || len(got.Branches) != 1 {
+	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || got.ImageCacheBytes != 16384 || got.ImageCacheTotalBytes != 32768 || len(got.Branches) != 1 {
 		t.Fatalf("stats=%+v", got)
 	}
 }
@@ -1216,6 +1217,7 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 			Digest:       digest,
 			Platform:     "linux/arm64/v8",
 			Materialized: true,
+			LocalCache:   &ImageCacheInfo{CompleteFiles: 3, TotalFiles: 5, CompleteBytes: 1024, TotalBytes: 2048},
 		},
 	}
 	got, err := inspectImageFromInventory(infos, "busybox")
@@ -1224,6 +1226,9 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 	}
 	if got.ID != digest || got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" || !got.Materialized {
 		t.Errorf("inspect info=%+v", got)
+	}
+	if got.LocalCache == nil || got.LocalCache.CompleteBytes != 1024 || got.LocalCache.TotalBytes != 2048 {
+		t.Errorf("LocalCache=%+v", got.LocalCache)
 	}
 	if want := []string{"busybox:latest", "busybox:stable"}; !reflect.DeepEqual(got.RepoTags, want) {
 		t.Errorf("RepoTags=%q, want %q", got.RepoTags, want)

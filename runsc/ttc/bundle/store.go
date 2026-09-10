@@ -4588,6 +4588,25 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 	return true, nil
 }
 
+// ImageCacheUsage reports complete immutable regular-file content in a
+// clustered node-local image skeleton. The boolean is false for an absent
+// cache or for standalone fully-extracted roots, which are authoritative image
+// storage rather than a disposable cache.
+func (s Store) ImageCacheUsage(digest, platform string) (ttcpack.LazyCacheUsage, bool, error) {
+	if s.activeRoot() == s.Root || digest == "" || platform == "" {
+		return ttcpack.LazyCacheUsage{}, false, nil
+	}
+	rootfs := filepath.Join(s.imageRootDir(), imageRootKey(digest, platform), "rootfs")
+	usage, err := ttcpack.InspectLazyCache(rootfs)
+	if errors.Is(err, os.ErrNotExist) {
+		return ttcpack.LazyCacheUsage{}, false, nil
+	}
+	if err != nil {
+		return ttcpack.LazyCacheUsage{}, false, fmt.Errorf("inspecting node-local image cache for %s (%s): %w", digest, platform, err)
+	}
+	return usage, true, nil
+}
+
 var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)
 
 // nodeLocalImageCacheGrace closes the short interval between publishing a

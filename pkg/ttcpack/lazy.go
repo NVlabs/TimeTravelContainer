@@ -129,6 +129,17 @@ type FileMetadata struct {
 	Mode uint32
 }
 
+// LazyCacheUsage summarizes immutable regular-file data represented by one
+// local skeleton. CompleteBytes is the logical size of files whose durable
+// completion marker is visible; TotalBytes is the fully populated cache size.
+// Hardlinks are counted once by canonical file identity.
+type LazyCacheUsage struct {
+	CompleteFiles uint64 `json:"complete_files"`
+	TotalFiles    uint64 `json:"total_files"`
+	CompleteBytes uint64 `json:"complete_bytes"`
+	TotalBytes    uint64 `json:"total_bytes"`
+}
+
 // LazyDirectory populates whole regular files from a pre-opened pack. It owns
 // descriptors for the pack, local root, and completion-record directory so it
 // remains usable after the gofer chroots.
@@ -287,6 +298,65 @@ func lazyLockName(path string) (string, string) {
 	digest := sha256.Sum256([]byte(path))
 	encoded := hex.EncodeToString(digest[:])
 	return encoded[:2], encoded[2:]
+}
+
+func (d *LazyDirectory) complete(canonical string) bool {
+	shard, name := lazyLockName(canonical)
+	shardFD, err := unix.Openat(d.stateFD, shard, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(shardFD)
+	markerFD, err := unix.Openat(shardFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(markerFD)
+	marker := make([]byte, len("complete\n"))
+	n, err := unix.Pread(markerFD, marker, 0)
+	return err == nil && n == len(marker) && string(marker) == "complete\n"
+}
+
+// Usage returns a lock-free point-in-time view of cache completion. A file
+// racing publication is conservatively absent until its complete marker is
+// fully visible.
+func (d *LazyDirectory) Usage() LazyCacheUsage {
+	var usage LazyCacheUsage
+	if d == nil {
+		return usage
+	}
+	for _, canonical := range d.paths {
+		metadata := d.metadata[canonical]
+		usage.TotalFiles++
+		if metadata.Size > 0 {
+			usage.TotalBytes += uint64(metadata.Size)
+		}
+		if d.complete(canonical) {
+			usage.CompleteFiles++
+			if metadata.Size > 0 {
+				usage.CompleteBytes += uint64(metadata.Size)
+			}
+		}
+	}
+	return usage
+}
+
+// InspectLazyCache opens a skeleton's descriptor and reports its current
+// completion without reading regular-file payloads.
+func InspectLazyCache(rootfs string) (LazyCacheUsage, error) {
+	descriptor, err := ReadLazyDescriptor(rootfs)
+	if err != nil {
+		return LazyCacheUsage{}, err
+	}
+	directory, err := OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		return LazyCacheUsage{}, err
+	}
+	usage := directory.Usage()
+	if err := directory.Close(); err != nil {
+		return LazyCacheUsage{}, err
+	}
+	return usage, nil
 }
 
 // Ensure makes virtualPath complete before any guest descriptor can observe

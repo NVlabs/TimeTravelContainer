@@ -4997,10 +4997,21 @@ type ImageInfo struct {
 	Size         int64             `json:"size"`
 	Platform     string            `json:"platform"`
 	Materialized bool              `json:"materialized"`
+	LocalCache   *ImageCacheInfo   `json:"local_cache,omitempty"`
 	Containers   []string          `json:"containers,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
+}
+
+// ImageCacheInfo describes a clustered node's disposable, whole-file image
+// cache. Total is the logical fully-populated size; Complete is immediately
+// readable without another shared-pack range fetch.
+type ImageCacheInfo struct {
+	CompleteFiles uint64 `json:"complete_files"`
+	TotalFiles    uint64 `json:"total_files"`
+	CompleteBytes uint64 `json:"complete_bytes"`
+	TotalBytes    uint64 `json:"total_bytes"`
 }
 
 // ImageInspectInfo follows Docker's top-level image inspection naming while
@@ -5016,6 +5027,7 @@ type ImageInspectInfo struct {
 	Variant      string             `json:"Variant,omitempty"`
 	MediaType    string             `json:"MediaType"`
 	Materialized bool               `json:"Materialized"`
+	LocalCache   *ImageCacheInfo    `json:"LocalCache,omitempty"`
 	Containers   []string           `json:"Containers,omitempty"`
 	Config       ImageInspectConfig `json:"Config"`
 }
@@ -5111,6 +5123,8 @@ type FamilyResourceStats struct {
 	FilesystemUniqueBytes     uint64                `json:"filesystem_unique_bytes"`
 	DependentMemoryBytes      uint64                `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes  uint64                `json:"dependent_filesystem_bytes,omitempty"`
+	ImageCacheBytes           uint64                `json:"image_cache_bytes,omitempty"`
+	ImageCacheTotalBytes      uint64                `json:"image_cache_total_bytes,omitempty"`
 }
 
 type resourceStatsBackend interface {
@@ -5152,12 +5166,16 @@ func writeResourceStats(stdout io.Writer, stats FamilyResourceStats, jsonOutput 
 		return encoder.Encode(stats)
 	}
 	table := tabwriter.NewWriter(stdout, 0, 4, 2, 24, 0)
-	fmt.Fprintln(table, "TARGET\tSTATE\tSTORAGE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED\tREMOTE DEPENDENT")
+	fmt.Fprintln(table, "TARGET\tSTATE\tSTORAGE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED\tREMOTE DEPENDENT\tIMAGE CACHE")
 	for _, branch := range stats.Branches {
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", branch.Target, branch.State, branch.StorageState,
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\n", branch.Target, branch.State, branch.StorageState,
 			formatImageSize(int64(branch.ResidentMemory.PrivateBytes)), formatImageSize(int64(branch.ResidentMemory.SharedBytes)),
 			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)),
 			formatImageSize(int64(branch.DependentMemoryBytes+branch.DependentFilesystemBytes)))
+	}
+	if stats.ImageCacheTotalBytes != 0 {
+		fmt.Fprintf(table, "image cache\t-\t-\t-\t-\t-\t-\t-\t-\t%s / %s\n",
+			formatImageSize(int64(stats.ImageCacheBytes)), formatImageSize(int64(stats.ImageCacheTotalBytes)))
 	}
 	return table.Flush()
 }
@@ -5771,6 +5789,15 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 		if err != nil {
 			return nil, err
 		}
+		var cache *ImageCacheInfo
+		if usage, present, err := store.ImageCacheUsage(record.Digest, record.Platform); err != nil {
+			return nil, err
+		} else if present {
+			cache = &ImageCacheInfo{
+				CompleteFiles: usage.CompleteFiles, TotalFiles: usage.TotalFiles,
+				CompleteBytes: usage.CompleteBytes, TotalBytes: usage.TotalBytes,
+			}
+		}
 		containerNames := append([]string(nil), users[record.Digest]...)
 		sort.Strings(containerNames)
 		infos = append(infos, ImageInfo{
@@ -5780,6 +5807,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 			Size:         record.Size,
 			Platform:     record.Platform,
 			Materialized: materialized,
+			LocalCache:   cache,
 			Containers:   containerNames,
 			Labels:       cloneStringMap(record.Labels),
 			CreatedAt:    record.CreatedAt,
@@ -5914,6 +5942,7 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 	seenRepoDigest := make(map[string]bool)
 	seenContainer := make(map[string]bool)
 	materialized := false
+	var localCache *ImageCacheInfo
 	for i := range infos {
 		info := &infos[i]
 		if info.Digest != digest {
@@ -5938,6 +5967,10 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 			}
 		}
 		materialized = materialized || info.Materialized
+		if info.LocalCache != nil && (localCache == nil || info.LocalCache.CompleteBytes > localCache.CompleteBytes) {
+			copy := *info.LocalCache
+			localCache = &copy
+		}
 		for _, container := range info.Containers {
 			if !seenContainer[container] {
 				containers = append(containers, container)
@@ -5973,6 +6006,7 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 		Variant:      variant,
 		MediaType:    selected.MediaType,
 		Materialized: materialized,
+		LocalCache:   localCache,
 		Containers:   containers,
 		Config:       ImageInspectConfig{Labels: cloneStringMap(selected.Labels)},
 	}, nil
@@ -12725,6 +12759,12 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 				return FamilyResourceStats{}, residentErr
 			}
 		}
+	}
+	if usage, present, cacheErr := b.containerStore().ImageCacheUsage(info.Digest, info.Platform); cacheErr != nil {
+		return FamilyResourceStats{}, cacheErr
+	} else if present {
+		result.ImageCacheBytes = usage.CompleteBytes
+		result.ImageCacheTotalBytes = usage.TotalBytes
 	}
 	return result, nil
 }
