@@ -3350,6 +3350,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	})
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
+	var sharedGCStopped <-chan struct{}
 	var elasticRecord *cluster.NodeRecord
 	var clusterTargetBackend *runtimeBackend
 	var leaseGuardian *os.File
@@ -3357,6 +3358,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		close(clusterDone)
 		if elasticHeartbeatStopped != nil {
 			<-elasticHeartbeatStopped
+		}
+		if sharedGCStopped != nil {
+			<-sharedGCStopped
 		}
 		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
 			if !server.cleanStop.Load() && clusterTargetBackend != nil {
@@ -3526,6 +3530,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
+			gcStopped := make(chan struct{})
+			sharedGCStopped = gcStopped
+			go func() {
+				defer close(gcStopped)
+				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
+			}()
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})
 			elasticHeartbeatStopped = heartbeatStopped

@@ -2984,6 +2984,56 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 	}
 }
 
+// maintainSharedGCCoordinator elects exactly one daemon for shared snapshot
+// reference accounting and pack mutation. Actual collection additionally
+// validates the lease generation at every retirement boundary; merely holding
+// this lease never makes a pack reclaimable.
+func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, nodeID, incarnation string, stderr io.Writer, done <-chan struct{}) {
+	if authority == nil || nodeID == "" || incarnation == "" {
+		return
+	}
+	const duration = 15 * time.Second
+	ticker := time.NewTicker(duration / 3)
+	defer ticker.Stop()
+	var held cluster.SharedGCLease
+	release := func() {
+		if held.Generation == 0 {
+			return
+		}
+		if err := authority.ReleaseSharedGCLease(held); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: releasing shared GC lease generation %d: %v\n", held.Generation, err)
+		}
+		held = cluster.SharedGCLease{}
+	}
+	defer release()
+	for {
+		now := time.Now()
+		if held.Generation != 0 {
+			if renewed, err := authority.RenewSharedGCLease(held, duration); err == nil {
+				held = renewed
+			} else {
+				held = cluster.SharedGCLease{}
+			}
+		} else if current, err := authority.SharedGCLease(); err == nil {
+			switch {
+			case current.Generation != 0 && now.Before(current.ExpiresAt) && (current.NodeID != nodeID || current.Incarnation != incarnation):
+				// Another healthy coordinator owns the lease.
+			case current.Generation != 0 && now.Before(current.ExpiresAt):
+				held = current
+			default:
+				if acquired, err := authority.AcquireSharedGCLease(nodeID, incarnation, duration); err == nil {
+					held = acquired
+				}
+			}
+		}
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error) {
 	interval := lease
 	if interval < 5*time.Second {

@@ -151,6 +151,9 @@ func normalizeAuthorityLeaseClock(state *AuthorityState, localNow time.Time) {
 		}
 		state.Nodes[id] = record
 	}
+	if !state.SharedGC.ExpiresAt.IsZero() {
+		state.SharedGC.ExpiresAt = localNow.Add(state.SharedGC.ExpiresAt.Sub(leaderNow))
+	}
 	state.LeaderObservedAt = localNow
 }
 
