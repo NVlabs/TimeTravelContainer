@@ -228,30 +228,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			}
 			manifest.MemorySnapshot = branch.SnapshotID
 		} else {
-			chunks := filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks")
-			repository, err := ttcchunk.OpenMemoryRepository(chunks)
-			if err != nil {
-				return ttcstorage.Result{}, err
-			}
-			memorySnapshot := filepath.Join(staging, "memory-repository")
-			var inheritedMemory map[ttcchunk.ID]struct{}
-			if intent.ParentManifest != "" {
-				inheritedMemory, err = p.inheritedMemoryObjectIDs(intent.ParentManifest)
-				if err != nil {
-					repository.Close()
-					return ttcstorage.Result{}, err
-				}
-			}
-			exportErr := repository.ExportBranchDelta(intent.MemoryBranch, branch.FilesystemBranch, memorySnapshot, inheritedMemory)
-			closeErr := repository.Close()
-			if exportErr != nil || closeErr != nil {
-				return ttcstorage.Result{}, errors.Join(exportErr, closeErr)
-			}
-			pack, err = ttcpack.WriteDirectory(memorySnapshot, filepath.Join(p.sharedRoot, "cold"))
-			if err != nil {
-				return ttcstorage.Result{}, err
-			}
-			manifest.Packs = append(manifest.Packs, coldPackReference{Source: "memory-chunks", Pack: pack.String()})
+			return ttcstorage.Result{}, errors.New("new-format dehydration branch lacks graph-native snapshot identity")
 		}
 	}
 	sort.Slice(manifest.Packs, func(i, j int) bool { return manifest.Packs[i].Source < manifest.Packs[j].Source })
@@ -438,18 +415,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 				}
 			}
 		} else {
-			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks"))
-			if err != nil {
-				return false, err
-			}
-			_, branchErr := repository.Branch(intent.MemoryBranch)
-			closeErr := repository.Close()
-			if errors.Is(branchErr, os.ErrNotExist) {
-				return false, closeErr
-			}
-			if branchErr != nil || closeErr != nil {
-				return false, errors.Join(branchErr, closeErr)
-			}
+			return false, errors.New("new-format dehydration branch lacks graph-native snapshot identity")
 		}
 	}
 	if p.authority != nil {
@@ -509,17 +475,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if branchErr == nil && branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
 			return os.RemoveAll(publicationMemoryControlPath(p.localRoot, intent.MemoryControl))
 		}
-		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks"))
-		if err != nil {
-			return err
-		}
-		removeErr := repository.DeleteBranch(intent.MemoryBranch)
-		if errors.Is(removeErr, os.ErrNotExist) {
-			removeErr = nil
-		}
-		_, gcErr := repository.CollectGarbage(ttcchunk.GCOptions{})
-		closeErr := repository.Close()
-		return errors.Join(removeErr, gcErr, closeErr, os.RemoveAll(publicationMemoryControlPath(p.localRoot, intent.MemoryControl)))
+		return errors.Join(branchErr, errors.New("new-format dehydration cleanup lacks graph-native snapshot identity"))
 	}
 	return nil
 }
@@ -958,7 +914,6 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	} else if err != nil {
 		return err
 	}
-	memoryPack, ok := packBySource["memory-chunks"]
 	if manifest.MemorySnapshot != 0 {
 		if manifest.MemorySnapshot != branch.SnapshotID || len(branch.MemoryRoots) == 0 {
 			return errors.New("cold manifest graph snapshot disagrees with branch memory roots")
@@ -971,43 +926,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		}
 		return store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{})
 	}
-	if !ok {
-		return errors.New("cold manifest omits sparse memory chunks")
-	}
-	memorySnapshot := filepath.Join(staging, "memory-repository")
-	if err := ttcpack.MaterializeMetadata(filepath.Join(b.dataRoot, "cold"), memoryPack, memorySnapshot, "chunks"); err != nil {
-		return err
-	}
-	memoryDestination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-	if _, err := os.Stat(memoryDestination); errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(filepath.Dir(memoryDestination), 0700); err != nil {
-			return err
-		}
-		if err := os.Rename(memorySnapshot, memoryDestination); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	} else {
-		sourceRepository, err := ttcchunk.OpenMemoryRepository(memorySnapshot)
-		if err != nil {
-			return err
-		}
-		destinationRepository, err := ttcchunk.OpenMemoryRepository(memoryDestination)
-		if err != nil {
-			sourceRepository.Close()
-			return err
-		}
-		manifestID, branchErr := sourceRepository.Branch(branch.FilesystemBranch)
-		if branchErr == nil {
-			branchErr = destinationRepository.ImportRemoteManifest(sourceRepository, manifestID, branch.FilesystemBranch)
-		}
-		closeErr := errors.Join(sourceRepository.Close(), destinationRepository.Close())
-		if branchErr != nil || closeErr != nil {
-			return errors.Join(branchErr, closeErr)
-		}
-	}
-	return store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{})
+	return errors.New("new-format cold manifest omits graph-native memory snapshot")
 }
 
 // ensureLocalColdFilesystem materializes the filesystem portion of a durable
@@ -1263,51 +1182,7 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		// origin resolver. Only legacy dehydration images need a ttcchunk relay.
 		return relays, nil
 	}
-	if ids, err := b.coldPackChain(manifest, "memory-chunks"); err == nil {
-		directory, err := ttcpack.OpenDirectory(filepath.Join(b.dataRoot, "cold"), ids)
-		if err != nil {
-			return fail(err)
-		}
-		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
-		if err != nil {
-			directory.Close()
-			return fail(err)
-		}
-		manifestID, manifestErr := repository.Branch(branch.FilesystemBranch)
-		memoryManifest, loadErr := repository.LoadManifest(manifestID)
-		closeErr := repository.Close()
-		if manifestErr != nil || loadErr != nil || closeErr != nil {
-			directory.Close()
-			return fail(errors.Join(manifestErr, loadErr, closeErr))
-		}
-		allowed := make(map[ttcchunk.ID]struct{})
-		for _, run := range memoryManifest.Runs {
-			allowed[run.Object] = struct{}{}
-		}
-		if _, err := rand.Read(relays.memoryToken[:]); err != nil {
-			directory.Close()
-			return fail(err)
-		}
-		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-		if err != nil {
-			directory.Close()
-			return fail(err)
-		}
-		server := os.NewFile(uintptr(fds[0]), "ttc-cold-memory-server")
-		relays.memoryClient = os.NewFile(uintptr(fds[1]), "ttc-cold-memory-client")
-		done := make(chan error, 1)
-		go func() {
-			err := ttcchunk.ServeRemoteChunks(server, relays.memoryToken, coldPackMemoryReader{directory: directory}, allowed)
-			b.reportColdRelayError("memory", err)
-			done <- err
-			_ = directory.Close()
-			close(done)
-		}()
-		relays.done = append(relays.done, done)
-	} else {
-		return fail(err)
-	}
-	return relays, nil
+	return fail(errors.New("new-format cold manifest omits graph-native memory snapshot"))
 }
 
 func (b *runtimeBackend) materializeColdSource(manifest coldBranchManifest, source, destination string) error {
