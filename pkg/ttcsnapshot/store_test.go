@@ -577,6 +577,130 @@ func TestRetainRootsIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestRetainRootsJournalPrefixRecovery(t *testing.T) {
+	base := t.TempDir()
+	store, err := Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.CreateObject(origin, "build/crash-root", ObjectKindMetadata, []byte("stable"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoot("branch/source", object); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("build/crash-root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	journalName := filepath.Base(store.journal.Name())
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	baseline := readGraphTestFiles(t, base)
+
+	store, err = Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := map[string]ObjectID{"remote/tx/root-0": object}
+	if err := store.RetainRoots(binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.ReadFile(filepath.Join(base, journalName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) <= len(journalHeader) {
+		t.Fatal("retain transaction did not append a journal record")
+	}
+	record := journal[len(journalHeader):]
+
+	for prefix := 0; prefix <= len(record); prefix++ {
+		dir := filepath.Join(t.TempDir(), fmt.Sprintf("prefix-%04d", prefix))
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeGraphTestFiles(t, dir, baseline)
+		file, err := os.OpenFile(filepath.Join(dir, journalName), os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write(record[:prefix]); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		recovered, err := Open(dir)
+		if err != nil {
+			t.Fatalf("prefix %d/%d: %v", prefix, len(record), err)
+		}
+		root, retained := recovered.Root("remote/tx/root-0")
+		gotObject, exists := recovered.Object(object)
+		if !exists {
+			recovered.Close()
+			t.Fatalf("prefix %d removed baseline object", prefix)
+		}
+		complete := prefix == len(record)
+		if retained != complete || retained && root != object {
+			recovered.Close()
+			t.Fatalf("prefix %d retained=(%s,%t), complete=%t", prefix, root, retained, complete)
+		}
+		wantRefs := uint64(1)
+		if complete {
+			wantRefs = 2
+		}
+		if gotObject.Refs != wantRefs {
+			recovered.Close()
+			t.Fatalf("prefix %d refs=%d, want %d", prefix, gotObject.Refs, wantRefs)
+		}
+		if err := recovered.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func readGraphTestFiles(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte)
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[entry.Name()] = data
+	}
+	return files
+}
+
+func writeGraphTestFiles(t *testing.T, dir string, files map[string][]byte) {
+	t.Helper()
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
