@@ -5055,6 +5055,26 @@ func TestValidateGraphRootObjectsAllowsInheritedOrigin(t *testing.T) {
 	}
 }
 
+func TestGraphReferenceRootsPreserveLogicalSlots(t *testing.T) {
+	bindings := []cluster.SnapshotRootBinding{
+		{Slot: 7, Object: "000000000000002a-03-0000000000000001"},
+		{Slot: 11, Object: "000000000000002a-03-0000000000000001"},
+	}
+	roots, err := graphReferenceRoots(42, "tx-reference", bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 2 || roots["remote/42/tx-reference/00000007"] != roots["remote/42/tx-reference/0000000b"] {
+		t.Fatalf("reference roots=%+v", roots)
+	}
+	if _, err := graphReferenceRoots(42, "tx-reference", append(bindings, bindings[0])); err == nil {
+		t.Fatal("duplicate logical slot was accepted")
+	}
+	if _, err := graphReferenceRoots(42, "tx-reference", []cluster.SnapshotRootBinding{{Slot: 1, Object: "0000000000000029-03-0000000000000001"}}); err == nil {
+		t.Fatal("root from another origin was accepted")
+	}
+}
+
 func TestCompletionScripts(t *testing.T) {
 	for _, shell := range []string{"bash", "zsh", "fish"} {
 		t.Run(shell, func(t *testing.T) {

@@ -556,14 +556,20 @@ func TestRetainRootsIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("failed batch changed second refs to %d", secondObject.Refs)
 	}
 
-	if err := store.ReleaseRoots([]string{
-		"remote/operation-a/root-0", "remote/operation-a/root-1", "remote/operation-a/root-2",
-	}); err != nil {
+	wrongRelease := map[string]ObjectID{
+		"remote/operation-a/root-0": second,
+		"remote/operation-a/root-1": first,
+	}
+	if err := store.ReleaseRetainedRoots(wrongRelease); err == nil {
+		t.Fatal("mismatched release removed an authoritative root")
+	}
+	if got, ok := store.Root("remote/operation-a/root-1"); !ok || got != first {
+		t.Fatalf("failed release changed sibling root=(%s,%t)", got, ok)
+	}
+	if err := store.ReleaseRetainedRoots(bindings); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReleaseRoots([]string{
-		"remote/operation-a/root-0", "remote/operation-a/root-1", "remote/operation-a/root-2",
-	}); err != nil {
+	if err := store.ReleaseRetainedRoots(bindings); err != nil {
 		t.Fatalf("idempotent release: %v", err)
 	}
 	if collected, err := store.Collect(8); err != nil || collected != 2 {

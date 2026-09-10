@@ -557,6 +557,10 @@ type ControlPlane struct {
 	// SnapshotProvider serves immutable graph metadata without transferring
 	// reference-count authority to the requesting cache.
 	SnapshotProvider ImmutableSnapshotProvider
+	// SnapshotReferences applies bounded root-reference operations at the
+	// unique volatile origin owner. Object and descendant counts never enter
+	// the control plane or Raft.
+	SnapshotReferences SnapshotReferenceProvider
 	operationMu      sync.Mutex // serializes reservation/quota accounting
 	transactionMu    sync.Map   // transaction ID -> *sync.Mutex
 }
@@ -570,6 +574,28 @@ type ImmutableObjectProvider interface {
 // ImmutableSnapshotProvider opens the exact metadata catalog for one origin.
 type ImmutableSnapshotProvider interface {
 	OpenSnapshot(context.Context, string, uint64, string) (io.ReadCloser, uint64, error)
+}
+
+// SnapshotRootBinding identifies one logical root slot and its immutable root
+// object. Slot is stable within an operation, so retries have exactly the same
+// provider-owned root name even when several roots select the same object.
+type SnapshotRootBinding struct {
+	Slot   uint32 `json:"slot"`
+	Object string `json:"object"`
+}
+
+// SnapshotReferenceProvider owns reference counts for volatile origins.
+// Implementations must make retain/release idempotent by operation identity.
+type SnapshotReferenceProvider interface {
+	RetainSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
+	ReleaseSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
+}
+
+type snapshotReferenceRequest struct {
+	Transaction string                `json:"transaction"`
+	Operation   string                `json:"operation"`
+	Action      string                `json:"action"`
+	Roots       []SnapshotRootBinding `json:"roots"`
 }
 
 func (c *ControlPlane) lockTransaction(id string) func() {
@@ -701,23 +727,27 @@ func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer 
 }
 
 func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, peer string) {
-	if r.Method != http.MethodGet {
-		writeControlError(w, http.StatusMethodNotAllowed, "immutable snapshot fetch requires GET")
-		return
-	}
-	if c.SnapshotProvider == nil {
-		writeControlError(w, http.StatusNotImplemented, "immutable snapshot provider is unavailable")
-		return
-	}
 	remainder := strings.TrimPrefix(r.URL.Path, controlSnapshotPrefix)
 	text, suffix, ok := strings.Cut(remainder, "/")
-	if !ok || suffix != "catalog" {
+	if !ok || (suffix != "catalog" && suffix != "references") {
 		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot path")
 		return
 	}
 	snapshot, err := strconv.ParseUint(text, 10, 64)
 	if err != nil || snapshot == 0 || strconv.FormatUint(snapshot, 10) != text {
 		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot ID")
+		return
+	}
+	if suffix == "references" {
+		c.serveSnapshotReferences(w, r, peer, snapshot)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "immutable snapshot fetch requires GET")
+		return
+	}
+	if c.SnapshotProvider == nil {
+		writeControlError(w, http.StatusNotImplemented, "immutable snapshot provider is unavailable")
 		return
 	}
 	reader, length, err := c.SnapshotProvider.OpenSnapshot(r.Context(), peer, snapshot, r.URL.Query().Get("transaction"))
@@ -735,6 +765,41 @@ func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, pee
 		copyErr = io.ErrUnexpectedEOF
 	}
 	_ = copyErr
+}
+
+func (c *ControlPlane) serveSnapshotReferences(w http.ResponseWriter, r *http.Request, peer string, snapshot uint64) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "snapshot reference mutation requires POST")
+		return
+	}
+	if c.SnapshotReferences == nil {
+		writeControlError(w, http.StatusNotImplemented, "snapshot reference provider is unavailable")
+		return
+	}
+	var request snapshotReferenceRequest
+	if err := decodeControlJSON(r.Body, &request); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !transactionIDPattern.MatchString(request.Transaction) || !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) == 0 || len(request.Roots) > 4096 {
+		writeControlError(w, http.StatusBadRequest, "invalid snapshot reference operation")
+		return
+	}
+	var err error
+	switch request.Action {
+	case "retain":
+		err = c.SnapshotReferences.RetainSnapshotRoots(r.Context(), peer, snapshot, request.Transaction, request.Operation, request.Roots)
+	case "release":
+		err = c.SnapshotReferences.ReleaseSnapshotRoots(r.Context(), peer, snapshot, request.Transaction, request.Operation, request.Roots)
+	default:
+		writeControlError(w, http.StatusBadRequest, "invalid snapshot reference action")
+		return
+	}
+	if err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"snapshot_id": snapshot, "operation": request.Operation, "action": request.Action})
 }
 
 func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer string) {
@@ -1375,6 +1440,26 @@ func (c *Client) FetchSnapshot(ctx context.Context, snapshot uint64, transaction
 		return nil, 0, errors.New("immutable snapshot provider returned an invalid exact length")
 	}
 	return response.Body, length, nil
+}
+
+// RetainSnapshotRoots durably activates a bounded logical-root batch at the
+// unique provider for snapshot. Retrying the same operation is a no-op.
+func (c *Client) RetainSnapshotRoots(ctx context.Context, snapshot uint64, transaction, operation string, roots []SnapshotRootBinding) error {
+	return c.mutateSnapshotRoots(ctx, snapshot, snapshotReferenceRequest{Transaction: transaction, Operation: operation, Action: "retain", Roots: roots})
+}
+
+// ReleaseSnapshotRoots durably deactivates a previously retained root batch.
+// Retrying a completed release is a no-op.
+func (c *Client) ReleaseSnapshotRoots(ctx context.Context, snapshot uint64, transaction, operation string, roots []SnapshotRootBinding) error {
+	return c.mutateSnapshotRoots(ctx, snapshot, snapshotReferenceRequest{Transaction: transaction, Operation: operation, Action: "release", Roots: roots})
+}
+
+func (c *Client) mutateSnapshotRoots(ctx context.Context, snapshot uint64, request snapshotReferenceRequest) error {
+	if snapshot == 0 || !transactionIDPattern.MatchString(request.Transaction) || !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) == 0 || len(request.Roots) > 4096 {
+		return errors.New("invalid snapshot reference operation")
+	}
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlSnapshotPrefix+strconv.FormatUint(snapshot, 10)+"/references", request, &response)
 }
 
 // NewClient constructs a client using tlsConfig for peer authentication.

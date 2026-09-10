@@ -3380,6 +3380,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		clusterRuntime.controlPlane.ObjectProvider = graphProvider
 		clusterRuntime.controlPlane.SnapshotProvider = graphProvider
+		clusterRuntime.controlPlane.SnapshotReferences = graphProvider
 		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
 			raftOriginLocator{authority: clusterRuntime.raftCatalog},
 			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)

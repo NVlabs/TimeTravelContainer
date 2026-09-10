@@ -224,8 +224,64 @@ func (p *graphObjectProvider) OpenSnapshot(_ context.Context, peer string, snaps
 	return io.NopCloser(bytes.NewReader(encoded)), uint64(len(encoded)), nil
 }
 
+func graphReferenceRoots(snapshot ttcsnapshot.SnapshotID, operation string, bindings []cluster.SnapshotRootBinding) (map[string]ttcsnapshot.ObjectID, error) {
+	if snapshot == 0 || operation == "" || len(bindings) == 0 || len(bindings) > 4096 {
+		return nil, errors.New("invalid snapshot reference operation")
+	}
+	result := make(map[string]ttcsnapshot.ObjectID, len(bindings))
+	seenSlots := make(map[uint32]struct{}, len(bindings))
+	for _, binding := range bindings {
+		if _, exists := seenSlots[binding.Slot]; exists {
+			return nil, fmt.Errorf("snapshot reference operation repeats slot %d", binding.Slot)
+		}
+		seenSlots[binding.Slot] = struct{}{}
+		id, err := ttcsnapshot.ParseObjectID(binding.Object)
+		if err != nil {
+			return nil, err
+		}
+		if id.Snapshot != snapshot {
+			return nil, fmt.Errorf("root object %s does not belong to snapshot origin %d", id, snapshot)
+		}
+		name := fmt.Sprintf("remote/%d/%s/%08x", snapshot, operation, binding.Slot)
+		result[name] = id
+	}
+	return result, nil
+}
+
+// RetainSnapshotRoots activates one transaction-fenced root batch in the
+// volatile origin's authoritative graph. Store.RetainRoots supplies the
+// durable idempotency boundary; neither descendant edges nor counts enter
+// Raft or this request.
+func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
+	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	if err := p.authorizeSnapshot(peer, snapshot, transaction); err != nil {
+		return err
+	}
+	roots, err := graphReferenceRoots(snapshot, operation, bindings)
+	if err != nil {
+		return err
+	}
+	return p.graph.RetainRoots(roots)
+}
+
+// ReleaseSnapshotRoots deactivates the exact retained batch. Expected object
+// IDs fence stale or malformed releases from deleting another operation's
+// roots, and completed retries are no-ops.
+func (p *graphObjectProvider) ReleaseSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
+	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	if err := p.authorizeSnapshot(peer, snapshot, transaction); err != nil {
+		return err
+	}
+	roots, err := graphReferenceRoots(snapshot, operation, bindings)
+	if err != nil {
+		return err
+	}
+	return p.graph.ReleaseRetainedRoots(roots)
+}
+
 var _ cluster.ImmutableObjectProvider = (*graphObjectProvider)(nil)
 var _ cluster.ImmutableSnapshotProvider = (*graphObjectProvider)(nil)
+var _ cluster.SnapshotReferenceProvider = (*graphObjectProvider)(nil)
 
 func decodeGraphSnapshotCatalog(reader io.Reader, length uint64, snapshot ttcsnapshot.SnapshotID) (*ttcsnapshot.ImmutableCatalog, error) {
 	if reader == nil || length == 0 || length > 512<<20 {

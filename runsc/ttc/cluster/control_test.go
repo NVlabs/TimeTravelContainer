@@ -43,6 +43,61 @@ type testImmutableObjectProvider struct {
 	length      uint64
 }
 
+type testSnapshotReferenceProvider struct {
+	peer      string
+	snapshot  uint64
+	operation string
+	roots     []SnapshotRootBinding
+	retained  int
+	released  int
+}
+
+func (provider *testSnapshotReferenceProvider) RetainSnapshotRoots(_ context.Context, peer string, snapshot uint64, _, operation string, roots []SnapshotRootBinding) error {
+	provider.peer, provider.snapshot, provider.operation = peer, snapshot, operation
+	provider.roots = append([]SnapshotRootBinding(nil), roots...)
+	provider.retained++
+	return nil
+}
+
+func (provider *testSnapshotReferenceProvider) ReleaseSnapshotRoots(_ context.Context, peer string, snapshot uint64, _, operation string, roots []SnapshotRootBinding) error {
+	provider.peer, provider.snapshot, provider.operation = peer, snapshot, operation
+	provider.roots = append([]SnapshotRootBinding(nil), roots...)
+	provider.released++
+	return nil
+}
+
+func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(storeRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &testSnapshotReferenceProvider{}
+	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotReferences: provider}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "target", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := []SnapshotRootBinding{{Slot: 3, Object: "000000000000002a-03-0000000000000001"}}
+	if err := client.RetainSnapshotRoots(context.Background(), 42, "tx-request", "tx-request", roots); err != nil {
+		t.Fatal(err)
+	}
+	if provider.retained != 1 || provider.released != 0 || provider.peer != "target" || provider.snapshot != 42 || provider.operation != "tx-request" || len(provider.roots) != 1 || provider.roots[0] != roots[0] {
+		t.Fatalf("retain provider state=%+v", provider)
+	}
+	if err := client.ReleaseSnapshotRoots(context.Background(), 42, "tx-request", "tx-request", roots); err != nil {
+		t.Fatal(err)
+	}
+	if provider.retained != 1 || provider.released != 1 {
+		t.Fatalf("release provider state=%+v", provider)
+	}
+}
+
 func (provider *testImmutableObjectProvider) OpenSnapshot(_ context.Context, peer string, snapshot uint64, transaction string) (io.ReadCloser, uint64, error) {
 	provider.peer, provider.snapshot, provider.transaction = peer, snapshot, transaction
 	return io.NopCloser(bytes.NewReader(provider.data)), provider.length, nil

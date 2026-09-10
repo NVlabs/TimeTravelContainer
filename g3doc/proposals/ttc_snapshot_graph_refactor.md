@@ -70,6 +70,11 @@ fork. A second cold fork imported beside the first branch in the same Sentry;
 their filesystem writes remained isolated. Dehydrating the imported branch and
 forking it back to the first node preserved execution state and left no staged
 metadata or graph manifests in the shared transaction directories.
+The volatile-origin provider protocol also exposes bounded, transaction-fenced
+root retain/release operations. Each batch is journaled atomically at the
+provider, identifies roots by immutable object ID and stable logical slot, and
+is idempotent across lost responses. Descendant edges and object counts remain
+entirely in the provider's graph ledger rather than entering HTTP or Raft.
 
 ## Goals
 

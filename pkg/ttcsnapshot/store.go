@@ -1600,6 +1600,68 @@ func (s *Store) ReleaseRoots(names []string) error {
 	return s.deleteRoots(names, true)
 }
 
+// ReleaseRetainedRoots atomically releases an externally named root batch if
+// every existing name still selects the expected object. Missing bindings are
+// treated as completed retries; a mismatched binding rejects the whole batch.
+func (s *Store) ReleaseRetainedRoots(roots map[string]ObjectID) error {
+	if len(roots) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(roots))
+	for name, id := range roots {
+		if err := validateRootName(name); err != nil {
+			return err
+		}
+		if err := id.validate(); err != nil {
+			return err
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, name := range names {
+		if current, ok := s.state.Roots[name]; ok && current != roots[name] {
+			return fmt.Errorf("root %q retains %s, not expected %s", name, current.key(), roots[name].key())
+		}
+	}
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(roots)*2)
+	for _, name := range names {
+		id, ok := s.state.Roots[name]
+		if !ok {
+			continue
+		}
+		object, ok := touched[id.key()]
+		if !ok {
+			object, ok = s.state.Objects[id.key()]
+		}
+		if !ok {
+			return fmt.Errorf("object %s does not exist", id.key())
+		}
+		var err error
+		object, err = releaseObject(object)
+		if err != nil {
+			return err
+		}
+		touched[id.key()] = object
+		ops = append(ops, journalOp{RootName: name, DeleteRoot: true})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
+	}
+	return s.commitLocked(ops)
+}
+
 func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 	if len(names) == 0 {
 		return nil
