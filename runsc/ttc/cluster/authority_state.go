@@ -78,6 +78,7 @@ const (
 	AuthoritySharedGCAcquire       AuthorityCommandKind = "shared-gc-acquire"
 	AuthoritySharedGCRenew         AuthorityCommandKind = "shared-gc-renew"
 	AuthoritySharedGCRelease       AuthorityCommandKind = "shared-gc-release"
+	AuthoritySharedGCRetire        AuthorityCommandKind = "shared-gc-retire-origin"
 )
 
 // AuthorityCommand is the sole replicated mutation envelope. IssuedAt is
@@ -165,6 +166,14 @@ type SharedGCLease struct {
 	ExpiresAt   time.Time `json:"expires_at"`
 }
 
+// SharedPackRetirement permanently fences an unreachable origin against a
+// late publisher. Physical deletion may be retried by later GC coordinators.
+type SharedPackRetirement struct {
+	SnapshotID   uint64    `json:"snapshot_id"`
+	GCGeneration uint64    `json:"gc_generation"`
+	RetiredAt    time.Time `json:"retired_at"`
+}
+
 // BranchAuthority is the cluster-wide authority record that is not already
 // represented by PlacementRecord.
 type BranchAuthority struct {
@@ -237,6 +246,7 @@ type AuthorityState struct {
 	Publications     map[string]PublicationRecord       `json:"publications,omitempty"`
 	VolatileOrigins  map[uint64]SnapshotOriginProvider  `json:"volatile_origins,omitempty"`
 	SharedGC         SharedGCLease                      `json:"shared_gc,omitempty"`
+	RetiredOrigins   map[uint64]SharedPackRetirement    `json:"retired_origins,omitempty"`
 	Requests         map[string]appliedAuthorityRequest `json:"requests,omitempty"`
 	RequestOrder     []string                           `json:"request_order,omitempty"`
 }
@@ -266,6 +276,9 @@ func (s *AuthorityState) initMaps() {
 	}
 	if s.VolatileOrigins == nil {
 		s.VolatileOrigins = make(map[uint64]SnapshotOriginProvider)
+	}
+	if s.RetiredOrigins == nil {
+		s.RetiredOrigins = make(map[uint64]SharedPackRetirement)
 	}
 	if s.NextSnapshotID == 0 {
 		s.NextSnapshotID = 1
@@ -422,6 +435,8 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
 	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
 		// SharedGC is copied by value with AuthorityState.
+	case AuthoritySharedGCRetire:
+		s.RetiredOrigins = cloneAuthorityMap(s.RetiredOrigins)
 	}
 }
 
@@ -533,6 +548,7 @@ type AuthoritySharedGCPayload struct {
 	NodeID, Incarnation string
 	Generation          uint64
 	Lease               time.Duration
+	SnapshotID          uint64
 }
 
 // AuthorityMigrationCutoverPayload joins the transaction and placement CASes
@@ -591,7 +607,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyBranch(command)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
 		return s.applySnapshot(command)
-	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
+	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease, AuthoritySharedGCRetire:
 		return s.applySharedGC(command)
 	default:
 		return nil, fmt.Errorf("unknown authority command %q", command.Kind)
@@ -608,7 +624,7 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 	}
 	switch command.Kind {
 	case AuthoritySharedGCAcquire:
-		if p.Generation != 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease {
+		if p.Generation != 0 || p.SnapshotID != 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease {
 			return nil, errors.New("invalid shared GC lease acquisition")
 		}
 		if !s.SharedGC.ExpiresAt.IsZero() && command.IssuedAt.Before(s.SharedGC.ExpiresAt) &&
@@ -626,7 +642,7 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		}
 		return authorityValue(s.SharedGC)
 	case AuthoritySharedGCRenew:
-		if p.Generation == 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease ||
+		if p.Generation == 0 || p.SnapshotID != 0 || p.Lease <= 0 || p.Lease > maxSharedGCLease ||
 			s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation || s.SharedGC.Generation != p.Generation ||
 			!command.IssuedAt.Before(s.SharedGC.ExpiresAt) {
 			return nil, errors.New("shared GC lease is not renewable")
@@ -634,7 +650,7 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		s.SharedGC.ExpiresAt = command.IssuedAt.Add(p.Lease)
 		return authorityValue(s.SharedGC)
 	case AuthoritySharedGCRelease:
-		if p.Lease != 0 || p.Generation == 0 {
+		if p.Lease != 0 || p.SnapshotID != 0 || p.Generation == 0 {
 			return nil, errors.New("invalid shared GC lease release")
 		}
 		if s.SharedGC.NodeID == "" {
@@ -645,6 +661,21 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		}
 		s.SharedGC = SharedGCLease{}
 		return authorityValue(s.SharedGC)
+	case AuthoritySharedGCRetire:
+		if p.Lease != 0 || p.Generation == 0 || p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID ||
+			s.SharedGC.NodeID != p.NodeID || s.SharedGC.Incarnation != p.Incarnation || s.SharedGC.Generation != p.Generation ||
+			!command.IssuedAt.Before(s.SharedGC.ExpiresAt) {
+			return nil, errors.New("shared GC retirement lacks a current lease")
+		}
+		if _, volatile := s.VolatileOrigins[p.SnapshotID]; volatile {
+			return nil, errors.New("cannot retire a volatile snapshot origin")
+		}
+		if retirement, retired := s.RetiredOrigins[p.SnapshotID]; retired {
+			return authorityValue(retirement)
+		}
+		retirement := SharedPackRetirement{SnapshotID: p.SnapshotID, GCGeneration: p.Generation, RetiredAt: command.IssuedAt}
+		s.RetiredOrigins[p.SnapshotID] = retirement
+		return authorityValue(retirement)
 	default:
 		panic("unreachable")
 	}
@@ -676,6 +707,9 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 	case AuthoritySnapshotPublish:
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
 			return nil, errors.New("invalid snapshot publication request")
+		}
+		if _, retired := s.RetiredOrigins[p.SnapshotID]; retired {
+			return nil, errors.New("snapshot origin is permanently retired")
 		}
 		provider, ok := s.VolatileOrigins[p.SnapshotID]
 		if !ok {
@@ -1623,6 +1657,15 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	for id, provider := range state.VolatileOrigins {
 		if id == 0 || id >= state.NextSnapshotID || provider.SnapshotID != id || provider.NodeID == "" {
 			return nil, errors.New("authority snapshot has invalid volatile origin")
+		}
+	}
+	for id, retirement := range state.RetiredOrigins {
+		if id == 0 || id >= state.NextSnapshotID || retirement.SnapshotID != id || retirement.GCGeneration == 0 ||
+			retirement.GCGeneration >= state.NextSharedGCGeneration || retirement.RetiredAt.IsZero() {
+			return nil, errors.New("authority snapshot has invalid shared-pack retirement")
+		}
+		if _, volatile := state.VolatileOrigins[id]; volatile {
+			return nil, errors.New("authority snapshot marks an origin volatile and retired")
 		}
 	}
 	if lease := state.SharedGC; lease.NodeID != "" {

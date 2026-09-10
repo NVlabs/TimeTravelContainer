@@ -193,6 +193,27 @@ func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {
 	if result := state.Apply(staleRelease); result.Err() == nil {
 		t.Fatal("stale owner released successor lease")
 	}
+	allocation := decodeAuthorityResultForTest[SnapshotAllocation](t, applyAuthorityForTest(t, state, "gc-allocate-origin", at.Add(15*time.Second), AuthoritySnapshotAllocate, AuthoritySnapshotPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Count: 1,
+	}))
+	applyAuthorityForTest(t, state, "gc-publish-origin", at.Add(15*time.Second), AuthoritySnapshotPublish, AuthoritySnapshotPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", SnapshotID: allocation.First,
+	})
+	retirement := decodeAuthorityResultForTest[SharedPackRetirement](t, applyAuthorityForTest(t, state, "gc-retire-origin", at.Add(15*time.Second), AuthoritySharedGCRetire, AuthoritySharedGCPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation, SnapshotID: allocation.First,
+	}))
+	if retirement.SnapshotID != allocation.First || retirement.GCGeneration != second.Generation {
+		t.Fatalf("retirement = %+v", retirement)
+	}
+	latePublish, err := NewAuthorityCommand("gc-late-publish", at.Add(15*time.Second), AuthoritySnapshotPublish, AuthoritySnapshotPayload{
+		NodeID: "node-b", Incarnation: "incarnation-b", SnapshotID: allocation.First,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(latePublish); result.Err() == nil {
+		t.Fatal("late publisher resurrected a retired origin")
+	}
 	applyAuthorityForTest(t, state, "gc-release-b", at.Add(16*time.Second), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
 		NodeID: "node-b", Incarnation: "incarnation-b", Generation: second.Generation,
 	})

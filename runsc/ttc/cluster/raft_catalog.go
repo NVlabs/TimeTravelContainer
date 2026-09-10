@@ -229,6 +229,9 @@ func (c *RaftCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOrig
 	if snapshotID == 0 || snapshotID >= state.NextSnapshotID {
 		return SnapshotOriginProvider{}, false, os.ErrNotExist
 	}
+	if _, retired := state.RetiredOrigins[snapshotID]; retired {
+		return SnapshotOriginProvider{}, false, os.ErrNotExist
+	}
 	provider, found = state.VolatileOrigins[snapshotID]
 	return provider, found, nil
 }
@@ -263,6 +266,18 @@ func (c *RaftCatalog) ReleaseSharedGCLease(lease SharedGCLease) error {
 	return applyRaftNoValue(c, time.Now().UTC(), AuthoritySharedGCRelease, AuthoritySharedGCPayload{
 		NodeID: lease.NodeID, Incarnation: lease.Incarnation, Generation: lease.Generation,
 	})
+}
+
+// RetireSharedSnapshot permanently removes one proven-unreachable shared
+// origin from routing before its physical packs are deleted.
+func (c *RaftCatalog) RetireSharedSnapshot(lease SharedGCLease, snapshotID uint64) (SharedPackRetirement, error) {
+	value, err := applyRaftValue[SharedPackRetirement](c, time.Now().UTC(), AuthoritySharedGCRetire, AuthoritySharedGCPayload{
+		NodeID: lease.NodeID, Incarnation: lease.Incarnation, Generation: lease.Generation, SnapshotID: snapshotID,
+	})
+	if err != nil {
+		return SharedPackRetirement{}, err
+	}
+	return *value, nil
 }
 
 // SharedGCLease returns the current replicated lease. Callers must still
