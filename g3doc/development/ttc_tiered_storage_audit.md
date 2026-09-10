@@ -1,5 +1,10 @@
 # TTC tiered-storage and data-path audit
 
+The follow-up
+[snapshot-graph storage refactor](../proposals/ttc_snapshot_graph_refactor.md)
+is the authoritative replacement plan. This document remains the audit of the
+pre-refactor implementation and the evidence for that plan.
+
 Status: audit of commit `8f7a3a327` (2026-09-09). This document records
 current behavior and design requirements. It does not prescribe the replacement
 architecture yet.

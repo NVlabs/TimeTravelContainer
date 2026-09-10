@@ -1,5 +1,11 @@
 # TTC cluster-wide Raft control plane
 
+> **Planned data-plane replacement:** The
+> [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) preserves
+> the single cluster-wide Raft group but replaces storage generations,
+> content-addressed TTC data objects, and the existing publication/ownership
+> details in the next incompatible root format.
+
 ## Status
 
 This document defines the implemented authoritative control-plane state

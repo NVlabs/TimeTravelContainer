@@ -1,5 +1,10 @@
 # Elastic TimeTravelContainer clusters
 
+> **Planned data-plane replacement:** The
+> [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) is the
+> authoritative storage and ownership design for the next, incompatible TTC
+> root format. This document remains the current scheduler/elasticity design.
+
 Status: the cluster authority has moved to one persistent cluster-wide Raft
 group. Identity-preserving migration uses live sparse memory transfer, and
 placement uses a cluster-global hypergraph with event-local movable vertices

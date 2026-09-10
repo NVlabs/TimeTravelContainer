@@ -244,6 +244,7 @@ recovery, and nested execution.
 
 ### Development Docs
 
+- [Snapshot-graph storage refactor plan](g3doc/proposals/ttc_snapshot_graph_refactor.md)
 - [Harness feature tracker and stress-test policy](g3doc/development/ttc_harness_features.md)
 - [Client/daemon boundary and size audit](g3doc/development/ttc_client_boundary.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)

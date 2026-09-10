@@ -1,5 +1,11 @@
 # TTC userspace extent store
 
+> **Planned replacement:** The
+> [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) is the
+> authoritative design for the next, incompatible TTC root format. This
+> document describes the current/older implementation and its historical
+> experiments.
+
 ## Status
 
 The memory-hydration backend is implemented. It includes stable logical page

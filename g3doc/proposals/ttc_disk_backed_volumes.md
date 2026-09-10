@@ -1,5 +1,10 @@
 # TTC disk-backed managed volumes
 
+> **Planned replacement:** The
+> [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) is the
+> authoritative design for the next, incompatible TTC root format. This
+> document describes the current/older implementation.
+
 > **Current storage design:** This document describes the implementation used
 > today. The [TTC userspace extent store](ttc_userspace_extent_store.md) now
 > backs dehydrated and distributed memory only. Replacing rootfs and volume

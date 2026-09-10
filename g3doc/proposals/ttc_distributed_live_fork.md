@@ -1,5 +1,10 @@
 # Distributed live fork with remote copy-on-read memory
 
+> **Planned replacement:** The
+> [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) is the
+> authoritative data-plane design for the next, incompatible TTC root format.
+> This document describes the current/older implementation.
+
 > **Current storage design:**
 > [TTC userspace extent store](ttc_userspace_extent_store.md) specifies the
 > implemented immutable 1 MiB loose-chunk repository. It replaces
