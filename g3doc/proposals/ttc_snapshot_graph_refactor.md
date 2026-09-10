@@ -36,8 +36,8 @@ waive that phase's remaining migration or qualification work.
 | 0: specification and boundary | in progress | Plan committed in `15705aec7`; strict root recognition and the destructive format boundary landed in `5de1eb4a3`. | Record the complete pre/post performance and NFS/Lustre qualification matrix. |
 | 1: version/API/config cleanup | in progress | Standalone format 2 and clustered format 5 are enforced; writable repositories moved behind repository format 3 in `90b336ae9`; reflink is optional with automatic whole-file fallback. | Finish schema audit and prove every removed legacy option/API is absent from client, daemon, SDKs, and MCP. |
 | 2: common graph | in progress | Persistent IDs/journal/reference engine (`8f5b5c821`), immutable filesystem roots (`0429be25f`), standalone data store (`9bfae5618`), daemon graph (`a4b47356b`), O(1) batch fork (`3f9acf50c`), origin resolver (`448af1144`), graph packs (`5cf9a74de`), generation-selected WAL compaction (`0e414a808`), and graph-native 1 MiB memory records (`061371505`) are present. Memory radix mutations use bounded touched-object overlays instead of cloning the full graph. | Complete the crash matrix and exact residue tests. |
-| 3: standalone filesystem/images | in progress | Directory import (`2e3ec8092`), managed/rootfs repository graph conversion (`8da8fc220`), and ancestry-independent direct lookup with authoritative diff roots (`edf392cb9`) have landed. | Remove remaining legacy filesystem data paths and qualify OCI commit/save/load, mounts, FUSE, NFS deletion, and whole-file CoW. |
-| 4: standalone memory/lifecycle | in progress | Dehydration dual-writes cold state into 1 MiB graph objects with independent 4 KiB page identities and versions; live and dehydrated forks clone only radix-root references (`061371505`). | Restore directly from graph roots, then remove the legacy sparse chunk repository, application memory files, and compatibility metadata. Qualify every lifecycle transition and residue gate. |
+| 3: standalone filesystem/images | in progress | Directory import (`2e3ec8092`), managed/rootfs repository graph conversion (`8da8fc220`), ancestry-independent direct lookup with authoritative diff roots (`edf392cb9`), and Sentry-safe descriptor-relative graph/object mutation (`2146eaff3`) have landed. | Remove remaining legacy filesystem data paths and qualify OCI commit/save/load, mounts, FUSE, NFS deletion, and whole-file CoW. |
+| 4: standalone memory/lifecycle | in progress | Dehydration writes cold state into 1 MiB graph objects with independent 4 KiB page identities and versions (`061371505`); direct graph reads (`a72e461e4`) and standalone graph-root rehydration (`1c570928f`) are active; live and dehydrated forks clone only radix-root references. | Remove the legacy sparse chunk repository, application memory files, and compatibility metadata. Qualify every lifecycle transition and residue gate. |
 | 5: distributed provider protocol | in progress | Raft snapshot allocation (`8ed3d29fa`), provider fencing (`3409e38d2`), transport (`819c907b0`), publication fencing (`ca619de37`), and resolver initialization (`de71aeefa`) are foundations. | Make every remote fork/migration/rehydration data path graph-native and pass interruption/retry tests. |
 | 6: shared images/cache | not started | None. | Random-access image packs, background/on-demand whole-file materialization, cache eviction, and cold-start gates. |
 | 7: peer data/publication | not started | Immutable object transport is available as a primitive. | Peer filesystem/memory range service, asynchronous publication, dependency accounting, and repeated migration gates. |
@@ -47,11 +47,12 @@ waive that phase's remaining migration or qualification work.
 
 ### Current milestone
 
-The active milestone makes graph roots the authoritative standalone
-dehydration source. It adds a graph-backed sparse-memory reader, switches
-rehydration and dehydrated fork to that reader, and then removes compatibility
-roots from the legacy chunk repository. Resident memory remains anonymous and
-4 KiB CoW; only cold snapshot data is written to the graph store.
+Graph roots are now the authoritative standalone dehydration read source, and
+descriptor-donated Sentries can mutate graph metadata and whole-file objects
+without reopening host paths. The active milestone removes compatibility roots
+and bulk data from the legacy sparse chunk repository, followed by
+`application.mem`. Resident memory remains anonymous and 4 KiB CoW; only cold
+snapshot data is written to the graph store.
 
 ## Goals
 
