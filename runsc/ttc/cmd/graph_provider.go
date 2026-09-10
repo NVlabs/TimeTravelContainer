@@ -316,7 +316,7 @@ var _ cluster.ImmutableObjectProvider = (*graphObjectProvider)(nil)
 var _ cluster.ImmutableSnapshotProvider = (*graphObjectProvider)(nil)
 var _ cluster.SnapshotReferenceProvider = (*graphObjectProvider)(nil)
 
-func decodeGraphSnapshotCatalog(reader io.Reader, length uint64, snapshot ttcsnapshot.SnapshotID) (*ttcsnapshot.ImmutableCatalog, error) {
+func decodeGraphSnapshotObjects(reader io.Reader, length uint64, snapshot ttcsnapshot.SnapshotID) ([]ttcsnapshot.Object, error) {
 	if reader == nil || length == 0 || length > 512<<20 {
 		return nil, errors.New("invalid immutable snapshot catalog length")
 	}
@@ -337,22 +337,27 @@ func decodeGraphSnapshotCatalog(reader io.Reader, length uint64, snapshot ttcsna
 			return nil, fmt.Errorf("snapshot %d catalog contains foreign object %s", snapshot, object.ID)
 		}
 	}
-	return ttcsnapshot.NewImmutableCatalog(wire.Objects)
+	if _, err := ttcsnapshot.NewImmutableCatalog(wire.Objects); err != nil {
+		return nil, err
+	}
+	return wire.Objects, nil
 }
 
 // immutableSnapshotCatalog resolves metadata by origin authority. Unlike the
 // bulk resolver it never installs metadata into the local authoritative graph.
-func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, snapshot ttcsnapshot.SnapshotID, transaction string) (*ttcsnapshot.ImmutableCatalog, error) {
-	if b == nil || snapshot == 0 {
+func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, roots []ttcsnapshot.ObjectID, transaction string) (*ttcsnapshot.ImmutableCatalog, error) {
+	if b == nil || len(roots) == 0 {
 		return nil, errors.New("invalid immutable snapshot catalog request")
 	}
+	return ttcsnapshot.ResolveImmutableCatalog(roots, func(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.Object, error) {
+		return b.immutableSnapshotOriginObjects(ctx, origin, transaction)
+	})
+}
+
+func (b *runtimeBackend) immutableSnapshotOriginObjects(ctx context.Context, snapshot ttcsnapshot.SnapshotID, transaction string) ([]ttcsnapshot.Object, error) {
 	if b.snapshotGraph != nil {
 		if record, ok := b.snapshotGraph.Snapshot(snapshot); ok && record.State != ttcsnapshot.SnapshotWorking {
-			objects, err := b.snapshotGraph.SnapshotObjects(snapshot)
-			if err != nil {
-				return nil, err
-			}
-			return ttcsnapshot.NewImmutableCatalog(objects)
+			return b.snapshotGraph.SnapshotObjects(snapshot)
 		}
 	}
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
@@ -374,7 +379,7 @@ func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, snapshot 
 		for index := range manifest.Objects {
 			objects[index] = manifest.Objects[index].Object
 		}
-		return ttcsnapshot.NewImmutableCatalog(objects)
+		return objects, nil
 	}
 	if provider.NodeID == b.nodeID {
 		return nil, fmt.Errorf("local node owns snapshot %d but has no sealed graph metadata", snapshot)
@@ -388,5 +393,5 @@ func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, snapshot 
 		return nil, err
 	}
 	defer reader.Close()
-	return decodeGraphSnapshotCatalog(reader, length, snapshot)
+	return decodeGraphSnapshotObjects(reader, length, snapshot)
 }

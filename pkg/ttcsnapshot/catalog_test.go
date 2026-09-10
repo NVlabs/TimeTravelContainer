@@ -66,3 +66,29 @@ func TestImmutableCatalogReadsMemoryWithoutOwningReferences(t *testing.T) {
 		t.Fatalf("catalog did not preserve immutable metadata: (%+v,%t)", object, ok)
 	}
 }
+
+func TestResolveImmutableCatalogFollowsOriginEdgesOnce(t *testing.T) {
+	old := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 1}
+	root := ObjectID{Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 1}
+	sections := map[SnapshotID][]Object{
+		1: {{ID: old, State: ObjectLive, Refs: 7, BulkLength: 4096}},
+		2: {{ID: root, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: old}}}},
+	}
+	loads := make(map[SnapshotID]int)
+	catalog, err := ResolveImmutableCatalog([]ObjectID{root, root}, func(origin SnapshotID) ([]Object, error) {
+		loads[origin]++
+		return sections[origin], nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads[1] != 1 || loads[2] != 1 {
+		t.Fatalf("origin loads = %v, want each exactly once", loads)
+	}
+	if _, ok := catalog.Object(root); !ok {
+		t.Fatal("resolved catalog omitted root origin")
+	}
+	if object, ok := catalog.Object(old); !ok || object.BulkLength != 4096 {
+		t.Fatalf("resolved catalog old object = (%+v, %t)", object, ok)
+	}
+}

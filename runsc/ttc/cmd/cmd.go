@@ -11998,6 +11998,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		return nil, errors.New("graph-native dehydration roots are unavailable")
 	}
 	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
+	rootObjects := make([]ttcsnapshot.ObjectID, len(capture.MemoryRoots))
 	localRoots := b.snapshotGraph != nil
 	for index, recorded := range capture.MemoryRoots {
 		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
@@ -12011,12 +12012,13 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 			}
 		}
 		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
+		rootObjects[index] = id
 	}
 	var catalog ttcsnapshot.MemoryCatalog
 	if localRoots {
 		catalog = b.snapshotGraph
 	} else {
-		immutable, err := b.immutableSnapshotCatalog(context.Background(), ttcsnapshot.SnapshotID(capture.SnapshotID), "")
+		immutable, err := b.immutableSnapshotCatalog(context.Background(), rootObjects, "")
 		if err != nil {
 			return nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
 		}
@@ -12705,39 +12707,106 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 	}
 
-	memoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-	if _, statErr := os.Stat(memoryPath); statErr == nil {
-		memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
-		if openErr != nil {
-			return FamilyResourceStats{}, openErr
+	graphMemory := make(map[string]map[ttcsnapshot.ObjectID]uint64)
+	objectBranches := make(map[ttcsnapshot.ObjectID]uint64)
+	objectSizes := make(map[ttcsnapshot.ObjectID]uint64)
+	for _, branch := range branches {
+		if len(branch.MemoryRootObjects) == 0 {
+			continue
 		}
-		roots, rootsErr := memoryRepository.ListBranches()
-		if rootsErr != nil {
-			memoryRepository.Close()
-			return FamilyResourceStats{}, rootsErr
+		if err := validateGraphRootObjects(branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+			return FamilyResourceStats{}, fmt.Errorf("accounting %s@%s memory roots: %w", result.Container, branch.ID, err)
 		}
-		memoryBranches := make(map[string]string)
-		for visible, filesystem := range filesystemBranches {
-			if _, ok := roots[filesystem]; ok {
-				memoryBranches[visible] = filesystem
+		roots := make([]ttcsnapshot.ObjectID, len(branch.MemoryRootObjects))
+		allLocal := b.snapshotGraph != nil
+		for index, encoded := range branch.MemoryRootObjects {
+			id, err := ttcsnapshot.ParseObjectID(encoded)
+			if err != nil {
+				return FamilyResourceStats{}, err
+			}
+			roots[index] = id
+			if allLocal {
+				_, allLocal = b.snapshotGraph.Object(id)
 			}
 		}
-		usage, usageErr := memoryRepository.BranchSetUsage(memoryBranches)
-		closeErr := memoryRepository.Close()
-		if usageErr != nil {
-			return FamilyResourceStats{}, usageErr
-		}
-		if closeErr != nil {
-			return FamilyResourceStats{}, closeErr
-		}
-		result.MemoryBackingUniqueBytes = usage.UniqueBytes
-		for _, branchUsage := range usage.Branches {
-			if account := byID[branchUsage.ID]; account != nil {
-				addResourceBytes(&account.MemoryBacking, branchUsage.PrivateBytes, branchUsage.SharedBytes)
+		var catalog ttcsnapshot.ObjectCatalog
+		if allLocal {
+			catalog = b.snapshotGraph
+		} else {
+			immutable, err := b.immutableSnapshotCatalog(context.Background(), roots, "")
+			if err != nil {
+				return FamilyResourceStats{}, fmt.Errorf("resolving immutable memory catalog for %s@%s: %w", result.Container, branch.ID, err)
 			}
+			catalog = immutable
 		}
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return FamilyResourceStats{}, statErr
+		objects, err := ttcsnapshot.ReachableBulkObjects(catalog, roots)
+		if err != nil {
+			return FamilyResourceStats{}, fmt.Errorf("traversing memory roots for %s@%s: %w", result.Container, branch.ID, err)
+		}
+		memoryObjects := make(map[ttcsnapshot.ObjectID]uint64)
+		for id, size := range objects {
+			if id.Kind != ttcsnapshot.ObjectKindMemoryChunk {
+				return FamilyResourceStats{}, fmt.Errorf("memory root for %s@%s reaches non-memory bulk object %s", result.Container, branch.ID, id)
+			}
+			memoryObjects[id] = size
+			objectBranches[id]++
+			objectSizes[id] = size
+		}
+		graphMemory[branch.ID] = memoryObjects
+	}
+	if len(graphMemory) != 0 {
+		for branch, objects := range graphMemory {
+			account := byID[branch]
+			for id, size := range objects {
+				if objectBranches[id] > 1 {
+					account.MemoryBacking.SharedBytes += size
+				} else {
+					account.MemoryBacking.PrivateBytes += size
+				}
+			}
+			account.MemoryBacking.TotalBytes = account.MemoryBacking.PrivateBytes + account.MemoryBacking.SharedBytes
+		}
+		for _, size := range objectSizes {
+			result.MemoryBackingUniqueBytes += size
+		}
+	} else {
+		// This path exists only while the live remote-fork implementation still
+		// produces its pre-graph sparse repository. New dehydration roots are
+		// always accounted by immutable graph identity above.
+		memoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
+		if _, statErr := os.Stat(memoryPath); statErr == nil {
+			memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
+			if openErr != nil {
+				return FamilyResourceStats{}, openErr
+			}
+			roots, rootsErr := memoryRepository.ListBranches()
+			if rootsErr != nil {
+				memoryRepository.Close()
+				return FamilyResourceStats{}, rootsErr
+			}
+			memoryBranches := make(map[string]string)
+			for visible, filesystem := range filesystemBranches {
+				if _, ok := roots[filesystem]; ok {
+					memoryBranches[visible] = filesystem
+				}
+			}
+			usage, usageErr := memoryRepository.BranchSetUsage(memoryBranches)
+			closeErr := memoryRepository.Close()
+			if usageErr != nil {
+				return FamilyResourceStats{}, usageErr
+			}
+			if closeErr != nil {
+				return FamilyResourceStats{}, closeErr
+			}
+			result.MemoryBackingUniqueBytes = usage.UniqueBytes
+			for _, branchUsage := range usage.Branches {
+				if account := byID[branchUsage.ID]; account != nil {
+					addResourceBytes(&account.MemoryBacking, branchUsage.PrivateBytes, branchUsage.SharedBytes)
+				}
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return FamilyResourceStats{}, statErr
+		}
 	}
 
 	output, residentErr := b.command("timetravel", resolved.container, "stats", resolved.branch)

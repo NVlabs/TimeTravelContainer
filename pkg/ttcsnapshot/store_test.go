@@ -923,6 +923,42 @@ func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
 	}
 }
 
+func TestReachableBulkObjectsUsesImmutableIdentity(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitBulk := func(pin string, kind ObjectKind, length uint64) ObjectID {
+		t.Helper()
+		id, err := store.ReserveObject(origin, kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CommitReservedObject(id, pin, length, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	shared := commitBulk("build/shared", ObjectKindFile, 4096)
+	private := commitBulk("build/private", ObjectKindMemoryChunk, MemoryChunkBytes)
+	root, err := store.CreateObject(origin, "build/root", ObjectKindMetadata, nil, []Edge{{Slot: 0, Child: shared}, {Slot: 1, Child: private}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := ReachableBulkObjects(store, []ObjectID{root, root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 || objects[shared] != 4096 || objects[private] != MemoryChunkBytes {
+		t.Fatalf("reachable bulk objects = %+v", objects)
+	}
+	missing := ObjectID{Snapshot: origin, Kind: ObjectKindMetadata, Ordinal: 9999}
+	if _, err := ReachableBulkObjects(store, []ObjectID{missing}); err == nil {
+		t.Fatal("missing reachable object was silently ignored")
+	}
+}
+
 func TestMemoryChunkCreatesOneSharedRadixPath(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()

@@ -1979,6 +1979,46 @@ type Inspection struct {
 	Objects   []Object
 }
 
+// ObjectCatalog is the read-only graph surface required for reachability
+// accounting. Both an authoritative Store and an ImmutableCatalog implement
+// it; accounting therefore does not import reference authority into a cache.
+type ObjectCatalog interface {
+	Object(ObjectID) (Object, bool)
+}
+
+// ReachableBulkObjects returns every bulk object reachable from roots, keyed
+// by immutable object identity. Metadata nodes are traversed but contribute no
+// bytes. Missing or reclaiming objects fail closed instead of under-reporting
+// resource use.
+func ReachableBulkObjects(catalog ObjectCatalog, roots []ObjectID) (map[ObjectID]uint64, error) {
+	if catalog == nil {
+		return nil, errors.New("TTC snapshot catalog is unavailable")
+	}
+	result := make(map[ObjectID]uint64)
+	seen := make(map[ObjectID]struct{})
+	stack := append([]ObjectID(nil), roots...)
+	for len(stack) != 0 {
+		index := len(stack) - 1
+		id := stack[index]
+		stack = stack[:index]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		object, ok := catalog.Object(id)
+		if !ok || object.State != ObjectLive {
+			return nil, fmt.Errorf("reachable TTC object %s is missing or not live", id)
+		}
+		if object.BulkLength != 0 {
+			result[id] = object.BulkLength
+		}
+		for _, edge := range object.Children {
+			stack = append(stack, edge.Child)
+		}
+	}
+	return result, nil
+}
+
 // Inspect returns a consistent logical graph view. Callers must not infer
 // physical placement or authority from object ordering.
 func (s *Store) Inspect() Inspection {

@@ -14,7 +14,12 @@
 
 package ttcsnapshot
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+)
 
 // MemoryCatalog is the immutable subset of a snapshot graph required to
 // reconstruct graph-native memory. Store implements it for authoritative
@@ -49,6 +54,68 @@ func NewImmutableCatalog(objects []Object) (*ImmutableCatalog, error) {
 		catalog.objects[key] = cloneObject(object)
 	}
 	return catalog, nil
+}
+
+// ResolveImmutableCatalog loads immutable origin sections while walking only
+// objects reachable from roots. Snapshot packs intentionally contain objects
+// allocated by one origin; when a reachable edge crosses origins, load
+// supplies that origin directly from its Raft-selected provider or shared
+// pack. Each origin and object is visited at most once.
+func ResolveImmutableCatalog(roots []ObjectID, load func(SnapshotID) ([]Object, error)) (*ImmutableCatalog, error) {
+	if len(roots) == 0 || load == nil {
+		return nil, errors.New("immutable TTC catalog resolution requires a root")
+	}
+	loaded := make(map[SnapshotID]struct{})
+	all := make(map[string]Object)
+	seen := make(map[ObjectID]struct{})
+	pending := append([]ObjectID(nil), roots...)
+	for len(pending) != 0 {
+		index := len(pending) - 1
+		id := pending[index]
+		pending = pending[:index]
+		if err := id.validate(); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		object, ok := all[id.key()]
+		if !ok {
+			origin := id.Snapshot
+			if _, ok := loaded[origin]; ok {
+				return nil, fmt.Errorf("immutable TTC origin %d omits reachable object %s", origin, id)
+			}
+			objects, err := load(origin)
+			if err != nil {
+				return nil, fmt.Errorf("loading immutable TTC origin %d: %w", origin, err)
+			}
+			loaded[origin] = struct{}{}
+			for _, candidate := range objects {
+				if candidate.ID.Snapshot != origin {
+					return nil, fmt.Errorf("immutable TTC origin %d returned foreign object %s", origin, candidate.ID)
+				}
+				key := candidate.ID.key()
+				if previous, exists := all[key]; exists && !reflect.DeepEqual(previous, candidate) {
+					return nil, fmt.Errorf("immutable TTC object %s has conflicting metadata", candidate.ID)
+				}
+				all[key] = cloneObject(candidate)
+			}
+			object, ok = all[id.key()]
+			if !ok {
+				return nil, fmt.Errorf("immutable TTC origin %d omits reachable object %s", origin, id)
+			}
+		}
+		for _, edge := range object.Children {
+			pending = append(pending, edge.Child)
+		}
+	}
+	objects := make([]Object, 0, len(all))
+	for _, object := range all {
+		objects = append(objects, object)
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	return NewImmutableCatalog(objects)
 }
 
 // Object returns an immutable metadata record.
