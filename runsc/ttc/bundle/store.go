@@ -411,10 +411,14 @@ type BranchInfo struct {
 	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
 	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
 	MemoryRoots              []string  `json:"memory_roots,omitempty"`
-	ForkTotalNS              int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS         int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS             int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt                time.Time `json:"created_at"`
+	// MemoryRootObjects records the immutable object selected by each logical
+	// root name. Names are branch-local handles; object IDs remain stable when
+	// authority moves from a node to shared storage.
+	MemoryRootObjects []string  `json:"memory_root_objects,omitempty"`
+	ForkTotalNS       int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS  int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS      int64     `json:"kernel_fork_ns,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // BranchNodeID returns the effective cluster owner of branchID.
@@ -3393,7 +3397,10 @@ func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) e
 // UpdateBranchMemoryGraph records or clears the authoritative logical memory
 // roots for a branch. Physical provider/cache locations are deliberately not
 // part of this record.
-func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots []string) error {
+func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots, objects []string) error {
+	if len(roots) != len(objects) {
+		return fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
+	}
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			branch := &info.Branches[i]
@@ -3402,6 +3409,7 @@ func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64,
 			}
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = append([]string(nil), roots...)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
 			return true, nil
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)

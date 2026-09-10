@@ -761,15 +761,15 @@ func localGraphCaptureMatches(path string, branch ttcbundle.BranchInfo) bool {
 	if err := json.Unmarshal(control, &capture); err != nil {
 		return false
 	}
-	if capture.SnapshotID != branch.SnapshotID || len(capture.MemoryRoots) != len(branch.MemoryRoots) {
+	if capture.SnapshotID != branch.SnapshotID || len(capture.MemoryRoots) != len(branch.MemoryRoots) || len(branch.MemoryRootObjects) != len(branch.MemoryRoots) {
 		return false
 	}
-	wanted := make(map[string]struct{}, len(branch.MemoryRoots))
-	for _, name := range branch.MemoryRoots {
-		wanted[name] = struct{}{}
+	wanted := make(map[string]string, len(branch.MemoryRoots))
+	for index, name := range branch.MemoryRoots {
+		wanted[name] = branch.MemoryRootObjects[index]
 	}
 	for _, root := range capture.MemoryRoots {
-		if _, ok := wanted[root.Name]; !ok {
+		if object, ok := wanted[root.Name]; !ok || object != root.Root {
 			return false
 		}
 		delete(wanted, root.Name)

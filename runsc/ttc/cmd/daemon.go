@@ -3172,6 +3172,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("opening shared snapshot packs: %w", err)
 		}
 	}
+	if err := validatePersistedMemoryGraph(ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}); err != nil {
+		return fmt.Errorf("validating snapshot-graph branch records: %w", err)
+	}
 	removeRetiredRaftState := false
 	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
 		// This defer is intentionally registered before raft.Close below, so it
@@ -3536,6 +3539,38 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		go server.handle(conn, stderr)
 	}
+}
+
+// validatePersistedMemoryGraph rejects incomplete intermediate development
+// layouts at daemon startup. A root name is only a branch-local handle; every
+// graph-backed branch must also retain the immutable root object IDs needed
+// after its origin moves to shared storage or another node.
+func validatePersistedMemoryGraph(store ttcbundle.Store) error {
+	containers, err := store.ListContainersForGC()
+	if err != nil {
+		return err
+	}
+	for _, container := range containers {
+		for _, branch := range container.Branches {
+			if branch.SnapshotID == 0 && len(branch.MemoryRoots) == 0 && len(branch.MemoryRootObjects) == 0 {
+				continue
+			}
+			if err := validateGraphRootObjects(branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+				return fmt.Errorf("%s@%s: %w; this root predates immutable root-object records and is not migrated", container.Name, branch.ID, err)
+			}
+			names := make(map[string]struct{}, len(branch.MemoryRoots))
+			for _, name := range branch.MemoryRoots {
+				if name == "" {
+					return fmt.Errorf("%s@%s has an empty memory root name", container.Name, branch.ID)
+				}
+				if _, ok := names[name]; ok {
+					return fmt.Errorf("%s@%s repeats memory root %q", container.Name, branch.ID, name)
+				}
+				names[name] = struct{}{}
+			}
+		}
+	}
+	return nil
 }
 
 // shutdownClusterServer lets an in-flight proxied node-stop response drain

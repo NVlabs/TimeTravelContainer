@@ -5004,11 +5004,11 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	now := time.Now().UTC()
 	merged := mergeBranchHistory(
-		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now, SnapshotID: 41, MemoryRoots: []string{"memory/41/root"}}},
+		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now, SnapshotID: 41, MemoryRoots: []string{"memory/41/root"}, MemoryRootObjects: []string{"0000000000000029-03-0000000000000001"}}},
 		[]Branch{{ID: "child", ParentID: "removed-parent", State: "paused", CreatedAt: now}},
 	)
 	if len(merged) != 1 || merged[0].ParentID != "" || !merged[0].Quarantined || merged[0].State != "paused" ||
-		merged[0].SnapshotID != 41 || !slices.Equal(merged[0].MemoryRoots, []string{"memory/41/root"}) {
+		merged[0].SnapshotID != 41 || !slices.Equal(merged[0].MemoryRoots, []string{"memory/41/root"}) || !slices.Equal(merged[0].MemoryRootObjects, []string{"0000000000000029-03-0000000000000001"}) {
 		t.Fatalf("merged branch=%+v, want persisted parent and live state", merged)
 	}
 }
@@ -5019,7 +5019,7 @@ func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "control.json"), []byte(control), 0600); err != nil {
 		t.Fatal(err)
 	}
-	branch := ttcbundle.BranchInfo{SnapshotID: 8, MemoryRoots: []string{"memory/8/root"}}
+	branch := ttcbundle.BranchInfo{SnapshotID: 8, MemoryRoots: []string{"memory/8/root"}, MemoryRootObjects: []string{"0000000000000008-03-0000000000000001"}}
 	if !localGraphCaptureMatches(dir, branch) {
 		t.Fatal("matching local graph capture was rejected")
 	}
@@ -5032,6 +5032,26 @@ func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
 	}
 	if localGraphCaptureMatches(dir, branch) {
 		t.Fatal("malformed local graph capture was accepted")
+	}
+}
+
+func TestValidateGraphRootObjectsAllowsInheritedOrigin(t *testing.T) {
+	if err := validateGraphRootObjects(9, []string{"memory/branch/main/resource-0000"}, []string{"0000000000000008-03-0000000000000001"}); err != nil {
+		t.Fatalf("inherited immutable origin was rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		objects []string
+	}{
+		{name: "missing", objects: nil},
+		{name: "wrong kind", objects: []string{"0000000000000008-02-0000000000000001"}},
+		{name: "malformed", objects: []string{"not-an-object"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateGraphRootObjects(9, []string{"memory/branch/main/resource-0000"}, test.objects); err == nil {
+				t.Fatal("invalid immutable root-object metadata was accepted")
+			}
+		})
 	}
 }
 
