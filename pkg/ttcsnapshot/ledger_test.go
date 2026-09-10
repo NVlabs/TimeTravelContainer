@@ -182,6 +182,66 @@ func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerCheckpointAndOldWALCrashPrefix(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := ledgerObject(12, 1, ObjectKindFile)
+	if err := ledger.ImportOrigin(12, []Object{object}, map[string]ObjectID{"branch": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyReference("pin", "runtime", object.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	oldWAL, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ledger.JournalBytes(); got != int64(len(referenceLedgerHeader)) {
+		t.Fatalf("compacted journal is %d bytes, want %d", got, len(referenceLedgerHeader))
+	}
+	if err := ledger.ApplyReference("drop-runtime", "runtime", object.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emulate a crash after checkpoint publication but before the old WAL was
+	// replaced. Reopen must skip the prefix incorporated by the checkpoint.
+	if err := os.WriteFile(filepath.Join(directory, "ledger.log"), oldWAL, 0600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspection := reopened.Inspect()
+	if got := inspection.Objects[object.ID]; got != 2 {
+		t.Fatalf("references after old-WAL replay=%d, want 2", got)
+	}
+	if err := reopened.ApplyReference("drop-runtime", "runtime", object.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	final, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Close()
+	if got := final.Inspect().Objects[object.ID]; got != 1 {
+		t.Fatalf("references after post-checkpoint replay=%d, want 1", got)
+	}
+}
+
 func TestSnapshotLedgerCapturesForeignParentEdges(t *testing.T) {
 	graph, err := Open(filepath.Join(t.TempDir(), "graph"))
 	if err != nil {

@@ -33,7 +33,14 @@ import (
 const (
 	referenceLedgerHeader    = "TTCRL1\n"
 	maxReferenceLedgerRecord = 8 << 20
+	referenceLedgerVersion   = 1
 )
+
+type referenceLedgerCheckpoint struct {
+	Version  int                  `json:"version"`
+	Sequence uint64               `json:"sequence"`
+	State    referenceLedgerState `json:"state"`
+}
 
 // OutboundReference is one ordered cross-owner edge mutation. Name is stable
 // for the immutable parent edge. Delivery is strictly in Sequence order and
@@ -147,7 +154,8 @@ func OpenReferenceLedger(dir string) (*ReferenceLedger, error) {
 		return nil, err
 	}
 	for _, entry := range entries {
-		if entry.Name() != "ledger.lock" && entry.Name() != "ledger.log" {
+		if entry.Name() != "ledger.lock" && entry.Name() != "ledger.log" && entry.Name() != "ledger.checkpoint" &&
+			!strings.HasPrefix(entry.Name(), ".ledger-checkpoint-") && !strings.HasPrefix(entry.Name(), ".ledger-log-") {
 			return nil, fmt.Errorf("reference ledger contains unknown entry %q", entry.Name())
 		}
 	}
@@ -164,11 +172,39 @@ func OpenReferenceLedger(dir string) (*ReferenceLedger, error) {
 		return fail(err)
 	}
 	ledger := &ReferenceLedger{state: newReferenceLedgerState(), dir: dir, lock: lock, journal: journal}
+	if err := ledger.loadCheckpoint(); err != nil {
+		ledger.Close()
+		return nil, err
+	}
 	if err := ledger.replay(); err != nil {
 		ledger.Close()
 		return nil, err
 	}
 	return ledger, nil
+}
+
+func (ledger *ReferenceLedger) loadCheckpoint() error {
+	data, err := os.ReadFile(filepath.Join(ledger.dir, "ledger.checkpoint"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var checkpoint referenceLedgerCheckpoint
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&checkpoint)
+	trailingErr := decoder.Decode(&struct{}{})
+	if decodeErr != nil || trailingErr != io.EOF || checkpoint.Version != referenceLedgerVersion {
+		return fmt.Errorf("invalid reference ledger checkpoint (decode=%v trailing=%v version=%d sequence=%d)", decodeErr, trailingErr, checkpoint.Version, checkpoint.Sequence)
+	}
+	if err := validateReferenceLedgerState(checkpoint.State); err != nil {
+		return fmt.Errorf("validating reference ledger checkpoint: %w", err)
+	}
+	ledger.state = cloneReferenceLedgerState(checkpoint.State)
+	ledger.sequence = checkpoint.Sequence
+	return nil
 }
 
 func (ledger *ReferenceLedger) replay() error {
@@ -189,9 +225,8 @@ func (ledger *ReferenceLedger) replay() error {
 	if _, err := ledger.journal.ReadAt(header, 0); err != nil || string(header) != referenceLedgerHeader {
 		return fmt.Errorf("invalid reference ledger header: %w", err)
 	}
-	temporary := NewReferenceLedger()
+	temporary := &ReferenceLedger{state: cloneReferenceLedgerState(ledger.state), sequence: ledger.sequence}
 	offset := int64(len(referenceLedgerHeader))
-	expected := uint64(1)
 	for {
 		var framing [8]byte
 		n, err := ledger.journal.ReadAt(framing[:], offset)
@@ -221,17 +256,22 @@ func (ledger *ReferenceLedger) replay() error {
 		decoder.DisallowUnknownFields()
 		decodeErr := decoder.Decode(&record)
 		trailingErr := decoder.Decode(&struct{}{})
-		if decodeErr != nil || trailingErr != io.EOF || record.Version != 1 || record.Sequence != expected {
-			return fmt.Errorf("invalid reference ledger record %d (decode=%v trailing=%v version=%d sequence=%d)", expected, decodeErr, trailingErr, record.Version, record.Sequence)
+		if decodeErr != nil || trailingErr != io.EOF || record.Version != referenceLedgerVersion || record.Sequence == 0 {
+			return fmt.Errorf("invalid reference ledger record (decode=%v trailing=%v version=%d sequence=%d)", decodeErr, trailingErr, record.Version, record.Sequence)
 		}
-		if err := replayReferenceLedgerRecord(temporary, record); err != nil {
-			return fmt.Errorf("replaying reference ledger record %d: %w", expected, err)
+		if record.Sequence > temporary.sequence {
+			if record.Sequence != temporary.sequence+1 {
+				return fmt.Errorf("reference ledger record %d follows %d", record.Sequence, temporary.sequence)
+			}
+			if err := replayReferenceLedgerRecord(temporary, record); err != nil {
+				return fmt.Errorf("replaying reference ledger record %d: %w", record.Sequence, err)
+			}
+			temporary.sequence = record.Sequence
 		}
 		offset += 8 + int64(length)
-		expected++
 	}
 	ledger.state = cloneReferenceLedgerState(temporary.state)
-	ledger.sequence = expected - 1
+	ledger.sequence = temporary.sequence
 	_, err = ledger.journal.Seek(offset, io.SeekStart)
 	return err
 }
@@ -284,7 +324,7 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 	if ledger.sequence == math.MaxUint64 {
 		return errors.New("reference ledger sequence exhausted")
 	}
-	record.Version = 1
+	record.Version = referenceLedgerVersion
 	record.Sequence = ledger.sequence + 1
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -310,6 +350,147 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 	ledger.sequence = record.Sequence
 	ledger.state = next
 	return nil
+}
+
+func validateReferenceLedgerState(state referenceLedgerState) error {
+	if state.Origins == nil || state.Objects == nil || state.References == nil || state.Applied == nil || state.NextSequence == 0 {
+		return errors.New("reference ledger checkpoint has nil or invalid state")
+	}
+	for origin := range state.Origins {
+		if origin == 0 {
+			return errors.New("reference ledger owns zero origin")
+		}
+	}
+	for key, object := range state.Objects {
+		if key != object.ID.key() || !state.owns(object.ID) {
+			return fmt.Errorf("reference ledger object %q has invalid owner", key)
+		}
+		if err := validateObject(object); err != nil {
+			return err
+		}
+	}
+	expected := make(map[string]uint64, len(state.Objects))
+	for name, id := range state.References {
+		if err := validateReferenceName(name); err != nil {
+			return err
+		}
+		if _, ok := state.Objects[id.key()]; !ok || !state.owns(id) {
+			return fmt.Errorf("reference %q selects unavailable object %s", name, id)
+		}
+		expected[id.key()]++
+	}
+	for _, parent := range state.Objects {
+		for _, edge := range parent.Children {
+			if state.owns(edge.Child) {
+				if _, ok := state.Objects[edge.Child.key()]; !ok {
+					return fmt.Errorf("object %s references missing owned child %s", parent.ID, edge.Child)
+				}
+				expected[edge.Child.key()]++
+			}
+		}
+	}
+	for key, object := range state.Objects {
+		if object.Refs != expected[key] || (object.Refs == 0) != (object.State == ObjectReclaiming) {
+			return fmt.Errorf("object %s reference state is inconsistent", object.ID)
+		}
+	}
+	previous := state.Acknowledged
+	for _, outbound := range state.Outbox {
+		if outbound.Sequence <= previous || outbound.Sequence >= state.NextSequence {
+			return fmt.Errorf("invalid outbound reference sequence %d", outbound.Sequence)
+		}
+		previous = outbound.Sequence
+	}
+	for operation, applied := range state.Applied {
+		if operation == "" || validateReferenceName(applied.Name) != nil || applied.Object.IsZero() {
+			return fmt.Errorf("invalid applied reference operation %q", operation)
+		}
+	}
+	return nil
+}
+
+// Checkpoint bounds recovery work by atomically publishing a complete ledger
+// state and replacing the semantic WAL with an empty one. If a crash lands
+// between the two renames, replay skips WAL records already included in the
+// checkpoint, so either durable prefix reconstructs the same state.
+func (ledger *ReferenceLedger) Checkpoint() error {
+	if ledger == nil {
+		return errors.New("reference ledger is nil")
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if ledger.journal == nil {
+		return errors.New("in-memory reference ledger cannot be checkpointed")
+	}
+	if ledger.poisoned != nil {
+		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
+	}
+	checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: ledger.sequence, State: cloneReferenceLedgerState(ledger.state)}
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := writeReferenceLedgerAtomic(ledger.dir, "ledger.checkpoint", ".ledger-checkpoint-", data); err != nil {
+		return err
+	}
+	if err := writeReferenceLedgerAtomic(ledger.dir, "ledger.log", ".ledger-log-", []byte(referenceLedgerHeader)); err != nil {
+		return err
+	}
+	journal, err := os.OpenFile(filepath.Join(ledger.dir, "ledger.log"), os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		ledger.poisoned = err
+		return err
+	}
+	old := ledger.journal
+	ledger.journal = journal
+	return old.Close()
+}
+
+func writeReferenceLedgerAtomic(dir, destination, prefix string, data []byte) error {
+	temporary, err := os.CreateTemp(dir, prefix)
+	if err != nil {
+		return err
+	}
+	path := temporary.Name()
+	keep := false
+	defer func() {
+		_ = temporary.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if err := writeFull(temporary, data); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(path, filepath.Join(dir, destination)); err != nil {
+		return err
+	}
+	keep = true
+	return syncDirectory(dir)
+}
+
+// JournalBytes returns the current semantic WAL size.
+func (ledger *ReferenceLedger) JournalBytes() int64 {
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	if ledger.journal == nil {
+		return 0
+	}
+	info, err := ledger.journal.Stat()
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // Close releases a durable ledger. It is harmless for an in-memory ledger.
