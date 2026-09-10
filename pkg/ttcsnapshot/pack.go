@@ -150,6 +150,17 @@ func writePadding(file *os.File) error {
 // pack and commits the manifest last. Retrying an already committed snapshot
 // is idempotent and never replaces its authority.
 func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource) error {
+	return store.publish(ctx, graph, snapshot, source, false)
+}
+
+// PublishHandoff publishes a provider-to-shared handoff baseline. The graph
+// durably records reference mutations that race the bulk pack write, allowing
+// the caller to catch the shared ledger up before the short final freeze.
+func (store *SharedPackStore) PublishHandoff(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource) error {
+	return store.publish(ctx, graph, snapshot, source, true)
+}
+
+func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapshot SnapshotID, source ObjectSource, handoff bool) error {
 	if graph == nil || source == nil || snapshot == 0 {
 		return errors.New("invalid shared snapshot publication")
 	}
@@ -168,7 +179,14 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 	if snapshotRecord.State != SnapshotSealedVolatile && snapshotRecord.State != SnapshotSealedLocal && snapshotRecord.State != SnapshotShared {
 		return fmt.Errorf("snapshot %d is %q, not immutable", snapshot, snapshotRecord.State)
 	}
-	objects, references, err := graph.SnapshotLedger(snapshot)
+	var objects []Object
+	var references map[string]ObjectID
+	var err error
+	if handoff {
+		objects, references, _, err = graph.BeginSnapshotLedgerHandoff(snapshot)
+	} else {
+		objects, references, err = graph.SnapshotLedger(snapshot)
+	}
 	if err != nil {
 		return err
 	}

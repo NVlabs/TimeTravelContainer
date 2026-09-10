@@ -253,6 +253,7 @@ type daemonServer struct {
 	snapshotData          *ttcsnapshot.LocalDataStore
 	snapshotResolver      *ttcsnapshot.Resolver
 	snapshotShared        *ttcsnapshot.SharedPackStore
+	sharedReferences      *sharedReferenceService
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -1603,6 +1604,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotData = s.snapshotData
 	backend.snapshotResolver = s.snapshotResolver
 	backend.snapshotShared = s.snapshotShared
+	backend.sharedReferences = s.sharedReferences
 }
 
 type daemonStopTarget struct {
@@ -3315,11 +3317,16 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	var sharedReferences *sharedReferenceService
+	if clusterRuntime != nil {
+		sharedReferences = newSharedReferenceService(dataRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
+		server.sharedReferences = sharedReferences
+	}
 	var publicationQueue *ttcstorage.Queue
 	if clusterRuntime != nil {
 		publisher := &branchPublisher{
 			sharedRoot: dataRoot, localRoot: localRoot,
-			graph: snapshotGraph, graphData: snapshotData, graphShared: sharedObjects,
+			graph: snapshotGraph, graphData: snapshotData, graphShared: sharedObjects, sharedRefs: sharedReferences,
 		}
 		publisher.event = func(event DaemonEvent) { server.recordEvent(dataRoot, event) }
 		publisher.nodeID = clusterRuntime.nodeRecord.NodeID
@@ -3327,6 +3334,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		publisher.placements = clusterRuntime.placements
 		publisher.transactions = clusterRuntime.transactions
 		publisher.authority = clusterRuntime.raftCatalog
+		publisher.peers = clusterRuntime.source
 		publicationQueue, err = ttcstorage.Open(localRoot, publisher)
 		if err != nil {
 			return fmt.Errorf("opening durable publication queue: %w", err)
@@ -3397,11 +3405,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		graphProvider := &graphObjectProvider{
 			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.raftCatalog,
 			transactions: clusterRuntime.transactions, nodeID: clusterRuntime.nodeRecord.NodeID,
-			incarnation: clusterRuntime.nodeRecord.Incarnation,
+			incarnation: clusterRuntime.nodeRecord.Incarnation, shared: sharedReferences,
 		}
 		clusterRuntime.controlPlane.ObjectProvider = graphProvider
 		clusterRuntime.controlPlane.SnapshotProvider = graphProvider
 		clusterRuntime.controlPlane.SnapshotReferences = graphProvider
+		clusterRuntime.controlPlane.SharedReferences = sharedReferences
 		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
 			raftOriginLocator{authority: clusterRuntime.raftCatalog},
 			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)
@@ -3534,7 +3543,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			sharedGCStopped = gcStopped
 			go func() {
 				defer close(gcStopped)
-				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
+				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
 			}()
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})

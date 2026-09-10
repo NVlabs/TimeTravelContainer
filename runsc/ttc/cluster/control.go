@@ -44,6 +44,7 @@ const (
 	controlProxyPath          = "/v1/daemon"
 	controlObjectPrefix       = "/v1/objects/"
 	controlSnapshotPrefix     = "/v1/snapshots/"
+	controlSharedLedgerPrefix = "/v1/shared-ledger/"
 	maxControlBody            = 1 << 20
 	controlNodeHeader         = "X-TTC-Node"
 	controlObjectLengthHeader = "X-TTC-Object-Length"
@@ -571,8 +572,12 @@ type ControlPlane struct {
 	// unique volatile origin owner. Object and descendant counts never enter
 	// the control plane or Raft.
 	SnapshotReferences SnapshotReferenceProvider
-	operationMu        sync.Mutex // serializes reservation/quota accounting
-	transactionMu      sync.Map   // transaction ID -> *sync.Mutex
+	// SharedReferences is active only on the daemon holding the current Raft
+	// shared-GC lease. It imports a manifest-backed origin and applies the
+	// provider's ordered handoff suffix before Raft changes object routing.
+	SharedReferences SharedSnapshotReferenceProvider
+	operationMu      sync.Mutex // serializes reservation/quota accounting
+	transactionMu    sync.Map   // transaction ID -> *sync.Mutex
 }
 
 // ImmutableObjectProvider opens one complete immutable object after checking
@@ -599,6 +604,31 @@ type SnapshotRootBinding struct {
 type SnapshotReferenceProvider interface {
 	RetainSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
 	ReleaseSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
+	ApplySnapshotReference(context.Context, string, uint64, string, string, string, bool) error
+}
+
+// SharedReferenceMutation is one provider handoff record. Object uses TTC's
+// stable textual object identity so the cluster package remains independent
+// of the graph implementation.
+type SharedReferenceMutation struct {
+	Sequence  uint64 `json:"sequence"`
+	Operation string `json:"operation"`
+	Name      string `json:"name"`
+	Object    string `json:"object"`
+	Retain    bool   `json:"retain"`
+}
+
+// SharedSnapshotReferenceProvider owns exact reference state while its daemon
+// holds the Raft shared-GC lease.
+type SharedSnapshotReferenceProvider interface {
+	ImportSharedSnapshot(context.Context, string, uint64) error
+	ApplySharedSnapshotHandoff(context.Context, string, uint64, uint64, []SharedReferenceMutation) error
+	FlushSharedSnapshot(context.Context, string, uint64) error
+}
+
+type sharedHandoffRequest struct {
+	From      uint64                    `json:"from"`
+	Mutations []SharedReferenceMutation `json:"mutations"`
 }
 
 type snapshotReferenceRequest struct {
@@ -606,6 +636,9 @@ type snapshotReferenceRequest struct {
 	Operation   string                `json:"operation"`
 	Action      string                `json:"action"`
 	Roots       []SnapshotRootBinding `json:"roots"`
+	Name        string                `json:"name,omitempty"`
+	Object      string                `json:"object,omitempty"`
+	Retain      bool                  `json:"retain,omitempty"`
 }
 
 func (c *ControlPlane) lockTransaction(id string) func() {
@@ -642,6 +675,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, controlSnapshotPrefix) {
 		c.serveSnapshot(w, r, peer)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, controlSharedLedgerPrefix) {
+		c.serveSharedLedger(w, r, peer)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
@@ -700,6 +737,54 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeControlError(w, http.StatusNotFound, "unknown cluster endpoint")
+}
+
+func (c *ControlPlane) serveSharedLedger(w http.ResponseWriter, r *http.Request, peer string) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "shared reference mutation requires POST")
+		return
+	}
+	if c.SharedReferences == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "shared reference coordinator is unavailable")
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, controlSharedLedgerPrefix)
+	text, action, ok := strings.Cut(remainder, "/")
+	snapshot, err := strconv.ParseUint(text, 10, 64)
+	if !ok || snapshot == 0 || err != nil || strconv.FormatUint(snapshot, 10) != text {
+		writeControlError(w, http.StatusBadRequest, "invalid shared snapshot path")
+		return
+	}
+	switch action {
+	case "import":
+		if err := c.SharedReferences.ImportSharedSnapshot(r.Context(), peer, snapshot); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+	case "catchup":
+		var request sharedHandoffRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if len(request.Mutations) > 4096 {
+			writeControlError(w, http.StatusBadRequest, "shared handoff batch exceeds limit")
+			return
+		}
+		if err := c.SharedReferences.ApplySharedSnapshotHandoff(r.Context(), peer, snapshot, request.From, request.Mutations); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+	case "flush":
+		if err := c.SharedReferences.FlushSharedSnapshot(r.Context(), peer, snapshot); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+	default:
+		writeControlError(w, http.StatusNotFound, "unknown shared reference operation")
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]any{"snapshot_id": snapshot, "action": action})
 }
 
 func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer string) {
@@ -791,16 +876,30 @@ func (c *ControlPlane) serveSnapshotReferences(w http.ResponseWriter, r *http.Re
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if !transactionIDPattern.MatchString(request.Transaction) || !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) == 0 || len(request.Roots) > 4096 {
+	if !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) > 4096 {
 		writeControlError(w, http.StatusBadRequest, "invalid snapshot reference operation")
 		return
 	}
 	var err error
 	switch request.Action {
 	case "retain":
+		if !transactionIDPattern.MatchString(request.Transaction) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
+			writeControlError(w, http.StatusBadRequest, "invalid snapshot root retain")
+			return
+		}
 		err = c.SnapshotReferences.RetainSnapshotRoots(r.Context(), peer, snapshot, request.Transaction, request.Operation, request.Roots)
 	case "release":
+		if !transactionIDPattern.MatchString(request.Transaction) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
+			writeControlError(w, http.StatusBadRequest, "invalid snapshot root release")
+			return
+		}
 		err = c.SnapshotReferences.ReleaseSnapshotRoots(r.Context(), peer, snapshot, request.Transaction, request.Operation, request.Roots)
+	case "reference":
+		if request.Transaction != "" || len(request.Roots) != 0 || request.Name == "" || request.Object == "" {
+			writeControlError(w, http.StatusBadRequest, "invalid owner reference mutation")
+			return
+		}
+		err = c.SnapshotReferences.ApplySnapshotReference(r.Context(), peer, snapshot, request.Operation, request.Name, request.Object, request.Retain)
 	default:
 		writeControlError(w, http.StatusBadRequest, "invalid snapshot reference action")
 		return
@@ -1470,6 +1569,48 @@ func (c *Client) mutateSnapshotRoots(ctx context.Context, snapshot uint64, reque
 	}
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlSnapshotPrefix+strconv.FormatUint(snapshot, 10)+"/references", request, &response)
+}
+
+// ApplySnapshotReference delivers one ordered cross-owner object edge to a
+// volatile provider. The provider stores it as a bridge root until ownership
+// changes or the edge is released.
+func (c *Client) ApplySnapshotReference(ctx context.Context, snapshot uint64, operation, name, object string, retain bool) error {
+	if snapshot == 0 || !transactionIDPattern.MatchString(operation) || name == "" || object == "" {
+		return errors.New("invalid owner reference mutation")
+	}
+	var response map[string]any
+	request := snapshotReferenceRequest{Operation: operation, Action: "reference", Name: name, Object: object, Retain: retain}
+	return c.call(ctx, http.MethodPost, controlSnapshotPrefix+strconv.FormatUint(snapshot, 10)+"/references", request, &response)
+}
+
+// ImportSharedSnapshot asks the current shared-GC coordinator to import the
+// immutable manifest baseline. Retrying after a lost response is idempotent.
+func (c *Client) ImportSharedSnapshot(ctx context.Context, snapshot uint64) error {
+	if snapshot == 0 {
+		return errors.New("invalid shared snapshot import")
+	}
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlSharedLedgerPrefix+strconv.FormatUint(snapshot, 10)+"/import", struct{}{}, &response)
+}
+
+// ApplySharedSnapshotHandoff advances the coordinator's durable exact cursor.
+func (c *Client) ApplySharedSnapshotHandoff(ctx context.Context, snapshot, from uint64, mutations []SharedReferenceMutation) error {
+	if snapshot == 0 || len(mutations) > 4096 {
+		return errors.New("invalid shared snapshot handoff")
+	}
+	var response map[string]any
+	request := sharedHandoffRequest{From: from, Mutations: append([]SharedReferenceMutation(nil), mutations...)}
+	return c.call(ctx, http.MethodPost, controlSharedLedgerPrefix+strconv.FormatUint(snapshot, 10)+"/catchup", request, &response)
+}
+
+// FlushSharedSnapshot waits until every preceding cross-owner edge retain for
+// the imported origin is durable at its destination provider.
+func (c *Client) FlushSharedSnapshot(ctx context.Context, snapshot uint64) error {
+	if snapshot == 0 {
+		return errors.New("invalid shared snapshot flush")
+	}
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlSharedLedgerPrefix+strconv.FormatUint(snapshot, 10)+"/flush", struct{}{}, &response)
 }
 
 // NewClient constructs a client using tlsConfig for peer authentication.

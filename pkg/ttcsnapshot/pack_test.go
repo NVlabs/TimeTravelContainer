@@ -109,6 +109,57 @@ func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
 	}
 }
 
+func TestSharedPackHandoffUsesDurableBaseline(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := OpenSharedPackStore(filepath.Join(directory, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := graph.CreateObject(origin, "publish/root", ObjectKindMetadata, []byte("metadata"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.PublishHandoff(context.Background(), graph, origin, local); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("publish/root"); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := shared.Manifest(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.References["pin/publish/root"] != object {
+		t.Fatalf("manifest did not retain original handoff baseline: %+v", manifest.References)
+	}
+	changes, cursor, frozen, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 1 || frozen || len(changes) != 1 || changes[0].Retain || changes[0].Object != object {
+		t.Fatalf("handoff changes=%+v cursor=%d frozen=%t", changes, cursor, frozen)
+	}
+	if collected, err := graph.Collect(1); err != nil || collected != 0 {
+		t.Fatalf("active pack handoff allowed collection: (%d,%v)", collected, err)
+	}
+}
+
 func TestSharedPackManifestLastAndTruncation(t *testing.T) {
 	directory := t.TempDir()
 	sharedRoot := filepath.Join(directory, "shared")

@@ -655,10 +655,41 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 				if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
 					return fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
 				}
-				child.Refs++
-				next.Objects[edge.Child.key()] = child
+				bridge := edgeReferenceName(parent.ID, edge.Slot)
+				if bridged, ok := next.References[bridge]; ok {
+					if bridged != edge.Child {
+						return fmt.Errorf("incoming edge bridge %q selects %s, want %s", bridge, bridged, edge.Child)
+					}
+					// Replace the external named reference with the now-internal
+					// structural edge. The child's count is unchanged.
+					delete(next.References, bridge)
+				} else {
+					child.Refs++
+					next.Objects[edge.Child.key()] = child
+				}
 			} else if err := next.enqueue(parent.ID, edge, true); err != nil {
 				return err
+			}
+		}
+	}
+	internalIncoming := make(map[string]ObjectID)
+	for _, parent := range next.Objects {
+		if !next.owns(parent.ID) {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == origin {
+				name := edgeReferenceName(parent.ID, edge.Slot)
+				internalIncoming[name] = edge.Child
+				if parent.ID.Snapshot != origin {
+					child, ok := next.Objects[edge.Child.key()]
+					if !ok || child.Refs == math.MaxUint64 {
+						return fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
+					}
+					child.State = ObjectLive
+					child.Refs++
+					next.Objects[edge.Child.key()] = child
+				}
 			}
 		}
 	}
@@ -668,8 +699,19 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := next.retain(name, references[name]); err != nil {
-			return fmt.Errorf("importing reference %q: %w", name, err)
+		effectiveName := name
+		if strings.HasPrefix(name, "root/bridge/edge/") {
+			effectiveName = strings.TrimPrefix(name, "root/bridge/")
+		}
+		if internal, ok := internalIncoming[effectiveName]; ok {
+			if references[name] != internal {
+				return fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
+			}
+			// The already-owned parent edge supplies this count directly.
+			continue
+		}
+		if err := next.retain(effectiveName, references[name]); err != nil {
+			return fmt.Errorf("importing reference %q: %w", effectiveName, err)
 		}
 	}
 	for key, object := range next.Objects {
@@ -786,6 +828,31 @@ func (ledger *ReferenceLedger) PendingOutbound() []OutboundReference {
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
 	return append([]OutboundReference(nil), ledger.state.Outbox...)
+}
+
+// OwnsEdge reports whether parent and child are both owned by this ledger and
+// the immutable parent contains the exact slot. It lets an outbox dispatcher
+// fold a queued cross-owner retain into an edge that became local while the
+// destination origin was being imported.
+func (ledger *ReferenceLedger) OwnsEdge(parent ObjectID, slot uint16, child ObjectID) bool {
+	if ledger == nil {
+		return false
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	if !ledger.state.owns(parent) || !ledger.state.owns(child) {
+		return false
+	}
+	object, ok := ledger.state.Objects[parent.key()]
+	if !ok {
+		return false
+	}
+	for _, edge := range object.Children {
+		if edge.Slot == slot {
+			return edge.Child == child
+		}
+	}
+	return false
 }
 
 // AcknowledgeOutbound removes only the oldest mutation. Serial acknowledgement

@@ -15,6 +15,7 @@ go_library(
 		"elastic_capacity.go",
 		"graph_provider.go",
 		"graph_references.go",
+		"shared_references.go",
         "daemon.go",
         "daemon_requests.go",
         "daemon_stdin_lease.go",

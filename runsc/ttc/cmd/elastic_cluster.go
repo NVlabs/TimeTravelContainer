@@ -2989,7 +2989,7 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 // reference accounting and pack mutation. Actual collection additionally
 // validates the lease generation at every retirement boundary; merely holding
 // this lease never makes a pack reclaimable.
-func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, nodeID, incarnation string, stderr io.Writer, done <-chan struct{}) {
+func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, references *sharedReferenceService, nodeID, incarnation string, stderr io.Writer, done <-chan struct{}) {
 	if authority == nil || packs == nil || nodeID == "" || incarnation == "" {
 		return
 	}
@@ -2997,7 +2997,15 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 	ticker := time.NewTicker(duration / 3)
 	defer ticker.Stop()
 	var held cluster.SharedGCLease
+	deactivateReferences := func() {
+		if references != nil {
+			if err := references.deactivate(); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: closing shared reference ledger: %v\n", err)
+			}
+		}
+	}
 	release := func() {
+		deactivateReferences()
 		if held.Generation == 0 {
 			return
 		}
@@ -3014,11 +3022,13 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 				held = renewed
 			} else {
 				held = cluster.SharedGCLease{}
+				deactivateReferences()
 			}
 		} else if current, err := authority.SharedGCLease(); err == nil {
 			switch {
 			case current.Generation != 0 && now.Before(current.ExpiresAt) && (current.NodeID != nodeID || current.Incarnation != incarnation):
 				// Another healthy coordinator owns the lease.
+				deactivateReferences()
 			case current.Generation != 0 && now.Before(current.ExpiresAt):
 				held = current
 			default:
@@ -3028,6 +3038,27 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 			}
 		}
 		if held.Generation != 0 && time.Now().Before(held.ExpiresAt) {
+			if references != nil {
+				if err := references.activate(held); err != nil {
+					if stderr != nil {
+						fmt.Fprintf(stderr, "ttcd: warning: activating shared reference ledger: %v\n", err)
+					}
+					select {
+					case <-done:
+						return
+					case <-ticker.C:
+						continue
+					}
+				}
+			}
+			if references != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), duration/3)
+				_, err := references.drainOutbox(ctx, 4096)
+				cancel()
+				if err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: delivering shared snapshot references: %v\n", err)
+				}
+			}
 			retirements, err := authority.RetiredSharedSnapshots()
 			if err == nil {
 				for _, retirement := range retirements {

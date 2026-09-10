@@ -101,6 +101,7 @@ type graphObjectProvider struct {
 	transactions cluster.TransactionCatalog
 	nodeID       string
 	incarnation  string
+	shared       *sharedReferenceService
 }
 
 const graphSnapshotCatalogVersion = 1
@@ -287,6 +288,16 @@ func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]clus
 // Raft or this request.
 func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	_, volatile, err := p.authority.SnapshotProvider(snapshotID)
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		if err := p.authorizeReferenceTransaction(peer, transaction, false); err != nil {
+			return err
+		}
+		return p.shared.mutateRoots(snapshot, operation, bindings, true)
+	}
 	if err := p.authorizeSnapshot(peer, snapshot, transaction, false); err != nil {
 		return err
 	}
@@ -302,6 +313,16 @@ func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer stri
 // roots, and completed retries are no-ops.
 func (p *graphObjectProvider) ReleaseSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	_, volatile, err := p.authority.SnapshotProvider(snapshotID)
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		if err := p.authorizeReferenceTransaction(peer, transaction, true); err != nil {
+			return err
+		}
+		return p.shared.mutateRoots(snapshot, operation, bindings, false)
+	}
 	if err := p.authorizeSnapshot(peer, snapshot, transaction, true); err != nil {
 		return err
 	}
@@ -310,6 +331,62 @@ func (p *graphObjectProvider) ReleaseSnapshotRoots(ctx context.Context, peer str
 		return err
 	}
 	return p.graph.ReleaseRetainedRoots(roots)
+}
+
+// ApplySnapshotReference installs or removes one cross-owner bridge while the
+// child origin remains volatile on this provider. The bridge is represented as
+// a graph root and is folded back into an internal edge if both origins later
+// move to the shared ledger.
+func (p *graphObjectProvider) ApplySnapshotReference(ctx context.Context, peer string, snapshotID uint64, operation, name, objectText string, retain bool) error {
+	if operation == "" || name == "" {
+		return errors.New("invalid owner reference mutation")
+	}
+	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	_, volatile, err := p.authority.SnapshotProvider(snapshotID)
+	if err != nil {
+		return err
+	}
+	object, err := ttcsnapshot.ParseObjectID(objectText)
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		if object.Snapshot != snapshot {
+			return fmt.Errorf("owner reference object %s does not belong to snapshot %d", object, snapshot)
+		}
+		return p.shared.mutateReference(operation, name, object, retain)
+	}
+	if err := p.authorizeSnapshot(peer, snapshot, "", true); err != nil {
+		return err
+	}
+	if object.Snapshot != snapshot {
+		return fmt.Errorf("owner reference object %s does not belong to snapshot %d", object, snapshot)
+	}
+	bridge := map[string]ttcsnapshot.ObjectID{"bridge/" + name: object}
+	if retain {
+		return p.graph.RetainRoots(bridge)
+	}
+	return p.graph.ReleaseRetainedRoots(bridge)
+}
+
+func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID string, allowTerminal bool) error {
+	if transactionID == "" {
+		return nil
+	}
+	if p.transactions == nil {
+		return errors.New("snapshot transaction catalog is unavailable")
+	}
+	transaction, err := p.transactions.Load(transactionID)
+	if err != nil {
+		return err
+	}
+	if transaction.Identity.TargetNodeID != peer {
+		return errors.New("snapshot transaction does not authorize this requester")
+	}
+	if !allowTerminal && (transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed) {
+		return fmt.Errorf("snapshot transaction is %s", transaction.State)
+	}
+	return nil
 }
 
 var _ cluster.ImmutableObjectProvider = (*graphObjectProvider)(nil)

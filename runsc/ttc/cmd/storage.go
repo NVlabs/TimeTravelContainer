@@ -89,6 +89,8 @@ type branchPublisher struct {
 	graph        *ttcsnapshot.Store
 	graphData    *ttcsnapshot.LocalDataStore
 	graphShared  *ttcsnapshot.SharedPackStore
+	sharedRefs   *sharedReferenceService
+	peers        *distributedSourceRuntime
 	event        func(DaemonEvent)
 }
 
@@ -198,7 +200,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				return ttcstorage.Result{}, errors.New("graph-native snapshot publication is unavailable")
 			}
 			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
-			if err := p.graphShared.Publish(context.Background(), p.graph, snapshot, p.graphData); err != nil {
+			if err := p.graphShared.PublishHandoff(context.Background(), p.graph, snapshot, p.graphData); err != nil {
 				return ttcstorage.Result{}, fmt.Errorf("publishing graph memory snapshot %d: %w", snapshot, err)
 			}
 			manifest.MemorySnapshot = branch.SnapshotID
@@ -424,7 +426,7 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 	prefix := fmt.Sprintf("remote/%d/", snapshot)
 	bindings := make(map[string]ttcsnapshot.ObjectID)
 	for name, object := range graph.Inspect().Roots {
-		if !strings.HasPrefix(name, prefix) {
+		if !strings.HasPrefix(name, prefix) && !(strings.HasPrefix(name, "bridge/edge/") && object.Snapshot == snapshot) {
 			continue
 		}
 		if object.Snapshot != snapshot {
@@ -528,14 +530,40 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			// The shared graph manifest was committed by Publish before the cold
 			// branch manifest. Switch object routing to shared first; a crash here
 			// leaves a retryable publishing branch whose data is already durable.
-			if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, branch.SnapshotID); err != nil {
-				return fmt.Errorf("publishing snapshot origin %d in Raft: %w", branch.SnapshotID, err)
+			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
+			_, volatile, err := p.authority.SnapshotProvider(branch.SnapshotID)
+			if err != nil {
+				return err
+			}
+			if volatile {
+				if p.graph == nil {
+					return errors.New("snapshot graph is unavailable for shared reference handoff")
+				}
+				if _, _, err := p.graph.FreezeSnapshotLedger(snapshot); err != nil {
+					return fmt.Errorf("freezing snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
+				}
+				changes, _, frozen, err := p.graph.SnapshotLedgerHandoffChanges(snapshot, 0)
+				if err != nil {
+					return fmt.Errorf("reading snapshot origin %d reference catch-up: %w", branch.SnapshotID, err)
+				}
+				if !frozen {
+					return fmt.Errorf("snapshot origin %d reference handoff is not frozen", branch.SnapshotID)
+				}
+				if err := p.publishSharedReferenceLedger(snapshot, changes); err != nil {
+					return fmt.Errorf("transferring snapshot origin %d reference authority: %w", branch.SnapshotID, err)
+				}
+				if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, branch.SnapshotID); err != nil {
+					return fmt.Errorf("publishing snapshot origin %d in Raft: %w", branch.SnapshotID, err)
+				}
 			}
 			if p.graph != nil {
-				if err := p.graph.MarkShared(ttcsnapshot.SnapshotID(branch.SnapshotID)); err != nil {
+				if err := p.graph.MarkShared(snapshot); err != nil {
 					return fmt.Errorf("marking snapshot origin %d shared: %w", branch.SnapshotID, err)
 				}
-				if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, ttcsnapshot.SnapshotID(branch.SnapshotID)); err != nil {
+				if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
+					return fmt.Errorf("consuming snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
+				}
+				if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot); err != nil {
 					return fmt.Errorf("releasing volatile provider roots for snapshot origin %d: %w", branch.SnapshotID, err)
 				}
 			}
@@ -608,6 +636,67 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	default:
 		return fmt.Errorf("distributed fork transaction %q is %s", transactionID, tx.State)
 	}
+}
+
+func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.SnapshotID, changes []ttcsnapshot.SnapshotReferenceMutation) error {
+	if p == nil || p.authority == nil || p.graphShared == nil || snapshot == 0 {
+		return errors.New("shared reference publication is unavailable")
+	}
+	lease, err := p.authority.SharedGCLease()
+	if err != nil {
+		return err
+	}
+	if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
+		return errors.New("shared reference coordinator has no active lease")
+	}
+	var importOrigin func(context.Context, uint64) error
+	var applyHandoff func(context.Context, uint64, uint64, []cluster.SharedReferenceMutation) error
+	var flushOrigin func(context.Context, uint64) error
+	if lease.NodeID == p.nodeID && lease.Incarnation == p.incarnation {
+		importOrigin = func(ctx context.Context, snapshot uint64) error {
+			return p.sharedRefs.ImportSharedSnapshot(ctx, p.nodeID, snapshot)
+		}
+		applyHandoff = func(ctx context.Context, snapshot, from uint64, mutations []cluster.SharedReferenceMutation) error {
+			return p.sharedRefs.ApplySharedSnapshotHandoff(ctx, p.nodeID, snapshot, from, mutations)
+		}
+		flushOrigin = func(ctx context.Context, snapshot uint64) error {
+			return p.sharedRefs.FlushSharedSnapshot(ctx, p.nodeID, snapshot)
+		}
+	} else {
+		if p.peers == nil {
+			return errors.New("cluster peer routing is unavailable")
+		}
+		peer, err := p.peers.peer(lease.NodeID, false)
+		if err != nil {
+			return err
+		}
+		importOrigin = peer.ImportSharedSnapshot
+		applyHandoff = peer.ApplySharedSnapshotHandoff
+		flushOrigin = peer.FlushSharedSnapshot
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := importOrigin(ctx, uint64(snapshot)); err != nil {
+		return err
+	}
+	const batchSize = 4096
+	from := uint64(0)
+	for len(changes) != 0 {
+		count := min(len(changes), batchSize)
+		wire := make([]cluster.SharedReferenceMutation, count)
+		for index, mutation := range changes[:count] {
+			wire[index] = cluster.SharedReferenceMutation{
+				Sequence: mutation.Sequence, Operation: mutation.Operation, Name: mutation.Name,
+				Object: mutation.Object.String(), Retain: mutation.Retain,
+			}
+		}
+		if err := applyHandoff(ctx, uint64(snapshot), from, wire); err != nil {
+			return err
+		}
+		from = wire[len(wire)-1].Sequence
+		changes = changes[count:]
+	}
+	return flushOrigin(ctx, uint64(snapshot))
 }
 
 func fileSHA256Digest(path string) (string, error) {

@@ -52,6 +52,31 @@ type testSnapshotReferenceProvider struct {
 	released  int
 }
 
+type testSharedReferenceProvider struct {
+	peer      string
+	snapshot  uint64
+	from      uint64
+	mutations []SharedReferenceMutation
+	imports   int
+}
+
+func (provider *testSharedReferenceProvider) ImportSharedSnapshot(_ context.Context, peer string, snapshot uint64) error {
+	provider.peer, provider.snapshot = peer, snapshot
+	provider.imports++
+	return nil
+}
+
+func (provider *testSharedReferenceProvider) ApplySharedSnapshotHandoff(_ context.Context, peer string, snapshot, from uint64, mutations []SharedReferenceMutation) error {
+	provider.peer, provider.snapshot, provider.from = peer, snapshot, from
+	provider.mutations = append([]SharedReferenceMutation(nil), mutations...)
+	return nil
+}
+
+func (provider *testSharedReferenceProvider) FlushSharedSnapshot(_ context.Context, peer string, snapshot uint64) error {
+	provider.peer, provider.snapshot = peer, snapshot
+	return nil
+}
+
 func (provider *testSnapshotReferenceProvider) RetainSnapshotRoots(_ context.Context, peer string, snapshot uint64, _, operation string, roots []SnapshotRootBinding) error {
 	provider.peer, provider.snapshot, provider.operation = peer, snapshot, operation
 	provider.roots = append([]SnapshotRootBinding(nil), roots...)
@@ -63,6 +88,16 @@ func (provider *testSnapshotReferenceProvider) ReleaseSnapshotRoots(_ context.Co
 	provider.peer, provider.snapshot, provider.operation = peer, snapshot, operation
 	provider.roots = append([]SnapshotRootBinding(nil), roots...)
 	provider.released++
+	return nil
+}
+
+func (provider *testSnapshotReferenceProvider) ApplySnapshotReference(_ context.Context, peer string, snapshot uint64, operation, _, _ string, retain bool) error {
+	provider.peer, provider.snapshot, provider.operation = peer, snapshot, operation
+	if retain {
+		provider.retained++
+	} else {
+		provider.released++
+	}
 	return nil
 }
 
@@ -95,6 +130,44 @@ func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
 	}
 	if provider.retained != 1 || provider.released != 1 {
 		t.Fatalf("release provider state=%+v", provider)
+	}
+	if err := client.ApplySnapshotReference(context.Background(), 42, "edge-0000000000000001-0000000000000001", "edge/0000000000000001-04-0000000000000001/0003", roots[0].Object, true); err != nil {
+		t.Fatal(err)
+	}
+	if provider.retained != 2 || provider.operation != "edge-0000000000000001-0000000000000001" {
+		t.Fatalf("owner reference provider state=%+v", provider)
+	}
+}
+
+func TestSharedReferenceProviderReceivesImportAndCatchup(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(storeRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &testSharedReferenceProvider{}
+	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SharedReferences: provider}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "target", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ImportSharedSnapshot(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	mutations := []SharedReferenceMutation{{Sequence: 8, Operation: "op", Name: "root/x", Object: "000000000000002a-03-0000000000000001", Retain: true}}
+	if err := client.ApplySharedSnapshotHandoff(context.Background(), 42, 7, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.FlushSharedSnapshot(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if provider.imports != 1 || provider.peer != "target" || provider.snapshot != 42 || provider.from != 7 || len(provider.mutations) != 1 || provider.mutations[0] != mutations[0] {
+		t.Fatalf("shared provider state=%+v", provider)
 	}
 }
 

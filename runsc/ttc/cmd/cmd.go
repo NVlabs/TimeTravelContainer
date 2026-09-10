@@ -5476,6 +5476,7 @@ type runtimeBackend struct {
 	snapshotData     *ttcsnapshot.LocalDataStore
 	snapshotResolver *ttcsnapshot.Resolver
 	snapshotShared   *ttcsnapshot.SharedPackStore
+	sharedReferences *sharedReferenceService
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool
@@ -8389,6 +8390,11 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
 	}
 	for _, branch := range info.Branches {
+		if branch.DistributedGraphReferenceOperation == "" {
+			if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+				return fmt.Errorf("releasing shared graph roots for %s@%s: %w", info.Name, branch.ID, err)
+			}
+		}
 		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, branch)); err != nil {
 			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
 		}
@@ -10980,6 +10986,11 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
 		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 	}
+	if branch.DistributedGraphReferenceOperation == "" {
+		if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+			return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
+		}
+	}
 	if err := b.releaseGraphMemoryRoots(branch.MemoryRoots); err != nil {
 		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 	}
@@ -11321,6 +11332,11 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	dehydrated = true
 	graphMemoryRoots = nil
 	if graphMemorySnapshot != 0 && len(previousGraphMemoryRoots) != 0 {
+		if persistentBranch.DistributedGraphReferenceOperation == "" {
+			if err := b.releaseSharedGraphMemoryRoots(previousGraphMemoryRoots, previousGraphMemoryRootObjects); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded shared memory roots for %s: %v\n", target, err)
+			}
+		}
 		if err := b.releaseGraphMemoryRoots(previousGraphMemoryRoots); err != nil && b.stderr != nil {
 			// The new roots are already authoritative. Retaining the superseded
 			// roots is a safe leak that standalone graph reconciliation retries;
@@ -12326,6 +12342,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
+		}
+		if recorded.DistributedGraphReferenceOperation == "" {
+			if err := b.releaseSharedGraphMemoryRoots(recorded.MemoryRoots, recorded.MemoryRootObjects); err != nil {
+				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
+			}
 		}
 		if err := b.releaseGraphMemoryRoots(recorded.MemoryRoots); err != nil {
 			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)

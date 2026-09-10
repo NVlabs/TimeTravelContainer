@@ -52,6 +52,43 @@ func TestReferenceLedgerInternalCascade(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerConvertsIncomingBridgeInEitherImportOrder(t *testing.T) {
+	child := ledgerObject(21, 1, ObjectKindFile)
+	parent := ledgerObject(22, 1, ObjectKindInode, Edge{Slot: 9, Child: child.ID})
+	edgeName := edgeReferenceName(parent.ID, 9)
+	for _, childFirst := range []bool{false, true} {
+		ledger := NewReferenceLedger()
+		importChild := func() error {
+			return ledger.ImportOrigin(21, []Object{child}, map[string]ObjectID{"child-root": child.ID, edgeName: child.ID})
+		}
+		importParent := func() error {
+			return ledger.ImportOrigin(22, []Object{parent}, map[string]ObjectID{"parent-root": parent.ID})
+		}
+		if childFirst {
+			if err := importChild(); err != nil {
+				t.Fatal(err)
+			}
+			if err := importParent(); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if err := importParent(); err != nil {
+				t.Fatal(err)
+			}
+			if err := importChild(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		inspection := ledger.Inspect()
+		if got := inspection.Objects[child.ID]; got != 2 {
+			t.Fatalf("childFirst=%t child references=%d, want root+internal edge=2", childFirst, got)
+		}
+		if _, bridged := inspection.References[edgeName]; bridged {
+			t.Fatalf("childFirst=%t retained obsolete external edge bridge", childFirst)
+		}
+	}
+}
+
 func TestReferenceLedgerCrossOwnerOrderingAndDeduplication(t *testing.T) {
 	childOwner := NewReferenceLedger()
 	child := ledgerObject(1, 1, ObjectKindFile)

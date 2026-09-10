@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -318,11 +319,25 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 	if err != nil {
 		return err
 	}
-	// Once an origin is fully published, shared storage—not its former node—
-	// owns lifetime. Durable branch manifests retain shared roots; no mutable
-	// provider root is needed for this operation.
 	if !volatile {
-		return nil
+		lease, err := b.distributedSource.authority.SharedGCLease()
+		if err != nil {
+			return err
+		}
+		if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
+			return errors.New("shared reference coordinator has no active lease")
+		}
+		if lease.NodeID == b.nodeID && lease.Incarnation == b.distributedSource.incarnation {
+			return b.sharedReferences.mutateRoots(ttcsnapshot.SnapshotID(group.Origin), intent.Operation, group.Roots, retain)
+		}
+		peer, err := b.distributedSource.peer(lease.NodeID, false)
+		if err != nil {
+			return err
+		}
+		if retain {
+			return peer.RetainSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+		}
+		return peer.ReleaseSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
 	}
 	if group.Provider == "" || current.NodeID != group.Provider {
 		return fmt.Errorf("snapshot origin %d provider changed from %q to %q without shared publication", group.Origin, group.Provider, current.NodeID)
@@ -345,6 +360,55 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 		return peer.RetainSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
 	}
 	return peer.ReleaseSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+}
+
+// releaseSharedGraphMemoryRoots releases the canonical roots captured for the
+// branch that originally produced a shared snapshot. Remote descendants use
+// graphReferenceIntent instead; the producer branch has no such transaction
+// and must address its baseline root names directly.
+func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || len(roots) == 0 {
+		return nil
+	}
+	if len(roots) != len(objects) {
+		return errors.New("shared memory root names and objects differ in length")
+	}
+	for index, name := range roots {
+		id, err := ttcsnapshot.ParseObjectID(objects[index])
+		if err != nil {
+			return err
+		}
+		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+		if err != nil {
+			return err
+		}
+		if volatile {
+			continue
+		}
+		lease, err := b.distributedSource.authority.SharedGCLease()
+		if err != nil {
+			return err
+		}
+		if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
+			return errors.New("shared reference coordinator has no active lease")
+		}
+		canonical := "root/" + name
+		digest := sha256.Sum256([]byte(canonical + "\x00" + id.String()))
+		operation := fmt.Sprintf("root-release-%x", digest[:12])
+		if lease.NodeID == b.nodeID && lease.Incarnation == b.distributedSource.incarnation {
+			err = b.sharedReferences.mutateReference(operation, canonical, id, false)
+		} else {
+			peer, peerErr := b.distributedSource.peer(lease.NodeID, false)
+			if peerErr != nil {
+				return peerErr
+			}
+			err = peer.ApplySnapshotReference(context.Background(), uint64(id.Snapshot), operation, canonical, id.String(), false)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newGraphReferenceOperation() (string, error) {
