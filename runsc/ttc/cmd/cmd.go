@@ -10688,7 +10688,15 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 		}
 	}
 	_, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
-	return err
+	if err != nil {
+		return err
+	}
+	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting reclaimed snapshot graph: %w", err)
+		}
+	}
+	return nil
 }
 
 const snapshotGraphJournalCompactBytes = 8 << 20

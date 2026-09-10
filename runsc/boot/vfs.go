@@ -1327,6 +1327,16 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 			return nil
 		}
 	}
+	// TTC's writable root is already backed by its persistent graph volume.
+	// Hiding an empty /tmp beneath gVisor's historical anonymous tmpfs makes
+	// the directory invisible to offline branch operations and needlessly
+	// consumes resident memory. Leave /tmp on the rootfs upper; users that want
+	// memory-backed temporary storage can mount tmpfs explicitly or use
+	// /dev/shm.
+	if _, ok := c.l.ttcVolumeRepositories[specutils.TTCRootfsUpperSource]; ok {
+		log.Infof(`Leaving "/tmp" on the persistent TTC rootfs upper`)
+		return nil
+	}
 
 	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
