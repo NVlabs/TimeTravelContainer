@@ -813,6 +813,47 @@ func TestSnapshotRoundTripIsBranchScoped(t *testing.T) {
 	}
 }
 
+func TestPathBackedRepositoryExportsBulkObjects(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("path-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "manager-side export", 0)
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Daemon publication opens repositories by their trusted absolute path,
+	// rather than through Manager.Open. This must still expose a path-backed
+	// LocalDataStore to ExportSnapshot.
+	repository, err = OpenRepository(path, CopyModeFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := repository.ExportSnapshot(MainBranch, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(snapshot, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("snapshot objects=%v, want one", entries)
+	}
+}
+
 func TestUnlinkedInodeRemainsCheckpointable(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("orphan")

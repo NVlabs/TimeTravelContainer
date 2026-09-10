@@ -569,6 +569,22 @@ func OpenRepository(path string, mode CopyMode) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
+	// OpenRepositoryFD deliberately keeps the bulk store descriptor-only for
+	// the isolated Sentry. Manager-side operations such as snapshot export need
+	// a trusted host path for reflink/copy source selection and garbage
+	// collection. Reopen only the bulk store in path-backed mode; retaining the
+	// descriptor-only instance made objectPath return data/invalid even though
+	// the referenced object existed.
+	if err := repository.data.Close(); err != nil {
+		repository.Close()
+		return nil, err
+	}
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(path, "data"))
+	if err != nil {
+		repository.Close()
+		return nil, fmt.Errorf("opening path-backed repository data store: %w", err)
+	}
+	repository.data = data
 	repository.path = path
 	return repository, nil
 }
