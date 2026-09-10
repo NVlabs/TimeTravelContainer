@@ -5452,6 +5452,8 @@ type runtimeBackend struct {
 	lifecycleReady   func()
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
+	snapshotData     *ttcsnapshot.LocalDataStore
+	snapshotResolver *ttcsnapshot.Resolver
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool

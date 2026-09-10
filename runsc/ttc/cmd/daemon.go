@@ -249,6 +249,8 @@ type daemonServer struct {
 	clusterPlacements     cluster.PlacementCatalog
 	publicationQueue      *ttcstorage.Queue
 	snapshotGraph         *ttcsnapshot.Store
+	snapshotData          *ttcsnapshot.LocalDataStore
+	snapshotResolver      *ttcsnapshot.Resolver
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -1528,6 +1530,8 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.volumeCopyMode = s.volumeCapability.Mode
 	backend.publicationQueue = s.publicationQueue
 	backend.snapshotGraph = s.snapshotGraph
+	backend.snapshotData = s.snapshotData
+	backend.snapshotResolver = s.snapshotResolver
 }
 
 type daemonStopTarget struct {
@@ -3223,6 +3227,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		runsc:                 runsc,
 		volumeCapability:      volumeCapability,
 		snapshotGraph:         snapshotGraph,
+		snapshotData:          snapshotData,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
@@ -3302,6 +3307,17 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			transactions: clusterRuntime.transactions, nodeID: clusterRuntime.nodeRecord.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation,
 		}
+		sharedObjects, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(dataRoot, "snapshot-packs"))
+		if err != nil {
+			return fmt.Errorf("opening shared snapshot packs: %w", err)
+		}
+		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
+			raftOriginLocator{authority: clusterRuntime.raftCatalog},
+			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)
+		if err != nil {
+			return fmt.Errorf("opening distributed snapshot resolver: %w", err)
+		}
+		server.snapshotResolver = resolver
 		targetBackend := directBackend(options{
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,

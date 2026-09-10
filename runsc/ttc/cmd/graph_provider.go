@@ -36,6 +36,35 @@ type graphObjectProvider struct {
 	incarnation  string
 }
 
+type raftOriginLocator struct{ authority *cluster.RaftCatalog }
+
+func (locator raftOriginLocator) Provider(_ context.Context, snapshot ttcsnapshot.SnapshotID) (string, bool, error) {
+	provider, found, err := locator.authority.SnapshotProvider(uint64(snapshot))
+	return provider.NodeID, found, err
+}
+
+type clusterObjectSource struct {
+	client      *cluster.Client
+	transaction string
+}
+
+func (source clusterObjectSource) Fetch(ctx context.Context, id ttcsnapshot.ObjectID) (io.ReadCloser, uint64, error) {
+	return source.client.FetchObject(ctx, id.String(), source.transaction)
+}
+
+type clusterPeerSources struct {
+	runtime     *distributedSourceRuntime
+	transaction string
+}
+
+func (sources clusterPeerSources) Peer(_ context.Context, node string) (ttcsnapshot.ObjectSource, error) {
+	client, err := sources.runtime.peer(node, false)
+	if err != nil {
+		return nil, err
+	}
+	return clusterObjectSource{client: client, transaction: sources.transaction}, nil
+}
+
 func (p *graphObjectProvider) OpenObject(_ context.Context, peer, objectText, transactionID string) (io.ReadCloser, uint64, error) {
 	if p == nil || p.graph == nil || p.data == nil || p.authority == nil {
 		return nil, 0, errors.New("snapshot graph provider is unavailable")
