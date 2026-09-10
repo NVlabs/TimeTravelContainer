@@ -47,6 +47,7 @@ import (
 
 type distributedSourceRuntime struct {
 	capabilities  cluster.Capabilities
+	incarnation   string
 	peers         map[string]*cluster.Client
 	directory     cluster.NodeCatalog
 	placements    cluster.PlacementCatalog

@@ -2819,7 +2819,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	transactions := catalog.Transactions()
 	placements := catalog.Placements()
 	source := &distributedSourceRuntime{
-		capabilities: capabilities, peers: clients,
+		capabilities: capabilities, incarnation: incarnation, peers: clients,
 		directory: catalog, placements: placements, transactions: transactions, authority: catalog,
 		authToken:    opts.AuthToken,
 		dynamicPeers: make(map[string]dynamicClusterPeer),
@@ -3165,6 +3165,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot object store: %w", err)
 	}
+	var sharedObjects *ttcsnapshot.SharedPackStore
+	if clusterRuntime != nil {
+		sharedObjects, err = ttcsnapshot.OpenSharedPackStore(filepath.Join(dataRoot, "snapshot-packs"))
+		if err != nil {
+			return fmt.Errorf("opening shared snapshot packs: %w", err)
+		}
+	}
 	removeRetiredRaftState := false
 	if clusterRuntime != nil && clusterRuntime.raftLocalDir != "" {
 		// This defer is intentionally registered before raft.Close below, so it
@@ -3235,7 +3242,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	var publicationQueue *ttcstorage.Queue
 	if clusterRuntime != nil {
-		publisher := &branchPublisher{sharedRoot: dataRoot, localRoot: localRoot}
+		publisher := &branchPublisher{
+			sharedRoot: dataRoot, localRoot: localRoot,
+			graph: snapshotGraph, graphData: snapshotData, graphShared: sharedObjects,
+		}
 		publisher.event = func(event DaemonEvent) { server.recordEvent(dataRoot, event) }
 		publisher.nodeID = clusterRuntime.nodeRecord.NodeID
 		publisher.incarnation = clusterRuntime.nodeRecord.Incarnation
@@ -3312,10 +3322,6 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		clusterRuntime.controlPlane.ObjectProvider = graphProvider
 		clusterRuntime.controlPlane.SnapshotProvider = graphProvider
-		sharedObjects, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(dataRoot, "snapshot-packs"))
-		if err != nil {
-			return fmt.Errorf("opening shared snapshot packs: %w", err)
-		}
 		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
 			raftOriginLocator{authority: clusterRuntime.raftCatalog},
 			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)

@@ -31,7 +31,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 2
+	AuthorityFormatVersion = 3
 	maxRememberedRequests  = 65536
 )
 
@@ -131,6 +131,7 @@ type appliedAuthorityRequest struct {
 // never the pages, file extents, or packs reached through them.
 type DurableRoots struct {
 	MemoryRoot      string `json:"memory_root,omitempty"`
+	MemorySnapshot  uint64 `json:"memory_snapshot,omitempty"`
 	FilesystemRoot  string `json:"filesystem_root,omitempty"`
 	ObjectSetDigest string `json:"object_set_digest,omitempty"`
 }
@@ -1302,7 +1303,10 @@ func validateDurableRoots(roots DurableRoots) error {
 			}
 		}
 	}
-	if roots.MemoryRoot == "" && roots.FilesystemRoot == "" {
+	if roots.MemoryRoot != "" && roots.MemorySnapshot != 0 {
+		return errors.New("durable memory authority names both a digest and a snapshot")
+	}
+	if roots.MemoryRoot == "" && roots.MemorySnapshot == 0 && roots.FilesystemRoot == "" {
 		return errors.New("durable roots are empty")
 	}
 	return nil

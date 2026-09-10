@@ -5004,11 +5004,34 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	now := time.Now().UTC()
 	merged := mergeBranchHistory(
-		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now}},
+		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now, SnapshotID: 41, MemoryRoots: []string{"memory/41/root"}}},
 		[]Branch{{ID: "child", ParentID: "removed-parent", State: "paused", CreatedAt: now}},
 	)
-	if len(merged) != 1 || merged[0].ParentID != "" || !merged[0].Quarantined || merged[0].State != "paused" {
+	if len(merged) != 1 || merged[0].ParentID != "" || !merged[0].Quarantined || merged[0].State != "paused" ||
+		merged[0].SnapshotID != 41 || !slices.Equal(merged[0].MemoryRoots, []string{"memory/41/root"}) {
 		t.Fatalf("merged branch=%+v, want persisted parent and live state", merged)
+	}
+}
+
+func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	control := `{"snapshot_id":8,"memory_roots":[{"name":"memory/8/root","root":"0000000000000008-03-0000000000000001"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "control.json"), []byte(control), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{SnapshotID: 8, MemoryRoots: []string{"memory/8/root"}}
+	if !localGraphCaptureMatches(dir, branch) {
+		t.Fatal("matching local graph capture was rejected")
+	}
+	branch.SnapshotID = 9
+	if localGraphCaptureMatches(dir, branch) {
+		t.Fatal("stale local graph capture was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "control.json"), []byte("not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if localGraphCaptureMatches(dir, branch) {
+		t.Fatal("malformed local graph capture was accepted")
 	}
 }
 

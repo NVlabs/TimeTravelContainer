@@ -152,6 +152,29 @@ func TestAdoptWorkingPreservesExternalIdentityAndLocalMonotonicity(t *testing.T)
 	}
 }
 
+func TestMarkSharedRequiresImmutableSnapshot(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkShared(origin); err == nil {
+		t.Fatal("working snapshot became shared without being sealed")
+	}
+	if err := store.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkShared(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkShared(origin); err != nil {
+		t.Fatalf("idempotent shared transition failed: %v", err)
+	}
+	if snapshot, ok := store.Snapshot(origin); !ok || snapshot.State != SnapshotShared {
+		t.Fatalf("shared snapshot=(%+v,%t)", snapshot, ok)
+	}
+}
+
 func TestExternallyCoordinatedStoresReload(t *testing.T) {
 	dir := t.TempDir()
 	first, err := OpenExternallyCoordinated(dir)

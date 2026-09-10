@@ -4943,6 +4943,8 @@ type Branch struct {
 	StorageError             string    `json:"storage_error,omitempty"`
 	StorageManifest          string    `json:"storage_manifest,omitempty"`
 	StorageRetryAt           time.Time `json:"storage_retry_at,omitempty"`
+	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string  `json:"memory_roots,omitempty"`
 	SourceNode               string    `json:"source_node,omitempty"`
 	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
@@ -5654,18 +5656,25 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		forks = append(forks, fork)
 	}
 	if kind == "dehydrate" {
-		repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
-		if err != nil {
-			return rollback(err)
-		}
-		manifest, branchErr := repository.Branch(filesystemBranch)
-		if branchErr == nil {
-			branchErr = repository.SetBranch(captureBranch, manifest)
-			memoryPinned = branchErr == nil
-		}
-		closeErr := repository.Close()
-		if branchErr != nil || closeErr != nil {
-			return rollback(errors.Join(branchErr, closeErr))
+		if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
+			if err != nil {
+				return rollback(err)
+			}
+			manifest, branchErr := repository.Branch(filesystemBranch)
+			if branchErr == nil {
+				branchErr = repository.SetBranch(captureBranch, manifest)
+				memoryPinned = branchErr == nil
+			}
+			closeErr := repository.Close()
+			if branchErr != nil || closeErr != nil {
+				return rollback(errors.Join(branchErr, closeErr))
+			}
+		} else {
+			record, ok := b.snapshotGraph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
+			if !ok || (record.State != ttcsnapshot.SnapshotSealedLocal && record.State != ttcsnapshot.SnapshotSealedVolatile) {
+				return rollback(fmt.Errorf("graph memory snapshot %d is not sealed", branch.SnapshotID))
+			}
 		}
 		source := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		destination := publicationMemoryControlPath(b.activeDataRoot(), captureBranch)
@@ -9760,8 +9769,8 @@ func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch
 	return Branch{
 		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
 		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
-		StorageManifest: info.StorageManifest,
-		StorageRetryAt:  info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
+		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
+		StorageRetryAt: info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
 		DependentFilesystemBytes: info.DependentFilesystemBytes,
 		ForkTotalNS:              info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 	}
@@ -9817,6 +9826,8 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			branch.StorageError = recorded.StorageError
 			branch.StorageManifest = recorded.StorageManifest
 			branch.StorageRetryAt = recorded.StorageRetryAt
+			branch.SnapshotID = recorded.SnapshotID
+			branch.MemoryRoots = append([]string(nil), recorded.MemoryRoots...)
 			branch.SourceNode = recorded.SourceNode
 			branch.DependentMemoryBytes = recorded.DependentMemoryBytes
 			branch.DependentFilesystemBytes = recorded.DependentFilesystemBytes
@@ -10815,6 +10826,72 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 	return nil
 }
 
+// allocateGraphSnapshotOrigin keeps the core graph independent of its ID
+// allocator. Standalone roots allocate locally; clustered roots first commit
+// the globally unique origin and exact volatile provider through Raft.
+func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, ttcsnapshot.SnapshotState, error) {
+	if b.snapshotGraph == nil {
+		return 0, "", errors.New("snapshot graph is unavailable")
+	}
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		origin, err := b.snapshotGraph.AllocateWorking()
+		return origin, ttcsnapshot.SnapshotSealedLocal, err
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, "", errors.New("cluster snapshot allocation lacks node incarnation")
+	}
+	allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, b.distributedSource.incarnation, 1)
+	if err != nil {
+		return 0, "", fmt.Errorf("allocating Raft snapshot origin: %w", err)
+	}
+	origin := ttcsnapshot.SnapshotID(allocation.First)
+	if allocation.Count != 1 || origin == 0 {
+		return 0, "", fmt.Errorf("Raft returned invalid snapshot allocation %+v", allocation)
+	}
+	if err := b.snapshotGraph.AdoptWorking(origin); err != nil {
+		return 0, "", fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
+	}
+	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
+}
+
+// retireFailedGraphSnapshot makes a Raft allocation resolve to a committed
+// empty shared snapshot after a capture fails. This is safe even when some
+// unreachable capture objects were already created: the immutable pack is
+// published first, then Raft removes the volatile-provider entry. Normal graph
+// reclamation may subsequently release the local objects.
+func (b *runtimeBackend) retireFailedGraphSnapshot(origin ttcsnapshot.SnapshotID) error {
+	if origin == 0 || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	record, ok := b.snapshotGraph.Snapshot(origin)
+	if !ok {
+		return fmt.Errorf("allocated snapshot origin %d is missing locally", origin)
+	}
+	if record.State == ttcsnapshot.SnapshotWorking {
+		if err := b.snapshotGraph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+			return err
+		}
+	}
+	if b.snapshotShared == nil || b.snapshotData == nil {
+		return errors.New("shared graph snapshot repository is unavailable")
+	}
+	if err := b.snapshotShared.Publish(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
+		return err
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if err := b.distributedSource.authority.PublishSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
+		return err
+	}
+	return b.snapshotGraph.MarkShared(origin)
+}
+
 func (b *runtimeBackend) dehydrate(target selector) error {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -10848,6 +10925,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	var memoryRepository *ttcchunk.MemoryRepository
 	var graphMemoryRoots []string
 	var graphMemorySnapshot uint64
+	var graphMemorySealState ttcsnapshot.SnapshotState
 	graphMemoryRecorded := false
 	previousGraphMemorySnapshot := persistentBranch.SnapshotID
 	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
@@ -10881,6 +10959,11 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		if graphMemoryRecorded {
 			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots)
+		}
+		if graphMemorySnapshot != 0 && b.distributedSource != nil {
+			if graphErr := b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: retiring failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
+			}
 		}
 		if len(graphMemoryRoots) != 0 {
 			if graphErr := b.releaseGraphMemoryRoots(graphMemoryRoots); graphErr != nil && b.stderr != nil {
@@ -10959,11 +11042,13 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if err := json.Unmarshal(output, &capture); err != nil {
 			return fmt.Errorf("decoding dehydration capture description: %w", err)
 		}
-		if b.snapshotGraph != nil && b.snapshotData != nil && b.nodeID == "" {
-			origin, err := b.snapshotGraph.AllocateWorking()
+		if b.snapshotGraph != nil && b.snapshotData != nil {
+			origin, sealState, err := b.allocateGraphSnapshotOrigin()
 			if err != nil {
 				return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
 			}
+			graphMemorySnapshot = uint64(origin)
+			graphMemorySealState = sealState
 			prefix := fmt.Sprintf("memory/%016x", uint64(origin))
 			reader, writer, err := os.Pipe()
 			if err != nil {
@@ -10996,11 +11081,10 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 				})
 				graphMemoryRoots = append(graphMemoryRoots, root.Name)
 			}
-			if err := b.snapshotGraph.Seal(origin, ttcsnapshot.SnapshotSealedLocal); err != nil {
+			if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
 				return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
 			}
 			capture.SnapshotID = uint64(origin)
-			graphMemorySnapshot = uint64(origin)
 			capture.SparseManifest = ttcchunk.ManifestID{}
 		} else {
 			sparseRepositoryPath = filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
@@ -11475,7 +11559,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
 		return errors.New("dehydration control state is incomplete")
 	}
-	graphSparse := b.nodeID == "" && len(capture.MemoryRoots) != 0
+	graphSparse := len(capture.MemoryRoots) != 0
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{}) || graphSparse
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
@@ -11774,7 +11858,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if relays != nil {
 		defer relays.close()
 	}
-	graphSparse := b.nodeID == "" && len(capture.MemoryRoots) != 0
+	graphSparse := len(capture.MemoryRoots) != 0
 	sparse := capture.SparseManifest != (ttcchunk.ManifestID{}) || graphSparse
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {

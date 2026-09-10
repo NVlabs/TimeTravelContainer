@@ -968,6 +968,26 @@ func (s *Store) Seal(id SnapshotID, state SnapshotState) error {
 	return s.commitLocked([]journalOp{{PutSnapshot: &snapshot}})
 }
 
+// MarkShared records that an immutable origin has completed the authoritative
+// provider-to-shared handoff. Replays are idempotent; a working origin can
+// never bypass sealing.
+func (s *Store) MarkShared(id SnapshotID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.state.Snapshots[snapshotKey(id)]
+	if !ok {
+		return fmt.Errorf("snapshot %d does not exist", id)
+	}
+	if snapshot.State == SnapshotShared {
+		return nil
+	}
+	if snapshot.State != SnapshotSealedLocal && snapshot.State != SnapshotSealedVolatile {
+		return fmt.Errorf("snapshot %d is %s, want sealed", id, snapshot.State)
+	}
+	snapshot.State = SnapshotShared
+	return s.commitLocked([]journalOp{{PutSnapshot: &snapshot}})
+}
+
 // SealAndFork atomically seals source, copies named logical roots, and
 // allocates fresh working origins for every resumed source/destination branch.
 // copies maps destination root names to existing source root names.

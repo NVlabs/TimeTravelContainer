@@ -234,14 +234,14 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	}))
 	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
-		Roots: DurableRoots{FilesystemRoot: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Roots: DurableRoots{MemorySnapshot: 7, FilesystemRoot: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	})
 	placement := state.Placements[logicalBranchKey("family", "main")]
 	if placement.State != PlacementUnplaced {
 		t.Fatalf("durable healthy branch placement = %+v, want unplaced", placement)
 	}
 	branch := state.Branches[logicalBranchKey("family", "main")]
-	if branch.Corrupted || branch.Lifecycle != "exited" {
+	if branch.Corrupted || branch.Lifecycle != "exited" || branch.Roots.MemorySnapshot != 7 {
 		t.Fatalf("durable healthy branch authority = %+v", branch)
 	}
 }
