@@ -1460,7 +1460,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	child := BranchInfo{ID: "child", ParentID: "main", State: "running", CreatedAt: childCreated, ForkTotalNS: 123}
 	if err := store.RecordBranches("demo", []BranchInfo{
 		child,
-		{ID: "grandchild", ParentID: "child", State: "paused", CreatedAt: childCreated.Add(time.Second)},
+		{ID: "grandchild", ParentID: "child", State: "paused", DistributedGraphReferenceOperation: "branch-operation", CreatedAt: childCreated.Add(time.Second)},
 	}); err != nil {
 		t.Fatalf("RecordBranches: %v", err)
 	}
@@ -1471,7 +1471,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContainer with lineage: %v", err)
 	}
-	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" {
+	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" || withHistory.Branches[1].DistributedGraphReferenceOperation != "branch-operation" {
 		t.Fatalf("persisted lineage=%+v", withHistory.Branches)
 	}
 	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", State: "running", CreatedAt: time.Now().UTC()}); err != nil {

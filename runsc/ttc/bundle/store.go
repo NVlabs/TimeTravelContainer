@@ -395,10 +395,15 @@ type BranchInfo struct {
 	ParentID                     string `json:"parent_id,omitempty"`
 	FilesystemBranch             string `json:"filesystem_branch,omitempty"`
 	DistributedForkTransactionID string `json:"distributed_fork_transaction_id,omitempty"`
-	DistributedSparseRepository  string `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch      string `json:"distributed_sparse_branch,omitempty"`
-	DistributedMigration         bool   `json:"distributed_migration,omitempty"`
-	State                        string `json:"state"`
+	// DistributedGraphReferenceOperation names this branch's independent,
+	// idempotent provider-root batch. Multiple local descendants may share the
+	// same authorizing distributed transaction, but must never share this
+	// lifetime identity.
+	DistributedGraphReferenceOperation string `json:"distributed_graph_reference_operation,omitempty"`
+	DistributedSparseRepository        string `json:"distributed_sparse_repository,omitempty"`
+	DistributedSparseBranch            string `json:"distributed_sparse_branch,omitempty"`
+	DistributedMigration               bool   `json:"distributed_migration,omitempty"`
+	State                              string `json:"state"`
 	// StorageState describes where the authoritative captured generation is.
 	// It is independent of the process lifecycle in State.
 	StorageState             string    `json:"storage_state,omitempty"`

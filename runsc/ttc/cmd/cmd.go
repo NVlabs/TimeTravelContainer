@@ -9922,6 +9922,17 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
+	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
+	referenceOperations := make([]string, len(destinations))
+	if referenceTransaction != "" && len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		for index := range referenceOperations {
+			operation, err := newGraphReferenceOperation()
+			if err != nil {
+				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destinations[index], err)
+			}
+			referenceOperations[index] = operation
+		}
+	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
 		args = append(args, "--paused")
@@ -9957,6 +9968,10 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				Quarantined: branch.Quarantined,
 				State:       branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
+			}
+			if referenceOperations[i] != "" {
+				records[i].DistributedForkTransactionID = referenceTransaction
+				records[i].DistributedGraphReferenceOperation = referenceOperations[i]
 			}
 		}
 		graphRoots, err := b.cloneGraphMemoryRootsMany(sourceRecord.MemoryRoots, sourceRecord.MemoryRootObjects, sourceRecord.SnapshotID, records)
@@ -10005,6 +10020,21 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				return nil, fmt.Errorf("persisting batch fork lineage: %w; cleaning unrecorded branches: %v", err, cleanupErr)
 			}
 			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
+		}
+		for i := range records {
+			if records[i].DistributedGraphReferenceOperation == "" {
+				continue
+			}
+			if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, records[i].MemoryRootObjects); err != nil {
+				var cleanupErr error
+				for _, cleanupDestination := range destinations {
+					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
+				}
+				if cleanupErr != nil {
+					return nil, fmt.Errorf("retaining graph origins for branch %q: %w; cleaning batch branches: %v", records[i].ID, err, cleanupErr)
+				}
+				return nil, fmt.Errorf("retaining graph origins for branch %q: %w; batch branches were destroyed", records[i].ID, err)
+			}
 		}
 		for i := range records {
 			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch, sourceRecord.StorageManifest != ""); err != nil {
@@ -10114,9 +10144,18 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 
 	createdAt := time.Now().UTC()
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
+	referenceTransaction := transactionIDForBranch(info, sourceBranch)
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
 		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
+		if referenceTransaction != "" && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
+			operation, err := newGraphReferenceOperation()
+			if err != nil {
+				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destination, err)
+			}
+			branch.DistributedForkTransactionID = referenceTransaction
+			branch.DistributedGraphReferenceOperation = operation
+		}
 		childDir := memoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
 		graphRoots, err := b.cloneGraphMemoryRoots(sourceBranch.MemoryRoots, sourceBranch.MemoryRootObjects, sourceBranch.SnapshotID, filesystemBranch)
@@ -10203,6 +10242,14 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	}
 	if err := b.containerStore().RecordBranches(info.ID, records); err != nil {
 		return nil, fmt.Errorf("recording dehydrated fork children: %w", err)
+	}
+	for i := range records {
+		if records[i].DistributedGraphReferenceOperation == "" {
+			continue
+		}
+		if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, records[i].MemoryRootObjects); err != nil {
+			return nil, fmt.Errorf("retaining graph origins for dehydrated branch %q: %w", records[i].ID, err)
+		}
 	}
 
 	peer := false
@@ -10880,6 +10927,9 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.releaseGraphMemoryRoots(branch.MemoryRoots); err != nil {
 		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 	}
+	if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, branch)); err != nil {
+		return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
+	}
 	if len(branch.MemoryRoots) != 0 {
 		if err := store.UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil); err != nil {
 			return err
@@ -11293,6 +11343,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			// roots is a safe leak that standalone graph reconciliation retries;
 			// it must not turn a successful dehydration into an ambiguous failure.
 			fmt.Fprintf(b.stderr, "ttc: warning: reclaiming superseded memory roots for %s: %v\n", target, err)
+		}
+		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, persistentBranch)); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded distributed memory origins for %s: %v\n", target, err)
 		}
 	}
 	if b.dataRoot != "" {
@@ -12367,6 +12420,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 		if err := b.releaseGraphMemoryRoots(recorded.MemoryRoots); err != nil {
 			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
+		}
+		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, *recorded)); err != nil {
+			return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {
 			if portErr != nil {

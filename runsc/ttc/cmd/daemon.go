@@ -438,7 +438,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := validateGraphRootObjects(session.GraphSnapshot, rootNames, session.GraphRootObjects); err != nil {
 			return fmt.Errorf("validating distributed graph memory identity: %w", err)
 		}
+		if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, tx.Identity.TransactionID, info.ID, targetBranch.ID, session.GraphRootObjects); err != nil {
+			return fmt.Errorf("retaining distributed graph memory origins: %w", err)
+		}
 		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects); err != nil {
+			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
 			return fmt.Errorf("recording distributed graph memory identity: %w", err)
 		}
 		restoreArgs.GraphRemote = true
@@ -954,6 +958,9 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			}
 		}
 		if releaseErr := r.backend.releaseDistributedSparseRootTransaction(tx.Identity.TransactionID); releaseErr != nil {
+			return releaseErr
+		}
+		if releaseErr := r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID); releaseErr != nil {
 			return releaseErr
 		}
 	}
@@ -3407,6 +3414,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		targetBackend.distributedSource = clusterRuntime.source
+		if err := targetBackend.reconcileDistributedGraphReferences(true); err != nil {
+			return fmt.Errorf("recovering distributed graph references: %w", err)
+		}
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
@@ -3552,6 +3562,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}()
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
+		go maintainDistributedGraphReferences(targetBackend, stderr, clusterDone, func() func() {
+			return server.lockDataRoot(server.dataRoot)
+		})
 		if elasticRecord != nil {
 			go maintainElasticMigrationRecovery(targetBackend, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
 				unlock := server.lockDataRoot(server.dataRoot)
@@ -3601,6 +3614,27 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		go server.handle(conn, stderr)
+	}
+}
+
+func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		unlock := func() {}
+		if lock != nil {
+			unlock = lock()
+		}
+		err := backend.reconcileDistributedGraphReferences(false)
+		unlock()
+		if err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: reconciling distributed graph references: %v\n", err)
+		}
 	}
 }
 

@@ -148,7 +148,7 @@ func (p *graphObjectProvider) OpenObject(_ context.Context, peer, objectText, tr
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := p.authorizeSnapshot(peer, id.Snapshot, transactionID); err != nil {
+	if err := p.authorizeSnapshot(peer, id.Snapshot, transactionID, false); err != nil {
 		return nil, 0, err
 	}
 	object, ok := p.graph.Object(id)
@@ -165,7 +165,7 @@ func (p *graphObjectProvider) OpenObject(_ context.Context, peer, objectText, tr
 	return file, object.BulkLength, nil
 }
 
-func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapshot.SnapshotID, transactionID string) error {
+func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapshot.SnapshotID, transactionID string, allowTerminal bool) error {
 	provider, found, err := p.authority.SnapshotProvider(uint64(snapshot))
 	if err != nil {
 		return err
@@ -198,7 +198,7 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		if transaction.Identity.TargetNodeID != peer {
 			return errors.New("snapshot transaction does not authorize this requester")
 		}
-		if transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed {
+		if !allowTerminal && (transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed) {
 			return fmt.Errorf("snapshot transaction is %s", transaction.State)
 		}
 	}
@@ -212,7 +212,7 @@ func (p *graphObjectProvider) OpenSnapshot(_ context.Context, peer string, snaps
 		return nil, 0, errors.New("snapshot graph provider is unavailable")
 	}
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
-	if err := p.authorizeSnapshot(peer, snapshot, transactionID); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transactionID, false); err != nil {
 		return nil, 0, err
 	}
 	record, ok := p.graph.Snapshot(snapshot)
@@ -287,7 +287,7 @@ func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]clus
 // Raft or this request.
 func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
-	if err := p.authorizeSnapshot(peer, snapshot, transaction); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transaction, false); err != nil {
 		return err
 	}
 	roots, err := graphReferenceRoots(snapshot, operation, bindings)
@@ -302,7 +302,7 @@ func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer stri
 // roots, and completed retries are no-ops.
 func (p *graphObjectProvider) ReleaseSnapshotRoots(ctx context.Context, peer string, snapshotID uint64, transaction, operation string, bindings []cluster.SnapshotRootBinding) error {
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
-	if err := p.authorizeSnapshot(peer, snapshot, transaction); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transaction, true); err != nil {
 		return err
 	}
 	roots, err := graphReferenceRoots(snapshot, operation, bindings)
