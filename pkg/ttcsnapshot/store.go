@@ -529,6 +529,68 @@ func (s *Store) CreateObject(origin SnapshotID, pin string, kind ObjectKind, dat
 	return id, nil
 }
 
+// ReserveObject durably allocates an object ID before bulk bytes are written.
+// A crash may leave an unused ordinal, but IDs are never reused and no graph
+// reference exists until CommitReservedObject succeeds.
+func (s *Store) ReserveObject(origin SnapshotID, kind ObjectKind) (ObjectID, error) {
+	if !kind.valid() {
+		return ObjectID{}, fmt.Errorf("invalid TTC object kind %d", kind)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
+	if !ok || snapshot.State != SnapshotWorking {
+		return ObjectID{}, fmt.Errorf("snapshot %d is not working", origin)
+	}
+	if snapshot.NextOrdinal == 0 || snapshot.NextOrdinal == math.MaxUint64 {
+		return ObjectID{}, fmt.Errorf("snapshot %d object ordinal space exhausted", origin)
+	}
+	id := ObjectID{Snapshot: origin, Ordinal: snapshot.NextOrdinal, Kind: kind}
+	snapshot.NextOrdinal++
+	if err := s.commitLocked([]journalOp{{PutSnapshot: &snapshot}}); err != nil {
+		return ObjectID{}, err
+	}
+	return id, nil
+}
+
+// CommitReservedObject makes a reserved ID reachable through pin. Bulk data
+// must already have been atomically installed before this call.
+func (s *Store) CommitReservedObject(id ObjectID, pin string, data []byte, children []Edge) error {
+	if err := id.validate(); err != nil {
+		return err
+	}
+	if err := validateRootName(pin); err != nil {
+		return fmt.Errorf("invalid construction pin: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.state.Snapshots[snapshotKey(id.Snapshot)]
+	if !ok || snapshot.State != SnapshotWorking || id.Ordinal >= snapshot.NextOrdinal {
+		return fmt.Errorf("object ID %s is not reserved in a working snapshot", id.key())
+	}
+	if _, ok := s.state.Objects[id.key()]; ok {
+		return fmt.Errorf("object %s already exists", id.key())
+	}
+	if _, ok := s.state.Pins[pin]; ok {
+		return fmt.Errorf("construction pin %q already exists", pin)
+	}
+	object := Object{ID: id, State: ObjectLive, Refs: 1, Data: append([]byte(nil), data...), Children: append([]Edge(nil), children...)}
+	if err := validateObject(object); err != nil {
+		return err
+	}
+	ops := make([]journalOp, 0, len(children)+2)
+	for _, edge := range object.Children {
+		child, ok := s.state.Objects[edge.Child.key()]
+		if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
+			return fmt.Errorf("child object %s cannot be retained", edge.Child.key())
+		}
+		child.Refs++
+		ops = append(ops, journalOp{PutObject: &child})
+	}
+	ops = append(ops, journalOp{PutObject: &object}, journalOp{PinName: pin, PutPin: &id})
+	return s.commitLocked(ops)
+}
+
 // Object returns a copy of object metadata.
 func (s *Store) Object(id ObjectID) (Object, bool) {
 	s.mu.RLock()

@@ -36,6 +36,7 @@ type InodeRecord struct {
 	Nlink       uint32
 	Size        int64
 	File        ObjectID
+	Directory   ObjectID
 	Target      string
 	DeviceMajor uint32
 	DeviceMinor uint32
@@ -63,8 +64,7 @@ type FilesystemOperation struct {
 }
 
 type filesystemRoot struct {
-	inodes      ObjectID
-	directories ObjectID
+	inodes ObjectID
 }
 
 func decodeFilesystemRoot(object Object) (filesystemRoot, error) {
@@ -76,8 +76,6 @@ func decodeFilesystemRoot(object Object) (filesystemRoot, error) {
 		switch edge.Slot {
 		case 0:
 			root.inodes = edge.Child
-		case 1:
-			root.directories = edge.Child
 		default:
 			return filesystemRoot{}, fmt.Errorf("filesystem root %s has invalid edge slot %d", object.ID.key(), edge.Slot)
 		}
@@ -104,6 +102,23 @@ func encodeRecord(value any) ([]byte, error) {
 		return nil, errors.New("TTC filesystem metadata record is too large")
 	}
 	return data, nil
+}
+
+func inodeChildren(inode InodeRecord) ([]Edge, error) {
+	var children []Edge
+	if !inode.File.IsZero() {
+		if inode.File.Kind != ObjectKindFile {
+			return nil, errors.New("inode content is not a whole-file object")
+		}
+		children = append(children, Edge{Slot: 0, Child: inode.File})
+	}
+	if !inode.Directory.IsZero() {
+		if inode.Directory.Kind != ObjectKindDirectoryNode {
+			return nil, errors.New("inode directory is not a directory-tree object")
+		}
+		children = append(children, Edge{Slot: 1, Child: inode.Directory})
+	}
+	return children, nil
 }
 
 func (builder *bTreeBuilder) set(root ObjectID, key []byte, value ObjectID) (ObjectID, error) {
@@ -156,7 +171,6 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 		}
 	}
 	inodeBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode}
-	directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
 	for _, operation := range operations {
 		selectors := 0
 		if operation.PutInode != nil {
@@ -180,12 +194,9 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if inode.Number == 0 || inode.Type == "" {
 				return ObjectID{}, errors.New("invalid TTC inode record")
 			}
-			var children []Edge
-			if !inode.File.IsZero() {
-				if inode.File.Kind != ObjectKindFile {
-					return ObjectID{}, errors.New("inode content is not a whole-file object")
-				}
-				children = []Edge{{Slot: 0, Child: inode.File}}
+			children, err := inodeChildren(inode)
+			if err != nil {
+				return ObjectID{}, err
 			}
 			data, err := encodeRecord(inode)
 			if err != nil {
@@ -210,6 +221,18 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if err != nil || entry.Inode == 0 {
 				return ObjectID{}, errors.New("invalid TTC directory entry record")
 			}
+			parentID, ok, err := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(entry.Parent))
+			if err != nil || !ok {
+				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", entry.Parent, err)
+			}
+			parentObject := mutation.state.Objects[parentID.key()]
+			var parent InodeRecord
+			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
+				return ObjectID{}, err
+			}
+			if parent.Type != "directory" {
+				return ObjectID{}, errors.New("directory entry parent is not a directory")
+			}
 			data, err := encodeRecord(entry)
 			if err != nil {
 				return ObjectID{}, err
@@ -218,7 +241,24 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if err != nil {
 				return ObjectID{}, err
 			}
-			root.directories, err = directoryBuilder.set(root.directories, key, object)
+			directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
+			parent.Directory, err = directoryBuilder.set(parent.Directory, key[8:], object)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentData, err := encodeRecord(parent)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentEdges, err := inodeChildren(parent)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentObjectID, err := mutation.create(ObjectKindInode, parentData, parentEdges)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			root.inodes, err = inodeBuilder.set(root.inodes, InodeKey(parent.Number), parentObjectID)
 			if err != nil {
 				return ObjectID{}, err
 			}
@@ -227,7 +267,33 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if err != nil {
 				return ObjectID{}, err
 			}
-			root.directories, _, err = directoryBuilder.delete(root.directories, key)
+			parentID, ok, lookupErr := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(operation.DeleteEntry.Parent))
+			if lookupErr != nil || !ok {
+				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", operation.DeleteEntry.Parent, lookupErr)
+			}
+			parentObject := mutation.state.Objects[parentID.key()]
+			var parent InodeRecord
+			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
+				return ObjectID{}, err
+			}
+			directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
+			parent.Directory, _, err = directoryBuilder.delete(parent.Directory, key[8:])
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentData, err := encodeRecord(parent)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentEdges, err := inodeChildren(parent)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			parentObjectID, err := mutation.create(ObjectKindInode, parentData, parentEdges)
+			if err != nil {
+				return ObjectID{}, err
+			}
+			root.inodes, err = inodeBuilder.set(root.inodes, InodeKey(parent.Number), parentObjectID)
 			if err != nil {
 				return ObjectID{}, err
 			}
@@ -236,9 +302,6 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 	var edges []Edge
 	if !root.inodes.IsZero() {
 		edges = append(edges, Edge{Slot: 0, Child: root.inodes})
-	}
-	if !root.directories.IsZero() {
-		edges = append(edges, Edge{Slot: 1, Child: root.directories})
 	}
 	if len(edges) == 0 {
 		return ObjectID{}, errors.New("TTC filesystem transaction produced an empty filesystem")
@@ -325,7 +388,16 @@ func (s *Store) FilesystemLookup(rootID ObjectID, parent uint64, name string) (D
 	if err != nil {
 		return DirectoryEntryRecord{}, false, err
 	}
-	id, ok, err := bTreeLookupState(s.state, root.directories, ObjectKindDirectoryNode, key)
+	parentID, ok, err := bTreeLookupState(s.state, root.inodes, ObjectKindInodeNode, InodeKey(parent))
+	if err != nil || !ok {
+		return DirectoryEntryRecord{}, ok, err
+	}
+	parentObject := s.state.Objects[parentID.key()]
+	var parentInode InodeRecord
+	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
+		return DirectoryEntryRecord{}, false, err
+	}
+	id, ok, err := bTreeLookupState(s.state, parentInode.Directory, ObjectKindDirectoryNode, key[8:])
 	if err != nil || !ok {
 		return DirectoryEntryRecord{}, ok, err
 	}
@@ -350,8 +422,20 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 		return nil, fmt.Errorf("filesystem root %s is missing", rootID.key())
 	}
 	root, err := decodeFilesystemRoot(rootObject)
-	if err != nil || root.directories.IsZero() {
+	if err != nil {
 		return nil, err
+	}
+	parentID, ok, err := bTreeLookupState(s.state, root.inodes, ObjectKindInodeNode, InodeKey(parent))
+	if err != nil || !ok {
+		return nil, err
+	}
+	parentObject := s.state.Objects[parentID.key()]
+	var parentInode InodeRecord
+	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
+		return nil, err
+	}
+	if parentInode.Directory.IsZero() {
+		return nil, nil
 	}
 	var result []DirectoryEntryRecord
 	var visit func(ObjectID) error
@@ -372,10 +456,7 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 			}
 			return nil
 		}
-		for index, key := range node.keys {
-			if len(key) < 8 || binary.BigEndian.Uint64(key[:8]) != parent {
-				continue
-			}
+		for index := range node.keys {
 			value := s.state.Objects[node.children[index].key()]
 			var entry DirectoryEntryRecord
 			if err := json.Unmarshal(value.Data, &entry); err != nil {
@@ -385,7 +466,7 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 		}
 		return nil
 	}
-	if err := visit(root.directories); err != nil {
+	if err := visit(parentInode.Directory); err != nil {
 		return nil, err
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })

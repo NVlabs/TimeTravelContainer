@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -369,5 +370,80 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 	}
 	if err := store.Verify(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(filepath.Join(dir, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := graph.ReserveObject(origin, ObjectKindFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := bytes.Repeat([]byte("snapshot-data"), 4096)
+	if err := data.Install(source, bytes.NewReader(contents), int64(len(contents))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(source, "build/source", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	clone, err := graph.ReserveObject(origin, ObjectKindFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := data.Clone(source, clone); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(clone, "build/clone", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	clonePath, err := data.objectPath(clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloneFile, err := os.OpenFile(clonePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cloneFile.WriteAt([]byte("private"), 0); err != nil {
+		t.Fatal(err)
+	}
+	cloneFile.Close()
+	sourceFile, err := data.Open(source, int64(len(contents)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len("snapshot-data"))
+	if _, err := sourceFile.Read(got); err != nil {
+		t.Fatal(err)
+	}
+	sourceFile.Close()
+	if !bytes.Equal(got, []byte("snapshot-data")) {
+		t.Fatalf("clone write changed source to %q", got)
+	}
+	if err := graph.DeletePin("build/source"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/clone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.Collect(16); err != nil {
+		t.Fatal(err)
+	}
+	removed, quarantined, err := data.ReclaimUnreferenced(graph)
+	if err != nil || removed != 2 || quarantined != 0 {
+		t.Fatalf("reclaim=(%d,%d,%v), want (2,0,nil)", removed, quarantined, err)
 	}
 }
