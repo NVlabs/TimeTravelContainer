@@ -15,11 +15,23 @@
 package ttcsnapshot
 
 import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
+)
+
+const (
+	referenceLedgerHeader    = "TTCRL1\n"
+	maxReferenceLedgerRecord = 8 << 20
 )
 
 // OutboundReference is one ordered cross-owner edge mutation. Name is stable
@@ -48,6 +60,29 @@ type referenceLedgerState struct {
 	Outbox       []OutboundReference
 	NextSequence uint64
 	Acknowledged uint64
+}
+
+type ledgerImportRecord struct {
+	Origin     SnapshotID
+	Objects    []Object
+	References map[string]ObjectID
+}
+
+type ledgerReferenceRecord struct {
+	Operation string
+	Name      string
+	Object    ObjectID
+	Retain    bool
+}
+
+type referenceLedgerRecord struct {
+	Version   int
+	Sequence  uint64
+	Import    *ledgerImportRecord
+	Reference *ledgerReferenceRecord
+	Ack       *uint64
+	Collect   *int
+	Collected int
 }
 
 func newReferenceLedgerState() referenceLedgerState {
@@ -81,13 +116,218 @@ func cloneReferenceLedgerState(state referenceLedgerState) referenceLedgerState 
 // providers and the elected shared-GC coordinator. Durable wrappers journal
 // its bounded mutations; this type contains no filesystem or Raft policy.
 type ReferenceLedger struct {
-	mu    sync.RWMutex
-	state referenceLedgerState
+	mu       sync.RWMutex
+	state    referenceLedgerState
+	dir      string
+	lock     *os.File
+	journal  *os.File
+	sequence uint64
+	poisoned error
 }
 
 // NewReferenceLedger returns an empty owner ledger.
 func NewReferenceLedger() *ReferenceLedger {
 	return &ReferenceLedger{state: newReferenceLedgerState()}
+}
+
+// OpenReferenceLedger opens a durable owner ledger. Complete mutations are
+// length-framed and fsynced; an incomplete final frame is discarded on reopen.
+// The directory lock ensures exactly one provider/coordinator process applies
+// counts at a time.
+func OpenReferenceLedger(dir string) (*ReferenceLedger, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, errors.New("reference ledger directory must be absolute")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Name() != "ledger.lock" && entry.Name() != "ledger.log" {
+			return nil, fmt.Errorf("reference ledger contains unknown entry %q", entry.Name())
+		}
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "ledger.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*ReferenceLedger, error) { lock.Close(); return nil, err }
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fail(fmt.Errorf("locking reference ledger: %w", err))
+	}
+	journal, err := os.OpenFile(filepath.Join(dir, "ledger.log"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fail(err)
+	}
+	ledger := &ReferenceLedger{state: newReferenceLedgerState(), dir: dir, lock: lock, journal: journal}
+	if err := ledger.replay(); err != nil {
+		ledger.Close()
+		return nil, err
+	}
+	return ledger, nil
+}
+
+func (ledger *ReferenceLedger) replay() error {
+	info, err := ledger.journal.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		if _, err := ledger.journal.WriteString(referenceLedgerHeader); err != nil {
+			return err
+		}
+		if err := ledger.journal.Sync(); err != nil {
+			return err
+		}
+		return syncDirectory(ledger.dir)
+	}
+	header := make([]byte, len(referenceLedgerHeader))
+	if _, err := ledger.journal.ReadAt(header, 0); err != nil || string(header) != referenceLedgerHeader {
+		return fmt.Errorf("invalid reference ledger header: %w", err)
+	}
+	temporary := NewReferenceLedger()
+	offset := int64(len(referenceLedgerHeader))
+	expected := uint64(1)
+	for {
+		var framing [8]byte
+		n, err := ledger.journal.ReadAt(framing[:], offset)
+		if errors.Is(err, io.EOF) && n == 0 {
+			break
+		}
+		if err != nil || n != len(framing) {
+			if err := ledger.journal.Truncate(offset); err != nil {
+				return err
+			}
+			break
+		}
+		length := binary.BigEndian.Uint64(framing[:])
+		if length == 0 || length > maxReferenceLedgerRecord {
+			return fmt.Errorf("invalid reference ledger record length %d", length)
+		}
+		data := make([]byte, length)
+		n, err = ledger.journal.ReadAt(data, offset+8)
+		if err != nil || uint64(n) != length {
+			if err := ledger.journal.Truncate(offset); err != nil {
+				return err
+			}
+			break
+		}
+		var record referenceLedgerRecord
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		decodeErr := decoder.Decode(&record)
+		trailingErr := decoder.Decode(&struct{}{})
+		if decodeErr != nil || trailingErr != io.EOF || record.Version != 1 || record.Sequence != expected {
+			return fmt.Errorf("invalid reference ledger record %d (decode=%v trailing=%v version=%d sequence=%d)", expected, decodeErr, trailingErr, record.Version, record.Sequence)
+		}
+		if err := replayReferenceLedgerRecord(temporary, record); err != nil {
+			return fmt.Errorf("replaying reference ledger record %d: %w", expected, err)
+		}
+		offset += 8 + int64(length)
+		expected++
+	}
+	ledger.state = cloneReferenceLedgerState(temporary.state)
+	ledger.sequence = expected - 1
+	_, err = ledger.journal.Seek(offset, io.SeekStart)
+	return err
+}
+
+func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedgerRecord) error {
+	set := 0
+	if record.Import != nil {
+		set++
+		if err := ledger.ImportOrigin(record.Import.Origin, record.Import.Objects, record.Import.References); err != nil {
+			return err
+		}
+	}
+	if record.Reference != nil {
+		set++
+		r := record.Reference
+		if err := ledger.ApplyReference(r.Operation, r.Name, r.Object, r.Retain); err != nil {
+			return err
+		}
+	}
+	if record.Ack != nil {
+		set++
+		if err := ledger.AcknowledgeOutbound(*record.Ack); err != nil {
+			return err
+		}
+	}
+	if record.Collect != nil {
+		set++
+		collected, err := ledger.Collect(*record.Collect)
+		if err != nil {
+			return err
+		}
+		if collected != record.Collected {
+			return fmt.Errorf("collection replay removed %d objects, want %d", collected, record.Collected)
+		}
+	}
+	if set != 1 {
+		return errors.New("reference ledger record must contain exactly one mutation")
+	}
+	return nil
+}
+
+func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next referenceLedgerState) error {
+	if ledger.poisoned != nil {
+		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
+	}
+	if ledger.journal == nil {
+		ledger.state = next
+		return nil
+	}
+	if ledger.sequence == math.MaxUint64 {
+		return errors.New("reference ledger sequence exhausted")
+	}
+	record.Version = 1
+	record.Sequence = ledger.sequence + 1
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("encoding reference ledger record: %w", err)
+	}
+	if len(data) == 0 || len(data) > maxReferenceLedgerRecord {
+		return fmt.Errorf("reference ledger record has invalid length %d", len(data))
+	}
+	var framing [8]byte
+	binary.BigEndian.PutUint64(framing[:], uint64(len(data)))
+	encoded := append(framing[:], data...)
+	var written int
+	if written, err = ledger.journal.Write(encoded); err == nil && written != len(encoded) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		err = ledger.journal.Sync()
+	}
+	if err != nil {
+		ledger.poisoned = err
+		return err
+	}
+	ledger.sequence = record.Sequence
+	ledger.state = next
+	return nil
+}
+
+// Close releases a durable ledger. It is harmless for an in-memory ledger.
+func (ledger *ReferenceLedger) Close() error {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	var result error
+	if ledger.journal != nil {
+		result = ledger.journal.Close()
+		ledger.journal = nil
+	}
+	if ledger.lock != nil {
+		result = errors.Join(result, syscall.Flock(int(ledger.lock.Fd()), syscall.LOCK_UN), ledger.lock.Close())
+		ledger.lock = nil
+	}
+	return result
 }
 
 func edgeReferenceName(parent ObjectID, slot uint16) string {
@@ -221,8 +461,7 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 			next.Objects[key] = object
 		}
 	}
-	ledger.state = next
-	return nil
+	return ledger.commitLocked(referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}, next)
 }
 
 // ApplyReference applies one idempotent local root or delivered cross-owner
@@ -251,8 +490,9 @@ func (ledger *ReferenceLedger) ApplyReference(operation, name string, object Obj
 		return err
 	}
 	next.Applied[operation] = want
-	ledger.state = next
-	return nil
+	return ledger.commitLocked(referenceLedgerRecord{Reference: &ledgerReferenceRecord{
+		Operation: operation, Name: name, Object: object, Retain: retain,
+	}}, next)
 }
 
 // PendingOutbound returns the ordered, unacknowledged cross-owner mutations.
@@ -279,9 +519,10 @@ func (ledger *ReferenceLedger) AcknowledgeOutbound(sequence uint64) error {
 	if ledger.state.Outbox[0].Sequence != sequence {
 		return fmt.Errorf("outbox acknowledgement %d does not select oldest sequence %d", sequence, ledger.state.Outbox[0].Sequence)
 	}
-	ledger.state.Outbox = append([]OutboundReference(nil), ledger.state.Outbox[1:]...)
-	ledger.state.Acknowledged = sequence
-	return nil
+	next := cloneReferenceLedgerState(ledger.state)
+	next.Outbox = append([]OutboundReference(nil), next.Outbox[1:]...)
+	next.Acknowledged = sequence
+	return ledger.commitLocked(referenceLedgerRecord{Ack: &sequence}, next)
 }
 
 // Collect reclaims zero-count immutable objects and cascades internal edges.
@@ -334,7 +575,9 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 		delete(next.Objects, key)
 		collected++
 	}
-	ledger.state = next
+	if err := ledger.commitLocked(referenceLedgerRecord{Collect: &limit, Collected: collected}, next); err != nil {
+		return 0, err
+	}
 	return collected, nil
 }
 

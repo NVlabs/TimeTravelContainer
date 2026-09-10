@@ -14,7 +14,11 @@
 
 package ttcsnapshot
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func ledgerObject(snapshot SnapshotID, ordinal uint64, kind ObjectKind, children ...Edge) Object {
 	return Object{ID: ObjectID{Snapshot: snapshot, Ordinal: ordinal, Kind: kind}, State: ObjectLive, Children: children}
@@ -122,5 +126,58 @@ func TestReferenceLedgerImportRequiresCompleteBaseline(t *testing.T) {
 	}
 	if collected, err := ledger.Collect(1); err != nil || collected != 1 {
 		t.Fatalf("Collect=(%d,%v)", collected, err)
+	}
+}
+
+func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := ledgerObject(9, 1, ObjectKindMemoryChunk)
+	if err := ledger.ImportOrigin(9, []Object{object}, map[string]ObjectID{"branch": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenReferenceLedger(directory); err == nil {
+		t.Fatal("second writer opened a locked reference ledger")
+	}
+	if err := ledger.ApplyReference("release-branch", "branch", object.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := os.OpenFile(filepath.Join(directory, "ledger.log"), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.Write([]byte{0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	journal.Close()
+
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	inspection := reopened.Inspect()
+	if got := inspection.Objects[object.ID]; got != 0 {
+		t.Fatalf("replayed references=%d, want 0", got)
+	}
+	if collected, err := reopened.Collect(1); err != nil || collected != 1 {
+		t.Fatalf("replayed Collect=(%d,%v)", collected, err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	final, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Close()
+	if got := len(final.Inspect().Objects); got != 0 {
+		t.Fatalf("objects after collection replay=%d, want 0", got)
 	}
 }
