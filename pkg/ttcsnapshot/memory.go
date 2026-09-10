@@ -50,6 +50,7 @@ type MemoryPageIdentity struct {
 	LogicalSequence  uint64
 	VersionAllocator [16]byte
 	VersionSequence  uint64
+	References       uint64
 }
 
 // MemoryPageDescriptor describes one independently-CoW base page in a bulk
@@ -91,7 +92,7 @@ func validateMemoryNode(object Object, level int) error {
 	return nil
 }
 
-const memoryPageRecordBytes = 4 + 16 + 8 + 16 + 8
+const memoryPageRecordBytes = 4 + 16 + 8 + 16 + 8 + 8
 
 func encodeMemoryPageRecord(offset uint32, identity MemoryPageIdentity) []byte {
 	data := make([]byte, memoryPageRecordBytes)
@@ -100,6 +101,7 @@ func encodeMemoryPageRecord(offset uint32, identity MemoryPageIdentity) []byte {
 	binary.BigEndian.PutUint64(data[20:28], identity.LogicalSequence)
 	copy(data[28:44], identity.VersionAllocator[:])
 	binary.BigEndian.PutUint64(data[44:52], identity.VersionSequence)
+	binary.BigEndian.PutUint64(data[52:60], identity.References)
 	return data[:]
 }
 
@@ -112,6 +114,7 @@ func decodeMemoryPageRecord(data []byte) (uint32, MemoryPageIdentity, error) {
 	identity.LogicalSequence = binary.BigEndian.Uint64(data[20:28])
 	copy(identity.VersionAllocator[:], data[28:44])
 	identity.VersionSequence = binary.BigEndian.Uint64(data[44:52])
+	identity.References = binary.BigEndian.Uint64(data[52:60])
 	return binary.BigEndian.Uint32(data[0:4]), identity, nil
 }
 
@@ -260,6 +263,49 @@ func (s *Store) MemoryPage(root ObjectID, pageIndex uint64) (ObjectID, bool, err
 		current = child
 	}
 	panic("unreachable")
+}
+
+// MemoryPages enumerates the page-index-to-object mapping represented by a
+// radix root. Rehydration necessarily visits each mapped page to reconstruct
+// the guest MemoryFile; ordinary lookup and fork never call this method.
+func (s *Store) MemoryPages(root ObjectID) (map[uint64]ObjectID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[uint64]ObjectID)
+	var visit func(ObjectID, int, uint64) error
+	visit = func(id ObjectID, level int, prefix uint64) error {
+		object, ok := s.state.Objects[id.key()]
+		if !ok {
+			return fmt.Errorf("memory node %s does not exist", id.key())
+		}
+		if err := validateMemoryNode(object, level); err != nil {
+			return err
+		}
+		for _, edge := range object.Children {
+			if edge.Slot > 255 {
+				return fmt.Errorf("memory node %s has invalid slot %d", id.key(), edge.Slot)
+			}
+			index := prefix | uint64(edge.Slot)<<(8*level)
+			if level == 0 {
+				if edge.Child.Kind != ObjectKindPage {
+					return fmt.Errorf("memory leaf references non-page object %s", edge.Child.key())
+				}
+				if _, exists := result[index]; exists {
+					return fmt.Errorf("memory radix repeats page index %#x", index)
+				}
+				result[index] = edge.Child
+				continue
+			}
+			if err := visit(edge.Child, level-1, index); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(root, memoryTreeLevels-1, 0); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // SetMemoryPage path-copies a fixed-height radix path and atomically replaces

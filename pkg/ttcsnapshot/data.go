@@ -31,7 +31,8 @@ import (
 // LocalDataStore stores authoritative standalone whole-file objects. Reflink
 // is opportunistic; correctness always falls back to a complete copy.
 type LocalDataStore struct {
-	root string
+	root   string
+	rootFD *os.File
 }
 
 // OpenLocalDataStore opens a standalone bulk-object directory.
@@ -43,6 +44,31 @@ func OpenLocalDataStore(root string) (*LocalDataStore, error) {
 		return nil, err
 	}
 	return &LocalDataStore{root: root}, nil
+}
+
+// OpenLocalDataStoreFD opens a donated, read-only bulk-object directory. It is
+// used by an isolated Sentry for graph-native demand paging without granting
+// it a host pathname or one descriptor per memory chunk.
+func OpenLocalDataStoreFD(directory *os.File) (*LocalDataStore, error) {
+	if directory == nil {
+		return nil, errors.New("TTC bulk-object directory descriptor is nil")
+	}
+	fd, err := unix.Dup(int(directory.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	return &LocalDataStore{rootFD: os.NewFile(uintptr(fd), "ttc-graph-objects")}, nil
+}
+
+// Close releases a donated directory. Path-opened stores own no persistent
+// descriptor and Close is a no-op.
+func (store *LocalDataStore) Close() error {
+	if store == nil || store.rootFD == nil {
+		return nil
+	}
+	err := store.rootFD.Close()
+	store.rootFD = nil
+	return err
 }
 
 func objectKindName(kind ObjectKind) (string, error) {
@@ -59,6 +85,17 @@ func objectKindName(kind ObjectKind) (string, error) {
 }
 
 func (store *LocalDataStore) objectPath(id ObjectID) (string, error) {
+	if store.root == "" {
+		return "", errors.New("donated TTC bulk-object store has no host path")
+	}
+	relative, err := objectRelativePath(id)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(store.root, relative), nil
+}
+
+func objectRelativePath(id ObjectID) (string, error) {
 	name, err := objectKindName(id.Kind)
 	if err != nil {
 		return "", err
@@ -66,7 +103,7 @@ func (store *LocalDataStore) objectPath(id ObjectID) (string, error) {
 	if err := id.validate(); err != nil {
 		return "", err
 	}
-	return filepath.Join(store.root, name, snapshotKey(id.Snapshot), fmt.Sprintf("%02x", byte(id.Ordinal)), id.key()+".data"), nil
+	return filepath.Join(name, snapshotKey(id.Snapshot), fmt.Sprintf("%02x", byte(id.Ordinal)), id.key()+".data"), nil
 }
 
 // Path returns the trusted host path for a bulk object. It is used by the
@@ -181,16 +218,30 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID) error {
 
 // Open returns a read-only complete object after verifying its exact length.
 func (store *LocalDataStore) Open(id ObjectID, length int64) (*os.File, error) {
-	path, err := store.objectPath(id)
-	if err != nil {
-		return nil, err
+	var file *os.File
+	var err error
+	if store.rootFD != nil {
+		relative, pathErr := objectRelativePath(id)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		fd, openErr := unix.Openat(int(store.rootFD.Fd()), relative, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			return nil, openErr
+		}
+		file = os.NewFile(uintptr(fd), id.String())
+	} else {
+		path, pathErr := store.objectPath(id)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		file, err = os.Open(path)
 	}
-	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	info, err := file.Stat()
-	if err != nil || info.Size() != length || !info.Mode().IsRegular() {
+	if err != nil || length >= 0 && info.Size() != length || !info.Mode().IsRegular() {
 		file.Close()
 		if err != nil {
 			return nil, err
@@ -204,11 +255,7 @@ func (store *LocalDataStore) Open(id ObjectID, length int64) (*os.File, error) {
 // node-local caches. The graph-independent source API intentionally carries
 // the length with the reader so callers can reject incomplete providers.
 func (store *LocalDataStore) Fetch(_ context.Context, id ObjectID) (io.ReadCloser, uint64, error) {
-	path, err := store.objectPath(id)
-	if err != nil {
-		return nil, 0, err
-	}
-	file, err := os.Open(path)
+	file, err := store.Open(id, -1)
 	if err != nil {
 		return nil, 0, err
 	}

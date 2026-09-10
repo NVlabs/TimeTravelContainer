@@ -175,6 +175,7 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 			Object: pgalloc.SparseChunkObjectID(object), Logical: objects[object],
 			Kind: kind, MemCgID: memCgID,
 		}
+		installedPages := make(map[uint8]pgalloc.SparseChunkPage)
 		for _, run := range manifest.Runs {
 			if run.Object != object {
 				continue
@@ -182,11 +183,19 @@ func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Mani
 			for i := uint16(0); i < run.Pages; i++ {
 				slot := run.FirstSlot + uint8(i)
 				version := pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + uint64(i)}
-				install.Pages = append(install.Pages, pgalloc.SparseChunkPage{
+				page := pgalloc.SparseChunkPage{
 					Slot:    slot,
 					Page:    pgalloc.LogicalPageID{Allocator: run.FirstPage.Allocator, Sequence: run.FirstPage.Sequence + uint64(i)},
 					Version: version, References: run.References,
-				})
+				}
+				if previous, ok := installedPages[slot]; ok {
+					if previous != page {
+						return InstallResult{}, fmt.Errorf("manifest object %s slot %d has conflicting page identities", object, slot)
+					}
+					continue
+				}
+				installedPages[slot] = page
+				install.Pages = append(install.Pages, page)
 			}
 		}
 		installs = append(installs, install)

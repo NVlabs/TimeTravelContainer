@@ -16,12 +16,17 @@ package ttcchunk
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+	"sync"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -41,6 +46,15 @@ type GraphImportResult struct {
 	Roots    []GraphMemoryRoot
 	Chunks   uint64
 	Pages    uint64
+}
+
+// GraphManifestResult adapts graph-native roots to the existing in-Sentry
+// sparse installer while that installer is being generalized. Chunks maps the
+// opaque process-local residency identity to the authoritative graph object;
+// it is not a content checksum or a second persistent manifest.
+type GraphManifestResult struct {
+	Manifest Manifest
+	Chunks   map[ID]ttcsnapshot.ObjectID
 }
 
 type graphResourcePages struct {
@@ -121,6 +135,16 @@ func (r *MemoryRepository) ImportSnapshotGraph(graph *ttcsnapshot.Store, data *t
 		if err != nil {
 			return GraphImportResult{}, fmt.Errorf("reading memory chunk %s: %w", use.id, err)
 		}
+		references := make(map[uint8]uint64)
+		for _, run := range use.runs {
+			for delta := uint16(0); delta < run.Pages; delta++ {
+				slot := uint8(uint16(run.FirstSlot) + delta)
+				if previous, ok := references[slot]; ok && previous != run.References {
+					return GraphImportResult{}, fmt.Errorf("chunk %s slot %d has conflicting reference counts %d and %d", use.id, slot, previous, run.References)
+				}
+				references[slot] = run.References
+			}
+		}
 		pages := make([]ttcsnapshot.MemoryPageDescriptor, 0, len(chunk.Pages))
 		raw := make([]byte, ttcsnapshot.MemoryChunkBytes)
 		for _, page := range chunk.Pages {
@@ -132,6 +156,7 @@ func (r *MemoryRepository) ImportSnapshotGraph(graph *ttcsnapshot.Store, data *t
 					LogicalSequence:  logicalSequence,
 					VersionAllocator: [16]byte(page.Version.Allocator),
 					VersionSequence:  page.Version.Sequence,
+					References:       references[page.Slot],
 				},
 			})
 			if !page.Zero {
@@ -231,4 +256,172 @@ func sortedResourceKeys(resources map[string]*graphResourcePages) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func graphChunkResidencyID(chunk ttcsnapshot.ObjectID) ID {
+	var id ID
+	copy(id[:8], []byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H'})
+	binary.BigEndian.PutUint64(id[8:16], uint64(chunk.Snapshot))
+	id[16] = byte(chunk.Kind)
+	binary.BigEndian.PutUint64(id[17:25], chunk.Ordinal)
+	return id
+}
+
+// BuildGraphManifest enumerates graph roots for rehydration. Enumeration is
+// intentionally an O(mapped pages) rehydrate operation; fork and lookup share
+// roots directly and never call it.
+func BuildGraphManifest(graph *ttcsnapshot.Store, roots []GraphMemoryRoot) (GraphManifestResult, error) {
+	if graph == nil || len(roots) == 0 {
+		return GraphManifestResult{}, errors.New("memory graph roots are unavailable")
+	}
+	var bindings []StoredBinding
+	result := GraphManifestResult{Chunks: make(map[ID]ttcsnapshot.ObjectID)}
+	chunkResources := make(map[ttcsnapshot.ObjectID]checkpoint.ResourceID)
+	for _, root := range roots {
+		pages, err := graph.MemoryPages(root.Root)
+		if err != nil {
+			return GraphManifestResult{}, fmt.Errorf("enumerating memory root %q: %w", root.Name, err)
+		}
+		indexes := make([]uint64, 0, len(pages))
+		for index := range pages {
+			indexes = append(indexes, index)
+		}
+		sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+		for _, index := range indexes {
+			page := pages[index]
+			chunk, offset, identity, err := graph.MemoryPageRecord(page)
+			if err != nil {
+				return GraphManifestResult{}, err
+			}
+			if identity.LogicalAllocator == ([16]byte{}) || identity.VersionAllocator == ([16]byte{}) || identity.References == 0 {
+				return GraphManifestResult{}, fmt.Errorf("page %s has incomplete restore identity", page)
+			}
+			chunkObject := ttcsnapshot.ObjectID(chunk)
+			if previous, ok := chunkResources[chunkObject]; ok && previous != root.ResourceID {
+				return GraphManifestResult{}, fmt.Errorf("memory chunk %s spans resources %s and %s", chunkObject, previous, root.ResourceID)
+			}
+			chunkResources[chunkObject] = root.ResourceID
+			residency := graphChunkResidencyID(chunkObject)
+			result.Chunks[residency] = chunkObject
+			logicalPage := pgalloc.LogicalPageID{Allocator: pgalloc.LogicalAllocatorID(identity.LogicalAllocator), Sequence: identity.LogicalSequence}
+			logicalChunk, slot := logicalPage.Chunk()
+			if want := uint8(offset / hostarch.PageSize); slot != want {
+				return GraphManifestResult{}, fmt.Errorf("page %s has logical slot %d but bulk offset slot %d", page, slot, want)
+			}
+			bindings = append(bindings, StoredBinding{
+				Binding: pgalloc.CapturedPageBinding{
+					ResourceID: root.ResourceID,
+					OldOffset:  index * hostarch.PageSize,
+					References: identity.References,
+					Page:       logicalPage,
+					Version:    pgalloc.PageVersionID{Allocator: pgalloc.LogicalAllocatorID(identity.VersionAllocator), Sequence: identity.VersionSequence},
+					Chunk:      logicalChunk,
+					Slot:       slot,
+				},
+				Object: residency,
+			})
+		}
+	}
+	manifest, err := CompactBindings(bindings)
+	if err != nil {
+		return GraphManifestResult{}, err
+	}
+	result.Manifest = manifest
+	return result, nil
+}
+
+// GraphChunkReader exposes graph-native raw 1 MiB chunks in the dense stream
+// assigned by InstallManifestSet. It owns data when ownData is true.
+type GraphChunkReader struct {
+	data    *ttcsnapshot.LocalDataStore
+	chunks  []ttcsnapshot.ObjectID
+	ownData bool
+	mu      sync.RWMutex
+	closed  bool
+}
+
+// NewGraphChunkReader constructs a demand reader without materializing a
+// compatibility chunk repository.
+func NewGraphChunkReader(data *ttcsnapshot.LocalDataStore, chunkObjects map[ID]ttcsnapshot.ObjectID, installed []InstalledChunk, ownData bool) (*GraphChunkReader, error) {
+	if data == nil {
+		return nil, errors.New("nil TTC graph memory data store")
+	}
+	chunks := make([]ttcsnapshot.ObjectID, len(installed))
+	for index, chunk := range installed {
+		if chunk.StreamOffset != uint64(index)*pgalloc.SparseChunkBytes || chunk.Target.Length() != pgalloc.SparseChunkBytes {
+			return nil, fmt.Errorf("invalid graph installed chunk %d: %+v", index, chunk)
+		}
+		object, ok := chunkObjects[chunk.Object]
+		if !ok || object.Kind != ttcsnapshot.ObjectKindMemoryChunk {
+			return nil, fmt.Errorf("graph installed chunk %s has no bulk object", chunk.Object)
+		}
+		chunks[index] = object
+	}
+	return &GraphChunkReader{data: data, chunks: chunks, ownData: ownData}, nil
+}
+
+// Close prevents future reads and releases a donated data directory.
+func (r *GraphChunkReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if r.ownData {
+		return r.data.Close()
+	}
+	return nil
+}
+
+// ReadAt reads each touched chunk completely before exposing any of its bytes
+// to the asynchronous installer.
+func (r *GraphChunkReader) ReadAt(dst []byte, off int64) (int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.closed {
+		return 0, errors.New("TTC graph memory reader is closed")
+	}
+	if off < 0 {
+		return 0, errors.New("negative TTC graph memory offset")
+	}
+	total := uint64(len(r.chunks)) * pgalloc.SparseChunkBytes
+	if uint64(off) >= total {
+		return 0, io.EOF
+	}
+	written := 0
+	for len(dst) != 0 && uint64(off) < total {
+		index := int(uint64(off) / pgalloc.SparseChunkBytes)
+		within := uint64(off) % pgalloc.SparseChunkBytes
+		file, err := r.data.Open(r.chunks[index], int64(pgalloc.SparseChunkBytes))
+		if err != nil {
+			return written, err
+		}
+		data := make([]byte, pgalloc.SparseChunkBytes)
+		_, readErr := io.ReadFull(file, data)
+		closeErr := file.Close()
+		if readErr != nil {
+			return written, readErr
+		}
+		if closeErr != nil {
+			return written, closeErr
+		}
+		n := copy(dst, data[within:])
+		written += n
+		dst = dst[n:]
+		off += int64(n)
+	}
+	if len(dst) != 0 {
+		return written, io.EOF
+	}
+	return written, nil
+}
+
+// AsyncReader wraps graph chunks with the same atomic 1 MiB demand geometry
+// as the existing sparse loader.
+func (r *GraphChunkReader) AsyncReader(parallel int) stateio.AsyncReader {
+	if parallel <= 0 {
+		parallel = 1
+	}
+	return stateio.NewIOReader(r, pgalloc.SparseChunkBytes, 16, parallel)
 }

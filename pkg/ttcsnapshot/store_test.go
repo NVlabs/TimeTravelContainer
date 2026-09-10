@@ -601,7 +601,7 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 99, VersionAllocator: [16]byte{2}, VersionSequence: 103}
+	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 99, VersionAllocator: [16]byte{2}, VersionSequence: 103, References: 2}
 	reservation, err := store.ReserveMemoryChunkPages(origin, "build/memory-0", []MemoryPageDescriptor{{Slot: 0, Identity: identity}, {Slot: 7}, {Slot: 255}})
 	if err != nil {
 		t.Fatal(err)
@@ -633,6 +633,15 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 			t.Fatalf("slot %d lookup=(%s,%t,%v), want %s", slot, got, ok, err, ObjectID(want))
 		}
 	}
+	all, err := store.MemoryPages(root)
+	if err != nil || len(all) != len(reservation.Pages) {
+		t.Fatalf("MemoryPages=(%d,%v), want %d entries", len(all), err, len(reservation.Pages))
+	}
+	for slot, want := range reservation.Pages {
+		if got := all[0x1000+uint64(slot)]; got != ObjectID(want) {
+			t.Fatalf("MemoryPages slot %d=%s, want %s", slot, got, ObjectID(want))
+		}
+	}
 	_, _, gotIdentity, err := store.MemoryPageRecord(ObjectID(reservation.Pages[0]))
 	if err != nil || gotIdentity != identity {
 		t.Fatalf("MemoryPageRecord identity=(%+v,%v), want %+v", gotIdentity, err, identity)
@@ -645,6 +654,26 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	file.Close()
 	if err != nil || !bytes.Equal(loaded, payload) {
 		t.Fatalf("cold chunk load bytes=%d err=%v", len(loaded), err)
+	}
+	objectsDir, err := os.Open(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	donated, err := OpenLocalDataStoreFD(objectsDir)
+	objectsDir.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err = donated.Open(ObjectID(reservation.Chunk), MemoryChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := file.Stat(); err != nil || info.Size() != MemoryChunkBytes {
+		t.Fatalf("donated object info=(%v,%v)", info, err)
+	}
+	file.Close()
+	if err := donated.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -233,6 +233,33 @@ func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
 	if identity.LogicalAllocator != [16]byte(page.Allocator) || identity.LogicalSequence != page.Sequence || identity.VersionAllocator != [16]byte(chunk.Pages[0].Version.Allocator) || identity.VersionSequence != chunk.Pages[0].Version.Sequence {
 		t.Fatalf("page identity=%+v, want logical=%+v version=%+v", identity, page, chunk.Pages[0].Version)
 	}
+	adapted, err := BuildGraphManifest(graph, imported.Roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adapted.Manifest.Runs) != 2 || len(adapted.Chunks) != 1 {
+		t.Fatalf("graph manifest has %d runs and %d chunks, want 2 and 1", len(adapted.Manifest.Runs), len(adapted.Chunks))
+	}
+	if adapted.Manifest.Runs[0].Object != adapted.Manifest.Runs[1].Object || adapted.Manifest.Runs[0].FirstPage != adapted.Manifest.Runs[1].FirstPage {
+		t.Fatalf("graph manifest lost aliasing: %+v", adapted.Manifest.Runs)
+	}
+	reader, err := NewGraphChunkReader(data, adapted.Chunks, []InstalledChunk{{
+		Object: adapted.Manifest.Runs[0].Object,
+		Target: memmap.FileRange{End: pgalloc.SparseChunkBytes},
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := make([]byte, hostarch.PageSize)
+	if _, err := reader.ReadAt(loaded, int64(chunk.Pages[0].Slot)*hostarch.PageSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(loaded, chunk.Pages[0].Data) {
+		t.Fatal("graph chunk reader returned different page bytes")
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
 	file, err := data.Open(ttcsnapshot.ObjectID(graphChunk), ttcsnapshot.MemoryChunkBytes)
 	if err != nil {
 		t.Fatal(err)
