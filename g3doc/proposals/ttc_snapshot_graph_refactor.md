@@ -117,6 +117,11 @@ and resumed the branch without losing Raft quorum. An earlier NFSv4.2 run also
 reached guest execution and subsequently exercised cluster self-fencing and
 Raft rejoin when the host NFS export was externally restarted; that outage is
 not counted as large-image performance evidence.
+The shared-GC role was also exercised with three fresh local cluster nodes.
+Node A acquired generation 1; after a clean A retirement, the surviving quorum
+elected a new Raft leader and node C acquired generation 2. The two-node
+negative control correctly lost quorum after its first voter retired and did
+not permit an unfenced lease takeover. All test daemons and roots were removed.
 
 ## Goals
 
