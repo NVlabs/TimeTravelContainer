@@ -13,6 +13,7 @@ go_library(
         "data.go",
         "filesystem.go",
 		"hosttree.go",
+		"ledger.go",
         "memory.go",
         "pack.go",
 		"relay.go",
@@ -30,6 +31,7 @@ go_test(
     srcs = [
 		"catalog_test.go",
 		"hosttree_test.go",
+		"ledger_test.go",
 		"pack_test.go",
 		"relay_test.go",
         "resolver_test.go",
