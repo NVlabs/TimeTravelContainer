@@ -1599,3 +1599,204 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 		t.Fatalf("opaque implementation xattr leaked into layer: %+v", headers["opaque"].PAXRecords)
 	}
 }
+
+func TestRandomForkHardlinkOrphanAndNameReuse(t *testing.T) {
+	type branchModel struct {
+		entries map[string]uint64
+		data    map[uint64]string
+	}
+	cloneModel := func(source *branchModel) *branchModel {
+		clone := &branchModel{entries: make(map[string]uint64, len(source.entries)), data: make(map[uint64]string, len(source.data))}
+		for name, ino := range source.entries {
+			clone.entries[name] = ino
+		}
+		for ino, contents := range source.data {
+			clone.data[ino] = contents
+		}
+		return clone
+	}
+	sortedKeys := func(values map[string]uint64) []string {
+		result := make([]string, 0, len(values))
+		for value := range values {
+			result = append(result, value)
+		}
+		sort.Strings(result)
+		return result
+	}
+	sortedBranches := func(values map[string]*branchModel) []string {
+		result := make([]string, 0, len(values))
+		for value := range values {
+			result = append(result, value)
+		}
+		sort.Strings(result)
+		return result
+	}
+	linkCount := func(model *branchModel, ino uint64) uint32 {
+		var count uint32
+		for _, linked := range model.entries {
+			if linked == ino {
+				count++
+			}
+		}
+		return count
+	}
+
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("random-semantics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := map[string]*branchModel{MainBranch: {entries: make(map[string]uint64), data: make(map[uint64]string)}}
+	var random uint64 = 0x92346871da05bc4f
+	nextRandom := func(limit int) int {
+		random ^= random << 13
+		random ^= random >> 7
+		random ^= random << 17
+		return int(random % uint64(limit))
+	}
+	validate := func(step int) {
+		for branch, model := range models {
+			for name, wantIno := range model.entries {
+				gotIno, err := repository.Lookup(branch, RootInode, name)
+				if err != nil || gotIno != wantIno {
+					t.Fatalf("step %d %s/%s lookup=(%d,%v), want %d", step, branch, name, gotIno, err, wantIno)
+				}
+			}
+			for ino, wantData := range model.data {
+				inode, err := repository.Inode(branch, ino)
+				if err != nil {
+					t.Fatalf("step %d %s inode %d: %v", step, branch, ino, err)
+				}
+				if wantLinks := linkCount(model, ino); inode.Nlink != wantLinks {
+					t.Fatalf("step %d %s inode %d links=%d, want %d", step, branch, ino, inode.Nlink, wantLinks)
+				}
+				if got := readAll(t, repository, branch, ino); got != wantData {
+					t.Fatalf("step %d %s inode %d data=%q, want %q", step, branch, ino, got, wantData)
+				}
+			}
+		}
+		if err := repository.graph.Verify(); err != nil {
+			t.Fatalf("step %d graph: %v", step, err)
+		}
+	}
+
+	for step := 0; step < 300; step++ {
+		branches := sortedBranches(models)
+		branch := branches[nextRandom(len(branches))]
+		model := models[branch]
+		switch nextRandom(8) {
+		case 0:
+			name := fmt.Sprintf("file-%02d", nextRandom(24))
+			if _, exists := model.entries[name]; !exists {
+				ino, err := repository.CreateRegular(branch, RootInode, name, 0644, 0, 0)
+				if err != nil {
+					t.Fatalf("step %d create: %v", step, err)
+				}
+				model.entries[name] = ino
+				model.data[ino] = ""
+			}
+		case 1:
+			if len(model.data) != 0 {
+				var inodes []uint64
+				for ino := range model.data {
+					inodes = append(inodes, ino)
+				}
+				sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
+				ino := inodes[nextRandom(len(inodes))]
+				value := fmt.Sprintf("%08x", step)
+				write(t, repository, branch, ino, value, 0)
+				model.data[ino] = value
+			}
+		case 2:
+			entries := sortedKeys(model.entries)
+			name := fmt.Sprintf("link-%02d", nextRandom(24))
+			if len(entries) != 0 {
+				if _, exists := model.entries[name]; !exists {
+					ino := model.entries[entries[nextRandom(len(entries))]]
+					if err := repository.Link(branch, RootInode, name, ino); err != nil {
+						t.Fatalf("step %d link: %v", step, err)
+					}
+					model.entries[name] = ino
+				}
+			}
+		case 3:
+			entries := sortedKeys(model.entries)
+			if len(entries) != 0 {
+				name := entries[nextRandom(len(entries))]
+				if err := repository.Unlink(branch, RootInode, name); err != nil {
+					t.Fatalf("step %d unlink: %v", step, err)
+				}
+				delete(model.entries, name)
+			}
+		case 4:
+			var orphans []uint64
+			for ino := range model.data {
+				if linkCount(model, ino) == 0 {
+					orphans = append(orphans, ino)
+				}
+			}
+			if len(orphans) != 0 {
+				sort.Slice(orphans, func(i, j int) bool { return orphans[i] < orphans[j] })
+				ino := orphans[nextRandom(len(orphans))]
+				if err := repository.ReapOrphan(branch, ino); err != nil {
+					t.Fatalf("step %d reap: %v", step, err)
+				}
+				delete(model.data, ino)
+			}
+		case 5:
+			child := fmt.Sprintf("branch-%02d", nextRandom(16))
+			if _, exists := models[child]; !exists {
+				if err := repository.Fork(branch, child); err != nil {
+					t.Fatalf("step %d fork: %v", step, err)
+				}
+				models[child] = cloneModel(model)
+			}
+		case 6:
+			if len(models) > 1 {
+				if err := repository.RemoveBranch(branch); err != nil {
+					t.Fatalf("step %d remove branch: %v", step, err)
+				}
+				delete(models, branch)
+				if err := repository.GarbageCollect(); err != nil {
+					t.Fatalf("step %d collect: %v", step, err)
+				}
+			}
+		case 7:
+			entries := sortedKeys(model.entries)
+			newName := fmt.Sprintf("renamed-%02d", nextRandom(24))
+			if len(entries) != 0 {
+				if _, exists := model.entries[newName]; !exists {
+					oldName := entries[nextRandom(len(entries))]
+					ino := model.entries[oldName]
+					if err := repository.Rename(branch, RootInode, oldName, RootInode, newName, true); err != nil {
+						t.Fatalf("step %d rename: %v", step, err)
+					}
+					delete(model.entries, oldName)
+					model.entries[newName] = ino
+				}
+			}
+		}
+		validate(step)
+		if step%61 == 60 {
+			if err := repository.Close(); err != nil {
+				t.Fatal(err)
+			}
+			repository, err = manager.Open("random-semantics")
+			if err != nil {
+				t.Fatalf("step %d reopen: %v", step, err)
+			}
+			validate(step)
+		}
+	}
+	if err := repository.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	validate(300)
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
