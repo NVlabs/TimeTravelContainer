@@ -194,6 +194,28 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if inode.Number == 0 || inode.Type == "" {
 				return ObjectID{}, errors.New("invalid TTC inode record")
 			}
+			// Directory membership is maintained by PutEntry/DeleteEntry. The
+			// public inode metadata used by filesystem clients intentionally
+			// does not expose the internal directory-tree root, so an ordinary
+			// chmod/chown/timestamp update carries a zero Directory field. Keep
+			// the existing root instead of silently detaching every child.
+			if inode.Type == "directory" && inode.Directory.IsZero() && !root.inodes.IsZero() {
+				oldID, found, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(inode.Number))
+				if err != nil {
+					return ObjectID{}, err
+				}
+				if found {
+					oldObject, ok := mutation.object(oldID)
+					if !ok || oldObject.ID.Kind != ObjectKindInode {
+						return ObjectID{}, errors.New("inode tree references missing or invalid inode object")
+					}
+					var old InodeRecord
+					if err := json.Unmarshal(oldObject.Data, &old); err != nil {
+						return ObjectID{}, err
+					}
+					inode.Directory = old.Directory
+				}
+			}
 			children, err := inodeChildren(inode)
 			if err != nil {
 				return ObjectID{}, err

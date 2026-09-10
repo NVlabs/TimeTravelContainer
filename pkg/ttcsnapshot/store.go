@@ -669,9 +669,6 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 		if err := validateRootName(sourceName); err != nil {
 			return nil, err
 		}
-		if _, exists := s.state.Roots[destination]; exists {
-			return nil, fmt.Errorf("destination root %q already exists", destination)
-		}
 		if _, exists := s.state.Roots[sourceName]; !exists {
 			return nil, fmt.Errorf("source root %q does not exist", sourceName)
 		}
@@ -694,6 +691,18 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 		}
 		object.Refs++
 		touched[id.key()] = object
+		if previous, exists := s.state.Roots[destination]; exists {
+			old, ok := touched[previous.key()]
+			if !ok {
+				old = s.state.Objects[previous.key()]
+			}
+			var err error
+			old, err = releaseObject(old)
+			if err != nil {
+				return nil, fmt.Errorf("replacing destination root %q: %w", destination, err)
+			}
+			touched[previous.key()] = old
+		}
 		ops = append(ops, journalOp{RootName: destination, PutRoot: &id})
 	}
 	keys := make([]string, 0, len(touched))
@@ -1108,20 +1117,56 @@ func (s *Store) SetRoot(name string, id ObjectID) error {
 
 // DeleteRoot removes a named root and releases its object.
 func (s *Store) DeleteRoot(name string) error {
-	if err := validateRootName(name); err != nil {
-		return err
+	return s.DeleteRoots([]string{name})
+}
+
+// DeleteRoots removes named roots and releases their objects in one journal
+// transaction. Missing roots are rejected so callers cannot silently lose a
+// required lifetime reference.
+func (s *Store) DeleteRoots(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	for _, name := range names {
+		if err := validateRootName(name); err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id, ok := s.state.Roots[name]
-	if !ok {
-		return os.ErrNotExist
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(names)*2)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("root batch repeats %q", name)
+		}
+		seen[name] = struct{}{}
+		id, ok := s.state.Roots[name]
+		if !ok {
+			return os.ErrNotExist
+		}
+		object, ok := touched[id.key()]
+		if !ok {
+			object = s.state.Objects[id.key()]
+		}
+		object, err := releaseObject(object)
+		if err != nil {
+			return err
+		}
+		touched[id.key()] = object
+		ops = append(ops, journalOp{RootName: name, DeleteRoot: true})
 	}
-	object, err := releaseObject(s.state.Objects[id.key()])
-	if err != nil {
-		return err
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
 	}
-	return s.commitLocked([]journalOp{{RootName: name, DeleteRoot: true}, {PutObject: &object}})
+	sort.Strings(keys)
+	for _, key := range keys {
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
+	}
+	return s.commitLocked(ops)
 }
 
 // Collect reclaims at most limit zero-count objects and cascades their child

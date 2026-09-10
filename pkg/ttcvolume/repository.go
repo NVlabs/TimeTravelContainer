@@ -660,7 +660,10 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 			}
 			return fmt.Errorf("repository root has unsupported type %q", root.Type)
 		}
-		entries := r.metadataDirectory(state, rootInode)
+		entries, err := r.metadataDirectory(state, rootInode)
+		if err != nil {
+			return err
+		}
 		if len(entries) != 0 {
 			return errors.New("regular repository root requires an empty namespace")
 		}
@@ -799,6 +802,14 @@ func (r *Repository) recoverGraphState() error {
 				branch.Root = root.String()
 				changed = true
 			}
+			base, hasBase := r.graph.Root(graphBaseRootName(id))
+			if hasBase && branch.BaseRoot != base.String() {
+				branch.BaseRoot = base.String()
+				changed = true
+			}
+			if !hasBase && branch.BaseRoot != "" {
+				return fmt.Errorf("branch %q has a diff base without an authoritative graph root", id)
+			}
 			working, ok := r.graph.Snapshot(ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
 			if !ok {
 				return fmt.Errorf("branch %q references missing working snapshot %d", id, branch.WorkingSnapshot)
@@ -807,7 +818,12 @@ func (r *Repository) recoverGraphState() error {
 				// The only repository operation that seals a working origin is a
 				// fork. Preserve its diff boundary even if publication stopped
 				// between the graph transaction and the branch pointer rename.
-				branch.BaseRoot = branch.Root
+				if !hasBase {
+					if err := r.graph.SetRoot(graphBaseRootName(id), root); err != nil {
+						return fmt.Errorf("retaining recovered diff base for branch %q: %w", id, err)
+					}
+					branch.BaseRoot = root.String()
+				}
 				fresh, err := r.graph.AllocateWorking()
 				if err != nil {
 					return err
@@ -830,18 +846,24 @@ func (r *Repository) recoverGraphState() error {
 			rootNames = append(rootNames, name)
 		}
 		sort.Strings(rootNames)
+		var orphanRoots []string
 		for _, name := range rootNames {
-			const prefix = "filesystem/"
-			if !strings.HasPrefix(name, prefix) {
+			id := ""
+			switch {
+			case strings.HasPrefix(name, "filesystem/"):
+				id = strings.TrimPrefix(name, "filesystem/")
+			case strings.HasPrefix(name, "filesystem-base/"):
+				id = strings.TrimPrefix(name, "filesystem-base/")
+			default:
 				return fmt.Errorf("repository graph contains unexpected root %q", name)
 			}
-			id := strings.TrimPrefix(name, prefix)
 			if _, ok := branches[id]; ok {
 				continue
 			}
-			if err := r.graph.DeleteRoot(name); err != nil {
-				return fmt.Errorf("releasing unpublished graph root %q: %w", name, err)
-			}
+			orphanRoots = append(orphanRoots, name)
+		}
+		if err := r.graph.DeleteRoots(orphanRoots); err != nil {
+			return fmt.Errorf("releasing unpublished graph roots: %w", err)
 		}
 
 		pinNames := make([]string, 0, len(inspection.Pins))
@@ -872,7 +894,8 @@ func (r *Repository) RemoveBranch(id string) error {
 		return err
 	}
 	return r.withLock(func() error {
-		if _, err := r.readBranch(id); err != nil {
+		branch, err := r.readBranch(id)
+		if err != nil {
 			return err
 		}
 		if id == mainBranch {
@@ -910,7 +933,11 @@ func (r *Repository) RemoveBranch(id string) error {
 		if err := r.graph.ReloadForWrite(); err != nil {
 			return err
 		}
-		if err := r.graph.DeleteRoot(graphRootName(id)); err != nil {
+		roots := []string{graphRootName(id)}
+		if branch.BaseRoot != "" {
+			roots = append(roots, graphBaseRootName(id))
+		}
+		if err := r.graph.DeleteRoots(roots); err != nil {
 			return err
 		}
 		return nil
@@ -1009,7 +1036,11 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		working, err := r.graph.SealAndFork(
 			ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
 			ttcsnapshot.SnapshotSealedLocal,
-			map[string]string{graphRootName(child): graphRootName(source)},
+			map[string]string{
+				graphRootName(child):      graphRootName(source),
+				graphBaseRootName(source): graphRootName(source),
+				graphBaseRootName(child):  graphRootName(source),
+			},
 			2,
 		)
 		if err != nil {
@@ -1041,7 +1072,7 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 			if syncErr := r.syncDirectory("branches"); syncErr != nil {
 				return fmt.Errorf("publishing child branch: %w (syncing child removal also failed: %v)", err, syncErr)
 			}
-			if rootErr := r.graph.DeleteRoot(graphRootName(child)); rootErr != nil {
+			if rootErr := r.graph.DeleteRoots([]string{graphRootName(child), graphBaseRootName(child)}); rootErr != nil {
 				return fmt.Errorf("publishing child branch: %w (releasing child graph root also failed: %v)", err, rootErr)
 			}
 			return err
@@ -1094,7 +1125,7 @@ func (tx *ForkTransaction) Abort() error {
 		if err := tx.repo.syncDirectory("branches"); err != nil {
 			return err
 		}
-		return tx.repo.graph.DeleteRoot(graphRootName(tx.child.ID))
+		return tx.repo.graph.DeleteRoots([]string{graphRootName(tx.child.ID), graphBaseRootName(tx.child.ID)})
 	})
 	if err != nil {
 		return err
@@ -1372,7 +1403,10 @@ func (r *Repository) RemoveDirectory(branchID string, parent uint64, name string
 		if inode.Type != "directory" {
 			return syscall.ENOTDIR
 		}
-		entries := r.metadataDirectory(state, ino)
+		entries, err := r.metadataDirectory(state, ino)
+		if err != nil {
+			return err
+		}
 		if len(entries) != 0 {
 			return syscall.ENOTEMPTY
 		}
@@ -1456,7 +1490,10 @@ func (r *Repository) Rename(branchID string, oldParent uint64, oldName string, n
 			case moved.Type != "directory" && replaced.Type == "directory":
 				return syscall.EISDIR
 			case replaced.Type == "directory":
-				entries := r.metadataDirectory(state, replacedIno)
+				entries, err := r.metadataDirectory(state, replacedIno)
+				if err != nil {
+					return err
+				}
 				if len(entries) != 0 {
 					return syscall.ENOTEMPTY
 				}
@@ -1972,7 +2009,7 @@ func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryE
 	if err != nil {
 		return nil, err
 	}
-	return r.metadataDirectory(state, parent), nil
+	return r.metadataDirectory(state, parent)
 }
 
 // ListDirectoryItems returns a directory's entries and inode metadata in
@@ -1986,14 +2023,15 @@ func (r *Repository) ListDirectoryItems(branchID string, parent uint64) ([]Direc
 	if err != nil {
 		return nil, err
 	}
-	state.mu.RLock()
-	defer state.mu.RUnlock()
-	directory := state.directories[parent]
-	items := make([]DirectoryItem, 0, len(directory))
-	for _, entry := range directory {
-		inode, ok := state.inodes[entry.Inode]
-		if !ok {
-			return nil, fmt.Errorf("directory entry %q references missing inode %d", entry.Name, entry.Inode)
+	entries, err := r.metadataDirectory(state, parent)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]DirectoryItem, 0, len(entries))
+	for _, entry := range entries {
+		inode, err := r.metadataInode(state, entry.Inode)
+		if err != nil {
+			return nil, fmt.Errorf("directory entry %q references inode %d: %w", entry.Name, entry.Inode, err)
 		}
 		items = append(items, DirectoryItem{Entry: entry, Inode: inode})
 	}
@@ -2010,6 +2048,9 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 	}
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
+		return 0, 0, err
+	}
+	if err := r.completeMetadata(state); err != nil {
 		return 0, 0, err
 	}
 	state.mu.RLock()
@@ -2067,6 +2108,9 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 		if err != nil {
 			return BranchSetDataUsage{}, err
 		}
+		if err := r.completeMetadata(state); err != nil {
+			return BranchSetDataUsage{}, err
+		}
 		state.mu.RLock()
 		current := snapshot{inodes: uint64(len(state.inodes)), objects: make(map[string]uint64)}
 		for _, inode := range state.inodes {
@@ -2121,6 +2165,9 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	}
 	current, err := r.metadataForBranch(branch)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.completeMetadata(current); err != nil {
 		return nil, err
 	}
 	current.mu.RLock()
@@ -2215,6 +2262,9 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 	}
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
+		return err
+	}
+	if err := r.completeMetadata(state); err != nil {
 		return err
 	}
 	state.mu.RLock()

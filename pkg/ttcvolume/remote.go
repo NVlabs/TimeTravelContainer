@@ -303,6 +303,9 @@ func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := r.completeMetadata(state); err != nil {
+		return nil, err
+	}
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	objects := make(map[string]int64)

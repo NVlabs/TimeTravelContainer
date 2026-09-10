@@ -81,6 +81,9 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 	if err != nil {
 		return SnapshotInfo{}, nil, err
 	}
+	if err := r.completeMetadata(state); err != nil {
+		return SnapshotInfo{}, nil, err
+	}
 	state.mu.RLock()
 	metadata := snapshotMetadata{Inodes: make([]Inode, 0, len(state.inodes)), Entries: make([]snapshotDirectoryEntry, 0, len(state.entries))}
 	objects := make(map[string]int64)
@@ -167,6 +170,9 @@ func (r *Repository) exportSnapshot(branchID, destination string, inherited map[
 	}
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	if err := r.completeMetadata(state); err != nil {
 		return SnapshotInfo{}, err
 	}
 	state.mu.RLock()

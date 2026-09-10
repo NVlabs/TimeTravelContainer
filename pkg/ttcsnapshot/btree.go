@@ -114,26 +114,10 @@ func (s *Store) BTreeLookup(root ObjectID, kind ObjectKind, key []byte) (ObjectI
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	current := root
-	for depth := 0; depth < bTreeMaxDepth; depth++ {
-		object, ok := s.state.Objects[current.key()]
-		if !ok {
-			return ObjectID{}, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
-		}
-		node, err := decodeBTreeNode(object, kind)
-		if err != nil {
-			return ObjectID{}, false, err
-		}
-		index := bTreePosition(node.keys, key)
-		if node.leaf {
-			if !bytes.Equal(node.keys[index], key) {
-				return ObjectID{}, false, nil
-			}
-			return node.children[index], true, nil
-		}
-		current = node.children[index]
-	}
-	return ObjectID{}, false, errors.New("TTC B-tree exceeds maximum structural depth")
+	return bTreeLookupObjects(root, kind, key, func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	})
 }
 
 type graphMutation struct {

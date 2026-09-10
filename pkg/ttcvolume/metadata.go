@@ -53,17 +53,20 @@ type metadataOp struct {
 }
 
 type branchMetadata struct {
-	mu          sync.RWMutex
-	branch      Branch
-	inodes      map[uint64]Inode
-	entries     map[metadataEntryKey]DirectoryEntry
-	directories map[uint64]map[string]DirectoryEntry
+	mu                sync.RWMutex
+	branch            Branch
+	inodes            map[uint64]Inode
+	entries           map[metadataEntryKey]DirectoryEntry
+	directories       map[uint64]map[string]DirectoryEntry
+	loadedDirectories map[uint64]bool
+	complete          bool
 }
 
 func newBranchMetadata(branch Branch) *branchMetadata {
 	return &branchMetadata{
 		branch: branch, inodes: make(map[uint64]Inode),
 		entries: make(map[metadataEntryKey]DirectoryEntry), directories: make(map[uint64]map[string]DirectoryEntry),
+		loadedDirectories: make(map[uint64]bool),
 	}
 }
 
@@ -81,6 +84,10 @@ func graphRootName(branchID string) string {
 	return "filesystem/" + branchID
 }
 
+func graphBaseRootName(branchID string) string {
+	return "filesystem-base/" + branchID
+}
+
 func graphConstructionPin(id ttcsnapshot.ObjectID) string {
 	return "construct/" + id.String()
 }
@@ -89,6 +96,17 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 	if err := normalizeBranchLayers(&branch); err != nil {
 		return nil, err
 	}
+	if err := r.graph.Reload(); err != nil {
+		return nil, err
+	}
+	root, ok := r.graph.Root(graphRootName(branch.ID))
+	if !ok {
+		return nil, fmt.Errorf("branch %q has no snapshot graph root", branch.ID)
+	}
+	// The graph transaction precedes the branch pointer rename. Reading the
+	// graph root here makes the two-file publication appear atomically at the
+	// graph commit point, including to a reader in the small rename window.
+	branch.Root = root.String()
 	r.metadataMu.Lock()
 	defer r.metadataMu.Unlock()
 	if r.metadata == nil {
@@ -105,18 +123,36 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 			return state, nil
 		}
 	}
-	if err := r.graph.Reload(); err != nil {
-		return nil, err
+	state := newBranchMetadata(branch)
+	r.metadata[branch.ID] = state
+	return state, nil
+}
+
+func (r *Repository) completeMetadata(state *branchMetadata) error {
+	state.mu.RLock()
+	if state.complete {
+		state.mu.RUnlock()
+		return nil
 	}
+	branch := state.branch
+	state.mu.RUnlock()
 	root, err := ttcsnapshot.ParseObjectID(branch.Root)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	inodes, entries, err := r.graph.FilesystemRecords(root)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	state := newBranchMetadata(branch)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.branch.Root != branch.Root {
+		return errors.New("filesystem root changed while materializing metadata")
+	}
+	state.inodes = make(map[uint64]Inode, len(inodes))
+	state.entries = make(map[metadataEntryKey]DirectoryEntry, len(entries))
+	state.directories = make(map[uint64]map[string]DirectoryEntry)
+	state.loadedDirectories = make(map[uint64]bool)
 	for _, record := range inodes {
 		inode := inodeFromGraph(record)
 		state.inodes[inode.Number] = inode
@@ -131,9 +167,15 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 			state.directories[record.Parent] = directory
 		}
 		directory[record.Name] = entry
+		state.loadedDirectories[record.Parent] = true
 	}
-	r.metadata[branch.ID] = state
-	return state, nil
+	for _, inode := range state.inodes {
+		if inode.Type == "directory" {
+			state.loadedDirectories[inode.Number] = true
+		}
+	}
+	state.complete = true
+	return nil
 }
 
 func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops []metadataOp) error {
@@ -253,23 +295,33 @@ func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
 				return errors.New("invalid set-inode operation")
 			}
 			state.inodes[op.Inode.Number] = *op.Inode
+			if state.complete && op.Inode.Type == "directory" {
+				state.loadedDirectories[op.Inode.Number] = true
+				if state.directories[op.Inode.Number] == nil {
+					state.directories[op.Inode.Number] = make(map[string]DirectoryEntry)
+				}
+			}
 		case metadataDeleteInode:
 			if op.Number == 0 {
 				return errors.New("invalid delete-inode operation")
 			}
 			delete(state.inodes, op.Number)
+			delete(state.directories, op.Number)
+			delete(state.loadedDirectories, op.Number)
 		case metadataSetEntry:
 			if op.Entry == nil || op.Parent == 0 || validateEntryName(op.Entry.Name) != nil || op.Entry.Inode == 0 {
 				return errors.New("invalid set-entry operation")
 			}
 			key := metadataEntryKey{Parent: op.Parent, Name: op.Entry.Name}
 			state.entries[key] = *op.Entry
-			directory := state.directories[op.Parent]
-			if directory == nil {
-				directory = make(map[string]DirectoryEntry)
-				state.directories[op.Parent] = directory
+			if state.loadedDirectories[op.Parent] {
+				directory := state.directories[op.Parent]
+				if directory == nil {
+					directory = make(map[string]DirectoryEntry)
+					state.directories[op.Parent] = directory
+				}
+				directory[op.Entry.Name] = *op.Entry
 			}
-			directory[op.Entry.Name] = *op.Entry
 		case metadataDeleteEntry:
 			if op.Parent == 0 || validateEntryName(op.Name) != nil {
 				return errors.New("invalid delete-entry operation")
@@ -290,34 +342,101 @@ func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
 
 func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
 	inode, ok := state.inodes[ino]
+	branch := state.branch
+	state.mu.RUnlock()
+	if ok {
+		return inode, nil
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return Inode{}, err
+	}
+	record, ok, err := r.graph.FilesystemInode(root, ino)
+	if err != nil {
+		return Inode{}, err
+	}
 	if !ok {
 		return Inode{}, fs.ErrNotExist
 	}
+	inode = inodeFromGraph(record)
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		state.inodes[ino] = inode
+	}
+	state.mu.Unlock()
 	return inode, nil
 }
 
 func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name string) (uint64, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
 	entry, ok := state.entries[metadataEntryKey{Parent: parent, Name: name}]
+	branch := state.branch
+	state.mu.RUnlock()
+	if ok {
+		return entry.Inode, nil
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return 0, err
+	}
+	record, ok, err := r.graph.FilesystemLookup(root, parent, name)
+	if err != nil {
+		return 0, err
+	}
 	if !ok {
 		return 0, fs.ErrNotExist
 	}
+	entry = DirectoryEntry{Name: record.Name, Inode: record.Inode}
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		state.entries[metadataEntryKey{Parent: parent, Name: name}] = entry
+	}
+	state.mu.Unlock()
 	return entry.Inode, nil
 }
 
-func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) []DirectoryEntry {
+func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) ([]DirectoryEntry, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
-	directory := state.directories[parent]
-	entries := make([]DirectoryEntry, 0, len(directory))
-	for _, entry := range directory {
+	loaded := state.loadedDirectories[parent]
+	branch := state.branch
+	if loaded {
+		directory := state.directories[parent]
+		entries := make([]DirectoryEntry, 0, len(directory))
+		for _, entry := range directory {
+			entries = append(entries, entry)
+		}
+		state.mu.RUnlock()
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		return entries, nil
+	}
+	state.mu.RUnlock()
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return nil, err
+	}
+	records, err := r.graph.FilesystemDirectory(root, parent)
+	if err != nil {
+		return nil, err
+	}
+	directory := make(map[string]DirectoryEntry, len(records))
+	entries := make([]DirectoryEntry, 0, len(records))
+	for _, record := range records {
+		entry := DirectoryEntry{Name: record.Name, Inode: record.Inode}
+		directory[entry.Name] = entry
 		entries = append(entries, entry)
 	}
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		state.directories[parent] = directory
+		state.loadedDirectories[parent] = true
+		for _, entry := range entries {
+			state.entries[metadataEntryKey{Parent: parent, Name: entry.Name}] = entry
+		}
+	}
+	state.mu.Unlock()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
-	return entries
+	return entries, nil
 }
 
 func (r *Repository) allocateInodeLocked() (uint64, error) {

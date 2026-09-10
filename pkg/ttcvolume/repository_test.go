@@ -947,6 +947,54 @@ func TestOpenRecoversCommittedGraphBeforeBranchPointer(t *testing.T) {
 	}
 }
 
+func TestReopenUsesDirectGraphLookupWithoutWholeTreeDecode(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("direct-lookup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 100; index++ {
+		if _, err := repository.CreateRegular(MainBranch, RootInode, fmt.Sprintf("file-%03d", index), 0644, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = manager.Open("direct-lookup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.Lookup(MainBranch, RootInode, "file-050")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Inode(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	}
+	repository.metadataMu.Lock()
+	state := repository.metadata[MainBranch]
+	repository.metadataMu.Unlock()
+	state.mu.RLock()
+	if state.complete || len(state.entries) != 1 || len(state.inodes) != 1 || len(state.directories) != 0 {
+		t.Fatalf("lookup eagerly decoded metadata: complete=%t entries=%d inodes=%d directories=%d", state.complete, len(state.entries), len(state.inodes), len(state.directories))
+	}
+	state.mu.RUnlock()
+	entries, err := repository.ListDirectory(MainBranch, RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 100 {
+		t.Fatalf("directory entries=%d, want 100", len(entries))
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if state.complete || len(state.inodes) != 1 || len(state.directories[RootInode]) != 100 {
+		t.Fatalf("readdir decoded unrelated inodes: complete=%t inodes=%d entries=%d", state.complete, len(state.inodes), len(state.directories[RootInode]))
+	}
+}
+
 func TestOpenRecoversInterruptedForkGraphTransaction(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("recover-fork")
@@ -1088,8 +1136,8 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	if err := repository.graph.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if stats := repository.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
-		t.Fatalf("graph after churn=%+v, want one root, at most two live origins, and no reclaiming objects", stats)
+	if stats := repository.graph.Stats(); stats.Roots != 2 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("graph after churn=%+v, want current+diff roots, at most two live origins, and no reclaiming objects", stats)
 	}
 	repository.metadataMu.Lock()
 	metadataEntries := len(repository.metadata)
@@ -1382,6 +1430,49 @@ func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	}
 	if !reflect.DeepEqual(changes, want) {
 		t.Fatalf("BranchDiff=%+v, want %+v", changes, want)
+	}
+}
+
+func TestDiffBaseIsAnAuthoritativeGraphRoot(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-root-lifetime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "base", 0)
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "main", 0)
+	write(t, repository, "child", ino, "child", 0)
+	if err := repository.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, change := range changes {
+		if change.Path == "/value" && change.Kind == "modify" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("diff after both current roots advanced=%+v, want /value modification", changes)
+	}
+	branch, err := repository.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, ok := repository.graph.Root(graphBaseRootName("child"))
+	if !ok || branch.BaseRoot != base.String() {
+		t.Fatalf("branch base=%q graph base=%v found=%t", branch.BaseRoot, base, ok)
 	}
 }
 
