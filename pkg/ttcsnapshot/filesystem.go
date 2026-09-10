@@ -221,14 +221,14 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if err != nil || entry.Inode == 0 {
 				return ObjectID{}, errors.New("invalid TTC directory entry record")
 			}
-			if _, exists, lookupErr := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(entry.Inode)); lookupErr != nil || !exists {
+			if _, exists, lookupErr := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(entry.Inode)); lookupErr != nil || !exists {
 				return ObjectID{}, fmt.Errorf("looking up directory entry inode %d: %w", entry.Inode, lookupErr)
 			}
-			parentID, ok, err := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(entry.Parent))
+			parentID, ok, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(entry.Parent))
 			if err != nil || !ok {
 				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", entry.Parent, err)
 			}
-			parentObject := mutation.state.Objects[parentID.key()]
+			parentObject, _ := mutation.object(parentID)
 			var parent InodeRecord
 			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
 				return ObjectID{}, err
@@ -270,11 +270,11 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if err != nil {
 				return ObjectID{}, err
 			}
-			parentID, ok, lookupErr := bTreeLookupState(mutation.state, root.inodes, ObjectKindInodeNode, InodeKey(operation.DeleteEntry.Parent))
+			parentID, ok, lookupErr := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(operation.DeleteEntry.Parent))
 			if lookupErr != nil || !ok {
 				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", operation.DeleteEntry.Parent, lookupErr)
 			}
-			parentObject := mutation.state.Objects[parentID.key()]
+			parentObject, _ := mutation.object(parentID)
 			var parent InodeRecord
 			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
 				return ObjectID{}, err
@@ -323,12 +323,23 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 }
 
 func bTreeLookupState(state graphState, root ObjectID, kind ObjectKind, key []byte) (ObjectID, bool, error) {
+	return bTreeLookupObjects(root, kind, key, func(id ObjectID) (Object, bool) {
+		object, ok := state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func bTreeLookupMutation(mutation *graphMutation, root ObjectID, kind ObjectKind, key []byte) (ObjectID, bool, error) {
+	return bTreeLookupObjects(root, kind, key, mutation.object)
+}
+
+func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor func(ObjectID) (Object, bool)) (ObjectID, bool, error) {
 	if root.IsZero() {
 		return ObjectID{}, false, nil
 	}
 	current := root
 	for depth := 0; depth < 64; depth++ {
-		object, ok := state.Objects[current.key()]
+		object, ok := objectFor(current)
 		if !ok {
 			return ObjectID{}, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
 		}
@@ -474,4 +485,100 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
+}
+
+// FilesystemRecords returns a consistent decoded view of a filesystem root.
+// It is intended for export, diagnostics, and adapters that are being moved
+// from a flat metadata representation. Normal pathname operations should use
+// FilesystemInode, FilesystemLookup, and FilesystemDirectory so their work is
+// independent of the total filesystem size.
+func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rootObject, ok := s.state.Objects[rootID.key()]
+	if !ok {
+		return nil, nil, fmt.Errorf("filesystem root %s is missing", rootID.key())
+	}
+	root, err := decodeFilesystemRoot(rootObject)
+	if err != nil {
+		return nil, nil, err
+	}
+	var inodeIDs []ObjectID
+	if !root.inodes.IsZero() {
+		inodeIDs, err = bTreeValuesState(s.state, root.inodes, ObjectKindInodeNode)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	inodes := make([]InodeRecord, 0, len(inodeIDs))
+	var entries []DirectoryEntryRecord
+	for _, id := range inodeIDs {
+		object, ok := s.state.Objects[id.key()]
+		if !ok || object.ID.Kind != ObjectKindInode {
+			return nil, nil, fmt.Errorf("inode tree references missing or invalid object %s", id.key())
+		}
+		var inode InodeRecord
+		if err := json.Unmarshal(object.Data, &inode); err != nil {
+			return nil, nil, err
+		}
+		inodes = append(inodes, inode)
+		if inode.Directory.IsZero() {
+			continue
+		}
+		entryIDs, err := bTreeValuesState(s.state, inode.Directory, ObjectKindDirectoryNode)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, entryID := range entryIDs {
+			entryObject, ok := s.state.Objects[entryID.key()]
+			if !ok || entryObject.ID.Kind != ObjectKindMetadata {
+				return nil, nil, fmt.Errorf("directory tree references missing or invalid object %s", entryID.key())
+			}
+			var entry DirectoryEntryRecord
+			if err := json.Unmarshal(entryObject.Data, &entry); err != nil {
+				return nil, nil, err
+			}
+			entries = append(entries, entry)
+		}
+	}
+	sort.Slice(inodes, func(i, j int) bool { return inodes[i].Number < inodes[j].Number })
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Parent != entries[j].Parent {
+			return entries[i].Parent < entries[j].Parent
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	return inodes, entries, nil
+}
+
+func bTreeValuesState(state graphState, root ObjectID, kind ObjectKind) ([]ObjectID, error) {
+	var values []ObjectID
+	var visit func(ObjectID, int) error
+	visit = func(id ObjectID, depth int) error {
+		if depth >= bTreeMaxDepth {
+			return errors.New("TTC B-tree exceeds maximum structural depth")
+		}
+		object, ok := state.Objects[id.key()]
+		if !ok {
+			return fmt.Errorf("TTC B-tree node %s is missing", id.key())
+		}
+		node, err := decodeBTreeNode(object, kind)
+		if err != nil {
+			return err
+		}
+		if node.leaf {
+			values = append(values, node.children...)
+			return nil
+		}
+		for _, child := range node.children {
+			if err := visit(child, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(root, 0); err != nil {
+		return nil, err
+	}
+	return values, nil
 }

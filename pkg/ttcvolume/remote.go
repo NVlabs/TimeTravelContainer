@@ -10,12 +10,15 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"strings"
 	"sync"
+
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 const (
-	remoteProtocolVersion = 1
-	remoteHeaderSize      = 88
+	remoteProtocolVersion = 2
+	remoteHeaderSize      = 112
 	remoteExtentBytes     = 1 << 20
 	remoteMaxErrorBytes   = 4096
 )
@@ -41,7 +44,7 @@ type remoteHeader struct {
 	token     RemoteToken
 	requestID uint32
 	source    RemoteSourceKey
-	object    [16]byte
+	object    [40]byte
 	offset    uint64
 	length    uint32
 	checksum  uint32
@@ -55,9 +58,9 @@ func (h remoteHeader) marshal(dst []byte) {
 	copy(dst[8:24], h.token[:])
 	binary.BigEndian.PutUint32(dst[24:28], h.requestID)
 	copy(dst[28:60], h.source[:])
-	copy(dst[60:76], h.object[:])
-	binary.BigEndian.PutUint64(dst[76:84], h.offset)
-	binary.BigEndian.PutUint32(dst[84:88], h.length)
+	copy(dst[60:100], h.object[:])
+	binary.BigEndian.PutUint64(dst[100:108], h.offset)
+	binary.BigEndian.PutUint32(dst[108:112], h.length)
 	// Data checksums are encoded as a four-byte trailer after the payload. This
 	// keeps the fixed request header naturally aligned and leaves future header
 	// growth versioned rather than silently changing offsets.
@@ -76,9 +79,9 @@ func readRemoteHeader(reader io.Reader) (remoteHeader, error) {
 	copy(header.token[:], encoded[8:24])
 	header.requestID = binary.BigEndian.Uint32(encoded[24:28])
 	copy(header.source[:], encoded[28:60])
-	copy(header.object[:], encoded[60:76])
-	header.offset = binary.BigEndian.Uint64(encoded[76:84])
-	header.length = binary.BigEndian.Uint32(encoded[84:88])
+	copy(header.object[:], encoded[60:100])
+	header.offset = binary.BigEndian.Uint64(encoded[100:108])
+	header.length = binary.BigEndian.Uint32(encoded[108:112])
 	return header, nil
 }
 
@@ -169,7 +172,7 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 			return writeRemoteError(conn, request, "invalid or unauthorized filesystem range request")
 		}
 		source, ok := byKey[request.source]
-		object := fmt.Sprintf("%x", request.object[:])
+		object := strings.TrimRight(string(request.object[:]), "\x00")
 		size, allowed := source.Objects[object]
 		if !ok || !allowed || request.offset >= uint64(size) || uint64(request.length) > uint64(size)-request.offset {
 			return writeRemoteError(conn, request, "filesystem object or range is outside the captured generation")
@@ -211,6 +214,7 @@ type remoteObjectClient struct {
 	next       uint32
 	fetched    map[string]map[uint64]struct{}
 	objects    map[string]int64
+	sources    map[string]string
 	repository *Repository
 }
 
@@ -224,7 +228,7 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if err != nil {
 		return err
 	}
-	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, fetched: make(map[string]map[uint64]struct{}), objects: make(map[string]int64), repository: r}
+	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, fetched: make(map[string]map[uint64]struct{}), objects: make(map[string]int64), sources: make(map[string]string), repository: r}
 	r.remoteMu.Lock()
 	defer r.remoteMu.Unlock()
 	if r.remotes == nil {
@@ -232,7 +236,7 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 		r.remoteByObject = make(map[string]*remoteObjectClient)
 	}
 	for object, size := range objects {
-		pending, err := r.remoteObjectPending(object)
+		sourceObject, pending, err := r.remoteSourceObject(object)
 		if err != nil {
 			return err
 		}
@@ -240,10 +244,47 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 			continue
 		}
 		remote.objects[object] = size
+		remote.sources[object] = sourceObject
 		// Object IDs are content-addressed, so any authorized source for the
 		// same object is equivalent. Prefer the newest live attachment over a
 		// reader retained by an older branch.
 		r.remoteByObject[object] = remote
+	}
+	// Target-local IDs are not content hashes. A newer attachment for the
+	// same immutable source identity can nevertheless take over every sparse
+	// local placeholder backed by that source.
+	for localObject, owner := range r.remoteByObject {
+		if owner == remote {
+			continue
+		}
+		sourceObject, pending, err := r.remoteSourceObject(localObject)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			continue
+		}
+		matched := false
+		for _, candidate := range remote.sources {
+			if candidate == sourceObject {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		id, err := ttcsnapshot.ParseObjectID(localObject)
+		if err != nil {
+			return err
+		}
+		object, ok := r.graph.Object(id)
+		if !ok {
+			return fmt.Errorf("remote target object %s is absent from graph", localObject)
+		}
+		remote.objects[localObject] = int64(object.BulkLength)
+		remote.sources[localObject] = sourceObject
+		r.remoteByObject[localObject] = remote
 	}
 	if len(remote.objects) == 0 {
 		return conn.Close()
@@ -364,7 +405,7 @@ func (r *Repository) ensureObjectRange(object string, size, offset, length int64
 }
 
 func (c *remoteObjectClient) ensure(object string, size, offset, length int64) error {
-	if !validID(object) || size < 0 || offset < 0 || length < 0 || offset > size || length > size-offset {
+	if !validObjectID(object) || size < 0 || offset < 0 || length < 0 || offset > size || length > size-offset {
 		return errors.New("invalid remote filesystem object range")
 	}
 	c.mu.Lock()
@@ -413,13 +454,13 @@ func (c *remoteObjectClient) ensure(object string, size, offset, length int64) e
 }
 
 func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) ([]byte, error) {
-	decoded, err := decodeID(object)
-	if err != nil {
-		return nil, err
+	remoteObject := c.sources[object]
+	if !validObjectID(remoteObject) || len(remoteObject) > 40 {
+		return nil, fmt.Errorf("invalid object ID %q", object)
 	}
 	c.next++
 	request := remoteHeader{type_: remotePull, token: c.token, requestID: c.next, source: c.source, offset: offset, length: length}
-	copy(request.object[:], decoded)
+	copy(request.object[:], remoteObject)
 	var encoded [remoteHeaderSize]byte
 	request.marshal(encoded[:])
 	if err := writeAll(c.conn, encoded[:]); err != nil {
@@ -450,27 +491,4 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 		return nil, errors.New("invalid remote filesystem data response")
 	}
 	return payload, nil
-}
-
-func decodeID(id string) ([]byte, error) {
-	if !validID(id) {
-		return nil, fmt.Errorf("invalid object ID %q", id)
-	}
-	decoded := make([]byte, 16)
-	for i := 0; i < 16; i++ {
-		var value byte
-		for _, digit := range []byte{id[2*i], id[2*i+1]} {
-			value <<= 4
-			switch {
-			case digit >= '0' && digit <= '9':
-				value |= digit - '0'
-			case digit >= 'a' && digit <= 'f':
-				value |= digit - 'a' + 10
-			default:
-				return nil, fmt.Errorf("invalid object ID %q", id)
-			}
-		}
-		decoded[i] = value
-	}
-	return decoded, nil
 }

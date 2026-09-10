@@ -71,6 +71,68 @@ func TestSnapshotIDsNeverReuse(t *testing.T) {
 	}
 }
 
+func TestCollectEmptySnapshotsNeverReusesIdentity(t *testing.T) {
+	store := openTestStore(t)
+	first, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := store.CollectEmptySnapshots([]SnapshotID{retained}); err != nil || collected != 1 {
+		t.Fatalf("CollectEmptySnapshots collected=%d err=%v, want 1", collected, err)
+	}
+	if _, ok := store.Snapshot(first); ok {
+		t.Fatalf("empty snapshot %d survived collection", first)
+	}
+	if _, ok := store.Snapshot(retained); !ok {
+		t.Fatalf("retained snapshot %d was collected", retained)
+	}
+	next, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != retained+1 {
+		t.Fatalf("snapshot identity after collection=%d, want %d", next, retained+1)
+	}
+}
+
+func TestExternallyCoordinatedStoresReload(t *testing.T) {
+	dir := t.TempDir()
+	first, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	one, err := first.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	two, err := second.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if two != one+1 {
+		t.Fatalf("second snapshot = %d, want %d", two, one+1)
+	}
+	if err := first.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := first.Snapshot(two); !ok {
+		t.Fatalf("first store did not observe snapshot %d after reload", two)
+	}
+}
+
 func TestRootSharingAndZeroCountCascade(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
@@ -483,5 +545,8 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	removed, quarantined, err := data.ReclaimUnreferenced(graph)
 	if err != nil || removed != 2 || quarantined != 0 {
 		t.Fatalf("reclaim=(%d,%d,%v), want (2,0,nil)", removed, quarantined, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "objects", "files", snapshotKey(origin))); !os.IsNotExist(err) {
+		t.Fatalf("empty snapshot data directory survived reclaim: %v", err)
 	}
 }

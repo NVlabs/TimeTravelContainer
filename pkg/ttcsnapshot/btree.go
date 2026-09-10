@@ -26,6 +26,7 @@ import (
 const (
 	bTreeMaxEntries  = 31
 	bTreeMaxKeyBytes = 4096
+	bTreeMaxDepth    = 64
 )
 
 type bTreeNode struct {
@@ -114,7 +115,7 @@ func (s *Store) BTreeLookup(root ObjectID, kind ObjectKind, key []byte) (ObjectI
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	current := root
-	for depth := 0; depth < 64; depth++ {
+	for depth := 0; depth < bTreeMaxDepth; depth++ {
 		object, ok := s.state.Objects[current.key()]
 		if !ok {
 			return ObjectID{}, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
@@ -137,9 +138,8 @@ func (s *Store) BTreeLookup(root ObjectID, kind ObjectKind, key []byte) (ObjectI
 
 type graphMutation struct {
 	store    *Store
-	state    graphState
 	snapshot Snapshot
-	touched  map[string]struct{}
+	objects  map[string]Object
 }
 
 func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
@@ -147,17 +147,28 @@ func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
 	if !ok || snapshot.State != SnapshotWorking {
 		return nil, fmt.Errorf("snapshot %d is not working", origin)
 	}
-	return &graphMutation{store: store, state: cloneGraphState(store.state), snapshot: snapshot, touched: make(map[string]struct{})}, nil
+	return &graphMutation{store: store, snapshot: snapshot, objects: make(map[string]Object)}, nil
+}
+
+func (mutation *graphMutation) object(id ObjectID) (Object, bool) {
+	if object, ok := mutation.objects[id.key()]; ok {
+		return object, true
+	}
+	object, ok := mutation.store.state.Objects[id.key()]
+	return object, ok
+}
+
+func (mutation *graphMutation) put(object Object) {
+	mutation.objects[object.ID.key()] = object
 }
 
 func (mutation *graphMutation) retain(id ObjectID) error {
-	object, ok := mutation.state.Objects[id.key()]
+	object, ok := mutation.object(id)
 	if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
 		return fmt.Errorf("object %s cannot be retained", id.key())
 	}
 	object.Refs++
-	mutation.state.Objects[id.key()] = object
-	mutation.touched[id.key()] = struct{}{}
+	mutation.put(object)
 	return nil
 }
 
@@ -176,8 +187,7 @@ func (mutation *graphMutation) create(kind ObjectKind, data []byte, children []E
 			return ObjectID{}, err
 		}
 	}
-	mutation.state.Objects[id.key()] = object
-	mutation.touched[id.key()] = struct{}{}
+	mutation.put(object)
 	return id, nil
 }
 
@@ -185,38 +195,38 @@ func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
 	if err := mutation.retain(id); err != nil {
 		return err
 	}
-	if oldID, ok := mutation.state.Roots[name]; ok {
-		old, err := releaseObject(mutation.state.Objects[oldID.key()])
+	if oldID, ok := mutation.store.state.Roots[name]; ok {
+		oldObject, exists := mutation.object(oldID)
+		if !exists {
+			return fmt.Errorf("root %q references missing object %s", name, oldID.key())
+		}
+		old, err := releaseObject(oldObject)
 		if err != nil {
 			return err
 		}
-		mutation.state.Objects[oldID.key()] = old
-		mutation.touched[oldID.key()] = struct{}{}
+		mutation.put(old)
 	}
-	mutation.state.Roots[name] = id
-	mutation.state.Snapshots[snapshotKey(mutation.snapshot.ID)] = mutation.snapshot
 	// A multi-operation transaction may path-copy the same tree more than
 	// once. Intermediate immutable nodes were never published as roots; queue
 	// them for ordinary cascading GC in the same atomic commit.
-	for key := range mutation.touched {
-		object := mutation.state.Objects[key]
+	for key, object := range mutation.objects {
 		if object.Refs == 0 {
 			object.State = ObjectReclaiming
-			mutation.state.Objects[key] = object
+			mutation.objects[key] = object
 		}
 	}
-	return validateGraphState(&mutation.state)
+	return nil
 }
 
 func (mutation *graphMutation) commit(rootName string, root ObjectID) error {
-	keys := make([]string, 0, len(mutation.touched))
-	for key := range mutation.touched {
+	keys := make([]string, 0, len(mutation.objects))
+	for key := range mutation.objects {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	ops := make([]journalOp, 0, len(keys)+2)
 	for _, key := range keys {
-		object := mutation.state.Objects[key]
+		object := mutation.objects[key]
 		ops = append(ops, journalOp{PutObject: &object})
 	}
 	ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, PutRoot: &root})
@@ -253,7 +263,7 @@ func insertKey(keys [][]byte, children []ObjectID, index int, key []byte, child 
 }
 
 func (builder *bTreeBuilder) insert(current ObjectID, key []byte, value ObjectID) ([]ObjectID, [][]byte, error) {
-	object, ok := builder.mutation.state.Objects[current.key()]
+	object, ok := builder.mutation.object(current)
 	if !ok {
 		return nil, nil, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
 	}
@@ -297,7 +307,7 @@ func (builder *bTreeBuilder) insert(current ObjectID, key []byte, value ObjectID
 }
 
 func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []byte, bool, error) {
-	object, ok := builder.mutation.state.Objects[current.key()]
+	object, ok := builder.mutation.object(current)
 	if !ok {
 		return ObjectID{}, nil, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
 	}
@@ -330,7 +340,10 @@ func (builder *bTreeBuilder) remove(current ObjectID, key []byte) (ObjectID, []b
 		return ObjectID{}, nil, true, nil
 	}
 	if !node.leaf && len(node.keys) == 1 {
-		childObject := builder.mutation.state.Objects[node.children[0].key()]
+		childObject, ok := builder.mutation.object(node.children[0])
+		if !ok {
+			return ObjectID{}, nil, false, fmt.Errorf("TTC B-tree child %s does not exist", node.children[0].key())
+		}
 		childNode, err := decodeBTreeNode(childObject, builder.kind)
 		if err != nil {
 			return ObjectID{}, nil, false, err
@@ -415,25 +428,23 @@ func (s *Store) BTreeDelete(origin SnapshotID, rootName string, kind ObjectKind,
 		return changed, err
 	}
 	if root.IsZero() {
-		old, err := releaseObject(mutation.state.Objects[oldRoot.key()])
+		oldObject, exists := mutation.object(oldRoot)
+		if !exists {
+			return false, fmt.Errorf("B-tree root %s is missing", oldRoot.key())
+		}
+		old, err := releaseObject(oldObject)
 		if err != nil {
 			return false, err
 		}
-		mutation.state.Objects[oldRoot.key()] = old
-		mutation.touched[oldRoot.key()] = struct{}{}
-		delete(mutation.state.Roots, rootName)
-		mutation.state.Snapshots[snapshotKey(origin)] = mutation.snapshot
-		if err := validateGraphState(&mutation.state); err != nil {
-			return false, err
-		}
-		keys := make([]string, 0, len(mutation.touched))
-		for key := range mutation.touched {
+		mutation.put(old)
+		keys := make([]string, 0, len(mutation.objects))
+		for key := range mutation.objects {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
 		ops := make([]journalOp, 0, len(keys)+2)
 		for _, key := range keys {
-			object := mutation.state.Objects[key]
+			object := mutation.objects[key]
 			ops = append(ops, journalOp{PutObject: &object})
 		}
 		ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, DeleteRoot: true})

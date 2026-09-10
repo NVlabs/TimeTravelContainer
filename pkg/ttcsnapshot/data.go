@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -64,6 +65,13 @@ func (store *LocalDataStore) objectPath(id ObjectID) (string, error) {
 		return "", err
 	}
 	return filepath.Join(store.root, name, snapshotKey(id.Snapshot), fmt.Sprintf("%02x", byte(id.Ordinal)), id.key()+".data"), nil
+}
+
+// Path returns the trusted host path for a bulk object. It is used by the
+// standalone filesystem backend while a working-origin file is exclusively
+// mutable. Callers must not mutate objects from sealed origins.
+func (store *LocalDataStore) Path(id ObjectID) (string, error) {
+	return store.objectPath(id)
 }
 
 func syncDirectory(path string) error {
@@ -232,6 +240,7 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 	quarantine := filepath.Join(store.root, "quarantine")
 	for _, kind := range []string{"pages", "files"} {
 		base := filepath.Join(store.root, kind)
+		var directories []string
 		walkErr := filepath.WalkDir(base, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				if errors.Is(walkErr, fs.ErrNotExist) {
@@ -239,7 +248,13 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				}
 				return walkErr
 			}
-			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			if entry.IsDir() {
+				if path != base {
+					directories = append(directories, path)
+				}
+				return nil
+			}
+			if strings.HasPrefix(entry.Name(), ".") {
 				return nil
 			}
 			name := strings.TrimSuffix(entry.Name(), ".data")
@@ -266,6 +281,12 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 		})
 		if walkErr != nil {
 			return removed, quarantined, walkErr
+		}
+		sort.Slice(directories, func(i, j int) bool { return len(directories[i]) > len(directories[j]) })
+		for _, directory := range directories {
+			if err := os.Remove(directory); err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, unix.ENOTEMPTY) {
+				return removed, quarantined, err
+			}
 		}
 	}
 	return removed, quarantined, nil

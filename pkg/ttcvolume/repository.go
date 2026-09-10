@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Package ttcvolume implements TTC's persistent, branchable managed-volume
-// repository. Namespace metadata is stored in transactional, branchable
-// journals, while regular-file contents live in opaque host files.
+// repository. Namespace metadata is stored in the immutable snapshot graph;
+// regular-file contents use graph-identified whole-file objects.
 package ttcvolume
 
 import (
@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 const (
@@ -171,14 +172,15 @@ type VolumeInfo struct {
 	NextInode uint64    `json:"next_inode"`
 }
 
-// Branch identifies the immutable metadata layers inherited by a branch and
-// its final writable layer. Root aliases the writable layer for compatibility
-// with older callers that use it as an opaque change identity.
+// Branch identifies one immutable filesystem root and the exclusive working
+// snapshot origin used by its next metadata and whole-file CoW mutations.
 type Branch struct {
-	ID         string    `json:"id"`
-	Root       string    `json:"root"`
-	Generation uint64    `json:"generation"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Root            string    `json:"root"`
+	BaseRoot        string    `json:"base_root,omitempty"`
+	WorkingSnapshot uint64    `json:"working_snapshot"`
+	Generation      uint64    `json:"generation"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Inode is branch-resolved virtual inode metadata.
@@ -231,6 +233,8 @@ type Repository struct {
 	dir      *os.File
 	copyMode CopyMode
 	info     VolumeInfo
+	graph    *ttcsnapshot.Store
+	data     *ttcsnapshot.LocalDataStore
 
 	// Ordinary Linux namespace mutations are not durable until fsync(2),
 	// sync(2), or filesystem teardown. Track journal and pointer files that
@@ -250,11 +254,8 @@ type Repository struct {
 	operationMu sync.Mutex
 	lockFile    *os.File
 
-	branchMu    sync.Mutex
-	branchCache map[string]cachedBranch
-	journalMu   sync.Mutex
-	journals    map[string]*os.File
-
+	branchMu       sync.Mutex
+	branchCache    map[string]cachedBranch
 	remoteMu       sync.Mutex
 	remotes        map[*remoteObjectClient]struct{}
 	remoteByObject map[string]*remoteObjectClient
@@ -314,7 +315,7 @@ func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
 }
 
 func (m *Manager) createAt(path, name, id string) (*Repository, error) {
-	for _, dir := range []string{path, filepath.Join(path, "objects"), filepath.Join(path, "staging"), filepath.Join(path, "branches"), filepath.Join(path, "layers")} {
+	for _, dir := range []string{path, filepath.Join(path, "staging"), filepath.Join(path, "branches"), filepath.Join(path, "graph"), filepath.Join(path, "data")} {
 		if err := os.Mkdir(dir, 0700); err != nil {
 			_ = os.RemoveAll(path)
 			return nil, fmt.Errorf("creating volume repository: %w", err)
@@ -336,7 +337,7 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	layer, err := repo.createMetadataLayer("")
+	working, err := repo.graph.AllocateWorking()
 	if err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
@@ -346,7 +347,7 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2,
 		AtimeNsec: now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 	}
-	branch := Branch{ID: mainBranch, Root: layer, Generation: 1, CreatedAt: time.Now().UTC()}
+	branch := Branch{ID: mainBranch, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
 	state := newBranchMetadata(branch)
 	if err := repo.commitMetadata(&state.branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &rootMeta}}); err != nil {
 		_ = os.RemoveAll(path)
@@ -390,7 +391,15 @@ func (m *Manager) OpenPrivate(path string) (*Repository, error) {
 	if version != strconv.Itoa(formatVersion) {
 		return nil, fmt.Errorf("private repository uses unsupported format %q", strings.TrimSpace(string(format)))
 	}
-	return m.openPath(path, info)
+	repository, err := m.openPath(path, info)
+	if err != nil {
+		return nil, err
+	}
+	if err := repository.recoverGraphState(); err != nil {
+		repository.Close()
+		return nil, fmt.Errorf("recovering private repository: %w", err)
+	}
+	return repository, nil
 }
 
 // List returns all valid snapshot-graph-era volumes.
@@ -444,7 +453,15 @@ func (m *Manager) Open(nameOrID string) (*Repository, error) {
 			if strings.TrimSpace(string(format)) != strconv.Itoa(formatVersion) {
 				return nil, fmt.Errorf("volume %q uses unsupported format %q", info.Name, strings.TrimSpace(string(format)))
 			}
-			return m.openPath(path, info)
+			repository, err := m.openPath(path, info)
+			if err != nil {
+				return nil, err
+			}
+			if err := repository.recoverGraphState(); err != nil {
+				repository.Close()
+				return nil, fmt.Errorf("recovering volume %q: %w", info.Name, err)
+			}
+			return repository, nil
 		}
 	}
 	return nil, fs.ErrNotExist
@@ -469,7 +486,18 @@ func (m *Manager) openPath(path string, info VolumeInfo) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info}, nil
+	graph, err := ttcsnapshot.OpenExternallyCoordinated(filepath.Join(path, "graph"))
+	if err != nil {
+		dir.Close()
+		return nil, fmt.Errorf("opening repository snapshot graph: %w", err)
+	}
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(path, "data"))
+	if err != nil {
+		graph.Close()
+		dir.Close()
+		return nil, fmt.Errorf("opening repository data store: %w", err)
+	}
+	return &Repository{path: path, dir: dir, copyMode: m.capability.Mode, info: info, graph: graph, data: data}, nil
 }
 
 // OpenRepositoryFD opens a repository from an already-open O_DIRECTORY file.
@@ -483,6 +511,17 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		return nil, err
 	}
 	repo := &Repository{dir: os.NewFile(uintptr(dup), "ttc-volume-repository"), copyMode: mode}
+	graphPath := fmt.Sprintf("/proc/self/fd/%d/graph", repo.dir.Fd())
+	repo.graph, err = ttcsnapshot.OpenExternallyCoordinated(graphPath)
+	if err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("opening donated repository snapshot graph: %w", err)
+	}
+	repo.data, err = ttcsnapshot.OpenLocalDataStore(fmt.Sprintf("/proc/self/fd/%d/data", repo.dir.Fd()))
+	if err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("opening donated repository data store: %w", err)
+	}
 	if err := repo.readJSON("volume.json", &repo.info); err != nil {
 		repo.Close()
 		return nil, err
@@ -500,6 +539,10 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 	if version != strconv.Itoa(formatVersion) {
 		repo.Close()
 		return nil, fmt.Errorf("unsupported repository format %q", strings.TrimSpace(string(format)))
+	}
+	if err := repo.recoverGraphState(); err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("recovering donated repository: %w", err)
 	}
 	return repo, nil
 }
@@ -536,15 +579,11 @@ func (r *Repository) Close() error {
 	r.remotes = nil
 	r.remoteByObject = nil
 	r.remoteMu.Unlock()
-	r.journalMu.Lock()
-	var journalErr error
-	for layer, journal := range r.journals {
-		if err := journal.Close(); err != nil && journalErr == nil {
-			journalErr = fmt.Errorf("closing metadata journal %q: %w", layer, err)
-		}
+	var graphErr error
+	if r.graph != nil {
+		graphErr = r.graph.Close()
+		r.graph = nil
 	}
-	r.journals = nil
-	r.journalMu.Unlock()
 	var lockErr error
 	if r.lockFile != nil {
 		lockErr = r.lockFile.Close()
@@ -555,11 +594,11 @@ func (r *Repository) Close() error {
 	if lockErr != nil {
 		return lockErr
 	}
-	if journalErr != nil {
-		return journalErr
-	}
 	if remoteErr != nil {
 		return remoteErr
+	}
+	if graphErr != nil {
+		return graphErr
 	}
 	return err
 }
@@ -625,7 +664,7 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 		if len(entries) != 0 {
 			return errors.New("regular repository root requires an empty namespace")
 		}
-		object, err := r.createObject("")
+		object, err := r.createObject(branch.WorkingSnapshot, "")
 		if err != nil {
 			return err
 		}
@@ -633,7 +672,7 @@ func (r *Repository) InitializeRootRegular(mode, uid, gid uint32) error {
 		root = Inode{
 			Number: rootInode, Type: "regular", Mode: mode & 07777,
 			UID: uid, GID: gid, Nlink: 1, Object: object,
-			DataGeneration: branch.Generation,
+			DataGeneration: branch.WorkingSnapshot,
 			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
 		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &root}})
@@ -682,7 +721,7 @@ func (r *Repository) readBranch(id string) (Branch, error) {
 	if err := r.readJSON(name, &branch); err != nil {
 		return Branch{}, err
 	}
-	if branch.ID != id || branch.Root == "" || branch.Generation == 0 {
+	if branch.ID != id || branch.Root == "" || branch.WorkingSnapshot == 0 || branch.Generation == 0 {
 		return Branch{}, fmt.Errorf("invalid branch record for %q", id)
 	}
 	if err := normalizeBranchLayers(&branch); err != nil {
@@ -710,6 +749,115 @@ func (r *Repository) writeBranch(branch Branch) error {
 	return nil
 }
 
+// recoverGraphState reconciles the graph journal, branch pointer files, and
+// transaction pins after an interrupted repository mutation. The graph
+// transaction is always committed before its small branch pointer file, so a
+// graph root is authoritative when the two disagree. Conversely, a graph root
+// without a published branch pointer is an unpublished transaction and is
+// released.
+//
+// A fork may also seal the source working origin before either branch pointer
+// is published. Such a branch receives a fresh working origin during recovery;
+// sealed origins are never reopened or reused.
+func (r *Repository) recoverGraphState() error {
+	return r.withLock(func() error {
+		if err := r.graph.ReloadForWrite(); err != nil {
+			return err
+		}
+		branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		names, readErr := branchDir.Readdirnames(-1)
+		closeErr := branchDir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		branches := make(map[string]struct{})
+		sort.Strings(names)
+		for _, name := range names {
+			if !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(name, ".json")
+			if err := validateName(id, "branch"); err != nil {
+				return fmt.Errorf("invalid branch pointer %q: %w", name, err)
+			}
+			branch, err := r.readBranch(id)
+			if err != nil {
+				return err
+			}
+			root, ok := r.graph.Root(graphRootName(id))
+			if !ok {
+				return fmt.Errorf("branch %q has no snapshot graph root", id)
+			}
+			changed := false
+			if branch.Root != root.String() {
+				branch.Root = root.String()
+				changed = true
+			}
+			working, ok := r.graph.Snapshot(ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
+			if !ok {
+				return fmt.Errorf("branch %q references missing working snapshot %d", id, branch.WorkingSnapshot)
+			}
+			if working.State != ttcsnapshot.SnapshotWorking {
+				// The only repository operation that seals a working origin is a
+				// fork. Preserve its diff boundary even if publication stopped
+				// between the graph transaction and the branch pointer rename.
+				branch.BaseRoot = branch.Root
+				fresh, err := r.graph.AllocateWorking()
+				if err != nil {
+					return err
+				}
+				branch.WorkingSnapshot = uint64(fresh)
+				branch.Generation++
+				changed = true
+			}
+			if changed {
+				if err := r.writeBranch(branch); err != nil {
+					return err
+				}
+			}
+			branches[id] = struct{}{}
+		}
+
+		inspection := r.graph.Inspect()
+		rootNames := make([]string, 0, len(inspection.Roots))
+		for name := range inspection.Roots {
+			rootNames = append(rootNames, name)
+		}
+		sort.Strings(rootNames)
+		for _, name := range rootNames {
+			const prefix = "filesystem/"
+			if !strings.HasPrefix(name, prefix) {
+				return fmt.Errorf("repository graph contains unexpected root %q", name)
+			}
+			id := strings.TrimPrefix(name, prefix)
+			if _, ok := branches[id]; ok {
+				continue
+			}
+			if err := r.graph.DeleteRoot(name); err != nil {
+				return fmt.Errorf("releasing unpublished graph root %q: %w", name, err)
+			}
+		}
+
+		pinNames := make([]string, 0, len(inspection.Pins))
+		for name := range inspection.Pins {
+			if strings.HasPrefix(name, "construct/") {
+				pinNames = append(pinNames, name)
+			}
+		}
+		sort.Strings(pinNames)
+		if err := r.graph.DeletePins(pinNames); err != nil {
+			return fmt.Errorf("releasing interrupted construction pins: %w", err)
+		}
+		return nil
+	})
+}
+
 // Branch returns a branch root.
 func (r *Repository) Branch(id string) (Branch, error) {
 	return r.readBranch(id)
@@ -717,7 +865,7 @@ func (r *Repository) Branch(id string) (Branch, error) {
 
 // RemoveBranch removes a branch pointer after its Kernel no longer exists.
 // The canonical main pointer may be removed only when another branch keeps the
-// repository live. Immutable layers and objects are reclaimed separately by
+// repository live. Immutable graph objects are reclaimed separately by
 // GarbageCollect.
 func (r *Repository) RemoveBranch(id string) error {
 	if err := validateName(id, "branch"); err != nil {
@@ -756,7 +904,16 @@ func (r *Repository) RemoveBranch(id string) error {
 		r.branchMu.Lock()
 		delete(r.branchCache, id)
 		r.branchMu.Unlock()
-		return r.syncDirectory("branches")
+		if err := r.syncDirectory("branches"); err != nil {
+			return err
+		}
+		if err := r.graph.ReloadForWrite(); err != nil {
+			return err
+		}
+		if err := r.graph.DeleteRoot(graphRootName(id)); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 
@@ -771,14 +928,9 @@ func (r *Repository) ForgetBranch(id string) {
 	defer r.operationMu.Unlock()
 
 	r.metadataMu.Lock()
-	var layers []string
 	if state := r.metadata[id]; state != nil {
-		state.mu.RLock()
-		layers = append(layers, state.layers...)
-		state.mu.RUnlock()
 		delete(r.metadata, id)
 	}
-	r.pruneUnreferencedLayerCachesLocked(layers)
 	r.metadataMu.Unlock()
 
 	r.branchMu.Lock()
@@ -851,22 +1003,23 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 			return err
 		}
 		tx.source = sourceBranch
-		// Seal the source's current writable layer by giving each resulting
-		// branch a fresh writable layer. Both new manifests retain the sealed
-		// layer by reference, so namespace fork cost is independent of its size.
-		sharedLayer := sourceBranch.Root
-		sourceLayer, err := r.createMetadataLayer(sharedLayer)
+		if err := r.graph.ReloadForWrite(); err != nil {
+			return err
+		}
+		working, err := r.graph.SealAndFork(
+			ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
+			ttcsnapshot.SnapshotSealedLocal,
+			map[string]string{graphRootName(child): graphRootName(source)},
+			2,
+		)
 		if err != nil {
 			return err
 		}
-		childLayer, err := r.createMetadataLayer(sharedLayer)
-		if err != nil {
-			return err
-		}
-		sourceBranch.Root = sourceLayer
+		sourceBranch.WorkingSnapshot = uint64(working[0])
+		sourceBranch.BaseRoot = sourceBranch.Root
 		sourceBranch.Generation++
 		childBranch := Branch{
-			ID: child, Root: childLayer,
+			ID: child, Root: sourceBranch.Root, BaseRoot: sourceBranch.Root, WorkingSnapshot: uint64(working[1]),
 			Generation: sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes
@@ -888,8 +1041,8 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 			if syncErr := r.syncDirectory("branches"); syncErr != nil {
 				return fmt.Errorf("publishing child branch: %w (syncing child removal also failed: %v)", err, syncErr)
 			}
-			if rollbackErr := r.writeBranch(tx.source); rollbackErr != nil {
-				return fmt.Errorf("publishing child branch: %w (restoring source branch also failed: %v)", err, rollbackErr)
+			if rootErr := r.graph.DeleteRoot(graphRootName(child)); rootErr != nil {
+				return fmt.Errorf("publishing child branch: %w (releasing child graph root also failed: %v)", err, rootErr)
 			}
 			return err
 		}
@@ -913,8 +1066,9 @@ func (tx *ForkTransaction) Commit() error {
 	return nil
 }
 
-// Abort removes the child branch and restores the exact source branch record.
-// It fails closed if either pointer changed after BeginFork.
+// Abort removes the child branch. The source retains its freshly allocated
+// working origin: snapshot IDs are never reused and sealed origins never move
+// backward to working.
 func (tx *ForkTransaction) Abort() error {
 	if tx == nil || tx.done {
 		return nil
@@ -940,11 +1094,7 @@ func (tx *ForkTransaction) Abort() error {
 		if err := tx.repo.syncDirectory("branches"); err != nil {
 			return err
 		}
-		// Remove the child before restoring the source generation. A crash in
-		// between leaves only a conservative generation bump. Restoring the
-		// source first could expose the same mutable object through a child that
-		// still exists.
-		return tx.repo.writeBranch(tx.source)
+		return tx.repo.graph.DeleteRoot(graphRootName(tx.child.ID))
 	})
 	if err != nil {
 		return err
@@ -989,7 +1139,7 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		object, err := r.createObject("")
+		object, err := r.createObject(branch.WorkingSnapshot, "")
 		if err != nil {
 			return err
 		}
@@ -1001,7 +1151,7 @@ func (r *Repository) CreateRegular(branchID string, parent uint64, name string, 
 		inode := Inode{
 			Number: created, Type: "regular", Mode: mode & 07777,
 			UID: uid, GID: gid, Nlink: 1, Object: object,
-			DataGeneration: branch.Generation,
+			DataGeneration: branch.WorkingSnapshot,
 			AtimeNsec:      now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
 		}
 		entry := DirectoryEntry{Name: name, Inode: created}
@@ -1431,10 +1581,10 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if inode.Type != "regular" {
 		return false, syscall.EINVAL
 	}
-	if !validID(inode.Object) {
+	if !validObjectID(inode.Object) {
 		return false, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 	}
-	if inode.DataGeneration == branch.Generation {
+	if inode.DataGeneration == branch.WorkingSnapshot {
 		return false, nil
 	}
 	// A remotely inherited object is sparse in the target repository. A file-
@@ -1443,12 +1593,12 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if err := r.ensureObjectRange(inode.Object, inode.Size, 0, inode.Size); err != nil {
 		return false, err
 	}
-	object, err := r.createObject(inode.Object)
+	object, err := r.createObject(branch.WorkingSnapshot, inode.Object)
 	if err != nil {
 		return false, err
 	}
 	inode.Object = object
-	inode.DataGeneration = branch.Generation
+	inode.DataGeneration = branch.WorkingSnapshot
 	if err := r.commitMetadata(branch, state, []metadataOp{{Kind: metadataSetInode, Inode: inode}}); err != nil {
 		return false, err
 	}
@@ -1522,7 +1672,7 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	if inode.Type != "regular" {
 		return 0, syscall.EINVAL
 	}
-	if !validID(inode.Object) {
+	if !validObjectID(inode.Object) {
 		return 0, fmt.Errorf("inode %d has invalid object ID %q", inode.Number, inode.Object)
 	}
 	if length := int64(len(data)); length != 0 {
@@ -1639,11 +1789,9 @@ func (r *Repository) SyncMetadata() error {
 // completed before it began.
 func (r *Repository) syncMetadataLocked() error {
 	r.dirtyMu.Lock()
-	var journals, rootDirty, branchDirty []string
+	var rootDirty, branchDirty []string
 	for name := range r.dirtyFiles {
 		switch {
-		case strings.HasSuffix(name, "/journal"):
-			journals = append(journals, name)
 		case strings.HasPrefix(name, "branches/"):
 			branchDirty = append(branchDirty, name)
 		default:
@@ -1655,7 +1803,6 @@ func (r *Repository) syncMetadataLocked() error {
 		dirtyDirs = append(dirtyDirs, name)
 	}
 	r.dirtyMu.Unlock()
-	sort.Strings(journals)
 	sort.Strings(rootDirty)
 	sort.Strings(branchDirty)
 	// Children must precede parents so every object name is durable before a
@@ -1689,9 +1836,6 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 	}
 	if err := syncFiles(rootDirty); err != nil {
-		return err
-	}
-	if err := syncFiles(journals); err != nil {
 		return err
 	}
 	if err := syncFiles(branchDirty); err != nil {
@@ -1967,15 +2111,11 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 	return result, nil
 }
 
-// BranchDiff returns paths changed by branchID relative to the immutable
-// metadata layer beneath its current writable layer. It reads TTC metadata;
-// it does not walk materialized host or guest directory trees.
+// BranchDiff returns paths changed by branchID relative to the immutable graph
+// root captured at its most recent fork. It reads TTC metadata; it does not
+// walk materialized host or guest directory trees.
 func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	branch, err := r.readBranch(branchID)
-	if err != nil {
-		return nil, err
-	}
-	layers, err := r.metadataLayers(branch.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -1991,16 +2131,28 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	}
 
 	base := newBranchMetadata(Branch{ID: branchID + "-diff-base"})
-	if len(layers) > 1 {
-		base.layers = append([]string(nil), layers[:len(layers)-1]...)
-		base.branch.Root = base.layers[len(base.layers)-1]
-		for _, layer := range base.layers {
-			size, sequence, err := r.replayMetadataLayer(layer, base)
-			if err != nil {
-				return nil, fmt.Errorf("replaying diff base layer %q: %w", layer, err)
+	if branch.BaseRoot != "" {
+		root, err := ttcsnapshot.ParseObjectID(branch.BaseRoot)
+		if err != nil {
+			return nil, err
+		}
+		inodes, entries, err := r.graph.FilesystemRecords(root)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range inodes {
+			inode := inodeFromGraph(record)
+			base.inodes[inode.Number] = inode
+		}
+		for _, record := range entries {
+			entry := DirectoryEntry{Name: record.Name, Inode: record.Inode}
+			base.entries[metadataEntryKey{Parent: record.Parent, Name: record.Name}] = entry
+			directory := base.directories[record.Parent]
+			if directory == nil {
+				directory = make(map[string]DirectoryEntry)
+				base.directories[record.Parent] = directory
 			}
-			base.layerSizes[layer] = size
-			base.nextSequence = sequence
+			directory[record.Name] = entry
 		}
 	}
 	basePaths, err := metadataPaths(base)
@@ -2323,73 +2475,41 @@ func mapsEqual(a, b map[string]string) bool {
 	return true
 }
 
-func (r *Repository) createObject(source string) (string, error) {
-	if source != "" && !validID(source) {
-		return "", fmt.Errorf("invalid source object ID %q", source)
+func (r *Repository) createObject(origin uint64, source string) (string, error) {
+	if origin == 0 {
+		return "", errors.New("cannot create a file without a working snapshot")
 	}
-	id, err := randomID()
+	if err := r.graph.ReloadForWrite(); err != nil {
+		return "", err
+	}
+	id, err := r.graph.ReserveObject(ttcsnapshot.SnapshotID(origin), ttcsnapshot.ObjectKindFile)
 	if err != nil {
 		return "", err
 	}
-	destination := r.objectPath(id)
-	if err := r.mkdirAll(filepath.Dir(destination), 0700); err != nil {
-		return "", err
-	}
-	dst, err := r.openFile(destination, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return "", err
-	}
-	keep := false
-	defer func() {
-		dst.Close()
-		if !keep {
-			_ = r.unlink(destination)
-		}
-	}()
-	if source != "" {
-		src, err := r.openObject(source, os.O_RDONLY)
-		if err != nil {
+	var length int64
+	if source == "" {
+		if err := r.data.Install(id, strings.NewReader(""), 0); err != nil {
 			return "", err
 		}
-		switch r.copyMode {
-		case CopyModeReflink:
-			err = unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
-		case CopyModeFull:
-			// Avoid os.File's copy_file_range fast path. Full-copy mode is the
-			// explicit portability fallback and the Sentry's host seccomp
-			// policy intentionally exposes only read/write for copying data.
-			buf := make([]byte, 256<<10)
-			for {
-				n, readErr := src.Read(buf)
-				if n != 0 {
-					if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
-						err = writeErr
-						break
-					}
-				}
-				if readErr != nil {
-					if readErr != io.EOF {
-						err = readErr
-					}
-					break
-				}
-			}
-		default:
-			err = fmt.Errorf("unknown volume copy mode %q", r.copyMode)
+	} else {
+		sourceID, err := ttcsnapshot.ParseObjectID(source)
+		if err != nil || sourceID.Kind != ttcsnapshot.ObjectKindFile {
+			return "", fmt.Errorf("invalid source object ID %q", source)
 		}
-		src.Close()
-		if err != nil {
-			return "", fmt.Errorf("privatizing volume object %q using %s: %w", source, r.copyMode, err)
+		object, ok := r.graph.Object(sourceID)
+		if !ok {
+			return "", fmt.Errorf("source object %q is absent from snapshot graph", source)
+		}
+		length = int64(object.BulkLength)
+		if err := r.data.Clone(sourceID, id); err != nil {
+			return "", fmt.Errorf("privatizing volume object %q: %w", source, err)
 		}
 	}
-	if err := dst.Close(); err != nil {
+	if err := r.graph.CommitReservedObject(id, graphConstructionPin(id), uint64(length), nil, nil); err != nil {
+		_ = r.data.Remove(id)
 		return "", err
 	}
-	// The object name is synchronized before any metadata journal that refers
-	// to it. Avoid forcing an fsync for every empty file creation.
-	r.markDirtyDirectory(filepath.Dir(destination))
-	keep = true
-	return id, nil
+	return id.String(), nil
 }
 
 func validateName(name, kind string) error {
@@ -2402,6 +2522,11 @@ func validateName(name, kind string) error {
 		}
 	}
 	return nil
+}
+
+func validObjectID(value string) bool {
+	id, err := ttcsnapshot.ParseObjectID(value)
+	return err == nil && id.Kind == ttcsnapshot.ObjectKindFile
 }
 
 func validateEntryName(name string) error {
@@ -2506,7 +2631,7 @@ func (r *Repository) openFile(name string, flags int, mode fs.FileMode) (*os.Fil
 }
 
 func (r *Repository) remoteObjectMarkerPath(id string) (string, error) {
-	if !validID(id) {
+	if !validObjectID(id) {
 		return "", fmt.Errorf("invalid object ID %q", id)
 	}
 	return filepath.Join("remote", id[:2], id[2:4], id), nil
@@ -2516,7 +2641,10 @@ func (r *Repository) remoteObjectMarkerPath(id string) (string, error) {
 // remote data, not ordinary sparse zero ranges. The marker is repository-wide
 // because object IDs are immutable and content-addressed; once one reader has
 // materialized the object, every branch referencing it is independent.
-func (r *Repository) markRemoteObjectPending(id string) error {
+func (r *Repository) markRemoteObjectPending(id, source string) error {
+	if !validObjectID(source) {
+		return fmt.Errorf("invalid source object ID %q", source)
+	}
 	marker, err := r.remoteObjectMarkerPath(id)
 	if err != nil {
 		return err
@@ -2531,11 +2659,34 @@ func (r *Repository) markRemoteObjectPending(id string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := file.WriteString(source + "\n"); err != nil {
+		file.Close()
+		return err
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
 	r.markDirtyFile(marker)
 	return nil
+}
+
+func (r *Repository) remoteSourceObject(id string) (string, bool, error) {
+	marker, err := r.remoteObjectMarkerPath(id)
+	if err != nil {
+		return "", false, err
+	}
+	data, err := r.readFile(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	source := strings.TrimSpace(string(data))
+	if !validObjectID(source) {
+		return "", false, fmt.Errorf("remote marker for %q has invalid source %q", id, source)
+	}
+	return source, true, nil
 }
 
 func (r *Repository) remoteObjectPending(id string) (bool, error) {

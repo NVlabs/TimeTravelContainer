@@ -56,6 +56,7 @@ func newGraphState() graphState {
 
 type journalOp struct {
 	PutSnapshot     *Snapshot
+	DeleteSnapshot  SnapshotID
 	PutObject       *Object
 	DeleteObject    string
 	RootName        string
@@ -75,16 +76,35 @@ type journalRecord struct {
 
 // Store owns one authoritative logical snapshot graph.
 type Store struct {
-	mu       sync.RWMutex
-	dir      string
-	lock     *os.File
-	journal  *os.File
-	state    graphState
-	poisoned error
+	mu         sync.RWMutex
+	dir        string
+	lock       *os.File
+	journal    *os.File
+	state      graphState
+	poisoned   error
+	journalEnd int64
+	// externallyCoordinated is used by graph stores embedded in a TTC
+	// filesystem repository. In that mode the repository's cross-process
+	// flock serializes writers, so this Store must not retain graph.lock for
+	// its whole lifetime. Callers must invoke Reload while holding that flock
+	// before every mutation that may race another process.
+	externallyCoordinated bool
 }
 
 // Open opens or creates a snapshot graph store at dir.
 func Open(dir string) (*Store, error) {
+	return open(dir, false)
+}
+
+// OpenExternallyCoordinated opens a graph whose writers are serialized by an
+// enclosing cross-process transaction lock. Unlike Open, it does not retain
+// graph.lock. This is intentionally a narrow integration API for repository
+// implementations; ordinary graph owners should use Open.
+func OpenExternallyCoordinated(dir string) (*Store, error) {
+	return open(dir, true)
+}
+
+func open(dir string, externallyCoordinated bool) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("TTC snapshot graph directory is empty")
 	}
@@ -95,11 +115,13 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return nil, fmt.Errorf("locking TTC snapshot graph: %w", err)
+	if !externallyCoordinated {
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			lock.Close()
+			return nil, fmt.Errorf("locking TTC snapshot graph: %w", err)
+		}
 	}
-	store := &Store{dir: dir, lock: lock, state: newGraphState()}
+	store := &Store{dir: dir, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated}
 	if err := store.loadCheckpoint(); err != nil {
 		store.Close()
 		return nil, err
@@ -117,6 +139,67 @@ func Open(dir string) (*Store, error) {
 	return store, nil
 }
 
+// Reload discards process-local graph state and replays the durable
+// checkpoint and journal. For externally-coordinated stores, callers must
+// hold the enclosing repository's cross-process lock. Reload is harmless for
+// exclusive stores and is useful in tests and recovery tooling.
+func (s *Store) Reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.poisoned != nil {
+		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
+	}
+	if s.externallyCoordinated {
+		info, err := s.journal.Stat()
+		if err != nil {
+			return err
+		}
+		if s.journalEnd == info.Size() {
+			return nil
+		}
+	}
+	state := newGraphState()
+	s.state = state
+	if err := s.loadCheckpoint(); err != nil {
+		return err
+	}
+	if _, err := s.journal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return s.replayJournal()
+}
+
+// ReloadForWrite reloads and repairs an incomplete journal tail while the
+// caller holds the enclosing repository's cross-process writer lock.
+func (s *Store) ReloadForWrite() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.externallyCoordinated {
+		return errors.New("ReloadForWrite is only valid for an externally-coordinated TTC graph")
+	}
+	if s.poisoned != nil {
+		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
+	}
+	info, err := s.journal.Stat()
+	if err != nil {
+		return err
+	}
+	if s.journalEnd == info.Size() {
+		return nil
+	}
+	s.state = newGraphState()
+	if err := s.loadCheckpoint(); err != nil {
+		return err
+	}
+	if _, err := s.journal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	s.externallyCoordinated = false
+	err = s.replayJournal()
+	s.externallyCoordinated = true
+	return err
+}
+
 // Close releases the store lock.
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -127,8 +210,10 @@ func (s *Store) Close() error {
 		s.journal = nil
 	}
 	if s.lock != nil {
-		if unlockErr := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN); err == nil {
-			err = unlockErr
+		if !s.externallyCoordinated {
+			if unlockErr := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN); err == nil {
+				err = unlockErr
+			}
 		}
 		if closeErr := s.lock.Close(); err == nil {
 			err = closeErr
@@ -247,6 +332,7 @@ func (s *Store) replayJournal() error {
 		return errors.New("invalid TTC snapshot graph journal header")
 	}
 	offset := int64(len(journalHeader))
+	s.journalEnd = offset
 	lengthBuffer := make([]byte, 4)
 	for {
 		recordStart := offset
@@ -258,6 +344,10 @@ func (s *Store) replayJournal() error {
 			return err
 		}
 		if n != len(lengthBuffer) {
+			if s.externallyCoordinated {
+				_, seekErr := s.journal.Seek(0, io.SeekEnd)
+				return seekErr
+			}
 			return s.truncateJournal(recordStart)
 		}
 		offset += int64(len(lengthBuffer))
@@ -271,6 +361,10 @@ func (s *Store) replayJournal() error {
 			return err
 		}
 		if n != len(data) {
+			if s.externallyCoordinated {
+				_, seekErr := s.journal.Seek(0, io.SeekEnd)
+				return seekErr
+			}
 			return s.truncateJournal(recordStart)
 		}
 		offset += int64(length)
@@ -281,6 +375,9 @@ func (s *Store) replayJournal() error {
 		if record.Version != formatVersion {
 			return fmt.Errorf("journal record version %d, want %d", record.Version, formatVersion)
 		}
+		if err := validateJournalRecord(record); err != nil {
+			return fmt.Errorf("validating TTC snapshot graph journal record at %d: %w", recordStart, err)
+		}
 		if record.Sequence <= s.state.Sequence {
 			continue
 		}
@@ -290,6 +387,10 @@ func (s *Store) replayJournal() error {
 		if err := applyJournalRecord(&s.state, record); err != nil {
 			return fmt.Errorf("applying journal sequence %d: %w", record.Sequence, err)
 		}
+		s.journalEnd = offset
+	}
+	if err := validateGraphState(&s.state); err != nil {
+		return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
 	}
 	_, err = s.journal.Seek(0, io.SeekEnd)
 	return err
@@ -302,57 +403,119 @@ func (s *Store) truncateJournal(offset int64) error {
 	if err := s.journal.Sync(); err != nil {
 		return err
 	}
+	s.journalEnd = offset
 	_, err := s.journal.Seek(0, io.SeekEnd)
 	return err
 }
 
 func applyJournalRecord(state *graphState, record journalRecord) error {
-	next := cloneGraphState(*state)
 	for _, op := range record.Ops {
 		switch {
 		case op.PutSnapshot != nil:
-			next.Snapshots[snapshotKey(op.PutSnapshot.ID)] = *op.PutSnapshot
+			state.Snapshots[snapshotKey(op.PutSnapshot.ID)] = *op.PutSnapshot
+		case op.DeleteSnapshot != 0:
+			delete(state.Snapshots, snapshotKey(op.DeleteSnapshot))
 		case op.PutObject != nil:
 			if err := validateObject(*op.PutObject); err != nil {
 				return err
 			}
-			next.Objects[op.PutObject.ID.key()] = cloneObject(*op.PutObject)
+			state.Objects[op.PutObject.ID.key()] = cloneObject(*op.PutObject)
 		case op.DeleteObject != "":
 			if _, err := parseObjectKey(op.DeleteObject); err != nil {
 				return err
 			}
-			delete(next.Objects, op.DeleteObject)
+			delete(state.Objects, op.DeleteObject)
 		case op.PutRoot != nil:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
 			}
-			next.Roots[op.RootName] = *op.PutRoot
+			state.Roots[op.RootName] = *op.PutRoot
 		case op.DeleteRoot:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
 			}
-			delete(next.Roots, op.RootName)
+			delete(state.Roots, op.RootName)
 		case op.PutPin != nil:
 			if err := validateRootName(op.PinName); err != nil {
 				return err
 			}
-			next.Pins[op.PinName] = *op.PutPin
+			state.Pins[op.PinName] = *op.PutPin
 		case op.DeletePin:
 			if err := validateRootName(op.PinName); err != nil {
 				return err
 			}
-			delete(next.Pins, op.PinName)
+			delete(state.Pins, op.PinName)
 		case op.SetNextSnapshot != nil:
-			next.NextSnapshot = *op.SetNextSnapshot
+			state.NextSnapshot = *op.SetNextSnapshot
 		default:
 			return errors.New("empty TTC snapshot graph journal operation")
 		}
 	}
-	next.Sequence = record.Sequence
-	if err := validateGraphState(&next); err != nil {
-		return err
+	state.Sequence = record.Sequence
+	return nil
+}
+
+func validateJournalRecord(record journalRecord) error {
+	if record.Version != formatVersion || record.Sequence == 0 {
+		return errors.New("invalid TTC snapshot graph journal record header")
 	}
-	*state = next
+	for _, op := range record.Ops {
+		selectors := 0
+		if op.PutSnapshot != nil {
+			selectors++
+			if op.PutSnapshot.ID == 0 || !op.PutSnapshot.State.valid() || op.PutSnapshot.NextOrdinal == 0 {
+				return fmt.Errorf("invalid snapshot %d", op.PutSnapshot.ID)
+			}
+		}
+		if op.DeleteSnapshot != 0 {
+			selectors++
+		}
+		if op.PutObject != nil {
+			selectors++
+			if err := validateObject(*op.PutObject); err != nil {
+				return err
+			}
+		}
+		if op.DeleteObject != "" {
+			selectors++
+			if _, err := parseObjectKey(op.DeleteObject); err != nil {
+				return err
+			}
+		}
+		if op.PutRoot != nil {
+			selectors++
+			if err := validateRootName(op.RootName); err != nil {
+				return err
+			}
+		}
+		if op.DeleteRoot {
+			selectors++
+			if err := validateRootName(op.RootName); err != nil {
+				return err
+			}
+		}
+		if op.PutPin != nil {
+			selectors++
+			if err := validateRootName(op.PinName); err != nil {
+				return err
+			}
+		}
+		if op.DeletePin {
+			selectors++
+			if err := validateRootName(op.PinName); err != nil {
+				return err
+			}
+		}
+		if op.SetNextSnapshot != nil {
+			selectors++
+			if *op.SetNextSnapshot == 0 {
+				return errors.New("invalid next snapshot ID")
+			}
+		}
+		if selectors != 1 {
+			return errors.New("invalid TTC snapshot graph journal operation selector")
+		}
+	}
 	return nil
 }
 
@@ -390,8 +553,7 @@ func (s *Store) commitLocked(ops []journalOp) error {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
 	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops}
-	next := cloneGraphState(s.state)
-	if err := applyJournalRecord(&next, record); err != nil {
+	if err := validateJournalRecord(record); err != nil {
 		return err
 	}
 	data, err := json.Marshal(record)
@@ -427,7 +589,11 @@ func (s *Store) commitLocked(ops []journalOp) error {
 		s.poisoned = err
 		return err
 	}
-	s.state = next
+	s.journalEnd = start + int64(len(length)) + int64(len(data))
+	if err := applyJournalRecord(&s.state, record); err != nil {
+		s.poisoned = fmt.Errorf("durable TTC graph transaction could not be applied in memory: %w", err)
+		return s.poisoned
+	}
 	return nil
 }
 
@@ -743,6 +909,44 @@ func (s *Store) Object(id ObjectID) (Object, bool) {
 	return cloneObject(object), ok
 }
 
+// UpdateWorkingBulkLength records the current length of an exclusively
+// mutable bulk object. Bytes may change in-place only while their origin is
+// working; sealing freezes both content and length.
+func (s *Store) UpdateWorkingBulkLength(id ObjectID, length uint64) error {
+	if id.Kind != ObjectKindFile && id.Kind != ObjectKindPage {
+		return fmt.Errorf("object %s is not bulk data", id.key())
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.state.Objects[id.key()]
+	if !ok || object.State != ObjectLive {
+		return fmt.Errorf("working bulk object %s does not exist", id.key())
+	}
+	snapshot, ok := s.state.Snapshots[snapshotKey(id.Snapshot)]
+	if !ok || snapshot.State != SnapshotWorking {
+		return fmt.Errorf("bulk object %s origin is not working", id.key())
+	}
+	if object.BulkLength == length {
+		return nil
+	}
+	object.BulkLength = length
+	return s.commitLocked([]journalOp{{PutObject: &object}})
+}
+
+// DeletePinIfPresent releases a construction pin if it still exists.
+func (s *Store) DeletePinIfPresent(name string) error {
+	if err := validateRootName(name); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	_, ok := s.state.Pins[name]
+	s.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return s.DeletePin(name)
+}
+
 // Snapshot returns a copy of snapshot authority metadata.
 func (s *Store) Snapshot(id SnapshotID) (Snapshot, bool) {
 	s.mu.RLock()
@@ -928,22 +1132,39 @@ func (s *Store) Collect(limit int) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	queue := make([]string, 0)
+	for key, object := range s.state.Objects {
+		if object.State == ObjectReclaiming {
+			queue = append(queue, key)
+		}
+	}
+	sort.Strings(queue)
+	if len(queue) == 0 {
+		return 0, nil
+	}
+	touched := make(map[string]Object)
+	deleted := make(map[string]struct{})
+	queued := make(map[string]struct{}, len(queue))
+	for _, key := range queue {
+		queued[key] = struct{}{}
+	}
+	objectFor := func(key string) (Object, bool) {
+		if object, ok := touched[key]; ok {
+			return object, true
+		}
+		object, ok := s.state.Objects[key]
+		return object, ok
+	}
 	collected := 0
-	for collected < limit {
-		keys := make([]string, 0)
-		for key, object := range s.state.Objects {
-			if object.State == ObjectReclaiming {
-				keys = append(keys, key)
-			}
+	for len(queue) != 0 && collected < limit {
+		key := queue[0]
+		queue = queue[1:]
+		object, ok := objectFor(key)
+		if !ok || object.State != ObjectReclaiming {
+			continue
 		}
-		if len(keys) == 0 {
-			break
-		}
-		sort.Strings(keys)
-		object := s.state.Objects[keys[0]]
-		ops := make([]journalOp, 0, len(object.Children)+1)
 		for _, edge := range object.Children {
-			child, ok := s.state.Objects[edge.Child.key()]
+			child, ok := objectFor(edge.Child.key())
 			if !ok {
 				return collected, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
 			}
@@ -952,21 +1173,98 @@ func (s *Store) Collect(limit int) (int, error) {
 			if err != nil {
 				return collected, err
 			}
-			ops = append(ops, journalOp{PutObject: &child})
+			touched[child.ID.key()] = child
+			if child.State == ObjectReclaiming {
+				if _, exists := queued[child.ID.key()]; !exists {
+					queue = append(queue, child.ID.key())
+					queued[child.ID.key()] = struct{}{}
+				}
+			}
 		}
-		ops = append(ops, journalOp{DeleteObject: object.ID.key()})
-		if err := s.commitLocked(ops); err != nil {
-			return collected, err
-		}
+		delete(touched, key)
+		deleted[key] = struct{}{}
 		collected++
 	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		if _, removed := deleted[key]; !removed {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	deletedKeys := make([]string, 0, len(deleted))
+	for key := range deleted {
+		deletedKeys = append(deletedKeys, key)
+	}
+	sort.Strings(deletedKeys)
+	ops := make([]journalOp, 0, len(keys)+len(deletedKeys))
+	for _, key := range keys {
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
+	}
+	for _, key := range deletedKeys {
+		ops = append(ops, journalOp{DeleteObject: key})
+	}
+	if err := s.commitLocked(ops); err != nil {
+		return 0, err
+	}
 	return collected, nil
+}
+
+// CollectEmptySnapshots removes origins that own no graph objects and are not
+// named in retain. NextSnapshot is monotonic and is never moved backward, so
+// deleting an empty origin cannot cause identity reuse. The caller decides
+// which authority records must remain; repositories retain every active
+// branch's working origin.
+func (s *Store) CollectEmptySnapshots(retain []SnapshotID) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	retained := make(map[SnapshotID]struct{}, len(retain))
+	for _, id := range retain {
+		if id == 0 {
+			return 0, errors.New("cannot retain zero snapshot ID")
+		}
+		retained[id] = struct{}{}
+	}
+	occupied := make(map[SnapshotID]struct{})
+	for _, object := range s.state.Objects {
+		occupied[object.ID.Snapshot] = struct{}{}
+	}
+	ids := make([]SnapshotID, 0)
+	for _, snapshot := range s.state.Snapshots {
+		if _, keep := retained[snapshot.ID]; keep {
+			continue
+		}
+		if _, used := occupied[snapshot.ID]; used {
+			continue
+		}
+		ids = append(ids, snapshot.ID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	ops := make([]journalOp, 0, len(ids))
+	for _, id := range ids {
+		ops = append(ops, journalOp{DeleteSnapshot: id})
+	}
+	if err := s.commitLocked(ops); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
 }
 
 // Checkpoint atomically writes a compact graph checkpoint and resets the WAL.
 func (s *Store) Checkpoint() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.externallyCoordinated {
+		return errors.New("externally-coordinated TTC graph checkpoint requires repository-level compaction")
+	}
+	return s.checkpointLocked()
+}
+
+func (s *Store) checkpointLocked() error {
 	data, err := json.Marshal(s.state)
 	if err != nil {
 		return err
@@ -1015,6 +1313,7 @@ func (s *Store) Checkpoint() error {
 	if err := s.journal.Sync(); err != nil {
 		return err
 	}
+	s.journalEnd = int64(len(journalHeader))
 	_, err = s.journal.Seek(0, io.SeekEnd)
 	return err
 }
