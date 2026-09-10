@@ -39,11 +39,13 @@ import (
 )
 
 const (
-	controlReservePath = "/v1/forks/reserve"
-	controlForkPrefix  = "/v1/forks/"
-	controlProxyPath   = "/v1/daemon"
-	maxControlBody     = 1 << 20
-	controlNodeHeader  = "X-TTC-Node"
+	controlReservePath        = "/v1/forks/reserve"
+	controlForkPrefix         = "/v1/forks/"
+	controlProxyPath          = "/v1/daemon"
+	controlObjectPrefix       = "/v1/objects/"
+	maxControlBody            = 1 << 20
+	controlNodeHeader         = "X-TTC-Node"
+	controlObjectLengthHeader = "X-TTC-Object-Length"
 )
 
 // LoadServerTLSConfig constructs a TLS 1.3 configuration that requires a
@@ -530,9 +532,18 @@ type ControlPlane struct {
 	AuthToken string
 	// CommandProxy forwards the TTC daemon wire protocol after peer
 	// authentication. It is optional for non-elastic deployments.
-	CommandProxy  http.Handler
-	operationMu   sync.Mutex // serializes reservation/quota accounting
-	transactionMu sync.Map   // transaction ID -> *sync.Mutex
+	CommandProxy http.Handler
+	// ObjectProvider serves immutable graph objects owned by this node. Reads
+	// are fenced by the provider's current Raft authority and transaction.
+	ObjectProvider ImmutableObjectProvider
+	operationMu    sync.Mutex // serializes reservation/quota accounting
+	transactionMu  sync.Map   // transaction ID -> *sync.Mutex
+}
+
+// ImmutableObjectProvider opens one complete immutable object after checking
+// that this daemon still owns its snapshot origin.
+type ImmutableObjectProvider interface {
+	OpenObject(context.Context, string, string, string) (io.ReadCloser, uint64, error)
 }
 
 func (c *ControlPlane) lockTransaction(id string) func() {
@@ -561,6 +572,10 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.CommandProxy.ServeHTTP(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, controlObjectPrefix) {
+		c.serveObject(w, r, peer)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
@@ -619,6 +634,40 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeControlError(w, http.StatusNotFound, "unknown cluster endpoint")
+}
+
+func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer string) {
+	if r.Method != http.MethodGet {
+		writeControlError(w, http.StatusMethodNotAllowed, "immutable object fetch requires GET")
+		return
+	}
+	if c.ObjectProvider == nil {
+		writeControlError(w, http.StatusNotImplemented, "immutable object provider is unavailable")
+		return
+	}
+	objectID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, controlObjectPrefix))
+	if err != nil || objectID == "" || strings.Contains(objectID, "/") {
+		writeControlError(w, http.StatusBadRequest, "invalid immutable object ID")
+		return
+	}
+	transaction := r.URL.Query().Get("transaction")
+	reader, length, err := c.ObjectProvider.OpenObject(r.Context(), peer, objectID, transaction)
+	if err != nil {
+		writeControlError(w, http.StatusConflict, err.Error())
+		return
+	}
+	defer reader.Close()
+	w.Header().Set(controlObjectLengthHeader, strconv.FormatUint(length, 10))
+	w.Header().Set("Content-Length", strconv.FormatUint(length, 10))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	written, copyErr := io.CopyN(w, reader, int64(length))
+	if copyErr == nil && uint64(written) != length {
+		copyErr = io.ErrUnexpectedEOF
+	}
+	// At this point headers are committed. Closing the response early is the
+	// protocol error signal; the target installs nothing until exact EOF.
+	_ = copyErr
 }
 
 func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer string) {
@@ -1179,6 +1228,46 @@ func (c *Client) authenticate(req *http.Request) {
 	if c.authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
+}
+
+// FetchObject opens one immutable graph object as a streaming response. The
+// caller must read exactly length bytes before atomically installing it.
+func (c *Client) FetchObject(ctx context.Context, objectID, transaction string) (io.ReadCloser, uint64, error) {
+	if objectID == "" || strings.Contains(objectID, "/") {
+		return nil, 0, errors.New("invalid immutable object ID")
+	}
+	endpoint := c.BaseURL + controlObjectPrefix + url.PathEscape(objectID)
+	if transaction != "" {
+		endpoint += "?transaction=" + url.QueryEscape(transaction)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	c.authenticate(request)
+	client := c.streamHTTP
+	if client == nil {
+		client = c.HTTP
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		var failure controlError
+		if err := json.NewDecoder(io.LimitReader(response.Body, maxControlBody)).Decode(&failure); err != nil || failure.Error == "" {
+			return nil, 0, fmt.Errorf("immutable object provider returned %s", response.Status)
+		}
+		return nil, 0, errors.New(failure.Error)
+	}
+	lengthText := response.Header.Get(controlObjectLengthHeader)
+	length, err := strconv.ParseUint(lengthText, 10, 64)
+	if err != nil || response.ContentLength < 0 || uint64(response.ContentLength) != length {
+		response.Body.Close()
+		return nil, 0, errors.New("immutable object provider returned an invalid exact length")
+	}
+	return response.Body, length, nil
 }
 
 // NewClient constructs a client using tlsConfig for peer authentication.

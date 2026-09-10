@@ -15,12 +15,14 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/http/httptest"
@@ -31,6 +33,51 @@ import (
 	"testing"
 	"time"
 )
+
+type testImmutableObjectProvider struct {
+	peer        string
+	object      string
+	transaction string
+	data        []byte
+	length      uint64
+}
+
+func (provider *testImmutableObjectProvider) OpenObject(_ context.Context, peer, object, transaction string) (io.ReadCloser, uint64, error) {
+	provider.peer, provider.object, provider.transaction = peer, object, transaction
+	return io.NopCloser(bytes.NewReader(provider.data)), provider.length, nil
+}
+
+func TestImmutableObjectProviderStreamsExactObject(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(storeRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &testImmutableObjectProvider{data: bytes.Repeat([]byte("object"), 1000)}
+	provider.length = uint64(len(provider.data))
+	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ObjectProvider: provider}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, length, err := client.FetchObject(context.Background(), "0000000000000001-02-0000000000000001", "tx-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil || length != uint64(len(provider.data)) || !bytes.Equal(got, provider.data) {
+		t.Fatalf("object length=%d bytes=%d err=%v", length, len(got), err)
+	}
+	if provider.peer != "source" || provider.object != "0000000000000001-02-0000000000000001" || provider.transaction != "tx-request" {
+		t.Fatalf("provider request=(%q,%q,%q)", provider.peer, provider.object, provider.transaction)
+	}
+}
 
 type testTargetRuntime struct {
 	mu            sync.Mutex
