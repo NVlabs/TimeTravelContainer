@@ -6,6 +6,11 @@ bundle, storage, or Sentry packages. `ttcd` alone interprets `TTC_ROOT` and
 `TTC_LOCAL_ROOT`, owns runtimes and storage, and contains internal copy and
 detached-auto-remove helpers.
 
+This boundary also applies to `ttc daemon start`: the client verifies and
+launches its exact-build sibling but does not inspect current or legacy root
+environment variables. `ttcd` validates them before creating runtime or
+storage state.
+
 The official CLI includes its build ID on daemon requests. A mismatch rejects
 every operation except the minimal `daemon stop` escape hatch. SDKs and MCP
 clients instead negotiate API version and the `features` returned by `ping`.

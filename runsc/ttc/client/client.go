@@ -401,9 +401,6 @@ func exchangeControl(socket string, req request, stdout, stderr io.Writer) int {
 }
 
 func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
-	if err := validateDaemonStartEnvironment(); err != nil {
-		return err
-	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -498,19 +495,6 @@ func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
 		// A task in uninterruptible kernel I/O cannot be reaped yet, but SIGKILL
 		// remains pending and prevents it from becoming a daemon after recovery.
 	}
-}
-
-// validateDaemonStartEnvironment enforces the daemon's explicit-root contract
-// before the client creates a log, socket directory, or ttcd process. The
-// client deliberately does not interpret or forward the root.
-func validateDaemonStartEnvironment() error {
-	if strings.TrimSpace(os.Getenv("TTC_ROOT")) != "" {
-		return nil
-	}
-	if strings.TrimSpace(os.Getenv("TTC_DATA_ROOT")) != "" {
-		return errors.New("TTC_DATA_ROOT is no longer supported; set TTC_ROOT to a fresh absolute path")
-	}
-	return errors.New("TTC_ROOT must be explicitly set before starting ttcd")
 }
 
 func connect(socket string) (net.Conn, error) {
