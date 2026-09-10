@@ -58,6 +58,9 @@ func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
 	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +133,9 @@ func TestSharedPackManifestLastAndTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := graph.CommitReservedObject(id, "page", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
 		t.Fatal(err)
 	}
 	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {

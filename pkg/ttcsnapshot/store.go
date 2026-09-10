@@ -678,6 +678,14 @@ func (s *Store) Object(id ObjectID) (Object, bool) {
 	return cloneObject(object), ok
 }
 
+// Snapshot returns a copy of snapshot authority metadata.
+func (s *Store) Snapshot(id SnapshotID) (Snapshot, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot, ok := s.state.Snapshots[snapshotKey(id)]
+	return snapshot, ok
+}
+
 // SnapshotObjects returns a stable copy of every graph object whose immutable
 // identity was allocated by snapshot. It does not walk roots or ancestry.
 func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {

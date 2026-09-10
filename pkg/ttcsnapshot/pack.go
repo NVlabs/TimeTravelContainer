@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -149,6 +150,13 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 	if graph == nil || source == nil || snapshot == 0 {
 		return errors.New("invalid shared snapshot publication")
 	}
+	snapshotRecord, ok := graph.Snapshot(snapshot)
+	if !ok {
+		return os.ErrNotExist
+	}
+	if snapshotRecord.State != SnapshotSealedVolatile && snapshotRecord.State != SnapshotSealedLocal && snapshotRecord.State != SnapshotShared {
+		return fmt.Errorf("snapshot %d is %q, not immutable", snapshot, snapshotRecord.State)
+	}
 	objects, err := graph.SnapshotObjects(snapshot)
 	if err != nil {
 		return err
@@ -245,8 +253,19 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 		return err
 	}
 	destination := filepath.Join(directory, packName(packNumber))
-	if err := os.Rename(temporaryPath, destination); err != nil {
-		return err
+	if err := os.Link(temporaryPath, destination); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		existing, openErr := os.Open(destination)
+		if openErr != nil {
+			return openErr
+		}
+		validateErr := validatePackHeader(existing, snapshot, packNumber, info.Size())
+		existing.Close()
+		if validateErr != nil {
+			return fmt.Errorf("validating existing immutable pack: %w", validateErr)
+		}
 	}
 	if err := syncDirectory(directory); err != nil {
 		return err
@@ -265,8 +284,7 @@ func validatePublishedObjects(manifest *SnapshotManifest, objects []Object) erro
 		return errors.New("committed snapshot manifest disagrees with graph object count")
 	}
 	for index := range objects {
-		if manifest.Objects[index].Object.ID != objects[index].ID ||
-			manifest.Objects[index].Object.BulkLength != objects[index].BulkLength {
+		if !reflect.DeepEqual(manifest.Objects[index].Object, objects[index]) {
 			return fmt.Errorf("committed snapshot manifest disagrees at object %d", index)
 		}
 	}
