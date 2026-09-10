@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -303,6 +304,73 @@ func (s *sharedReferenceService) mutateReference(operation, name string, object 
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		return ledger.ApplyReference(operation, name, object, retain)
 	})
+}
+
+// collectAndRetire performs the shared origin retirement protocol in its only
+// safe order: collect exact zero-count objects, deliver every resulting
+// cross-origin release, fence the empty origin permanently in Raft, forget its
+// ledger state, and only then remove physical packs. Each boundary is durable
+// and idempotent, so a successor lease holder rolls an interrupted attempt
+// forward rather than guessing from directory contents.
+func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease cluster.SharedGCLease, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	collected := 0
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		var err error
+		collected, err = ledger.Collect(limit)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	if _, err := s.drainOutbox(ctx, limit*4); err != nil {
+		return collected, err
+	}
+	var candidates []ttcsnapshot.SnapshotID
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		candidates = ledger.EmptyOrigins()
+		return nil
+	}); err != nil {
+		return collected, err
+	}
+	for _, snapshot := range candidates {
+		if err := ctx.Err(); err != nil {
+			return collected, err
+		}
+		_, volatile, err := s.authority.SnapshotProvider(uint64(snapshot))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return collected, err
+		}
+		if volatile {
+			// Import precedes the provider-to-shared authority switch. An empty
+			// handoff baseline cannot be retired until that switch commits.
+			continue
+		}
+		if _, err := s.authority.RetireSharedSnapshot(lease, uint64(snapshot)); err != nil {
+			return collected, err
+		}
+		if err := s.completeRetirement(snapshot); err != nil {
+			return collected, err
+		}
+	}
+	return collected, nil
+}
+
+func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		return ledger.RetireOrigin(snapshot)
+	}); err != nil {
+		return err
+	}
+	busy, err := s.packs.CompleteRetirement(snapshot)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return fmt.Errorf("shared snapshot %d still has an active reader lease", snapshot)
+	}
+	return nil
 }
 
 var _ cluster.SharedSnapshotReferenceProvider = (*sharedReferenceService)(nil)

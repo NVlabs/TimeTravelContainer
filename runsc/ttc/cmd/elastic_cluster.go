@@ -3053,10 +3053,10 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 			}
 			if references != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), duration/3)
-				_, err := references.drainOutbox(ctx, 4096)
+				_, err := references.collectAndRetire(ctx, held, 4096)
 				cancel()
 				if err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: delivering shared snapshot references: %v\n", err)
+					fmt.Fprintf(stderr, "ttcd: warning: collecting shared snapshot graph: %v\n", err)
 				}
 			}
 			retirements, err := authority.RetiredSharedSnapshots()
@@ -3065,12 +3065,14 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 					if !time.Now().Before(held.ExpiresAt) {
 						break
 					}
-					busy, err := packs.CompleteRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
+					var err error
+					if references != nil {
+						err = references.completeRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
+					} else {
+						_, err = packs.CompleteRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
+					}
 					if err != nil && stderr != nil {
 						fmt.Fprintf(stderr, "ttcd: warning: completing retirement of shared snapshot %d: %v\n", retirement.SnapshotID, err)
-					}
-					if busy {
-						continue
 					}
 				}
 			}

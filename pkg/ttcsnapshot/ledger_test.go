@@ -571,3 +571,66 @@ func TestSnapshotLedgerHandoffCatchupIsDurableAndExact(t *testing.T) {
 		t.Fatalf("foreign edge missing from final references: %+v", currentReferences)
 	}
 }
+
+func TestReferenceLedgerRetiresOnlyEmptyDrainedOrigin(t *testing.T) {
+	origin := SnapshotID(41)
+	object := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1}}
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(origin, []Object{object}, map[string]ObjectID{"root/branch/demo": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ledger.EmptyOrigins(); len(got) != 0 {
+		t.Fatalf("live origin reported empty: %v", got)
+	}
+	if err := ledger.RetireOrigin(origin); err == nil {
+		t.Fatal("retired referenced origin")
+	}
+	if err := ledger.ApplyReference("release-demo", "root/branch/demo", object.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ledger.Collect(16); err != nil || got != 1 {
+		t.Fatalf("Collect()=(%d, %v), want (1, nil)", got, err)
+	}
+	if got := ledger.EmptyOrigins(); len(got) != 1 || got[0] != origin {
+		t.Fatalf("empty origins=%v, want [%d]", got, origin)
+	}
+	if err := ledger.RetireOrigin(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.RetireOrigin(origin); err != nil {
+		t.Fatalf("idempotent retirement: %v", err)
+	}
+	if got := ledger.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 || got.AppliedOperations != 0 {
+		t.Fatalf("retired ledger residue: %+v", got)
+	}
+}
+
+func TestReferenceLedgerRetirementRecovers(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	origin := SnapshotID(52)
+	object := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindMemoryChunk, Ordinal: 1}, BulkLength: 4096}
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ImportOrigin(origin, []Object{object}, map[string]ObjectID{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ledger.Collect(16); err != nil || got != 1 {
+		t.Fatalf("Collect()=(%d, %v), want (1, nil)", got, err)
+	}
+	if err := ledger.RetireOrigin(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err = OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	if got := ledger.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 {
+		t.Fatalf("retired origin reappeared after replay: %+v", got)
+	}
+}

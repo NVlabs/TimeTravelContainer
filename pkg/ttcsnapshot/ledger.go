@@ -99,6 +99,7 @@ type referenceLedgerRecord struct {
 	Ack       *uint64
 	Collect   *int
 	Collected int
+	Retire    *SnapshotID
 }
 
 func newReferenceLedgerState() referenceLedgerState {
@@ -324,6 +325,12 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 		}
 		if collected != record.Collected {
 			return fmt.Errorf("collection replay removed %d objects, want %d", collected, record.Collected)
+		}
+	}
+	if record.Retire != nil {
+		set++
+		if err := ledger.RetireOrigin(*record.Retire); err != nil {
+			return err
 		}
 	}
 	if set != 1 {
@@ -932,6 +939,80 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 		return 0, err
 	}
 	return collected, nil
+}
+
+// EmptyOrigins returns origins whose immutable object graph has been fully
+// collected and whose cross-owner edge queue is drained. The shared-GC
+// coordinator must commit permanent retirement in Raft before calling
+// RetireOrigin; this method merely reports candidates.
+func (ledger *ReferenceLedger) EmptyOrigins() []SnapshotID {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	blocked := make(map[SnapshotID]struct{})
+	for _, object := range ledger.state.Objects {
+		blocked[object.ID.Snapshot] = struct{}{}
+	}
+	for _, reference := range ledger.state.References {
+		blocked[reference.Snapshot] = struct{}{}
+	}
+	for _, outbound := range ledger.state.Outbox {
+		blocked[outbound.Parent.Snapshot] = struct{}{}
+		blocked[outbound.Child.Snapshot] = struct{}{}
+	}
+	result := make([]SnapshotID, 0, len(ledger.state.Origins))
+	for origin := range ledger.state.Origins {
+		if _, exists := blocked[origin]; !exists {
+			result = append(result, origin)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
+}
+
+// RetireOrigin forgets an empty origin after Raft has permanently fenced its
+// snapshot ID. It is idempotent so a successor coordinator can finish a crash
+// that occurred after the Raft commit. Physical packs are removed only after
+// this durable ledger mutation succeeds.
+func (ledger *ReferenceLedger) RetireOrigin(origin SnapshotID) error {
+	if ledger == nil || origin == 0 {
+		return errors.New("invalid reference-ledger origin retirement")
+	}
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	if _, exists := ledger.state.Origins[origin]; !exists {
+		return nil
+	}
+	for _, object := range ledger.state.Objects {
+		if object.ID.Snapshot == origin {
+			return fmt.Errorf("snapshot origin %d still contains object %s", origin, object.ID)
+		}
+	}
+	for name, object := range ledger.state.References {
+		if object.Snapshot == origin {
+			return fmt.Errorf("snapshot origin %d still has reference %q", origin, name)
+		}
+	}
+	for _, outbound := range ledger.state.Outbox {
+		if outbound.Parent.Snapshot == origin || outbound.Child.Snapshot == origin {
+			return fmt.Errorf("snapshot origin %d still has pending outbound reference %d", origin, outbound.Sequence)
+		}
+	}
+	next := cloneReferenceLedgerState(ledger.state)
+	delete(next.Origins, origin)
+	delete(next.HandoffCursor, origin)
+	// Once Raft fences the immutable ID, retries are rejected before reaching
+	// this ledger. Its old operation receipts no longer serve deduplication and
+	// would otherwise grow without bound over long-lived clusters.
+	for operation, applied := range next.Applied {
+		if applied.Object.Snapshot == origin {
+			delete(next.Applied, operation)
+		}
+	}
+	retired := origin
+	return ledger.commitLocked(referenceLedgerRecord{Retire: &retired}, next)
 }
 
 // ReferenceLedgerInspection is a stable diagnostic snapshot.
