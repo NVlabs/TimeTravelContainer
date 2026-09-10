@@ -268,6 +268,16 @@ type BranchDehydrateInfo struct {
 	ExecSessions     []ExecSessionInfo             `json:"exec_sessions,omitempty"`
 	FilesystemBranch string                        `json:"filesystem_branch"`
 	SparseManifest   ttcchunk.ManifestID           `json:"sparse_manifest,omitempty"`
+	SnapshotID       uint64                        `json:"snapshot_id,omitempty"`
+	MemoryRoots      []BranchMemoryRoot            `json:"memory_roots,omitempty"`
+}
+
+// BranchMemoryRoot binds one captured MemoryFile to an ancestry-independent
+// snapshot-graph radix root.
+type BranchMemoryRoot struct {
+	ResourceID checkpoint.ResourceID `json:"resource_id"`
+	Name       string                `json:"name"`
+	Root       string                `json:"root"`
 }
 
 // BranchDehydrationExportArgs donates packed snapshot destinations in the

@@ -9952,9 +9952,34 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 			}
 		}
+		graphRoots, err := b.cloneGraphMemoryRootsMany(sourceRecord.MemoryRoots, records)
+		if err != nil {
+			var cleanupErr error
+			store := b.containerStore()
+			for i, cleanupDestination := range destinations {
+				if _, destroyErr := b.command("timetravel", source.container, "destroy", cleanupDestination); destroyErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
+					continue
+				}
+				record := ttcbundle.BranchInfo{ID: cleanupDestination, FilesystemBranch: infos[i].FilesystemBranch}
+				cleanupErr = errors.Join(cleanupErr, store.RemoveBranchFilesystems(source.container, record))
+				cleanupErr = errors.Join(cleanupErr, store.RemoveBranchArtifacts(source.container, record))
+			}
+			if cleanupErr != nil {
+				return nil, fmt.Errorf("rooting graph memory for batch fork: %w; cleanup: %v", err, cleanupErr)
+			}
+			return nil, fmt.Errorf("rooting graph memory for batch fork: %w", err)
+		}
+		for i := range records {
+			records[i].SnapshotID = sourceRecord.SnapshotID
+			records[i].MemoryRoots = graphRoots[records[i].FilesystemBranch]
+		}
 		if err := b.containerStore().RecordBranches(source.container, records); err != nil {
 			var cleanupErr error
 			store := b.containerStore()
+			for _, roots := range graphRoots {
+				cleanupErr = errors.Join(cleanupErr, b.releaseGraphMemoryRoots(roots))
+			}
 			for i, cleanupDestination := range destinations {
 				if _, destroyErr := b.command("timetravel", source.container, "destroy", cleanupDestination); destroyErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
@@ -10068,6 +10093,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			}
 			result = errors.Join(result, os.RemoveAll(child.dir))
 			result = errors.Join(result, b.releaseSparseMemoryRoot(info.ID, child.branch.FilesystemBranch))
+			result = errors.Join(result, b.releaseGraphMemoryRoots(child.branch.MemoryRoots))
 			result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, child.branch))
 		}
 		return result
@@ -10083,8 +10109,14 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
 		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, SnapshotID: sourceBranch.SnapshotID, CreatedAt: createdAt}
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
+		graphRoots, err := b.cloneGraphMemoryRoots(sourceBranch.MemoryRoots, filesystemBranch)
+		if err != nil {
+			return nil, fmt.Errorf("rooting graph memory for %s@%s: %w", source.container, destination, err)
+		}
+		branch.MemoryRoots = graphRoots
+		children[len(children)-1].branch = branch
 		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
 			return nil, fmt.Errorf("forking filesystems for %s@%s: %w", source.container, destination, err)
@@ -10119,6 +10151,15 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		childCapture := capture
 		childCapture.FilesystemBranch = filesystemBranch
 		childCapture.Resume = capture.Resume && !paused
+		if len(graphRoots) != 0 {
+			if len(childCapture.MemoryRoots) != len(graphRoots) {
+				return nil, fmt.Errorf("dehydrated source has %d graph control roots and %d branch roots", len(childCapture.MemoryRoots), len(graphRoots))
+			}
+			childCapture.MemoryRoots = append([]boot.BranchMemoryRoot(nil), childCapture.MemoryRoots...)
+			for index := range childCapture.MemoryRoots {
+				childCapture.MemoryRoots[index].Name = graphRoots[index]
+			}
+		}
 		if _, err := os.Stat(childDir); err == nil {
 			return nil, fmt.Errorf("dehydration image already exists for branch %q", destination)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -10456,6 +10497,59 @@ func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBran
 	return repository.SetBranch(targetFilesystemBranch, manifest)
 }
 
+func graphMemoryRootNames(filesystemBranch string, count int) []string {
+	result := make([]string, count)
+	for index := range result {
+		result[index] = fmt.Sprintf("memory/branch/%s/resource-%04x", filesystemBranch, index)
+	}
+	return result
+}
+
+// cloneGraphMemoryRoots gives a branch O(1)-with-respect-to-memory references
+// to the same immutable radix roots as its source. No page or radix node is
+// walked or copied.
+func (b *runtimeBackend) cloneGraphMemoryRoots(sourceRoots []string, targetFilesystemBranch string) ([]string, error) {
+	if len(sourceRoots) == 0 {
+		return nil, nil
+	}
+	if b.snapshotGraph == nil || targetFilesystemBranch == "" {
+		return nil, errors.New("snapshot graph is unavailable for memory-root fork")
+	}
+	destinations := graphMemoryRootNames(targetFilesystemBranch, len(sourceRoots))
+	copies := make(map[string]string, len(sourceRoots))
+	for index, source := range sourceRoots {
+		copies[destinations[index]] = source
+	}
+	if err := b.snapshotGraph.CloneRoots(copies); err != nil {
+		return nil, err
+	}
+	return destinations, nil
+}
+
+// cloneGraphMemoryRootsMany commits all roots for a batch fork in one graph
+// transaction, so no sibling can be left partially rooted after a crash.
+func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots []string, branches []ttcbundle.BranchInfo) (map[string][]string, error) {
+	result := make(map[string][]string, len(branches))
+	if len(sourceRoots) == 0 {
+		return result, nil
+	}
+	if b.snapshotGraph == nil {
+		return nil, errors.New("snapshot graph is unavailable for batch memory-root fork")
+	}
+	copies := make(map[string]string, len(sourceRoots)*len(branches))
+	for _, branch := range branches {
+		destinations := graphMemoryRootNames(branch.FilesystemBranch, len(sourceRoots))
+		result[branch.FilesystemBranch] = destinations
+		for index, source := range sourceRoots {
+			copies[destinations[index]] = source
+		}
+	}
+	if err := b.snapshotGraph.CloneRoots(copies); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // releaseSparseMemoryRoot removes one branch's durable chunk reachability
 // only after its runtime has stopped using the on-demand loader, then reclaims
 // objects no surviving branch, lease, or publication transaction references.
@@ -10479,6 +10573,28 @@ func (b *runtimeBackend) releaseSparseMemoryRoot(containerID, filesystemBranch s
 		return err
 	}
 	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
+	return err
+}
+
+// releaseGraphMemoryRoots drops logical branch reachability, cascades exact
+// reference counts, and then removes only bulk objects absent from the graph.
+func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
+	if len(roots) == 0 || b.snapshotGraph == nil || b.snapshotData == nil {
+		return nil
+	}
+	if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
+		return err
+	}
+	for {
+		collected, err := b.snapshotGraph.Collect(4096)
+		if err != nil {
+			return err
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	_, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
 	return err
 }
 
@@ -10575,6 +10691,14 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
 		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 	}
+	if err := b.releaseGraphMemoryRoots(branch.MemoryRoots); err != nil {
+		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
+	}
+	if len(branch.MemoryRoots) != 0 {
+		if err := store.UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil); err != nil {
+			return err
+		}
+	}
 	latest, err := store.LoadContainer(info.ID)
 	if err != nil {
 		return err
@@ -10643,6 +10767,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	var previousSparseRoot ttcchunk.ManifestID
 	var sparseRepositoryPath string
 	var sparseFilesystemBranch string
+	var graphMemoryRoots []string
+	var graphMemorySnapshot uint64
+	graphMemoryRecorded := false
 	defer func() {
 		if dehydrated {
 			return
@@ -10669,6 +10796,14 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 				}
 			} else if b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: opening sparse memory repository to roll back %s: %v\n", target, openErr)
+			}
+		}
+		if graphMemoryRecorded {
+			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil)
+		}
+		if len(graphMemoryRoots) != 0 {
+			if graphErr := b.releaseGraphMemoryRoots(graphMemoryRoots); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
 			}
 		}
 		if finalPublished {
@@ -10784,6 +10919,34 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		sparseRootChanged = true
 		capture.SparseManifest = exportInfo.Manifest
+		// Standalone roots use the daemon's authoritative graph directly. A
+		// clustered daemon must first obtain the origin from Raft, which is wired
+		// in the distributed data-plane phase rather than allocating a conflicting
+		// node-local ID here.
+		if b.snapshotGraph != nil && b.snapshotData != nil && b.nodeID == "" {
+			origin, err := b.snapshotGraph.AllocateWorking()
+			if err != nil {
+				return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
+			}
+			prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+			imported, err := memoryRepository.ImportSnapshotGraph(b.snapshotGraph, b.snapshotData, origin, exportInfo.Manifest, prefix)
+			if err != nil {
+				return fmt.Errorf("importing graph-native dehydration memory: %w", err)
+			}
+			for _, root := range imported.Roots {
+				capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+					ResourceID: root.ResourceID,
+					Name:       root.Name,
+					Root:       root.Root.String(),
+				})
+				graphMemoryRoots = append(graphMemoryRoots, root.Name)
+			}
+			if err := b.snapshotGraph.Seal(origin, ttcsnapshot.SnapshotSealedLocal); err != nil {
+				return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+			}
+			capture.SnapshotID = uint64(origin)
+			graphMemorySnapshot = uint64(origin)
+		}
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
 		}
@@ -10808,6 +10971,12 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = dir.Sync()
 			_ = dir.Close()
 		}
+		if graphMemorySnapshot != 0 {
+			if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots); err != nil {
+				return fmt.Errorf("recording graph-native dehydration roots: %w", err)
+			}
+			graphMemoryRecorded = true
+		}
 		// Remote dependencies remain live until the asynchronous shared
 		// publication commits. The publisher advances the transaction only after
 		// its manifest is authoritative.
@@ -10830,6 +10999,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		return fmt.Errorf("queueing durable dehydration publication: %w", err)
 	}
 	dehydrated = true
+	graphMemoryRoots = nil
 	if b.dataRoot != "" {
 		activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
@@ -11703,6 +11873,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
+		}
+		if err := b.releaseGraphMemoryRoots(recorded.MemoryRoots); err != nil {
+			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {
 			if portErr != nil {

@@ -13,6 +13,7 @@ go_library(
         "consumption_tracker.go",
         "chunk.go",
         "donated.go",
+        "graph.go",
         "install.go",
         "lifecycle.go",
         "manifest.go",
@@ -32,6 +33,7 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
+        "//pkg/ttcsnapshot",
     ],
 )
 
@@ -45,5 +47,6 @@ go_test(
         "//pkg/sentry/checkpoint",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/ttcsnapshot",
     ],
 )

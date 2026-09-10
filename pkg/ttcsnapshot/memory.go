@@ -36,9 +36,27 @@ const (
 // Pins are removed only after every branch memory root referencing Pages is
 // committed.
 type MemoryChunkReservation struct {
-	Chunk MemoryChunkID
-	Pages map[uint8]PageID
-	Pins  []string
+	Chunk      MemoryChunkID
+	Pages      map[uint8]PageID
+	Identities map[uint8]MemoryPageIdentity
+	Pins       []string
+}
+
+// MemoryPageIdentity preserves the guest memory manager's stable logical page
+// and content-version identities across dehydration. Logical identity remains
+// unchanged by CoW; Version changes when one branch writes the page.
+type MemoryPageIdentity struct {
+	LogicalAllocator [16]byte
+	LogicalSequence  uint64
+	VersionAllocator [16]byte
+	VersionSequence  uint64
+}
+
+// MemoryPageDescriptor describes one independently-CoW base page in a bulk
+// memory chunk.
+type MemoryPageDescriptor struct {
+	Slot     uint8
+	Identity MemoryPageIdentity
 }
 
 func memorySlot(pageIndex uint64, level int) uint16 {
@@ -73,50 +91,89 @@ func validateMemoryNode(object Object, level int) error {
 	return nil
 }
 
-func encodeMemoryPageOffset(offset uint32) []byte {
-	var data [4]byte
-	binary.BigEndian.PutUint32(data[:], offset)
+const memoryPageRecordBytes = 4 + 16 + 8 + 16 + 8
+
+func encodeMemoryPageRecord(offset uint32, identity MemoryPageIdentity) []byte {
+	data := make([]byte, memoryPageRecordBytes)
+	binary.BigEndian.PutUint32(data[0:4], offset)
+	copy(data[4:20], identity.LogicalAllocator[:])
+	binary.BigEndian.PutUint64(data[20:28], identity.LogicalSequence)
+	copy(data[28:44], identity.VersionAllocator[:])
+	binary.BigEndian.PutUint64(data[44:52], identity.VersionSequence)
 	return data[:]
+}
+
+func decodeMemoryPageRecord(data []byte) (uint32, MemoryPageIdentity, error) {
+	if len(data) != memoryPageRecordBytes {
+		return 0, MemoryPageIdentity{}, fmt.Errorf("memory page record has %d bytes, want %d", len(data), memoryPageRecordBytes)
+	}
+	var identity MemoryPageIdentity
+	copy(identity.LogicalAllocator[:], data[4:20])
+	identity.LogicalSequence = binary.BigEndian.Uint64(data[20:28])
+	copy(identity.VersionAllocator[:], data[28:44])
+	identity.VersionSequence = binary.BigEndian.Uint64(data[44:52])
+	return binary.BigEndian.Uint32(data[0:4]), identity, nil
+}
+
+// MemoryPageRecord returns the chunk coordinate and stable logical identity
+// of a graph-native page.
+func (s *Store) MemoryPageRecord(page ObjectID) (MemoryChunkID, uint32, MemoryPageIdentity, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	object, ok := s.state.Objects[page.key()]
+	if !ok || object.ID.Kind != ObjectKindPage || len(object.Children) != 1 || object.Children[0].Slot != 0 || object.Children[0].Child.Kind != ObjectKindMemoryChunk {
+		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("object %s is not a chunk-backed memory page", page.key())
+	}
+	offset, identity, err := decodeMemoryPageRecord(object.Data)
+	if err != nil {
+		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("page %s: %w", page.key(), err)
+	}
+	chunk := s.state.Objects[object.Children[0].Child.key()]
+	if uint64(offset)+memoryPageBytes > chunk.BulkLength || offset%memoryPageBytes != 0 {
+		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("page %s has invalid chunk offset %d", page.key(), offset)
+	}
+	return MemoryChunkID(object.Children[0].Child), offset, identity, nil
 }
 
 // MemoryPageOffset returns the byte offset of page in its immutable 1-MiB
 // chunk. The page object contains no bulk bytes of its own.
 func (s *Store) MemoryPageOffset(page ObjectID) (MemoryChunkID, uint32, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	object, ok := s.state.Objects[page.key()]
-	if !ok || object.ID.Kind != ObjectKindPage || len(object.Data) != 4 || len(object.Children) != 1 || object.Children[0].Slot != 0 || object.Children[0].Child.Kind != ObjectKindMemoryChunk {
-		return MemoryChunkID{}, 0, fmt.Errorf("object %s is not a chunk-backed memory page", page.key())
-	}
-	offset := binary.BigEndian.Uint32(object.Data)
-	chunk := s.state.Objects[object.Children[0].Child.key()]
-	if uint64(offset)+memoryPageBytes > chunk.BulkLength || offset%memoryPageBytes != 0 {
-		return MemoryChunkID{}, 0, fmt.Errorf("page %s has invalid chunk offset %d", page.key(), offset)
-	}
-	return MemoryChunkID(object.Children[0].Child), offset, nil
+	chunk, offset, _, err := s.MemoryPageRecord(page)
+	return chunk, offset, err
 }
 
 // ReserveMemoryChunk allocates one bulk chunk ID and one PageID per selected
 // slot in a single journal transaction. Slots are canonicalized so retries
 // and callers have deterministic page ordering.
 func (s *Store) ReserveMemoryChunk(origin SnapshotID, pinPrefix string, slots []uint8) (MemoryChunkReservation, error) {
+	descriptors := make([]MemoryPageDescriptor, len(slots))
+	for index, slot := range slots {
+		descriptors[index].Slot = slot
+	}
+	return s.ReserveMemoryChunkPages(origin, pinPrefix, descriptors)
+}
+
+// ReserveMemoryChunkPages is ReserveMemoryChunk with stable guest page
+// identities. The descriptors are persisted only by CommitMemoryChunk, after
+// the corresponding bulk object has been installed.
+func (s *Store) ReserveMemoryChunkPages(origin SnapshotID, pinPrefix string, pages []MemoryPageDescriptor) (MemoryChunkReservation, error) {
 	if err := validateRootName(pinPrefix); err != nil {
 		return MemoryChunkReservation{}, err
 	}
-	if len(slots) == 0 || len(slots) > pagesPerChunk {
+	if len(pages) == 0 || len(pages) > pagesPerChunk {
 		return MemoryChunkReservation{}, errors.New("invalid TTC memory chunk slots")
 	}
-	ordered := append([]uint8(nil), slots...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	ordered := append([]MemoryPageDescriptor(nil), pages...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Slot < ordered[j].Slot })
 	for index := 1; index < len(ordered); index++ {
-		if ordered[index] == ordered[index-1] {
-			return MemoryChunkReservation{}, fmt.Errorf("memory chunk repeats page slot %d", ordered[index])
+		if ordered[index].Slot == ordered[index-1].Slot {
+			return MemoryChunkReservation{}, fmt.Errorf("memory chunk repeats page slot %d", ordered[index].Slot)
 		}
 	}
 	pins := make([]string, 0, len(ordered)+1)
 	pins = append(pins, pinPrefix+"/chunk")
-	for _, slot := range ordered {
-		pins = append(pins, fmt.Sprintf("%s/page-%02x", pinPrefix, slot))
+	for _, page := range ordered {
+		pins = append(pins, fmt.Sprintf("%s/page-%02x", pinPrefix, page.Slot))
 	}
 	for _, pin := range pins {
 		if err := validateRootName(pin); err != nil {
@@ -133,12 +190,14 @@ func (s *Store) ReserveMemoryChunk(origin SnapshotID, pinPrefix string, slots []
 		return MemoryChunkReservation{}, err
 	}
 	reservation := MemoryChunkReservation{
-		Chunk: MemoryChunkID(ids[0]),
-		Pages: make(map[uint8]PageID, len(ordered)),
-		Pins:  pins,
+		Chunk:      MemoryChunkID(ids[0]),
+		Pages:      make(map[uint8]PageID, len(ordered)),
+		Identities: make(map[uint8]MemoryPageIdentity, len(ordered)),
+		Pins:       pins,
 	}
-	for index, slot := range ordered {
-		reservation.Pages[slot] = PageID(ids[index+1])
+	for index, page := range ordered {
+		reservation.Pages[page.Slot] = PageID(ids[index+1])
+		reservation.Identities[page.Slot] = page.Identity
 	}
 	return reservation, nil
 }
@@ -164,7 +223,7 @@ func (s *Store) CommitMemoryChunk(reservation MemoryChunkReservation) error {
 		}
 		objects = append(objects, ReservedObject{
 			ID: page, Pin: reservation.Pins[index+1],
-			Data:     encodeMemoryPageOffset(uint32(slot) * memoryPageBytes),
+			Data:     encodeMemoryPageRecord(uint32(slot)*memoryPageBytes, reservation.Identities[uint8(slot)]),
 			Children: []Edge{{Slot: 0, Child: chunk}},
 		})
 	}
@@ -324,7 +383,7 @@ func (s *Store) SetMemoryChunk(origin SnapshotID, rootName string, basePage uint
 			return ObjectID{}, nil, fmt.Errorf("memory chunk repeats page slot %d", slot)
 		}
 		seen[slot] = struct{}{}
-		page, err := mutation.create(ObjectKindPage, encodeMemoryPageOffset(uint32(slot)*memoryPageBytes), []Edge{{Slot: 0, Child: chunk}})
+		page, err := mutation.create(ObjectKindPage, encodeMemoryPageRecord(uint32(slot)*memoryPageBytes, MemoryPageIdentity{}), []Edge{{Slot: 0, Child: chunk}})
 		if err != nil {
 			return ObjectID{}, nil, err
 		}

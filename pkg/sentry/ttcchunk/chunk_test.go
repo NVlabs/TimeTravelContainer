@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 type remoteReaderFunc func(ID) ([]byte, error)
@@ -173,6 +174,73 @@ func TestChunkRoundTrip(t *testing.T) {
 	data[len(data)-1] ^= 1
 	if _, err := Decode(data, &id); err == nil {
 		t.Fatal("corrupted chunk passed content-address verification")
+	}
+}
+
+func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
+	repository, err := OpenMemoryRepository(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	chunk := testChunk()
+	encoded, chunkID, err := Encode(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)}
+	bindings := []StoredBinding{
+		{Binding: pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
+		{Binding: pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
+	}
+	manifest, err := repository.Publish([]Object{{ID: chunkID, Logical: chunk.Logical, Data: encoded}}, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, err := repository.ImportSnapshotGraph(graph, data, origin, manifest, "family/main/memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Chunks != 1 || imported.Pages != 2 || len(imported.Roots) != 1 {
+		t.Fatalf("graph import=%+v, want one chunk, two mappings, and one root", imported)
+	}
+	first, ok, err := graph.MemoryPage(imported.Roots[0].Root, 0)
+	if err != nil || !ok {
+		t.Fatalf("first page=(%s,%t,%v)", first, ok, err)
+	}
+	second, ok, err := graph.MemoryPage(imported.Roots[0].Root, 1)
+	if err != nil || !ok || second != first {
+		t.Fatalf("aliased page=(%s,%t,%v), want %s", second, ok, err, first)
+	}
+	graphChunk, offset, identity, err := graph.MemoryPageRecord(first)
+	if err != nil || offset != 0 {
+		t.Fatalf("page backing=(%s,%d,%v)", ttcsnapshot.ObjectID(graphChunk), offset, err)
+	}
+	if identity.LogicalAllocator != [16]byte(page.Allocator) || identity.LogicalSequence != page.Sequence || identity.VersionAllocator != [16]byte(chunk.Pages[0].Version.Allocator) || identity.VersionSequence != chunk.Pages[0].Version.Sequence {
+		t.Fatalf("page identity=%+v, want logical=%+v version=%+v", identity, page, chunk.Pages[0].Version)
+	}
+	file, err := data.Open(ttcsnapshot.ObjectID(graphChunk), ttcsnapshot.MemoryChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(raw[:hostarch.PageSize], chunk.Pages[0].Data) {
+		t.Fatalf("graph chunk payload bytes=%d err=%v", len(raw), err)
 	}
 }
 

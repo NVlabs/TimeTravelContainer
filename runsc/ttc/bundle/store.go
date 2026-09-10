@@ -409,6 +409,8 @@ type BranchInfo struct {
 	SourceNode               string    `json:"source_node,omitempty"`
 	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string  `json:"memory_roots,omitempty"`
 	ForkTotalNS              int64     `json:"fork_total_ns,omitempty"`
 	SourceDowntimeNS         int64     `json:"source_downtime_ns,omitempty"`
 	KernelForkNS             int64     `json:"kernel_fork_ns,omitempty"`
@@ -3341,6 +3343,24 @@ func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) e
 				return false, nil
 			}
 			info.Branches[i].Quarantined = quarantined
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// UpdateBranchMemoryGraph records or clears the authoritative logical memory
+// roots for a branch. Physical provider/cache locations are deliberately not
+// part of this record.
+func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots []string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = append([]string(nil), roots...)
 			return true, nil
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)

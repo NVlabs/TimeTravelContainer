@@ -570,7 +570,7 @@ func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
 	}
 	if err := store.CommitReservedObjects([]ReservedObject{
 		{ID: ids[0], Pin: "build/chunk", BulkLength: MemoryChunkBytes},
-		{ID: ids[1], Pin: "build/page", Data: encodeMemoryPageOffset(0), Children: []Edge{{Slot: 0, Child: ids[0]}}},
+		{ID: ids[1], Pin: "build/page", Data: encodeMemoryPageRecord(0, MemoryPageIdentity{}), Children: []Edge{{Slot: 0, Child: ids[0]}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +601,8 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation, err := store.ReserveMemoryChunk(origin, "build/memory-0", []uint8{0, 7, 255})
+	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 99, VersionAllocator: [16]byte{2}, VersionSequence: 103}
+	reservation, err := store.ReserveMemoryChunkPages(origin, "build/memory-0", []MemoryPageDescriptor{{Slot: 0, Identity: identity}, {Slot: 7}, {Slot: 255}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,6 +633,10 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 			t.Fatalf("slot %d lookup=(%s,%t,%v), want %s", slot, got, ok, err, ObjectID(want))
 		}
 	}
+	_, _, gotIdentity, err := store.MemoryPageRecord(ObjectID(reservation.Pages[0]))
+	if err != nil || gotIdentity != identity {
+		t.Fatalf("MemoryPageRecord identity=(%+v,%v), want %+v", gotIdentity, err, identity)
+	}
 	file, err := data.Open(ObjectID(reservation.Chunk), MemoryChunkBytes)
 	if err != nil {
 		t.Fatal(err)
@@ -640,6 +645,61 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	file.Close()
 	if err != nil || !bytes.Equal(loaded, payload) {
 		t.Fatalf("cold chunk load bytes=%d err=%v", len(loaded), err)
+	}
+}
+
+func TestCloneRootsIsAtomicAndReferenceCounted(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.CreateObject(origin, "construction/root", ObjectKindMetadata, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetRoot("memory/source/0", object); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("construction/root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloneRoots(map[string]string{
+		"memory/child-a/0": "memory/source/0",
+		"memory/child-b/0": "memory/source/0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Object(object)
+	if !ok || got.Refs != 3 {
+		t.Fatalf("shared object=(%+v,%t), want three root references", got, ok)
+	}
+	if err := store.CloneRoots(map[string]string{
+		"memory/child-c/0": "memory/source/0",
+		"memory/child-a/0": "memory/source/0",
+	}); err == nil {
+		t.Fatal("CloneRoots replaced an existing destination")
+	}
+	if _, ok := store.Root("memory/child-c/0"); ok {
+		t.Fatal("failed CloneRoots left a partial destination")
+	}
+	got, _ = store.Object(object)
+	if got.Refs != 3 {
+		t.Fatalf("failed CloneRoots changed refs to %d", got.Refs)
+	}
+	if err := store.ReleaseRoots([]string{"memory/child-a/0", "memory/missing/0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseRoots([]string{"memory/child-a/0"}); err != nil {
+		t.Fatalf("idempotent ReleaseRoots: %v", err)
+	}
+	got, _ = store.Object(object)
+	if got.Refs != 2 {
+		t.Fatalf("ReleaseRoots left refs=%d, want 2", got.Refs)
 	}
 }
 

@@ -1347,6 +1347,64 @@ func (s *Store) SetRoot(name string, id ObjectID) error {
 	return s.commitLocked(ops)
 }
 
+// CloneRoots atomically gives each destination a reference to the object
+// named by its source root. Destinations must not already exist. Work is
+// proportional only to the number of logical roots, never to the number of
+// pages or filesystem objects reachable through them.
+func (s *Store) CloneRoots(copies map[string]string) error {
+	if len(copies) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	destinations := make([]string, 0, len(copies))
+	for destination, source := range copies {
+		if err := validateRootName(destination); err != nil {
+			return err
+		}
+		if err := validateRootName(source); err != nil {
+			return err
+		}
+		if destination == source {
+			return fmt.Errorf("cannot clone root %q onto itself", source)
+		}
+		if _, exists := s.state.Roots[destination]; exists {
+			return fmt.Errorf("destination root %q already exists", destination)
+		}
+		if _, exists := s.state.Roots[source]; !exists {
+			return fmt.Errorf("source root %q does not exist", source)
+		}
+		destinations = append(destinations, destination)
+	}
+	sort.Strings(destinations)
+	touched := make(map[string]Object)
+	ops := make([]journalOp, 0, len(copies)*2)
+	for _, destination := range destinations {
+		id := s.state.Roots[copies[destination]]
+		object, ok := touched[id.key()]
+		if !ok {
+			object = s.state.Objects[id.key()]
+		}
+		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
+			return fmt.Errorf("root object %s cannot be retained", id.key())
+		}
+		object.Refs++
+		touched[id.key()] = object
+		ops = append(ops, journalOp{RootName: destination, PutRoot: &id})
+	}
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	objectOps := make([]journalOp, 0, len(keys))
+	for _, key := range keys {
+		object := touched[key]
+		objectOps = append(objectOps, journalOp{PutObject: &object})
+	}
+	return s.commitLocked(append(objectOps, ops...))
+}
+
 // DeleteRoot removes a named root and releases its object.
 func (s *Store) DeleteRoot(name string) error {
 	return s.DeleteRoots([]string{name})
@@ -1356,6 +1414,17 @@ func (s *Store) DeleteRoot(name string) error {
 // transaction. Missing roots are rejected so callers cannot silently lose a
 // required lifetime reference.
 func (s *Store) DeleteRoots(names []string) error {
+	return s.deleteRoots(names, false)
+}
+
+// ReleaseRoots is the idempotent lifecycle form of DeleteRoots. Missing names
+// are treated as an already-committed release, while all existing roots and
+// reference decrements are still recorded in one journal transaction.
+func (s *Store) ReleaseRoots(names []string) error {
+	return s.deleteRoots(names, true)
+}
+
+func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 	if len(names) == 0 {
 		return nil
 	}
@@ -1376,6 +1445,9 @@ func (s *Store) DeleteRoots(names []string) error {
 		seen[name] = struct{}{}
 		id, ok := s.state.Roots[name]
 		if !ok {
+			if allowMissing {
+				continue
+			}
 			return os.ErrNotExist
 		}
 		object, ok := touched[id.key()]
@@ -1388,6 +1460,9 @@ func (s *Store) DeleteRoots(names []string) error {
 		}
 		touched[id.key()] = object
 		ops = append(ops, journalOp{RootName: name, DeleteRoot: true})
+	}
+	if len(ops) == 0 {
+		return nil
 	}
 	keys := make([]string, 0, len(touched))
 	for key := range touched {
