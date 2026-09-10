@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -342,13 +343,20 @@ func edgeOperationName(parent ObjectID, slot uint16, retain bool) string {
 	return fmt.Sprintf("%s:%s:%04x", action, parent.key(), slot)
 }
 
+func validateReferenceName(name string) error {
+	if name == "" || len(name) > 1024 || strings.TrimSpace(name) != name || strings.ContainsRune(name, 0) {
+		return errors.New("invalid TTC reference name")
+	}
+	return nil
+}
+
 func (state *referenceLedgerState) owns(id ObjectID) bool {
 	_, ok := state.Origins[id.Snapshot]
 	return ok
 }
 
 func (state *referenceLedgerState) retain(name string, id ObjectID) error {
-	if err := validateRootName(name); err != nil {
+	if err := validateReferenceName(name); err != nil {
 		return err
 	}
 	if previous, ok := state.References[name]; ok {

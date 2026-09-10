@@ -181,3 +181,41 @@ func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
 		t.Fatalf("objects after collection replay=%d, want 0", got)
 	}
 }
+
+func TestSnapshotLedgerCapturesForeignParentEdges(t *testing.T) {
+	graph, err := Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	first, _ := graph.AllocateWorking()
+	child, err := graph.CreateObject(first, "child-pin", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(first, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := graph.AllocateWorking()
+	parent, err := graph.CreateObject(second, "parent-pin", ObjectKindInode, nil, []Edge{{Slot: 4, Child: child}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(second, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, references, err := graph.SnapshotLedger(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || references["pin/child-pin"] != child || references[edgeReferenceName(parent, 4)] != child {
+		t.Fatalf("objects=%+v references=%+v", objects, references)
+	}
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(first, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	if got := ledger.Inspect().Objects[child]; got != 2 {
+		t.Fatalf("imported child references=%d, want pin+foreign parent=2", got)
+	}
+}

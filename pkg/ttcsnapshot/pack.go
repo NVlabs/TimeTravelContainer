@@ -25,7 +25,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -65,10 +64,11 @@ type PackInfo struct {
 // SnapshotManifest is the sole authority pointer for a published snapshot.
 // Pack files without this manifest are uncommitted staging residue.
 type SnapshotManifest struct {
-	Version  int            `json:"version"`
-	Snapshot SnapshotID     `json:"snapshot"`
-	Packs    []PackInfo     `json:"packs"`
-	Objects  []PackedObject `json:"objects"`
+	Version    int                 `json:"version"`
+	Snapshot   SnapshotID          `json:"snapshot"`
+	Packs      []PackInfo          `json:"packs"`
+	Objects    []PackedObject      `json:"objects"`
+	References map[string]ObjectID `json:"references,omitempty"`
 }
 
 // SharedPackStore stores immutable snapshot-origin packs. It intentionally
@@ -153,6 +153,14 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 	if graph == nil || source == nil || snapshot == 0 {
 		return errors.New("invalid shared snapshot publication")
 	}
+	if _, err := store.Manifest(snapshot); err == nil {
+		// The manifest is the immutable authority point. Provider reference
+		// counts may already have moved to the shared ledger, so a post-handoff
+		// retry must not compare them with the former local graph.
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	snapshotRecord, ok := graph.Snapshot(snapshot)
 	if !ok {
 		return os.ErrNotExist
@@ -160,16 +168,10 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 	if snapshotRecord.State != SnapshotSealedVolatile && snapshotRecord.State != SnapshotSealedLocal && snapshotRecord.State != SnapshotShared {
 		return fmt.Errorf("snapshot %d is %q, not immutable", snapshot, snapshotRecord.State)
 	}
-	objects, err := graph.SnapshotObjects(snapshot)
+	objects, references, err := graph.SnapshotLedger(snapshot)
 	if err != nil {
 		return err
 	}
-	if existing, err := store.Manifest(snapshot); err == nil {
-		return validatePublishedObjects(existing, objects)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-
 	directory := store.snapshotDirectory(snapshot)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
@@ -185,7 +187,7 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 		temporary.Close()
 		return err
 	}
-	manifest := SnapshotManifest{Version: sharedPackVersion, Snapshot: snapshot}
+	manifest := SnapshotManifest{Version: sharedPackVersion, Snapshot: snapshot, References: references}
 	buffer := make([]byte, sharedPackExtent)
 	for _, object := range objects {
 		if err := ctx.Err(); err != nil {
@@ -282,18 +284,6 @@ func (store *SharedPackStore) Publish(ctx context.Context, graph *Store, snapsho
 	return nil
 }
 
-func validatePublishedObjects(manifest *SnapshotManifest, objects []Object) error {
-	if len(manifest.Objects) != len(objects) {
-		return errors.New("committed snapshot manifest disagrees with graph object count")
-	}
-	for index := range objects {
-		if !reflect.DeepEqual(manifest.Objects[index].Object, objects[index]) {
-			return fmt.Errorf("committed snapshot manifest disagrees at object %d", index)
-		}
-	}
-	return nil
-}
-
 func writeAtomicJSON(path string, value any) error {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, ".manifest-")
@@ -329,6 +319,10 @@ func cloneManifest(manifest *SnapshotManifest) *SnapshotManifest {
 	}
 	copy := *manifest
 	copy.Packs = append([]PackInfo(nil), manifest.Packs...)
+	copy.References = make(map[string]ObjectID, len(manifest.References))
+	for name, object := range manifest.References {
+		copy.References[name] = object
+	}
 	copy.Objects = make([]PackedObject, len(manifest.Objects))
 	for index, object := range manifest.Objects {
 		copy.Objects[index] = PackedObject{Object: cloneObject(object.Object), Extents: append([]PackExtent(nil), object.Extents...)}
@@ -387,6 +381,7 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 		}
 	}
 	seen := make(map[string]struct{}, len(manifest.Objects))
+	objects := make(map[string]Object, len(manifest.Objects))
 	for _, packed := range manifest.Objects {
 		if err := validateObject(packed.Object); err != nil {
 			return err
@@ -398,6 +393,7 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 			return fmt.Errorf("shared manifest repeats object %s", packed.Object.ID.key())
 		}
 		seen[packed.Object.ID.key()] = struct{}{}
+		objects[packed.Object.ID.key()] = packed.Object
 		var length uint64
 		for _, extent := range packed.Extents {
 			pack, ok := packs[extent.Pack]
@@ -409,6 +405,36 @@ func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error
 		}
 		if length != packed.Object.BulkLength {
 			return fmt.Errorf("object %s extents total %d, want %d", packed.Object.ID.key(), length, packed.Object.BulkLength)
+		}
+	}
+	for name, object := range manifest.References {
+		if err := validateReferenceName(name); err != nil {
+			return fmt.Errorf("shared manifest reference %q: %w", name, err)
+		}
+		if object.Snapshot != manifest.Snapshot {
+			return fmt.Errorf("shared manifest reference %q selects foreign object %s", name, object)
+		}
+		if _, ok := objects[object.key()]; !ok {
+			return fmt.Errorf("shared manifest reference %q selects absent object %s", name, object)
+		}
+	}
+	counts := make(map[string]uint64, len(objects))
+	for _, packed := range manifest.Objects {
+		for _, edge := range packed.Object.Children {
+			if edge.Child.Snapshot == manifest.Snapshot {
+				if _, ok := objects[edge.Child.key()]; !ok {
+					return fmt.Errorf("shared object %s selects absent same-origin child %s", packed.Object.ID, edge.Child)
+				}
+				counts[edge.Child.key()]++
+			}
+		}
+	}
+	for _, object := range manifest.References {
+		counts[object.key()]++
+	}
+	for _, object := range objects {
+		if counts[object.ID.key()] != object.Refs {
+			return fmt.Errorf("shared object %s baseline has %d references, manifest records %d", object.ID, counts[object.ID.key()], object.Refs)
 		}
 	}
 	sort.Slice(manifest.Objects, func(i, j int) bool {

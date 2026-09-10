@@ -1345,6 +1345,68 @@ func (s *Store) SnapshotObjects(snapshot SnapshotID) ([]Object, error) {
 	return objects, nil
 }
 
+// SnapshotLedger returns an atomic provider-to-owner handoff baseline for one
+// immutable origin. References includes named roots, pins, and every incoming
+// parent edge owned by another origin. Same-origin edges remain represented by
+// the returned immutable objects themselves. The sum of these references and
+// same-origin edges exactly reproduces each object's current reference count.
+func (s *Store) SnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record, ok := s.state.Snapshots[snapshotKey(snapshot)]
+	if !ok {
+		return nil, nil, os.ErrNotExist
+	}
+	if record.State == SnapshotWorking {
+		return nil, nil, fmt.Errorf("snapshot %d is still working", snapshot)
+	}
+	objects := make([]Object, 0)
+	for _, object := range s.state.Objects {
+		if object.ID.Snapshot == snapshot {
+			objects = append(objects, cloneObject(object))
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	references := make(map[string]ObjectID)
+	for name, object := range s.state.Roots {
+		if object.Snapshot == snapshot {
+			references["root/"+name] = object
+		}
+	}
+	for name, object := range s.state.Pins {
+		if object.Snapshot == snapshot {
+			references["pin/"+name] = object
+		}
+	}
+	for _, parent := range s.state.Objects {
+		if parent.ID.Snapshot == snapshot {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
+			}
+		}
+	}
+	counts := make(map[string]uint64, len(objects))
+	for _, parent := range objects {
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				counts[edge.Child.key()]++
+			}
+		}
+	}
+	for _, object := range references {
+		counts[object.key()]++
+	}
+	for _, object := range objects {
+		if counts[object.ID.key()] != object.Refs {
+			return nil, nil, fmt.Errorf("snapshot %d object %s baseline has %d references, graph records %d", snapshot, object.ID, counts[object.ID.key()], object.Refs)
+		}
+	}
+	return objects, references, nil
+}
+
 // Root returns a named root.
 func (s *Store) Root(name string) (ObjectID, bool) {
 	s.mu.RLock()
