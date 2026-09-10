@@ -16,7 +16,6 @@ package ttcsnapshot
 
 import (
 	"fmt"
-	"math"
 	"sort"
 )
 
@@ -104,23 +103,20 @@ func (s *Store) SetMemoryPage(origin SnapshotID, rootName string, pageIndex uint
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, ok := s.state.Snapshots[snapshotKey(origin)]
-	if !ok || snapshot.State != SnapshotWorking {
-		return ObjectID{}, fmt.Errorf("snapshot %d is not working", origin)
+	mutation, err := newGraphMutation(s, origin)
+	if err != nil {
+		return ObjectID{}, err
 	}
-	pageObject, ok := s.state.Objects[page.key()]
+	pageObject, ok := mutation.object(page)
 	if !ok || pageObject.State != ObjectLive {
 		return ObjectID{}, fmt.Errorf("page object %s is not live", page.key())
-	}
-	if snapshot.NextOrdinal > math.MaxUint64-memoryTreeLevels {
-		return ObjectID{}, fmt.Errorf("snapshot %d object ordinal space exhausted", origin)
 	}
 
 	// Capture the old nodes on the affected path. Missing suffixes are empty.
 	var oldPath [memoryTreeLevels]*Object
 	if current, exists := s.state.Roots[rootName]; exists {
 		for level := memoryTreeLevels - 1; level >= 0; level-- {
-			object, ok := s.state.Objects[current.key()]
+			object, ok := mutation.object(current)
 			if !ok {
 				return ObjectID{}, fmt.Errorf("memory root references missing object %s", current.key())
 			}
@@ -137,19 +133,6 @@ func (s *Store) SetMemoryPage(origin SnapshotID, rootName string, pageIndex uint
 		}
 	}
 
-	next := cloneGraphState(s.state)
-	touched := make(map[string]struct{})
-	retain := func(id ObjectID) error {
-		object, ok := next.Objects[id.key()]
-		if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
-			return fmt.Errorf("child object %s cannot be retained", id.key())
-		}
-		object.Refs++
-		next.Objects[id.key()] = object
-		touched[id.key()] = struct{}{}
-		return nil
-	}
-
 	child := page
 	for level := 0; level < memoryTreeLevels; level++ {
 		var children []Edge
@@ -157,51 +140,16 @@ func (s *Store) SetMemoryPage(origin SnapshotID, rootName string, pageIndex uint
 			children = oldPath[level].Children
 		}
 		children = replaceEdge(children, memorySlot(pageIndex, level), child)
-		id := ObjectID{Snapshot: origin, Ordinal: snapshot.NextOrdinal, Kind: ObjectKindMemoryNode}
-		snapshot.NextOrdinal++
-		node := Object{ID: id, State: ObjectLive, Data: []byte{byte(level)}, Children: children}
-		if err := validateObject(node); err != nil {
-			return ObjectID{}, err
-		}
-		for _, edge := range children {
-			if err := retain(edge.Child); err != nil {
-				return ObjectID{}, err
-			}
-		}
-		next.Objects[id.key()] = node
-		touched[id.key()] = struct{}{}
-		child = id
-	}
-	newRoot := child
-	if err := retain(newRoot); err != nil {
-		return ObjectID{}, err
-	}
-	if oldRoot, exists := next.Roots[rootName]; exists {
-		object, err := releaseObject(next.Objects[oldRoot.key()])
+		child, err = mutation.create(ObjectKindMemoryNode, []byte{byte(level)}, children)
 		if err != nil {
 			return ObjectID{}, err
 		}
-		next.Objects[oldRoot.key()] = object
-		touched[oldRoot.key()] = struct{}{}
 	}
-	next.Roots[rootName] = newRoot
-	next.Snapshots[snapshotKey(origin)] = snapshot
-	if err := validateGraphState(&next); err != nil {
+	newRoot := child
+	if err := mutation.setRoot(rootName, newRoot); err != nil {
 		return ObjectID{}, err
 	}
-
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	ops := make([]journalOp, 0, len(keys)+2)
-	for _, key := range keys {
-		object := next.Objects[key]
-		ops = append(ops, journalOp{PutObject: &object})
-	}
-	ops = append(ops, journalOp{PutSnapshot: &snapshot}, journalOp{RootName: rootName, PutRoot: &newRoot})
-	if err := s.commitLocked(ops); err != nil {
+	if err := mutation.commit(rootName, newRoot); err != nil {
 		return ObjectID{}, err
 	}
 	return newRoot, nil

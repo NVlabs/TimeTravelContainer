@@ -35,7 +35,7 @@ waive that phase's remaining migration or qualification work.
 | --- | --- | --- | --- |
 | 0: specification and boundary | in progress | Plan committed in `15705aec7`; strict root recognition and the destructive format boundary landed in `5de1eb4a3`. | Record the complete pre/post performance and NFS/Lustre qualification matrix. |
 | 1: version/API/config cleanup | in progress | Standalone format 2 and clustered format 5 are enforced; writable repositories moved behind repository format 3 in `90b336ae9`; reflink is optional with automatic whole-file fallback. | Finish schema audit and prove every removed legacy option/API is absent from client, daemon, SDKs, and MCP. |
-| 2: common graph | in progress | Persistent IDs/journal/reference engine (`8f5b5c821`), immutable filesystem roots (`0429be25f`), standalone data store (`9bfae5618`), daemon graph (`a4b47356b`), O(1) batch fork (`3f9acf50c`), origin resolver (`448af1144`), and graph packs (`5cf9a74de`) are present. | Complete crash matrix, memory radix-tree hot path, generation-selected graph compaction, and exact residue tests. |
+| 2: common graph | in progress | Persistent IDs/journal/reference engine (`8f5b5c821`), immutable filesystem roots (`0429be25f`), standalone data store (`9bfae5618`), daemon graph (`a4b47356b`), O(1) batch fork (`3f9acf50c`), origin resolver (`448af1144`), graph packs (`5cf9a74de`), and generation-selected WAL compaction (`0e414a808`) are present. Memory radix mutations now use bounded touched-object overlays instead of cloning the full graph. | Complete crash matrix, graph-native 1 MiB memory records, and exact residue tests. |
 | 3: standalone filesystem/images | in progress | Directory import (`2e3ec8092`), managed/rootfs repository graph conversion (`8da8fc220`), and ancestry-independent direct lookup with authoritative diff roots (`edf392cb9`) have landed. | Remove remaining legacy filesystem data paths and qualify OCI commit/save/load, mounts, FUSE, NFS deletion, and whole-file CoW. |
 | 4: standalone memory/lifecycle | not started | The generic memory radix tree and 1 MiB object APIs exist. | Move live memory and hydration to them, remove legacy chunk/application files, and qualify every lifecycle transition. |
 | 5: distributed provider protocol | in progress | Raft snapshot allocation (`8ed3d29fa`), provider fencing (`3409e38d2`), transport (`819c907b0`), publication fencing (`ca619de37`), and resolver initialization (`de71aeefa`) are foundations. | Make every remote fork/migration/rehydration data path graph-native and pass interruption/retry tests. |
@@ -47,9 +47,10 @@ waive that phase's remaining migration or qualification work.
 
 ### Current milestone
 
-The active milestone adds generation-selected graph WAL compaction with atomic
-head publication and concurrent-reader coverage. Live-memory migration follows
-after this milestone commits.
+The active milestone connects the fixed-height memory radix tree to immutable
+1 MiB memory records and the dehydration lifecycle without reintroducing a
+pathname-backed live allocator. Resident memory remains anonymous and 4 KiB
+CoW; only cold snapshot data is written to the graph store.
 
 ## Goals
 
