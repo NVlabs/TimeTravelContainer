@@ -925,6 +925,31 @@ func (s *Store) AllocateWorking() (SnapshotID, error) {
 	return id, nil
 }
 
+// AdoptWorking installs an exact externally allocated snapshot origin. It is
+// used by clustered TTC after Raft commits the globally monotonic ID. Replays
+// are idempotent only while the local origin remains working; immutable state
+// can never be regressed to working.
+func (s *Store) AdoptWorking(id SnapshotID) error {
+	if id == 0 || id == SnapshotID(math.MaxUint64) {
+		return fmt.Errorf("invalid externally allocated snapshot ID %d", id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.state.Snapshots[snapshotKey(id)]; ok {
+		if existing.State == SnapshotWorking {
+			return nil
+		}
+		return fmt.Errorf("snapshot %d is already %s", id, existing.State)
+	}
+	snapshot := Snapshot{ID: id, State: SnapshotWorking, NextOrdinal: 1}
+	ops := []journalOp{{PutSnapshot: &snapshot}}
+	if id >= s.state.NextSnapshot {
+		next := id + 1
+		ops = append(ops, journalOp{SetNextSnapshot: &next})
+	}
+	return s.commitLocked(ops)
+}
+
 // Seal freezes a working origin in O(1).
 func (s *Store) Seal(id SnapshotID, state SnapshotState) error {
 	if state != SnapshotSealedLocal && state != SnapshotSealedVolatile {

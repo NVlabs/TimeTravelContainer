@@ -123,6 +123,35 @@ func TestCollectEmptySnapshotsNeverReusesIdentity(t *testing.T) {
 	}
 }
 
+func TestAdoptWorkingPreservesExternalIdentityAndLocalMonotonicity(t *testing.T) {
+	store := openTestStore(t)
+	if err := store.AdoptWorking(42); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptWorking(42); err != nil {
+		t.Fatalf("idempotent adoption: %v", err)
+	}
+	if snapshot, ok := store.Snapshot(42); !ok || snapshot.State != SnapshotWorking {
+		t.Fatalf("adopted snapshot=(%+v,%t), want working", snapshot, ok)
+	}
+	next, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 43 {
+		t.Fatalf("next local snapshot=%d, want 43", next)
+	}
+	if err := store.Seal(42, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdoptWorking(42); err == nil {
+		t.Fatal("immutable snapshot regressed to working")
+	}
+	if err := store.AdoptWorking(0); err == nil {
+		t.Fatal("zero external snapshot was accepted")
+	}
+}
+
 func TestExternallyCoordinatedStoresReload(t *testing.T) {
 	dir := t.TempDir()
 	first, err := OpenExternallyCoordinated(dir)
