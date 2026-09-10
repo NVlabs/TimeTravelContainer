@@ -1846,3 +1846,12 @@ func (s *Store) Stats() Stats {
 	}
 	return stats
 }
+
+// JournalBytes returns the selected WAL generation's durable byte length.
+// Callers use this only to schedule compaction; correctness never depends on
+// the value being current after this call returns.
+func (s *Store) JournalBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.journalEnd
+}

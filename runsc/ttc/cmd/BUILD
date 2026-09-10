@@ -77,6 +77,7 @@ go_test(
     library = ":cmd",
     deps = [
         "//pkg/ttcremote",
+		"//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/specutils",
         "//runsc/ttc/cluster",

@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -5450,5 +5451,47 @@ func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	}
 	if err := runRename([]string{"demo@try-a"}, &out, backend); err == nil {
 		t.Fatal("a rename with no new name was accepted")
+	}
+}
+
+func TestReconcileStandaloneMemoryGraphReclaimsCrashResidue(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "catalog", "snapshot-graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootObject, err := graph.CreateObject(origin, "memory/crash/root-pin", ttcsnapshot.ObjectKindMetadata, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("memory/crash/resource-0000", rootObject); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("memory/crash/root-pin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "memory/crash/construction-pin", ttcsnapshot.ObjectKindMetadata, []byte("partial"), nil); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root, localRoot: root, snapshotGraph: graph, snapshotData: data}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	stats := graph.Stats()
+	if stats.Snapshots != 0 || stats.Objects != 0 || stats.Roots != 0 || stats.Pins != 0 || stats.Reclaiming != 0 {
+		t.Fatalf("graph after reconciliation = %+v, want empty", stats)
+	}
+	if got := graph.JournalBytes(); got > 1024 {
+		t.Fatalf("compacted journal has %d bytes, want at most 1024", got)
 	}
 }

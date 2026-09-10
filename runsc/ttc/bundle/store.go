@@ -2737,6 +2737,13 @@ func (s Store) ListContainers() ([]ContainerInfo, error) {
 	return s.listContainersWithPolicy(false, true)
 }
 
+// ListContainersForGC returns every durable container, including internal
+// removal tombstones, and fails rather than treating an unreadable record as
+// unreachable. Destructive graph reconciliation must use this view.
+func (s Store) ListContainersForGC() ([]ContainerInfo, error) {
+	return s.listContainers(true)
+}
+
 func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 	return s.listContainersWithPolicy(includeHidden, false)
 }

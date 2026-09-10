@@ -3258,7 +3258,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	maintenanceDone := make(chan struct{})
 	defer close(maintenanceDone)
-	go maintainRepositories(dataRoot, localRoot, publicationQueue, stderr, maintenanceDone, func() func() {
+	go maintainRepositories(dataRoot, localRoot, publicationQueue, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
 	})
 	clusterDone := make(chan struct{})
@@ -3587,7 +3587,7 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	return err
 }
 
-func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	for {
@@ -3612,6 +3612,12 @@ func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Q
 		}
 		if err := collectColdStorage(dataRoot, localRoot, publications); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
+		}
+		if standalone {
+			backend := &runtimeBackend{dataRoot: dataRoot, localRoot: localRoot, snapshotGraph: snapshotGraph, snapshotData: snapshotData}
+			if err := backend.reconcileStandaloneMemoryGraph(); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
+			}
 		}
 		unlock()
 		timer.Reset(repositoryMaintenanceInterval)
@@ -4403,6 +4409,12 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	// and target metadata ownership. Reconcile only after runtime/container
 	// state has been refreshed, and fail conservatively inside the helper.
 	_ = backend.reconcileClusterSparseMemoryRoots()
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		quarantineReconciled = false
+		if backend.stderr != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
+		}
+	}
 	_ = backend.reconcilePlacementCatalog()
 	if quarantineReconciled {
 		s.reconciled[key] = true

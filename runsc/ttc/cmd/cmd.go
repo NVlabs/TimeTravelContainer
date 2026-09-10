@@ -10598,6 +10598,91 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	return err
 }
 
+const snapshotGraphJournalCompactBytes = 8 << 20
+
+// reconcileStandaloneMemoryGraph makes durable branch records the sole root
+// directory for standalone memory. It runs only while the daemon's mutation
+// lock excludes capture/fork/removal, so every construction pin is necessarily
+// crash residue. Cluster graphs require their origin-owned ledger instead.
+func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
+	if b == nil || b.nodeID != "" || b.snapshotGraph == nil || b.snapshotData == nil {
+		return nil
+	}
+	containers, err := b.containerStore().ListContainersForGC()
+	if err != nil {
+		return fmt.Errorf("listing authoritative memory roots: %w", err)
+	}
+	liveRoots := make(map[string]struct{})
+	retainedSnapshots := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, container := range containers {
+		for _, branch := range container.Branches {
+			if branch.SnapshotID != 0 {
+				retainedSnapshots[ttcsnapshot.SnapshotID(branch.SnapshotID)] = struct{}{}
+			}
+			for _, name := range branch.MemoryRoots {
+				liveRoots[name] = struct{}{}
+				if _, ok := b.snapshotGraph.Root(name); !ok {
+					return fmt.Errorf("branch %s@%s references missing memory root %q", container.Name, branch.ID, name)
+				}
+			}
+		}
+	}
+	inspection := b.snapshotGraph.Inspect()
+	var orphanRoots []string
+	for name := range inspection.Roots {
+		if strings.HasPrefix(name, "memory/") {
+			if _, live := liveRoots[name]; !live {
+				orphanRoots = append(orphanRoots, name)
+			}
+		}
+	}
+	sort.Strings(orphanRoots)
+	if err := b.snapshotGraph.ReleaseRoots(orphanRoots); err != nil {
+		return fmt.Errorf("releasing orphan memory roots: %w", err)
+	}
+	var orphanPins []string
+	for name := range inspection.Pins {
+		if strings.HasPrefix(name, "memory/") {
+			orphanPins = append(orphanPins, name)
+		}
+	}
+	sort.Strings(orphanPins)
+	if err := b.snapshotGraph.DeletePins(orphanPins); err != nil {
+		return fmt.Errorf("releasing orphan memory construction pins: %w", err)
+	}
+	collectedTotal := 0
+	for {
+		collected, err := b.snapshotGraph.Collect(4096)
+		if err != nil {
+			return err
+		}
+		collectedTotal += collected
+		if collected == 0 {
+			break
+		}
+	}
+	retained := make([]ttcsnapshot.SnapshotID, 0, len(retainedSnapshots))
+	for id := range retainedSnapshots {
+		retained = append(retained, id)
+	}
+	sort.Slice(retained, func(i, j int) bool { return retained[i] < retained[j] })
+	emptySnapshots, err := b.snapshotGraph.CollectEmptySnapshots(retained)
+	if err != nil {
+		return err
+	}
+	reclaimedObjects, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
+	if err != nil {
+		return err
+	}
+	changed := len(orphanRoots) != 0 || len(orphanPins) != 0 || collectedTotal != 0 || emptySnapshots != 0 || reclaimedObjects != 0
+	if changed || b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting standalone memory graph: %w", err)
+		}
+	}
+	return b.snapshotGraph.Verify()
+}
+
 // discard releases one branch's process/kernel/dehydration state while
 // retaining its persistent filesystem, logs, identity, and peer branches.
 func (b *runtimeBackend) discard(target selector) error {
@@ -10771,6 +10856,8 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	var graphMemoryRoots []string
 	var graphMemorySnapshot uint64
 	graphMemoryRecorded := false
+	previousGraphMemorySnapshot := persistentBranch.SnapshotID
+	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
 	defer func() {
 		if dehydrated {
 			return
@@ -10800,7 +10887,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			}
 		}
 		if graphMemoryRecorded {
-			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil)
+			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots)
 		}
 		if len(graphMemoryRoots) != 0 {
 			if graphErr := b.releaseGraphMemoryRoots(graphMemoryRoots); graphErr != nil && b.stderr != nil {
@@ -11023,6 +11110,14 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	}
 	dehydrated = true
 	graphMemoryRoots = nil
+	if graphMemorySnapshot != 0 && len(previousGraphMemoryRoots) != 0 {
+		if err := b.releaseGraphMemoryRoots(previousGraphMemoryRoots); err != nil && b.stderr != nil {
+			// The new roots are already authoritative. Retaining the superseded
+			// roots is a safe leak that standalone graph reconciliation retries;
+			// it must not turn a successful dehydration into an ambiguous failure.
+			fmt.Fprintf(b.stderr, "ttc: warning: reclaiming superseded memory roots for %s: %v\n", target, err)
+		}
+	}
 	if b.dataRoot != "" {
 		activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
 		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
