@@ -9,6 +9,7 @@ go_library(
     name = "ttcsnapshot",
     srcs = [
         "btree.go",
+		"catalog.go",
         "data.go",
         "filesystem.go",
 		"hosttree.go",
@@ -26,6 +27,7 @@ go_test(
     name = "ttcsnapshot_test",
     size = "small",
     srcs = [
+		"catalog_test.go",
 		"hosttree_test.go",
 		"pack_test.go",
         "resolver_test.go",

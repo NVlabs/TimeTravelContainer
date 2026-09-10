@@ -320,7 +320,7 @@ func GraphChunkObjects(manifest Manifest) (map[ID]ttcsnapshot.ObjectID, error) {
 // BuildGraphManifest enumerates graph roots for rehydration. Enumeration is
 // intentionally an O(mapped pages) rehydrate operation; fork and lookup share
 // roots directly and never call it.
-func BuildGraphManifest(graph *ttcsnapshot.Store, roots []GraphMemoryRoot) (GraphManifestResult, error) {
+func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot) (GraphManifestResult, error) {
 	if graph == nil || len(roots) == 0 {
 		return GraphManifestResult{}, errors.New("memory graph roots are unavailable")
 	}

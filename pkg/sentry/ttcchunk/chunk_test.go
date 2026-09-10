@@ -243,6 +243,21 @@ func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
 	if adapted.Manifest.Runs[0].Object != adapted.Manifest.Runs[1].Object || adapted.Manifest.Runs[0].FirstPage != adapted.Manifest.Runs[1].FirstPage {
 		t.Fatalf("graph manifest lost aliasing: %+v", adapted.Manifest.Runs)
 	}
+	objects, err := graph.SnapshotObjects(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := ttcsnapshot.NewImmutableCatalog(objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromCatalog, err := BuildGraphManifest(catalog, imported.Roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fromCatalog, adapted) {
+		t.Fatalf("immutable-catalog manifest=%+v, want %+v", fromCatalog, adapted)
+	}
 	reader, err := NewGraphChunkReader(data, adapted.Chunks, []InstalledChunk{{
 		Object: adapted.Manifest.Runs[0].Object,
 		Target: memmap.FileRange{End: pgalloc.SparseChunkBytes},
