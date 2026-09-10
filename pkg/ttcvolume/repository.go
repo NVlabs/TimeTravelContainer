@@ -517,7 +517,14 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		repo.Close()
 		return nil, fmt.Errorf("opening donated repository snapshot graph: %w", err)
 	}
-	repo.data, err = ttcsnapshot.OpenLocalDataStore(fmt.Sprintf("/proc/self/fd/%d/data", repo.dir.Fd()))
+	dataFD, openErr := unix.Openat(int(repo.dir.Fd()), "data", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if openErr != nil {
+		repo.Close()
+		return nil, fmt.Errorf("opening donated repository data directory: %w", openErr)
+	}
+	dataDirectory := os.NewFile(uintptr(dataFD), "ttc-volume-data")
+	repo.data, err = ttcsnapshot.OpenLocalDataStoreFD(dataDirectory)
+	_ = dataDirectory.Close()
 	if err != nil {
 		repo.Close()
 		return nil, fmt.Errorf("opening donated repository data store: %w", err)
@@ -2544,7 +2551,7 @@ func (r *Repository) createObject(origin uint64, source string) (string, error) 
 			return "", fmt.Errorf("source object %q is absent from snapshot graph", source)
 		}
 		length = int64(object.BulkLength)
-		if err := r.data.Clone(sourceID, id); err != nil {
+		if err := r.data.Clone(sourceID, id, r.copyMode == CopyModeReflink); err != nil {
 			return "", fmt.Errorf("privatizing volume object %q: %w", source, err)
 		}
 	}

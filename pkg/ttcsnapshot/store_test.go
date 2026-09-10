@@ -875,7 +875,7 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := data.Clone(source, clone); err != nil {
+	if err := data.Clone(source, clone, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := graph.CommitReservedObject(clone, "build/clone", uint64(len(contents)), nil, nil); err != nil {

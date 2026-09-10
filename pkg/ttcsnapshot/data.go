@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -46,9 +47,9 @@ func OpenLocalDataStore(root string) (*LocalDataStore, error) {
 	return &LocalDataStore{root: root}, nil
 }
 
-// OpenLocalDataStoreFD opens a donated, read-only bulk-object directory. It is
-// used by an isolated Sentry for graph-native demand paging without granting
-// it a host pathname or one descriptor per memory chunk.
+// OpenLocalDataStoreFD opens a donated bulk-object directory. All access stays
+// descriptor-relative so an isolated Sentry can read and create graph objects
+// without receiving a host pathname or one descriptor per object.
 func OpenLocalDataStoreFD(directory *os.File) (*LocalDataStore, error) {
 	if directory == nil {
 		return nil, errors.New("TTC bulk-object directory descriptor is nil")
@@ -58,6 +59,40 @@ func OpenLocalDataStoreFD(directory *os.File) (*LocalDataStore, error) {
 		return nil, err
 	}
 	return &LocalDataStore{rootFD: os.NewFile(uintptr(fd), "ttc-graph-objects")}, nil
+}
+
+var dataTemporarySequence atomic.Uint64
+
+const wholeFileCopyBufferSize = 1 << 20
+
+// copyWholeFile deliberately uses Read and Write instead of io.Copy. The
+// latter selects copy_file_range for two *os.File values, which would require
+// broadening the isolated Sentry's host syscall policy for an operation that
+// is needed only when reflinks are unavailable.
+func copyWholeFile(destination, source *os.File) error {
+	buffer := make([]byte, wholeFileCopyBufferSize)
+	for {
+		read, readErr := source.Read(buffer)
+		if read > 0 {
+			written := 0
+			for written < read {
+				n, writeErr := destination.Write(buffer[written:read])
+				if writeErr != nil {
+					return writeErr
+				}
+				if n == 0 {
+					return io.ErrShortWrite
+				}
+				written += n
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
 
 // Close releases a donated directory. Path-opened stores own no persistent
@@ -93,6 +128,59 @@ func (store *LocalDataStore) objectPath(id ObjectID) (string, error) {
 		return "", err
 	}
 	return filepath.Join(store.root, relative), nil
+}
+
+func (store *LocalDataStore) mkdirAllRelative(relative string) error {
+	if store.rootFD == nil {
+		return errors.New("TTC bulk-object store has no directory descriptor")
+	}
+	current := ""
+	for _, component := range strings.Split(filepath.Clean(relative), string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." {
+			return fmt.Errorf("invalid TTC bulk-object directory %q", relative)
+		}
+		if current == "" {
+			current = component
+		} else {
+			current = filepath.Join(current, component)
+		}
+		if err := unix.Mkdirat(int(store.rootFD.Fd()), current, 0700); err != nil && !errors.Is(err, unix.EEXIST) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *LocalDataStore) openRelative(relative string, flags int, mode uint32) (*os.File, error) {
+	if store.rootFD == nil {
+		return nil, errors.New("TTC bulk-object store has no directory descriptor")
+	}
+	fd, err := unix.Openat(int(store.rootFD.Fd()), relative, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW, mode)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), relative), nil
+}
+
+func (store *LocalDataStore) syncRelativeDirectory(relative string) error {
+	directory, err := store.openRelative(relative, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+func (store *LocalDataStore) createRelativeTemporary(directory, prefix string) (*os.File, string, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		name := filepath.Join(directory, fmt.Sprintf("%s%016x", prefix, dataTemporarySequence.Add(1)))
+		file, err := store.openRelative(name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0600)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		return file, name, err
+	}
+	return nil, "", errors.New("allocating temporary TTC bulk-object file")
 }
 
 func objectRelativePath(id ObjectID) (string, error) {
@@ -149,6 +237,48 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
+	relative, err := objectRelativePath(id)
+	if err != nil {
+		return err
+	}
+	if store.rootFD != nil {
+		directory := filepath.Dir(relative)
+		if err := store.mkdirAllRelative(directory); err != nil {
+			return err
+		}
+		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".object-")
+		if err != nil {
+			return err
+		}
+		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
+		written, err := io.CopyN(temporary, source, length)
+		if err != nil {
+			temporary.Close()
+			return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
+		}
+		if err := temporary.Sync(); err != nil {
+			temporary.Close()
+			return err
+		}
+		if err := temporary.Close(); err != nil {
+			return err
+		}
+		if err := unix.Linkat(int(store.rootFD.Fd()), temporaryName, int(store.rootFD.Fd()), relative, 0); err != nil {
+			if !errors.Is(err, unix.EEXIST) {
+				return err
+			}
+			existing, openErr := store.openRelative(relative, unix.O_RDONLY, 0)
+			if openErr != nil {
+				return openErr
+			}
+			info, statErr := existing.Stat()
+			closeErr := existing.Close()
+			if statErr != nil || closeErr != nil || info.Size() != length {
+				return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
+			}
+		}
+		return store.syncRelativeDirectory(directory)
+	}
 	destination, err := store.objectPath(id)
 	if err != nil {
 		return err
@@ -170,9 +300,77 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 	return installTemporary(temporary, temporaryPath, destination, length)
 }
 
-// Clone installs destination from a complete source object. It first attempts
-// FICLONE and transparently uses a whole-file copy when unavailable.
-func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID) error {
+// Clone installs destination from a complete source object. If tryReflink is
+// true, it first attempts FICLONE and transparently uses a whole-file copy when
+// unavailable. Callers should pass false after probing a filesystem that does
+// not support reflinks, avoiding a failing ioctl for every privatized file.
+func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink bool) error {
+	if store.rootFD != nil {
+		source, err := store.Open(sourceID, -1)
+		if err != nil {
+			return err
+		}
+		defer source.Close()
+		info, err := source.Stat()
+		if err != nil {
+			return err
+		}
+		relative, err := objectRelativePath(destinationID)
+		if err != nil {
+			return err
+		}
+		directory := filepath.Dir(relative)
+		if err := store.mkdirAllRelative(directory); err != nil {
+			return err
+		}
+		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".clone-")
+		if err != nil {
+			return err
+		}
+		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
+		var cloneErr error
+		if tryReflink {
+			cloneErr = unix.IoctlFileClone(int(temporary.Fd()), int(source.Fd()))
+		} else {
+			cloneErr = unix.EOPNOTSUPP
+		}
+		if cloneErr != nil {
+			if err := temporary.Truncate(0); err != nil {
+				temporary.Close()
+				return err
+			}
+			if _, err := source.Seek(0, io.SeekStart); err != nil {
+				temporary.Close()
+				return err
+			}
+			if err := copyWholeFile(temporary, source); err != nil {
+				temporary.Close()
+				return err
+			}
+		}
+		if err := temporary.Sync(); err != nil {
+			temporary.Close()
+			return err
+		}
+		if err := temporary.Close(); err != nil {
+			return err
+		}
+		if err := unix.Linkat(int(store.rootFD.Fd()), temporaryName, int(store.rootFD.Fd()), relative, 0); err != nil {
+			if !errors.Is(err, unix.EEXIST) {
+				return err
+			}
+			existing, openErr := store.openRelative(relative, unix.O_RDONLY, 0)
+			if openErr != nil {
+				return openErr
+			}
+			existingInfo, statErr := existing.Stat()
+			closeErr := existing.Close()
+			if statErr != nil || closeErr != nil || existingInfo.Size() != info.Size() {
+				return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
+			}
+		}
+		return store.syncRelativeDirectory(directory)
+	}
 	sourcePath, err := store.objectPath(sourceID)
 	if err != nil {
 		return err
@@ -199,7 +397,13 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID) error {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err := unix.IoctlFileClone(int(temporary.Fd()), int(source.Fd())); err != nil {
+	var cloneErr error
+	if tryReflink {
+		cloneErr = unix.IoctlFileClone(int(temporary.Fd()), int(source.Fd()))
+	} else {
+		cloneErr = unix.EOPNOTSUPP
+	}
+	if cloneErr != nil {
 		if err := temporary.Truncate(0); err != nil {
 			temporary.Close()
 			return err
@@ -208,7 +412,7 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID) error {
 			temporary.Close()
 			return err
 		}
-		if _, err := io.Copy(temporary, source); err != nil {
+		if err := copyWholeFile(temporary, source); err != nil {
 			temporary.Close()
 			return err
 		}
@@ -218,6 +422,12 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID) error {
 
 // Open returns a read-only complete object after verifying its exact length.
 func (store *LocalDataStore) Open(id ObjectID, length int64) (*os.File, error) {
+	return store.OpenFile(id, unix.O_RDONLY, length)
+}
+
+// OpenFile opens a complete bulk object using descriptor-relative access when
+// the store was donated to an isolated Sentry.
+func (store *LocalDataStore) OpenFile(id ObjectID, flags int, length int64) (*os.File, error) {
 	var file *os.File
 	var err error
 	if store.rootFD != nil {
@@ -225,17 +435,13 @@ func (store *LocalDataStore) Open(id ObjectID, length int64) (*os.File, error) {
 		if pathErr != nil {
 			return nil, pathErr
 		}
-		fd, openErr := unix.Openat(int(store.rootFD.Fd()), relative, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-		if openErr != nil {
-			return nil, openErr
-		}
-		file = os.NewFile(uintptr(fd), id.String())
+		file, err = store.openRelative(relative, flags, 0)
 	} else {
 		path, pathErr := store.objectPath(id)
 		if pathErr != nil {
 			return nil, pathErr
 		}
-		file, err = os.Open(path)
+		file, err = os.OpenFile(path, flags, 0)
 	}
 	if err != nil {
 		return nil, err
@@ -273,6 +479,16 @@ func (store *LocalDataStore) Fetch(_ context.Context, id ObjectID) (io.ReadClose
 
 // Remove deletes an object whose authoritative graph record was reclaimed.
 func (store *LocalDataStore) Remove(id ObjectID) error {
+	if store.rootFD != nil {
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(int(store.rootFD.Fd()), relative, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			return err
+		}
+		return nil
+	}
 	path, err := store.objectPath(id)
 	if err != nil {
 		return err

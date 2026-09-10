@@ -550,9 +550,5 @@ func (r *Repository) openObject(id string, flags int) (*os.File, error) {
 	if err != nil || parsed.Kind != ttcsnapshot.ObjectKindFile {
 		return nil, fmt.Errorf("invalid whole-file object ID %q", id)
 	}
-	path, err := r.data.Path(parsed)
-	if err != nil {
-		return nil, err
-	}
-	return os.OpenFile(path, flags, 0)
+	return r.data.OpenFile(parsed, flags, -1)
 }
