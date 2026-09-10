@@ -10116,8 +10116,8 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
-		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", StorageManifest: sourceBranch.StorageManifest, SnapshotID: sourceBranch.SnapshotID, CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
+		childDir := memoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
 		graphRoots, err := b.cloneGraphMemoryRoots(sourceBranch.MemoryRoots, sourceBranch.MemoryRootObjects, sourceBranch.SnapshotID, filesystemBranch)
 		if err != nil {

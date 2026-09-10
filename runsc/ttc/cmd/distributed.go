@@ -906,8 +906,8 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err := json.Unmarshal(controlData, &capture); err != nil {
 		return selector{}, fmt.Errorf("decoding dehydrated source control state: %w", err)
 	}
-	if capture.FilesystemBranch == "" || capture.SparseManifest == (ttcchunk.ManifestID{}) {
-		return selector{}, errors.New("dehydrated source has no sparse memory root")
+	if capture.FilesystemBranch == "" || capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
+		return selector{}, errors.New("dehydrated source has no graph-native memory roots")
 	}
 	encodedMetadata, err := os.ReadFile(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
@@ -919,35 +919,27 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		return selector{}, fmt.Errorf("publishing distributed metadata: %w", err)
 	}
 	defer os.Remove(metadataPath)
+	graphRestore, err := b.openGraphMemoryRestore(capture)
+	if err != nil {
+		return selector{}, fmt.Errorf("opening dehydrated graph memory: %w", err)
+	}
+	graphManifest, err := io.ReadAll(graphRestore.manifest)
+	graphRestore.close()
+	if err != nil {
+		return selector{}, fmt.Errorf("reading dehydrated graph manifest: %w", err)
+	}
+	decodedGraphManifest, err := ttcchunk.DecodeManifest(graphManifest, nil)
+	if err != nil {
+		return selector{}, fmt.Errorf("decoding dehydrated graph manifest: %w", err)
+	}
+	graphManifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
+	graphManifestPath := filepath.Join(b.dataRoot, graphManifestRelative)
+	if err := writeDurableDistributedFile(graphManifestPath, graphManifest); err != nil {
+		return selector{}, fmt.Errorf("publishing distributed graph manifest: %w", err)
+	}
+	defer os.Remove(graphManifestPath)
 
-	clusterRepositoryRelative := filepath.Join("cluster", "memory-chunks")
-	clusterRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, clusterRepositoryRelative))
-	if err != nil {
-		return selector{}, fmt.Errorf("opening cluster memory repository: %w", err)
-	}
-	defer clusterRepository.Close()
-	sourceRepository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", sourceInfo.ID, "memory", "chunks"))
-	if err != nil {
-		return selector{}, fmt.Errorf("opening dehydrated source memory repository: %w", err)
-	}
-	if _, err := clusterRepository.ImportManifest(sourceRepository, capture.SparseManifest); err != nil {
-		sourceRepository.Close()
-		return selector{}, fmt.Errorf("importing dehydrated source memory: %w", err)
-	}
-	if err := sourceRepository.Close(); err != nil {
-		return selector{}, err
-	}
 	childFilesystemBranch := ttcvolume.ScopedBranchID(sourceInfo.ID, transactionID)
-	if err := clusterRepository.SetBranch(childFilesystemBranch, capture.SparseManifest); err != nil {
-		return selector{}, fmt.Errorf("rooting remote sparse memory: %w", err)
-	}
-	sparseRootCommitted := false
-	defer func() {
-		if !sparseRootCommitted {
-			_ = clusterRepository.DeleteBranch(childFilesystemBranch)
-			_, _ = clusterRepository.CollectGarbage(ttcchunk.GCOptions{})
-		}
-	}()
 
 	filesystemForks, err := b.forkDehydratedDistributedFilesystems(sourceInfo.ID, capture.FilesystemBranch, childFilesystemBranch)
 	if err != nil {
@@ -1004,20 +996,15 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
 	}
-	manifest, err := clusterRepository.LoadManifest(capture.SparseManifest)
-	if err != nil {
-		return selector{}, err
-	}
 	var streamBytes uint64
-	for _, run := range manifest.Runs {
+	for _, run := range decodedGraphManifest.Runs {
 		streamBytes += uint64(run.Pages) * 4096
 	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: advertise, SnapshotToken: hex.EncodeToString(filesystemToken[:]),
 		MetadataBytes: uint64(len(encodedMetadata)), StreamBytes: streamBytes,
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
-		SharedMetadata:   metadataRelative, SparseRepository: clusterRepositoryRelative,
-		SparseManifest: capture.SparseManifest.String(), SparseBranch: childFilesystemBranch,
+		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
 		DurableDehydration: true, FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
@@ -1032,7 +1019,6 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		}
 		tx = status
 	}
-	sparseRootCommitted = true
 	committed = true
 	relayOwned = false
 	go b.completeDehydratedFilesystemTransfer(peer, transactionID, tx.Revision, sourceInfo.ID, childFilesystemBranch, relay)

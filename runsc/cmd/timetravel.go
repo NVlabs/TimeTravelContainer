@@ -487,6 +487,30 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
 			defer repository.Close()
 		}
+		if restoreArgs.GraphSparse {
+			if t.dehydrationGraphManifestFD < 0 || t.dehydrationMemoryRepositoryFD < 0 || restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
+				util.Fatalf("graph distributed restore requires a graph manifest and object directory")
+			}
+			manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "distributed-graph-memory-manifest")
+			objects := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-graph-object-directory")
+			if manifest == nil || objects == nil {
+				util.Fatalf("invalid inherited distributed graph descriptors")
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, manifest, objects)
+			defer manifest.Close()
+			defer objects.Close()
+			if restoreArgs.GraphRemote {
+				if t.dehydrationMemoryRemoteFD < 0 {
+					util.Fatalf("graph distributed restore requires an object relay")
+				}
+				remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "distributed-graph-object-relay")
+				if remote == nil {
+					util.Fatalf("invalid inherited distributed graph relay")
+				}
+				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, remote)
+				defer remote.Close()
+			}
+		}
 		if t.distributedConnectionsCount < 0 || (t.distributedConnectionsCount != 0 && t.distributedConnectionsStartFD < 0) {
 			util.Fatalf("invalid inherited distributed connection range")
 		}

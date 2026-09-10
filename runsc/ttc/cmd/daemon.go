@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -415,6 +416,11 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		SharedSnapshot:        session.SharedSnapshot != "",
 		SharedMetadata:        session.SharedMetadata != "",
 		DurableDehydration:    session.DurableDehydration,
+		GraphSparse:           session.GraphManifest != "",
+	}
+	restoreArgs.FilesystemRestoreIDs, err = r.backend.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return fmt.Errorf("resolving distributed filesystem identities: %w", err)
 	}
 	if session.SparseManifest != "" {
 		manifest, err := ttcchunk.ParseManifestID(session.SparseManifest)
@@ -425,6 +431,12 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.SparseBranch = session.SparseBranch
 		if err := r.backend.containerStore().UpdateDistributedForkSparseRoot(tx.Identity.TransactionID, session.SparseRepository, session.SparseBranch); err != nil {
 			return fmt.Errorf("recording distributed sparse memory root: %w", err)
+		}
+	}
+	if restoreArgs.GraphSparse {
+		restoreArgs.GraphRemote = true
+		if _, err := rand.Read(restoreArgs.GraphRemoteToken[:]); err != nil {
+			return fmt.Errorf("generating graph restore token: %w", err)
 		}
 	}
 	switch tx.Negotiated.PagingPolicy.Prefetch {
@@ -465,12 +477,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			}
 			defer cleanup()
 		}
-		status, err := r.backend.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
+		var diagnostic bytes.Buffer
+		commandBackend := *r.backend
+		commandBackend.stderr = &diagnostic
+		status, err := commandBackend.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
 		if err != nil {
 			return fmt.Errorf("creating distributed target runtime: %w", err)
 		}
 		if status != 0 {
-			return fmt.Errorf("creating distributed target runtime exited with status %d", status)
+			return fmt.Errorf("creating distributed target runtime exited with status %d: %s", status, strings.TrimSpace(diagnostic.String()))
 		}
 		runtimeState.Status = "created"
 		runtimeCreated = true
@@ -503,7 +518,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if !restoreArgs.SharedMetadata {
 			connectionCount++
 		}
-		if !restoreArgs.SharedSnapshot && restoreArgs.SparseManifest == (ttcchunk.ManifestID{}) {
+		if !restoreArgs.SharedSnapshot && restoreArgs.SparseManifest == (ttcchunk.ManifestID{}) && !restoreArgs.GraphSparse {
 			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
 			if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
 				connectionCount++
@@ -565,6 +580,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		var sharedMetadata *os.File
 		var sharedSnapshot *os.File
 		var sparseRepository *os.File
+		var graphRestore *graphMemoryRestore
 		var durableTargets []*os.File
 		durableActiveDir := ""
 		keepDurableTargets := false
@@ -616,6 +632,30 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 				return fmt.Errorf("shared distributed memory snapshot size is %d, want %d", stat.Size(), session.StreamBytes)
 			}
 			files = append(files, sharedSnapshot)
+			connectionsStartFD++
+		}
+		if restoreArgs.GraphSparse {
+			graphPath := filepath.Join(r.backend.dataRoot, session.GraphManifest)
+			graphManifest, openErr := os.Open(graphPath)
+			if openErr != nil {
+				reader.Close()
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				return fmt.Errorf("opening shared graph memory manifest: %w", openErr)
+			}
+			graphRestore, err = r.backend.openDistributedGraphRestore(graphManifest, tx.Identity.TransactionID, restoreArgs.GraphRemoteToken)
+			if err != nil {
+				graphManifest.Close()
+				reader.Close()
+				for _, file := range connectionFiles {
+					file.Close()
+				}
+				return fmt.Errorf("preparing graph memory resolver: %w", err)
+			}
+			files = append(files, graphRestore.manifest, graphRestore.objects)
+			connectionsStartFD += 2
+			files = append(files, graphRestore.remote)
 			connectionsStartFD++
 		}
 		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
@@ -671,6 +711,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
 			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd="+strconv.Itoa(connectionsStartFD-1))
 		}
+		if restoreArgs.GraphSparse {
+			graphStartFD := 5
+			commandArgs = append(commandArgs,
+				"--dehydration-graph-manifest-fd="+strconv.Itoa(graphStartFD),
+				"--dehydration-memory-repository-fd="+strconv.Itoa(graphStartFD+1))
+			if restoreArgs.GraphRemote {
+				commandArgs = append(commandArgs, "--dehydration-memory-remote-fd="+strconv.Itoa(graphStartFD+2))
+			}
+		}
 		commandArgs = append(commandArgs,
 			"--distributed-connections-start-fd="+strconv.Itoa(connectionsStartFD), "--distributed-connections-count="+strconv.Itoa(len(connectionFiles)),
 			info.ID, "distributed-restore", tx.Identity.TransactionID)
@@ -685,6 +734,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if sparseRepository != nil {
 			sparseRepository.Close()
 		}
+		if graphRestore != nil {
+			graphRestore.close()
+		}
 		for _, file := range connectionFiles {
 			file.Close()
 		}
@@ -693,12 +745,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		keepDurableTargets = true
 		if runtimeCreated {
-			status, err := r.backend.runConfiguredCommandWithArgs(configured, "start", info.ID)
+			var diagnostic bytes.Buffer
+			commandBackend := *r.backend
+			commandBackend.stderr = &diagnostic
+			status, err := commandBackend.runConfiguredCommandWithArgs(configured, "start", info.ID)
 			if err != nil {
 				return fmt.Errorf("starting paused distributed target: %w", err)
 			}
 			if status != 0 {
-				return fmt.Errorf("starting paused distributed target exited with status %d", status)
+				return fmt.Errorf("starting paused distributed target exited with status %d: %s", status, strings.TrimSpace(diagnostic.String()))
 			}
 		}
 		if err := r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {

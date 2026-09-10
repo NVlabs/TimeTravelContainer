@@ -163,6 +163,34 @@ func TestRemoteSessionDescriptorSharedMetadata(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := RemoteSessionDescriptor{
+		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
+		SharedMetadata: "cluster/memory-metadata/tx.state",
+		GraphManifest:  "cluster/memory-manifests/tx.manifest", DurableDehydration: true,
+	}
+	if err := base.validate(negotiated); err != nil {
+		t.Fatalf("valid graph metadata descriptor: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.GraphManifest = "../manifest" },
+		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
+		func(d *RemoteSessionDescriptor) { d.DurableDehydration = false },
+		func(d *RemoteSessionDescriptor) { d.SparseRepository = "cluster/chunks" },
+		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
+	} {
+		invalid := base
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted invalid graph descriptor: %+v", invalid)
+		}
+	}
+}
+
 func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {

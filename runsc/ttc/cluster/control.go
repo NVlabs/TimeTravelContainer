@@ -136,6 +136,11 @@ type RemoteSessionDescriptor struct {
 	SparseRepository string `json:"sparse_repository,omitempty"`
 	SparseManifest   string `json:"sparse_manifest,omitempty"`
 	SparseBranch     string `json:"sparse_branch,omitempty"`
+	// GraphManifest is a clean shared-root-relative path containing the
+	// ephemeral dense restore view derived from immutable snapshot-graph roots.
+	// Bulk objects remain in their authoritative provider or shared pack and
+	// are populated into the target cache only when faulted.
+	GraphManifest string `json:"graph_manifest,omitempty"`
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
@@ -191,6 +196,18 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return fmt.Errorf("invalid shared memory snapshot path %q", s.SharedSnapshot)
 		}
 	}
+	if s.GraphManifest != "" {
+		clean := filepath.Clean(s.GraphManifest)
+		if filepath.IsAbs(s.GraphManifest) || clean != s.GraphManifest || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("invalid graph memory manifest path %q", s.GraphManifest)
+		}
+		if s.SharedMetadata == "" || !s.DurableDehydration {
+			return errors.New("graph memory restore requires durable shared metadata")
+		}
+		if s.SharedSnapshot != "" || s.SparseRepository != "" {
+			return errors.New("graph, packed, and legacy sparse snapshots are mutually exclusive")
+		}
+	}
 	if (s.SparseRepository == "") != (s.SparseManifest == "") ||
 		(s.SparseRepository == "") != (s.SparseBranch == "") {
 		return errors.New("sparse repository, manifest, and branch must be specified together")
@@ -214,8 +231,8 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return fmt.Errorf("invalid sparse memory branch %q", s.SparseBranch)
 		}
 	}
-	if s.SharedMetadata != "" && s.SparseRepository == "" {
-		return errors.New("shared distributed metadata requires a sparse memory repository")
+	if s.SharedMetadata != "" && s.SparseRepository == "" && s.GraphManifest == "" {
+		return errors.New("shared distributed metadata requires a graph or legacy sparse memory repository")
 	}
 	if s.DurableDehydration && s.SharedMetadata == "" {
 		return errors.New("durable dehydration restore requires shared metadata")

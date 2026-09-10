@@ -1082,9 +1082,18 @@ func (b *runtimeBackend) filesystemRestoreIDs(container string) (map[string]stri
 	}
 	ids := make(map[string]string)
 	for _, repository := range repositories {
-		if repository.RestoreID != "" {
-			ids[repository.Source] = repository.RestoreID
+		if repository.RestoreID == "" {
+			continue
 		}
+		opened, err := ttcvolume.OpenRepository(repository.Path, ttcvolume.CopyMode(repository.CopyMode))
+		if err != nil {
+			return nil, fmt.Errorf("opening active repository %q: %w", repository.Source, err)
+		}
+		current := opened.Info().ID
+		if err := opened.Close(); err != nil {
+			return nil, fmt.Errorf("closing active repository %q: %w", repository.Source, err)
+		}
+		ids[current] = repository.RestoreID
 	}
 	return ids, nil
 }

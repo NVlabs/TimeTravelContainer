@@ -23,11 +23,76 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"syscall"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
+
+// openDistributedGraphRestore turns an immutable graph manifest into the
+// descriptors consumed by the Sentry. The local object directory is always
+// donated. A transaction-fenced resolver stream resolves cache misses without
+// making the Sentry aware of provider placement or shared storage.
+func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, transaction string, token ttcsnapshot.ObjectRelayToken) (*graphMemoryRestore, error) {
+	if b == nil || manifest == nil || b.snapshotData == nil {
+		return nil, errors.New("distributed graph restore is unavailable")
+	}
+	encoded, err := io.ReadAll(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := manifest.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	decoded, err := ttcchunk.DecodeManifest(encoded, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decoding distributed graph manifest: %w", err)
+	}
+	chunks, err := ttcchunk.GraphChunkObjects(decoded)
+	if err != nil {
+		return nil, err
+	}
+	objects, err := os.Open(filepath.Join(b.activeDataRoot(), "objects"))
+	if err != nil {
+		return nil, err
+	}
+	restore := &graphMemoryRestore{manifest: manifest, objects: objects}
+	available := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
+	for _, id := range chunks {
+		available[id] = ttcsnapshot.Object{ID: id, State: ttcsnapshot.ObjectLive, BulkLength: ttcsnapshot.MemoryChunkBytes}
+	}
+	if b.distributedSource == nil || b.distributedSource.authority == nil || b.snapshotShared == nil || b.snapshotGraph == nil {
+		restore.close()
+		return nil, errors.New("distributed graph restore has missing objects and no resolver")
+	}
+	resolver, err := ttcsnapshot.NewResolver(b.snapshotGraph, b.snapshotData,
+		raftOriginLocator{authority: b.distributedSource.authority},
+		clusterPeerSources{runtime: b.distributedSource, transaction: transaction}, b.snapshotShared)
+	if err != nil {
+		restore.close()
+		return nil, err
+	}
+	restore.token = token
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		restore.close()
+		return nil, err
+	}
+	server := os.NewFile(uintptr(fds[0]), "ttc-distributed-graph-server")
+	restore.remote = os.NewFile(uintptr(fds[1]), "ttc-distributed-graph-client")
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(available))
+	for id := range available {
+		allowed[id] = ttcsnapshot.MemoryChunkBytes
+	}
+	go func() {
+		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: resolver, objects: available}, allowed)
+		b.reportColdRelayError("distributed graph memory", err)
+	}()
+	return restore, nil
+}
 
 type graphObjectProvider struct {
 	graph        *ttcsnapshot.Store
