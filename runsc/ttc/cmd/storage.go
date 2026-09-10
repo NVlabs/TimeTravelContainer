@@ -424,9 +424,18 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			if p.graph == nil || p.graphShared == nil || p.graphData == nil {
 				return false, errors.New("graph-native snapshot publication is unavailable")
 			}
-			record, ok := p.graph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
-			if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
+			record, ok := p.graph.Snapshot(snapshot)
+			if !ok || (record.State != ttcsnapshot.SnapshotSealedVolatile && record.State != ttcsnapshot.SnapshotShared) {
 				return false, nil
+			}
+			if record.State == ttcsnapshot.SnapshotShared {
+				if _, err := p.graphShared.Manifest(snapshot); err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return false, nil
+					}
+					return false, err
+				}
 			}
 		} else {
 			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(p.localRoot, "containers", info.ID, "memory", "chunks"))
@@ -519,6 +528,46 @@ func publicationMemoryControlPath(localRoot, capture string) string {
 	return filepath.Join(localRoot, "publication-captures", "memory-control", capture)
 }
 
+// releasePublishedProviderGraphRoots drops the temporary roots installed for
+// remote consumers once Raft routes the origin to its committed shared pack.
+// Branch-local roots remain untouched, and targets now resolve the immutable
+// data from shared storage, so the provider copy is cache rather than
+// authority after this boundary.
+func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, snapshot ttcsnapshot.SnapshotID) error {
+	if graph == nil || snapshot == 0 {
+		return nil
+	}
+	prefix := fmt.Sprintf("remote/%d/", snapshot)
+	bindings := make(map[string]ttcsnapshot.ObjectID)
+	for name, object := range graph.Inspect().Roots {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if object.Snapshot != snapshot {
+			return fmt.Errorf("provider root %q selects foreign object %s", name, object)
+		}
+		bindings[name] = object
+	}
+	if err := graph.ReleaseRetainedRoots(bindings); err != nil {
+		return err
+	}
+	for {
+		collected, err := graph.Collect(4096)
+		if err != nil {
+			return err
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if data != nil {
+		if _, _, err := data.ReclaimUnreferenced(graph); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // snapshotImmutableTree seals the small process/control portion of a
 // dehydration image independently of the user-visible local image. Regular
 // files are hard-linked within TTC_LOCAL_ROOT and copied only if the backing
@@ -600,6 +649,9 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			if p.graph != nil {
 				if err := p.graph.MarkShared(ttcsnapshot.SnapshotID(branch.SnapshotID)); err != nil {
 					return fmt.Errorf("marking snapshot origin %d shared: %w", branch.SnapshotID, err)
+				}
+				if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, ttcsnapshot.SnapshotID(branch.SnapshotID)); err != nil {
+					return fmt.Errorf("releasing volatile provider roots for snapshot origin %d: %w", branch.SnapshotID, err)
 				}
 			}
 		}

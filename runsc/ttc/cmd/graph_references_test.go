@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -36,6 +37,61 @@ func TestGraphReferenceOperationIsBranchScoped(t *testing.T) {
 	}
 	if got := graphReferenceOperationForBranch(info, child); got != "branch-independent" {
 		t.Fatalf("child operation=%q, want independent branch identity", got)
+	}
+}
+
+func TestPublishedOriginReleasesOnlyItsProviderRoots(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	first, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstObject, err := graph.CreateObject(first, "build/first", ttcsnapshot.ObjectKindMemoryNode, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(first, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	second, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondObject, err := graph.CreateObject(second, "build/second", ttcsnapshot.ObjectKindMemoryNode, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(second, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	bindings := map[string]ttcsnapshot.ObjectID{
+		"remote/1/op/00000000": firstObject,
+		"remote/2/op/00000000": secondObject,
+	}
+	if err := graph.RetainRoots(bindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePins([]string{"build/first", "build/second"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.MarkShared(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := releasePublishedProviderGraphRoots(graph, nil, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root("remote/1/op/00000000"); ok {
+		t.Fatal("published provider root remains")
+	}
+	if _, ok := graph.Object(firstObject); ok {
+		t.Fatal("published provider-only object remains in local graph")
+	}
+	if got, ok := graph.Root("remote/2/op/00000000"); !ok || got != secondObject {
+		t.Fatalf("unrelated provider root=(%s,%t), want %s", got, ok, secondObject)
 	}
 }
 
