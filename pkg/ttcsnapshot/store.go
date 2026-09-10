@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	journalHeader        = "TTCSGJ3\n"
+	journalHeader        = "TTCSGJ4\n"
 	maxJournalRecordSize = 8 << 20
 	headFileName         = "graph.head"
 )
@@ -53,6 +53,7 @@ type graphState struct {
 	Roots        map[string]ObjectID
 	Pins         map[string]ObjectID
 	Frozen       map[string]bool
+	Handoffs     map[string]SnapshotLedgerHandoff
 }
 
 func newGraphState() graphState {
@@ -64,7 +65,29 @@ func newGraphState() graphState {
 		Roots:        make(map[string]ObjectID),
 		Pins:         make(map[string]ObjectID),
 		Frozen:       make(map[string]bool),
+		Handoffs:     make(map[string]SnapshotLedgerHandoff),
 	}
+}
+
+// SnapshotReferenceMutation is one ordered reference change after a handoff
+// baseline. Release precedes retain when one stable name is rebound.
+type SnapshotReferenceMutation struct {
+	Sequence  uint64
+	Operation string
+	Name      string
+	Object    ObjectID
+	Retain    bool
+}
+
+// SnapshotLedgerHandoff is the durable provider-side publication cursor. The
+// baseline is captured before bulk publication; mutations catch the receiver
+// up, and Frozen marks the short final authority-switch barrier.
+type SnapshotLedgerHandoff struct {
+	Snapshot     SnapshotID
+	NextSequence uint64
+	Baseline     map[string]ObjectID
+	Mutations    []SnapshotReferenceMutation
+	Frozen       bool
 }
 
 type journalOp struct {
@@ -81,6 +104,8 @@ type journalOp struct {
 	SetNextSnapshot  *SnapshotID
 	FreezeSnapshot   SnapshotID
 	UnfreezeSnapshot SnapshotID
+	BeginHandoff     *SnapshotLedgerHandoff
+	AppendHandoff    *SnapshotReferenceMutation
 }
 
 type journalRecord struct {
@@ -548,7 +573,7 @@ func validateGraphState(state *graphState) error {
 	if state == nil || state.Version != formatVersion || state.NextSnapshot == 0 {
 		return errors.New("invalid graph state header")
 	}
-	if state.Snapshots == nil || state.Objects == nil || state.Roots == nil || state.Pins == nil || state.Frozen == nil {
+	if state.Snapshots == nil || state.Objects == nil || state.Roots == nil || state.Pins == nil || state.Frozen == nil || state.Handoffs == nil {
 		return errors.New("graph state has nil maps")
 	}
 	for key, snapshot := range state.Snapshots {
@@ -582,6 +607,29 @@ func validateGraphState(state *graphState) error {
 		snapshot, ok := state.Snapshots[key]
 		if !ok || snapshot.State == SnapshotWorking {
 			return fmt.Errorf("snapshot reference barrier %q does not select an immutable origin", key)
+		}
+	}
+	for key, handoff := range state.Handoffs {
+		if key != snapshotKey(handoff.Snapshot) {
+			return fmt.Errorf("snapshot handoff key %q does not match %d", key, handoff.Snapshot)
+		}
+		if err := validateSnapshotLedgerHandoff(handoff); err != nil {
+			return err
+		}
+		if handoff.Frozen != state.Frozen[key] {
+			return fmt.Errorf("snapshot %d handoff and final barrier disagree", handoff.Snapshot)
+		}
+		snapshot, ok := state.Snapshots[key]
+		if !ok {
+			return fmt.Errorf("snapshot %d handoff has no origin", handoff.Snapshot)
+		}
+		if snapshot.State == SnapshotWorking {
+			return fmt.Errorf("snapshot %d handoff selects a working origin", handoff.Snapshot)
+		}
+	}
+	for key := range state.Frozen {
+		if _, ok := state.Handoffs[key]; !ok {
+			return fmt.Errorf("snapshot reference barrier %q has no handoff", key)
 		}
 	}
 	expected := make(map[string]uint64, len(state.Objects))
@@ -763,9 +811,40 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 		case op.SetNextSnapshot != nil:
 			state.NextSnapshot = *op.SetNextSnapshot
 		case op.FreezeSnapshot != 0:
-			state.Frozen[snapshotKey(op.FreezeSnapshot)] = true
+			key := snapshotKey(op.FreezeSnapshot)
+			handoff, ok := state.Handoffs[key]
+			if !ok {
+				return fmt.Errorf("snapshot %d has no active reference handoff", op.FreezeSnapshot)
+			}
+			handoff.Frozen = true
+			state.Handoffs[key] = handoff
+			state.Frozen[key] = true
 		case op.UnfreezeSnapshot != 0:
 			delete(state.Frozen, snapshotKey(op.UnfreezeSnapshot))
+			delete(state.Handoffs, snapshotKey(op.UnfreezeSnapshot))
+		case op.BeginHandoff != nil:
+			handoff := cloneSnapshotLedgerHandoff(*op.BeginHandoff)
+			key := snapshotKey(handoff.Snapshot)
+			if _, ok := state.Handoffs[key]; ok {
+				return fmt.Errorf("snapshot %d already has an active reference handoff", handoff.Snapshot)
+			}
+			state.Handoffs[key] = handoff
+			if handoff.Frozen {
+				state.Frozen[key] = true
+			}
+		case op.AppendHandoff != nil:
+			mutation := *op.AppendHandoff
+			key := snapshotKey(mutation.Object.Snapshot)
+			handoff, ok := state.Handoffs[key]
+			if !ok {
+				return fmt.Errorf("snapshot %d has no active reference handoff", mutation.Object.Snapshot)
+			}
+			if mutation.Sequence != handoff.NextSequence {
+				return fmt.Errorf("snapshot %d handoff mutation %d follows %d", handoff.Snapshot, mutation.Sequence, handoff.NextSequence-1)
+			}
+			handoff.Mutations = append(handoff.Mutations, mutation)
+			handoff.NextSequence++
+			state.Handoffs[key] = handoff
 		default:
 			return errors.New("empty TTC snapshot graph journal operation")
 		}
@@ -837,6 +916,18 @@ func validateJournalRecord(record journalRecord) error {
 		if op.UnfreezeSnapshot != 0 {
 			selectors++
 		}
+		if op.BeginHandoff != nil {
+			selectors++
+			if err := validateSnapshotLedgerHandoff(*op.BeginHandoff); err != nil {
+				return err
+			}
+		}
+		if op.AppendHandoff != nil {
+			selectors++
+			if err := validateSnapshotReferenceMutation(*op.AppendHandoff); err != nil {
+				return err
+			}
+		}
 		if selectors != 1 {
 			return errors.New("invalid TTC snapshot graph journal operation selector")
 		}
@@ -852,6 +943,7 @@ func cloneGraphState(state graphState) graphState {
 		Roots:     make(map[string]ObjectID, len(state.Roots)),
 		Pins:      make(map[string]ObjectID, len(state.Pins)),
 		Frozen:    make(map[string]bool, len(state.Frozen)),
+		Handoffs:  make(map[string]SnapshotLedgerHandoff, len(state.Handoffs)),
 	}
 	for key, value := range state.Snapshots {
 		next.Snapshots[key] = value
@@ -868,7 +960,62 @@ func cloneGraphState(state graphState) graphState {
 	for key, value := range state.Frozen {
 		next.Frozen[key] = value
 	}
+	for key, value := range state.Handoffs {
+		next.Handoffs[key] = cloneSnapshotLedgerHandoff(value)
+	}
 	return next
+}
+
+func cloneSnapshotLedgerHandoff(handoff SnapshotLedgerHandoff) SnapshotLedgerHandoff {
+	handoff.Baseline = cloneObjectReferences(handoff.Baseline)
+	handoff.Mutations = append([]SnapshotReferenceMutation(nil), handoff.Mutations...)
+	return handoff
+}
+
+func cloneObjectReferences(references map[string]ObjectID) map[string]ObjectID {
+	cloned := make(map[string]ObjectID, len(references))
+	for name, object := range references {
+		cloned[name] = object
+	}
+	return cloned
+}
+
+func validateSnapshotReferenceMutation(mutation SnapshotReferenceMutation) error {
+	if mutation.Sequence == 0 || mutation.Operation == "" {
+		return errors.New("invalid snapshot handoff mutation identity")
+	}
+	if err := validateReferenceName(mutation.Name); err != nil {
+		return err
+	}
+	return mutation.Object.validate()
+}
+
+func validateSnapshotLedgerHandoff(handoff SnapshotLedgerHandoff) error {
+	if handoff.Snapshot == 0 || handoff.NextSequence == 0 || handoff.Baseline == nil {
+		return errors.New("invalid snapshot ledger handoff header")
+	}
+	for name, object := range handoff.Baseline {
+		if err := validateReferenceName(name); err != nil {
+			return err
+		}
+		if object.Snapshot != handoff.Snapshot {
+			return fmt.Errorf("snapshot %d handoff baseline %q selects foreign object %s", handoff.Snapshot, name, object)
+		}
+	}
+	want := uint64(1)
+	for _, mutation := range handoff.Mutations {
+		if err := validateSnapshotReferenceMutation(mutation); err != nil {
+			return err
+		}
+		if mutation.Object.Snapshot != handoff.Snapshot || mutation.Sequence != want {
+			return fmt.Errorf("snapshot %d has invalid handoff mutation sequence %d", handoff.Snapshot, mutation.Sequence)
+		}
+		want++
+	}
+	if handoff.NextSequence != want {
+		return fmt.Errorf("snapshot %d handoff next sequence is %d, want %d", handoff.Snapshot, handoff.NextSequence, want)
+	}
+	return nil
 }
 
 func snapshotReferences(state graphState, snapshot SnapshotID) map[string]ObjectID {
@@ -954,6 +1101,20 @@ func (s *Store) commitLocked(ops []journalOp) error {
 	if err := applyJournalRecord(&next, record); err != nil {
 		return err
 	}
+	mutations, err := snapshotHandoffMutationOps(s.state, next)
+	if err != nil {
+		return err
+	}
+	if len(mutations) != 0 {
+		record.Ops = append(record.Ops, mutations...)
+		if err := validateJournalRecord(record); err != nil {
+			return err
+		}
+		next = cloneGraphState(s.state)
+		if err := applyJournalRecord(&next, record); err != nil {
+			return err
+		}
+	}
 	if err := validateFrozenSnapshotMutation(s.state, next, ops); err != nil {
 		return err
 	}
@@ -996,6 +1157,58 @@ func (s *Store) commitLocked(ops []journalOp) error {
 		return s.poisoned
 	}
 	return nil
+}
+
+func snapshotHandoffMutationOps(previous, next graphState) ([]journalOp, error) {
+	keys := make([]string, 0, len(previous.Handoffs))
+	for key := range previous.Handoffs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var ops []journalOp
+	for _, key := range keys {
+		handoff := previous.Handoffs[key]
+		before := snapshotReferences(previous, handoff.Snapshot)
+		after := snapshotReferences(next, handoff.Snapshot)
+		if handoff.Frozen {
+			continue
+		}
+		names := make(map[string]struct{}, len(before)+len(after))
+		for name := range before {
+			names[name] = struct{}{}
+		}
+		for name := range after {
+			names[name] = struct{}{}
+		}
+		ordered := make([]string, 0, len(names))
+		for name := range names {
+			ordered = append(ordered, name)
+		}
+		sort.Strings(ordered)
+		sequence := handoff.NextSequence
+		appendMutation := func(name string, object ObjectID, retain bool) {
+			mutation := &SnapshotReferenceMutation{
+				Sequence: sequence, Operation: fmt.Sprintf("handoff-%016x-%016x", uint64(handoff.Snapshot), sequence),
+				Name: name, Object: object, Retain: retain,
+			}
+			ops = append(ops, journalOp{AppendHandoff: mutation})
+			sequence++
+		}
+		for _, name := range ordered {
+			old, hadOld := before[name]
+			updated, hasUpdated := after[name]
+			if hadOld && hasUpdated && old == updated {
+				continue
+			}
+			if hadOld {
+				appendMutation(name, old, false)
+			}
+			if hasUpdated {
+				appendMutation(name, updated, true)
+			}
+		}
+	}
+	return ops, nil
 }
 
 func writeFull(writer io.Writer, data []byte) error {
@@ -1494,11 +1707,61 @@ func snapshotLedger(state graphState, snapshot SnapshotID) ([]Object, map[string
 	return objects, references, nil
 }
 
+// BeginSnapshotLedgerHandoff durably captures the bulk-transfer baseline for
+// one immutable origin. Reference mutations after the baseline are recorded in
+// order until FreezeSnapshotLedger installs the final short barrier. Repeating
+// the call after a crash returns the original baseline and current cursor.
+func (s *Store) BeginSnapshotLedgerHandoff(snapshot SnapshotID) ([]Object, map[string]ObjectID, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	objects, references, err := snapshotLedger(s.state, snapshot)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	key := snapshotKey(snapshot)
+	if handoff, ok := s.state.Handoffs[key]; ok {
+		return objects, cloneObjectReferences(handoff.Baseline), handoff.NextSequence - 1, nil
+	}
+	handoff := SnapshotLedgerHandoff{
+		Snapshot:     snapshot,
+		NextSequence: 1,
+		Baseline:     cloneObjectReferences(references),
+	}
+	if err := s.commitLocked([]journalOp{{BeginHandoff: &handoff}}); err != nil {
+		return nil, nil, 0, err
+	}
+	return objects, references, 0, nil
+}
+
+// SnapshotLedgerHandoffChanges returns the ordered mutation suffix after
+// cursor. The returned cursor is stable once frozen and can be acknowledged by
+// an idempotent receiver.
+func (s *Store) SnapshotLedgerHandoffChanges(snapshot SnapshotID, cursor uint64) ([]SnapshotReferenceMutation, uint64, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	handoff, ok := s.state.Handoffs[snapshotKey(snapshot)]
+	if !ok {
+		return nil, 0, false, os.ErrNotExist
+	}
+	latest := handoff.NextSequence - 1
+	if cursor > latest {
+		return nil, latest, handoff.Frozen, fmt.Errorf("snapshot %d handoff cursor %d is beyond latest mutation %d", snapshot, cursor, latest)
+	}
+	changes := make([]SnapshotReferenceMutation, 0, latest-cursor)
+	for _, mutation := range handoff.Mutations {
+		if mutation.Sequence > cursor {
+			changes = append(changes, mutation)
+		}
+	}
+	return changes, latest, handoff.Frozen, nil
+}
+
 // FreezeSnapshotLedger durably installs the final provider-to-owner handoff
-// barrier and returns its exact reference baseline. While the barrier exists,
-// no root, pin, foreign parent edge, or object owned by snapshot may change;
-// unrelated origins remain writable. Repeating the call after a crash returns
-// the same baseline.
+// barrier and returns its original exact reference baseline. While the barrier
+// exists, no root, pin, foreign parent edge, or object owned by snapshot may
+// change; unrelated origins remain writable. The receiver applies the ordered
+// suffix from SnapshotLedgerHandoffChanges after importing this baseline.
+// Repeating the call after a crash returns the same baseline.
 func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]ObjectID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1507,13 +1770,26 @@ func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]
 		return nil, nil, err
 	}
 	key := snapshotKey(snapshot)
-	if s.state.Frozen[key] {
+	handoff, exists := s.state.Handoffs[key]
+	if !exists {
+		handoff = SnapshotLedgerHandoff{
+			Snapshot:     snapshot,
+			NextSequence: 1,
+			Baseline:     cloneObjectReferences(references),
+			Frozen:       true,
+		}
+		if err := s.commitLocked([]journalOp{{BeginHandoff: &handoff}}); err != nil {
+			return nil, nil, err
+		}
 		return objects, references, nil
+	}
+	if handoff.Frozen {
+		return objects, cloneObjectReferences(handoff.Baseline), nil
 	}
 	if err := s.commitLocked([]journalOp{{FreezeSnapshot: snapshot}}); err != nil {
 		return nil, nil, err
 	}
-	return objects, references, nil
+	return objects, cloneObjectReferences(handoff.Baseline), nil
 }
 
 // UnfreezeSnapshotLedger cancels a failed authority handoff. It must not be
@@ -1523,7 +1799,7 @@ func (s *Store) UnfreezeSnapshotLedger(snapshot SnapshotID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := snapshotKey(snapshot)
-	if !s.state.Frozen[key] {
+	if _, ok := s.state.Handoffs[key]; !ok {
 		return nil
 	}
 	return s.commitLocked([]journalOp{{UnfreezeSnapshot: snapshot}})
@@ -1930,6 +2206,9 @@ func (s *Store) Collect(limit int) (int, error) {
 	queue := make([]string, 0)
 	for key, object := range s.state.Objects {
 		if object.State == ObjectReclaiming {
+			if _, transferring := s.state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
+				continue
+			}
 			queue = append(queue, key)
 		}
 	}
@@ -2028,6 +2307,9 @@ func (s *Store) CollectEmptySnapshots(retain []SnapshotID) (int, error) {
 	ids := make([]SnapshotID, 0)
 	for _, snapshot := range s.state.Snapshots {
 		if _, keep := retained[snapshot.ID]; keep {
+			continue
+		}
+		if _, transferring := s.state.Handoffs[snapshotKey(snapshot.ID)]; transferring {
 			continue
 		}
 		if _, used := occupied[snapshot.ID]; used {

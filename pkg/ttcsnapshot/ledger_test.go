@@ -349,3 +349,136 @@ func TestSnapshotLedgerFinalBarrierIsDurableAndOriginScoped(t *testing.T) {
 		t.Fatal("unrelated origin object disappeared")
 	}
 }
+
+func TestSnapshotLedgerHandoffCatchupIsDurableAndExact(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "graph")
+	graph, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := graph.CreateObject(origin, "build/first", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := graph.CreateObject(origin, "build/second", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/source", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	objects, baseline, cursor, err := graph.BeginSnapshotLedgerHandoff(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 0 || baseline["root/branch/source"] != first || baseline["pin/build/second"] != second {
+		t.Fatalf("cursor=%d baseline=%+v", cursor, baseline)
+	}
+	if err := graph.SetRoot("branch/source", second); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/second"); err != nil {
+		t.Fatal(err)
+	}
+	other, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := graph.CreateObject(other, "build/parent", ObjectKindInode, nil, []Edge{{Slot: 7, Child: second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changes, cursor, frozen, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen || cursor != 4 || len(changes) != 4 {
+		t.Fatalf("changes=%+v cursor=%d frozen=%t", changes, cursor, frozen)
+	}
+	for index, mutation := range changes {
+		if mutation.Sequence != uint64(index+1) || mutation.Operation == "" {
+			t.Fatalf("mutation %d=%+v", index, mutation)
+		}
+	}
+	if changes[0].Name != "root/branch/source" || changes[0].Object != first || changes[0].Retain ||
+		changes[1].Name != "root/branch/source" || changes[1].Object != second || !changes[1].Retain {
+		t.Fatalf("root replacement ordering=%+v", changes[:2])
+	}
+	if got, err := graph.Collect(100); err != nil || got != 0 {
+		t.Fatalf("collection crossed an active handoff: got=%d err=%v", got, err)
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	graph, err = Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	repeatedObjects, repeatedBaseline, repeatedCursor, err := graph.BeginSnapshotLedgerHandoff(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repeatedObjects) != len(objects) || repeatedCursor != cursor || !sameObjectReferences(repeatedBaseline, baseline) {
+		t.Fatalf("reopened handoff changed: objects=%d/%d cursor=%d/%d baseline=%+v/%+v", len(repeatedObjects), len(objects), repeatedCursor, cursor, repeatedBaseline, baseline)
+	}
+	frozenObjects, frozenBaseline, err := graph.FreezeSnapshotLedger(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frozenObjects) != len(objects) || !sameObjectReferences(frozenBaseline, baseline) {
+		t.Fatalf("freeze changed baseline: objects=%d/%d baseline=%+v/%+v", len(frozenObjects), len(objects), frozenBaseline, baseline)
+	}
+	changes, finalCursor, frozen, err := graph.SnapshotLedgerHandoffChanges(origin, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !frozen || finalCursor != cursor || len(changes) != 2 {
+		t.Fatalf("final suffix=%+v cursor=%d frozen=%t", changes, finalCursor, frozen)
+	}
+	if err := graph.DeleteRoot("branch/source"); err == nil {
+		t.Fatal("mutated references after final handoff freeze")
+	}
+
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(origin, objects, baseline); err != nil {
+		t.Fatal(err)
+	}
+	allChanges, _, _, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range allChanges {
+		if err := ledger.ApplyReference(mutation.Operation, mutation.Name, mutation.Object, mutation.Retain); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspection := ledger.Inspect()
+	currentObjects, currentReferences, err := graph.SnapshotLedger(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameObjectReferences(inspection.References, currentReferences) {
+		t.Fatalf("receiver references=%+v provider=%+v", inspection.References, currentReferences)
+	}
+	for _, object := range currentObjects {
+		if got := inspection.Objects[object.ID]; got != object.Refs {
+			t.Fatalf("receiver object %s refs=%d, provider=%d", object.ID, got, object.Refs)
+		}
+	}
+	if currentReferences[edgeReferenceName(parent, 7)] != second {
+		t.Fatalf("foreign edge missing from final references: %+v", currentReferences)
+	}
+}
