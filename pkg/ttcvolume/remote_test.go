@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func TestRemoteSnapshotFetchesExtentsAndPrivatizesWrites(t *testing.T) {
+func TestRemoteSnapshotFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")
 	if err != nil {
@@ -82,6 +82,19 @@ func TestRemoteSnapshotFetchesExtentsAndPrivatizesWrites(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload[offset:offset+int64(len(got))]) {
 		t.Fatal("remote range contents differ")
+	}
+	// One small read installs the entire immutable file. Local cache state is
+	// absent/complete; it is never a sparse partially-populated object.
+	remoteInode, err := target.Inode("target-generation", ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := target.remoteObjectPending(remoteInode.Object); err != nil || pending {
+		t.Fatalf("remote object pending after first read: pending=%t err=%v", pending, err)
+	}
+	localBytes, err := os.ReadFile(filepath.Join(target.path, target.objectPath(remoteInode.Object)))
+	if err != nil || !bytes.Equal(localBytes, payload) {
+		t.Fatalf("complete local materialization: bytes=%d err=%v", len(localBytes), err)
 	}
 	if n, cloned, err := target.WriteAt("target-generation", ino, []byte("TARGET"), 17); err != nil || n != 6 || !cloned {
 		t.Fatalf("remote target WriteAt: n=%d cloned=%t err=%v", n, cloned, err)

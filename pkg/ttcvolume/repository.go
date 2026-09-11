@@ -1738,9 +1738,9 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if inode.DataGeneration == branch.WorkingSnapshot {
 		return false, nil
 	}
-	// A remotely inherited object is sparse in the target repository. A file-
-	// level CoW clone must not preserve unfetched holes as zeroes, so fetch this
-	// one object completely before creating its private writable generation.
+	// A remotely inherited object starts as an incomplete target placeholder.
+	// Materialize the complete immutable file before creating its private
+	// writable generation.
 	if err := r.ensureObjectRange(inode.Object, inode.Size, 0, inode.Size); err != nil {
 		return false, err
 	}

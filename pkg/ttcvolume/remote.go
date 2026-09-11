@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"strings"
@@ -17,7 +16,7 @@ import (
 )
 
 const (
-	remoteProtocolVersion = 2
+	remoteProtocolVersion = 3
 	remoteHeaderSize      = 112
 	remoteExtentBytes     = 1 << 20
 	remoteMaxErrorBytes   = 4096
@@ -47,7 +46,6 @@ type remoteHeader struct {
 	object    [40]byte
 	offset    uint64
 	length    uint32
-	checksum  uint32
 }
 
 func (h remoteHeader) marshal(dst []byte) {
@@ -61,9 +59,6 @@ func (h remoteHeader) marshal(dst []byte) {
 	copy(dst[60:100], h.object[:])
 	binary.BigEndian.PutUint64(dst[100:108], h.offset)
 	binary.BigEndian.PutUint32(dst[108:112], h.length)
-	// Data checksums are encoded as a four-byte trailer after the payload. This
-	// keeps the fixed request header naturally aligned and leaves future header
-	// growth versioned rather than silently changing offsets.
 }
 
 func readRemoteHeader(reader io.Reader) (remoteHeader, error) {
@@ -95,9 +90,7 @@ func writeRemoteMessage(writer io.Writer, header remoteHeader, payload []byte) e
 	if err := writeAll(writer, payload); err != nil {
 		return err
 	}
-	var trailer [4]byte
-	binary.BigEndian.PutUint32(trailer[:], crc32.ChecksumIEEE(payload))
-	return writeAll(writer, trailer[:])
+	return nil
 }
 
 func writeAll(writer io.Writer, data []byte) error {
@@ -212,7 +205,7 @@ type remoteObjectClient struct {
 	token      RemoteToken
 	source     RemoteSourceKey
 	next       uint32
-	fetched    map[string]map[uint64]struct{}
+	complete   map[string]bool
 	objects    map[string]int64
 	sources    map[string]string
 	repository *Repository
@@ -228,7 +221,7 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if err != nil {
 		return err
 	}
-	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, fetched: make(map[string]map[uint64]struct{}), objects: make(map[string]int64), sources: make(map[string]string), repository: r}
+	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, complete: make(map[string]bool), objects: make(map[string]int64), sources: make(map[string]string), repository: r}
 	r.remoteMu.Lock()
 	defer r.remoteMu.Unlock()
 	if r.remotes == nil {
@@ -366,9 +359,10 @@ func (r *Repository) MaterializeRemoteObjects() error {
 	return nil
 }
 
-// EnsureDataRange fetches every 1 MiB extent intersecting an arbitrary guest
-// read. Already resident extents are served entirely from the target-local
-// object file.
+// EnsureDataRange materializes the complete immutable file on its first guest
+// access. The transport remains bounded to 1 MiB messages, but cache state is
+// deliberately only absent or complete: TTC does not depend on sparse host
+// files or expose a partly populated file to the guest.
 func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length int64) error {
 	if offset < 0 || length < 0 {
 		return os.ErrInvalid
@@ -413,47 +407,54 @@ func (c *remoteObjectClient) ensure(object string, size, offset, length int64) e
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	resident := c.fetched[object]
-	if resident == nil {
-		resident = make(map[uint64]struct{})
-		c.fetched[object] = resident
+	if c.complete[object] {
+		return nil
 	}
-	first := uint64(offset) / remoteExtentBytes
-	last := (uint64(offset+length) + remoteExtentBytes - 1) / remoteExtentBytes
-	for extent := first; extent < last; extent++ {
-		if _, ok := resident[extent]; ok {
-			continue
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return err
+	}
+	reader := &remoteWholeFileReader{client: c, object: object, size: uint64(size)}
+	if err := c.repository.data.ReplaceDeferred(id, reader, size); err != nil {
+		return err
+	}
+	if err := c.repository.clearRemoteObjectPending(object); err != nil {
+		return err
+	}
+	c.complete[object] = true
+	return nil
+}
+
+type remoteWholeFileReader struct {
+	client *remoteObjectClient
+	object string
+	size   uint64
+	offset uint64
+	buffer []byte
+}
+
+func (reader *remoteWholeFileReader) Read(destination []byte) (int, error) {
+	if len(destination) == 0 {
+		return 0, nil
+	}
+	if len(reader.buffer) == 0 {
+		if reader.offset == reader.size {
+			return 0, io.EOF
 		}
-		start := extent * remoteExtentBytes
 		want := uint64(remoteExtentBytes)
-		if remaining := uint64(size) - start; want > remaining {
+		if remaining := reader.size - reader.offset; want > remaining {
 			want = remaining
 		}
-		data, err := c.pull(object, start, uint32(want))
+		data, err := reader.client.pull(reader.object, reader.offset, uint32(want))
 		if err != nil {
-			return err
+			return 0, err
 		}
-		file, err := c.repository.openObject(object, os.O_WRONLY)
-		if err != nil {
-			return err
-		}
-		n, writeErr := file.WriteAt(data, int64(start))
-		closeErr := file.Close()
-		if writeErr != nil || closeErr != nil {
-			return errors.Join(writeErr, closeErr)
-		}
-		if n != len(data) {
-			return io.ErrShortWrite
-		}
-		resident[extent] = struct{}{}
+		reader.buffer = data
 	}
-	needed := (uint64(size) + remoteExtentBytes - 1) / remoteExtentBytes
-	if uint64(len(resident)) == needed {
-		if err := c.repository.clearRemoteObjectPending(object); err != nil {
-			return err
-		}
-	}
-	return nil
+	n := copy(destination, reader.buffer)
+	reader.buffer = reader.buffer[n:]
+	reader.offset += uint64(n)
+	return n, nil
 }
 
 func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) ([]byte, error) {
@@ -479,13 +480,6 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 	payload := make([]byte, response.length)
 	if _, err := io.ReadFull(c.conn, payload); err != nil {
 		return nil, err
-	}
-	var trailer [4]byte
-	if _, err := io.ReadFull(c.conn, trailer[:]); err != nil {
-		return nil, err
-	}
-	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(trailer[:]) {
-		return nil, errors.New("remote filesystem response checksum mismatch")
 	}
 	if response.type_ == remoteError {
 		return nil, errors.New(string(payload))

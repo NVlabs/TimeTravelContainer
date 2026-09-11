@@ -1507,6 +1507,47 @@ func TestLocalDataStoreInstallCrashBoundaries(t *testing.T) {
 	}
 }
 
+func TestLocalDataStoreReplaceDeferredIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	data, err := OpenLocalDataStore(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 1}
+	old := []byte("incomplete-placeholder")
+	if err := data.InstallDeferred(id, bytes.NewReader(old), int64(len(old))); err != nil {
+		t.Fatal(err)
+	}
+	// An interrupted replacement cannot expose its prefix as a complete cache
+	// object or destroy the previous placeholder.
+	if err := data.ReplaceDeferred(id, bytes.NewReader([]byte("short")), 100); err == nil {
+		t.Fatal("short replacement unexpectedly succeeded")
+	}
+	file, err := data.Open(id, int64(len(old)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(got, old) {
+		t.Fatalf("placeholder changed after interrupted replacement: %q, %v", got, err)
+	}
+
+	replacement := bytes.Repeat([]byte("complete"), 4096)
+	if err := data.ReplaceDeferred(id, bytes.NewReader(replacement), int64(len(replacement))); err != nil {
+		t.Fatal(err)
+	}
+	file, err = data.Open(id, int64(len(replacement)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(got, replacement) {
+		t.Fatalf("replacement bytes=%d err=%v", len(got), err)
+	}
+}
+
 func assertGraphReferenceModel(t *testing.T, store *Store) {
 	t.Helper()
 	inspection := store.Inspect()

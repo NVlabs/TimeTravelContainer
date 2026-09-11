@@ -251,6 +251,57 @@ func (store *LocalDataStore) InstallDeferred(id ObjectID, source io.Reader, leng
 	return store.install(id, source, length, false)
 }
 
+// ReplaceDeferred writes a complete cache object and atomically replaces any
+// incomplete placeholder for id. It is intentionally non-durable: distributed
+// cache contents are disposable and can be fetched again after a crash.
+// Authoritative callers must continue using Install or InstallDeferred, whose
+// create-if-absent semantics protect immutable objects from replacement.
+func (store *LocalDataStore) ReplaceDeferred(id ObjectID, source io.Reader, length int64) error {
+	if length < 0 {
+		return errors.New("negative TTC bulk-object length")
+	}
+	relative, err := objectRelativePath(id)
+	if err != nil {
+		return err
+	}
+	if store.rootFD != nil {
+		directory := filepath.Dir(relative)
+		if err := store.mkdirAllRelative(directory); err != nil {
+			return err
+		}
+		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".replace-")
+		if err != nil {
+			return err
+		}
+		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
+		written, copyErr := io.CopyN(temporary, source, length)
+		closeErr := temporary.Close()
+		if copyErr != nil || closeErr != nil {
+			return fmt.Errorf("writing TTC replacement object after %d bytes: %w", written, errors.Join(copyErr, closeErr))
+		}
+		return unix.Renameat(int(store.rootFD.Fd()), temporaryName, int(store.rootFD.Fd()), relative)
+	}
+	destination, err := store.objectPath(id)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".replace-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	written, copyErr := io.CopyN(temporary, source, length)
+	closeErr := temporary.Close()
+	if copyErr != nil || closeErr != nil {
+		return fmt.Errorf("writing TTC replacement object after %d bytes: %w", written, errors.Join(copyErr, closeErr))
+	}
+	return os.Rename(temporaryPath, destination)
+}
+
 func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64, durable bool) error {
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
@@ -650,7 +701,7 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				}
 				return nil
 			}
-			if strings.HasPrefix(entry.Name(), ".object-") || strings.HasPrefix(entry.Name(), ".clone-") {
+			if strings.HasPrefix(entry.Name(), ".object-") || strings.HasPrefix(entry.Name(), ".clone-") || strings.HasPrefix(entry.Name(), ".replace-") {
 				// Install and Clone publish with link(2) only after the temporary
 				// file is complete and durable. A named temporary is therefore
 				// never authoritative and is safe to remove while reconciliation
