@@ -137,6 +137,18 @@ func (r *Repository) remoteGraphObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Obj
 	if !ok || (snapshot.State == ttcsnapshot.SnapshotWorking && object.SourceCatalog == "") || object.State != ttcsnapshot.ObjectLive {
 		return ttcsnapshot.Object{}, fmt.Errorf("filesystem object %s is not in an immutable generation", id)
 	}
+	// A repository may itself be a lazy target and then become the source of a
+	// later hop before any guest pathname has reached this file. Resolving graph
+	// metadata alone does not run prepareDeferredInode, so register the bulk
+	// object's inherited source here as well. Otherwise the later hop receives a
+	// valid immutable object ID whose local sparse placeholder and relay mapping
+	// were never installed, and a returning A-to-B-to-A path fails as a missing
+	// local file (or waits forever on the relay that requested it).
+	if object.ID.Kind == ttcsnapshot.ObjectKindFile {
+		if err := r.prepareDeferredFileObject(object.ID, int64(object.BulkLength)); err != nil {
+			return ttcsnapshot.Object{}, err
+		}
+	}
 	return object, nil
 }
 
@@ -283,26 +295,34 @@ func (r *Repository) prepareDeferredInode(inode *Inode) error {
 	if err != nil {
 		return err
 	}
+	if err := r.prepareDeferredFileObject(id, inode.Size); err != nil {
+		return err
+	}
+	if _, _, deferred := r.graph.DeferredSource(id); deferred {
+		// A deferred file is immutable foreign data. Its first write must always
+		// path-copy into the branch working generation.
+		inode.DataGeneration = 0
+	}
+	return nil
+}
+
+func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int64) error {
 	catalog, sourceID, deferred := r.graph.DeferredSource(id)
 	if !deferred {
 		return nil
 	}
-	// The local stub uses the working origin only for collision-free identity.
-	// Its bytes still belong to an immutable foreign generation, so first write
-	// must create a private object instead of modifying the fetched cache.
-	inode.DataGeneration = 0
 	object, err := r.graph.ResolveObject(id)
 	if err != nil {
 		return err
 	}
-	if object.ID.Kind != ttcsnapshot.ObjectKindFile || object.BulkLength != uint64(inode.Size) || sourceID.Kind != ttcsnapshot.ObjectKindFile {
-		return fmt.Errorf("deferred file %s metadata disagrees with inode %d", id, inode.Number)
+	if size < 0 || object.ID.Kind != ttcsnapshot.ObjectKindFile || object.BulkLength != uint64(size) || sourceID.Kind != ttcsnapshot.ObjectKindFile {
+		return fmt.Errorf("deferred file %s metadata disagrees with length %d", id, size)
 	}
 	pending, err := r.remoteObjectPending(id.String())
 	if err != nil {
 		return err
 	}
-	file, openErr := r.data.Open(id, inode.Size)
+	file, openErr := r.data.Open(id, size)
 	if openErr == nil {
 		openErr = file.Close()
 	}
@@ -314,7 +334,7 @@ func (r *Repository) prepareDeferredInode(inode *Inode) error {
 	r.remoteMu.Lock()
 	remote := r.remoteByCatalog[catalog]
 	if remote != nil {
-		remote.objects[id.String()] = inode.Size
+		remote.objects[id.String()] = size
 		remote.sources[id.String()] = sourceID.String()
 		r.remoteByObject[id.String()] = remote
 	}
@@ -323,7 +343,7 @@ func (r *Repository) prepareDeferredInode(inode *Inode) error {
 		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
 	}
 	if openErr != nil {
-		if err := r.data.CreateSparsePlaceholder(id, inode.Size); err != nil {
+		if err := r.data.CreateSparsePlaceholder(id, size); err != nil {
 			return err
 		}
 	}
@@ -649,15 +669,18 @@ func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length
 }
 
 func (r *Repository) ensureObjectRange(object string, size, offset, length int64) error {
+	// Empty files have no remote bytes to materialize. Return before pinning the
+	// reader; otherwise the unmatched WaitGroup reference makes source handoff
+	// wait forever whenever a fork captures a file between O_TRUNC and write.
+	if length == 0 {
+		return nil
+	}
 	r.remoteMu.Lock()
 	remote := r.remoteByObject[object]
 	if remote != nil {
 		remote.users.Add(1)
 	}
 	r.remoteMu.Unlock()
-	if length == 0 {
-		return nil
-	}
 	if remote == nil {
 		pending, err := r.remoteObjectPending(object)
 		if err != nil {

@@ -504,3 +504,90 @@ func TestRemoteSnapshotImportAndLookupStayGraphBounded(t *testing.T) {
 		t.Fatalf("single lookup installed %d graph objects, want bounded B-tree paths and child stubs", loaded)
 	}
 }
+
+func TestRemoteSnapshotReexportReturningToExistingRepositories(t *testing.T) {
+	managerA := openTestManager(t)
+	repositoryA, err := managerA.Create("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repositoryA.Close()
+	inode, err := repositoryA.CreateRegular(MainBranch, RootInode, "payload", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repositoryA.WriteAt(MainBranch, inode, []byte("original"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositoryA.CreateRegular(MainBranch, RootInode, "empty", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repositoryA.Fork(MainBranch, "ab"); err != nil {
+		t.Fatal(err)
+	}
+
+	var token RemoteToken
+	copy(token[:], []byte("returning-hops"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	exportAB := filepath.Join(t.TempDir(), "ab")
+	_, objectsAB, err := repositoryA.ExportRemoteSnapshot("ab", exportAB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerB := openTestManager(t)
+	repositoryB, _, err := managerB.ImportPrivateRemoteSnapshot(filepath.Join(managerB.root, "family"), "family", exportAB, "ab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repositoryB.Close()
+	serverAB, clientAB := net.Pipe()
+	go ServeRemoteObjects(serverAB, token, []RemoteObjectSource{{Key: key, Repository: repositoryA, Objects: objectsAB}})
+	if err := repositoryB.AttachRemoteObjectSource(clientAB, token, key, "ab"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repositoryB.Fork("ab", "ba"); err != nil {
+		t.Fatal(err)
+	}
+	exportBA := filepath.Join(t.TempDir(), "ba")
+	_, objectsBA, err := repositoryB.ExportRemoteSnapshot("ba", exportBA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositoryA.ImportRemoteBranchSnapshot(exportBA, "ba"); err != nil {
+		t.Fatal(err)
+	}
+	serverBA, clientBA := net.Pipe()
+	go ServeRemoteObjects(serverBA, token, []RemoteObjectSource{{Key: key, Repository: repositoryB, Objects: objectsBA}})
+	if err := repositoryA.AttachRemoteObjectSource(clientBA, token, key, "ba"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repositoryA.Fork("ba", "aba"); err != nil {
+		t.Fatal(err)
+	}
+	exportABA := filepath.Join(t.TempDir(), "aba")
+	_, objectsABA, err := repositoryA.ExportRemoteSnapshot("aba", exportABA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repositoryB.ImportRemoteBranchSnapshot(exportABA, "aba"); err != nil {
+		t.Fatal(err)
+	}
+	serverABA, clientABA := net.Pipe()
+	go ServeRemoteObjects(serverABA, token, []RemoteObjectSource{{Key: key, Repository: repositoryA, Objects: objectsABA}})
+	if err := repositoryB.AttachRemoteObjectSource(clientABA, token, key, "aba"); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- repositoryB.MaterializeRemoteObjects() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("materializing A-to-B-to-A-to-B repository dependency deadlocked")
+	}
+}
