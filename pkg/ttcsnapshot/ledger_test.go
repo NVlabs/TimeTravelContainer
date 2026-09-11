@@ -86,6 +86,13 @@ func TestReferenceLedgerConvertsIncomingBridgeInEitherImportOrder(t *testing.T) 
 		if _, bridged := inspection.References[edgeName]; bridged {
 			t.Fatalf("childFirst=%t retained obsolete external edge bridge", childFirst)
 		}
+		objects, references, ok := ledger.OriginManifest(21)
+		if !ok || len(objects) != 1 || objects[0].Refs != 2 {
+			t.Fatalf("childFirst=%t origin manifest objects=%+v ok=%t", childFirst, objects, ok)
+		}
+		if references[edgeName] != child.ID || references["child-root"] != child.ID {
+			t.Fatalf("childFirst=%t origin manifest references=%+v", childFirst, references)
+		}
 	}
 }
 

@@ -1025,6 +1025,46 @@ type ReferenceLedgerInspection struct {
 	HandoffCursors    map[SnapshotID]uint64
 }
 
+// OriginManifest returns the current immutable objects and complete incoming
+// reference baseline for one owned origin. Cross-origin parent edges are
+// represented as stable named references so the result can independently
+// reconstruct the origin's exact counts after pack compaction or coordinator
+// rebuild.
+func (ledger *ReferenceLedger) OriginManifest(origin SnapshotID) ([]Object, map[string]ObjectID, bool) {
+	if ledger == nil || origin == 0 {
+		return nil, nil, false
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	if _, ok := ledger.state.Origins[origin]; !ok {
+		return nil, nil, false
+	}
+	objects := make([]Object, 0)
+	for _, object := range ledger.state.Objects {
+		if object.ID.Snapshot == origin {
+			objects = append(objects, cloneObject(object))
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	references := make(map[string]ObjectID)
+	for name, object := range ledger.state.References {
+		if object.Snapshot == origin {
+			references[name] = object
+		}
+	}
+	for _, parent := range ledger.state.Objects {
+		if parent.ID.Snapshot == origin {
+			continue
+		}
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == origin {
+				references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
+			}
+		}
+	}
+	return objects, references, true
+}
+
 // Inspect reports exact owner-local counts without exposing mutable maps.
 func (ledger *ReferenceLedger) Inspect() ReferenceLedgerInspection {
 	ledger.mu.RLock()

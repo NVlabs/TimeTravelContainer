@@ -327,6 +327,54 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if _, err := s.drainOutbox(ctx, limit*4); err != nil {
 		return collected, err
 	}
+	// Rewrite at most one partially-live origin per maintenance pass. Logical
+	// collection is already durable in the ledger; compaction only changes its
+	// reader-fenced physical representation and therefore may be retried after
+	// interruption without affecting authority.
+	var origins []ttcsnapshot.SnapshotID
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		origins = ledger.Inspect().Origins
+		return nil
+	}); err != nil {
+		return collected, err
+	}
+	for _, origin := range origins {
+		if err := ctx.Err(); err != nil {
+			return collected, err
+		}
+		var objects []ttcsnapshot.Object
+		var references map[string]ttcsnapshot.ObjectID
+		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+			var ok bool
+			objects, references, ok = ledger.OriginManifest(origin)
+			if !ok {
+				return os.ErrNotExist
+			}
+			return nil
+		}); err != nil {
+			return collected, err
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		if _, busy, err := s.packs.Reconcile(origin); err != nil {
+			return collected, err
+		} else if busy {
+			continue
+		}
+		manifest, err := s.packs.Manifest(origin)
+		if err != nil {
+			return collected, err
+		}
+		if !sharedPackNeedsCompaction(manifest, objects) {
+			continue
+		}
+		if _, busy, err := s.packs.Compact(origin, objects, references); err != nil {
+			return collected, err
+		} else if !busy {
+			break
+		}
+	}
 	var candidates []ttcsnapshot.SnapshotID
 	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		candidates = ledger.EmptyOrigins()
@@ -355,6 +403,34 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		}
 	}
 	return collected, nil
+}
+
+func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []ttcsnapshot.Object) bool {
+	if manifest == nil || len(live) == 0 {
+		return false
+	}
+	if len(manifest.Packs) > 32 {
+		return true
+	}
+	liveIDs := make(map[ttcsnapshot.ObjectID]struct{}, len(live))
+	for _, object := range live {
+		liveIDs[object.ID] = struct{}{}
+	}
+	// Account for both aligned bulk extents and the manifest records that hold
+	// metadata-only objects. This keeps metadata-heavy filesystem origins from
+	// growing forever even though their B-tree nodes occupy no pack extents.
+	var total, retained uint64
+	for _, packed := range manifest.Objects {
+		weight := uint64(64 + len(packed.Object.Data) + 32*len(packed.Object.Children) + 32*len(packed.Extents))
+		for _, extent := range packed.Extents {
+			weight += uint64((extent.Length + 4095) &^ 4095)
+		}
+		total += weight
+		if _, ok := liveIDs[packed.Object.ID]; ok {
+			retained += weight
+		}
+	}
+	return total != 0 && retained <= total/2
 }
 
 func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {

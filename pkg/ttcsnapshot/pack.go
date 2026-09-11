@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,7 +79,12 @@ type SharedPackStore struct {
 	root string
 
 	mu        sync.Mutex
-	manifests map[SnapshotID]*SnapshotManifest
+	manifests map[SnapshotID]cachedSharedManifest
+}
+
+type cachedSharedManifest struct {
+	manifest *SnapshotManifest
+	info     os.FileInfo
 }
 
 // OpenSharedPackStore opens a shared pack repository.
@@ -89,7 +95,7 @@ func OpenSharedPackStore(root string) (*SharedPackStore, error) {
 	if err := os.MkdirAll(filepath.Join(root, "snapshots"), 0700); err != nil {
 		return nil, err
 	}
-	return &SharedPackStore{root: root, manifests: make(map[SnapshotID]*SnapshotManifest)}, nil
+	return &SharedPackStore{root: root, manifests: make(map[SnapshotID]cachedSharedManifest)}, nil
 }
 
 func (store *SharedPackStore) snapshotDirectory(id SnapshotID) string {
@@ -97,6 +103,17 @@ func (store *SharedPackStore) snapshotDirectory(id SnapshotID) string {
 }
 
 func packName(number uint32) string { return fmt.Sprintf("pack-%08x.data", number) }
+
+func parsePackName(name string) (uint32, bool) {
+	if !strings.HasPrefix(name, "pack-") || !strings.HasSuffix(name, ".data") {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".data"), 16, 32)
+	if err != nil || packName(uint32(value)) != name {
+		return 0, false
+	}
+	return uint32(value), true
+}
 
 func alignPack(value int64) int64 {
 	return (value + sharedPackAlignment - 1) &^ (sharedPackAlignment - 1)
@@ -297,7 +314,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		return err
 	}
 	store.mu.Lock()
-	store.manifests[snapshot] = cloneManifest(&manifest)
+	delete(store.manifests, snapshot)
 	store.mu.Unlock()
 	return nil
 }
@@ -331,6 +348,33 @@ func writeAtomicJSON(path string, value any) error {
 	return syncDirectory(directory)
 }
 
+func replaceAtomicJSON(path string, value any) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".manifest-replacement-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	encoder := json.NewEncoder(temporary)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(directory)
+}
+
 func cloneManifest(manifest *SnapshotManifest) *SnapshotManifest {
 	if manifest == nil {
 		return nil
@@ -351,16 +395,31 @@ func cloneManifest(manifest *SnapshotManifest) *SnapshotManifest {
 // Manifest opens and structurally validates an authoritative manifest and its
 // pack headers without reading bulk data.
 func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, error) {
+	path := filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
 	store.mu.Lock()
-	if manifest := store.manifests[snapshot]; manifest != nil {
-		result := cloneManifest(manifest)
+	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime() == info.ModTime() {
+		result := cloneManifest(cached.manifest)
 		store.mu.Unlock()
+		file.Close()
 		return result, nil
 	}
 	store.mu.Unlock()
-	data, err := os.ReadFile(filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName))
+	data, err := io.ReadAll(file)
+	closeErr := file.Close()
 	if err != nil {
 		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 	var manifest SnapshotManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
@@ -370,7 +429,7 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return nil, err
 	}
 	store.mu.Lock()
-	store.manifests[snapshot] = cloneManifest(&manifest)
+	store.manifests[snapshot] = cachedSharedManifest{manifest: cloneManifest(&manifest), info: info}
 	store.mu.Unlock()
 	return cloneManifest(&manifest), nil
 }
@@ -555,6 +614,210 @@ func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCl
 		readers = append(readers, io.NewSectionReader(file, extent.Offset, extent.Length))
 	}
 	return &extentReadCloser{reader: io.MultiReader(readers...), files: files, lease: lease}, packed.Object.BulkLength, nil
+}
+
+// PackCompactionStats describes one physical representation rewrite. Object
+// identities and logical reference counts do not change.
+type PackCompactionStats struct {
+	BeforePacks   int
+	BeforeObjects int
+	BeforeBytes   int64
+	AfterPacks    int
+	AfterObjects  int
+	AfterBytes    int64
+}
+
+// Compact rewrites one partially-live origin into a single pack using the
+// exact object/reference view supplied by its authoritative reference ledger.
+// It takes the same directory lease as retirement, so no cooperating reader
+// can retain an old pack FD while it is unlinked (important on NFS).
+func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, references map[string]ObjectID) (PackCompactionStats, bool, error) {
+	var stats PackCompactionStats
+	if snapshot == 0 || len(objects) == 0 {
+		return stats, false, errors.New("shared pack compaction requires a nonempty origin")
+	}
+	lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return stats, true, nil
+	}
+	if err != nil {
+		return stats, false, err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		_ = lease.Close()
+	}()
+	manifest, err := store.Manifest(snapshot)
+	if err != nil {
+		return stats, false, err
+	}
+	stats.BeforePacks, stats.BeforeObjects = len(manifest.Packs), len(manifest.Objects)
+	for _, pack := range manifest.Packs {
+		stats.BeforeBytes += pack.Size
+	}
+	old := make(map[string]PackedObject, len(manifest.Objects))
+	for _, object := range manifest.Objects {
+		old[object.Object.ID.key()] = object
+	}
+	objects = append([]Object(nil), objects...)
+	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	for _, object := range objects {
+		packed, ok := old[object.ID.key()]
+		if !ok || object.ID.Snapshot != snapshot || object.State != ObjectLive || packed.Object.BulkLength != object.BulkLength {
+			return stats, false, fmt.Errorf("shared pack compaction view contains invalid object %s", object.ID)
+		}
+		if err := validateObject(object); err != nil {
+			return stats, false, err
+		}
+	}
+
+	directory := store.snapshotDirectory(snapshot)
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return stats, false, err
+	}
+	var nextPack uint64
+	for _, entry := range entries {
+		name := entry.Name()
+		value, ok := parsePackName(name)
+		if ok && uint64(value) >= nextPack {
+			nextPack = uint64(value) + 1
+		}
+	}
+	if nextPack > uint64(^uint32(0)) {
+		return stats, false, errors.New("shared pack number space exhausted")
+	}
+	packNumber := uint32(nextPack)
+	temporary, err := os.CreateTemp(directory, ".compact-pack-")
+	if err != nil {
+		return stats, false, err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	fail := func(err error) (PackCompactionStats, bool, error) {
+		_ = temporary.Close()
+		return stats, false, err
+	}
+	if err := writePackHeader(temporary, snapshot, packNumber); err != nil {
+		return fail(err)
+	}
+	replacement := SnapshotManifest{Version: sharedPackVersion, Snapshot: snapshot, References: make(map[string]ObjectID, len(references))}
+	for name, object := range references {
+		replacement.References[name] = object
+	}
+	for _, object := range objects {
+		previous := old[object.ID.key()]
+		packed := PackedObject{Object: cloneObject(object)}
+		for _, extent := range previous.Extents {
+			source, err := os.Open(filepath.Join(directory, packName(extent.Pack)))
+			if err != nil {
+				return fail(err)
+			}
+			offset, err := temporary.Seek(0, io.SeekCurrent)
+			if err == nil {
+				_, err = io.CopyN(temporary, io.NewSectionReader(source, extent.Offset, extent.Length), extent.Length)
+			}
+			closeErr := source.Close()
+			if err != nil || closeErr != nil {
+				return fail(errors.Join(err, closeErr))
+			}
+			packed.Extents = append(packed.Extents, PackExtent{Pack: packNumber, Offset: offset, Length: extent.Length})
+			if err := writePadding(temporary); err != nil {
+				return fail(err)
+			}
+		}
+		replacement.Objects = append(replacement.Objects, packed)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fail(err)
+	}
+	info, err := temporary.Stat()
+	if err != nil {
+		return fail(err)
+	}
+	replacement.Packs = []PackInfo{{Number: packNumber, Size: info.Size()}}
+	if err := temporary.Close(); err != nil {
+		return stats, false, err
+	}
+	destination := filepath.Join(directory, packName(packNumber))
+	if err := os.Rename(temporaryPath, destination); err != nil {
+		return stats, false, err
+	}
+	if err := syncDirectory(directory); err != nil {
+		return stats, false, err
+	}
+	if err := store.validateManifest(&replacement); err != nil {
+		return stats, false, fmt.Errorf("validating compacted shared pack: %w", err)
+	}
+	if err := replaceAtomicJSON(filepath.Join(directory, sharedManifestName), replacement); err != nil {
+		return stats, false, err
+	}
+	store.mu.Lock()
+	delete(store.manifests, snapshot)
+	store.mu.Unlock()
+	var removeErr error
+	for _, pack := range manifest.Packs {
+		if pack.Number != packNumber {
+			removeErr = errors.Join(removeErr, os.Remove(filepath.Join(directory, packName(pack.Number))))
+		}
+	}
+	removeErr = errors.Join(removeErr, syncDirectory(directory))
+	stats.AfterPacks, stats.AfterObjects, stats.AfterBytes = 1, len(objects), info.Size()
+	return stats, false, removeErr
+}
+
+// Reconcile removes finalized pack files that are not selected by the current
+// authoritative manifest. This rolls forward a crash or transient failure
+// after a compaction manifest switch. Unknown and temporary files are left
+// untouched for the higher-level transaction reconciler; they never make the
+// pack unreadable.
+func (store *SharedPackStore) Reconcile(snapshot SnapshotID) (int, bool, error) {
+	if snapshot == 0 {
+		return 0, false, errors.New("cannot reconcile snapshot zero")
+	}
+	lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return 0, true, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		_ = lease.Close()
+	}()
+	manifest, err := store.Manifest(snapshot)
+	if err != nil {
+		return 0, false, err
+	}
+	live := make(map[uint32]struct{}, len(manifest.Packs))
+	for _, pack := range manifest.Packs {
+		live[pack.Number] = struct{}{}
+	}
+	entries, err := os.ReadDir(store.snapshotDirectory(snapshot))
+	if err != nil {
+		return 0, false, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		number, ok := parsePackName(entry.Name())
+		if !ok {
+			continue
+		}
+		if _, ok := live[number]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(store.snapshotDirectory(snapshot), entry.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return removed, false, err
+		}
+		removed++
+	}
+	if removed != 0 {
+		if err := syncDirectory(store.snapshotDirectory(snapshot)); err != nil {
+			return removed, false, err
+		}
+	}
+	return removed, false, nil
 }
 
 // Retire removes one unreachable committed snapshot pack without racing a

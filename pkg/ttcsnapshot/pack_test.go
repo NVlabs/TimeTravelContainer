@@ -279,3 +279,140 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := filepath.Join(directory, "shared")
+	shared, err := OpenSharedPackStore(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := func(pin string, value byte) ObjectID {
+		id, err := graph.ReserveObject(origin, ObjectKindFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := bytes.Repeat([]byte{value}, 1<<20)
+		if err := local.Install(id, bytes.NewReader(payload), int64(len(payload))); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.CommitReservedObject(id, pin, uint64(len(payload)), nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	dead := install("dead", 0xd0)
+	live := install("live", 0x1a)
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := shared.Manifest(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherNode, err := OpenSharedPackStore(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached, err := otherNode.Manifest(origin); err != nil || len(cached.Objects) != 2 {
+		t.Fatalf("other-node initial manifest=%+v err=%v", cached, err)
+	}
+	oldPack := filepath.Join(shared.snapshotDirectory(origin), packName(manifest.Packs[0].Number))
+	objects := make([]Object, len(manifest.Objects))
+	for i := range manifest.Objects {
+		objects[i] = manifest.Objects[i].Object
+	}
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(origin, objects, manifest.References); err != nil {
+		t.Fatal(err)
+	}
+	var deadReference string
+	for name, object := range manifest.References {
+		if object == dead {
+			deadReference = name
+			break
+		}
+	}
+	if deadReference == "" {
+		t.Fatal("dead object has no publication reference")
+	}
+	if err := ledger.ApplyReference("drop-dead", deadReference, dead, false); err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := ledger.Collect(16); err != nil || collected != 1 {
+		t.Fatalf("Collect()=(%d,%v), want (1,nil)", collected, err)
+	}
+	liveObjects, liveReferences, ok := ledger.OriginManifest(origin)
+	if !ok || len(liveObjects) != 1 || liveObjects[0].ID != live {
+		t.Fatalf("live origin view=%+v ok=%t", liveObjects, ok)
+	}
+
+	reader, _, err := shared.Fetch(context.Background(), live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, busy, err := shared.Compact(origin, liveObjects, liveReferences); err != nil || !busy {
+		t.Fatalf("Compact with reader=(busy=%t,err=%v), want busy", busy, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, busy, err := shared.Compact(origin, liveObjects, liveReferences)
+	if err != nil || busy {
+		t.Fatalf("Compact=(%+v,busy=%t,err=%v)", stats, busy, err)
+	}
+	if stats.BeforeObjects != 2 || stats.AfterObjects != 1 || stats.AfterBytes >= stats.BeforeBytes {
+		t.Fatalf("compaction stats=%+v", stats)
+	}
+	if _, err := os.Stat(oldPack); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old pack survived compaction: %v", err)
+	}
+	reader, length, err := shared.Fetch(context.Background(), live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || length != 1<<20 || len(got) != 1<<20 || got[0] != 0x1a {
+		t.Fatalf("compacted live read length=%d bytes=%d err=%v", length, len(got), errors.Join(readErr, closeErr))
+	}
+	if _, _, err := shared.Fetch(context.Background(), dead); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("collected object fetch error=%v, want not-exist", err)
+	}
+	if reopened, err := otherNode.Manifest(origin); err != nil || len(reopened.Objects) != 1 || reopened.Objects[0].Object.ID != live {
+		t.Fatalf("reopened compacted manifest=%+v err=%v", reopened, err)
+	}
+	residue := filepath.Join(shared.snapshotDirectory(origin), packName(0x99))
+	if err := os.WriteFile(residue, []byte("post-manifest crash residue"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	unknown := filepath.Join(shared.snapshotDirectory(origin), "operator-note")
+	if err := os.WriteFile(unknown, []byte("leave me"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if removed, busy, err := shared.Reconcile(origin); err != nil || busy || removed != 1 {
+		t.Fatalf("Reconcile()=(removed=%d,busy=%t,err=%v)", removed, busy, err)
+	}
+	if _, err := os.Stat(residue); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete finalized pack survived reconciliation: %v", err)
+	}
+	if _, err := os.Stat(unknown); err != nil {
+		t.Fatalf("unknown file was removed: %v", err)
+	}
+}
