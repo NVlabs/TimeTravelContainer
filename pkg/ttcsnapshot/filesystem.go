@@ -23,7 +23,9 @@ import (
 	"sort"
 )
 
-const filesystemRootMagic = "TTCFS1"
+const filesystemRootMagic = "TTCFS2"
+
+const filesystemRootDataBytes = len(filesystemRootMagic) + 8
 
 // InodeRecord is immutable guest inode metadata. File is set only for regular
 // files and identifies the whole-file data object.
@@ -99,14 +101,15 @@ func validateFilesystemJournalMutation(mutation filesystemJournalMutation) error
 }
 
 type filesystemRoot struct {
-	inodes ObjectID
+	inodes    ObjectID
+	bulkBytes uint64
 }
 
 func decodeFilesystemRoot(object Object) (filesystemRoot, error) {
-	if object.ID.Kind != ObjectKindMetadata || string(object.Data) != filesystemRootMagic {
+	if object.ID.Kind != ObjectKindMetadata || len(object.Data) != filesystemRootDataBytes || string(object.Data[:len(filesystemRootMagic)]) != filesystemRootMagic {
 		return filesystemRoot{}, fmt.Errorf("object %s is not a filesystem root", object.ID.key())
 	}
-	var root filesystemRoot
+	root := filesystemRoot{bulkBytes: binary.BigEndian.Uint64(object.Data[len(filesystemRootMagic):])}
 	for _, edge := range object.Children {
 		switch edge.Slot {
 		case 0:
@@ -116,6 +119,48 @@ func decodeFilesystemRoot(object Object) (filesystemRoot, error) {
 		}
 	}
 	return root, nil
+}
+
+func encodeFilesystemRoot(root filesystemRoot) []byte {
+	data := make([]byte, filesystemRootDataBytes)
+	copy(data, filesystemRootMagic)
+	binary.BigEndian.PutUint64(data[len(filesystemRootMagic):], root.bulkBytes)
+	return data
+}
+
+func inodeBulkLength(inode InodeRecord) (uint64, error) {
+	if inode.Type != "regular" {
+		return 0, nil
+	}
+	if inode.Size < 0 {
+		return 0, fmt.Errorf("inode %d has negative size", inode.Number)
+	}
+	return uint64(inode.Size), nil
+}
+
+func replaceFilesystemBulkLength(total uint64, old InodeRecord, oldExists bool, replacement InodeRecord, replacementExists bool) (uint64, error) {
+	var oldLength, newLength uint64
+	var err error
+	if oldExists {
+		oldLength, err = inodeBulkLength(old)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if replacementExists {
+		newLength, err = inodeBulkLength(replacement)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if oldLength > total {
+		return 0, errors.New("TTC filesystem byte aggregate underflow")
+	}
+	total -= oldLength
+	if newLength > ^uint64(0)-total {
+		return 0, errors.New("TTC filesystem byte aggregate overflow")
+	}
+	return total + newLength, nil
 }
 
 func directoryKey(parent uint64, name string) ([]byte, error) {
@@ -406,6 +451,28 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 	}
 	inodeBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode}
 
+	// Update the whole-filesystem byte aggregate from the final inode changes
+	// before replacing any immutable paths. Directory entries and hard links do
+	// not affect it: each regular inode contributes exactly once.
+	changedInodes := make(map[uint64]struct{}, len(inodePuts)+len(inodeDeletes))
+	for number := range inodePuts {
+		changedInodes[number] = struct{}{}
+	}
+	for number := range inodeDeletes {
+		changedInodes[number] = struct{}{}
+	}
+	for number := range changedInodes {
+		old, found, err := lookupInode(number)
+		if err != nil {
+			return nil, ObjectID{}, err
+		}
+		replacement, replacing := inodePuts[number]
+		root.bulkBytes, err = replaceFilesystemBulkLength(root.bulkBytes, old, found, replacement, replacing)
+		if err != nil {
+			return nil, ObjectID{}, err
+		}
+	}
+
 	// Install final inode records first so directory entries may reference
 	// inodes created in the same transaction.
 	inodeNumbers := make([]uint64, 0, len(inodePuts))
@@ -532,7 +599,7 @@ func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName st
 	if root.inodes.IsZero() {
 		return nil, ObjectID{}, errors.New("TTC filesystem transaction produced an empty filesystem")
 	}
-	logicalRoot, err := mutation.create(ObjectKindMetadata, []byte(filesystemRootMagic), []Edge{{Slot: 0, Child: root.inodes}})
+	logicalRoot, err := mutation.create(ObjectKindMetadata, encodeFilesystemRoot(root), []Edge{{Slot: 0, Child: root.inodes}})
 	if err != nil {
 		return nil, ObjectID{}, err
 	}
@@ -600,25 +667,31 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 			if inode.Number == 0 || inode.Type == "" {
 				return nil, ObjectID{}, errors.New("invalid TTC inode record")
 			}
+			oldID, oldExists, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(inode.Number))
+			if err != nil {
+				return nil, ObjectID{}, err
+			}
+			var old InodeRecord
+			if oldExists {
+				oldObject, ok := mutation.object(oldID)
+				if !ok || oldObject.ID.Kind != ObjectKindInode {
+					return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
+				}
+				if err := json.Unmarshal(oldObject.Data, &old); err != nil {
+					return nil, ObjectID{}, err
+				}
+			}
+			root.bulkBytes, err = replaceFilesystemBulkLength(root.bulkBytes, old, oldExists, inode, true)
+			if err != nil {
+				return nil, ObjectID{}, err
+			}
 			// Directory membership is maintained by PutEntry/DeleteEntry. The
 			// public inode metadata used by filesystem clients intentionally
 			// does not expose the internal directory-tree root, so an ordinary
 			// chmod/chown/timestamp update carries a zero Directory field. Keep
 			// the existing root instead of silently detaching every child.
 			if inode.Type == "directory" && inode.Directory.IsZero() && !root.inodes.IsZero() {
-				oldID, found, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(inode.Number))
-				if err != nil {
-					return nil, ObjectID{}, err
-				}
-				if found {
-					oldObject, ok := mutation.object(oldID)
-					if !ok || oldObject.ID.Kind != ObjectKindInode {
-						return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
-					}
-					var old InodeRecord
-					if err := json.Unmarshal(oldObject.Data, &old); err != nil {
-						return nil, ObjectID{}, err
-					}
+				if oldExists {
 					inode.Directory = old.Directory
 				}
 			}
@@ -654,6 +727,24 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 				return nil, ObjectID{}, err
 			}
 		case operation.DeleteInode != 0:
+			oldID, found, lookupErr := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(operation.DeleteInode))
+			if lookupErr != nil {
+				return nil, ObjectID{}, lookupErr
+			}
+			var old InodeRecord
+			if found {
+				oldObject, ok := mutation.object(oldID)
+				if !ok || oldObject.ID.Kind != ObjectKindInode {
+					return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
+				}
+				if err := json.Unmarshal(oldObject.Data, &old); err != nil {
+					return nil, ObjectID{}, err
+				}
+			}
+			root.bulkBytes, err = replaceFilesystemBulkLength(root.bulkBytes, old, found, InodeRecord{}, false)
+			if err != nil {
+				return nil, ObjectID{}, err
+			}
 			root.inodes, _, err = inodeBuilder.delete(root.inodes, InodeKey(operation.DeleteInode))
 			if err != nil {
 				return nil, ObjectID{}, err
@@ -752,7 +843,7 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 	if len(edges) == 0 {
 		return nil, ObjectID{}, errors.New("TTC filesystem transaction produced an empty filesystem")
 	}
-	logicalRoot, err := mutation.create(ObjectKindMetadata, []byte(filesystemRootMagic), edges)
+	logicalRoot, err := mutation.create(ObjectKindMetadata, encodeFilesystemRoot(root), edges)
 	if err != nil {
 		return nil, ObjectID{}, err
 	}
@@ -888,6 +979,25 @@ func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bo
 		return object, found && resolveErr == nil
 	})
 	return record, ok, errors.Join(err, loadErr)
+}
+
+// FilesystemBulkBytes returns the logical bytes in regular-file inodes in
+// constant time. Hard links are counted once because they share one inode.
+func (s *Store) FilesystemBulkBytes(rootID ObjectID) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok, err := s.resolveDeferredLocked(rootID)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, fmt.Errorf("filesystem root %s is missing", rootID.key())
+	}
+	root, err := decodeFilesystemRoot(object)
+	if err != nil {
+		return 0, err
+	}
+	return root.bulkBytes, nil
 }
 
 func filesystemInodeObjects(rootID ObjectID, number uint64, objectFor func(ObjectID) (Object, bool)) (InodeRecord, bool, error) {

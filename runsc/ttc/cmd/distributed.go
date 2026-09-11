@@ -451,7 +451,7 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 	defer os.RemoveAll(staging)
 	var repositories []*ttcvolume.Repository
 	var dependentBytes uint64
-	countedObjects := make(map[string]struct{})
+	countedRepositories := make(map[string]struct{})
 	closeRepositories := func() {
 		for _, repository := range repositories {
 			_ = repository.Close()
@@ -466,18 +466,21 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		}
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
 		destination := filepath.Join(staging, hex.EncodeToString(key[:]))
-		_, objects, err := repository.ExportRemoteSnapshot(filesystemBranch, destination)
+		snapshot, _, err := repository.ExportRemoteSnapshot(filesystemBranch, destination)
 		if err != nil {
 			repository.Close()
 			closeRepositories()
 			return "", 0, err
 		}
-		for object, size := range objects {
-			identity := repository.Info().ID + ":" + object
-			if _, ok := countedObjects[identity]; !ok {
-				dependentBytes += uint64(size)
-				countedObjects[identity] = struct{}{}
+		repositoryID := repository.Info().ID
+		if _, counted := countedRepositories[repositoryID]; !counted {
+			if snapshot.LogicalBytes > ^uint64(0)-dependentBytes {
+				repository.Close()
+				closeRepositories()
+				return "", 0, errors.New("distributed filesystem dependency byte count overflow")
 			}
+			dependentBytes += snapshot.LogicalBytes
+			countedRepositories[repositoryID] = struct{}{}
 		}
 		repositories = append(repositories, repository)
 	}

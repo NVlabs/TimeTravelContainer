@@ -29,7 +29,7 @@ import (
 
 const (
 	snapshotFormatVersion       = 2
-	remoteSnapshotFormatVersion = 4
+	remoteSnapshotFormatVersion = 5
 )
 
 // SnapshotInfo describes one self-contained repository branch snapshot.
@@ -39,6 +39,7 @@ type SnapshotInfo struct {
 	BranchID      string    `json:"branch_id"`
 	Root          string    `json:"root"`
 	NextInode     uint64    `json:"next_inode"`
+	LogicalBytes  uint64    `json:"logical_bytes"`
 	CreatedAt     time.Time `json:"created_at"`
 }
 
@@ -80,7 +81,11 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 	if _, ok, err := r.graph.FilesystemInode(root, rootInode); err != nil || !ok {
 		return SnapshotInfo{}, nil, errors.Join(errors.New("remote filesystem graph omits its root inode"), err)
 	}
-	snapshot := SnapshotInfo{FormatVersion: remoteSnapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: branch.Root, NextInode: info.NextInode, CreatedAt: time.Now().UTC()}
+	logicalBytes, err := r.graph.FilesystemBulkBytes(root)
+	if err != nil {
+		return SnapshotInfo{}, nil, fmt.Errorf("reading filesystem byte aggregate: %w", err)
+	}
+	snapshot := SnapshotInfo{FormatVersion: remoteSnapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: branch.Root, NextInode: info.NextInode, LogicalBytes: logicalBytes, CreatedAt: time.Now().UTC()}
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return SnapshotInfo{}, nil, err
 	}
@@ -152,6 +157,14 @@ func (r *Repository) exportSnapshot(branchID, destination string, inherited map[
 		Root:          branch.Root,
 		NextInode:     info.NextInode,
 		CreatedAt:     time.Now().UTC(),
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return SnapshotInfo{}, fmt.Errorf("parsing filesystem graph root: %w", err)
+	}
+	snapshot.LogicalBytes, err = r.graph.FilesystemBulkBytes(root)
+	if err != nil {
+		return SnapshotInfo{}, fmt.Errorf("reading filesystem byte aggregate: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return SnapshotInfo{}, fmt.Errorf("creating snapshot parent directory: %w", err)

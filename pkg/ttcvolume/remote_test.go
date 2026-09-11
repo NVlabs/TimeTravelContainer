@@ -38,9 +38,12 @@ func TestRemoteSnapshotFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshotDir := filepath.Join(t.TempDir(), "snapshot")
-	_, objects, err := source.ExportRemoteSnapshot("remote-generation", snapshotDir)
+	snapshot, objects, err := source.ExportRemoteSnapshot("remote-generation", snapshotDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if snapshot.LogicalBytes != uint64(len(payload)) {
+		t.Fatalf("remote logical bytes=%d, want %d", snapshot.LogicalBytes, len(payload))
 	}
 	if _, err := os.Stat(filepath.Join(snapshotDir, "graph.json")); err != nil {
 		t.Fatalf("graph-native remote metadata is missing: %v", err)

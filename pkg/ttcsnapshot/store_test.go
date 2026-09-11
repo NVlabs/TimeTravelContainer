@@ -1273,6 +1273,9 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 	if got, ok, err := store.FilesystemInode(root, 2); err != nil || !ok || got.File != file || string(got.Xattrs["user.test"]) != "value" {
 		t.Fatalf("inode=(%+v,%t,%v)", got, ok, err)
 	}
+	if got, err := store.FilesystemBulkBytes(root); err != nil || got != 7 {
+		t.Fatalf("FilesystemBulkBytes=%d, %v; want 7, nil", got, err)
+	}
 	entries, err := store.FilesystemDirectory(root, 1)
 	if err != nil || len(entries) != 2 || entries[0].Name != "first" || entries[1].Name != "second" {
 		t.Fatalf("directory=(%+v,%v)", entries, err)
@@ -1291,11 +1294,67 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 	if _, ok, err := store.FilesystemInode(root, 2); err != nil || ok {
 		t.Fatalf("deleted inode lookup=(%t,%v), want (false,nil)", ok, err)
 	}
+	if got, err := store.FilesystemBulkBytes(root); err != nil || got != 0 {
+		t.Fatalf("FilesystemBulkBytes after delete=%d, %v; want 0, nil", got, err)
+	}
 	if _, err := store.Collect(10000); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Verify(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFilesystemBulkBytesTracksInodesNotDirectoryEntries(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file1, err := store.CreateObject(origin, "build/file-1", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file2, err := store.CreateObject(origin, "build/file-2", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInode := InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}
+	first := InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 2, Size: 100, File: file1}
+	root, err := store.ApplyFilesystem(origin, "branch/main/filesystem", []FilesystemOperation{
+		{PutInode: &rootInode}, {PutInode: &first},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "one", Inode: 2}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "hardlink", Inode: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.FilesystemBulkBytes(root); err != nil || got != 100 {
+		t.Fatalf("hard-linked aggregate=%d, %v; want 100, nil", got, err)
+	}
+	first.Size = 40
+	second := InodeRecord{Number: 3, Type: "regular", Mode: 0644, Nlink: 1, Size: 25, File: file2}
+	root, err = store.ApplyFilesystem(origin, "branch/main/filesystem", []FilesystemOperation{
+		{PutInode: &first}, {PutInode: &second},
+		{DeleteEntry: &DirectoryEntryRecord{Parent: 1, Name: "one"}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "two", Inode: 3}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.FilesystemBulkBytes(root); err != nil || got != 65 {
+		t.Fatalf("updated aggregate=%d, %v; want 65, nil", got, err)
+	}
+	forked := "branch/peer/filesystem"
+	if err := store.CloneRoots(map[string]string{forked: "branch/main/filesystem"}); err != nil {
+		t.Fatal(err)
+	}
+	peerRoot, ok := store.Root(forked)
+	if !ok {
+		t.Fatal("forked filesystem root is missing")
+	}
+	if got, err := store.FilesystemBulkBytes(peerRoot); err != nil || got != 65 {
+		t.Fatalf("forked aggregate=%d, %v; want 65, nil", got, err)
 	}
 }
 
