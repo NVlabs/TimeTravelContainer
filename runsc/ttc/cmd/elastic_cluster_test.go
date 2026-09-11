@@ -98,6 +98,16 @@ func TestDaemonCommandOwner(t *testing.T) {
 	if info, err := (ttcbundle.Store{Root: root}).LoadContainer("web"); err != nil || info.NodeID != "node-b" {
 		t.Fatalf("loading routing fixture=(%+v, %v)", info, err)
 	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	for _, args := range [][]string{
 		{"exec", "-it", "web@main", "bash"},
 		{"cp", "web@main:/tmp/result", "/tmp/result"},
@@ -166,6 +176,36 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	}
 	if _, _, err := daemonCommandPlacement(root, []string{"exec", "web@main", "true"}); err == nil {
 		t.Fatal("new command was routed into an in-progress migration")
+	}
+}
+
+func TestDaemonCommandPlacementRejectsMissingCurrentPlacement(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
+		t.Fatal("branch without a Raft placement used persistent metadata as a routing fallback")
 	}
 }
 

@@ -410,10 +410,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 				}
 			}
 		case errors.Is(err, os.ErrNotExist):
-			// Legacy families acquire a placement record lazily at their first
-			// migration. Until then persistent branch ownership remains the
-			// compatibility routing source.
-			branchOwner = info.BranchNodeID(selected.branch)
+			return "", nil, fmt.Errorf("resolving placement for %s: current-format clustered branch has no Raft placement record", selected)
 		default:
 			return "", nil, fmt.Errorf("resolving placement for %s: %w", selected, err)
 		}
@@ -655,14 +652,7 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		}
 		record, err := placements.Lookup(info.ID, branch.ID)
 		if errors.Is(err, os.ErrNotExist) {
-			if !branch.Unplaced {
-				// Legacy placed branches are enrolled by ordinary post-command
-				// reconciliation and require no cold-placement claim.
-				continue
-			}
-			record, err = placements.Create(cluster.PlacementRecord{
-				FamilyID: info.ID, BranchID: branch.ID, State: cluster.PlacementUnplaced,
-			}, time.Now())
+			return fmt.Errorf("loading placement for %s: current-format clustered branch has no Raft placement record", target)
 		}
 		if err != nil {
 			return fmt.Errorf("loading placement for %s: %w", target, err)
