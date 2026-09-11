@@ -274,6 +274,94 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 	return errors.Join(syncErr, closeErr)
 }
 
+// releaseDistributedGraphReferencesEventually preserves lifecycle
+// availability across the short interval between one shared-reference
+// coordinator releasing its lease and another rebuilding the ledger. The
+// release intent is already durable and continues to reserve every root, so
+// deferring only this coordination failure can leak temporarily but cannot
+// reclaim live data. Other failures still stop the caller.
+func (b *runtimeBackend) releaseDistributedGraphReferencesEventually(operation string) error {
+	err := b.releaseDistributedGraphReferences(operation)
+	if err == nil || !isSharedReferenceCoordinatorTransition(err) {
+		return err
+	}
+	if b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: deferred graph-reference release %q until shared coordinator takeover: %v\n", operation, err)
+	}
+	return nil
+}
+
+func isSharedReferenceCoordinatorTransition(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"shared reference coordinator has no active lease",
+		"shared reference coordinator is unavailable",
+		"does not hold an active shared reference lease",
+		"shared reference lease is stale",
+		"shared reference lease changed",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *runtimeBackend) pendingGraphReferenceReleases() (int, error) {
+	dir := filepath.Join(b.activeDataRoot(), "graph-references")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	pending := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		intent, err := readGraphReferenceIntent(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return 0, err
+		}
+		if intent.State == "releasing" {
+			pending++
+		}
+	}
+	return pending, nil
+}
+
+// flushGraphReferenceReleases is a retirement fence. Unlike an ordinary
+// remove, node retirement cannot leave retryable intents behind on scratch
+// that is about to become disposable.
+func (b *runtimeBackend) flushGraphReferenceReleases(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := b.reconcileDistributedGraphReferences(false); err != nil {
+			lastErr = err
+		}
+		pending, err := b.pendingGraphReferenceReleases()
+		if err != nil {
+			return err
+		}
+		if pending == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("%d graph-reference releases remain pending: %w", pending, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // reconcileDistributedGraphReferences closes every crash prefix before the
 // node may resume execution. Retains are completed first; terminal or missing
 // branches are released. Release failures remain durable and retryable, while

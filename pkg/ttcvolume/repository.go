@@ -187,14 +187,19 @@ type VolumeInfo struct {
 // Branch identifies one immutable filesystem root and the exclusive working
 // snapshot origin used by its next metadata and whole-file CoW mutations.
 type Branch struct {
-	ID                    string    `json:"id"`
-	Root                  string    `json:"root"`
-	BaseRoot              string    `json:"base_root,omitempty"`
-	RemoteCatalog         string    `json:"remote_catalog,omitempty"`
-	RemoteCatalogSnapshot uint64    `json:"remote_catalog_snapshot,omitempty"`
-	WorkingSnapshot       uint64    `json:"working_snapshot"`
-	Generation            uint64    `json:"generation"`
-	CreatedAt             time.Time `json:"created_at"`
+	ID                    string `json:"id"`
+	Root                  string `json:"root"`
+	BaseRoot              string `json:"base_root,omitempty"`
+	RemoteCatalog         string `json:"remote_catalog,omitempty"`
+	RemoteCatalogSnapshot uint64 `json:"remote_catalog_snapshot,omitempty"`
+	// RemoteLogicalBytes is the constant-time byte aggregate from the
+	// authoritative foreign filesystem root. It is needed only while Root is
+	// still an unresolved deferred stub; after the root is expanded, its graph
+	// metadata carries the current aggregate directly.
+	RemoteLogicalBytes uint64    `json:"remote_logical_bytes,omitempty"`
+	WorkingSnapshot    uint64    `json:"working_snapshot"`
+	Generation         uint64    `json:"generation"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // Inode is branch-resolved virtual inode metadata.
@@ -1208,7 +1213,8 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		childBranch := Branch{
 			ID: child, Root: sourceBranch.Root, BaseRoot: sourceBranch.Root, WorkingSnapshot: uint64(working[1]),
 			RemoteCatalog: sourceBranch.RemoteCatalog, RemoteCatalogSnapshot: sourceBranch.RemoteCatalogSnapshot,
-			Generation: sourceBranch.Generation, CreatedAt: time.Now().UTC(),
+			RemoteLogicalBytes: sourceBranch.RemoteLogicalBytes,
+			Generation:         sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes
 		// before the child pointer appears, the only effect is a conservative

@@ -149,6 +149,21 @@ func TestGraphReferenceIntentVersionOneMeansBranchReference(t *testing.T) {
 	}
 }
 
+func TestSharedReferenceCoordinatorTransitionClassification(t *testing.T) {
+	for _, message := range []string{
+		"shared reference coordinator has no active lease",
+		"cluster peer: this daemon does not hold an active shared reference lease",
+		"shared reference lease is stale",
+	} {
+		if !isSharedReferenceCoordinatorTransition(errors.New(message)) {
+			t.Fatalf("%q was not classified as coordinator turnover", message)
+		}
+	}
+	if isSharedReferenceCoordinatorTransition(errors.New("snapshot root is missing")) {
+		t.Fatal("permanent graph corruption was classified as coordinator turnover")
+	}
+}
+
 func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	localRoot := t.TempDir()
 	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}

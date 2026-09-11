@@ -274,6 +274,55 @@ func TestRemoteSnapshotReexportsTargetLocalFile(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotReexportFromIndependentManagerHandle(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "payload", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("remote-data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "first-hop"); err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot := filepath.Join(t.TempDir(), "first")
+	firstInfo, _, err := source.ExportRemoteSnapshot("first-hop", firstSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	targetPath := filepath.Join(targetManager.root, "target")
+	target, _, err := targetManager.ImportPrivateRemoteSnapshot(targetPath, "target", firstSnapshot, "first-hop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	// A daemon-side repository handle does not own the Sentry's transient
+	// provider connection. Re-export must remain O(1) and preserve the
+	// deferred root instead of trying to resolve it through this handle.
+	managerHandle, err := OpenRepository(targetPath, CopyModeFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer managerHandle.Close()
+	secondSnapshot := filepath.Join(t.TempDir(), "second")
+	secondInfo, _, err := managerHandle.ExportRemoteSnapshot("first-hop", secondSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondInfo.Root == "" || secondInfo.LogicalBytes != firstInfo.LogicalBytes {
+		t.Fatalf("second-hop snapshot=%+v, want logical bytes %d", secondInfo, firstInfo.LogicalBytes)
+	}
+}
+
 func TestRemoteSnapshotNeverReadsUnattachedPlaceholderAsZeros(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

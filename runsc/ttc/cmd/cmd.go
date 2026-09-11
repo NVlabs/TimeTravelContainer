@@ -8404,7 +8404,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 				return fmt.Errorf("releasing shared graph roots for %s@%s: %w", info.Name, branch.ID, err)
 			}
 		}
-		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, branch)); err != nil {
+		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
 			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
 		}
 	}
@@ -10898,7 +10898,7 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.releaseGraphMemoryRoots(branch.MemoryRoots); err != nil {
 		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 	}
-	if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, branch)); err != nil {
+	if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
 		return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
 	}
 	if len(branch.MemoryRoots) != 0 {
@@ -12263,7 +12263,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		if err := b.releaseGraphMemoryRoots(recorded.MemoryRoots); err != nil {
 			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 		}
-		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, *recorded)); err != nil {
+		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, *recorded)); err != nil {
 			return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {

@@ -74,18 +74,27 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 		return SnapshotInfo{}, nil, err
 	}
 	info := r.Info()
-	root, err := ttcsnapshot.ParseObjectID(branch.Root)
-	if err != nil {
-		return SnapshotInfo{}, nil, fmt.Errorf("parsing filesystem graph root: %w", err)
+	// Branch JSON is a durability summary and may lag the graph root advanced
+	// by the live Sentry. Capture the authoritative root name. In particular,
+	// re-exporting a remotely imported branch must not accidentally address its
+	// original deferred stub after local path-copy mutations.
+	root, ok := r.graph.Root(graphRootName(branchID))
+	if !ok {
+		return SnapshotInfo{}, nil, fmt.Errorf("branch %q has no snapshot graph root", branchID)
 	}
-	if _, ok, err := r.graph.FilesystemInode(root, rootInode); err != nil || !ok {
-		return SnapshotInfo{}, nil, errors.Join(errors.New("remote filesystem graph omits its root inode"), err)
+	rootObject, ok := r.graph.Object(root)
+	if !ok || rootObject.State != ttcsnapshot.ObjectLive || rootObject.ID.Kind != ttcsnapshot.ObjectKindMetadata {
+		return SnapshotInfo{}, nil, errors.New("remote filesystem graph omits its live root metadata")
 	}
-	logicalBytes, err := r.graph.FilesystemBulkBytes(root)
-	if err != nil {
-		return SnapshotInfo{}, nil, fmt.Errorf("reading filesystem byte aggregate: %w", err)
+	logicalBytes := branch.RemoteLogicalBytes
+	if !rootObject.Deferred {
+		var err error
+		logicalBytes, err = r.graph.FilesystemBulkBytes(root)
+		if err != nil {
+			return SnapshotInfo{}, nil, fmt.Errorf("reading filesystem byte aggregate: %w", err)
+		}
 	}
-	snapshot := SnapshotInfo{FormatVersion: remoteSnapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: branch.Root, NextInode: info.NextInode, LogicalBytes: logicalBytes, CreatedAt: time.Now().UTC()}
+	snapshot := SnapshotInfo{FormatVersion: remoteSnapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: root.String(), NextInode: info.NextInode, LogicalBytes: logicalBytes, CreatedAt: time.Now().UTC()}
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return SnapshotInfo{}, nil, err
 	}
@@ -362,7 +371,7 @@ func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (Sn
 		if err := r.graph.SetRoot(graphBaseRootName(targetBranch), root); err != nil {
 			return err
 		}
-		branch := Branch{ID: targetBranch, Root: root.String(), BaseRoot: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+		branch := Branch{ID: targetBranch, Root: root.String(), BaseRoot: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), RemoteLogicalBytes: snapshot.LogicalBytes, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
 		return r.writeBranch(branch)
 	})
 }
@@ -552,7 +561,7 @@ func (r *Repository) importRemoteSnapshotMode(source, targetBranch string) (Snap
 	if err := r.graph.SetRoot(graphBaseRootName(targetBranch), root); err != nil {
 		return SnapshotInfo{}, err
 	}
-	branch.Root, branch.BaseRoot, branch.RemoteCatalog, branch.RemoteCatalogSnapshot = root.String(), root.String(), catalog, uint64(catalogWorking)
+	branch.Root, branch.BaseRoot, branch.RemoteCatalog, branch.RemoteCatalogSnapshot, branch.RemoteLogicalBytes = root.String(), root.String(), catalog, uint64(catalogWorking), snapshot.LogicalBytes
 	if err := r.writeBranch(branch); err != nil {
 		return SnapshotInfo{}, err
 	}

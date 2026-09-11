@@ -2387,6 +2387,22 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if err != nil {
 		return nil, err
 	}
+	// A leadership change invalidates the old term's execution renewal even
+	// though its wall-clock lease may not have expired. Node stop is itself an
+	// owner-local, authority-changing operation, so renew synchronously before
+	// cordoning instead of racing the periodic heartbeat's next tick.
+	lease := source.LeaseDuration
+	if lease <= 0 {
+		lease = source.LeaseExpiresAt.Sub(source.UpdatedAt)
+	}
+	current := source.MemoryCurrentBytes
+	if measured, measureErr := currentNodeMemoryBytes(); measureErr == nil {
+		current = measured
+	}
+	source, err = b.distributedSource.directory.Heartbeat(source.NodeID, source.Incarnation, current, time.Now(), lease)
+	if err != nil {
+		return nil, fmt.Errorf("renewing node %q before stop: %w", sourceNode, err)
+	}
 	if !source.LeaseActive(time.Now()) {
 		return nil, fmt.Errorf("source node %q lease is expired or offline", sourceNode)
 	}
@@ -2394,7 +2410,6 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 		return nil, fmt.Errorf("node %q cannot stop from state %s", sourceNode, source.State)
 	}
 	if source.State != cluster.NodeDraining {
-		lease := source.LeaseExpiresAt.Sub(source.UpdatedAt)
 		if _, err := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, cluster.NodeDraining, time.Now(), lease); err != nil {
 			return nil, fmt.Errorf("cordoning node %q: %w", sourceNode, err)
 		}
@@ -2495,6 +2510,9 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 		if err := drainSourceDependencies(b, b.distributedSource, transactionStore, b.nodeID); err != nil {
 			return nil, fmt.Errorf("draining remote page dependencies: %w", err)
 		}
+		if err := b.flushGraphReferenceReleases(2 * lease); err != nil {
+			return nil, fmt.Errorf("flushing graph-reference releases: %w", err)
+		}
 		return nil, nil
 	}
 	targets, err := b.drainTargets(targetNode)
@@ -2565,6 +2583,9 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 	}
 	if err := drainSourceDependencies(b, b.distributedSource, transactionStore, b.nodeID); err != nil {
 		return moved, fmt.Errorf("draining remote page dependencies: %w", err)
+	}
+	if err := b.flushGraphReferenceReleases(2 * lease); err != nil {
+		return moved, fmt.Errorf("flushing graph-reference releases: %w", err)
 	}
 	return moved, nil
 }

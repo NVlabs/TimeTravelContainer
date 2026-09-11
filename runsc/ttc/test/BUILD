@@ -88,6 +88,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts a three-node cluster, migrates live branches, and
+# retires a node through scheduler-selected evacuation.
+sh_binary(
+    name = "e2e_elastic_lifecycle",
+    srcs = ["e2e_elastic_lifecycle.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
