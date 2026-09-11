@@ -48,6 +48,11 @@ example `ttc_fork_many`, `ttc_exec_logs`, `ttc_stats`, `ttc_diff`,
 `ttc_tty_stat`, and `ttc_checkpoint`. `ttc_command` provides the rest of TTC's
 non-interactive command surface.
 
+`ttc_inspect` accepts a container family name and returns every branch under
+`TTC.branches`. `ttc_stats` accepts a full branch selector and includes
+placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
+and private/shared resource usage.
+
 `ttc_image_load` and `ttc_image_save` accept archive paths on the machine
 running `ttcd`; the MCP transport does not copy image archives through JSON.
 

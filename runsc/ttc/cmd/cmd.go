@@ -5105,8 +5105,16 @@ type ResourceBytes struct {
 type BranchResourceStats struct {
 	Target                   string        `json:"target"`
 	State                    string        `json:"state"`
+	NodeID                   string        `json:"node_id,omitempty"`
+	Quarantined              bool          `json:"quarantined,omitempty"`
 	StorageState             string        `json:"storage_state"`
 	StorageGeneration        uint64        `json:"storage_generation,omitempty"`
+	StorageError             string        `json:"storage_error,omitempty"`
+	StorageRetryAt           time.Time     `json:"storage_retry_at,omitempty"`
+	SnapshotID               uint64        `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string      `json:"memory_roots,omitempty"`
+	MemoryRootObjects        []string      `json:"memory_root_objects,omitempty"`
+	FilesystemRoot           string        `json:"filesystem_root,omitempty"`
 	SourceNode               string        `json:"source_node,omitempty"`
 	DependentMemoryBytes     uint64        `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes uint64        `json:"dependent_filesystem_bytes,omitempty"`
@@ -5116,17 +5124,33 @@ type BranchResourceStats struct {
 	FilesystemInodes         uint64        `json:"filesystem_inodes"`
 }
 
+// SnapshotGraphResourceStats is a physical-path-free node-local diagnostic.
+// FamilyReachableObjects and PendingReferenceOperations are scoped to the
+// reported family; the remaining counts describe the serving node's graph.
+type SnapshotGraphResourceStats struct {
+	Sequence                   uint64 `json:"sequence"`
+	Snapshots                  int    `json:"snapshots"`
+	Objects                    int    `json:"objects"`
+	Roots                      int    `json:"roots"`
+	Pins                       int    `json:"pins"`
+	Reclaiming                 int    `json:"reclaiming"`
+	JournalBytes               int64  `json:"journal_bytes"`
+	FamilyReachableObjects     int    `json:"family_reachable_objects"`
+	PendingReferenceOperations int    `json:"pending_reference_operations"`
+}
+
 // FamilyResourceStats includes branch attribution and non-double-counted totals.
 type FamilyResourceStats struct {
-	Container                 string                `json:"container"`
-	Branches                  []BranchResourceStats `json:"branches"`
-	ResidentMemoryUniqueBytes uint64                `json:"resident_memory_unique_bytes"`
-	MemoryBackingUniqueBytes  uint64                `json:"memory_backing_unique_bytes"`
-	FilesystemUniqueBytes     uint64                `json:"filesystem_unique_bytes"`
-	DependentMemoryBytes      uint64                `json:"dependent_memory_bytes,omitempty"`
-	DependentFilesystemBytes  uint64                `json:"dependent_filesystem_bytes,omitempty"`
-	ImageCacheBytes           uint64                `json:"image_cache_bytes,omitempty"`
-	ImageCacheTotalBytes      uint64                `json:"image_cache_total_bytes,omitempty"`
+	Container                 string                      `json:"container"`
+	Branches                  []BranchResourceStats       `json:"branches"`
+	ResidentMemoryUniqueBytes uint64                      `json:"resident_memory_unique_bytes"`
+	MemoryBackingUniqueBytes  uint64                      `json:"memory_backing_unique_bytes"`
+	FilesystemUniqueBytes     uint64                      `json:"filesystem_unique_bytes"`
+	DependentMemoryBytes      uint64                      `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes  uint64                      `json:"dependent_filesystem_bytes,omitempty"`
+	ImageCacheBytes           uint64                      `json:"image_cache_bytes,omitempty"`
+	ImageCacheTotalBytes      uint64                      `json:"image_cache_total_bytes,omitempty"`
+	SnapshotGraph             *SnapshotGraphResourceStats `json:"snapshot_graph,omitempty"`
 }
 
 type resourceStatsBackend interface {
@@ -12450,7 +12474,12 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	for _, branch := range branches {
 		account := BranchResourceStats{
 			Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State),
-			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration, SourceNode: branch.SourceNode,
+			NodeID: info.BranchNodeID(branch.ID), Quarantined: branch.Quarantined,
+			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration,
+			StorageError: branch.StorageError, StorageRetryAt: branch.StorageRetryAt,
+			SnapshotID: branch.SnapshotID, MemoryRoots: append([]string(nil), branch.MemoryRoots...),
+			MemoryRootObjects: append([]string(nil), branch.MemoryRootObjects...), FilesystemRoot: branch.StorageManifest,
+			SourceNode:           branch.SourceNode,
 			DependentMemoryBytes: branch.DependentMemoryBytes, DependentFilesystemBytes: branch.DependentFilesystemBytes,
 		}
 		result.DependentMemoryBytes += branch.DependentMemoryBytes
@@ -12462,6 +12491,19 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			filesystemBranch = offlineCopyBranch(info, branch.ID)
 		}
 		filesystemBranches[branch.ID] = filesystemBranch
+	}
+	if b.snapshotGraph != nil {
+		graph := b.snapshotGraph.Stats()
+		result.SnapshotGraph = &SnapshotGraphResourceStats{
+			Sequence: graph.Sequence, Snapshots: graph.Snapshots, Objects: graph.Objects,
+			Roots: graph.Roots, Pins: graph.Pins, Reclaiming: graph.Reclaiming,
+			JournalBytes: b.snapshotGraph.JournalBytes(),
+		}
+		for _, branch := range branches {
+			if branch.DistributedGraphReferenceOperation != "" {
+				result.SnapshotGraph.PendingReferenceOperations++
+			}
+		}
 	}
 
 	spec, err := b.containerStore().LoadSpec(info.ID)
@@ -12516,6 +12558,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	graphMemory := make(map[string]map[ttcsnapshot.ObjectID]uint64)
 	objectBranches := make(map[ttcsnapshot.ObjectID]uint64)
 	objectSizes := make(map[ttcsnapshot.ObjectID]uint64)
+	familyReachableObjects := make(map[ttcsnapshot.ObjectID]struct{})
 	for _, branch := range branches {
 		if len(branch.MemoryRootObjects) == 0 {
 			continue
@@ -12559,6 +12602,18 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			objectSizes[id] = size
 		}
 		graphMemory[branch.ID] = memoryObjects
+		if result.SnapshotGraph != nil {
+			reachable, err := ttcsnapshot.ReachableObjects(catalog, roots)
+			if err != nil {
+				return FamilyResourceStats{}, fmt.Errorf("traversing graph roots for %s@%s: %w", result.Container, branch.ID, err)
+			}
+			for _, object := range reachable {
+				familyReachableObjects[object.ID] = struct{}{}
+			}
+		}
+	}
+	if result.SnapshotGraph != nil {
+		result.SnapshotGraph.FamilyReachableObjects = len(familyReachableObjects)
 	}
 	if len(graphMemory) != 0 {
 		for branch, objects := range graphMemory {

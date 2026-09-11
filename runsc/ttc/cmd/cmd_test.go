@@ -192,7 +192,12 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	backend := &fakeBackend{resourceStatsResult: FamilyResourceStats{
 		Container: "demo", ResidentMemoryUniqueBytes: 4096, FilesystemUniqueBytes: 8192,
 		ImageCacheBytes: 16384, ImageCacheTotalBytes: 32768,
-		Branches: []BranchResourceStats{{Target: "demo@main", State: "running", ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096}}},
+		SnapshotGraph: &SnapshotGraphResourceStats{Sequence: 7, Objects: 11, FamilyReachableObjects: 5, PendingReferenceOperations: 1},
+		Branches: []BranchResourceStats{{
+			Target: "demo@main", State: "running", NodeID: "node-a", Quarantined: true,
+			SnapshotID: 3, MemoryRoots: []string{"memory/root"}, MemoryRootObjects: []string{"object-3"}, FilesystemRoot: "filesystem-root",
+			ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096},
+		}},
 	}}
 	var stdout bytes.Buffer
 	if err := runStats([]string{"--json", "demo@main"}, &stdout, io.Discard, backend); err != nil {
@@ -205,7 +210,8 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || got.ImageCacheBytes != 16384 || got.ImageCacheTotalBytes != 32768 || len(got.Branches) != 1 {
+	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || got.ImageCacheBytes != 16384 || got.ImageCacheTotalBytes != 32768 || len(got.Branches) != 1 ||
+		got.SnapshotGraph == nil || got.SnapshotGraph.Sequence != 7 || got.SnapshotGraph.FamilyReachableObjects != 5 || got.Branches[0].SnapshotID != 3 || got.Branches[0].NodeID != "node-a" || !got.Branches[0].Quarantined || got.Branches[0].FilesystemRoot != "filesystem-root" {
 		t.Fatalf("stats=%+v", got)
 	}
 }

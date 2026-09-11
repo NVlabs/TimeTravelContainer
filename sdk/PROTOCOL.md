@@ -52,8 +52,11 @@ not add implicit `main` selection beyond what the CLI command itself documents.
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
 Inspection and statistics also expose storage placement (`local`,
 `publishing`, `shared`, `materializing`, or `error`) and any volatile source
-dependencies. `wait --condition durable` completes only after the selected
-generation is committed to shared storage.
+dependencies. `inspect` accepts a family name and returns branch records under
+`TTC.branches`; `stats --json` accepts a full branch selector and reports
+placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
+and private/shared resource bytes. `wait --condition durable` completes only
+after the selected generation is committed to shared storage.
 
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`

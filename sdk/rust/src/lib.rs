@@ -461,8 +461,9 @@ impl Client {
         checked_json(self.command(["ls", "--json"])?)
     }
 
-    pub fn inspect(&self, target: &str) -> Result<Value, Error> {
-        checked_json(self.command(["inspect", target])?)
+    /// Inspects a container family; branch details are included in TTC.branches.
+    pub fn inspect(&self, container: &str) -> Result<Value, Error> {
+        checked_json(self.command(["inspect", container])?)
     }
 
     pub fn pull(&self, image: &str) -> Result<CommandResult, Error> {

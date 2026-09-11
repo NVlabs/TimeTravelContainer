@@ -70,17 +70,6 @@ install -m 0755 "$tmp/ttcd-linux-$arch" "$install_dir/ttcd.new"
 mv -f "$install_dir/ttc.new" "$install_dir/ttc"
 mv -f "$install_dir/ttcd.new" "$install_dir/ttcd"
 
-data_dir=${TTC_DATA_ROOT:-${XDG_DATA_HOME:-"$HOME/.local/share"}/ttc}
-if [ -n "${TTC_RUNTIME_DIR:-}" ]; then
-	runtime_dir=$TTC_RUNTIME_DIR
-elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-	runtime_dir=$XDG_RUNTIME_DIR/ttc
-else
-	runtime_dir=${TMPDIR:-/tmp}/ttc-$(id -u)
-fi
-mkdir -p "$data_dir" "$runtime_dir"
-chmod 0700 "$data_dir" "$runtime_dir"
-
 profile=$HOME/.profile
 if [ "$install_dir" = "$HOME/.local/bin" ] &&
 	! grep -Fq '# TimeTravelContainer PATH' "$profile" 2>/dev/null; then
@@ -103,3 +92,4 @@ if [ -n "$profile_note" ]; then
 elif ! command -v ttc >/dev/null 2>&1; then
 	echo "Add $install_dir to PATH before running ttc."
 fi
+echo "Before starting the daemon, set TTC_ROOT to an explicit new or existing TTC data root."

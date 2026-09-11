@@ -46,6 +46,9 @@ ttc.rehydrate("demo@experiment").check()
 for family in ttc.list():
     print(family)
 
+# inspect takes a family name; its TTC.branches array contains branch details.
+print(ttc.inspect("demo"))
+
 result = ttc.exec("demo@experiment", ["sh", "-c", "uname -a"])
 print(result.stdout_text())
 result.check()
@@ -76,6 +79,8 @@ Harness-oriented helpers return structured JSON or ordinary command results:
 ```python
 ttc.exec_session("demo@candidate-a", ["sh"], session="build1", tty=True).check()
 print(ttc.tty_stat("demo@candidate-a", "build1"))
+# Includes placement, snapshot/root IDs, publication errors, graph/GC counts,
+# and private/shared memory and filesystem bytes.
 print(ttc.stats("demo@candidate-a"))
 print(ttc.diff("demo@candidate-a"))
 ttc.wait("demo@candidate-a", condition="durable").check()

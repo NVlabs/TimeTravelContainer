@@ -343,8 +343,9 @@ class Client:
     def list(self) -> Any:
         return self.command(["ls", "--json"], check=True).json()
 
-    def inspect(self, target: str) -> Any:
-        return self.command(["inspect", target], check=True).json()
+    def inspect(self, container: str) -> Any:
+        """Inspect a container family; branch details are included in TTC.branches."""
+        return self.command(["inspect", container], check=True).json()
 
     def pull(self, image: str) -> Result:
         return self.command(["pull", image])

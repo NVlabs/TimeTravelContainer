@@ -70,11 +70,11 @@ export function createServer(client = new Client()): McpServer {
   server.registerTool(
     "ttc_inspect",
     {
-      description: "Inspect a TTC container or branch.",
-      inputSchema: { target: z.string().describe("Full container@branch selector") },
+      description: "Inspect a TTC container family, including all branch details.",
+      inputSchema: { container: z.string().describe("Container family name or ID") },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ target }) => jsonResponse(await client.inspect(target)),
+    async ({ container }) => jsonResponse(await client.inspect(container)),
   );
 
   server.registerTool(

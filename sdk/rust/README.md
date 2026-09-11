@@ -63,7 +63,10 @@ Use `run_on`, `start_on`, `fork_many`, `rehydrate_on`, or `restore_on` to
 request a node. Their ordinary counterparts leave placement to TTC.
 
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
-named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
+named work. `inspect` takes a family name and returns its branches under
+`TTC.branches`. `tty_stat`, `stats`, and `diff` return structured JSON;
+`stats` includes placement, immutable snapshot/root IDs, publication errors,
+graph/GC counts, and private/shared bytes. `commit`
 accepts Docker-style image changes, while `load` and `save` exchange standard
 image archives. `copy` exposes branch-aware file transfer.
 `wait_for(target, "durable")` waits for shared publication instead of process

@@ -58,6 +58,8 @@ Omit it to let TTC select a compatible ready node.
 Harness-oriented helpers are available directly:
 
 ```ts
+// inspect() takes a family name and returns branch details in TTC.branches.
+console.log(await ttc.inspect("demo"));
 (await ttc.execSession("demo@candidate-a", ["sh"], "build1", { tty: true })).check();
 console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
 console.log(await ttc.stats("demo@candidate-a"));

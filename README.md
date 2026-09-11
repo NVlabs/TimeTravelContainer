@@ -151,6 +151,9 @@ TTC includes:
   restore.
 - Per-branch CoW resource accounting, metadata-based filesystem diffs, named
   reattachable exec sessions, and terminal-observation APIs for agent harnesses.
+- Stable JSON observability for placement, immutable snapshot and root IDs,
+  publication errors, volatile dependencies, graph/GC counts, and image-cache
+  progress.
 - Copy-on-write process memory, tmpfs, internal IPC and sockets, and persistent
   writable filesystems.
 - Rootless userspace networking with isolated virtual NICs, outbound NAT,

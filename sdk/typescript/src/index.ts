@@ -457,8 +457,9 @@ export class Client {
     return (await this.command(["ls", "--json"], { check: true })).json<T>();
   }
 
-  async inspect<T = unknown>(target: string): Promise<T> {
-    return (await this.command(["inspect", target], { check: true })).json<T>();
+  /** Inspect a container family; branch details are included in TTC.branches. */
+  async inspect<T = unknown>(container: string): Promise<T> {
+    return (await this.command(["inspect", container], { check: true })).json<T>();
   }
 
   pull(image: string): Promise<Result> {
