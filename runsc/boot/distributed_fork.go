@@ -486,6 +486,31 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	return &info, nil
 }
 
+// aliasLiveForkFilesystemResources adds the repository identities recorded by
+// an incoming checkpoint as aliases for the repositories already active in
+// this Sentry. A branch that has crossed nodes more than once is serialized
+// against the repository identity on its immediately previous node, which is
+// not necessarily the identity cached in Loader.ttcVolumeRepositories from
+// the first branch that bootstrapped the local Sentry.
+func aliasLiveForkFilesystemResources(resources vfs.LiveForkFilesystemResources, restoreIDs map[string]string) (vfs.LiveForkFilesystemResources, error) {
+	if len(restoreIDs) == 0 {
+		return resources, nil
+	}
+	aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(restoreIDs))
+	for id, resource := range resources {
+		aliased[id] = resource
+	}
+	for current, restoreID := range restoreIDs {
+		currentID := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: current}
+		resource, ok := resources[currentID]
+		if !ok {
+			return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
+		}
+		aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+	}
+	return aliased, nil
+}
+
 // restoreDistributedForkPeer reconstructs a branch beside an active peer. It
 // deliberately reuses the peer's Platform and application MemoryFile, which is
 // what makes repeated imports of identical chunks share resident host pages in
@@ -529,8 +554,12 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	connectionIndex := 0
 	for _, volume := range l.ttcVolumeRepositories {
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
-		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, volume.config.Branch); err != nil {
-			return nil, fmt.Errorf("attaching distributed peer filesystem source %q branch %q: %w", volume.config.Source, volume.config.Branch, err)
+		// Loader.ttcVolumeRepositories is initialized by the branch that first
+		// bootstrapped this Sentry, so volume.config.Branch may name that older
+		// branch after a remote branch migrates back to the same node. Attach the
+		// donated source to the freshly imported generation named by the request.
+		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, args.FilesystemBranch); err != nil {
+			return nil, fmt.Errorf("attaching distributed peer filesystem source %q branch %q: %w", volume.config.Source, args.FilesystemBranch, err)
 		}
 		connectionIndex++
 	}
@@ -600,6 +629,10 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}()
 	var child *kernel.Kernel
 	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		resources, err = aliasLiveForkFilesystemResources(resources, args.FilesystemRestoreIDs)
+		if err != nil {
+			return nil, err
+		}
 		// The live target filesystem records its node-local repository ID, while
 		// the incoming Kernel was serialized against the source repository ID.
 		// Both identities refer to the same imported generation. Make the source

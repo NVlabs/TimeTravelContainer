@@ -2906,6 +2906,14 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 				(placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused || placement.State == cluster.PlacementMigrating) {
 				continue
 			}
+			// Migration transfers guest execution authority before the target has
+			// necessarily materialized every sparse page. The old branch remains
+			// paused as a transaction-fenced data-plane provider until the target
+			// records independence. Do not let the periodic placement enforcer reap
+			// that provider merely because ordinary branch placement has moved.
+			if backend.activeSparseMigrationSource(family.ID, branch.ID) {
+				continue
+			}
 			// A remote target is restored before its public placement can be
 			// committed: the placement contains the physical identity that the
 			// target reports only after restore. The Raft transaction is the

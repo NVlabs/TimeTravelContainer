@@ -180,6 +180,7 @@ go_test(
     size = "small",
     srcs = [
         "compat_test.go",
+        "distributed_fork_test.go",
         "loader_test.go",
         "mount_hints_test.go",
         "timetravel_network_test.go",
@@ -196,6 +197,7 @@ go_test(
         "//pkg/lisafs",
         "//pkg/log",
         "//pkg/safemem",
+        "//pkg/sentry/checkpoint",
         "//pkg/sentry/fsimpl/eventfd",
         "//pkg/sentry/fsimpl/erofs",
         "//pkg/sentry/fsimpl/pipefs",
