@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -122,6 +123,79 @@ func TestRemoteSnapshotFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	case <-serverErr:
 	case <-time.After(time.Second):
 		t.Fatal("source stream remained open after target materialization")
+	}
+}
+
+func TestPackedSnapshotFetchesPortableObjectIdentity(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-packed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("packed-object-identity\n"), 10000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	snapshotDir := filepath.Join(t.TempDir(), "portable")
+	if _, err := source.ExportSnapshot(MainBranch, snapshotDir); err != nil {
+		t.Fatal(err)
+	}
+	sourceObjects, err := source.BranchObjects(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Shared-pack metadata materialization deliberately omits object bytes.
+	if err := os.RemoveAll(filepath.Join(snapshotDir, "objects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(snapshotDir, "objects"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	targetPath := filepath.Join(targetManager.root, "packed-target")
+	target, _, err := targetManager.ImportPrivatePackedSnapshot(targetPath, "packed-target", snapshotDir, "restored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	allowed, err := target.BranchRemoteSourceObjects("restored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allowed) != len(sourceObjects) {
+		t.Fatalf("source allowlist=%v, want %v", allowed, sourceObjects)
+	}
+	for object, size := range sourceObjects {
+		if allowed[object] != size {
+			t.Fatalf("source allowlist[%s]=%d, want %d", object, allowed[object], size)
+		}
+	}
+	server, client := net.Pipe()
+	var token RemoteToken
+	copy(token[:], []byte("packed-token-001"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source, Objects: sourceObjects}})
+	}()
+	if err := target.AttachRemoteObjectSource(client, token, key, "restored"); err != nil {
+		t.Fatal(err)
+	}
+	got := readAll(t, target, "restored", ino)
+	if !bytes.Equal([]byte(got), payload) {
+		t.Fatal("lazy portable object contents differ")
+	}
+	if err := target.MaterializeRemoteObjects(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
 	}
 }
 

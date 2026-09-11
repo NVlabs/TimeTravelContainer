@@ -454,6 +454,32 @@ func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 	return objects, nil
 }
 
+// BranchRemoteSourceObjects returns the immutable source identities needed to
+// serve every lazy object reachable from branchID. Portable shared-pack
+// imports allocate new node-local object IDs, so the source identity recorded
+// in each pending marker (rather than the local placeholder name) is the key
+// understood by the pack reader.
+func (r *Repository) BranchRemoteSourceObjects(branchID string) (map[string]int64, error) {
+	objects, err := r.BranchObjects(branchID)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]int64, len(objects))
+	for object, size := range objects {
+		source, pending, err := r.remoteSourceObject(object)
+		if err != nil {
+			return nil, err
+		}
+		if pending {
+			if previous, ok := result[source]; ok && previous != size {
+				return nil, fmt.Errorf("remote source object %s has inconsistent sizes %d and %d", source, previous, size)
+			}
+			result[source] = size
+		}
+	}
+	return result, nil
+}
+
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
 // source handoff or local durable publication.
 func (r *Repository) MaterializeRemoteObjects() error {

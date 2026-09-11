@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -973,7 +974,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 			if err := os.MkdirAll(filepath.Dir(repository.Path), 0700); err != nil {
 				return err
 			}
-			imported, snapshotInfo, err := manager.ImportPrivateRemoteSnapshot(repository.Path, fmt.Sprintf("cold-%d", index), snapshot, branch.FilesystemBranch)
+			imported, snapshotInfo, err := manager.ImportPrivatePackedSnapshot(repository.Path, fmt.Sprintf("cold-%d", index), snapshot, branch.FilesystemBranch)
 			if err != nil {
 				return err
 			}
@@ -987,7 +988,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 			if err != nil {
 				return err
 			}
-			snapshotInfo, importErr := opened.ImportRemoteBranchSnapshot(snapshot, branch.FilesystemBranch)
+			snapshotInfo, importErr := opened.ImportPackedBranchSnapshot(snapshot, branch.FilesystemBranch)
 			closeErr := opened.Close()
 			if importErr != nil || closeErr != nil {
 				return errors.Join(importErr, closeErr)
@@ -1096,7 +1097,7 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 			return err
 		}
 		if _, statErr := os.Stat(filepath.Join(repository.Path, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
-			imported, snapshotInfo, err := manager.ImportPrivateRemoteSnapshot(repository.Path, fmt.Sprintf("cold-fs-%d", index), snapshot, branch.FilesystemBranch)
+			imported, snapshotInfo, err := manager.ImportPrivatePackedSnapshot(repository.Path, fmt.Sprintf("cold-fs-%d", index), snapshot, branch.FilesystemBranch)
 			if err != nil {
 				return err
 			}
@@ -1112,7 +1113,7 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 			if err != nil {
 				return err
 			}
-			snapshotInfo, importErr := opened.ImportRemoteBranchSnapshot(snapshot, branch.FilesystemBranch)
+			snapshotInfo, importErr := opened.ImportPackedBranchSnapshot(snapshot, branch.FilesystemBranch)
 			closeErr := opened.Close()
 			if importErr != nil || closeErr != nil {
 				return errors.Join(importErr, closeErr)
@@ -1245,7 +1246,7 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 			directory.Close()
 			return fail(err)
 		}
-		objects, objectErr := repository.BranchObjects(branch.FilesystemBranch)
+		objects, objectErr := repository.BranchRemoteSourceObjects(branch.FilesystemBranch)
 		closeErr := repository.Close()
 		if objectErr != nil || closeErr != nil {
 			directory.Close()
@@ -1278,6 +1279,94 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		return relays, nil
 	}
 	return fail(errors.New("new-format cold manifest omits graph-native memory snapshot"))
+}
+
+// prepareColdDirectFilesystemSources opens the process-free equivalent of
+// prepareColdFilesystemRelays. Each manager-side repository resolves its lazy
+// local placeholders from the committed shared pack chain, then serves its
+// graph metadata and immutable files directly to a remote child. The returned
+// cleanup owns every repository and upstream pack stream.
+func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, filesystemBranch string) ([]ttcvolume.RemoteObjectSource, func(), error) {
+	if branch.StorageManifest == "" {
+		return nil, nil, errors.New("dehydrated branch has no durable filesystem manifest")
+	}
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return nil, nil, err
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	sort.Slice(configs, func(i, j int) bool { return configs[i].Source < configs[j].Source })
+	var repositories []*ttcvolume.Repository
+	var clients []io.Closer
+	cleanup := func() {
+		for _, repository := range repositories {
+			_ = repository.Close()
+		}
+		for _, client := range clients {
+			_ = client.Close()
+		}
+	}
+	fail := func(err error) ([]ttcvolume.RemoteObjectSource, func(), error) {
+		cleanup()
+		return nil, nil, err
+	}
+	sources := make([]ttcvolume.RemoteObjectSource, 0, len(configs))
+	for _, config := range configs {
+		ids, err := b.coldPackChain(manifest, config.Source)
+		if err != nil {
+			return fail(err)
+		}
+		directory, err := ttcpack.OpenDirectory(filepath.Join(b.dataRoot, "cold"), ids)
+		if err != nil {
+			return fail(err)
+		}
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			directory.Close()
+			return fail(err)
+		}
+		objects, err := repository.BranchRemoteSourceObjects(filesystemBranch)
+		if err != nil {
+			repository.Close()
+			directory.Close()
+			return fail(err)
+		}
+		server, client := net.Pipe()
+		var token ttcvolume.RemoteToken
+		if _, err := rand.Read(token[:]); err != nil {
+			repository.Close()
+			directory.Close()
+			server.Close()
+			client.Close()
+			return fail(err)
+		}
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
+		go func() {
+			_ = ttcvolume.ServeRemoteObjects(server, token, []ttcvolume.RemoteObjectSource{{Key: key, Reader: coldPackObjectReader{directory: directory}, Objects: objects}})
+			_ = directory.Close()
+		}()
+		if err := repository.AttachRemoteObjectSource(client, token, key, filesystemBranch); err != nil {
+			server.Close()
+			client.Close()
+			repository.Close()
+			return fail(err)
+		}
+		repositories = append(repositories, repository)
+		clients = append(clients, client)
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository})
+	}
+	if len(sources) == 0 {
+		cleanup()
+		return nil, nil, errors.New("dehydrated branch has no managed filesystem repositories")
+	}
+	return sources, cleanup, nil
 }
 
 func (b *runtimeBackend) materializeColdSource(manifest coldBranchManifest, source, destination string) error {

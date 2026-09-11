@@ -275,6 +275,60 @@ func (m *Manager) ImportPrivateSnapshot(path, name, source string) (*Repository,
 	}
 }
 
+// ImportPrivatePackedSnapshot installs the portable metadata stored in a
+// durable shared pack while leaving regular-file objects as lazy local
+// placeholders. The caller must attach an object source before the repository
+// is used. Unlike ImportPrivateRemoteSnapshot, this consumes the flattened
+// portable descriptor written by ExportSnapshotDelta rather than a live
+// peer's deferred graph descriptor.
+func (m *Manager) ImportPrivatePackedSnapshot(path, name, source, targetBranch string) (*Repository, SnapshotInfo, error) {
+	if err := validateName(targetBranch, "branch"); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	path = filepath.Clean(path)
+	if _, err := os.Lstat(path); err == nil {
+		return nil, SnapshotInfo{}, fmt.Errorf("private repository path %q already exists", path)
+	} else if !os.IsNotExist(err) {
+		return nil, SnapshotInfo{}, err
+	}
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	stage, err := os.MkdirTemp(parent, "."+filepath.Base(path)+".packed-import-")
+	if err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	if err := os.Remove(stage); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	keepStage := false
+	defer func() {
+		if !keepStage {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	repository, err := m.CreatePrivate(stage, name)
+	if err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	snapshot, err := repository.importPortableSnapshotMode(source, targetBranch, true)
+	closeErr := repository.Close()
+	if err != nil || closeErr != nil {
+		return nil, SnapshotInfo{}, errors.Join(err, closeErr)
+	}
+	if err := os.Rename(stage, path); err != nil {
+		return nil, SnapshotInfo{}, err
+	}
+	keepStage = true
+	repository, err = m.OpenPrivate(path)
+	if err != nil {
+		_ = os.RemoveAll(path)
+		return nil, SnapshotInfo{}, err
+	}
+	return repository, snapshot, nil
+}
+
 // ImportPrivateRemoteSnapshot installs metadata and sparse local object files
 // for a peer generation. targetBranch is the physical branch identity already
 // embedded in the captured Kernel.
@@ -376,6 +430,17 @@ func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (Sn
 	})
 }
 
+// ImportPackedBranchSnapshot adds portable shared-pack metadata to an
+// existing repository and records regular-file objects as lazy. The target
+// branch receives independent local object identities whose pending markers
+// retain the source-pack identities.
+func (r *Repository) ImportPackedBranchSnapshot(source, targetBranch string) (SnapshotInfo, error) {
+	if err := validateName(targetBranch, "branch"); err != nil {
+		return SnapshotInfo{}, err
+	}
+	return r.importPortableSnapshotMode(source, targetBranch, true)
+}
+
 // ImportSnapshot creates a catalogued managed volume from snapshot.
 func (m *Manager) ImportSnapshot(name, source string) (*Repository, SnapshotInfo, error) {
 	repository, err := m.Create(name)
@@ -402,6 +467,13 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 	}
 	if remote {
 		return r.importRemoteSnapshotMode(source, targetBranch)
+	}
+	return r.importPortableSnapshotMode(source, targetBranch, false)
+}
+
+func (r *Repository) importPortableSnapshotMode(source, targetBranch string, lazyObjects bool) (SnapshotInfo, error) {
+	if err := requireSnapshotDirectory(source); err != nil {
+		return SnapshotInfo{}, err
 	}
 	snapshotPath := filepath.Join(source, "snapshot.json")
 	if err := requireSnapshotRegularFile(snapshotPath); err != nil {
@@ -476,7 +548,7 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 	} else if err != nil {
 		return SnapshotInfo{}, err
 	}
-	if err := r.importGraphFiles(&metadata, objectsDir, objects, ttcsnapshot.SnapshotID(branch.WorkingSnapshot), remote); err != nil {
+	if err := r.importGraphFiles(&metadata, objectsDir, objects, ttcsnapshot.SnapshotID(branch.WorkingSnapshot), lazyObjects); err != nil {
 		return SnapshotInfo{}, err
 	}
 	r.info.NextInode = snapshot.NextInode

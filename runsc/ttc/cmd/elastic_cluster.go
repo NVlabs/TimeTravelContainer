@@ -1142,12 +1142,9 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			return fmt.Errorf("restored migration source has runtime state %q, want %q: %v", runtimeState, state, runtimeErr)
 		}
 	}
-	sourceRecord, err := b.distributedSource.directory.Lookup(b.nodeID)
+	sourceRecord, err := b.renewDistributedExecutionAuthority()
 	if err != nil {
-		return fmt.Errorf("source node lease is unavailable: %w", err)
-	}
-	if !sourceRecord.LeaseActive(time.Now()) {
-		return fmt.Errorf("source node %q lease is expired or offline", b.nodeID)
+		return fmt.Errorf("renewing source node lease: %w", err)
 	}
 	targetRecord, err := b.distributedSource.directory.Lookup(targetNode)
 	if err != nil {

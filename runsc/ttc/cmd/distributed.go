@@ -104,6 +104,40 @@ type dynamicClusterPeer struct {
 	client      *cluster.Client
 }
 
+// renewDistributedExecutionAuthority synchronously acquires an execution
+// lease in the current Raft term. A leader change intentionally invalidates
+// grants from the prior term; user-triggered fork and migration operations
+// must not race the periodic heartbeat and fail dynamically during that
+// otherwise healthy takeover window.
+func (b *runtimeBackend) renewDistributedExecutionAuthority() (*cluster.NodeRecord, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
+		return nil, errors.New("distributed execution authority is unavailable")
+	}
+	record, err := b.distributedSource.directory.Lookup(b.nodeID)
+	if err != nil {
+		return nil, err
+	}
+	lease := record.LeaseDuration
+	if lease <= 0 {
+		lease = record.LeaseExpiresAt.Sub(record.UpdatedAt)
+	}
+	if lease <= 0 {
+		return nil, errors.New("distributed node has no configured execution lease")
+	}
+	current := record.MemoryCurrentBytes
+	if measured, measureErr := currentNodeMemoryBytes(); measureErr == nil {
+		current = measured
+	}
+	renewed, err := b.distributedSource.directory.Heartbeat(record.NodeID, record.Incarnation, current, time.Now(), lease)
+	if err != nil {
+		return nil, err
+	}
+	if !renewed.LeaseActive(time.Now()) {
+		return nil, fmt.Errorf("node %q did not acquire active execution authority", renewed.NodeID)
+	}
+	return renewed, nil
+}
+
 func (b *runtimeBackend) placementCatalog() (cluster.PlacementCatalog, error) {
 	if b != nil && b.distributedSource != nil && b.distributedSource.placements != nil {
 		return b.distributedSource.placements, nil
@@ -253,6 +287,10 @@ type distributedPageRelay struct {
 	commands             map[*exec.Cmd]struct{}
 	connections          map[*net.TCPConn]struct{}
 	filesystemConfigured bool
+	directFilesystem     []ttcvolume.RemoteObjectSource
+	directToken          ttcvolume.RemoteToken
+	directCleanup        func()
+	directWG             sync.WaitGroup
 }
 
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
@@ -306,11 +344,21 @@ func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
 		r.mu.Lock()
 		configured := r.filesystemConfigured
 		closed := r.closed
-		r.mu.Unlock()
+		direct := len(r.directFilesystem) != 0
 		if closed || !configured {
+			r.mu.Unlock()
 			tcp.Close()
 			return
 		}
+		if direct {
+			sources := append([]ttcvolume.RemoteObjectSource(nil), r.directFilesystem...)
+			token := r.directToken
+			r.directWG.Add(1)
+			r.mu.Unlock()
+			r.serveDirectFilesystem(tcp, token, sources)
+			return
+		}
+		r.mu.Unlock()
 		file, err := tcp.File()
 		tcp.Close()
 		if err != nil {
@@ -359,6 +407,30 @@ func (r *distributedPageRelay) ConfigureFilesystem() error {
 	}
 	r.filesystemConfigured = true
 	return nil
+}
+
+// ConfigureDirectFilesystem switches an already configured filesystem relay
+// from Sentry donation to daemon-side immutable repository serving. This is
+// used by process-free dehydrated branches: there is no source Sentry, while
+// the manager-side graph repository is backed lazily by durable shared packs.
+// It must be installed before the target receives the relay address.
+func (r *distributedPageRelay) ConfigureDirectFilesystem(token ttcvolume.RemoteToken, sources []ttcvolume.RemoteObjectSource, cleanup func()) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || !r.filesystemConfigured || len(r.directFilesystem) != 0 || len(sources) == 0 {
+		return errors.New("distributed direct filesystem relay is unavailable or already configured")
+	}
+	r.directToken = token
+	r.directFilesystem = sources
+	r.directCleanup = cleanup
+	return nil
+}
+
+func (r *distributedPageRelay) serveDirectFilesystem(conn *net.TCPConn, token ttcvolume.RemoteToken, sources []ttcvolume.RemoteObjectSource) {
+	defer r.directWG.Done()
+	if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		fmt.Fprintf(os.Stderr, "ttcd: distributed direct filesystem relay failed: %v\n", err)
+	}
 }
 
 func (r *distributedPageRelay) serveFile(file *os.File) {
@@ -430,6 +502,15 @@ func (r *distributedPageRelay) Close() {
 				if command.Process != nil {
 					_ = command.Process.Kill()
 				}
+			}
+			r.directWG.Wait()
+			r.mu.Lock()
+			cleanup := r.directCleanup
+			r.directCleanup = nil
+			r.directFilesystem = nil
+			r.mu.Unlock()
+			if cleanup != nil {
+				cleanup()
 			}
 		})
 	}
@@ -805,6 +886,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
+	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+		return selector{}, fmt.Errorf("renewing source execution authority: %w", err)
+	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
 	}
@@ -1075,6 +1159,14 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
 	}
+	directSources, directCleanup, err := b.prepareColdDirectFilesystemSources(sourceInfo, sourceBranch, childFilesystemBranch)
+	if err != nil {
+		return selector{}, fmt.Errorf("opening durable filesystem sources: %w", err)
+	}
+	if err := relay.ConfigureDirectFilesystem(filesystemToken, directSources, directCleanup); err != nil {
+		directCleanup()
+		return selector{}, err
+	}
 	var streamBytes uint64
 	for _, run := range decodedGraphManifest.Runs {
 		streamBytes += uint64(run.Pages) * 4096
@@ -1318,6 +1410,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	sourceBranch, err := persistentBranchInfo(sourceInfo, source.branch)
 	if err != nil {
 		return nil, err
+	}
+	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+		return nil, fmt.Errorf("renewing source execution authority: %w", err)
 	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		results := make([]selector, 0, len(targetContainers))

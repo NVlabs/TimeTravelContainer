@@ -201,15 +201,18 @@ func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphRe
 	if intent == nil || intent.State == "releasing" {
 		return errors.New("graph reference operation is already releasing")
 	}
-	if b.sharedReferences != nil {
-		// Coordinator turnover rebuilds from these durable intent states. Keep
-		// the provider acknowledgement and the matching local state transition
-		// on one side of an inventory observation.
-		b.sharedReferences.claimMu.Lock()
-		defer b.sharedReferences.claimMu.Unlock()
-	}
-	return advanceGraphReferenceRetain(path, intent, func(group graphReferenceGroup) error {
-		return b.mutateGraphReferenceGroup(context.Background(), *intent, group, true)
+	return b.retryGraphReferenceMutation(func(ctx context.Context) error {
+		if b.sharedReferences != nil {
+			// Coordinator turnover rebuilds from these durable intent states.
+			// Keep one provider attempt and its matching local transition on one
+			// side of an inventory observation, but release the lock between
+			// retries so this node may itself rebuild the next coordinator ledger.
+			b.sharedReferences.claimMu.Lock()
+			defer b.sharedReferences.claimMu.Unlock()
+		}
+		return advanceGraphReferenceRetain(path, intent, func(group graphReferenceGroup) error {
+			return b.mutateGraphReferenceGroup(ctx, *intent, group, true)
+		})
 	})
 }
 
@@ -238,10 +241,6 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 	if operation == "" || b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.snapshotGraph == nil {
 		return nil
 	}
-	if b.sharedReferences != nil {
-		b.sharedReferences.claimMu.Lock()
-		defer b.sharedReferences.claimMu.Unlock()
-	}
 	path, err := graphReferenceIntentPath(b.activeDataRoot(), operation)
 	if err != nil {
 		return err
@@ -257,8 +256,14 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 	if err := writeDurableJSON(path, &intent); err != nil {
 		return err
 	}
-	if err := advanceGraphReferenceRelease(path, &intent, func(group graphReferenceGroup) error {
-		return b.mutateGraphReferenceGroup(context.Background(), intent, group, false)
+	if err := b.retryGraphReferenceMutation(func(ctx context.Context) error {
+		if b.sharedReferences != nil {
+			b.sharedReferences.claimMu.Lock()
+			defer b.sharedReferences.claimMu.Unlock()
+		}
+		return advanceGraphReferenceRelease(path, &intent, func(group graphReferenceGroup) error {
+			return b.mutateGraphReferenceGroup(ctx, intent, group, false)
+		})
 	}); err != nil {
 		return err
 	}
@@ -272,6 +277,31 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
 	return errors.Join(syncErr, closeErr)
+}
+
+// retryGraphReferenceMutation hides the bounded unavailability window of the
+// disposable shared-reference coordinator. Each attempt remains serialized
+// with local inventory capture, but waiting occurs outside claimMu: otherwise
+// a node elected as the successor could deadlock rebuilding its own inventory.
+func (b *runtimeBackend) retryGraphReferenceMutation(run func(context.Context) error) error {
+	if run == nil {
+		return errors.New("invalid graph-reference mutation")
+	}
+	deadline := time.Now().Add(45 * time.Second)
+	var lastErr error
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := run(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isSharedReferenceCoordinatorTransition(err) || !time.Now().Before(deadline) {
+			return lastErr
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // releaseDistributedGraphReferencesEventually preserves lifecycle
@@ -302,6 +332,12 @@ func isSharedReferenceCoordinatorTransition(err error) bool {
 		"does not hold an active shared reference lease",
 		"shared reference lease is stale",
 		"shared reference lease changed",
+		"connection refused",
+		"connection reset by peer",
+		"no route to host",
+		"lease has expired",
+		"context deadline exceeded",
+		"client.timeout exceeded",
 	} {
 		if strings.Contains(message, fragment) {
 			return true

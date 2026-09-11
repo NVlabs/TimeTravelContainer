@@ -98,6 +98,16 @@ sh_binary(
     ],
 )
 
+# Manual because it kills the active shared-GC coordinator and verifies that
+# a shared-root retain waits through fenced lease takeover and ledger rebuild.
+sh_binary(
+    name = "e2e_shared_gc_turnover",
+    srcs = ["e2e_shared_gc_turnover.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
