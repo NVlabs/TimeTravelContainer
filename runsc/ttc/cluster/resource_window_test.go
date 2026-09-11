@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -50,6 +51,46 @@ func TestBuildFixedTerminalProblemIntersectsVersionRuns(t *testing.T) {
 	}
 	if problem.Branches[0].PrivateBytes != 2*4096 || problem.Branches[1].PrivateBytes != 0 {
 		t.Fatalf("branches=%+v", problem.Branches)
+	}
+}
+
+func TestBuildFixedTerminalProblemIntersectsVersionChunks(t *testing.T) {
+	const allocator = "000102030405060708090a0b0c0d0e0f"
+	bitmap := func(slots ...int) string {
+		bytes := make([]byte, 32)
+		for _, slot := range slots {
+			bytes[slot/8] |= byte(1 << uint(slot%8))
+		}
+		const digits = "0123456789abcdef"
+		var result strings.Builder
+		for _, value := range bytes {
+			result.WriteByte(digits[value>>4])
+			result.WriteByte(digits[value&15])
+		}
+		return result.String()
+	}
+	problem, err := BuildFixedTerminalProblem(
+		PlacementRelievePressure, "a",
+		[]NodeResource{{ID: "a", CurrentBytes: 1000, TargetBytes: 500}, {ID: "b", CurrentBytes: 100, TargetBytes: 1000}},
+		[]PlannerSnapshot{
+			{NodeID: "a", Branches: []PlannerBranchSnapshot{{ID: "f@x", TotalBytes: 3 * 4096}, {ID: "f@y", TotalBytes: 2 * 4096}}, VersionChunks: []PlannerVersionChunk{
+				{Branch: "f@x", Allocator: allocator, Chunk: 7, Bitmap: bitmap(0, 2, 255)},
+				{Branch: "f@y", Allocator: allocator, Chunk: 7, Bitmap: bitmap(2, 255)},
+			}},
+			{NodeID: "b", Branches: []PlannerBranchSnapshot{{ID: "f@z", TotalBytes: 4096}}, VersionChunks: []PlannerVersionChunk{
+				{Branch: "f@z", Allocator: allocator, Chunk: 7, Bitmap: bitmap(255)},
+			}},
+		}, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []SharedResource{
+		{ID: "resident-version-0000", Bytes: 4096, Branches: []string{"f@x", "f@y"}},
+		{ID: "resident-version-0001", Bytes: 4096, Branches: []string{"f@x", "f@y"}, FixedNodes: []string{"b"}},
+	}
+	if !reflect.DeepEqual(problem.Shared, want) {
+		t.Fatalf("shared=%+v, want %+v", problem.Shared, want)
 	}
 }
 

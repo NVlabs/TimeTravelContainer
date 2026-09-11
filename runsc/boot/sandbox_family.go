@@ -300,8 +300,8 @@ type BranchRootfsSizeArgs struct {
 	CID      string
 }
 
-// BranchResidentMemory is mapped resident memory attributed to one live
-// branch. Private and shared classify physical Sentry pages across this family.
+// BranchResidentMemory is resident guest memory attributed to one live branch.
+// Private and shared classify physical Sentry pages across this family.
 type BranchResidentMemory struct {
 	ID           string `json:"id"`
 	State        string `json:"state"`
@@ -312,12 +312,13 @@ type BranchResidentMemory struct {
 
 // FamilyResidentMemory is a family-wide resident-memory accounting snapshot.
 type FamilyResidentMemory struct {
-	Branches                 []BranchResidentMemory      `json:"branches"`
-	SharingEdges             []ResidentMemorySharingEdge `json:"sharing_edges,omitempty"`
-	VersionRuns              []ResidentMemoryVersionRun  `json:"version_runs,omitempty"`
-	SharingEdgesTruncated    bool                        `json:"sharing_edges_truncated,omitempty"`
-	SharingEdgesOmittedBytes uint64                      `json:"sharing_edges_omitted_bytes,omitempty"`
-	UniqueBytes              uint64                      `json:"unique_bytes"`
+	Branches                 []BranchResidentMemory       `json:"branches"`
+	SharingEdges             []ResidentMemorySharingEdge  `json:"sharing_edges,omitempty"`
+	VersionRuns              []ResidentMemoryVersionRun   `json:"version_runs,omitempty"`
+	VersionChunks            []ResidentMemoryVersionChunk `json:"version_chunks,omitempty"`
+	SharingEdgesTruncated    bool                         `json:"sharing_edges_truncated,omitempty"`
+	SharingEdgesOmittedBytes uint64                       `json:"sharing_edges_omitted_bytes,omitempty"`
+	UniqueBytes              uint64                       `json:"unique_bytes"`
 }
 
 // ResidentMemoryVersionRun is a compressed stable identity range for resident
@@ -329,6 +330,17 @@ type ResidentMemoryVersionRun struct {
 	Allocator     string `json:"allocator"`
 	FirstSequence uint64 `json:"first_sequence"`
 	Pages         uint64 `json:"pages"`
+}
+
+// ResidentMemoryVersionChunk is a bounded bitmap of stable content-version
+// identities. Bitmap is 256 bits encoded as 64 lowercase hexadecimal digits;
+// bit N represents version Chunk*256+N. Unlike contiguous runs, this remains
+// compact when concurrent sibling CoW faults interleave allocator sequences.
+type ResidentMemoryVersionChunk struct {
+	Branch    string `json:"branch"`
+	Allocator string `json:"allocator"`
+	Chunk     uint64 `json:"chunk"`
+	Bitmap    string `json:"bitmap"`
 }
 
 // ResidentMemorySharingEdge is an exact weighted hyperedge. It coalesces all
@@ -2758,8 +2770,49 @@ func residentMemoryVersionRuns(branchIDs []string, branchPages []map[mm.Resident
 	return result
 }
 
-// ResidentMemory accounts mapped resident guest pages across live branches.
-// It deliberately excludes Sentry Go heap and unmapped page-cache objects.
+func residentMemoryVersionChunks(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}) []ResidentMemoryVersionChunk {
+	if len(branchIDs) != len(branchPages) {
+		panic("resident memory branch identity/page count mismatch")
+	}
+	type chunkKey struct {
+		allocator pgalloc.LogicalAllocatorID
+		sequence  uint64
+	}
+	var result []ResidentMemoryVersionChunk
+	for index, pages := range branchPages {
+		chunks := make(map[chunkKey][32]byte)
+		for page := range pages {
+			key := chunkKey{allocator: page.Version.Allocator, sequence: page.Version.Sequence / 256}
+			bitmap := chunks[key]
+			slot := page.Version.Sequence % 256
+			bitmap[slot/8] |= byte(1 << (slot % 8))
+			chunks[key] = bitmap
+		}
+		keys := make([]chunkKey, 0, len(chunks))
+		for key := range chunks {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].allocator != keys[j].allocator {
+				return string(keys[i].allocator[:]) < string(keys[j].allocator[:])
+			}
+			return keys[i].sequence < keys[j].sequence
+		})
+		for _, key := range keys {
+			bitmap := chunks[key]
+			result = append(result, ResidentMemoryVersionChunk{
+				Branch: branchIDs[index], Allocator: hex.EncodeToString(key.allocator[:]),
+				Chunk: key.sequence, Bitmap: hex.EncodeToString(bitmap[:]),
+			})
+		}
+	}
+	return result
+}
+
+// ResidentMemory accounts resident guest pages across live branches. This
+// includes task mappings and tmpfs/shmem file contents, including unmapped
+// contents retained by /dev/shm files. It deliberately excludes the Sentry Go
+// heap and host-backed filesystem page-cache objects.
 func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
@@ -2797,7 +2850,11 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}()
 
 	for index := range held {
-		held[index].pages = held[index].branch.k.ResidentPageVersions()
+		pages, err := held[index].branch.k.ResidentPageVersions()
+		if err != nil {
+			return fmt.Errorf("accounting resident memory for branch %q: %w", held[index].branch.id, err)
+		}
+		held[index].pages = pages
 	}
 	heldIDs := make([]string, 0, len(held))
 	heldPages := make([]map[mm.ResidentPageVersion]struct{}, 0, len(held))
@@ -2807,7 +2864,11 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}
 	var counts map[mm.ResidentPageVersion]uint32
 	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes, counts = residentMemorySharingEdges(heldIDs, heldPages, maxResidentMemorySharingEdges)
-	out.VersionRuns = residentMemoryVersionRuns(heldIDs, heldPages)
+	// Bitmaps have a fixed cost per 256-version window even when concurrent
+	// sibling writes interleave every allocated sequence. This avoids
+	// page-count-sized planner RPCs under the exact workload that creates
+	// placement pressure.
+	out.VersionChunks = residentMemoryVersionChunks(heldIDs, heldPages)
 	out.Branches = make([]BranchResidentMemory, 0, len(ids))
 	const pageBytes = uint64(hostarch.PageSize)
 	for _, id := range ids {

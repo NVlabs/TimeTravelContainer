@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -39,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 type ownedKernelTCPReader struct {
@@ -83,6 +86,51 @@ func newRemoteKernelMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 }
 
 var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
+
+func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	defer k.Release()
+	ctx := k.SupervisorContext()
+	creds := auth.CredentialsFromContext(ctx)
+	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{}, k)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	defer mntns.DecRef(ctx)
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+
+	before, err := k.ResidentPageVersions()
+	if err != nil {
+		t.Fatalf("ResidentPageVersions before write: %v", err)
+	}
+	fd, err := k.VFS().OpenAt(ctx, creds, &vfs.PathOperation{
+		Root: root, Start: root, Path: fspath.Parse("resident"),
+	}, &vfs.OpenOptions{Flags: linux.O_CREAT | linux.O_RDWR, Mode: 0600})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	data := make([]byte, 3*hostarch.PageSize)
+	for i := range data {
+		data[i] = byte(i + 1)
+	}
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		fd.DecRef(ctx)
+		t.Fatalf("PWrite: n=%d err=%v", n, err)
+	}
+	fd.DecRef(ctx) // The file remains linked, but has no FD or VMA reference.
+
+	after, err := k.ResidentPageVersions()
+	if err != nil {
+		t.Fatalf("ResidentPageVersions after write: %v", err)
+	}
+	if got, want := len(after)-len(before), 3; got != want {
+		t.Fatalf("resident page increase after unmapped tmpfs write: got %d pages, want %d", got, want)
+	}
+}
 
 func TestLiveForkFailureCleanup(t *testing.T) {
 	stages := []kernel.LiveForkStage{

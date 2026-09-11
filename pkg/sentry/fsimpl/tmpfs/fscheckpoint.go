@@ -41,7 +41,11 @@ func MemoryFileOf(vfsfs *vfs.Filesystem) *pgalloc.MemoryFile {
 // files, which remain part of the serialized object graph. Disk-backed TTC
 // volumes do not own regular-file contents in a MemoryFile.
 //
-// Preconditions: application tasks must be paused.
+// CaptureMemoryFileRanges may run concurrently with filesystem operations. It
+// takes a point-in-time snapshot of each regular file while holding the
+// filesystem's live-file registry lock and the file's data lock. Callers that
+// require a transactionally consistent snapshot of the complete Kernel object
+// graph (checkpoint, fork, and dehydration) must still pause application tasks.
 func CaptureMemoryFileRanges(vfsfs *vfs.Filesystem, capture *pgalloc.MemoryRangeCapture) error {
 	fs, _ := vfsfs.Impl().(*filesystem)
 	if fs == nil || fs.diskVolume != nil {

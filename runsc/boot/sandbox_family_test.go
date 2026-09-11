@@ -110,6 +110,25 @@ func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
 	}
 }
 
+func TestResidentMemoryVersionChunksBoundFragmentation(t *testing.T) {
+	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
+	file1 := &pgalloc.MemoryFile{}
+	file2 := &pgalloc.MemoryFile{}
+	pages := make(map[mm.ResidentPageVersion]struct{})
+	for sequence := uint64(0); sequence < 256; sequence += 2 {
+		pages[mm.ResidentPageVersion{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: sequence}}] = struct{}{}
+	}
+	// A physical alias of the same stable version must not create another bit.
+	pages[mm.ResidentPageVersion{File: file2, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 10}}] = struct{}{}
+	chunks := residentMemoryVersionChunks([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
+	if len(chunks) != 1 {
+		t.Fatalf("chunks=%+v, want one bounded record", chunks)
+	}
+	if got := chunks[0]; got.Branch != "main" || got.Chunk != 0 || got.Bitmap != strings.Repeat("55", 32) {
+		t.Fatalf("chunk=%+v, want even-slot bitmap", got)
+	}
+}
+
 type testDistributedBranchResource struct {
 	removed []string
 }

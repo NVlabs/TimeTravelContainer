@@ -92,7 +92,7 @@ memory_current() {
 baseline=$(memory_current)
 # Same-host test daemons share the caller's cgroup. Give node-a enough startup
 # headroom, then create 8 independently dirtied branches to cross its target.
-source_target=$((baseline + 1024 * 1024 * 1024))
+source_target=$((baseline + 256 * 1024 * 1024))
 # Planner estimates deliberately include conservative shared-memory exposure;
 # leave ample accepting capacity so this test exercises placement rather than
 # capacity provisioning.
@@ -106,7 +106,7 @@ client a pull "$IMAGE" >/dev/null
 fill_pids=
 for family in $FAMILIES; do
 	client a run -d --node node-a --name "$family" "$IMAGE" sh -c \
-		'while test ! -e /tmp/fill; do sleep 0.05; done; blob=$(yes 0123456789abcdef | head -c 201326592); printf PRESSURE >/tmp/ready; sleep 3600' >/dev/null
+		'while test ! -e /tmp/fill; do sleep 0.05; done; yes 0123456789abcdef | head -c 50331648 >/dev/shm/private && printf PRESSURE >/tmp/ready; sleep 3600' >/dev/null
 	client a fork --node node-a "$family@main" b1 b2 b3 >/dev/null
 	for branch in main b1 b2 b3; do
 		client a exec "$family@$branch" touch /tmp/fill &
@@ -143,6 +143,17 @@ if test "$state" != pressured; then
 fi
 
 client a node _planner-resources --_local node-a >"$ROOT/planner-node-a.json"
+planner_bytes=$(wc -c <"$ROOT/planner-node-a.json")
+if test "$planner_bytes" -gt $((512 * 1024)); then
+	echo "planner snapshot expanded to $planner_bytes bytes for a 384 MiB fragmented CoW workload" >&2
+	exit 1
+fi
+accounted=$(jq '[.branches[].total_bytes] | add // 0' "$ROOT/planner-node-a.json")
+if test "$accounted" -lt $((384 * 1024 * 1024)); then
+	echo "planner accounted only $accounted bytes for eight 48 MiB tmpfs files" >&2
+	cat "$ROOT/planner-node-a.json" >&2
+	exit 1
+fi
 if ! plan=$(client b node rebalance node-a); then
 	echo "node-a planner snapshot:" >&2
 	cat "$ROOT/planner-node-a.json" >&2
@@ -156,6 +167,7 @@ for family in $FAMILIES; do
 		owner=$(client b ls --json | jq -r --arg f "$family" --arg b "$branch" '.[] | select(.name == $f) | .branches[] | select(.id == $b) | .node_id')
 		case "$owner" in node-a) node=a ;; node-b) node=b ;; node-c) node=c ;; *) exit 1 ;; esac
 		test "$(client "$node" exec "$family@$branch" cat /tmp/ready)" = PRESSURE
+		test "$(client "$node" exec "$family@$branch" head -c 8 /dev/shm/private)" = 01234567
 	done
 done
 

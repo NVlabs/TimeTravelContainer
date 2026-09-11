@@ -14,12 +14,20 @@
 
 package kernel
 
-import "gvisor.dev/gvisor/pkg/sentry/mm"
+import (
+	"fmt"
 
-// ResidentPageVersions returns the physical-and-logical page identities mapped
-// by any task in k. Multiple threads and processes mapping the same resident
-// page contribute one identity.
-func (k *Kernel) ResidentPageVersions() map[mm.ResidentPageVersion]struct{} {
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
+	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+)
+
+// ResidentPageVersions returns the physical-and-logical identities of all
+// resident guest pages reachable from k. This includes pages mapped by tasks
+// and tmpfs/shmem regular-file contents, even when the latter are not mapped.
+// Multiple graph paths to the same resident page contribute one identity.
+func (k *Kernel) ResidentPageVersions() (map[mm.ResidentPageVersion]struct{}, error) {
 	managers := make(map[*mm.MemoryManager]struct{})
 	ts := k.TaskSet()
 	ts.mu.RLock()
@@ -45,5 +53,39 @@ func (k *Kernel) ResidentPageVersions() map[mm.ResidentPageVersion]struct{} {
 			pages[page] = struct{}{}
 		}
 	}
-	return pages
+
+	// A tmpfs file can retain resident memory without being mapped by a task.
+	// This is the common case for /dev/shm after a writer closes the file. The
+	// VFS filesystem registry and tmpfs live-file registry let us enumerate
+	// these allocations without walking directory trees; CaptureMemoryFileRanges
+	// also includes unlinked files that remain reachable through an FD or VMA.
+	ctx := k.SupervisorContext()
+	filesystems := k.vfs.GetFilesystems()
+	capture := pgalloc.NewMemoryRangeCapture()
+	for fsIndex, fs := range filesystems {
+		// Disk-backed TTC volumes own their data in host files and are excluded
+		// by tmpfs.CaptureMemoryFileRanges.
+		if err := tmpfs.CaptureMemoryFileRanges(fs, capture); err != nil {
+			for _, remaining := range filesystems[fsIndex:] {
+				remaining.DecRef(ctx)
+			}
+			return nil, fmt.Errorf("capturing resident filesystem memory: %w", err)
+		}
+		fs.DecRef(ctx)
+	}
+	for _, captured := range capture.Ranges() {
+		for _, run := range captured.MemoryFile.LogicalPageRanges(captured.Range) {
+			count := run.Range.Length() / hostarch.PageSize
+			for index := uint64(0); index < count; index++ {
+				pages[mm.ResidentPageVersion{
+					File: captured.MemoryFile,
+					Version: pgalloc.PageVersionID{
+						Allocator: run.FirstVersion.Allocator,
+						Sequence:  run.FirstVersion.Sequence + index,
+					},
+				}] = struct{}{}
+			}
+		}
+	}
+	return pages, nil
 }

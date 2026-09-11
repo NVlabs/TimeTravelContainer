@@ -2062,6 +2062,15 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 				Branch: id, Allocator: run.Allocator, FirstSequence: run.FirstSequence, Pages: run.Pages,
 			})
 		}
+		for _, chunk := range resident.VersionChunks {
+			id, ok := localIDs[chunk.Branch]
+			if !ok {
+				continue
+			}
+			snapshot.VersionChunks = append(snapshot.VersionChunks, cluster.PlannerVersionChunk{
+				Branch: id, Allocator: chunk.Allocator, Chunk: chunk.Chunk, Bitmap: chunk.Bitmap,
+			})
+		}
 	}
 	sort.Slice(snapshot.Branches, func(i, j int) bool { return snapshot.Branches[i].ID < snapshot.Branches[j].ID })
 	sort.Slice(snapshot.VersionRuns, func(i, j int) bool {
@@ -2071,6 +2080,16 @@ func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error)
 		}
 		if left.FirstSequence != right.FirstSequence {
 			return left.FirstSequence < right.FirstSequence
+		}
+		return left.Branch < right.Branch
+	})
+	sort.Slice(snapshot.VersionChunks, func(i, j int) bool {
+		left, right := snapshot.VersionChunks[i], snapshot.VersionChunks[j]
+		if left.Allocator != right.Allocator {
+			return left.Allocator < right.Allocator
+		}
+		if left.Chunk != right.Chunk {
+			return left.Chunk < right.Chunk
 		}
 		return left.Branch < right.Branch
 	})
