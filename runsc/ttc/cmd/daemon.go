@@ -401,7 +401,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}
 	memoryDependencyBytes := session.StreamBytes
-	if session.SparseManifest != "" || session.SharedSnapshot != "" {
+	if session.GraphManifest != "" {
 		memoryDependencyBytes = 0
 	}
 	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, memoryDependencyBytes, session.FilesystemBytes); err != nil {
@@ -425,7 +425,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
 		FilesystemConnections: filesystemConnections,
 		PushPolicy:            ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
-		SharedSnapshot:        session.SharedSnapshot != "",
 		SharedMetadata:        session.SharedMetadata != "",
 		DurableDehydration:    session.DurableDehydration,
 		GraphSparse:           session.GraphManifest != "",
@@ -433,17 +432,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	restoreArgs.FilesystemRestoreIDs, err = r.backend.filesystemRestoreIDs(info.ID)
 	if err != nil {
 		return fmt.Errorf("resolving distributed filesystem identities: %w", err)
-	}
-	if session.SparseManifest != "" {
-		manifest, err := ttcchunk.ParseManifestID(session.SparseManifest)
-		if err != nil {
-			return fmt.Errorf("parsing distributed sparse manifest: %w", err)
-		}
-		restoreArgs.SparseManifest = manifest
-		restoreArgs.SparseBranch = session.SparseBranch
-		if err := r.backend.containerStore().UpdateDistributedForkSparseRoot(tx.Identity.TransactionID, session.SparseRepository, session.SparseBranch); err != nil {
-			return fmt.Errorf("recording distributed sparse memory root: %w", err)
-		}
 	}
 	if restoreArgs.GraphSparse {
 		rootNames := graphMemoryRootNames(targetBranch.FilesystemBranch, len(session.GraphRootObjects))
@@ -541,7 +529,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if !restoreArgs.SharedMetadata {
 			connectionCount++
 		}
-		if !restoreArgs.SharedSnapshot && restoreArgs.SparseManifest == (ttcchunk.ManifestID{}) && !restoreArgs.GraphSparse {
+		if !restoreArgs.GraphSparse {
 			connectionCount += (restoreArgs.MaxParallel + 1) * (restoreArgs.RetryLimit + 1)
 			if restoreArgs.PushPolicy != ttcremote.TCPPushDemandOnly {
 				connectionCount++
@@ -601,8 +589,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		files := []*os.File{reader}
 		connectionsStartFD := 4
 		var sharedMetadata *os.File
-		var sharedSnapshot *os.File
-		var sparseRepository *os.File
 		var graphRestore *graphMemoryRestore
 		var durableTargets []*os.File
 		durableActiveDir := ""
@@ -633,30 +619,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			files = append(files, sharedMetadata)
 			connectionsStartFD++
 		}
-		if restoreArgs.SharedSnapshot {
-			sharedPath := filepath.Join(r.backend.dataRoot, session.SharedSnapshot)
-			sharedSnapshot, err = os.Open(sharedPath)
-			if err != nil {
-				reader.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				return fmt.Errorf("opening shared distributed memory snapshot: %w", err)
-			}
-			if stat, err := sharedSnapshot.Stat(); err != nil || uint64(stat.Size()) != session.StreamBytes {
-				sharedSnapshot.Close()
-				reader.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				if err != nil {
-					return fmt.Errorf("stating shared distributed memory snapshot: %w", err)
-				}
-				return fmt.Errorf("shared distributed memory snapshot size is %d, want %d", stat.Size(), session.StreamBytes)
-			}
-			files = append(files, sharedSnapshot)
-			connectionsStartFD++
-		}
 		if restoreArgs.GraphSparse {
 			graphPath := filepath.Join(r.backend.dataRoot, session.GraphManifest)
 			graphManifest, openErr := os.Open(graphPath)
@@ -679,19 +641,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			files = append(files, graphRestore.manifest, graphRestore.objects)
 			connectionsStartFD += 2
 			files = append(files, graphRestore.remote)
-			connectionsStartFD++
-		}
-		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
-			sparsePath := filepath.Join(r.backend.dataRoot, session.SparseRepository)
-			sparseRepository, err = os.Open(sparsePath)
-			if err != nil {
-				reader.Close()
-				for _, file := range connectionFiles {
-					file.Close()
-				}
-				return fmt.Errorf("opening shared sparse memory repository: %w", err)
-			}
-			files = append(files, sparseRepository)
 			connectionsStartFD++
 		}
 		if peer && restoreArgs.DurableDehydration {
@@ -728,12 +677,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if restoreArgs.SharedMetadata {
 			commandArgs = append(commandArgs, "--distributed-metadata-fd=4")
 		}
-		if restoreArgs.SharedSnapshot {
-			commandArgs = append(commandArgs, "--distributed-snapshot-fd="+strconv.Itoa(connectionsStartFD-1))
-		}
-		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
-			commandArgs = append(commandArgs, "--dehydration-memory-repository-fd="+strconv.Itoa(connectionsStartFD-1))
-		}
 		if restoreArgs.GraphSparse {
 			graphStartFD := 5
 			commandArgs = append(commandArgs,
@@ -750,12 +693,6 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		reader.Close()
 		if sharedMetadata != nil {
 			sharedMetadata.Close()
-		}
-		if sharedSnapshot != nil {
-			sharedSnapshot.Close()
-		}
-		if sparseRepository != nil {
-			sparseRepository.Close()
 		}
 		if graphRestore != nil {
 			graphRestore.close()
@@ -1002,9 +939,6 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 				return fmt.Errorf("deleting canceled distributed target family %q: %w", info.ID, deleteErr)
 			}
 		}
-		if releaseErr := r.backend.releaseDistributedSparseRootTransaction(tx.Identity.TransactionID); releaseErr != nil {
-			return releaseErr
-		}
 		if releaseErr := r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID); releaseErr != nil {
 			return releaseErr
 		}
@@ -1014,72 +948,6 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 	}
 	if familyID != "" {
 		return r.backend.removeLocalFamilyStateIfUnowned(familyID)
-	}
-	return nil
-}
-
-// releaseDistributedSparseRoot drops the durable root only after the target
-// loader has installed every chunk, or after the target runtime is gone. It is
-// idempotent so recovery may repeat it after any crash boundary.
-func (b *runtimeBackend) releaseDistributedSparseRoot(info ttcbundle.ContainerInfo) error {
-	var result error
-	if info.DistributedSparseRepository != "" || info.DistributedSparseBranch != "" {
-		result = errors.Join(result, b.releaseSparseRoot(info.DistributedSparseRepository, info.DistributedSparseBranch))
-		if result == nil && info.DistributedForkTransactionID != "" {
-			result = errors.Join(result, b.containerStore().UpdateDistributedForkSparseRoot(info.DistributedForkTransactionID, "", ""))
-		}
-	}
-	for _, branch := range info.Branches {
-		if branch.DistributedSparseRepository == "" && branch.DistributedSparseBranch == "" {
-			continue
-		}
-		if err := b.releaseSparseRoot(branch.DistributedSparseRepository, branch.DistributedSparseBranch); err != nil {
-			result = errors.Join(result, err)
-			continue
-		}
-		if branch.DistributedForkTransactionID != "" {
-			result = errors.Join(result, b.containerStore().UpdateDistributedForkSparseRoot(branch.DistributedForkTransactionID, "", ""))
-		}
-	}
-	return result
-}
-
-func (b *runtimeBackend) releaseDistributedSparseRootTransaction(transactionID string) error {
-	_, branch, _, err := b.containerStore().DistributedForkTargetBranch(transactionID)
-	if err != nil {
-		return err
-	}
-	if branch.DistributedSparseRepository == "" && branch.DistributedSparseBranch == "" {
-		return nil
-	}
-	if err := b.releaseSparseRoot(branch.DistributedSparseRepository, branch.DistributedSparseBranch); err != nil {
-		return err
-	}
-	return b.containerStore().UpdateDistributedForkSparseRoot(transactionID, "", "")
-}
-
-func (b *runtimeBackend) releaseSparseRoot(repositoryPath, branch string) error {
-	if repositoryPath == "" || branch == "" {
-		return errors.New("distributed sparse memory root is incomplete")
-	}
-	clean := filepath.Clean(repositoryPath)
-	if filepath.IsAbs(clean) || clean == "." || clean != repositoryPath || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("invalid distributed sparse repository %q", repositoryPath)
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, clean))
-	if err != nil {
-		return fmt.Errorf("opening distributed sparse repository: %w", err)
-	}
-	deletionErr := repository.DeleteBranch(branch)
-	if errors.Is(deletionErr, os.ErrNotExist) {
-		deletionErr = nil
-	}
-	if deletionErr == nil {
-		_, deletionErr = repository.CollectGarbage(ttcchunk.GCOptions{})
-	}
-	closeErr := repository.Close()
-	if deletionErr != nil || closeErr != nil {
-		return errors.Join(deletionErr, closeErr)
 	}
 	return nil
 }
@@ -1350,15 +1218,9 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
 			}
 			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
-			// The target MemoryFile now contains every page, so the immutable
-			// shared snapshot no longer owns storage for this branch.
-			_ = os.Remove(filepath.Join(r.backend.dataRoot, distributedSnapshotRelativePath(transactionID)))
-			if _, err := r.backend.containerStore().LoadDistributedForkTarget(transactionID); err == nil {
-				// A cleanup failure is deliberately non-fatal: retaining a root is
-				// safe and startup recovery will retry it. Invalidating an already
-				// independent, running target would be incorrect.
-				_ = r.backend.releaseDistributedSparseRootTransaction(transactionID)
-			}
+			// The graph reference remains branch-scoped until the branch itself
+			// is replaced or removed; becoming independent only removes its
+			// volatile provider dependency.
 			return
 		}
 	}()
@@ -4662,10 +4524,6 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			}
 		}
 	}
-	// A crash can strand a cluster memory root between immutable publication
-	// and target metadata ownership. Reconcile only after runtime/container
-	// state has been refreshed, and fail conservatively inside the helper.
-	_ = backend.reconcileClusterSparseMemoryRoots()
 	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
 		quarantineReconciled = false
 		if backend.stderr != nil {

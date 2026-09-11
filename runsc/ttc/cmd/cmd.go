@@ -8372,9 +8372,6 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		}
 		break
 	}
-	if err := b.releaseDistributedSparseRoot(info); err != nil {
-		return fmt.Errorf("releasing distributed sparse memory: %w", err)
-	}
 	graphRoots := make([]string, 0)
 	seenGraphRoots := make(map[string]struct{})
 	for _, branch := range info.Branches {
@@ -9460,17 +9457,6 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
-				// No process can fault the imported backing after the family
-				// runtime is gone. Persist the exited state first, then release
-				// the cluster root; a failure remains conservative and a later
-				// listing retries the idempotent cleanup.
-				if persistentFamilyProcessFree(reconciled) {
-					if err := b.releaseDistributedSparseRoot(reconciled); err == nil {
-						if latest, err := store.LoadContainer(container.ID); err == nil {
-							reconciled = latest
-						}
-					}
-				}
 				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
 				family.Branches = persistentBranches(reconciled.Branches, reconciled.NodeID)
@@ -12331,11 +12317,6 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		if b.publicationQueue != nil {
 			if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
 				return fmt.Errorf("canceling pending publications for %s: %w", target, err)
-			}
-		}
-		if recorded.DistributedSparseRepository != "" || recorded.DistributedSparseBranch != "" {
-			if err := b.releaseSparseRoot(recorded.DistributedSparseRepository, recorded.DistributedSparseBranch); err != nil {
-				return fmt.Errorf("releasing distributed sparse memory for %s: %w", target, err)
 			}
 		}
 		if err := b.releaseSparseMemoryRoot(info.ID, recorded.FilesystemBranch); err != nil {

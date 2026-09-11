@@ -130,15 +130,6 @@ type RemoteSessionDescriptor struct {
 	// DurableDehydration declares that SharedMetadata is a TTC dehydration
 	// envelope rather than a live-fork SessionMetadata envelope.
 	DurableDehydration bool `json:"durable_dehydration,omitempty"`
-	// SharedSnapshot is a clean repository-relative path containing the
-	// immutable packed memory stream. It is non-secret and remains valid after
-	// the source Sentry and page server exit.
-	SharedSnapshot string `json:"shared_snapshot,omitempty"`
-	// SparseRepository names a shared-data-root-relative TTC chunk repository;
-	// SparseManifest is the immutable memory graph to demand-load from it.
-	SparseRepository string `json:"sparse_repository,omitempty"`
-	SparseManifest   string `json:"sparse_manifest,omitempty"`
-	SparseBranch     string `json:"sparse_branch,omitempty"`
 	// GraphManifest is a clean shared-root-relative path containing the
 	// ephemeral dense restore view derived from immutable snapshot-graph roots.
 	// Bulk objects remain in their authoritative provider or shared pack and
@@ -198,12 +189,6 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return errors.New("filesystem snapshot token must be 16 bytes encoded as hexadecimal")
 		}
 	}
-	if s.SharedSnapshot != "" {
-		clean := filepath.Clean(s.SharedSnapshot)
-		if filepath.IsAbs(s.SharedSnapshot) || clean != s.SharedSnapshot || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("invalid shared memory snapshot path %q", s.SharedSnapshot)
-		}
-	}
 	if s.GraphManifest != "" {
 		clean := filepath.Clean(s.GraphManifest)
 		if filepath.IsAbs(s.GraphManifest) || clean != s.GraphManifest || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
@@ -212,40 +197,14 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if s.SharedMetadata == "" || !s.DurableDehydration {
 			return errors.New("graph memory restore requires durable shared metadata")
 		}
-		if s.SharedSnapshot != "" || s.SparseRepository != "" {
-			return errors.New("graph, packed, and legacy sparse snapshots are mutually exclusive")
-		}
 		if s.GraphSnapshot == 0 || len(s.GraphRootObjects) == 0 || len(s.GraphRootObjects) > 4096 {
 			return errors.New("graph memory restore requires bounded immutable root identities")
 		}
 	} else if s.GraphSnapshot != 0 || len(s.GraphRootObjects) != 0 {
 		return errors.New("graph memory identity requires a graph manifest")
 	}
-	if (s.SparseRepository == "") != (s.SparseManifest == "") ||
-		(s.SparseRepository == "") != (s.SparseBranch == "") {
-		return errors.New("sparse repository, manifest, and branch must be specified together")
-	}
-	if s.SparseRepository != "" {
-		if s.SharedSnapshot != "" {
-			return errors.New("packed and sparse shared snapshots are mutually exclusive")
-		}
-		if s.SharedMetadata == "" && s.Address == "" {
-			return errors.New("sparse memory restore has no metadata source")
-		}
-		clean := filepath.Clean(s.SparseRepository)
-		if filepath.IsAbs(s.SparseRepository) || clean != s.SparseRepository || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("invalid sparse memory repository path %q", s.SparseRepository)
-		}
-		decoded, err := hex.DecodeString(s.SparseManifest)
-		if err != nil || len(decoded) != sha256.Size {
-			return errors.New("sparse memory manifest must be a SHA-256 hexadecimal ID")
-		}
-		if s.SparseBranch == "." || s.SparseBranch == ".." || strings.ContainsAny(s.SparseBranch, `/\\`) || strings.TrimSpace(s.SparseBranch) != s.SparseBranch {
-			return fmt.Errorf("invalid sparse memory branch %q", s.SparseBranch)
-		}
-	}
-	if s.SharedMetadata != "" && s.SparseRepository == "" && s.GraphManifest == "" {
-		return errors.New("shared distributed metadata requires a graph or legacy sparse memory repository")
+	if s.SharedMetadata != "" && s.GraphManifest == "" {
+		return errors.New("shared distributed metadata requires graph memory")
 	}
 	if s.DurableDehydration && s.SharedMetadata == "" {
 		return errors.New("durable dehydration restore requires shared metadata")

@@ -84,85 +84,6 @@ func TestNegotiateRejectsRepositoryAndRequiredFeatureMismatch(t *testing.T) {
 	}
 }
 
-func TestRemoteSessionDescriptorSharedSnapshotPath(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := RemoteSessionDescriptor{
-		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
-		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedSnapshot: "cluster/memory-snapshots/tx.mem",
-	}
-	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid shared snapshot: %v", err)
-	}
-	for _, path := range []string{"/tmp/tx.mem", "../tx.mem", "cluster/../tx.mem", "."} {
-		invalid := base
-		invalid.SharedSnapshot = path
-		if err := invalid.validate(negotiated); err == nil {
-			t.Errorf("accepted invalid shared snapshot path %q", path)
-		}
-	}
-}
-
-func TestRemoteSessionDescriptorSparseRepository(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := RemoteSessionDescriptor{
-		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
-		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SparseRepository: "containers/family/memory/chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
-	}
-	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid sparse repository: %v", err)
-	}
-	for _, mutate := range []func(*RemoteSessionDescriptor){
-		func(d *RemoteSessionDescriptor) { d.SparseManifest = "" },
-		func(d *RemoteSessionDescriptor) { d.SparseBranch = "" },
-		func(d *RemoteSessionDescriptor) { d.SparseBranch = "../remote" },
-		func(d *RemoteSessionDescriptor) { d.SparseManifest = "xyz" },
-		func(d *RemoteSessionDescriptor) { d.SparseRepository = "../chunks" },
-		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
-	} {
-		invalid := base
-		mutate(&invalid)
-		if err := invalid.validate(negotiated); err == nil {
-			t.Fatalf("accepted invalid sparse descriptor: %+v", invalid)
-		}
-	}
-}
-
-func TestRemoteSessionDescriptorSharedMetadata(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := RemoteSessionDescriptor{
-		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedMetadata:   "cluster/memory-metadata/tx.state",
-		SparseRepository: "cluster/memory-chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
-	}
-	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid shared metadata descriptor: %v", err)
-	}
-	for _, mutate := range []func(*RemoteSessionDescriptor){
-		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "../metadata" },
-		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
-		func(d *RemoteSessionDescriptor) { d.Address = "127.0.0.1:1" },
-		func(d *RemoteSessionDescriptor) { d.SnapshotToken = strings.Repeat("11", 16) },
-		func(d *RemoteSessionDescriptor) { d.SparseRepository = "" },
-	} {
-		invalid := base
-		mutate(&invalid)
-		if err := invalid.validate(negotiated); err == nil {
-			t.Fatalf("accepted invalid shared metadata descriptor: %+v", invalid)
-		}
-	}
-}
-
 func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {
@@ -181,8 +102,6 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 		func(d *RemoteSessionDescriptor) { d.GraphManifest = "../manifest" },
 		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
 		func(d *RemoteSessionDescriptor) { d.DurableDehydration = false },
-		func(d *RemoteSessionDescriptor) { d.SparseRepository = "cluster/chunks" },
-		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
 		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
 		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
 	} {
@@ -202,8 +121,9 @@ func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T)
 	descriptor := RemoteSessionDescriptor{
 		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
 		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedMetadata: "cluster/memory-metadata/tx.state", SparseRepository: "cluster/memory-chunks",
-		SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+		SharedMetadata: "cluster/memory-metadata/tx.state", DurableDehydration: true,
+		GraphManifest: "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
+		GraphRootObjects:       []string{"0000000000000007-03-0000000000000001"},
 		FilesystemMetadataPack: strings.Repeat("cd", 32), FilesystemBytes: 1 << 20,
 	}
 	if err := descriptor.validate(negotiated); err != nil {

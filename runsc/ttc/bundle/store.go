@@ -401,8 +401,6 @@ type BranchInfo struct {
 	// same authorizing distributed transaction, but must never share this
 	// lifetime identity.
 	DistributedGraphReferenceOperation string `json:"distributed_graph_reference_operation,omitempty"`
-	DistributedSparseRepository        string `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch            string `json:"distributed_sparse_branch,omitempty"`
 	DistributedMigration               bool   `json:"distributed_migration,omitempty"`
 	State                              string `json:"state"`
 	// StorageState describes where the authoritative captured generation is.
@@ -460,8 +458,6 @@ type DistributedForkImport struct {
 	FilesystemBranch         string    `json:"filesystem_branch"`
 	State                    string    `json:"state"`
 	CreatedAt                time.Time `json:"created_at"`
-	SparseRepository         string    `json:"sparse_repository,omitempty"`
-	SparseBranch             string    `json:"sparse_branch,omitempty"`
 	SourceNode               string    `json:"source_node,omitempty"`
 	TargetNode               string    `json:"target_node,omitempty"`
 	Migration                bool      `json:"migration,omitempty"`
@@ -544,8 +540,6 @@ type ContainerInfo struct {
 	DistributedForkTransactionID string                           `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string                           `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool                             `json:"distributed_fork_hidden,omitempty"`
-	DistributedSparseRepository  string                           `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch      string                           `json:"distributed_sparse_branch,omitempty"`
 	DistributedFamilyID          string                           `json:"distributed_family_id,omitempty"`
 	DistributedForkImports       map[string]DistributedForkImport `json:"distributed_fork_imports,omitempty"`
 	NodeID                       string                           `json:"node_id,omitempty"`
@@ -1571,11 +1565,6 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
-	// Sparse roots describe this target runtime's own demand-page source. They
-	// must never be inherited when the source is itself a distributed child;
-	// Prepare will install a new root if this transaction uses sparse handoff.
-	target.DistributedSparseRepository = ""
-	target.DistributedSparseBranch = ""
 	target.DistributedFamilyID = globalFamilyID
 	target.DistributedForkImports = nil
 	target.NodeID = opts.NodeID
@@ -2907,8 +2896,6 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					branch.DependentMemoryBytes = pending.DependentMemoryBytes
 					branch.DependentFilesystemBytes = pending.DependentFilesystemBytes
 					branch.DistributedForkTransactionID = transactionID
-					branch.DistributedSparseRepository = pending.SparseRepository
-					branch.DistributedSparseBranch = pending.SparseBranch
 					branch.DistributedMigration = true
 					branch.SnapshotID = pending.SnapshotID
 					branch.MemoryRoots = append([]string(nil), pending.MemoryRoots...)
@@ -2933,8 +2920,6 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					State:       pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
 					DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
 					DistributedForkTransactionID: transactionID,
-					DistributedSparseRepository:  pending.SparseRepository,
-					DistributedSparseBranch:      pending.SparseBranch,
 					SnapshotID:                   pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
 					MemoryRootObjects:                  append([]string(nil), pending.MemoryRootObjects...),
 					DistributedGraphReferenceOperation: pending.GraphReferenceOperation,
@@ -3083,42 +3068,6 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 	})
 }
 
-// UpdateDistributedForkSparseRoot records the shared sparse-memory root that
-// keeps a distributed target restorable until its demand loader has installed
-// every chunk. Passing empty values clears an already-released root.
-func (s Store) UpdateDistributedForkSparseRoot(transactionID, repository, branch string) error {
-	if (repository == "") != (branch == "") {
-		return errors.New("distributed sparse repository and branch must be specified together")
-	}
-	info, err := s.LoadDistributedForkTarget(transactionID)
-	if err != nil {
-		return err
-	}
-	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
-		if current.DistributedForkTransactionID == transactionID {
-			current.DistributedSparseRepository = repository
-			current.DistributedSparseBranch = branch
-		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
-			pending.SparseRepository = repository
-			pending.SparseBranch = branch
-			current.DistributedForkImports[transactionID] = pending
-		} else {
-			found := false
-			for i := range current.Branches {
-				if current.Branches[i].DistributedForkTransactionID == transactionID {
-					current.Branches[i].DistributedSparseRepository = repository
-					current.Branches[i].DistributedSparseBranch = branch
-					found = true
-				}
-			}
-			if !found {
-				return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-			}
-		}
-		return true, nil
-	})
-}
-
 // DistributedForkTargetBranch resolves the branch associated with a target
 // transaction. peer is true when it was imported into an existing family.
 func (s Store) DistributedForkTargetBranch(transactionID string) (info ContainerInfo, branch BranchInfo, peer bool, err error) {
@@ -3130,8 +3079,6 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		for _, candidate := range info.Branches {
 			if candidate.ID == "main" {
 				candidate.DistributedForkTransactionID = transactionID
-				candidate.DistributedSparseRepository = info.DistributedSparseRepository
-				candidate.DistributedSparseBranch = info.DistributedSparseBranch
 				return info, candidate, false, nil
 			}
 		}
@@ -3153,8 +3100,6 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		branch.FilesystemBranch = pending.FilesystemBranch
 		branch.State = pending.State
 		branch.DistributedForkTransactionID = transactionID
-		branch.DistributedSparseRepository = pending.SparseRepository
-		branch.DistributedSparseBranch = pending.SparseBranch
 		branch.DistributedMigration = pending.Migration
 		return info, branch, true, nil
 	}

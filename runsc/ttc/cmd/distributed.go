@@ -646,43 +646,6 @@ func (b *runtimeBackend) exportDistributedSnapshot(containerID, transactionID st
 	return relative, nil
 }
 
-func (b *runtimeBackend) exportDistributedSparse(containerID, transactionID string) (string, boot.DistributedForkExportInfo, error) {
-	if b.dataRoot == "" {
-		return "", boot.DistributedForkExportInfo{}, errors.New("distributed sparse export requires a TTC data root")
-	}
-	// Distributed roots must outlive the source container directory: the
-	// target may remain partially resident after the source family is removed.
-	// A cluster-level content-addressed repository also deduplicates identical
-	// chunks across source families and remote siblings.
-	relative := filepath.Join("cluster", "memory-chunks")
-	path := filepath.Join(b.dataRoot, relative)
-	repository, err := ttcchunk.OpenMemoryRepository(path)
-	if err != nil {
-		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("opening distributed sparse repository: %w", err)
-	}
-	defer repository.Close()
-	dir, err := os.Open(path)
-	if err != nil {
-		return "", boot.DistributedForkExportInfo{}, err
-	}
-	output, err := b.commandWithFiles([]*os.File{dir}, "timetravel", "--dehydration-memory-repository-fd=3", containerID, "distributed-export", transactionID)
-	_ = dir.Close()
-	if err != nil {
-		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("exporting distributed sparse memory: %w", err)
-	}
-	var info boot.DistributedForkExportInfo
-	if err := json.Unmarshal(output, &info); err != nil {
-		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("decoding distributed sparse manifest: %w", err)
-	}
-	if info.Manifest == (ttcchunk.ManifestID{}) || info.FilesystemBranch == "" {
-		return "", boot.DistributedForkExportInfo{}, errors.New("distributed sparse export returned incomplete identity")
-	}
-	if err := repository.SetBranch(info.FilesystemBranch, info.Manifest); err != nil {
-		return "", boot.DistributedForkExportInfo{}, fmt.Errorf("rooting distributed sparse manifest: %w", err)
-	}
-	return relative, info, nil
-}
-
 // exportDistributedGraph publishes the fork-time memory retained by session
 // into a graph-native snapshot origin. The Sentry writes a bounded capture
 // stream directly to the daemon; no compatibility repository is created.
@@ -1691,88 +1654,6 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 	}
 	_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
 	_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
-}
-
-func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, branch string) {
-	if repositoryPath == "" || branch == "" {
-		return
-	}
-	if repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, repositoryPath)); err == nil {
-		_ = repository.DeleteBranch(branch)
-		_, _ = repository.CollectGarbage(ttcchunk.GCOptions{})
-		_ = repository.Close()
-	}
-}
-
-// reconcileClusterSparseMemoryRoots removes branch pointers left behind when
-// a daemon dies after publishing a graph handoff but before target metadata
-// records ownership. Container records are authoritative after Prepare;
-// nonterminal transaction identities protect the narrow pre-Prepare window.
-func (b *runtimeBackend) reconcileClusterSparseMemoryRoots() error {
-	if b == nil || b.dataRoot == "" {
-		return nil
-	}
-	const repositoryRelative = "cluster/memory-chunks"
-	repositoryPath := filepath.Join(b.dataRoot, repositoryRelative)
-	if _, err := os.Stat(repositoryPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
-	if err != nil {
-		return err
-	}
-	defer repository.Close()
-	branches, err := repository.ListBranches()
-	if err != nil {
-		return err
-	}
-	keep := make(map[string]struct{})
-	containers, err := b.containerStore().ListContainers()
-	if err != nil {
-		return err
-	}
-	for _, container := range containers {
-		if filepath.Clean(container.DistributedSparseRepository) == repositoryRelative && container.DistributedSparseBranch != "" {
-			keep[container.DistributedSparseBranch] = struct{}{}
-		}
-		for _, branch := range container.Branches {
-			if filepath.Clean(branch.DistributedSparseRepository) == repositoryRelative && branch.DistributedSparseBranch != "" {
-				keep[branch.DistributedSparseBranch] = struct{}{}
-			}
-		}
-		for _, pending := range container.DistributedForkImports {
-			if filepath.Clean(pending.SparseRepository) == repositoryRelative && pending.SparseBranch != "" {
-				keep[pending.SparseBranch] = struct{}{}
-			}
-		}
-	}
-	transactions, err := b.transactionCatalog()
-	if err != nil {
-		return err
-	}
-	records, err := transactions.List()
-	if err != nil {
-		return err
-	}
-	for i := range records {
-		if records[i].Terminal() {
-			continue
-		}
-		keep[ttcvolume.ScopedBranchID(records[i].Identity.SourceContainer, records[i].Identity.TransactionID)] = struct{}{}
-	}
-	for branch := range branches {
-		if _, ok := keep[branch]; ok {
-			continue
-		}
-		if err := repository.DeleteBranch(branch); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("removing orphaned cluster memory root %q: %w", branch, err)
-		}
-	}
-	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
-	return err
 }
 
 func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
