@@ -1149,6 +1149,14 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		return
 	}
 	if (tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent) && !tx.Activated {
+		// A migration is published physically before its placement cutover. A
+		// replayed Publish request may therefore observe TransactionPublished
+		// while the source still owns execution authority. Only the explicit
+		// Activate request, which checks OwnershipCommitted below, may resume it.
+		if tx.Identity.Migration {
+			writeControlJSON(w, http.StatusOK, tx)
+			return
+		}
 		if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
 			writeControlError(w, http.StatusConflict, "target placement is committed but activation retry failed: "+err.Error())
 			return
@@ -1204,7 +1212,7 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if raftAuthority && !request.Paused && !tx.Activated {
+	if raftAuthority && !tx.Identity.Migration && !request.Paused && !tx.Activated {
 		if err := c.TargetRuntime.Activate(r.Context(), tx); err != nil {
 			// Placement is already committed. Leave the target physically paused
 			// and let recovery retry activation; rolling authority back after the

@@ -345,6 +345,14 @@ type staleReservationStore struct {
 	once sync.Once
 }
 
+type atomicTestTransactionStore struct {
+	*Store
+}
+
+func (s *atomicTestTransactionStore) PublishTarget(id string, revision uint64, desiredPaused bool, family, branch, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error) {
+	return nil, errors.New("unexpected fork publication in migration test")
+}
+
 func (s *staleReservationStore) Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error) {
 	if next == TransactionTargetReserved {
 		injected := false
@@ -715,6 +723,63 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if runtime.prepared != 2 || runtime.published != 2 || runtime.activated != 1 || runtime.drained != 1 || runtime.independent != 1 || len(runtime.publishPaused) != 2 || !runtime.publishPaused[0] || !runtime.publishPaused[1] {
 		t.Fatalf("runtime calls: %+v", runtime)
+	}
+}
+
+func TestMigrationPublishRetryCannotActivateBeforeCutover(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &testTargetRuntime{}
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: &atomicTestTransactionStore{Store: store},
+		MaxTransactions: 1, Now: time.Now, TargetRuntime: runtime,
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := testForkIdentity()
+	identity.TransactionID = "migration-publish-retry"
+	identity.TargetContainer = identity.SourceContainer
+	identity.TargetBranch = identity.TransactionID
+	identity.TargetVisibleBranch = identity.SourceBranch
+	identity.Migration = true
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := RemoteSessionDescriptor{
+		Address: "10.0.0.1:12345", SnapshotToken: strings.Repeat("ab", 16),
+		MetadataBytes: 1 << 20, StreamBytes: 8 << 20, MaxTransferBytes: 64 << 10,
+	}
+	prepared, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.State != TransactionPublished || published.Activated || published.OwnershipCommitted {
+		t.Fatalf("pre-cutover publication=%+v", published)
+	}
+	// Model a lost first response. A retry carrying the old prepared revision
+	// must return the durable publication without resuming the target.
+	retried, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, false)
+	if err != nil || retried.Revision != published.Revision || retried.Activated {
+		t.Fatalf("pre-cutover publish retry=%+v err=%v", retried, err)
+	}
+	if _, err := client.Activate(context.Background(), tx.Identity.TransactionID, published.Revision); err == nil {
+		t.Fatal("pre-cutover migration activation unexpectedly succeeded")
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.published != 1 || runtime.activated != 0 {
+		t.Fatalf("runtime calls after publish retry: %+v", runtime)
 	}
 }
 
