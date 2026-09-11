@@ -123,6 +123,16 @@ creation and divergence, exited main/child `ttc cp`, copy into a
 created-but-never-started container, and stop/start reopening without explicit
 save or restore.
 
+`e2e_fuse_lifecycle.sh` installs `fuse-overlayfs` inside an Ubuntu guest and
+keeps its `/dev/fuse` server and writable mount active across live fork,
+branch-local writes, dehydration, and rehydration. It requires an already
+running daemon and a TTC client selected through `TTC`:
+
+```shell
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+  "$PWD/runsc/ttc/test/e2e_fuse_lifecycle.sh"
+```
+
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTC's runsc arguments, daemon namespace preflight,

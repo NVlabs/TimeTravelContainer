@@ -49,6 +49,16 @@ sh_binary(
     ],
 )
 
+# Manual because it installs fuse-overlayfs from a public Ubuntu repository,
+# then exercises an in-sandbox FUSE daemon across TTC lifecycle operations.
+sh_binary(
+    name = "e2e_fuse_lifecycle",
+    srcs = ["e2e_fuse_lifecycle.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",

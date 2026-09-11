@@ -222,7 +222,16 @@ func TestHostConnectionInit(t *testing.T) {
 			t.Errorf("expected FUSE_INIT opcode, got %d", reqHdr.Opcode)
 			return
 		}
-		_ = n
+		if n < int(linux.SizeOfFUSEHeaderIn)+(*linux.FUSEInitIn)(nil).SizeBytes() {
+			t.Errorf("short FUSE_INIT request: %d bytes", n)
+			return
+		}
+		var initIn linux.FUSEInitIn
+		initIn.UnmarshalUnsafe(buf[linux.SizeOfFUSEHeaderIn:])
+		if initIn.Flags&linux.FUSE_DONT_MASK == 0 {
+			t.Errorf("FUSE_INIT flags %#x omit FUSE_DONT_MASK", initIn.Flags)
+			return
+		}
 
 		initOut := linux.FUSEInitOut{
 			Major:    linux.FUSE_KERNEL_VERSION,
