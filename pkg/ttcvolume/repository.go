@@ -44,6 +44,12 @@ const (
 	formatVersion = 3
 	mainBranch    = "main"
 	rootInode     = uint64(1)
+
+	// Bound obsolete whole-file payloads and graph WAL growth even when a
+	// workload never calls fsync(2). The durability fence is amortized across a
+	// large batch rather than imposed on every namespace mutation.
+	reclaimBatchObjects = 512
+	reclaimJournalBytes = 8 << 20
 )
 
 // ErrFinalBranch indicates that deleting a branch would leave a repository
@@ -252,7 +258,12 @@ type Repository struct {
 	// authoritative graph root. Publishing these on fsync/lifecycle fences
 	// avoids an atomic temp-file+rename for every guest inode mutation.
 	dirtyBranches map[string]*branchMetadata
-	knownDirs     map[string]struct{}
+	// pendingReclaims contains bulk objects whose graph records have been
+	// removed by committed path-copy mutations. Their bytes cannot be unlinked
+	// until the graph WAL is durable: crash recovery may otherwise select the
+	// preceding root and find its payload missing.
+	pendingReclaims map[string]ttcsnapshot.ObjectID
+	knownDirs       map[string]struct{}
 
 	// metadata is the decoded view of each locally-used branch. The journal is
 	// authoritative and is replayed when a branch first becomes active.
@@ -1951,6 +1962,30 @@ func (r *Repository) syncMetadataLocked() error {
 	// durable above. Persist it before publishing branch pointer files.
 	if err := r.graph.Sync(); err != nil {
 		return fmt.Errorf("syncing repository snapshot graph: %w", err)
+	}
+	// The graph WAL is now a durable proof that these immutable payloads are
+	// unreachable. Delete them directly by ID instead of scanning the complete
+	// object store; a crash before an unlink merely leaves harmless garbage for
+	// startup reconciliation.
+	r.dirtyMu.Lock()
+	reclaims := make([]ttcsnapshot.ObjectID, 0, len(r.pendingReclaims))
+	for _, id := range r.pendingReclaims {
+		reclaims = append(reclaims, id)
+	}
+	r.dirtyMu.Unlock()
+	sort.Slice(reclaims, func(i, j int) bool { return reclaims[i].String() < reclaims[j].String() })
+	for _, id := range reclaims {
+		if err := r.data.Remove(id); err != nil {
+			return fmt.Errorf("removing reclaimed repository object %s: %w", id, err)
+		}
+		if id.Kind == ttcsnapshot.ObjectKindFile {
+			if err := r.clearRemoteObjectPending(id.String()); err != nil {
+				return fmt.Errorf("removing reclaimed remote marker %s: %w", id, err)
+			}
+		}
+		r.dirtyMu.Lock()
+		delete(r.pendingReclaims, id.String())
+		r.dirtyMu.Unlock()
 	}
 	for _, id := range dirtyBranches {
 		r.dirtyMu.Lock()

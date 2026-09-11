@@ -188,30 +188,42 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 // ApplyFilesystemAndReleasePins publishes a filesystem update and converts
 // construction pins into immutable inode edges in the same transaction.
 func (s *Store) ApplyFilesystemAndReleasePins(origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (ObjectID, error) {
+	root, _, err := s.ApplyFilesystemAndReleasePinsReclaimed(origin, rootName, operations, releasePins)
+	return root, err
+}
+
+// ApplyFilesystemAndReleasePinsReclaimed is
+// ApplyFilesystemAndReleasePins with the immutable bulk objects made
+// unreachable by the committed root replacement. Callers may delete the
+// returned payloads only after synchronizing this graph transaction.
+func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (ObjectID, []ObjectID, error) {
 	if err := validateRootName(rootName); err != nil {
-		return ObjectID{}, err
+		return ObjectID{}, nil, err
 	}
 	if len(operations) == 0 {
-		return ObjectID{}, errors.New("empty TTC filesystem transaction")
+		return ObjectID{}, nil, errors.New("empty TTC filesystem transaction")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	mutation, logicalRoot, err := buildFilesystemMutation(&s.state, origin, rootName, operations, releasePins)
 	if err != nil {
-		return ObjectID{}, err
+		return ObjectID{}, nil, err
 	}
 	journalMutation := filesystemJournalMutation{
 		Origin: origin, RootName: rootName,
 		Operations:  append([]FilesystemOperation(nil), operations...),
 		ReleasePins: append([]string(nil), releasePins...), Result: logicalRoot,
 	}
+	var reclaimed []ObjectID
 	err = s.commitLockedPrepared([]journalOp{{ApplyFilesystem: &journalMutation}}, nil, func(state *graphState) error {
-		return installGraphMutation(state, mutation, rootName, logicalRoot, releasePins)
+		var installErr error
+		reclaimed, installErr = installGraphMutation(state, mutation, rootName, logicalRoot, releasePins)
+		return installErr
 	})
 	if err != nil {
-		return ObjectID{}, err
+		return ObjectID{}, nil, err
 	}
-	return logicalRoot, nil
+	return logicalRoot, reclaimed, nil
 }
 
 func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
@@ -417,7 +429,7 @@ func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName stri
 	return mutation, logicalRoot, nil
 }
 
-func installGraphMutation(state *graphState, mutation *graphMutation, rootName string, root ObjectID, releasePins []string) error {
+func installGraphMutation(state *graphState, mutation *graphMutation, rootName string, root ObjectID, releasePins []string) ([]ObjectID, error) {
 	var reclaim []string
 	for key, object := range mutation.objects {
 		state.Objects[key] = cloneObject(object)
@@ -438,8 +450,9 @@ func installGraphMutation(state *graphState, mutation *graphMutation, rootName s
 // object is reached by cascading from a zero-reference object touched by the
 // transaction. Objects participating in an authority handoff retain the
 // existing deferred-GC behavior.
-func collectFilesystemMutationGarbage(state *graphState, queue []string) error {
+func collectFilesystemMutationGarbage(state *graphState, queue []string) ([]ObjectID, error) {
 	queued := make(map[string]struct{}, len(queue))
+	var reclaimed []ObjectID
 	for _, key := range queue {
 		queued[key] = struct{}{}
 	}
@@ -454,11 +467,14 @@ func collectFilesystemMutationGarbage(state *graphState, queue []string) error {
 			continue
 		}
 		delete(state.Objects, key)
+		if object.ID.Kind == ObjectKindFile || object.ID.Kind == ObjectKindPage || object.ID.Kind == ObjectKindMemoryChunk {
+			reclaimed = append(reclaimed, object.ID)
+		}
 		for _, edge := range object.Children {
 			childKey := edge.Child.key()
 			child, ok := state.Objects[childKey]
 			if !ok || child.State != ObjectLive || child.Refs == 0 {
-				return fmt.Errorf("reclaiming object %s references unavailable child %s", key, childKey)
+				return nil, fmt.Errorf("reclaiming object %s references unavailable child %s", key, childKey)
 			}
 			child.Refs--
 			if child.Refs == 0 {
@@ -471,7 +487,7 @@ func collectFilesystemMutationGarbage(state *graphState, queue []string) error {
 			state.Objects[childKey] = child
 		}
 	}
-	return nil
+	return reclaimed, nil
 }
 
 func bTreeLookupState(state graphState, root ObjectID, kind ObjectKind, key []byte) (ObjectID, bool, error) {

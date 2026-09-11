@@ -225,7 +225,7 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 			}
 		}
 	}
-	root, err := r.graph.ApplyFilesystemAndReleasePins(ttcsnapshot.SnapshotID(branch.WorkingSnapshot), graphRootName(branch.ID), graphOps, releasePins)
+	root, reclaimed, err := r.graph.ApplyFilesystemAndReleasePinsReclaimed(ttcsnapshot.SnapshotID(branch.WorkingSnapshot), graphRootName(branch.ID), graphOps, releasePins)
 	if err != nil {
 		return err
 	}
@@ -242,7 +242,24 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 		r.dirtyBranches = make(map[string]*branchMetadata)
 	}
 	r.dirtyBranches[branch.ID] = state
+	if r.pendingReclaims == nil {
+		r.pendingReclaims = make(map[string]ttcsnapshot.ObjectID)
+	}
+	for _, id := range reclaimed {
+		r.pendingReclaims[id.String()] = id
+	}
+	flush := len(r.pendingReclaims) >= reclaimBatchObjects || r.graph.JournalBytes() >= reclaimJournalBytes
 	r.dirtyMu.Unlock()
+	if flush {
+		if err := r.syncMetadataLocked(); err != nil {
+			return fmt.Errorf("flushing bounded filesystem garbage: %w", err)
+		}
+		if r.graph.JournalBytes() >= reclaimJournalBytes {
+			if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
+				return fmt.Errorf("compacting bounded filesystem journal: %w", err)
+			}
+		}
+	}
 	return nil
 }
 

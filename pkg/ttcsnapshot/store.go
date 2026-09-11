@@ -958,7 +958,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			if root != op.ApplyFilesystem.Result {
 				return fmt.Errorf("filesystem journal replay produced root %s, want %s", root, op.ApplyFilesystem.Result)
 			}
-			if err := installGraphMutation(state, mutation, op.ApplyFilesystem.RootName, root, op.ApplyFilesystem.ReleasePins); err != nil {
+			if _, err := installGraphMutation(state, mutation, op.ApplyFilesystem.RootName, root, op.ApplyFilesystem.ReleasePins); err != nil {
 				return err
 			}
 		default:

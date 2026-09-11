@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1282,6 +1283,56 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	repository.branchMu.Unlock()
 	if branchCacheEntries > 1 {
 		t.Fatalf("process-local branch cache retained %d historical branches, want at most main", branchCacheEntries)
+	}
+}
+
+func TestMetadataDurabilityFenceReclaimsObsoleteBulkByID(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("bounded-bulk-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	countBulk := func() int {
+		count := 0
+		if err := filepath.WalkDir(filepath.Join(repository.path, "data", "files"), func(_ string, entry fs.DirEntry, walkErr error) error {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".data") {
+				count++
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	for iteration := 0; iteration < reclaimBatchObjects+100; iteration++ {
+		ino, err := repository.CreateRegular(MainBranch, RootInode, "temporary", 0600, 0, 0)
+		if err != nil {
+			t.Fatalf("iteration %d create: %v", iteration, err)
+		}
+		if err := repository.Unlink(MainBranch, RootInode, "temporary"); err != nil {
+			t.Fatalf("iteration %d unlink: %v", iteration, err)
+		}
+		if err := repository.ReapOrphan(MainBranch, ino); err != nil {
+			t.Fatalf("iteration %d reap: %v", iteration, err)
+		}
+	}
+	if got := countBulk(); got >= reclaimBatchObjects {
+		t.Fatalf("automatic durability fence retained %d obsolete objects, want fewer than %d", got, reclaimBatchObjects)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBulk(); got != 0 {
+		t.Fatalf("explicit durability fence retained %d obsolete objects", got)
 	}
 }
 

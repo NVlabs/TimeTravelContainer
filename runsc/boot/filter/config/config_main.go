@@ -506,6 +506,16 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
 		},
+		// Snapshot-graph checkpoint rotation enumerates the donated graph
+		// directory to retire obsolete checkpoint and journal generations. The
+		// directory itself is opened by runsc and all names remain relative to
+		// that descriptor; without getdents64 the first bounded WAL compaction
+		// terminates the Sentry with SIGSYS.
+		unix.SYS_GETDENTS64: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+		},
 		unix.SYS_LINKAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
