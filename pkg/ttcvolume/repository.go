@@ -296,13 +296,20 @@ type Repository struct {
 
 	operationMu sync.Mutex
 	lockFile    *os.File
+	// activeLock holds a shared lifecycle lease for descriptor-backed
+	// repositories donated to a live Sentry. Manager-side garbage collection
+	// takes the same file exclusively and non-blockingly, so it cannot mistake
+	// the Sentry's intentionally batched in-memory graph tail for unreachable
+	// data. Path-backed manager repositories do not retain this lease.
+	activeLock *os.File
 
-	branchMu        sync.Mutex
-	branchCache     map[string]cachedBranch
-	remoteMu        sync.Mutex
-	remotes         map[*remoteObjectClient]struct{}
-	remoteByObject  map[string]*remoteObjectClient
-	remoteByCatalog map[string]*remoteObjectClient
+	branchMu          sync.Mutex
+	branchCache       map[string]cachedBranch
+	remoteLifecycleMu sync.Mutex
+	remoteMu          sync.Mutex
+	remotes           map[*remoteObjectClient]struct{}
+	remoteByObject    map[string]*remoteObjectClient
+	remoteByCatalog   map[string]*remoteObjectClient
 
 	// materializationMu serializes installation of remotely inherited objects
 	// with runtime backing-cache invalidation. Hooks are invoked while this
@@ -646,6 +653,16 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		repo.Close()
 		return nil, fmt.Errorf("recovering donated repository: %w", err)
 	}
+	activeFD, err := unix.Openat(int(repo.dir.Fd()), "active.lock", unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("opening donated repository lifecycle lock: %w", err)
+	}
+	repo.activeLock = os.NewFile(uintptr(activeFD), "ttc-volume-active")
+	if err := unix.Flock(activeFD, unix.LOCK_SH); err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("locking donated repository lifecycle: %w", err)
+	}
 	return repo, nil
 }
 
@@ -681,7 +698,23 @@ func OpenRepository(path string, mode CopyMode) (*Repository, error) {
 	}
 	repository.data = data
 	repository.path = path
+	// OpenRepositoryFD conservatively assumes that its descriptor was donated
+	// to a Sentry. This wrapper is explicitly manager-side and must not make its
+	// own maintenance handle look like an active runtime.
+	if err := repository.releaseActiveLock(); err != nil {
+		repository.Close()
+		return nil, fmt.Errorf("releasing manager repository lifecycle lock: %w", err)
+	}
 	return repository, nil
+}
+
+func (r *Repository) releaseActiveLock() error {
+	if r == nil || r.activeLock == nil {
+		return nil
+	}
+	err := errors.Join(unix.Flock(int(r.activeLock.Fd()), unix.LOCK_UN), r.activeLock.Close())
+	r.activeLock = nil
+	return err
 }
 
 // Close releases the repository directory descriptor.
@@ -695,15 +728,24 @@ func (r *Repository) Close() error {
 	if r.graph != nil && r.data != nil {
 		syncErr = r.SyncMetadata()
 	}
+	r.remoteLifecycleMu.Lock()
+	defer r.remoteLifecycleMu.Unlock()
 	r.remoteMu.Lock()
 	var remoteErr error
+	remotes := make([]*remoteObjectClient, 0, len(r.remotes))
 	for remote := range r.remotes {
-		remoteErr = errors.Join(remoteErr, remote.conn.Close())
+		remotes = append(remotes, remote)
 	}
 	r.remotes = nil
 	r.remoteByObject = nil
 	r.remoteByCatalog = nil
 	r.remoteMu.Unlock()
+	for _, remote := range remotes {
+		remote.users.Wait()
+		remote.mu.Lock()
+		remoteErr = errors.Join(remoteErr, remote.conn.Close())
+		remote.mu.Unlock()
+	}
 	var graphErr error
 	if r.graph != nil {
 		graphErr = r.graph.Close()
@@ -714,9 +756,10 @@ func (r *Repository) Close() error {
 		lockErr = r.lockFile.Close()
 		r.lockFile = nil
 	}
+	activeErr := r.releaseActiveLock()
 	err := r.dir.Close()
 	r.dir = nil
-	return errors.Join(syncErr, lockErr, remoteErr, graphErr, err)
+	return errors.Join(syncErr, lockErr, activeErr, remoteErr, graphErr, err)
 }
 
 // Directory duplicates the repository directory descriptor for donation to a

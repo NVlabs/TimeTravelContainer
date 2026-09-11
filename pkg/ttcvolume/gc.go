@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -42,6 +43,27 @@ func (r *Repository) GarbageCollect() error {
 	if r == nil || r.path == "" {
 		return errors.New("garbage collection requires a path-backed repository")
 	}
+	// A live Sentry may have installed complete bulk bytes whose corresponding
+	// graph objects are intentionally still in its bounded metadata batch. That
+	// process-local tail is invisible to a separately opened manager handle.
+	// Skip this maintenance pass while any descriptor-backed runtime holds a
+	// shared lifecycle lease; the Sentry flushes the tail on close, and a later
+	// pass (including crash recovery) can then collect safely.
+	active, err := os.OpenFile(filepath.Join(r.path, "active.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening repository lifecycle lock: %w", err)
+	}
+	if err := unix.Flock(int(active.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		closeErr := active.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return closeErr
+		}
+		return errors.Join(fmt.Errorf("locking repository lifecycle: %w", err), closeErr)
+	}
+	defer func() {
+		_ = unix.Flock(int(active.Fd()), unix.LOCK_UN)
+		_ = active.Close()
+	}()
 	return r.withLock(r.garbageCollectLocked)
 }
 

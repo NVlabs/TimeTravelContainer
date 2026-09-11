@@ -1016,23 +1016,52 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 		if status.Error != "" {
 			return fmt.Errorf("graph memory handoff failed: %s", status.Error)
 		}
-		if _, err := r.backend.command("timetravel", info.ID, "distributed-filesystem-drain", branch.ID); err != nil {
-			return fmt.Errorf("starting graph handoff filesystem drain: %w", err)
-		}
-		output, err = r.backend.command("timetravel", info.ID, "distributed-filesystem-drain-status", branch.ID)
+	} else {
+		info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 		if err != nil {
-			return fmt.Errorf("reading graph handoff filesystem drain status: %w", err)
+			return err
 		}
-		var filesystemStatus boot.DistributedForkFilesystemDrainStatus
-		if err := json.Unmarshal(output, &filesystemStatus); err != nil {
-			return fmt.Errorf("decoding graph handoff filesystem drain status: %w", err)
+		output, err := r.backend.command("timetravel", info.ID, "distributed-dependency", branch.ID)
+		if err != nil {
+			return fmt.Errorf("reading distributed memory drain status: %w", err)
 		}
-		if !filesystemStatus.Done {
-			return errors.New("graph filesystem handoff is still in progress")
+		var status pgalloc.AsyncPagesFileLoadStats
+		if err := json.Unmarshal(output, &status); err != nil {
+			return fmt.Errorf("decoding distributed memory drain status: %w", err)
 		}
-		if filesystemStatus.Error != "" {
-			return fmt.Errorf("graph filesystem handoff failed: %s", filesystemStatus.Error)
+		if !status.Done {
+			return errors.New("distributed memory drain is still in progress")
 		}
+		if status.Error != "" {
+			return fmt.Errorf("distributed memory drain failed: %s", status.Error)
+		}
+	}
+	// Independence is a release fence, not merely a control-plane state. A
+	// concurrent source graph handoff and an eager node drain may both attempt
+	// this transition. Never acknowledge either one until the target has
+	// actually replaced every volatile filesystem source. Otherwise the source
+	// may close its relay after the state transition while the guest still has
+	// deferred files, permanently stranding the migrated branch.
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
+	if _, err := r.backend.command("timetravel", info.ID, "distributed-filesystem-drain", branch.ID); err != nil {
+		return fmt.Errorf("starting distributed filesystem drain: %w", err)
+	}
+	output, err := r.backend.command("timetravel", info.ID, "distributed-filesystem-drain-status", branch.ID)
+	if err != nil {
+		return fmt.Errorf("reading distributed filesystem drain status: %w", err)
+	}
+	var filesystemStatus boot.DistributedForkFilesystemDrainStatus
+	if err := json.Unmarshal(output, &filesystemStatus); err != nil {
+		return fmt.Errorf("decoding distributed filesystem drain status: %w", err)
+	}
+	if !filesystemStatus.Done {
+		return errors.New("distributed filesystem drain is still in progress")
+	}
+	if filesystemStatus.Error != "" {
+		return fmt.Errorf("distributed filesystem drain failed: %s", filesystemStatus.Error)
 	}
 	return r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, 0)
 }
@@ -3578,9 +3607,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 					}
 					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
 					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) {
-						unlock := server.lockDataRoot(server.dataRoot)
+						// Do not take the command lifecycle lock here. A drain holds it
+						// while completing peer dependencies after Raft cutover, exactly
+						// when this callback observes a revoked source placement. Waiting
+						// for that lock would stop lease renewal and self-fence the whole
+						// cluster. The enforcer is generation-fenced and its destroy paths
+						// explicitly tolerate racing migration cleanup.
 						enforceErr := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation)
-						unlock()
 						if enforceErr != nil {
 							// A committed revocation must be enforced before this node may
 							// consume its renewed lease. Fail closed immediately rather than

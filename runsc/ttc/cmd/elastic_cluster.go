@@ -972,7 +972,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
-		if owner, claims, err := daemonCommandPlacement(s.dataRoot, child.args); err != nil {
+		// Clustered roots have exactly one placement authority: the Raft
+		// catalog installed on the daemon. Do not reopen the retired
+		// shared-filesystem catalog here. In particular, a family operation
+		// runs several child mutations and re-resolves each one after the
+		// preceding child may have changed metadata; consulting the empty
+		// legacy catalog at this point made rm/stop/dehydrate fail after an
+		// otherwise successful migration.
+		if owner, claims, err := daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, child.args); err != nil {
 			return true, 1, nil, diagnostic.Bytes(), err
 		} else {
 			if owner != "" {
@@ -1687,10 +1694,13 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 			tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 			continue
 		}
-		// The live session itself is authoritative. In particular, protect the
-		// narrow interval after the target records independence but before the
-		// source releases its last page and filesystem references.
-		if _, err := b.command("timetravel", containerID, "distributed-status", tx.Identity.TransactionID); err == nil {
+		// SourceNeeded is the Raft-committed lifetime fence for the paused source
+		// provider. Do not query the Sentry from the lease-renewal path: its
+		// control server may be occupied by the migration itself, and blocking a
+		// short lease here would self-fence the node that owns the only remaining
+		// volatile data. A stale transaction is deliberately conservative; its
+		// recovery path must resolve source authority before the runtime is reaped.
+		if tx.SourceNeeded {
 			return true
 		}
 	}

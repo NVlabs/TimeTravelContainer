@@ -443,13 +443,12 @@ func (r *distributedPageRelay) serveFilesystemFile(file *os.File) {
 
 func (r *distributedPageRelay) serveRunscFile(file *os.File, action string) {
 	defer file.Close()
-	timeout := unix.NsecToTimeval((30 * time.Second).Nanoseconds())
-	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
-		return
-	}
-	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_SNDTIMEO, &timeout); err != nil {
-		return
-	}
+	// A donated filesystem stream is deliberately lazy: the target may not
+	// fault its first deferred object until minutes or hours after migration.
+	// Do not put an inactivity timeout on this socket. Relay.Close tracks and
+	// kills the serving command, so explicit transaction completion remains the
+	// lifetime fence without turning an idle, authoritative source into a
+	// broken pipe.
 	command := runscCommand(r.backend.runsc,
 		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
 		r.source, action, r.session)

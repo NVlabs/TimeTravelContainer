@@ -209,6 +209,51 @@ func TestDaemonCommandPlacementRejectsMissingCurrentPlacement(t *testing.T) {
 	}
 }
 
+func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the historical shared-root catalog empty. This models a
+	// current-format clustered root, where placements exist only in Raft.
+	raftPlacements, err := cluster.OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raftPlacements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Unix(2, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, raftPlacements, []string{"rm", "-f", "web@main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner != "node-b" || len(claims) != 1 || claims[0].BranchID != "main" {
+		t.Fatalf("placement owner=%q claims=%+v", owner, claims)
+	}
+	if _, _, err := daemonCommandPlacement(root, []string{"rm", "-f", "web@main"}); err == nil {
+		t.Fatal("empty legacy catalog unexpectedly resolved a current Raft placement")
+	}
+}
+
 func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()

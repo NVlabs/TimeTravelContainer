@@ -1411,6 +1411,92 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectSkipsLiveDonatedRepositoryMetadataTail(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("live-gc-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := OpenRepositoryFD(directory, CopyModeFull)
+	if err != nil {
+		directory.Close()
+		t.Fatal(err)
+	}
+	directory.Close()
+
+	ino, err := runtime.CreateRegular(MainBranch, RootInode, "pending", 0644, 0, 0)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := runtime.WriteAt(MainBranch, ino, []byte("still-live"), 0); err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	inode, err := runtime.Inode(MainBranch, ino)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	objectID, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, ok := runtime.graph.Object(objectID); ok {
+		runtime.Close()
+		t.Fatal("test object was published before the metadata-tail GC check")
+	}
+	collector, err := manager.Open("live-gc-fence")
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(path, collector.objectPath(inode.Object))
+	if err := collector.GarbageCollect(); err != nil {
+		collector.Close()
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(objectPath); err != nil {
+		collector.Close()
+		runtime.Close()
+		t.Fatalf("GC removed a live Sentry metadata-tail object: %v", err)
+	}
+	if got := readAll(t, runtime, MainBranch, ino); got != "still-live" {
+		collector.Close()
+		runtime.Close()
+		t.Fatalf("data after skipped GC=%q", got)
+	}
+	if err := collector.Close(); err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	collector, err = manager.Open("live-gc-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Close()
+	if err := collector.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, collector, MainBranch, ino); got != "still-live" {
+		t.Fatalf("published data after runtime close=%q", got)
+	}
+}
+
 func TestMetadataDurabilityFenceReclaimsObsoleteBulkByID(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("bounded-bulk-churn")

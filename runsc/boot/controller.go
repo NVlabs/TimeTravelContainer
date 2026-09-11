@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"strconv"
@@ -1186,8 +1187,8 @@ func (cm *containerManager) ServeDistributedFilesystemConnection(args *Distribut
 		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository})
 	}
 	go func() {
-		if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil {
-			log.Debugf("Distributed filesystem stream ended: %v", err)
+		if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			log.Warningf("Distributed filesystem stream failed: %v", err)
 		}
 	}()
 	return nil
@@ -1239,10 +1240,11 @@ func (cm *containerManager) DrainDistributedForkFilesystems(_ *DistributedForkDe
 	if current := cm.filesystemDrain; current != nil {
 		select {
 		case <-current.done:
-			if current.err == nil {
-				cm.filesystemDrainMu.Unlock()
-				return nil
-			}
+			// A completed drain is only a barrier for sources that were attached
+			// before that drain acquired the repository lifecycle lock. Another
+			// remote branch may have joined this physical Sentry afterward. Always
+			// establish a fresh barrier for a later request; concurrent callers
+			// still share the in-progress state below.
 			cm.filesystemDrain = nil
 		default:
 			cm.filesystemDrainMu.Unlock()

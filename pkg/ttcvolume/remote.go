@@ -262,6 +262,7 @@ func writeRemoteFailure(writer io.Writer, request remoteHeader, message string) 
 
 type remoteObjectClient struct {
 	mu         sync.Mutex
+	users      sync.WaitGroup
 	conn       io.ReadWriteCloser
 	token      RemoteToken
 	source     RemoteSourceKey
@@ -338,6 +339,12 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if r == nil || conn == nil {
 		return errors.New("remote filesystem source requires repository and connection")
 	}
+	// A source attachment changes the resolver set consumed by the
+	// repository-wide independence barrier. Serialize the two operations so a
+	// concurrent sibling migration cannot have its newly attached catalog
+	// detached by an older branch's drain.
+	r.remoteLifecycleMu.Lock()
+	defer r.remoteLifecycleMu.Unlock()
 	branch, err := r.Branch(branchID)
 	if err != nil {
 		return err
@@ -436,6 +443,10 @@ func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.branchObjects(branch)
+}
+
+func (r *Repository) branchObjects(branch Branch) (map[string]int64, error) {
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
 		return nil, err
@@ -483,6 +494,20 @@ func (r *Repository) BranchRemoteSourceObjects(branchID string) (map[string]int6
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
 // source handoff or local durable publication.
 func (r *Repository) MaterializeRemoteObjects() error {
+	// The cross-instance repository lock is also a guest-mutation fence. A
+	// running target may otherwise path-copy an unexpanded deferred child after
+	// the scan below but before its resolver is detached, leaving an apparently
+	// independent branch that still needs the source.
+	return r.withLock(r.materializeRemoteObjectsLocked)
+}
+
+func (r *Repository) materializeRemoteObjectsLocked() error {
+	// Multiple distributed transactions in one physical Sentry share this
+	// repository. Their eager drains may arrive concurrently, but detaching
+	// remote catalogs is a repository-wide barrier and must execute exactly one
+	// at a time.
+	r.remoteLifecycleMu.Lock()
+	defer r.remoteLifecycleMu.Unlock()
 	// Resolve every still-foreign namespace before detaching its provider.
 	// This is an explicit independence barrier and is allowed to be O(total
 	// metadata); ordinary remote start and pathname access remain lazy.
@@ -495,7 +520,23 @@ func (r *Repository) MaterializeRemoteObjects() error {
 	}
 	r.remoteMu.Unlock()
 	for _, branch := range deferredBranches {
-		if _, err := r.BranchObjects(branch); err != nil {
+		// MaterializeRemoteObjects holds the repository operation lock, so using
+		// the public Branch helper here would recursively acquire it. Flush the
+		// bounded metadata tail directly and construct the same authoritative
+		// graph-root view while the mutation fence remains held.
+		if err := r.flushMetadataBatchLocked(branch); err != nil {
+			return err
+		}
+		branchRecord, err := r.readBranch(branch)
+		if err != nil {
+			return err
+		}
+		root, ok := r.graph.Root(graphRootName(branch))
+		if !ok {
+			return fmt.Errorf("branch %q has no snapshot graph root", branch)
+		}
+		branchRecord.Root = root.String()
+		if _, err := r.branchObjects(branchRecord); err != nil {
 			return err
 		}
 	}
@@ -542,6 +583,13 @@ func (r *Repository) MaterializeRemoteObjects() error {
 			}
 		}
 		r.remoteMu.Unlock()
+		// A reader may have selected this client immediately before it was
+		// removed from remoteByObject. Wait for every such pinned selection
+		// before closing the stream; c.mu alone cannot distinguish a queued
+		// pre-detach reader from a new use of an already closed connection.
+		remote.mu.Unlock()
+		remote.users.Wait()
+		remote.mu.Lock()
 		err := remote.conn.Close()
 		remote.mu.Unlock()
 		if err != nil {
@@ -603,6 +651,9 @@ func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length
 func (r *Repository) ensureObjectRange(object string, size, offset, length int64) error {
 	r.remoteMu.Lock()
 	remote := r.remoteByObject[object]
+	if remote != nil {
+		remote.users.Add(1)
+	}
 	r.remoteMu.Unlock()
 	if length == 0 {
 		return nil
@@ -617,6 +668,7 @@ func (r *Repository) ensureObjectRange(object string, size, offset, length int64
 		}
 		return nil
 	}
+	defer remote.users.Done()
 	return remote.ensure(object, size, offset, length)
 }
 
@@ -677,7 +729,13 @@ func (reader *remoteWholeFileReader) Read(destination []byte) (int, error) {
 }
 
 func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) ([]byte, error) {
+	// sources is populated while deferred graph nodes are expanded. Those
+	// expansions may run concurrently with a first data read for another file.
+	// The repository remote lock protects the per-client object/source maps;
+	// c.mu separately serializes the byte stream and request IDs.
+	c.repository.remoteMu.Lock()
 	remoteObject := c.sources[object]
+	c.repository.remoteMu.Unlock()
 	if !validObjectID(remoteObject) || len(remoteObject) > 40 {
 		return nil, fmt.Errorf("invalid object ID %q", object)
 	}

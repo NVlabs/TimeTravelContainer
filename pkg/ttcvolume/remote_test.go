@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -253,8 +254,21 @@ func TestRemoteSnapshotSharedObjectUsesNewestLiveSource(t *testing.T) {
 	// same content-addressed object, repository-wide materialization must use
 	// the newer live connection and make both branches self-contained.
 	_ = server1.Close()
-	if err := target.MaterializeRemoteObjects(); err != nil {
-		t.Fatalf("MaterializeRemoteObjects: %v", err)
+	var drains sync.WaitGroup
+	drainErrors := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		drains.Add(1)
+		go func() {
+			defer drains.Done()
+			drainErrors <- target.MaterializeRemoteObjects()
+		}()
+	}
+	drains.Wait()
+	close(drainErrors)
+	for err := range drainErrors {
+		if err != nil {
+			t.Fatalf("concurrent MaterializeRemoteObjects: %v", err)
+		}
 	}
 	select {
 	case <-server2Done:
