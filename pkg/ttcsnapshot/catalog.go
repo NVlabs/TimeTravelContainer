@@ -30,6 +30,16 @@ type MemoryCatalog interface {
 	MemoryPageRecord(ObjectID) (MemoryChunkID, uint32, MemoryPageIdentity, error)
 }
 
+// FilesystemCatalog is the immutable read surface needed by a graph-backed
+// filesystem. Store implements it for authoritative local state and
+// ImmutableCatalog implements it for peer/shared metadata without importing
+// reference ownership into a cache.
+type FilesystemCatalog interface {
+	FilesystemInode(ObjectID, uint64) (InodeRecord, bool, error)
+	FilesystemLookup(ObjectID, uint64, string) (DirectoryEntryRecord, bool, error)
+	FilesystemDirectory(ObjectID, uint64) ([]DirectoryEntryRecord, error)
+}
+
 // ImmutableCatalog is a structurally validated read-only object catalog. It
 // intentionally contains neither roots nor reference counts: branch roots
 // arrive in the fenced control record, and reference ownership remains at the
@@ -127,6 +137,21 @@ func (catalog *ImmutableCatalog) Object(id ObjectID) (Object, bool) {
 	return cloneObject(object), ok
 }
 
+// FilesystemInode resolves immutable inode metadata from this catalog.
+func (catalog *ImmutableCatalog) FilesystemInode(root ObjectID, number uint64) (InodeRecord, bool, error) {
+	return filesystemInodeObjects(root, number, catalog.Object)
+}
+
+// FilesystemLookup resolves one immutable directory entry from this catalog.
+func (catalog *ImmutableCatalog) FilesystemLookup(root ObjectID, parent uint64, name string) (DirectoryEntryRecord, bool, error) {
+	return filesystemLookupObjects(root, parent, name, catalog.Object)
+}
+
+// FilesystemDirectory lists one immutable directory from this catalog.
+func (catalog *ImmutableCatalog) FilesystemDirectory(root ObjectID, parent uint64) ([]DirectoryEntryRecord, error) {
+	return filesystemDirectoryObjects(root, parent, catalog.Object)
+}
+
 // MemoryPages enumerates one fixed-height memory radix tree.
 func (catalog *ImmutableCatalog) MemoryPages(root ObjectID) (map[uint64]ObjectID, error) {
 	if catalog == nil {
@@ -194,3 +219,5 @@ func (catalog *ImmutableCatalog) MemoryPageRecord(page ObjectID) (MemoryChunkID,
 
 var _ MemoryCatalog = (*Store)(nil)
 var _ MemoryCatalog = (*ImmutableCatalog)(nil)
+var _ FilesystemCatalog = (*Store)(nil)
+var _ FilesystemCatalog = (*ImmutableCatalog)(nil)

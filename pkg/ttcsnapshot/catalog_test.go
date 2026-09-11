@@ -92,3 +92,43 @@ func TestResolveImmutableCatalogFollowsOriginEdgesOnce(t *testing.T) {
 		t.Fatalf("resolved catalog old object = (%+v, %t)", object, ok)
 	}
 }
+
+func TestImmutableCatalogReadsFilesystemWithoutOwningReferences(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := store.CreateObject(origin, "file", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.ApplyFilesystem(origin, "filesystem/main", []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}},
+		{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, Size: 12, File: file}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "hello", Inode: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := store.SnapshotObjects(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := NewImmutableCatalog(objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err := catalog.FilesystemLookup(root, 1, "hello")
+	if err != nil || !ok || entry.Inode != 2 {
+		t.Fatalf("lookup = (%+v, %t, %v), want inode 2", entry, ok, err)
+	}
+	inode, ok, err := catalog.FilesystemInode(root, entry.Inode)
+	if err != nil || !ok || inode.File != file || inode.Size != 12 {
+		t.Fatalf("inode = (%+v, %t, %v), want file %s", inode, ok, err, file)
+	}
+	entries, err := catalog.FilesystemDirectory(root, 1)
+	if err != nil || len(entries) != 1 || entries[0] != entry {
+		t.Fatalf("directory = (%+v, %v), want [%+v]", entries, err, entry)
+	}
+}

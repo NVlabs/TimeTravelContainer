@@ -385,7 +385,14 @@ func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor fu
 func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rootObject, ok := s.state.Objects[rootID.key()]
+	return filesystemInodeObjects(rootID, number, func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func filesystemInodeObjects(rootID ObjectID, number uint64, objectFor func(ObjectID) (Object, bool)) (InodeRecord, bool, error) {
+	rootObject, ok := objectFor(rootID)
 	if !ok {
 		return InodeRecord{}, false, fmt.Errorf("filesystem root %s is missing", rootID.key())
 	}
@@ -393,12 +400,12 @@ func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bo
 	if err != nil {
 		return InodeRecord{}, false, err
 	}
-	id, ok, err := bTreeLookupState(s.state, root.inodes, ObjectKindInodeNode, InodeKey(number))
+	id, ok, err := bTreeLookupObjects(root.inodes, ObjectKindInodeNode, InodeKey(number), objectFor)
 	if err != nil || !ok {
 		return InodeRecord{}, ok, err
 	}
-	object := s.state.Objects[id.key()]
-	if object.ID.Kind != ObjectKindInode {
+	object, exists := objectFor(id)
+	if !exists || object.ID.Kind != ObjectKindInode {
 		return InodeRecord{}, false, errors.New("inode tree references non-inode object")
 	}
 	var inode InodeRecord
@@ -410,13 +417,20 @@ func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bo
 
 // FilesystemLookup resolves a directory entry without an ancestry walk.
 func (s *Store) FilesystemLookup(rootID ObjectID, parent uint64, name string) (DirectoryEntryRecord, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return filesystemLookupObjects(rootID, parent, name, func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func filesystemLookupObjects(rootID ObjectID, parent uint64, name string, objectFor func(ObjectID) (Object, bool)) (DirectoryEntryRecord, bool, error) {
 	key, err := directoryKey(parent, name)
 	if err != nil {
 		return DirectoryEntryRecord{}, false, err
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rootObject, ok := s.state.Objects[rootID.key()]
+	rootObject, ok := objectFor(rootID)
 	if !ok {
 		return DirectoryEntryRecord{}, false, fmt.Errorf("filesystem root %s is missing", rootID.key())
 	}
@@ -424,22 +438,25 @@ func (s *Store) FilesystemLookup(rootID ObjectID, parent uint64, name string) (D
 	if err != nil {
 		return DirectoryEntryRecord{}, false, err
 	}
-	parentID, ok, err := bTreeLookupState(s.state, root.inodes, ObjectKindInodeNode, InodeKey(parent))
+	parentID, ok, err := bTreeLookupObjects(root.inodes, ObjectKindInodeNode, InodeKey(parent), objectFor)
 	if err != nil || !ok {
 		return DirectoryEntryRecord{}, ok, err
 	}
-	parentObject := s.state.Objects[parentID.key()]
+	parentObject, exists := objectFor(parentID)
+	if !exists || parentObject.ID.Kind != ObjectKindInode {
+		return DirectoryEntryRecord{}, false, errors.New("inode tree references missing or invalid parent inode")
+	}
 	var parentInode InodeRecord
 	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
 		return DirectoryEntryRecord{}, false, err
 	}
-	id, ok, err := bTreeLookupState(s.state, parentInode.Directory, ObjectKindDirectoryNode, key[8:])
+	id, ok, err := bTreeLookupObjects(parentInode.Directory, ObjectKindDirectoryNode, key[8:], objectFor)
 	if err != nil || !ok {
 		return DirectoryEntryRecord{}, ok, err
 	}
-	object := s.state.Objects[id.key()]
+	object, exists := objectFor(id)
 	var entry DirectoryEntryRecord
-	if object.ID.Kind != ObjectKindMetadata {
+	if !exists || object.ID.Kind != ObjectKindMetadata {
 		return entry, false, errors.New("directory tree references non-metadata object")
 	}
 	if err := json.Unmarshal(object.Data, &entry); err != nil {
@@ -453,7 +470,14 @@ func (s *Store) FilesystemLookup(rootID ObjectID, parent uint64, name string) (D
 func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]DirectoryEntryRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rootObject, ok := s.state.Objects[rootID.key()]
+	return filesystemDirectoryObjects(rootID, parent, func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(ObjectID) (Object, bool)) ([]DirectoryEntryRecord, error) {
+	rootObject, ok := objectFor(rootID)
 	if !ok {
 		return nil, fmt.Errorf("filesystem root %s is missing", rootID.key())
 	}
@@ -461,11 +485,14 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 	if err != nil {
 		return nil, err
 	}
-	parentID, ok, err := bTreeLookupState(s.state, root.inodes, ObjectKindInodeNode, InodeKey(parent))
+	parentID, ok, err := bTreeLookupObjects(root.inodes, ObjectKindInodeNode, InodeKey(parent), objectFor)
 	if err != nil || !ok {
 		return nil, err
 	}
-	parentObject := s.state.Objects[parentID.key()]
+	parentObject, exists := objectFor(parentID)
+	if !exists || parentObject.ID.Kind != ObjectKindInode {
+		return nil, errors.New("inode tree references missing or invalid parent inode")
+	}
 	var parentInode InodeRecord
 	if err := json.Unmarshal(parentObject.Data, &parentInode); err != nil {
 		return nil, err
@@ -476,7 +503,7 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 	var result []DirectoryEntryRecord
 	var visit func(ObjectID) error
 	visit = func(id ObjectID) error {
-		object, ok := s.state.Objects[id.key()]
+		object, ok := objectFor(id)
 		if !ok {
 			return fmt.Errorf("directory node %s is missing", id.key())
 		}
@@ -493,7 +520,10 @@ func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]Directory
 			return nil
 		}
 		for index := range node.keys {
-			value := s.state.Objects[node.children[index].key()]
+			value, ok := objectFor(node.children[index])
+			if !ok || value.ID.Kind != ObjectKindMetadata {
+				return fmt.Errorf("directory tree references missing or invalid object %s", node.children[index].key())
+			}
 			var entry DirectoryEntryRecord
 			if err := json.Unmarshal(value.Data, &entry); err != nil {
 				return err
