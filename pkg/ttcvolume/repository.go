@@ -1019,9 +1019,13 @@ func (r *Repository) Branch(id string) (Branch, error) {
 }
 
 // RemoveBranch removes a branch pointer after its Kernel no longer exists.
-// The canonical main pointer may be removed only when another branch keeps the
-// repository live. Immutable graph objects are reclaimed separately by
-// GarbageCollect.
+// The final pointer, regardless of its name, may only be removed by deleting
+// the repository itself. This matters for elastic TTC: a node-local private
+// repository may contain only a scoped branch such as b-<digest>, rather than
+// the canonical main pointer. Allowing that pointer to be unlinked first
+// leaves an empty repository that cannot distinguish a committed deletion
+// from an interrupted one. Immutable graph objects are reclaimed separately
+// by GarbageCollect.
 func (r *Repository) RemoveBranch(id string) error {
 	if err := validateName(id, "branch"); err != nil {
 		return err
@@ -1034,28 +1038,26 @@ func (r *Repository) RemoveBranch(id string) error {
 		if err := r.flushMetadataBatchLocked(id); err != nil {
 			return fmt.Errorf("publishing branch metadata before removal: %w", err)
 		}
-		if id == mainBranch {
-			branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
-			if err != nil {
-				return err
+		branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		names, readErr := branchDir.Readdirnames(-1)
+		closeErr := branchDir.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		branchPointers := 0
+		for _, name := range names {
+			if strings.HasSuffix(name, ".json") {
+				branchPointers++
 			}
-			names, readErr := branchDir.Readdirnames(-1)
-			closeErr := branchDir.Close()
-			if readErr != nil {
-				return readErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			branchPointers := 0
-			for _, name := range names {
-				if strings.HasSuffix(name, ".json") {
-					branchPointers++
-				}
-			}
-			if branchPointers <= 1 {
-				return ErrFinalBranch
-			}
+		}
+		if branchPointers <= 1 {
+			return ErrFinalBranch
 		}
 		if err := r.unlink(filepath.Join("branches", id+".json")); err != nil {
 			return err

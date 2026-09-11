@@ -1079,6 +1079,42 @@ func TestRemoveBranchKeepsMain(t *testing.T) {
 	}
 }
 
+func TestRemoveBranchRejectsFinalScopedBranch(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := repository.Fork(MainBranch, "scoped"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch(MainBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch("scoped"); !errors.Is(err, ErrFinalBranch) {
+		t.Fatalf("RemoveBranch(scoped)=%v, want ErrFinalBranch", err)
+	}
+	if _, err := repository.Branch("scoped"); err != nil {
+		t.Fatalf("final scoped branch was removed: %v", err)
+	}
+}
+
+func TestGarbageCollectReportsInterruptedFinalBranchRemoval(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := os.Remove(filepath.Join(repository.path, "branches", MainBranch+".json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.GarbageCollect(); !errors.Is(err, ErrEmptyRepository) {
+		t.Fatalf("GarbageCollect()=%v, want ErrEmptyRepository", err)
+	}
+}
+
 func TestManagerRemovePrivateFinalRepository(t *testing.T) {
 	manager := openTestManager(t)
 	parent := filepath.Join(manager.root, "families")

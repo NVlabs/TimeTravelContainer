@@ -3935,6 +3935,14 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		if removeErr == nil {
 			if !removeRepository {
 				removeErr = repository.GarbageCollect()
+				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) && repositoryCanonicalBranchBelongsToFamily(config) {
+					// The Sentry may have committed its own branch-pointer
+					// deletion before daemon-side artifact cleanup begins. An
+					// empty family-private repository is therefore the same
+					// final-repository case as ErrFinalBranch, not a failure.
+					removeRepository = true
+					removeErr = nil
+				}
 			}
 		}
 		closeErr := repository.Close()

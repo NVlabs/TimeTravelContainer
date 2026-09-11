@@ -122,4 +122,26 @@ client_b exec "$NAME@remote2" sh -c "printf REMOTE-2 >/identity"
 test "$(client_a exec "$NAME@remote1" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-2
 
+# Optional maintenance settling is useful for stress jobs that need to observe
+# publication, handoff, compaction, and GC after execution has gone idle.
+if test -n "${TTC_DISTRIBUTED_TEST_SETTLE:-}"; then
+	sleep "$TTC_DISTRIBUTED_TEST_SETTLE"
+fi
+
+# Family deletion is part of the distributed lifecycle being tested. Keep it
+# on the asserted path rather than relying on the best-effort EXIT trap: a
+# branch-local repository cleanup failure must not leave Sentries, placements,
+# or shared family metadata behind while this test still reports success.
+client_a rm -f "$NAME" >/dev/null
+if client_a ps -a --format '{{.Container}}' | grep -Fx "$NAME" >/dev/null; then
+	echo "distributed family $NAME remained visible after rm" >&2
+	exit 1
+fi
+client_b node stop node-b --stop-all >/dev/null
+wait "$PID_B"
+PID_B=
+client_a node stop node-a --stop-all >/dev/null
+wait "$PID_A"
+PID_A=
+
 echo "TTC A-to-B-to-A-to-B sparse migration/fork lifecycle passed"

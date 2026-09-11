@@ -24,6 +24,12 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
+// ErrEmptyRepository reports a repository whose last branch pointer was
+// already removed by the runtime before daemon-side lifecycle cleanup. The
+// caller may remove a family-private repository as a whole; named repositories
+// retain the error because losing their canonical pointer is corruption.
+var ErrEmptyRepository = errors.New("repository has no published branches")
+
 // GarbageCollect removes graph metadata and data objects that are unreachable
 // from every published branch pointer. Repository mutation and collection use
 // the same cross-process flock, so a concurrent Sentry fork or write either
@@ -66,7 +72,7 @@ func (r *Repository) garbageCollectLocked() error {
 		workingSnapshots = append(workingSnapshots, ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
 	}
 	if len(liveBranchIDs) == 0 {
-		return errors.New("repository has no published branches")
+		return ErrEmptyRepository
 	}
 
 	// Drop decoded state for removed branch IDs before graph collection.
