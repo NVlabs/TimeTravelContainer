@@ -17,21 +17,17 @@ package ttcchunk
 import (
 	"errors"
 	"fmt"
-	"io"
 	"sort"
-	"sync"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 // InstalledChunk maps one newly allocated resident chunk to a virtual stream
-// offset in ChunkReader. Reused resident chunks are omitted.
+// offset in a graph chunk reader. Reused resident chunks are omitted.
 type InstalledChunk struct {
 	Object       ID
 	ResourceID   checkpoint.ResourceID
@@ -123,14 +119,6 @@ func (r *InstallResult) Commit() error { return r.transaction.Commit() }
 
 // Abort rolls back an incomplete restore.
 func (r *InstallResult) Abort() error { return r.transaction.Abort() }
-
-// InstallManifest validates manifest objects, installs or reuses their 1 MiB
-// resident ranges, and builds the old-offset relocation table used by state
-// restore. Newly allocated ranges remain zero until Chunks are attached to an
-// asynchronous ChunkReader.
-func (r *MemoryRepository) InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
-	return InstallManifest(mf, manifest, kind, memCgID)
-}
 
 // InstallManifest installs an already-loaded immutable manifest. It is shared
 // by legacy repositories and graph-native memory sources.
@@ -250,12 +238,6 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 	return result, nil
 }
 
-// InstallManifestSet installs manifest into the MemoryFile selected by each
-// run's ResourceID. One immutable object may belong to only one MemoryFile.
-func (r *MemoryRepository) InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallSetResult, error) {
-	return InstallManifestSet(memoryFiles, manifest, kind, memCgID)
-}
-
 // InstallManifestSet installs an already-loaded manifest into its selected
 // MemoryFiles without requiring a pathname-backed repository.
 func InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallSetResult, error) {
@@ -318,162 +300,4 @@ func InstallManifestSet(memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFil
 	sort.Slice(result.Objects, func(i, j int) bool { return result.Objects[i].String() < result.Objects[j].String() })
 	committed = true
 	return result, nil
-}
-
-// ChunkReader exposes decoded chunks as a dense virtual stream of 1 MiB
-// records. Each ReadAt is transactional: it verifies the immutable object,
-// builds the complete record in private memory, then copies to the caller.
-type ChunkReader struct {
-	store       *Store
-	objects     []ID
-	mu          sync.RWMutex
-	closed      bool
-	ownStore    bool
-	consumption *ConsumptionTracker
-}
-
-// NewChunkReader creates a virtual stream in installed-chunk order.
-func NewChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*ChunkReader, error) {
-	return newChunkReader(repository, installed, false)
-}
-
-// NewOwnedChunkReader is NewChunkReader but closes repository when the reader
-// closes. It is used for a repository directory donated to an isolated Sentry.
-func NewOwnedChunkReader(repository *MemoryRepository, installed []InstalledChunk) (*ChunkReader, error) {
-	return newChunkReader(repository, installed, true)
-}
-
-// NewOwnedConsumingChunkReader creates a reader that records successfully
-// installed objects against branch after ActivateConsumption. Until then,
-// completions are buffered so a failed restore leaves its durable image intact.
-func NewOwnedConsumingChunkReader(repository *MemoryRepository, installed []InstalledChunk, branch string, manifest ManifestID) (*ChunkReader, error) {
-	reader, err := newChunkReader(repository, installed, true)
-	if err != nil {
-		return nil, err
-	}
-	tracker, err := newConsumptionTracker(repository, branch, manifest, reader.objects)
-	if err != nil {
-		_ = reader.Close()
-		return nil, err
-	}
-	reader.consumption = tracker
-	return reader, nil
-}
-
-// ActivateConsumption commits buffered completions and marks already-resident
-// objects consumed. It must be called only after restored graph references are
-// committed.
-func (r *ChunkReader) ActivateConsumption(alreadyResident []ID) {
-	if r != nil && r.consumption != nil {
-		r.consumption.Activate(alreadyResident)
-	}
-}
-
-// AbortConsumption prevents buffered completions from changing durable roots.
-func (r *ChunkReader) AbortConsumption() {
-	if r != nil && r.consumption != nil {
-		r.consumption.Abort()
-	}
-}
-
-// RangeLoaded records a pages-file range after atomic MemoryFile installation.
-func (r *ChunkReader) RangeLoaded(offset, length uint64) {
-	if r != nil && r.consumption != nil {
-		r.consumption.Record(offset, length)
-	}
-}
-
-func newChunkReader(repository *MemoryRepository, installed []InstalledChunk, ownStore bool) (*ChunkReader, error) {
-	if repository == nil {
-		return nil, fmt.Errorf("nil TTC memory repository")
-	}
-	objects := make([]ID, len(installed))
-	for i, chunk := range installed {
-		if chunk.StreamOffset != uint64(i)*pgalloc.SparseChunkBytes || chunk.Target.Length() != pgalloc.SparseChunkBytes {
-			return nil, fmt.Errorf("invalid installed chunk %d: %+v", i, chunk)
-		}
-		objects[i] = chunk.Object
-	}
-	return &ChunkReader{store: repository.chunks, objects: objects, ownStore: ownStore}, nil
-}
-
-// Close prevents future reads.
-func (r *ChunkReader) Close() error {
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
-	r.closed = true
-	var err error
-	if r.ownStore {
-		if r.consumption != nil {
-			err = r.consumption.ReaderClosed()
-		} else {
-			err = r.store.closeRepository()
-		}
-	}
-	r.mu.Unlock()
-	return err
-}
-
-func (r *ChunkReader) decoded(index int) ([]byte, error) {
-	chunk, err := r.store.Get(r.objects[index])
-	if err != nil {
-		return nil, err
-	}
-	data := make([]byte, pgalloc.SparseChunkBytes)
-	for _, page := range chunk.Pages {
-		if !page.Zero {
-			copy(data[uint64(page.Slot)*hostarch.PageSize:], page.Data)
-		}
-	}
-	return data, nil
-}
-
-// ReadAt implements io.ReaderAt.
-func (r *ChunkReader) ReadAt(dst []byte, off int64) (int, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.closed {
-		return 0, fmt.Errorf("TTC memory chunk reader is closed")
-	}
-	if off < 0 {
-		return 0, fmt.Errorf("negative TTC memory chunk offset")
-	}
-	readLock, err := r.store.repository.lockGarbageCollection(unix.LOCK_SH)
-	if err != nil {
-		return 0, fmt.Errorf("locking TTC memory chunks for reading: %w", err)
-	}
-	defer unlockGarbageCollection(readLock)
-	total := uint64(len(r.objects)) * pgalloc.SparseChunkBytes
-	if uint64(off) >= total {
-		return 0, io.EOF
-	}
-	written := 0
-	for len(dst) != 0 && uint64(off) < total {
-		index := int(uint64(off) / pgalloc.SparseChunkBytes)
-		within := uint64(off) % pgalloc.SparseChunkBytes
-		decoded, err := r.decoded(index)
-		if err != nil {
-			return written, err
-		}
-		n := copy(dst, decoded[within:])
-		written += n
-		dst = dst[n:]
-		off += int64(n)
-	}
-	if len(dst) != 0 {
-		return written, io.EOF
-	}
-	return written, nil
-}
-
-// AsyncReader wraps r with bounded parallel synchronous host reads. One
-// demand fault reads exactly one 1 MiB unloaded segment.
-func (r *ChunkReader) AsyncReader(parallel int) stateio.AsyncReader {
-	if parallel <= 0 {
-		parallel = 1
-	}
-	return stateio.NewIOReader(r, pgalloc.SparseChunkBytes, 16, parallel)
 }

@@ -40,9 +40,9 @@ type GraphMemoryRoot struct {
 	Root       ttcsnapshot.ObjectID
 }
 
-// GraphImportResult describes one graph-native import of a legacy capture
-// stream. The compatibility input is consumed chunk-by-chunk; all new bulk
-// data and liveness are represented by typed graph objects.
+// GraphImportResult describes one graph-native capture-stream import. The
+// input is consumed chunk-by-chunk; all bulk data and liveness are represented
+// by typed graph objects.
 type GraphImportResult struct {
 	Snapshot ttcsnapshot.SnapshotID
 	Roots    []GraphMemoryRoot
@@ -68,24 +68,8 @@ func resourceKey(id checkpoint.ResourceID) string {
 	return id.ContainerName + "\x00" + id.Path
 }
 
-// ImportSnapshotGraph converts manifest into fixed-size graph memory chunks.
-// It never installs a partially-populated branch root: on failure every root
-// created under rootPrefix is released and unreferenced bulk objects are
-// reclaimed. origin remains allocated (snapshot IDs are never reused).
-func (r *MemoryRepository) ImportSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifestID ManifestID, rootPrefix string) (_ GraphImportResult, retErr error) {
-	if r == nil || graph == nil || data == nil || origin == 0 || rootPrefix == "" {
-		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
-	}
-	manifest, err := r.LoadManifest(manifestID)
-	if err != nil {
-		return GraphImportResult{}, err
-	}
-	return importSnapshotGraph(graph, data, origin, manifest, rootPrefix, r.chunks.Get)
-}
-
 // importSnapshotGraph installs manifest and its immutable source chunks into
-// graph. getChunk deliberately abstracts the compatibility repository away so
-// new-format callers can stream a capture directly from the Sentry.
+// graph. getChunk lets callers stream a capture directly from the Sentry.
 func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, getChunk func(ID) (Chunk, error)) (_ GraphImportResult, retErr error) {
 	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || getChunk == nil {
 		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
