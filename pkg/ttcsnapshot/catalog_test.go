@@ -14,7 +14,10 @@
 
 package ttcsnapshot
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestImmutableCatalogReadsMemoryWithoutOwningReferences(t *testing.T) {
 	store := openTestStore(t)
@@ -147,5 +150,71 @@ func TestImmutableCatalogReadsFilesystemWithoutOwningReferences(t *testing.T) {
 	entries, err := catalog.FilesystemDirectory(root, 1)
 	if err != nil || len(entries) != 1 || entries[0] != entry {
 		t.Fatalf("directory = (%+v, %v), want [%+v]", entries, err, entry)
+	}
+}
+
+func TestLazyImmutableCatalogLoadsOnlyLookupPath(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}}}
+	for index := uint64(0); index < 400; index++ {
+		file, err := store.CreateObject(origin, fmt.Sprintf("file/%04d", index), ObjectKindFile, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode := index + 2
+		ops = append(ops,
+			FilesystemOperation{PutInode: &InodeRecord{Number: inode, Type: "regular", Mode: 0644, Nlink: 1, Size: int64(index), File: file}},
+			FilesystemOperation{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("file-%04d", index), Inode: inode}},
+		)
+	}
+	root, err := store.ApplyFilesystem(origin, "filesystem/main", ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := store.SnapshotObjects(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[ObjectID]Object, len(objects))
+	for _, object := range objects {
+		byID[object.ID] = object
+	}
+	loads := 0
+	catalog, err := NewLazyImmutableCatalog(func(id ObjectID) (Object, error) {
+		loads++
+		object, ok := byID[id]
+		if !ok {
+			return Object{}, fmt.Errorf("missing %s", id)
+		}
+		return object, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err := catalog.FilesystemLookup(root, 1, "file-0200")
+	if err != nil || !ok || entry.Inode != 202 {
+		t.Fatalf("lookup = (%+v,%t,%v), want inode 202", entry, ok, err)
+	}
+	inode, ok, err := catalog.FilesystemInode(root, entry.Inode)
+	if err != nil || !ok || inode.Number != 202 {
+		t.Fatalf("inode = (%+v,%t,%v), want 202", inode, ok, err)
+	}
+	if loads != catalog.LoadedObjects() {
+		t.Fatalf("loader calls=%d, cached=%d", loads, catalog.LoadedObjects())
+	}
+	if loads >= len(objects)/4 {
+		t.Fatalf("point lookup loaded %d of %d metadata objects", loads, len(objects))
+	}
+	// A repeated lookup is served entirely from the immutable local cache.
+	before := loads
+	if _, _, err := catalog.FilesystemLookup(root, 1, "file-0200"); err != nil {
+		t.Fatal(err)
+	}
+	if loads != before {
+		t.Fatalf("repeated lookup issued %d additional loads", loads-before)
 	}
 }

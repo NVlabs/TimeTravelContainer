@@ -176,6 +176,11 @@ func (provider *testImmutableObjectProvider) OpenSnapshot(_ context.Context, pee
 	return io.NopCloser(bytes.NewReader(provider.data)), provider.length, nil
 }
 
+func (provider *testImmutableObjectProvider) OpenSnapshotObject(_ context.Context, peer string, snapshot uint64, object, transaction string) (io.ReadCloser, uint64, error) {
+	provider.peer, provider.snapshot, provider.object, provider.transaction = peer, snapshot, object, transaction
+	return io.NopCloser(bytes.NewReader(provider.data)), provider.length, nil
+}
+
 func (provider *testImmutableObjectProvider) OpenObject(_ context.Context, peer, object, transaction string) (io.ReadCloser, uint64, error) {
 	provider.peer, provider.object, provider.transaction = peer, object, transaction
 	return io.NopCloser(bytes.NewReader(provider.data)), provider.length, nil
@@ -210,6 +215,39 @@ func TestImmutableSnapshotProviderStreamsExactCatalog(t *testing.T) {
 	}
 	if provider.peer != "source" || provider.snapshot != 42 || provider.transaction != "tx-request" {
 		t.Fatalf("provider request=(%q,%d,%q)", provider.peer, provider.snapshot, provider.transaction)
+	}
+}
+
+func TestImmutableSnapshotProviderStreamsOneMetadataObject(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(storeRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &testImmutableObjectProvider{data: []byte(`{"ID":{"Snapshot":42,"Ordinal":7,"Kind":4},"State":"live","Refs":1,"BulkLength":0,"Data":null,"Children":null}`)}
+	provider.length = uint64(len(provider.data))
+	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, SnapshotProvider: provider}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const object = "000000000000002a-04-0000000000000007"
+	reader, length, err := client.FetchSnapshotObject(context.Background(), 42, object, "tx-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil || length != uint64(len(provider.data)) || !bytes.Equal(got, provider.data) {
+		t.Fatalf("metadata object length=%d bytes=%d err=%v", length, len(got), err)
+	}
+	if provider.peer != "source" || provider.snapshot != 42 || provider.object != object || provider.transaction != "tx-request" {
+		t.Fatalf("provider request=(%q,%d,%q,%q)", provider.peer, provider.snapshot, provider.object, provider.transaction)
 	}
 }
 

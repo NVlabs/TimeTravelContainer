@@ -242,6 +242,42 @@ func (p *graphObjectProvider) OpenSnapshot(_ context.Context, peer string, snaps
 	return io.NopCloser(bytes.NewReader(encoded)), uint64(len(encoded)), nil
 }
 
+// OpenSnapshotObject serves one immutable metadata record without enumerating
+// its origin. Tree edges in the returned record are the capabilities needed
+// to discover the next bounded level; bulk bytes remain on OpenObject.
+func (p *graphObjectProvider) OpenSnapshotObject(_ context.Context, peer string, snapshotID uint64, objectText, transactionID string) (io.ReadCloser, uint64, error) {
+	if p == nil || p.graph == nil || p.authority == nil || snapshotID == 0 {
+		return nil, 0, errors.New("snapshot graph provider is unavailable")
+	}
+	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	id, err := ttcsnapshot.ParseObjectID(objectText)
+	if err != nil {
+		return nil, 0, err
+	}
+	if id.Snapshot != snapshot {
+		return nil, 0, fmt.Errorf("snapshot %d cannot serve object from origin %d", snapshot, id.Snapshot)
+	}
+	if err := p.authorizeSnapshot(peer, snapshot, transactionID, false); err != nil {
+		return nil, 0, err
+	}
+	record, ok := p.graph.Snapshot(snapshot)
+	if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+		return nil, 0, fmt.Errorf("snapshot origin %d is not sealed for peer reads", snapshot)
+	}
+	object, ok := p.graph.Object(id)
+	if !ok || object.State != ttcsnapshot.ObjectLive {
+		return nil, 0, os.ErrNotExist
+	}
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(encoded) == 0 || len(encoded) > 8<<20 {
+		return nil, 0, errors.New("snapshot metadata object exceeds transport limit")
+	}
+	return io.NopCloser(bytes.NewReader(encoded)), uint64(len(encoded)), nil
+}
+
 func graphReferenceRoots(snapshot ttcsnapshot.SnapshotID, operation string, bindings []cluster.SnapshotRootBinding) (map[string]ttcsnapshot.ObjectID, error) {
 	if snapshot == 0 || operation == "" || len(bindings) == 0 || len(bindings) > 4096 {
 		return nil, errors.New("invalid snapshot reference operation")
@@ -431,6 +467,30 @@ func decodeGraphSnapshotObjects(reader io.Reader, length uint64, snapshot ttcsna
 	return wire.Objects, nil
 }
 
+func decodeGraphSnapshotObject(reader io.Reader, length uint64, expected ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	if reader == nil || length == 0 || length > 8<<20 {
+		return ttcsnapshot.Object{}, errors.New("invalid immutable snapshot object length")
+	}
+	var object ttcsnapshot.Object
+	decoder := json.NewDecoder(io.LimitReader(reader, int64(length)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&object); err != nil {
+		return ttcsnapshot.Object{}, fmt.Errorf("decoding immutable snapshot object: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return ttcsnapshot.Object{}, errors.New("immutable snapshot object contains trailing JSON")
+	}
+	if object.ID != expected {
+		return ttcsnapshot.Object{}, fmt.Errorf("immutable snapshot object identifies %s, want %s", object.ID, expected)
+	}
+	// NewImmutableCatalog supplies the package's complete structural validator
+	// without exporting mutable graph internals.
+	if _, err := ttcsnapshot.NewImmutableCatalog([]ttcsnapshot.Object{object}); err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	return object, nil
+}
+
 // immutableSnapshotCatalog resolves metadata by origin authority. Unlike the
 // bulk resolver it never installs metadata into the local authoritative graph.
 func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, roots []ttcsnapshot.ObjectID, transaction string) (*ttcsnapshot.ImmutableCatalog, error) {
@@ -439,6 +499,67 @@ func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, roots []t
 	}
 	return ttcsnapshot.ResolveImmutableCatalog(roots, func(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.Object, error) {
 		return b.immutableSnapshotOriginObjects(ctx, origin, transaction)
+	})
+}
+
+// lazyImmutableSnapshotCatalog resolves one metadata object at a time from its
+// immutable origin. It is the filesystem lookup path; memory reconstruction
+// continues using immutableSnapshotCatalog because building a process image
+// necessarily enumerates the complete radix page map.
+func (b *runtimeBackend) lazyImmutableSnapshotCatalog(ctx context.Context, roots []ttcsnapshot.ObjectID, transaction string) (*ttcsnapshot.LazyImmutableCatalog, error) {
+	if b == nil || len(roots) == 0 {
+		return nil, errors.New("invalid lazy immutable snapshot catalog request")
+	}
+	for _, root := range roots {
+		if root.IsZero() {
+			return nil, errors.New("lazy immutable snapshot catalog contains an empty root")
+		}
+	}
+	return ttcsnapshot.NewLazyImmutableCatalog(func(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+		if b.snapshotGraph != nil {
+			if record, ok := b.snapshotGraph.Snapshot(id.Snapshot); ok && record.State != ttcsnapshot.SnapshotWorking {
+				object, ok := b.snapshotGraph.Object(id)
+				if !ok {
+					return ttcsnapshot.Object{}, os.ErrNotExist
+				}
+				return object, nil
+			}
+		}
+		if b.distributedSource == nil || b.distributedSource.authority == nil {
+			return ttcsnapshot.Object{}, os.ErrNotExist
+		}
+		provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+		if err != nil {
+			return ttcsnapshot.Object{}, err
+		}
+		if !volatile {
+			if b.snapshotShared == nil {
+				return ttcsnapshot.Object{}, errors.New("shared snapshot repository is unavailable")
+			}
+			manifest, err := b.snapshotShared.Manifest(id.Snapshot)
+			if err != nil {
+				return ttcsnapshot.Object{}, err
+			}
+			for _, packed := range manifest.Objects {
+				if packed.Object.ID == id {
+					return packed.Object, nil
+				}
+			}
+			return ttcsnapshot.Object{}, os.ErrNotExist
+		}
+		if provider.NodeID == b.nodeID {
+			return ttcsnapshot.Object{}, fmt.Errorf("local node owns snapshot %d but has no sealed graph metadata", id.Snapshot)
+		}
+		peer, err := b.distributedSource.peer(provider.NodeID, false)
+		if err != nil {
+			return ttcsnapshot.Object{}, err
+		}
+		reader, length, err := peer.FetchSnapshotObject(ctx, uint64(id.Snapshot), id.String(), transaction)
+		if err != nil {
+			return ttcsnapshot.Object{}, err
+		}
+		defer reader.Close()
+		return decodeGraphSnapshotObject(reader, length, id)
 	})
 }
 

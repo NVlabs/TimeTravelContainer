@@ -559,6 +559,7 @@ type ImmutableObjectProvider interface {
 // ImmutableSnapshotProvider opens the exact metadata catalog for one origin.
 type ImmutableSnapshotProvider interface {
 	OpenSnapshot(context.Context, string, uint64, string) (io.ReadCloser, uint64, error)
+	OpenSnapshotObject(context.Context, string, uint64, string, string) (io.ReadCloser, uint64, error)
 }
 
 // SnapshotRootBinding identifies one logical root slot and its immutable root
@@ -794,7 +795,7 @@ func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer 
 func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, peer string) {
 	remainder := strings.TrimPrefix(r.URL.Path, controlSnapshotPrefix)
 	text, suffix, ok := strings.Cut(remainder, "/")
-	if !ok || (suffix != "catalog" && suffix != "references") {
+	if !ok || (suffix != "catalog" && suffix != "references" && !strings.HasPrefix(suffix, "objects/")) {
 		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot path")
 		return
 	}
@@ -815,7 +816,19 @@ func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, pee
 		writeControlError(w, http.StatusNotImplemented, "immutable snapshot provider is unavailable")
 		return
 	}
-	reader, length, err := c.SnapshotProvider.OpenSnapshot(r.Context(), peer, snapshot, r.URL.Query().Get("transaction"))
+	transaction := r.URL.Query().Get("transaction")
+	var reader io.ReadCloser
+	var length uint64
+	if strings.HasPrefix(suffix, "objects/") {
+		object, unescapeErr := url.PathUnescape(strings.TrimPrefix(suffix, "objects/"))
+		if unescapeErr != nil || object == "" || strings.Contains(object, "/") {
+			writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot object ID")
+			return
+		}
+		reader, length, err = c.SnapshotProvider.OpenSnapshotObject(r.Context(), peer, snapshot, object, transaction)
+	} else {
+		reader, length, err = c.SnapshotProvider.OpenSnapshot(r.Context(), peer, snapshot, transaction)
+	}
 	if err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
@@ -1517,6 +1530,47 @@ func (c *Client) FetchSnapshot(ctx context.Context, snapshot uint64, transaction
 	if err != nil || length == 0 || length > maxAuthoritySnapshotBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
 		response.Body.Close()
 		return nil, 0, errors.New("immutable snapshot provider returned an invalid exact length")
+	}
+	return response.Body, length, nil
+}
+
+// FetchSnapshotObject fetches one immutable metadata record from its exact
+// origin. Unlike FetchSnapshot, this operation is O(1) in the number of other
+// objects in that origin and is suitable for demand-loaded filesystem walks.
+func (c *Client) FetchSnapshotObject(ctx context.Context, snapshot uint64, objectID, transaction string) (io.ReadCloser, uint64, error) {
+	if snapshot == 0 || objectID == "" || strings.Contains(objectID, "/") {
+		return nil, 0, errors.New("invalid immutable snapshot object request")
+	}
+	endpoint := c.BaseURL + controlSnapshotPrefix + strconv.FormatUint(snapshot, 10) + "/objects/" + url.PathEscape(objectID)
+	if transaction != "" {
+		endpoint += "?transaction=" + url.QueryEscape(transaction)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	c.authenticate(request)
+	client := c.streamHTTP
+	if client == nil {
+		client = c.HTTP
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	if response.StatusCode != http.StatusOK {
+		defer response.Body.Close()
+		var failure controlError
+		if err := json.NewDecoder(io.LimitReader(response.Body, maxControlBody)).Decode(&failure); err != nil || failure.Error == "" {
+			return nil, 0, fmt.Errorf("immutable snapshot object provider returned %s", response.Status)
+		}
+		return nil, 0, errors.New(failure.Error)
+	}
+	lengthText := response.Header.Get(controlObjectLengthHeader)
+	length, err := strconv.ParseUint(lengthText, 10, 64)
+	if err != nil || length == 0 || length > maxAuthoritySnapshotBytes || response.ContentLength < 0 || uint64(response.ContentLength) != length {
+		response.Body.Close()
+		return nil, 0, errors.New("immutable snapshot object provider returned an invalid exact length")
 	}
 	return response.Body, length, nil
 }
