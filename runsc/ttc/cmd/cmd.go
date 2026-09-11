@@ -11491,6 +11491,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
 					return err
 				}
+				b.releaseConsumedStandaloneMemoryBacking(target, *persistentBranch)
 				b.retainRehydrationPageSource(info.ID, *persistentBranch, "")
 				if _, err := b.ensureConsoleDrain(target, false); err != nil {
 					return fmt.Errorf("reattaching init console: %w", err)
@@ -11514,6 +11515,60 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 	}
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
+}
+
+// releaseConsumedStandaloneMemoryBacking drops a cold graph root once the
+// restored Kernel has no outstanding reads from it. The durable branch CAS is
+// the commit point: if graph collection then fails or the daemon crashes,
+// standalone startup reconciliation finds and releases the orphan root. A
+// clustered branch instead uses its origin ledger and publication protocol;
+// it must never take this local-only shortcut.
+func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector, branch ttcbundle.BranchInfo) {
+	if b.nodeID != "" || branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+		return
+	}
+	output, err := b.command("timetravel", target.container, "distributed-dependency", target.branch)
+	if err != nil {
+		return
+	}
+	var status pgalloc.AsyncPagesFileLoadStats
+	if err := json.Unmarshal(output, &status); err != nil || !status.Done || status.Error != "" {
+		return
+	}
+	cleared, err := b.containerStore().ClearBranchMemoryGraphIf(
+		target.container, target.branch, branch.SnapshotID, branch.MemoryRoots,
+		branch.MemoryRootObjects, branch.DistributedGraphReferenceOperation)
+	if err == nil && cleared {
+		err = b.releaseGraphMemoryRoots(branch.MemoryRoots)
+	}
+	if err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: warning: releasing consumed memory backing for %s: %v\n", target, err)
+	}
+}
+
+// reconcileConsumedStandaloneMemoryBacking eventually releases roots whose
+// demand loader completed after rehydrate returned. Polling is daemon-side and
+// infrequent; ordinary guest faults never mutate the graph or storage catalog.
+func (b *runtimeBackend) reconcileConsumedStandaloneMemoryBacking() error {
+	if b.nodeID != "" {
+		return nil
+	}
+	containers, err := b.containerStore().ListContainersForGC()
+	if err != nil {
+		return err
+	}
+	for _, container := range containers {
+		for _, branch := range container.Branches {
+			if len(branch.MemoryRoots) == 0 {
+				continue
+			}
+			switch normalizeLifecycleState(branch.State) {
+			case "running", "paused":
+				b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+			}
+		}
+	}
+	return nil
 }
 
 // retainRehydrationPageSource removes a consumed per-branch control image
@@ -11724,6 +11779,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	// The live runtime and its persistent state are now committed. Failures in
 	// sidecar attachment or page-source bookkeeping must not delete it.
 	runtimeCreated = false
+	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, imageDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
@@ -12020,6 +12076,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
 	// readers reachable and do not roll the peer back for artifact bookkeeping.
+	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, sourceDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)

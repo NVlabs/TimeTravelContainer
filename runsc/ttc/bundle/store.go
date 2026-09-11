@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -3396,6 +3397,40 @@ func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64,
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)
 	})
+}
+
+// ClearBranchMemoryGraphIf clears a consumed immutable-memory backing only if
+// the branch still names the exact capture observed by the caller. Rehydrate,
+// dehydrate, fork, migration, and name reuse may all replace branch metadata
+// while an asynchronous page loader is finishing; a stale completion must not
+// release the replacement capture.
+func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64, roots, objects []string, referenceOperation string) (bool, error) {
+	if len(roots) != len(objects) {
+		return false, fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
+	}
+	cleared := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID ||
+				!slices.Equal(branch.MemoryRoots, roots) ||
+				!slices.Equal(branch.MemoryRootObjects, objects) ||
+				branch.DistributedGraphReferenceOperation != referenceOperation {
+				return false, nil
+			}
+			branch.SnapshotID = 0
+			branch.MemoryRoots = nil
+			branch.MemoryRootObjects = nil
+			branch.DistributedGraphReferenceOperation = ""
+			cleared = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return cleared, err
 }
 
 // BeginBranchPublication allocates a family-monotonic generation and marks a

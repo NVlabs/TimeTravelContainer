@@ -98,6 +98,46 @@ func TestCompareAndSwapNodeID(t *testing.T) {
 	}
 }
 
+func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "container-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	wantRoots := []string{"memory/7/resource-0000"}
+	wantObjects := []string{"0000000000000007-03-0000000000000001"}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: bundleDir,
+		Branches: []BranchInfo{{
+			ID: "main", SnapshotID: 7, MemoryRoots: wantRoots,
+			MemoryRootObjects: wantObjects, DistributedGraphReferenceOperation: "retain-7",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	cleared, err := store.ClearBranchMemoryGraphIf("example", "main", 6, wantRoots, wantObjects, "retain-7")
+	if err != nil || cleared {
+		t.Fatalf("stale snapshot clear=(%t, %v), want false, nil", cleared, err)
+	}
+	cleared, err = store.ClearBranchMemoryGraphIf("example", "main", 7, wantRoots, wantObjects, "retain-7")
+	if err != nil || !cleared {
+		t.Fatalf("matching snapshot clear=(%t, %v), want true, nil", cleared, err)
+	}
+	info, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := info.Branches[0]
+	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.DistributedGraphReferenceOperation != "" {
+		t.Fatalf("cleared branch retained memory graph: %+v", branch)
+	}
+}
+
 func TestUpdateBranchQuarantinePersistsIndependentlyOfLifecycle(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "container-id")

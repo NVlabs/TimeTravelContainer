@@ -3296,7 +3296,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	if clusterRuntime != nil {
 		maintenanceTransactions = clusterRuntime.transactions
 	}
-	go maintainRepositories(dataRoot, localRoot, publicationQueue, maintenanceTransactions, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
+	go maintainRepositories(dataRoot, localRoot, server.root, server.runsc, publicationQueue, maintenanceTransactions, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
 	})
 	clusterDone := make(chan struct{})
@@ -3708,43 +3708,57 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	return err
 }
 
-func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
+	consumption := time.NewTicker(30 * time.Second)
+	defer consumption.Stop()
 	for {
+		full := false
 		select {
 		case <-done:
 			return
 		case <-timer.C:
+			full = true
+		case <-consumption.C:
 		}
 		unlock := func() {}
 		if lock != nil {
 			unlock = lock()
 		}
-		store := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
-		if _, err := store.RecoverContainerRemovals(); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", err)
-		}
-		if _, err := store.GarbageCollectRepositories(); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
-		}
-		if _, err := store.PruneImageRoots(context.Background()); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: pruning node-local image cache: %v\n", err)
-		}
-		if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
-		}
-		if err := collectColdStorage(dataRoot, localRoot, publications, transactions); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
+		if full {
+			store := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
+			if _, err := store.RecoverContainerRemovals(); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", err)
+			}
+			if _, err := store.GarbageCollectRepositories(); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: collecting unreachable volume data: %v\n", err)
+			}
+			if _, err := store.PruneImageRoots(context.Background()); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: pruning node-local image cache: %v\n", err)
+			}
+			if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
+			}
+			if err := collectColdStorage(dataRoot, localRoot, publications, transactions); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
+			}
 		}
 		if standalone {
-			backend := &runtimeBackend{dataRoot: dataRoot, localRoot: localRoot, snapshotGraph: snapshotGraph, snapshotData: snapshotData}
-			if err := backend.reconcileStandaloneMemoryGraph(); err != nil && stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
+			backend := &runtimeBackend{root: runtimeRoot, runsc: runsc, dataRoot: dataRoot, localRoot: localRoot, snapshotGraph: snapshotGraph, snapshotData: snapshotData, stderr: stderr}
+			if full {
+				if err := backend.reconcileStandaloneMemoryGraph(); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
+				}
+			}
+			if err := backend.reconcileConsumedStandaloneMemoryBacking(); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: reconciling consumed standalone memory backing: %v\n", err)
 			}
 		}
 		unlock()
-		timer.Reset(repositoryMaintenanceInterval)
+		if full {
+			timer.Reset(repositoryMaintenanceInterval)
+		}
 	}
 }
 
@@ -4510,6 +4524,12 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 		quarantineReconciled = false
 		if backend.stderr != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
+		}
+	}
+	if err := backend.reconcileConsumedStandaloneMemoryBacking(); err != nil {
+		quarantineReconciled = false
+		if backend.stderr != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling consumed standalone memory backing: %v\n", err)
 		}
 	}
 	_ = backend.reconcilePlacementCatalog()
