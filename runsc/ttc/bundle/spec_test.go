@@ -2166,6 +2166,42 @@ func TestSharedImagePackRoundTrip(t *testing.T) {
 	if usage, present, err := store.ImageCacheUsage("sha256:"+strings.Repeat("b", 64), info.Platform); err != nil || !present || usage.CompleteBytes != uint64(len(payload)) || usage.TotalBytes != uint64(len(payload)) {
 		t.Fatalf("populated image cache usage = (%+v, %t, %v)", usage, present, err)
 	}
+	// A live gofer pins the whole immutable root. Capacity enforcement must
+	// skip it rather than invalidating an already-donated host descriptor.
+	lazy, err = ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneImageCache(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned.EvictedBytes != 0 || pruned.BusyBytes != uint64(len(payload)) || pruned.AfterBytes != uint64(len(payload)) {
+		t.Fatalf("active capacity pass = %+v", pruned)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err = store.PruneImageCache(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned.EvictedFiles != 1 || pruned.EvictedBytes != uint64(len(payload)) || pruned.AfterBytes != 0 {
+		t.Fatalf("inactive capacity pass = %+v", pruned)
+	}
+	if stat, err := os.Stat(target); err != nil || stat.Size() != 0 {
+		t.Fatalf("evicted image file = %v, %v", stat, err)
+	}
+	lazy, err = ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Ensure("usr/bin/tool"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
 	got, err := os.ReadFile(target)
 	if err != nil || string(got) != payload {
 		t.Fatalf("materialized payload length=%d err=%v", len(got), err)

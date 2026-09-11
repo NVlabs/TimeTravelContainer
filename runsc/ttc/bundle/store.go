@@ -84,6 +84,17 @@ type Store struct {
 	removeAllPath func(string) error
 }
 
+// ImageCachePruneResult summarizes a node-local capacity pass. BusyBytes are
+// complete immutable bytes pinned by an active gofer and therefore never
+// eligible for eviction during the pass.
+type ImageCachePruneResult struct {
+	BeforeBytes  uint64 `json:"before_bytes"`
+	AfterBytes   uint64 `json:"after_bytes"`
+	EvictedFiles uint64 `json:"evicted_files"`
+	EvictedBytes uint64 `json:"evicted_bytes"`
+	BusyBytes    uint64 `json:"busy_bytes"`
+}
+
 type activeRepositoryMapping struct {
 	Path      string `json:"path"`
 	RestoreID string `json:"restore_id,omitempty"`
@@ -4331,6 +4342,106 @@ func (s Store) ImageCacheUsage(digest, platform string) (ttcpack.LazyCacheUsage,
 		return ttcpack.LazyCacheUsage{}, false, fmt.Errorf("inspecting node-local image cache for %s (%s): %w", digest, platform, err)
 	}
 	return usage, true, nil
+}
+
+// DefaultImageCacheTarget returns the default node-local immutable image
+// cache budget. It scales with the local filesystem while remaining bounded
+// on very large scratch devices. Active gofers may temporarily keep usage
+// above this target; correctness takes precedence over cache reclamation.
+func DefaultImageCacheTarget(root string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(root, &stat); err != nil {
+		return 0, err
+	}
+	capacity := stat.Blocks * uint64(stat.Bsize)
+	target := capacity / 4
+	const (
+		minimum = uint64(512 << 20)
+		maximum = uint64(64 << 30)
+	)
+	if target < minimum && capacity >= minimum {
+		target = minimum
+	}
+	if target > maximum {
+		target = maximum
+	}
+	return target, nil
+}
+
+// PruneImageCache evicts oldest complete files from inactive clustered image
+// skeletons until their aggregate content is at most targetBytes. Metadata,
+// directories, symlinks, and hardlinks remain, and an active gofer pins its
+// whole image root with a shared lock so cache deletion cannot affect open or
+// running files.
+func (s Store) PruneImageCache(targetBytes uint64) (ImageCachePruneResult, error) {
+	var result ImageCachePruneResult
+	if s.activeRoot() == s.Root {
+		return result, nil
+	}
+	entries, err := os.ReadDir(s.imageRootDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	type cachedRoot struct {
+		path  string
+		usage ttcpack.LazyCacheUsage
+		mtime time.Time
+	}
+	var roots []cachedRoot
+	for _, entry := range entries {
+		if !entry.IsDir() || !imageRootDirectoryPattern.MatchString(entry.Name()) || strings.Contains(entry.Name(), ".tmp-") {
+			continue
+		}
+		path := filepath.Join(s.imageRootDir(), entry.Name(), "rootfs")
+		usage, err := ttcpack.InspectLazyCache(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return result, fmt.Errorf("inspecting image cache %q: %w", entry.Name(), err)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return result, err
+		}
+		result.BeforeBytes += usage.CompleteBytes
+		roots = append(roots, cachedRoot{path: path, usage: usage, mtime: info.ModTime()})
+	}
+	result.AfterBytes = result.BeforeBytes
+	if result.AfterBytes <= targetBytes {
+		return result, nil
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		if !roots[i].mtime.Equal(roots[j].mtime) {
+			return roots[i].mtime.Before(roots[j].mtime)
+		}
+		return roots[i].path < roots[j].path
+	})
+	for _, root := range roots {
+		if result.AfterBytes <= targetBytes {
+			break
+		}
+		need := result.AfterBytes - targetBytes
+		rootTarget := uint64(0)
+		if root.usage.CompleteBytes > need {
+			rootTarget = root.usage.CompleteBytes - need
+		}
+		usage, evicted, err := ttcpack.EvictLazyCache(root.path, rootTarget)
+		if errors.Is(err, ttcpack.ErrLazyCacheBusy) {
+			result.BusyBytes += root.usage.CompleteBytes
+			continue
+		}
+		if err != nil {
+			return result, fmt.Errorf("evicting image cache %q: %w", root.path, err)
+		}
+		result.AfterBytes -= root.usage.CompleteBytes - usage.CompleteBytes
+		result.EvictedFiles += evicted.Files
+		result.EvictedBytes += evicted.Bytes
+	}
+	return result, nil
 }
 
 var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)

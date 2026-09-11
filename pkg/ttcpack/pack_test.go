@@ -313,3 +313,81 @@ func TestLazyDirectoryPopulatesWholeFileAfterCrashAndConcurrency(t *testing.T) {
 		t.Fatalf("populated lazy cache usage = %+v", usage)
 	}
 }
+
+func TestLazyDirectoryCapacityEvictionFencesActiveGofer(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	contents := bytes.Repeat([]byte("capacity-managed-image"), 10000)
+	file := filepath.Join(source, "large")
+	if err := os.WriteFile(file, contents, 0440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(file, filepath.Join(source, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	id, err := WriteDirectory(source, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs := filepath.Join(root, "cache", "rootfs")
+	if err := MaterializeSkeleton(repository, id, rootfs, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLazyDescriptor(rootfs, repository, id, ""); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := ReadLazyDescriptor(rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy, err := OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Ensure("alias"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := EvictLazyCache(rootfs, 0); !errors.Is(err, ErrLazyCacheBusy) {
+		t.Fatalf("active eviction error = %v, want %v", err, ErrLazyCacheBusy)
+	}
+	if got, err := os.ReadFile(filepath.Join(rootfs, "large")); err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("active cache changed: len=%d err=%v", len(got), err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, evicted, err := EvictLazyCache(rootfs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.CompleteFiles != 0 || usage.CompleteBytes != 0 || evicted.Files != 1 || evicted.Bytes != uint64(len(contents)) {
+		t.Fatalf("eviction = usage %+v, result %+v", usage, evicted)
+	}
+	for _, name := range []string{"large", "alias"} {
+		if info, err := os.Stat(filepath.Join(rootfs, name)); err != nil || info.Size() != 0 {
+			t.Fatalf("evicted %s = %+v, %v", name, info, err)
+		}
+	}
+
+	lazy, err = OpenLazyDirectory(rootfs, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size, mode, ok := lazy.Metadata("large"); !ok || size != int64(len(contents)) || mode&07777 != 0440 {
+		t.Fatalf("evicted metadata = (%d, %#o, %t)", size, mode, ok)
+	}
+	if err := lazy.Ensure("large"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(rootfs, "alias")); err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("refetched alias: len=%d err=%v", len(got), err)
+	}
+}

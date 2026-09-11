@@ -140,6 +140,19 @@ type LazyCacheUsage struct {
 	TotalBytes    uint64 `json:"total_bytes"`
 }
 
+// LazyCacheEviction summarizes complete immutable files removed from a
+// node-local image cache. Eviction leaves the metadata skeleton intact, so a
+// later guest open can repopulate the file from the shared pack.
+type LazyCacheEviction struct {
+	Files uint64 `json:"files"`
+	Bytes uint64 `json:"bytes"`
+}
+
+// ErrLazyCacheBusy means that a gofer currently has the cache open. TTC never
+// evicts from an active image root: an already-donated host descriptor must
+// continue to name stable bytes for the lifetime of the sandbox.
+var ErrLazyCacheBusy = errors.New("lazy image cache is in use")
+
 // LazyDirectory populates whole regular files from a pre-opened pack. It owns
 // descriptors for the pack, local root, and completion-record directory so it
 // remains usable after the gofer chroots.
@@ -155,6 +168,7 @@ type LazyDirectory struct {
 	stop       chan struct{}
 	closeOnce  sync.Once
 	prefetchWG sync.WaitGroup
+	stateLock  bool
 }
 
 // OpenLazyDirectory opens descriptor and the skeleton root. It reads only the
@@ -186,7 +200,7 @@ func OpenLazyDirectory(rootfs string, descriptor LazyDescriptor) (*LazyDirectory
 		unix.Close(rootFD)
 		return fail(err)
 	}
-	return openLazyDirectory(pack, rootFD, stateFD, descriptor.Prefix)
+	return openLazyDirectory(pack, rootFD, stateFD, descriptor.Prefix, true)
 }
 
 // OpenLazyDirectoryFromFDs reconstructs a lazy directory after the rootless
@@ -204,10 +218,18 @@ func OpenLazyDirectoryFromFDs(packFD, rootFD, stateFD int, prefix string) (*Lazy
 	if pack == nil {
 		return nil, errors.New("invalid inherited lazy image pack descriptor")
 	}
-	return openLazyDirectory(pack, rootFD, stateFD, prefix)
+	return openLazyDirectory(pack, rootFD, stateFD, prefix, true)
 }
 
-func openLazyDirectory(pack *os.File, rootFD, stateFD int, prefix string) (*LazyDirectory, error) {
+func openLazyDirectory(pack *os.File, rootFD, stateFD int, prefix string, lockState bool) (*LazyDirectory, error) {
+	if lockState {
+		if err := unix.Flock(stateFD, unix.LOCK_SH); err != nil {
+			_ = pack.Close()
+			_ = unix.Close(rootFD)
+			_ = unix.Close(stateFD)
+			return nil, fmt.Errorf("locking lazy image cache: %w", err)
+		}
+	}
 	index, err := ReadIndex(pack)
 	if err != nil {
 		_ = pack.Close()
@@ -218,7 +240,7 @@ func openLazyDirectory(pack *os.File, rootFD, stateFD int, prefix string) (*Lazy
 	d := &LazyDirectory{
 		pack: pack, rootFD: rootFD, stateFD: stateFD, prefix: prefix,
 		files: make(map[string][]Entry), metadata: make(map[string]FileMetadata), canonical: make(map[string]string),
-		stop: make(chan struct{}),
+		stop: make(chan struct{}), stateLock: lockState,
 	}
 	logicalPath := func(packPath string) (string, bool) {
 		if prefix == "" {
@@ -359,6 +381,148 @@ func InspectLazyCache(rootfs string) (LazyCacheUsage, error) {
 	return usage, nil
 }
 
+// EvictLazyCache reduces the complete regular-file content in rootfs to at
+// most targetBytes. Files are selected oldest-completion-first. It returns
+// ErrLazyCacheBusy without changing anything when a gofer has the image root
+// open. The target is best effort when one file is larger than the remaining
+// budget or another process has already changed a completion record.
+func EvictLazyCache(rootfs string, targetBytes uint64) (LazyCacheUsage, LazyCacheEviction, error) {
+	descriptor, err := ReadLazyDescriptor(rootfs)
+	if err != nil {
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	id, err := ParseID(descriptor.Pack)
+	if err != nil {
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	pack, _, err := OpenIndexed(descriptor.Repository, id)
+	if err != nil {
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	rootFD, err := unix.Open(rootfs, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = pack.Close()
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	statePath := filepath.Join(filepath.Dir(rootfs), LazyStateDirectory)
+	stateFD, err := unix.Open(statePath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = pack.Close()
+		_ = unix.Close(rootFD)
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	directory, err := openLazyDirectory(pack, rootFD, stateFD, descriptor.Prefix, false)
+	if err != nil {
+		return LazyCacheUsage{}, LazyCacheEviction{}, err
+	}
+	defer directory.Close()
+	if err := unix.Flock(stateFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return directory.Usage(), LazyCacheEviction{}, ErrLazyCacheBusy
+		}
+		return LazyCacheUsage{}, LazyCacheEviction{}, fmt.Errorf("locking lazy image cache for eviction: %w", err)
+	}
+	directory.stateLock = true
+
+	type candidate struct {
+		path      string
+		shard     string
+		name      string
+		size      uint64
+		completed unix.Timespec
+	}
+	usage := directory.Usage()
+	if usage.CompleteBytes <= targetBytes {
+		return usage, LazyCacheEviction{}, nil
+	}
+	var candidates []candidate
+	for _, path := range directory.paths {
+		shard, name := lazyLockName(path)
+		shardFD, err := unix.Openat(stateFD, shard, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return usage, LazyCacheEviction{}, err
+		}
+		var stat unix.Stat_t
+		err = unix.Fstatat(shardFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		_ = unix.Close(shardFD)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return usage, LazyCacheEviction{}, err
+		}
+		size := uint64(0)
+		if metadata := directory.metadata[path]; metadata.Size > 0 {
+			size = uint64(metadata.Size)
+		}
+		candidates = append(candidates, candidate{path: path, shard: shard, name: name, size: size, completed: stat.Mtim})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].completed.Sec != candidates[j].completed.Sec {
+			return candidates[i].completed.Sec < candidates[j].completed.Sec
+		}
+		if candidates[i].completed.Nsec != candidates[j].completed.Nsec {
+			return candidates[i].completed.Nsec < candidates[j].completed.Nsec
+		}
+		return candidates[i].path < candidates[j].path
+	})
+	var evicted LazyCacheEviction
+	for _, item := range candidates {
+		if usage.CompleteBytes <= targetBytes {
+			break
+		}
+		shardFD, err := unix.Openat(stateFD, item.shard, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return usage, evicted, err
+		}
+		if err := unix.Unlinkat(shardFD, item.name, 0); err != nil {
+			_ = unix.Close(shardFD)
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return usage, evicted, err
+		}
+		// The absent completion record must be durable before the cached bytes
+		// can disappear. After a crash, Ensure may safely repeat the fetch.
+		if err := unix.Fsync(shardFD); err != nil {
+			_ = unix.Close(shardFD)
+			return usage, evicted, err
+		}
+		_ = unix.Close(shardFD)
+		targetFD, err := unix.Openat(rootFD, item.path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return usage, evicted, err
+		}
+		if err := unix.Fchmod(targetFD, 0600); err != nil {
+			_ = unix.Close(targetFD)
+			return usage, evicted, err
+		}
+		_ = unix.Close(targetFD)
+		targetFD, err = unix.Openat(rootFD, item.path, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return usage, evicted, err
+		}
+		if err := unix.Fsync(targetFD); err != nil {
+			_ = unix.Close(targetFD)
+			return usage, evicted, err
+		}
+		if err := unix.Close(targetFD); err != nil {
+			return usage, evicted, err
+		}
+		usage.CompleteFiles--
+		usage.CompleteBytes -= item.size
+		evicted.Files++
+		evicted.Bytes += item.size
+	}
+	return usage, evicted, nil
+}
+
 // Ensure makes virtualPath complete before any guest descriptor can observe
 // it. The completion record is written only after file data and metadata have
 // been synced. A crash before then causes the next caller to rewrite the file.
@@ -400,7 +564,21 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 	if n, err := unix.Pread(lockFD, marker, 0); err == nil && n == len(marker) && string(marker) == "complete\n" {
 		return nil
 	}
-	targetFD, err := unix.Openat(d.rootFD, canonical, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	// Incomplete skeleton files are normally writable. Eviction deliberately
+	// leaves an immutable completed file at size zero, so restore owner-write
+	// permission before reopening it for replacement.
+	targetFD, err := unix.Openat(d.rootFD, canonical, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	if err := unix.Fchmod(targetFD, 0600); err != nil {
+		_ = unix.Close(targetFD)
+		return err
+	}
+	if err := unix.Close(targetFD); err != nil {
+		return err
+	}
+	targetFD, err = unix.Openat(d.rootFD, canonical, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
@@ -480,6 +658,9 @@ func (d *LazyDirectory) Close() error {
 	d.closeOnce.Do(func() {
 		close(d.stop)
 		d.prefetchWG.Wait()
+		if d.stateLock {
+			_ = unix.Flock(d.stateFD, unix.LOCK_UN)
+		}
 		result = errors.Join(d.pack.Close(), unix.Close(d.rootFD), unix.Close(d.stateFD))
 	})
 	return result

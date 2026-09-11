@@ -3811,6 +3811,19 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 			}
 		}
 		unlock()
+		if full && !standalone {
+			// Immutable image-cache eviction has its own image-root and
+			// gofer-lifetime locks. Keep its file fsyncs outside the lifecycle
+			// critical section so cache pressure cannot stall ps/exec/fork.
+			store := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
+			target, err := ttcbundle.DefaultImageCacheTarget(localRoot)
+			if err == nil {
+				_, err = store.PruneImageCache(target)
+			}
+			if err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: enforcing node-local image cache capacity: %v\n", err)
+			}
+		}
 		if full {
 			timer.Reset(repositoryMaintenanceInterval)
 		}
