@@ -12486,6 +12486,16 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.DependentFilesystemBytes += branch.DependentFilesystemBytes
 		result.Branches = append(result.Branches, account)
 		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
+		// A remotely backed filesystem deliberately keeps its deferred catalog
+		// and provider connection inside the live Sentry. The manager-side
+		// repository handle has neither, and traversing it would either fail or
+		// turn an observation into an eager independence barrier. Report the
+		// already persisted dependent byte count until the Sentry completes the
+		// drain; the next snapshot can then account exact private/shared local
+		// object identity without touching the provider.
+		if branch.DependentFilesystemBytes != 0 {
+			continue
+		}
 		filesystemBranch := branch.FilesystemBranch
 		if filesystemBranch == "" {
 			filesystemBranch = offlineCopyBranch(info, branch.ID)
@@ -12515,6 +12525,9 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		return FamilyResourceStats{}, err
 	}
 	for _, config := range repositories {
+		if len(filesystemBranches) == 0 {
+			break
+		}
 		dir, err := os.Open(config.Path)
 		if err != nil {
 			return FamilyResourceStats{}, err
