@@ -263,6 +263,7 @@ type daemonServer struct {
 
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
+	mutationCount atomic.Uint64
 
 	eventMu  sync.Mutex
 	eventSeq uint64
@@ -276,6 +277,16 @@ type daemonServer struct {
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
 	closingConsoleClient map[string]int
+}
+
+func (s *daemonServer) mutationRoot() string {
+	if s != nil && s.localRoot != "" {
+		return s.localRoot
+	}
+	if s == nil {
+		return ""
+	}
+	return s.dataRoot
 }
 
 type daemonConsoleClient struct {
@@ -937,8 +948,10 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
+	var familyID string
 	info, branch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err == nil {
+		familyID = info.ID
 		if tx.Identity.Migration && branch.DistributedMigration {
 			if _, pending := info.DistributedForkImports[tx.Identity.TransactionID]; !pending {
 				return fmt.Errorf("published migration %q cannot be canceled", tx.Identity.TransactionID)
@@ -965,7 +978,13 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			return releaseErr
 		}
 	}
-	return r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TransactionID)
+	if err := r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TransactionID); err != nil {
+		return err
+	}
+	if familyID != "" {
+		return r.backend.removeLocalFamilyStateIfUnowned(familyID)
+	}
+	return nil
 }
 
 // releaseDistributedSparseRoot drops the durable root only after the target
@@ -3317,6 +3336,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
+		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)
+	}
 	var sharedReferences *sharedReferenceService
 	if clusterRuntime != nil {
 		sharedReferences = newSharedReferenceService(dataRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
@@ -3988,7 +4010,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		s.stopOnce.Do(func() { s.listener.Close() })
 		return
 	case "mutation-control":
-		status := s.handleMutationControl(s.dataRoot, request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
+		status := s.handleMutationControl(s.mutationRoot(), request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 		_ = writeDaemonStatus(conn, &writeMu, status)
 		return
 	case "command":
@@ -4197,7 +4219,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
-		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
+		mutationRoot := s.mutationRoot()
+		record, replay, err := beginDaemonMutation(mutationRoot, request)
 		if err != nil {
 			unlock()
 			stdinReader.Close()
@@ -4232,12 +4255,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
 		}
-		completed, err := completeDaemonMutation(opts.dataRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
+		completed, err := completeDaemonMutation(mutationRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
 		if err != nil {
 			fmt.Fprintf(&mutationStderr, "ttcd: %v; command outcome is indeterminate\n", err)
 			status = 1
 		} else {
 			record = completed
+			s.maybeCompactDaemonMutations(mutationRoot)
 		}
 		unlock()
 		stdinReader.Close()
@@ -4269,6 +4293,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		s.cleanStop.Store(true)
 		s.stopOnce.Do(func() { _ = s.listener.Close() })
 	}
+}
+
+func (s *daemonServer) maybeCompactDaemonMutations(dataRoot string) {
+	if s == nil || s.mutationCount.Add(1)%daemonMutationCompactionInterval != 0 {
+		return
+	}
+	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
 }
 
 func writeDaemonBufferedResult(conn net.Conn, writeMu *sync.Mutex, stdout, stderr []byte, status int) {

@@ -708,6 +708,9 @@ func (r raftTransactionCatalog) BindSession(id string, revision uint64, digest s
 func (r raftTransactionCatalog) BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error) {
 	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionHandoff, AuthorityTransactionPayload{ID: id, Revision: revision, Sparse: &sparse})
 }
+func (r raftTransactionCatalog) Delete(id string, revision uint64) error {
+	return applyRaftNoValue(r.RaftCatalog, time.Now().UTC(), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: id, Revision: revision})
+}
 func (r raftTransactionCatalog) List() ([]Transaction, error) {
 	state, err := r.state()
 	if err != nil {

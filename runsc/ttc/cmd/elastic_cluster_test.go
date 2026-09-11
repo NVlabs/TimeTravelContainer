@@ -53,6 +53,29 @@ func TestClusterAdvertiseResolution(t *testing.T) {
 	}
 }
 
+func TestTransactionTargetsRemovedPlacement(t *testing.T) {
+	fork := cluster.Transaction{Identity: cluster.ForkIdentity{
+		SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+		TargetVisibleBranch: "child",
+	}}
+	if !transactionTargetsRemovedPlacement(fork, cluster.PlacementRecord{FamilyID: "family", BranchID: "child"}) {
+		t.Fatal("remote fork did not match its logical target")
+	}
+	if transactionTargetsRemovedPlacement(fork, cluster.PlacementRecord{FamilyID: "family", BranchID: "main"}) {
+		t.Fatal("remote fork matched its source placement")
+	}
+	physical := fork
+	physical.Identity.TargetContainer = "friendly-name"
+	if !transactionTargetsRemovedPlacement(physical, cluster.PlacementRecord{FamilyID: "family", BranchID: "child"}) {
+		t.Fatal("remote fork did not match the physical source-family placement")
+	}
+	migration := fork
+	migration.Identity.Migration = true
+	if !transactionTargetsRemovedPlacement(migration, cluster.PlacementRecord{FamilyID: "family", BranchID: "main"}) {
+		t.Fatal("migration did not match its preserved placement")
+	}
+}
+
 func TestDaemonCommandOwner(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "web")
@@ -379,6 +402,14 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 	}
 	if !provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", load) {
 		t.Fatal("current Raft target transaction did not authorize its provisional runtime")
+	}
+	visible := info
+	visible.DistributedForkImports = nil
+	visible.Branches = []ttcbundle.BranchInfo{{
+		ID: "child", NodeID: "node-b", State: "running", DistributedForkTransactionID: "tx-fork",
+	}}
+	if !provisionalRaftTargetAuthorized(visible, "child", "node-b", "inc-b", load) {
+		t.Fatal("visible target transaction did not authorize pre-placement runtime")
 	}
 
 	for _, test := range []struct {

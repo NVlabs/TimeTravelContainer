@@ -47,6 +47,7 @@ type TransactionCatalog interface {
 	MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error)
 	BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error)
 	BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error)
+	Delete(id string, revision uint64) error
 	List() ([]Transaction, error)
 }
 

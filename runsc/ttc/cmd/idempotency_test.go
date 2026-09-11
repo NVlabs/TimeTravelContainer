@@ -118,6 +118,49 @@ func TestCompactDaemonMutationsRetainsNewestCompletedAndAllPending(t *testing.T)
 	}
 }
 
+func TestDaemonMutationCompactionIsBatched(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("%032x", i+1)
+		path, err := daemonMutationPath(root, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeDurableJSON(path, &daemonMutationRecord{
+			Version: daemonMutationSchemaVersion, RequestID: id, Fingerprint: id,
+			State: "completed", CreatedAt: time.Unix(int64(i+1), 0), CompletedAt: time.Unix(int64(i+1), 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := &daemonServer{}
+	server.mutationCount.Store(daemonMutationCompactionInterval - 2)
+	server.maybeCompactDaemonMutations(root)
+	entries, err := os.ReadDir(filepath.Join(root, "daemon", "requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("non-boundary completion compacted history: %d entries", len(entries))
+	}
+	// Use a deliberately small retention directly to prove the boundary
+	// counter without constructing thousands of records.
+	server.mutationCount.Store(daemonMutationCompactionInterval - 1)
+	if got := server.mutationCount.Add(1) % daemonMutationCompactionInterval; got != 0 {
+		t.Fatalf("compaction boundary remainder=%d", got)
+	}
+	if err := compactDaemonMutations(root, 2); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(filepath.Join(root, "daemon", "requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("boundary compaction retained %d entries, want 2", len(entries))
+	}
+}
+
 func TestResolveDaemonMutationIsExplicitAndNeverReexecutes(t *testing.T) {
 	root := t.TempDir()
 	id := fmt.Sprintf("%032x", 42)

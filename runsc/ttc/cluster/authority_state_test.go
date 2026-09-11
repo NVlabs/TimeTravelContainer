@@ -222,6 +222,38 @@ func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {
 	}
 }
 
+func TestAuthorityNodeReincarnationRevokesSharedGCLease(t *testing.T) {
+	at := time.Unix(1800, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-2*time.Hour))
+	lease := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "gc-acquire-old", at.Add(-90*time.Minute), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Lease: 10 * time.Second,
+	}))
+	if lease.NodeID == "" {
+		t.Fatal("old incarnation did not acquire shared GC lease")
+	}
+	replacement := testAuthorityNode(at)
+	replacement.NodeID, replacement.Incarnation, replacement.Capabilities.NodeID = "node-a", "incarnation-new", "node-a"
+	applyAuthorityForTest(t, state, "register-new-incarnation", at, AuthorityNodeRegister, AuthorityNodeRegisterPayload{
+		Record: replacement, LeaseDuration: time.Hour,
+	})
+	if state.SharedGC != (SharedGCLease{}) {
+		t.Fatalf("reincarnation retained stale shared GC lease: %+v", state.SharedGC)
+	}
+	if _, err := RestoreAuthorityState(mustAuthoritySnapshotForTest(t, state)); err != nil {
+		t.Fatalf("state after reincarnation is not restorable: %v", err)
+	}
+}
+
+func mustAuthoritySnapshotForTest(t *testing.T, state *AuthorityState) []byte {
+	t.Helper()
+	data, err := state.SnapshotBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	at := time.Unix(2000, 0).UTC()
 	state := NewAuthorityState()
@@ -367,6 +399,60 @@ func TestAuthorityActivationMayRecoverAfterIndependence(t *testing.T) {
 	}))
 	if !activated.Activated || activated.State != TransactionIndependent || activated.Revision != 9 {
 		t.Fatalf("late activation = %+v", activated)
+	}
+}
+
+func TestAuthorityRetiresTerminalTransactionOnlyAfterTargetRemoval(t *testing.T) {
+	at := time.Unix(3600, 0).UTC()
+	state := NewAuthorityState()
+	state.Transactions["fork-1"] = Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "friendly-name",
+			TargetBranch: "hidden", TargetVisibleBranch: "child",
+		},
+		State: TransactionIndependent, Revision: 9, CreatedAt: at, UpdatedAt: at,
+	}
+	key := logicalBranchKey("family", "child")
+	state.Placements[key] = PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "family", PhysicalBranch: "child",
+		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", Generation: 1,
+		State: PlacementRunning, Revision: 1, UpdatedAt: at,
+	}
+	command, err := NewAuthorityCommand("retire-live", at.Add(time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "fork-1", Revision: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(command); result.Err() == nil {
+		t.Fatal("retired transaction while its target placement existed")
+	}
+	applyAuthorityForTest(t, state, "remove-target", at.Add(2*time.Second), AuthorityPlacementRemove, AuthorityPlacementPayload{
+		Family: "family", Branch: "child", Generation: 1,
+	})
+	applyAuthorityForTest(t, state, "retire-removed", at.Add(3*time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "fork-1", Revision: 9})
+	if _, ok := state.Transactions["fork-1"]; ok {
+		t.Fatal("terminal transaction remains after target removal")
+	}
+}
+
+func TestAuthorityRejectsRetirementWithVolatileDependency(t *testing.T) {
+	at := time.Unix(3650, 0).UTC()
+	state := NewAuthorityState()
+	state.Transactions["failed-1"] = Transaction{
+		Identity: ForkIdentity{TransactionID: "failed-1"},
+		State:    TransactionFailed, Revision: 4, CreatedAt: at, UpdatedAt: at,
+	}
+	state.Branches[logicalBranchKey("family", "child")] = BranchAuthority{
+		FamilyID: "family", BranchID: "child", Generation: 1, Lifecycle: "running",
+		VolatileDependencies: []VolatileDependency{{TransactionID: "failed-1", SourceNode: "node-a", SourceIncarnation: "incarnation-a"}},
+		UpdatedAt:            at,
+	}
+	command, err := NewAuthorityCommand("retire-dependent", at.Add(time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "failed-1", Revision: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(command); result.Err() == nil {
+		t.Fatal("retired transaction while a volatile dependency referenced it")
 	}
 }
 

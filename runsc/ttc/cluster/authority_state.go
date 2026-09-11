@@ -63,6 +63,7 @@ const (
 	AuthorityTransactionActivate   AuthorityCommandKind = "transaction-activate"
 	AuthorityTransactionSession    AuthorityCommandKind = "transaction-bind-session"
 	AuthorityTransactionHandoff    AuthorityCommandKind = "transaction-bind-handoff"
+	AuthorityTransactionRetire     AuthorityCommandKind = "transaction-retire"
 	AuthorityMigrationCutover      AuthorityCommandKind = "migration-cutover"
 	AuthorityForkPublish           AuthorityCommandKind = "fork-publish"
 	AuthorityPublicationBegin      AuthorityCommandKind = "publication-begin"
@@ -407,7 +408,8 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Branches = cloneAuthorityMap(s.Branches)
 	case AuthorityTransactionCreate, AuthorityTransactionPublish,
-		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff:
+		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff,
+		AuthorityTransactionRetire:
 		s.Transactions = cloneAuthorityMap(s.Transactions)
 	case AuthorityTransactionAdvance:
 		s.Transactions = cloneAuthorityMap(s.Transactions)
@@ -594,7 +596,8 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		AuthorityPlacementStableState, AuthorityPlacementRemove:
 		return s.applyPlacement(command)
 	case AuthorityTransactionCreate, AuthorityTransactionAdvance, AuthorityTransactionPublish,
-		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff:
+		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff,
+		AuthorityTransactionRetire:
 		return s.applyTransaction(command)
 	case AuthorityMigrationCutover:
 		return s.applyMigrationCutover(command)
@@ -869,6 +872,13 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 			if current.Incarnation != record.Incarnation {
 				s.invalidateNodeIncarnation(current.NodeID, current.Incarnation, false,
 					"source or target daemon incarnation ended before volatile state became durable", command.IssuedAt)
+				// A shared-GC lease is fenced by the daemon incarnation as well as
+				// its generation. Re-registration must revoke the old holder in the
+				// same Raft transition; otherwise the replicated state contains a
+				// lease that no registered incarnation can legally exercise.
+				if s.SharedGC.NodeID == current.NodeID && s.SharedGC.Incarnation == current.Incarnation {
+					s.SharedGC = SharedGCLease{}
+				}
 			}
 			record.Revision = current.Revision + 1
 			if current.Incarnation == record.Incarnation {
@@ -1313,6 +1323,35 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		return nil, os.ErrNotExist
 	}
 	switch command.Kind {
+	case AuthorityTransactionRetire:
+		if tx.Revision != p.Revision {
+			return nil, errors.New("stale transaction revision")
+		}
+		if !tx.Terminal() {
+			return nil, errors.New("nonterminal transaction cannot be retired")
+		}
+		for _, branch := range s.Branches {
+			for _, dependency := range branch.VolatileDependencies {
+				if dependency.TransactionID == p.ID {
+					return nil, errors.New("transaction remains a volatile branch dependency")
+				}
+			}
+		}
+		for _, placement := range s.Placements {
+			if placement.OperationID == p.ID || placement.LastOperationID == p.ID {
+				return nil, errors.New("transaction remains a placement operation")
+			}
+			if transactionTargetsPlacement(tx, placement) {
+				return nil, errors.New("transaction target placement still exists")
+			}
+		}
+		for _, publication := range s.Publications {
+			if publication.OperationID == p.ID && publication.State != PublicationCommitted && publication.State != PublicationCanceled && publication.State != PublicationFailed {
+				return nil, errors.New("transaction remains an active publication")
+			}
+		}
+		delete(s.Transactions, p.ID)
+		return nil, nil
 	case AuthorityTransactionAdvance:
 		if tx.OwnershipCommitted && (p.Next == TransactionCanceled || p.Next == TransactionFailed) {
 			return nil, errors.New("authoritative migration target cannot be canceled or failed")
@@ -1415,6 +1454,19 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 	}
 	s.Transactions[p.ID] = tx
 	return authorityValue(tx)
+}
+
+func transactionTargetsPlacement(tx Transaction, placement PlacementRecord) bool {
+	if tx.Identity.Migration {
+		return placement.FamilyID == tx.Identity.SourceContainer && placement.BranchID == tx.Identity.SourceBranch
+	}
+	if placement.BranchID != tx.Identity.VisibleTargetBranch() {
+		return false
+	}
+	return placement.FamilyID == tx.Identity.TargetContainer ||
+		placement.PhysicalContainer == tx.Identity.TargetContainer ||
+		placement.FamilyID == tx.Identity.SourceContainer ||
+		placement.PhysicalContainer == tx.Identity.SourceContainer
 }
 
 func validateDurableRoots(roots DurableRoots) error {

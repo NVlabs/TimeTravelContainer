@@ -5439,6 +5439,31 @@ func TestPendingDistributedTargetProtectsHiddenRuntime(t *testing.T) {
 	if !pendingDistributedTarget(container, "child", "node-b") {
 		t.Fatal("ordinary remote fork target was not protected before publication")
 	}
+	container.DistributedForkImports = nil
+	container.Branches = append(container.Branches, ttcbundle.BranchInfo{
+		ID: "child", NodeID: "node-b", State: "running", DistributedForkTransactionID: "tx-fork",
+	})
+	if !pendingDistributedTarget(container, "child", "node-b") {
+		t.Fatal("visible target was not protected before Raft placement publication")
+	}
+}
+
+func TestLocalFamilyStateNeeded(t *testing.T) {
+	info := ttcbundle.ContainerInfo{NodeID: "node-a", Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}}}
+	if localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("remote-only family retained node-local state")
+	}
+	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "child", NodeID: "node-b", State: "running"})
+	if !localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("locally owned branch did not retain node-local state")
+	}
+	info.Branches = info.Branches[:1]
+	info.DistributedForkImports = map[string]ttcbundle.DistributedForkImport{
+		"tx": {BranchID: "child", TargetNode: "node-b"},
+	}
+	if !localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("provisional import did not retain node-local state")
+	}
 }
 
 func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {

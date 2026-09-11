@@ -12369,6 +12369,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
 		}
+		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {
+			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
+		}
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
 			if authority, err := b.distributedSource.authority.Branch(info.ID, target.branch); err == nil && authority.Corrupted {
 				if err := b.distributedSource.authority.RemoveCorruptedBranch(info.ID, target.branch); err != nil {

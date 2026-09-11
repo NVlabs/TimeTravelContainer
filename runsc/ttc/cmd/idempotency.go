@@ -30,6 +30,9 @@ import (
 const (
 	daemonMutationSchemaVersion = 1
 	daemonMutationRetention     = 2048
+	// Directory enumeration and JSON parsing are O(retained requests). Keep
+	// them off the foreground path while still bounding durable replay history.
+	daemonMutationCompactionInterval = 128
 )
 
 type daemonMutationRecord struct {
@@ -192,7 +195,6 @@ func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status
 	if err := writeDurableJSON(path, &record); err != nil {
 		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation result: %w", err)
 	}
-	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
 	return record, nil
 }
 

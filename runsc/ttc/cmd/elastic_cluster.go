@@ -554,9 +554,52 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 		if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
 			result = errors.Join(result, fmt.Errorf("removing stale placement %s@%s: %w", record.FamilyID, record.BranchID, err))
+			continue
+		}
+		if err := b.retireTransactionsForRemovedPlacement(record); err != nil {
+			result = errors.Join(result, fmt.Errorf("retiring transactions for removed placement %s@%s: %w", record.FamilyID, record.BranchID, err))
 		}
 	}
 	return result
+}
+
+// retireTransactionsForRemovedPlacement bounds Raft history after the target
+// branch has disappeared. The replicated state machine repeats all safety
+// checks, so a concurrent dependency or placement change fails closed and is
+// retried by a later reconciliation pass.
+func (b *runtimeBackend) retireTransactionsForRemovedPlacement(removed cluster.PlacementRecord) error {
+	transactions, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := transactions.List()
+	if err != nil {
+		return err
+	}
+	var result error
+	for i := range records {
+		tx := &records[i]
+		if !tx.Terminal() || !transactionTargetsRemovedPlacement(*tx, removed) {
+			continue
+		}
+		if err := transactions.Delete(tx.Identity.TransactionID, tx.Revision); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+func transactionTargetsRemovedPlacement(tx cluster.Transaction, removed cluster.PlacementRecord) bool {
+	if tx.Identity.Migration {
+		return removed.FamilyID == tx.Identity.SourceContainer && removed.BranchID == tx.Identity.SourceBranch
+	}
+	if removed.BranchID != tx.Identity.VisibleTargetBranch() {
+		return false
+	}
+	return removed.FamilyID == tx.Identity.TargetContainer ||
+		removed.PhysicalContainer == tx.Identity.TargetContainer ||
+		removed.FamilyID == tx.Identity.SourceContainer ||
+		removed.PhysicalContainer == tx.Identity.SourceContainer
 }
 
 func daemonCommandNeedsPlacementAdmission(args []string) bool {
@@ -1003,7 +1046,8 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 		return 1, stdout.String(), stderr.String(), err
 	}
 	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
-		record, replay, err := beginDaemonMutation(opts.dataRoot, request)
+		mutationRoot := s.mutationRoot()
+		record, replay, err := beginDaemonMutation(mutationRoot, request)
 		if err != nil {
 			return 1, stdout.String(), stderr.String(), err
 		}
@@ -1020,10 +1064,11 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 				fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
 		}
-		record, err = completeDaemonMutation(opts.dataRoot, record, status, stdout.Bytes(), stderr.Bytes())
+		record, err = completeDaemonMutation(mutationRoot, record, status, stdout.Bytes(), stderr.Bytes())
 		if err != nil {
 			return 1, stdout.String(), stderr.String(), err
 		}
+		s.maybeCompactDaemonMutations(mutationRoot)
 		return record.Status, string(record.Stdout), string(record.Stderr), nil
 	}
 	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
@@ -1516,7 +1561,57 @@ func pendingDistributedTarget(info ttcbundle.ContainerInfo, branchID, nodeID str
 			return true
 		}
 	}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID && branch.NodeID == nodeID && branch.DistributedForkTransactionID != "" {
+			return true
+		}
+	}
 	return false
+}
+
+func localFamilyStateNeeded(info ttcbundle.ContainerInfo, nodeID string) bool {
+	if nodeID == "" {
+		return true
+	}
+	for _, branch := range info.Branches {
+		if info.BranchNodeID(branch.ID) == nodeID || pendingDistributedTarget(info, branch.ID, nodeID) {
+			return true
+		}
+	}
+	for _, pending := range info.DistributedForkImports {
+		if pending.TargetNode == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// removeLocalFamilyStateIfUnowned removes a cluster node's disposable active
+// tier after its final branch or provisional import has gone away. Shared
+// metadata remains authoritative. Refuse cleanup while a Sentry for the
+// family still exists, since that would turn a lifecycle ordering bug into
+// live backing-file loss.
+func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) error {
+	if b.localRoot == "" || b.nodeID == "" || containerID == "" {
+		return nil
+	}
+	info, err := b.containerStore().LoadContainer(containerID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err == nil && localFamilyStateNeeded(info, b.nodeID) {
+		return nil
+	}
+	runtimes, err := b.listRuntimeFamilies()
+	if err != nil {
+		return fmt.Errorf("checking runtime ownership: %w", err)
+	}
+	for _, family := range runtimes {
+		if family.ID == containerID {
+			return fmt.Errorf("runtime family %q still exists", containerID)
+		}
+	}
+	return os.RemoveAll(filepath.Join(b.localRoot, "containers", containerID))
 }
 
 // provisionalRaftTargetAuthorized validates the Raft execution grant for a
@@ -1541,6 +1636,11 @@ func provisionalRaftTargetAuthorized(info ttcbundle.ContainerInfo, branchID, nod
 	for transactionID, pending := range info.DistributedForkImports {
 		if pending.BranchID == branchID && pending.TargetNode == nodeID {
 			transactionIDs = append(transactionIDs, transactionID)
+		}
+	}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID && branch.NodeID == nodeID && branch.DistributedForkTransactionID != "" {
+			transactionIDs = append(transactionIDs, branch.DistributedForkTransactionID)
 		}
 	}
 	for _, transactionID := range transactionIDs {

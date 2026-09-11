@@ -139,6 +139,27 @@ func registerReadyRaftNode(t *testing.T, leader *AuthorityRaftNode, id, incarnat
 	}
 }
 
+func TestAuthorityFSMReadCopyOmitsReplayHistory(t *testing.T) {
+	fsm := NewAuthorityFSM()
+	fsm.state.Revision = 7
+	fsm.state.Requests["request-1"] = appliedAuthorityRequest{Digest: "digest"}
+	fsm.state.RequestOrder = []string{"request-1"}
+
+	state, err := fsm.copyState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Revision != 7 {
+		t.Fatalf("read copy lost authority state: %+v", state)
+	}
+	if len(state.Requests) != 0 || len(state.RequestOrder) != 0 {
+		t.Fatalf("read copy exposed replay history: requests=%d order=%d", len(state.Requests), len(state.RequestOrder))
+	}
+	if len(fsm.state.Requests) != 1 || len(fsm.state.RequestOrder) != 1 {
+		t.Fatal("read copy mutated replicated replay history")
+	}
+}
+
 func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	serverTLS, clientTLS := newAuthorityRaftTLS(t)
 	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{

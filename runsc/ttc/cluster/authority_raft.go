@@ -126,7 +126,15 @@ func (f *AuthorityFSM) Restore(reader io.ReadCloser) error {
 
 func (f *AuthorityFSM) copyState() (*AuthorityState, error) {
 	f.mu.RLock()
-	data, err := f.state.SnapshotBytes()
+	// Requests and RequestOrder are replicated replay protection, not cluster
+	// state returned by a read. Including them made every catalog lookup copy
+	// all historical command results, so steady-state latency grew with Raft
+	// history even after transactions and placements were retired. Real Raft
+	// snapshots still use Snapshot() above and retain the replay window.
+	view := *f.state
+	view.Requests = nil
+	view.RequestOrder = nil
+	data, err := view.SnapshotBytes()
 	f.mu.RUnlock()
 	if err != nil {
 		return nil, err
