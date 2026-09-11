@@ -169,6 +169,14 @@ repository lock boundary, 0.96 seconds to mutation coalescing, and 0.35 seconds
 to the batched graph builder; TTC graph serialization is therefore no longer
 the dominant remaining package-install cost. Fixed-width object IDs also no
 longer use `fmt.Sprintf` on the graph lookup path.
+A Rocky source-build qualification created and compiled 300 translation units,
+forked the live compiler workspace, rebuilt one object in the child, and
+verified outputs of 301 and 1299 in the isolated parent and child. The child
+then dehydrated and rehydrated process-free while retaining the rebuilt binary
+and exact output. Portable export now reads whole-file payloads exclusively
+through their graph-native data-store paths; a regression test removes such a
+payload, installs a decoy at the former flat `objects/<id>` location, and
+requires export to fail closed rather than cross the new-root format boundary.
 
 ## Goals
 

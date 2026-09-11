@@ -268,9 +268,6 @@ func (r *Repository) exportSnapshot(branchID, destination string, inherited map[
 			return SnapshotInfo{}, fmt.Errorf("materializing remote object %q: %w", id, err)
 		}
 		source := filepath.Join(r.path, r.objectPath(id))
-		if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
-			source = filepath.Join(r.path, "objects", id)
-		}
 		if err := snapshotCopyFile(source, filepath.Join(destination, "objects", id), r.copyMode == CopyModeReflink); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("copying object %q: %w", id, err)
 		}

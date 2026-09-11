@@ -958,6 +958,42 @@ func TestPathBackedRepositoryExportsBulkObjects(t *testing.T) {
 	}
 }
 
+func TestExportSnapshotNeverFallsBackToLegacyObjectPath(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("no-legacy-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "authoritative graph object", 0)
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	inode, err := repository.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authoritative := filepath.Join(repository.path, repository.objectPath(inode.Object))
+	if err := os.Remove(authoritative); err != nil {
+		t.Fatal(err)
+	}
+	legacyDir := filepath.Join(repository.path, "objects")
+	if err := os.MkdirAll(legacyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, inode.Object), []byte("legacy decoy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repository.ExportSnapshot(MainBranch, filepath.Join(t.TempDir(), "snapshot")); err == nil {
+		t.Fatal("ExportSnapshot used a legacy flat object instead of rejecting missing graph data")
+	}
+}
+
 func TestUnlinkedInodeRemainsCheckpointable(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("orphan")
