@@ -356,6 +356,52 @@ func TestFencedRuntimeRequiresEveryBranchInCurrentIncarnation(t *testing.T) {
 	}
 }
 
+func TestProvisionalRaftTargetAuthorization(t *testing.T) {
+	info := ttcbundle.ContainerInfo{
+		ID: "family-id", Name: "family",
+		DistributedForkImports: map[string]ttcbundle.DistributedForkImport{
+			"tx-fork": {BranchID: "child", TargetNode: "node-b"},
+		},
+	}
+	tx := &cluster.Transaction{
+		Identity: cluster.ForkIdentity{
+			TransactionID: "tx-fork", TargetNodeID: "node-b",
+			TargetContainer: "family", TargetVisibleBranch: "child",
+		},
+		State: cluster.TransactionTargetRestoring, TargetIncarnation: "inc-b",
+	}
+	load := func(id string) (*cluster.Transaction, error) {
+		if id != "tx-fork" {
+			return nil, os.ErrNotExist
+		}
+		copy := *tx
+		return &copy, nil
+	}
+	if !provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", load) {
+		t.Fatal("current Raft target transaction did not authorize its provisional runtime")
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*cluster.Transaction)
+	}{
+		{"wrong incarnation", func(tx *cluster.Transaction) { tx.TargetIncarnation = "old" }},
+		{"wrong node", func(tx *cluster.Transaction) { tx.Identity.TargetNodeID = "node-c" }},
+		{"wrong branch", func(tx *cluster.Transaction) { tx.Identity.TargetVisibleBranch = "other" }},
+		{"wrong family", func(tx *cluster.Transaction) { tx.Identity.TargetContainer = "other" }},
+		{"canceled", func(tx *cluster.Transaction) { tx.State = cluster.TransactionCanceled }},
+		{"published without placement", func(tx *cluster.Transaction) { tx.State = cluster.TransactionPublished }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			copy := *tx
+			test.mutate(&copy)
+			if provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", func(string) (*cluster.Transaction, error) { return &copy, nil }) {
+				t.Fatal("invalid transaction authorized provisional runtime")
+			}
+		})
+	}
+}
+
 func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
 	command := exec.Command("bash", "-c", "exec -a 'ttc-sentry[guardian-test]' bash -c 'while :; do sleep 1; done' -- --root="+runtimeRoot)

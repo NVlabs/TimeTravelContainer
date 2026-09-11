@@ -5416,7 +5416,7 @@ func TestPersistentFamilyRequiredRuntime(t *testing.T) {
 	}
 }
 
-func TestPendingDistributedTargetProtectsHiddenMigrationRuntime(t *testing.T) {
+func TestPendingDistributedTargetProtectsHiddenRuntime(t *testing.T) {
 	container := ttcbundle.ContainerInfo{
 		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running"}},
 		DistributedForkImports: map[string]ttcbundle.DistributedForkImport{
@@ -5436,8 +5436,8 @@ func TestPendingDistributedTargetProtectsHiddenMigrationRuntime(t *testing.T) {
 	if pendingDistributedTarget(container, "main", "node-a") {
 		t.Fatal("hidden migration target protected the source node")
 	}
-	if pendingDistributedTarget(container, "child", "node-b") {
-		t.Fatal("ordinary remote fork import was mistaken for a migration replacement")
+	if !pendingDistributedTarget(container, "child", "node-b") {
+		t.Fatal("ordinary remote fork target was not protected before publication")
 	}
 }
 

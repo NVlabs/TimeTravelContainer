@@ -1500,11 +1500,60 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 }
 
 // pendingDistributedTarget reports whether branchID is a transaction-fenced
-// physical target on nodeID. The logical branch remains source-owned until the
-// placement compare-and-swap, so BranchNodeID alone cannot identify it.
+// physical target on nodeID. The logical branch is absent (fork) or remains
+// source-owned (migration) until publication, so BranchNodeID alone cannot
+// identify it.
 func pendingDistributedTarget(info ttcbundle.ContainerInfo, branchID, nodeID string) bool {
+	if info.DistributedForkTransactionID != "" && info.DistributedForkNodeID == nodeID {
+		for _, branch := range info.Branches {
+			if branch.ID == branchID {
+				return true
+			}
+		}
+	}
 	for _, pending := range info.DistributedForkImports {
-		if pending.Migration && pending.BranchID == branchID && pending.TargetNode == nodeID {
+		if pending.BranchID == branchID && pending.TargetNode == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+// provisionalRaftTargetAuthorized validates the Raft execution grant for a
+// physical target that does not have a public placement yet. Container
+// metadata identifies the transaction that created the local Kernel; Raft
+// supplies the current, incarnation-fenced authority. Both bindings are
+// required so stale shared metadata cannot extend a canceled transaction or
+// authorize a different branch.
+func provisionalRaftTargetAuthorized(info ttcbundle.ContainerInfo, branchID, nodeID, incarnation string, load func(string) (*cluster.Transaction, error)) bool {
+	if load == nil || branchID == "" || nodeID == "" || incarnation == "" {
+		return false
+	}
+	var transactionIDs []string
+	if info.DistributedForkTransactionID != "" && info.DistributedForkNodeID == nodeID {
+		for _, branch := range info.Branches {
+			if branch.ID == branchID {
+				transactionIDs = append(transactionIDs, info.DistributedForkTransactionID)
+				break
+			}
+		}
+	}
+	for transactionID, pending := range info.DistributedForkImports {
+		if pending.BranchID == branchID && pending.TargetNode == nodeID {
+			transactionIDs = append(transactionIDs, transactionID)
+		}
+	}
+	for _, transactionID := range transactionIDs {
+		tx, err := load(transactionID)
+		if err != nil || tx == nil || tx.Identity.TransactionID != transactionID ||
+			tx.Identity.TargetNodeID != nodeID || tx.TargetIncarnation != incarnation ||
+			tx.Identity.VisibleTargetBranch() != branchID ||
+			(tx.Identity.TargetContainer != info.ID && tx.Identity.TargetContainer != info.Name) {
+			continue
+		}
+		switch tx.State {
+		case cluster.TransactionTargetReserved, cluster.TransactionSourceCaptured,
+			cluster.TransactionTargetRestoring, cluster.TransactionTargetPaused:
 			return true
 		}
 	}
@@ -2748,10 +2797,26 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 	}
 	for _, family := range families {
 		var revoked []Branch
+		var info ttcbundle.ContainerInfo
+		var infoErr error
+		infoLoaded := false
 		for _, branch := range family.Branches {
 			placement, lookupErr := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
 			if lookupErr == nil && placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation &&
 				(placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused || placement.State == cluster.PlacementMigrating) {
+				continue
+			}
+			// A remote target is restored before its public placement can be
+			// committed: the placement contains the physical identity that the
+			// target reports only after restore. The Raft transaction is the
+			// execution grant during this deliberately narrow interval. Without
+			// recognizing it, the heartbeat enforcer can destroy a healthy target
+			// between Prepare and Publish.
+			if !infoLoaded {
+				info, infoErr = backend.containerStore().LoadContainer(family.ID)
+				infoLoaded = true
+			}
+			if infoErr == nil && provisionalRaftTargetAuthorized(info, branch.ID, nodeID, incarnation, backend.distributedSource.authority.LoadTransaction) {
 				continue
 			}
 			revoked = append(revoked, branch)
