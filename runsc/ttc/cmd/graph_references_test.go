@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -184,7 +185,7 @@ func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	if err := writeDurableJSON(path, &intent); err != nil {
 		t.Fatal(err)
 	}
-	inventory, err := service.SnapshotReferenceInventory(nil, "coordinator")
+	inventory, err := service.SnapshotReferenceInventory(context.Background(), "coordinator")
 	if err != nil {
 		t.Fatal(err)
 	}

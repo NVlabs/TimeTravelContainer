@@ -32,8 +32,44 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/version"
 )
+
+type transactionLoadCatalog struct {
+	cluster.TransactionCatalog
+	load func(string) (*cluster.Transaction, error)
+}
+
+func (c transactionLoadCatalog) Load(id string) (*cluster.Transaction, error) {
+	return c.load(id)
+}
+
+func TestDistributedSourceNoLongerNeeded(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		tx   *cluster.Transaction
+		err  error
+		want bool
+	}{
+		{name: "published", tx: &cluster.Transaction{State: cluster.TransactionPublished, SourceNeeded: true}},
+		{name: "draining", tx: &cluster.Transaction{State: cluster.TransactionDraining, SourceNeeded: true}},
+		{name: "source released", tx: &cluster.Transaction{State: cluster.TransactionPublished}, want: true},
+		{name: "independent", tx: &cluster.Transaction{State: cluster.TransactionIndependent}, want: true},
+		{name: "retired", err: os.ErrNotExist, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			catalog := transactionLoadCatalog{load: func(string) (*cluster.Transaction, error) { return test.tx, test.err }}
+			got, err := distributedSourceNoLongerNeeded(catalog, "fork-race")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("distributedSourceNoLongerNeeded=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
 
 func TestDaemonWireOptionsContainNoClientPaths(t *testing.T) {
 	if got := wireOptions(options{root: "/runtime", dataRoot: "/data"}); got != (daemonWireOptions{}) {

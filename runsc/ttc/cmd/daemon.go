@@ -1756,6 +1756,28 @@ func drainSourceDependencies(backend *runtimeBackend, source *distributedSourceR
 	return drainSourceDependenciesMatching(backend, source, store, nodeID, "", "")
 }
 
+// distributedSourceNoLongerNeeded resolves the race between a source-side
+// dependency scan and target-side transaction completion. Transactions may be
+// retired after they become terminal and their placement and volatile
+// references disappear. Consequently, a transaction that was source-backed
+// when List returned can legitimately be absent by the time the source asks
+// the target to drain it. Re-read the linearizable authority before treating a
+// lost target reply as a failure; absence is itself proof that Raft admitted
+// the terminal retirement.
+func distributedSourceNoLongerNeeded(store cluster.TransactionCatalog, transactionID string) (bool, error) {
+	if store == nil || transactionID == "" {
+		return false, nil
+	}
+	tx, err := store.Load(transactionID)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !tx.SourceNeeded || tx.Terminal(), nil
+}
+
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	if backend == nil || source == nil || store == nil || nodeID == "" {
 		return nil
@@ -1786,8 +1808,16 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 			if err != nil {
 				if current, statusErr := peer.Status(ctx, tx.Identity.TransactionID); statusErr != nil ||
 					(current.State != cluster.TransactionDraining && current.State != cluster.TransactionIndependent) {
-					cancel()
-					return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, err)
+					settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
+					if authorityErr != nil {
+						cancel()
+						return fmt.Errorf("rechecking distributed target %q after drain failure: %w", tx.Identity.TargetContainer, authorityErr)
+					}
+					if !settled {
+						cancel()
+						return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, err)
+					}
+					tx.State = cluster.TransactionIndependent
 				} else {
 					tx = *current
 				}
@@ -1806,6 +1836,15 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 			}
 			current, err := peer.Status(ctx, tx.Identity.TransactionID)
 			if err != nil {
+				settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
+				if authorityErr != nil {
+					ticker.Stop()
+					cancel()
+					return fmt.Errorf("rechecking distributed target %q while draining: %w", tx.Identity.TargetContainer, authorityErr)
+				}
+				if settled {
+					tx.State = cluster.TransactionIndependent
+				}
 				continue
 			}
 			tx = *current

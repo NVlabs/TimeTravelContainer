@@ -20,12 +20,13 @@ PORT_A=${TTC_SHARED_GC_TEST_PORT_A:-20183}
 PORT_B=${TTC_SHARED_GC_TEST_PORT_B:-20193}
 PORT_C=${TTC_SHARED_GC_TEST_PORT_C:-20203}
 KEEP_ROOT=${TTC_SHARED_GC_TEST_KEEP_ROOT:-}
+COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PID_A=
 PID_B=
 PID_C=
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") "$TTC" "$@"; }
+client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1

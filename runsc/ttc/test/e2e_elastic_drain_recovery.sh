@@ -11,6 +11,7 @@ ROOT=${TTC_ELASTIC_DRAIN_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-drain.XX
 SHARED=$ROOT/shared
 NAME=drain-recovery-$$
 TOKEN=ttc-elastic-drain-$$
+COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PORT_A=${TTC_ELASTIC_DRAIN_PORT_A:-20583}
 PORT_B=${TTC_ELASTIC_DRAIN_PORT_B:-20593}
 PORT_C=${TTC_ELASTIC_DRAIN_PORT_C:-20603}
@@ -20,7 +21,7 @@ PID_C=
 STOP_CLIENT=
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") "$TTC" "$@"; }
+client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1

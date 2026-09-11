@@ -10,6 +10,7 @@ IMAGE=${TTC_ELASTIC_PRESSURE_IMAGE:-busybox:1.36}
 ROOT=${TTC_ELASTIC_PRESSURE_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-pressure.XXXXXX")}
 SHARED=$ROOT/shared
 TOKEN=ttc-elastic-pressure-$$
+COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PORT_A=${TTC_ELASTIC_PRESSURE_PORT_A:-20383}
 PORT_B=${TTC_ELASTIC_PRESSURE_PORT_B:-20393}
 PORT_C=${TTC_ELASTIC_PRESSURE_PORT_C:-20403}
@@ -19,7 +20,7 @@ PID_C=
 FAMILIES="pressure-a-$$ pressure-b-$$"
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") "$TTC" "$@"; }
+client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
