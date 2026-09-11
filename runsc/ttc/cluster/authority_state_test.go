@@ -81,6 +81,35 @@ func registerReadyAuthorityNode(t *testing.T, state *AuthorityState, id, incarna
 	})
 }
 
+func TestAuthorityNodeRenewDerivesPressureStateAtomically(t *testing.T) {
+	at := time.Unix(1000, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+
+	pressured := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "renew-pressured", at.Add(2*time.Millisecond), AuthorityNodeRenew, AuthorityNodeRenewPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", MemoryCurrentBytes: 9 << 30, LeaseDuration: time.Hour,
+	}))
+	if pressured.State != NodePressured {
+		t.Fatalf("renewed state got %q, want %q", pressured.State, NodePressured)
+	}
+
+	// Pressure uses 10% hysteresis, so merely returning below the target does
+	// not flap the node back to ready.
+	stillPressured := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "renew-hysteresis", at.Add(3*time.Millisecond), AuthorityNodeRenew, AuthorityNodeRenewPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", MemoryCurrentBytes: 15 << 29, LeaseDuration: time.Hour,
+	}))
+	if stillPressured.State != NodePressured {
+		t.Fatalf("state inside hysteresis got %q, want %q", stillPressured.State, NodePressured)
+	}
+
+	ready := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "renew-ready", at.Add(4*time.Millisecond), AuthorityNodeRenew, AuthorityNodeRenewPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", MemoryCurrentBytes: 7 << 30, LeaseDuration: time.Hour,
+	}))
+	if ready.State != NodeReady {
+		t.Fatalf("state below hysteresis got %q, want %q", ready.State, NodeReady)
+	}
+}
+
 func TestAuthorityCommandIdempotencyAndInputReuse(t *testing.T) {
 	at := time.Unix(1000, 0).UTC()
 	state := NewAuthorityState()

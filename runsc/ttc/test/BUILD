@@ -98,6 +98,16 @@ sh_binary(
     ],
 )
 
+# Manual multi-daemon pressure/rebalance qualification. It intentionally
+# allocates hundreds of MiB and performs live migrations.
+sh_binary(
+    name = "e2e_elastic_pressure",
+    srcs = ["e2e_elastic_pressure.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it kills the active shared-GC coordinator and verifies that
 # a shared-root retain waits through fenced lease takeover and ledger rebuild.
 sh_binary(

@@ -931,6 +931,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		}
 		record.MemoryCurrentBytes = p.MemoryCurrentBytes
 		pruneIncomingReservations(&record, command.IssuedAt)
+		updateNodePressureState(&record)
 		record.Revision++
 		record.UpdatedAt, record.LeaseExpiresAt, record.LeaseTerm = command.IssuedAt, leaseUntil, command.LeaderTerm
 		record.LeaseDuration = leaseUntil.Sub(command.IssuedAt)

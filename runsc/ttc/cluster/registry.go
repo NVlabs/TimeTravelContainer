@@ -311,6 +311,7 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 		}
 		record.MemoryCurrentBytes = current
 		pruneIncomingReservations(&record, now)
+		updateNodePressureState(&record)
 		record.Revision++
 		record.UpdatedAt = now
 		record.LeaseExpiresAt = now.Add(lease)
@@ -325,6 +326,23 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 		return nil, err
 	}
 	return &result, nil
+}
+
+// updateNodePressureState derives the ordinary ready/pressured load state from
+// the committed memory sample. Keep this in the catalog mutation rather than
+// in a caller-side follow-up transition: Raft renewals must publish the load
+// and the state it implies atomically, and must not bypass pressure detection.
+func updateNodePressureState(record *NodeRecord) {
+	switch record.State {
+	case NodeReady:
+		if record.MemoryTargetBytes != 0 && record.MemoryCurrentBytes > record.MemoryTargetBytes {
+			record.State = NodePressured
+		}
+	case NodePressured:
+		if record.MemoryTargetBytes == 0 || record.MemoryCurrentBytes < record.MemoryTargetBytes-record.MemoryTargetBytes/10 {
+			record.State = NodeReady
+		}
+	}
 }
 
 func pruneIncomingReservations(record *NodeRecord, now time.Time) {
