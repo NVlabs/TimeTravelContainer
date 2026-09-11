@@ -34,6 +34,8 @@ func (conn *connection) afterLoad(goContext.Context) {
 
 func (fs *filesystem) afterLoad(ctx goContext.Context) {
 	fs.mf = pgalloc.MemoryFileFromContext(ctx)
+	fs.cacheMu.Lock()
+	defer fs.cacheMu.Unlock()
 	if fs.fileCaches == nil {
 		fs.fileCaches = make(map[fileCacheKey]*fileCache)
 	}

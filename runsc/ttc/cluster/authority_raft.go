@@ -112,7 +112,7 @@ func (f *AuthorityFSM) Restore(reader io.ReadCloser) error {
 		return err
 	}
 	if len(data) > maxAuthoritySnapshotBytes {
-		return fmt.Errorf("Raft authority snapshot exceeds %d bytes", maxAuthoritySnapshotBytes)
+		return fmt.Errorf("raft authority snapshot exceeds %d bytes", maxAuthoritySnapshotBytes)
 	}
 	state, err := RestoreAuthorityState(data)
 	if err != nil {
@@ -309,13 +309,13 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 		return nil, fmt.Errorf("invalid Raft node ID %q", options.NodeID)
 	}
 	if options.LocalDir == "" || !filepath.IsAbs(options.LocalDir) {
-		return nil, errors.New("Raft local directory must be an absolute node-local path")
+		return nil, errors.New("raft local directory must be an absolute node-local path")
 	}
 	if (options.ListenAddress == "" && options.Listener == nil) || options.AdvertiseHost == "" {
-		return nil, errors.New("Raft listen and advertise addresses are required")
+		return nil, errors.New("raft listen and advertise addresses are required")
 	}
 	if (options.ServerTLS == nil) != (options.ClientTLS == nil) {
-		return nil, errors.New("Raft server and client TLS must be configured together")
+		return nil, errors.New("raft server and client TLS must be configured together")
 	}
 	if err := os.MkdirAll(options.LocalDir, 0700); err != nil {
 		return nil, err
@@ -558,7 +558,7 @@ func (n *AuthorityRaftNode) Propose(ctx context.Context, requestID string, kind 
 				safety = current.LeaseDuration
 			}
 			if safety > 0 && !n.LeadershipSafeFor(safety) {
-				return AuthorityResult{}, errors.New("Raft leader is waiting for prior-term execution leases to self-fence")
+				return AuthorityResult{}, errors.New("raft leader is waiting for prior-term execution leases to self-fence")
 			}
 		}
 	}
@@ -702,9 +702,10 @@ func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
 			copy := server
 			retiring = &copy
 		}
-		if server.Suffrage == raft.Voter {
+		switch server.Suffrage {
+		case raft.Voter:
 			voters = append(voters, server)
-		} else if server.Suffrage == raft.Nonvoter {
+		case raft.Nonvoter:
 			learners = append(learners, server)
 		}
 	}

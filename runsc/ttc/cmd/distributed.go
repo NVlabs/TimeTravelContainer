@@ -624,12 +624,12 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 		pathKey := sha256.Sum256([]byte(filepath.Clean(config.Path)))
 		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
 		var repository *ttcvolume.Repository
-		if _, err := os.Stat(destination); err == nil {
+		if _, statErr := os.Stat(destination); statErr == nil {
 			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
-		} else if errors.Is(err, os.ErrNotExist) {
+		} else if errors.Is(statErr, os.ErrNotExist) {
 			repository, _, err = manager.ImportPrivateRemoteSnapshot(destination, "remote-"+fmt.Sprint(index), snapshot, filesystemBranch)
 		} else {
-			return 0, err
+			return 0, statErr
 		}
 		if err != nil {
 			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)

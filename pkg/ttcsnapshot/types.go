@@ -72,11 +72,19 @@ func ParseObjectID(value string) (ObjectID, error) {
 	return parseObjectKey(value)
 }
 
-// Typed IDs prevent callers from confusing bulk objects at API boundaries.
+// PageID identifies one immutable 4 KiB memory page.
 type PageID ObjectID
+
+// MemoryChunkID identifies one immutable cold-memory chunk.
 type MemoryChunkID ObjectID
+
+// FileID identifies one immutable whole-file data object.
 type FileID ObjectID
+
+// InodeID identifies one immutable inode record.
 type InodeID ObjectID
+
+// MetadataID identifies one immutable graph metadata object.
 type MetadataID ObjectID
 
 // AsPageID checks and converts id to a page ID.

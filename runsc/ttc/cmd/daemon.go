@@ -468,7 +468,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return fmt.Errorf("decoding target runtime state: %w", err)
 		}
 	} else {
-		bundleDir := info.BundleDir
+		var bundleDir string
 		var cleanup func()
 		if peer {
 			// This is either a migration or the first physical branch of an
@@ -2885,7 +2885,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		}
 		record, ok := state.Nodes[nodeID]
 		if !ok {
-			return nil, fmt.Errorf("Raft leader %q has no replicated node record", nodeID)
+			return nil, fmt.Errorf("raft leader %q has no replicated node record", nodeID)
 		}
 		return source.peerForRecord(record)
 	})
@@ -2992,7 +2992,7 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 		}
 		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
 		if seen[key] {
-			return fmt.Errorf("Raft leader redirect loop through %q", redirect.LeaderID)
+			return fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
 		}
 		seen[key] = true
 		var clientErr error
@@ -3744,7 +3744,7 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 
 func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation string) error {
 	if runtime == nil || runtime.raft == nil || runtime.source == nil {
-		return errors.New("Raft retirement is unavailable")
+		return errors.New("raft retirement is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

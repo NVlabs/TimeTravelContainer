@@ -406,7 +406,7 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return nil, err
 	}
 	store.mu.Lock()
-	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime() == info.ModTime() {
+	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime().Equal(info.ModTime()) {
 		result := cloneManifest(cached.manifest)
 		store.mu.Unlock()
 		file.Close()

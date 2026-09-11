@@ -194,6 +194,14 @@ seconds with only the source branch present, zero memory bulk objects outside
 durable branches, and an empty Sentry panic log. Together with the earlier
 131-cycle graph GC and 32-sibling disjoint-page tests, this closes the
 standalone memory/lifecycle churn and accounting gate.
+A repository-wide TTC analyzer pass now covers the graph, volume, bundle,
+checkpoint, cluster, command, image, ownership, and storage dependency graphs
+for both amd64 and arm64. It found and fixed a shadowed remote-import error
+that could suppress repository-open failures, an ignored cluster-advertise
+parse error, stale distributed-stream mode state, and missing synchronization
+around restored FUSE caches, packet-mmap ranges, and iptables reaper state.
+The focused runtime suites for the graph, volume, FUSE, network stack, cluster,
+and command layers pass after these corrections.
 
 ## Goals
 

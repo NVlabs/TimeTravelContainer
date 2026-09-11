@@ -471,7 +471,7 @@ func decodeAuthorityPayload[T any](command AuthorityCommand) (T, error) {
 
 func authorityValue(value any) (json.RawMessage, error) { return json.Marshal(value) }
 
-// Node command payloads.
+// AuthorityNodeRegisterPayload carries a node registration command.
 type AuthorityNodeRegisterPayload struct {
 	Record        NodeRecord    `json:"record"`
 	LeaseUntil    time.Time     `json:"lease_until,omitempty"`
@@ -500,7 +500,7 @@ type AuthorityCapacityPayload struct {
 	TTL                                          time.Duration
 }
 
-// Placement command payload. Unused fields must be empty and are ignored only
+// AuthorityPlacementPayload carries a placement command. Unused fields must be empty and are ignored only
 // by command kinds for which they have no meaning.
 type AuthorityPlacementPayload struct {
 	Record                               PlacementRecord `json:"record,omitempty"`
@@ -512,7 +512,7 @@ type AuthorityPlacementPayload struct {
 	State                                PlacementState
 }
 
-// Transaction command payload.
+// AuthorityTransactionPayload carries a distributed transaction command.
 type AuthorityTransactionPayload struct {
 	Transaction    Transaction             `json:"transaction,omitempty"`
 	ID             string                  `json:"id,omitempty"`
@@ -527,7 +527,7 @@ type AuthorityTransactionPayload struct {
 	Activated      bool                    `json:"activated,omitempty"`
 }
 
-// Publication command payload.
+// AuthorityPublicationPayload carries a durable publication command.
 type AuthorityPublicationPayload struct {
 	Family, Branch, Operation                     string
 	Lifecycle                                     string

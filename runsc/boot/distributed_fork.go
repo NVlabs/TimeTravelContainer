@@ -190,7 +190,6 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}()
 	}
 	var donated []net.Conn
-	donatedMode := len(files) != 0
 	for _, file := range files {
 		conn, err := ttcremote.NewDonatedTCPConn(file)
 		if err != nil {
@@ -223,7 +222,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		connectionIndex++
 	}
 	donated = donated[args.FilesystemConnections:]
-	donatedMode = len(donated) != 0
+	donatedMode := len(donated) != 0
 	var pushConn net.Conn
 	if !args.GraphSparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {

@@ -155,6 +155,7 @@ func translateDeferredFilesystemData(source Object, children map[string]ObjectID
 // multi-hop graph can re-enter this Store while resolving an ancestor. The
 // object and expansion origin are revalidated after the lock is reacquired,
 // so observers still see either the stub or the complete committed expansion.
+// +checklocksignore
 func (s *Store) resolveDeferredLocked(id ObjectID) (Object, bool, error) {
 	object, ok, _, err := s.resolveDeferredLockedAfter(id, 0)
 	return object, ok, err
@@ -164,6 +165,7 @@ func (s *Store) resolveDeferredLocked(id ObjectID) (Object, bool, error) {
 // ordinalFloor. Filesystem mutations may already have allocated unpublished
 // path-copy objects in the same working origin; honoring their next ordinal
 // prevents a demand-loaded child from colliding with that private batch.
+// +checklocksignore
 func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Object, bool, uint64, error) {
 	object, ok := s.state.Objects[id.key()]
 	if !ok || !object.Deferred {

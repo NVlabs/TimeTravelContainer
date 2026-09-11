@@ -1349,7 +1349,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		tx = status
 	}
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
-		return abort(errors.New("Raft migration authority is unavailable"))
+		return abort(errors.New("raft migration authority is unavailable"))
 	}
 	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch)
 	if err != nil {
@@ -2578,6 +2578,9 @@ func parseClusterAdvertise(value string) (baseURL, serverName string, err error)
 	}
 	baseURL = "http://" + value
 	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", "", fmt.Errorf("parsing --cluster-advertise %q: %w", value, err)
+	}
 	if parsed.Port() == "" {
 		return "", "", fmt.Errorf("--cluster-advertise URL %q must include a port", baseURL)
 	}

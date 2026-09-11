@@ -4546,7 +4546,6 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 	default:
 		return fmt.Errorf("cannot stop %s in state %q", target.selector, target.state)
 	}
-	return nil
 }
 
 func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -10969,7 +10968,7 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, 
 	}
 	origin := ttcsnapshot.SnapshotID(allocation.First)
 	if allocation.Count != 1 || origin == 0 {
-		return 0, "", fmt.Errorf("Raft returned invalid snapshot allocation %+v", allocation)
+		return 0, "", fmt.Errorf("raft returned invalid snapshot allocation %+v", allocation)
 	}
 	if err := b.snapshotGraph.AdoptWorking(origin); err != nil {
 		return 0, "", fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)

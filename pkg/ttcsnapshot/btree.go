@@ -553,7 +553,7 @@ func (s *Store) BTreeSet(origin SnapshotID, rootName string, kind ObjectKind, ke
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if object, ok := s.state.Objects[value.key()]; !ok || object.State != ObjectLive {
-		return ObjectID{}, fmt.Errorf("B-tree value %s is not live", value.key())
+		return ObjectID{}, fmt.Errorf("b-tree value %s is not live", value.key())
 	}
 	mutation, err := newGraphMutation(s, origin)
 	if err != nil {
@@ -616,7 +616,7 @@ func (s *Store) BTreeDelete(origin SnapshotID, rootName string, kind ObjectKind,
 	if root.IsZero() {
 		oldObject, exists := mutation.object(oldRoot)
 		if !exists {
-			return false, fmt.Errorf("B-tree root %s is missing", oldRoot.key())
+			return false, fmt.Errorf("b-tree root %s is missing", oldRoot.key())
 		}
 		old, err := releaseObject(oldObject)
 		if err != nil {

@@ -2554,8 +2554,7 @@ func (r *Repository) WriteLayerTar(branchID string, output io.Writer) error {
 	defer state.mu.RUnlock()
 	writer := tar.NewWriter(output)
 	hardlinks := make(map[uint64]string)
-	var writeInode func(string, Inode) error
-	writeInode = func(name string, inode Inode) error {
+	writeInode := func(name string, inode Inode) error {
 		if inode.Type == "socket" {
 			return nil
 		}

@@ -265,18 +265,24 @@ func (fd *regularFileFD) writebackAll(ctx context.Context) error {
 
 func (fd *regularFileFD) writebackAllUsingHandle(ctx context.Context) error {
 	inode := fd.inode()
+	inode.attrMu.Lock()
+	size := inode.size.Load()
+	inode.attrMu.Unlock()
 	cache := inode.cache
 	cache.dataMu.Lock()
 	defer cache.dataMu.Unlock()
-	return fsutil.SyncDirtyAll(ctx, &cache.data, &cache.dirty, inode.size.Load(), inode.fs.mf, fd.writeFromBlocksAt)
+	return fsutil.SyncDirtyAll(ctx, &cache.data, &cache.dirty, size, inode.fs.mf, fd.writeFromBlocksAt)
 }
 
 func (fd *regularFileFD) writebackRange(ctx context.Context, mr memmap.MappableRange) error {
 	inode := fd.inode()
+	inode.attrMu.Lock()
+	size := inode.size.Load()
+	inode.attrMu.Unlock()
 	cache := inode.cache
 	cache.dataMu.Lock()
 	defer cache.dataMu.Unlock()
-	return fsutil.SyncDirty(ctx, mr, &cache.data, &cache.dirty, inode.size.Load(), inode.fs.mf, fd.writeFromBlocksAt)
+	return fsutil.SyncDirty(ctx, mr, &cache.data, &cache.dirty, size, inode.fs.mf, fd.writeFromBlocksAt)
 }
 
 // writeFromBlocksAt writes cached mmap pages through the FUSE handle.
@@ -471,7 +477,10 @@ func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 		return 0, nil
 	}
 	inode := r.fd.inode()
-	end := inode.size.Load()
+	inode.attrMu.Lock()
+	fileSize := inode.size.Load()
+	inode.attrMu.Unlock()
+	end := fileSize
 	if r.off >= end {
 		return 0, io.EOF
 	}
@@ -483,7 +492,7 @@ func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	cache := inode.cache
 	cache.dataMu.Lock()
 	defer cache.dataMu.Unlock()
-	_, fillErr := cache.data.Fill(r.ctx, required, required, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
+	_, fillErr := cache.data.Fill(r.ctx, required, required, fileSize, inode.fs.mf, pgalloc.AllocOpts{
 		Kind:    usage.PageCache,
 		MemCgID: pgalloc.MemoryCgroupIDFromContext(r.ctx),
 		Mode:    pgalloc.AllocateAndWritePopulate,
