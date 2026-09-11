@@ -18,15 +18,54 @@ import (
 	"errors"
 	"fmt"
 	stdfs "io/fs"
+	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	gerrors "gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+// diskVolumeError translates repository implementation failures at the guest
+// syscall boundary. Linux errors retain their exact errno; graph/WAL
+// invariants and other implementation errors are logged and become EIO. An
+// arbitrary Go error must never escape into kernel.ExtractErrno, which treats
+// unknown syscall errors as a Sentry invariant violation and panics.
+func diskVolumeError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var linuxError *gerrors.Error
+	if errors.As(err, &linuxError) {
+		return linuxError
+	}
+	var syscallError syscall.Errno
+	if errors.As(err, &syscallError) {
+		return syscallError
+	}
+	var unixError unix.Errno
+	if errors.As(err, &unixError) {
+		return unixError
+	}
+	switch {
+	case errors.Is(err, stdfs.ErrNotExist):
+		return linuxerr.ENOENT
+	case errors.Is(err, stdfs.ErrExist):
+		return linuxerr.EEXIST
+	case errors.Is(err, stdfs.ErrPermission):
+		return linuxerr.EACCES
+	case errors.Is(err, stdfs.ErrInvalid):
+		return linuxerr.EINVAL
+	}
+	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
+	return linuxerr.EIO
+}
 
 func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 	if fs.diskVolume == nil || fs.diskVolume.Repository == nil {
@@ -129,11 +168,11 @@ func (fs *filesystem) diskChildLocked(dir *directory, name string) (*dentry, err
 		if errors.Is(err, stdfs.ErrNotExist) {
 			return nil, linuxerr.ENOENT
 		}
-		return nil, err
+		return nil, diskVolumeError("lookup", err)
 	}
 	childInode, err := fs.loadDiskInode(ino, dir)
 	if err != nil {
-		return nil, fmt.Errorf("loading %q: %w", name, err)
+		return nil, diskVolumeError("load lookup inode", fmt.Errorf("loading %q: %w", name, err))
 	}
 	var child *dentry
 	if childDir, ok := childInode.impl.(*directory); ok {
@@ -160,7 +199,7 @@ func (fs *filesystem) diskDirectoryEmptyLocked(dir *directory) (bool, error) {
 		return len(dir.childMap) == 0, nil
 	}
 	entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, dir.inode.ino)
-	return len(entries) == 0, err
+	return len(entries) == 0, diskVolumeError("test directory emptiness", err)
 }
 
 func pageRoundedDiskBytes(size uint64) uint64 {
@@ -363,7 +402,7 @@ func (fs *filesystem) persistDiskMetadata(inode *inode) error {
 	}
 	generation := inode.diskMetadataGeneration.Load()
 	if err := fs.diskVolume.Repository.UpdateMetadata(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
-		return err
+		return diskVolumeError("update inode metadata", err)
 	}
 	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
 	return nil
@@ -375,7 +414,7 @@ func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 	}
 	generation := inode.diskMetadataGeneration.Load()
 	if err := fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
-		return err
+		return diskVolumeError("publish written inode metadata", err)
 	}
 	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
 	return nil
@@ -428,7 +467,7 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 		updates[idx] = pending[idx].metadata
 	}
 	if err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates); err != nil {
-		return err
+		return diskVolumeError("update inode metadata batch", err)
 	}
 	for _, update := range pending {
 		update.inode.diskMetadataGeneration.CompareAndSwap(update.generation, 0)
@@ -453,7 +492,7 @@ func (fs *filesystem) syncDiskData() error {
 	fs.liveForkMu.Unlock()
 	for _, file := range files {
 		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil {
-			return err
+			return diskVolumeError("sync regular-file data", err)
 		}
 	}
 	return nil

@@ -22,10 +22,27 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+func TestDiskVolumeErrorNeverLeaksUnknownSyscallError(t *testing.T) {
+	if got := diskVolumeError("test invariant", errors.New("broken graph edge")); !linuxerr.Equals(linuxerr.EIO, got) {
+		t.Fatalf("generic repository error translated to %v, want EIO", got)
+	}
+	if got := diskVolumeError("test errno", linuxerr.ENOSPC); !linuxerr.Equals(linuxerr.ENOSPC, got) {
+		t.Fatalf("Linux error translated to %v, want ENOSPC", got)
+	}
+	pathErr := &os.PathError{Op: "open", Path: "object", Err: unix.EROFS}
+	if got := diskVolumeError("test path errno", pathErr); !linuxerr.Equals(linuxerr.EROFS, got) {
+		t.Fatalf("host path error translated to %v, want EROFS", got)
+	}
+	if got := diskVolumeError("test missing", os.ErrNotExist); !linuxerr.Equals(linuxerr.ENOENT, got) {
+		t.Fatalf("portable missing error translated to %v, want ENOENT", got)
+	}
+}
 
 func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	manager, err := ttcvolume.OpenManager(t.TempDir())

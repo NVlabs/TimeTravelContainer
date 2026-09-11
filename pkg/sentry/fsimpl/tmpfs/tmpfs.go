@@ -1500,9 +1500,9 @@ func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 func (fd *fileDescription) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	if fs := fd.filesystem(); fs.diskVolume != nil {
 		if _, ok := fd.inode().impl.(*regularFile); ok {
-			return fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, fd.inode().ino, opts.DataOnly)
+			return diskVolumeError("sync inode data", fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, fd.inode().ino, opts.DataOnly))
 		}
-		return fs.diskVolume.Repository.SyncMetadata()
+		return diskVolumeError("sync inode metadata", fs.diskVolume.Repository.SyncMetadata())
 	}
 	return nil
 }

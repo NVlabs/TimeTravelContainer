@@ -262,7 +262,7 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		rf.diskObject = ""
 	})
 	if err != nil {
-		return err
+		return diskVolumeError("open mmap backing", err)
 	}
 	defer file.Close()
 	if rf.diskObject == meta.Object && rf.diskMmap.FD() >= 0 {
@@ -294,7 +294,7 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 	volume := rf.inode.fs.diskVolume
 	file, meta, cloned, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, writable, onCoW)
 	if err != nil {
-		return nil, false, err
+		return nil, false, diskVolumeError("open regular-file data", err)
 	}
 	rf.diskIOFile = file
 	rf.diskIOObject = meta.Object
@@ -549,7 +549,7 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		rf.diskIOMu.Unlock()
 		if err != nil {
 			rf.mapsMu.Unlock()
-			return err
+			return diskVolumeError("truncate", err)
 		}
 		rf.size.Store(newSize)
 		rf.inode.fs.adjustDiskBytes(oldSize, newSize)
@@ -854,12 +854,12 @@ func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
 	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, opts.DataOnly); err != nil {
-		return err
+		return diskVolumeError("sync regular-file data", err)
 	}
 	if err := f.flushDiskMetadataLocked(); err != nil {
 		return err
 	}
-	return f.inode.fs.diskVolume.Repository.SyncMetadata()
+	return diskVolumeError("sync filesystem metadata", f.inode.fs.diskVolume.Repository.SyncMetadata())
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -885,7 +885,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		f.diskIOMu.Unlock()
 		f.mapsMu.Unlock()
 		if err != nil {
-			return err
+			return diskVolumeError("allocate file range", err)
 		}
 		if end > f.size.Load() {
 			f.size.Store(end)
@@ -1013,7 +1013,7 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		for dst.NumBytes() != 0 {
 			want := min(dst.NumBytes(), int64(len(buf)))
 			if err := f.inode.fs.diskVolume.Repository.EnsureDataRange(f.inode.fs.diskVolume.Branch, f.inode.ino, offset+done, want); err != nil {
-				return done, err
+				return done, diskVolumeError("materialize file range", err)
 			}
 			n, readErr := file.ReadAt(buf[:want], offset+done)
 			if n != 0 {
@@ -1166,7 +1166,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		f.inode.xattrs.KillPriv()
 		f.markDiskMetadataDirtyLocked()
 		if err := f.inode.fs.diskVolume.Repository.MarkDataDirty(f.diskIOObject); err != nil {
-			return done, offset + done, err
+			return done, offset + done, diskVolumeError("mark regular-file data dirty", err)
 		}
 		status := fd.vfsfd.StatusFlags()
 		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {
@@ -1184,7 +1184,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 				return done, offset + done, err
 			}
 			if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
-				return done, offset + done, err
+				return done, offset + done, diskVolumeError("sync filesystem metadata", err)
 			}
 		}
 		return done, offset + done, nil

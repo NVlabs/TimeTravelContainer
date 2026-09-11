@@ -66,7 +66,7 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 		if err := fs.syncDiskData(); err != nil {
 			return err
 		}
-		return fs.diskVolume.Repository.SyncMetadata()
+		return diskVolumeError("sync filesystem metadata", fs.diskVolume.Repository.SyncMetadata())
 	}
 	return nil
 }
@@ -320,7 +320,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		}
 		if fs.diskVolume != nil {
 			if err := fs.diskVolume.Repository.Link(fs.diskVolume.Branch, parentDir.inode.ino, name, i.ino); err != nil {
-				return err
+				return diskVolumeError("link", err)
 			}
 		}
 		i.incLinksLocked()
@@ -348,11 +348,11 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			if err != nil {
 				childDir.inode.decLinksLocked(ctx)
 				childDir.inode.decLinksLocked(ctx)
-				return err
+				return diskVolumeError("mkdir", err)
 			}
 			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 			if err != nil {
-				return err
+				return diskVolumeError("read created directory metadata", err)
 			}
 			fs.applyDiskMetadata(&childDir.inode, meta)
 		}
@@ -412,11 +412,11 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 			}
 			if err != nil {
 				childInode.decLinksLocked(ctx)
-				return err
+				return diskVolumeError("mknod", err)
 			}
 			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 			if err != nil {
-				return err
+				return diskVolumeError("read created inode metadata", err)
 			}
 			fs.applyDiskMetadata(childInode, meta)
 		}
@@ -521,11 +521,11 @@ afterTrailingSymlink:
 				childInode.mode.Load()&07777, childInode.uid.Load(), childInode.gid.Load())
 			if err != nil {
 				childInode.decLinksLocked(ctx)
-				return nil, err
+				return nil, diskVolumeError("create regular file", err)
 			}
 			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 			if err != nil {
-				return nil, err
+				return nil, diskVolumeError("read created file metadata", err)
 			}
 			fs.applyDiskMetadata(childInode, meta)
 		}
@@ -781,7 +781,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			oldParentDir.inode.ino, oldName,
 			newParentDir.inode.ino, newName,
 			opts.Flags&linux.RENAME_NOREPLACE != 0); err != nil {
-			return err
+			return diskVolumeError("rename", err)
 		}
 	}
 	if replaced != nil {
@@ -871,7 +871,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	}
 	if fs.diskVolume != nil {
 		if err := fs.diskVolume.Repository.RemoveDirectory(fs.diskVolume.Branch, parentDir.inode.ino, name); err != nil {
-			return err
+			return diskVolumeError("remove directory", err)
 		}
 	}
 	parentDir.removeChildLocked(child)
@@ -959,11 +959,11 @@ func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, targ
 				childInode.uid.Load(), childInode.gid.Load())
 			if err != nil {
 				childInode.decLinksLocked(ctx)
-				return err
+				return diskVolumeError("create symlink", err)
 			}
 			meta, err := fs.diskVolume.Repository.Inode(fs.diskVolume.Branch, ino)
 			if err != nil {
-				return err
+				return diskVolumeError("read created symlink metadata", err)
 			}
 			fs.applyDiskMetadata(childInode, meta)
 		}
@@ -1022,7 +1022,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	}
 	if fs.diskVolume != nil {
 		if err := fs.diskVolume.Repository.Unlink(fs.diskVolume.Branch, parentDir.inode.ino, name); err != nil {
-			return err
+			return diskVolumeError("unlink", err)
 		}
 	}
 	// Generate inotify events. Note that this must take place before the link

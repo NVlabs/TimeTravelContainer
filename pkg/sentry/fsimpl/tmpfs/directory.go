@@ -187,7 +187,7 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	if fs.diskVolume != nil {
 		items, err := fs.diskVolume.Repository.ListDirectoryItems(fs.diskVolume.Branch, dir.inode.ino)
 		if err != nil {
-			return err
+			return diskVolumeError("list directory", err)
 		}
 		start := fd.off - 2
 		if start < 0 {
