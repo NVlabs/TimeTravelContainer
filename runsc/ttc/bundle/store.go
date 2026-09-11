@@ -2577,6 +2577,18 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 				spec.Annotations = make(map[string]string)
 			}
 			spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
+			// The canonical spec is shared metadata and may describe a fully
+			// extracted root on another node. Lazy image backing is a property of
+			// this node's cache, so derive its annotation from the rewritten root
+			// instead of copying the canonical annotation. Without this, the gofer
+			// sees zero-length skeleton files as complete files during distributed
+			// restore, and executable mappings fail with SIGBUS on first access.
+			delete(spec.Annotations, ttcpack.LazyAnnotation)
+			if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
+				spec.Annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("loading node-local lazy image descriptor: %w", err)
+			}
 		}
 		repositories, err := specutils.TTCVolumeRepositories(&spec)
 		if err != nil {

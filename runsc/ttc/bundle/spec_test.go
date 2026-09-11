@@ -2740,8 +2740,11 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := &specs.Spec{
-		Root:        &specs.Root{Path: filepath.Join(shared, "images", "source", "rootfs")},
-		Annotations: map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)},
+		Root: &specs.Root{Path: filepath.Join(shared, "images", "source", "rootfs")},
+		Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories: string(encoded),
+			ttcpack.LazyAnnotation:                    filepath.Join(shared, "images", "source", ttcpack.LazyDescriptorName),
+		},
 	}
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
 		t.Fatal(err)
@@ -2763,9 +2766,29 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := loaded.Annotations[ttcpack.LazyAnnotation]; got != "" {
+		t.Fatalf("stale lazy image annotation = %q, want empty", got)
+	}
 	wantRoot := filepath.Join(local, "images", imageRootKey(digest, "linux/amd64"), "rootfs")
+	if err := os.MkdirAll(wantRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	packID, err := ttcpack.ParseID(strings.Repeat("c", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ttcpack.WriteLazyDescriptor(wantRoot, filepath.Join(shared, "image-packs"), packID, "rootfs"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if loaded.Root == nil || loaded.Root.Path != wantRoot {
 		t.Fatalf("root path = %+v, want %q", loaded.Root, wantRoot)
+	}
+	if got, want := loaded.Annotations[ttcpack.LazyAnnotation], ttcpack.LazyDescriptorPath(wantRoot); got != want {
+		t.Fatalf("lazy image annotation = %q, want %q", got, want)
 	}
 	resolved, err := specutils.TTCVolumeRepositories(loaded)
 	if err != nil {
