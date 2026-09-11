@@ -211,9 +211,11 @@ func syncDirectory(path string) error {
 	return directory.Sync()
 }
 
-func installTemporary(temporary *os.File, temporaryPath, destination string, length int64) error {
-	if err := temporary.Sync(); err != nil {
-		return err
+func installTemporary(temporary *os.File, temporaryPath, destination string, length int64, durable bool) error {
+	if durable {
+		if err := temporary.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := temporary.Close(); err != nil {
 		return err
@@ -227,14 +229,29 @@ func installTemporary(temporary *os.File, temporaryPath, destination string, len
 			return fmt.Errorf("existing immutable object %q has unexpected length", destination)
 		}
 	}
-	if err := syncDirectory(filepath.Dir(destination)); err != nil {
-		return err
+	if durable {
+		if err := syncDirectory(filepath.Dir(destination)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // Install writes exactly length bytes and atomically publishes id.
 func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64) error {
+	return store.install(id, source, length, true)
+}
+
+// InstallDeferred writes and atomically publishes id without imposing a
+// durability barrier. Filesystem repositories use this for ordinary guest
+// writes, then call SyncObjects before making the graph transaction durable at
+// fsync/sync or a lifecycle fence. Other LocalDataStore users retain Install's
+// immediate-durability contract.
+func (store *LocalDataStore) InstallDeferred(id ObjectID, source io.Reader, length int64) error {
+	return store.install(id, source, length, false)
+}
+
+func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64, durable bool) error {
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
@@ -257,9 +274,11 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 			temporary.Close()
 			return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
 		}
-		if err := temporary.Sync(); err != nil {
-			temporary.Close()
-			return err
+		if durable {
+			if err := temporary.Sync(); err != nil {
+				temporary.Close()
+				return err
+			}
 		}
 		if err := temporary.Close(); err != nil {
 			return err
@@ -278,7 +297,10 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 				return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
 			}
 		}
-		return store.syncRelativeDirectory(directory)
+		if durable {
+			return store.syncRelativeDirectory(directory)
+		}
+		return nil
 	}
 	destination, err := store.objectPath(id)
 	if err != nil {
@@ -298,7 +320,7 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 		temporary.Close()
 		return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
 	}
-	return installTemporary(temporary, temporaryPath, destination, length)
+	return installTemporary(temporary, temporaryPath, destination, length, durable)
 }
 
 // Clone installs destination from a complete source object. If tryReflink is
@@ -306,6 +328,17 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 // unavailable. Callers should pass false after probing a filesystem that does
 // not support reflinks, avoiding a failing ioctl for every privatized file.
 func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink bool) error {
+	return store.clone(sourceID, destinationID, tryReflink, true)
+}
+
+// CloneDeferred installs a complete clone without synchronizing it. The
+// enclosing filesystem repository must pass destinationID to SyncObjects
+// before synchronizing the graph transaction that names it.
+func (store *LocalDataStore) CloneDeferred(sourceID, destinationID ObjectID, tryReflink bool) error {
+	return store.clone(sourceID, destinationID, tryReflink, false)
+}
+
+func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink, durable bool) error {
 	if store.rootFD != nil {
 		source, err := store.Open(sourceID, -1)
 		if err != nil {
@@ -349,9 +382,11 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink 
 				return err
 			}
 		}
-		if err := temporary.Sync(); err != nil {
-			temporary.Close()
-			return err
+		if durable {
+			if err := temporary.Sync(); err != nil {
+				temporary.Close()
+				return err
+			}
 		}
 		if err := temporary.Close(); err != nil {
 			return err
@@ -370,7 +405,10 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink 
 				return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
 			}
 		}
-		return store.syncRelativeDirectory(directory)
+		if durable {
+			return store.syncRelativeDirectory(directory)
+		}
+		return nil
 	}
 	sourcePath, err := store.objectPath(sourceID)
 	if err != nil {
@@ -418,7 +456,56 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink 
 			return err
 		}
 	}
-	return installTemporary(temporary, temporaryPath, destination, info.Size())
+	return installTemporary(temporary, temporaryPath, destination, info.Size(), durable)
+}
+
+// SyncObjects makes complete object contents and every directory entry in
+// their descriptor-relative path durable. Files precede leaf directories and
+// directories precede their parents, so a subsequently synchronized graph can
+// never name an object omitted by a completed durability fence.
+func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	directories := make(map[string]struct{})
+	for _, id := range ids {
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return err
+		}
+		file, err := store.Open(id, -1)
+		if err != nil {
+			return err
+		}
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if syncErr != nil || closeErr != nil {
+			return errors.Join(syncErr, closeErr)
+		}
+		for directory := filepath.Dir(relative); directory != "."; directory = filepath.Dir(directory) {
+			directories[directory] = struct{}{}
+		}
+		directories["."] = struct{}{}
+	}
+	ordered := make([]string, 0, len(directories))
+	for directory := range directories {
+		ordered = append(ordered, directory)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return strings.Count(ordered[i], string(filepath.Separator)) > strings.Count(ordered[j], string(filepath.Separator))
+	})
+	for _, directory := range ordered {
+		if store.rootFD != nil {
+			if err := store.syncRelativeDirectory(directory); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := syncDirectory(filepath.Join(store.root, directory)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Open returns a read-only complete object after verifying its exact length.

@@ -146,6 +146,17 @@ data object, and left a 611 KiB current journal. The first run revealed that
 checkpoint cleanup's descriptor-relative directory enumeration was absent from
 the Sentry seccomp policy; allowing that donated-directory operation prevents
 the previous deterministic SIGSYS at iteration 1025.
+Ordinary filesystem object creation and first-writer clones no longer impose
+their own file and directory fsync barriers. The repository tracks concurrent
+data mutation generations and, at guest fsync/sync or a lifecycle fence,
+orders synchronization as payloads, payload directories, graph WAL, and branch
+summaries. Existing immediate-durability users of the generic object store are
+unchanged. The repository suite fell from 56.5 to 15.7 seconds on the same
+host; the 1,100-generation BusyBox replacement workload fell from 26.0 to 19.7
+seconds, crossed graph compaction, retained one live payload, and survived a
+fork/dehydrate/rehydrate divergence check. This removes redundant storage
+barriers, although per-syscall graph path-copy and guest process-launch cost
+remain visible in this deliberately adversarial workload.
 
 ## Goals
 

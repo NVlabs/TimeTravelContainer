@@ -63,6 +63,9 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 		if err := fs.flushDiskWriteMetadata(); err != nil {
 			return err
 		}
+		if err := fs.syncDiskData(); err != nil {
+			return err
+		}
 		return fs.diskVolume.Repository.SyncMetadata()
 	}
 	return nil

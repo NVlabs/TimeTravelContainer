@@ -586,6 +586,9 @@ func (fs *filesystem) Release(ctx context.Context) {
 		ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
 	}
 	if fs.diskVolume != nil {
+		if err := fs.syncDiskData(); err != nil {
+			ctx.Warningf("syncing TTC volume data during filesystem release: %v", err)
+		}
 		if err := fs.diskVolume.Repository.SyncMetadata(); err != nil {
 			ctx.Warningf("syncing TTC volume metadata during filesystem release: %v", err)
 		}

@@ -258,6 +258,11 @@ type Repository struct {
 	// authoritative graph root. Publishing these on fsync/lifecycle fences
 	// avoids an atomic temp-file+rename for every guest inode mutation.
 	dirtyBranches map[string]*branchMetadata
+	// dirtyData is a per-object mutation generation. Object installation and
+	// subsequent writes increment it; SyncMetadata clears only the generation
+	// it actually synchronized so a concurrent write cannot be lost from the
+	// next durability fence.
+	dirtyData map[string]uint64
 	// pendingReclaims contains bulk objects whose graph records have been
 	// removed by committed path-copy mutations. Their bytes cannot be unlinked
 	// until the graph WAL is durable: crash recovery may otherwise select the
@@ -1754,6 +1759,9 @@ func (r *Repository) WriteAt(branchID string, ino uint64, data []byte, offset in
 		if closeErr != nil {
 			return closeErr
 		}
+		if err := r.MarkDataDirty(inode.Object); err != nil {
+			return err
+		}
 		end := offset + int64(written)
 		if end > inode.Size {
 			inode.Size = end
@@ -1890,6 +1898,24 @@ func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error 
 	return nil
 }
 
+// MarkDataDirty records that a writable object may contain bytes newer than
+// the last repository durability fence. The object identity is supplied by
+// the filesystem after CoW selection, avoiding a metadata-tree lookup on each
+// write(2).
+func (r *Repository) MarkDataDirty(object string) error {
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil || id.Kind != ttcsnapshot.ObjectKindFile {
+		return fmt.Errorf("invalid dirty repository object %q", object)
+	}
+	r.dirtyMu.Lock()
+	if r.dirtyData == nil {
+		r.dirtyData = make(map[string]uint64)
+	}
+	r.dirtyData[object]++
+	r.dirtyMu.Unlock()
+	return nil
+}
+
 // SyncMetadata makes repository namespace and inode metadata durable.
 func (r *Repository) SyncMetadata() error {
 	return r.withLock(r.syncMetadataLocked)
@@ -1903,11 +1929,32 @@ func (r *Repository) syncMetadataLocked() error {
 	// Branch pointer files are recovery summaries. The graph root is visible
 	// immediately and remains authoritative between durability fences.
 	r.dirtyMu.Lock()
+	dirtyData := make(map[string]uint64, len(r.dirtyData))
+	for name, generation := range r.dirtyData {
+		if _, reclaiming := r.pendingReclaims[name]; !reclaiming {
+			dirtyData[name] = generation
+		}
+	}
 	dirtyBranches := make([]string, 0, len(r.dirtyBranches))
 	for id := range r.dirtyBranches {
 		dirtyBranches = append(dirtyBranches, id)
 	}
 	r.dirtyMu.Unlock()
+	dataIDs := make([]ttcsnapshot.ObjectID, 0, len(dirtyData))
+	for name := range dirtyData {
+		id, err := ttcsnapshot.ParseObjectID(name)
+		if err != nil || id.Kind != ttcsnapshot.ObjectKindFile {
+			return fmt.Errorf("invalid dirty repository object %q", name)
+		}
+		dataIDs = append(dataIDs, id)
+	}
+	sort.Slice(dataIDs, func(i, j int) bool { return dataIDs[i].String() < dataIDs[j].String() })
+	// A guest durability boundary first persists every new or modified payload
+	// and the complete directory path that publishes it. Only then may the
+	// graph WAL making those immutable IDs reachable become durable.
+	if err := r.data.SyncObjects(dataIDs); err != nil {
+		return fmt.Errorf("syncing repository data objects: %w", err)
+	}
 	sort.Strings(dirtyBranches)
 	r.dirtyMu.Lock()
 	var rootDirty []string
@@ -1963,6 +2010,13 @@ func (r *Repository) syncMetadataLocked() error {
 	if err := r.graph.Sync(); err != nil {
 		return fmt.Errorf("syncing repository snapshot graph: %w", err)
 	}
+	r.dirtyMu.Lock()
+	for name, generation := range dirtyData {
+		if r.dirtyData[name] == generation {
+			delete(r.dirtyData, name)
+		}
+	}
+	r.dirtyMu.Unlock()
 	// The graph WAL is now a durable proof that these immutable payloads are
 	// unreachable. Delete them directly by ID instead of scanning the complete
 	// object store; a crash before an unlink merely leaves harmless garbage for
@@ -1985,6 +2039,7 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 		r.dirtyMu.Lock()
 		delete(r.pendingReclaims, id.String())
+		delete(r.dirtyData, id.String())
 		r.dirtyMu.Unlock()
 	}
 	for _, id := range dirtyBranches {
@@ -2077,6 +2132,9 @@ func (r *Repository) TruncateWithCoW(branchID string, ino uint64, size int64, on
 		if closeErr != nil {
 			return closeErr
 		}
+		if err := r.MarkDataDirty(inode.Object); err != nil {
+			return err
+		}
 		inode.Size = size
 		return r.commitMetadata(&branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &inode}})
 	})
@@ -2127,6 +2185,9 @@ func (r *Repository) AllocateWithCoW(branchID string, ino uint64, offset, length
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+		if err := r.MarkDataDirty(inode.Object); err != nil {
+			return err
 		}
 		end := offset + length
 		if end <= inode.Size {
@@ -2674,7 +2735,7 @@ func (r *Repository) createObject(origin uint64, source string) (string, error) 
 	}
 	var length int64
 	if source == "" {
-		if err := r.data.Install(id, strings.NewReader(""), 0); err != nil {
+		if err := r.data.InstallDeferred(id, strings.NewReader(""), 0); err != nil {
 			return "", err
 		}
 	} else {
@@ -2687,12 +2748,15 @@ func (r *Repository) createObject(origin uint64, source string) (string, error) 
 			return "", fmt.Errorf("source object %q is absent from snapshot graph", source)
 		}
 		length = int64(object.BulkLength)
-		if err := r.data.Clone(sourceID, id, r.copyMode == CopyModeReflink); err != nil {
+		if err := r.data.CloneDeferred(sourceID, id, r.copyMode == CopyModeReflink); err != nil {
 			return "", fmt.Errorf("privatizing volume object %q: %w", source, err)
 		}
 	}
 	if err := r.graph.CommitReservedObject(id, graphConstructionPin(id), uint64(length), nil, nil); err != nil {
 		_ = r.data.Remove(id)
+		return "", err
+	}
+	if err := r.MarkDataDirty(id.String()); err != nil {
 		return "", err
 	}
 	return id.String(), nil

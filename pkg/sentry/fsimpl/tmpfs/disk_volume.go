@@ -435,3 +435,26 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 	}
 	return nil
 }
+
+// syncDiskData synchronizes the data objects represented by live regular-file
+// inodes. This includes MAP_SHARED writes, which can modify the donated host
+// mapping without passing through regularFileFD.PWrite. Namespace-created
+// objects that have already left the runtime inode cache remain covered by the
+// repository's dirty-object set.
+func (fs *filesystem) syncDiskData() error {
+	if fs.diskVolume == nil {
+		return nil
+	}
+	fs.liveForkMu.Lock()
+	files := make([]*regularFile, 0, len(fs.liveForkFiles))
+	for file := range fs.liveForkFiles {
+		files = append(files, file)
+	}
+	fs.liveForkMu.Unlock()
+	for _, file := range files {
+		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}

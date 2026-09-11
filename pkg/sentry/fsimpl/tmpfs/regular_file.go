@@ -1165,6 +1165,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		}
 		f.inode.xattrs.KillPriv()
 		f.markDiskMetadataDirtyLocked()
+		if err := f.inode.fs.diskVolume.Repository.MarkDataDirty(f.diskIOObject); err != nil {
+			return done, offset + done, err
+		}
 		status := fd.vfsfd.StatusFlags()
 		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {
 			dataOnly := opts.Flags&linux.RWF_SYNC == 0 && status&linux.O_SYNC == 0
