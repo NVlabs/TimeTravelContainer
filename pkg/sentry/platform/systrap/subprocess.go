@@ -854,15 +854,24 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 
 	// Check if there's been an error.
 	threadID := ctx.threadID()
-	if threadID != invalidThreadID {
+	errorThreadID := threadID
+	if errorThreadID == invalidThreadID {
+		// switch_context() clears ThreadID before waking the Sentry. A stub can
+		// still fail after that point while restoring the next context (for
+		// example, while changing FS/GS), so consult LastThreadID as well.
+		errorThreadID = ctx.lastThreadID()
+	}
+	if errorThreadID != invalidThreadID {
 		s.sysmsgThreadsMu.RLock()
-		sysThread, ok := s.sysmsgThreads[threadID]
+		sysThread, ok := s.sysmsgThreads[errorThreadID]
 		s.sysmsgThreadsMu.RUnlock()
 		if ok && sysThread.msg.Err != 0 {
 			sysmsgErr := sysThread.msg.ConvertSysmsgErr()
 			log.BugTraceback(sysmsgErr)
 			return false, false, hostarch.NoAccess, sysmsgErr
 		}
+	}
+	if threadID != invalidThreadID {
 		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("found unexpected ThreadContext.ThreadID field, expected %d found %d", invalidThreadID, threadID))
 	}
 

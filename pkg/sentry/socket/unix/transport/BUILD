@@ -121,5 +121,7 @@ go_test(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/syserr",
+		"//pkg/tcpip",
+		"//pkg/waiter",
     ],
 )

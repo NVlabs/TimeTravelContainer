@@ -21,5 +21,14 @@ package linux
 // be one of three values, corresponding to 3-level, 4-level and
 // 5-level paging.
 //
-// The array has to be sorted in decreasing order.
-var feasibleTaskSizes = []uintptr{1 << 52, 1 << 48, 1 << 39}
+// detectTaskSize checks the architectural address-space sizes in decreasing
+// order. Unlike amd64, the selected size configures the ARM64 page-table
+// geometry and therefore must remain one of these architectural values.
+func detectTaskSize(pageSize uintptr) uintptr {
+	for _, size := range [...]uintptr{1 << 52, 1 << 48, 1 << 39} {
+		if taskSizeUsable(size, pageSize) {
+			return size
+		}
+	}
+	panic("none of the supported ARM64 task sizes is usable")
+}

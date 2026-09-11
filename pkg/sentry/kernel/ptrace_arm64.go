@@ -26,3 +26,7 @@ import (
 func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) error {
 	return linuxerr.EIO
 }
+
+func (t *Task) ptracePrepareGuestGS(target *Task, data hostarch.Addr, length int) error {
+	return nil
+}

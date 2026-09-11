@@ -339,6 +339,7 @@ func (c *ThreadContext) Init(initialThreadID uint32) {
 	c.State = ContextStateNone
 	c.GuestGS = 0
 	c.ThreadID = initialThreadID
+	c.LastThreadID = initialThreadID
 	c.ThreadName = [linux.TASK_COMM_LEN]byte{}
 }
 

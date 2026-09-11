@@ -197,7 +197,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 			ucs.FaultAddr = info.Addr()
 		}
 
-		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, ucs.FaultAddr)
+		t.Debugf("Signal %d, PID: %d, TID: %d, ip: %#x, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, t.Arch().IP(), ucs.FaultAddr)
 		eventchannel.Emit(ucs)
 
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
@@ -213,7 +213,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 
 	case SignalActionHandler:
 		// Try to deliver the signal to the user-configured handler.
-		t.Debugf("Signal %d: delivering to handler", info.Signo)
+		t.Debugf("Signal %d: delivering to handler at ip=%#x fault addr=%#x", info.Signo, t.Arch().IP(), info.Addr())
 		if err := t.deliverSignalToHandler(info, act); err != nil {
 			// This is not a warning, it can occur during normal operation.
 			t.Debugf("Failed to deliver signal %+v to user handler: %v", info, err)

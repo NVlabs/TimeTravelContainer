@@ -223,37 +223,59 @@ func stubInit() {
 	stubContextRegionLen = sysmsg.AllocatedSizeofThreadContextStruct * (maxGuestContexts + 1)
 	mapLen, _ = hostarch.PageRoundUp(mapLen + stubContextRegionLen)
 
-	// Try a few times to avoid cases when new mappings are created.
-	for i := 0; i < 32; i++ {
-		if i == 0 { // fast path
-			// Randomize stubStart address.
-			randomOffset := uintptr(rand.Uint64() * hostarch.PageSize)
-			maxRandomOffset := maxRandomOffsetOfStubAddress - mapLen
-			stubStart = maxStubUserAddress + randomOffset%maxRandomOffset
-		} else {
-			regions, err := parseMaps(maxStubUserAddress, maximumUserAddress-mapLen+stubROMapEnd, stubROMapEnd)
-			if err != nil {
-				panic(fmt.Sprintf("failed to parse /proc/self/maps: %s", err))
+	// Prefer the highest stub band. A Sentry nested inside another systrap
+	// sandbox cannot see the outer Sentry's private stub mappings in
+	// /proc/self/maps, even though mmap correctly rejects addresses occupied by
+	// them. If all candidates in a band are rejected, move the complete inner
+	// stub reservation down by one band and lower MaxUserAddress accordingly.
+	// This preserves a contiguous guest address space and permits repeated
+	// nesting; ordinary, non-nested Sentries retain the historical layout.
+	stubAreaEnd := maximumUserAddress
+	const attemptsPerBand = 32
+	for bandStart := maxStubUserAddress; bandStart >= maxRandomOffsetOfStubAddress; bandStart -= maxRandomOffsetOfStubAddress {
+		bandEnd := bandStart + maxRandomOffsetOfStubAddress
+		for attempt := 0; attempt < attemptsPerBand; attempt++ {
+			if attempt == 0 {
+				// Fast path: choose a random address that leaves room for the
+				// complete sparse stub reservation within this band.
+				available := maxRandomOffsetOfStubAddress - mapLen
+				randomOffset := uintptr(rand.Uint64()) * hostarch.PageSize
+				stubStart = bandStart + randomOffset%available
+			} else {
+				regions, err := parseMaps(bandStart, bandEnd-mapLen+stubROMapEnd, stubROMapEnd)
+				if err != nil {
+					panic(fmt.Sprintf("failed to parse /proc/self/maps: %s", err))
+				}
+				if len(regions) == 0 {
+					break
+				}
+				r := regions[rand.Uint64()%uint64(len(regions))]
+				available := r.end - r.start - stubROMapEnd
+				stubStart = r.start
+				if available != 0 {
+					stubStart += uintptr(rand.Uint64()) * hostarch.PageSize % available
+				}
 			}
-			n := len(regions)
-			if n == 0 {
-				panic("failed to map stub code")
+			// Map the target address for the executable/read-only stub. The
+			// remaining sparse reservation is positioned later after a gap is
+			// selected within the same band.
+			addr, _ := hostsyscall.RawSyscall6(
+				unix.SYS_MMAP,
+				stubStart,
+				stubROMapEnd,
+				unix.PROT_WRITE|unix.PROT_READ,
+				unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE,
+				0 /* fd */, 0 /* offset */)
+			if addr == stubStart {
+				maxStubUserAddress = bandStart
+				stubAreaEnd = bandEnd
+				break
 			}
-			r := regions[rand.Uint64()%uint64(n)]
-			stubStart = r.start + uintptr(rand.Uint64())*hostarch.PageSize%(r.end-r.start-stubROMapEnd)
+			stubStart = uintptr(0)
 		}
-		// Map the target address for the stub.
-		addr, _ := hostsyscall.RawSyscall6(
-			unix.SYS_MMAP,
-			stubStart,
-			stubROMapEnd,
-			unix.PROT_WRITE|unix.PROT_READ,
-			unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE,
-			0 /* fd */, 0 /* offset */)
-		if addr == stubStart {
+		if stubStart != 0 {
 			break
 		}
-		stubStart = uintptr(0)
 	}
 
 	if stubStart == 0 {
@@ -262,7 +284,7 @@ func stubInit() {
 		panic("failed to map stub")
 	}
 	// Randomize stubSysmsgStack address.
-	gap := uintptr(rand.Uint64()) * hostarch.PageSize % (maximumUserAddress - stubStart - mapLen)
+	gap := uintptr(rand.Uint64()) * hostarch.PageSize % (stubAreaEnd - stubStart - mapLen)
 	stubSysmsgStack += uintptr(gap)
 	stubContextQueueRegion += uintptr(gap)
 	stubContextRegion += uintptr(gap)

@@ -169,6 +169,10 @@ type Context64 struct {
 	sigFPState []fpu.State // fpstate to be restored on sigreturn.
 }
 
+// SetSignalFault implements Context.SetSignalFault. ARM64's signal frame does
+// not expose a page-fault access code analogous to x86 REG_ERR.
+func (c *Context64) SetSignalFault(addr hostarch.Addr, at hostarch.AccessType) {}
+
 // Arch implements Context.Arch.
 func (c *Context64) Arch() Arch {
 	return ARM64

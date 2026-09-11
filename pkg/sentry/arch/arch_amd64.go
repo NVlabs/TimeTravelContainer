@@ -106,6 +106,12 @@ const (
 // +stateify savable
 type Context64 struct {
 	State
+
+	// signalFault* describes the synchronous platform fault awaiting signal
+	// delivery. It is consumed by SignalSetup when the matching SIGSEGV or
+	// SIGBUS frame is built.
+	signalFaultAddr   hostarch.Addr
+	signalFaultAccess hostarch.AccessType
 }
 
 // Arch implements Context.Arch.
@@ -121,7 +127,9 @@ func (c *Context64) FloatingPointData() *fpu.State {
 // Fork returns an exact copy of this context.
 func (c *Context64) Fork() *Context64 {
 	return &Context64{
-		State: c.State.Fork(),
+		State:             c.State.Fork(),
+		signalFaultAddr:   c.signalFaultAddr,
+		signalFaultAccess: c.signalFaultAccess,
 	}
 }
 

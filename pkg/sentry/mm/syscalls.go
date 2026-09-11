@@ -83,6 +83,17 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	}
 	opts.Length = uint64(length)
 
+	// Linux reports ENOMEM for fixed mappings outside the task address space
+	// before it reports EINVAL for an unaligned address. Besides matching the
+	// host ABI, this ordering lets runtimes nested inside the Sentry probe the
+	// usable virtual-address width reliably.
+	if opts.Fixed {
+		end, ok := opts.Addr.AddLength(opts.Length)
+		if !ok || end > mm.layout.MaxAddr {
+			return 0, linuxerr.ENOMEM
+		}
+	}
+
 	if opts.Mappable != nil {
 		// Offset must be aligned.
 		if hostarch.Addr(opts.Offset).RoundDown() != hostarch.Addr(opts.Offset) {

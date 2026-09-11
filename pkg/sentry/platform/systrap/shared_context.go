@@ -183,6 +183,10 @@ func (sc *sharedContext) threadID() uint32 {
 	return atomic.LoadUint32(&sc.shared.ThreadID)
 }
 
+func (sc *sharedContext) lastThreadID() uint32 {
+	return atomic.LoadUint32(&sc.shared.LastThreadID)
+}
+
 // EnableSentryFastPath indicates that the polling mode is enabled for the
 // Sentry. It has to be called before putting the context into the context queue.
 func (sc *sharedContext) enableSentryFastPath() {
