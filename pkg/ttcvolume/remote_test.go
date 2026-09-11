@@ -6,6 +6,7 @@ package ttcvolume
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -38,6 +39,12 @@ func TestRemoteSnapshotFetchesExtentsAndPrivatizesWrites(t *testing.T) {
 	_, objects, err := source.ExportRemoteSnapshot("remote-generation", snapshotDir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(snapshotDir, "graph.json")); err != nil {
+		t.Fatalf("graph-native remote metadata is missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(snapshotDir, "metadata.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("flattened remote metadata exists: %v", err)
 	}
 	targetManager := openTestManager(t)
 	targetPath := filepath.Join(targetManager.root, "target-repository")

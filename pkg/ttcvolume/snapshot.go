@@ -27,7 +27,10 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-const snapshotFormatVersion = 2
+const (
+	snapshotFormatVersion       = 2
+	remoteSnapshotFormatVersion = 3
+)
 
 // SnapshotInfo describes one self-contained repository branch snapshot.
 type SnapshotInfo struct {
@@ -49,9 +52,19 @@ type snapshotDirectoryEntry struct {
 	DirectoryEntry
 }
 
-// ExportRemoteSnapshot writes only the namespace/inode metadata for a sealed
+// remoteGraphMetadata is the graph-native control plane for a live remote
+// filesystem handoff. It preserves immutable object identities and bounded
+// B-tree structure; regular-file bytes remain on the source and are fetched
+// through the transaction-fenced object relay.
+type remoteGraphMetadata struct {
+	Root    ttcsnapshot.ObjectID `json:"root"`
+	Objects []ttcsnapshot.Object `json:"objects"`
+}
+
+// ExportRemoteSnapshot writes the immutable graph metadata for a sealed
 // branch. Regular-file objects are returned as an allowlist and are fetched
-// by the target in authenticated 1 MiB ranges.
+// by the target in authenticated 1 MiB ranges. Unlike portable snapshot
+// export, this does not flatten inode and directory B-trees.
 func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (SnapshotInfo, map[string]int64, error) {
 	if r == nil || r.path == "" {
 		return SnapshotInfo{}, nil, errors.New("remote snapshot export requires a manager-side repository")
@@ -61,7 +74,26 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 		return SnapshotInfo{}, nil, err
 	}
 	info := r.Info()
-	snapshot := SnapshotInfo{FormatVersion: snapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: branch.Root, NextInode: info.NextInode, CreatedAt: time.Now().UTC()}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return SnapshotInfo{}, nil, fmt.Errorf("parsing filesystem graph root: %w", err)
+	}
+	objects, err := ttcsnapshot.ReachableObjects(r.graph, []ttcsnapshot.ObjectID{root})
+	if err != nil {
+		return SnapshotInfo{}, nil, fmt.Errorf("enumerating filesystem graph metadata: %w", err)
+	}
+	catalog, err := ttcsnapshot.NewImmutableCatalog(objects)
+	if err != nil {
+		return SnapshotInfo{}, nil, err
+	}
+	if _, ok, err := catalog.FilesystemInode(root, rootInode); err != nil || !ok {
+		return SnapshotInfo{}, nil, errors.Join(errors.New("remote filesystem graph omits its root inode"), err)
+	}
+	bulk, err := ttcsnapshot.ReachableBulkObjects(catalog, []ttcsnapshot.ObjectID{root})
+	if err != nil {
+		return SnapshotInfo{}, nil, err
+	}
+	snapshot := SnapshotInfo{FormatVersion: remoteSnapshotFormatVersion, RepositoryID: info.ID, BranchID: branch.ID, Root: branch.Root, NextInode: info.NextInode, CreatedAt: time.Now().UTC()}
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
 		return SnapshotInfo{}, nil, err
 	}
@@ -74,52 +106,63 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 			_ = os.RemoveAll(destination)
 		}
 	}()
-	if err := os.Mkdir(filepath.Join(destination, "objects"), 0700); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	state, err := r.metadataForBranch(branch)
-	if err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	if err := r.completeMetadata(state); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	state.mu.RLock()
-	metadata := snapshotMetadata{Inodes: make([]Inode, 0, len(state.inodes)), Entries: make([]snapshotDirectoryEntry, 0, len(state.entries))}
-	objects := make(map[string]int64)
-	for _, inode := range state.inodes {
-		metadata.Inodes = append(metadata.Inodes, inode)
-		if inode.Object != "" {
-			if !validObjectID(inode.Object) || inode.Size < 0 {
-				state.mu.RUnlock()
-				return SnapshotInfo{}, nil, fmt.Errorf("inode %d has invalid remote object", inode.Number)
-			}
-			if previous, ok := objects[inode.Object]; ok && previous != inode.Size {
-				state.mu.RUnlock()
-				return SnapshotInfo{}, nil, fmt.Errorf("object %q has inconsistent sizes %d and %d", inode.Object, previous, inode.Size)
-			}
-			objects[inode.Object] = inode.Size
+	allow := make(map[string]int64)
+	for id, length := range bulk {
+		if id.Kind != ttcsnapshot.ObjectKindFile || length > uint64(^uint64(0)>>1) {
+			return SnapshotInfo{}, nil, fmt.Errorf("filesystem graph contains invalid bulk object %s", id)
 		}
+		allow[id.String()] = int64(length)
 	}
-	for key, entry := range state.entries {
-		metadata.Entries = append(metadata.Entries, snapshotDirectoryEntry{Parent: key.Parent, DirectoryEntry: entry})
-	}
-	state.mu.RUnlock()
-	sort.Slice(metadata.Inodes, func(i, j int) bool { return metadata.Inodes[i].Number < metadata.Inodes[j].Number })
-	sort.Slice(metadata.Entries, func(i, j int) bool {
-		if metadata.Entries[i].Parent != metadata.Entries[j].Parent {
-			return metadata.Entries[i].Parent < metadata.Entries[j].Parent
-		}
-		return metadata.Entries[i].Name < metadata.Entries[j].Name
-	})
-	if err := writeJSONAtomic(destination, filepath.Join(destination, "metadata.json"), metadata); err != nil {
+	graph := remoteGraphMetadata{Root: root, Objects: objects}
+	if err := writeJSONAtomic(destination, filepath.Join(destination, "graph.json"), graph); err != nil {
 		return SnapshotInfo{}, nil, err
 	}
 	if err := writeJSONAtomic(destination, filepath.Join(destination, "snapshot.json"), snapshot); err != nil {
 		return SnapshotInfo{}, nil, err
 	}
 	keep = true
-	return snapshot, objects, nil
+	return snapshot, allow, nil
+}
+
+func readRemoteGraphSnapshot(source string) (SnapshotInfo, snapshotMetadata, map[string]int64, error) {
+	var snapshot SnapshotInfo
+	if err := readJSON(filepath.Join(source, "snapshot.json"), &snapshot); err != nil {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, err
+	}
+	if snapshot.FormatVersion != remoteSnapshotFormatVersion || !validID(snapshot.RepositoryID) || snapshot.NextInode <= rootInode {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, errors.New("invalid remote graph snapshot identity")
+	}
+	var graph remoteGraphMetadata
+	if err := readJSON(filepath.Join(source, "graph.json"), &graph); err != nil {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, err
+	}
+	if graph.Root.String() != snapshot.Root {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, errors.New("remote graph root disagrees with snapshot descriptor")
+	}
+	catalog, err := ttcsnapshot.NewImmutableCatalog(graph.Objects)
+	if err != nil {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, err
+	}
+	inodes, entries, err := catalog.FilesystemRecords(graph.Root)
+	if err != nil {
+		return SnapshotInfo{}, snapshotMetadata{}, nil, err
+	}
+	metadata := snapshotMetadata{Inodes: make([]Inode, 0, len(inodes)), Entries: make([]snapshotDirectoryEntry, 0, len(entries))}
+	objects := make(map[string]int64)
+	for _, record := range inodes {
+		inode := inodeFromGraph(record)
+		metadata.Inodes = append(metadata.Inodes, inode)
+		if inode.Object != "" {
+			if inode.Size < 0 {
+				return SnapshotInfo{}, snapshotMetadata{}, nil, fmt.Errorf("inode %d has invalid size", inode.Number)
+			}
+			objects[inode.Object] = inode.Size
+		}
+	}
+	for _, entry := range entries {
+		metadata.Entries = append(metadata.Entries, snapshotDirectoryEntry{Parent: entry.Parent, DirectoryEntry: DirectoryEntry{Name: entry.Name, Inode: entry.Inode}})
+	}
+	return snapshot, metadata, objects, nil
 }
 
 // ExportSnapshot writes the immutable metadata and regular-file objects
@@ -320,15 +363,8 @@ func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (Sn
 	if err := requireSnapshotDirectory(source); err != nil {
 		return SnapshotInfo{}, err
 	}
-	var snapshot SnapshotInfo
-	if err := readJSON(filepath.Join(source, "snapshot.json"), &snapshot); err != nil {
-		return SnapshotInfo{}, err
-	}
-	if snapshot.FormatVersion != snapshotFormatVersion || !validID(snapshot.RepositoryID) || snapshot.NextInode <= rootInode {
-		return SnapshotInfo{}, errors.New("invalid remote branch snapshot identity")
-	}
-	var metadata snapshotMetadata
-	if err := readJSON(filepath.Join(source, "metadata.json"), &metadata); err != nil {
+	snapshot, metadata, _, err := readRemoteGraphSnapshot(source)
+	if err != nil {
 		return SnapshotInfo{}, err
 	}
 	return snapshot, r.withLock(func() error {
@@ -421,6 +457,9 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 	if err := requireSnapshotDirectory(source); err != nil {
 		return SnapshotInfo{}, err
 	}
+	if remote {
+		return r.importRemoteSnapshotMode(source, targetBranch)
+	}
 	snapshotPath := filepath.Join(source, "snapshot.json")
 	if err := requireSnapshotRegularFile(snapshotPath); err != nil {
 		return SnapshotInfo{}, err
@@ -449,13 +488,6 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 		if _, exists := inodes[inode.Number]; exists {
 			return SnapshotInfo{}, fmt.Errorf("duplicate snapshot inode %d", inode.Number)
 		}
-		if remote && inode.Type == "regular" {
-			// The sparse imported object is immutable inherited data. Force the
-			// first writable open through ensurePrivate regardless of whether a
-			// source generation number happens to equal the new repository's
-			// initial generation.
-			inode.DataGeneration = 0
-		}
 		inodes[inode.Number] = inode
 		if inode.Object != "" {
 			if !validObjectID(inode.Object) {
@@ -465,13 +497,6 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 				return SnapshotInfo{}, fmt.Errorf("object %q has inconsistent sizes %d and %d", inode.Object, previous, inode.Size)
 			}
 			objects[inode.Object] = inode.Size
-		}
-	}
-	if remote {
-		for i := range metadata.Inodes {
-			if metadata.Inodes[i].Type == "regular" {
-				metadata.Inodes[i].DataGeneration = 0
-			}
 		}
 	}
 	if _, ok := inodes[rootInode]; !ok {
@@ -548,10 +573,60 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 	if err := flush(); err != nil {
 		return SnapshotInfo{}, err
 	}
-	if remote {
-		if err := r.sealRemoteImport(&branch, state); err != nil {
+	if err := r.writeBranch(branch); err != nil {
+		return SnapshotInfo{}, err
+	}
+	return snapshot, nil
+}
+
+func (r *Repository) importRemoteSnapshotMode(source, targetBranch string) (SnapshotInfo, error) {
+	snapshot, metadata, objects, err := readRemoteGraphSnapshot(source)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	for i := range metadata.Inodes {
+		if metadata.Inodes[i].Type == "regular" {
+			metadata.Inodes[i].DataGeneration = 0
+		}
+	}
+	branch, err := r.readBranch(targetBranch)
+	if errors.Is(err, os.ErrNotExist) {
+		working, allocErr := r.graph.AllocateWorking()
+		if allocErr != nil {
+			return SnapshotInfo{}, allocErr
+		}
+		branch = Branch{ID: targetBranch, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+	} else if err != nil {
+		return SnapshotInfo{}, err
+	}
+	if err := r.importGraphFiles(&metadata, "", objects, ttcsnapshot.SnapshotID(branch.WorkingSnapshot), true); err != nil {
+		return SnapshotInfo{}, err
+	}
+	if snapshot.NextInode > r.info.NextInode {
+		r.info.NextInode = snapshot.NextInode
+		if err := writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "volume.json"), r.info); err != nil {
 			return SnapshotInfo{}, err
 		}
+	}
+	state := newBranchMetadata(branch)
+	ops := make([]metadataOp, 0, len(metadata.Inodes)+len(metadata.Entries))
+	for i := range metadata.Inodes {
+		ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &metadata.Inodes[i]})
+	}
+	for i := range metadata.Entries {
+		entry := &metadata.Entries[i]
+		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: entry.Parent, Entry: &entry.DirectoryEntry})
+	}
+	const batch = 1000
+	for len(ops) != 0 {
+		count := min(len(ops), batch)
+		if err := r.commitMetadata(&branch, state, ops[:count]); err != nil {
+			return SnapshotInfo{}, err
+		}
+		ops = ops[count:]
+	}
+	if err := r.sealRemoteImport(&branch, state); err != nil {
+		return SnapshotInfo{}, err
 	}
 	if err := r.writeBranch(branch); err != nil {
 		return SnapshotInfo{}, err

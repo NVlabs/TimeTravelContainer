@@ -38,6 +38,7 @@ type FilesystemCatalog interface {
 	FilesystemInode(ObjectID, uint64) (InodeRecord, bool, error)
 	FilesystemLookup(ObjectID, uint64, string) (DirectoryEntryRecord, bool, error)
 	FilesystemDirectory(ObjectID, uint64) ([]DirectoryEntryRecord, error)
+	FilesystemRecords(ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error)
 }
 
 // ImmutableCatalog is a structurally validated read-only object catalog. It
@@ -150,6 +151,13 @@ func (catalog *ImmutableCatalog) FilesystemLookup(root ObjectID, parent uint64, 
 // FilesystemDirectory lists one immutable directory from this catalog.
 func (catalog *ImmutableCatalog) FilesystemDirectory(root ObjectID, parent uint64) ([]DirectoryEntryRecord, error) {
 	return filesystemDirectoryObjects(root, parent, catalog.Object)
+}
+
+// FilesystemRecords returns a decoded immutable filesystem. This is reserved
+// for explicit portable export and transitional adapters; live lookups should
+// use the point and single-directory methods above.
+func (catalog *ImmutableCatalog) FilesystemRecords(root ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
+	return filesystemRecordsObjects(root, catalog.Object)
 }
 
 // MemoryPages enumerates one fixed-height memory radix tree.

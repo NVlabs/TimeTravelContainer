@@ -2460,6 +2460,39 @@ type ObjectCatalog interface {
 	Object(ObjectID) (Object, bool)
 }
 
+// ReachableObjects returns a stable copy of the immutable metadata graph
+// reachable from roots. It is intended for explicit metadata transfer and
+// validation; it never reads bulk file or memory bytes.
+func ReachableObjects(catalog ObjectCatalog, roots []ObjectID) ([]Object, error) {
+	if catalog == nil || len(roots) == 0 {
+		return nil, errors.New("TTC snapshot catalog and root are required")
+	}
+	objects := make(map[string]Object)
+	stack := append([]ObjectID(nil), roots...)
+	for len(stack) != 0 {
+		index := len(stack) - 1
+		id := stack[index]
+		stack = stack[:index]
+		if _, ok := objects[id.key()]; ok {
+			continue
+		}
+		object, ok := catalog.Object(id)
+		if !ok || object.State != ObjectLive {
+			return nil, fmt.Errorf("reachable TTC object %s is missing or not live", id)
+		}
+		objects[id.key()] = cloneObject(object)
+		for _, edge := range object.Children {
+			stack = append(stack, edge.Child)
+		}
+	}
+	result := make([]Object, 0, len(objects))
+	for _, object := range objects {
+		result = append(result, object)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID.key() < result[j].ID.key() })
+	return result, nil
+}
+
 // ReachableBulkObjects returns every bulk object reachable from roots, keyed
 // by immutable object identity. Metadata nodes are traversed but contribute no
 // bytes. Missing or reclaiming objects fail closed instead of under-reporting

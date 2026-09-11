@@ -93,6 +93,23 @@ func TestResolveImmutableCatalogFollowsOriginEdgesOnce(t *testing.T) {
 	}
 }
 
+func TestReachableObjectsExcludesUnrelatedOriginObjects(t *testing.T) {
+	leaf := Object{ID: ObjectID{Snapshot: 1, Kind: ObjectKindFile, Ordinal: 1}, State: ObjectLive, Refs: 1, BulkLength: 4}
+	root := Object{ID: ObjectID{Snapshot: 2, Kind: ObjectKindMetadata, Ordinal: 1}, State: ObjectLive, Refs: 1, Children: []Edge{{Slot: 0, Child: leaf.ID}}}
+	unrelated := Object{ID: ObjectID{Snapshot: 2, Kind: ObjectKindFile, Ordinal: 2}, State: ObjectLive, Refs: 1, BulkLength: 9}
+	catalog, err := NewImmutableCatalog([]Object{leaf, root, unrelated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := ReachableObjects(catalog, []ObjectID{root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 || objects[0].ID != leaf.ID || objects[1].ID != root.ID {
+		t.Fatalf("reachable objects = %+v, want leaf and root only", objects)
+	}
+}
+
 func TestImmutableCatalogReadsFilesystemWithoutOwningReferences(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()

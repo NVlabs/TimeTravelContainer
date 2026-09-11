@@ -547,7 +547,14 @@ func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(O
 func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rootObject, ok := s.state.Objects[rootID.key()]
+	return filesystemRecordsObjects(rootID, func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object, bool)) ([]InodeRecord, []DirectoryEntryRecord, error) {
+	rootObject, ok := objectFor(rootID)
 	if !ok {
 		return nil, nil, fmt.Errorf("filesystem root %s is missing", rootID.key())
 	}
@@ -557,7 +564,7 @@ func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEn
 	}
 	var inodeIDs []ObjectID
 	if !root.inodes.IsZero() {
-		inodeIDs, err = bTreeValuesState(s.state, root.inodes, ObjectKindInodeNode)
+		inodeIDs, err = bTreeValuesObjects(root.inodes, ObjectKindInodeNode, objectFor)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -565,7 +572,7 @@ func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEn
 	inodes := make([]InodeRecord, 0, len(inodeIDs))
 	var entries []DirectoryEntryRecord
 	for _, id := range inodeIDs {
-		object, ok := s.state.Objects[id.key()]
+		object, ok := objectFor(id)
 		if !ok || object.ID.Kind != ObjectKindInode {
 			return nil, nil, fmt.Errorf("inode tree references missing or invalid object %s", id.key())
 		}
@@ -577,12 +584,12 @@ func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEn
 		if inode.Directory.IsZero() {
 			continue
 		}
-		entryIDs, err := bTreeValuesState(s.state, inode.Directory, ObjectKindDirectoryNode)
+		entryIDs, err := bTreeValuesObjects(inode.Directory, ObjectKindDirectoryNode, objectFor)
 		if err != nil {
 			return nil, nil, err
 		}
 		for _, entryID := range entryIDs {
-			entryObject, ok := s.state.Objects[entryID.key()]
+			entryObject, ok := objectFor(entryID)
 			if !ok || entryObject.ID.Kind != ObjectKindMetadata {
 				return nil, nil, fmt.Errorf("directory tree references missing or invalid object %s", entryID.key())
 			}
@@ -604,13 +611,20 @@ func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEn
 }
 
 func bTreeValuesState(state graphState, root ObjectID, kind ObjectKind) ([]ObjectID, error) {
+	return bTreeValuesObjects(root, kind, func(id ObjectID) (Object, bool) {
+		object, ok := state.Objects[id.key()]
+		return object, ok
+	})
+}
+
+func bTreeValuesObjects(root ObjectID, kind ObjectKind, objectFor func(ObjectID) (Object, bool)) ([]ObjectID, error) {
 	var values []ObjectID
 	var visit func(ObjectID, int) error
 	visit = func(id ObjectID, depth int) error {
 		if depth >= bTreeMaxDepth {
 			return errors.New("TTC B-tree exceeds maximum structural depth")
 		}
-		object, ok := state.Objects[id.key()]
+		object, ok := objectFor(id)
 		if !ok {
 			return fmt.Errorf("TTC B-tree node %s is missing", id.key())
 		}
