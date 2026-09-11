@@ -202,6 +202,13 @@ parse error, stale distributed-stream mode state, and missing synchronization
 around restored FUSE caches, packet-mmap ranges, and iptables reaper state.
 The focused runtime suites for the graph, volume, FUSE, network stack, cluster,
 and command layers pass after these corrections.
+The control-plane interruption matrix now commits each reservation, session
+binding, restore-complete, publication, drain, and independence transition and
+then loses its response. Reopening the catalog and replaying the original
+request neither repeats target-local work nor loses the committed transition.
+This test also exposed and closed a migration-specific ordering hole: physical
+publication and a replayed Publish remain paused until Raft has committed the
+placement cutover.
 
 ## Goals
 

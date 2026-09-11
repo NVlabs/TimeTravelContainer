@@ -328,6 +328,7 @@ func TestImmutableObjectProviderStreamsExactObject(t *testing.T) {
 
 type testTargetRuntime struct {
 	mu            sync.Mutex
+	reserved      int
 	prepared      int
 	published     int
 	activated     int
@@ -353,6 +354,52 @@ func (s *atomicTestTransactionStore) PublishTarget(id string, revision uint64, d
 	return nil, errors.New("unexpected fork publication in migration test")
 }
 
+// lostResponseTransactionStore commits one selected mutation and then models
+// the daemon or HTTP connection disappearing before its response arrives.
+type lostResponseTransactionStore struct {
+	TransactionCatalog
+	failAdvance TransactionState
+	failBind    bool
+	failPublish bool
+	failIndep   bool
+}
+
+func (s *lostResponseTransactionStore) Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error) {
+	tx, err := s.TransactionCatalog.Advance(id, revision, next, failure, now)
+	if err == nil && s.failAdvance == next {
+		s.failAdvance = ""
+		return nil, io.ErrUnexpectedEOF
+	}
+	return tx, err
+}
+
+func (s *lostResponseTransactionStore) BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error) {
+	tx, err := s.TransactionCatalog.BindSession(id, revision, digest, filesystemPack, now)
+	if err == nil && s.failBind {
+		s.failBind = false
+		return nil, io.ErrUnexpectedEOF
+	}
+	return tx, err
+}
+
+func (s *lostResponseTransactionStore) Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error) {
+	tx, err := s.TransactionCatalog.Publish(id, revision, desiredPaused, activated, now)
+	if err == nil && s.failPublish {
+		s.failPublish = false
+		return nil, io.ErrUnexpectedEOF
+	}
+	return tx, err
+}
+
+func (s *lostResponseTransactionStore) AdvanceIndependent(id string, revision uint64, metrics TransferMetrics, now time.Time) (*Transaction, error) {
+	tx, err := s.TransactionCatalog.AdvanceIndependent(id, revision, metrics, now)
+	if err == nil && s.failIndep {
+		s.failIndep = false
+		return nil, io.ErrUnexpectedEOF
+	}
+	return tx, err
+}
+
 func (s *staleReservationStore) Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error) {
 	if next == TransactionTargetReserved {
 		injected := false
@@ -367,7 +414,12 @@ func (s *staleReservationStore) Advance(id string, revision uint64, next Transac
 	return s.TransactionCatalog.Advance(id, revision, next, failure, now)
 }
 
-func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error { return nil }
+func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reserved++
+	return nil
+}
 
 func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error {
 	r.mu.Lock()
@@ -780,6 +832,116 @@ func TestMigrationPublishRetryCannotActivateBeforeCutover(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if runtime.published != 1 || runtime.activated != 0 {
 		t.Fatalf("runtime calls after publish retry: %+v", runtime)
+	}
+}
+
+func TestTransactionLostResponsesRecoverAtEveryPersistentBoundary(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "transactions")
+	runtime := &testTargetRuntime{}
+	start := func(catalog TransactionCatalog) (*Client, func()) {
+		t.Helper()
+		server := httptest.NewServer(&ControlPlane{
+			Capabilities: testCapabilities("target"), Store: catalog,
+			MaxTransactions: 1, Now: time.Now, TargetRuntime: runtime,
+		})
+		client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+		if err != nil {
+			server.Close()
+			t.Fatal(err)
+		}
+		return client, server.Close
+	}
+	reopen := func() *Store {
+		t.Helper()
+		store, err := OpenStore(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()}
+
+	// Target reservation committed, but the first daemon disappeared before
+	// acknowledging it. The handler resolves the committed state immediately,
+	// and a replacement daemon must not reserve twice.
+	client, stop := start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failAdvance: TransactionTargetReserved})
+	tx, err := client.Reserve(context.Background(), request)
+	if err != nil || tx.State != TransactionTargetReserved {
+		t.Fatalf("reservation response recovery=%+v err=%v", tx, err)
+	}
+	stop()
+	client, stop = start(reopen())
+	tx, err = client.Reserve(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop()
+
+	session := RemoteSessionDescriptor{
+		Address: "10.0.0.1:12345", SnapshotToken: strings.Repeat("ab", 16),
+		MetadataBytes: 1 << 20, StreamBytes: 8 << 20, MaxTransferBytes: 64 << 10,
+	}
+	// Session binding and runtime-restore completion are separate durable
+	// boundaries. Lose each response, reopen the catalog, and replay the same
+	// original request/revision.
+	client, stop = start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failBind: true})
+	if _, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session); err == nil {
+		t.Fatal("session binding with lost response unexpectedly succeeded")
+	}
+	stop()
+	client, stop = start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failAdvance: TransactionTargetPaused})
+	if _, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session); err == nil {
+		t.Fatal("restore completion with lost response unexpectedly succeeded")
+	}
+	stop()
+	client, stop = start(reopen())
+	prepared, err := client.Prepare(context.Background(), tx.Identity.TransactionID, tx.Revision, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop()
+
+	client, stop = start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failPublish: true})
+	if _, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, false); err == nil {
+		t.Fatal("publication with lost response unexpectedly succeeded")
+	}
+	stop()
+	client, stop = start(reopen())
+	published, err := client.Publish(context.Background(), tx.Identity.TransactionID, prepared.Revision, false)
+	if err != nil || published.State != TransactionPublished {
+		t.Fatalf("publication recovery=%+v err=%v", published, err)
+	}
+	stop()
+
+	client, stop = start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failAdvance: TransactionDraining})
+	if _, err := client.Drain(context.Background(), tx.Identity.TransactionID, published.Revision); err == nil {
+		t.Fatal("drain with lost response unexpectedly succeeded")
+	}
+	stop()
+	client, stop = start(reopen())
+	draining, err := client.Drain(context.Background(), tx.Identity.TransactionID, published.Revision)
+	if err != nil || draining.State != TransactionDraining {
+		t.Fatalf("drain recovery=%+v err=%v", draining, err)
+	}
+	stop()
+
+	metrics := TransferMetrics{PullRequests: 1, PullBytes: 4096, PagesTotal: 1, PagesReleased: 1}
+	client, stop = start(&lostResponseTransactionStore{TransactionCatalog: reopen(), failIndep: true})
+	if _, err := client.MarkIndependentWithMetrics(context.Background(), tx.Identity.TransactionID, draining.Revision, metrics); err == nil {
+		t.Fatal("independence with lost response unexpectedly succeeded")
+	}
+	stop()
+	client, stop = start(reopen())
+	independent, err := client.MarkIndependentWithMetrics(context.Background(), tx.Identity.TransactionID, draining.Revision, metrics)
+	if err != nil || independent.State != TransactionIndependent || independent.SourceNeeded {
+		t.Fatalf("independence recovery=%+v err=%v", independent, err)
+	}
+	stop()
+
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.reserved != 1 || runtime.prepared != 1 || runtime.published != 1 || runtime.drained != 1 || runtime.independent != 1 {
+		t.Fatalf("runtime operations were not idempotent across response loss: %+v", runtime)
 	}
 }
 
