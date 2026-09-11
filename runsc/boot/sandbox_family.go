@@ -198,15 +198,10 @@ type DistributedForkServeArgs struct {
 	SessionID string
 }
 
-// DistributedForkExportArgs donates a destination for a durable packed page
-// snapshot. The destination is controlled by ttcd and never guest-visible.
+// DistributedForkExportArgs donates a destination for a graph capture stream.
 type DistributedForkExportArgs struct {
 	urpc.FilePayload
 	SessionID string
-	AllowCopy bool
-	// Graph writes the retained fork-time snapshot as a graph-capture stream.
-	// It is mutually exclusive with packed snapshot export.
-	Graph bool
 }
 
 // DistributedForkExportInfo identifies the filesystem branch captured at the
@@ -1001,8 +996,7 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	return session.server.ServeStream(conn)
 }
 
-// ExportDistributedForkSnapshot persists a session's immutable page stream in
-// the exact packed layout consumed by distributed restore.
+// ExportDistributedForkSnapshot writes a session's immutable memory graph.
 func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExportArgs) (*DistributedForkExportInfo, error) {
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return nil, errors.New("distributed snapshot export requires a session and one destination")
@@ -1012,9 +1006,6 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	f.mu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
-	}
-	if !args.Graph {
-		return nil, session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()

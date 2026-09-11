@@ -97,8 +97,6 @@ type TimeTravel struct {
 	distributedConnectionFD       int
 	distributedConnectionsStartFD int
 	distributedConnectionsCount   int
-	distributedSnapshotFD         int
-	distributedSnapshotAllowCopy  bool
 	distributedPrefetchBytes      uint64
 	distributedPrefetchBehind     uint64
 	distributedPushPolicy         string
@@ -190,8 +188,6 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
 	f.IntVar(&t.distributedConnectionsStartFD, "distributed-connections-start-fd", -1, "first inherited target page stream")
 	f.IntVar(&t.distributedConnectionsCount, "distributed-connections-count", 0, "number of inherited target page streams")
-	f.IntVar(&t.distributedSnapshotFD, "distributed-snapshot-fd", -1, "inherited durable distributed-memory snapshot")
-	f.BoolVar(&t.distributedSnapshotAllowCopy, "distributed-snapshot-allow-copy", false, "allow full copying when distributed snapshot reflinks are unsupported")
 	f.Uint64Var(&t.distributedPrefetchBytes, "distributed-prefetch-bytes", 0, "remote-memory bytes to prefetch after a fault")
 	f.Uint64Var(&t.distributedPrefetchBehind, "distributed-prefetch-behind-bytes", 0, "remote-memory bytes to prefetch before a fault")
 	f.StringVar(&t.distributedPushPolicy, "distributed-push-policy", "demand-only", "reverse push policy")
@@ -375,23 +371,15 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		})
 		connection.Close()
 	case "distributed-export":
-		fd := t.distributedSnapshotFD
-		name := "distributed-memory-snapshot"
-		graph := t.dehydrationGraphStreamFD >= 0
-		if graph {
-			fd = t.dehydrationGraphStreamFD
-			name = "distributed-graph-memory-stream"
+		if t.dehydrationGraphStreamFD < 0 {
+			util.Fatalf("--dehydration-graph-stream-fd is required")
 		}
-		if fd < 0 {
-			util.Fatalf("a distributed snapshot or graph stream FD is required")
-		}
-		snapshot := os.NewFile(uintptr(fd), name)
+		snapshot := os.NewFile(uintptr(t.dehydrationGraphStreamFD), "distributed-graph-memory-stream")
 		if snapshot == nil {
 			util.Fatalf("invalid distributed export FD")
 		}
 		output, err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
-			AllowCopy: t.distributedSnapshotAllowCopy, Graph: graph,
 		})
 		snapshot.Close()
 	case "distributed-status":
@@ -479,17 +467,6 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			}
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
 			defer metadata.Close()
-		}
-		if restoreArgs.SharedSnapshot {
-			if t.distributedSnapshotFD < 0 {
-				util.Fatalf("--distributed-snapshot-fd is required for shared distributed restore")
-			}
-			snapshot := os.NewFile(uintptr(t.distributedSnapshotFD), "distributed-shared-memory-snapshot")
-			if snapshot == nil {
-				util.Fatalf("invalid inherited distributed snapshot FD")
-			}
-			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, snapshot)
-			defer snapshot.Close()
 		}
 		if restoreArgs.GraphSparse {
 			if t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 {

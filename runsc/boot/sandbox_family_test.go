@@ -250,7 +250,7 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	graphExport, err := family.ExportDistributedForkSnapshot(&DistributedForkExportArgs{
-		FilePayload: urpc.FilePayload{Files: []*os.File{graphStream}}, SessionID: "tx-1", Graph: true,
+		FilePayload: urpc.FilePayload{Files: []*os.File{graphStream}}, SessionID: "tx-1",
 	})
 	if err != nil {
 		t.Fatalf("ExportDistributedForkSnapshot graph: %v", err)

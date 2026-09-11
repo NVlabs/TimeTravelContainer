@@ -61,9 +61,6 @@ type DistributedForkRestoreArgs struct {
 	AckBatchPages       int
 	AckInterval         time.Duration
 	PushPolicy          ttcremote.TCPPushPolicy
-	// SharedSnapshot selects the first donated file as an immutable packed
-	// memory stream. Network connections are then used only to fetch metadata.
-	SharedSnapshot bool
 	// SharedMetadata selects the first donated file as an immutable
 	// SessionMetadata envelope. This removes the source-process dependency for
 	// forks of dehydrated branches.
@@ -137,17 +134,6 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			return nil, errors.New("distributed target is missing its shared metadata")
 		}
 		sharedMetadata = files[0]
-		files = files[1:]
-	}
-	var sharedSnapshot *os.File
-	if args.GraphSparse && args.SharedSnapshot {
-		return nil, errors.New("packed and sparse distributed snapshots are mutually exclusive")
-	}
-	if args.SharedSnapshot {
-		if len(files) == 0 {
-			return nil, errors.New("distributed target is missing its shared memory snapshot")
-		}
-		sharedSnapshot = files[0]
 		files = files[1:]
 	}
 	var graphManifest ttcchunk.Manifest
@@ -239,7 +225,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	donated = donated[args.FilesystemConnections:]
 	donatedMode = len(donated) != 0
 	var pushConn net.Conn
-	if !args.SharedSnapshot && !args.GraphSparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if !args.GraphSparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {
 			return nil, errors.New("distributed reverse push requires a dedicated donated stream")
 		}
@@ -293,16 +279,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
 	var reader stateio.AsyncReader
-	if args.SharedSnapshot {
-		if len(donated) != 0 {
-			return nil, fmt.Errorf("shared distributed snapshot has %d unused page connections", len(donated))
-		}
-		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
-		if err != nil {
-			return nil, fmt.Errorf("duplicating shared distributed snapshot: %w", err)
-		}
-		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
-	} else if args.GraphSparse {
+	if args.GraphSparse {
 		if len(donated) != 0 {
 			return nil, fmt.Errorf("graph distributed snapshot has %d unused page connections", len(donated))
 		}
@@ -525,13 +502,6 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 		sharedMetadata, files = files[0], files[1:]
 	}
-	var sharedSnapshot *os.File
-	if args.SharedSnapshot {
-		if len(files) == 0 {
-			return nil, errors.New("distributed peer is missing shared memory")
-		}
-		sharedSnapshot, files = files[0], files[1:]
-	}
 	var donated []net.Conn
 	for _, file := range files {
 		conn, err := ttcremote.NewDonatedTCPConn(file)
@@ -566,7 +536,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}
 	donated = donated[args.FilesystemConnections:]
 	var pushConn net.Conn
-	if !args.SharedSnapshot && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if len(donated) < 2 {
 			return nil, errors.New("distributed peer reverse push requires a dedicated donated stream")
 		}
@@ -611,16 +581,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
 	var reader stateio.AsyncReader
-	if args.SharedSnapshot {
-		if len(donated) != 0 {
-			return nil, fmt.Errorf("shared distributed peer snapshot has %d unused connections", len(donated))
-		}
-		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
-		if err != nil {
-			return nil, err
-		}
-		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
-	} else if len(donated) != 0 {
+	if len(donated) != 0 {
 		reader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
 		if err == nil {
 			donatedOwned = false

@@ -598,54 +598,6 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 	return len(configs), nil
 }
 
-func distributedSnapshotRelativePath(transactionID string) string {
-	return filepath.Join("cluster", "memory-snapshots", transactionID+".mem")
-}
-
-func (b *runtimeBackend) exportDistributedSnapshot(containerID, transactionID string) (string, error) {
-	if b.dataRoot == "" {
-		return "", errors.New("distributed snapshot export requires a TTC data root")
-	}
-	relative := distributedSnapshotRelativePath(transactionID)
-	directory := filepath.Join(b.dataRoot, filepath.Dir(relative))
-	if err := os.MkdirAll(directory, 0700); err != nil {
-		return "", fmt.Errorf("creating distributed snapshot directory: %w", err)
-	}
-	temp, err := os.CreateTemp(directory, ".snapshot-*")
-	if err != nil {
-		return "", fmt.Errorf("creating distributed memory snapshot: %w", err)
-	}
-	tempPath := temp.Name()
-	keep := false
-	defer func() {
-		_ = temp.Close()
-		if !keep {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	args := []string{"timetravel", "--distributed-snapshot-fd=3"}
-	if b.volumeCopyMode == ttcvolume.CopyModeFull {
-		args = append(args, "--distributed-snapshot-allow-copy")
-	}
-	args = append(args, containerID, "distributed-export", transactionID)
-	if _, err := b.commandWithFiles([]*os.File{temp}, args...); err != nil {
-		return "", fmt.Errorf("exporting durable distributed memory snapshot: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return "", fmt.Errorf("closing distributed memory snapshot: %w", err)
-	}
-	finalPath := filepath.Join(b.dataRoot, relative)
-	if err := os.Rename(tempPath, finalPath); err != nil {
-		return "", fmt.Errorf("publishing distributed memory snapshot: %w", err)
-	}
-	keep = true
-	if dir, err := os.Open(directory); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return relative, nil
-}
-
 // exportDistributedGraph publishes the fork-time memory retained by session
 // into a graph-native snapshot origin. The Sentry writes a bounded capture
 // stream directly to the daemon; no compatibility repository is created.
