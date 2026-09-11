@@ -66,15 +66,13 @@ type DurableDehydrationRestoreArgs struct {
 	// This lets siblings restored from the same durable manifest share the
 	// same resident host pages and retain 4 KiB CoW behavior.
 	ReusePeerApplicationMemoryFile bool
-	// Sparse uses Files as metadata and a memory source. GraphSparse selects an
-	// ephemeral manifest followed by the graph bulk-object directory; legacy
-	// sparse restore selects one compatibility repository directory.
-	Sparse            bool
-	GraphSparse       bool
-	GraphRemote       bool
-	GraphRemoteToken  ttcsnapshot.ObjectRelayToken
-	SparseRemote      bool
-	SparseRemoteToken ttcchunk.RemoteToken
+	// Sparse selects graph-native restore: an ephemeral manifest followed by
+	// the graph bulk-object directory and optional object relay. The name is
+	// retained temporarily while packed bootstrap restore is removed.
+	Sparse           bool
+	GraphSparse      bool
+	GraphRemote      bool
+	GraphRemoteToken ttcsnapshot.ObjectRelayToken
 	// FilesystemConnections is the number of donated, fenced range streams at
 	// the end of Files. They lazily populate sparse active object caches from a
 	// committed cold pack chain.
@@ -136,10 +134,8 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		if got, want := len(payloadMemoryFiles)-1, len(metadata.Memories); got != want {
 			return nil, fmt.Errorf("got %d dehydration snapshots, want %d", got, want)
 		}
-	} else if args.GraphSparse && (len(payloadMemoryFiles) != 3+boolInt(args.GraphRemote) || args.SparseRemote) {
+	} else if !args.GraphSparse || len(payloadMemoryFiles) != 3+boolInt(args.GraphRemote) {
 		return nil, errors.New("graph sparse dehydration restore requires metadata, manifest, object directory, and optional graph relay")
-	} else if !args.GraphSparse && (args.GraphRemote || len(payloadMemoryFiles) != 2+boolInt(args.SparseRemote) || metadata.SparseManifest == (ttcchunk.ManifestID{})) {
-		return nil, fmt.Errorf("sparse dehydration restore requires metadata and one repository")
 	}
 	if err := l.attachColdFilesystemSources(filesystemFiles, args.FilesystemToken, args.FilesystemBranch); err != nil {
 		return nil, err
@@ -236,7 +232,6 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	loadOptions := kernel.DurableDehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 		Quarantined: args.Quarantined, OverrideQuarantine: true,
-		SparseBranch:               args.FilesystemBranch,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: restoreMnts.fdmap,
 		ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 			return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
@@ -244,59 +239,36 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	}
 	var child *kernel.Kernel
 	if args.Sparse {
-		if args.GraphSparse {
-			manifestData, readErr := io.ReadAll(payloadMemoryFiles[1])
-			if readErr != nil {
-				return nil, fmt.Errorf("reading graph memory manifest: %w", readErr)
-			}
-			manifest, decodeErr := ttcchunk.DecodeManifest(manifestData, nil)
-			if decodeErr != nil {
-				return nil, fmt.Errorf("decoding graph memory manifest: %w", decodeErr)
-			}
-			chunks, chunksErr := ttcchunk.GraphChunkObjects(manifest)
-			if chunksErr != nil {
-				return nil, chunksErr
-			}
-			data, openErr := ttcsnapshot.OpenLocalDataStoreFD(payloadMemoryFiles[2])
-			if openErr != nil {
-				return nil, openErr
-			}
-			var remote *ttcsnapshot.ObjectRelayClient
-			if args.GraphRemote {
-				fd, dupErr := unix.Dup(int(payloadMemoryFiles[3].Fd()))
-				if dupErr != nil {
-					_ = data.Close()
-					return nil, dupErr
-				}
-				remote, openErr = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "ttc-graph-memory-stream"), args.GraphRemoteToken)
-				if openErr != nil {
-					_ = data.Close()
-					return nil, openErr
-				}
-			}
-			child, err = kernel.LoadGraphDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, manifest, chunks, data, remote, loadOptions)
-		} else {
-			repository, openErr := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
-			if openErr != nil {
-				for _, mf := range memoryFiles {
-					mf.Destroy()
-				}
-				return nil, openErr
-			}
-			if args.SparseRemote {
-				fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
-				if dupErr != nil {
-					_ = repository.Close()
-					return nil, dupErr
-				}
-				if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
-					_ = repository.Close()
-					return nil, attachErr
-				}
-			}
-			loadOptions.OwnSparseRepository = true
-			child, err = kernel.LoadSparseDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, repository, loadOptions)
+		manifestData, readErr := io.ReadAll(payloadMemoryFiles[1])
+		if readErr != nil {
+			return nil, fmt.Errorf("reading graph memory manifest: %w", readErr)
 		}
+		manifest, decodeErr := ttcchunk.DecodeManifest(manifestData, nil)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decoding graph memory manifest: %w", decodeErr)
+		}
+		chunks, chunksErr := ttcchunk.GraphChunkObjects(manifest)
+		if chunksErr != nil {
+			return nil, chunksErr
+		}
+		data, openErr := ttcsnapshot.OpenLocalDataStoreFD(payloadMemoryFiles[2])
+		if openErr != nil {
+			return nil, openErr
+		}
+		var remote *ttcsnapshot.ObjectRelayClient
+		if args.GraphRemote {
+			fd, dupErr := unix.Dup(int(payloadMemoryFiles[3].Fd()))
+			if dupErr != nil {
+				_ = data.Close()
+				return nil, dupErr
+			}
+			remote, openErr = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "ttc-graph-memory-stream"), args.GraphRemoteToken)
+			if openErr != nil {
+				_ = data.Close()
+				return nil, openErr
+			}
+		}
+		child, err = kernel.LoadGraphDurableDehydration(l.k.SupervisorContext(), p, metadata, memoryFiles, manifest, chunks, data, remote, loadOptions)
 	} else {
 		child, err = kernel.LoadDurableDehydration(l.k.SupervisorContext(), p, metadata, loadMemories, loadOptions)
 	}
@@ -408,17 +380,10 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 	n := len(metadata.Memories)
 	wantFiles := 1 + 2*n
 	if args.Sparse {
-		memorySources := 1
-		if args.GraphSparse {
-			if args.SparseRemote {
-				return nil, errors.New("graph dehydration peer restore cannot use a legacy sparse remote")
-			}
-			memorySources = 2 + boolInt(args.GraphRemote)
-		} else if args.GraphRemote {
-			return nil, errors.New("legacy sparse dehydration peer restore cannot use a graph remote")
-		} else {
-			memorySources += boolInt(args.SparseRemote)
+		if !args.GraphSparse {
+			return nil, errors.New("new-format dehydration peer restore requires graph memory")
 		}
+		memorySources := 2 + boolInt(args.GraphRemote)
 		wantFiles = 1 + memorySources + n
 		if args.ReusePeerApplicationMemoryFile {
 			wantFiles--
@@ -452,10 +417,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 		targetStart := 1 + n
 		if args.Sparse {
-			targetStart = 2 + boolInt(args.SparseRemote)
-			if args.GraphSparse {
-				targetStart = 3 + boolInt(args.GraphRemote)
-			}
+			targetStart = 3 + boolInt(args.GraphRemote)
 		}
 		targetIndex := targetStart + i
 		if args.Sparse && args.ReusePeerApplicationMemoryFile {
@@ -509,7 +471,6 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		loadOptions := kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
 			Quarantined: args.Quarantined, OverrideQuarantine: true,
-			SparseBranch:        args.FilesystemBranch,
 			FilesystemResources: resources, ConfigureNetwork: func(k *kernel.Kernel, stack inet.Stack) error {
 				return l.configureNetworkWithArgs(k, stack, args.NetworkArgs)
 			},
@@ -517,63 +478,37 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		var child *kernel.Kernel
 		var err error
 		if args.Sparse {
-			var repository *ttcchunk.MemoryRepository
-			var graphManifest ttcchunk.Manifest
-			var graphChunks map[ttcchunk.ID]ttcsnapshot.ObjectID
-			var graphData *ttcsnapshot.LocalDataStore
+			manifestData, readErr := io.ReadAll(args.FilePayload.Files[1])
+			if readErr != nil {
+				return nil, fmt.Errorf("reading graph peer memory manifest: %w", readErr)
+			}
+			graphManifest, readErr := ttcchunk.DecodeManifest(manifestData, nil)
+			if readErr != nil {
+				return nil, fmt.Errorf("decoding graph peer memory manifest: %w", readErr)
+			}
+			graphChunks, readErr := ttcchunk.GraphChunkObjects(graphManifest)
+			if readErr != nil {
+				return nil, readErr
+			}
+			graphData, readErr := ttcsnapshot.OpenLocalDataStoreFD(args.FilePayload.Files[2])
+			if readErr != nil {
+				return nil, readErr
+			}
 			var graphRemote *ttcsnapshot.ObjectRelayClient
-			if args.GraphSparse {
-				manifestData, readErr := io.ReadAll(args.FilePayload.Files[1])
-				if readErr != nil {
-					return nil, fmt.Errorf("reading graph peer memory manifest: %w", readErr)
+			if args.GraphRemote {
+				fd, dupErr := unix.Dup(int(args.FilePayload.Files[3].Fd()))
+				if dupErr != nil {
+					_ = graphData.Close()
+					return nil, dupErr
 				}
-				graphManifest, readErr = ttcchunk.DecodeManifest(manifestData, nil)
+				graphRemote, readErr = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "ttc-graph-peer-memory-stream"), args.GraphRemoteToken)
 				if readErr != nil {
-					return nil, fmt.Errorf("decoding graph peer memory manifest: %w", readErr)
-				}
-				graphChunks, readErr = ttcchunk.GraphChunkObjects(graphManifest)
-				if readErr != nil {
+					_ = graphData.Close()
 					return nil, readErr
-				}
-				graphData, readErr = ttcsnapshot.OpenLocalDataStoreFD(args.FilePayload.Files[2])
-				if readErr != nil {
-					return nil, readErr
-				}
-				if args.GraphRemote {
-					fd, dupErr := unix.Dup(int(args.FilePayload.Files[3].Fd()))
-					if dupErr != nil {
-						_ = graphData.Close()
-						return nil, dupErr
-					}
-					graphRemote, readErr = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "ttc-graph-peer-memory-stream"), args.GraphRemoteToken)
-					if readErr != nil {
-						_ = graphData.Close()
-						return nil, readErr
-					}
-				}
-			} else {
-				var openErr error
-				repository, openErr = ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[1])
-				if openErr != nil {
-					return nil, openErr
-				}
-				if args.SparseRemote {
-					fd, dupErr := unix.Dup(int(args.FilePayload.Files[2].Fd()))
-					if dupErr != nil {
-						_ = repository.Close()
-						return nil, dupErr
-					}
-					if attachErr := repository.AttachRemoteChunkSource(os.NewFile(uintptr(fd), "ttc-cold-peer-memory-stream"), args.SparseRemoteToken, metadata.SparseManifest); attachErr != nil {
-						_ = repository.Close()
-						return nil, attachErr
-					}
 				}
 			}
 			if args.ReusePeerApplicationMemoryFile {
 				if source.MemoryFile() == nil {
-					if repository != nil {
-						_ = repository.Close()
-					}
 					if graphData != nil {
 						_ = graphData.Close()
 					}
@@ -591,12 +526,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 				loadMemories[i].MemoryFile = nil
 			}
 			consumed = true
-			if args.GraphSparse {
-				child, err = kernel.LoadGraphDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, graphManifest, graphChunks, graphData, graphRemote, loadOptions)
-			} else {
-				loadOptions.OwnSparseRepository = true
-				child, err = kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, repository, loadOptions)
-			}
+			child, err = kernel.LoadGraphDurableDehydration(source.SupervisorContext(), source.Platform, metadata, memoryFiles, graphManifest, graphChunks, graphData, graphRemote, loadOptions)
 		} else {
 			consumed = true
 			child, err = kernel.LoadDurableDehydration(source.SupervisorContext(), source.Platform, metadata, loadMemories, loadOptions)

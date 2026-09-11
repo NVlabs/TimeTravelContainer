@@ -54,7 +54,6 @@ type DehydrationCapture struct {
 	MemoryImages        []DurableDehydrationMemory
 	SparseBindings      []pgalloc.CapturedPageBinding
 	SparseSnapshot      *pgalloc.RemoteSnapshot
-	SparseManifest      ttcchunk.ManifestID
 
 	reservations []*pgalloc.RemoteSnapshot
 	emptyOwners  []*pgalloc.MemoryFile
@@ -80,7 +79,6 @@ type DurableDehydrationMetadata struct {
 	Version        int                        `json:"version"`
 	KernelMetadata []byte                     `json:"kernel_metadata"`
 	Memories       []DurableDehydrationMemory `json:"memories"`
-	SparseManifest ttcchunk.ManifestID        `json:"sparse_manifest,omitempty"`
 }
 
 const durableDehydrationVersion = 1
@@ -122,9 +120,6 @@ type DurableDehydrationLoadOptions struct {
 	ConfigureNetwork           func(*Kernel, inet.Stack) error
 	MaxReadBytes               uint64
 	MaxParallel                int
-	OwnSparseRepository        bool
-	// SparseBranch names the durable retention root for per-chunk reclamation.
-	SparseBranch string
 }
 
 // WithDehydrationFilesystemResources exposes an active branch's process-local
@@ -332,36 +327,7 @@ func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
 	}
 	return DurableDehydrationMetadata{
 		Version: durableDehydrationVersion, KernelMetadata: append([]byte(nil), d.KernelMetadata...), Memories: memories,
-		SparseManifest: d.SparseManifest,
 	}
-}
-
-// PublishSparse persists the exact branch-reachable memory graph as immutable
-// 1 MiB objects. The coordinator installs the returned manifest as the durable
-// branch root after it has committed the corresponding control metadata.
-func (d *DehydrationCapture) PublishSparse(repository *ttcchunk.MemoryRepository) (ttcchunk.ManifestID, error) {
-	if d == nil || d.consumed || d.SparseSnapshot == nil || repository == nil {
-		return ttcchunk.ManifestID{}, errors.New("sparse dehydration publication is unavailable")
-	}
-	objects, bindings, err := ttcchunk.ReadSnapshot(d.SparseSnapshot, d.SparseBindings)
-	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	manifest, err := repository.Publish(objects, bindings)
-	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	if err := d.SparseSnapshot.Close(); err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	d.SparseSnapshot = nil
-	d.SparseManifest = manifest
-	if d.metadataFile != nil {
-		if err := writeDehydrationMetadata(d.metadataFile, d.DurableMetadata()); err != nil {
-			return ttcchunk.ManifestID{}, fmt.Errorf("updating sparse dehydration metadata: %w", err)
-		}
-	}
-	return manifest, nil
 }
 
 // PublishGraphStream sends the exact branch-reachable memory graph to the
@@ -378,7 +344,6 @@ func (d *DehydrationCapture) PublishGraphStream(writer io.Writer) error {
 		return err
 	}
 	d.SparseSnapshot = nil
-	d.SparseManifest = ttcchunk.ManifestID{}
 	if d.metadataFile != nil {
 		if err := writeDehydrationMetadata(d.metadataFile, d.DurableMetadata()); err != nil {
 			return fmt.Errorf("updating graph dehydration metadata: %w", err)
@@ -693,51 +658,6 @@ func LoadDurableDehydration(ctx context.Context, p platform.Platform, image Dura
 	}
 	child.Pause()
 	return child, nil
-}
-
-// LoadSparseDurableDehydration reconstructs a paused Kernel from an immutable
-// sparse manifest. memoryFiles must contain the application MemoryFile under
-// the zero ResourceID and every private MemoryFile named by the manifest. The
-// function consumes all MemoryFiles on success and failure.
-func LoadSparseDurableDehydration(ctx context.Context, p platform.Platform, image DurableDehydrationMetadata, memoryFiles map[checkpoint.ResourceID]*pgalloc.MemoryFile, repository *ttcchunk.MemoryRepository, opts DurableDehydrationLoadOptions) (*Kernel, error) {
-	if repository == nil || image.SparseManifest == (ttcchunk.ManifestID{}) {
-		for _, mf := range memoryFiles {
-			if mf != nil {
-				mf.Destroy()
-			}
-		}
-		return nil, errors.New("sparse durable dehydration load is missing its repository or manifest")
-	}
-	manifest, err := repository.LoadManifest(image.SparseManifest)
-	if err != nil {
-		for _, mf := range memoryFiles {
-			if mf != nil {
-				mf.Destroy()
-			}
-		}
-		return nil, fmt.Errorf("loading sparse dehydration manifest: %w", err)
-	}
-	source := sparseDehydrationSource{
-		manifest: manifest,
-		newReader: func(installed []ttcchunk.InstalledChunk) (sparseDehydrationReader, error) {
-			if opts.OwnSparseRepository && opts.SparseBranch != "" {
-				return ttcchunk.NewOwnedConsumingChunkReader(repository, installed, opts.SparseBranch, image.SparseManifest)
-			}
-			if opts.OwnSparseRepository {
-				return ttcchunk.NewOwnedChunkReader(repository, installed)
-			}
-			return ttcchunk.NewChunkReader(repository, installed)
-		},
-	}
-	if opts.OwnSparseRepository {
-		source.close = repository.Close
-	}
-	if opts.SparseBranch != "" {
-		source.markConsumed = func(objects []ttcchunk.ID) {
-			_ = repository.MarkConsumed(opts.SparseBranch, image.SparseManifest, objects)
-		}
-	}
-	return loadSparseDurableDehydration(ctx, p, image, memoryFiles, source, opts)
 }
 
 type sparseDehydrationReader interface {

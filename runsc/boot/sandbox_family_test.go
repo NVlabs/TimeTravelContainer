@@ -245,28 +245,6 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	if status.Snapshot.PagesOutstanding == 0 || status.Transport.MetadataBytesSent != uint64(len(encoded)) {
 		t.Fatalf("unexpected session status: %+v", status)
 	}
-	repositoryRoot := t.TempDir()
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repositoryDir, err := os.Open(repositoryRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exported, err := family.ExportDistributedForkSnapshot(&DistributedForkExportArgs{
-		FilePayload: urpc.FilePayload{Files: []*os.File{repositoryDir}}, SessionID: "tx-1", Sparse: true,
-	})
-	repositoryDir.Close()
-	if err != nil {
-		t.Fatalf("ExportDistributedForkSnapshot sparse: %v", err)
-	}
-	if exported.Manifest == (ttcchunk.ManifestID{}) || exported.FilesystemBranch != "remote-1" {
-		t.Fatalf("incomplete sparse export: %+v", exported)
-	}
-	if _, err := repository.LoadManifest(exported.Manifest); err != nil {
-		t.Fatalf("loading exported sparse manifest: %v", err)
-	}
 	graphStream, err := os.CreateTemp(t.TempDir(), "graph-capture-")
 	if err != nil {
 		t.Fatal(err)

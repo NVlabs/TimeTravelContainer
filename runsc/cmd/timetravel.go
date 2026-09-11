@@ -32,7 +32,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
@@ -82,7 +81,7 @@ type TimeTravel struct {
 	dehydrationSnapshotsStartFD   int
 	dehydrationSnapshotsCount     int
 	dehydrationSnapshotAllowCopy  bool
-	dehydrationMemoryRepositoryFD int
+	dehydrationGraphObjectsFD     int
 	dehydrationGraphStreamFD      int
 	dehydrationGraphManifestFD    int
 	dehydrationMemoryRemoteFD     int
@@ -178,7 +177,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationSnapshotsStartFD, "dehydration-snapshots-start-fd", -1, "first inherited dehydration snapshot destination")
 	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
 	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
-	f.IntVar(&t.dehydrationMemoryRepositoryFD, "dehydration-memory-repository-fd", -1, "inherited sparse dehydration memory repository directory")
+	f.IntVar(&t.dehydrationGraphObjectsFD, "dehydration-graph-objects-fd", -1, "inherited graph-native dehydration object directory")
 	f.IntVar(&t.dehydrationGraphStreamFD, "dehydration-graph-stream-fd", -1, "inherited graph-native dehydration capture stream")
 	f.IntVar(&t.dehydrationGraphManifestFD, "dehydration-graph-manifest-fd", -1, "inherited graph-native dehydration memory manifest")
 	f.IntVar(&t.dehydrationMemoryRemoteFD, "dehydration-memory-remote-fd", -1, "inherited cold memory chunk stream")
@@ -382,7 +381,6 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		})
 		connection.Close()
 	case "distributed-export":
-		sparse := t.dehydrationMemoryRepositoryFD >= 0
 		fd := t.distributedSnapshotFD
 		name := "distributed-memory-snapshot"
 		graph := t.dehydrationGraphStreamFD >= 0
@@ -390,15 +388,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			fd = t.dehydrationGraphStreamFD
 			name = "distributed-graph-memory-stream"
 		}
-		if sparse {
-			fd = t.dehydrationMemoryRepositoryFD
-			name = "distributed-memory-repository"
-		}
-		if graph && sparse {
-			util.Fatalf("--dehydration-graph-stream-fd and --dehydration-memory-repository-fd are mutually exclusive")
-		}
 		if fd < 0 {
-			util.Fatalf("a distributed snapshot or sparse repository FD is required")
+			util.Fatalf("a distributed snapshot or graph stream FD is required")
 		}
 		snapshot := os.NewFile(uintptr(fd), name)
 		if snapshot == nil {
@@ -406,7 +397,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
-			AllowCopy: t.distributedSnapshotAllowCopy, Sparse: sparse, Graph: graph,
+			AllowCopy: t.distributedSnapshotAllowCopy, Graph: graph,
 		})
 		snapshot.Close()
 	case "distributed-status":
@@ -420,15 +411,15 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "distributed-filesystem-drain":
 		err = cont.Sandbox.DrainDistributedForkFilesystems(f.Arg(2))
 	case "distributed-handoff":
-		if t.dehydrationGraphManifestFD < 0 || t.dehydrationMemoryRepositoryFD < 0 || t.distributedSessionID == "" {
-			util.Fatalf("graph handoff requires --dehydration-graph-manifest-fd, --dehydration-memory-repository-fd, and --distributed-session=<snapshot>")
+		if t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 || t.distributedSessionID == "" {
+			util.Fatalf("graph handoff requires --dehydration-graph-manifest-fd, --dehydration-graph-objects-fd, and --distributed-session=<snapshot>")
 		}
 		snapshot, parseErr := strconv.ParseUint(t.distributedSessionID, 10, 64)
 		if parseErr != nil || snapshot == 0 {
 			util.Fatalf("parsing distributed graph snapshot %q: %v", t.distributedSessionID, parseErr)
 		}
 		manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "distributed-handoff-graph-manifest")
-		objects := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-handoff-graph-objects")
+		objects := os.NewFile(uintptr(t.dehydrationGraphObjectsFD), "distributed-handoff-graph-objects")
 		if manifest == nil || objects == nil {
 			util.Fatalf("invalid distributed graph handoff descriptors")
 		}
@@ -506,23 +497,12 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, snapshot)
 			defer snapshot.Close()
 		}
-		if restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
-			if t.dehydrationMemoryRepositoryFD < 0 {
-				util.Fatalf("--dehydration-memory-repository-fd is required for sparse distributed restore")
-			}
-			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-sparse-memory-repository")
-			if repository == nil {
-				util.Fatalf("invalid inherited distributed sparse repository FD")
-			}
-			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
-			defer repository.Close()
-		}
 		if restoreArgs.GraphSparse {
-			if t.dehydrationGraphManifestFD < 0 || t.dehydrationMemoryRepositoryFD < 0 || restoreArgs.SparseManifest != (ttcchunk.ManifestID{}) {
+			if t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 {
 				util.Fatalf("graph distributed restore requires a graph manifest and object directory")
 			}
 			manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "distributed-graph-memory-manifest")
-			objects := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-graph-object-directory")
+			objects := os.NewFile(uintptr(t.dehydrationGraphObjectsFD), "distributed-graph-object-directory")
 			if manifest == nil || objects == nil {
 				util.Fatalf("invalid inherited distributed graph descriptors")
 			}
@@ -575,7 +555,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
 	case "dehydrate-export":
 		if t.dehydrationGraphStreamFD >= 0 {
-			if t.dehydrationMemoryRepositoryFD >= 0 || t.dehydrationSnapshotsCount != 0 {
+			if t.dehydrationGraphObjectsFD >= 0 || t.dehydrationSnapshotsCount != 0 {
 				util.Fatalf("graph dehydration stream cannot be combined with another export destination")
 			}
 			stream := os.NewFile(uintptr(t.dehydrationGraphStreamFD), "dehydration-graph-stream")
@@ -585,17 +565,6 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			defer stream.Close()
 			output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
 				FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, ID: f.Arg(2), GraphStream: true,
-			})
-			break
-		}
-		if t.dehydrationMemoryRepositoryFD >= 0 {
-			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-memory-repository")
-			if repository == nil {
-				util.Fatalf("invalid dehydration memory repository FD")
-			}
-			defer repository.Close()
-			output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
-				FilePayload: urpc.FilePayload{Files: []*os.File{repository}}, ID: f.Arg(2), Sparse: true,
 			})
 			break
 		}
@@ -646,7 +615,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
 		defer metadata.Close()
 		if restoreArgs.Sparse {
-			if t.dehydrationMemoryRepositoryFD < 0 || t.dehydrationSnapshotsCount != 0 || (restoreArgs.GraphSparse != (t.dehydrationGraphManifestFD >= 0)) {
+			if t.dehydrationGraphObjectsFD < 0 || t.dehydrationSnapshotsCount != 0 || (restoreArgs.GraphSparse != (t.dehydrationGraphManifestFD >= 0)) {
 				util.Fatalf("sparse dehydration restore requires a repository and no packed snapshots")
 			}
 			if restoreArgs.GraphSparse {
@@ -657,13 +626,13 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, manifest)
 				defer manifest.Close()
 			}
-			repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "dehydration-restore-memory-repository")
-			if repository == nil {
-				util.Fatalf("invalid dehydration memory repository FD")
+			objects := os.NewFile(uintptr(t.dehydrationGraphObjectsFD), "dehydration-restore-graph-objects")
+			if objects == nil {
+				util.Fatalf("invalid dehydration graph objects FD")
 			}
-			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, repository)
-			defer repository.Close()
-			if restoreArgs.SparseRemote || restoreArgs.GraphRemote {
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, objects)
+			defer objects.Close()
+			if restoreArgs.GraphRemote {
 				if t.dehydrationMemoryRemoteFD < 0 {
 					util.Fatalf("remote dehydration restore requires a cold memory stream")
 				}

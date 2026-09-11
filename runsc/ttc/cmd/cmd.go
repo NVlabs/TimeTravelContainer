@@ -10214,7 +10214,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			_ = os.RemoveAll(staging)
 			return nil, err
 		}
-		if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 || capture.SparseManifest != (ttcchunk.ManifestID{}) {
+		if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
 			_ = os.RemoveAll(staging)
 			return nil, errors.New("new-format dehydrated source is not graph-native")
 		}
@@ -11139,7 +11139,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
 		}
 		capture.SnapshotID = uint64(origin)
-		capture.SparseManifest = ttcchunk.ManifestID{}
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
 		}
@@ -11496,7 +11495,7 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 	}
 	if control, err := os.ReadFile(filepath.Join(sourceDir, "control.json")); err == nil {
 		var capture boot.BranchDehydrateInfo
-		if json.Unmarshal(control, &capture) == nil && (capture.SparseManifest != (ttcchunk.ManifestID{}) || len(capture.MemoryRoots) != 0) {
+		if json.Unmarshal(control, &capture) == nil && len(capture.MemoryRoots) != 0 {
 			if err := os.RemoveAll(sourceDir); err != nil {
 				if b.stderr != nil {
 					fmt.Fprintf(b.stderr, "ttc: warning: removing consumed sparse dehydration image for %s@%s: %v\n", containerID, branchID, err)
@@ -11573,7 +11572,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
 		return errors.New("dehydration control state is incomplete")
 	}
-	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 || capture.SparseManifest != (ttcchunk.ManifestID{}) {
+	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
 		return errors.New("new-format dehydration control state is not graph-native")
 	}
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
@@ -11661,7 +11660,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	files = append(files, graphRestore.manifest)
 	objectsFD := 3 + len(files)
 	files = append(files, graphRestore.objects)
-	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
 	if graphRestore.remote != nil {
 		remoteFD := 3 + len(files)
 		files = append(files, graphRestore.remote)
@@ -11968,7 +11967,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		files = append(files, graphRestore.manifest)
 		objectsFD := 3 + len(files)
 		files = append(files, graphRestore.objects)
-		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-memory-repository-fd=%d", objectsFD))
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
 		if graphRestore.remote != nil {
 			remoteFD := 3 + len(files)
 			files = append(files, graphRestore.remote)

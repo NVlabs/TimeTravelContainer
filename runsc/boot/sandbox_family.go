@@ -204,16 +204,14 @@ type DistributedForkExportArgs struct {
 	urpc.FilePayload
 	SessionID string
 	AllowCopy bool
-	Sparse    bool
 	// Graph writes the retained fork-time snapshot as a graph-capture stream.
-	// It is mutually exclusive with Sparse and packed snapshot export.
+	// It is mutually exclusive with packed snapshot export.
 	Graph bool
 }
 
-// DistributedForkExportInfo identifies a sparse distributed memory manifest
-// and the filesystem branch captured at the same instant.
+// DistributedForkExportInfo identifies the filesystem branch captured at the
+// same instant as a distributed memory export.
 type DistributedForkExportInfo struct {
-	Manifest         ttcchunk.ManifestID
 	FilesystemBranch string
 }
 
@@ -274,7 +272,6 @@ type BranchDehydrateInfo struct {
 	Resume           bool                          `json:"resume"`
 	ExecSessions     []ExecSessionInfo             `json:"exec_sessions,omitempty"`
 	FilesystemBranch string                        `json:"filesystem_branch"`
-	SparseManifest   ttcchunk.ManifestID           `json:"sparse_manifest,omitempty"`
 	SnapshotID       uint64                        `json:"snapshot_id,omitempty"`
 	MemoryRoots      []BranchMemoryRoot            `json:"memory_roots,omitempty"`
 }
@@ -293,14 +290,11 @@ type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
 	ID          string
 	AllowCopy   bool
-	Sparse      bool
 	GraphStream bool
 }
 
-// BranchDehydrationExportInfo identifies a published sparse memory root.
-type BranchDehydrationExportInfo struct {
-	Manifest ttcchunk.ManifestID `json:"manifest"`
-}
+// BranchDehydrationExportInfo is reserved for graph export metadata.
+type BranchDehydrationExportInfo struct{}
 
 // BranchProcessesArgs selects a container inside one live branch.
 type BranchProcessesArgs struct {
@@ -1016,16 +1010,13 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return nil, errors.New("distributed snapshot export requires a session and one destination")
 	}
-	if args.Graph && args.Sparse {
-		return nil, errors.New("distributed graph and legacy sparse export are mutually exclusive")
-	}
 	f.mu.Lock()
 	session := f.distributedSessions[args.SessionID]
 	f.mu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
 	}
-	if !args.Sparse && !args.Graph {
+	if !args.Graph {
 		return nil, session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
 	}
 	session.mu.Lock()
@@ -1033,29 +1024,10 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if session.sparseSnapshot == nil {
 		return nil, fmt.Errorf("distributed fork session %q sparse snapshot is unavailable", args.SessionID)
 	}
-	if args.Graph {
-		if err := ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings); err != nil {
-			return nil, fmt.Errorf("writing distributed graph capture: %w", err)
-		}
-		return &DistributedForkExportInfo{FilesystemBranch: session.filesystemBranch}, nil
+	if err := ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings); err != nil {
+		return nil, fmt.Errorf("writing distributed graph capture: %w", err)
 	}
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
-	}
-	defer repository.Close()
-	objects, bindings, err := ttcchunk.ReadSnapshot(session.sparseSnapshot, session.memoryBindings)
-	if err != nil {
-		return nil, err
-	}
-	manifest, err := repository.Publish(objects, bindings)
-	if err != nil {
-		return nil, err
-	}
-	// Keep sparseSnapshot until distributed-complete. This makes publication
-	// retryable after a ttcd crash between repository publication and the
-	// target's durable handoff record.
-	return &DistributedForkExportInfo{Manifest: manifest, FilesystemBranch: session.filesystemBranch}, nil
+	return &DistributedForkExportInfo{FilesystemBranch: session.filesystemBranch}, nil
 }
 
 // DistributedForkSessionStatus returns progress without disclosing the bearer
@@ -2200,7 +2172,7 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 	image := b.dehydration.image
 	f.mu.Unlock()
 	if args.GraphStream {
-		if args.Sparse || len(args.FilePayload.Files) != 1 {
+		if len(args.FilePayload.Files) != 1 {
 			return nil, fmt.Errorf("graph dehydration export has %d stream descriptors, want 1", len(args.FilePayload.Files))
 		}
 		if err := image.PublishGraphStream(args.FilePayload.Files[0]); err != nil {
@@ -2208,22 +2180,7 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 		}
 		return &BranchDehydrationExportInfo{}, nil
 	}
-	if !args.Sparse {
-		return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
-	}
-	if len(args.FilePayload.Files) != 1 {
-		return nil, fmt.Errorf("sparse dehydration export has %d repository descriptors, want 1", len(args.FilePayload.Files))
-	}
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return nil, fmt.Errorf("opening sparse memory repository: %w", err)
-	}
-	defer repository.Close()
-	manifest, err := image.PublishSparse(repository)
-	if err != nil {
-		return nil, err
-	}
-	return &BranchDehydrationExportInfo{Manifest: manifest}, nil
+	return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its

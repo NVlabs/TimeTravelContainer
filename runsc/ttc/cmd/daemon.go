@@ -680,7 +680,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			graphStartFD := 5
 			commandArgs = append(commandArgs,
 				"--dehydration-graph-manifest-fd="+strconv.Itoa(graphStartFD),
-				"--dehydration-memory-repository-fd="+strconv.Itoa(graphStartFD+1))
+				"--dehydration-graph-objects-fd="+strconv.Itoa(graphStartFD+1))
 			if restoreArgs.GraphRemote {
 				commandArgs = append(commandArgs, "--dehydration-memory-remote-fd="+strconv.Itoa(graphStartFD+2))
 			}
@@ -896,7 +896,7 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 	defer restore.close()
 	files := []*os.File{restore.manifest, restore.objects}
 	args := []string{
-		"timetravel", "--dehydration-graph-manifest-fd=3", "--dehydration-memory-repository-fd=4",
+		"timetravel", "--dehydration-graph-manifest-fd=3", "--dehydration-graph-objects-fd=4",
 		"--distributed-session=" + strconv.FormatUint(graph.GraphSnapshot, 10),
 	}
 	if restore.remote != nil {

@@ -80,7 +80,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -188,11 +187,8 @@ type Kernel struct {
 	// was ever there.
 	liveForkQuarantine bool
 	// remoteLoadRanges retain the packed-stream layout while remotePageLoad may
-	// be handed from a live source to shared sparse chunks.
+	// be handed from a live source to graph-native chunks.
 	remoteLoadRanges []pgalloc.RemoteLoadRange `state:"nosave"`
-	// remoteHandoffManifest makes daemon retries idempotent after a successful
-	// live-to-sparse reader switch.
-	remoteHandoffManifest ttcchunk.ManifestID `state:"nosave"`
 	// remoteHandoffSnapshot is the graph-native equivalent. Snapshot IDs are
 	// globally unique and make repeated control requests idempotent.
 	remoteHandoffSnapshot uint64 `state:"nosave"`
@@ -2466,7 +2462,6 @@ func (k *Kernel) Release() {
 		k.remotePageLoad = nil
 	}
 	k.remoteLoadRanges = nil
-	k.remoteHandoffManifest = ttcchunk.ManifestID{}
 	k.remoteHandoffSnapshot = 0
 	for _, load := range k.auxiliaryRemotePageLoads {
 		load.Cancel()
