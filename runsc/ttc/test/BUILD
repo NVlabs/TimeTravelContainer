@@ -78,6 +78,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts a three-voter cluster and deliberately kills the
+# source-node daemon and every runtime in its host session.
+sh_binary(
+    name = "e2e_distributed_source_loss",
+    srcs = ["e2e_distributed_source_loss.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
