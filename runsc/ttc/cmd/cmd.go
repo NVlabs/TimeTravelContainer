@@ -6440,14 +6440,25 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	if err := b.waitForPausedBootstrap(runtimeID, target.branch, 5*time.Second); err != nil {
 		return fmt.Errorf("waiting for paused bootstrap for %s: %w", target, err)
 	}
-	capture, metadata, snapshots, err := b.captureTransientBranch(runtimeID, target.branch, stagingDir)
+	capture, metadata, err := b.captureTransientBranch(runtimeID, target.branch, stagingDir)
 	if err != nil {
 		return fmt.Errorf("capturing paused bootstrap for %s: %w", target, err)
 	}
 	defer metadata.Close()
+	graphRoots := make([]string, len(capture.MemoryRoots))
+	graphObjects := make([]string, len(capture.MemoryRoots))
+	for i, root := range capture.MemoryRoots {
+		graphRoots[i] = root.Name
+		graphObjects[i] = root.Root
+	}
+	graphRecorded := false
 	defer func() {
-		for _, snapshot := range snapshots {
-			_ = snapshot.Close()
+		if graphRecorded {
+			return
+		}
+		_ = b.releaseGraphMemoryRoots(graphRoots)
+		if b.distributedSource != nil {
+			_ = b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(capture.SnapshotID))
 		}
 	}()
 	if _, err := b.command("delete", "--force", runtimeID); err != nil {
@@ -6474,10 +6485,22 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	} else {
 		return fmt.Errorf("querying active peers before starting %s: %w", target, err)
 	}
+	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.DistributedGraphReferenceOperation != "" {
+		return fmt.Errorf("fresh branch %s unexpectedly retains an older memory snapshot", target)
+	}
+	if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, capture.SnapshotID, graphRoots, graphObjects, ""); err != nil {
+		return fmt.Errorf("recording bootstrap memory graph for %s: %w", target, err)
+	}
+	defer func() {
+		if !graphRecorded {
+			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil, "")
+		}
+	}()
 	capture.Resume = true
-	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, snapshots, false); err != nil {
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, false); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
 	}
+	graphRecorded = true
 	return nil
 }
 
@@ -6513,70 +6536,84 @@ func (b *runtimeBackend) waitForPausedBootstrap(runtimeID, branchID string, time
 // captureTransientBranch exports one already-paused bootstrap branch into
 // short-lived files suitable for peer import. The caller owns the returned
 // open files and directory.
-func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir string) (boot.BranchDehydrateInfo, *os.File, []*os.File, error) {
+func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir string) (_ boot.BranchDehydrateInfo, _ *os.File, retErr error) {
 	metadataPath := filepath.Join(stagingDir, "metadata.state")
 	metadata, err := os.OpenFile(metadataPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
 	output, err := b.commandWithFiles([]*os.File{metadata}, "timetravel", "--dehydration-fd=3", runtimeID, "dehydrate", branchID)
 	if closeErr := metadata.Close(); err == nil && closeErr != nil {
 		err = closeErr
 	}
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
 	var capture boot.BranchDehydrateInfo
 	if err := json.Unmarshal(output, &capture); err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, fmt.Errorf("decoding bootstrap capture: %w", err)
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("decoding bootstrap capture: %w", err)
 	}
 	if len(capture.Memories) == 0 {
-		return boot.BranchDehydrateInfo{}, nil, nil, errors.New("bootstrap capture contains no memory images")
+		return boot.BranchDehydrateInfo{}, nil, errors.New("bootstrap capture contains no memory images")
 	}
-	exportFiles := make([]*os.File, 0, len(capture.Memories))
-	for i := range capture.Memories {
-		file, err := os.OpenFile(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		if err != nil {
-			for _, opened := range exportFiles {
-				_ = opened.Close()
-			}
-			return boot.BranchDehydrateInfo{}, nil, nil, err
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("allocating bootstrap snapshot origin: %w", err)
+	}
+	var roots []string
+	defer func() {
+		if retErr == nil {
+			return
 		}
-		exportFiles = append(exportFiles, file)
-	}
-	exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(exportFiles))}
-	if b.volumeCopyMode == ttcvolume.CopyModeFull {
-		exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
-	}
-	exportArgs = append(exportArgs, runtimeID, "dehydrate-export", branchID)
-	_, exportErr := b.commandWithFiles(exportFiles, exportArgs...)
-	for _, file := range exportFiles {
-		if closeErr := file.Close(); exportErr == nil && closeErr != nil {
-			exportErr = closeErr
+		if len(roots) != 0 {
+			_ = b.releaseGraphMemoryRoots(roots)
 		}
+		if b.distributedSource != nil {
+			_ = b.retireFailedGraphSnapshot(origin)
+		}
+	}()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
+	type graphImportOutcome struct {
+		result ttcchunk.GraphImportResult
+		err    error
+	}
+	imported := make(chan graphImportOutcome, 1)
+	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+	go func() {
+		result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+		_ = reader.Close()
+		imported <- graphImportOutcome{result: result, err: importErr}
+	}()
+	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", runtimeID, "dehydrate-export", branchID)
+	_ = writer.Close()
+	outcome := <-imported
 	if exportErr != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, exportErr
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("streaming graph-native bootstrap memory: %w", exportErr)
 	}
+	if outcome.err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("importing graph-native bootstrap memory: %w", outcome.err)
+	}
+	for _, root := range outcome.result.Roots {
+		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+			ResourceID: root.ResourceID,
+			Name:       root.Name,
+			Root:       root.Root.String(),
+		})
+		roots = append(roots, root.Name)
+	}
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("sealing bootstrap snapshot origin %d: %w", origin, err)
+	}
+	capture.SnapshotID = uint64(origin)
 	metadata, err = os.Open(metadataPath)
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
-	snapshots := make([]*os.File, 0, len(capture.Memories))
-	for i := range capture.Memories {
-		file, err := os.Open(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)))
-		if err != nil {
-			metadata.Close()
-			for _, opened := range snapshots {
-				_ = opened.Close()
-			}
-			return boot.BranchDehydrateInfo{}, nil, nil, err
-		}
-		snapshots = append(snapshots, file)
-	}
-	return capture, metadata, snapshots, nil
+	return capture, metadata, nil
 }
-
 func (b *runtimeBackend) finishPreservedPeerStart(info ttcbundle.ContainerInfo, target selector, detach, interactive bool) (int, error) {
 	b.signalLifecycleReady()
 	if detach {
@@ -11472,14 +11509,12 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
 }
 
-// retainRehydrationPageSource finalizes a consumed dehydration image after the
-// restored branch is committed. Sparse restores read immutable objects from
-// the family repository, so their per-branch control directory is removed.
-// Legacy packed restores retain their snapshot files under the active branch
-// because the on-demand readers may still have those files open.
+// retainRehydrationPageSource removes a consumed per-branch control image
+// after the graph-backed runtime is committed. All demand-loaded bulk memory
+// lives in the central graph object store, so no branch-local page source must
+// remain open or be moved beneath the active branch.
 //
-// Failure is a post-commit cleanup warning and must never roll back a live
-// branch or change its persistent state.
+// Failure is post-commit cleanup: report it without rolling back a live branch.
 func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch ttcbundle.BranchInfo, sourceDir string) {
 	branchID := branch.ID
 	if sourceDir == "" {
@@ -11493,44 +11528,17 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 		}
 		return
 	}
-	if control, err := os.ReadFile(filepath.Join(sourceDir, "control.json")); err == nil {
-		var capture boot.BranchDehydrateInfo
-		if json.Unmarshal(control, &capture) == nil && len(capture.MemoryRoots) != 0 {
-			if err := os.RemoveAll(sourceDir); err != nil {
-				if b.stderr != nil {
-					fmt.Fprintf(b.stderr, "ttc: warning: removing consumed sparse dehydration image for %s@%s: %v\n", containerID, branchID, err)
-				}
-				return
-			}
-			if dir, err := os.Open(filepath.Dir(sourceDir)); err == nil {
-				_ = dir.Sync()
-				_ = dir.Close()
-			}
-			return
-		}
-	}
-	activeDir := memoryBranchDir(b.activeDataRoot(), containerID, "active", branch)
-	if err := os.MkdirAll(activeDir, 0700); err != nil {
+	if err := os.RemoveAll(sourceDir); err != nil {
 		if b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
+			fmt.Fprintf(b.stderr, "ttc: warning: removing consumed dehydration image for %s@%s: %v\n", containerID, branchID, err)
 		}
 		return
 	}
-	destination := filepath.Join(activeDir, "dehydration-source")
-	if err := os.Rename(sourceDir, destination); err != nil {
-		if b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
-		}
-		return
-	}
-	for _, directory := range []string{filepath.Dir(sourceDir), activeDir} {
-		if dir, err := os.Open(directory); err == nil {
-			_ = dir.Sync()
-			_ = dir.Close()
-		}
+	if dir, err := os.Open(filepath.Dir(sourceDir)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 }
-
 func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
 	refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
 	if err != nil {
@@ -11581,7 +11589,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	defer metadata.Close()
 	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, nil, needsColdMaterialization)
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, needsColdMaterialization)
 	}
 	var relays *coldFilesystemRelays
 	if needsColdMaterialization {
@@ -11875,7 +11883,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	return restore, nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File, needsColdMaterialization bool) error {
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, needsColdMaterialization bool) error {
 	var relays *coldFilesystemRelays
 	var err error
 	if needsColdMaterialization {
@@ -11893,14 +11901,13 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 			_ = file.Close()
 		}
 	}()
-	graphSparse := len(capture.MemoryRoots) != 0
-	firstTarget := 0
-	if graphSparse {
-		// Graph restores install application chunks into the family's existing
-		// MemoryFile. Only private filesystem MemoryFiles need new donated backing
-		// files.
-		firstTarget = 1
+	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
+		return errors.New("new-format peer restore is not graph-native")
 	}
+	// Graph restores install application chunks into the family's existing
+	// MemoryFile. Only private filesystem MemoryFiles need new donated backing
+	// files.
+	firstTarget := 1
 	for i := firstTarget; i < len(capture.Memories); i++ {
 		fd, err := memutil.CreateMemFD(fmt.Sprintf("ttc-rehydration-memory-%04d", i), 0)
 		if err != nil {
@@ -11915,8 +11922,8 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: graphSparse, GraphSparse: graphSparse,
-		ReusePeerApplicationMemoryFile: graphSparse, Quarantined: branch.Quarantined,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: true, GraphSparse: true,
+		ReusePeerApplicationMemoryFile: true, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -11931,17 +11938,14 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		return err
 	}
 	restoreArgs.NetworkArgs = networkArgs
-	var graphRestore *graphMemoryRestore
-	if graphSparse {
-		graphRestore, err = b.openGraphMemoryRestore(capture)
-		if err != nil {
-			return err
-		}
-		defer graphRestore.close()
-		if graphRestore.remote != nil {
-			restoreArgs.GraphRemote = true
-			restoreArgs.GraphRemoteToken = graphRestore.token
-		}
+	graphRestore, err := b.openGraphMemoryRestore(capture)
+	if err != nil {
+		return err
+	}
+	defer graphRestore.close()
+	if graphRestore.remote != nil {
+		restoreArgs.GraphRemote = true
+		restoreArgs.GraphRemoteToken = graphRestore.token
 	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
@@ -11962,20 +11966,15 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
-	if graphSparse {
-		manifestFD := 3 + len(files)
-		files = append(files, graphRestore.manifest)
-		objectsFD := 3 + len(files)
-		files = append(files, graphRestore.objects)
-		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
-		if graphRestore.remote != nil {
-			remoteFD := 3 + len(files)
-			files = append(files, graphRestore.remote)
-			commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
-		}
-	} else {
-		files = append(files, snapshots...)
-		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
+	manifestFD := 3 + len(files)
+	files = append(files, graphRestore.manifest)
+	objectsFD := 3 + len(files)
+	files = append(files, graphRestore.objects)
+	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
+	if graphRestore.remote != nil {
+		remoteFD := 3 + len(files)
+		files = append(files, graphRestore.remote)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
 	}
 	targetStartFD := 3 + len(files)
 	files = append(files, targets...)

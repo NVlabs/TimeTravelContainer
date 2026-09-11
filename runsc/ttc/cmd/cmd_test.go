@@ -3222,7 +3222,7 @@ func TestDehydrationNetworkArgs(t *testing.T) {
 	}
 }
 
-func TestRetainRehydrationPageSource(t *testing.T) {
+func TestRemoveConsumedRehydrationPageSource(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		branch    string
@@ -3262,24 +3262,20 @@ func TestRetainRehydrationPageSource(t *testing.T) {
 			}
 			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
-				t.Fatalf("retaining page source warned: %s", stderr.String())
+				t.Fatalf("removing page source warned: %s", stderr.String())
 			}
 			if _, err := os.Lstat(sourceDir); !os.IsNotExist(err) {
 				t.Fatalf("source directory still exists: %v", err)
 			}
-			destination := filepath.Join(memoryRoot, "active", encodedBranch, "dehydration-source", "memory-0000.snapshot")
-			if got, err := os.ReadFile(destination); err != nil || string(got) != "lazy page data" {
-				t.Fatalf("retained snapshot=(%q, %v)", got, err)
-			}
 			got, err := io.ReadAll(openSnapshot)
 			if err != nil || string(got) != "lazy page data" {
-				t.Fatalf("open snapshot after rename=(%q, %v)", got, err)
+				t.Fatalf("open snapshot after unlink=(%q, %v)", got, err)
 			}
 
-			// The ownership transfer is idempotent after the source has moved.
+			// Cleanup is idempotent after the source has been removed.
 			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
-				t.Fatalf("repeated retention warned: %s", stderr.String())
+				t.Fatalf("repeated cleanup warned: %s", stderr.String())
 			}
 		})
 	}

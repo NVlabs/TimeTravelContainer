@@ -551,6 +551,39 @@ func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
 	}
 }
 
+func TestFreshDaemonRootAllowsOnlyActiveStartupLog(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "ttcd.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logInfo, err := logFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("reading startup root: entries=%v err=%v", entries, err)
+	}
+	if !freshDaemonRootEntryAllowed(entries[0], logInfo) {
+		t.Fatal("active startup log was not admitted")
+	}
+	other, err := os.CreateTemp(t.TempDir(), "other-log-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	otherInfo, err := other.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshDaemonRootEntryAllowed(entries[0], otherInfo) {
+		t.Fatal("stale startup log was admitted")
+	}
+}
+
 func TestDaemonStorageRootRejectsOldMarkerWithoutMutation(t *testing.T) {
 	for _, test := range []struct {
 		name    string

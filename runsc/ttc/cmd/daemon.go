@@ -2213,8 +2213,28 @@ type daemonRootMarker struct {
 
 const daemonRootMarkerTemporaryPrefix = ".ttc-root-format.tmp-"
 
-func freshDaemonRootEntryAllowed(entry os.DirEntry) bool {
-	return entry.Name() == "lost+found" || strings.HasPrefix(entry.Name(), daemonRootMarkerTemporaryPrefix) && entry.Type().IsRegular()
+func freshDaemonRootEntryAllowed(entry os.DirEntry, startupLog os.FileInfo) bool {
+	if entry.Name() == "lost+found" || strings.HasPrefix(entry.Name(), daemonRootMarkerTemporaryPrefix) && entry.Type().IsRegular() {
+		return true
+	}
+	// The thin client opens ttcd.log before exec so startup diagnostics survive
+	// a daemon failure. If TTC_SOCKET's directory is the new TTC_ROOT, that log
+	// is necessarily visible before the daemon can publish the format marker.
+	// Admit only the exact regular file currently attached to stderr; a stale
+	// or user-created ttcd.log must still make an unmarked root fail closed.
+	if entry.Name() != "ttcd.log" || startupLog == nil || !entry.Type().IsRegular() {
+		return false
+	}
+	info, err := entry.Info()
+	return err == nil && os.SameFile(info, startupLog)
+}
+
+func daemonStartupLogInfo() os.FileInfo {
+	info, err := os.Stat("/proc/self/fd/2")
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 func daemonRootMarkerFor(role, repositoryID, nodeID string) (daemonRootMarker, error) {
@@ -2291,8 +2311,9 @@ func inspectDaemonStorageRoot(root, role string) error {
 	if err != nil {
 		return err
 	}
+	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {
-		if !freshDaemonRootEntryAllowed(entry) {
+		if !freshDaemonRootEntryAllowed(entry, startupLog) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
 	}
@@ -2329,8 +2350,9 @@ func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
 	if err != nil {
 		return err
 	}
+	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {
-		if !freshDaemonRootEntryAllowed(entry) {
+		if !freshDaemonRootEntryAllowed(entry, startupLog) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
 	}
