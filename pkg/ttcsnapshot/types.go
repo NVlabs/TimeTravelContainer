@@ -17,6 +17,8 @@
 package ttcsnapshot
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -130,23 +132,32 @@ func (id ObjectID) validate() error {
 }
 
 func (id ObjectID) key() string {
-	return fmt.Sprintf("%016x-%02x-%016x", uint64(id.Snapshot), uint8(id.Kind), id.Ordinal)
+	var raw [17]byte
+	binary.BigEndian.PutUint64(raw[0:8], uint64(id.Snapshot))
+	raw[8] = byte(id.Kind)
+	binary.BigEndian.PutUint64(raw[9:17], id.Ordinal)
+	var encoded [36]byte
+	hex.Encode(encoded[0:16], raw[0:8])
+	encoded[16] = '-'
+	hex.Encode(encoded[17:19], raw[8:9])
+	encoded[19] = '-'
+	hex.Encode(encoded[20:36], raw[9:17])
+	return string(encoded[:])
 }
 
 func parseObjectKey(key string) (ObjectID, error) {
-	parts := strings.Split(key, "-")
-	if len(parts) != 3 {
+	if len(key) != 36 || key[16] != '-' || key[19] != '-' {
 		return ObjectID{}, fmt.Errorf("invalid TTC object key %q", key)
 	}
-	snapshot, err := strconv.ParseUint(parts[0], 16, 64)
+	snapshot, err := strconv.ParseUint(key[0:16], 16, 64)
 	if err != nil {
 		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
 	}
-	kind, err := strconv.ParseUint(parts[1], 16, 8)
+	kind, err := strconv.ParseUint(key[17:19], 16, 8)
 	if err != nil {
 		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
 	}
-	ordinal, err := strconv.ParseUint(parts[2], 16, 64)
+	ordinal, err := strconv.ParseUint(key[20:36], 16, 64)
 	if err != nil {
 		return ObjectID{}, fmt.Errorf("invalid TTC object key %q: %w", key, err)
 	}

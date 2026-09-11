@@ -426,6 +426,12 @@ func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (Sn
 			}
 			ops = ops[count:]
 		}
+		if err := r.flushMetadataBatchLocked(targetBranch); err != nil {
+			return err
+		}
+		state.mu.RLock()
+		branch = state.branch
+		state.mu.RUnlock()
 		if err := r.sealRemoteImport(&branch, state); err != nil {
 			return err
 		}
@@ -573,6 +579,12 @@ func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch
 	if err := flush(); err != nil {
 		return SnapshotInfo{}, err
 	}
+	if err := r.flushMetadataBatchLocked(targetBranch); err != nil {
+		return SnapshotInfo{}, err
+	}
+	state.mu.RLock()
+	branch = state.branch
+	state.mu.RUnlock()
 	if err := r.writeBranch(branch); err != nil {
 		return SnapshotInfo{}, err
 	}
@@ -625,6 +637,12 @@ func (r *Repository) importRemoteSnapshotMode(source, targetBranch string) (Snap
 		}
 		ops = ops[count:]
 	}
+	if err := r.flushMetadataBatchLocked(targetBranch); err != nil {
+		return SnapshotInfo{}, err
+	}
+	state.mu.RLock()
+	branch = state.branch
+	state.mu.RUnlock()
 	if err := r.sealRemoteImport(&branch, state); err != nil {
 		return SnapshotInfo{}, err
 	}

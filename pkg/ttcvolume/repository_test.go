@@ -338,7 +338,7 @@ func TestHardLinksTrackBranchLocalInodeObject(t *testing.T) {
 	}
 }
 
-func TestRepositoryReopensWithoutImport(t *testing.T) {
+func TestRepositoryReopensAfterDurabilityFenceWithoutImport(t *testing.T) {
 	root := t.TempDir()
 	manager, err := OpenManager(root)
 	if err != nil {
@@ -353,6 +353,12 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, repo, "main", ino, "persisted", 0)
+	// A second Repository instance cannot observe this process's bounded live
+	// metadata batch until an ordinary filesystem durability boundary publishes
+	// it to the immutable graph.
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
 	id := repo.Info().ID
 
 	manager, err = OpenManager(root)
@@ -371,6 +377,53 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 	}
 	if matches, err := filepath.Glob(filepath.Join(root, "filesystems", "volumes", id, "*.tar")); err != nil || len(matches) != 0 {
 		t.Fatalf("unexpected tar persistence: matches=%v err=%v", matches, err)
+	}
+}
+
+func TestMetadataBatchDropsDeletedTransientSubtree(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := repo.CreateDirectory("main", rootInode, "temporary", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular("main", dir, "payload", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, "main", ino, "discarded", 0)
+	if err := repo.Unlink("main", dir, "payload"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReapOrphan("main", ino); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RemoveDirectory("main", rootInode, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Lookup("main", rootInode, "temporary"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted transient directory lookup: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if _, err := repo.Lookup("main", rootInode, "temporary"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replayed transient directory lookup: %v", err)
 	}
 }
 

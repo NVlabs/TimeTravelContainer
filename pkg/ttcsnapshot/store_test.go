@@ -1298,6 +1298,57 @@ func TestFilesystemAtomicMetadataAndDeletion(t *testing.T) {
 	}
 }
 
+func TestFilesystemLargeBatchCopiesEachTreePathOnce(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const files = 512
+	rootInode := InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}
+	operations := []FilesystemOperation{{PutInode: &rootInode}}
+	for index := 0; index < files; index++ {
+		inode := InodeRecord{Number: uint64(index + 2), Type: "regular", Mode: 0644, Nlink: 1}
+		entry := DirectoryEntryRecord{Parent: 1, Name: fmt.Sprintf("file-%04d", index), Inode: inode.Number}
+		operations = append(operations, FilesystemOperation{PutInode: &inode}, FilesystemOperation{PutEntry: &entry})
+	}
+	root, err := store.ApplyFilesystem(origin, "branch/main/filesystem", operations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := store.FilesystemDirectory(root, 1); err != nil || len(entries) != files {
+		t.Fatalf("directory entries=%d err=%v, want %d", len(entries), err, files)
+	}
+	// One inode value and one directory-entry value per file dominate this
+	// graph. A generous linear bound catches accidental per-operation path-copy
+	// chains without depending on exact B-tree packing.
+	if objects := store.Stats().Objects; objects > 3*files {
+		t.Fatalf("batched filesystem created %d live objects for %d files", objects, files)
+	}
+	if err := store.Verify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	replayed, ok := store.Root("branch/main/filesystem")
+	if !ok || replayed != root {
+		t.Fatalf("replayed root=(%s,%t), want %s", replayed, ok, root)
+	}
+	if entry, ok, err := store.FilesystemLookup(replayed, 1, "file-0511"); err != nil || !ok || entry.Inode != 513 {
+		t.Fatalf("replayed lookup=(%+v,%t,%v)", entry, ok, err)
+	}
+}
+
 func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	dir := t.TempDir()
 	graph, err := Open(filepath.Join(dir, "graph"))

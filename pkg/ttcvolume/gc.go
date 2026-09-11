@@ -40,6 +40,9 @@ func (r *Repository) GarbageCollect() error {
 }
 
 func (r *Repository) garbageCollectLocked() error {
+	if err := r.flushAllMetadataBatchesLocked(); err != nil {
+		return fmt.Errorf("publishing metadata before garbage collection: %w", err)
+	}
 	branchDir := filepath.Join(r.path, "branches")
 	entries, err := os.ReadDir(branchDir)
 	if err != nil {
@@ -91,5 +94,20 @@ func (r *Repository) garbageCollectLocked() error {
 	if err != nil {
 		return err
 	}
+	// ReclaimUnreferenced may remove objects dirtied before their branch was
+	// deleted. Drop only bookkeeping whose graph object is now absent; a later
+	// durability fence must not try to reopen reclaimed payloads.
+	r.dirtyMu.Lock()
+	for name := range r.dirtyData {
+		id, parseErr := ttcsnapshot.ParseObjectID(name)
+		if parseErr != nil {
+			continue
+		}
+		if _, ok := r.graph.Object(id); !ok {
+			delete(r.dirtyData, name)
+			delete(r.pendingReclaims, name)
+		}
+	}
+	r.dirtyMu.Unlock()
 	return r.graph.CheckpointExternallyCoordinated()
 }

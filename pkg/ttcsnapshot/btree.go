@@ -230,12 +230,190 @@ type bTreeBuilder struct {
 	kind     ObjectKind
 }
 
+type bTreeEdit struct {
+	key    []byte
+	value  ObjectID
+	delete bool
+}
+
 func (builder *bTreeBuilder) makeNode(node bTreeNode) (ObjectID, error) {
 	data, edges, err := encodeBTreeNode(node)
 	if err != nil {
 		return ObjectID{}, err
 	}
 	return builder.mutation.create(builder.kind, data, edges)
+}
+
+// apply path-copies every node touched by a sorted set of edits exactly once.
+// Calling set/delete repeatedly in one logical filesystem transaction creates
+// a complete obsolete path for every operation; package managers routinely
+// turn that into tens of thousands of short-lived metadata objects. Batched
+// descent instead partitions edits at each bounded-fanout node and shares all
+// unaffected children.
+func (builder *bTreeBuilder) apply(root ObjectID, edits []bTreeEdit) (ObjectID, error) {
+	if len(edits) == 0 {
+		return root, nil
+	}
+	sort.Slice(edits, func(i, j int) bool { return bytes.Compare(edits[i].key, edits[j].key) < 0 })
+	for index := range edits {
+		if len(edits[index].key) == 0 || len(edits[index].key) > bTreeMaxKeyBytes {
+			return ObjectID{}, errors.New("invalid TTC B-tree batch key")
+		}
+		if index != 0 && bytes.Equal(edits[index-1].key, edits[index].key) {
+			return ObjectID{}, errors.New("duplicate TTC B-tree batch key")
+		}
+		if !edits[index].delete && edits[index].value.IsZero() {
+			return ObjectID{}, errors.New("TTC B-tree batch put has zero value")
+		}
+	}
+	if root.IsZero() {
+		var keys [][]byte
+		var children []ObjectID
+		for _, edit := range edits {
+			if edit.delete {
+				continue
+			}
+			keys = append(keys, append([]byte(nil), edit.key...))
+			children = append(children, edit.value)
+		}
+		return builder.buildTree(true, keys, children)
+	}
+	ids, minima, changed, err := builder.applyNode(root, edits)
+	if err != nil || !changed {
+		return root, err
+	}
+	return builder.buildUpper(ids, minima)
+}
+
+func (builder *bTreeBuilder) buildTree(leaf bool, keys [][]byte, children []ObjectID) (ObjectID, error) {
+	if len(keys) == 0 {
+		return ObjectID{}, nil
+	}
+	ids, minima, err := builder.makeLevel(leaf, keys, children)
+	if err != nil {
+		return ObjectID{}, err
+	}
+	return builder.buildUpper(ids, minima)
+}
+
+func (builder *bTreeBuilder) buildUpper(ids []ObjectID, minima [][]byte) (ObjectID, error) {
+	for len(ids) > 1 {
+		var err error
+		ids, minima, err = builder.makeLevel(false, minima, ids)
+		if err != nil {
+			return ObjectID{}, err
+		}
+	}
+	if len(ids) == 0 {
+		return ObjectID{}, nil
+	}
+	return ids[0], nil
+}
+
+func (builder *bTreeBuilder) makeLevel(leaf bool, keys [][]byte, children []ObjectID) ([]ObjectID, [][]byte, error) {
+	if len(keys) != len(children) {
+		return nil, nil, errors.New("invalid TTC B-tree batch level")
+	}
+	ids := make([]ObjectID, 0, (len(keys)+bTreeMaxEntries-1)/bTreeMaxEntries)
+	minima := make([][]byte, 0, cap(ids))
+	for start := 0; start < len(keys); start += bTreeMaxEntries {
+		end := min(start+bTreeMaxEntries, len(keys))
+		id, err := builder.makeNode(bTreeNode{leaf: leaf, keys: keys[start:end], children: children[start:end]})
+		if err != nil {
+			return nil, nil, err
+		}
+		ids = append(ids, id)
+		minima = append(minima, append([]byte(nil), keys[start]...))
+	}
+	return ids, minima, nil
+}
+
+func (builder *bTreeBuilder) applyNode(current ObjectID, edits []bTreeEdit) ([]ObjectID, [][]byte, bool, error) {
+	object, ok := builder.mutation.object(current)
+	if !ok {
+		return nil, nil, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
+	}
+	node, err := decodeBTreeNode(object, builder.kind)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if node.leaf {
+		keys := make([][]byte, 0, len(node.keys)+len(edits))
+		children := make([]ObjectID, 0, len(node.children)+len(edits))
+		changed := false
+		oldIndex, editIndex := 0, 0
+		for oldIndex < len(node.keys) || editIndex < len(edits) {
+			if editIndex == len(edits) || (oldIndex < len(node.keys) && bytes.Compare(node.keys[oldIndex], edits[editIndex].key) < 0) {
+				keys = append(keys, node.keys[oldIndex])
+				children = append(children, node.children[oldIndex])
+				oldIndex++
+				continue
+			}
+			if oldIndex == len(node.keys) || bytes.Compare(edits[editIndex].key, node.keys[oldIndex]) < 0 {
+				if !edits[editIndex].delete {
+					keys = append(keys, append([]byte(nil), edits[editIndex].key...))
+					children = append(children, edits[editIndex].value)
+					changed = true
+				}
+				editIndex++
+				continue
+			}
+			// Equal keys replace or remove the existing value.
+			if edits[editIndex].delete {
+				changed = true
+			} else {
+				keys = append(keys, node.keys[oldIndex])
+				children = append(children, edits[editIndex].value)
+				changed = changed || node.children[oldIndex] != edits[editIndex].value
+			}
+			oldIndex++
+			editIndex++
+		}
+		if !changed {
+			return []ObjectID{current}, [][]byte{append([]byte(nil), node.keys[0]...)}, false, nil
+		}
+		ids, minima, err := builder.makeLevel(true, keys, children)
+		return ids, minima, true, err
+	}
+
+	grouped := make([][]bTreeEdit, len(node.children))
+	for _, edit := range edits {
+		index := bTreePosition(node.keys, edit.key)
+		grouped[index] = append(grouped[index], edit)
+	}
+	keys := make([][]byte, 0, len(node.keys)+len(edits))
+	children := make([]ObjectID, 0, len(node.children)+len(edits))
+	changed := false
+	for index, child := range node.children {
+		if len(grouped[index]) == 0 {
+			keys = append(keys, node.keys[index])
+			children = append(children, child)
+			continue
+		}
+		ids, minima, childChanged, err := builder.applyNode(child, grouped[index])
+		if err != nil {
+			return nil, nil, false, err
+		}
+		changed = changed || childChanged
+		keys = append(keys, minima...)
+		children = append(children, ids...)
+	}
+	if !changed {
+		return []ObjectID{current}, [][]byte{append([]byte(nil), node.keys[0]...)}, false, nil
+	}
+	if len(children) == 1 {
+		childObject, ok := builder.mutation.object(children[0])
+		if !ok {
+			return nil, nil, false, fmt.Errorf("TTC B-tree child %s does not exist", children[0].key())
+		}
+		childNode, err := decodeBTreeNode(childObject, builder.kind)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return []ObjectID{children[0]}, [][]byte{append([]byte(nil), childNode.keys[0]...)}, true, nil
+	}
+	ids, minima, err := builder.makeLevel(false, keys, children)
+	return ids, minima, true, err
 }
 
 func splitBTreeNode(node bTreeNode) (bTreeNode, bTreeNode) {

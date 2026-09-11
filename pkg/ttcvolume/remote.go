@@ -295,7 +295,7 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 
 // BranchObjects returns the immutable object allowlist referenced by branch.
 func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
-	branch, err := r.readBranch(branchID)
+	branch, err := r.Branch(branchID)
 	if err != nil {
 		return nil, err
 	}

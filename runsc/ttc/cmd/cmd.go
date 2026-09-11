@@ -8560,6 +8560,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	args := []string{
 		"--root", b.root,
 		"--platform=" + runtimePlatform,
+		// Preserve Sentry runtime failures even when the OCI console and control
+		// channel both disappear. Multiple sandboxes append complete Go runtime
+		// reports to this daemon-local diagnostic file.
+		"--panic-log=" + filepath.Join(b.root, "sentry-panic.log"),
 	}
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
