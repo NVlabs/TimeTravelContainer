@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -339,6 +340,25 @@ type testTargetRuntime struct {
 	cancelErr     error
 }
 
+type staleReservationStore struct {
+	TransactionCatalog
+	once sync.Once
+}
+
+func (s *staleReservationStore) Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error) {
+	if next == TransactionTargetReserved {
+		injected := false
+		s.once.Do(func() {
+			injected = true
+			_, _ = s.TransactionCatalog.Advance(id, revision, next, failure, now)
+		})
+		if injected {
+			return nil, errors.New("stale transaction revision")
+		}
+	}
+	return s.TransactionCatalog.Advance(id, revision, next, failure, now)
+}
+
 func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error { return nil }
 
 func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error {
@@ -514,6 +534,31 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	// A lost cancel response is also idempotent with the original revision.
 	if again, err := client.Cancel(context.Background(), tx.Identity.TransactionID, tx.Revision); err != nil || again.Revision != canceled.Revision {
 		t.Fatalf("idempotent cancel=%+v err=%v", again, err)
+	}
+}
+
+func TestControlPlaneReservationResolvesLostAdvanceResponse(t *testing.T) {
+	base, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &staleReservationStore{TransactionCatalog: base}
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1,
+		Now: time.Now, TargetRuntime: &testTargetRuntime{},
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.State != TransactionTargetReserved || tx.Revision != 2 {
+		t.Fatalf("reserved transaction=%+v", tx)
 	}
 }
 

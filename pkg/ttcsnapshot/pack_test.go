@@ -245,11 +245,17 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if ready, err := shared.RetirementReady(origin); err != nil || ready {
+		t.Fatalf("RetirementReady with reader = (ready=%t, err=%v), want not ready", ready, err)
+	}
 	if busy, err := shared.Retire(origin); err != nil || !busy {
 		t.Fatalf("Retire with reader = (busy=%t, err=%v), want busy", busy, err)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if ready, err := shared.RetirementReady(origin); err != nil || !ready {
+		t.Fatalf("RetirementReady after close = (ready=%t, err=%v), want ready", ready, err)
 	}
 	if busy, err := shared.Retire(origin); err != nil || busy {
 		t.Fatalf("Retire after close = (busy=%t, err=%v)", busy, err)

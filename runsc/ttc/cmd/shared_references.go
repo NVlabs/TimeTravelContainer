@@ -532,10 +532,11 @@ func (s *sharedReferenceService) mutateReference(operation, name string, object 
 
 // collectAndRetire performs the shared origin retirement protocol in its only
 // safe order: collect exact zero-count objects, deliver every resulting
-// cross-origin release, fence the empty origin permanently in Raft, forget its
-// ledger state, and only then remove physical packs. Each boundary is durable
-// and idempotent, so a successor lease holder rolls an interrupted attempt
-// forward rather than guessing from directory contents.
+// cross-origin release, prove that no physical reader remains, fence the empty
+// origin permanently in Raft, remove its physical packs, and finally forget
+// its ledger state. Each boundary is durable and idempotent, so a successor
+// lease holder rolls an interrupted attempt forward rather than guessing from
+// directory contents.
 func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease cluster.SharedGCLease, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -619,6 +620,16 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			// handoff baseline cannot be retired until that switch commits.
 			continue
 		}
+		ready, err := s.packs.RetirementReady(snapshot)
+		if err != nil {
+			return collected, err
+		}
+		if !ready {
+			// A range reader is still using this origin. Do not make the
+			// irreversible Raft transition until the physical data plane agrees
+			// with the ledger's zero-reference result.
+			continue
+		}
 		if _, err := s.authority.RetireSharedSnapshot(lease, uint64(snapshot)); err != nil {
 			return collected, err
 		}
@@ -658,11 +669,6 @@ func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []tt
 }
 
 func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {
-	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return ledger.RetireOrigin(snapshot)
-	}); err != nil {
-		return err
-	}
 	busy, err := s.packs.CompleteRetirement(snapshot)
 	if err != nil {
 		return err
@@ -670,7 +676,9 @@ func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.Snapsho
 	if busy {
 		return fmt.Errorf("shared snapshot %d still has an active reader lease", snapshot)
 	}
-	return nil
+	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		return ledger.RetireOrigin(snapshot)
+	})
 }
 
 var _ cluster.SharedSnapshotReferenceProvider = (*sharedReferenceService)(nil)

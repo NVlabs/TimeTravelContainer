@@ -31,12 +31,18 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
-const graphReferenceIntentVersion = 1
+const graphReferenceIntentVersion = 2
+
+const (
+	graphReferencePurposeBranch   = "branch"
+	graphReferencePurposeTransfer = "transfer"
+)
 
 type graphReferenceIntent struct {
 	Version     int                   `json:"version"`
 	Transaction string                `json:"transaction"`
 	Operation   string                `json:"operation"`
+	Purpose     string                `json:"purpose"`
 	Container   string                `json:"container"`
 	Branch      string                `json:"branch"`
 	State       string                `json:"state"`
@@ -70,8 +76,16 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 	if err := decoder.Decode(&intent); err != nil {
 		return graphReferenceIntent{}, err
 	}
+	// Version 1 predates transaction-owned migration transfer roots. Its only
+	// possible meaning is a branch-owned reference, so upgrade that record in
+	// memory without crossing the data-root format boundary.
+	if intent.Version == 1 && intent.Purpose == "" {
+		intent.Version = graphReferenceIntentVersion
+		intent.Purpose = graphReferencePurposeBranch
+	}
 	if intent.Version != graphReferenceIntentVersion || intent.Transaction == "" || intent.Operation == "" ||
 		intent.Container == "" || intent.Branch == "" || len(intent.Groups) == 0 ||
+		(intent.Purpose != graphReferencePurposeBranch && intent.Purpose != graphReferencePurposeTransfer) ||
 		(intent.State != "retaining" && intent.State != "active" && intent.State != "releasing") {
 		return graphReferenceIntent{}, errors.New("invalid graph reference intent")
 	}
@@ -79,6 +93,10 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 }
 
 func (b *runtimeBackend) newGraphReferenceIntent(transaction, operation, container, branch string, objects []string) (graphReferenceIntent, string, error) {
+	return b.newGraphReferenceIntentWithPurpose(transaction, operation, container, branch, graphReferencePurposeBranch, objects)
+}
+
+func (b *runtimeBackend) newGraphReferenceIntentWithPurpose(transaction, operation, container, branch, purpose string, objects []string) (graphReferenceIntent, string, error) {
 	path, err := graphReferenceIntentPath(b.activeDataRoot(), operation)
 	if err != nil {
 		return graphReferenceIntent{}, "", err
@@ -94,7 +112,7 @@ func (b *runtimeBackend) newGraphReferenceIntent(transaction, operation, contain
 	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
 	intent := graphReferenceIntent{
 		Version: graphReferenceIntentVersion, Transaction: transaction, Operation: operation,
-		Container: container, Branch: branch, State: "retaining", CreatedAt: time.Now().UTC(),
+		Purpose: purpose, Container: container, Branch: branch, State: "retaining", CreatedAt: time.Now().UTC(),
 	}
 	for _, encodedOrigin := range origins {
 		origin := ttcsnapshot.SnapshotID(encodedOrigin)
@@ -127,7 +145,7 @@ func (b *runtimeBackend) newGraphReferenceIntent(transaction, operation, contain
 
 func graphReferenceIntentEqualIdentity(a, b graphReferenceIntent) bool {
 	if a.Version != b.Version || a.Transaction != b.Transaction || a.Operation != b.Operation ||
-		a.Container != b.Container || a.Branch != b.Branch || len(a.Groups) != len(b.Groups) {
+		a.Purpose != b.Purpose || a.Container != b.Container || a.Branch != b.Branch || len(a.Groups) != len(b.Groups) {
 		return false
 	}
 	for i := range a.Groups {
@@ -157,6 +175,26 @@ func (b *runtimeBackend) retainDistributedGraphReferences(transaction, operation
 		return err
 	}
 	return b.resumeGraphReferenceRetain(path, &intent)
+}
+
+// retainDistributedGraphTransfer holds the source branch's current immutable
+// roots across a migration cutover. The visible branch record is replaced by
+// the target before asynchronous graph handoff completes, so ordinary
+// branch-owned reference reconciliation cannot safely cover this interval.
+func (b *runtimeBackend) retainDistributedGraphTransfer(transaction, container, branch string, objects []string) error {
+	if len(objects) == 0 {
+		return nil
+	}
+	operation := graphTransferReferenceOperation(transaction)
+	intent, path, err := b.newGraphReferenceIntentWithPurpose(transaction, operation, container, branch, graphReferencePurposeTransfer, objects)
+	if err != nil {
+		return err
+	}
+	return b.resumeGraphReferenceRetain(path, &intent)
+}
+
+func graphTransferReferenceOperation(transaction string) string {
+	return "transfer-" + transaction
 }
 
 func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphReferenceIntent) error {
@@ -268,7 +306,6 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			continue
 		}
 		tx, txErr := b.distributedSource.transactions.Load(intent.Transaction)
-		terminal := txErr == nil && (tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed)
 		branchPresent := false
 		if info, loadErr := b.containerStore().LoadContainer(intent.Container); loadErr == nil {
 			for _, branch := range info.Branches {
@@ -278,7 +315,7 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 				}
 			}
 		}
-		if intent.State == "releasing" || terminal || !branchPresent {
+		if graphReferenceIntentShouldRelease(intent, tx, txErr, branchPresent) {
 			if err := b.releaseDistributedGraphReferences(intent.Operation); err != nil {
 				retryable = errors.Join(retryable, fmt.Errorf("resuming graph reference release %q: %w", intent.Operation, err))
 			}
@@ -303,6 +340,21 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 		}
 	}
 	return retryable
+}
+
+func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.Transaction, txErr error, branchPresent bool) bool {
+	if intent.State == "releasing" {
+		return true
+	}
+	if intent.Purpose == graphReferencePurposeTransfer {
+		// A transfer intent is transaction-owned, not branch-owned. Keep it
+		// while the target can still depend on the source even though Raft
+		// cutover has already replaced the visible branch metadata. A failed
+		// post-cutover migration deliberately retains its source for recovery.
+		return txErr == nil && tx != nil && (tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled)
+	}
+	terminal := txErr == nil && tx != nil && (tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed)
+	return terminal || !branchPresent
 }
 
 func advanceGraphReferenceRelease(path string, intent *graphReferenceIntent, mutate func(graphReferenceGroup) error) error {

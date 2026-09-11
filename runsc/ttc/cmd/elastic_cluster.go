@@ -1206,11 +1206,23 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
 		return fmt.Errorf("reserving sparse migration target %q: %w", targetNode, err)
 	}
+	transferRetained := false
+	if len(persistentBranch.MemoryRootObjects) != 0 {
+		if err := b.retainDistributedGraphTransfer(requestID, info.ID, target.branch, persistentBranch.MemoryRootObjects); err != nil {
+			_, _ = peer.Cancel(ctx, requestID, tx.Revision)
+			_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+			return fmt.Errorf("retaining sparse migration source graph: %w", err)
+		}
+		transferRetained = true
+	}
 
 	execSessions, sidecarErr := b.stopMigrationBranchSidecars(target, info)
 	if sidecarErr != nil {
 		_, _ = peer.Cancel(ctx, requestID, tx.Revision)
 		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		if transferRetained {
+			_ = b.releaseDistributedGraphReferences(graphTransferReferenceOperation(requestID))
+		}
 		return sidecarErr
 	}
 	var relay *distributedPageRelay
@@ -1265,6 +1277,11 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		}
 		if restoreErr != nil {
 			return fmt.Errorf("%w; restoring sparse migration source: %v", cause, restoreErr)
+		}
+		if transferRetained {
+			if releaseErr := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(requestID)); releaseErr != nil {
+				return fmt.Errorf("%w; releasing sparse migration transfer roots: %v", cause, releaseErr)
+			}
 		}
 		return cause
 	}
@@ -1323,7 +1340,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return abort(fmt.Errorf("preparing sparse migration target: %w", err))
 	}
-	tx, err = peer.Publish(ctx, requestID, tx.Revision, state == "paused")
+	tx, err = publishRemoteTarget(ctx, peer, requestID, tx.Revision, state == "paused")
 	if err != nil {
 		status, statusErr := peer.Status(ctx, requestID)
 		if statusErr != nil || (status.State != cluster.TransactionPublished && status.State != cluster.TransactionDraining && status.State != cluster.TransactionIndependent) {
@@ -1418,6 +1435,9 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 		case cluster.TransactionIndependent:
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
 			relay.Close()
+			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: retaining completed migration transfer roots for retry %s@%s: %v\n", containerID, branchID, err)
+			}
 			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: retaining source runtime after sparse migration %s@%s: %v\n", containerID, branchID, err)
 			}
@@ -3003,7 +3023,13 @@ func nodeExecutionGrants(state *cluster.AuthorityState, nodeID, incarnation stri
 			authorized = !tx.Activated
 		}
 		if authorized {
-			grants[key(tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch())] = struct{}{}
+			// A distributed fork restores another physical branch in the
+			// source family. TargetContainer is the user-facing destination
+			// name and may differ from the immutable physical family ID used
+			// by the placement committed at publication. Key both provisional
+			// and published grants by SourceContainer so the handoff cannot be
+			// mistaken for an execution-authority revocation.
+			grants[key(tx.Identity.SourceContainer, tx.Identity.VisibleTargetBranch())] = struct{}{}
 		}
 	}
 	return grants
@@ -3148,7 +3174,7 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 	return os.Remove(path)
 }
 
-func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func() error, fence func() error, fatal chan<- error) {
+func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func(*cluster.AuthorityState) error, fence func() error, fatal chan<- error) {
 	interval := lease / 3
 	if interval < 250*time.Millisecond {
 		interval = 250 * time.Millisecond
@@ -3167,10 +3193,24 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 		case now := <-ticker.C:
 			renewalStarted := time.Now()
 			current, err := currentNodeMemoryBytes()
+			var authorityState *cluster.AuthorityState
 			if err == nil {
-				record, err = heartbeatElasticNode(directory, record, current, now, lease)
+				if catalog, ok := directory.(*cluster.RaftCatalog); ok {
+					// Bound the complete renewal and local-apply wait well inside
+					// the guardian deadline. A failed attempt leaves another
+					// interval for recovery before conservative self-fencing.
+					ctx, cancel := context.WithTimeout(context.Background(), interval)
+					var renewedRecord *cluster.NodeRecord
+					renewedRecord, authorityState, err = catalog.HeartbeatState(ctx, record.NodeID, record.Incarnation, current, lease)
+					cancel()
+					if err == nil {
+						record = *renewedRecord
+					}
+				} else {
+					record, err = heartbeatElasticNode(directory, record, current, now, lease)
+				}
 				if err == nil && renewed != nil {
-					err = renewed()
+					err = renewed(authorityState)
 				}
 				if err == nil {
 					localDeadline = renewalStarted.Add(lease)

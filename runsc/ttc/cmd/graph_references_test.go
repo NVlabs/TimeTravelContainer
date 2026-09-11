@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func TestPublishedOriginReleasesOnlyItsProviderRoots(t *testing.T) {
 
 func TestGraphReferenceIdentitySurvivesProviderPublication(t *testing.T) {
 	left := graphReferenceIntent{
-		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "op", Container: "family", Branch: "branch",
+		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "op", Purpose: graphReferencePurposeBranch, Container: "family", Branch: "branch",
 		Groups: []graphReferenceGroup{{Origin: 1, Provider: "node-a", Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}}},
 	}
 	right := left
@@ -112,11 +113,47 @@ func TestGraphReferenceIdentitySurvivesProviderPublication(t *testing.T) {
 	}
 }
 
+func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
+	intent := graphReferenceIntent{Purpose: graphReferencePurposeTransfer, State: "active"}
+	for _, state := range []cluster.TransactionState{cluster.TransactionPreparing, cluster.TransactionTargetPaused, cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionFailed} {
+		if graphReferenceIntentShouldRelease(intent, &cluster.Transaction{State: state}, nil, false) {
+			t.Fatalf("transfer intent released in %s", state)
+		}
+	}
+	for _, state := range []cluster.TransactionState{cluster.TransactionIndependent, cluster.TransactionCanceled} {
+		if !graphReferenceIntentShouldRelease(intent, &cluster.Transaction{State: state}, nil, true) {
+			t.Fatalf("transfer intent retained in %s", state)
+		}
+	}
+	if graphReferenceIntentShouldRelease(intent, nil, os.ErrNotExist, false) {
+		t.Fatal("transfer intent released while transaction authority was unavailable")
+	}
+	branch := graphReferenceIntent{Purpose: graphReferencePurposeBranch, State: "active"}
+	if !graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: cluster.TransactionPublished}, nil, false) {
+		t.Fatal("orphaned branch intent was retained")
+	}
+}
+
+func TestGraphReferenceIntentVersionOneMeansBranchReference(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	legacy := `{"version":1,"transaction":"tx","operation":"op","container":"family","branch":"child","state":"active","groups":[{"origin":1,"roots":[{"slot":0,"object":"0000000000000001-03-0000000000000001"}]}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := readGraphReferenceIntent(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.Version != graphReferenceIntentVersion || intent.Purpose != graphReferencePurposeBranch {
+		t.Fatalf("decoded intent version/purpose=%d/%q, want %d/%q", intent.Version, intent.Purpose, graphReferenceIntentVersion, graphReferencePurposeBranch)
+	}
+}
+
 func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	localRoot := t.TempDir()
 	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
 	intent := graphReferenceIntent{
-		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "branch-op",
+		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "branch-op", Purpose: graphReferencePurposeBranch,
 		Container: "family", Branch: "branch", State: "releasing", CreatedAt: time.Unix(1, 0),
 		Groups: []graphReferenceGroup{
 			{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}},
@@ -149,7 +186,7 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "references", "operation.json")
 			intent := graphReferenceIntent{
-				Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "operation",
+				Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "operation", Purpose: graphReferencePurposeBranch,
 				Container: "family", Branch: "child", State: "retaining", CreatedAt: time.Unix(1, 0),
 				Groups: []graphReferenceGroup{
 					{Origin: 1, Provider: "node-a", Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}},

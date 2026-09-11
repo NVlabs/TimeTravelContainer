@@ -965,6 +965,33 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
+	advanceReserved := func(tx *Transaction) (*Transaction, error) {
+		advanced, err := c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionTargetReserved, "", c.Now())
+		if err == nil {
+			return advanced, nil
+		}
+		// The local reservation is idempotent and may overlap recovery or a
+		// replayed request at this final Raft CAS. Resolve the authoritative
+		// state rather than leaking a stale-revision implementation detail.
+		current, loadErr := c.Store.Load(tx.Identity.TransactionID)
+		if loadErr != nil {
+			return nil, errors.Join(err, loadErr)
+		}
+		if !reflect.DeepEqual(current.Identity, tx.Identity) || !reflect.DeepEqual(current.Negotiated, tx.Negotiated) {
+			return nil, errors.New("transaction changed identity while reserving target")
+		}
+		switch current.State {
+		case TransactionPreparing:
+			return c.Store.Advance(current.Identity.TransactionID, current.Revision, TransactionTargetReserved, "", c.Now())
+		case TransactionTargetReserved, TransactionSourceCaptured, TransactionTargetRestoring,
+			TransactionTargetPaused, TransactionPublished, TransactionDraining, TransactionIndependent:
+			return current, nil
+		case TransactionCanceled, TransactionFailed:
+			return nil, fmt.Errorf("transaction became %s while reserving target: %s", current.State, current.Failure)
+		default:
+			return nil, err
+		}
+	}
 	if existing, err := c.Store.Load(request.Identity.TransactionID); err == nil {
 		if reflect.DeepEqual(existing.Identity, request.Identity) && reflect.DeepEqual(existing.Negotiated, negotiated) {
 			if existing.State == TransactionPreparing {
@@ -976,7 +1003,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 					writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
 					return
 				}
-				existing, err = c.Store.Advance(existing.Identity.TransactionID, existing.Revision, TransactionTargetReserved, "", c.Now())
+				existing, err = advanceReserved(existing)
 				if err != nil {
 					writeControlError(w, http.StatusInternalServerError, err.Error())
 					return
@@ -1021,7 +1048,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
 		return
 	}
-	tx, err = c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionTargetReserved, "", c.Now())
+	tx, err = advanceReserved(tx)
 	if err != nil {
 		writeControlError(w, http.StatusInternalServerError, err.Error())
 		return

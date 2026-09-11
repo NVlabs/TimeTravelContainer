@@ -509,6 +509,51 @@ func (c *RaftCatalog) Heartbeat(nodeID, incarnation string, current uint64, now 
 	return applyRaftValue[NodeRecord](c, now, AuthorityNodeRenew, AuthorityNodeRenewPayload{NodeID: nodeID, Incarnation: incarnation, MemoryCurrentBytes: current, LeaseDuration: lease})
 }
 
+// HeartbeatState renews a node's execution lease and returns a local authority
+// snapshot that includes the committed renewal. Unlike a subsequent
+// LinearizableState call, this never adds another leader round trip after the
+// lease has already been granted. Lease guardians use the returned snapshot to
+// enforce any preceding execution-grant revocation before accepting the new
+// local deadline.
+func (c *RaftCatalog) HeartbeatState(ctx context.Context, nodeID, incarnation string, current uint64, lease time.Duration) (*NodeRecord, *AuthorityState, error) {
+	id, err := newAuthorityRequestID()
+	if err != nil {
+		return nil, nil, err
+	}
+	result, err := c.propose(ctx, id, AuthorityNodeRenew, AuthorityNodeRenewPayload{
+		NodeID: nodeID, Incarnation: incarnation, MemoryCurrentBytes: current, LeaseDuration: lease,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := result.Err(); err != nil {
+		return nil, nil, err
+	}
+	var record NodeRecord
+	if err := json.Unmarshal(result.Value, &record); err != nil {
+		return nil, nil, err
+	}
+	// A forwarded proposal may receive the leader's response just before this
+	// follower applies the same committed entry. Wait only for the local FSM;
+	// no network or shared-storage operation is involved.
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, err := c.node.AppliedState()
+		if err != nil {
+			return nil, nil, err
+		}
+		if state.Revision >= result.Revision {
+			return &record, state, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (c *RaftCatalog) ReserveIncoming(nodeID, incarnation, operation, sourceNode string, bytes uint64, now time.Time, ttl time.Duration) (*NodeRecord, error) {
 	return applyRaftValue[NodeRecord](c, now, AuthorityCapacityReserve, AuthorityCapacityPayload{NodeID: nodeID, Incarnation: incarnation, OperationID: operation, SourceNode: sourceNode, Bytes: bytes, TTL: ttl})
 }

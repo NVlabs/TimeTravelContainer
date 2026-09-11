@@ -909,6 +909,26 @@ func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error)
 	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
 }
 
+// RetirementReady reports whether retirement can acquire the snapshot's
+// exclusive physical lease. It does not alter the snapshot. Distributed GC
+// calls this immediately before permanently fencing the origin in Raft: a
+// busy result proves that some data-plane reader still observes the origin,
+// which is inconsistent with retiring it even if the reference ledger has
+// already reached zero.
+func (store *SharedPackStore) RetirementReady(snapshot SnapshotID) (bool, error) {
+	if snapshot == 0 {
+		return false, errors.New("cannot inspect retirement of snapshot zero")
+	}
+	lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, errors.Join(syscall.Flock(int(lease.Fd()), syscall.LOCK_UN), lease.Close())
+}
+
 // CompleteRetirement idempotently finishes physical deletion after Raft has
 // permanently retired snapshot. It also removes directories left after a
 // crash between the namespace rename and RemoveAll.

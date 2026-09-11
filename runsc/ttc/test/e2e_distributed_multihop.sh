@@ -23,9 +23,9 @@ if test -n "${TTC_DISTRIBUTED_TEST_ROOT:-}"; then
 else
 	ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-distributed-multihop.XXXXXX")
 fi
-SHARED=$ROOT/shared
-LOCAL_A=$ROOT/local-a
-LOCAL_B=$ROOT/local-b
+SHARED=${TTC_DISTRIBUTED_TEST_SHARED_ROOT:-$ROOT/shared}
+LOCAL_A=${TTC_DISTRIBUTED_TEST_LOCAL_A_ROOT:-$ROOT/local-a}
+LOCAL_B=${TTC_DISTRIBUTED_TEST_LOCAL_B_ROOT:-$ROOT/local-b}
 RUN_A=$ROOT/run-a
 RUN_B=$ROOT/run-b
 SOCKET_A=$RUN_A/ttcd.sock

@@ -45,6 +45,43 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
+// publishRemoteTarget retries the idempotent publication boundary while a
+// restored target remains physically paused. A Raft leadership change renews
+// node execution leases in the new term asynchronously; without this retry a
+// perfectly healthy target can be exposed to the caller as a dynamic fork
+// denial during that short interval. Status distinguishes a lost successful
+// response from a target that is still safe to retry.
+func publishRemoteTarget(ctx context.Context, peer *cluster.Client, transactionID string, revision uint64, paused bool) (*cluster.Transaction, error) {
+	var lastErr error
+	for {
+		tx, err := peer.Publish(ctx, transactionID, revision, paused)
+		if err == nil {
+			return tx, nil
+		}
+		lastErr = err
+		status, statusErr := peer.Status(ctx, transactionID)
+		if statusErr == nil {
+			switch status.State {
+			case cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionIndependent:
+				return status, nil
+			case cluster.TransactionTargetPaused:
+				revision = status.Revision
+			case cluster.TransactionCanceled, cluster.TransactionFailed:
+				return nil, fmt.Errorf("remote target became %s while publishing: %s", status.State, status.Failure)
+			default:
+				return nil, err
+			}
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("publishing remote target: %w (last attempt: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
 type distributedSourceRuntime struct {
 	capabilities  cluster.Capabilities
 	incarnation   string
@@ -875,15 +912,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("restoring target node %s: %w", targetNode, err)
 	}
-	tx, err = peer.Publish(ctx, transactionID, tx.Revision, paused)
+	tx, err = publishRemoteTarget(ctx, peer, transactionID, tx.Revision, paused)
 	if err != nil {
-		// A response may be lost after publication. Status makes this operation
-		// safely retryable without accidentally deleting a visible target.
-		status, statusErr := peer.Status(ctx, transactionID)
-		if statusErr != nil || (status.State != cluster.TransactionPublished && status.State != cluster.TransactionIndependent) {
-			return selector{}, fmt.Errorf("publishing target node %s: %w", targetNode, err)
-		}
-		tx = status
+		return selector{}, fmt.Errorf("publishing target node %s: %w", targetNode, err)
 	}
 	committed = true
 	monitorBackend := *b
@@ -1064,7 +1095,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, fmt.Errorf("restoring dehydrated target node %s: %w", targetNode, err)
 	}
-	tx, err = peer.Publish(ctx, transactionID, tx.Revision, paused)
+	tx, err = publishRemoteTarget(ctx, peer, transactionID, tx.Revision, paused)
 	if err != nil {
 		status, statusErr := peer.Status(ctx, transactionID)
 		if statusErr != nil || (status.State != cluster.TransactionPublished && status.State != cluster.TransactionIndependent) {
@@ -1504,14 +1535,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		go func() {
 			defer publishWG.Done()
 			child := &children[i]
-			child.tx, publishErrors[i] = peer.Publish(ctx, child.transaction, child.tx.Revision, paused)
-			if publishErrors[i] != nil {
-				status, statusErr := peer.Status(ctx, child.transaction)
-				if statusErr == nil && (status.State == cluster.TransactionPublished || status.State == cluster.TransactionIndependent) {
-					child.tx = status
-					publishErrors[i] = nil
-				}
-			}
+			child.tx, publishErrors[i] = publishRemoteTarget(ctx, peer, child.transaction, child.tx.Revision, paused)
 		}()
 	}
 	publishWG.Wait()

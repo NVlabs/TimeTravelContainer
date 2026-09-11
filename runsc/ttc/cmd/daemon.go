@@ -3526,10 +3526,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			elasticHeartbeatStopped = heartbeatStopped
 			go func(record cluster.NodeRecord) {
 				defer close(heartbeatStopped)
-				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func() error {
-					state, err := clusterRuntime.raftCatalog.AuthorityState()
-					if err != nil {
-						return fmt.Errorf("reading Raft execution grants: %w", err)
+				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func(state *cluster.AuthorityState) error {
+					if state == nil {
+						var err error
+						state, err = clusterRuntime.raftCatalog.AuthorityState()
+						if err != nil {
+							return fmt.Errorf("reading Raft execution grants: %w", err)
+						}
 					}
 					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
 					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) {

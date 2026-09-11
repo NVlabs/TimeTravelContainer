@@ -527,23 +527,43 @@ func TestNodeExecutionGrantsOnlyRequireEnforcementOnRevocation(t *testing.T) {
 		t.Fatalf("initial grants=%v, want one", previous)
 	}
 	state.Transactions["tx"] = cluster.Transaction{
-		Identity: cluster.ForkIdentity{TargetNodeID: "node-a", TargetContainer: "family", TargetVisibleBranch: "child"},
+		Identity:          cluster.ForkIdentity{TargetNodeID: "node-a", SourceContainer: "family", TargetContainer: "family-alias", TargetVisibleBranch: "child"},
 		TargetIncarnation: "inc-a", State: cluster.TransactionTargetRestoring,
 	}
 	added := nodeExecutionGrants(state, "node-a", "inc-a")
 	if executionGrantRevoked(previous, added) {
 		t.Fatal("grant addition was classified as a revocation")
 	}
+	// Publication replaces the provisional transaction grant with a placement
+	// grant. The user-facing target name differs from the physical family ID,
+	// but the represented runtime is unchanged and must not be evicted.
+	state.Transactions["tx"] = cluster.Transaction{
+		Identity:          cluster.ForkIdentity{TargetNodeID: "node-a", SourceContainer: "family", TargetContainer: "family-alias", TargetVisibleBranch: "child"},
+		TargetIncarnation: "inc-a", State: cluster.TransactionPublished, Activated: true,
+	}
+	state.Placements["child"] = cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}
+	published := nodeExecutionGrants(state, "node-a", "inc-a")
+	if executionGrantRevoked(added, published) {
+		t.Fatalf("transaction-to-placement handoff was classified as a revocation: before=%v after=%v", added, published)
+	}
 	delete(state.Placements, "placed")
 	revoked := nodeExecutionGrants(state, "node-a", "inc-a")
-	if !executionGrantRevoked(added, revoked) {
+	if !executionGrantRevoked(published, revoked) {
 		t.Fatal("placement removal was not classified as a revocation")
 	}
+	delete(state.Placements, "child")
 	state.Transactions["tx"] = cluster.Transaction{
-		Identity: cluster.ForkIdentity{TargetNodeID: "node-a", TargetContainer: "family", TargetVisibleBranch: "child"},
+		Identity:          cluster.ForkIdentity{TargetNodeID: "node-a", SourceContainer: "family", TargetContainer: "family-alias", TargetVisibleBranch: "child"},
+		TargetIncarnation: "inc-a", State: cluster.TransactionTargetRestoring,
+	}
+	provisional := nodeExecutionGrants(state, "node-a", "inc-a")
+	state.Transactions["tx"] = cluster.Transaction{
+		Identity:          cluster.ForkIdentity{TargetNodeID: "node-a", SourceContainer: "family", TargetContainer: "family-alias", TargetVisibleBranch: "child"},
 		TargetIncarnation: "inc-a", State: cluster.TransactionCanceled,
 	}
-	if !executionGrantRevoked(revoked, nodeExecutionGrants(state, "node-a", "inc-a")) {
+	if !executionGrantRevoked(provisional, nodeExecutionGrants(state, "node-a", "inc-a")) {
 		t.Fatal("provisional target cancellation was not classified as a revocation")
 	}
 }

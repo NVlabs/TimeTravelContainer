@@ -193,6 +193,38 @@ func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	}
 }
 
+func TestRaftCatalogHeartbeatReturnsLocallyAppliedState(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+		NodeID: "node-a", LocalDir: filepath.Join(t.TempDir(), "raft"),
+		ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+		ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	waitAuthorityLeader(t, node)
+	registerReadyRaftNode(t, node, "node-a", "incarnation-a")
+	catalog, err := NewRaftCatalog(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	record, state, err := catalog.HeartbeatState(ctx, "node-a", "incarnation-a", 1234, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.MemoryCurrentBytes != 1234 || record.LeaseTerm == 0 {
+		t.Fatalf("unexpected renewed record: %+v", record)
+	}
+	applied, ok := state.Nodes["node-a"]
+	if !ok || applied.Revision != record.Revision || applied.MemoryCurrentBytes != record.MemoryCurrentBytes {
+		t.Fatalf("returned state does not include renewal: record=%+v state=%+v", record, applied)
+	}
+}
+
 func TestAuthorityRaftFollowerRejectsLocalMutation(t *testing.T) {
 	var node AuthorityRaftNode
 	_, err := node.Apply(context.Background(), AuthorityCommand{})
