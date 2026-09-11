@@ -284,13 +284,10 @@ type BranchMemoryRoot struct {
 	Root       string                `json:"root"`
 }
 
-// BranchDehydrationExportArgs donates packed snapshot destinations in the
-// exact order reported by BranchDehydrateInfo.
+// BranchDehydrationExportArgs donates one graph capture stream destination.
 type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
-	ID          string
-	AllowCopy   bool
-	GraphStream bool
+	ID string
 }
 
 // BranchDehydrationExportInfo is reserved for graph export metadata.
@@ -2152,8 +2149,7 @@ func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error)
 	return info, nil
 }
 
-// ExportDehydration writes all packed memory streams for an already
-// dehydrated branch.
+// ExportDehydration writes graph-native memory for an already dehydrated branch.
 func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*BranchDehydrationExportInfo, error) {
 	if args == nil || args.ID == "" {
 		return nil, errors.New("dehydration export requires a branch ID")
@@ -2171,16 +2167,13 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 	}
 	image := b.dehydration.image
 	f.mu.Unlock()
-	if args.GraphStream {
-		if len(args.FilePayload.Files) != 1 {
-			return nil, fmt.Errorf("graph dehydration export has %d stream descriptors, want 1", len(args.FilePayload.Files))
-		}
-		if err := image.PublishGraphStream(args.FilePayload.Files[0]); err != nil {
-			return nil, err
-		}
-		return &BranchDehydrationExportInfo{}, nil
+	if len(args.FilePayload.Files) != 1 {
+		return nil, fmt.Errorf("graph dehydration export has %d stream descriptors, want 1", len(args.FilePayload.Files))
 	}
-	return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
+	if err := image.PublishGraphStream(args.FilePayload.Files[0]); err != nil {
+		return nil, err
+	}
+	return &BranchDehydrationExportInfo{}, nil
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its

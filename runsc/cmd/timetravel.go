@@ -78,9 +78,6 @@ type TimeTravel struct {
 	checkpointCompression         CheckpointCompression
 	dehydrationFD                 int
 	dehydrationConfigFD           int
-	dehydrationSnapshotsStartFD   int
-	dehydrationSnapshotsCount     int
-	dehydrationSnapshotAllowCopy  bool
 	dehydrationGraphObjectsFD     int
 	dehydrationGraphStreamFD      int
 	dehydrationGraphManifestFD    int
@@ -174,9 +171,6 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
 	f.IntVar(&t.dehydrationFD, "dehydration-fd", -1, "inherited file for durable dehydration metadata")
 	f.IntVar(&t.dehydrationConfigFD, "dehydration-config-fd", -1, "inherited FD containing durable dehydration restore arguments")
-	f.IntVar(&t.dehydrationSnapshotsStartFD, "dehydration-snapshots-start-fd", -1, "first inherited dehydration snapshot destination")
-	f.IntVar(&t.dehydrationSnapshotsCount, "dehydration-snapshots-count", 0, "number of inherited dehydration snapshot destinations")
-	f.BoolVar(&t.dehydrationSnapshotAllowCopy, "dehydration-snapshot-allow-copy", false, "allow full copying when dehydration snapshot reflinks are unsupported")
 	f.IntVar(&t.dehydrationGraphObjectsFD, "dehydration-graph-objects-fd", -1, "inherited graph-native dehydration object directory")
 	f.IntVar(&t.dehydrationGraphStreamFD, "dehydration-graph-stream-fd", -1, "inherited graph-native dehydration capture stream")
 	f.IntVar(&t.dehydrationGraphManifestFD, "dehydration-graph-manifest-fd", -1, "inherited graph-native dehydration memory manifest")
@@ -554,40 +548,20 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.DehydrateBranch(f.Arg(2), metadataFile)
 	case "dehydrate-export":
-		if t.dehydrationGraphStreamFD >= 0 {
-			if t.dehydrationGraphObjectsFD >= 0 || t.dehydrationSnapshotsCount != 0 {
-				util.Fatalf("graph dehydration stream cannot be combined with another export destination")
-			}
-			stream := os.NewFile(uintptr(t.dehydrationGraphStreamFD), "dehydration-graph-stream")
-			if stream == nil {
-				util.Fatalf("invalid dehydration graph stream FD")
-			}
-			defer stream.Close()
-			output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
-				FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, ID: f.Arg(2), GraphStream: true,
-			})
-			break
+		if t.dehydrationGraphStreamFD < 0 {
+			util.Fatalf("--dehydration-graph-stream-fd is required")
 		}
-		if t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) {
-			util.Fatalf("invalid inherited dehydration snapshot range")
+		stream := os.NewFile(uintptr(t.dehydrationGraphStreamFD), "dehydration-graph-stream")
+		if stream == nil {
+			util.Fatalf("invalid dehydration graph stream FD")
 		}
-		files := make([]*os.File, 0, t.dehydrationSnapshotsCount)
-		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
-			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-snapshot-%d", i))
-			if file == nil {
-				util.Fatalf("invalid inherited dehydration snapshot FD %d", t.dehydrationSnapshotsStartFD+i)
-			}
-			files = append(files, file)
-			defer file.Close()
-		}
-		_, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
-			FilePayload: urpc.FilePayload{Files: files},
-			ID:          f.Arg(2),
-			AllowCopy:   t.dehydrationSnapshotAllowCopy,
+		defer stream.Close()
+		output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, ID: f.Arg(2),
 		})
 	case "dehydrate-restore":
-		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationSnapshotsCount < 0 || (t.dehydrationSnapshotsCount != 0 && t.dehydrationSnapshotsStartFD < 0) || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) || t.dehydrationFilesystemsCount < 0 || (t.dehydrationFilesystemsCount != 0 && t.dehydrationFilesystemsStartFD < 0) {
-			util.Fatalf("--dehydration-config-fd, --dehydration-fd, and a valid snapshot range are required")
+		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) || t.dehydrationFilesystemsCount < 0 || (t.dehydrationFilesystemsCount != 0 && t.dehydrationFilesystemsStartFD < 0) {
+			util.Fatalf("dehydration restore requires config, metadata, graph manifest, graph objects, and valid target ranges")
 		}
 		configFile := os.NewFile(uintptr(t.dehydrationConfigFD), "dehydration-restore-config")
 		if configFile == nil {
@@ -614,43 +588,28 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, metadata)
 		defer metadata.Close()
-		if restoreArgs.Sparse {
-			if t.dehydrationGraphObjectsFD < 0 || t.dehydrationSnapshotsCount != 0 || (restoreArgs.GraphSparse != (t.dehydrationGraphManifestFD >= 0)) {
-				util.Fatalf("sparse dehydration restore requires a repository and no packed snapshots")
-			}
-			if restoreArgs.GraphSparse {
-				manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "dehydration-restore-graph-manifest")
-				if manifest == nil {
-					util.Fatalf("invalid dehydration graph manifest FD")
-				}
-				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, manifest)
-				defer manifest.Close()
-			}
-			objects := os.NewFile(uintptr(t.dehydrationGraphObjectsFD), "dehydration-restore-graph-objects")
-			if objects == nil {
-				util.Fatalf("invalid dehydration graph objects FD")
-			}
-			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, objects)
-			defer objects.Close()
-			if restoreArgs.GraphRemote {
-				if t.dehydrationMemoryRemoteFD < 0 {
-					util.Fatalf("remote dehydration restore requires a cold memory stream")
-				}
-				remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "dehydration-restore-memory-remote")
-				if remote == nil {
-					util.Fatalf("invalid inherited cold memory FD %d", t.dehydrationMemoryRemoteFD)
-				}
-				restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, remote)
-				defer remote.Close()
-			}
+		manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "dehydration-restore-graph-manifest")
+		if manifest == nil {
+			util.Fatalf("invalid dehydration graph manifest FD")
 		}
-		for i := 0; i < t.dehydrationSnapshotsCount; i++ {
-			file := os.NewFile(uintptr(t.dehydrationSnapshotsStartFD+i), fmt.Sprintf("dehydration-restore-snapshot-%d", i))
-			if file == nil {
-				util.Fatalf("invalid inherited dehydration snapshot FD %d", t.dehydrationSnapshotsStartFD+i)
+		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, manifest)
+		defer manifest.Close()
+		objects := os.NewFile(uintptr(t.dehydrationGraphObjectsFD), "dehydration-restore-graph-objects")
+		if objects == nil {
+			util.Fatalf("invalid dehydration graph objects FD")
+		}
+		restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, objects)
+		defer objects.Close()
+		if restoreArgs.GraphRemote {
+			if t.dehydrationMemoryRemoteFD < 0 {
+				util.Fatalf("remote dehydration restore requires a cold memory stream")
 			}
-			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, file)
-			defer file.Close()
+			remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "dehydration-restore-memory-remote")
+			if remote == nil {
+				util.Fatalf("invalid inherited cold memory FD %d", t.dehydrationMemoryRemoteFD)
+			}
+			restoreArgs.FilePayload.Files = append(restoreArgs.FilePayload.Files, remote)
+			defer remote.Close()
 		}
 		for i := 0; i < t.dehydrationTargetsCount; i++ {
 			file := os.NewFile(uintptr(t.dehydrationTargetsStartFD+i), fmt.Sprintf("dehydration-target-memory-%d", i))

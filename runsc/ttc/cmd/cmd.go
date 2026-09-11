@@ -11622,7 +11622,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: true, GraphSparse: true, Quarantined: branch.Quarantined,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
 	if err != nil {
@@ -11922,7 +11922,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: true, GraphSparse: true,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true,
 		ReusePeerApplicationMemoryFile: true, Quarantined: branch.Quarantined,
 	}
 	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)

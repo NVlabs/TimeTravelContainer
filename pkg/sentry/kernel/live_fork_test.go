@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -261,72 +260,6 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	}
 	if err := restored.StartPaused(); err != nil {
 		t.Fatalf("starting rehydrated distributed target: %v", err)
-	}
-	restored.Release()
-	parent.Release()
-}
-
-func TestDurableDehydrationLoadsPackedMemoryOnDemand(t *testing.T) {
-	parent, err := testutil.Boot()
-	if err != nil {
-		t.Fatalf("Boot: %v", err)
-	}
-	parent.PipeMount().IncRef()
-	parent.SetHostMount(parent.PipeMount())
-	parent.Pause()
-	image, err := parent.CaptureDehydration(parent.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "durable"})
-	if err != nil {
-		parent.Release()
-		t.Fatalf("CaptureDehydration: %v", err)
-	}
-	metadata := image.DurableMetadata()
-	snapshots := make([]*os.File, len(metadata.Memories))
-	for i := range snapshots {
-		snapshots[i], err = os.CreateTemp(t.TempDir(), "packed-*.mem")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := image.ExportPackedSnapshots(snapshots, true); err != nil {
-		t.Fatalf("ExportPackedSnapshots: %v", err)
-	}
-	loads := make([]kernel.DurableDehydrationLoadMemory, len(metadata.Memories))
-	for i := range loads {
-		fd, err := unix.Dup(int(snapshots[i].Fd()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		loads[i].Reader = stateio.NewFDReader(int32(fd), 256<<10, 16, 2)
-		target, err := os.CreateTemp(t.TempDir(), "target-*.mem")
-		if err != nil {
-			t.Fatal(err)
-		}
-		loads[i].MemoryFile, err = pgalloc.NewMemoryFile(target, pgalloc.MemoryFileOpts{
-			DiskBackedFile: true, DisableIMAWorkAround: true, DisableMemoryAccounting: true,
-			ResourceID: metadata.Memories[i].ResourceID,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	var restored *kernel.Kernel
-	if err := parent.WithDehydrationFilesystemResources(parent.SupervisorContext(), "durable", func(resources vfs.LiveForkFilesystemResources) error {
-		var err error
-		restored, err = kernel.LoadDurableDehydration(parent.SupervisorContext(), parent.Platform, metadata, loads, kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: "durable", FilesystemResources: resources,
-		})
-		return err
-	}); err != nil {
-		t.Fatalf("LoadDurableDehydration: %v", err)
-	}
-	if !restored.MemoryFile().IsAsyncLoading() {
-		t.Fatal("durable application memory was eagerly loaded")
-	}
-	if err := image.Close(); err != nil {
-		t.Fatalf("closing capture: %v", err)
-	}
-	if err := restored.StartPaused(); err != nil {
-		t.Fatalf("StartPaused: %v", err)
 	}
 	restored.Release()
 	parent.Release()
