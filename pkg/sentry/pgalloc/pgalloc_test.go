@@ -302,6 +302,58 @@ func TestCapturedMemoryLayoutChunkOrdered(t *testing.T) {
 	}
 }
 
+func TestCapturedMemoryLayoutChunkOrderedAllowsDivergedCOWAliases(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	source, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.DecRef(target)
+	defer f.DecRef(source)
+	if err := f.AdoptCOWIdentities(f, source, target); err != nil {
+		t.Fatal(err)
+	}
+	sourcePage, sourceVersion, ok := f.LogicalPageVersionAt(source.Start)
+	if !ok {
+		t.Fatal("source page has no identities")
+	}
+	targetPage, targetVersion, ok := f.LogicalPageVersionAt(target.Start)
+	if !ok {
+		t.Fatal("target page has no identities")
+	}
+	if sourcePage != targetPage || sourceVersion == targetVersion {
+		t.Fatalf("CoW identities source=(%+v,%+v) target=(%+v,%+v)", sourcePage, sourceVersion, targetPage, targetVersion)
+	}
+	chunk, slot := sourcePage.Chunk()
+	layout := CapturedMemoryLayout{
+		Regions: []RemoteSnapshotRegion{{ID: 1, File: f, Range: memmap.FileRange{Start: source.Start, End: target.End}}},
+		Bindings: []CapturedPageBinding{
+			{OldOffset: source.Start, References: 1, Page: sourcePage, Version: sourceVersion, Chunk: chunk, Slot: slot},
+			{OldOffset: target.Start, References: 1, Page: targetPage, Version: targetVersion, Chunk: chunk, Slot: slot},
+		},
+	}
+	ordered, err := layout.ChunkOrdered()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ordered.Bindings); got != 2 {
+		t.Fatalf("got %d bindings, want 2", got)
+	}
+	if ordered.Bindings[0].Page != ordered.Bindings[1].Page || ordered.Bindings[0].Version == ordered.Bindings[1].Version {
+		t.Fatalf("ordered bindings lost divergent CoW versions: %+v", ordered.Bindings)
+	}
+}
+
 func TestMemoryRangeCaptureRejectsRetiredPage(t *testing.T) {
 	f := newLogicalPageTestMemoryFile()
 	fr, err := f.findAllocatableAndMarkUsed(&allocState{

@@ -73,6 +73,12 @@ func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 		if left.Slot != right.Slot {
 			return left.Slot < right.Slot
 		}
+		if cmp := bytes.Compare(left.Version.Allocator[:], right.Version.Allocator[:]); cmp != 0 {
+			return cmp < 0
+		}
+		if left.Version.Sequence != right.Version.Sequence {
+			return left.Version.Sequence < right.Version.Sequence
+		}
 		if left.ResourceID != right.ResourceID {
 			return left.ResourceID.String() < right.ResourceID.String()
 		}
@@ -88,16 +94,24 @@ func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
 	}
 	ordered := CapturedMemoryLayout{Bindings: bindings}
 	var previousPage LogicalPageID
+	var previousVersion PageVersionID
 	for i := range ordered.Bindings {
 		binding := &ordered.Bindings[i]
 		file := files[binding.ResourceID]
 		if file == nil {
 			return CapturedMemoryLayout{}, fmt.Errorf("captured binding %s:%#x has no MemoryFile", binding.ResourceID, binding.OldOffset)
 		}
-		if i != 0 && binding.Page == previousPage {
-			return CapturedMemoryLayout{}, fmt.Errorf("captured logical page %+v is repeated", binding.Page)
+		// A branch may legitimately contain multiple content versions of one
+		// logical page. For example, two MAP_PRIVATE aliases initially share a
+		// page and then diverge through CoW. Chunk assembly deliberately places
+		// those versions in separate immutable objects. Only an identical
+		// page-version pair is ambiguous here: it would cause the same immutable
+		// version to have two physical stream sources.
+		if i != 0 && binding.Page == previousPage && binding.Version == previousVersion {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured logical page %+v repeats version %+v", binding.Page, binding.Version)
 		}
 		previousPage = binding.Page
+		previousVersion = binding.Version
 		binding.StreamOffset = uint64(i) * hostarch.PageSize
 		page := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + hostarch.PageSize}
 		if len(ordered.Regions) != 0 {

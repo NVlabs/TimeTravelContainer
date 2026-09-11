@@ -177,6 +177,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			}
 			fs.diskVolume.Repository = repository
 			fs.diskVolume.Branch = childBranch
+			fs.registerDiskMaterializationHook()
 			fs.rebuildDiskInodeCache()
 			return nil
 		}
@@ -199,6 +200,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 	fs.diskVolume.Repository = repository
 	fs.diskVolume.Branch = resource.Branch
+	fs.registerDiskMaterializationHook()
 	info := repository.Info()
 	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}
 	fs.rebuildDiskInodeCache()

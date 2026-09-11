@@ -2934,6 +2934,10 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		}
 		if len(revoked) == len(family.Branches) {
 			if _, err := backend.command("delete", "--force", family.ID); err != nil {
+				present, checkErr := runtimeBranchPresent(backend, family.ID, "")
+				if checkErr == nil && !present {
+					continue
+				}
 				return fmt.Errorf("destroying wholly unauthorized runtime %q: %w", family.ID, err)
 			}
 			continue
@@ -2941,10 +2945,18 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		for _, branch := range revoked {
 			if branch.State == "running" || branch.State == "restarting" {
 				if _, err := backend.command("timetravel", family.ID, "prepare-stop", branch.ID); err != nil {
+					present, checkErr := runtimeBranchPresent(backend, family.ID, branch.ID)
+					if checkErr == nil && !present {
+						continue
+					}
 					return fmt.Errorf("quiescing revoked branch %s@%s: %w", family.ID, branch.ID, err)
 				}
 			}
 			if _, err := backend.command("timetravel", family.ID, "destroy", branch.ID); err != nil {
+				present, checkErr := runtimeBranchPresent(backend, family.ID, branch.ID)
+				if checkErr == nil && !present {
+					continue
+				}
 				return fmt.Errorf("destroying revoked branch %s@%s: %w", family.ID, branch.ID, err)
 			}
 			if placement, err := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID); err == nil && placement.State == cluster.PlacementCorrupted {
@@ -2953,6 +2965,37 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		}
 	}
 	return nil
+}
+
+// runtimeBranchPresent resolves a failed idempotent eviction without parsing
+// human-readable runsc errors. Empty branchID asks whether the family itself
+// remains. The placement enforcer races ordinary migration cleanup by design:
+// if that cleanup wins, the desired physical state has already been reached
+// and lease renewal must not fail closed merely because destroy saw ENOENT.
+func runtimeBranchPresent(backend *runtimeBackend, familyID, branchID string) (bool, error) {
+	families, err := backend.listRuntimeFamilies()
+	if err != nil {
+		return false, err
+	}
+	return runtimeFamiliesContain(families, familyID, branchID), nil
+}
+
+func runtimeFamiliesContain(families []Family, familyID, branchID string) bool {
+	for _, family := range families {
+		if family.ID != familyID {
+			continue
+		}
+		if branchID == "" {
+			return true
+		}
+		for _, branch := range family.Branches {
+			if branch.ID == branchID {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // corruptFencedRuntimePeers records the unavoidable blast radius when a

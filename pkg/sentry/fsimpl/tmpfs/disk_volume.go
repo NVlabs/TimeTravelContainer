@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
@@ -65,6 +66,44 @@ func diskVolumeError(op string, err error) error {
 	}
 	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
 	return linuxerr.EIO
+}
+
+// registerDiskMaterializationHook keeps the guest's cached host descriptors
+// and mappings coherent when a remotely inherited placeholder is atomically
+// replaced by its authoritative whole-file contents.
+func (fs *filesystem) registerDiskMaterializationHook() {
+	if fs.diskVolume == nil || fs.diskVolume.Repository == nil {
+		return
+	}
+	if fs.unregisterMaterializationHook != nil {
+		fs.unregisterMaterializationHook()
+	}
+	fs.unregisterMaterializationHook = fs.diskVolume.Repository.RegisterMaterializationHook(fs.invalidateMaterializedObject)
+}
+
+func (fs *filesystem) invalidateMaterializedObject(object string) {
+	fs.liveForkMu.Lock()
+	files := make([]*regularFile, 0, len(fs.liveForkFiles))
+	for file := range fs.liveForkFiles {
+		files = append(files, file)
+	}
+	fs.liveForkMu.Unlock()
+	for _, file := range files {
+		file.mapsMu.Lock()
+		file.diskIOMu.Lock()
+		if file.diskIOObject == object {
+			file.invalidateDiskIOLocked()
+		}
+		if file.diskObject == object {
+			// Preserve already-private application pages while forcing clean
+			// translations to fault against the newly installed backing inode.
+			file.mappings.InvalidateAll(memmap.InvalidateOpts{})
+			file.diskMmap.ResetFD()
+			file.diskObject = ""
+		}
+		file.diskIOMu.Unlock()
+		file.mapsMu.Unlock()
+	}
 }
 
 func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {

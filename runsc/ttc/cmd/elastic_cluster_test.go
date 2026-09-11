@@ -379,6 +379,26 @@ func TestFencedRuntimeRequiresEveryBranchInCurrentIncarnation(t *testing.T) {
 	}
 }
 
+func TestRuntimeFamiliesContainToleratesConcurrentEviction(t *testing.T) {
+	families := []Family{{ID: "other", Branches: []Branch{{ID: "main"}}}, {
+		ID: "family", Branches: []Branch{{ID: "main"}, {ID: "child"}},
+	}}
+	for _, test := range []struct {
+		family string
+		branch string
+		want   bool
+	}{
+		{"family", "", true},
+		{"family", "child", true},
+		{"family", "gone", false},
+		{"gone", "", false},
+	} {
+		if got := runtimeFamiliesContain(families, test.family, test.branch); got != test.want {
+			t.Errorf("runtimeFamiliesContain(%q, %q)=%t, want %t", test.family, test.branch, got, test.want)
+		}
+	}
+}
+
 func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "family",

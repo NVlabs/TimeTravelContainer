@@ -318,6 +318,19 @@ func (rf *regularFile) invalidateDiskIO() {
 	rf.diskIOMu.Unlock()
 }
 
+// ensureDiskData materializes a remotely inherited whole-file object before
+// any runtime cache can open its placeholder inode. Materialization is
+// deliberately outside mapsMu and diskIOMu: repository callbacks acquire
+// those locks to invalidate caches in every branch sharing the repository.
+func (rf *regularFile) ensureDiskData() error {
+	if rf.inode.fs.diskVolume == nil {
+		return nil
+	}
+	size := int64(rf.size.Load())
+	return diskVolumeError("materialize file", rf.inode.fs.diskVolume.Repository.EnsureDataRange(
+		rf.inode.fs.diskVolume.Branch, rf.inode.ino, 0, size))
+}
+
 // resetDiskMmapLocked revokes application translations and drops the mmap
 // cache's host reference to an object that repository CoW made unreachable.
 //
@@ -530,6 +543,9 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		return nil
 	}
 	if rf.inode.fs.diskVolume != nil {
+		if err := rf.ensureDiskData(); err != nil {
+			return err
+		}
 		if newSize > oldSize {
 			if rf.seals&linux.F_SEAL_GROW != 0 {
 				return linuxerr.EPERM
@@ -670,6 +686,9 @@ func (rf *regularFile) CopyMapping(ctx context.Context, ms memmap.MappingSpace, 
 // Translate implements memmap.Mappable.Translate.
 func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	if rf.inode.fs.diskVolume != nil {
+		if err := rf.ensureDiskData(); err != nil {
+			return nil, &memmap.BusError{err}
+		}
 		rf.mapsMu.Lock()
 		defer rf.mapsMu.Unlock()
 		// Privatize on the first mapping fault after a fork, including a read
@@ -874,6 +893,9 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		return linuxerr.EFBIG
 	}
 	if f.inode.fs.diskVolume != nil {
+		if err := f.ensureDiskData(); err != nil {
+			return err
+		}
 		oldSize := f.size.Load()
 		f.mapsMu.Lock()
 		f.diskIOMu.Lock()
@@ -1001,6 +1023,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 	f := fd.inode().impl.(*regularFile)
 	if f.inode.fs.diskVolume != nil {
+		if err := f.ensureDiskData(); err != nil {
+			return 0, err
+		}
 		f.diskIOMu.Lock()
 		defer f.diskIOMu.Unlock()
 		file, _, err := f.openDiskIOLocked(false, nil)
@@ -1012,9 +1037,6 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		var done int64
 		for dst.NumBytes() != 0 {
 			want := min(dst.NumBytes(), int64(len(buf)))
-			if err := f.inode.fs.diskVolume.Repository.EnsureDataRange(f.inode.fs.diskVolume.Branch, f.inode.ino, offset+done, want); err != nil {
-				return done, diskVolumeError("materialize file range", err)
-			}
 			n, readErr := file.ReadAt(buf[:want], offset+done)
 			if n != 0 {
 				copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
@@ -1113,6 +1135,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	src = src.TakeFirst64(srclen)
 
 	if f.inode.fs.diskVolume != nil {
+		if err := f.ensureDiskData(); err != nil {
+			return 0, offset, err
+		}
 		oldSize := f.size.Load()
 		// Object transitions always take mapsMu before diskIOMu. The CoW
 		// callback runs while repository GC is excluded, so it can revoke the
@@ -1152,8 +1177,10 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 				return done, offset + done, io.ErrNoProgress
 			}
 		}
+		grew := false
 		if end := uint64(offset + done); end > f.size.Load() {
 			f.size.Store(end)
+			grew = true
 		}
 		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
 		f.inode.touchCMtimeLocked()
@@ -1167,6 +1194,17 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		f.markDiskMetadataDirtyLocked()
 		if err := f.inode.fs.diskVolume.Repository.MarkDataDirty(f.diskIOObject); err != nil {
 			return done, offset + done, diskVolumeError("mark regular-file data dirty", err)
+		}
+		// A newly created or extended file must become visible to an immediate
+		// live-fork capture even if the writing task has exited but its FD-table
+		// teardown has not yet invoked OnClose/Release. UpdateAfterWrite only
+		// appends to the repository's bounded metadata batch; it does not fsync
+		// or publish a graph root here. BeginFork flushes that batch atomically.
+		// Same-size writes retain the normal close/fsync/fork coalescing path.
+		if grew {
+			if err := f.flushDiskMetadataLocked(); err != nil {
+				return done, offset + done, err
+			}
 		}
 		status := fd.vfsfd.StatusFlags()
 		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {

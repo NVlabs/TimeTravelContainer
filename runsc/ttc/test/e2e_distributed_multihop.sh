@@ -106,6 +106,7 @@ client_a run -d --node node-a --name "$NAME" --shm-size 64m "$IMAGE" sh -c \
 
 client_a fork --node node-b "$NAME@main" remote1 >/dev/null
 client_b exec "$NAME@remote1" sh -c "printf REMOTE-1 >/identity"
+test "$(client_b exec "$NAME@remote1" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote1" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 
 client_b migrate --node node-a "$NAME@remote1" >/dev/null

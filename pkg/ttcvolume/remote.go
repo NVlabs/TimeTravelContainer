@@ -395,7 +395,17 @@ func (r *Repository) ensureObjectRange(object string, size, offset, length int64
 	r.remoteMu.Lock()
 	remote := r.remoteByObject[object]
 	r.remoteMu.Unlock()
-	if remote == nil || length == 0 {
+	if length == 0 {
+		return nil
+	}
+	if remote == nil {
+		pending, err := r.remoteObjectPending(object)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return fmt.Errorf("remote filesystem object %q has no attached authoritative source", object)
+		}
 		return nil
 	}
 	return remote.ensure(object, size, offset, length)
@@ -415,7 +425,7 @@ func (c *remoteObjectClient) ensure(object string, size, offset, length int64) e
 		return err
 	}
 	reader := &remoteWholeFileReader{client: c, object: object, size: uint64(size)}
-	if err := c.repository.data.ReplaceDeferred(id, reader, size); err != nil {
+	if err := c.repository.replaceRemoteObject(id, object, reader, size); err != nil {
 		return err
 	}
 	if err := c.repository.clearRemoteObjectPending(object); err != nil {

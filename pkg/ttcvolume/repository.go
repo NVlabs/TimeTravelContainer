@@ -295,6 +295,45 @@ type Repository struct {
 	remoteMu       sync.Mutex
 	remotes        map[*remoteObjectClient]struct{}
 	remoteByObject map[string]*remoteObjectClient
+
+	// materializationMu serializes installation of remotely inherited objects
+	// with runtime backing-cache invalidation. Hooks are invoked while this
+	// mutex is held, immediately before the placeholder pathname is replaced.
+	materializationMu       sync.Mutex
+	materializationHooks    map[uint64]func(string)
+	nextMaterializationHook uint64
+}
+
+// RegisterMaterializationHook registers a callback that revokes runtime-local
+// file descriptors and mappings backed by object before remote materialization
+// replaces its placeholder inode. The returned function unregisters the hook
+// and waits for an in-flight invocation to finish.
+func (r *Repository) RegisterMaterializationHook(hook func(object string)) func() {
+	if hook == nil {
+		return func() {}
+	}
+	r.materializationMu.Lock()
+	if r.materializationHooks == nil {
+		r.materializationHooks = make(map[uint64]func(string))
+	}
+	r.nextMaterializationHook++
+	id := r.nextMaterializationHook
+	r.materializationHooks[id] = hook
+	r.materializationMu.Unlock()
+	return func() {
+		r.materializationMu.Lock()
+		delete(r.materializationHooks, id)
+		r.materializationMu.Unlock()
+	}
+}
+
+func (r *Repository) replaceRemoteObject(id ttcsnapshot.ObjectID, object string, reader io.Reader, size int64) error {
+	r.materializationMu.Lock()
+	defer r.materializationMu.Unlock()
+	for _, hook := range r.materializationHooks {
+		hook(object)
+	}
+	return r.data.ReplaceDeferred(id, reader, size)
 }
 
 type cachedBranch struct {

@@ -170,6 +170,10 @@ type filesystem struct {
 	// diskVolume is non-nil for TTC-managed persistent volumes.
 	diskVolume *diskVolumeState
 
+	// unregisterMaterializationHook removes this filesystem's backing-cache
+	// invalidation hook from diskVolume.Repository. It is runtime-local state.
+	unregisterMaterializationHook func() `state:"nosave"`
+
 	// diskInodes preserves inode identity for the subset of persistent objects
 	// currently instantiated by paths, file descriptions, mappings, mounts, or
 	// watches. The repository owns the complete namespace; this cache is rebuilt
@@ -508,6 +512,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	var root *dentry
 	if fs.diskVolume != nil {
+		fs.registerDiskMaterializationHook()
 		root, err = fs.loadDiskVolume(ctx)
 		if err != nil {
 			fs.vfsfs.DecRef(ctx)
@@ -582,6 +587,10 @@ func (fs *filesystem) LiveForkFilesystemEligibility() vfs.LiveForkFilesystemElig
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	if fs.unregisterMaterializationHook != nil {
+		fs.unregisterMaterializationHook()
+		fs.unregisterMaterializationHook = nil
+	}
 	if err := fs.flushDiskWriteMetadata(); err != nil {
 		ctx.Warningf("flushing TTC volume metadata during filesystem release: %v", err)
 	}
