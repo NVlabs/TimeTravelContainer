@@ -2027,13 +2027,9 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	store := ttcbundle.Store{Root: daemonDataRoot, ActiveRoot: roots.local}
 	// Namespace recovery must precede every startup inventory. In particular,
 	// image-root pruning uses a conservative container scan and should never be
-	// reached with a half-deleted legacy directory still in containers/.
+	// reached with a half-deleted directory still in containers/.
 	if _, err := store.RecoverContainerRemovals(); err != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers before startup inventory: %v\n", err)
-	}
-	if _, err := store.RemoveObsoleteApplicationMemoryFiles(); err != nil {
-		fmt.Fprintf(stderr, "ttcd: removing obsolete application memory files: %v\n", err)
-		return 1
 	}
 	if _, err := store.PruneImageRoots(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "ttcd: pruning stale image roots: %v\n", err)

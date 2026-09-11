@@ -212,7 +212,7 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 	}
 }
 
-func TestRenameBranchPromotesStableMemoryAndConsoleState(t *testing.T) {
+func TestRenameBranchKeepsStableMemoryAndRenamesConsoleState(t *testing.T) {
 	root := t.TempDir()
 	containerID := "container-id"
 	containerDir := filepath.Join(root, "containers", containerID)
@@ -240,11 +240,11 @@ func TestRenameBranchPromotesStableMemoryAndConsoleState(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(containerDir, "console", "old.log"), []byte("console"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	legacyMemory := filepath.Join(containerDir, "memory", "dehydrated", hex.EncodeToString([]byte("old")))
-	if err := os.MkdirAll(legacyMemory, 0700); err != nil {
+	stableMemory := filepath.Join(containerDir, "memory", "dehydrated", MemoryBranchKey(branch))
+	if err := os.MkdirAll(stableMemory, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(legacyMemory, "control.json"), []byte("{}"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(stableMemory, "control.json"), []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -255,7 +255,6 @@ func TestRenameBranchPromotesStableMemoryAndConsoleState(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(containerDir, "console", "new.log")); err != nil {
 		t.Errorf("renamed console: %v", err)
 	}
-	stableMemory := filepath.Join(containerDir, "memory", "dehydrated", MemoryBranchKey(branch))
 	if _, err := os.Stat(filepath.Join(stableMemory, "control.json")); err != nil {
 		t.Errorf("stable memory: %v", err)
 	}

@@ -17,7 +17,6 @@ package bundle
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -56,10 +55,6 @@ const (
 	// DefaultLogDriver is the persistent logging policy used when none is specified.
 	DefaultLogDriver = "local"
 )
-
-// promotedRepositoryDir is retained by the legacy compatibility helper and
-// its cleanup tests. Production tiered-storage paths never invoke promotion.
-const promotedRepositoryDir = "repositories"
 
 // removedContainerDir is outside the active container namespace so that a
 // failed physical deletion cannot make container discovery fail. It remains
@@ -110,44 +105,6 @@ func (s Store) imageRootDir() string {
 }
 
 var warnedUnreadableContainers sync.Map
-
-// RemoveObsoleteApplicationMemoryFiles removes pathname-backed live memory
-// allocators created by TTC versions predating sparse dehydration. Current
-// runtimes use anonymous memfds; durable page contents live exclusively in the
-// family memory-chunk repository. Unlinking is safe even if an older Sentry
-// still has the file open, since its descriptor remains valid until it exits.
-func (s Store) RemoveObsoleteApplicationMemoryFiles() (int, error) {
-	containersRoot := filepath.Join(s.activeRoot(), "containers")
-	entries, err := os.ReadDir(containersRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	removed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(containersRoot, entry.Name(), "memory", "application.mem")
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return removed, fmt.Errorf("checking obsolete application memory for %s: %w", entry.Name(), err)
-		}
-		if !info.Mode().IsRegular() {
-			return removed, fmt.Errorf("obsolete application memory path for %s is not a regular file", entry.Name())
-		}
-		if err := os.Remove(path); err != nil {
-			return removed, fmt.Errorf("removing obsolete application memory for %s: %w", entry.Name(), err)
-		}
-		removed++
-	}
-	return removed, nil
-}
 
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
 // branch from its persistent filesystem pointer without changing its visible
@@ -3155,17 +3112,14 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 	return s.removeContainerInfo(info)
 }
 
-func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
+func (s Store) removeDistributedMemoryMetadata(info ContainerInfo) error {
 	if info.DistributedForkTransactionID == "" {
 		return nil
 	}
 	artifacts := []struct {
 		path string
 		name string
-	}{
-		{filepath.Join(s.Root, "cluster", "memory-snapshots", info.DistributedForkTransactionID+".mem"), "memory snapshot"},
-		{filepath.Join(s.Root, "cluster", "memory-metadata", info.DistributedForkTransactionID+".state"), "kernel metadata"},
-	}
+	}{{filepath.Join(s.Root, "cluster", "memory-metadata", info.DistributedForkTransactionID+".state"), "kernel metadata"}}
 	for _, artifact := range artifacts {
 		if err := os.Remove(artifact.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("removing distributed %s: %w", artifact.name, err)
@@ -3661,9 +3615,8 @@ type renamePath struct {
 }
 
 // renameBranchArtifacts moves name-keyed state as one rollback-capable
-// transaction. Memory directories from older TTC versions are also promoted
-// to the stable filesystem-branch key here; current directories never move on
-// subsequent renames.
+// transaction. Memory directories use stable filesystem-branch keys and do
+// not move when a visible branch is renamed.
 func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldID, newID string) (func() error, error) {
 	var paths []renamePath
 	dir := filepath.Join(s.activeRoot(), "containers", containerID, "console")
@@ -3685,19 +3638,6 @@ func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldI
 		paths = append(paths, renamePath{execDir, filepath.Join(dir, "exec", newID)})
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading exec console state: %w", err)
-	}
-
-	legacyKey := hex.EncodeToString([]byte(oldID))
-	stableKey := MemoryBranchKey(branch)
-	if legacyKey != stableKey {
-		for _, state := range []string{"dehydrated", "active"} {
-			oldPath := filepath.Join(s.activeRoot(), "containers", containerID, "memory", state, legacyKey)
-			if _, err := os.Lstat(oldPath); err == nil {
-				paths = append(paths, renamePath{oldPath, filepath.Join(filepath.Dir(oldPath), stableKey)})
-			} else if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("checking legacy %s memory state: %w", state, err)
-			}
-		}
 	}
 
 	for _, path := range paths {
@@ -4226,7 +4166,7 @@ func (s Store) cleanupRemovedContainer(path string, known *ContainerInfo) error 
 			return fmt.Errorf("releasing image content for removed container %q: %w", info.ID, err)
 		}
 	}
-	if err := s.removeDistributedMemorySnapshot(*info); err != nil {
+	if err := s.removeDistributedMemoryMetadata(*info); err != nil {
 		return err
 	}
 	return s.removeAll(path)
@@ -4241,17 +4181,10 @@ func (s Store) removeContainerInfo(info ContainerInfo) error {
 		log.Warningf("Container %q was removed; deferred physical cleanup of %q: %v", info.Name, tombstone, err)
 	}
 	s.removeActiveContainer(info.ID)
-	// Also sweep the repository namespace used by experimental pre-tiered
-	// roots. Fresh format-v1 roots never populate it, but keeping deletion
-	// tolerant avoids leaking data created by tests or interrupted development
-	// builds that already carry the current root marker.
-	if err := s.gcPromotedRepositories(); err != nil {
-		log.Warningf("Container %q was removed; deferred legacy repository cleanup: %v", info.Name, err)
-	}
 	return nil
 }
 
-// RecoverContainerRemovals moves incomplete legacy container directories out
+// RecoverContainerRemovals moves incomplete container directories out
 // of the active namespace, then retries every tombstone independently. It is
 // intended to run at daemon startup and during periodic maintenance while the
 // data-root mutation lock is held.
@@ -4319,220 +4252,6 @@ func (s Store) SweepRemovedContainers() (int, error) {
 		removed++
 	}
 	return removed, result
-}
-
-// PromoteContainerRepositories moves container-private repositories into the
-// shared cluster repository namespace. Open repository directory descriptors
-// remain valid across the rename, while future starts and distributed targets
-// use the new stable paths recorded in the source OCI spec.
-//
-// Promotion is idempotent and is required before reserving a distributed fork
-// target. It ensures that deleting the source container metadata cannot delete
-// filesystem state still referenced by a remote branch.
-func (s Store) PromoteContainerRepositories(name string) error {
-	return s.withPromotedRepositoryLock(func() error {
-		info, err := s.LoadContainer(name)
-		if err != nil {
-			return err
-		}
-		spec, err := s.LoadSpec(info.ID)
-		if err != nil {
-			return err
-		}
-		repositories, err := specutils.TTCVolumeRepositories(spec)
-		if err != nil {
-			return err
-		}
-		containerDir := filepath.Join(s.Root, "containers", info.ID)
-		familyDir := filepath.Join(s.promotedRepositoryRoot(), info.ID)
-		type movedRepository struct {
-			oldPath string
-			newPath string
-		}
-		var moved []movedRepository
-		changed := false
-		rollback := func() {
-			for i := len(moved) - 1; i >= 0; i-- {
-				_ = os.Rename(moved[i].newPath, moved[i].oldPath)
-			}
-		}
-		for i := range repositories {
-			repository := &repositories[i]
-			inside, err := pathWithin(containerDir, repository.Path)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q: %w", repository.Source, err)
-			}
-			if !inside {
-				continue
-			}
-			if err := os.MkdirAll(familyDir, 0700); err != nil {
-				rollback()
-				return fmt.Errorf("creating promoted repository namespace: %w", err)
-			}
-			digest := sha256.Sum256([]byte(repository.Source))
-			base := filepath.Base(repository.Path)
-			destination := filepath.Join(familyDir, base+"-"+hex.EncodeToString(digest[:8]))
-			oldExists, err := directoryExistsWithoutSymlink(repository.Path)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q source: %w", repository.Source, err)
-			}
-			newExists, err := directoryExistsWithoutSymlink(destination)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q destination: %w", repository.Source, err)
-			}
-			switch {
-			case oldExists && !newExists:
-				if err := os.Rename(repository.Path, destination); err != nil {
-					rollback()
-					return fmt.Errorf("promoting repository %q: %w", repository.Source, err)
-				}
-				moved = append(moved, movedRepository{oldPath: repository.Path, newPath: destination})
-			case oldExists && newExists:
-				rollback()
-				return fmt.Errorf("promoting repository %q: both source and destination exist", repository.Source)
-			case !oldExists && !newExists:
-				rollback()
-				return fmt.Errorf("promoting repository %q: source is missing", repository.Source)
-			}
-			repository.Path = destination
-			changed = true
-		}
-		if !changed {
-			return nil
-		}
-		encoded, err := json.Marshal(repositories)
-		if err != nil {
-			rollback()
-			return err
-		}
-		if spec.Annotations == nil {
-			spec.Annotations = make(map[string]string)
-		}
-		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-		if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
-			rollback()
-			return fmt.Errorf("recording promoted repository paths: %w", err)
-		}
-		return nil
-	})
-}
-
-func (s Store) promotedRepositoryRoot() string {
-	return filepath.Join(s.Root, "cluster", promotedRepositoryDir)
-}
-
-func (s Store) withPromotedRepositoryLock(fn func() error) error {
-	root := s.promotedRepositoryRoot()
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	return fn()
-}
-
-func pathWithin(parent, child string) (bool, error) {
-	parent = filepath.Clean(parent)
-	child = filepath.Clean(child)
-	relative, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false, err
-	}
-	return relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)), nil
-}
-
-func directoryExistsWithoutSymlink(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("%q is not a directory", path)
-	}
-	return true, nil
-}
-
-// gcPromotedRepositories removes stable family repositories after no
-// remaining container spec references them. Scanning specs is deliberately
-// conservative: any unreadable metadata aborts collection rather than risking
-// live branch data.
-func (s Store) gcPromotedRepositories() error {
-	return s.withPromotedRepositoryLock(func() error {
-		root := s.promotedRepositoryRoot()
-		containers, err := s.listContainers(true)
-		if err != nil {
-			return err
-		}
-		referenced := make(map[string]struct{})
-		for _, container := range containers {
-			spec, err := s.LoadSpec(container.ID)
-			if err != nil {
-				return err
-			}
-			repositories, err := specutils.TTCVolumeRepositories(spec)
-			if err != nil {
-				return err
-			}
-			for _, repository := range repositories {
-				inside, err := pathWithin(root, repository.Path)
-				if err != nil {
-					return err
-				}
-				if inside {
-					referenced[filepath.Clean(repository.Path)] = struct{}{}
-				}
-			}
-		}
-		families, err := os.ReadDir(root)
-		if err != nil {
-			return err
-		}
-		for _, family := range families {
-			if family.Name() == ".lock" || !family.IsDir() {
-				continue
-			}
-			familyPath := filepath.Join(root, family.Name())
-			repositories, err := os.ReadDir(familyPath)
-			if err != nil {
-				return err
-			}
-			for _, repository := range repositories {
-				path := filepath.Join(familyPath, repository.Name())
-				if _, ok := referenced[path]; ok {
-					continue
-				}
-				if repository.Type()&os.ModeSymlink != 0 || !repository.IsDir() {
-					return fmt.Errorf("unexpected entry in promoted repository namespace: %s", path)
-				}
-				if err := os.RemoveAll(path); err != nil {
-					return err
-				}
-			}
-			remaining, err := os.ReadDir(familyPath)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-			if len(remaining) == 0 {
-				if err := os.Remove(familyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return err
-				}
-			}
-		}
-		return nil
-	})
 }
 
 // HasImageRoot reports whether TTC has materialized the immutable root for a
