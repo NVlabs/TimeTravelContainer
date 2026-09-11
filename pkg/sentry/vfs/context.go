@@ -63,6 +63,11 @@ const (
 	// Filesystems must still prepare their in-memory state for CoW, but must
 	// not create the branches again.
 	CtxLiveForkBranchesPrepared
+
+	// CtxLiveForkFilesystemResource restricts filesystem preparation to one
+	// persistent resource. It is used to snapshot a named volume for a new
+	// read-only attachment without cloning the source Kernel.
+	CtxLiveForkFilesystemResource
 )
 
 // RestoreFilesystemResource associates an implementation-specific resource
@@ -187,6 +192,13 @@ func LiveForkTransactionsFromContext(ctx goContext.Context) *LiveForkTransaction
 func LiveForkBranchesPreparedFromContext(ctx goContext.Context) bool {
 	prepared, _ := ctx.Value(CtxLiveForkBranchesPrepared).(bool)
 	return prepared
+}
+
+// LiveForkFilesystemResourceFromContext returns the optional persistent
+// resource filter for a filesystem-only snapshot.
+func LiveForkFilesystemResourceFromContext(ctx goContext.Context) (checkpoint.ResourceID, bool) {
+	resource, ok := ctx.Value(CtxLiveForkFilesystemResource).(checkpoint.ResourceID)
+	return resource, ok
 }
 
 // RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used

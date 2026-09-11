@@ -172,6 +172,10 @@ const (
 	// ContMgrResumeBranch resumes one in-memory branch.
 	ContMgrResumeBranch = "containerManager.ResumeBranch"
 
+	// ContMgrSnapshotFilesystemBranch snapshots one persistent filesystem
+	// resource while preserving the selected branch's run/pause state.
+	ContMgrSnapshotFilesystemBranch = "containerManager.SnapshotFilesystemBranch"
+
 	// ContMgrSetBranchQuarantine changes one branch's external-connectivity bit.
 	ContMgrSetBranchQuarantine = "containerManager.SetBranchQuarantine"
 
@@ -785,6 +789,14 @@ type BranchCheckpointArgs struct {
 	BranchID string
 }
 
+// FilesystemBranchSnapshotArgs selects a live branch, one persistent
+// filesystem resource, and the new repository branch pointer to create.
+type FilesystemBranchSnapshotArgs struct {
+	BranchID   string
+	ResourceID checkpoint.ResourceID
+	Child      string
+}
+
 // Restore loads a container from a statefile.
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
@@ -1352,6 +1364,14 @@ func (cm *containerManager) PauseBranch(args *BranchArgs, _ *struct{}) error {
 // ResumeBranch resumes one branch.
 func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Resume(args.ID)
+}
+
+// SnapshotFilesystemBranch creates a consistent filesystem-only snapshot.
+func (cm *containerManager) SnapshotFilesystemBranch(args *FilesystemBranchSnapshotArgs, _ *struct{}) error {
+	if args == nil {
+		return errors.New("missing filesystem snapshot arguments")
+	}
+	return cm.l.family.SnapshotFilesystemBranch(args.BranchID, args.ResourceID, args.Child)
 }
 
 // SetBranchQuarantine changes one branch's external-connectivity bit.

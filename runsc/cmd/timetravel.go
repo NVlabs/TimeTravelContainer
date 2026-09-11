@@ -31,6 +31,7 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -130,6 +131,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|quarantine|unquarantine|destroy <branch-id>\n" +
+		"timetravel [flags] <container-id> filesystem-snapshot <branch-id> <volume-id> <child-filesystem-branch>\n" +
 		"timetravel [flags] <container-id> rename <branch-id> <new-branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-export <branch-id>\n" +
@@ -255,6 +257,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "rename":
 		// The old name and the new one.
 		wantArgs = 4
+	case "filesystem-snapshot":
+		wantArgs = 5
 	}
 	if (action == "fork" && f.NArg() < wantArgs) || (action != "fork" && f.NArg() != wantArgs) {
 		f.Usage()
@@ -526,6 +530,12 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.PauseBranch(f.Arg(2))
 	case "resume":
 		err = cont.Sandbox.ResumeBranch(f.Arg(2))
+	case "filesystem-snapshot":
+		err = cont.Sandbox.SnapshotFilesystemBranch(&boot.FilesystemBranchSnapshotArgs{
+			BranchID:   f.Arg(2),
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: f.Arg(3)},
+			Child:      f.Arg(4),
+		})
 	case "quarantine":
 		err = cont.Sandbox.SetBranchQuarantine(f.Arg(2), true)
 	case "unquarantine":

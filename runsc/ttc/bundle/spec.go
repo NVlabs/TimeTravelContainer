@@ -32,6 +32,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -144,7 +145,11 @@ type ManagedVolume struct {
 	Anonymous      bool   `json:"anonymous,omitempty"`
 	NoCopy         bool   `json:"no_copy,omitempty"`
 	RepositoryPath string `json:"-"`
-	CopyMode       string `json:"-"`
+	// RepositoryBranch is the physical branch mounted by this family's
+	// initial branch. Read-only attachments use an isolated snapshot rather
+	// than sharing a mutable repository pointer with another Sentry.
+	RepositoryBranch string `json:"-"`
+	CopyMode         string `json:"-"`
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind, a
@@ -816,6 +821,10 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		if volume.Readonly {
 			options[0] = "ro"
 		}
+		repositoryBranch := volume.RepositoryBranch
+		if repositoryBranch == "" {
+			repositoryBranch = ttcvolume.MainBranch
+		}
 		mounts = append(mounts, specs.Mount{
 			Destination: destination,
 			Type:        "ttcvol",
@@ -823,7 +832,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Options:     options,
 		})
 		volumeRepositories = append(volumeRepositories, specutils.TTCVolumeRepository{
-			Source: source, Path: volume.RepositoryPath, Branch: "main", CopyMode: volume.CopyMode,
+			Source: source, Path: volume.RepositoryPath, Branch: repositoryBranch, CopyMode: volume.CopyMode,
 		})
 	}
 	copiedHostMounts := make(map[string]string)

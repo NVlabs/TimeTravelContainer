@@ -1343,7 +1343,7 @@ func (b *runtimeBackend) forkDehydratedDistributedFilesystems(containerID, sourc
 		if err != nil {
 			return transactions, errors.Join(err, abortFilesystemForks(transactions))
 		}
-		tx, err := repository.BeginFork(sourceBranch, childBranch)
+		tx, err := repository.BeginFork(repositoryPhysicalBranch(config, sourceBranch), childBranch)
 		if err != nil {
 			repository.Close()
 			return transactions, errors.Join(err, abortFilesystemForks(transactions))

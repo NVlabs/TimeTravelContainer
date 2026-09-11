@@ -2351,6 +2351,14 @@ func (s *Sandbox) ResumeBranch(id string) error {
 	return nil
 }
 
+// SnapshotFilesystemBranch snapshots one persistent resource in a branch.
+func (s *Sandbox) SnapshotFilesystemBranch(args *boot.FilesystemBranchSnapshotArgs) error {
+	if err := s.call(boot.ContMgrSnapshotFilesystemBranch, args, nil); err != nil {
+		return fmt.Errorf("snapshotting filesystem resource %q from branch %q: %w", args.ResourceID, args.BranchID, err)
+	}
+	return nil
+}
+
 // SetBranchQuarantine changes one branch's external-connectivity bit.
 func (s *Sandbox) SetBranchQuarantine(id string, enabled bool) error {
 	args := boot.BranchQuarantineArgs{ID: id, Enabled: enabled}

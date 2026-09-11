@@ -190,7 +190,9 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 		return "", nil, err
 	}
 	for i := range repositories {
-		repositories[i].Branch = filesystemBranch
+		if filesystemBranch != ttcvolume.MainBranch || repositories[i].Branch == "" {
+			repositories[i].Branch = filesystemBranch
+		}
 	}
 	if len(repositories) != 0 {
 		encoded, err := json.Marshal(repositories)
@@ -294,6 +296,10 @@ type PrepareOptions struct {
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
 	NodeID         string
+	// SnapshotManagedVolume snapshots a named volume through its live owning
+	// Sentry. This preserves bounded process-local metadata batching and mmap
+	// CoW correctness when a second family attaches read-only.
+	SnapshotManagedVolume func(ownerContainer, ownerBranch, volumeID, childBranch string) error
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -914,10 +920,17 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
-	opts.ManagedVolumes, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
+	var cleanupManagedVolumeSnapshots func()
+	opts.ManagedVolumes, cleanupManagedVolumeSnapshots, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
 	if err != nil {
 		return Prepared{}, err
 	}
+	keepManagedVolumeSnapshots := false
+	defer func() {
+		if !keepManagedVolumeSnapshots && cleanupManagedVolumeSnapshots != nil {
+			cleanupManagedVolumeSnapshots()
+		}
+	}()
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
@@ -1052,6 +1065,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)
 	}
 	keep = true
+	keepManagedVolumeSnapshots = true
 	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
@@ -1637,7 +1651,7 @@ func copyRestoreHostFile(source, destination string, mode os.FileMode) error {
 	return output.Close()
 }
 
-func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, error) {
+func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, func(), error) {
 	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
 	mounted := make(map[string]bool)
 	for _, mount := range opts.HostMounts {
@@ -1649,7 +1663,7 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	for _, volume := range volumes {
 		destination := filepath.Clean(volume.Destination)
 		if mounted[destination] {
-			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+			return nil, nil, fmt.Errorf("duplicate mount destination %q", destination)
 		}
 		mounted[destination] = true
 	}
@@ -1661,7 +1675,7 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	for _, destination := range imageDestinations {
 		clean := filepath.Clean(destination)
 		if !filepath.IsAbs(clean) || clean == "/" {
-			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
+			return nil, nil, fmt.Errorf("image declares invalid volume destination %q", destination)
 		}
 		if mounted[clean] {
 			continue
@@ -1670,25 +1684,46 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 		mounted[clean] = true
 	}
 	if len(volumes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
-		return nil, fmt.Errorf("volume backing capability changed while preparing managed volumes: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
+		return nil, nil, fmt.Errorf("volume backing capability changed while preparing managed volumes: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 	}
 	ownerManifest, err := ownership.Read(ownership.ManifestPath(rootfs))
 	if err != nil {
-		return nil, fmt.Errorf("loading image ownership for managed volumes: %w", err)
+		return nil, nil, fmt.Errorf("loading image ownership for managed volumes: %w", err)
 	}
+	type createdSnapshot struct {
+		volume string
+		branch string
+	}
+	var snapshots []createdSnapshot
+	cleanup := func() {
+		for i := len(snapshots) - 1; i >= 0; i-- {
+			repository, openErr := manager.Open(snapshots[i].volume)
+			if openErr != nil {
+				continue
+			}
+			_ = repository.RemoveBranch(snapshots[i].branch)
+			_ = repository.Close()
+		}
+	}
+	success := false
+	defer func() {
+		if !success {
+			cleanup()
+		}
+	}()
 	seenIDs := make(map[string]string)
 	for i := range volumes {
 		if volumes[i].Name == "" {
 			id, err := randomObjectID("anonymous volume", 16)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			volumes[i].Name = "anon-" + id
 			volumes[i].Anonymous = true
@@ -1700,30 +1735,87 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 			created = err == nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("resolving managed volume %q: %w", volumes[i].Name, err)
+			return nil, nil, fmt.Errorf("resolving managed volume %q: %w", volumes[i].Name, err)
 		}
 		if created && !volumes[i].NoCopy {
 			if err := seedManagedVolume(repository, rootfs, volumes[i].Destination, ownerManifest); err != nil {
 				repository.Close()
 				_ = manager.Remove(volumes[i].Name)
-				return nil, fmt.Errorf("initializing managed volume %q from image path %q: %w", volumes[i].Name, volumes[i].Destination, err)
+				return nil, nil, fmt.Errorf("initializing managed volume %q from image path %q: %w", volumes[i].Name, volumes[i].Destination, err)
 			}
 		}
 		info := repository.Info()
 		if err := validateManagedVolumeAttachment(info.ID, volumes[i], containers); err != nil {
 			repository.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		volumes[i].ID = info.ID
 		volumes[i].RepositoryPath = repository.HostPath()
+		volumes[i].RepositoryBranch = ttcvolume.MainBranch
 		volumes[i].CopyMode = string(manager.Capability().Mode)
-		repository.Close()
+		if err := repository.Close(); err != nil {
+			return nil, nil, err
+		}
+		if volumes[i].Readonly {
+			nonce, err := randomObjectID("managed volume attachment", 16)
+			if err != nil {
+				return nil, nil, err
+			}
+			child := "a-" + nonce
+			owner, ownerBranch := managedVolumeWritableOwner(info.ID, containers)
+			if owner != nil && (ownerBranch.State == "running" || ownerBranch.State == "paused") {
+				if opts.SnapshotManagedVolume == nil {
+					return nil, nil, fmt.Errorf("managed volume %q requires a live snapshot from container %q", volumes[i].Name, owner.Name)
+				}
+				if err := opts.SnapshotManagedVolume(owner.ID, ownerBranch.ID, info.ID, child); err != nil {
+					return nil, nil, fmt.Errorf("snapshotting managed volume %q from %s@%s: %w", volumes[i].Name, owner.Name, ownerBranch.ID, err)
+				}
+			} else {
+				repository, err := manager.Open(info.ID)
+				if err != nil {
+					return nil, nil, err
+				}
+				tx, forkErr := repository.BeginFork(ttcvolume.MainBranch, child)
+				if forkErr == nil {
+					forkErr = tx.Commit()
+				}
+				closeErr := repository.Close()
+				if forkErr != nil || closeErr != nil {
+					return nil, nil, errors.Join(forkErr, closeErr)
+				}
+			}
+			volumes[i].RepositoryBranch = child
+			snapshots = append(snapshots, createdSnapshot{volume: info.ID, branch: child})
+		}
 		if previous, ok := seenIDs[info.ID]; ok {
-			return nil, fmt.Errorf("managed volume %q is mounted more than once (%q and %q); aliases are not yet supported", volumes[i].Name, previous, volumes[i].Destination)
+			return nil, nil, fmt.Errorf("managed volume %q is mounted more than once (%q and %q); aliases are not yet supported", volumes[i].Name, previous, volumes[i].Destination)
 		}
 		seenIDs[info.ID] = volumes[i].Destination
 	}
-	return volumes, nil
+	success = true
+	return volumes, cleanup, nil
+}
+
+func managedVolumeWritableOwner(volumeID string, containers []ContainerInfo) (*ContainerInfo, BranchInfo) {
+	for i := range containers {
+		writable := false
+		for _, volume := range containers[i].Volumes {
+			if volume.ID == volumeID && !volume.Readonly {
+				writable = true
+				break
+			}
+		}
+		if !writable {
+			continue
+		}
+		for _, branch := range containers[i].Branches {
+			if branch.ID == "main" {
+				return &containers[i], branch
+			}
+		}
+		return &containers[i], BranchInfo{}
+	}
+	return nil, BranchInfo{}
 }
 
 func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptions) error {
@@ -3925,7 +4017,11 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 			continue
 		}
 		seen[path] = struct{}{}
-		if persistentBranch == ttcvolume.MainBranch && !repositoryCanonicalBranchBelongsToFamily(config) {
+		repositoryBranch := persistentBranch
+		if persistentBranch == ttcvolume.MainBranch && config.Branch != "" {
+			repositoryBranch = config.Branch
+		}
+		if repositoryBranch == ttcvolume.MainBranch && !repositoryCanonicalBranchBelongsToFamily(config) {
 			// The canonical branch is named-volume state, not family-private
 			// state. Descendants and reused visible "main" branches are scoped
 			// and therefore take the normal removal path.
@@ -3935,7 +4031,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		if err != nil {
 			return fmt.Errorf("opening repository %q: %w", config.Source, err)
 		}
-		removeErr := repository.RemoveBranch(persistentBranch)
+		removeErr := repository.RemoveBranch(repositoryBranch)
 		if errors.Is(removeErr, fs.ErrNotExist) {
 			removeErr = nil
 		}
@@ -3958,7 +4054,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		}
 		closeErr := repository.Close()
 		if removeErr != nil {
-			return fmt.Errorf("removing branch %q from repository %q: %w", persistentBranch, config.Source, removeErr)
+			return fmt.Errorf("removing branch %q from repository %q: %w", repositoryBranch, config.Source, removeErr)
 		}
 		if closeErr != nil {
 			return fmt.Errorf("closing repository %q: %w", config.Source, closeErr)

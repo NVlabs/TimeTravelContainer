@@ -243,7 +243,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			}
 		}
 		snapshotPath := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
-		_, snapshotErr := repository.ExportSnapshotDelta(intent.FilesystemBranch, snapshotPath, inherited)
+		_, snapshotErr := repository.ExportSnapshotDelta(repositoryPhysicalBranch(config, intent.FilesystemBranch), snapshotPath, inherited)
 		closeErr := repository.Close()
 		if snapshotErr != nil || closeErr != nil {
 			return ttcstorage.Result{}, errors.Join(snapshotErr, closeErr)
@@ -371,7 +371,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 		if err != nil {
 			return false, err
 		}
-		_, branchErr := repository.Branch(intent.FilesystemBranch)
+		_, branchErr := repository.Branch(repositoryPhysicalBranch(config, intent.FilesystemBranch))
 		closeErr := repository.Close()
 		if errors.Is(branchErr, os.ErrNotExist) {
 			return false, closeErr
@@ -468,7 +468,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if err != nil {
 			return err
 		}
-		removeErr := repository.RemoveBranch(intent.FilesystemBranch)
+		removeErr := repository.RemoveBranch(repositoryPhysicalBranch(config, intent.FilesystemBranch))
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
@@ -1332,7 +1332,8 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 			directory.Close()
 			return fail(err)
 		}
-		objects, err := repository.BranchRemoteSourceObjects(filesystemBranch)
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		objects, err := repository.BranchRemoteSourceObjects(physicalBranch)
 		if err != nil {
 			repository.Close()
 			directory.Close()
@@ -1352,7 +1353,7 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 			_ = ttcvolume.ServeRemoteObjects(server, token, []ttcvolume.RemoteObjectSource{{Key: key, Reader: coldPackObjectReader{directory: directory}, Objects: objects}})
 			_ = directory.Close()
 		}()
-		if err := repository.AttachRemoteObjectSource(client, token, key, filesystemBranch); err != nil {
+		if err := repository.AttachRemoteObjectSource(client, token, key, physicalBranch); err != nil {
 			server.Close()
 			client.Close()
 			repository.Close()

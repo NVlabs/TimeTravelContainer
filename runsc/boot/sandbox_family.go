@@ -1973,6 +1973,71 @@ func (f *SandboxFamily) Pause(id string) error {
 	return nil
 }
 
+// SnapshotFilesystemBranch creates an O(1) repository branch for one
+// persistent filesystem without cloning the Kernel. The guest branch is
+// paused across metadata flushing, mmap invalidation, and branch publication,
+// so an attachment in another Sentry cannot observe a torn filesystem or
+// leave the source writing through a pre-fork object generation.
+func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.ResourceID, child string) (retErr error) {
+	if !resource.Ok() || child == "" {
+		return errors.New("filesystem snapshot requires a resource and child branch")
+	}
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+
+	f.mu.Lock()
+	state := b.state
+	if state != BranchRunning && state != BranchPaused {
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, not running or paused", id, state)
+	}
+	wasRunning := state == BranchRunning
+	f.mu.Unlock()
+	if wasRunning {
+		b.k.Pause()
+	}
+	defer func() {
+		if !wasRunning {
+			return
+		}
+		b.k.Unpause()
+		if err := control.PostResume(b.k, nil); err != nil {
+			b.k.Pause()
+			if retErr == nil {
+				retErr = fmt.Errorf("resuming branch %q after filesystem snapshot: %w", id, err)
+			}
+		}
+	}()
+
+	resources := make(vfs.LiveForkFilesystemResources)
+	transactions := &vfs.LiveForkTransactions{}
+	ctx := context.WithValues(b.k.SupervisorContext(), map[any]any{
+		pgalloc.CtxLiveForkSource:          true,
+		vfs.CtxLiveForkFilesystemResources: resources,
+		vfs.CtxLiveForkChildBranchID:       child,
+		vfs.CtxLiveForkTransactions:        transactions,
+		vfs.CtxLiveForkFilesystemResource:  resource,
+	})
+	if err := b.k.VFS().PrepareSave(ctx); err != nil {
+		_ = transactions.Abort()
+		return fmt.Errorf("preparing filesystem resource %q: %w", resource, err)
+	}
+	defer b.k.VFS().BeforeResume(ctx)
+	if _, ok := resources[resource]; !ok {
+		_ = transactions.Abort()
+		return fmt.Errorf("filesystem resource %q is not mounted in branch %q", resource, id)
+	}
+	if err := transactions.Commit(); err != nil {
+		_ = transactions.Abort()
+		return fmt.Errorf("committing filesystem snapshot: %w", err)
+	}
+	return nil
+}
+
 // Rename changes a branch's visible name, leaving everything else alone.
 //
 // A name is how a branch is asked for, not what it is: the Kernel, the tasks in

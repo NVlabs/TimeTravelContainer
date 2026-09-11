@@ -5681,7 +5681,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 			return rollback(err)
 		}
 		repositories = append(repositories, repository)
-		fork, err := repository.BeginFork(filesystemBranch, captureBranch)
+		fork, err := repository.BeginFork(repositoryPhysicalBranch(config, filesystemBranch), captureBranch)
 		if err != nil {
 			return rollback(fmt.Errorf("sealing repository %q: %w", config.Source, err))
 		}
@@ -6162,6 +6162,11 @@ func (b *runtimeBackend) initialConsoleSize(enabled bool) (*specs.Box, error) {
 	return &specs.Box{Height: uint(rows), Width: uint(cols)}, nil
 }
 
+func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volumeID, childBranch string) error {
+	_, err := b.command("timetravel", ownerContainer, "filesystem-snapshot", ownerBranch, volumeID, childBranch)
+	return err
+}
+
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	consoleSize, err := b.initialConsoleSize(request.terminal)
 	if err != nil {
@@ -6203,24 +6208,25 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:          request.reference,
-		PullPolicy:         request.pullPolicy,
-		LogDriver:          request.logDriver,
-		LogOptions:         request.logOptions,
-		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
-		OpenStdin:          request.interactive,
-		AutoRemove:         request.autoRemove,
-		StopTimeout:        &request.stopTimeout,
-		NetworkNAT:         request.networkNAT,
-		NetworkIP:          request.networkIP,
-		NetworkMAC:         request.networkMAC,
-		PublishedPorts:     request.publishedPorts,
-		WaiveLiveFork:      !request.liveForkEligible,
-		LiveForkWaiver:     request.liveForkWaiver,
-		Progress:           b.imageProgress(),
-		VolumeCopyMode:     b.volumeCopyMode,
-		NodeID:             b.nodeID,
+		Reference:             request.reference,
+		PullPolicy:            request.pullPolicy,
+		LogDriver:             request.logDriver,
+		LogOptions:            request.logOptions,
+		ConsoleLogMaxBytes:    request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles:    request.consoleLogMaxFiles,
+		OpenStdin:             request.interactive,
+		AutoRemove:            request.autoRemove,
+		StopTimeout:           &request.stopTimeout,
+		NetworkNAT:            request.networkNAT,
+		NetworkIP:             request.networkIP,
+		NetworkMAC:            request.networkMAC,
+		PublishedPorts:        request.publishedPorts,
+		WaiveLiveFork:         !request.liveForkEligible,
+		LiveForkWaiver:        request.liveForkWaiver,
+		Progress:              b.imageProgress(),
+		VolumeCopyMode:        b.volumeCopyMode,
+		NodeID:                b.nodeID,
+		SnapshotManagedVolume: b.snapshotManagedVolume,
 	})
 	if err != nil {
 		return containerRunResult{}, err
@@ -6278,24 +6284,25 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:          request.reference,
-		PullPolicy:         request.pullPolicy,
-		LogDriver:          request.logDriver,
-		LogOptions:         request.logOptions,
-		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
-		OpenStdin:          request.interactive,
-		AutoRemove:         request.autoRemove,
-		StopTimeout:        &request.stopTimeout,
-		NetworkNAT:         request.networkNAT,
-		NetworkIP:          request.networkIP,
-		NetworkMAC:         request.networkMAC,
-		PublishedPorts:     request.publishedPorts,
-		WaiveLiveFork:      !request.liveForkEligible,
-		LiveForkWaiver:     request.liveForkWaiver,
-		Progress:           b.imageProgress(),
-		VolumeCopyMode:     b.volumeCopyMode,
-		NodeID:             b.nodeID,
+		Reference:             request.reference,
+		PullPolicy:            request.pullPolicy,
+		LogDriver:             request.logDriver,
+		LogOptions:            request.logOptions,
+		ConsoleLogMaxBytes:    request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles:    request.consoleLogMaxFiles,
+		OpenStdin:             request.interactive,
+		AutoRemove:            request.autoRemove,
+		StopTimeout:           &request.stopTimeout,
+		NetworkNAT:            request.networkNAT,
+		NetworkIP:             request.networkIP,
+		NetworkMAC:            request.networkMAC,
+		PublishedPorts:        request.publishedPorts,
+		WaiveLiveFork:         !request.liveForkEligible,
+		LiveForkWaiver:        request.liveForkWaiver,
+		Progress:              b.imageProgress(),
+		VolumeCopyMode:        b.volumeCopyMode,
+		NodeID:                b.nodeID,
+		SnapshotManagedVolume: b.snapshotManagedVolume,
 	})
 	if err != nil {
 		return "", err
@@ -12403,7 +12410,7 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		if err != nil {
 			return nil, fmt.Errorf("opening repository for %s: %w", mount, err)
 		}
-		diff, diffErr := repository.BranchDiff(filesystemBranch)
+		diff, diffErr := repository.BranchDiff(repositoryPhysicalBranch(config, filesystemBranch))
 		closeErr := repository.Close()
 		if diffErr != nil {
 			return nil, fmt.Errorf("reading repository diff for %s: %w", mount, diffErr)
@@ -12539,12 +12546,15 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 		filesystemIDs := make([]string, 0, len(filesystemBranches))
 		seenFilesystemIDs := make(map[string]struct{}, len(filesystemBranches))
-		for _, filesystemBranch := range filesystemBranches {
-			if _, ok := seenFilesystemIDs[filesystemBranch]; ok {
+		visibleByFilesystem := make(map[string][]string)
+		for visible, filesystemBranch := range filesystemBranches {
+			physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+			visibleByFilesystem[physicalBranch] = append(visibleByFilesystem[physicalBranch], visible)
+			if _, ok := seenFilesystemIDs[physicalBranch]; ok {
 				continue
 			}
-			seenFilesystemIDs[filesystemBranch] = struct{}{}
-			filesystemIDs = append(filesystemIDs, filesystemBranch)
+			seenFilesystemIDs[physicalBranch] = struct{}{}
+			filesystemIDs = append(filesystemIDs, physicalBranch)
 		}
 		usage, usageErr := repository.BranchSetUsage(filesystemIDs)
 		closeErr := repository.Close()
@@ -12555,10 +12565,6 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			return FamilyResourceStats{}, closeErr
 		}
 		result.FilesystemUniqueBytes += usage.UniqueBytes
-		visibleByFilesystem := make(map[string][]string)
-		for visible, filesystem := range filesystemBranches {
-			visibleByFilesystem[filesystem] = append(visibleByFilesystem[filesystem], visible)
-		}
 		for _, branchUsage := range usage.Branches {
 			for _, visible := range visibleByFilesystem[branchUsage.ID] {
 				account := byID[visible]

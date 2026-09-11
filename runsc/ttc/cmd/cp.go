@@ -424,6 +424,17 @@ func offlineCopyBranch(info ttcbundle.ContainerInfo, visible string) string {
 	return ttcvolume.ScopedBranchID(info.ID, visible)
 }
 
+// repositoryPhysicalBranch resolves the one intentional heterogeneous case:
+// an initial container branch may mount a read-only named-volume snapshot
+// whose physical branch differs from the family-private rootfs branch.
+// Descendants use one scoped identity across all repositories.
+func repositoryPhysicalBranch(config specutils.TTCVolumeRepository, filesystemBranch string) string {
+	if filesystemBranch == ttcvolume.MainBranch && config.Branch != "" {
+		return config.Branch
+	}
+	return filesystemBranch
+}
+
 func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch string, helperArgs []string) (*specs.Spec, error) {
 	encoded, err := json.Marshal(original)
 	if err != nil {
@@ -472,7 +483,7 @@ func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch 
 	}
 	persistentBranch := offlineCopyBranch(info, branch)
 	for i := range repositories {
-		repositories[i].Branch = persistentBranch
+		repositories[i].Branch = repositoryPhysicalBranch(repositories[i], persistentBranch)
 	}
 	encoded, err = json.Marshal(repositories)
 	if err != nil {

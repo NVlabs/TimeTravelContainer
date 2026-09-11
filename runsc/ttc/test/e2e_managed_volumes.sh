@@ -373,11 +373,18 @@ ttc exec "$MAIN@fdchild" sh -c 'test "$(tail -n 1 /data/openfd)" = child-fd'
 ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
 ttc fork "$SECOND@main" f1 >/dev/null
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
+ttc exec "$SECOND@f1" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
+ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
+ttc exec "$SECOND@f1" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 ttc daemon stop --stop-all >/dev/null
 ttc "$@"
 ttc start "$MAIN@main" >/dev/null
 ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
+ttc start "$SECOND@main" >/dev/null
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 
 echo "ttc managed-volume e2e: PASS"
