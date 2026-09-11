@@ -326,11 +326,12 @@ func TestTransactionStoreLifecycleAndRevisionChecks(t *testing.T) {
 	if stored.State != TransactionTargetReserved || stored.Revision != 2 {
 		t.Fatalf("advanced transaction=%+v", stored)
 	}
-	bound, err := store.BindSession(stored.Identity.TransactionID, stored.Revision, "sha256:"+strings.Repeat("a", 64), now.Add(2*time.Second))
+	pack := strings.Repeat("b", 64)
+	bound, err := store.BindSession(stored.Identity.TransactionID, stored.Revision, "sha256:"+strings.Repeat("a", 64), pack, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bound.State != TransactionSourceCaptured || bound.SessionDigest == "" {
+	if bound.State != TransactionSourceCaptured || bound.SessionDigest == "" || bound.FilesystemMetadataPack != pack {
 		t.Fatalf("bound transaction=%+v", bound)
 	}
 	// Reopening the store must observe the atomically replaced record.

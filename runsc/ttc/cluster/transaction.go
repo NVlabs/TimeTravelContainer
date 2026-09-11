@@ -138,6 +138,17 @@ func validateSHA256Digest(digest string) error {
 	return nil
 }
 
+func validateFilesystemPackID(id string) error {
+	if id == "" {
+		return nil
+	}
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != sha256.Size {
+		return errors.New("filesystem metadata pack must be a SHA-256 hexadecimal ID")
+	}
+	return nil
+}
+
 // Transaction is the durable control-plane record. A target container is not
 // externally visible until State reaches TransactionPublished.
 type Transaction struct {
@@ -158,6 +169,10 @@ type Transaction struct {
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`
+	// FilesystemMetadataPack is the immutable shared pack required to replay
+	// target preparation. It is bound atomically with SessionDigest and roots
+	// the pack until the transaction is retired.
+	FilesystemMetadataPack string `json:"filesystem_metadata_pack,omitempty"`
 	// SparseHandoff is durable and non-secret, allowing either daemon to retry
 	// the live-to-shared reader transition after a control-plane restart.
 	SparseHandoff *SparseHandoffDescriptor `json:"sparse_handoff,omitempty"`

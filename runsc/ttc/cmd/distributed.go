@@ -436,6 +436,9 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 	if len(configs) == 0 {
 		return "", 0, nil
 	}
+	if err := beginColdPackIntent(b.dataRoot, transactionID); err != nil {
+		return "", 0, fmt.Errorf("recording distributed filesystem pack intent: %w", err)
+	}
 	staging := filepath.Join(b.activeDataRoot(), "distributed-filesystem-staging", transactionID)
 	if err := os.RemoveAll(staging); err != nil {
 		return "", 0, err
@@ -482,6 +485,10 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 	if err != nil {
 		closeRepositories()
 		return "", 0, err
+	}
+	if err := bindColdPackIntent(b.dataRoot, transactionID, pack); err != nil {
+		closeRepositories()
+		return "", 0, fmt.Errorf("binding distributed filesystem pack intent: %w", err)
 	}
 	if err := relay.ConfigureFilesystem(token, sources, repositories); err != nil {
 		closeRepositories()

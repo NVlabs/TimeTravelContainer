@@ -45,7 +45,7 @@ type TransactionCatalog interface {
 	AdvanceIndependent(id string, revision uint64, metrics TransferMetrics, now time.Time) (*Transaction, error)
 	Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error)
 	MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error)
-	BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error)
+	BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error)
 	BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error)
 	Delete(id string, revision uint64) error
 	List() ([]Transaction, error)
@@ -257,9 +257,12 @@ func (s *Store) advance(id string, revision uint64, next TransactionState, failu
 // BindSession atomically records the data-plane descriptor digest and advances
 // a reserved target to source-captured. The secret descriptor itself is never
 // written to the transaction store.
-func (s *Store) BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error) {
+func (s *Store) BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error) {
 	if err := validateSHA256Digest(digest); err != nil {
 		return nil, fmt.Errorf("session digest: %w", err)
+	}
+	if err := validateFilesystemPackID(filesystemPack); err != nil {
+		return nil, err
 	}
 	path, err := s.path(id)
 	if err != nil {
@@ -272,7 +275,7 @@ func (s *Store) BindSession(id string, revision uint64, digest string, now time.
 		return nil, err
 	}
 	if tx.SessionDigest != "" {
-		if tx.SessionDigest != digest {
+		if tx.SessionDigest != digest || tx.FilesystemMetadataPack != filesystemPack {
 			return nil, fmt.Errorf("transaction %q is bound to another data-plane session", id)
 		}
 		if tx.State == TransactionSourceCaptured {
@@ -294,6 +297,7 @@ func (s *Store) BindSession(id string, revision uint64, digest string, now time.
 		return nil, fmt.Errorf("transaction %q is %s, not target-reserved", id, tx.State)
 	}
 	tx.SessionDigest = digest
+	tx.FilesystemMetadataPack = filesystemPack
 	if err := tx.Advance(TransactionSourceCaptured, "", now); err != nil {
 		return nil, err
 	}
@@ -478,6 +482,9 @@ func loadTransaction(path, id string) (*Transaction, error) {
 		if err := validateSHA256Digest(tx.SessionDigest); err != nil {
 			return nil, fmt.Errorf("transaction %q session digest: %w", id, err)
 		}
+	}
+	if err := validateFilesystemPackID(tx.FilesystemMetadataPack); err != nil {
+		return nil, fmt.Errorf("transaction %q: %w", id, err)
 	}
 	if tx.SparseHandoff != nil {
 		if err := tx.SparseHandoff.validate(); err != nil {

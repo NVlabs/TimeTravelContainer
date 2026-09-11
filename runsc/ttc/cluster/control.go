@@ -1035,7 +1035,7 @@ func (c *ControlPlane) prepare(w http.ResponseWriter, r *http.Request, id, peer 
 		return
 	}
 	if tx.State == TransactionTargetReserved {
-		tx, err = c.Store.BindSession(id, request.Revision, digest, c.Now())
+		tx, err = c.Store.BindSession(id, request.Revision, digest, request.Session.FilesystemMetadataPack, c.Now())
 		if err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return

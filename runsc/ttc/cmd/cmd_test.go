@@ -37,6 +37,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -5272,6 +5273,38 @@ func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
 	}
 	if _, err := repository.LoadManifest(manifest); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unrooted manifest error=%v, want not-exist", err)
+	}
+}
+
+func TestColdPackIntentReclaimsRetiredTransactionPack(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	staging := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staging, "snapshot.json"), []byte("metadata"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const transaction = "fork-retired"
+	if err := beginColdPackIntent(shared, transaction); err != nil {
+		t.Fatal(err)
+	}
+	pack, err := ttcpack.WriteDirectory(staging, filepath.Join(shared, "cold"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bindColdPackIntent(shared, transaction, pack); err != nil {
+		t.Fatal(err)
+	}
+	if err := collectColdStorage(shared, local, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ttcpack.Path(filepath.Join(shared, "cold"), pack)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired transaction pack remains: %v", err)
+	}
+	intent, err := coldPackIntentPath(shared, transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired transaction intent remains: %v", err)
 	}
 }
 

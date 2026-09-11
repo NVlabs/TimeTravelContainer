@@ -3375,7 +3375,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	maintenanceDone := make(chan struct{})
 	defer close(maintenanceDone)
-	go maintainRepositories(dataRoot, localRoot, publicationQueue, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
+	var maintenanceTransactions cluster.TransactionCatalog
+	if clusterRuntime != nil {
+		maintenanceTransactions = clusterRuntime.transactions
+	}
+	go maintainRepositories(dataRoot, localRoot, publicationQueue, maintenanceTransactions, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
 	})
 	clusterDone := make(chan struct{})
@@ -3774,7 +3778,7 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	return err
 }
 
-func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	for {
@@ -3803,7 +3807,7 @@ func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Q
 		if err := collectSparseMemoryRepositories(dataRoot, localRoot); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)
 		}
-		if err := collectColdStorage(dataRoot, localRoot, publications); err != nil && stderr != nil {
+		if err := collectColdStorage(dataRoot, localRoot, publications, transactions); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
 		}
 		if standalone {

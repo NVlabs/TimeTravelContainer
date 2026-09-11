@@ -31,6 +31,74 @@ import (
 
 type coldPackObjectReader struct{ directory *ttcpack.Directory }
 
+const coldPackIntentVersion = 1
+
+type coldPackIntent struct {
+	Version       int       `json:"version"`
+	TransactionID string    `json:"transaction_id"`
+	Pack          string    `json:"pack,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+func coldPackIntentPath(sharedRoot, transactionID string) (string, error) {
+	if transactionID == "" || filepath.Base(transactionID) != transactionID || strings.ContainsRune(transactionID, os.PathSeparator) {
+		return "", fmt.Errorf("invalid cold-pack transaction %q", transactionID)
+	}
+	return filepath.Join(sharedRoot, "cold", "inflight", transactionID+".json"), nil
+}
+
+func beginColdPackIntent(sharedRoot, transactionID string) error {
+	path, err := coldPackIntentPath(sharedRoot, transactionID)
+	if err != nil {
+		return err
+	}
+	if existing, err := readColdPackIntent(path); err == nil {
+		if existing.TransactionID != transactionID {
+			return errors.New("cold-pack intent identity mismatch")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeDurableJSON(path, &coldPackIntent{Version: coldPackIntentVersion, TransactionID: transactionID, CreatedAt: time.Now().UTC()})
+}
+
+func bindColdPackIntent(sharedRoot, transactionID string, pack ttcpack.ID) error {
+	path, err := coldPackIntentPath(sharedRoot, transactionID)
+	if err != nil {
+		return err
+	}
+	intent, err := readColdPackIntent(path)
+	if err != nil {
+		return err
+	}
+	if intent.Pack != "" && intent.Pack != pack.String() {
+		return errors.New("cold-pack intent is already bound to another pack")
+	}
+	intent.Pack = pack.String()
+	return writeDurableJSON(path, &intent)
+}
+
+func readColdPackIntent(path string) (coldPackIntent, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return coldPackIntent{}, err
+	}
+	var intent coldPackIntent
+	if err := json.Unmarshal(data, &intent); err != nil {
+		return coldPackIntent{}, err
+	}
+	if intent.Version != coldPackIntentVersion || intent.TransactionID == "" || intent.CreatedAt.IsZero() {
+		return coldPackIntent{}, errors.New("invalid cold-pack intent")
+	}
+	if intent.Pack != "" {
+		if _, err := ttcpack.ParseID(intent.Pack); err != nil {
+			return coldPackIntent{}, err
+		}
+	}
+	return intent, nil
+}
+
 func (r coldPackObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
 	return r.directory.ReadAt("objects/"+object, destination, offset)
 }
@@ -1255,7 +1323,7 @@ func (b *runtimeBackend) materializeColdSource(manifest coldBranchManifest, sour
 // collectColdStorage traces every authoritative and pending manifest before
 // reclaiming immutable packs. A grace period protects a publisher between
 // writing its pack and atomically committing its manifest.
-func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue) error {
+func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog) error {
 	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
 	containers, err := store.ListContainers()
 	if err != nil {
@@ -1288,6 +1356,24 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 	}
 	manifests := make(map[string]struct{})
 	packs := make(map[ttcpack.ID]struct{})
+	transactionsByID := make(map[string]cluster.Transaction)
+	if transactions != nil {
+		records, err := transactions.List()
+		if err != nil {
+			return err
+		}
+		for _, tx := range records {
+			transactionsByID[tx.Identity.TransactionID] = tx
+			if tx.FilesystemMetadataPack == "" {
+				continue
+			}
+			id, err := ttcpack.ParseID(tx.FilesystemMetadataPack)
+			if err != nil {
+				return fmt.Errorf("transaction %q filesystem pack: %w", tx.Identity.TransactionID, err)
+			}
+			packs[id] = struct{}{}
+		}
+	}
 	for len(queue) != 0 {
 		path := queue[len(queue)-1]
 		queue = queue[:len(queue)-1]
@@ -1311,6 +1397,57 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 				return err
 			}
 			packs[id] = struct{}{}
+		}
+	}
+	var immediate []ttcpack.ID
+	inflightRoot := filepath.Join(sharedRoot, "cold", "inflight")
+	entries, err := os.ReadDir(inflightRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(inflightRoot, entry.Name())
+		intent, err := readColdPackIntent(path)
+		if err != nil {
+			return fmt.Errorf("reading cold-pack intent %q: %w", entry.Name(), err)
+		}
+		tx, live := transactionsByID[intent.TransactionID]
+		if live {
+			if intent.Pack != "" {
+				id, err := ttcpack.ParseID(intent.Pack)
+				if err != nil {
+					return err
+				}
+				packs[id] = struct{}{}
+			}
+			if tx.FilesystemMetadataPack == "" {
+				continue
+			}
+			if intent.Pack != tx.FilesystemMetadataPack {
+				return fmt.Errorf("transaction %q and cold-pack intent disagree", intent.TransactionID)
+			}
+			continue
+		}
+		if intent.Pack != "" {
+			id, err := ttcpack.ParseID(intent.Pack)
+			if err != nil {
+				return err
+			}
+			immediate = append(immediate, id)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	for _, id := range immediate {
+		if _, rooted := packs[id]; rooted {
+			continue
+		}
+		if err := os.Remove(ttcpack.Path(filepath.Join(sharedRoot, "cold"), id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 	}
 	grace := time.Now().Add(-10 * time.Minute)
