@@ -138,6 +138,13 @@ different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set
 `TTC_FANOUT_TEST_BRANCHES` to increase the fanout.
 
+`e2e_distributed_multihop.sh` starts a fresh two-node cluster, remotely forks
+A-to-B, migrates the child B-to-A, and remotely forks it A-to-B again. It
+verifies a continuously running process, exact 32 MiB memory contents, sparse
+whole-file materialization, and branch-local filesystem divergence after both
+handoffs. `TTC_DISTRIBUTED_TEST_PORT_A` and
+`TTC_DISTRIBUTED_TEST_PORT_B` select its host listener ports.
+
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTC's runsc arguments, daemon namespace preflight,

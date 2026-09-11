@@ -69,6 +69,15 @@ sh_binary(
     ],
 )
 
+# Manual because it starts two clustered daemons and binds two host TCP ports.
+sh_binary(
+    name = "e2e_distributed_multihop",
+    srcs = ["e2e_distributed_multihop.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
