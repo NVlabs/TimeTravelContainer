@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 )
 
@@ -209,12 +210,19 @@ func (mutation *graphMutation) commit(rootName string, root ObjectID) error {
 	}
 	sort.Strings(keys)
 	ops := make([]journalOp, 0, len(keys)+2)
+	references := make(map[string]Object)
 	for _, key := range keys {
 		object := mutation.objects[key]
+		if previous, ok := mutation.store.state.Objects[key]; ok && previous.ID == object.ID && previous.BulkLength == object.BulkLength && bytes.Equal(previous.Data, object.Data) && slices.Equal(previous.Children, object.Children) {
+			if previous.Refs != object.Refs || previous.State != object.State {
+				references[key] = object
+			}
+			continue
+		}
 		ops = append(ops, journalOp{PutObject: &object})
 	}
 	ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, PutRoot: &root})
-	return mutation.store.commitLocked(ops)
+	return mutation.store.commitLockedWithMaterializedReferences(ops, references)
 }
 
 type bTreeBuilder struct {

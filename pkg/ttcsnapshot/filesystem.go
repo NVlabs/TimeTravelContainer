@@ -63,6 +63,41 @@ type FilesystemOperation struct {
 	DeleteEntry *DirectoryEntryRecord
 }
 
+// filesystemJournalMutation is the compact, deterministic WAL form of a
+// filesystem update. Immutable B-tree nodes are reconstructed from these
+// logical operations during recovery instead of serializing every path-copy
+// node and reference-count adjustment.
+type filesystemJournalMutation struct {
+	Origin      SnapshotID
+	RootName    string
+	Operations  []FilesystemOperation
+	ReleasePins []string
+	Result      ObjectID
+}
+
+func validateFilesystemJournalMutation(mutation filesystemJournalMutation) error {
+	if mutation.Origin == 0 || mutation.Result.IsZero() {
+		return errors.New("invalid TTC filesystem journal identity")
+	}
+	if err := validateRootName(mutation.RootName); err != nil {
+		return err
+	}
+	if len(mutation.Operations) == 0 {
+		return errors.New("empty TTC filesystem journal transaction")
+	}
+	seenPins := make(map[string]struct{}, len(mutation.ReleasePins))
+	for _, pin := range mutation.ReleasePins {
+		if err := validateRootName(pin); err != nil {
+			return fmt.Errorf("invalid released construction pin: %w", err)
+		}
+		if _, ok := seenPins[pin]; ok {
+			return fmt.Errorf("filesystem journal repeats released pin %q", pin)
+		}
+		seenPins[pin] = struct{}{}
+	}
+	return nil
+}
+
 type filesystemRoot struct {
 	inodes ObjectID
 }
@@ -147,6 +182,12 @@ func (builder *bTreeBuilder) delete(root ObjectID, key []byte) (ObjectID, bool, 
 // inode and directory B-tree paths, then replacing one logical filesystem
 // root. Forking that root remains one reference increment.
 func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations []FilesystemOperation) (ObjectID, error) {
+	return s.ApplyFilesystemAndReleasePins(origin, rootName, operations, nil)
+}
+
+// ApplyFilesystemAndReleasePins publishes a filesystem update and converts
+// construction pins into immutable inode edges in the same transaction.
+func (s *Store) ApplyFilesystemAndReleasePins(origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (ObjectID, error) {
 	if err := validateRootName(rootName); err != nil {
 		return ObjectID{}, err
 	}
@@ -155,19 +196,39 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	mutation, err := newGraphMutation(s, origin)
+	mutation, logicalRoot, err := buildFilesystemMutation(&s.state, origin, rootName, operations, releasePins)
 	if err != nil {
 		return ObjectID{}, err
 	}
+	journalMutation := filesystemJournalMutation{
+		Origin: origin, RootName: rootName,
+		Operations:  append([]FilesystemOperation(nil), operations...),
+		ReleasePins: append([]string(nil), releasePins...), Result: logicalRoot,
+	}
+	err = s.commitLockedPrepared([]journalOp{{ApplyFilesystem: &journalMutation}}, nil, func(state *graphState) error {
+		return installGraphMutation(state, mutation, rootName, logicalRoot, releasePins)
+	})
+	if err != nil {
+		return ObjectID{}, err
+	}
+	return logicalRoot, nil
+}
+
+func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
+	store := &Store{state: *state}
+	mutation, err := newGraphMutation(store, origin)
+	if err != nil {
+		return nil, ObjectID{}, err
+	}
 	var root filesystemRoot
-	if current, ok := s.state.Roots[rootName]; ok {
-		object, ok := s.state.Objects[current.key()]
+	if current, ok := state.Roots[rootName]; ok {
+		object, ok := state.Objects[current.key()]
 		if !ok {
-			return ObjectID{}, fmt.Errorf("filesystem root object %s is missing", current.key())
+			return nil, ObjectID{}, fmt.Errorf("filesystem root object %s is missing", current.key())
 		}
 		root, err = decodeFilesystemRoot(object)
 		if err != nil {
-			return ObjectID{}, err
+			return nil, ObjectID{}, err
 		}
 	}
 	inodeBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindInodeNode}
@@ -186,13 +247,13 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			selectors++
 		}
 		if selectors != 1 {
-			return ObjectID{}, errors.New("invalid TTC filesystem operation selector")
+			return nil, ObjectID{}, errors.New("invalid TTC filesystem operation selector")
 		}
 		switch {
 		case operation.PutInode != nil:
 			inode := *operation.PutInode
 			if inode.Number == 0 || inode.Type == "" {
-				return ObjectID{}, errors.New("invalid TTC inode record")
+				return nil, ObjectID{}, errors.New("invalid TTC inode record")
 			}
 			// Directory membership is maintained by PutEntry/DeleteEntry. The
 			// public inode metadata used by filesystem clients intentionally
@@ -202,125 +263,125 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 			if inode.Type == "directory" && inode.Directory.IsZero() && !root.inodes.IsZero() {
 				oldID, found, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(inode.Number))
 				if err != nil {
-					return ObjectID{}, err
+					return nil, ObjectID{}, err
 				}
 				if found {
 					oldObject, ok := mutation.object(oldID)
 					if !ok || oldObject.ID.Kind != ObjectKindInode {
-						return ObjectID{}, errors.New("inode tree references missing or invalid inode object")
+						return nil, ObjectID{}, errors.New("inode tree references missing or invalid inode object")
 					}
 					var old InodeRecord
 					if err := json.Unmarshal(oldObject.Data, &old); err != nil {
-						return ObjectID{}, err
+						return nil, ObjectID{}, err
 					}
 					inode.Directory = old.Directory
 				}
 			}
 			children, err := inodeChildren(inode)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			data, err := encodeRecord(inode)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			object, err := mutation.create(ObjectKindInode, data, children)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			root.inodes, err = inodeBuilder.set(root.inodes, InodeKey(inode.Number), object)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 		case operation.DeleteInode != 0:
 			root.inodes, _, err = inodeBuilder.delete(root.inodes, InodeKey(operation.DeleteInode))
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 		case operation.PutEntry != nil:
 			entry := *operation.PutEntry
 			key, err := directoryKey(entry.Parent, entry.Name)
 			if err != nil || entry.Inode == 0 {
-				return ObjectID{}, errors.New("invalid TTC directory entry record")
+				return nil, ObjectID{}, errors.New("invalid TTC directory entry record")
 			}
 			if _, exists, lookupErr := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(entry.Inode)); lookupErr != nil || !exists {
-				return ObjectID{}, fmt.Errorf("looking up directory entry inode %d: %w", entry.Inode, lookupErr)
+				return nil, ObjectID{}, fmt.Errorf("looking up directory entry inode %d: %w", entry.Inode, lookupErr)
 			}
 			parentID, ok, err := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(entry.Parent))
 			if err != nil || !ok {
-				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", entry.Parent, err)
+				return nil, ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", entry.Parent, err)
 			}
 			parentObject, _ := mutation.object(parentID)
 			var parent InodeRecord
 			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			if parent.Type != "directory" {
-				return ObjectID{}, errors.New("directory entry parent is not a directory")
+				return nil, ObjectID{}, errors.New("directory entry parent is not a directory")
 			}
 			data, err := encodeRecord(entry)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			object, err := mutation.create(ObjectKindMetadata, data, nil)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
 			parent.Directory, err = directoryBuilder.set(parent.Directory, key[8:], object)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentData, err := encodeRecord(parent)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentEdges, err := inodeChildren(parent)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentObjectID, err := mutation.create(ObjectKindInode, parentData, parentEdges)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			root.inodes, err = inodeBuilder.set(root.inodes, InodeKey(parent.Number), parentObjectID)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 		case operation.DeleteEntry != nil:
 			key, err := directoryKey(operation.DeleteEntry.Parent, operation.DeleteEntry.Name)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentID, ok, lookupErr := bTreeLookupMutation(mutation, root.inodes, ObjectKindInodeNode, InodeKey(operation.DeleteEntry.Parent))
 			if lookupErr != nil || !ok {
-				return ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", operation.DeleteEntry.Parent, lookupErr)
+				return nil, ObjectID{}, fmt.Errorf("looking up parent inode %d: %w", operation.DeleteEntry.Parent, lookupErr)
 			}
 			parentObject, _ := mutation.object(parentID)
 			var parent InodeRecord
 			if err := json.Unmarshal(parentObject.Data, &parent); err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			directoryBuilder := bTreeBuilder{mutation: mutation, kind: ObjectKindDirectoryNode}
 			parent.Directory, _, err = directoryBuilder.delete(parent.Directory, key[8:])
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentData, err := encodeRecord(parent)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentEdges, err := inodeChildren(parent)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			parentObjectID, err := mutation.create(ObjectKindInode, parentData, parentEdges)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 			root.inodes, err = inodeBuilder.set(root.inodes, InodeKey(parent.Number), parentObjectID)
 			if err != nil {
-				return ObjectID{}, err
+				return nil, ObjectID{}, err
 			}
 		}
 	}
@@ -329,19 +390,88 @@ func (s *Store) ApplyFilesystem(origin SnapshotID, rootName string, operations [
 		edges = append(edges, Edge{Slot: 0, Child: root.inodes})
 	}
 	if len(edges) == 0 {
-		return ObjectID{}, errors.New("TTC filesystem transaction produced an empty filesystem")
+		return nil, ObjectID{}, errors.New("TTC filesystem transaction produced an empty filesystem")
 	}
 	logicalRoot, err := mutation.create(ObjectKindMetadata, []byte(filesystemRootMagic), edges)
 	if err != nil {
-		return ObjectID{}, err
+		return nil, ObjectID{}, err
 	}
 	if err := mutation.setRoot(rootName, logicalRoot); err != nil {
-		return ObjectID{}, err
+		return nil, ObjectID{}, err
 	}
-	if err := mutation.commit(rootName, logicalRoot); err != nil {
-		return ObjectID{}, err
+	for _, pin := range releasePins {
+		id, ok := state.Pins[pin]
+		if !ok {
+			return nil, ObjectID{}, fmt.Errorf("construction pin %q does not exist", pin)
+		}
+		object, ok := mutation.object(id)
+		if !ok {
+			return nil, ObjectID{}, fmt.Errorf("construction pin %q references missing object %s", pin, id)
+		}
+		object, err = releaseObject(object)
+		if err != nil {
+			return nil, ObjectID{}, err
+		}
+		mutation.put(object)
 	}
-	return logicalRoot, nil
+	return mutation, logicalRoot, nil
+}
+
+func installGraphMutation(state *graphState, mutation *graphMutation, rootName string, root ObjectID, releasePins []string) error {
+	var reclaim []string
+	for key, object := range mutation.objects {
+		state.Objects[key] = cloneObject(object)
+		if object.State == ObjectReclaiming {
+			reclaim = append(reclaim, key)
+		}
+	}
+	state.Snapshots[snapshotKey(mutation.snapshot.ID)] = mutation.snapshot
+	state.Roots[rootName] = root
+	for _, pin := range releasePins {
+		delete(state.Pins, pin)
+	}
+	return collectFilesystemMutationGarbage(state, reclaim)
+}
+
+// collectFilesystemMutationGarbage eagerly collapses the obsolete path that
+// the same root swap made unreachable. It never scans the graph: each visited
+// object is reached by cascading from a zero-reference object touched by the
+// transaction. Objects participating in an authority handoff retain the
+// existing deferred-GC behavior.
+func collectFilesystemMutationGarbage(state *graphState, queue []string) error {
+	queued := make(map[string]struct{}, len(queue))
+	for _, key := range queue {
+		queued[key] = struct{}{}
+	}
+	for len(queue) != 0 {
+		key := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		object, ok := state.Objects[key]
+		if !ok || object.State != ObjectReclaiming || object.Refs != 0 {
+			continue
+		}
+		if _, transferring := state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
+			continue
+		}
+		delete(state.Objects, key)
+		for _, edge := range object.Children {
+			childKey := edge.Child.key()
+			child, ok := state.Objects[childKey]
+			if !ok || child.State != ObjectLive || child.Refs == 0 {
+				return fmt.Errorf("reclaiming object %s references unavailable child %s", key, childKey)
+			}
+			child.Refs--
+			if child.Refs == 0 {
+				child.State = ObjectReclaiming
+				if _, ok := queued[childKey]; !ok {
+					queue = append(queue, childKey)
+					queued[childKey] = struct{}{}
+				}
+			}
+			state.Objects[childKey] = child
+		}
+	}
+	return nil
 }
 
 func bTreeLookupState(state graphState, root ObjectID, kind ObjectKind, key []byte) (ObjectID, bool, error) {

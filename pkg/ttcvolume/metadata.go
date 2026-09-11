@@ -214,14 +214,22 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 			return fmt.Errorf("unknown metadata operation %q", op.Kind)
 		}
 	}
-	root, err := r.graph.ApplyFilesystem(ttcsnapshot.SnapshotID(branch.WorkingSnapshot), graphRootName(branch.ID), graphOps)
+	var releasePins []string
+	for _, op := range ops {
+		if op.Inode != nil && op.Inode.Object != "" {
+			if id, err := ttcsnapshot.ParseObjectID(op.Inode.Object); err == nil {
+				pin := graphConstructionPin(id)
+				if r.graph.HasPin(pin) {
+					releasePins = append(releasePins, pin)
+				}
+			}
+		}
+	}
+	root, err := r.graph.ApplyFilesystemAndReleasePins(ttcsnapshot.SnapshotID(branch.WorkingSnapshot), graphRootName(branch.ID), graphOps, releasePins)
 	if err != nil {
 		return err
 	}
 	branch.Root = root.String()
-	if err := r.writeBranch(*branch); err != nil {
-		return err
-	}
 	state.mu.Lock()
 	if err := applyMetadataOps(state, ops); err != nil {
 		state.mu.Unlock()
@@ -229,15 +237,12 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	}
 	state.branch = *branch
 	state.mu.Unlock()
-	for _, op := range ops {
-		if op.Inode != nil && op.Inode.Object != "" {
-			if id, err := ttcsnapshot.ParseObjectID(op.Inode.Object); err == nil {
-				if err := r.graph.DeletePinIfPresent(graphConstructionPin(id)); err != nil {
-					return err
-				}
-			}
-		}
+	r.dirtyMu.Lock()
+	if r.dirtyBranches == nil {
+		r.dirtyBranches = make(map[string]*branchMetadata)
 	}
+	r.dirtyBranches[branch.ID] = state
+	r.dirtyMu.Unlock()
 	return nil
 }
 

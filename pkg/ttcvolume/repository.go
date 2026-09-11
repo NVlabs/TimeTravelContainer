@@ -248,7 +248,11 @@ type Repository struct {
 	dirtyMu    sync.Mutex
 	dirtyFiles map[string]struct{}
 	dirtyDirs  map[string]struct{}
-	knownDirs  map[string]struct{}
+	// dirtyBranches names branch pointer files whose Root field trails the
+	// authoritative graph root. Publishing these on fsync/lifecycle fences
+	// avoids an atomic temp-file+rename for every guest inode mutation.
+	dirtyBranches map[string]*branchMetadata
+	knownDirs     map[string]struct{}
 
 	// metadata is the decoded view of each locally-used branch. The journal is
 	// authoritative and is replayed when a branch first becomes active.
@@ -925,7 +929,19 @@ func (r *Repository) recoverGraphState() error {
 
 // Branch returns a branch root.
 func (r *Repository) Branch(id string) (Branch, error) {
-	return r.readBranch(id)
+	branch, err := r.readBranch(id)
+	if err != nil {
+		return Branch{}, err
+	}
+	if err := r.graph.Reload(); err != nil {
+		return Branch{}, err
+	}
+	root, ok := r.graph.Root(graphRootName(id))
+	if !ok {
+		return Branch{}, fmt.Errorf("branch %q has no snapshot graph root", id)
+	}
+	branch.Root = root.String()
+	return branch, nil
 }
 
 // RemoveBranch removes a branch pointer after its Kernel no longer exists.
@@ -1064,6 +1080,14 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		if err != nil {
 			return err
 		}
+		// Root advances are published to the graph immediately and summarized
+		// in the branch pointer only at durability fences. Fork from the
+		// authoritative graph root, never from a possibly lagging summary.
+		sourceRoot, ok := r.graph.Root(graphRootName(source))
+		if !ok {
+			return fmt.Errorf("branch %q has no snapshot graph root", source)
+		}
+		sourceBranch.Root = sourceRoot.String()
 		if _, err := r.readBranch(child); err == nil {
 			return fmt.Errorf("branch %q already exists", child)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -1097,6 +1121,9 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		if err := r.writeBranch(sourceBranch); err != nil {
 			return err
 		}
+		r.dirtyMu.Lock()
+		delete(r.dirtyBranches, source)
+		r.dirtyMu.Unlock()
 		if err := r.writeBranch(childBranch); err != nil {
 			// writeBranch may fail after its rename succeeded (for example,
 			// while fsyncing the directory). Remove the child pointer before
@@ -1862,13 +1889,19 @@ func (r *Repository) SyncMetadata() error {
 // by the repository flock, so a successful call covers every mutation that
 // completed before it began.
 func (r *Repository) syncMetadataLocked() error {
+	// Branch pointer files are recovery summaries. The graph root is visible
+	// immediately and remains authoritative between durability fences.
 	r.dirtyMu.Lock()
-	var rootDirty, branchDirty []string
+	dirtyBranches := make([]string, 0, len(r.dirtyBranches))
+	for id := range r.dirtyBranches {
+		dirtyBranches = append(dirtyBranches, id)
+	}
+	r.dirtyMu.Unlock()
+	sort.Strings(dirtyBranches)
+	r.dirtyMu.Lock()
+	var rootDirty []string
 	for name := range r.dirtyFiles {
-		switch {
-		case strings.HasPrefix(name, "branches/"):
-			branchDirty = append(branchDirty, name)
-		default:
+		if !strings.HasPrefix(name, "branches/") {
 			rootDirty = append(rootDirty, name)
 		}
 	}
@@ -1878,7 +1911,6 @@ func (r *Repository) syncMetadataLocked() error {
 	}
 	r.dirtyMu.Unlock()
 	sort.Strings(rootDirty)
-	sort.Strings(branchDirty)
 	// Children must precede parents so every object name is durable before a
 	// journal transaction that makes it reachable.
 	sort.Slice(dirtyDirs, func(i, j int) bool {
@@ -1901,6 +1933,12 @@ func (r *Repository) syncMetadataLocked() error {
 		}
 		return nil
 	}
+	if err := syncFiles(rootDirty); err != nil {
+		return err
+	}
+	// Persist directory entries only after the files they name. The graph WAL
+	// is the final reachability barrier, so every immutable object must already
+	// be openable if that WAL survives a crash.
 	for _, name := range dirtyDirs {
 		if name == "." {
 			continue
@@ -1909,9 +1947,35 @@ func (r *Repository) syncMetadataLocked() error {
 			return fmt.Errorf("syncing dirty repository directory %q: %w", name, err)
 		}
 	}
-	if err := syncFiles(rootDirty); err != nil {
-		return err
+	// The graph journal names the immutable metadata and data objects made
+	// durable above. Persist it before publishing branch pointer files.
+	if err := r.graph.Sync(); err != nil {
+		return fmt.Errorf("syncing repository snapshot graph: %w", err)
 	}
+	for _, id := range dirtyBranches {
+		r.dirtyMu.Lock()
+		state := r.dirtyBranches[id]
+		r.dirtyMu.Unlock()
+		if state == nil {
+			return fmt.Errorf("dirty branch %q has no process-local metadata", id)
+		}
+		state.mu.RLock()
+		branch := state.branch
+		state.mu.RUnlock()
+		if err := r.writeBranch(branch); err != nil {
+			return err
+		}
+	}
+	// writeBranch above adds the newly published summaries to dirtyFiles.
+	r.dirtyMu.Lock()
+	var branchDirty []string
+	for name := range r.dirtyFiles {
+		if strings.HasPrefix(name, "branches/") {
+			branchDirty = append(branchDirty, name)
+		}
+	}
+	r.dirtyMu.Unlock()
+	sort.Strings(branchDirty)
 	if err := syncFiles(branchDirty); err != nil {
 		return err
 	}
@@ -1927,6 +1991,9 @@ func (r *Repository) syncMetadataLocked() error {
 	}
 	for name := range r.dirtyDirs {
 		delete(r.dirtyDirs, name)
+	}
+	for _, id := range dirtyBranches {
+		delete(r.dirtyBranches, id)
 	}
 	r.dirtyMu.Unlock()
 	return nil

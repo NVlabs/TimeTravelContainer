@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,6 +108,7 @@ type journalOp struct {
 	UnfreezeSnapshot SnapshotID
 	BeginHandoff     *SnapshotLedgerHandoff
 	AppendHandoff    *SnapshotReferenceMutation
+	ApplyFilesystem  *filesystemJournalMutation
 }
 
 type journalRecord struct {
@@ -125,6 +128,10 @@ type Store struct {
 	state      graphState
 	poisoned   error
 	journalEnd int64
+	headDev    uint64
+	headIno    uint64
+	headSize   int64
+	headMtime  int64
 	// externallyCoordinated is used by graph stores embedded in a TTC
 	// filesystem repository. In that mode the repository's cross-process
 	// flock serializes writers, so this Store must not retain graph.lock for
@@ -289,18 +296,22 @@ func (s *Store) Reload() error {
 		}
 		defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 	}
-	head, err := s.readHead()
-	if err != nil {
-		return err
-	}
-	if head.Generation == s.generation && s.journal != nil {
+	if s.journal != nil {
+		unchanged, err := s.headUnchanged()
+		if err != nil {
+			return err
+		}
 		info, err := s.journal.Stat()
 		if err != nil {
 			return err
 		}
-		if s.journalEnd == info.Size() {
+		if unchanged && s.journalEnd == info.Size() {
 			return nil
 		}
+	}
+	head, err := s.readHead()
+	if err != nil {
+		return err
 	}
 	return s.loadGeneration(head, false)
 }
@@ -320,20 +331,45 @@ func (s *Store) ReloadForWrite() error {
 		return err
 	}
 	defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
-	head, err := s.readHead()
-	if err != nil {
-		return err
-	}
-	if head.Generation == s.generation && s.journal != nil {
+	if s.journal != nil {
+		unchanged, err := s.headUnchanged()
+		if err != nil {
+			return err
+		}
 		info, err := s.journal.Stat()
 		if err != nil {
 			return err
 		}
-		if s.journalEnd == info.Size() {
+		if unchanged && s.journalEnd == info.Size() {
 			return nil
 		}
 	}
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
 	return s.loadGeneration(head, true)
+}
+
+func (s *Store) headUnchanged() (bool, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(s.dirFD.Fd()), headFileName, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return false, err
+	}
+	mtime := stat.Mtim.Sec*1e9 + stat.Mtim.Nsec
+	return uint64(stat.Dev) == s.headDev && stat.Ino == s.headIno && stat.Size == s.headSize && mtime == s.headMtime, nil
+}
+
+func (s *Store) rememberHead() error {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(s.dirFD.Fd()), headFileName, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	s.headDev = uint64(stat.Dev)
+	s.headIno = stat.Ino
+	s.headSize = stat.Size
+	s.headMtime = stat.Mtim.Sec*1e9 + stat.Mtim.Nsec
+	return nil
 }
 
 // Close releases the store lock.
@@ -551,6 +587,8 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	previousState := s.state
 	previousGeneration := s.generation
 	previousEnd := s.journalEnd
+	previousHeadDev, previousHeadIno := s.headDev, s.headIno
+	previousHeadSize, previousHeadMtime := s.headSize, s.headMtime
 	s.state = state
 	s.journal = journal
 	s.generation = head.Generation
@@ -560,6 +598,18 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		s.state = previousState
 		s.generation = previousGeneration
 		s.journalEnd = previousEnd
+		s.headDev, s.headIno = previousHeadDev, previousHeadIno
+		s.headSize, s.headMtime = previousHeadSize, previousHeadMtime
+		journal.Close()
+		return err
+	}
+	if err := s.rememberHead(); err != nil {
+		s.journal = previous
+		s.state = previousState
+		s.generation = previousGeneration
+		s.journalEnd = previousEnd
+		s.headDev, s.headIno = previousHeadDev, previousHeadIno
+		s.headSize, s.headMtime = previousHeadSize, previousHeadMtime
 		journal.Close()
 		return err
 	}
@@ -711,7 +761,10 @@ func (s *Store) replayJournal(repairTail bool) error {
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}
-			return s.truncateJournal(recordStart)
+			if err := s.truncateJournal(recordStart); err != nil {
+				return err
+			}
+			break
 		}
 		offset += int64(len(lengthBuffer))
 		length := binary.BigEndian.Uint32(lengthBuffer)
@@ -728,7 +781,10 @@ func (s *Store) replayJournal(repairTail bool) error {
 				_, seekErr := s.journal.Seek(0, io.SeekEnd)
 				return seekErr
 			}
-			return s.truncateJournal(recordStart)
+			if err := s.truncateJournal(recordStart); err != nil {
+				return err
+			}
+			break
 		}
 		offset += int64(length)
 		var record journalRecord
@@ -752,11 +808,60 @@ func (s *Store) replayJournal(repairTail bool) error {
 		}
 		s.journalEnd = offset
 	}
+	// Reference counts are a materialized index of immutable parent edges and
+	// stable roots/pins. Hot path-copy transactions intentionally omit updates
+	// that change only this index, so reconstruct it once after replay rather
+	// than writing every unchanged B-tree child back into the WAL.
+	if err := recomputeGraphReferences(&s.state); err != nil {
+		return fmt.Errorf("rebuilding TTC snapshot graph references after journal replay: %w", err)
+	}
 	if err := validateGraphState(&s.state); err != nil {
 		return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
 	}
 	_, err = s.journal.Seek(0, io.SeekEnd)
 	return err
+}
+
+func recomputeGraphReferences(state *graphState) error {
+	expected := make(map[string]uint64, len(state.Objects))
+	retain := func(id ObjectID) error {
+		key := id.key()
+		if _, ok := state.Objects[key]; !ok {
+			return fmt.Errorf("reference selects missing object %s", key)
+		}
+		if expected[key] == math.MaxUint64 {
+			return fmt.Errorf("object %s reference count overflows", key)
+		}
+		expected[key]++
+		return nil
+	}
+	for _, id := range state.Roots {
+		if err := retain(id); err != nil {
+			return err
+		}
+	}
+	for _, id := range state.Pins {
+		if err := retain(id); err != nil {
+			return err
+		}
+	}
+	for _, object := range state.Objects {
+		for _, edge := range object.Children {
+			if err := retain(edge.Child); err != nil {
+				return fmt.Errorf("object %s child: %w", object.ID.key(), err)
+			}
+		}
+	}
+	for key, object := range state.Objects {
+		object.Refs = expected[key]
+		if object.Refs == 0 {
+			object.State = ObjectReclaiming
+		} else {
+			object.State = ObjectLive
+		}
+		state.Objects[key] = object
+	}
+	return nil
 }
 
 func (s *Store) truncateJournal(offset int64) error {
@@ -845,6 +950,17 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			handoff.Mutations = append(handoff.Mutations, mutation)
 			handoff.NextSequence++
 			state.Handoffs[key] = handoff
+		case op.ApplyFilesystem != nil:
+			mutation, root, err := buildFilesystemMutation(state, op.ApplyFilesystem.Origin, op.ApplyFilesystem.RootName, op.ApplyFilesystem.Operations, op.ApplyFilesystem.ReleasePins)
+			if err != nil {
+				return err
+			}
+			if root != op.ApplyFilesystem.Result {
+				return fmt.Errorf("filesystem journal replay produced root %s, want %s", root, op.ApplyFilesystem.Result)
+			}
+			if err := installGraphMutation(state, mutation, op.ApplyFilesystem.RootName, root, op.ApplyFilesystem.ReleasePins); err != nil {
+				return err
+			}
 		default:
 			return errors.New("empty TTC snapshot graph journal operation")
 		}
@@ -925,6 +1041,12 @@ func validateJournalRecord(record journalRecord) error {
 		if op.AppendHandoff != nil {
 			selectors++
 			if err := validateSnapshotReferenceMutation(*op.AppendHandoff); err != nil {
+				return err
+			}
+		}
+		if op.ApplyFilesystem != nil {
+			selectors++
+			if err := validateFilesystemJournalMutation(*op.ApplyFilesystem); err != nil {
 				return err
 			}
 		}
@@ -1090,6 +1212,21 @@ func cloneObject(object Object) Object {
 }
 
 func (s *Store) commitLocked(ops []journalOp) error {
+	return s.commitLockedPrepared(ops, nil, nil)
+}
+
+// commitLockedWithMaterializedReferences commits authoritative graph changes
+// and then installs reference-count-only object updates in memory. Those
+// updates are omitted from the WAL because replay derives them exactly from
+// immutable edges, roots, and pins.
+func (s *Store) commitLockedWithMaterializedReferences(ops []journalOp, references map[string]Object) error {
+	return s.commitLockedPrepared(ops, references, nil)
+}
+
+// commitLockedPrepared writes ops and installs a transaction that was already
+// built against the current state. prepared avoids rebuilding high-level
+// filesystem operations after their compact WAL record has been appended.
+func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Object, prepared func(*graphState) error) error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
@@ -1097,26 +1234,42 @@ func (s *Store) commitLocked(ops []journalOp) error {
 	if err := validateJournalRecord(record); err != nil {
 		return err
 	}
-	next := cloneGraphState(s.state)
-	if err := applyJournalRecord(&next, record); err != nil {
-		return err
-	}
-	mutations, err := snapshotHandoffMutationOps(s.state, next)
-	if err != nil {
-		return err
-	}
-	if len(mutations) != 0 {
-		record.Ops = append(record.Ops, mutations...)
-		if err := validateJournalRecord(record); err != nil {
-			return err
+	// The overwhelmingly common filesystem transaction has no authority
+	// handoff in progress. All of its semantic validation has already happened
+	// while constructing ops, and validateJournalRecord makes applying it
+	// infallible. Avoid cloning the entire graph for every inode mutation: that
+	// made a package installation O(number of mutations * graph size).
+	previewRequired := len(s.state.Handoffs) != 0 || len(s.state.Frozen) != 0
+	if !previewRequired {
+		for _, op := range ops {
+			if op.FreezeSnapshot != 0 || op.UnfreezeSnapshot != 0 || op.BeginHandoff != nil || op.AppendHandoff != nil {
+				previewRequired = true
+				break
+			}
 		}
-		next = cloneGraphState(s.state)
+	}
+	if previewRequired {
+		next := cloneGraphState(s.state)
 		if err := applyJournalRecord(&next, record); err != nil {
 			return err
 		}
-	}
-	if err := validateFrozenSnapshotMutation(s.state, next, ops); err != nil {
-		return err
+		mutations, err := snapshotHandoffMutationOps(s.state, next)
+		if err != nil {
+			return err
+		}
+		if len(mutations) != 0 {
+			record.Ops = append(record.Ops, mutations...)
+			if err := validateJournalRecord(record); err != nil {
+				return err
+			}
+			next = cloneGraphState(s.state)
+			if err := applyJournalRecord(&next, record); err != nil {
+				return err
+			}
+		}
+		if err := validateFrozenSnapshotMutation(s.state, next, ops); err != nil {
+			return err
+		}
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -1145,16 +1298,67 @@ func (s *Store) commitLocked(ops []journalOp) error {
 	if err := writeFull(s.journal, data); err != nil {
 		return rollback(err)
 	}
-	if err := s.journal.Sync(); err != nil {
-		// The kernel may have persisted any prefix, all, or none of the record.
-		// Do not issue another transaction until reopen resolves that outcome.
-		s.poisoned = err
-		return err
+	// A Store embedded in a filesystem repository follows ordinary Linux
+	// filesystem durability semantics: mutations become visible immediately,
+	// but need not survive a host crash until the guest calls fsync/sync or TTC
+	// reaches a lifecycle durability fence. The repository calls Sync below at
+	// those boundaries. Syncing every namespace mutation makes workloads such
+	// as package installation serialize on a host fsync for every inode update.
+	//
+	// Standalone graph users retain the original commit-is-durable contract.
+	if !s.externallyCoordinated {
+		if err := s.journal.Sync(); err != nil {
+			// The kernel may have persisted any prefix, all, or none of the record.
+			// Do not issue another transaction until reopen resolves that outcome.
+			s.poisoned = err
+			return err
+		}
 	}
 	s.journalEnd = start + int64(len(length)) + int64(len(data))
-	if err := applyJournalRecord(&s.state, record); err != nil {
-		s.poisoned = fmt.Errorf("durable TTC graph transaction could not be applied in memory: %w", err)
+	var applyErr error
+	if prepared != nil {
+		applyErr = prepared(&s.state)
+		if applyErr == nil {
+			s.state.Sequence = record.Sequence
+		}
+	} else {
+		applyErr = applyJournalRecord(&s.state, record)
+	}
+	if applyErr != nil {
+		s.poisoned = fmt.Errorf("durable TTC graph transaction could not be applied in memory: %w", applyErr)
 		return s.poisoned
+	}
+	for key, object := range references {
+		if key != object.ID.key() {
+			s.poisoned = fmt.Errorf("materialized TTC graph reference key %q does not match %s", key, object.ID.key())
+			return s.poisoned
+		}
+		current, ok := s.state.Objects[key]
+		if !ok || current.ID != object.ID || current.BulkLength != object.BulkLength || !bytes.Equal(current.Data, object.Data) || !slices.Equal(current.Children, object.Children) {
+			s.poisoned = fmt.Errorf("materialized TTC graph reference update changes immutable object %s", key)
+			return s.poisoned
+		}
+		s.state.Objects[key] = cloneObject(object)
+	}
+	return nil
+}
+
+// Sync makes every journal transaction completed before this call durable.
+// Externally-coordinated filesystem stores call this from guest fsync/sync and
+// TTC lifecycle fences. Exclusive stores already synchronize every commit,
+// but accepting Sync keeps the durability boundary explicit for their users.
+func (s *Store) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.poisoned != nil {
+		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
+	}
+	if s.journal == nil {
+		return errors.New("TTC snapshot graph is closed")
+	}
+	if err := s.journal.Sync(); err != nil {
+		s.poisoned = err
+		return err
 	}
 	return nil
 }
@@ -1821,6 +2025,14 @@ func (s *Store) Root(name string) (ObjectID, bool) {
 	return id, ok
 }
 
+// HasPin reports whether name currently retains an object.
+func (s *Store) HasPin(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.state.Pins[name]
+	return ok
+}
+
 // SetPin atomically replaces a named transaction/open/cache pin.
 func (s *Store) SetPin(name string, id ObjectID) error {
 	if err := validateRootName(name); err != nil {
@@ -2271,15 +2483,15 @@ func (s *Store) Collect(limit int) (int, error) {
 		deletedKeys = append(deletedKeys, key)
 	}
 	sort.Strings(deletedKeys)
-	ops := make([]journalOp, 0, len(keys)+len(deletedKeys))
+	ops := make([]journalOp, 0, len(deletedKeys))
+	references := make(map[string]Object, len(keys))
 	for _, key := range keys {
-		object := touched[key]
-		ops = append(ops, journalOp{PutObject: &object})
+		references[key] = touched[key]
 	}
 	for _, key := range deletedKeys {
 		ops = append(ops, journalOp{DeleteObject: key})
 	}
-	if err := s.commitLocked(ops); err != nil {
+	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
 		return 0, err
 	}
 	return collected, nil
@@ -2401,6 +2613,11 @@ func (s *Store) compactGenerationLocked() error {
 	if err := s.writeHead(graphHead{Version: formatVersion, Generation: nextGeneration}); err != nil {
 		journal.Close()
 		return err
+	}
+	if err := s.rememberHead(); err != nil {
+		journal.Close()
+		s.poisoned = fmt.Errorf("published TTC graph generation %d but cannot identify its head: %w", nextGeneration, err)
+		return s.poisoned
 	}
 	previous := s.journal
 	s.journal = journal

@@ -592,8 +592,58 @@ func TestMutationAndForkAppendBoundedGraphTransactions(t *testing.T) {
 	if _, err := repo.CreateRegular("child", rootInode, "x", 0644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if delta := journalSize() - beforeMutation; delta <= 0 || delta > 64<<10 {
-		t.Fatalf("one mutation appended %d graph bytes, want bounded path-copy transactions", delta)
+	if delta := journalSize() - beforeMutation; delta <= 0 || delta > 8<<10 {
+		t.Fatalf("one mutation appended %d graph bytes, want one compact logical filesystem transaction", delta)
+	}
+}
+
+func TestRepeatedMetadataUpdatesKeepGraphBoundedAndRecoverable(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := repo.graph.Stats().Objects
+	for iteration := 0; iteration < 1000; iteration++ {
+		inode, err := repo.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.Mode = uint32(0600 | iteration&077)
+		inode.MtimeNsec = int64(iteration + 1)
+		if err := repo.UpdateMetadata(MainBranch, inode); err != nil {
+			t.Fatalf("metadata update %d: %v", iteration, err)
+		}
+		if stats := repo.graph.Stats(); stats.Objects > baseline+4 || stats.Reclaiming != 0 {
+			t.Fatalf("metadata update %d left an unbounded graph: baseline=%d stats=%+v", iteration, baseline, stats)
+		}
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	root := repo.path
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = manager.Open("metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	got, err := repo.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MtimeNsec != 1000 {
+		t.Fatalf("recovered mtime=%d, want 1000", got.MtimeNsec)
+	}
+	if stats := repo.graph.Stats(); stats.Objects > baseline+4 || stats.Reclaiming != 0 {
+		t.Fatalf("reopened graph at %q is unbounded: baseline=%d stats=%+v", root, baseline, stats)
 	}
 }
 
