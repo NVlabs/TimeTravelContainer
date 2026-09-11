@@ -46,7 +46,7 @@ type TransactionCatalog interface {
 	Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error)
 	MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error)
 	BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error)
-	BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error)
+	BindGraphHandoff(id string, revision uint64, sparse GraphHandoffDescriptor, now time.Time) (*Transaction, error)
 	Delete(id string, revision uint64) error
 	List() ([]Transaction, error)
 }
@@ -311,11 +311,11 @@ func (s *Store) BindSession(id string, revision uint64, digest, filesystemPack s
 	return tx, nil
 }
 
-// BindSparseHandoff durably records the immutable shared-memory identity
+// BindGraphHandoff durably records the immutable shared-memory identity
 // before the target reader is switched. It deliberately does not advance the
 // transaction so a crash can safely retry the idempotent runtime operation.
-func (s *Store) BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error) {
-	if err := sparse.validate(); err != nil {
+func (s *Store) BindGraphHandoff(id string, revision uint64, graph GraphHandoffDescriptor, now time.Time) (*Transaction, error) {
+	if err := graph.validate(); err != nil {
 		return nil, err
 	}
 	path, err := s.path(id)
@@ -328,17 +328,17 @@ func (s *Store) BindSparseHandoff(id string, revision uint64, sparse SparseHando
 	if err != nil {
 		return nil, err
 	}
-	if tx.SparseHandoff != nil {
-		if *tx.SparseHandoff != sparse {
-			return nil, fmt.Errorf("transaction %q is bound to another sparse handoff", id)
+	if tx.GraphHandoff != nil {
+		if *tx.GraphHandoff != graph {
+			return nil, fmt.Errorf("transaction %q is bound to another graph handoff", id)
 		}
 		return tx, nil
 	}
 	if tx.Revision != revision || tx.State != TransactionPublished {
 		return nil, fmt.Errorf("transaction %q is %s revision %d, not published revision %d", id, tx.State, tx.Revision, revision)
 	}
-	copy := sparse
-	tx.SparseHandoff = &copy
+	copy := graph
+	tx.GraphHandoff = &copy
 	tx.UpdatedAt = now
 	data, err := marshalTransaction(tx)
 	if err != nil {
@@ -486,9 +486,9 @@ func loadTransaction(path, id string) (*Transaction, error) {
 	if err := validateFilesystemPackID(tx.FilesystemMetadataPack); err != nil {
 		return nil, fmt.Errorf("transaction %q: %w", id, err)
 	}
-	if tx.SparseHandoff != nil {
-		if err := tx.SparseHandoff.validate(); err != nil {
-			return nil, fmt.Errorf("transaction %q sparse handoff: %w", id, err)
+	if tx.GraphHandoff != nil {
+		if err := tx.GraphHandoff.validate(); err != nil {
+			return nil, fmt.Errorf("transaction %q graph handoff: %w", id, err)
 		}
 	}
 	if _, known := transactionTransitions[tx.State]; !known && !tx.Terminal() {

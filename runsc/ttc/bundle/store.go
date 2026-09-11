@@ -470,6 +470,7 @@ type DistributedForkImport struct {
 	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
 	MemoryRoots              []string  `json:"memory_roots,omitempty"`
 	MemoryRootObjects        []string  `json:"memory_root_objects,omitempty"`
+	GraphReferenceOperation  string    `json:"graph_reference_operation,omitempty"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
@@ -2912,6 +2913,7 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					branch.SnapshotID = pending.SnapshotID
 					branch.MemoryRoots = append([]string(nil), pending.MemoryRoots...)
 					branch.MemoryRootObjects = append([]string(nil), pending.MemoryRootObjects...)
+					branch.DistributedGraphReferenceOperation = pending.GraphReferenceOperation
 					found = true
 					break
 				}
@@ -2934,7 +2936,8 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					DistributedSparseRepository:  pending.SparseRepository,
 					DistributedSparseBranch:      pending.SparseBranch,
 					SnapshotID:                   pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
-					MemoryRootObjects: append([]string(nil), pending.MemoryRootObjects...),
+					MemoryRootObjects:                  append([]string(nil), pending.MemoryRootObjects...),
+					DistributedGraphReferenceOperation: pending.GraphReferenceOperation,
 				})
 			}
 			delete(current.DistributedForkImports, transactionID)
@@ -3054,12 +3057,14 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
+			branch.DistributedGraphReferenceOperation = transactionID
 			return true, nil
 		}
 		if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.SnapshotID = snapshotID
 			pending.MemoryRoots = makeRoots(pending.FilesystemBranch)
 			pending.MemoryRootObjects = append([]string(nil), objects...)
+			pending.GraphReferenceOperation = transactionID
 			current.DistributedForkImports[transactionID] = pending
 			return true, nil
 		}
@@ -3071,6 +3076,7 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
+			branch.DistributedGraphReferenceOperation = transactionID
 			return true, nil
 		}
 		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
@@ -3473,7 +3479,7 @@ func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) e
 // UpdateBranchMemoryGraph records or clears the authoritative logical memory
 // roots for a branch. Physical provider/cache locations are deliberately not
 // part of this record.
-func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots, objects []string) error {
+func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots, objects []string, referenceOperation string) error {
 	if len(roots) != len(objects) {
 		return fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
 	}
@@ -3486,6 +3492,7 @@ func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64,
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = append([]string(nil), roots...)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
+			branch.DistributedGraphReferenceOperation = referenceOperation
 			return true, nil
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)

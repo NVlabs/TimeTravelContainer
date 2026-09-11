@@ -173,9 +173,9 @@ type Transaction struct {
 	// target preparation. It is bound atomically with SessionDigest and roots
 	// the pack until the transaction is retired.
 	FilesystemMetadataPack string `json:"filesystem_metadata_pack,omitempty"`
-	// SparseHandoff is durable and non-secret, allowing either daemon to retry
+	// GraphHandoff is durable and non-secret, allowing either daemon to retry
 	// the live-to-shared reader transition after a control-plane restart.
-	SparseHandoff *SparseHandoffDescriptor `json:"sparse_handoff,omitempty"`
+	GraphHandoff *GraphHandoffDescriptor `json:"graph_handoff,omitempty"`
 	// DesiredPaused is the source-visible state requested at publication. All
 	// distributed targets are first published physically paused and become
 	// runnable only after their placement grant commits; Activated records that

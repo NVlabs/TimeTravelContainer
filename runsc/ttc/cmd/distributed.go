@@ -683,6 +683,120 @@ func (b *runtimeBackend) exportDistributedSparse(containerID, transactionID stri
 	return relative, info, nil
 }
 
+// exportDistributedGraph publishes the fork-time memory retained by session
+// into a graph-native snapshot origin. The Sentry writes a bounded capture
+// stream directly to the daemon; no compatibility repository is created.
+func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID string) (_ cluster.GraphHandoffDescriptor, rootNames, rootObjects []string, retErr error) {
+	if b.snapshotGraph == nil || b.snapshotData == nil || b.snapshotShared == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("distributed graph publication is unavailable")
+	}
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	shared := false
+	manifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
+	manifestPath := filepath.Join(b.dataRoot, manifestRelative)
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		_ = os.Remove(manifestPath)
+		if shared {
+			_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+		} else {
+			_ = b.releaseGraphMemoryRoots(rootNames)
+		}
+		if err := b.retireFailedGraphSnapshot(origin); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: retiring failed live handoff snapshot %d: %v\n", origin, err)
+		}
+	}()
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	type importResult struct {
+		capture ttcchunk.GraphImportResult
+		err     error
+	}
+	imported := make(chan importResult, 1)
+	prefix := fmt.Sprintf("remote/%d/%s", origin, transactionID)
+	go func() {
+		capture, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+		_ = reader.Close()
+		imported <- importResult{capture: capture, err: importErr}
+	}()
+	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", containerID, "distributed-export", transactionID)
+	_ = writer.Close()
+	outcome := <-imported
+	if exportErr != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("streaming live graph memory: %w", exportErr)
+	}
+	if outcome.err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("importing live graph memory: %w", outcome.err)
+	}
+	for _, root := range outcome.capture.Roots {
+		rootNames = append(rootNames, root.Name)
+		rootObjects = append(rootObjects, root.Root.String())
+	}
+	if len(rootObjects) == 0 {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("live graph capture returned no roots")
+	}
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("sealing live graph snapshot %d: %w", origin, err)
+	}
+	adapted, err := ttcchunk.BuildGraphManifest(b.snapshotGraph, outcome.capture.Roots)
+	if err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
+	if err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	if err := writeDurableDistributedFile(manifestPath, encoded); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph manifest: %w", err)
+	}
+	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph snapshot %d: %w", origin, err)
+	}
+	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	changes, _, frozen, err := b.snapshotGraph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	if !frozen {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("live graph reference handoff did not freeze")
+	}
+	publisher := &branchPublisher{
+		nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	if err := publisher.publishSharedReferenceLedger(origin, changes); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph reference ledger: %w", err)
+	}
+	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph authority: %w", err)
+	}
+	shared = true
+	if err := b.snapshotGraph.MarkShared(origin); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	if err := b.snapshotGraph.UnfreezeSnapshotLedger(origin); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	if err := releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin); err != nil {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, err
+	}
+	return cluster.GraphHandoffDescriptor{
+		GraphManifest: manifestRelative, GraphSnapshot: uint64(origin),
+		GraphRootObjects: strings.Join(rootObjects, ","),
+	}, rootNames, rootObjects, nil
+}
+
 func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, repositoryID string) (string, error) {
 	identity := struct {
 		ContainerID  string                    `json:"container_id"`
@@ -1506,43 +1620,42 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 // Failure before the target acknowledges the switch falls back to ordinary
 // live paging; it never invalidates an already-published target.
 func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
-	repositoryPath, export, err := b.exportDistributedSparse(sourceContainer, transactionID)
+	handoff, rootNames, rootObjects, err := b.exportDistributedGraph(sourceContainer, transactionID)
 	if err != nil {
 		b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
 		return
 	}
-	sparse := cluster.SparseHandoffDescriptor{
-		Repository: repositoryPath, Manifest: export.Manifest.String(), Branch: export.FilesystemBranch,
-	}
 	var tx *cluster.Transaction
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		tx, err = peer.Handoff(ctx, transactionID, revision, sparse)
+		tx, err = peer.Handoff(ctx, transactionID, revision, handoff)
 		if err != nil {
 			if current, statusErr := peer.Status(ctx, transactionID); statusErr == nil {
 				tx = current
 				revision = current.Revision
 				switch current.State {
 				case cluster.TransactionDraining, cluster.TransactionIndependent:
-					if current.SparseHandoff != nil && *current.SparseHandoff == sparse {
+					if current.GraphHandoff != nil && *current.GraphHandoff == handoff {
 						err = nil
-					} else if current.State == cluster.TransactionDraining && current.SparseHandoff == nil {
+					} else if current.State == cluster.TransactionDraining && current.GraphHandoff == nil {
 						// A concurrent node drain may eagerly materialize the target
-						// before this optional sparse handoff is bound. Eager drain is
+						// before this optional graph handoff is bound. Eager drain is
 						// already a valid route to independence; do not retry handoff
 						// forever merely because the faster strategy lost the race.
 						err = nil
 					} else if current.State == cluster.TransactionIndependent {
 						// The target faulted every page from TCP before handoff.
 						cancel()
-						b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
+						_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+						_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
 						_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 						relay.Close()
 						return
 					}
 				case cluster.TransactionCanceled, cluster.TransactionFailed:
 					cancel()
-					b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
+					_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+					_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
 					_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
 					relay.Close()
 					return
@@ -1564,16 +1677,20 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		relay.Close()
 		return
 	}
-	if tx.SparseHandoff == nil {
+	if tx.GraphHandoff == nil {
 		// Eager drain won the race, so this source-side sparse publication was
 		// never made authoritative and can be reclaimed immediately.
-		b.cleanupDistributedSparsePublication(repositoryPath, export.FilesystemBranch)
+		_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+		_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
 	}
 	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
 		// Retrying status/independence is safe; the target now has no source
 		// reads, while the source retains its snapshot until completion.
 		b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay)
+		return
 	}
+	_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+	_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
 }
 
 func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, branch string) {
@@ -1588,7 +1705,7 @@ func (b *runtimeBackend) cleanupDistributedSparsePublication(repositoryPath, bra
 }
 
 // reconcileClusterSparseMemoryRoots removes branch pointers left behind when
-// a daemon dies after publishing a sparse handoff but before target metadata
+// a daemon dies after publishing a graph handoff but before target metadata
 // records ownership. Container records are authoritative after Prepare;
 // nonterminal transaction identities protect the narrow pre-Prepare window.
 func (b *runtimeBackend) reconcileClusterSparseMemoryRoots() error {
@@ -1817,9 +1934,9 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 						}
 					}
 				}
-				if tx.State == cluster.TransactionPublished && tx.SparseHandoff != nil {
+				if tx.State == cluster.TransactionPublished && tx.GraphHandoff != nil {
 					txCopy := tx
-					go recoverTargetSparseHandoff(targetRuntime, runtime.controlPlane, &txCopy)
+					go recoverTargetGraphHandoff(targetRuntime, runtime.controlPlane, &txCopy)
 				}
 				targetRuntime.monitorDependency(tx.Identity.TransactionID, info.ID)
 			}
@@ -1885,12 +2002,12 @@ func recoverTargetActivation(targetRuntime *daemonTargetRuntime, control *cluste
 	_, _ = control.Store.MarkActivated(tx.Identity.TransactionID, tx.Revision, control.Now())
 }
 
-func recoverTargetSparseHandoff(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
-	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.SparseHandoff == nil {
+func recoverTargetGraphHandoff(targetRuntime *daemonTargetRuntime, control *cluster.ControlPlane, tx *cluster.Transaction) {
+	if targetRuntime == nil || control == nil || control.Store == nil || tx == nil || tx.GraphHandoff == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	err := targetRuntime.Handoff(ctx, tx, *tx.SparseHandoff)
+	err := targetRuntime.Handoff(ctx, tx, *tx.GraphHandoff)
 	cancel()
 	if err != nil {
 		return

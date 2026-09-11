@@ -188,6 +188,14 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		}
 		transaction, err := p.transactions.Load(transactionID)
 		if err != nil {
+			// Branches may outlive the bounded Raft transaction history that
+			// originally authorized their retain. A release is still fenced by its
+			// unguessable operation name and exact object IDs, and can only remove
+			// that previously-created reference. Requiring the retired transaction
+			// here would make an old but live branch permanently unreclaimable.
+			if allowTerminal && errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 		// An immutable root may have been inherited through any number of local
@@ -378,6 +386,9 @@ func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID 
 	}
 	transaction, err := p.transactions.Load(transactionID)
 	if err != nil {
+		if allowTerminal && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
 	if transaction.Identity.TargetNodeID != peer {

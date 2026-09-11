@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -383,9 +385,17 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		sparse := t.dehydrationMemoryRepositoryFD >= 0
 		fd := t.distributedSnapshotFD
 		name := "distributed-memory-snapshot"
+		graph := t.dehydrationGraphStreamFD >= 0
+		if graph {
+			fd = t.dehydrationGraphStreamFD
+			name = "distributed-graph-memory-stream"
+		}
 		if sparse {
 			fd = t.dehydrationMemoryRepositoryFD
 			name = "distributed-memory-repository"
+		}
+		if graph && sparse {
+			util.Fatalf("--dehydration-graph-stream-fd and --dehydration-memory-repository-fd are mutually exclusive")
 		}
 		if fd < 0 {
 			util.Fatalf("a distributed snapshot or sparse repository FD is required")
@@ -396,7 +406,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
-			AllowCopy: t.distributedSnapshotAllowCopy, Sparse: sparse,
+			AllowCopy: t.distributedSnapshotAllowCopy, Sparse: sparse, Graph: graph,
 		})
 		snapshot.Close()
 	case "distributed-status":
@@ -410,21 +420,41 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "distributed-filesystem-drain":
 		err = cont.Sandbox.DrainDistributedForkFilesystems(f.Arg(2))
 	case "distributed-handoff":
-		if t.dehydrationMemoryRepositoryFD < 0 || t.distributedSessionID == "" {
-			util.Fatalf("--dehydration-memory-repository-fd and --distributed-session=<manifest> are required")
+		if t.dehydrationGraphManifestFD < 0 || t.dehydrationMemoryRepositoryFD < 0 || t.distributedSessionID == "" {
+			util.Fatalf("graph handoff requires --dehydration-graph-manifest-fd, --dehydration-memory-repository-fd, and --distributed-session=<snapshot>")
 		}
-		manifest, parseErr := ttcchunk.ParseManifestID(t.distributedSessionID)
-		if parseErr != nil {
-			util.Fatalf("parsing distributed sparse manifest: %v", parseErr)
+		snapshot, parseErr := strconv.ParseUint(t.distributedSessionID, 10, 64)
+		if parseErr != nil || snapshot == 0 {
+			util.Fatalf("parsing distributed graph snapshot %q: %v", t.distributedSessionID, parseErr)
 		}
-		repository := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-handoff-memory-repository")
-		if repository == nil {
-			util.Fatalf("invalid distributed handoff repository FD")
+		manifest := os.NewFile(uintptr(t.dehydrationGraphManifestFD), "distributed-handoff-graph-manifest")
+		objects := os.NewFile(uintptr(t.dehydrationMemoryRepositoryFD), "distributed-handoff-graph-objects")
+		if manifest == nil || objects == nil {
+			util.Fatalf("invalid distributed graph handoff descriptors")
 		}
-		err = cont.Sandbox.HandoffDistributedForkMemory(&boot.DistributedForkHandoffArgs{
-			FilePayload: urpc.FilePayload{Files: []*os.File{repository}}, BranchID: f.Arg(2), Manifest: manifest,
-		})
-		repository.Close()
+		files := []*os.File{manifest, objects}
+		args := &boot.DistributedForkHandoffArgs{
+			FilePayload: urpc.FilePayload{Files: files}, BranchID: f.Arg(2),
+			GraphSnapshot: ttcsnapshot.SnapshotID(snapshot),
+		}
+		if t.dehydrationMemoryRemoteFD >= 0 {
+			remote := os.NewFile(uintptr(t.dehydrationMemoryRemoteFD), "distributed-handoff-graph-relay")
+			if remote == nil {
+				util.Fatalf("invalid distributed graph handoff relay FD")
+			}
+			files = append(files, remote)
+			args.FilePayload.Files = files
+			args.GraphRemote = true
+			decoded, decodeErr := hex.DecodeString(t.distributedFamilyID)
+			if decodeErr != nil || len(decoded) != len(args.GraphRemoteToken) {
+				util.Fatalf("distributed graph handoff token must contain %d hexadecimal bytes", len(args.GraphRemoteToken))
+			}
+			copy(args.GraphRemoteToken[:], decoded)
+		}
+		err = cont.Sandbox.HandoffDistributedForkMemory(args)
+		for _, file := range files {
+			file.Close()
+		}
 	case "distributed-cancel":
 		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
 	case "distributed-complete":

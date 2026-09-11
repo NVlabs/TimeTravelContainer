@@ -193,6 +193,9 @@ type Kernel struct {
 	// remoteHandoffManifest makes daemon retries idempotent after a successful
 	// live-to-sparse reader switch.
 	remoteHandoffManifest ttcchunk.ManifestID `state:"nosave"`
+	// remoteHandoffSnapshot is the graph-native equivalent. Snapshot IDs are
+	// globally unique and make repeated control requests idempotent.
+	remoteHandoffSnapshot uint64 `state:"nosave"`
 	// auxiliaryRemotePageLoads supply private MemoryFiles (for example tmpfs)
 	// restored from a process-free dehydration image. Application memory uses
 	// remotePageLoad so existing distributed-fork controls retain their meaning.
@@ -2464,6 +2467,7 @@ func (k *Kernel) Release() {
 	}
 	k.remoteLoadRanges = nil
 	k.remoteHandoffManifest = ttcchunk.ManifestID{}
+	k.remoteHandoffSnapshot = 0
 	for _, load := range k.auxiliaryRemotePageLoads {
 		load.Cancel()
 		_ = load.Wait()

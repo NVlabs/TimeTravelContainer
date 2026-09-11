@@ -918,30 +918,61 @@ func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) 
 	return err
 }
 
-func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, sparse cluster.SparseHandoffDescriptor) error {
+func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
-	manifest, err := ttcchunk.ParseManifestID(sparse.Manifest)
-	if err != nil {
-		return fmt.Errorf("parsing distributed sparse manifest: %w", err)
+	objects := strings.Split(graph.GraphRootObjects, ",")
+	if err := validateGraphRootObjects(graph.GraphSnapshot, graphMemoryRootNames(branch.FilesystemBranch, len(objects)), objects); err != nil {
+		return fmt.Errorf("validating graph handoff roots: %w", err)
 	}
-	if err := r.backend.containerStore().UpdateDistributedForkSparseRoot(tx.Identity.TransactionID, sparse.Repository, sparse.Branch); err != nil {
-		return fmt.Errorf("recording distributed sparse memory root: %w", err)
+	if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, tx.Identity.TransactionID, info.ID, branch.ID, objects); err != nil {
+		return fmt.Errorf("retaining graph handoff roots: %w", err)
 	}
-	path := filepath.Join(r.backend.dataRoot, sparse.Repository)
-	directory, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("opening distributed sparse repository: %w", err)
+	retained := true
+	defer func() {
+		if retained {
+			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
+		}
+	}()
+	if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, graph.GraphSnapshot, objects); err != nil {
+		return fmt.Errorf("recording graph handoff roots: %w", err)
 	}
-	defer directory.Close()
-	_, err = r.backend.commandWithFiles([]*os.File{directory},
-		"timetravel", "--dehydration-memory-repository-fd=3", "--distributed-session="+manifest.String(),
-		info.ID, "distributed-handoff", branch.ID)
+	// The persistent branch record now owns this reference intent. A later
+	// handoff retry must retain it even if the current Sentry switch fails.
+	retained = false
+	manifest, err := os.Open(filepath.Join(r.backend.dataRoot, graph.GraphManifest))
 	if err != nil {
-		return fmt.Errorf("switching distributed target to sparse memory: %w", err)
+		return fmt.Errorf("opening graph handoff manifest: %w", err)
+	}
+	var token ttcsnapshot.ObjectRelayToken
+	if _, err := rand.Read(token[:]); err != nil {
+		manifest.Close()
+		return err
+	}
+	restore, err := r.backend.openDistributedGraphRestore(manifest, tx.Identity.TransactionID, token)
+	if err != nil {
+		manifest.Close()
+		return fmt.Errorf("opening graph handoff resolver: %w", err)
+	}
+	defer restore.close()
+	files := []*os.File{restore.manifest, restore.objects}
+	args := []string{
+		"timetravel", "--dehydration-graph-manifest-fd=3", "--dehydration-memory-repository-fd=4",
+		"--distributed-session=" + strconv.FormatUint(graph.GraphSnapshot, 10),
+	}
+	if restore.remote != nil {
+		files = append(files, restore.remote)
+		args = append(args, "--dehydration-memory-remote-fd=5", "--distributed-family="+hex.EncodeToString(token[:]))
+	}
+	args = append(args, info.ID, "distributed-handoff", branch.ID)
+	if _, err := r.backend.commandWithFiles(files, args...); err != nil {
+		return fmt.Errorf("switching distributed target to graph memory: %w", err)
+	}
+	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, branch.DependentFilesystemBytes); err != nil {
+		return fmt.Errorf("recording graph memory independence: %w", err)
 	}
 	return nil
 }
@@ -1207,6 +1238,13 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			}
 			tx, err := r.store.Load(transactionID)
 			if err != nil || tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+				return
+			}
+			if tx.State == cluster.TransactionIndependent {
+				// Independence means all future reads resolve without the source
+				// node. A graph-backed demand loader may still report nonresident
+				// pages, but those are cache misses, not volatile dependencies.
+				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
 				return
 			}
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
@@ -1817,7 +1855,7 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 
 // ensureDistributedSourceIndependent prevents branch-destructive operations
 // from invalidating an already-published remote child. In the normal path the
-// asynchronous sparse handoff has already completed, so this is a no-op.
+// asynchronous graph handoff has already completed, so this is a no-op.
 func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchID string) error {
 	if b == nil || b.distributedSource == nil || b.nodeID == "" || b.dataRoot == "" {
 		return nil
@@ -3456,9 +3494,6 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		targetBackend.distributedSource = clusterRuntime.source
-		if err := targetBackend.reconcileDistributedGraphReferences(true); err != nil {
-			return fmt.Errorf("recovering distributed graph references: %w", err)
-		}
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,
@@ -3470,25 +3505,24 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		if clusterListener == nil {
 			return errors.New("cluster protocol multiplexer has no HTTP listener")
 		}
-		if clusterRuntime.directory != nil {
-			// Serve Raft authority traffic before this member registers and
-			// reconciles placements. During a simultaneous cluster restart,
-			// followers may already know this member is the leader and must be
-			// able to forward their own recovery proposals to it. Runtime target
-			// admission remains closed because this node is not ready yet.
-			clusterServer = &http.Server{
-				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
-				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
+		// Reference-intent recovery may need to contact either a volatile
+		// provider or the shared-reference coordinator. Serve those requests
+		// before doing any recovery ourselves so simultaneous daemon restarts
+		// cannot deadlock waiting for peers that are waiting on us.
+		clusterServer = &http.Server{
+			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
+		}
+		go func() {
+			err := clusterServer.Serve(clusterListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
 			}
-			go func() {
-				err := clusterServer.Serve(clusterListener)
-				if errors.Is(err, http.ErrServerClosed) {
-					err = nil
-				}
-				clusterErr <- err
-				listener.Close()
-			}()
-			defer shutdownClusterServer(clusterServer)
+			clusterErr <- err
+			listener.Close()
+		}()
+		defer shutdownClusterServer(clusterServer)
+		if clusterRuntime.directory != nil {
 			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
 			drainIntent, err := loadElasticDrainIntent(dataRoot, clusterRuntime.nodeRecord.NodeID)
 			if err != nil {
@@ -3505,6 +3539,20 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				_ = fenceElasticRuntimes(targetBackend, registered.NodeID, registered.Incarnation)
 				clusterListener.Close()
 				return fmt.Errorf("starting execution-lease guardian: %w", err)
+			}
+			// Start shared-reference election while the node is still joining.
+			// A recovered retain must be durable before any local runtime is
+			// admitted; if this node becomes the coordinator, its ledger must be
+			// available to that recovery first.
+			gcStopped := make(chan struct{})
+			sharedGCStopped = gcStopped
+			go func() {
+				defer close(gcStopped)
+				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, clusterDone)
+			}()
+			if err := reconcileDistributedGraphReferencesAtStartup(targetBackend, clusterRuntime.lease); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("recovering distributed graph references: %w", err)
 			}
 			// While joining, recover every retained placement into this exact
 			// incarnation. The ready transition then fences any old placement
@@ -3548,29 +3596,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		server.clusterPlacements = clusterRuntime.placements
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
-		if clusterServer == nil {
-			clusterServer = &http.Server{
-				Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
-				ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
-			}
-			go func() {
-				err := clusterServer.Serve(clusterListener)
-				if errors.Is(err, http.ErrServerClosed) {
-					err = nil
-				}
-				clusterErr <- err
-				listener.Close()
-			}()
-			defer shutdownClusterServer(clusterServer)
-		}
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
-			gcStopped := make(chan struct{})
-			sharedGCStopped = gcStopped
-			go func() {
-				defer close(gcStopped)
-				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, elasticRecord.NodeID, elasticRecord.Incarnation, stderr, clusterDone)
-			}()
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})
 			elasticHeartbeatStopped = heartbeatStopped
@@ -3683,6 +3710,30 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 		if err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: reconciling distributed graph references: %v\n", err)
 		}
+	}
+}
+
+// reconcileDistributedGraphReferencesAtStartup waits for the cluster's Raft
+// leader, volatile providers, and shared-reference coordinator to become
+// reachable during a simultaneous restart. The node remains joining and no
+// guest runtime is resumed while this runs.
+func reconcileDistributedGraphReferencesAtStartup(backend *runtimeBackend, lease time.Duration) error {
+	timeout := 2*lease + 30*time.Second
+	if timeout < time.Minute {
+		timeout = time.Minute
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := backend.reconcileDistributedGraphReferences(true); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			return lastErr
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

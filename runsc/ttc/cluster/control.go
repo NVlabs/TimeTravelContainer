@@ -36,6 +36,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 const (
@@ -266,33 +268,42 @@ type PrepareRequest struct {
 	Session  RemoteSessionDescriptor `json:"session"`
 }
 
-// SparseHandoffDescriptor identifies a non-secret shared-filesystem memory
-// snapshot that can replace a target's live source connection.
-type SparseHandoffDescriptor struct {
-	Repository string `json:"repository"`
-	Manifest   string `json:"manifest"`
-	Branch     string `json:"branch"`
+// GraphHandoffDescriptor identifies immutable graph memory that can replace a
+// target's live source connection.
+type GraphHandoffDescriptor struct {
+	GraphManifest    string `json:"graph_manifest,omitempty"`
+	GraphSnapshot    uint64 `json:"graph_snapshot"`
+	GraphRootObjects string `json:"graph_root_objects,omitempty"`
 }
 
-func (d SparseHandoffDescriptor) validate() error {
-	clean := filepath.Clean(d.Repository)
-	if d.Repository == "" || filepath.IsAbs(d.Repository) || clean != d.Repository || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("invalid sparse memory repository path %q", d.Repository)
+func (d GraphHandoffDescriptor) validate() error {
+	clean := filepath.Clean(d.GraphManifest)
+	if filepath.IsAbs(d.GraphManifest) || clean != d.GraphManifest || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("invalid graph handoff manifest path %q", d.GraphManifest)
 	}
-	decoded, err := hex.DecodeString(d.Manifest)
-	if err != nil || len(decoded) != sha256.Size {
-		return errors.New("sparse memory manifest must be a SHA-256 hexadecimal ID")
+	if d.GraphSnapshot == 0 {
+		return errors.New("graph handoff has no snapshot identity")
 	}
-	if d.Branch == "" || d.Branch == "." || d.Branch == ".." || strings.ContainsAny(d.Branch, `/\\`) || strings.TrimSpace(d.Branch) != d.Branch {
-		return fmt.Errorf("invalid sparse memory branch %q", d.Branch)
+	objects := strings.Split(d.GraphRootObjects, ",")
+	if len(objects) == 0 || len(objects) > 4096 {
+		return errors.New("graph handoff has an invalid root count")
+	}
+	for _, object := range objects {
+		if strings.TrimSpace(object) != object || object == "" {
+			return errors.New("graph handoff has an invalid root object")
+		}
+		id, err := ttcsnapshot.ParseObjectID(object)
+		if err != nil || uint64(id.Snapshot) != d.GraphSnapshot {
+			return fmt.Errorf("graph handoff root %q does not belong to snapshot %d", object, d.GraphSnapshot)
+		}
 	}
 	return nil
 }
 
-// HandoffRequest durably binds and installs a sparse replacement reader.
+// HandoffRequest durably binds and installs a graph replacement reader.
 type HandoffRequest struct {
-	Revision uint64                  `json:"revision"`
-	Sparse   SparseHandoffDescriptor `json:"sparse"`
+	Revision uint64                 `json:"revision"`
+	Graph    GraphHandoffDescriptor `json:"graph"`
 }
 
 // RevisionRequest advances a transaction without carrying new secret state.
@@ -316,7 +327,7 @@ type TargetRuntime interface {
 	Publish(context.Context, *Transaction, bool) error
 	Activate(context.Context, *Transaction) error
 	Drain(context.Context, *Transaction) error
-	Handoff(context.Context, *Transaction, SparseHandoffDescriptor) error
+	Handoff(context.Context, *Transaction, GraphHandoffDescriptor) error
 	Cancel(context.Context, *Transaction) error
 	MarkIndependent(context.Context, *Transaction) error
 }
@@ -1252,17 +1263,17 @@ func (c *ControlPlane) handoff(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := request.Sparse.validate(); err != nil {
+	if err := request.Graph.validate(); err != nil {
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if tx.SparseHandoff != nil && *tx.SparseHandoff != request.Sparse {
-		writeControlError(w, http.StatusConflict, "transaction is bound to another sparse handoff")
+	if tx.GraphHandoff != nil && *tx.GraphHandoff != request.Graph {
+		writeControlError(w, http.StatusConflict, "transaction is bound to another graph handoff")
 		return
 	}
 	if tx.State == TransactionIndependent || tx.State == TransactionDraining {
-		if tx.SparseHandoff == nil {
-			writeControlError(w, http.StatusConflict, "transaction advanced without a sparse handoff")
+		if tx.GraphHandoff == nil {
+			writeControlError(w, http.StatusConflict, "transaction advanced without a graph handoff")
 			return
 		}
 		writeControlJSON(w, http.StatusOK, tx)
@@ -1272,14 +1283,14 @@ func (c *ControlPlane) handoff(w http.ResponseWriter, r *http.Request, id, peer 
 		writeControlError(w, http.StatusConflict, fmt.Sprintf("transaction is %s revision %d, want %s revision %d", tx.State, tx.Revision, TransactionPublished, request.Revision))
 		return
 	}
-	if tx.SparseHandoff == nil {
-		tx, err = c.Store.BindSparseHandoff(id, tx.Revision, request.Sparse, c.Now())
+	if tx.GraphHandoff == nil {
+		tx, err = c.Store.BindGraphHandoff(id, tx.Revision, request.Graph, c.Now())
 		if err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
 	}
-	if err := c.TargetRuntime.Handoff(r.Context(), tx, request.Sparse); err != nil {
+	if err := c.TargetRuntime.Handoff(r.Context(), tx, request.Graph); err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -1792,16 +1803,16 @@ func (c *Client) Drain(ctx context.Context, id string, revision uint64) (*Transa
 	return c.advance(ctx, id, "drain", revision)
 }
 
-// Handoff replaces future live page pulls with a durable sparse manifest.
-func (c *Client) Handoff(ctx context.Context, id string, revision uint64, sparse SparseHandoffDescriptor) (*Transaction, error) {
+// Handoff replaces future live page pulls with an immutable graph snapshot.
+func (c *Client) Handoff(ctx context.Context, id string, revision uint64, graph GraphHandoffDescriptor) (*Transaction, error) {
 	if !transactionIDPattern.MatchString(id) {
 		return nil, fmt.Errorf("invalid transaction ID %q", id)
 	}
-	if err := sparse.validate(); err != nil {
+	if err := graph.validate(); err != nil {
 		return nil, err
 	}
 	var tx Transaction
-	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/handoff", HandoffRequest{Revision: revision, Sparse: sparse}, &tx); err != nil {
+	if err := c.call(ctx, http.MethodPost, controlForkPrefix+id+"/handoff", HandoffRequest{Revision: revision, Graph: graph}, &tx); err != nil {
 		return nil, err
 	}
 	return &tx, nil

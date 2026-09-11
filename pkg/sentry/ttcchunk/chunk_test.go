@@ -286,6 +286,24 @@ func TestImportSnapshotGraphPreservesPageAliasing(t *testing.T) {
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
+	packed, err := NewGraphPackedManifestReader(data, nil, adapted.Manifest, []pgalloc.RemoteLoadRange{{
+		Target: memmap.FileRange{End: 2 * hostarch.PageSize},
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int64{0, hostarch.PageSize} {
+		clear(loaded)
+		if _, err := packed.ReadAt(loaded, offset); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(loaded, chunk.Pages[0].Data) {
+			t.Fatalf("graph packed reader returned different bytes at offset %d", offset)
+		}
+	}
+	if err := packed.Close(); err != nil {
+		t.Fatal(err)
+	}
 	file, err := data.Open(ttcsnapshot.ObjectID(graphChunk), ttcsnapshot.MemoryChunkBytes)
 	if err != nil {
 		t.Fatal(err)

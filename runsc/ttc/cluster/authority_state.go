@@ -31,7 +31,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 5
+	AuthorityFormatVersion = 6
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -514,17 +514,17 @@ type AuthorityPlacementPayload struct {
 
 // Transaction command payload.
 type AuthorityTransactionPayload struct {
-	Transaction    Transaction              `json:"transaction,omitempty"`
-	ID             string                   `json:"id,omitempty"`
-	Revision       uint64                   `json:"revision,omitempty"`
-	Next           TransactionState         `json:"next,omitempty"`
-	Failure        string                   `json:"failure,omitempty"`
-	Digest         string                   `json:"digest,omitempty"`
-	FilesystemPack string                   `json:"filesystem_pack,omitempty"`
-	Metrics        *TransferMetrics         `json:"metrics,omitempty"`
-	Sparse         *SparseHandoffDescriptor `json:"sparse,omitempty"`
-	DesiredPaused  bool                     `json:"desired_paused,omitempty"`
-	Activated      bool                     `json:"activated,omitempty"`
+	Transaction    Transaction             `json:"transaction,omitempty"`
+	ID             string                  `json:"id,omitempty"`
+	Revision       uint64                  `json:"revision,omitempty"`
+	Next           TransactionState        `json:"next,omitempty"`
+	Failure        string                  `json:"failure,omitempty"`
+	Digest         string                  `json:"digest,omitempty"`
+	FilesystemPack string                  `json:"filesystem_pack,omitempty"`
+	Metrics        *TransferMetrics        `json:"metrics,omitempty"`
+	Graph          *GraphHandoffDescriptor `json:"graph,omitempty"`
+	DesiredPaused  bool                    `json:"desired_paused,omitempty"`
+	Activated      bool                    `json:"activated,omitempty"`
 }
 
 // Publication command payload.
@@ -1438,14 +1438,14 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			return nil, err
 		}
 	case AuthorityTransactionHandoff:
-		if p.Sparse == nil {
-			return nil, errors.New("missing sparse handoff")
+		if p.Graph == nil {
+			return nil, errors.New("missing graph handoff")
 		}
-		if err := p.Sparse.validate(); err != nil {
+		if err := p.Graph.validate(); err != nil {
 			return nil, err
 		}
-		if tx.SparseHandoff != nil {
-			if *tx.SparseHandoff != *p.Sparse {
+		if tx.GraphHandoff != nil {
+			if *tx.GraphHandoff != *p.Graph {
 				return nil, errors.New("transaction bound to another handoff")
 			}
 			return authorityValue(tx)
@@ -1453,8 +1453,8 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		if tx.Revision != p.Revision || tx.State != TransactionPublished {
 			return nil, errors.New("transaction is not ready for handoff")
 		}
-		copy := *p.Sparse
-		tx.SparseHandoff = &copy
+		copy := *p.Graph
+		tx.GraphHandoff = &copy
 		tx.UpdatedAt = command.IssuedAt
 	}
 	s.Transactions[p.ID] = tx

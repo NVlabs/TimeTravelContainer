@@ -419,12 +419,6 @@ func newGraphReferenceOperation() (string, error) {
 	return "branch-" + id, nil
 }
 
-func graphReferenceOperationForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) string {
-	if branch.DistributedGraphReferenceOperation != "" {
-		return branch.DistributedGraphReferenceOperation
-	}
-	// Distributed targets created before branch-scoped descendants use the
-	// transaction as their stable operation identity. New descendants always
-	// receive an explicit independent identity.
-	return transactionIDForBranch(info, branch)
+func graphReferenceOperationForBranch(_ ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) string {
+	return branch.DistributedGraphReferenceOperation
 }

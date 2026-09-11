@@ -28,8 +28,8 @@ import (
 func TestGraphReferenceOperationIsBranchScoped(t *testing.T) {
 	info := ttcbundle.ContainerInfo{DistributedForkTransactionID: "family-transaction"}
 	initial := ttcbundle.BranchInfo{ID: "remote"}
-	if got := graphReferenceOperationForBranch(info, initial); got != "family-transaction" {
-		t.Fatalf("initial operation=%q, want transaction fallback", got)
+	if got := graphReferenceOperationForBranch(info, initial); got != "" {
+		t.Fatalf("initial operation=%q, want no implicit family fallback", got)
 	}
 	child := ttcbundle.BranchInfo{
 		ID: "local", DistributedForkTransactionID: "family-transaction",

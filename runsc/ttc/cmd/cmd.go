@@ -8390,7 +8390,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
 	}
 	for _, branch := range info.Branches {
-		if branch.DistributedGraphReferenceOperation == "" {
+		if graphReferenceOperationForBranch(info, branch) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s@%s: %w", info.Name, branch.ID, err)
 			}
@@ -10986,7 +10986,7 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
 		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 	}
-	if branch.DistributedGraphReferenceOperation == "" {
+	if graphReferenceOperationForBranch(info, branch) == "" {
 		if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
 			return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
 		}
@@ -10998,7 +10998,7 @@ func (b *runtimeBackend) discard(target selector) error {
 		return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
 	}
 	if len(branch.MemoryRoots) != 0 {
-		if err := store.UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil); err != nil {
+		if err := store.UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil, ""); err != nil {
 			return err
 		}
 	}
@@ -11142,6 +11142,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	previousGraphMemorySnapshot := persistentBranch.SnapshotID
 	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
 	previousGraphMemoryRootObjects := append([]string(nil), persistentBranch.MemoryRootObjects...)
+	previousGraphReferenceOperation := persistentBranch.DistributedGraphReferenceOperation
 	defer func() {
 		if dehydrated {
 			return
@@ -11150,7 +11151,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
 		}
 		if graphMemoryRecorded {
-			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects)
+			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphReferenceOperation)
 		}
 		if graphMemorySnapshot != 0 && b.distributedSource != nil {
 			if graphErr := b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
@@ -11303,7 +11304,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = dir.Close()
 		}
 		if graphMemorySnapshot != 0 {
-			if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects); err != nil {
+			if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, ""); err != nil {
 				return fmt.Errorf("recording graph-native dehydration roots: %w", err)
 			}
 			graphMemoryRecorded = true
@@ -11332,7 +11333,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	dehydrated = true
 	graphMemoryRoots = nil
 	if graphMemorySnapshot != 0 && len(previousGraphMemoryRoots) != 0 {
-		if persistentBranch.DistributedGraphReferenceOperation == "" {
+		if graphReferenceOperationForBranch(info, persistentBranch) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(previousGraphMemoryRoots, previousGraphMemoryRootObjects); err != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded shared memory roots for %s: %v\n", target, err)
 			}
@@ -12343,7 +12344,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 		}
-		if recorded.DistributedGraphReferenceOperation == "" {
+		if graphReferenceOperationForBranch(info, *recorded) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(recorded.MemoryRoots, recorded.MemoryRootObjects); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
 			}

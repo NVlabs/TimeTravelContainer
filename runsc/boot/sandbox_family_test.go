@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -265,6 +267,44 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	if _, err := repository.LoadManifest(exported.Manifest); err != nil {
 		t.Fatalf("loading exported sparse manifest: %v", err)
 	}
+	graphStream, err := os.CreateTemp(t.TempDir(), "graph-capture-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphExport, err := family.ExportDistributedForkSnapshot(&DistributedForkExportArgs{
+		FilePayload: urpc.FilePayload{Files: []*os.File{graphStream}}, SessionID: "tx-1", Graph: true,
+	})
+	if err != nil {
+		t.Fatalf("ExportDistributedForkSnapshot graph: %v", err)
+	}
+	if graphExport.FilesystemBranch != "remote-1" {
+		t.Fatalf("graph export filesystem branch=%q, want remote-1", graphExport.FilesystemBranch)
+	}
+	if _, err := graphStream.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	graphRoot := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(graphRoot, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(graphRoot, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphImported, err := ttcchunk.ImportGraphCapture(graphStream, graph, data, origin, "remote/1/tx-1")
+	if err != nil {
+		t.Fatalf("ImportGraphCapture: %v", err)
+	}
+	if len(graphImported.Roots) == 0 || graphImported.Pages == 0 {
+		t.Fatalf("empty graph export: %+v", graphImported)
+	}
+	graphStream.Close()
 	if err := family.CancelDistributedForkSession("tx-1"); err != nil {
 		t.Fatalf("CancelDistributedForkSession: %v", err)
 	}

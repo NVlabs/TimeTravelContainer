@@ -290,7 +290,7 @@ func (r *testTargetRuntime) Drain(context.Context, *Transaction) error {
 	return nil
 }
 
-func (r *testTargetRuntime) Handoff(context.Context, *Transaction, SparseHandoffDescriptor) error {
+func (r *testTargetRuntime) Handoff(context.Context, *Transaction, GraphHandoffDescriptor) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handedOff++
@@ -593,7 +593,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	}
 }
 
-func TestMutualTLSControlPlaneSparseHandoffIsDurableAndIdempotent(t *testing.T) {
+func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 	files := newTestTLSFiles(t)
 	serverTLS, err := LoadServerTLSConfig(files.serverCert, files.serverKey, files.ca)
 	if err != nil {
@@ -637,9 +637,12 @@ func TestMutualTLSControlPlaneSparseHandoffIsDurableAndIdempotent(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	sparse := SparseHandoffDescriptor{Repository: "cluster/memory-chunks", Manifest: strings.Repeat("12", 32), Branch: "branch-a"}
+	sparse := GraphHandoffDescriptor{
+		GraphManifest: "cluster/memory-manifests/tx-1.manifest", GraphSnapshot: 17,
+		GraphRootObjects: "0000000000000011-03-0000000000000001",
+	}
 	draining, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse)
-	if err != nil || draining.State != TransactionDraining || draining.SparseHandoff == nil || *draining.SparseHandoff != sparse {
+	if err != nil || draining.State != TransactionDraining || draining.GraphHandoff == nil || *draining.GraphHandoff != sparse {
 		t.Fatalf("handoff=%+v err=%v", draining, err)
 	}
 	reopened, err := OpenStore(store.dir)
@@ -647,7 +650,7 @@ func TestMutualTLSControlPlaneSparseHandoffIsDurableAndIdempotent(t *testing.T) 
 		t.Fatal(err)
 	}
 	persisted, err := reopened.Load(tx.Identity.TransactionID)
-	if err != nil || persisted.SparseHandoff == nil || *persisted.SparseHandoff != sparse {
+	if err != nil || persisted.GraphHandoff == nil || *persisted.GraphHandoff != sparse {
 		t.Fatalf("persisted handoff=%+v err=%v", persisted, err)
 	}
 	// A replay with the pre-handoff revision models a lost HTTP response.
@@ -659,6 +662,27 @@ func TestMutualTLSControlPlaneSparseHandoffIsDurableAndIdempotent(t *testing.T) 
 	defer runtime.mu.Unlock()
 	if runtime.handedOff != 1 {
 		t.Fatalf("runtime handoff calls=%d, want 1", runtime.handedOff)
+	}
+}
+
+func TestGraphHandoffDescriptorRejectsCrossSnapshotRoots(t *testing.T) {
+	valid := GraphHandoffDescriptor{
+		GraphManifest:    "cluster/memory-manifests/tx.manifest",
+		GraphSnapshot:    17,
+		GraphRootObjects: "0000000000000011-03-0000000000000001",
+	}
+	if err := valid.validate(); err != nil {
+		t.Fatalf("valid descriptor: %v", err)
+	}
+	wrong := valid
+	wrong.GraphRootObjects = "0000000000000012-03-0000000000000001"
+	if err := wrong.validate(); err == nil {
+		t.Fatal("cross-snapshot root was accepted")
+	}
+	missing := valid
+	missing.GraphRootObjects = ""
+	if err := missing.validate(); err == nil {
+		t.Fatal("empty graph root set was accepted")
 	}
 }
 

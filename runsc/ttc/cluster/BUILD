@@ -28,6 +28,7 @@ go_library(
 		"@com_github_hashicorp_raft_boltdb_v2//:raft-boltdb",
 		"//pkg/hostarch",
 		"//pkg/ttcremote",
+		"//pkg/ttcsnapshot",
 	],
     visibility = ["//visibility:public"],
 )

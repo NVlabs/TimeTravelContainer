@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 // DistributedForkCaptureOptions controls portable source capture.
@@ -788,6 +789,63 @@ func (k *Kernel) HandoffDistributedForkMemory(repository *ttcchunk.MemoryReposit
 	return nil
 }
 
+// HandoffDistributedForkMemoryGraph replaces a live remote page source with
+// immutable graph-native 1 MiB objects. The existing target offsets and all
+// resident pages are preserved; only future faults change their source.
+func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataStore, remote *ttcsnapshot.ObjectRelayClient, manifest ttcchunk.Manifest, snapshot ttcsnapshot.SnapshotID) error {
+	closeInputs := func() {
+		if remote != nil {
+			_ = remote.Close()
+		}
+		if data != nil {
+			_ = data.Close()
+		}
+	}
+	if snapshot == 0 {
+		closeInputs()
+		return errors.New("distributed graph handoff has no snapshot identity")
+	}
+	if k.remoteHandoffSnapshot != 0 {
+		closeInputs()
+		if k.remoteHandoffSnapshot == uint64(snapshot) {
+			return nil
+		}
+		return fmt.Errorf("distributed memory was already handed to graph snapshot %d", k.remoteHandoffSnapshot)
+	}
+	if k.remoteHandoffManifest != (ttcchunk.ManifestID{}) {
+		closeInputs()
+		return fmt.Errorf("distributed memory was already handed to legacy manifest %s", k.remoteHandoffManifest)
+	}
+	if k.remotePageLoad == nil {
+		closeInputs()
+		return errors.New("kernel has no active distributed remote-memory load")
+	}
+	if stats := k.remotePageLoad.Stats(); stats.Done {
+		closeInputs()
+		if stats.Error != "" {
+			return fmt.Errorf("distributed memory load stopped before graph handoff: %s", stats.Error)
+		}
+		k.remoteHandoffSnapshot = uint64(snapshot)
+		return nil
+	}
+	geometry := k.remotePageLoad.ReaderGeometry()
+	if geometry.NeedsRegisterDestinationFD {
+		closeInputs()
+		return errors.New("distributed graph memory handoff does not support registered destination files")
+	}
+	packed, err := ttcchunk.NewGraphPackedManifestReader(data, remote, manifest, k.remoteLoadRanges, true)
+	if err != nil {
+		return err
+	}
+	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)
+	if err := k.remotePageLoad.SwitchReader(reader); err != nil {
+		_ = reader.Close()
+		return err
+	}
+	k.remoteHandoffSnapshot = uint64(snapshot)
+	return nil
+}
+
 // SetDistributedForkPrefetchWindow changes the active remote-memory prefetch
 // window for a distributed child. It affects future faults only.
 func (k *Kernel) SetDistributedForkPrefetchWindow(behind, ahead uint64) error {
@@ -848,4 +906,5 @@ func (k *Kernel) TransferDistributedForkMemorySources(target *Kernel) {
 	k.auxiliaryRemotePageLoads = nil
 	k.remoteLoadRanges = nil
 	k.remoteHandoffManifest = ttcchunk.ManifestID{}
+	k.remoteHandoffSnapshot = 0
 }

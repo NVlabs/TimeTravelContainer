@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -45,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	gsync "gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
@@ -203,6 +205,9 @@ type DistributedForkExportArgs struct {
 	SessionID string
 	AllowCopy bool
 	Sparse    bool
+	// Graph writes the retained fork-time snapshot as a graph-capture stream.
+	// It is mutually exclusive with Sparse and packed snapshot export.
+	Graph bool
 }
 
 // DistributedForkExportInfo identifies a sparse distributed memory manifest
@@ -229,12 +234,14 @@ type DistributedForkDependencyArgs struct {
 }
 
 // DistributedForkHandoffArgs replaces a target's live network page source
-// with an immutable sparse manifest. FilePayload contains one repository
-// directory descriptor.
+// with an immutable snapshot-graph manifest. FilePayload contains the
+// manifest and object-store descriptors, followed by an optional relay.
 type DistributedForkHandoffArgs struct {
 	urpc.FilePayload
-	BranchID string
-	Manifest ttcchunk.ManifestID
+	BranchID         string
+	GraphSnapshot    ttcsnapshot.SnapshotID
+	GraphRemote      bool
+	GraphRemoteToken ttcsnapshot.ObjectRelayToken
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -1009,19 +1016,28 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return nil, errors.New("distributed snapshot export requires a session and one destination")
 	}
+	if args.Graph && args.Sparse {
+		return nil, errors.New("distributed graph and legacy sparse export are mutually exclusive")
+	}
 	f.mu.Lock()
 	session := f.distributedSessions[args.SessionID]
 	f.mu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
 	}
-	if !args.Sparse {
+	if !args.Sparse && !args.Graph {
 		return nil, session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.sparseSnapshot == nil {
 		return nil, fmt.Errorf("distributed fork session %q sparse snapshot is unavailable", args.SessionID)
+	}
+	if args.Graph {
+		if err := ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings); err != nil {
+			return nil, fmt.Errorf("writing distributed graph capture: %w", err)
+		}
+		return &DistributedForkExportInfo{FilesystemBranch: session.filesystemBranch}, nil
 	}
 	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
 	if err != nil {
@@ -1156,21 +1172,49 @@ func (f *SandboxFamily) DrainDistributedForkMemory(branchID string) error {
 }
 
 // HandoffDistributedForkMemory switches future faults from the live source to
-// a durable sparse manifest after all in-flight network reads quiesce.
+// a durable snapshot graph after all in-flight network reads quiesce.
 func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs) error {
-	if args == nil || args.BranchID == "" || args.Manifest == (ttcchunk.ManifestID{}) || len(args.FilePayload.Files) != 1 {
-		return errors.New("distributed fork handoff requires a branch, manifest, and one repository descriptor")
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed fork handoff requires a branch")
 	}
 	b, release, err := f.beginControl(args.BranchID)
 	if err != nil {
 		return err
 	}
 	defer release()
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return fmt.Errorf("opening distributed handoff repository: %w", err)
+	want := 2
+	if args.GraphRemote {
+		want++
 	}
-	return b.k.HandoffDistributedForkMemory(repository, args.Manifest)
+	if args.GraphSnapshot == 0 || len(args.FilePayload.Files) != want {
+		return errors.New("distributed graph handoff requires a snapshot, manifest, object store, and optional relay")
+	}
+	encoded, err := io.ReadAll(args.FilePayload.Files[0])
+	if err != nil {
+		return fmt.Errorf("reading distributed graph handoff manifest: %w", err)
+	}
+	manifest, err := ttcchunk.DecodeManifest(encoded, nil)
+	if err != nil {
+		return fmt.Errorf("decoding distributed graph handoff manifest: %w", err)
+	}
+	data, err := ttcsnapshot.OpenLocalDataStoreFD(args.FilePayload.Files[1])
+	if err != nil {
+		return fmt.Errorf("opening distributed graph handoff objects: %w", err)
+	}
+	var remote *ttcsnapshot.ObjectRelayClient
+	if args.GraphRemote {
+		fd, err := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+		if err != nil {
+			data.Close()
+			return err
+		}
+		remote, err = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "distributed-graph-handoff-relay"), args.GraphRemoteToken)
+		if err != nil {
+			data.Close()
+			return err
+		}
+	}
+	return b.k.HandoffDistributedForkMemoryGraph(data, remote, manifest, args.GraphSnapshot)
 }
 
 // CloseDistributedForkSessions releases all remote dependencies during Sentry
