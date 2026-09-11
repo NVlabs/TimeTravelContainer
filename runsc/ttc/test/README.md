@@ -133,6 +133,11 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
   "$PWD/runsc/ttc/test/e2e_fuse_lifecycle.sh"
 ```
 
+`e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
+different 4 KiB page in every branch, and dehydrates/rehydrates alternating
+branches before verifying their private contents. Set
+`TTC_FANOUT_TEST_BRANCHES` to increase the fanout.
+
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTC's runsc arguments, daemon namespace preflight,

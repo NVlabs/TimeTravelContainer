@@ -59,6 +59,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts and mutates a configurable high-fanout branch
+# family against an already running TTC daemon.
+sh_binary(
+    name = "e2e_fanout_lifecycle",
+    srcs = ["e2e_fanout_lifecycle.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
