@@ -3450,7 +3450,7 @@ func maintainElasticRebalancer(backend *runtimeBackend, nodeID string, lease tim
 	}
 }
 
-func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error) {
+func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Duration, stderr io.Writer, done <-chan struct{}, serialize func(func() error) error, completed func()) {
 	interval := lease / 3
 	if interval < time.Second {
 		interval = time.Second
@@ -3515,6 +3515,9 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 		}
 		if stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: elastic drain %s for node %s completed after moving %d remaining branches\n", intent.OperationID, nodeID, len(moved))
+		}
+		if completed != nil {
+			completed()
 		}
 		return
 	}

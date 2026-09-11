@@ -41,6 +41,38 @@ func TestDaemonWireOptionsContainNoClientPaths(t *testing.T) {
 	}
 }
 
+func TestLocalNodeIncarnationPersistsForRootEpoch(t *testing.T) {
+	root := t.TempDir()
+	first, err := localNodeIncarnation(root, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := localNodeIncarnation(root, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" || second != first {
+		t.Fatalf("local incarnation changed across reopen: first=%q second=%q", first, second)
+	}
+	if _, err := localNodeIncarnation(root, "node-b"); err == nil {
+		t.Fatal("local root accepted a different node identity")
+	}
+}
+
+func TestLocalNodeIncarnationRejectsMalformedRecord(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "cluster", "node-incarnation.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"version":1,"node_id":"node-a","incarnation":"not-hex"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localNodeIncarnation(root, "node-a"); err == nil {
+		t.Fatal("malformed local incarnation was accepted")
+	}
+}
+
 func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 	server := &daemonServer{
 		socket:                "/run/ttc/ttcd.sock",

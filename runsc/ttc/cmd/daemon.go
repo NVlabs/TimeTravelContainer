@@ -342,6 +342,48 @@ type daemonClusterRuntime struct {
 	capacitySink    elasticCapacitySink
 }
 
+const daemonNodeIncarnationVersion = 1
+
+type daemonNodeIncarnation struct {
+	Version     int    `json:"version"`
+	NodeID      string `json:"node_id"`
+	Incarnation string `json:"incarnation"`
+}
+
+// localNodeIncarnation returns the identity of one exclusively locked local
+// root epoch. A daemon process restart must retain this identity: the detached
+// lease guardian first host-stops every Sentry, after which the replacement
+// daemon can resume the same fenced storage and in-flight transactions. A
+// discarded/recreated local root gets a fresh identity and therefore fences
+// all dependencies on the lost epoch.
+func localNodeIncarnation(localRoot, nodeID string) (string, error) {
+	path := filepath.Join(localRoot, "cluster", "node-incarnation.json")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var record daemonNodeIncarnation
+		if err := json.Unmarshal(data, &record); err != nil {
+			return "", fmt.Errorf("decoding local node incarnation: %w", err)
+		}
+		decoded, decodeErr := hex.DecodeString(record.Incarnation)
+		if record.Version != daemonNodeIncarnationVersion || record.NodeID != nodeID || decodeErr != nil || len(decoded) != 16 {
+			return "", fmt.Errorf("invalid local node incarnation for %q", nodeID)
+		}
+		return record.Incarnation, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("reading local node incarnation: %w", err)
+	}
+	incarnation, err := cluster.NewNodeIncarnation()
+	if err != nil {
+		return "", err
+	}
+	record := daemonNodeIncarnation{Version: daemonNodeIncarnationVersion, NodeID: nodeID, Incarnation: incarnation}
+	if err := writeDurableJSON(path, record); err != nil {
+		return "", fmt.Errorf("recording local node incarnation: %w", err)
+	}
+	return incarnation, nil
+}
+
 type daemonTargetRuntime struct {
 	backend     *runtimeBackend
 	nodeID      string
@@ -2854,7 +2896,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	if err != nil {
 		return nil, err
 	}
-	incarnation, err := cluster.NewNodeIncarnation()
+	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -3586,6 +3628,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				defer unlock()
 				server.reconcile(targetBackend)
 				return run()
+			}, func() {
+				// A recovered node-stop intent has exactly the same terminal
+				// semantics as the original command: once evacuation finishes,
+				// this daemon must leave the cluster automatically.
+				server.cleanStop.Store(true)
+				server.stopOnce.Do(func() { _ = server.listener.Close() })
 			})
 		}
 		if clusterRuntime.autoRebalance && elasticRecord != nil {

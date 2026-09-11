@@ -108,6 +108,16 @@ sh_binary(
     ],
 )
 
+# Manual three-daemon qualification that kills a draining daemon after its
+# durable intent is visible, restarts it, and verifies automatic evacuation.
+sh_binary(
+    name = "e2e_elastic_drain_recovery",
+    srcs = ["e2e_elastic_drain_recovery.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it kills the active shared-GC coordinator and verifies that
 # a shared-root retain waits through fenced lease takeover and ledger rebuild.
 sh_binary(
