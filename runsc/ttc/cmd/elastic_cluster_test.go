@@ -431,6 +431,11 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 	if !provisionalRaftTargetAuthorized(visible, "child", "node-b", "inc-b", load) {
 		t.Fatal("visible target transaction did not authorize pre-placement runtime")
 	}
+	tx.State = cluster.TransactionPublished
+	if !provisionalRaftTargetAuthorized(info, "child", "node-b", "inc-b", load) {
+		t.Fatal("published but unactivated migration target lost its provisional grant")
+	}
+	tx.State = cluster.TransactionTargetRestoring
 
 	for _, test := range []struct {
 		name   string
@@ -441,7 +446,10 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 		{"wrong branch", func(tx *cluster.Transaction) { tx.Identity.TargetVisibleBranch = "other" }},
 		{"wrong family", func(tx *cluster.Transaction) { tx.Identity.TargetContainer = "other" }},
 		{"canceled", func(tx *cluster.Transaction) { tx.State = cluster.TransactionCanceled }},
-		{"published without placement", func(tx *cluster.Transaction) { tx.State = cluster.TransactionPublished }},
+		{"activated without placement", func(tx *cluster.Transaction) {
+			tx.State = cluster.TransactionPublished
+			tx.Activated = true
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			copy := *tx

@@ -448,12 +448,20 @@ func (fs *filesystem) persistDiskMetadata(inode *inode) error {
 }
 
 func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
+	return diskVolumeError("publish written inode metadata", fs.persistDiskWriteMetadataRaw(inode))
+}
+
+// persistDiskWriteMetadataRaw is the control-plane form of
+// persistDiskWriteMetadata. Internal lifecycle operations must preserve the
+// repository's diagnostic instead of translating it to a guest errno; syscall
+// callers use persistDiskWriteMetadata above.
+func (fs *filesystem) persistDiskWriteMetadataRaw(inode *inode) error {
 	if fs.diskVolume == nil {
 		return nil
 	}
 	generation := inode.diskMetadataGeneration.Load()
 	if err := fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
-		return diskVolumeError("publish written inode metadata", err)
+		return err
 	}
 	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
 	return nil
@@ -463,12 +471,18 @@ func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 // writes. liveForkFiles contains every live regular file, including unlinked
 // files that remain reachable through an open description.
 func (fs *filesystem) flushDiskWriteMetadata() error {
+	return diskVolumeError("flush write metadata", fs.flushDiskWriteMetadataRaw())
+}
+
+// flushDiskWriteMetadataRaw is used by lifecycle operations, where preserving
+// the complete repository diagnostic is more useful than a guest errno.
+func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 	if fs.diskVolume == nil {
 		return nil
 	}
 	fs.liveForkMu.Lock()
 	for file := range fs.liveForkFiles {
-		if err := file.flushDiskMetadata(); err != nil {
+		if err := file.flushDiskMetadataRaw(); err != nil {
 			fs.liveForkMu.Unlock()
 			return err
 		}
@@ -506,7 +520,7 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 		updates[idx] = pending[idx].metadata
 	}
 	if err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates); err != nil {
-		return diskVolumeError("update inode metadata batch", err)
+		return fmt.Errorf("updating inode metadata batch: %w", err)
 	}
 	for _, update := range pending {
 		update.inode.diskMetadataGeneration.CompareAndSwap(update.generation, 0)

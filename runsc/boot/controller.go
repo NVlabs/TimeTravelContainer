@@ -15,6 +15,7 @@
 package boot
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -46,9 +47,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
@@ -116,6 +119,10 @@ const (
 
 	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
 	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
+
+	// ContMgrServeDistributedFilesystemConnection serves a host-accepted TTC
+	// filesystem stream from the live Sentry repository graph.
+	ContMgrServeDistributedFilesystemConnection = "containerManager.ServeDistributedFilesystemConnection"
 
 	// ContMgrExportDistributedForkSnapshot persists a session's immutable page stream.
 	ContMgrExportDistributedForkSnapshot = "containerManager.ExportDistributedForkSnapshot"
@@ -1133,6 +1140,29 @@ func (cm *containerManager) CaptureDistributedForkMany(args *DistributedForkCapt
 // ServeDistributedForkConnection handles one stream donated by ttcd.
 func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
 	return cm.l.family.ServeDistributedForkConnection(args)
+}
+
+// ServeDistributedFilesystemConnection handles one filesystem stream donated
+// by ttcd. Serving in the Sentry is essential for multihop forks: its
+// repositories own the transient upstream resolvers for inherited objects.
+func (cm *containerManager) ServeDistributedFilesystemConnection(args *DistributedForkServeArgs, _ *struct{}) error {
+	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
+		return errors.New("distributed filesystem serving requires a session and one connected socket")
+	}
+	token, err := cm.l.family.DistributedForkFilesystemToken(args.SessionID)
+	if err != nil {
+		return err
+	}
+	conn, err := ttcremote.NewDonatedTCPConn(args.FilePayload.Files[0])
+	if err != nil {
+		return err
+	}
+	sources := make([]ttcvolume.RemoteObjectSource, 0, len(cm.l.ttcVolumeRepositories))
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(source)))
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository})
+	}
+	return ttcvolume.ServeRemoteObjects(conn, token, sources)
 }
 
 // ExportDistributedForkSnapshot writes a durable shared-filesystem snapshot.

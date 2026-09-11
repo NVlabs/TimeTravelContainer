@@ -223,6 +223,13 @@ type Object struct {
 	BulkLength uint64
 	Data       []byte
 	Children   []Edge
+	// SourceCatalog and SourceObject preserve the immutable foreign identity
+	// from which this node was materialized. Deferred objects contain only
+	// these fields until a tree walk reaches them; expansion installs the
+	// bounded set of direct child stubs in one graph transaction.
+	SourceCatalog string   `json:",omitempty"`
+	SourceObject  ObjectID `json:",omitempty"`
+	Deferred      bool     `json:",omitempty"`
 }
 
 func validateObject(object Object) error {
@@ -234,6 +241,19 @@ func validateObject(object Object) error {
 	}
 	if object.State == ObjectReclaiming && object.Refs != 0 {
 		return fmt.Errorf("reclaiming object %s has %d references", object.ID.key(), object.Refs)
+	}
+	if object.Deferred {
+		if object.SourceCatalog == "" || object.SourceObject.IsZero() || object.SourceObject.Kind != object.ID.Kind {
+			return fmt.Errorf("deferred object %s has invalid foreign identity", object.ID.key())
+		}
+		if object.BulkLength != 0 || len(object.Data) != 0 || len(object.Children) != 0 {
+			return fmt.Errorf("deferred object %s contains materialized state", object.ID.key())
+		}
+	} else if (object.SourceCatalog == "") != object.SourceObject.IsZero() {
+		return fmt.Errorf("object %s has incomplete foreign identity", object.ID.key())
+	}
+	if len(object.SourceCatalog) > 256 || strings.ContainsRune(object.SourceCatalog, 0) {
+		return fmt.Errorf("object %s has invalid foreign catalog", object.ID.key())
 	}
 	if len(object.Data) > maxObjectDataBytes {
 		return fmt.Errorf("object %s has %d metadata bytes, limit is %d", object.ID.key(), len(object.Data), maxObjectDataBytes)

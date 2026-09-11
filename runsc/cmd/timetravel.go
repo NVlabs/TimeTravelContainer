@@ -119,6 +119,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-capture <target-branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-capture-many <batch-id>\n" +
 		"timetravel [flags] <container-id> distributed-serve <session-id>\n" +
+		"timetravel [flags] <container-id> distributed-filesystem-serve <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-export <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
@@ -367,6 +368,18 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			util.Fatalf("invalid distributed page connection FD")
 		}
 		err = cont.Sandbox.ServeDistributedForkConnection(&boot.DistributedForkServeArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{connection}}, SessionID: f.Arg(2),
+		})
+		connection.Close()
+	case "distributed-filesystem-serve":
+		if t.distributedConnectionFD < 0 {
+			util.Fatalf("--distributed-connection-fd is required")
+		}
+		connection := os.NewFile(uintptr(t.distributedConnectionFD), "distributed-filesystem-connection")
+		if connection == nil {
+			util.Fatalf("invalid distributed filesystem connection FD")
+		}
+		err = cont.Sandbox.ServeDistributedFilesystemConnection(&boot.DistributedForkServeArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{connection}}, SessionID: f.Arg(2),
 		})
 		connection.Close()

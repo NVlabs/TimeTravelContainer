@@ -85,7 +85,7 @@ func (i *inode) loadDefaultACL(_ goContext.Context, defaultACL *vfs.PosixACL) {
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	if pgalloc.IsLiveForkSource(ctx) {
-		if err := fs.flushDiskWriteMetadata(); err != nil {
+		if err := fs.flushDiskWriteMetadataRaw(); err != nil {
 			return fmt.Errorf("flushing TTC volume metadata before live fork: %w", err)
 		}
 		fs.liveForkMu.Lock()

@@ -5,6 +5,7 @@ package ttcvolume
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,10 +17,11 @@ import (
 )
 
 const (
-	remoteProtocolVersion = 3
-	remoteHeaderSize      = 112
-	remoteExtentBytes     = 1 << 20
-	remoteMaxErrorBytes   = 4096
+	remoteProtocolVersion  = 4
+	remoteHeaderSize       = 112
+	remoteExtentBytes      = 1 << 20
+	remoteMaxErrorBytes    = 4096
+	remoteMaxMetadataBytes = 5 << 20
 )
 
 var remoteMagic = [4]byte{'T', 'T', 'C', 'F'}
@@ -36,6 +38,7 @@ const (
 	remotePull remoteMessageType = iota + 1
 	remoteData
 	remoteError
+	remoteMetadataPull
 )
 
 type remoteHeader struct {
@@ -118,6 +121,25 @@ type RemoteObjectSource struct {
 	Objects map[string]int64
 }
 
+func (r *Repository) remoteGraphObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	if r == nil || r.graph == nil {
+		return ttcsnapshot.Object{}, os.ErrInvalid
+	}
+	object, err := r.graph.ResolveObject(id)
+	if err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	snapshot, ok := r.graph.Snapshot(id.Snapshot)
+	// Catalog-expansion origins stay working so later pathname faults can
+	// allocate more local stubs. Expanded objects are nevertheless immutable:
+	// they retain a foreign identity and are never modified in place. Ordinary
+	// branch-working objects remain ineligible until the branch is sealed.
+	if !ok || (snapshot.State == ttcsnapshot.SnapshotWorking && object.SourceCatalog == "") || object.State != ttcsnapshot.ObjectLive {
+		return ttcsnapshot.Object{}, fmt.Errorf("filesystem object %s is not in an immutable generation", id)
+	}
+	return object, nil
+}
+
 // RemoteObjectReader reads an immutable object range. Implementations may be
 // backed by a repository, an indexed pack chain, or another fenced source.
 type RemoteObjectReader interface {
@@ -151,7 +173,7 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 		if source.Reader == nil && source.Repository != nil {
 			source.Reader = repositoryObjectReader{repository: source.Repository}
 		}
-		if source.Reader == nil || len(source.Objects) == 0 {
+		if source.Reader == nil {
 			continue
 		}
 		byKey[source.Key] = source
@@ -161,27 +183,59 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 		if err != nil {
 			return err
 		}
-		if request.type_ != remotePull || request.token != token || request.length == 0 || request.length > remoteExtentBytes || request.offset%remoteExtentBytes != 0 {
-			return writeRemoteError(conn, request, "invalid or unauthorized filesystem range request")
+		if request.token != token {
+			return writeRemoteFailure(conn, request, "invalid or unauthorized filesystem range request")
 		}
 		source, ok := byKey[request.source]
 		object := strings.TrimRight(string(request.object[:]), "\x00")
+		id, parseErr := ttcsnapshot.ParseObjectID(object)
+		if !ok || parseErr != nil {
+			return writeRemoteFailure(conn, request, "filesystem object or range is outside the captured generation")
+		}
+		if request.type_ == remoteMetadataPull {
+			if request.offset != 0 || request.length != 0 || source.Repository == nil {
+				return writeRemoteFailure(conn, request, "invalid filesystem metadata request")
+			}
+			metadata, err := source.Repository.remoteGraphObject(id)
+			if err != nil {
+				return writeRemoteFailure(conn, request, err.Error())
+			}
+			payload, err := json.Marshal(metadata)
+			if err != nil || len(payload) > remoteMaxMetadataBytes {
+				return writeRemoteFailure(conn, request, "filesystem metadata response is too large")
+			}
+			response := request
+			response.type_ = remoteData
+			if err := writeRemoteMessage(conn, response, payload); err != nil {
+				return err
+			}
+			continue
+		}
+		if request.type_ != remotePull || request.length == 0 || request.length > remoteExtentBytes || request.offset%remoteExtentBytes != 0 || id.Kind != ttcsnapshot.ObjectKindFile {
+			return writeRemoteFailure(conn, request, "invalid or unauthorized filesystem range request")
+		}
 		size, allowed := source.Objects[object]
-		if !ok || !allowed || request.offset >= uint64(size) || uint64(request.length) > uint64(size)-request.offset {
-			return writeRemoteError(conn, request, "filesystem object or range is outside the captured generation")
+		if !allowed && source.Repository != nil {
+			metadata, err := source.Repository.remoteGraphObject(id)
+			if err == nil && metadata.BulkLength <= uint64(^uint64(0)>>1) {
+				size, allowed = int64(metadata.BulkLength), true
+			}
+		}
+		if !allowed || request.offset >= uint64(size) || uint64(request.length) > uint64(size)-request.offset {
+			return writeRemoteFailure(conn, request, "filesystem object or range is outside the captured generation")
 		}
 		payload := make([]byte, request.length)
 		if source.Repository != nil {
 			if err := source.Repository.ensureObjectRange(object, size, int64(request.offset), int64(request.length)); err != nil {
-				return writeRemoteError(conn, request, err.Error())
+				return writeRemoteFailure(conn, request, err.Error())
 			}
 		}
 		n, readErr := source.Reader.ReadObjectRange(object, payload, int64(request.offset))
 		if readErr != nil && !(errors.Is(readErr, io.EOF) && n == len(payload)) {
-			return writeRemoteError(conn, request, readErr.Error())
+			return writeRemoteFailure(conn, request, readErr.Error())
 		}
 		if n != len(payload) {
-			return writeRemoteError(conn, request, fmt.Sprintf("short filesystem object read: %d/%d", n, len(payload)))
+			return writeRemoteFailure(conn, request, fmt.Sprintf("short filesystem object read: %d/%d", n, len(payload)))
 		}
 		response := request
 		response.type_ = remoteData
@@ -199,6 +253,13 @@ func writeRemoteError(writer io.Writer, request remoteHeader, message string) er
 	return writeRemoteMessage(writer, request, []byte(message))
 }
 
+func writeRemoteFailure(writer io.Writer, request remoteHeader, message string) error {
+	if err := writeRemoteError(writer, request, message); err != nil {
+		return err
+	}
+	return errors.New(message)
+}
+
 type remoteObjectClient struct {
 	mu         sync.Mutex
 	conn       io.ReadWriteCloser
@@ -209,6 +270,66 @@ type remoteObjectClient struct {
 	objects    map[string]int64
 	sources    map[string]string
 	repository *Repository
+	branchID   string
+	catalog    string
+}
+
+func (r *Repository) prepareDeferredInode(inode *Inode) error {
+	if inode == nil || inode.Type != "regular" || inode.Object == "" {
+		return nil
+	}
+	id, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		return err
+	}
+	catalog, sourceID, deferred := r.graph.DeferredSource(id)
+	if !deferred {
+		return nil
+	}
+	// The local stub uses the working origin only for collision-free identity.
+	// Its bytes still belong to an immutable foreign generation, so first write
+	// must create a private object instead of modifying the fetched cache.
+	inode.DataGeneration = 0
+	object, err := r.graph.ResolveObject(id)
+	if err != nil {
+		return err
+	}
+	if object.ID.Kind != ttcsnapshot.ObjectKindFile || object.BulkLength != uint64(inode.Size) || sourceID.Kind != ttcsnapshot.ObjectKindFile {
+		return fmt.Errorf("deferred file %s metadata disagrees with inode %d", id, inode.Number)
+	}
+	pending, err := r.remoteObjectPending(id.String())
+	if err != nil {
+		return err
+	}
+	file, openErr := r.data.Open(id, inode.Size)
+	if openErr == nil {
+		openErr = file.Close()
+	}
+	if openErr == nil && !pending {
+		return nil
+	} else if openErr != nil && !errors.Is(openErr, os.ErrNotExist) {
+		return openErr
+	}
+	r.remoteMu.Lock()
+	remote := r.remoteByCatalog[catalog]
+	if remote != nil {
+		remote.objects[id.String()] = inode.Size
+		remote.sources[id.String()] = sourceID.String()
+		r.remoteByObject[id.String()] = remote
+	}
+	r.remoteMu.Unlock()
+	if remote == nil {
+		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
+	}
+	if openErr != nil {
+		if err := r.data.CreateSparsePlaceholder(id, inode.Size); err != nil {
+			return err
+		}
+	}
+	if err := r.markRemoteObjectPending(id.String(), sourceID.String()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // AttachRemoteObjectSource installs a donated, pre-connected range stream.
@@ -217,16 +338,39 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	if r == nil || conn == nil {
 		return errors.New("remote filesystem source requires repository and connection")
 	}
+	branch, err := r.Branch(branchID)
+	if err != nil {
+		return err
+	}
+	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, complete: make(map[string]bool), objects: make(map[string]int64), sources: make(map[string]string), repository: r, branchID: branchID, catalog: branch.RemoteCatalog}
+	if branch.RemoteCatalog != "" {
+		if branch.RemoteCatalogSnapshot == 0 {
+			return errors.New("remote filesystem branch has no catalog expansion origin")
+		}
+		if err := r.graph.AttachDeferredResolver(branch.RemoteCatalog, ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot), remote.pullMetadata); err != nil {
+			return err
+		}
+		r.remoteMu.Lock()
+		if r.remotes == nil {
+			r.remotes = make(map[*remoteObjectClient]struct{})
+			r.remoteByObject = make(map[string]*remoteObjectClient)
+			r.remoteByCatalog = make(map[string]*remoteObjectClient)
+		}
+		r.remotes[remote] = struct{}{}
+		r.remoteByCatalog[branch.RemoteCatalog] = remote
+		r.remoteMu.Unlock()
+		return nil
+	}
 	objects, err := r.BranchObjects(branchID)
 	if err != nil {
 		return err
 	}
-	remote := &remoteObjectClient{conn: conn, token: token, source: source, next: 1, complete: make(map[string]bool), objects: make(map[string]int64), sources: make(map[string]string), repository: r}
 	r.remoteMu.Lock()
 	defer r.remoteMu.Unlock()
 	if r.remotes == nil {
 		r.remotes = make(map[*remoteObjectClient]struct{})
 		r.remoteByObject = make(map[string]*remoteObjectClient)
+		r.remoteByCatalog = make(map[string]*remoteObjectClient)
 	}
 	for object, size := range objects {
 		sourceObject, pending, err := r.remoteSourceObject(object)
@@ -313,6 +457,22 @@ func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
 // source handoff or local durable publication.
 func (r *Repository) MaterializeRemoteObjects() error {
+	// Resolve every still-foreign namespace before detaching its provider.
+	// This is an explicit independence barrier and is allowed to be O(total
+	// metadata); ordinary remote start and pathname access remain lazy.
+	r.remoteMu.Lock()
+	var deferredBranches []string
+	for remote := range r.remotes {
+		if remote.catalog != "" {
+			deferredBranches = append(deferredBranches, remote.branchID)
+		}
+	}
+	r.remoteMu.Unlock()
+	for _, branch := range deferredBranches {
+		if _, err := r.BranchObjects(branch); err != nil {
+			return err
+		}
+	}
 	r.remoteMu.Lock()
 	remotes := make([]*remoteObjectClient, 0, len(r.remotes))
 	for remote := range r.remotes {
@@ -349,6 +509,12 @@ func (r *Repository) MaterializeRemoteObjects() error {
 				delete(r.remoteByObject, object)
 			}
 		}
+		for catalog, owner := range r.remoteByCatalog {
+			if owner == remote {
+				delete(r.remoteByCatalog, catalog)
+				r.graph.DetachDeferredResolver(catalog)
+			}
+		}
 		r.remoteMu.Unlock()
 		err := remote.conn.Close()
 		remote.mu.Unlock()
@@ -357,6 +523,23 @@ func (r *Repository) MaterializeRemoteObjects() error {
 		}
 	}
 	return nil
+}
+
+func (c *remoteObjectClient) pullMetadata(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	payload, err := c.request(remoteMetadataPull, id.String(), 0, 0)
+	if err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	var object ttcsnapshot.Object
+	if err := json.Unmarshal(payload, &object); err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	if object.ID != id {
+		return ttcsnapshot.Object{}, fmt.Errorf("remote filesystem metadata identifies %s, want %s", object.ID, id)
+	}
+	return object, nil
 }
 
 // EnsureDataRange materializes the complete immutable file on its first guest
@@ -472,9 +655,16 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 	if !validObjectID(remoteObject) || len(remoteObject) > 40 {
 		return nil, fmt.Errorf("invalid object ID %q", object)
 	}
+	return c.request(remotePull, remoteObject, offset, length)
+}
+
+func (c *remoteObjectClient) request(kind remoteMessageType, object string, offset uint64, length uint32) ([]byte, error) {
+	if len(object) > len(remoteHeader{}.object) {
+		return nil, errors.New("remote filesystem object identity is too long")
+	}
 	c.next++
-	request := remoteHeader{type_: remotePull, token: c.token, requestID: c.next, source: c.source, offset: offset, length: length}
-	copy(request.object[:], remoteObject)
+	request := remoteHeader{type_: kind, token: c.token, requestID: c.next, source: c.source, offset: offset, length: length}
+	copy(request.object[:], object)
 	var encoded [remoteHeaderSize]byte
 	request.marshal(encoded[:])
 	if err := writeAll(c.conn, encoded[:]); err != nil {
@@ -484,7 +674,11 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 	if err != nil {
 		return nil, err
 	}
-	if response.token != c.token || response.requestID != request.requestID || response.source != c.source || response.object != request.object || response.offset != offset || response.length > remoteExtentBytes {
+	maxResponse := uint32(remoteExtentBytes)
+	if kind == remoteMetadataPull {
+		maxResponse = uint32(remoteMaxMetadataBytes)
+	}
+	if response.token != c.token || response.requestID != request.requestID || response.source != c.source || response.object != request.object || response.offset != offset || response.length > maxResponse {
 		return nil, errors.New("remote filesystem response identity mismatch")
 	}
 	payload := make([]byte, response.length)
@@ -494,7 +688,7 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 	if response.type_ == remoteError {
 		return nil, errors.New(string(payload))
 	}
-	if response.type_ != remoteData || response.length != length {
+	if response.type_ != remoteData || (kind == remotePull && response.length != length) {
 		return nil, errors.New("invalid remote filesystem data response")
 	}
 	return payload, nil

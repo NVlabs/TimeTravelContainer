@@ -138,6 +138,17 @@ type Store struct {
 	// its whole lifetime. Callers must invoke Reload while holding that flock
 	// before every mutation that may race another process.
 	externallyCoordinated bool
+	deferredResolvers     map[string]deferredResolver
+	deferredObjects       map[string]ObjectID
+}
+
+type deferredResolver struct {
+	origin SnapshotID
+	load   ImmutableObjectLoader
+}
+
+func deferredObjectKey(catalog string, id ObjectID) string {
+	return catalog + "\x00" + id.key()
 }
 
 var graphTemporarySequence atomic.Uint64
@@ -264,7 +275,10 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 			return nil, fmt.Errorf("locking TTC snapshot graph: %w", err)
 		}
 	}
-	store := &Store{dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated}
+	store := &Store{
+		dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated,
+		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[string]ObjectID),
+	}
 	if externallyCoordinated {
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 			store.Close()
@@ -616,7 +630,17 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	if previous != nil {
 		_ = previous.Close()
 	}
+	s.rebuildDeferredObjectsLocked()
 	return nil
+}
+
+func (s *Store) rebuildDeferredObjectsLocked() {
+	s.deferredObjects = make(map[string]ObjectID)
+	for _, object := range s.state.Objects {
+		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
+			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
+		}
+	}
 }
 
 func validateGraphState(state *graphState) error {
@@ -1791,7 +1815,24 @@ func (s *Store) CommitReservedObjects(reserved []ReservedObject) error {
 	return s.commitLocked(ops)
 }
 
-// Object returns a copy of object metadata.
+// ResolveObject returns materialized object metadata. Deferred metadata is
+// fetched from its currently attached authoritative catalog first.
+func (s *Store) ResolveObject(id ObjectID) (Object, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok, err := s.resolveDeferredLocked(id)
+	if err != nil {
+		return Object{}, err
+	}
+	if !ok {
+		return Object{}, os.ErrNotExist
+	}
+	return cloneObject(object), nil
+}
+
+// Object returns a copy of locally available object metadata. It does not
+// contact a deferred provider; callers that require complete metadata use
+// ResolveObject.
 func (s *Store) Object(id ObjectID) (Object, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

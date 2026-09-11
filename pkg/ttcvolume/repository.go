@@ -187,12 +187,14 @@ type VolumeInfo struct {
 // Branch identifies one immutable filesystem root and the exclusive working
 // snapshot origin used by its next metadata and whole-file CoW mutations.
 type Branch struct {
-	ID              string    `json:"id"`
-	Root            string    `json:"root"`
-	BaseRoot        string    `json:"base_root,omitempty"`
-	WorkingSnapshot uint64    `json:"working_snapshot"`
-	Generation      uint64    `json:"generation"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                    string    `json:"id"`
+	Root                  string    `json:"root"`
+	BaseRoot              string    `json:"base_root,omitempty"`
+	RemoteCatalog         string    `json:"remote_catalog,omitempty"`
+	RemoteCatalogSnapshot uint64    `json:"remote_catalog_snapshot,omitempty"`
+	WorkingSnapshot       uint64    `json:"working_snapshot"`
+	Generation            uint64    `json:"generation"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 // Inode is branch-resolved virtual inode metadata.
@@ -290,11 +292,12 @@ type Repository struct {
 	operationMu sync.Mutex
 	lockFile    *os.File
 
-	branchMu       sync.Mutex
-	branchCache    map[string]cachedBranch
-	remoteMu       sync.Mutex
-	remotes        map[*remoteObjectClient]struct{}
-	remoteByObject map[string]*remoteObjectClient
+	branchMu        sync.Mutex
+	branchCache     map[string]cachedBranch
+	remoteMu        sync.Mutex
+	remotes         map[*remoteObjectClient]struct{}
+	remoteByObject  map[string]*remoteObjectClient
+	remoteByCatalog map[string]*remoteObjectClient
 
 	// materializationMu serializes installation of remotely inherited objects
 	// with runtime backing-cache invalidation. Hooks are invoked while this
@@ -694,6 +697,7 @@ func (r *Repository) Close() error {
 	}
 	r.remotes = nil
 	r.remoteByObject = nil
+	r.remoteByCatalog = nil
 	r.remoteMu.Unlock()
 	var graphErr error
 	if r.graph != nil {
@@ -1201,6 +1205,7 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		sourceBranch.Generation++
 		childBranch := Branch{
 			ID: child, Root: sourceBranch.Root, BaseRoot: sourceBranch.Root, WorkingSnapshot: uint64(working[1]),
+			RemoteCatalog: sourceBranch.RemoteCatalog, RemoteCatalogSnapshot: sourceBranch.RemoteCatalogSnapshot,
 			Generation: sourceBranch.Generation, CreatedAt: time.Now().UTC(),
 		}
 		// Publish the source's new generation first. If the process crashes

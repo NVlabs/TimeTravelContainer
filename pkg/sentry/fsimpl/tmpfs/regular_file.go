@@ -357,10 +357,18 @@ func (rf *regularFile) markDiskMetadataDirtyLocked() {
 //
 // Preconditions: rf.inode.mu is locked.
 func (rf *regularFile) flushDiskMetadataLocked() error {
+	return diskVolumeError("publish written inode metadata", rf.flushDiskMetadataRawLocked())
+}
+
+// flushDiskMetadataRawLocked preserves repository diagnostics for lifecycle
+// operations that are not guest syscall boundaries.
+//
+// Preconditions: rf.inode.mu is locked.
+func (rf *regularFile) flushDiskMetadataRawLocked() error {
 	if rf.inode.fs.diskVolume == nil || rf.diskMetadataDirty.Load() == 0 {
 		return nil
 	}
-	if err := rf.inode.fs.persistDiskWriteMetadata(&rf.inode); err != nil {
+	if err := rf.inode.fs.persistDiskWriteMetadataRaw(&rf.inode); err != nil {
 		return err
 	}
 	rf.diskMetadataDirty.Store(0)
@@ -371,6 +379,12 @@ func (rf *regularFile) flushDiskMetadata() error {
 	rf.inode.mu.Lock()
 	defer rf.inode.mu.Unlock()
 	return rf.flushDiskMetadataLocked()
+}
+
+func (rf *regularFile) flushDiskMetadataRaw() error {
+	rf.inode.mu.Lock()
+	defer rf.inode.mu.Unlock()
+	return rf.flushDiskMetadataRawLocked()
 }
 
 // copyOnWriteLocked gives rf private backing for shared pages in mr.

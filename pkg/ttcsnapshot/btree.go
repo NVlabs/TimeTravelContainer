@@ -125,6 +125,7 @@ type graphMutation struct {
 	store    *Store
 	snapshot Snapshot
 	objects  map[string]Object
+	err      error
 }
 
 func newGraphMutation(store *Store, origin SnapshotID) (*graphMutation, error) {
@@ -139,6 +140,21 @@ func (mutation *graphMutation) object(id ObjectID) (Object, bool) {
 	if object, ok := mutation.objects[id.key()]; ok {
 		return object, true
 	}
+	object, ok, nextOrdinal, err := mutation.store.resolveDeferredLockedAfter(id, mutation.snapshot.NextOrdinal)
+	if err != nil {
+		mutation.err = errors.Join(mutation.err, err)
+		return Object{}, false
+	}
+	if mutation.snapshot.NextOrdinal < nextOrdinal {
+		mutation.snapshot.NextOrdinal = nextOrdinal
+	}
+	return object, ok
+}
+
+func (mutation *graphMutation) rawObject(id ObjectID) (Object, bool) {
+	if object, ok := mutation.objects[id.key()]; ok {
+		return object, true
+	}
 	object, ok := mutation.store.state.Objects[id.key()]
 	return object, ok
 }
@@ -148,9 +164,9 @@ func (mutation *graphMutation) put(object Object) {
 }
 
 func (mutation *graphMutation) retain(id ObjectID) error {
-	object, ok := mutation.object(id)
+	object, ok := mutation.rawObject(id)
 	if !ok || object.State != ObjectLive || object.Refs == math.MaxUint64 {
-		return fmt.Errorf("object %s cannot be retained", id.key())
+		return errors.Join(mutation.err, fmt.Errorf("object %s cannot be retained (found=%t state=%q refs=%d deferred=%t)", id.key(), ok, object.State, object.Refs, object.Deferred))
 	}
 	object.Refs++
 	mutation.put(object)
@@ -181,7 +197,7 @@ func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
 		return err
 	}
 	if oldID, ok := mutation.store.state.Roots[name]; ok {
-		oldObject, exists := mutation.object(oldID)
+		oldObject, exists := mutation.rawObject(oldID)
 		if !exists {
 			return fmt.Errorf("root %q references missing object %s", name, oldID.key())
 		}

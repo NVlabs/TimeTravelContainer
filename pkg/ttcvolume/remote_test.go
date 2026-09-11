@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -284,8 +285,11 @@ func TestRemoteSnapshotNeverReadsUnattachedPlaceholderAsZeros(t *testing.T) {
 	if _, _, err := source.WriteAt(MainBranch, ino, []byte("not-zero"), 0); err != nil {
 		t.Fatal(err)
 	}
+	if err := source.Fork(MainBranch, "remote-generation"); err != nil {
+		t.Fatal(err)
+	}
 	snapshot := filepath.Join(t.TempDir(), "snapshot")
-	if _, _, err := source.ExportRemoteSnapshot(MainBranch, snapshot); err != nil {
+	if _, _, err := source.ExportRemoteSnapshot("remote-generation", snapshot); err != nil {
 		t.Fatal(err)
 	}
 	targetManager := openTestManager(t)
@@ -294,12 +298,69 @@ func TestRemoteSnapshotNeverReadsUnattachedPlaceholderAsZeros(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer target.Close()
-	targetIno, err := target.Lookup("remote", RootInode, "value")
+	if _, err := target.Lookup("remote", RootInode, "value"); err == nil || !strings.Contains(err.Error(), "no attached authoritative source") {
+		t.Fatalf("Lookup on unattached deferred metadata err=%v", err)
+	}
+}
+
+func TestRemoteSnapshotImportAndLookupStayGraphBounded(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := make([]byte, 8)
-	if _, err := target.ReadAt("remote", targetIno, data, 0); err == nil || !strings.Contains(err.Error(), "no attached authoritative source") {
-		t.Fatalf("ReadAt on unattached placeholder got %q, err=%v", data, err)
+	defer source.Close()
+	for i := 0; i < 512; i++ {
+		if _, err := source.CreateRegular(MainBranch, RootInode, fmt.Sprintf("entry-%04d", i), 0644, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Fork(MainBranch, "remote-generation"); err != nil {
+		t.Fatal(err)
+	}
+	sourceObjects := source.graph.Stats().Objects
+	if sourceObjects < 100 {
+		t.Fatalf("source graph objects=%d, want a nontrivial namespace", sourceObjects)
+	}
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if _, _, err := source.ExportRemoteSnapshot("remote-generation", snapshot); err != nil {
+		t.Fatal(err)
+	}
+	graphDescriptor, err := os.ReadFile(filepath.Join(snapshot, "graph.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graphDescriptor) > 512 {
+		t.Fatalf("remote root descriptor=%d bytes, want O(1) metadata", len(graphDescriptor))
+	}
+
+	targetManager := openTestManager(t)
+	target, _, err := targetManager.ImportPrivateRemoteSnapshot(filepath.Join(targetManager.root, "target"), "target", snapshot, "remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	initialObjects := target.graph.Stats().Objects
+	if initialObjects >= 16 || initialObjects >= sourceObjects {
+		t.Fatalf("initial target graph objects=%d, source=%d; import traversed the namespace", initialObjects, sourceObjects)
+	}
+
+	var token RemoteToken
+	copy(token[:], []byte("snapshot-token-1"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	server, client := net.Pipe()
+	go ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source}})
+	if err := target.AttachRemoteObjectSource(client, token, key, "remote"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Lookup("remote", RootInode, "entry-0256"); err != nil {
+		t.Fatal(err)
+	}
+	afterLookup := target.graph.Stats().Objects
+	// Expanding each node installs its bounded direct-child stubs, so the local
+	// object count includes at most the traversed paths plus one fanout per
+	// level. It must not scale with the complete namespace.
+	if loaded := afterLookup - initialObjects; loaded == 0 || loaded > 128 {
+		t.Fatalf("single lookup installed %d graph objects, want bounded B-tree paths and child stubs", loaded)
 	}
 }

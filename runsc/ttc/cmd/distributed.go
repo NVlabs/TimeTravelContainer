@@ -206,18 +206,16 @@ func (b *runtimeBackend) selectForkNode(requested string) (string, bool, error) 
 }
 
 type distributedPageRelay struct {
-	listener       net.Listener
-	backend        *runtimeBackend
-	source         string
-	session        string
-	close          sync.Once
-	mu             sync.Mutex
-	closed         bool
-	commands       map[*exec.Cmd]struct{}
-	connections    map[*net.TCPConn]struct{}
-	fsToken        ttcvolume.RemoteToken
-	fsSources      []ttcvolume.RemoteObjectSource
-	fsRepositories []*ttcvolume.Repository
+	listener             net.Listener
+	backend              *runtimeBackend
+	source               string
+	session              string
+	close                sync.Once
+	mu                   sync.Mutex
+	closed               bool
+	commands             map[*exec.Cmd]struct{}
+	connections          map[*net.TCPConn]struct{}
+	filesystemConfigured bool
 }
 
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
@@ -269,15 +267,19 @@ func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
 	}
 	if magic == [4]byte{'T', 'T', 'C', 'F'} {
 		r.mu.Lock()
-		token := r.fsToken
-		sources := append([]ttcvolume.RemoteObjectSource(nil), r.fsSources...)
+		configured := r.filesystemConfigured
 		closed := r.closed
 		r.mu.Unlock()
-		if closed || len(sources) == 0 {
+		if closed || !configured {
 			tcp.Close()
 			return
 		}
-		_ = ttcvolume.ServeRemoteObjects(tcp, token, sources)
+		file, err := tcp.File()
+		tcp.Close()
+		if err != nil {
+			return
+		}
+		r.serveFilesystemFile(file)
 		return
 	}
 	file, err := tcp.File()
@@ -312,19 +314,25 @@ func peekDistributedMagic(tcp *net.TCPConn) ([4]byte, error) {
 	return magic, errors.Join(err, socketErr)
 }
 
-func (r *distributedPageRelay) ConfigureFilesystem(token ttcvolume.RemoteToken, sources []ttcvolume.RemoteObjectSource, repositories []*ttcvolume.Repository) error {
+func (r *distributedPageRelay) ConfigureFilesystem() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || len(r.fsSources) != 0 {
+	if r.closed || r.filesystemConfigured {
 		return errors.New("distributed filesystem relay is closed or already configured")
 	}
-	r.fsToken = token
-	r.fsSources = append([]ttcvolume.RemoteObjectSource(nil), sources...)
-	r.fsRepositories = append([]*ttcvolume.Repository(nil), repositories...)
+	r.filesystemConfigured = true
 	return nil
 }
 
 func (r *distributedPageRelay) serveFile(file *os.File) {
+	r.serveRunscFile(file, "distributed-serve")
+}
+
+func (r *distributedPageRelay) serveFilesystemFile(file *os.File) {
+	r.serveRunscFile(file, "distributed-filesystem-serve")
+}
+
+func (r *distributedPageRelay) serveRunscFile(file *os.File, action string) {
 	defer file.Close()
 	timeout := unix.NsecToTimeval((30 * time.Second).Nanoseconds())
 	if err := unix.SetsockoptTimeval(int(file.Fd()), unix.SOL_SOCKET, unix.SO_RCVTIMEO, &timeout); err != nil {
@@ -335,7 +343,7 @@ func (r *distributedPageRelay) serveFile(file *os.File) {
 	}
 	command := runscCommand(r.backend.runsc,
 		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
-		r.source, "distributed-serve", r.session)
+		r.source, action, r.session)
 	command.ExtraFiles = []*os.File{file}
 	command.Stdin = strings.NewReader("")
 	command.Stdout = io.Discard
@@ -349,14 +357,14 @@ func (r *distributedPageRelay) serveFile(file *os.File) {
 	}
 	if err := command.Start(); err != nil {
 		r.mu.Unlock()
-		fmt.Fprintf(os.Stderr, "ttcd: distributed page relay could not start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ttcd: distributed %s relay could not start: %v\n", action, err)
 		return
 	}
 	r.commands[command] = struct{}{}
 	r.mu.Unlock()
 	waitErr := command.Wait()
 	if waitErr != nil {
-		fmt.Fprintf(os.Stderr, "ttcd: distributed page relay failed: %v: %s\n", waitErr, strings.TrimSpace(commandError.String()))
+		fmt.Fprintf(os.Stderr, "ttcd: distributed %s relay failed: %v: %s\n", action, waitErr, strings.TrimSpace(commandError.String()))
 	}
 	r.mu.Lock()
 	delete(r.commands, command)
@@ -377,9 +385,6 @@ func (r *distributedPageRelay) Close() {
 			for connection := range r.connections {
 				connections = append(connections, connection)
 			}
-			repositories := r.fsRepositories
-			r.fsRepositories = nil
-			r.fsSources = nil
 			r.mu.Unlock()
 			for _, connection := range connections {
 				_ = connection.Close()
@@ -388,9 +393,6 @@ func (r *distributedPageRelay) Close() {
 				if command.Process != nil {
 					_ = command.Process.Kill()
 				}
-			}
-			for _, repository := range repositories {
-				_ = repository.Close()
 			}
 		})
 	}
@@ -421,7 +423,7 @@ func newDistributedTransactionID() (string, error) {
 // prepareDistributedFilesystem seals metadata for the already-forked volume
 // generation into one immutable shared pack and configures the source relay to
 // serve only its allowlisted objects. Active object data remains node-local.
-func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch, transactionID string, token ttcvolume.RemoteToken, relay *distributedPageRelay) (string, uint64, error) {
+func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch, transactionID string, relay *distributedPageRelay) (string, uint64, error) {
 	if filesystemBranch == "" {
 		return "", 0, errors.New("distributed capture omitted its filesystem generation")
 	}
@@ -447,7 +449,6 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		return "", 0, err
 	}
 	defer os.RemoveAll(staging)
-	var sources []ttcvolume.RemoteObjectSource
 	var repositories []*ttcvolume.Repository
 	var dependentBytes uint64
 	countedObjects := make(map[string]struct{})
@@ -479,7 +480,6 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 			}
 		}
 		repositories = append(repositories, repository)
-		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository, Objects: objects})
 	}
 	pack, err := ttcpack.WriteDirectory(staging, filepath.Join(b.dataRoot, "cold"))
 	if err != nil {
@@ -490,8 +490,15 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		closeRepositories()
 		return "", 0, fmt.Errorf("binding distributed filesystem pack intent: %w", err)
 	}
-	if err := relay.ConfigureFilesystem(token, sources, repositories); err != nil {
-		closeRepositories()
+	// The manager opens repositories only to publish the immutable root
+	// descriptors above. Runtime reads, including multihop reads inherited from
+	// another node, must be served by the source Sentry: it owns the live
+	// repositories and their transient upstream resolvers. Retaining duplicate
+	// manager-side handles here both wastes descriptors and loses that resolver
+	// state.
+	closeRepositories()
+	repositories = nil
+	if err := relay.ConfigureFilesystem(); err != nil {
 		return "", 0, err
 	}
 	return pack.String(), dependentBytes, nil
@@ -556,7 +563,11 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 			if err != nil {
 				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
 			}
-			if _, err := repository.BranchObjects(filesystemBranch); err != nil {
+			// Remote metadata is intentionally unresolved until the fenced
+			// filesystem stream is donated to the Sentry. Verify only the durable
+			// branch pointer here; enumerating BranchObjects would defeat lazy
+			// startup and cannot succeed before the resolver is attached.
+			if _, err := repository.Branch(filesystemBranch); err != nil {
 				_ = repository.Close()
 				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
 			}
@@ -847,9 +858,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
-	var filesystemToken ttcvolume.RemoteToken
-	copy(filesystemToken[:], session.Token[:])
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, transactionID, filesystemToken, relay)
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, transactionID, relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
 	}
@@ -1028,7 +1037,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if _, err := rand.Read(filesystemToken[:]); err != nil {
 		return selector{}, err
 	}
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, transactionID, filesystemToken, relay)
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, transactionID, relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
 	}
@@ -1456,9 +1465,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
-		var filesystemToken ttcvolume.RemoteToken
-		copy(filesystemToken[:], session.Token[:])
-		filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.transaction, filesystemToken, child.relay)
+		filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.transaction, child.relay)
 		if err != nil {
 			return nil, fmt.Errorf("sealing filesystem generation for target %s: %w", child.target, err)
 		}

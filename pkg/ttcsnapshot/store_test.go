@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1545,6 +1546,43 @@ func TestLocalDataStoreReplaceDeferredIsAtomic(t *testing.T) {
 	file.Close()
 	if err != nil || !bytes.Equal(got, replacement) {
 		t.Fatalf("replacement bytes=%d err=%v", len(got), err)
+	}
+}
+
+func TestLocalDataStoreCreateSparsePlaceholderDescriptorRelative(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "objects")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := OpenLocalDataStoreFD(directory)
+	directory.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	id := ObjectID{Snapshot: 9, Kind: ObjectKindFile, Ordinal: 17}
+	const size = int64(7<<20 + 123)
+	if err := data.CreateSparsePlaceholder(id, size); err != nil {
+		t.Fatal(err)
+	}
+	file, err := data.Open(id, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(statErr, closeErr))
+	}
+	if info.Size() != size {
+		t.Fatalf("placeholder size=%d, want %d", info.Size(), size)
+	}
+	if _, err := data.objectPath(id); err == nil {
+		t.Fatal("descriptor-relative store unexpectedly exposed a host path")
 	}
 }
 

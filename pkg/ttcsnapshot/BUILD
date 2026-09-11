@@ -11,6 +11,7 @@ go_library(
         "btree.go",
 		"catalog.go",
         "data.go",
+		"deferred.go",
         "filesystem.go",
 		"hosttree.go",
 		"ledger.go",
@@ -30,6 +31,7 @@ go_test(
     size = "small",
     srcs = [
 		"catalog_test.go",
+		"deferred_test.go",
 		"hosttree_test.go",
 		"ledger_test.go",
 		"pack_test.go",

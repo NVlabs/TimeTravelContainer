@@ -2193,6 +2193,16 @@ func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServe
 	return nil
 }
 
+// ServeDistributedFilesystemConnection donates one accepted TTC filesystem
+// stream to the Sentry that owns the source repository and any upstream
+// resolvers needed for multihop service.
+func (s *Sandbox) ServeDistributedFilesystemConnection(args *boot.DistributedForkServeArgs) error {
+	if err := s.call(boot.ContMgrServeDistributedFilesystemConnection, args, nil); err != nil {
+		return fmt.Errorf("serving distributed filesystem session %q: %w", args.SessionID, err)
+	}
+	return nil
+}
+
 // ExportDistributedForkSnapshot persists a distributed session's page stream.
 func (s *Sandbox) ExportDistributedForkSnapshot(args *boot.DistributedForkExportArgs) (*boot.DistributedForkExportInfo, error) {
 	var info boot.DistributedForkExportInfo

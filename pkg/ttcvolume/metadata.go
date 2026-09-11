@@ -232,6 +232,14 @@ func (r *Repository) completeMetadata(state *branchMetadata) error {
 	if err != nil {
 		return err
 	}
+	resolvedInodes := make([]Inode, 0, len(inodes))
+	for _, record := range inodes {
+		inode := inodeFromGraph(record)
+		if err := r.prepareDeferredInode(&inode); err != nil {
+			return err
+		}
+		resolvedInodes = append(resolvedInodes, inode)
+	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.branch.Root != branch.Root {
@@ -243,8 +251,7 @@ func (r *Repository) completeMetadata(state *branchMetadata) error {
 	state.loadedDirectories = make(map[uint64]bool)
 	state.deletedInodes = make(map[uint64]bool)
 	state.deletedEntries = make(map[metadataEntryKey]bool)
-	for _, record := range inodes {
-		inode := inodeFromGraph(record)
+	for _, inode := range resolvedInodes {
 		state.inodes[inode.Number] = inode
 	}
 	for _, record := range entries {
@@ -591,6 +598,9 @@ func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, er
 	branch := state.branch
 	state.mu.RUnlock()
 	if ok {
+		if err := r.prepareDeferredInode(&inode); err != nil {
+			return Inode{}, err
+		}
 		return inode, nil
 	}
 	if deleted {
@@ -608,6 +618,9 @@ func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, er
 		return Inode{}, fs.ErrNotExist
 	}
 	inode = inodeFromGraph(record)
+	if err := r.prepareDeferredInode(&inode); err != nil {
+		return Inode{}, err
+	}
 	state.mu.Lock()
 	if state.branch.Root == branch.Root {
 		state.inodes[ino] = inode

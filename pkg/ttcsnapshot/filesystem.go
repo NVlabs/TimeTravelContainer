@@ -205,7 +205,10 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	mutation, logicalRoot, err := buildFilesystemMutation(&s.state, origin, rootName, operations, releasePins)
+	if err := s.resolveFilesystemOperationPathsLocked(rootName, operations); err != nil {
+		return ObjectID{}, nil, err
+	}
+	mutation, logicalRoot, err := buildFilesystemMutationStore(s, origin, rootName, operations, releasePins)
 	if err != nil {
 		return ObjectID{}, nil, err
 	}
@@ -226,16 +229,83 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 	return logicalRoot, reclaimed, nil
 }
 
+// resolveFilesystemOperationPathsLocked expands all foreign nodes whose data
+// will be decoded by one logical mutation before that mutation allocates an
+// object ID. This keeps the filesystem WAL deterministic while leaving every
+// unaffected sibling as a one-record deferred stub.
+func (s *Store) resolveFilesystemOperationPathsLocked(rootName string, operations []FilesystemOperation) error {
+	root, ok := s.state.Roots[rootName]
+	if !ok {
+		return nil
+	}
+	var loadErr error
+	objectFor := func(id ObjectID) (Object, bool) {
+		object, found, err := s.resolveDeferredLocked(id)
+		if err != nil {
+			loadErr = errors.Join(loadErr, err)
+		}
+		return object, found && err == nil
+	}
+	lookupInode := func(number uint64) error {
+		if number == 0 {
+			return nil
+		}
+		_, _, err := filesystemInodeObjects(root, number, objectFor)
+		return errors.Join(err, loadErr)
+	}
+	lookupEntry := func(parent uint64, name string) error {
+		if parent == 0 || name == "" {
+			return nil
+		}
+		_, _, err := filesystemLookupObjects(root, parent, name, objectFor)
+		return errors.Join(err, loadErr)
+	}
+	for _, operation := range operations {
+		switch {
+		case operation.PutInode != nil:
+			if err := lookupInode(operation.PutInode.Number); err != nil {
+				return err
+			}
+		case operation.DeleteInode != 0:
+			if err := lookupInode(operation.DeleteInode); err != nil {
+				return err
+			}
+		case operation.PutEntry != nil:
+			if err := lookupInode(operation.PutEntry.Parent); err != nil {
+				return err
+			}
+			if err := lookupInode(operation.PutEntry.Inode); err != nil {
+				return err
+			}
+			if err := lookupEntry(operation.PutEntry.Parent, operation.PutEntry.Name); err != nil {
+				return err
+			}
+		case operation.DeleteEntry != nil:
+			if err := lookupInode(operation.DeleteEntry.Parent); err != nil {
+				return err
+			}
+			if err := lookupEntry(operation.DeleteEntry.Parent, operation.DeleteEntry.Name); err != nil {
+				return err
+			}
+		}
+	}
+	return loadErr
+}
+
 func buildFilesystemMutation(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
-	return buildFilesystemMutationBatched(state, origin, rootName, operations, releasePins)
+	return buildFilesystemMutationStore(&Store{state: *state}, origin, rootName, operations, releasePins)
+}
+
+func buildFilesystemMutationStore(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
+	return buildFilesystemMutationBatched(store, origin, rootName, operations, releasePins)
 }
 
 // buildFilesystemMutationBatched applies a logical transaction with at most
 // three descents through the global inode tree and one descent through each
 // affected directory tree. Work is proportional to changed keys times tree
 // depth, rather than creating an obsolete immutable path for every operation.
-func buildFilesystemMutationBatched(state *graphState, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
-	store := &Store{state: *state}
+func buildFilesystemMutationBatched(store *Store, origin SnapshotID, rootName string, operations []FilesystemOperation, releasePins []string) (*graphMutation, ObjectID, error) {
+	state := &store.state
 	mutation, err := newGraphMutation(store, origin)
 	if err != nil {
 		return nil, ObjectID{}, err
@@ -807,12 +877,17 @@ func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor fu
 
 // FilesystemInode resolves immutable inode metadata.
 func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return filesystemInodeObjects(rootID, number, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
-		return object, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var loadErr error
+	record, ok, err := filesystemInodeObjects(rootID, number, func(id ObjectID) (Object, bool) {
+		object, found, resolveErr := s.resolveDeferredLocked(id)
+		if resolveErr != nil {
+			loadErr = errors.Join(loadErr, resolveErr)
+		}
+		return object, found && resolveErr == nil
 	})
+	return record, ok, errors.Join(err, loadErr)
 }
 
 func filesystemInodeObjects(rootID ObjectID, number uint64, objectFor func(ObjectID) (Object, bool)) (InodeRecord, bool, error) {
@@ -841,12 +916,17 @@ func filesystemInodeObjects(rootID ObjectID, number uint64, objectFor func(Objec
 
 // FilesystemLookup resolves a directory entry without an ancestry walk.
 func (s *Store) FilesystemLookup(rootID ObjectID, parent uint64, name string) (DirectoryEntryRecord, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return filesystemLookupObjects(rootID, parent, name, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
-		return object, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var loadErr error
+	record, ok, err := filesystemLookupObjects(rootID, parent, name, func(id ObjectID) (Object, bool) {
+		object, found, resolveErr := s.resolveDeferredLocked(id)
+		if resolveErr != nil {
+			loadErr = errors.Join(loadErr, resolveErr)
+		}
+		return object, found && resolveErr == nil
 	})
+	return record, ok, errors.Join(err, loadErr)
 }
 
 func filesystemLookupObjects(rootID ObjectID, parent uint64, name string, objectFor func(ObjectID) (Object, bool)) (DirectoryEntryRecord, bool, error) {
@@ -892,12 +972,17 @@ func filesystemLookupObjects(rootID ObjectID, parent uint64, name string, object
 // FilesystemDirectory lists the entries immediately beneath parent. Work is
 // proportional to the requested directory, not the recursive filesystem.
 func (s *Store) FilesystemDirectory(rootID ObjectID, parent uint64) ([]DirectoryEntryRecord, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return filesystemDirectoryObjects(rootID, parent, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
-		return object, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var loadErr error
+	records, err := filesystemDirectoryObjects(rootID, parent, func(id ObjectID) (Object, bool) {
+		object, found, resolveErr := s.resolveDeferredLocked(id)
+		if resolveErr != nil {
+			loadErr = errors.Join(loadErr, resolveErr)
+		}
+		return object, found && resolveErr == nil
 	})
+	return records, errors.Join(err, loadErr)
 }
 
 func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(ObjectID) (Object, bool)) ([]DirectoryEntryRecord, error) {
@@ -969,12 +1054,17 @@ func filesystemDirectoryObjects(rootID ObjectID, parent uint64, objectFor func(O
 // FilesystemInode, FilesystemLookup, and FilesystemDirectory so their work is
 // independent of the total filesystem size.
 func (s *Store) FilesystemRecords(rootID ObjectID) ([]InodeRecord, []DirectoryEntryRecord, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return filesystemRecordsObjects(rootID, func(id ObjectID) (Object, bool) {
-		object, ok := s.state.Objects[id.key()]
-		return object, ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var loadErr error
+	inodes, entries, err := filesystemRecordsObjects(rootID, func(id ObjectID) (Object, bool) {
+		object, found, resolveErr := s.resolveDeferredLocked(id)
+		if resolveErr != nil {
+			loadErr = errors.Join(loadErr, resolveErr)
+		}
+		return object, found && resolveErr == nil
 	})
+	return inodes, entries, errors.Join(err, loadErr)
 }
 
 func filesystemRecordsObjects(rootID ObjectID, objectFor func(ObjectID) (Object, bool)) ([]InodeRecord, []DirectoryEntryRecord, error) {

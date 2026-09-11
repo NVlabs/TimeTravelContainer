@@ -40,7 +40,6 @@ import (
 
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
-	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -1310,9 +1309,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if session.SessionID != requestID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return abort(errors.New("sparse migration capture returned incomplete session metadata"))
 	}
-	var filesystemToken ttcvolume.RemoteToken
-	copy(filesystemToken[:], session.Token[:])
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, requestID, filesystemToken, relay)
+	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, requestID, relay)
 	if err != nil {
 		return abort(fmt.Errorf("sealing sparse migration filesystem generation: %w", err))
 	}
@@ -1655,6 +1652,12 @@ func provisionalRaftTargetAuthorized(info ttcbundle.ContainerInfo, branchID, nod
 		case cluster.TransactionTargetReserved, cluster.TransactionSourceCaptured,
 			cluster.TransactionTargetRestoring, cluster.TransactionTargetPaused:
 			return true
+		case cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionIndependent:
+			// A migration target becomes transaction-published before the source
+			// can atomically cut placement over to it. Keep that physically
+			// paused target authorized until activation records completion. Once
+			// activated, the ordinary Raft placement is the only execution grant.
+			return !tx.Activated
 		}
 	}
 	return false

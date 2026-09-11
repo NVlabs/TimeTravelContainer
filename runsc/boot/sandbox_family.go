@@ -589,6 +589,7 @@ type distributedForkSession struct {
 	server           *ttcremote.TCPPageServer
 	sparseSnapshot   *pgalloc.RemoteSnapshot
 	memoryBindings   []pgalloc.CapturedPageBinding
+	filesystemToken  ttcvolume.RemoteToken
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -924,6 +925,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			resources: capture.FilesystemResources, server: server,
 			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.MemoryBindings,
 		}
+		copy(sessions[i].filesystemToken[:], token[:])
 		if capture.HandoffSnapshot != nil {
 			capture.HandoffSnapshot = nil
 		} else {
@@ -994,6 +996,18 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 		return err
 	}
 	return session.server.ServeStream(conn)
+}
+
+// DistributedForkFilesystemToken returns the transaction-fenced token for a
+// live capture. The token remains valid exactly as long as the source session.
+func (f *SandboxFamily) DistributedForkFilesystemToken(id string) (ttcvolume.RemoteToken, error) {
+	f.mu.Lock()
+	session := f.distributedSessions[id]
+	f.mu.Unlock()
+	if session == nil {
+		return ttcvolume.RemoteToken{}, fmt.Errorf("distributed fork session %q does not exist", id)
+	}
+	return session.filesystemToken, nil
 }
 
 // ExportDistributedForkSnapshot writes a session's immutable memory graph.
