@@ -5604,7 +5604,6 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	captureComplete := false
 	var forks []*ttcvolume.ForkTransaction
 	var repositories []*ttcvolume.Repository
-	memoryPinned := false
 	memoryControlCaptured := false
 	defer func() {
 		for _, repository := range repositories {
@@ -5615,19 +5614,6 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if !captureComplete {
 			for i := len(forks) - 1; i >= 0; i-- {
 				cause = errors.Join(cause, forks[i].Abort())
-			}
-			if memoryPinned {
-				info, loadErr := store.LoadContainer(target.container)
-				if loadErr == nil {
-					repository, openErr := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
-					if openErr == nil {
-						removeErr := repository.DeleteBranch(captureBranch)
-						if errors.Is(removeErr, os.ErrNotExist) {
-							removeErr = nil
-						}
-						cause = errors.Join(cause, removeErr, repository.Close())
-					}
-				}
 			}
 			if memoryControlCaptured {
 				cause = errors.Join(cause, os.RemoveAll(publicationMemoryControlPath(b.activeDataRoot(), captureBranch)))
@@ -5677,24 +5663,11 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	}
 	if kind == "dehydrate" {
 		if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
-			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
-			if err != nil {
-				return rollback(err)
-			}
-			manifest, branchErr := repository.Branch(filesystemBranch)
-			if branchErr == nil {
-				branchErr = repository.SetBranch(captureBranch, manifest)
-				memoryPinned = branchErr == nil
-			}
-			closeErr := repository.Close()
-			if branchErr != nil || closeErr != nil {
-				return rollback(errors.Join(branchErr, closeErr))
-			}
-		} else {
-			record, ok := b.snapshotGraph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
-			if !ok || (record.State != ttcsnapshot.SnapshotSealedLocal && record.State != ttcsnapshot.SnapshotSealedVolatile) {
-				return rollback(fmt.Errorf("graph memory snapshot %d is not sealed", branch.SnapshotID))
-			}
+			return rollback(errors.New("new-format dehydrated branch has no graph memory roots"))
+		}
+		record, ok := b.snapshotGraph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
+		if !ok || (record.State != ttcsnapshot.SnapshotSealedLocal && record.State != ttcsnapshot.SnapshotSealedVolatile) {
+			return rollback(fmt.Errorf("graph memory snapshot %d is not sealed", branch.SnapshotID))
 		}
 		source := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		destination := publicationMemoryControlPath(b.activeDataRoot(), captureBranch)
@@ -10084,18 +10057,6 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				return nil, fmt.Errorf("retaining graph origins for branch %q: %w; batch branches were destroyed", records[i].ID, err)
 			}
 		}
-		for i := range records {
-			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch, sourceRecord.StorageManifest != ""); err != nil {
-				var cleanupErr error
-				for _, cleanupDestination := range destinations {
-					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
-				}
-				if cleanupErr != nil {
-					return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; cleaning batch branches: %v", records[i].ID, err, cleanupErr)
-				}
-				return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; batch branches were destroyed", records[i].ID, err)
-			}
-		}
 	}
 	for _, destination := range destinations {
 		target := selector{container: source.container, branch: destination}
@@ -10130,8 +10091,8 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 
 // forkDehydratedMany creates local children directly from durable branch
 // state. The source remains process-free and its dehydration image is never
-// consumed. Filesystem metadata and sparse-memory manifests are immutable, so
-// preparing any number of siblings does not copy file or memory data.
+// consumed. Filesystem metadata and graph roots are immutable, so preparing
+// any number of siblings does not copy file or memory data.
 func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused, quarantined bool) (_ []Branch, retErr error) {
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
@@ -10178,7 +10139,6 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				}
 			}
 			result = errors.Join(result, os.RemoveAll(child.dir))
-			result = errors.Join(result, b.releaseSparseMemoryRoot(info.ID, child.branch.FilesystemBranch))
 			result = errors.Join(result, b.releaseGraphMemoryRoots(child.branch.MemoryRoots))
 			result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, child.branch))
 		}
@@ -10225,25 +10185,6 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				return nil, fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err)
 			}
 		}
-		if capture.SparseManifest != (ttcchunk.ManifestID{}) {
-			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks"))
-			if err != nil {
-				return nil, err
-			}
-			if sourceBranch.StorageManifest != "" {
-				err = repository.SetBranchLazy(filesystemBranch, capture.SparseManifest)
-			} else {
-				err = repository.SetBranch(filesystemBranch, capture.SparseManifest)
-			}
-			closeErr := repository.Close()
-			if err != nil {
-				return nil, fmt.Errorf("rooting sparse memory for %s@%s: %w", source.container, destination, err)
-			}
-			if closeErr != nil {
-				return nil, closeErr
-			}
-		}
-
 		childCapture := capture
 		childCapture.FilesystemBranch = filesystemBranch
 		childCapture.Resume = capture.Resume && !paused
@@ -10273,14 +10214,9 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			_ = os.RemoveAll(staging)
 			return nil, err
 		}
-		if capture.SparseManifest == (ttcchunk.ManifestID{}) && len(capture.MemoryRoots) == 0 {
-			for index := range capture.Memories {
-				name := fmt.Sprintf("memory-%04d.snapshot", index)
-				if err := copyCheckpointHostFile(filepath.Join(sourceDir, name), filepath.Join(staging, name), 0600); err != nil {
-					_ = os.RemoveAll(staging)
-					return nil, err
-				}
-			}
+		if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 || capture.SparseManifest != (ttcchunk.ManifestID{}) {
+			_ = os.RemoveAll(staging)
+			return nil, errors.New("new-format dehydrated source is not graph-native")
 		}
 		if err := os.Rename(staging, childDir); err != nil {
 			_ = os.RemoveAll(staging)
@@ -10569,38 +10505,6 @@ func (b *runtimeBackend) prepareStop(target selector) error {
 	return err
 }
 
-// cloneSparseMemoryRoot gives a newly forked branch an independent durable
-// root for any chunks that its source still faults on demand. A branch that
-// has never been restored from sparse storage has no root to clone.
-func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBranch, targetFilesystemBranch string, lazy bool) error {
-	if b.dataRoot == "" || sourceFilesystemBranch == "" || targetFilesystemBranch == "" {
-		return nil
-	}
-	repositoryPath := filepath.Join(b.activeDataRoot(), "containers", containerID, "memory", "chunks")
-	if _, err := os.Stat(repositoryPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
-	if err != nil {
-		return err
-	}
-	defer repository.Close()
-	manifest, err := repository.Branch(sourceFilesystemBranch)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if lazy {
-		return repository.SetBranchLazy(targetFilesystemBranch, manifest)
-	}
-	return repository.SetBranch(targetFilesystemBranch, manifest)
-}
-
 func graphMemoryRootNames(filesystemBranch string, count int) []string {
 	result := make([]string, count)
 	for index := range result {
@@ -10736,32 +10640,6 @@ func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots, sourceObjects []
 		return nil, err
 	}
 	return result, nil
-}
-
-// releaseSparseMemoryRoot removes one branch's durable chunk reachability
-// only after its runtime has stopped using the on-demand loader, then reclaims
-// objects no surviving branch, lease, or publication transaction references.
-func (b *runtimeBackend) releaseSparseMemoryRoot(containerID, filesystemBranch string) error {
-	if b.dataRoot == "" || filesystemBranch == "" {
-		return nil
-	}
-	repositoryPath := filepath.Join(b.activeDataRoot(), "containers", containerID, "memory", "chunks")
-	if _, err := os.Stat(repositoryPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
-	if err != nil {
-		return err
-	}
-	defer repository.Close()
-	if err := repository.DeleteBranch(filesystemBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
-	return err
 }
 
 // releaseGraphMemoryRoots drops logical branch reachability, cascades exact
@@ -10968,9 +10846,6 @@ func (b *runtimeBackend) discard(target selector) error {
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
-	}
-	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
-		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
 	}
 	if graphReferenceOperationForBranch(info, branch) == "" {
 		if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
@@ -12319,12 +12194,6 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("canceling pending publications for %s: %w", target, err)
 			}
 		}
-		if err := b.releaseSparseMemoryRoot(info.ID, recorded.FilesystemBranch); err != nil {
-			if portErr != nil {
-				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
-			}
-			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
-		}
 		if graphReferenceOperationForBranch(info, *recorded) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(recorded.MemoryRoots, recorded.MemoryRootObjects); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
@@ -12644,44 +12513,6 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 		for _, size := range objectSizes {
 			result.MemoryBackingUniqueBytes += size
-		}
-	} else {
-		// This path exists only while the live remote-fork implementation still
-		// produces its pre-graph sparse repository. New dehydration roots are
-		// always accounted by immutable graph identity above.
-		memoryPath := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "chunks")
-		if _, statErr := os.Stat(memoryPath); statErr == nil {
-			memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
-			if openErr != nil {
-				return FamilyResourceStats{}, openErr
-			}
-			roots, rootsErr := memoryRepository.ListBranches()
-			if rootsErr != nil {
-				memoryRepository.Close()
-				return FamilyResourceStats{}, rootsErr
-			}
-			memoryBranches := make(map[string]string)
-			for visible, filesystem := range filesystemBranches {
-				if _, ok := roots[filesystem]; ok {
-					memoryBranches[visible] = filesystem
-				}
-			}
-			usage, usageErr := memoryRepository.BranchSetUsage(memoryBranches)
-			closeErr := memoryRepository.Close()
-			if usageErr != nil {
-				return FamilyResourceStats{}, usageErr
-			}
-			if closeErr != nil {
-				return FamilyResourceStats{}, closeErr
-			}
-			result.MemoryBackingUniqueBytes = usage.UniqueBytes
-			for _, branchUsage := range usage.Branches {
-				if account := byID[branchUsage.ID]; account != nil {
-					addResourceBytes(&account.MemoryBacking, branchUsage.PrivateBytes, branchUsage.SharedBytes)
-				}
-			}
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return FamilyResourceStats{}, statErr
 		}
 	}
 

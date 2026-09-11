@@ -45,7 +45,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
@@ -3717,9 +3716,6 @@ func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Q
 		if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
 		}
-		if err := collectSparseMemoryRepositories(dataRoot, localRoot); err != nil && stderr != nil {
-			fmt.Fprintf(stderr, "ttcd: warning: collecting consumed sparse memory: %v\n", err)
-		}
 		if err := collectColdStorage(dataRoot, localRoot, publications, transactions); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
 		}
@@ -3732,38 +3728,6 @@ func maintainRepositories(dataRoot, localRoot string, publications *ttcstorage.Q
 		unlock()
 		timer.Reset(repositoryMaintenanceInterval)
 	}
-}
-
-func collectSparseMemoryRepositories(dataRoot, localRoot string) error {
-	paths := []string{filepath.Join(dataRoot, "cluster", "memory-chunks")}
-	containersRoot := filepath.Join(localRoot, "containers")
-	entries, err := os.ReadDir(containersRoot)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			paths = append(paths, filepath.Join(containersRoot, entry.Name(), "memory", "chunks"))
-		}
-	}
-	var result error
-	for _, path := range paths {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			result = errors.Join(result, err)
-			continue
-		}
-		repository, err := ttcchunk.OpenMemoryRepository(path)
-		if err == nil {
-			_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
-		}
-		if repository != nil {
-			err = errors.Join(err, repository.Close())
-		}
-		result = errors.Join(result, err)
-	}
-	return result
 }
 
 func checkDaemonPeer(conn net.Conn) error {

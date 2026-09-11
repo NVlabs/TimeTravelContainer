@@ -36,7 +36,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -4943,46 +4942,6 @@ func TestInspectCopiedHostMount(t *testing.T) {
 	}
 	if len(info.TTC.ExternalViews) != 0 {
 		t.Errorf("copied mount reported as external view: %+v", info.TTC.ExternalViews)
-	}
-}
-
-func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
-	dataRoot := t.TempDir()
-	const containerID = "family-id"
-	repositoryPath := filepath.Join(dataRoot, "containers", containerID, "memory", "chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.SetBranch("source-filesystem", manifest); err != nil {
-		t.Fatal(err)
-	}
-
-	backend := &runtimeBackend{dataRoot: dataRoot}
-	if err := backend.cloneSparseMemoryRoot(containerID, "source-filesystem", "child-filesystem", false); err != nil {
-		t.Fatalf("cloneSparseMemoryRoot: %v", err)
-	}
-	if got, err := repository.Branch("child-filesystem"); err != nil || got != manifest {
-		t.Fatalf("child root=(%v, %v), want %v", got, err, manifest)
-	}
-	if err := backend.releaseSparseMemoryRoot(containerID, "source-filesystem"); err != nil {
-		t.Fatalf("release source: %v", err)
-	}
-	if got, err := repository.Branch("child-filesystem"); err != nil || got != manifest {
-		t.Fatalf("surviving child root=(%v, %v), want %v", got, err, manifest)
-	}
-	if err := backend.releaseSparseMemoryRoot(containerID, "child-filesystem"); err != nil {
-		t.Fatalf("release child: %v", err)
-	}
-	if _, err := repository.Branch("child-filesystem"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released child root error=%v, want not-exist", err)
-	}
-	if _, err := repository.LoadManifest(manifest); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unrooted manifest error=%v, want not-exist", err)
 	}
 }
 
