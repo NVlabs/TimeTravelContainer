@@ -1421,7 +1421,10 @@ func parsePublishedPorts(values []string) ([]ttcbundle.PortBinding, error) {
 			return nil, fmt.Errorf("published host endpoint %s is specified more than once", key)
 		}
 		seen[key] = true
-		bindings = append(bindings, ttcbundle.PortBinding{HostIP: address.String(), HostPort: hostPort, ContainerPort: containerPort, Protocol: protocol})
+		// Command-line publications belong to the initial branch. New-format
+		// roots reject an empty branch identity instead of interpreting it as a
+		// legacy spelling of main.
+		bindings = append(bindings, ttcbundle.PortBinding{HostIP: address.String(), HostPort: hostPort, ContainerPort: containerPort, Protocol: protocol, BranchID: "main"})
 	}
 	return bindings, nil
 }

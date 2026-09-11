@@ -271,6 +271,16 @@ func TestPortCommandsAreBranchAware(t *testing.T) {
 	}
 }
 
+func TestParsePublishedPortsAssignsInitialBranch(t *testing.T) {
+	bindings, err := parsePublishedPorts([]string{"127.0.0.1:8080:80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 || bindings[0].BranchID != "main" {
+		t.Fatalf("bindings = %+v, want one main-branch binding", bindings)
+	}
+}
+
 func TestWriteTree(t *testing.T) {
 	created := time.Date(2026, 7, 17, 8, 9, 10, 123, time.UTC)
 	families := []Family{{
@@ -1171,8 +1181,8 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 
 func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 	wantPorts := []ttcbundle.PortBinding{
-		{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
-		{HostIP: "127.0.0.1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+		{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"},
+		{HostIP: "127.0.0.1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp", BranchID: "main"},
 	}
 	for _, command := range []string{"run", "create"} {
 		t.Run(command, func(t *testing.T) {
