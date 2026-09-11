@@ -254,8 +254,8 @@ type BranchDehydrateArgs struct {
 	ID string
 }
 
-// BranchDehydrationMemoryInfo describes one packed memory stream that ttcd
-// must persist before a fully dehydrated family can release its Sentry.
+// BranchDehydrationMemoryInfo describes one logical MemoryFile included in a
+// graph capture before a fully dehydrated family can release its Sentry.
 type BranchDehydrationMemoryInfo struct {
 	ResourceID  checkpoint.ResourceID `json:"resource_id"`
 	StreamBytes uint64                `json:"stream_bytes"`

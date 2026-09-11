@@ -2344,7 +2344,7 @@ func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.Branc
 	return &info, nil
 }
 
-// ExportDehydratedBranch persists packed streams or a sparse memory root.
+// ExportDehydratedBranch streams one graph-native immutable memory capture.
 func (s *Sandbox) ExportDehydratedBranch(args *boot.BranchDehydrationExportArgs) (*boot.BranchDehydrationExportInfo, error) {
 	var info boot.BranchDehydrationExportInfo
 	if err := s.call(boot.ContMgrExportDehydratedBranch, args, &info); err != nil {
@@ -2369,8 +2369,8 @@ func (s *Sandbox) DestroyBranch(id string) error {
 	return nil
 }
 
-// PrepareStopBranch moves legacy loader bookkeeping away from a branch before
-// its init process is terminated.
+// PrepareStopBranch moves process-local Loader bookkeeping away from a branch
+// before its init process is terminated.
 func (s *Sandbox) PrepareStopBranch(id string) error {
 	if err := s.call(boot.ContMgrPrepareStopBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
 		return fmt.Errorf("preparing live branch %q for stop: %w", id, err)

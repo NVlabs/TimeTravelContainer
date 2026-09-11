@@ -1273,7 +1273,7 @@ func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, out *Bran
 	return nil
 }
 
-// ExportDehydratedBranch writes process-independent packed memory streams.
+// ExportDehydratedBranch writes a process-independent graph memory stream.
 func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExportArgs, out *BranchDehydrationExportInfo) error {
 	info, err := cm.l.family.ExportDehydration(args)
 	if err != nil {

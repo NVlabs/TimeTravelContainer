@@ -120,8 +120,7 @@ func (r *InstallResult) Commit() error { return r.transaction.Commit() }
 // Abort rolls back an incomplete restore.
 func (r *InstallResult) Abort() error { return r.transaction.Abort() }
 
-// InstallManifest installs an already-loaded immutable manifest. It is shared
-// by legacy repositories and graph-native memory sources.
+// InstallManifest installs an already-loaded immutable graph manifest.
 func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.MemoryKind, memCgID uint32) (InstallResult, error) {
 	if mf == nil {
 		return InstallResult{}, fmt.Errorf("installing manifest into nil MemoryFile")
