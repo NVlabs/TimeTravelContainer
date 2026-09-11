@@ -31,28 +31,77 @@ import (
 )
 
 // sharedReferenceService serializes exact shared-origin reference mutations
-// through the daemon holding Raft's shared-GC lease. The ledger itself is on
-// TTC_ROOT and exclusively locked, so lease turnover cannot create concurrent
-// writers even if one daemon notices expiry late.
+// through the daemon holding Raft's shared-GC lease. The hot ledger lives only
+// on TTC_LOCAL_ROOT and is rebuilt for every new lease generation from shared
+// immutable manifests plus each live node's durable bounded root claims.
 type sharedReferenceService struct {
-	mu          sync.RWMutex
-	authority   *cluster.RaftCatalog
-	packs       *ttcsnapshot.SharedPackStore
-	directory   string
-	nodeID      string
-	incarnation string
-	graph       *ttcsnapshot.Store
-	peers       *distributedSourceRuntime
-	lease       cluster.SharedGCLease
-	ledger      *ttcsnapshot.ReferenceLedger
+	mu           sync.RWMutex
+	activationMu sync.Mutex
+	claimMu      sync.Mutex
+	authority    *cluster.RaftCatalog
+	packs        *ttcsnapshot.SharedPackStore
+	directory    string
+	localRoot    string
+	nodeID       string
+	incarnation  string
+	graph        *ttcsnapshot.Store
+	peers        *distributedSourceRuntime
+	lease        cluster.SharedGCLease
+	ledger       *ttcsnapshot.ReferenceLedger
 }
 
-func newSharedReferenceService(sharedRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
+func newSharedReferenceService(localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
 	return &sharedReferenceService{
 		authority: authority, packs: packs, nodeID: nodeID, incarnation: incarnation,
-		directory: filepath.Join(sharedRoot, "snapshot-graph", "shared-reference-ledger"),
-		graph:     graph, peers: peers,
+		directory: filepath.Join(localRoot, "snapshot-graph", "shared-reference-ledger"), localRoot: localRoot,
+		graph: graph, peers: peers,
 	}
+}
+
+// SnapshotReferenceInventory returns the locally durable claim set. The
+// intent itself reserves every not-yet-released group: it is written before
+// provider contact, so recovery remains safe across a lost retain response or
+// coordinator turnover in the middle of a multi-root operation.
+func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _ string) (*cluster.SnapshotReferenceInventory, error) {
+	if s == nil || s.localRoot == "" {
+		return nil, errors.New("snapshot reference inventory is unavailable")
+	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	dir := filepath.Join(s.localRoot, "graph-references")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return &cluster.SnapshotReferenceInventory{NodeID: s.nodeID, Incarnation: s.incarnation}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var claims []cluster.SnapshotReferenceClaim
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		intent, err := readGraphReferenceIntent(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("reading reference claim %q: %w", entry.Name(), err)
+		}
+		for _, group := range intent.Groups {
+			if group.Released {
+				continue
+			}
+			claims = append(claims, cluster.SnapshotReferenceClaim{
+				Origin: group.Origin, Operation: intent.Operation,
+				Roots: append([]cluster.SnapshotRootBinding(nil), group.Roots...),
+			})
+		}
+	}
+	sort.Slice(claims, func(i, j int) bool {
+		if claims[i].Origin != claims[j].Origin {
+			return claims[i].Origin < claims[j].Origin
+		}
+		return claims[i].Operation < claims[j].Operation
+	})
+	return &cluster.SnapshotReferenceInventory{NodeID: s.nodeID, Incarnation: s.incarnation, Claims: claims}, nil
 }
 
 func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (int, error) {
@@ -129,14 +178,176 @@ func outboundSlot(name string) uint16 {
 	return uint16(value)
 }
 
+func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*ttcsnapshot.ReferenceLedger, error) {
+	if s == nil || s.authority == nil || s.packs == nil || s.peers == nil {
+		return nil, errors.New("shared reference rebuild is unavailable")
+	}
+	state, err := s.authority.AuthorityState()
+	if err != nil {
+		return nil, err
+	}
+	if state.SharedGC.NodeID != lease.NodeID || state.SharedGC.Incarnation != lease.Incarnation || state.SharedGC.Generation != lease.Generation || !time.Now().Before(state.SharedGC.ExpiresAt) {
+		return nil, errors.New("shared reference lease changed before rebuild")
+	}
+	generationDir := filepath.Join(s.directory, fmt.Sprintf("generation-%016x", lease.Generation))
+	if err := os.RemoveAll(generationDir); err != nil {
+		return nil, err
+	}
+	ledger, err := ttcsnapshot.OpenReferenceLedger(generationDir)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*ttcsnapshot.ReferenceLedger, error) {
+		_ = ledger.Close()
+		_ = os.RemoveAll(generationDir)
+		return nil, err
+	}
+
+	// A cold branch's original canonical roots remain live exactly while Raft
+	// names its immutable memory snapshot. Cross-origin tree edges are rebuilt
+	// from immutable objects, never copied reference counters.
+	coldOrigins := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, branch := range state.Branches {
+		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 {
+			coldOrigins[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
+		}
+	}
+	for _, publication := range state.Publications {
+		if (publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady) && publication.CandidateRoots.MemorySnapshot != 0 {
+			coldOrigins[ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)] = struct{}{}
+		}
+	}
+
+	// Query every unfenced execution incarnation. If one cannot prove its
+	// claims, GC remains unavailable, but normal reads and execution continue.
+	// Claims must be part of ImportOrigin's initial baseline: importing an
+	// unreferenced object first would correctly make it reclaiming, after which
+	// a later retain is forbidden from resurrecting it.
+	claimReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
+	nodes := make([]cluster.NodeRecord, 0, len(state.Nodes))
+	for _, node := range state.Nodes {
+		if node.State != cluster.NodeOffline {
+			nodes = append(nodes, node)
+		}
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
+	observed := state.LeaderObservedAt
+	if observed.IsZero() {
+		observed = time.Now()
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), lease.ExpiresAt)
+	defer cancel()
+	for _, node := range nodes {
+		if !node.LeaseActive(observed) {
+			return fail(fmt.Errorf("node %s/%s has not been fenced and cannot provide a current reference inventory", node.NodeID, node.Incarnation))
+		}
+		var inventory *cluster.SnapshotReferenceInventory
+		if node.NodeID == s.nodeID && node.Incarnation == s.incarnation {
+			inventory, err = s.SnapshotReferenceInventory(ctx, s.nodeID)
+		} else {
+			peer, peerErr := s.peers.peer(node.NodeID, false)
+			if peerErr != nil {
+				return fail(peerErr)
+			}
+			inventory, err = peer.SnapshotReferenceInventory(ctx)
+		}
+		if err != nil {
+			return fail(fmt.Errorf("reading snapshot reference claims from node %s: %w", node.NodeID, err))
+		}
+		if inventory == nil || inventory.NodeID != node.NodeID || inventory.Incarnation != node.Incarnation {
+			return fail(fmt.Errorf("snapshot reference inventory identity is %v/%v, want %s/%s", inventoryNodeID(inventory), inventoryIncarnation(inventory), node.NodeID, node.Incarnation))
+		}
+		for _, claim := range inventory.Claims {
+			if _, volatile := state.VolatileOrigins[claim.Origin]; volatile {
+				continue
+			}
+			origin := ttcsnapshot.SnapshotID(claim.Origin)
+			if _, retired := state.RetiredOrigins[claim.Origin]; retired {
+				return fail(fmt.Errorf("node %s claims retired snapshot origin %d", node.NodeID, claim.Origin))
+			}
+			roots, err := graphReferenceRoots(origin, claim.Operation, claim.Roots)
+			if err != nil {
+				return fail(fmt.Errorf("validating node %s reference claim: %w", node.NodeID, err))
+			}
+			if claimReferences[origin] == nil {
+				claimReferences[origin] = make(map[string]ttcsnapshot.ObjectID)
+			}
+			for name, object := range roots {
+				if previous, exists := claimReferences[origin][name]; exists && previous != object {
+					return fail(fmt.Errorf("reference claim %q selects both %s and %s", name, previous, object))
+				}
+				claimReferences[origin][name] = object
+			}
+		}
+	}
+
+	manifests, err := s.packs.Manifests()
+	if err != nil {
+		return fail(err)
+	}
+	imported := make(map[ttcsnapshot.SnapshotID]struct{}, len(manifests))
+	for _, manifest := range manifests {
+		if _, retired := state.RetiredOrigins[uint64(manifest.Snapshot)]; retired {
+			continue
+		}
+		objects := make([]ttcsnapshot.Object, len(manifest.Objects))
+		for index, packed := range manifest.Objects {
+			objects[index] = packed.Object
+		}
+		references := make(map[string]ttcsnapshot.ObjectID)
+		if _, live := coldOrigins[manifest.Snapshot]; live {
+			for name, object := range manifest.References {
+				if strings.HasPrefix(name, "root/") {
+					references[name] = object
+				}
+			}
+		}
+		for name, object := range claimReferences[manifest.Snapshot] {
+			if previous, exists := references[name]; exists && previous != object {
+				return fail(fmt.Errorf("reference %q selects both %s and %s", name, previous, object))
+			}
+			references[name] = object
+		}
+		if err := ledger.ImportOrigin(manifest.Snapshot, objects, references); err != nil {
+			return fail(fmt.Errorf("importing shared origin %d during rebuild: %w", manifest.Snapshot, err))
+		}
+		imported[manifest.Snapshot] = struct{}{}
+	}
+	for origin := range claimReferences {
+		if _, ok := imported[origin]; !ok {
+			return fail(fmt.Errorf("active references select shared origin %d without a committed manifest", origin))
+		}
+	}
+	if err := ledger.Checkpoint(); err != nil {
+		return fail(err)
+	}
+	return ledger, nil
+}
+
+func inventoryNodeID(inventory *cluster.SnapshotReferenceInventory) string {
+	if inventory == nil {
+		return "<nil>"
+	}
+	return inventory.NodeID
+}
+
+func inventoryIncarnation(inventory *cluster.SnapshotReferenceInventory) string {
+	if inventory == nil {
+		return "<nil>"
+	}
+	return inventory.Incarnation
+}
+
 func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 	if s == nil || lease.Generation == 0 || lease.NodeID != s.nodeID || lease.Incarnation != s.incarnation || !time.Now().Before(lease.ExpiresAt) {
 		return errors.New("invalid shared reference coordinator lease")
 	}
+	s.activationMu.Lock()
+	defer s.activationMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ledger != nil && s.lease.Generation == lease.Generation {
 		s.lease = lease
+		s.mu.Unlock()
 		return nil
 	}
 	if s.ledger != nil {
@@ -144,7 +355,8 @@ func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 		s.ledger = nil
 		s.lease = cluster.SharedGCLease{}
 	}
-	ledger, err := ttcsnapshot.OpenReferenceLedger(s.directory)
+	s.mu.Unlock()
+	ledger, err := s.rebuildLedger(lease)
 	if err != nil {
 		return err
 	}
@@ -156,7 +368,17 @@ func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 		}
 		return errors.New("shared reference coordinator lease changed while opening ledger")
 	}
+	s.mu.Lock()
 	s.ledger, s.lease = ledger, current
+	s.mu.Unlock()
+	if entries, err := os.ReadDir(s.directory); err == nil {
+		keep := fmt.Sprintf("generation-%016x", current.Generation)
+		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), "generation-") && entry.Name() != keep {
+				_ = os.RemoveAll(filepath.Join(s.directory, entry.Name()))
+			}
+		}
+	}
 	return nil
 }
 
@@ -164,6 +386,8 @@ func (s *sharedReferenceService) deactivate() error {
 	if s == nil {
 		return nil
 	}
+	s.activationMu.Lock()
+	defer s.activationMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var err error
@@ -450,3 +674,4 @@ func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.Snapsho
 }
 
 var _ cluster.SharedSnapshotReferenceProvider = (*sharedReferenceService)(nil)
+var _ cluster.SnapshotReferenceInventoryProvider = (*sharedReferenceService)(nil)

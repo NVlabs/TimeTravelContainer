@@ -41,15 +41,16 @@ import (
 )
 
 const (
-	controlReservePath        = "/v1/forks/reserve"
-	controlForkPrefix         = "/v1/forks/"
-	controlProxyPath          = "/v1/daemon"
-	controlObjectPrefix       = "/v1/objects/"
-	controlSnapshotPrefix     = "/v1/snapshots/"
-	controlSharedLedgerPrefix = "/v1/shared-ledger/"
-	maxControlBody            = 1 << 20
-	controlNodeHeader         = "X-TTC-Node"
-	controlObjectLengthHeader = "X-TTC-Object-Length"
+	controlReservePath         = "/v1/forks/reserve"
+	controlForkPrefix          = "/v1/forks/"
+	controlProxyPath           = "/v1/daemon"
+	controlObjectPrefix        = "/v1/objects/"
+	controlSnapshotPrefix      = "/v1/snapshots/"
+	controlSharedLedgerPrefix  = "/v1/shared-ledger/"
+	controlReferenceClaimsPath = "/v1/reference-claims"
+	maxControlBody             = 1 << 20
+	controlNodeHeader          = "X-TTC-Node"
+	controlObjectLengthHeader  = "X-TTC-Object-Length"
 )
 
 // LoadServerTLSConfig constructs a TLS 1.3 configuration that requires a
@@ -546,8 +547,12 @@ type ControlPlane struct {
 	// shared-GC lease. It imports a manifest-backed origin and applies the
 	// provider's ordered handoff suffix before Raft changes object routing.
 	SharedReferences SharedSnapshotReferenceProvider
-	operationMu      sync.Mutex // serializes reservation/quota accounting
-	transactionMu    sync.Map   // transaction ID -> *sync.Mutex
+	// ReferenceInventory exposes this node's durable active root claims so a
+	// newly elected shared-GC coordinator can rebuild its disposable local
+	// ledger. It carries bounded roots, never pages or file records.
+	ReferenceInventory SnapshotReferenceInventoryProvider
+	operationMu        sync.Mutex // serializes reservation/quota accounting
+	transactionMu      sync.Map   // transaction ID -> *sync.Mutex
 }
 
 // ImmutableObjectProvider opens one complete immutable object after checking
@@ -595,6 +600,30 @@ type SharedSnapshotReferenceProvider interface {
 	ImportSharedSnapshot(context.Context, string, uint64) error
 	ApplySharedSnapshotHandoff(context.Context, string, uint64, uint64, []SharedReferenceMutation) error
 	FlushSharedSnapshot(context.Context, string, uint64) error
+}
+
+// SnapshotReferenceClaim is one currently active root batch retained by this
+// node. Operation and slots are stable idempotency identities.
+type SnapshotReferenceClaim struct {
+	Origin    uint64                `json:"origin"`
+	Operation string                `json:"operation"`
+	Roots     []SnapshotRootBinding `json:"roots"`
+}
+
+// SnapshotReferenceInventory binds claims to the exact daemon incarnation
+// that produced them. A node name alone is insufficient after restart: a
+// delayed response from the previous incarnation must not authorize GC.
+type SnapshotReferenceInventory struct {
+	NodeID      string                   `json:"node_id"`
+	Incarnation string                   `json:"incarnation"`
+	Claims      []SnapshotReferenceClaim `json:"claims,omitempty"`
+}
+
+// SnapshotReferenceInventoryProvider reports local durable claims during rare
+// coordinator rebuilds. Ordinary reads, writes, forks, and faults never call
+// this interface.
+type SnapshotReferenceInventoryProvider interface {
+	SnapshotReferenceInventory(context.Context, string) (*SnapshotReferenceInventory, error)
 }
 
 type sharedHandoffRequest struct {
@@ -650,6 +679,23 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, controlSharedLedgerPrefix) {
 		c.serveSharedLedger(w, r, peer)
+		return
+	}
+	if r.URL.Path == controlReferenceClaimsPath {
+		if r.Method != http.MethodGet {
+			writeControlError(w, http.StatusMethodNotAllowed, "snapshot reference inventory requires GET")
+			return
+		}
+		if c.ReferenceInventory == nil {
+			writeControlError(w, http.StatusServiceUnavailable, "snapshot reference inventory is unavailable")
+			return
+		}
+		inventory, err := c.ReferenceInventory.SnapshotReferenceInventory(r.Context(), peer)
+		if err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, inventory)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/authority/") {
@@ -1248,6 +1294,15 @@ func (c *ControlPlane) handoff(w http.ResponseWriter, r *http.Request, id, peer 
 			writeControlError(w, http.StatusConflict, "transaction advanced without a graph handoff")
 			return
 		}
+		if tx.State == TransactionDraining {
+			// The transaction record may outlive the target daemon process that
+			// started the asynchronous Sentry reader switch. Re-drive the exact
+			// immutable handoff before acknowledging a retry.
+			if err := c.TargetRuntime.Handoff(r.Context(), tx, request.Graph); err != nil {
+				writeControlError(w, http.StatusConflict, err.Error())
+				return
+			}
+		}
 		writeControlJSON(w, http.StatusOK, tx)
 		return
 	}
@@ -1705,6 +1760,16 @@ func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
 		return nil, err
 	}
 	return &state, nil
+}
+
+// SnapshotReferenceInventory fetches the peer's bounded durable root inventory
+// for shared reference-ledger reconstruction.
+func (c *Client) SnapshotReferenceInventory(ctx context.Context) (*SnapshotReferenceInventory, error) {
+	var inventory SnapshotReferenceInventory
+	if err := c.callWithLimit(ctx, http.MethodGet, controlReferenceClaimsPath, nil, &inventory, maxAuthoritySnapshotBytes); err != nil {
+		return nil, err
+	}
+	return &inventory, nil
 }
 
 // JoinAuthority admits this client's authenticated node as a learner. The

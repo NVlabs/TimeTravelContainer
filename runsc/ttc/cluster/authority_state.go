@@ -31,7 +31,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 6
+	AuthorityFormatVersion = 7
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -676,6 +676,16 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		}
 		if retirement, retired := s.RetiredOrigins[p.SnapshotID]; retired {
 			return authorityValue(retirement)
+		}
+		for _, branch := range s.Branches {
+			if !branch.Corrupted && branch.Roots.MemorySnapshot == p.SnapshotID {
+				return nil, errors.New("cannot retire a snapshot referenced by a branch root")
+			}
+		}
+		for _, publication := range s.Publications {
+			if (publication.State == PublicationPreparing || publication.State == PublicationReady) && publication.CandidateRoots.MemorySnapshot == p.SnapshotID {
+				return nil, errors.New("cannot retire a snapshot referenced by an in-flight publication")
+			}
 		}
 		retirement := SharedPackRetirement{SnapshotID: p.SnapshotID, GCGeneration: p.Generation, RetiredAt: command.IssuedAt}
 		s.RetiredOrigins[p.SnapshotID] = retirement
@@ -1491,6 +1501,19 @@ func validateDurableRoots(roots DurableRoots) error {
 	return nil
 }
 
+func (s *AuthorityState) validateSnapshotRootAuthority(roots DurableRoots) error {
+	if roots.MemorySnapshot == 0 {
+		return nil
+	}
+	if roots.MemorySnapshot >= s.NextSnapshotID {
+		return errors.New("durable memory snapshot was not allocated")
+	}
+	if _, retired := s.RetiredOrigins[roots.MemorySnapshot]; retired {
+		return errors.New("durable memory snapshot is permanently retired")
+	}
+	return nil
+}
+
 func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMessage, error) {
 	p, err := decodeAuthorityPayload[AuthorityPublicationPayload](command)
 	if err != nil {
@@ -1528,13 +1551,30 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		if record.State != PublicationPreparing {
 			return nil, errors.New("publication capture is not preparing")
 		}
-		record.State = PublicationReady
+		if p.Roots != (DurableRoots{}) {
+			if err := validateDurableRoots(p.Roots); err != nil {
+				return nil, fmt.Errorf("publication capture roots: %w", err)
+			}
+			if err := s.validateSnapshotRootAuthority(p.Roots); err != nil {
+				return nil, fmt.Errorf("publication capture roots: %w", err)
+			}
+		}
+		record.State, record.CandidateRoots = PublicationReady, p.Roots
 	case AuthorityPublicationCommit:
 		if record.State != PublicationReady {
 			return nil, errors.New("publication capture is not ready")
 		}
 		if err := validateDurableRoots(p.Roots); err != nil {
 			return nil, err
+		}
+		if err := s.validateSnapshotRootAuthority(p.Roots); err != nil {
+			return nil, err
+		}
+		if record.CandidateRoots.MemorySnapshot != 0 && record.CandidateRoots.MemorySnapshot != p.Roots.MemorySnapshot {
+			return nil, errors.New("publication memory snapshot differs from capture fence")
+		}
+		if record.CandidateRoots.MemoryRoot != "" && record.CandidateRoots.MemoryRoot != p.Roots.MemoryRoot {
+			return nil, errors.New("publication memory root differs from capture fence")
 		}
 		current := s.Branches[branchKey]
 		if current.Generation != record.BranchGeneration || current.StorageGeneration >= record.StorageGeneration || current.Corrupted {

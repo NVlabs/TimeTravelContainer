@@ -434,6 +434,47 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	return cloneManifest(&manifest), nil
 }
 
+// Manifests enumerates committed snapshot manifests without treating staging,
+// retired, or operator-created entries as authority. Callers use this to
+// rebuild disposable coordinator state; a directory without manifest.json is
+// never returned merely because pack-shaped files exist there.
+func (store *SharedPackStore) Manifests() ([]*SnapshotManifest, error) {
+	if store == nil || store.root == "" {
+		return nil, errors.New("shared pack store is unavailable")
+	}
+	entries, err := os.ReadDir(filepath.Join(store.root, "snapshots"))
+	if err != nil {
+		return nil, err
+	}
+	var snapshots []SnapshotID
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		value, err := strconv.ParseUint(entry.Name(), 16, 64)
+		if err != nil || value == 0 || snapshotKey(SnapshotID(value)) != entry.Name() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(store.root, "snapshots", entry.Name(), sharedManifestName)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		snapshots = append(snapshots, SnapshotID(value))
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i] < snapshots[j] })
+	manifests := make([]*SnapshotManifest, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		manifest, err := store.Manifest(snapshot)
+		if err != nil {
+			return nil, fmt.Errorf("opening shared snapshot %d during enumeration: %w", snapshot, err)
+		}
+		manifests = append(manifests, manifest)
+	}
+	return manifests, nil
+}
+
 func (store *SharedPackStore) validateManifest(manifest *SnapshotManifest) error {
 	if manifest.Version != sharedPackVersion || manifest.Snapshot == 0 {
 		return errors.New("invalid shared snapshot manifest header")

@@ -463,7 +463,10 @@ func TestProvisionalRaftTargetAuthorization(t *testing.T) {
 
 func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
-	command := exec.Command("bash", "-c", "exec -a 'ttc-sentry[guardian-test]' bash -c 'while :; do sleep 1; done' -- --root="+runtimeRoot)
+	// Use only shell builtins so the synthetic Sentry never has a transient
+	// child that inherits the identifying --root argument between discovery
+	// and fencing.
+	command := exec.Command("bash", "-c", "exec -a 'ttc-sentry[guardian-test]' bash -c 'while :; do read -t 1 || :; done' -- --root="+runtimeRoot)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -511,5 +514,36 @@ func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 			t.Fatalf("guardian target was not stopped:\n%s", status)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestNodeExecutionGrantsOnlyRequireEnforcementOnRevocation(t *testing.T) {
+	state := cluster.NewAuthorityState()
+	state.Placements["placed"] = cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}
+	previous := nodeExecutionGrants(state, "node-a", "inc-a")
+	if len(previous) != 1 {
+		t.Fatalf("initial grants=%v, want one", previous)
+	}
+	state.Transactions["tx"] = cluster.Transaction{
+		Identity: cluster.ForkIdentity{TargetNodeID: "node-a", TargetContainer: "family", TargetVisibleBranch: "child"},
+		TargetIncarnation: "inc-a", State: cluster.TransactionTargetRestoring,
+	}
+	added := nodeExecutionGrants(state, "node-a", "inc-a")
+	if executionGrantRevoked(previous, added) {
+		t.Fatal("grant addition was classified as a revocation")
+	}
+	delete(state.Placements, "placed")
+	revoked := nodeExecutionGrants(state, "node-a", "inc-a")
+	if !executionGrantRevoked(added, revoked) {
+		t.Fatal("placement removal was not classified as a revocation")
+	}
+	state.Transactions["tx"] = cluster.Transaction{
+		Identity: cluster.ForkIdentity{TargetNodeID: "node-a", TargetContainer: "family", TargetVisibleBranch: "child"},
+		TargetIncarnation: "inc-a", State: cluster.TransactionCanceled,
+	}
+	if !executionGrantRevoked(revoked, nodeExecutionGrants(state, "node-a", "inc-a")) {
+		t.Fatal("provisional target cancellation was not classified as a revocation")
 	}
 }

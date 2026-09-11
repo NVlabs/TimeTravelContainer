@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	// ControlProtocolVersion is the first cross-daemon control protocol.
-	ControlProtocolVersion = 1
+	// ControlProtocolVersion 2 adds incarnation-bound root inventory and
+	// coordinator-rebuild barriers for the disposable shared reference ledger.
+	ControlProtocolVersion = 2
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

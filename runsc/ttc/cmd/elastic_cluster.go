@@ -2970,6 +2970,54 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 	return nil
 }
 
+// nodeExecutionGrants returns the bounded set of logical runtimes that Raft
+// currently permits this exact node incarnation to host. Node heartbeats and
+// transfer accounting deliberately do not affect the set. The lease guardian
+// only needs a potentially blocking Sentry inventory pass after a grant is
+// revoked; additions cannot make an already-running local runtime unsafe.
+func nodeExecutionGrants(state *cluster.AuthorityState, nodeID, incarnation string) map[string]struct{} {
+	grants := make(map[string]struct{})
+	if state == nil || nodeID == "" || incarnation == "" {
+		return grants
+	}
+	key := func(family, branch string) string { return family + "\x00" + branch }
+	for _, placement := range state.Placements {
+		if placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation {
+			continue
+		}
+		switch placement.State {
+		case cluster.PlacementRunning, cluster.PlacementPaused, cluster.PlacementMigrating:
+			grants[key(placement.FamilyID, placement.BranchID)] = struct{}{}
+		}
+	}
+	for _, tx := range state.Transactions {
+		if tx.Identity.TargetNodeID != nodeID || tx.TargetIncarnation != incarnation {
+			continue
+		}
+		authorized := false
+		switch tx.State {
+		case cluster.TransactionTargetReserved, cluster.TransactionSourceCaptured,
+			cluster.TransactionTargetRestoring, cluster.TransactionTargetPaused:
+			authorized = true
+		case cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionIndependent:
+			authorized = !tx.Activated
+		}
+		if authorized {
+			grants[key(tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch())] = struct{}{}
+		}
+	}
+	return grants
+}
+
+func executionGrantRevoked(previous, current map[string]struct{}) bool {
+	for grant := range previous {
+		if _, ok := current[grant]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 // runtimeBranchPresent resolves a failed idempotent eviction without parsing
 // human-readable runsc errors. Empty branchID asks whether the family itself
 // remains. The placement enforcer races ordinary migration cleanup by design:

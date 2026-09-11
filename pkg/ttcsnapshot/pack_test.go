@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -414,5 +415,54 @@ func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	}
 	if _, err := os.Stat(unknown); err != nil {
 		t.Fatalf("unknown file was removed: %v", err)
+	}
+}
+
+func TestSharedPackManifestsEnumeratesOnlyCommittedOrigins(t *testing.T) {
+	sharedRoot := t.TempDir()
+	shared, err := OpenSharedPackStore(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := openTestStore(t)
+	data, err := OpenLocalDataStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var origins []SnapshotID
+	for index := 0; index < 2; index++ {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		object, err := graph.CreateObject(origin, fmt.Sprintf("root/%d", origin), ObjectKindMetadata, []byte{byte(origin)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.SetRoot(fmt.Sprintf("snapshot/%d", origin), object); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+			t.Fatal(err)
+		}
+		origins = append(origins, origin)
+	}
+	for index := len(origins) - 1; index >= 0; index-- {
+		if err := shared.Publish(context.Background(), graph, origins[index], data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(sharedRoot, "snapshots", "operator-notes"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sharedRoot, "snapshots", snapshotKey(origins[1]+1)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifests, err := shared.Manifests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifests) != 2 || manifests[0].Snapshot != origins[0] || manifests[1].Snapshot != origins[1] {
+		t.Fatalf("Manifests()=%+v, want snapshots %d and %d", manifests, origins[0], origins[1])
 	}
 }

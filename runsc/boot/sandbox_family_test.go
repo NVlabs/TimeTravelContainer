@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -244,6 +245,28 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	}
 	if status.Snapshot.PagesOutstanding == 0 || status.Transport.MetadataBytesSent != uint64(len(encoded)) {
 		t.Fatalf("unexpected session status: %+v", status)
+	}
+	streamFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	stream := os.NewFile(uintptr(streamFDs[0]), "distributed-page-stream")
+	peerStream := os.NewFile(uintptr(streamFDs[1]), "distributed-page-peer")
+	defer stream.Close()
+	defer peerStream.Close()
+	served := make(chan error, 1)
+	go func() {
+		served <- family.ServeDistributedForkConnection(&DistributedForkServeArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, SessionID: "tx-1",
+		})
+	}()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("ServeDistributedForkConnection: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeDistributedForkConnection occupied its control caller")
 	}
 	graphStream, err := os.CreateTemp(t.TempDir(), "graph-capture-")
 	if err != nil {

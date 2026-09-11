@@ -418,10 +418,19 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	}
 	if p.authority != nil {
 		lifecycle := "exited"
+		captureRoots := cluster.DurableRoots{}
 		if intent.Kind == "dehydrate" {
 			lifecycle = "dehydrated"
+			branch, err := persistentBranchInfo(info, intent.Branch)
+			if err != nil {
+				return false, err
+			}
+			if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+				return false, errors.New("new-format dehydration branch lacks graph-native snapshot identity")
+			}
+			captureRoots.MemorySnapshot = branch.SnapshotID
 		}
-		if _, err := p.authority.EnsurePublicationReady(info.ID, intent.Branch, intent.Generation, lifecycle); err != nil {
+		if _, err := p.authority.EnsurePublicationReady(info.ID, intent.Branch, intent.Generation, lifecycle, captureRoots); err != nil {
 			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
 		}
 	}

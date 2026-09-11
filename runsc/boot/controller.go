@@ -139,8 +139,14 @@ const (
 	// ContMgrDrainDistributedForkFilesystems materializes only remote files.
 	ContMgrDrainDistributedForkFilesystems = "containerManager.DrainDistributedForkFilesystems"
 
+	// ContMgrDistributedForkFilesystemDrainStatus reports asynchronous filesystem materialization progress.
+	ContMgrDistributedForkFilesystemDrainStatus = "containerManager.DistributedForkFilesystemDrainStatus"
+
 	// ContMgrHandoffDistributedForkMemory replaces live paging with sparse chunks.
 	ContMgrHandoffDistributedForkMemory = "containerManager.HandoffDistributedForkMemory"
+
+	// ContMgrDistributedForkMemoryHandoffStatus reports asynchronous reader-switch progress.
+	ContMgrDistributedForkMemoryHandoffStatus = "containerManager.DistributedForkMemoryHandoffStatus"
 
 	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
 	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
@@ -432,6 +438,22 @@ type containerManager struct {
 	// restorer is set when the sandbox in being restored. It stores the state
 	// of all containers and perform all actions required by restore.
 	restorer *restorer
+
+	filesystemDrainMu sync.Mutex
+	filesystemDrain   *distributedForkFilesystemDrain
+}
+
+type distributedForkFilesystemDrain struct {
+	done chan struct{}
+	err  error
+}
+
+// DistributedForkFilesystemDrainStatus reports completion of asynchronous
+// filesystem materialization. The work is process-wide because all branch
+// repositories in a Sentry share the same immutable remote object stores.
+type DistributedForkFilesystemDrainStatus struct {
+	Done  bool   `json:"done"`
+	Error string `json:"error,omitempty"`
 }
 
 // StartRoot will start the root container process.
@@ -1137,7 +1159,8 @@ func (cm *containerManager) CaptureDistributedForkMany(args *DistributedForkCapt
 	return nil
 }
 
-// ServeDistributedForkConnection handles one stream donated by ttcd.
+// ServeDistributedForkConnection transfers one stream donated by ttcd into
+// the Sentry. Serving continues asynchronously after the RPC returns.
 func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
 	return cm.l.family.ServeDistributedForkConnection(args)
 }
@@ -1162,7 +1185,12 @@ func (cm *containerManager) ServeDistributedFilesystemConnection(args *Distribut
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(source)))
 		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository})
 	}
-	return ttcvolume.ServeRemoteObjects(conn, token, sources)
+	go func() {
+		if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil {
+			log.Debugf("Distributed filesystem stream ended: %v", err)
+		}
+	}()
+	return nil
 }
 
 // ExportDistributedForkSnapshot writes a durable shared-filesystem snapshot.
@@ -1202,18 +1230,71 @@ func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDepe
 	return cm.materializeDistributedFilesystems()
 }
 
-// DrainDistributedForkFilesystems materializes filesystem dependencies without
-// forcing memory already backed by a durable sparse repository to become resident.
+// DrainDistributedForkFilesystems starts materializing filesystem dependencies
+// without forcing memory already backed by a durable sparse repository to
+// become resident. Materialization is asynchronous so it cannot monopolize the
+// Sentry's control server while ordinary exec and branch operations continue.
 func (cm *containerManager) DrainDistributedForkFilesystems(_ *DistributedForkDependencyArgs, _ *struct{}) error {
-	return cm.materializeDistributedFilesystems()
+	cm.filesystemDrainMu.Lock()
+	if current := cm.filesystemDrain; current != nil {
+		select {
+		case <-current.done:
+			if current.err == nil {
+				cm.filesystemDrainMu.Unlock()
+				return nil
+			}
+			cm.filesystemDrain = nil
+		default:
+			cm.filesystemDrainMu.Unlock()
+			return nil
+		}
+	}
+	state := &distributedForkFilesystemDrain{done: make(chan struct{})}
+	cm.filesystemDrain = state
+	cm.filesystemDrainMu.Unlock()
+	go func() {
+		err := cm.materializeDistributedFilesystems()
+		cm.filesystemDrainMu.Lock()
+		state.err = err
+		close(state.done)
+		cm.filesystemDrainMu.Unlock()
+	}()
+	return nil
+}
+
+// DistributedForkFilesystemDrainStatus observes asynchronous filesystem
+// materialization without waiting for it on the control server.
+func (cm *containerManager) DistributedForkFilesystemDrainStatus(_ *DistributedForkDependencyArgs, out *DistributedForkFilesystemDrainStatus) error {
+	cm.filesystemDrainMu.Lock()
+	defer cm.filesystemDrainMu.Unlock()
+	state := cm.filesystemDrain
+	if state == nil {
+		return errors.New("distributed filesystem drain has not been started")
+	}
+	select {
+	case <-state.done:
+		out.Done = true
+		if state.err != nil {
+			out.Error = state.err.Error()
+		}
+	default:
+	}
+	return nil
 }
 
 // HandoffDistributedForkMemory atomically replaces the target page reader.
 func (cm *containerManager) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs, _ *struct{}) error {
-	if err := cm.l.family.HandoffDistributedForkMemory(args); err != nil {
+	return cm.l.family.HandoffDistributedForkMemory(args)
+}
+
+// DistributedForkMemoryHandoffStatus observes asynchronous reader-switch progress.
+func (cm *containerManager) DistributedForkMemoryHandoffStatus(args *BranchArgs, out *DistributedForkHandoffStatus) error {
+	status, err := cm.l.family.DistributedForkMemoryHandoffStatus(args.ID)
+	if err != nil {
 		return err
 	}
-	return cm.materializeDistributedFilesystems()
+	*out = status
+	return nil
 }
 
 func (cm *containerManager) materializeDistributedFilesystems() error {

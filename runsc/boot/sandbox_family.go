@@ -575,6 +575,7 @@ type SandboxFamily struct {
 	testOnlyExecFailureInjector    func(SandboxExecStage) error
 	volumeBranchScope              string
 	distributedSessions            map[string]*distributedForkSession
+	distributedHandoffs            map[string]*distributedForkHandoff
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 	forgetFilesystemBranch         func(string)
@@ -590,6 +591,22 @@ type distributedForkSession struct {
 	sparseSnapshot   *pgalloc.RemoteSnapshot
 	memoryBindings   []pgalloc.CapturedPageBinding
 	filesystemToken  ttcvolume.RemoteToken
+}
+
+type distributedForkHandoff struct {
+	snapshot uint64
+	done     chan struct{}
+	err      error
+}
+
+// DistributedForkHandoffStatus reports completion of an asynchronous reader
+// switch. Starting the switch must not occupy the Sentry control server: the
+// old reader may have in-flight demand faults, while unrelated branch and exec
+// controls must remain available.
+type DistributedForkHandoffStatus struct {
+	Snapshot uint64 `json:"snapshot"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error,omitempty"`
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -672,6 +689,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
+		distributedHandoffs:            make(map[string]*distributedForkHandoff),
 		branches: map[string]*sandboxBranch{
 			initialID: {
 				id:               initialID,
@@ -980,7 +998,9 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	return infos, nil
 }
 
-// ServeDistributedForkConnection handles one connection accepted by ttcd.
+// ServeDistributedForkConnection takes ownership of one connection accepted
+// by ttcd and starts serving it. The stream may live for the entire remote
+// dependency lifetime, so it must not occupy the Sentry control RPC handler.
 func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServeArgs) error {
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return errors.New("distributed page serving requires a session and one connected socket")
@@ -995,7 +1015,8 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	if err != nil {
 		return err
 	}
-	return session.server.ServeStream(conn)
+	go func() { _ = session.server.ServeStream(conn) }()
+	return nil
 }
 
 // DistributedForkFilesystemToken returns the transaction-fenced token for a
@@ -1151,11 +1172,6 @@ func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandof
 	if args == nil || args.BranchID == "" {
 		return errors.New("distributed fork handoff requires a branch")
 	}
-	b, release, err := f.beginControl(args.BranchID)
-	if err != nil {
-		return err
-	}
-	defer release()
 	want := 2
 	if args.GraphRemote {
 		want++
@@ -1163,6 +1179,24 @@ func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandof
 	if args.GraphSnapshot == 0 || len(args.FilePayload.Files) != want {
 		return errors.New("distributed graph handoff requires a snapshot, manifest, object store, and optional relay")
 	}
+	f.mu.Lock()
+	if current := f.distributedHandoffs[args.BranchID]; current != nil {
+		select {
+		case <-current.done:
+			if current.err == nil && current.snapshot == uint64(args.GraphSnapshot) {
+				f.mu.Unlock()
+				return nil
+			}
+			delete(f.distributedHandoffs, args.BranchID)
+		default:
+			f.mu.Unlock()
+			if current.snapshot == uint64(args.GraphSnapshot) {
+				return nil
+			}
+			return fmt.Errorf("branch %q already has graph handoff %d in progress", args.BranchID, current.snapshot)
+		}
+	}
+	f.mu.Unlock()
 	encoded, err := io.ReadAll(args.FilePayload.Files[0])
 	if err != nil {
 		return fmt.Errorf("reading distributed graph handoff manifest: %w", err)
@@ -1188,7 +1222,57 @@ func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandof
 			return err
 		}
 	}
-	return b.k.HandoffDistributedForkMemoryGraph(data, remote, manifest, args.GraphSnapshot)
+	b, release, err := f.beginControl(args.BranchID)
+	if err != nil {
+		if remote != nil {
+			_ = remote.Close()
+		}
+		_ = data.Close()
+		return err
+	}
+	state := &distributedForkHandoff{snapshot: uint64(args.GraphSnapshot), done: make(chan struct{})}
+	f.mu.Lock()
+	if current := f.distributedHandoffs[args.BranchID]; current != nil {
+		f.mu.Unlock()
+		release()
+		if remote != nil {
+			_ = remote.Close()
+		}
+		_ = data.Close()
+		return errors.New("distributed graph handoff was started concurrently")
+	}
+	f.distributedHandoffs[args.BranchID] = state
+	f.mu.Unlock()
+	go func() {
+		err := b.k.HandoffDistributedForkMemoryGraph(data, remote, manifest, args.GraphSnapshot)
+		release()
+		f.mu.Lock()
+		state.err = err
+		close(state.done)
+		f.mu.Unlock()
+	}()
+	return nil
+}
+
+// DistributedForkMemoryHandoffStatus observes a reader switch without taking
+// the branch operation lock or waiting for its old in-flight reads.
+func (f *SandboxFamily) DistributedForkMemoryHandoffStatus(branchID string) (DistributedForkHandoffStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.distributedHandoffs[branchID]
+	if state == nil {
+		return DistributedForkHandoffStatus{}, fmt.Errorf("branch %q has no distributed graph handoff", branchID)
+	}
+	status := DistributedForkHandoffStatus{Snapshot: state.snapshot}
+	select {
+	case <-state.done:
+		status.Done = true
+		if state.err != nil {
+			status.Error = state.err.Error()
+		}
+	default:
+	}
+	return status, nil
 }
 
 // CloseDistributedForkSessions releases all remote dependencies during Sentry
@@ -1911,6 +1995,10 @@ func (f *SandboxFamily) Rename(id, newID string) error {
 	delete(f.branches, id)
 	b.id = newID
 	f.branches[newID] = b
+	if handoff := f.distributedHandoffs[id]; handoff != nil {
+		delete(f.distributedHandoffs, id)
+		f.distributedHandoffs[newID] = handoff
+	}
 	if f.loaderBranchID == id {
 		f.loaderBranchID = newID
 	}
@@ -2464,6 +2552,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 		err := image.image.Close()
 		f.mu.Lock()
 		delete(f.branches, id)
+		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
 		return err
@@ -2474,6 +2563,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 		}
 		f.mu.Lock()
 		delete(f.branches, id)
+		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
 		return nil
@@ -2500,6 +2590,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 
 	f.mu.Lock()
 	delete(f.branches, id)
+	delete(f.distributedHandoffs, id)
 	f.mu.Unlock()
 	return nil
 }

@@ -28,6 +28,7 @@ go_test(
     name = "ttcremote_test",
     size = "small",
     srcs = [
+		"donated_conn_test.go",
         "metadata_test.go",
         "tcp_test.go",
     ],

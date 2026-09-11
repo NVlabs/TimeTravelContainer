@@ -202,6 +202,13 @@ func (c *RaftCatalog) state() (*AuthorityState, error) {
 	return c.linearizableState(context.Background())
 }
 
+// AuthorityState returns a linearizable copy of the complete bounded cluster
+// control state. Bulk objects and object-level references are deliberately not
+// part of this snapshot.
+func (c *RaftCatalog) AuthorityState() (*AuthorityState, error) {
+	return c.state()
+}
+
 // AllocateSnapshotOrigins allocates globally monotonic IDs and records this
 // node as their exact volatile provider in one Raft command.
 func (c *RaftCatalog) AllocateSnapshotOrigins(node, incarnation string, count uint32) (SnapshotAllocation, error) {
@@ -315,7 +322,7 @@ func publicationOperationID(generation uint64) string {
 // EnsurePublicationReady authorizes one generation and records that its
 // node-local capture fence is complete. It is intentionally retryable after a
 // daemon crash; no shared bytes may be uploaded before it succeeds.
-func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGeneration uint64, lifecycle string) (*PublicationRecord, error) {
+func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGeneration uint64, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
 	state, err := c.state()
 	if err != nil {
 		return nil, err
@@ -344,9 +351,12 @@ func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGener
 	case PublicationPreparing:
 		return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationReady, AuthorityPublicationPayload{
 			Family: family, Branch: branch, Operation: operation,
-			BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision,
+			BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision, Roots: captureRoots,
 		})
 	case PublicationReady, PublicationCommitted:
+		if record.State == PublicationReady && record.CandidateRoots != captureRoots {
+			return nil, errors.New("publication capture roots differ")
+		}
 		return &record, nil
 	default:
 		return nil, errors.New("publication generation is not usable")

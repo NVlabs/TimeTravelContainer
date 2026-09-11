@@ -150,8 +150,11 @@ func translateDeferredFilesystemData(source Object, children map[string]ObjectID
 }
 
 // resolveDeferredLocked expands one node and its bounded direct-child set.
-// s.mu must be held. Network/provider latency is intentionally serialized per
-// graph so no observer can see a half-expanded immutable node.
+// s.mu must be held on entry and remains held on return. Provider I/O is
+// serialized per immutable source object, but is performed without s.mu: a
+// multi-hop graph can re-enter this Store while resolving an ancestor. The
+// object and expansion origin are revalidated after the lock is reacquired,
+// so observers still see either the stub or the complete committed expansion.
 func (s *Store) resolveDeferredLocked(id ObjectID) (Object, bool, error) {
 	object, ok, _, err := s.resolveDeferredLockedAfter(id, 0)
 	return object, ok, err
@@ -170,19 +173,81 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	if !ok || resolver.load == nil {
 		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC catalog %q has no attached authoritative source", object.SourceCatalog)
 	}
-	source, err := resolver.load(object.SourceObject)
-	if err != nil {
-		return Object{}, false, ordinalFloor, fmt.Errorf("loading deferred TTC object %s: %w", object.SourceObject, err)
+	catalog := object.SourceCatalog
+	sourceID := object.SourceObject
+	loadKey := deferredObjectKey(catalog, sourceID)
+	if inFlight := s.deferredLoads[loadKey]; inFlight != nil {
+		s.mu.Unlock()
+		<-inFlight.done
+		s.mu.Lock()
+		if inFlight.err != nil {
+			return Object{}, false, ordinalFloor, inFlight.err
+		}
+		// The leader commits the complete expansion before waking waiters.
+		// Re-read it rather than applying its source a second time.
+		object, ok = s.state.Objects[id.key()]
+		if !ok || !object.Deferred {
+			return object, ok, ordinalFloor, nil
+		}
+		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC object %s remained unresolved after provider load", id)
 	}
-	if err := validateObject(source); err != nil {
+	if s.deferredLoads == nil {
+		s.deferredLoads = make(map[string]*deferredLoad)
+	}
+	inFlight := &deferredLoad{done: make(chan struct{})}
+	s.deferredLoads[loadKey] = inFlight
+	s.mu.Unlock()
+	source, loadErr := resolver.load(sourceID)
+	s.mu.Lock()
+	if current := s.deferredLoads[loadKey]; current == inFlight {
+		delete(s.deferredLoads, loadKey)
+	}
+	if loadErr != nil {
+		inFlight.err = fmt.Errorf("loading deferred TTC object %s: %w", sourceID, loadErr)
+		close(inFlight.done)
+		return Object{}, false, ordinalFloor, inFlight.err
+	}
+	// The graph may have advanced while provider I/O was in flight. Another
+	// path can only have expanded this exact immutable stub to the same value.
+	object, ok = s.state.Objects[id.key()]
+	if !ok || !object.Deferred {
+		inFlight.source = source
+		close(inFlight.done)
+		return object, ok, ordinalFloor, nil
+	}
+	resolver, ok = s.deferredResolvers[catalog]
+	if !ok || resolver.load == nil || resolver.origin == 0 || object.SourceCatalog != catalog || object.SourceObject != sourceID {
+		inFlight.err = fmt.Errorf("deferred TTC catalog %q changed while loading object %s", catalog, sourceID)
+		close(inFlight.done)
+		return Object{}, false, ordinalFloor, inFlight.err
+	}
+	inFlight.source = source
+	// Wake waiters only after this goroutine has atomically committed the
+	// expansion below. Every error path after this point must publish it.
+	finishLoad := func(err error) {
+		inFlight.err = err
+		close(inFlight.done)
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			finishLoad(errors.New("deferred TTC expansion aborted"))
+		}
+	}()
+	fail := func(err error) (Object, bool, uint64, error) {
+		finished = true
+		finishLoad(err)
 		return Object{}, false, ordinalFloor, err
 	}
-	if source.ID != object.SourceObject || source.State != ObjectLive || source.Deferred {
-		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC source returned invalid object %s for %s", source.ID, object.SourceObject)
+	if err := validateObject(source); err != nil {
+		return fail(err)
+	}
+	if source.ID != sourceID || source.State != ObjectLive || source.Deferred {
+		return fail(fmt.Errorf("deferred TTC source returned invalid object %s for %s", source.ID, sourceID))
 	}
 	snapshot, ok := s.state.Snapshots[snapshotKey(resolver.origin)]
 	if !ok || snapshot.State != SnapshotWorking {
-		return Object{}, false, ordinalFloor, fmt.Errorf("deferred TTC expansion origin %d is not working", resolver.origin)
+		return fail(fmt.Errorf("deferred TTC expansion origin %d is not working", resolver.origin))
 	}
 	if snapshot.NextOrdinal < ordinalFloor {
 		snapshot.NextOrdinal = ordinalFloor
@@ -197,7 +262,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 		child, live := s.state.Objects[localID.key()]
 		if !found || !live || child.State != ObjectLive {
 			if snapshot.NextOrdinal == math.MaxUint64 {
-				return Object{}, false, snapshot.NextOrdinal, errors.New("deferred TTC object ordinal space exhausted")
+				return fail(errors.New("deferred TTC object ordinal space exhausted"))
 			}
 			localID = ObjectID{Snapshot: resolver.origin, Ordinal: snapshot.NextOrdinal, Kind: edge.Child.Kind}
 			snapshot.NextOrdinal++
@@ -211,7 +276,7 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 			child = previous
 		}
 		if child.Refs == math.MaxUint64 {
-			return Object{}, false, snapshot.NextOrdinal, fmt.Errorf("deferred child %s reference count overflows", localID)
+			return fail(fmt.Errorf("deferred child %s reference count overflows", localID))
 		}
 		child.Refs++
 		touched[localID.key()] = child
@@ -220,14 +285,14 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 	}
 	data, err := translateDeferredFilesystemData(source, mapped)
 	if err != nil {
-		return Object{}, false, snapshot.NextOrdinal, err
+		return fail(err)
 	}
 	object.Data = data
 	object.Children = edges
 	object.BulkLength = source.BulkLength
 	object.Deferred = false
 	if err := validateObject(object); err != nil {
-		return Object{}, false, snapshot.NextOrdinal, err
+		return fail(err)
 	}
 	keys := make([]string, 0, len(touched))
 	for key := range touched {
@@ -244,11 +309,13 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 		ops = append(ops, journalOp{PutSnapshot: &snapshot})
 	}
 	if err := s.commitLocked(ops); err != nil {
-		return Object{}, false, snapshot.NextOrdinal, err
+		return fail(err)
 	}
 	for key, localID := range newMappings {
 		s.deferredObjects[key] = localID
 	}
+	finished = true
+	finishLoad(nil)
 	return cloneObject(object), true, snapshot.NextOrdinal, nil
 }
 

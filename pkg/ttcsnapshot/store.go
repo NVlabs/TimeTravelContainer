@@ -140,11 +140,21 @@ type Store struct {
 	externallyCoordinated bool
 	deferredResolvers     map[string]deferredResolver
 	deferredObjects       map[string]ObjectID
+	// deferredLoads serializes provider I/O for one foreign immutable object.
+	// Provider reads must never run while mu is held: a multi-hop filesystem
+	// graph may legitimately re-enter this Store while resolving an ancestor.
+	deferredLoads map[string]*deferredLoad
 }
 
 type deferredResolver struct {
 	origin SnapshotID
 	load   ImmutableObjectLoader
+}
+
+type deferredLoad struct {
+	done   chan struct{}
+	source Object
+	err    error
 }
 
 func deferredObjectKey(catalog string, id ObjectID) string {
@@ -278,6 +288,7 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 	store := &Store{
 		dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated,
 		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[string]ObjectID),
+		deferredLoads: make(map[string]*deferredLoad),
 	}
 	if externallyCoordinated {
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {

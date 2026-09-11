@@ -112,6 +112,38 @@ func TestGraphReferenceIdentitySurvivesProviderPublication(t *testing.T) {
 	}
 }
 
+func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
+	localRoot := t.TempDir()
+	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
+	intent := graphReferenceIntent{
+		Version: graphReferenceIntentVersion, Transaction: "tx", Operation: "branch-op",
+		Container: "family", Branch: "branch", State: "releasing", CreatedAt: time.Unix(1, 0),
+		Groups: []graphReferenceGroup{
+			{Origin: 1, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "0000000000000001-03-0000000000000001"}}},
+			{Origin: 2, Roots: []cluster.SnapshotRootBinding{{Slot: 1, Object: "0000000000000002-03-0000000000000001"}}, Retained: true},
+			{Origin: 3, Roots: []cluster.SnapshotRootBinding{{Slot: 2, Object: "0000000000000003-03-0000000000000001"}}, Retained: true, Released: true},
+		},
+	}
+	path, err := graphReferenceIntentPath(localRoot, intent.Operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDurableJSON(path, &intent); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := service.SnapshotReferenceInventory(nil, "coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := inventory.Claims
+	if inventory.NodeID != "node-a" || inventory.Incarnation != "boot-a" {
+		t.Fatalf("inventory identity=%s/%s, want node-a/boot-a", inventory.NodeID, inventory.Incarnation)
+	}
+	if len(claims) != 2 || claims[0].Origin != 1 || claims[1].Origin != 2 || claims[0].Operation != intent.Operation || len(claims[0].Roots) != 1 || claims[0].Roots[0] != intent.Groups[0].Roots[0] || claims[1].Roots[0] != intent.Groups[1].Roots[0] {
+		t.Fatalf("claims=%+v, want unreleased origins 1 and 2", claims)
+	}
+}
+
 func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 	for failAt := 0; failAt < 2; failAt++ {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {

@@ -163,6 +163,13 @@ func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphRe
 	if intent == nil || intent.State == "releasing" {
 		return errors.New("graph reference operation is already releasing")
 	}
+	if b.sharedReferences != nil {
+		// Coordinator turnover rebuilds from these durable intent states. Keep
+		// the provider acknowledgement and the matching local state transition
+		// on one side of an inventory observation.
+		b.sharedReferences.claimMu.Lock()
+		defer b.sharedReferences.claimMu.Unlock()
+	}
 	return advanceGraphReferenceRetain(path, intent, func(group graphReferenceGroup) error {
 		return b.mutateGraphReferenceGroup(context.Background(), *intent, group, true)
 	})
@@ -192,6 +199,10 @@ func advanceGraphReferenceRetain(path string, intent *graphReferenceIntent, muta
 func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) error {
 	if operation == "" || b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.snapshotGraph == nil {
 		return nil
+	}
+	if b.sharedReferences != nil {
+		b.sharedReferences.claimMu.Lock()
+		defer b.sharedReferences.claimMu.Unlock()
 	}
 	path, err := graphReferenceIntentPath(b.activeDataRoot(), operation)
 	if err != nil {
@@ -373,10 +384,33 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 	if len(roots) != len(objects) {
 		return errors.New("shared memory root names and objects differ in length")
 	}
+	authority, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	protected := make(map[uint64]bool)
+	for _, branch := range authority.Branches {
+		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 {
+			protected[branch.Roots.MemorySnapshot] = true
+		}
+	}
+	for _, publication := range authority.Publications {
+		if (publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady) && publication.CandidateRoots.MemorySnapshot != 0 {
+			protected[publication.CandidateRoots.MemorySnapshot] = true
+		}
+	}
 	for index, name := range roots {
 		id, err := ttcsnapshot.ParseObjectID(objects[index])
 		if err != nil {
 			return err
+		}
+		// Raft branch/publication roots are the canonical reachability source.
+		// Never let a local cleanup race release one before the control-plane
+		// transition that replaces or removes it. A skipped release is reclaimed
+		// by the next coordinator rebuild; premature release could let pack
+		// compaction discard still-authoritative bytes.
+		if protected[uint64(id.Snapshot)] {
+			continue
 		}
 		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
 		if err != nil {

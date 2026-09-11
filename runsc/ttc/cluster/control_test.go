@@ -60,6 +60,18 @@ type testSharedReferenceProvider struct {
 	imports   int
 }
 
+type testReferenceInventory struct {
+	peer      string
+	inventory SnapshotReferenceInventory
+}
+
+func (inventory *testReferenceInventory) SnapshotReferenceInventory(_ context.Context, peer string) (*SnapshotReferenceInventory, error) {
+	inventory.peer = peer
+	result := inventory.inventory
+	result.Claims = append([]SnapshotReferenceClaim(nil), result.Claims...)
+	return &result, nil
+}
+
 func (provider *testSharedReferenceProvider) ImportSharedSnapshot(_ context.Context, peer string, snapshot uint64) error {
 	provider.peer, provider.snapshot = peer, snapshot
 	provider.imports++
@@ -168,6 +180,36 @@ func TestSharedReferenceProviderReceivesImportAndCatchup(t *testing.T) {
 	}
 	if provider.imports != 1 || provider.peer != "target" || provider.snapshot != 42 || provider.from != 7 || len(provider.mutations) != 1 || provider.mutations[0] != mutations[0] {
 		t.Fatalf("shared provider state=%+v", provider)
+	}
+}
+
+func TestSnapshotReferenceInventoryRoundTrip(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "transactions")
+	if err := os.Mkdir(storeRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []SnapshotReferenceClaim{{
+		Origin: 42, Operation: "branch-claim",
+		Roots: []SnapshotRootBinding{{Slot: 3, Object: "000000000000002a-03-0000000000000001"}},
+	}}
+	inventory := &testReferenceInventory{inventory: SnapshotReferenceInventory{NodeID: "target", Incarnation: "target-boot", Claims: want}}
+	control := &ControlPlane{Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now, ReferenceInventory: inventory}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "coordinator", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.SnapshotReferenceInventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.peer != "coordinator" || got.NodeID != "target" || got.Incarnation != "target-boot" || len(got.Claims) != 1 || got.Claims[0].Origin != want[0].Origin || got.Claims[0].Operation != want[0].Operation || len(got.Claims[0].Roots) != 1 || got.Claims[0].Roots[0] != want[0].Roots[0] {
+		t.Fatalf("claims=%+v peer=%q, want %+v coordinator", got, inventory.peer, want)
 	}
 }
 
@@ -698,8 +740,8 @@ func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.handedOff != 1 {
-		t.Fatalf("runtime handoff calls=%d, want 1", runtime.handedOff)
+	if runtime.handedOff != 2 {
+		t.Fatalf("runtime handoff calls=%d, want 2 (a draining retry must re-drive target-local async state)", runtime.handedOff)
 	}
 }
 

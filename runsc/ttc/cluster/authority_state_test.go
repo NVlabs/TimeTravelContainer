@@ -222,6 +222,47 @@ func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {
 	}
 }
 
+func TestAuthoritySharedGCRetirementRejectsControlPlaneRoots(t *testing.T) {
+	at := time.Unix(1750, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	allocation := decodeAuthorityResultForTest[SnapshotAllocation](t, applyAuthorityForTest(t, state, "allocate", at, AuthoritySnapshotAllocate, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Count: 1,
+	}))
+	applyAuthorityForTest(t, state, "publish", at, AuthoritySnapshotPublish, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", SnapshotID: allocation.First,
+	})
+	lease := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "lease", at, AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Lease: 10 * time.Second,
+	}))
+	branchKey := logicalBranchKey("family", "main")
+	state.Branches[branchKey] = BranchAuthority{FamilyID: "family", BranchID: "main", Generation: 1, Roots: DurableRoots{MemorySnapshot: allocation.First}}
+	retire := func(id string) AuthorityResult {
+		command, err := NewAuthorityCommand(id, at.Add(time.Second), AuthoritySharedGCRetire, AuthoritySharedGCPayload{
+			NodeID: "node-a", Incarnation: "incarnation-a", Generation: lease.Generation, SnapshotID: allocation.First,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state.Apply(command)
+	}
+	if err := retire("retire-branch-root").Err(); err == nil {
+		t.Fatal("retired snapshot still selected by a branch root")
+	}
+	delete(state.Branches, branchKey)
+	state.Publications["family/main/1"] = PublicationRecord{
+		FamilyID: "family", BranchID: "main", State: PublicationReady,
+		CandidateRoots: DurableRoots{MemorySnapshot: allocation.First},
+	}
+	if err := retire("retire-publication-root").Err(); err == nil {
+		t.Fatal("retired snapshot still selected by an in-flight publication")
+	}
+	delete(state.Publications, "family/main/1")
+	if err := retire("retire-unreferenced").Err(); err != nil {
+		t.Fatalf("retiring unreferenced snapshot: %v", err)
+	}
+}
+
 func TestAuthorityNodeReincarnationRevokesSharedGCLease(t *testing.T) {
 	at := time.Unix(1800, 0).UTC()
 	state := NewAuthorityState()
@@ -298,6 +339,7 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()
+	state.NextSnapshotID = 8
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
@@ -308,7 +350,11 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 	}))
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
+		Roots: DurableRoots{MemorySnapshot: 7},
 	}))
+	if ready.CandidateRoots.MemorySnapshot != 7 {
+		t.Fatalf("capture-ready publication did not fence snapshot 7: %+v", ready)
+	}
 	applyAuthorityForTest(t, state, "corrupt", at.Add(3*time.Second), AuthorityBranchCorrupt, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", BranchGeneration: created.Generation, Failure: "authoritative node-local state was lost",
 	})
@@ -331,6 +377,7 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	at := time.Unix(3500, 0).UTC()
 	state := NewAuthorityState()
+	state.NextSnapshotID = 8
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
@@ -341,6 +388,7 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	}))
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
+		Roots: DurableRoots{MemorySnapshot: 7},
 	}))
 	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,

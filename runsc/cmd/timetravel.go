@@ -125,6 +125,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-filesystem-drain <branch-id>\n" +
+		"timetravel [flags] <container-id> distributed-filesystem-drain-status <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-handoff <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-status|distributed-cancel|distributed-complete <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
@@ -405,6 +406,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.DrainDistributedForkMemory(f.Arg(2))
 	case "distributed-filesystem-drain":
 		err = cont.Sandbox.DrainDistributedForkFilesystems(f.Arg(2))
+	case "distributed-filesystem-drain-status":
+		output, err = cont.Sandbox.DistributedForkFilesystemDrainStatus(f.Arg(2))
 	case "distributed-handoff":
 		if t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 || t.distributedSessionID == "" {
 			util.Fatalf("graph handoff requires --dehydration-graph-manifest-fd, --dehydration-graph-objects-fd, and --distributed-session=<snapshot>")
@@ -441,6 +444,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		for _, file := range files {
 			file.Close()
 		}
+	case "distributed-handoff-status":
+		output, err = cont.Sandbox.DistributedForkMemoryHandoffStatus(f.Arg(2))
 	case "distributed-cancel":
 		err = cont.Sandbox.CancelDistributedForkSession(f.Arg(2))
 	case "distributed-complete":

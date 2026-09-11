@@ -2248,12 +2248,31 @@ func (s *Sandbox) DrainDistributedForkFilesystems(branchID string) error {
 	return nil
 }
 
+// DistributedForkFilesystemDrainStatus reports asynchronous filesystem
+// materialization progress.
+func (s *Sandbox) DistributedForkFilesystemDrainStatus(branchID string) (boot.DistributedForkFilesystemDrainStatus, error) {
+	var status boot.DistributedForkFilesystemDrainStatus
+	if err := s.call(boot.ContMgrDistributedForkFilesystemDrainStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID}, &status); err != nil {
+		return boot.DistributedForkFilesystemDrainStatus{}, fmt.Errorf("reading distributed filesystem drain status for branch %q: %w", branchID, err)
+	}
+	return status, nil
+}
+
 // HandoffDistributedForkMemory replaces a live source with a sparse manifest.
 func (s *Sandbox) HandoffDistributedForkMemory(args *boot.DistributedForkHandoffArgs) error {
 	if err := s.call(boot.ContMgrHandoffDistributedForkMemory, args, nil); err != nil {
 		return fmt.Errorf("handing off distributed fork memory for branch %q: %w", args.BranchID, err)
 	}
 	return nil
+}
+
+// DistributedForkMemoryHandoffStatus reports asynchronous reader-switch progress.
+func (s *Sandbox) DistributedForkMemoryHandoffStatus(branchID string) (boot.DistributedForkHandoffStatus, error) {
+	var status boot.DistributedForkHandoffStatus
+	if err := s.call(boot.ContMgrDistributedForkMemoryHandoffStatus, &boot.BranchArgs{ID: branchID}, &status); err != nil {
+		return boot.DistributedForkHandoffStatus{}, fmt.Errorf("reading distributed graph handoff for branch %q: %w", branchID, err)
+	}
+	return status, nil
 }
 
 // DistributedForkSessionStatus returns remote-memory transfer progress.

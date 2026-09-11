@@ -907,9 +907,6 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 	if _, err := r.backend.commandWithFiles(files, args...); err != nil {
 		return fmt.Errorf("switching distributed target to graph memory: %w", err)
 	}
-	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, branch.DependentFilesystemBytes); err != nil {
-		return fmt.Errorf("recording graph memory independence: %w", err)
-	}
 	return nil
 }
 
@@ -954,6 +951,46 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Transaction) error {
 	if r == nil || r.backend == nil || tx == nil {
 		return nil
+	}
+	if tx.GraphHandoff != nil {
+		info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+		if err != nil {
+			return err
+		}
+		output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
+		if err != nil {
+			return fmt.Errorf("reading graph memory handoff status: %w", err)
+		}
+		var status boot.DistributedForkHandoffStatus
+		if err := json.Unmarshal(output, &status); err != nil {
+			return fmt.Errorf("decoding graph memory handoff status: %w", err)
+		}
+		if status.Snapshot != tx.GraphHandoff.GraphSnapshot {
+			return fmt.Errorf("graph memory handoff snapshot is %d, want %d", status.Snapshot, tx.GraphHandoff.GraphSnapshot)
+		}
+		if !status.Done {
+			return errors.New("graph memory handoff is still in progress")
+		}
+		if status.Error != "" {
+			return fmt.Errorf("graph memory handoff failed: %s", status.Error)
+		}
+		if _, err := r.backend.command("timetravel", info.ID, "distributed-filesystem-drain", branch.ID); err != nil {
+			return fmt.Errorf("starting graph handoff filesystem drain: %w", err)
+		}
+		output, err = r.backend.command("timetravel", info.ID, "distributed-filesystem-drain-status", branch.ID)
+		if err != nil {
+			return fmt.Errorf("reading graph handoff filesystem drain status: %w", err)
+		}
+		var filesystemStatus boot.DistributedForkFilesystemDrainStatus
+		if err := json.Unmarshal(output, &filesystemStatus); err != nil {
+			return fmt.Errorf("decoding graph handoff filesystem drain status: %w", err)
+		}
+		if !filesystemStatus.Done {
+			return errors.New("graph filesystem handoff is still in progress")
+		}
+		if filesystemStatus.Error != "" {
+			return fmt.Errorf("graph filesystem handoff failed: %s", filesystemStatus.Error)
+		}
 	}
 	return r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, 0)
 }
@@ -3258,7 +3295,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	var sharedReferences *sharedReferenceService
 	if clusterRuntime != nil {
-		sharedReferences = newSharedReferenceService(dataRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
+		sharedReferences = newSharedReferenceService(localRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
 		server.sharedReferences = sharedReferences
 	}
 	var publicationQueue *ttcstorage.Queue
@@ -3354,6 +3391,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		clusterRuntime.controlPlane.SnapshotProvider = graphProvider
 		clusterRuntime.controlPlane.SnapshotReferences = graphProvider
 		clusterRuntime.controlPlane.SharedReferences = sharedReferences
+		clusterRuntime.controlPlane.ReferenceInventory = sharedReferences
 		resolver, err := ttcsnapshot.NewResolver(snapshotGraph, snapshotData,
 			raftOriginLocator{authority: clusterRuntime.raftCatalog},
 			clusterPeerSources{runtime: clusterRuntime.source}, sharedObjects)
@@ -3477,22 +3515,36 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		server.distributedSource = clusterRuntime.source
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
+			authorityState, err := clusterRuntime.raftCatalog.AuthorityState()
+			if err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("reading initial Raft execution grants: %w", err)
+			}
+			lastExecutionGrants := nodeExecutionGrants(authorityState, elasticRecord.NodeID, elasticRecord.Incarnation)
 			heartbeatFatal := make(chan error, 1)
 			heartbeatStopped := make(chan struct{})
 			elasticHeartbeatStopped = heartbeatStopped
 			go func(record cluster.NodeRecord) {
 				defer close(heartbeatStopped)
 				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func() error {
-					unlock := server.lockDataRoot(server.dataRoot)
-					enforceErr := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation)
-					unlock()
-					if enforceErr != nil {
-						// A committed revocation must be enforced before this node may
-						// consume its renewed lease. Fail closed immediately rather than
-						// waiting for the guardian deadline.
-						_ = fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
-						return fmt.Errorf("enforcing Raft branch authority: %w", enforceErr)
+					state, err := clusterRuntime.raftCatalog.AuthorityState()
+					if err != nil {
+						return fmt.Errorf("reading Raft execution grants: %w", err)
 					}
+					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
+					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) {
+						unlock := server.lockDataRoot(server.dataRoot)
+						enforceErr := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation)
+						unlock()
+						if enforceErr != nil {
+							// A committed revocation must be enforced before this node may
+							// consume its renewed lease. Fail closed immediately rather than
+							// waiting for the guardian deadline.
+							_ = fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
+							return fmt.Errorf("enforcing Raft branch authority: %w", enforceErr)
+						}
+					}
+					lastExecutionGrants = currentExecutionGrants
 					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
 						return fmt.Errorf("notifying execution-lease guardian: %w", err)
 					}

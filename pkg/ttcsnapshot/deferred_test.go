@@ -16,8 +16,10 @@ package ttcsnapshot
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestDeferredFilesystemRootLoadsOnlyTraversedMetadata(t *testing.T) {
@@ -124,5 +126,157 @@ func TestDeferredFilesystemRootLoadsOnlyTraversedMetadata(t *testing.T) {
 	}
 	if entry, ok, err := target.FilesystemLookup(root, 1, "file-257"); err != nil || !ok || entry.Inode != 257 {
 		t.Fatalf("reattached lookup=(%+v,%t,%v), want inode 257", entry, ok, err)
+	}
+}
+
+func TestDeferredResolutionAllowsReentrantAncestorLookup(t *testing.T) {
+	source, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	sourceOrigin, err := source.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoot, err := source.ApplyFilesystem(sourceOrigin, "source", []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755}},
+		{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "value", Inode: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Seal(sourceOrigin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetOrigin, err := target.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerRoot, err := target.ImportDeferredFilesystemRoot(targetOrigin, "inner", "peer-inner", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerRoot, err := target.ImportDeferredFilesystemRoot(targetOrigin, "outer", "peer-outer", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadSource := func(id ObjectID) (Object, error) {
+		object, ok := source.Object(id)
+		if !ok {
+			return Object{}, fmt.Errorf("source object %s is absent", id)
+		}
+		return object, nil
+	}
+	if err := target.AttachDeferredResolver("peer-inner", targetOrigin, loadSource); err != nil {
+		t.Fatal(err)
+	}
+	var outerLoads atomic.Int64
+	if err := target.AttachDeferredResolver("peer-outer", targetOrigin, func(id ObjectID) (Object, error) {
+		outerLoads.Add(1)
+		// A multi-hop provider may need to expand a different local stub in
+		// this same graph before it can answer the outer request.
+		if _, err := target.ResolveObject(innerRoot); err != nil {
+			return Object{}, err
+		}
+		return loadSource(id)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		entry, ok, err := target.FilesystemLookup(outerRoot, 1, "value")
+		if err == nil && (!ok || entry.Inode != 2) {
+			err = fmt.Errorf("lookup=(%+v,%t), want inode 2", entry, ok)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reentrant deferred resolution deadlocked")
+	}
+	if outerLoads.Load() == 0 {
+		t.Fatal("outer deferred resolver was not called")
+	}
+}
+
+func TestDeferredResolutionSingleFlightsProviderRead(t *testing.T) {
+	source, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	sourceOrigin, err := source.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoot, err := source.ApplyFilesystem(sourceOrigin, "source", []FilesystemOperation{{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Seal(sourceOrigin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	target, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetOrigin, err := target.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := target.ImportDeferredFilesystemRoot(targetOrigin, "target", "peer", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var loads atomic.Int64
+	if err := target.AttachDeferredResolver("peer", targetOrigin, func(id ObjectID) (Object, error) {
+		if loads.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		object, ok := source.Object(id)
+		if !ok {
+			return Object{}, fmt.Errorf("source object %s is absent", id)
+		}
+		return object, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := target.ResolveObject(root)
+			errs <- err
+		}()
+	}
+	<-entered
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("provider loads=%d, want one", got)
 	}
 }
