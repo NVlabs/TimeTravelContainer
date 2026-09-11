@@ -90,7 +90,7 @@ ttc fork "$ROOTFS_CONTAINER@main" child >/dev/null
 ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
 ttc exec "$ROOTFS_CONTAINER@main" test ! -e /rootfs-child
 ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
-find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/objects" -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/data/files" -type f -size +0c | grep . >/dev/null ||
   fail "running rootfs did not create a non-empty disk object"
 if find "$DATA_ROOT/containers/$ROOTFS_ID" -type f -name '*.tar' | grep . >/dev/null; then
   fail "writable rootfs unexpectedly created a tar persistence image"
@@ -138,7 +138,7 @@ ttc exec "$HOST_COW_CONTAINER@main" sh -c 'echo parent >/data/value; echo parent
 test ! -e "$HOST_COW_SOURCE/created" ||
   fail "writable host mount created a host file"
 HOST_COW_ID=$(ttc inspect -f '{{.Id}}' "$HOST_COW_CONTAINER")
-find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/data/files/*' -type f -size +0c | grep . >/dev/null ||
   fail "writable host mount did not write directly to a private repository"
 ttc fork "$HOST_COW_CONTAINER@main" child >/dev/null
 ttc exec "$HOST_COW_CONTAINER@child" sh -c 'test "$(cat /data/value)" = parent; echo child >/data/value; echo child >/data/child'
@@ -255,9 +255,9 @@ ttc exec "$MAIN@main" sh -c '
 
 # The canonical bytes and namespace are already disk objects while running;
 # no tmpfs/tar export is involved.
-find "$DATA_ROOT/volumes-v2" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/filesystems/volumes" -path '*/data/files/*' -type f -size +0c | grep . >/dev/null ||
   fail "running volume did not create a non-empty disk object"
-if find "$DATA_ROOT/volumes-v2" -type f -name '*.tar' | grep . >/dev/null; then
+if find "$DATA_ROOT/filesystems/volumes" -type f -name '*.tar' | grep . >/dev/null; then
   fail "managed volume unexpectedly created a tar persistence image"
 fi
 
