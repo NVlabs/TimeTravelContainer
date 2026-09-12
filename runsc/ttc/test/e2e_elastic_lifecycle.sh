@@ -53,8 +53,11 @@ cleanup() {
 	stop_session "$PID_B"
 	stop_session "$PID_A"
 	root_pattern="[/]${ROOT#/}"
-	root_pids=$(pgrep -f "$root_pattern" 2>/dev/null || true)
-	test -z "$root_pids" || kill -KILL $root_pids >/dev/null 2>&1 || true
+	for root_pid in $(pgrep -f "$root_pattern" 2>/dev/null || true); do
+		executable=$(readlink "/proc/$root_pid/exe" 2>/dev/null || true)
+		test "${executable##*/}" = ttcd || continue
+		kill -KILL "$root_pid" >/dev/null 2>&1 || true
+	done
 	if test -z "$KEEP_ROOT" && test -z "${TTC_ELASTIC_TEST_ROOT:-}"; then
 		rm -rf "$ROOT"
 	else
@@ -114,12 +117,15 @@ test "$(client a node ls --json | jq 'length')" -eq 3
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" --shm-size 32m "$IMAGE" sh -c \
 	'dd if=/dev/zero of=/dev/shm/resident bs=1M count=16 2>/dev/null; printf ELASTIC-MARK | dd of=/dev/shm/resident conv=notrunc 2>/dev/null; exec sleep 3600' >/dev/null
+source_digest=$(client a exec "$NAME@main" sha256sum /dev/shm/resident | awk '{print $1}')
 client a fork --node node-b "$NAME@main" child >/dev/null
+test "$(client b exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
 client b quarantine "$NAME@child" >/dev/null
 client b migrate --node node-c "$NAME@child" >/dev/null
 test "$(branch_field c child node_id)" = node-c
 test "$(branch_field c child quarantined)" = true
 test "$(client c exec "$NAME@child" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
+test "$(client c exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
 
 # Retiring node-a must move its remaining running branch, preserve its state,
 # and stop that daemon only after no authoritative state remains on its local
@@ -134,6 +140,7 @@ case "$owner" in
 	*) echo "retired node-a left main on unexpected owner $owner" >&2; exit 1 ;;
 esac
 test "$(client "$owner_client" exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
+test "$(client "$owner_client" exec "$NAME@main" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
 client c unquarantine "$NAME@child" >/dev/null
 # False boolean fields are omitted from the compact JSON representation.
 test "$(branch_field c child quarantined)" != true

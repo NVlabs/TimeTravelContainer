@@ -268,8 +268,24 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid daemon stream content type", http.StatusUnsupportedMediaType)
 		return
 	}
-	if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
+	controller := http.NewResponseController(w)
+	if err := controller.EnableFullDuplex(); err != nil {
 		http.Error(w, "cluster transport does not support full-duplex streams: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The HTTP server's ordinary request deadlines are appropriate for bounded
+	// control RPCs, but a daemon stream may contain an interactive exec or a
+	// node retirement whose evacuation legitimately takes longer than the
+	// server WriteTimeout. That deadline starts when the request is accepted,
+	// not when its first response byte is written; leaving it armed can discard
+	// the final successful status frame after a slow migration. The caller's
+	// context remains the lifetime and cancellation bound for this stream.
+	if err := controller.SetReadDeadline(time.Time{}); err != nil {
+		http.Error(w, "cluster transport cannot clear daemon-stream read deadline: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
+		http.Error(w, "cluster transport cannot clear daemon-stream write deadline: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	conn, err := net.Dial("unix", p.socket)
@@ -1363,7 +1379,19 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	monitorBackend.stdin = strings.NewReader("")
 	monitorBackend.stdout = io.Discard
 	monitorBackend.stderr = io.Discard
-	go monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+	// A cordoned source is being evacuated. drainNode immediately establishes
+	// an eager independence barrier after this call returns, so racing that
+	// barrier with the ordinary asynchronous graph handoff creates two terminal
+	// consumers of the same live filesystem session. In particular, a slow
+	// shared filesystem can let the reader switch win while the eager
+	// filesystem walk is still using the source stream. Use the direct drain
+	// path exclusively for retirement; target execution is already active, and
+	// node shutdown must wait for complete materialization in either case.
+	if sourceRecord.State == cluster.NodeDraining {
+		go monitorBackend.monitorDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+	} else {
+		go monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+	}
 	go monitorBackend.monitorSparseMigrationCleanup(peer, info.ID, target.branch, requestID, relay)
 	return nil
 }
@@ -1982,6 +2010,23 @@ func selectAdmissionNode(records []cluster.NodeRecord, local cluster.Capabilitie
 	}
 	sort.Slice(candidates, func(i, j int) bool { return nodeLoadLess(candidates[i], candidates[j]) })
 	return candidates[0], nil
+}
+
+// selectAdmissionNodeExcluding repeats admission after a peer connection was
+// refused before any request bytes could be delivered. Exclusion is local to
+// this command attempt: Raft membership and leases remain authoritative, while
+// an unplaced operation is free to choose another accepting node immediately.
+func selectAdmissionNodeExcluding(records []cluster.NodeRecord, local cluster.Capabilities, now time.Time, excluded map[string]struct{}) (cluster.NodeRecord, error) {
+	if len(excluded) == 0 {
+		return selectAdmissionNode(records, local, now)
+	}
+	eligible := make([]cluster.NodeRecord, 0, len(records))
+	for _, record := range records {
+		if _, skip := excluded[record.NodeID]; !skip {
+			eligible = append(eligible, record)
+		}
+	}
+	return selectAdmissionNode(eligible, local, now)
 }
 
 func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, error) {

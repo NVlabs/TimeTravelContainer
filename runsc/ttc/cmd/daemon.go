@@ -1802,60 +1802,65 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 		if err != nil {
 			return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		if tx.State == cluster.TransactionPublished {
-			draining, err := peer.Drain(ctx, tx.Identity.TransactionID, tx.Revision)
-			if err != nil {
-				if current, statusErr := peer.Status(ctx, tx.Identity.TransactionID); statusErr != nil ||
-					(current.State != cluster.TransactionDraining && current.State != cluster.TransactionIndependent) {
-					settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
-					if authorityErr != nil {
-						cancel()
-						return fmt.Errorf("rechecking distributed target %q after drain failure: %w", tx.Identity.TargetContainer, authorityErr)
-					}
-					if !settled {
-						cancel()
-						return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, err)
-					}
-					tx.State = cluster.TransactionIndependent
-				} else {
-					tx = *current
-				}
-			} else {
-				tx = *draining
-			}
-		}
-		ticker := time.NewTicker(100 * time.Millisecond)
+		// Drive both halves of the independence barrier. Drain materializes
+		// remote memory and advances Published -> Draining. MarkIndependent
+		// verifies memory completion, materializes every deferred filesystem
+		// object, and only then advances Draining -> Independent. Merely polling
+		// after Drain leaves filesystem-backed transactions in Draining forever.
+		//
+		// Each RPC is bounded so a lost peer is observable, but the operation as
+		// a whole has no data-size timeout: a healthy target on a throttled shared
+		// filesystem may legitimately need longer than any fixed deadline. Both
+		// transitions and their runtime operations are idempotent, so a request
+		// whose response was lost can be retried safely.
 		for tx.State != cluster.TransactionIndependent {
-			select {
-			case <-ctx.Done():
-				ticker.Stop()
-				cancel()
-				return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, ctx.Err())
-			case <-ticker.C:
-			}
-			current, err := peer.Status(ctx, tx.Identity.TransactionID)
-			if err != nil {
-				settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
-				if authorityErr != nil {
-					ticker.Stop()
-					cancel()
-					return fmt.Errorf("rechecking distributed target %q while draining: %w", tx.Identity.TargetContainer, authorityErr)
-				}
-				if settled {
-					tx.State = cluster.TransactionIndependent
-				}
-				continue
-			}
-			tx = *current
-			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
-				ticker.Stop()
+			var (
+				current *cluster.Transaction
+				stepErr error
+			)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			switch tx.State {
+			case cluster.TransactionPublished:
+				current, stepErr = peer.Drain(ctx, tx.Identity.TransactionID, tx.Revision)
+			case cluster.TransactionDraining:
+				current, stepErr = peer.MarkIndependent(ctx, tx.Identity.TransactionID, tx.Revision)
+			case cluster.TransactionCanceled, cluster.TransactionFailed:
 				cancel()
 				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+			default:
+				cancel()
+				return fmt.Errorf("distributed target %q is unexpectedly %s while draining", tx.Identity.TargetContainer, tx.State)
 			}
+			cancel()
+			if stepErr == nil && current != nil {
+				tx = *current
+				continue
+			}
+
+			// The target may have committed the transition after the caller's
+			// deadline or returned the expected "still in progress" conflict.
+			// Re-read its state before deciding whether the retry is necessary.
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			current, statusErr := peer.Status(ctx, tx.Identity.TransactionID)
+			cancel()
+			if statusErr == nil {
+				tx = *current
+				if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+					return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
+			if authorityErr != nil {
+				return fmt.Errorf("rechecking distributed target %q while draining: %w", tx.Identity.TargetContainer, authorityErr)
+			}
+			if settled {
+				tx.State = cluster.TransactionIndependent
+				break
+			}
+			return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, errors.Join(stepErr, statusErr))
 		}
-		ticker.Stop()
-		cancel()
 		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
 	}
 	return nil
@@ -4147,6 +4152,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	if s.distributedSource != nil && s.clusterCapabilities != nil {
 		owner := ""
+		automaticPlacement := false
+		failedAdmissionNodes := make(map[string]struct{})
 		var err error
 		if len(request.PlacementClaims) == 0 {
 			owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, request.Args)
@@ -4183,9 +4190,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				}
 				owner = selected.NodeID
 				request.PlacementNode = owner
+				automaticPlacement = true
 			}
 		}
-		if owner != "" && owner != s.clusterCapabilities.NodeID {
+		for owner != "" && owner != s.clusterCapabilities.NodeID {
 			if slices.Contains(request.Route, owner) || slices.Contains(request.Route, s.clusterCapabilities.NodeID) {
 				writeError(fmt.Errorf("cluster command routing loop through %v to node %q", request.Route, owner))
 				return
@@ -4195,8 +4203,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				writeError(err)
 				return
 			}
-			request.Route = append(request.Route, s.clusterCapabilities.NodeID)
-			encoded, err := json.Marshal(&request)
+			proxiedRequest := request
+			proxiedRequest.Route = append(append([]string(nil), request.Route...), s.clusterCapabilities.NodeID)
+			encoded, err := json.Marshal(&proxiedRequest)
 			if err != nil {
 				writeError(err)
 				return
@@ -4205,10 +4214,30 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if request.Stdin {
 				input = io.MultiReader(input, reader)
 			}
-			if err := peer.ProxyDaemon(context.Background(), input, conn); err != nil {
+			if err := peer.ProxyDaemon(context.Background(), input, conn); err == nil {
+				return
+			} else if !automaticPlacement || request.Stdin || !errors.Is(err, syscall.ECONNREFUSED) {
 				writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
+				return
 			}
-			return
+
+			// A refused connection proves that no request reached this
+			// automatically selected peer. The branch is still unplaced, so retry
+			// admission without waiting for the peer lease to expire. Explicit
+			// placement and streaming input are never replayed.
+			failedAdmissionNodes[owner] = struct{}{}
+			records, listErr := s.clusterDirectory.List()
+			if listErr != nil {
+				writeError(fmt.Errorf("reselecting cluster placement after node %q refused the connection: %w", owner, listErr))
+				return
+			}
+			selected, selectErr := selectAdmissionNodeExcluding(records, *s.clusterCapabilities, time.Now(), failedAdmissionNodes)
+			if selectErr != nil {
+				writeError(fmt.Errorf("reselecting cluster placement after node %q refused the connection: %w", owner, selectErr))
+				return
+			}
+			owner = selected.NodeID
+			request.PlacementNode = owner
 		}
 	}
 	if s.clusterDirectory != nil && daemonCommandNeedsPlacementAdmission(request.Args) {

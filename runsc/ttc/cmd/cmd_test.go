@@ -5230,6 +5230,16 @@ func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 	if selected, err := selectAdmissionNode([]cluster.NodeRecord{full}, local, now); err == nil {
 		t.Fatalf("selected full node %+v", selected)
 	}
+	selected, err = selectAdmissionNodeExcluding([]cluster.NodeRecord{
+		record("node-a", 1<<30, 8<<30, 0),
+		record("node-b", 2<<30, 8<<30, 0),
+	}, local, now, map[string]struct{}{"node-a": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.NodeID != "node-b" {
+		t.Fatalf("selected excluded node %q, want node-b", selected.NodeID)
+	}
 }
 
 func TestParseDistributedFamilyMutation(t *testing.T) {

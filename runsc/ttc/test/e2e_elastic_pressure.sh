@@ -8,7 +8,7 @@ TTC=${TTC:-ttc}
 TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_ELASTIC_PRESSURE_IMAGE:-busybox:1.36}
 ROOT=${TTC_ELASTIC_PRESSURE_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-pressure.XXXXXX")}
-SHARED=$ROOT/shared
+SHARED=${TTC_ELASTIC_PRESSURE_SHARED_ROOT:-$ROOT/shared}
 TOKEN=ttc-elastic-pressure-$$
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 PORT_A=${TTC_ELASTIC_PRESSURE_PORT_A:-20383}
@@ -50,8 +50,11 @@ cleanup() {
 	stop_session "$PID_B"
 	stop_session "$PID_A"
 	root_pattern="[/]${ROOT#/}"
-	root_pids=$(pgrep -f "$root_pattern" 2>/dev/null || true)
-	test -z "$root_pids" || kill -KILL $root_pids >/dev/null 2>&1 || true
+	for root_pid in $(pgrep -f "$root_pattern" 2>/dev/null || true); do
+		executable=$(readlink "/proc/$root_pid/exe" 2>/dev/null || true)
+		test "${executable##*/}" = ttcd || continue
+		kill -KILL "$root_pid" >/dev/null 2>&1 || true
+	done
 	if test -z "${TTC_ELASTIC_PRESSURE_ROOT:-}"; then rm -rf "$ROOT"; else echo "TTC elastic pressure root retained at $ROOT" >&2; fi
 }
 trap cleanup EXIT
