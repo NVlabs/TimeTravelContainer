@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,6 +51,14 @@ type Publisher interface {
 	Cleanup(Intent) error
 }
 
+// cancellationFencer is implemented by distributed publishers whose control
+// plane can reject an in-flight Complete before physical cleanup is safe. The
+// durable local tombstone is installed first; Raft then gives commit versus
+// cancel one total order.
+type cancellationFencer interface {
+	FenceCancellation(Intent) error
+}
+
 // Queue persists intents before returning to lifecycle commands and retries
 // them after daemon restart.
 type Queue struct {
@@ -80,6 +89,9 @@ func Open(localRoot string, publisher Publisher) (*Queue, error) {
 		inFlight: make(map[string]struct{}),
 	}
 	if err := q.recoverCaptures(); err != nil {
+		return nil, err
+	}
+	if err := q.pruneTerminalMarkers(); err != nil {
 		return nil, err
 	}
 	go q.run()
@@ -137,8 +149,13 @@ func (q *Queue) Cancel(container, branch string, generation uint64) error {
 	if err := writeJSONAtomic(q.path("canceled", id), map[string]any{"id": id, "canceled_at": time.Now().UTC()}); err != nil {
 		return err
 	}
-	if err := os.Remove(q.path("pending", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	if readErr == nil && intent.ID != "" {
+		if fencer, ok := q.publisher.(cancellationFencer); ok {
+			if err := fencer.FenceCancellation(intent); err != nil {
+				q.signal()
+				return err
+			}
+		}
 	}
 	q.mu.Lock()
 	_, inFlight := q.inFlight[id]
@@ -146,9 +163,45 @@ func (q *Queue) Cancel(container, branch string, generation uint64) error {
 	// The worker owns cleanup once publication has started. It observes the
 	// durable cancellation fence before completing or retrying the intent.
 	if !inFlight && readErr == nil && intent.ID != "" {
-		readErr = q.publisher.Cleanup(intent)
+		if cleanupErr := q.publisher.Cleanup(intent); cleanupErr != nil {
+			readErr = cleanupErr
+			intent.Attempts++
+			intent.LastError = cleanupErr.Error()
+			intent.RetryAt = time.Now().Add(time.Second << min(intent.Attempts-1, 8)).UTC()
+			if err := writeJSONAtomic(q.path("pending", id), intent); err != nil {
+				readErr = errors.Join(readErr, err)
+			}
+		} else if err := q.finishCancellation(id); err != nil {
+			readErr = err
+		}
+	}
+	if !inFlight && (readErr == nil || errors.Is(readErr, os.ErrNotExist)) && intent.ID == "" {
+		if err := os.Remove(q.path("canceled", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			readErr = errors.Join(readErr, err)
+		}
 	}
 	q.signal()
+	if inFlight {
+		for {
+			q.mu.Lock()
+			_, active := q.inFlight[id]
+			q.mu.Unlock()
+			if !active {
+				pending, err := q.read(id + ".json")
+				if errors.Is(err, os.ErrNotExist) {
+					return readErr
+				}
+				if err != nil {
+					return errors.Join(readErr, err)
+				}
+				if pending.LastError != "" {
+					return errors.Join(readErr, errors.New(pending.LastError))
+				}
+				return readErr
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	return readErr
 }
 
@@ -267,20 +320,36 @@ func (q *Queue) process() time.Duration {
 	next := time.Hour
 	for _, intent := range intents {
 		q.mu.Lock()
-		if q.canceled(intent.ID) {
-			q.mu.Unlock()
-			_ = os.Remove(q.path("pending", intent.ID))
-			continue
-		}
-		if !intent.CaptureReady {
-			q.mu.Unlock()
-			continue
-		}
 		if intent.RetryAt.After(now) {
 			q.mu.Unlock()
 			if delay := time.Until(intent.RetryAt); delay < next {
 				next = delay
 			}
+			continue
+		}
+		if q.canceled(intent.ID) {
+			q.inFlight[intent.ID] = struct{}{}
+			q.mu.Unlock()
+			cleanupErr := q.publisher.Cleanup(intent)
+			q.mu.Lock()
+			if cleanupErr == nil {
+				_ = q.finishCancellation(intent.ID)
+			} else {
+				intent.Attempts++
+				intent.LastError = cleanupErr.Error()
+				delay := time.Second << min(intent.Attempts-1, 8)
+				intent.RetryAt = time.Now().Add(delay).UTC()
+				_ = writeJSONAtomic(q.path("pending", intent.ID), intent)
+				if delay < next {
+					next = delay
+				}
+			}
+			delete(q.inFlight, intent.ID)
+			q.mu.Unlock()
+			continue
+		}
+		if !intent.CaptureReady {
+			q.mu.Unlock()
 			continue
 		}
 		q.inFlight[intent.ID] = struct{}{}
@@ -296,9 +365,20 @@ func (q *Queue) process() time.Duration {
 		q.mu.Unlock()
 
 		if canceled {
-			_ = q.publisher.Cleanup(intent)
+			cleanupErr := q.publisher.Cleanup(intent)
 			q.mu.Lock()
-			_ = os.Remove(q.path("pending", intent.ID))
+			if cleanupErr == nil {
+				_ = q.finishCancellation(intent.ID)
+			} else {
+				intent.Attempts++
+				intent.LastError = cleanupErr.Error()
+				delay := time.Second << min(intent.Attempts-1, 8)
+				intent.RetryAt = time.Now().Add(delay).UTC()
+				_ = writeJSONAtomic(q.path("pending", intent.ID), intent)
+				if delay < next {
+					next = delay
+				}
+			}
 			delete(q.inFlight, intent.ID)
 			q.mu.Unlock()
 			continue
@@ -310,13 +390,12 @@ func (q *Queue) process() time.Duration {
 		q.mu.Lock()
 		canceled = q.canceled(intent.ID)
 		if canceled {
-			_ = os.Remove(q.path("pending", intent.ID))
+			_ = q.finishCancellation(intent.ID)
 			delete(q.inFlight, intent.ID)
 			q.mu.Unlock()
 			continue
 		}
 		if publishErr == nil {
-			_ = writeJSONAtomic(q.path("complete", intent.ID), result)
 			_ = os.Remove(q.path("pending", intent.ID))
 			delete(q.inFlight, intent.ID)
 			q.mu.Unlock()
@@ -335,6 +414,45 @@ func (q *Queue) process() time.Duration {
 		}
 	}
 	return next
+}
+
+// finishCancellation deletes the work item before its tombstone. This order is
+// the cancellation fence: after a crash, a surviving pending intent still sees
+// the tombstone, while a surviving tombstone with no pending intent is inert
+// and can be pruned at startup.
+func (q *Queue) finishCancellation(id string) error {
+	if err := os.Remove(q.path("pending", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(q.path("canceled", id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (q *Queue) pruneTerminalMarkers() error {
+	for _, kind := range []string{"canceled", "complete"} {
+		entries, err := os.ReadDir(filepath.Join(q.root, kind))
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			if kind == "canceled" {
+				if _, err := os.Stat(filepath.Join(q.root, "pending", entry.Name())); err == nil {
+					continue
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			if err := os.Remove(filepath.Join(q.root, kind, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (q *Queue) recoverCaptures() error {

@@ -6,6 +6,8 @@ package storage
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +44,22 @@ type blockingPublisher struct {
 	started chan struct{}
 	release chan struct{}
 	cleaned chan struct{}
+}
+
+type retryCleanupPublisher struct {
+	testPublisher
+	mu       sync.Mutex
+	attempts int
+}
+
+func (p *retryCleanupPublisher) Cleanup(Intent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.attempts++
+	if p.attempts == 1 {
+		return errors.New("injected cleanup failure")
+	}
+	return nil
 }
 
 func (p *blockingPublisher) CaptureAvailable(Intent) (bool, error) { return true, nil }
@@ -110,9 +128,10 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	}
 }
 
-func TestCancelFencesPendingGeneration(t *testing.T) {
+func TestCancelWithoutPendingGenerationIsNoop(t *testing.T) {
 	publisher := &testPublisher{completed: make(chan Intent, 1)}
-	queue, err := Open(t.TempDir(), publisher)
+	root := t.TempDir()
+	queue, err := Open(root, publisher)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,14 +139,12 @@ func TestCancelFencesPendingGeneration(t *testing.T) {
 	if err := queue.Cancel("family", "reused", 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Enqueue(Intent{Container: "family", Branch: "reused", Generation: 3, Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+	entries, err := os.ReadDir(filepath.Join(root, "publication-queue", "canceled"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	select {
-	case <-publisher.completed:
-		t.Fatal("canceled generation was published")
-	default:
+	if len(entries) != 0 {
+		t.Fatalf("cancel without pending work retained markers: %v", entries)
 	}
 }
 
@@ -157,6 +174,13 @@ func TestCancelBranchRemovesSupersededGenerations(t *testing.T) {
 	if len(pending) != 1 || pending[0].Branch != "peer" {
 		t.Fatalf("pending after branch cancellation = %+v, want only peer", pending)
 	}
+	entries, err := os.ReadDir(filepath.Join(queue.root, "canceled"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("completed branch cancellation retained markers: %v", entries)
+	}
 }
 
 func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
@@ -180,9 +204,8 @@ func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("publication did not start")
 	}
-	if err := queue.Cancel("family", "main", 1); err != nil {
-		t.Fatal(err)
-	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- queue.Cancel("family", "main", 1) }()
 	select {
 	case <-publisher.cleaned:
 		t.Fatal("capture was cleaned while publisher was using it")
@@ -194,6 +217,9 @@ func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("worker did not clean canceled capture")
 	}
+	if err := <-canceled; err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		pending, err := queue.Pending()
@@ -202,6 +228,38 @@ func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("canceled intent was resurrected: pending=%+v, err=%v", pending, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCanceledCleanupRetriesFromDurableIntent(t *testing.T) {
+	publisher := &retryCleanupPublisher{testPublisher: testPublisher{completed: make(chan Intent, 1)}}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	intent := Intent{Container: "family", Branch: "main", Generation: 9, Kind: "stop", FilesystemBranch: "capture"}
+	if err := queue.Enqueue(intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Cancel("family", "main", 9); err == nil {
+		t.Fatal("Cancel succeeded despite injected cleanup failure")
+	}
+	pending, err := queue.Pending()
+	if err != nil || len(pending) != 1 || pending[0].LastError == "" {
+		t.Fatalf("failed canceled cleanup was not retained: pending=%+v err=%v", pending, err)
+	}
+	queue.signal()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err = queue.Pending()
+		if err == nil && len(pending) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("canceled cleanup was not retried: pending=%+v err=%v", pending, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

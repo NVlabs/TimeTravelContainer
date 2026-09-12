@@ -588,6 +588,17 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if volatile {
 			continue
 		}
+		// An abandoned provider origin and a committed shared origin both lack a
+		// volatile route. Only the latter has an immutable shared manifest and a
+		// corresponding shared-ledger baseline. Removal may be retrying after it
+		// already reclaimed the former, so do not invent a shared release.
+		if b.snapshotShared != nil {
+			if _, err := b.snapshotShared.Manifest(id.Snapshot); errors.Is(err, os.ErrNotExist) {
+				continue
+			} else if err != nil {
+				return err
+			}
+		}
 		lease, err := b.distributedSource.authority.SharedGCLease()
 		if err != nil {
 			return err

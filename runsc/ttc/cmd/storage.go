@@ -374,6 +374,15 @@ type branchPublisher struct {
 	event        func(DaemonEvent)
 }
 
+// FenceCancellation orders cancellation against the publication's one
+// irreversible Raft commit before waiting for data-plane cleanup.
+func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
+	if p.authority == nil {
+		return nil
+	}
+	return p.authority.CancelPublication(intent.Container, intent.Branch, intent.Generation)
+}
+
 func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
@@ -671,10 +680,24 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 }
 
 func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
+	canceled := p.authority != nil
 	if p.authority != nil {
 		if err := p.authority.CancelPublication(intent.Container, intent.Branch, intent.Generation); err != nil {
 			return fmt.Errorf("canceling publication authority: %w", err)
 		}
+		record, ok, err := p.authority.Publication(intent.Container, intent.Branch, intent.Generation)
+		if err != nil {
+			return fmt.Errorf("reading publication authority after cleanup fence: %w", err)
+		}
+		canceled = ok && record.State == cluster.PublicationCanceled
+	}
+	manifestPath := coldManifestPath(p.sharedRoot, intent.Container, intent.Branch, intent.Generation)
+	var published coldBranchManifest
+	haveManifest := false
+	if manifest, err := readColdBranchManifest(manifestPath); err == nil {
+		published, haveManifest = manifest, true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reading canceled publication manifest: %w", err)
 	}
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
@@ -690,6 +713,11 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		return err
 	}
 	seen := make(map[string]struct{})
+	filesystemOrigins := make(map[string][]uint64)
+	for _, filesystem := range published.Filesystems {
+		filesystemOrigins[filesystem.Root.Source] = append(filesystemOrigins[filesystem.Root.Source], filesystem.Origins...)
+	}
+	emptyFilesystemOrigins := make(map[uint64]bool)
 	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, ok := seen[path]; ok {
@@ -700,14 +728,116 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if err != nil {
 			return err
 		}
+		for _, encodedOrigin := range filesystemOrigins[config.Source] {
+			if !canceled {
+				break
+			}
+			origin := ttcsnapshot.SnapshotID(encodedOrigin)
+			provider, volatile, providerErr := p.authority.SnapshotProvider(encodedOrigin)
+			if providerErr != nil {
+				repository.Close()
+				return providerErr
+			}
+			if volatile && provider.NodeID == p.nodeID {
+				if err := repository.CancelOriginHandoff(origin); err != nil {
+					repository.Close()
+					return fmt.Errorf("canceling filesystem origin %d handoff: %w", origin, err)
+				}
+			}
+		}
 		removeErr := repository.RemoveBranch(repositoryPhysicalBranch(config, intent.FilesystemBranch))
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
 		gcErr := repository.GarbageCollect()
+		for _, encodedOrigin := range filesystemOrigins[config.Source] {
+			empty, emptyErr := repository.OriginEmpty(ttcsnapshot.SnapshotID(encodedOrigin))
+			if emptyErr != nil {
+				closeErr := repository.Close()
+				return errors.Join(emptyErr, closeErr)
+			}
+			emptyFilesystemOrigins[encodedOrigin] = empty
+		}
 		closeErr := repository.Close()
 		if removeErr != nil || gcErr != nil || closeErr != nil {
 			return errors.Join(removeErr, gcErr, closeErr)
+		}
+	}
+	for encodedOrigin, empty := range emptyFilesystemOrigins {
+		if !canceled {
+			break
+		}
+		provider, volatile, err := p.authority.SnapshotProvider(encodedOrigin)
+		if err != nil {
+			return err
+		}
+		if !volatile || provider.NodeID != p.nodeID {
+			continue
+		}
+		if p.graphShared != nil {
+			busy, err := p.graphShared.DiscardHandoff(ttcsnapshot.SnapshotID(encodedOrigin))
+			if err != nil || busy {
+				return errors.Join(err, func() error {
+					if busy {
+						return fmt.Errorf("filesystem origin %d handoff pack is busy", encodedOrigin)
+					}
+					return nil
+				}())
+			}
+		}
+		if empty {
+			if err := p.authority.AbandonSnapshotOrigin(p.nodeID, p.incarnation, encodedOrigin); err != nil {
+				return fmt.Errorf("abandoning empty filesystem origin %d: %w", encodedOrigin, err)
+			}
+		}
+	}
+	if canceled && haveManifest && published.MemorySnapshot != 0 && p.graph != nil && p.graphShared != nil {
+		snapshot := ttcsnapshot.SnapshotID(published.MemorySnapshot)
+		provider, volatile, err := p.authority.SnapshotProvider(published.MemorySnapshot)
+		if err != nil {
+			return err
+		}
+		if volatile && provider.NodeID == p.nodeID {
+			if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
+				return fmt.Errorf("canceling memory origin %d handoff: %w", snapshot, err)
+			}
+			busy, err := p.graphShared.DiscardHandoff(snapshot)
+			if err != nil || busy {
+				return errors.Join(err, func() error {
+					if busy {
+						return fmt.Errorf("memory origin %d handoff pack is busy", snapshot)
+					}
+					return nil
+				}())
+			}
+		}
+	}
+	if canceled && haveManifest {
+		if published.MemoryControlPack != "" {
+			pack, err := ttcpack.ParseID(published.MemoryControlPack)
+			if err != nil {
+				return err
+			}
+			busy, err := ttcpack.Discard(filepath.Join(p.sharedRoot, "cold"), pack)
+			if err != nil {
+				return fmt.Errorf("discarding canceled memory control pack: %w", err)
+			}
+			if busy {
+				return errors.New("discarding canceled memory control pack: pack is busy")
+			}
+		}
+		if err := os.Remove(manifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		// The generation manifest is authoritative; its branch/family
+		// directories are only namespace scaffolding. Remove empty scaffolding
+		// after cancellation so repeated branch creation does not leave one
+		// directory per historical name. Non-empty directories contain another
+		// live generation or branch and are retained.
+		for _, directory := range []string{filepath.Dir(manifestPath), filepath.Dir(filepath.Dir(manifestPath))} {
+			if err := os.Remove(directory); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+				return err
+			}
 		}
 	}
 	if intent.MemoryBranch != "" {
@@ -729,14 +859,21 @@ func publicationMemoryControlPath(localRoot, capture string) string {
 // Branch-local roots remain untouched, and targets now resolve the immutable
 // data from shared storage, so the provider copy is cache rather than
 // authority after this boundary.
-func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, snapshot ttcsnapshot.SnapshotID) error {
+func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, snapshot ttcsnapshot.SnapshotID, exactRoots ...[]string) error {
 	if graph == nil || snapshot == 0 {
 		return nil
 	}
 	prefix := fmt.Sprintf("remote/%d/", snapshot)
+	exact := make(map[string]struct{})
+	if len(exactRoots) != 0 {
+		for _, name := range exactRoots[0] {
+			exact[name] = struct{}{}
+		}
+	}
 	bindings := make(map[string]ttcsnapshot.ObjectID)
 	for name, object := range graph.Inspect().Roots {
-		if !strings.HasPrefix(name, prefix) && !(strings.HasPrefix(name, "bridge/edge/") && object.Snapshot == snapshot) {
+		_, explicitlySelected := exact[name]
+		if !explicitlySelected && !strings.HasPrefix(name, prefix) && !(strings.HasPrefix(name, "bridge/edge/") && object.Snapshot == snapshot) {
 			continue
 		}
 		if object.Snapshot != snapshot {
@@ -836,10 +973,12 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		if branchErr != nil {
 			return branchErr
 		}
+		manifest, err := readColdBranchManifest(result.Manifest)
+		if err != nil {
+			return fmt.Errorf("reading committed cold manifest: %w", err)
+		}
+		var handoffOrigins []uint64
 		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
-			// The shared graph manifest was committed by Publish before the cold
-			// branch manifest. Switch object routing to shared first; a crash here
-			// leaves a retryable publishing branch whose data is already durable.
 			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
 			_, volatile, err := p.authority.SnapshotProvider(branch.SnapshotID)
 			if err != nil {
@@ -862,25 +1001,8 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				if err := p.publishSharedReferenceLedger(snapshot, changes); err != nil {
 					return fmt.Errorf("transferring snapshot origin %d reference authority: %w", branch.SnapshotID, err)
 				}
-				if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, branch.SnapshotID); err != nil {
-					return fmt.Errorf("publishing snapshot origin %d in Raft: %w", branch.SnapshotID, err)
-				}
+				handoffOrigins = append(handoffOrigins, branch.SnapshotID)
 			}
-			if p.graph != nil {
-				if err := p.graph.MarkShared(snapshot); err != nil {
-					return fmt.Errorf("marking snapshot origin %d shared: %w", branch.SnapshotID, err)
-				}
-				if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
-					return fmt.Errorf("consuming snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
-				}
-				if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot); err != nil {
-					return fmt.Errorf("releasing volatile provider roots for snapshot origin %d: %w", branch.SnapshotID, err)
-				}
-			}
-		}
-		manifest, err := readColdBranchManifest(result.Manifest)
-		if err != nil {
-			return fmt.Errorf("reading committed cold manifest: %w", err)
 		}
 		spec, err := store.LoadSpec(info.ID)
 		if err != nil {
@@ -924,14 +1046,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 						repository.Close()
 						return fmt.Errorf("transferring filesystem snapshot origin %d reference authority: %w", origin, err)
 					}
-					if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, encodedOrigin); err != nil {
-						repository.Close()
-						return fmt.Errorf("publishing filesystem snapshot origin %d in Raft: %w", origin, err)
-					}
-				}
-				if err := repository.CompleteOriginHandoff(origin); err != nil {
-					repository.Close()
-					return fmt.Errorf("completing filesystem snapshot origin %d handoff: %w", origin, err)
+					handoffOrigins = append(handoffOrigins, encodedOrigin)
 				}
 			}
 			if err := repository.Close(); err != nil {
@@ -950,8 +1065,40 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			// Snapshot identity, not a runtime checksum, is the protocol root.
 			roots.MemorySnapshot = branch.SnapshotID
 		}
-		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.Generation, roots); err != nil {
+		// This single Raft entry is the irreversible publication boundary. It
+		// installs branch roots, releases placement, and changes every prepared
+		// origin from provider-owned to shared together. Cancellation before it
+		// reverses every handoff; cancellation after it is a no-op.
+		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.Generation, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
 			return fmt.Errorf("committing publication roots in Raft: %w", err)
+		}
+		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && p.graph != nil {
+			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
+			if err := p.graph.MarkShared(snapshot); err != nil {
+				return fmt.Errorf("marking snapshot origin %d shared: %w", branch.SnapshotID, err)
+			}
+			if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
+				return fmt.Errorf("consuming snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
+			}
+			if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot, branch.MemoryRoots); err != nil {
+				return fmt.Errorf("releasing volatile provider roots for snapshot origin %d: %w", branch.SnapshotID, err)
+			}
+		}
+		for _, filesystem := range manifest.Filesystems {
+			config := configBySource[filesystem.Root.Source]
+			repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+			if err != nil {
+				return err
+			}
+			for _, encodedOrigin := range filesystem.Origins {
+				if err := repository.CompleteOriginHandoff(ttcsnapshot.SnapshotID(encodedOrigin)); err != nil {
+					repository.Close()
+					return fmt.Errorf("completing filesystem snapshot origin %d handoff: %w", encodedOrigin, err)
+				}
+			}
+			if err := repository.Close(); err != nil {
+				return err
+			}
 		}
 	} else if p.nodeID != "" {
 		if p.placements == nil {
@@ -1647,8 +1794,38 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	if err := pruneEmptyColdManifestDirectories(root); err != nil {
+		return err
+	}
 	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, olderThan.UnixNano())
 	return err
+}
+
+func pruneEmptyColdManifestDirectories(root string) error {
+	var directories []string
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && path != root {
+			directories = append(directories, path)
+		}
+		return nil
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	sort.Slice(directories, func(i, j int) bool {
+		return strings.Count(directories[i], string(filepath.Separator)) > strings.Count(directories[j], string(filepath.Separator))
+	})
+	for _, directory := range directories {
+		if err := os.Remove(directory); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+	}
+	return nil
 }
 
 // collectTerminalColdStorage is the best-effort terminal hook for asynchronous

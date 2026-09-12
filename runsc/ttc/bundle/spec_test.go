@@ -35,6 +35,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
@@ -2527,6 +2528,77 @@ func TestGarbageCollectRepositoriesSkipsUnmaterializedPrivateRepository(t *testi
 	}
 	if collected != 0 {
 		t.Fatalf("collected=%d, want 0 for an unmaterialized remote repository", collected)
+	}
+}
+
+func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing.T) {
+	sharedRoot := t.TempDir()
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := manager.CreateWithOrigin("data", 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := named.Close(); err != nil {
+		t.Fatal(err)
+	}
+	containerID := strings.Repeat("b", 64)
+	privatePath := filepath.Join(localRoot, "containers", containerID, "rootfs-upper")
+	if err := os.MkdirAll(filepath.Dir(privatePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	private, err := manager.CreatePrivateWithOrigin(privatePath, "rootfs", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := private.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(sharedRoot, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: privatePath, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(repositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: containerID, Name: "inventory", BundleDir: bundleDir, Branches: []BranchInfo{{ID: "main"}}}
+	if err := writeCurrentContainerFixture(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: sharedRoot, ActiveRoot: localRoot}
+	origins, err := store.FilesystemSnapshotOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []ttcsnapshot.SnapshotID{41, 42} {
+		if _, ok := origins[origin]; !ok {
+			t.Errorf("origin inventory does not contain %d: %v", origin, origins)
+		}
+	}
+	if err := manager.RemovePrivate(privatePath); err != nil {
+		t.Fatal(err)
+	}
+	origins, err = store.FilesystemSnapshotOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := origins[42]; ok {
+		t.Errorf("removed private repository origin remains in inventory: %v", origins)
+	}
+	if _, ok := origins[41]; !ok {
+		t.Errorf("named-volume origin disappeared with private repository: %v", origins)
 	}
 }
 

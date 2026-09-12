@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -456,6 +457,43 @@ func Open(repository string, id ID) (*os.File, Index, error) {
 // read only fixed framing and indexed metadata, never the bulk payload.
 func OpenIndexed(repository string, id ID) (*os.File, Index, error) {
 	return open(repository, id)
+}
+
+// Discard removes one transaction-fenced pack that never became reachable
+// from an authoritative manifest. Open readers hold shared locks, so callers
+// retry a busy result instead of creating an NFS unlink tombstone.
+func Discard(repository string, id ID) (busy bool, err error) {
+	path := Path(repository, id)
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		closeErr := file.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return true, closeErr
+		}
+		return false, errors.Join(err, closeErr)
+	}
+	retired := path + fmt.Sprintf(".discarded-%d-%d", os.Getpid(), time.Now().UnixNano())
+	renameErr := os.Rename(path, retired)
+	unlockErr := unix.Flock(int(file.Fd()), unix.LOCK_UN)
+	closeErr := file.Close()
+	if renameErr != nil && !errors.Is(renameErr, os.ErrNotExist) {
+		return false, errors.Join(renameErr, unlockErr, closeErr)
+	}
+	removeErr := os.Remove(retired)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	directory, openErr := os.Open(filepath.Dir(path))
+	if openErr != nil {
+		return false, errors.Join(unlockErr, closeErr, removeErr, openErr)
+	}
+	return false, errors.Join(unlockErr, closeErr, removeErr, directory.Sync(), directory.Close())
 }
 
 func open(repository string, id ID) (*os.File, Index, error) {

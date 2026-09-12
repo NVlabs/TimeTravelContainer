@@ -98,8 +98,9 @@ func TestPublishedOriginReleasesOnlyItsProviderRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindings := map[string]ttcsnapshot.ObjectID{
-		"remote/1/op/00000000": firstObject,
-		"remote/2/op/00000000": secondObject,
+		"remote/1/op/00000000":           firstObject,
+		"memory/published/resource-0000": firstObject,
+		"remote/2/op/00000000":           secondObject,
 	}
 	if err := graph.RetainRoots(bindings); err != nil {
 		t.Fatal(err)
@@ -110,11 +111,14 @@ func TestPublishedOriginReleasesOnlyItsProviderRoots(t *testing.T) {
 	if err := graph.MarkShared(first); err != nil {
 		t.Fatal(err)
 	}
-	if err := releasePublishedProviderGraphRoots(graph, nil, first); err != nil {
+	if err := releasePublishedProviderGraphRoots(graph, nil, first, []string{"memory/published/resource-0000"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := graph.Root("remote/1/op/00000000"); ok {
 		t.Fatal("published provider root remains")
+	}
+	if _, ok := graph.Root("memory/published/resource-0000"); ok {
+		t.Fatal("published branch-local root remains")
 	}
 	if _, ok := graph.Object(firstObject); ok {
 		t.Fatal("published provider-only object remains in local graph")

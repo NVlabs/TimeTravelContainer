@@ -311,6 +311,58 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	}
 }
 
+func TestSharedPackDiscardHandoffWaitsForReaders(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := filepath.Join(directory, "shared")
+	shared, err := OpenSharedPackStore(sharedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, _ := graph.AllocateWorking()
+	id, _ := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	data := bytes.Repeat([]byte{0x3c}, 1<<20)
+	if err := local.Install(id, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(id, "chunk", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.PublishHandoff(context.Background(), graph, origin, local); err != nil {
+		t.Fatal(err)
+	}
+	reader, _, err := shared.Fetch(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.DiscardHandoff(origin); err != nil || !busy {
+		t.Fatalf("DiscardHandoff with reader = (busy=%t, err=%v), want busy", busy, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.DiscardHandoff(origin); err != nil || busy {
+		t.Fatalf("DiscardHandoff after close = (busy=%t, err=%v)", busy, err)
+	}
+	if _, err := shared.Manifest(origin); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded manifest error=%v, want not-exist", err)
+	}
+	if busy, err := shared.DiscardHandoff(origin); err != nil || busy {
+		t.Fatalf("idempotent DiscardHandoff = (busy=%t, err=%v)", busy, err)
+	}
+}
+
 func TestSharedPackCompactionUsesLedgerViewAndWaitsForReaders(t *testing.T) {
 	directory := t.TempDir()
 	graph, err := Open(filepath.Join(directory, "graph"))

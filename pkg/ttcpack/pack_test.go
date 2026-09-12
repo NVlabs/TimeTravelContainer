@@ -24,6 +24,41 @@ func TestLogicalPackIDIsStableAndUnambiguous(t *testing.T) {
 	}
 }
 
+func TestDiscardUncommittedPackWaitsForReader(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "payload"), []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, _, err := Open(repository, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := Discard(repository, id); err != nil || !busy {
+		t.Fatalf("Discard with reader = (busy=%t, err=%v), want busy", busy, err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := Discard(repository, id); err != nil || busy {
+		t.Fatalf("Discard after close = (busy=%t, err=%v)", busy, err)
+	}
+	if _, err := os.Stat(Path(repository, id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded pack stat error=%v, want not-exist", err)
+	}
+	if busy, err := Discard(repository, id); err != nil || busy {
+		t.Fatalf("idempotent Discard = (busy=%t, err=%v)", busy, err)
+	}
+}
+
 func TestLegacyPackFormatIsRejected(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")

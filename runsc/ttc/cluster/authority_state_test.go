@@ -441,6 +441,8 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	state := NewAuthorityState()
 	state.NextSnapshotID = 8
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	state.VolatileOrigins[6] = SnapshotOriginProvider{SnapshotID: 6, NodeID: "node-a"}
+	state.VolatileOrigins[7] = SnapshotOriginProvider{SnapshotID: 7, NodeID: "node-a"}
 	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
@@ -457,7 +459,8 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	}))
 	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
-		Roots: DurableRoots{MemorySnapshot: 7, FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"},
+		Roots:        DurableRoots{MemorySnapshot: 7, FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"},
+		ProviderNode: "node-a", ProviderIncarnation: "incarnation-a", SnapshotOrigins: []uint64{6, 7},
 	})
 	placement := state.Placements[logicalBranchKey("family", "main")]
 	if placement.State != PlacementUnplaced {
@@ -466,6 +469,12 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	branch := state.Branches[logicalBranchKey("family", "main")]
 	if branch.Corrupted || branch.Lifecycle != "exited" || branch.Roots.MemorySnapshot != 7 {
 		t.Fatalf("durable healthy branch authority = %+v", branch)
+	}
+	if _, ok := state.VolatileOrigins[6]; ok {
+		t.Fatal("filesystem origin remained volatile after atomic publication")
+	}
+	if _, ok := state.VolatileOrigins[7]; ok {
+		t.Fatal("memory origin remained volatile after atomic publication")
 	}
 }
 
@@ -555,6 +564,9 @@ func TestAuthorityRetiresTerminalTransactionOnlyAfterTargetRemoval(t *testing.T)
 		OwnerNode: "node-b", OwnerIncarnation: "incarnation-b", Generation: 1,
 		State: PlacementRunning, Revision: 1, UpdatedAt: at,
 	}
+	state.Branches[key] = BranchAuthority{FamilyID: "family", BranchID: "child", Generation: 1, Lifecycle: "running", UpdatedAt: at}
+	publication := PublicationRecord{FamilyID: "family", BranchID: "child", BranchGeneration: 1, StorageGeneration: 7, OperationID: "publication-7", State: PublicationCanceled}
+	state.Publications[publicationKey("family", "child", 7)] = publication
 	command, err := NewAuthorityCommand("retire-live", at.Add(time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "fork-1", Revision: 9})
 	if err != nil {
 		t.Fatal(err)
@@ -565,6 +577,9 @@ func TestAuthorityRetiresTerminalTransactionOnlyAfterTargetRemoval(t *testing.T)
 	applyAuthorityForTest(t, state, "remove-target", at.Add(2*time.Second), AuthorityPlacementRemove, AuthorityPlacementPayload{
 		Family: "family", Branch: "child", Generation: 1,
 	})
+	if len(state.Publications) != 0 {
+		t.Fatalf("branch removal retained terminal publication history: %+v", state.Publications)
+	}
 	applyAuthorityForTest(t, state, "retire-removed", at.Add(3*time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "fork-1", Revision: 9})
 	if _, ok := state.Transactions["fork-1"]; ok {
 		t.Fatal("terminal transaction remains after target removal")

@@ -8475,6 +8475,20 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			}
 		}
 	}
+	// Fence asynchronous publication while the runtime and its local graph are
+	// still intact. Raft atomically chooses cancellation or completed durable
+	// publication; either outcome is safe to remove after the queue drains.
+	if b.publicationQueue != nil {
+		for _, branch := range info.Branches {
+			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {
+				return fmt.Errorf("canceling publications for %s@%s: %w", info.Name, branch.ID, err)
+			}
+		}
+		info, err = store.LoadContainer(info.ID)
+		if err != nil {
+			return err
+		}
+	}
 	releaseClients, err := b.quiesceConsoleClients(selector{container: info.ID})
 	if err != nil {
 		return fmt.Errorf("detaching console clients for %q: %w", name, err)
@@ -8516,9 +8530,6 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			graphRoots = append(graphRoots, root)
 		}
 	}
-	if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
-		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
-	}
 	for _, branch := range info.Branches {
 		if graphReferenceOperationForBranch(info, branch) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
@@ -8529,15 +8540,17 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
 		}
 	}
-	if b.publicationQueue != nil {
-		for _, branch := range info.Branches {
-			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {
-				return fmt.Errorf("canceling publications for %s@%s: %w", info.Name, branch.ID, err)
-			}
-		}
+	// Resolve shared-ledger references while Raft still identifies local
+	// provider origins. Local collection may abandon an empty volatile origin;
+	// after that absence deliberately means "read from shared" to consumers.
+	if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
+		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
 	}
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
+	}
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return fmt.Errorf("reconciling filesystem origins after removing %q: %w", name, err)
 	}
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
 		for _, branch := range info.Branches {
@@ -10856,6 +10869,13 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	if len(roots) == 0 || b.snapshotGraph == nil || b.snapshotData == nil {
 		return nil
 	}
+	before := b.snapshotGraph.Inspect()
+	volatile := make([]ttcsnapshot.SnapshotID, 0)
+	for _, snapshot := range before.Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotSealedVolatile {
+			volatile = append(volatile, snapshot.ID)
+		}
+	}
 	if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
 		return err
 	}
@@ -10872,12 +10892,130 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	if err != nil {
 		return err
 	}
+	abandoned := make(map[ttcsnapshot.SnapshotID]struct{})
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		node := b.nodeID
+		if node == "" {
+			node = b.distributedSource.capabilities.NodeID
+		}
+		for _, origin := range volatile {
+			objects, objectErr := b.snapshotGraph.SnapshotObjects(origin)
+			if objectErr != nil && !errors.Is(objectErr, os.ErrNotExist) {
+				return objectErr
+			}
+			if len(objects) != 0 {
+				continue
+			}
+			provider, found, providerErr := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+			if providerErr != nil {
+				return providerErr
+			}
+			if !found || provider.NodeID != node {
+				continue
+			}
+			if b.snapshotShared != nil {
+				busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
+				if discardErr != nil {
+					return fmt.Errorf("discarding uncommitted memory origin %d: %w", origin, discardErr)
+				}
+				if busy {
+					return fmt.Errorf("discarding uncommitted memory origin %d: pack is busy", origin)
+				}
+			}
+			if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
+				return fmt.Errorf("abandoning empty memory origin %d: %w", origin, err)
+			}
+			abandoned[origin] = struct{}{}
+		}
+	}
+	if len(abandoned) != 0 {
+		retain := make([]ttcsnapshot.SnapshotID, 0, len(before.Snapshots)-len(abandoned))
+		for _, snapshot := range before.Snapshots {
+			if _, remove := abandoned[snapshot.ID]; !remove {
+				retain = append(retain, snapshot.ID)
+			}
+		}
+		if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
+			return err
+		}
+	}
 	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
 			return fmt.Errorf("compacting reclaimed snapshot graph: %w", err)
 		}
 	}
 	return nil
+}
+
+// reconcileVolatileSnapshotOrigins removes provider-directory entries whose
+// authoritative local graph no longer exists. Snapshot IDs are cluster-wide,
+// so a single union of the memory graph and filesystem repository graphs is
+// sufficient; Raft deliberately does not need page- or file-level state.
+//
+// Lifecycle mutations and this reconciliation share the daemon data-root
+// lock. Thus an origin allocated for an in-progress mutation cannot be
+// mistaken for crash residue between allocation and graph adoption. Any
+// uncommitted shared handoff is discarded before Raft forgets its provider, so
+// absence from the provider directory never exposes canceled bytes as shared
+// authority.
+func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return 0, nil
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, errors.New("cluster snapshot reconciliation lacks node incarnation")
+	}
+	live := make(map[ttcsnapshot.SnapshotID]struct{})
+	if b.snapshotGraph != nil {
+		for _, snapshot := range b.snapshotGraph.Inspect().Snapshots {
+			live[snapshot.ID] = struct{}{}
+		}
+	}
+	filesystem, err := b.containerStore().FilesystemSnapshotOrigins()
+	if err != nil {
+		return 0, fmt.Errorf("inventorying filesystem snapshot origins: %w", err)
+	}
+	for origin := range filesystem {
+		live[origin] = struct{}{}
+	}
+	state, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return 0, err
+	}
+	var stale []uint64
+	for id, provider := range state.VolatileOrigins {
+		if provider.NodeID != node {
+			continue
+		}
+		if _, ok := live[ttcsnapshot.SnapshotID(id)]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
+	for _, encoded := range stale {
+		origin := ttcsnapshot.SnapshotID(encoded)
+		if b.snapshotShared != nil {
+			busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
+			if discardErr != nil {
+				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: %w", origin, discardErr)
+			}
+			if busy {
+				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: pack is busy", origin)
+			}
+		}
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, encoded); err != nil {
+			// Another serialized cleanup may have completed between the state
+			// read and this proposal. Treat an already-retired origin as success.
+			if _, found, lookupErr := b.distributedSource.authority.SnapshotProvider(encoded); lookupErr != nil || found {
+				return 0, fmt.Errorf("abandoning orphan snapshot origin %d: %w", origin, errors.Join(err, lookupErr))
+			}
+		}
+	}
+	return len(stale), nil
 }
 
 const snapshotGraphJournalCompactBytes = 8 << 20
@@ -12429,6 +12567,25 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
 		}
 	}
+	if b.publicationQueue != nil {
+		if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
+			return fmt.Errorf("canceling pending publications for %s: %w", target, err)
+		}
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return err
+		}
+		recorded = nil
+		for i := range info.Branches {
+			if info.Branches[i].ID == target.branch {
+				recorded = &info.Branches[i]
+				break
+			}
+		}
+		if recorded == nil {
+			return fmt.Errorf("branch %q disappeared while fencing publication", target.branch)
+		}
+	}
 	remaining := len(info.Branches)
 	if remaining == 1 {
 		// Removing the family's final branch also removes the now-empty family.
@@ -12532,11 +12689,6 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
-		if b.publicationQueue != nil {
-			if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
-				return fmt.Errorf("canceling pending publications for %s: %w", target, err)
-			}
-		}
 		if graphReferenceOperationForBranch(info, *recorded) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(recorded.MemoryRoots, recorded.MemoryRootObjects); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
@@ -12553,6 +12705,9 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("reclaiming filesystems for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("reclaiming filesystems for %s: %w", target, err)
+		}
+		if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+			return fmt.Errorf("reconciling filesystem origins after removing %s: %w", target, err)
 		}
 		if err := store.RemoveBranchArtifacts(target.container, *recorded); err != nil {
 			return fmt.Errorf("removing persistent artifacts for %s: %w", target, err)

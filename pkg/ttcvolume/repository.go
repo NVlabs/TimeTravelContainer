@@ -374,6 +374,20 @@ func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
 	return origins
 }
 
+// SnapshotOrigins returns every origin represented by this repository's
+// authoritative graph. This includes working origins: in a cluster their IDs
+// have already been allocated by Raft even though their objects remain mutable.
+// Callers use this inventory to reconcile provider-directory entries after a
+// crash or repository removal; it does not expose object-level references.
+func (r *Repository) SnapshotOrigins() []ttcsnapshot.SnapshotID {
+	inspection := r.graph.Inspect()
+	origins := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots))
+	for _, snapshot := range inspection.Snapshots {
+		origins = append(origins, snapshot.ID)
+	}
+	return origins
+}
+
 // PrepareBranchPublication makes every local origin reachable from branch's
 // immutable root publishable, then returns the provider-owned origins in
 // deterministic order. A lazily imported filesystem uses a separate working
@@ -657,6 +671,23 @@ func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error 
 		return err
 	}
 	return r.graph.UnfreezeSnapshotLedger(origin)
+}
+
+// CancelOriginHandoff restores ordinary provider-side mutation and collection
+// after a publication was canceled before Raft routed origin to shared
+// storage. It is idempotent so crash recovery may repeat cleanup.
+func (r *Repository) CancelOriginHandoff(origin ttcsnapshot.SnapshotID) error {
+	return r.graph.UnfreezeSnapshotLedger(origin)
+}
+
+// OriginEmpty reports whether origin owns no remaining graph objects. Missing
+// origin metadata is equivalent to an already-collected empty origin.
+func (r *Repository) OriginEmpty(origin ttcsnapshot.SnapshotID) (bool, error) {
+	objects, err := r.graph.SnapshotObjects(origin)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return len(objects) == 0, err
 }
 
 // Create creates a new volume with an empty main branch.

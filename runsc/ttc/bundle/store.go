@@ -4053,30 +4053,9 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	paths := make(map[string]struct{})
-	volumes, err := manager.List()
+	paths, err := s.repositoryPaths(manager)
 	if err != nil {
 		return 0, err
-	}
-	for _, volume := range volumes {
-		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
-	}
-	containers, err := s.listContainers(true)
-	if err != nil {
-		return 0, err
-	}
-	for _, container := range containers {
-		spec, err := s.LoadSpec(container.ID)
-		if err != nil {
-			return 0, err
-		}
-		repositories, err := specutils.TTCVolumeRepositories(spec)
-		if err != nil {
-			return 0, err
-		}
-		for _, repository := range repositories {
-			paths[filepath.Clean(repository.Path)] = struct{}{}
-		}
 	}
 	ordered := make([]string, 0, len(paths))
 	for path := range paths {
@@ -4111,6 +4090,67 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 		collected++
 	}
 	return collected, nil
+}
+
+// FilesystemSnapshotOrigins returns the origin IDs that still have local
+// authoritative graph metadata in any named or container repository. Snapshot
+// IDs are globally unique, so the union is sufficient to reconcile Raft's
+// coarse provider directory without putting per-file state in Raft.
+func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{}, error) {
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return nil, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return nil, err
+	}
+	origins := make(map[ttcsnapshot.SnapshotID]struct{})
+	for path := range paths {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening repository %q for origin inventory: %w", path, err)
+		}
+		for _, origin := range repository.SnapshotOrigins() {
+			origins[origin] = struct{}{}
+		}
+		if err := repository.Close(); err != nil {
+			return nil, fmt.Errorf("closing repository %q after origin inventory: %w", path, err)
+		}
+	}
+	return origins, nil
+}
+
+func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{}, error) {
+	paths := make(map[string]struct{})
+	volumes, err := manager.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, volume := range volumes {
+		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return nil, err
+	}
+	for _, container := range containers {
+		spec, err := s.LoadSpec(container.ID)
+		if err != nil {
+			return nil, err
+		}
+		repositories, err := specutils.TTCVolumeRepositories(spec)
+		if err != nil {
+			return nil, err
+		}
+		for _, repository := range repositories {
+			paths[filepath.Clean(repository.Path)] = struct{}{}
+		}
+	}
+	return paths, nil
 }
 
 // repositoryCanonicalBranchBelongsToFamily reports whether the initial main

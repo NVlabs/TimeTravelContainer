@@ -769,12 +769,13 @@ func (reader *extentReadCloser) Close() error {
 	return result
 }
 
-// acquireSnapshotLease locks the snapshot directory itself rather than a
-// regular lock file. This matters on NFS: removing an open regular lock file
-// creates a .nfs tombstone. An open directory can be renamed and removed after
-// the lock is released without creating hidden files.
+// acquireSnapshotLease locks a writable file inside the snapshot directory.
+// NFS rejects exclusive flock on read-only descriptors (including an opened
+// directory) with EBADF. Retirement first renames the whole directory, then
+// closes this descriptor before recursive removal, so the lease itself cannot
+// become an NFS unlink tombstone.
 func (store *SharedPackStore) acquireSnapshotLease(snapshot SnapshotID, operation int) (*os.File, error) {
-	directory, err := os.Open(store.snapshotDirectory(snapshot))
+	directory, err := os.OpenFile(filepath.Join(store.snapshotDirectory(snapshot), ".lease"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -1085,6 +1086,49 @@ func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error)
 	}
 	removeErr := os.RemoveAll(retired)
 	syncErr := syncDirectory(parent)
+	store.mu.Lock()
+	delete(store.manifests, snapshot)
+	store.mu.Unlock()
+	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
+}
+
+// DiscardHandoff removes a pack written by PublishHandoff before its
+// provider-to-shared authority transition committed. The caller must first
+// prove that the snapshot is still routed to its volatile provider. In that
+// state no shared-pack reader can be authoritative; the lease nevertheless
+// prevents racing a diagnostic or an interrupted publisher that still has an
+// extent open.
+func (store *SharedPackStore) DiscardHandoff(snapshot SnapshotID) (busy bool, err error) {
+	if snapshot == 0 {
+		return false, errors.New("cannot discard snapshot zero")
+	}
+	if _, err := os.Stat(store.snapshotDirectory(snapshot)); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	directory := store.snapshotDirectory(snapshot)
+	parent := filepath.Dir(directory)
+	retired := filepath.Join(parent, fmt.Sprintf(".discarded-%s-%d-%d", snapshotKey(snapshot), os.Getpid(), time.Now().UnixNano()))
+	renameErr := os.Rename(directory, retired)
+	if errors.Is(renameErr, fs.ErrNotExist) {
+		renameErr = nil
+	}
+	unlockErr := syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+	closeErr := lease.Close()
+	if renameErr != nil {
+		return false, errors.Join(renameErr, unlockErr, closeErr)
+	}
+	syncErr := syncDirectory(parent)
+	removeErr := os.RemoveAll(retired)
+	syncErr = errors.Join(syncErr, syncDirectory(parent))
 	store.mu.Lock()
 	delete(store.manifests, snapshot)
 	store.mu.Unlock()

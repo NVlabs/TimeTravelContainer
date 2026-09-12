@@ -403,7 +403,7 @@ func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGener
 // CommitPublication atomically installs immutable roots and releases runtime
 // placement. A worker cannot resurrect a removed/superseded branch because
 // both branch and storage generations are checked by the Raft state machine.
-func (c *RaftCatalog) CommitPublication(family, branch string, storageGeneration uint64, roots DurableRoots) (*PublicationRecord, error) {
+func (c *RaftCatalog) CommitPublication(family, branch string, storageGeneration uint64, roots DurableRoots, providerNode, providerIncarnation string, snapshotOrigins []uint64) (*PublicationRecord, error) {
 	state, err := c.state()
 	if err != nil {
 		return nil, err
@@ -421,7 +421,8 @@ func (c *RaftCatalog) CommitPublication(family, branch string, storageGeneration
 	return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationCommit, AuthorityPublicationPayload{
 		Family: family, Branch: branch, Operation: record.OperationID,
 		BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration,
-		Revision: record.Revision, Roots: roots,
+		Revision: record.Revision, Roots: roots, ProviderNode: providerNode, ProviderIncarnation: providerIncarnation,
+		SnapshotOrigins: append([]uint64(nil), snapshotOrigins...),
 	})
 }
 
@@ -440,6 +441,16 @@ func (c *RaftCatalog) CancelPublication(family, branch string, storageGeneration
 		Family: family, Branch: branch, Operation: record.OperationID,
 		BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision,
 	})
+}
+
+// Publication returns one generation's authoritative publication state.
+func (c *RaftCatalog) Publication(family, branch string, storageGeneration uint64) (PublicationRecord, bool, error) {
+	state, err := c.state()
+	if err != nil {
+		return PublicationRecord{}, false, err
+	}
+	record, ok := state.Publications[publicationKey(family, branch, storageGeneration)]
+	return record, ok, nil
 }
 
 // MarkBranchCorrupted permanently fences a branch whose authoritative state

@@ -547,6 +547,8 @@ type AuthorityPublicationPayload struct {
 	Lifecycle                                     string
 	BranchGeneration, StorageGeneration, Revision uint64
 	Roots                                         DurableRoots
+	ProviderNode, ProviderIncarnation             string
+	SnapshotOrigins                               []uint64
 	Failure                                       string
 }
 
@@ -1292,6 +1294,14 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		delete(s.Placements, key)
 		delete(s.Branches, key)
+		// Publication records are generation fences only while their logical
+		// branch exists. Keeping terminal history after removal would make the
+		// bounded Raft state grow with every stop/dehydrate/name-reuse cycle.
+		for publicationKey, publication := range s.Publications {
+			if publication.FamilyID == p.Family && publication.BranchID == p.Branch {
+				delete(s.Publications, publicationKey)
+			}
+		}
 		return nil, nil
 	}
 	record.Revision++
@@ -1653,6 +1663,25 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		if record.CandidateRoots.MemoryRoot != "" && record.CandidateRoots.MemoryRoot != p.Roots.MemoryRoot {
 			return nil, errors.New("publication memory root differs from capture fence")
 		}
+		if len(p.SnapshotOrigins) != 0 {
+			if err := s.requireNodeIncarnation(p.ProviderNode, p.ProviderIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+				return nil, fmt.Errorf("publication provider: %w", err)
+			}
+			seen := make(map[uint64]struct{}, len(p.SnapshotOrigins))
+			for _, origin := range p.SnapshotOrigins {
+				if origin == 0 || origin >= s.NextSnapshotID {
+					return nil, fmt.Errorf("publication snapshot origin %d was not allocated", origin)
+				}
+				if _, duplicate := seen[origin]; duplicate {
+					return nil, fmt.Errorf("publication repeats snapshot origin %d", origin)
+				}
+				seen[origin] = struct{}{}
+				provider, ok := s.VolatileOrigins[origin]
+				if !ok || provider.NodeID != p.ProviderNode {
+					return nil, fmt.Errorf("publication snapshot origin %d is not owned by provider %q", origin, p.ProviderNode)
+				}
+			}
+		}
 		current := s.Branches[branchKey]
 		if current.Generation != record.BranchGeneration || current.StorageGeneration >= record.StorageGeneration || current.Corrupted {
 			return nil, errors.New("publication authority was superseded")
@@ -1675,6 +1704,9 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		current.Generation, current.StorageGeneration = placement.Generation, record.StorageGeneration
 		current.Roots, current.Lifecycle, current.UpdatedAt = p.Roots, record.Lifecycle, command.IssuedAt
 		s.Branches[branchKey] = current
+		for _, origin := range p.SnapshotOrigins {
+			delete(s.VolatileOrigins, origin)
+		}
 	case AuthorityPublicationFail:
 		if p.Failure == "" || record.State == PublicationCommitted || record.State == PublicationCanceled {
 			return nil, errors.New("invalid publication failure")

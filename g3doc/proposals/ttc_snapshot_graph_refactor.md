@@ -80,6 +80,13 @@ gates:
 * two consecutive cold publications over NFS shaped to 20 Mbit/s and 5 ms,
   control-daemon-independent lazy relays, an all-member Raft restart, and
   re-admission of a member removed while offline; and
+* dehydrate followed immediately by forced family removal while that same NFS
+  path was limited to 20 Mbit/s with 5 ms latency. Cancellation and publication
+  received one Raft ordering point; the run ended with zero branches,
+  publications, volatile origins, cold objects, graph packs, queue markers, or
+  `.nfs` entries. Restart reconciliation also withdrew provider origins left by
+  a deliberately interrupted older run without treating canceled packs as
+  shared authority; and
 * rootless TTC in an ordinary unprivileged Docker container and a complete
   TTC-in-TTC run in which the inner daemon loaded an OCI archive and executed
   a nested Ubuntu container.

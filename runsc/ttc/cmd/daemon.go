@@ -3788,6 +3788,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				}
 			}
 			elasticRecord = ready
+			// Origin abandonment is an execution-authority mutation and is not
+			// permitted while the node is joining. Reconcile only after the
+			// ready/pressured transition has admitted this incarnation.
+			if _, err := targetBackend.reconcileVolatileSnapshotOrigins(); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("reconciling volatile snapshot origins: %w", err)
+			}
 			// Enroll any legacy/untracked local branch now that ordinary placement
 			// creation is authorized. A prior lease failure may have left every
 			// Sentry physically stopped, so resume only after both passes succeed.
