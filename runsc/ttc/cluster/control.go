@@ -384,7 +384,8 @@ type AuthorityRetireRequest struct {
 }
 
 // AuthorityService exposes leader proposals and membership changes over the
-// existing mutually authenticated cluster HTTP endpoint.
+// existing token-authenticated cluster HTTP endpoint on the trusted private
+// cluster network.
 type AuthorityService struct {
 	Node         *AuthorityRaftNode
 	Capabilities Capabilities
@@ -582,7 +583,8 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 	}
 }
 
-// ControlPlane is the mutually authenticated target-side HTTP handler.
+// ControlPlane is the token-authenticated target-side HTTP handler on the
+// trusted private cluster network.
 type ControlPlane struct {
 	Capabilities    Capabilities
 	Store           TransactionCatalog

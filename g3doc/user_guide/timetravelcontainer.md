@@ -99,9 +99,9 @@ ttc daemon start --platform=kvm
 The KVM device is checked during daemon startup. Platform selection is
 daemon-wide; `ttc run` and `ttc create` always use the daemon's native CPU
 architecture and runtime platform. TTC does not emulate foreign CPU
-architectures. Stop and explicitly restart the daemon to change isolation,
-volume-copy, or runtime-platform modes. Ordinary commands do not autostart the service; if it is absent, they
-tell you to run `ttc daemon start`.
+architectures. Stop and explicitly restart the daemon to change isolation or
+runtime-platform modes. Ordinary commands do not autostart the service; if it
+is absent, they tell you to run `ttc daemon start`.
 
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but
 removes host-side defense in depth. Do not use it for untrusted images.
@@ -474,11 +474,11 @@ the owner-local operations and prints one result for the original family.
 
 Migration uses a live sparse cutover. It pauses and captures the selected
 branch once, prepares a paused target that can demand-page memory and
-filesystem ranges, atomically transfers fenced ownership, and only then lets
-the target run. The source cannot execute after ownership changes, while its
-sealed snapshot remains available until all target dependencies are local or
-shared-durable. External connections are interrupted according to the same
-policy as remote fork.
+materialize whole files on demand, atomically transfers fenced ownership, and
+only then lets the target run. The source cannot execute after ownership
+changes, while its sealed snapshot remains available until all target
+dependencies are local or shared-durable. External connections are interrupted
+according to the same policy as remote fork.
 
 To remove a compute node, stop it from any TTC client. Exactly one policy is
 chosen when it still owns active branches:

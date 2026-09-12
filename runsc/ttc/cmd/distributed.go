@@ -1210,7 +1210,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	}
 	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, relay)
 	if err != nil {
-		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
+		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
 	}
 	directSources, directCleanup, err := b.prepareColdDirectFilesystemSources(sourceInfo, sourceBranch, childFilesystemBranch)
 	if err != nil {

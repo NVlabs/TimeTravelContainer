@@ -136,7 +136,9 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 `e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
 different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set
-`TTC_FANOUT_TEST_BRANCHES` to increase the fanout.
+`TTC_FANOUT_TEST_BRANCHES` to increase the fanout. Final snapshot-graph
+qualification runs this test with 256 siblings and requires zero remaining
+bulk objects after its cleanup.
 
 `e2e_image_roundtrip.sh` commits running, paused, and exited branches to OCI
 images, saves and reloads those images through Docker-compatible archives, and

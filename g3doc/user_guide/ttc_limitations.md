@@ -75,11 +75,12 @@ non-forkable for its entire lifetime.
   are not currently implemented.
 - Image signature, attestation, and content-trust policy are not yet
   implemented.
-- Cross-node fork requires mutually authenticated TTC peers, common image
-  content, a shared TTC data root, and a reachable page-transfer network. Use
-  a checkpoint for offline transfer or unrelated TTC installations.
+- Cross-node fork assumes a trusted private network, a common shared TTC data
+  root, and reachable peer-transfer ports. `TTC_CLUSTER_TOKEN` adds a shared
+  admission/request token when desired; TTC does not currently add TLS. Use a
+  checkpoint for offline transfer or unrelated TTC installations.
 - Elastic migration uses live sparse handoff. A newly running target may
-  temporarily depend on transaction-fenced memory or filesystem ranges served
+  temporarily depend on transaction-fenced memory chunks or whole files served
   by the source. Graceful drain resolves these dependencies; unexpected source
   loss before they are cached or published is reported as unrecoverable
   volatile-state loss.

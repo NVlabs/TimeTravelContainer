@@ -43,8 +43,8 @@ TTC is designed for efficiency. Memory and writable storage are
   rehydrate it later with its processes and CoW relationships intact.
 - **Remote fork/migration:** fork a branch to another TTC node and start it
   without first transferring all of its memory or filesystem. Missing 1 MiB
-  memory and filesystem ranges are fetched on demand from the fenced source or
-  shared storage; target writes are always node-local.
+  memory chunks and whole files are fetched on demand from the fenced source
+  or shared storage; target writes are always node-local.
 
 ## Get Started
 
@@ -164,18 +164,19 @@ TTC includes:
   mappings; AppImages, the FUSE daemon, mount state, and cached pages remain
   forkable.
 - Optional multi-node live fork over a trusted private network, with an
-  optional shared token, a shared TTC data root, and a page-transfer network. Elastic mode
-  adds dynamic node discovery, transparent command routing, branch migration,
-  policy-driven node shutdown, and pressure-aware placement.
+  optional shared token, a shared TTC data root, and a page-transfer network.
+  Elastic mode adds dynamic node discovery, transparent command routing,
+  branch migration, policy-driven node shutdown, and pressure-aware placement.
 
 Unlike [CRIU](https://github.com/checkpoint-restore/criu) or a
 [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, a
 TTC live fork does not save the container's memory to a checkpoint first.
 Durable storage is used only for explicitly requested operations such as
 dehydration and checkpointing, or when a remote branch must no longer depend
-on a source node. When one branch is dehydrated, TTC initially writes only the
-memory that must become durable for that branch; CoW-shared pages can remain
-resident and are saved lazily if an active peer later writes them.
+on a source node. Dehydration stores branch-reachable memory in compact 1 MiB
+records while retaining independent 4 KiB page identities. Immutable pages
+already represented in the snapshot graph are referenced again rather than
+written a second time.
 
 Live-fork eligibility is a lifetime property of a container family. Families
 are eligible by default, and TTC rejects incompatible features when they are
@@ -190,14 +191,15 @@ Host requirements are deliberately small:
 
 - Linux 3.17 or newer on x86-64 or ARM64. Linux 4.14.77+ is recommended for
   full network performance.
-- (Optional) An unprivileged user namespace for normal rootless isolation. No subordinate
-  UID/GID ranges or `newuidmap` helpers are required. Trusted environments that
-  prohibit user namespaces can explicitly use `--unsafe-no-host-isolation`.
+- (Optional) An unprivileged user namespace for normal rootless isolation. No
+  subordinate UID/GID ranges or `newuidmap` helpers are required. Trusted
+  environments that prohibit user namespaces can explicitly use
+  `--unsafe-no-host-isolation`.
 - A data root on any supported local filesystem. TTC uses reflinks when
   available and otherwise transparently falls back to whole-file copying on
   the first write after a fork.
-- (optional) A delegated cgroup v2 subtree only when hard host CPU or memory limits are
-  requested.
+- (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
+  limits are requested.
 
 `TTC_ROOT` is always explicit. In standalone mode it contains all TTC state.
 Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
