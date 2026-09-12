@@ -80,12 +80,6 @@ func TestDistributedSourceNoLongerNeeded(t *testing.T) {
 	}
 }
 
-func TestDaemonWireOptionsContainNoClientPaths(t *testing.T) {
-	if got := wireOptions(options{root: "/runtime", dataRoot: "/data"}); got != (daemonWireOptions{}) {
-		t.Fatalf("wire options leak daemon-owned paths: %+v", got)
-	}
-}
-
 func TestLocalNodeIncarnationPersistsForRootEpoch(t *testing.T) {
 	root := t.TempDir()
 	first, err := localNodeIncarnation(root, "node-a")
@@ -128,7 +122,7 @@ func TestDaemonRequestOptionsUseServerDefaults(t *testing.T) {
 		unsafeNoHostIsolation: true,
 		disableHostGSO:        true,
 	}
-	opts := server.optionsFromRequest(daemonWireOptions{})
+	opts := server.optionsFromRequest()
 	if got, want := opts.root, server.root; got != want {
 		t.Errorf("root=%q, want %q", got, want)
 	}
@@ -158,7 +152,7 @@ func TestDaemonRequestOptionsCannotOverrideServerRuntime(t *testing.T) {
 		runsc:    "/default/ttcd",
 		dataRoot: "/daemon/data",
 	}
-	opts := server.optionsFromRequest(daemonWireOptions{})
+	opts := server.optionsFromRequest()
 	if got, want := opts.root, server.root; got != want {
 		t.Errorf("root=%q, want %q", got, want)
 	}
@@ -1130,7 +1124,6 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	status, stdout, stderr := exchange(daemonRequest{
 		Version: daemonAPIVersion,
 		Action:  "command",
-		Options: daemonWireOptions{},
 		Args:    []string{"completion", "bash"},
 	})
 	if status != 0 || !strings.Contains(stdout, "_ttc_completion()") || stderr != "" {

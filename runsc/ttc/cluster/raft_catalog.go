@@ -25,8 +25,8 @@ import (
 	"time"
 )
 
-// RaftCatalog is the compatibility facade used while TTC call sites move from
-// three filesystem stores to one replicated authority. All mutations are Raft
+// RaftCatalog presents TTC's typed membership, placement, transaction, and
+// snapshot APIs over one replicated authority. All mutations are Raft
 // proposals and all reads are linearizable leader reads.
 type RaftCatalog struct {
 	node         *AuthorityRaftNode

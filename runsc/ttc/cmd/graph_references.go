@@ -76,13 +76,6 @@ func readGraphReferenceIntent(path string) (graphReferenceIntent, error) {
 	if err := decoder.Decode(&intent); err != nil {
 		return graphReferenceIntent{}, err
 	}
-	// Version 1 predates transaction-owned migration transfer roots. Its only
-	// possible meaning is a branch-owned reference, so upgrade that record in
-	// memory without crossing the data-root format boundary.
-	if intent.Version == 1 && intent.Purpose == "" {
-		intent.Version = graphReferenceIntentVersion
-		intent.Purpose = graphReferencePurposeBranch
-	}
 	if intent.Version != graphReferenceIntentVersion || intent.Transaction == "" || intent.Operation == "" ||
 		intent.Container == "" || intent.Branch == "" || len(intent.Groups) == 0 ||
 		(intent.Purpose != graphReferencePurposeBranch && intent.Purpose != graphReferencePurposeTransfer) ||

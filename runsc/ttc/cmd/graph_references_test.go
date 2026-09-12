@@ -135,18 +135,14 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 	}
 }
 
-func TestGraphReferenceIntentVersionOneMeansBranchReference(t *testing.T) {
+func TestGraphReferenceIntentRejectsOldVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "intent.json")
 	legacy := `{"version":1,"transaction":"tx","operation":"op","container":"family","branch":"child","state":"active","groups":[{"origin":1,"roots":[{"slot":0,"object":"0000000000000001-03-0000000000000001"}]}]}`
 	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
 		t.Fatal(err)
 	}
-	intent, err := readGraphReferenceIntent(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intent.Version != graphReferenceIntentVersion || intent.Purpose != graphReferencePurposeBranch {
-		t.Fatalf("decoded intent version/purpose=%d/%q, want %d/%q", intent.Version, intent.Purpose, graphReferenceIntentVersion, graphReferencePurposeBranch)
+	if _, err := readGraphReferenceIntent(path); err == nil {
+		t.Fatal("old graph reference intent was accepted")
 	}
 }
 

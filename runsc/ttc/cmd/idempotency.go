@@ -60,12 +60,11 @@ func newDaemonRequestID() (string, error) {
 
 func daemonMutationFingerprint(request daemonRequest) (string, error) {
 	value := struct {
-		Version int               `json:"version"`
-		Action  string            `json:"action"`
-		Options daemonWireOptions `json:"options"`
-		Args    []string          `json:"args"`
-		Stdin   bool              `json:"stdin"`
-	}{request.Version, request.Action, request.Options, request.Args, request.Stdin}
+		Version int      `json:"version"`
+		Action  string   `json:"action"`
+		Args    []string `json:"args"`
+		Stdin   bool     `json:"stdin"`
+	}{request.Version, request.Action, request.Args, request.Stdin}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return "", err

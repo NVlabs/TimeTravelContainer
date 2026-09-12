@@ -606,10 +606,9 @@ func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 	return file.ReadAt(destination[:entry.Length], entry.RecordOffset+Alignment)
 }
 
-// Materialize reconstructs a pack below an existing empty destination. It is
-// primarily the compatibility fallback while Sentry-side lazy object
-// resolution is unavailable; pack readers can instead call ReadEntry on
-// demand and cache individual 1 MiB ranges.
+// Materialize reconstructs a complete pack below an existing empty
+// destination. Standalone image preparation uses this eager path; clustered
+// image caches use indexed demand reads instead.
 func Materialize(repository string, id ID, destination string) error {
 	return materialize(repository, id, destination, nil)
 }

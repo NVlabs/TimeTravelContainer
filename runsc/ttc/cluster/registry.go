@@ -177,8 +177,8 @@ type NodeDirectory struct {
 }
 
 // NodeCatalog is the linearizable membership and capacity authority consumed
-// by elastic placement. NodeDirectory is retained only for standalone tests
-// and old-format rejection; clustered TTC uses the Raft implementation.
+// by elastic placement. Clustered TTC uses the Raft implementation;
+// NodeDirectory is a filesystem-backed test implementation.
 type NodeCatalog interface {
 	Register(NodeRecord, time.Time, time.Duration) (*NodeRecord, error)
 	Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*NodeRecord, error)
@@ -191,8 +191,8 @@ type NodeCatalog interface {
 }
 
 // NodeExpiryCatalog commits the consequences of one exact expired execution
-// lease. It is separate from NodeCatalog because the legacy filesystem
-// directory is not a distributed fencing authority.
+// lease. It is separate from NodeCatalog because not every test catalog is a
+// distributed fencing authority.
 type NodeExpiryCatalog interface {
 	ExpireNode(nodeID, incarnation string, revision uint64) (*NodeRecord, error)
 }

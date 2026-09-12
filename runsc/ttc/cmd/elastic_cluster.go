@@ -867,7 +867,7 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		args := []string{"_stats-local", "--json", info.Name + "@" + owners[node]}
 		child := daemonRequest{
 			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, ordinal, args),
-			Options: request.Options, Args: args, DistributedLeaf: true,
+			Args: args, DistributedLeaf: true,
 		}
 		var status int
 		var stdout, stderr string
@@ -1005,7 +1005,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		}
 		childRequest := daemonRequest{
 			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, i, child.args),
-			Options: request.Options, Args: child.args, ClientTERM: request.ClientTERM,
+			Args: child.args, ClientTERM: request.ClientTERM,
 			DistributedLeaf: true, PlacementClaims: child.claims,
 		}
 		var status int
@@ -1037,7 +1037,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 }
 
 func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (int, string, string, error) {
-	opts := s.optionsFromRequest(request.Options)
+	opts := s.optionsFromRequest()
 	var stdout, stderr bytes.Buffer
 	backend := directBackend(opts, strings.NewReader(""), &stdout, &stderr)
 	s.configureVolumeBackend(backend)

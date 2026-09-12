@@ -20,8 +20,7 @@ import (
 )
 
 // runscCommand invokes TTC's OCI runtime. Production installations embed that
-// entry point in ttcd; an explicitly configured legacy/development runsc path
-// remains directly executable for tests and upgrades.
+// entry point in ttcd; tests may provide a dedicated runtime fixture.
 func runscCommand(path string, args ...string) *exec.Cmd {
 	if filepath.Base(path) == "ttcd" {
 		args = append([]string{"runsc"}, args...)

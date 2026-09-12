@@ -276,7 +276,10 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &daemonServer{clusterDirectory: directory, clusterCapabilities: &node.Capabilities}
-	backend := &runtimeBackend{dataRoot: root, localRoot: local, nodeID: "node-a"}
+	backend := &runtimeBackend{
+		dataRoot: root, localRoot: local, nodeID: "node-a",
+		distributedSource: &distributedSourceRuntime{directory: directory, placements: placements},
+	}
 	for range 2 {
 		if err := server.claimUnplacedLifecycleTargets(backend, []string{"rehydrate", "web@main"}); err != nil {
 			t.Fatal(err)

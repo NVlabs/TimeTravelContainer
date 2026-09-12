@@ -105,9 +105,6 @@ var (
 	daemonStatfs              = unix.Statfs
 )
 
-type daemonWireOptions struct {
-}
-
 type daemonRequest struct {
 	Version         int                    `json:"version"`
 	ClientBuildID   string                 `json:"client_build_id,omitempty"`
@@ -116,7 +113,6 @@ type daemonRequest struct {
 	ClientTERM      string                 `json:"client_term,omitempty"`
 	StderrTerminal  bool                   `json:"stderr_terminal,omitempty"`
 	StderrWidth     int                    `json:"stderr_width,omitempty"`
-	Options         daemonWireOptions      `json:"options,omitempty"`
 	Args            []string               `json:"args,omitempty"`
 	Stdin           bool                   `json:"stdin,omitempty"`
 	ManageStop      bool                   `json:"manage_stop,omitempty"`
@@ -1880,22 +1876,12 @@ func (b *runtimeBackend) ensureDistributedSourceIndependent(containerID, branchI
 	return drainSourceDependenciesMatching(b, b.distributedSource, store, b.nodeID, containerID, branchID)
 }
 
-func wireOptions(opts options) daemonWireOptions {
-	return daemonWireOptions{}
-}
-
-func optionsFromWire(w daemonWireOptions) options {
-	return options{}
-}
-
 // optionsFromRequest applies daemon-owned configuration. Runtime state, the
 // runtime executable, platform, isolation, and persistent data all belong to
 // the daemon selected by the socket; accepting client overrides would let two
 // independently configured daemons accidentally operate on the same runtime.
-// The legacy wire fields remain decodable for API compatibility but are
-// intentionally ignored.
-func (s *daemonServer) optionsFromRequest(w daemonWireOptions) options {
-	opts := optionsFromWire(w)
+func (s *daemonServer) optionsFromRequest() options {
+	opts := options{}
 	opts.root = s.root
 	opts.runsc = s.runsc
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
@@ -4120,7 +4106,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	case "stop":
 		if request.ManageStop {
-			opts := s.optionsFromRequest(request.Options)
+			opts := s.optionsFromRequest()
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			s.configureVolumeBackend(backend)
@@ -4310,7 +4296,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	terminalInput := newDaemonTerminalInput(stdinReader, conn, &writeMu)
 	go receiveDaemonInput(reader, stdinWriter, request.Stdin, terminalInput)
 
-	opts := s.optionsFromRequest(request.Options)
+	opts := s.optionsFromRequest()
 	cleanArgs, leaseKey, takeover, err := daemonAttachStdinLease(opts, request.Args, request.Stdin)
 	if err != nil {
 		stdinReader.Close()
@@ -4921,7 +4907,7 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 	}
 	stderrTerminal, stderrWidth := terminalWriterInfo(stderr)
 	request := daemonRequest{
-		Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Options: wireOptions(opts),
+		Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command",
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
 		StderrTerminal: stderrTerminal, StderrWidth: stderrWidth,
 	}
@@ -5318,7 +5304,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 1
 		}
 		defer conn.Close()
-		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "mutation-control", Options: wireOptions(opts), Args: append([]string(nil), args...)}, strings.NewReader(""), stdout, stderr)
+		status, err := exchangeDaemon(conn, daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "mutation-control", Args: append([]string(nil), args...)}, strings.NewReader(""), stdout, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
