@@ -766,8 +766,8 @@ func (r raftTransactionCatalog) PublishTarget(id string, revision uint64, desire
 func (r raftTransactionCatalog) MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error) {
 	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionActivate, AuthorityTransactionPayload{ID: id, Revision: revision})
 }
-func (r raftTransactionCatalog) BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error) {
-	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionSession, AuthorityTransactionPayload{ID: id, Revision: revision, Digest: digest, FilesystemPack: filesystemPack})
+func (r raftTransactionCatalog) BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error) {
+	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionSession, AuthorityTransactionPayload{ID: id, Revision: revision, Digest: digest})
 }
 func (r raftTransactionCatalog) BindGraphHandoff(id string, revision uint64, graph GraphHandoffDescriptor, now time.Time) (*Transaction, error) {
 	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionHandoff, AuthorityTransactionPayload{ID: id, Revision: revision, Graph: &graph})

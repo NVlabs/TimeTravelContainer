@@ -36,7 +36,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -4973,38 +4972,6 @@ func TestInspectCopiedHostMount(t *testing.T) {
 	}
 }
 
-func TestColdPackIntentReclaimsRetiredTransactionPack(t *testing.T) {
-	shared, local := t.TempDir(), t.TempDir()
-	staging := t.TempDir()
-	if err := os.WriteFile(filepath.Join(staging, "snapshot.json"), []byte("metadata"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	const transaction = "fork-retired"
-	if err := beginColdPackIntent(shared, transaction); err != nil {
-		t.Fatal(err)
-	}
-	pack, err := ttcpack.WriteDirectory(staging, filepath.Join(shared, "cold"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := bindColdPackIntent(shared, transaction, pack); err != nil {
-		t.Fatal(err)
-	}
-	if err := collectColdStorage(shared, local, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(ttcpack.Path(filepath.Join(shared, "cold"), pack)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("retired transaction pack remains: %v", err)
-	}
-	intent, err := coldPackIntentPath(shared, transaction)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("retired transaction intent remains: %v", err)
-	}
-}
-
 func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "manifest.json")
 	legacy := coldBranchManifest{Version: 1, Container: "family", Branch: "main", Generation: 1, Kind: "stop"}
@@ -5036,59 +5003,6 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	}
 	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 {
 		t.Fatalf("current cold manifest=%+v, %v", got, err)
-	}
-}
-
-func TestColdPackIntentTracksOnlyNonterminalTransaction(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		state cluster.TransactionState
-		keep  bool
-	}{
-		{name: "captured", state: cluster.TransactionSourceCaptured, keep: true},
-		{name: "independent", state: cluster.TransactionIndependent},
-		{name: "canceled", state: cluster.TransactionCanceled},
-		{name: "failed", state: cluster.TransactionFailed},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			shared, local := t.TempDir(), t.TempDir()
-			staging := t.TempDir()
-			if err := os.WriteFile(filepath.Join(staging, "snapshot.json"), []byte("metadata"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			const transaction = "fork-pack-lifecycle"
-			if err := beginColdPackIntent(shared, transaction); err != nil {
-				t.Fatal(err)
-			}
-			pack, err := ttcpack.WriteDirectory(staging, filepath.Join(shared, "cold"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := bindColdPackIntent(shared, transaction, pack); err != nil {
-				t.Fatal(err)
-			}
-			catalog := transactionListCatalog{records: []cluster.Transaction{{
-				Identity:               cluster.ForkIdentity{TransactionID: transaction},
-				State:                  test.state,
-				FilesystemMetadataPack: pack.String(),
-			}}}
-			if err := collectColdStorage(shared, local, nil, catalog); err != nil {
-				t.Fatal(err)
-			}
-			_, packErr := os.Stat(ttcpack.Path(filepath.Join(shared, "cold"), pack))
-			intent, err := coldPackIntentPath(shared, transaction)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, intentErr := os.Stat(intent)
-			if test.keep {
-				if packErr != nil || intentErr != nil {
-					t.Fatalf("nonterminal pack lifecycle = (%v, %v), want retained", packErr, intentErr)
-				}
-			} else if !errors.Is(packErr, os.ErrNotExist) || !errors.Is(intentErr, os.ErrNotExist) {
-				t.Fatalf("terminal pack lifecycle = (%v, %v), want reclaimed", packErr, intentErr)
-			}
-		})
 	}
 }
 

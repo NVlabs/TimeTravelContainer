@@ -58,10 +58,6 @@ type snapshotDirectoryEntry struct {
 // filesystem handoff. It preserves immutable object identities and bounded
 // B-tree structure; regular-file bytes remain on the source and are fetched
 // through the transaction-fenced object relay.
-type remoteGraphMetadata struct {
-	Root ttcsnapshot.ObjectID `json:"root"`
-}
-
 // RemoteSnapshotDescriptor is the bounded, path-free metadata needed to
 // install an immutable filesystem root on another node. It intentionally does
 // not contain file bytes or a host path; those are resolved by ObjectID through
@@ -128,42 +124,8 @@ func (r *Repository) DescribeRemoteSnapshot(branchID string) (RemoteSnapshotDesc
 	}, nil
 }
 
-// ExportRemoteSnapshot writes the immutable graph metadata for a sealed
-// branch. Regular-file objects are returned as an allowlist and are fetched
-// by the target in authenticated 1 MiB ranges. Unlike portable snapshot
-// export, this does not flatten inode and directory B-trees.
-func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (SnapshotInfo, map[string]int64, error) {
-	descriptor, err := r.DescribeRemoteSnapshot(branchID)
-	if err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	snapshot := descriptor.Snapshot
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	if err := os.Mkdir(destination, 0700); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			_ = os.RemoveAll(destination)
-		}
-	}()
-	graph := remoteGraphMetadata{Root: descriptor.Root}
-	if err := writeJSONAtomic(destination, filepath.Join(destination, "graph.json"), graph); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	if err := writeJSONAtomic(destination, filepath.Join(destination, "snapshot.json"), snapshot); err != nil {
-		return SnapshotInfo{}, nil, err
-	}
-	keep = true
-	return snapshot, nil, nil
-}
-
 // ImportRemoteBranchDescriptor installs descriptor as a deferred immutable
-// graph root. Unlike ImportRemoteBranchSnapshot it requires no temporary host
-// directory and therefore keeps a live remote fork off shared storage.
+// graph root without a temporary host directory or shared-storage write.
 func (r *Repository) ImportRemoteBranchDescriptor(descriptor RemoteSnapshotDescriptor, targetBranch string) error {
 	return r.importRemoteBranchDescriptor(descriptor, targetBranch, 0, 0)
 }
@@ -227,39 +189,14 @@ func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 	})
 }
 
-func readRemoteGraphDescriptor(source string) (SnapshotInfo, remoteGraphMetadata, error) {
-	var snapshot SnapshotInfo
-	if err := readJSON(filepath.Join(source, "snapshot.json"), &snapshot); err != nil {
-		return SnapshotInfo{}, remoteGraphMetadata{}, err
-	}
-	if snapshot.FormatVersion != remoteSnapshotFormatVersion || !validID(snapshot.RepositoryID) || snapshot.NextInode <= rootInode {
-		return SnapshotInfo{}, remoteGraphMetadata{}, errors.New("invalid remote graph snapshot identity")
-	}
-	var graph remoteGraphMetadata
-	if err := readJSON(filepath.Join(source, "graph.json"), &graph); err != nil {
-		return SnapshotInfo{}, remoteGraphMetadata{}, err
-	}
-	if graph.Root.String() != snapshot.Root || graph.Root.Kind != ttcsnapshot.ObjectKindMetadata {
-		return SnapshotInfo{}, remoteGraphMetadata{}, errors.New("remote graph root disagrees with snapshot descriptor")
-	}
-	return snapshot, graph, nil
-}
-
 // ExportSnapshot writes the immutable metadata and regular-file objects
 // reachable from branch into a new directory. It never serializes unrelated
 // branches.
 func (r *Repository) ExportSnapshot(branchID, destination string) (SnapshotInfo, error) {
-	return r.exportSnapshot(branchID, destination, nil)
+	return r.exportSnapshot(branchID, destination)
 }
 
-// ExportSnapshotDelta exports full namespace metadata but omits objects that
-// are already reachable from an immutable parent pack. Locally changed
-// objects remain self-contained in the resulting delta.
-func (r *Repository) ExportSnapshotDelta(branchID, destination string, inherited map[string]struct{}) (SnapshotInfo, error) {
-	return r.exportSnapshot(branchID, destination, inherited)
-}
-
-func (r *Repository) exportSnapshot(branchID, destination string, inherited map[string]struct{}) (SnapshotInfo, error) {
+func (r *Repository) exportSnapshot(branchID, destination string) (SnapshotInfo, error) {
 	if r == nil || r.path == "" {
 		return SnapshotInfo{}, errors.New("snapshot export requires a manager-side repository")
 	}
@@ -342,16 +279,6 @@ func (r *Repository) exportSnapshot(branchID, destination string, inherited map[
 	}
 	sort.Strings(objectIDs)
 	for _, id := range objectIDs {
-		if _, ok := inherited[id]; ok {
-			continue
-		}
-		if pending, err := r.remoteObjectPending(id); err != nil {
-			return SnapshotInfo{}, err
-		} else if pending {
-			// A remotely-backed target object is inherited even though its
-			// target-local graph identity differs from the source identity.
-			continue
-		}
 		if err := r.ensureObjectRange(id, objects[id], 0, objects[id]); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("materializing remote object %q: %w", id, err)
 		}
@@ -384,117 +311,8 @@ func (m *Manager) ImportPrivateSnapshot(path, name, source string) (*Repository,
 	}
 }
 
-// ImportPrivatePackedSnapshot installs the portable metadata stored in a
-// durable shared pack while leaving regular-file objects as lazy local
-// placeholders. The caller must attach an object source before the repository
-// is used. Unlike ImportPrivateRemoteSnapshot, this consumes the flattened
-// portable descriptor written by ExportSnapshotDelta rather than a live
-// peer's deferred graph descriptor.
-func (m *Manager) ImportPrivatePackedSnapshot(path, name, source, targetBranch string) (*Repository, SnapshotInfo, error) {
-	if err := validateName(targetBranch, "branch"); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	path = filepath.Clean(path)
-	if _, err := os.Lstat(path); err == nil {
-		return nil, SnapshotInfo{}, fmt.Errorf("private repository path %q already exists", path)
-	} else if !os.IsNotExist(err) {
-		return nil, SnapshotInfo{}, err
-	}
-	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, 0700); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	stage, err := os.MkdirTemp(parent, "."+filepath.Base(path)+".packed-import-")
-	if err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	if err := os.Remove(stage); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	keepStage := false
-	defer func() {
-		if !keepStage {
-			_ = os.RemoveAll(stage)
-		}
-	}()
-	repository, err := m.CreatePrivate(stage, name)
-	if err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	snapshot, err := repository.importPortableSnapshotMode(source, targetBranch, true)
-	closeErr := repository.Close()
-	if err != nil || closeErr != nil {
-		return nil, SnapshotInfo{}, errors.Join(err, closeErr)
-	}
-	if err := os.Rename(stage, path); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	keepStage = true
-	repository, err = m.OpenPrivate(path)
-	if err != nil {
-		_ = os.RemoveAll(path)
-		return nil, SnapshotInfo{}, err
-	}
-	return repository, snapshot, nil
-}
-
-// ImportPrivateRemoteSnapshot installs metadata and sparse local object files
-// for a peer generation. targetBranch is the physical branch identity already
-// embedded in the captured Kernel.
-func (m *Manager) ImportPrivateRemoteSnapshot(path, name, source, targetBranch string) (*Repository, SnapshotInfo, error) {
-	if err := validateName(targetBranch, "branch"); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	path = filepath.Clean(path)
-	if _, err := os.Lstat(path); err == nil {
-		return nil, SnapshotInfo{}, fmt.Errorf("private repository path %q already exists", path)
-	} else if !os.IsNotExist(err) {
-		return nil, SnapshotInfo{}, err
-	}
-	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, 0700); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	stage, err := os.MkdirTemp(parent, "."+filepath.Base(path)+".remote-import-")
-	if err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	if err := os.Remove(stage); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	keepStage := false
-	defer func() {
-		if !keepStage {
-			_ = os.RemoveAll(stage)
-		}
-	}()
-	repository, err := m.CreatePrivate(stage, name)
-	if err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	snapshot, err := repository.importSnapshotMode(source, true, targetBranch)
-	closeErr := repository.Close()
-	if err != nil || closeErr != nil {
-		return nil, SnapshotInfo{}, errors.Join(err, closeErr)
-	}
-	// Readers and background GC must see either no repository or its complete
-	// format, metadata, branches, and sparse objects. Publishing the populated
-	// sibling directory with one rename avoids exposing the creation sequence.
-	if err := os.Rename(stage, path); err != nil {
-		return nil, SnapshotInfo{}, err
-	}
-	keepStage = true
-	repository, err = m.OpenPrivate(path)
-	if err != nil {
-		_ = os.RemoveAll(path)
-		return nil, SnapshotInfo{}, err
-	}
-	return repository, snapshot, nil
-}
-
 // ImportPrivateRemoteDescriptor creates a private repository whose first
-// branch is backed by descriptor. It is the path-free equivalent of
-// ImportPrivateRemoteSnapshot used by live cluster handoff.
+// branch is backed by descriptor.
 func (m *Manager) ImportPrivateRemoteDescriptor(path, name string, descriptor RemoteSnapshotDescriptor, targetBranch string) (*Repository, error) {
 	return m.importPrivateRemoteDescriptor(path, name, descriptor, targetBranch, 0, 0)
 }
@@ -582,31 +400,6 @@ func (m *Manager) importPrivateRemoteDescriptor(path, name string, descriptor Re
 	return repository, nil
 }
 
-// ImportRemoteBranchSnapshot adds a sparse inherited branch to an existing
-// repository. This is used when a remote fork joins a family whose Sentry is
-// already running on the target node.
-func (r *Repository) ImportRemoteBranchSnapshot(source, targetBranch string) (SnapshotInfo, error) {
-	if err := requireSnapshotDirectory(source); err != nil {
-		return SnapshotInfo{}, err
-	}
-	snapshot, graph, err := readRemoteGraphDescriptor(source)
-	if err != nil {
-		return SnapshotInfo{}, err
-	}
-	return snapshot, r.ImportRemoteBranchDescriptor(RemoteSnapshotDescriptor{Snapshot: snapshot, Root: graph.Root}, targetBranch)
-}
-
-// ImportPackedBranchSnapshot adds portable shared-pack metadata to an
-// existing repository and records regular-file objects as lazy. The target
-// branch receives independent local object identities whose pending markers
-// retain the source-pack identities.
-func (r *Repository) ImportPackedBranchSnapshot(source, targetBranch string) (SnapshotInfo, error) {
-	if err := validateName(targetBranch, "branch"); err != nil {
-		return SnapshotInfo{}, err
-	}
-	return r.importPortableSnapshotMode(source, targetBranch, true)
-}
-
 // ImportSnapshot creates a catalogued managed volume from snapshot.
 func (m *Manager) ImportSnapshot(name, source string) (*Repository, SnapshotInfo, error) {
 	repository, err := m.Create(name)
@@ -624,20 +417,10 @@ func (m *Manager) ImportSnapshot(name, source string) (*Repository, SnapshotInfo
 }
 
 func (r *Repository) importSnapshot(source string) (SnapshotInfo, error) {
-	return r.importSnapshotMode(source, false, mainBranch)
+	return r.importPortableSnapshotMode(source, mainBranch)
 }
 
-func (r *Repository) importSnapshotMode(source string, remote bool, targetBranch string) (SnapshotInfo, error) {
-	if err := requireSnapshotDirectory(source); err != nil {
-		return SnapshotInfo{}, err
-	}
-	if remote {
-		return r.importRemoteSnapshotMode(source, targetBranch)
-	}
-	return r.importPortableSnapshotMode(source, targetBranch, false)
-}
-
-func (r *Repository) importPortableSnapshotMode(source, targetBranch string, lazyObjects bool) (SnapshotInfo, error) {
+func (r *Repository) importPortableSnapshotMode(source, targetBranch string) (SnapshotInfo, error) {
 	if err := requireSnapshotDirectory(source); err != nil {
 		return SnapshotInfo{}, err
 	}
@@ -714,7 +497,7 @@ func (r *Repository) importPortableSnapshotMode(source, targetBranch string, laz
 	} else if err != nil {
 		return SnapshotInfo{}, err
 	}
-	if err := r.importGraphFiles(&metadata, objectsDir, objects, ttcsnapshot.SnapshotID(branch.WorkingSnapshot), lazyObjects); err != nil {
+	if err := r.importGraphFiles(&metadata, objectsDir, objects, ttcsnapshot.SnapshotID(branch.WorkingSnapshot)); err != nil {
 		return SnapshotInfo{}, err
 	}
 	r.info.NextInode = snapshot.NextInode
@@ -766,51 +549,9 @@ func (r *Repository) importPortableSnapshotMode(source, targetBranch string, laz
 	return snapshot, nil
 }
 
-func (r *Repository) importRemoteSnapshotMode(source, targetBranch string) (SnapshotInfo, error) {
-	snapshot, graph, err := readRemoteGraphDescriptor(source)
-	if err != nil {
-		return SnapshotInfo{}, err
-	}
-	branch, err := r.readBranch(targetBranch)
-	if errors.Is(err, os.ErrNotExist) {
-		working, allocErr := r.graph.AllocateWorking()
-		if allocErr != nil {
-			return SnapshotInfo{}, allocErr
-		}
-		branch = Branch{ID: targetBranch, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
-	} else if err != nil {
-		return SnapshotInfo{}, err
-	}
-	catalogWorking, err := r.graph.AllocateWorking()
-	if err != nil {
-		return SnapshotInfo{}, err
-	}
-	if snapshot.NextInode > r.info.NextInode {
-		r.info.NextInode = snapshot.NextInode
-		if err := writeJSONAtomic(filepath.Join(r.path, "staging"), filepath.Join(r.path, "volume.json"), r.info); err != nil {
-			return SnapshotInfo{}, err
-		}
-	}
-	catalog := snapshot.RepositoryID + ":" + snapshot.Root
-	root, err := r.graph.ImportDeferredFilesystemRoot(catalogWorking, graphRootName(targetBranch), catalog, graph.Root)
-	if err != nil {
-		return SnapshotInfo{}, err
-	}
-	if err := r.graph.SetRoot(graphBaseRootName(targetBranch), root); err != nil {
-		return SnapshotInfo{}, err
-	}
-	branch.Root, branch.BaseRoot, branch.RemoteCatalog, branch.RemoteCatalogSnapshot, branch.RemoteLogicalBytes = root.String(), root.String(), catalog, uint64(catalogWorking), snapshot.LogicalBytes
-	if err := r.writeBranch(branch); err != nil {
-		return SnapshotInfo{}, err
-	}
-	return snapshot, nil
-}
-
 // importGraphFiles re-origins imported whole-file objects into the target
-// repository's working snapshot. Remote imports keep the source object ID in
-// the sparse-object marker so peer reads remain correctly addressed even
-// though target-local identities are independent.
-func (r *Repository) importGraphFiles(metadata *snapshotMetadata, objectsDir string, objects map[string]int64, working ttcsnapshot.SnapshotID, remote bool) error {
+// repository's working snapshot.
+func (r *Repository) importGraphFiles(metadata *snapshotMetadata, objectsDir string, objects map[string]int64, working ttcsnapshot.SnapshotID) error {
 	translated := make(map[string]string, len(objects))
 	keys := make([]string, 0, len(objects))
 	for source := range objects {
@@ -823,54 +564,25 @@ func (r *Repository) importGraphFiles(metadata *snapshotMetadata, objectsDir str
 		if err != nil {
 			return err
 		}
-		if remote {
-			path, err := r.data.Path(id)
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-			if err == nil {
-				err = file.Truncate(size)
-			}
-			if file != nil {
-				err = errors.Join(err, file.Sync(), file.Close())
-			}
-			if err != nil {
-				return err
-			}
-		} else {
-			file, err := os.Open(filepath.Join(objectsDir, source))
-			if err != nil {
-				return err
-			}
-			err = r.data.Install(id, file, size)
-			closeErr := file.Close()
-			if err != nil || closeErr != nil {
-				return errors.Join(err, closeErr)
-			}
+		file, err := os.Open(filepath.Join(objectsDir, source))
+		if err != nil {
+			return err
+		}
+		err = r.data.Install(id, file, size)
+		closeErr := file.Close()
+		if err != nil || closeErr != nil {
+			return errors.Join(err, closeErr)
 		}
 		if err := r.graph.CommitReservedObject(id, graphConstructionPin(id), uint64(size), nil, nil); err != nil {
 			_ = r.data.Remove(id)
 			return err
-		}
-		if remote && size != 0 {
-			if err := r.markRemoteObjectPending(id.String(), source); err != nil {
-				return err
-			}
 		}
 		translated[source] = id.String()
 	}
 	for index := range metadata.Inodes {
 		if target, ok := translated[metadata.Inodes[index].Object]; ok {
 			metadata.Inodes[index].Object = target
-			if remote {
-				metadata.Inodes[index].DataGeneration = 0
-			} else {
-				metadata.Inodes[index].DataGeneration = uint64(working)
-			}
+			metadata.Inodes[index].DataGeneration = uint64(working)
 		}
 	}
 	return nil

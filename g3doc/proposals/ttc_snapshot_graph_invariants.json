@@ -22,9 +22,8 @@
     {
       "id": "identity.distributed-filesystem-global",
       "requirement": "Distributed filesystem objects use Raft-allocated snapshot origins and route directly by origin.",
-      "status": "implemented-live-path",
-      "evidence": ["pkg/ttcvolume/repository.go", "runsc/ttc/bundle/store.go", "runsc/ttc/cmd/distributed.go", "runsc/ttc/cmd/elastic_cluster.go"],
-      "gap": "All clustered live and lifecycle operations use Raft-global origins, but stopped/dehydrated filesystem publication still serializes those origins through legacy cold packs."
+      "status": "implemented",
+      "evidence": ["pkg/ttcvolume/repository.go", "runsc/ttc/bundle/store.go", "runsc/ttc/cmd/distributed.go", "runsc/ttc/cmd/elastic_cluster.go", "runsc/ttc/cmd/storage.go"]
     },
     {
       "id": "immutability.sealed",
@@ -35,16 +34,14 @@
     {
       "id": "authority.single-ledger",
       "requirement": "Every immutable object has exactly one authoritative reference ledger.",
-      "status": "partial",
-      "evidence": ["pkg/ttcsnapshot/ledger.go", "runsc/ttc/cmd/shared_references.go"],
-      "gap": "Flattened filesystem cold packs are not represented by the origin ledger."
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/ledger.go", "runsc/ttc/cmd/shared_references.go"]
     },
     {
       "id": "authority.node-to-shared-only",
       "requirement": "Volatile origin authority transitions only from its provider node to shared storage.",
-      "status": "implemented-memory-only",
-      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cmd/graph_references.go"],
-      "gap": "Distributed filesystem storage still uses generation manifests outside this transition."
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cmd/graph_references.go", "runsc/ttc/cmd/storage.go"]
     },
     {
       "id": "references.edges-count-once",
@@ -55,9 +52,8 @@
     {
       "id": "references.zero-sufficient",
       "requirement": "A zero authoritative reference count is sufficient to reclaim an immutable object.",
-      "status": "partial",
-      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcsnapshot/ledger.go"],
-      "gap": "Filesystem cold-pack reclamation still uses manifest tracing and grace-based collection."
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcsnapshot/ledger.go", "runsc/ttc/cmd/shared_references.go"]
     },
     {
       "id": "references.open-files-explicit",
@@ -74,9 +70,8 @@
     {
       "id": "publication.restartable",
       "requirement": "Publication is restartable, idempotent, generation-fenced, and cancelable by removal.",
-      "status": "partial",
-      "evidence": ["runsc/ttc/storage/queue.go", "runsc/ttc/cmd/storage.go"],
-      "gap": "Graph memory publication meets the invariant; legacy filesystem cold-pack publication must be converted."
+      "status": "implemented",
+      "evidence": ["runsc/ttc/storage/queue.go", "runsc/ttc/cmd/storage.go", "runsc/ttc/cmd/shared_references.go"]
     },
     {
       "id": "execution.single-owner",
@@ -106,9 +101,9 @@
     {
       "id": "format.no-legacy-fallback",
       "requirement": "A new-format root cannot execute any legacy storage fallback.",
-      "status": "missing-test-guard",
-      "evidence": ["runsc/ttc/cmd/daemon_test.go"],
-      "gap": "Startup rejection is covered, but the required strict runtime test switch has not been added."
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cmd/daemon.go", "runsc/ttc/cmd/daemon_test.go"],
+      "qualification_mode": "TTC_SNAPSHOT_GRAPH_STRICT=1"
     }
   ]
 }

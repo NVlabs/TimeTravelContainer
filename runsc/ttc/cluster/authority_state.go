@@ -528,17 +528,16 @@ type AuthorityPlacementPayload struct {
 
 // AuthorityTransactionPayload carries a distributed transaction command.
 type AuthorityTransactionPayload struct {
-	Transaction    Transaction             `json:"transaction,omitempty"`
-	ID             string                  `json:"id,omitempty"`
-	Revision       uint64                  `json:"revision,omitempty"`
-	Next           TransactionState        `json:"next,omitempty"`
-	Failure        string                  `json:"failure,omitempty"`
-	Digest         string                  `json:"digest,omitempty"`
-	FilesystemPack string                  `json:"filesystem_pack,omitempty"`
-	Metrics        *TransferMetrics        `json:"metrics,omitempty"`
-	Graph          *GraphHandoffDescriptor `json:"graph,omitempty"`
-	DesiredPaused  bool                    `json:"desired_paused,omitempty"`
-	Activated      bool                    `json:"activated,omitempty"`
+	Transaction   Transaction             `json:"transaction,omitempty"`
+	ID            string                  `json:"id,omitempty"`
+	Revision      uint64                  `json:"revision,omitempty"`
+	Next          TransactionState        `json:"next,omitempty"`
+	Failure       string                  `json:"failure,omitempty"`
+	Digest        string                  `json:"digest,omitempty"`
+	Metrics       *TransferMetrics        `json:"metrics,omitempty"`
+	Graph         *GraphHandoffDescriptor `json:"graph,omitempty"`
+	DesiredPaused bool                    `json:"desired_paused,omitempty"`
+	Activated     bool                    `json:"activated,omitempty"`
 }
 
 // AuthorityPublicationPayload carries a durable publication command.
@@ -1490,11 +1489,8 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		if err := validateSHA256Digest(p.Digest); err != nil {
 			return nil, err
 		}
-		if err := validateFilesystemPackID(p.FilesystemPack); err != nil {
-			return nil, err
-		}
 		if tx.SessionDigest != "" {
-			if tx.SessionDigest != p.Digest || tx.FilesystemMetadataPack != p.FilesystemPack {
+			if tx.SessionDigest != p.Digest {
 				return nil, errors.New("transaction bound to another session")
 			}
 			return authorityValue(tx)
@@ -1503,7 +1499,6 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("transaction is not reserving a session")
 		}
 		tx.SessionDigest = p.Digest
-		tx.FilesystemMetadataPack = p.FilesystemPack
 		if err := tx.Advance(TransactionSourceCaptured, "", command.IssuedAt); err != nil {
 			return nil, err
 		}
@@ -1815,9 +1810,6 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 		}
 		if err := tx.Identity.Validate(); err != nil {
 			return nil, err
-		}
-		if err := validateFilesystemPackID(tx.FilesystemMetadataPack); err != nil {
-			return nil, fmt.Errorf("transaction %q: %w", id, err)
 		}
 	}
 	for id, provider := range state.VolatileOrigins {

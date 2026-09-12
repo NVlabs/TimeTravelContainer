@@ -449,7 +449,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
-	if session.SharedMetadata == "" || session.FilesystemMetadataPack != "" || len(session.FilesystemRoots) != 0 {
+	if session.SharedMetadata == "" || len(session.FilesystemRoots) != 0 {
 		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
 		if err != nil || len(tokenBytes) != 16 {
 			return errors.New("invalid distributed snapshot token")
@@ -2110,6 +2110,18 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
+	if os.Getenv("TTC_SNAPSHOT_GRAPH_STRICT") == "1" {
+		if err := validateStrictSnapshotGraphRoot(roots.shared); err != nil {
+			fmt.Fprintf(stderr, "ttcd: validating strict TTC_ROOT: %v\n", err)
+			return 1
+		}
+		if clusterOpts.Configured {
+			if err := validateStrictSnapshotGraphRoot(roots.local); err != nil {
+				fmt.Fprintf(stderr, "ttcd: validating strict TTC_LOCAL_ROOT: %v\n", err)
+				return 1
+			}
+		}
+	}
 	if clusterOpts.Configured {
 		if err := resolveSimpleClusterOptions(&clusterOpts, roots); err != nil {
 			fmt.Fprintf(stderr, "ttcd: configuring cluster identity: %v\n", err)
@@ -2466,6 +2478,39 @@ func inspectDaemonStorageRoot(root, role string) error {
 		}
 	}
 	return nil
+}
+
+// validateStrictSnapshotGraphRoot is a qualification guard for the destructive
+// format boundary. It makes tests fail if a current-format operation recreates
+// a pathname that belonged exclusively to the removed storage engines. It is
+// intentionally enabled only by TTC_SNAPSHOT_GRAPH_STRICT=1: walking a large
+// authoritative root at every production startup would violate TTC's bounded
+// startup requirement.
+func validateStrictSnapshotGraphRoot(root string) error {
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		legacy := relative == "cold/inflight" || relative == "distributed-filesystem-metadata" ||
+			strings.HasPrefix(relative, "distributed-filesystem-metadata/") ||
+			strings.Contains(relative, "/memory/chunks/chunks/") ||
+			strings.Contains(relative, "/promoted-repositories/") ||
+			(strings.Contains(relative, "/memory/") && (entry.Name() == "application.mem" || entry.Name() == "dehydration-source"))
+		if legacy {
+			return fmt.Errorf("new-format root contains removed legacy storage artifact %q", relative)
+		}
+		return nil
+	})
 }
 
 func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {

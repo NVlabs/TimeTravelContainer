@@ -373,8 +373,8 @@ func (s *lostResponseTransactionStore) Advance(id string, revision uint64, next 
 	return tx, err
 }
 
-func (s *lostResponseTransactionStore) BindSession(id string, revision uint64, digest, filesystemPack string, now time.Time) (*Transaction, error) {
-	tx, err := s.TransactionCatalog.BindSession(id, revision, digest, filesystemPack, now)
+func (s *lostResponseTransactionStore) BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error) {
+	tx, err := s.TransactionCatalog.BindSession(id, revision, digest, now)
 	if err == nil && s.failBind {
 		s.failBind = false
 		return nil, io.ErrUnexpectedEOF

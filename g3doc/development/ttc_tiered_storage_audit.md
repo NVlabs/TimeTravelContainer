@@ -449,8 +449,8 @@ count, lease, last-access signal, or eviction ordering across these classes.
 | Scenario | Current result | Required result |
 |---|---|---|
 | Run an image on a node with an empty local root | Waits for full extraction | Start after required metadata/bootstrap files are available; fault/cache file ranges on demand |
-| Remote fork under throttled shared FS | Waits for shared filesystem metadata pack and target image extraction | Execute from peer-fenced memory, image, and filesystem providers; publish in background |
-| Batch remote fork | Rebuilds the same filesystem metadata pack per child | Seal once and share one immutable generation/provider set |
+| Remote fork under throttled shared FS | Previously waited for shared filesystem metadata and target image extraction | Execute from peer-fenced memory, image, and filesystem providers; publish in background |
+| Batch remote fork | Previously rebuilt filesystem metadata per child | Seal once and share one immutable generation/provider set |
 | Stop, then immediately restart while publishing | Old worker remains live and may unplace/publish stale state | Activation atomically supersedes the old generation; worker cancellation is prompt and idempotent |
 | Start a stopped durable branch on another node | Sparse objects are created without a live provider | Provider installed before execution; no pending extent can read as zero |
 | Rehydrate a durable branch on another node | Memory and writable data are lazy, but image is eager | Bootstrap metadata only; all bulk image/filesystem/memory data lazy |

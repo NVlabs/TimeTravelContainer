@@ -36,7 +36,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
-	"gvisor.dev/gvisor/pkg/ttcpack"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -595,111 +594,6 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		return nil, 0, err
 	}
 	return roots, dependentBytes, nil
-}
-
-func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle.ContainerInfo, filesystemBranch, transactionID, packText string, peer bool) (int, error) {
-	if packText == "" {
-		return 0, nil
-	}
-	pack, err := ttcpack.ParseID(packText)
-	if err != nil {
-		return 0, err
-	}
-	staging := filepath.Join(b.activeDataRoot(), "distributed-filesystem-metadata", transactionID)
-	if err := os.RemoveAll(staging); err != nil {
-		return 0, err
-	}
-	if err := ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), pack, staging); err != nil {
-		return 0, err
-	}
-	defer os.RemoveAll(staging)
-	store := b.containerStore()
-	spec, err := store.LoadSpec(info.ID)
-	if err != nil {
-		return 0, err
-	}
-	configs, err := specutils.TTCVolumeRepositories(spec)
-	if err != nil {
-		return 0, err
-	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
-	if err != nil {
-		return 0, err
-	}
-	for index := range configs {
-		config := &configs[index]
-		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		snapshot := filepath.Join(staging, hex.EncodeToString(key[:]))
-		var snapshotInfo ttcvolume.SnapshotInfo
-		encodedSnapshot, err := os.ReadFile(filepath.Join(snapshot, "snapshot.json"))
-		if err != nil {
-			return 0, fmt.Errorf("reading remote repository %q identity: %w", config.Source, err)
-		}
-		if err := json.Unmarshal(encodedSnapshot, &snapshotInfo); err != nil {
-			return 0, fmt.Errorf("decoding remote repository %q identity: %w", config.Source, err)
-		}
-		if peer {
-			var repository *ttcvolume.Repository
-			if _, statErr := os.Stat(filepath.Join(config.Path, "volume.json")); statErr == nil {
-				repository, err = ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
-				if err == nil {
-					_, err = repository.ImportRemoteBranchSnapshot(snapshot, filesystemBranch)
-				}
-			} else if errors.Is(statErr, os.ErrNotExist) {
-				// A family can exist in the shared catalog without having any
-				// active filesystem on this node. Materialize its first imported
-				// branch directly into the node-local canonical repository path.
-				repository, _, err = manager.ImportPrivateRemoteSnapshot(config.Path, "peer-"+fmt.Sprint(index), snapshot, filesystemBranch)
-			} else {
-				err = statErr
-			}
-			if err != nil {
-				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
-			}
-			// Remote metadata is intentionally unresolved until the fenced
-			// filesystem stream is donated to the Sentry. Verify only the durable
-			// branch pointer here; enumerating BranchObjects would defeat lazy
-			// startup and cannot succeed before the resolver is attached.
-			if _, err := repository.Branch(filesystemBranch); err != nil {
-				_ = repository.Close()
-				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
-			}
-			config.Branch = filesystemBranch
-			config.CopyMode = string(manager.Capability().Mode)
-			config.RestoreID = snapshotInfo.RepositoryID
-			config.Private = true
-			closeErr := repository.Close()
-			if closeErr != nil {
-				return 0, closeErr
-			}
-			continue
-		}
-		pathKey := sha256.Sum256([]byte(filepath.Clean(config.Path)))
-		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
-		var repository *ttcvolume.Repository
-		if _, statErr := os.Stat(destination); statErr == nil {
-			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
-		} else if errors.Is(statErr, os.ErrNotExist) {
-			repository, _, err = manager.ImportPrivateRemoteSnapshot(destination, "remote-"+fmt.Sprint(index), snapshot, filesystemBranch)
-		} else {
-			return 0, statErr
-		}
-		if err != nil {
-			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
-		}
-		config.Path = destination
-		config.Branch = filesystemBranch
-		config.CopyMode = string(manager.Capability().Mode)
-		config.RestoreID = snapshotInfo.RepositoryID
-		config.Private = true
-		if err := repository.Close(); err != nil {
-			return 0, err
-		}
-	}
-	if err := store.WriteActiveRepositoryMap(info.ID, configs); err != nil {
-		return 0, err
-	}
-	return len(configs), nil
 }
 
 // materializeDistributedFilesystemRoots installs the bounded graph-root

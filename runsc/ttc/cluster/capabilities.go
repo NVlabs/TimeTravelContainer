@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 4 adds shared snapshot-graph filesystem roots to
-	// durable publication and removes flattened cold filesystem packs.
-	ControlProtocolVersion = 4
+	// ControlProtocolVersion 5 makes graph-root descriptors the only
+	// filesystem handoff representation and removes the compatibility metadata
+	// pack field from transaction and session state.
+	ControlProtocolVersion = 5
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

@@ -125,7 +125,7 @@ test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-2
 
 # Live handoff descriptors are carried directly over the cluster protocol.
 # Creating a branch or migrating it must not synchronously stage a legacy
-# filesystem metadata pack on the shared filesystem.
+# filesystem bootstrap object on the shared filesystem.
 if test -d "$SHARED/cold/inflight" && find "$SHARED/cold/inflight" -type f -print -quit | grep -q .; then
 	echo "live handoff created a shared cold-pack intent" >&2
 	find "$SHARED/cold/inflight" -type f -print >&2

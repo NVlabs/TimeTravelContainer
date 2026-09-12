@@ -703,6 +703,29 @@ func TestDaemonStorageRootRejectsWrongRole(t *testing.T) {
 	}
 }
 
+func TestStrictSnapshotGraphRootRejectsLegacyArtifacts(t *testing.T) {
+	root := t.TempDir()
+	current := filepath.Join(root, "containers", "family", "memory", "application.mem")
+	if err := os.MkdirAll(filepath.Dir(current), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(current, []byte("legacy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStrictSnapshotGraphRoot(root); err == nil || !strings.Contains(err.Error(), "removed legacy storage artifact") {
+		t.Fatalf("strict validation error=%v", err)
+	}
+	if err := os.Remove(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ttc-root-format"), []byte("current"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStrictSnapshotGraphRoot(root); err != nil {
+		t.Fatalf("strict current root: %v", err)
+	}
+}
+
 func TestDaemonRejectsOldRootBeforePlatformProbe(t *testing.T) {
 	root := t.TempDir()
 	markerPath := filepath.Join(root, ".ttc-root-format")
