@@ -1148,6 +1148,13 @@ type AsyncPagesFileLoad struct {
 	// immutable. errVal is stored with mu locked.
 	errVal atomic.Value
 
+	// errDetail retains the causal asynchronous-reader error for diagnostics.
+	// errVal intentionally remains a Linux EIO for guest-facing fault paths,
+	// which cannot safely expose arbitrary transport errors. Stats, however,
+	// must preserve the cause so a failed remote migration can be diagnosed and
+	// fenced instead of appearing as an unexplained "I/O error".
+	errDetail atomic.Pointer[string]
+
 	// demandOnly is true while unawaited pages must not be loaded. It may
 	// transition from true to false exactly once when Drain is called.
 	demandOnly atomic.Bool
@@ -1488,7 +1495,11 @@ func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
 	apfl.mu.Unlock()
 	apfl.amflsMu.Unlock()
 	if err := apfl.err(); err != nil {
-		stats.Error = err.Error()
+		if detail := apfl.errDetail.Load(); detail != nil {
+			stats.Error = *detail
+		} else {
+			stats.Error = err.Error()
+		}
 	}
 	return stats
 }
@@ -2582,6 +2593,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)
 			apfl.mu.Lock()
+			detail := fmt.Sprintf("waiting for remote page read: %v", err)
+			apfl.errDetail.Store(&detail)
 			apfl.errVal.Store(linuxerr.EIO)
 			apfl.mu.Unlock()
 			return
@@ -2605,6 +2618,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 			if c.N != op.total {
 				log.Warningf("Async page loading failed: read for MemoryFile(%p) pages %v (total %d bytes) returned %d bytes, error: %v", op.amfl.f, op.frs, op.total, c.N, c.Err)
+				detail := fmt.Sprintf("remote page read at offset %d returned %d of %d bytes: %v", op.off(), c.N, op.total, c.Err)
+				apfl.errDetail.Store(&detail)
 				apfl.errVal.Store(linuxerr.EIO)
 				apfl.mu.Unlock()
 				apfl.amflsMu.Unlock()

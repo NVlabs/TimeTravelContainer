@@ -209,6 +209,23 @@ func (c *RaftCatalog) AuthorityState() (*AuthorityState, error) {
 	return c.state()
 }
 
+// AppliedTransaction is a local, non-linearizable monitor read that avoids
+// copying the complete authority state.
+func (c *RaftCatalog) AppliedTransaction(id string) (Transaction, bool) {
+	if c == nil || c.node == nil {
+		return Transaction{}, false
+	}
+	return c.node.AppliedTransaction(id)
+}
+
+// AppliedNode is the node-record counterpart to AppliedTransaction.
+func (c *RaftCatalog) AppliedNode(id string) (NodeRecord, bool) {
+	if c == nil || c.node == nil {
+		return NodeRecord{}, false
+	}
+	return c.node.AppliedNode(id)
+}
+
 // AllocateSnapshotOrigins allocates globally monotonic IDs and records this
 // node as their exact volatile provider in one Raft command.
 func (c *RaftCatalog) AllocateSnapshotOrigins(node, incarnation string, count uint32) (SnapshotAllocation, error) {

@@ -5053,6 +5053,29 @@ func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
 	}
 }
 
+func TestFinalColdStorageCollectionHasNoPublicationGraceResidue(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	orphan := filepath.Join(shared, "cold", "manifests", "family", "branch", "0000000000000001.json")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("uncommitted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := collectColdStorage(shared, local, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("ordinary grace did not retain a recent publication: %v", err)
+	}
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final collection retained unreachable publication: %v", err)
+	}
+}
+
 func TestEmitCapacityRequestCoalescesUntilAcknowledged(t *testing.T) {
 	dataRoot := t.TempDir()
 	backend := &runtimeBackend{
@@ -5341,6 +5364,41 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 	}
 	if other := distributedChildRequestID("parent", 3, []string{"stop", "demo@main"}); first == other {
 		t.Fatalf("different child operations collided at %q", first)
+	}
+}
+
+func TestDistributedMutationSourceTransactions(t *testing.T) {
+	transaction := func(id, sourceNode, sourceBranch, targetBranch string, state cluster.TransactionState, needed bool) cluster.Transaction {
+		return cluster.Transaction{
+			Identity: cluster.ForkIdentity{
+				TransactionID: id, SourceNodeID: sourceNode, SourceContainer: "family-id", SourceBranch: sourceBranch,
+				TargetContainer: "family-id", TargetBranch: id, TargetVisibleBranch: targetBranch,
+			},
+			State: state, SourceNeeded: needed,
+		}
+	}
+	transactions := []cluster.Transaction{
+		transaction("incoming", "node-a", "main", "child", cluster.TransactionPublished, true),
+		transaction("outgoing", "node-b", "child", "grandchild", cluster.TransactionDraining, true),
+		transaction("independent", "node-c", "main", "old", cluster.TransactionIndependent, false),
+	}
+	info := ttcbundle.ContainerInfo{ID: "family-id"}
+	all := distributedMutationSourceTransactions(transactions, info, "")
+	if len(all) != 2 {
+		t.Fatalf("family settlement nodes=%v, want node-a and node-b", all)
+	}
+	if _, ok := all["node-a"]["incoming"]; !ok {
+		t.Fatalf("family settlement omitted incoming transaction: %v", all)
+	}
+	if _, ok := all["node-b"]["outgoing"]; !ok {
+		t.Fatalf("family settlement omitted outgoing transaction: %v", all)
+	}
+	child := distributedMutationSourceTransactions(transactions, info, "child")
+	if len(child) != 2 {
+		t.Fatalf("branch settlement nodes=%v, want incoming and outgoing sources", child)
+	}
+	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, ""); len(got) != 0 {
+		t.Fatalf("unrelated family selected transactions: %v", got)
 	}
 }
 

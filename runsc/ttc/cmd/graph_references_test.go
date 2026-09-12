@@ -27,6 +27,33 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
+func TestSnapshotReferenceRequesterAuthorization(t *testing.T) {
+	tx := &cluster.Transaction{Identity: cluster.ForkIdentity{
+		TransactionID: "fork-move", SourceNodeID: "node-source", TargetNodeID: "node-target", Migration: true,
+	}}
+	for _, test := range []struct {
+		name, peer, operation string
+		want                  bool
+	}{
+		{name: "target ordinary", peer: "node-target", operation: "branch-pin", want: true},
+		{name: "source transfer", peer: "node-source", operation: "transfer-fork-move", want: true},
+		{name: "source ordinary denied", peer: "node-source", operation: "branch-pin"},
+		{name: "other transfer denied", peer: "node-other", operation: "transfer-fork-move"},
+		{name: "wrong transfer transaction denied", peer: "node-source", operation: "transfer-fork-other"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := snapshotReferenceRequesterAuthorized(tx, test.peer, test.operation); got != test.want {
+				t.Fatalf("authorized=%t, want %t", got, test.want)
+			}
+		})
+	}
+	nonMigration := *tx
+	nonMigration.Identity.Migration = false
+	if snapshotReferenceRequesterAuthorized(&nonMigration, "node-source", "transfer-fork-move") {
+		t.Fatal("non-migration source received transfer authority")
+	}
+}
+
 func TestGraphReferenceOperationIsBranchScoped(t *testing.T) {
 	info := ttcbundle.ContainerInfo{DistributedForkTransactionID: "family-transaction"}
 	initial := ttcbundle.BranchInfo{ID: "remote"}

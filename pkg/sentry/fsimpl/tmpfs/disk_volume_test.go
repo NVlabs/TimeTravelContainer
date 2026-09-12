@@ -24,9 +24,34 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+func TestInstallDiskVolumeRepositoryCanonicalizesRemoteIdentity(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("restore-identity-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+
+	fs := &filesystem{diskVolume: &diskVolumeState{
+		ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: "source-node-repository"},
+	}}
+	fs.installDiskVolumeRepository(repository, "remote-child")
+	want := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
+	if got := fs.diskVolume.ResourceID; got != want {
+		t.Fatalf("installed resource ID=%q, want target-local %q", got, want)
+	}
+	if fs.diskVolume.Repository != repository || fs.diskVolume.Branch != "remote-child" {
+		t.Fatalf("installed disk volume=%+v", fs.diskVolume)
+	}
+}
 
 func TestDiskVolumeErrorNeverLeaksUnknownSyscallError(t *testing.T) {
 	if got := diskVolumeError("test invariant", errors.New("broken graph edge")); !linuxerr.Equals(linuxerr.EIO, got) {

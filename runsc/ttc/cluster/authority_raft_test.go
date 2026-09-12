@@ -27,6 +27,27 @@ import (
 	"github.com/hashicorp/raft"
 )
 
+func TestAuthorityAppliedObjectLookups(t *testing.T) {
+	fsm := NewAuthorityFSM()
+	fsm.mu.Lock()
+	fsm.state.Transactions["fork-1"] = Transaction{Identity: ForkIdentity{TransactionID: "fork-1"}, Revision: 7}
+	fsm.state.Nodes["node-a"] = NodeRecord{NodeID: "node-a", Incarnation: "inc-a", State: NodeReady}
+	fsm.mu.Unlock()
+	node := &AuthorityRaftNode{fsm: fsm}
+
+	tx, ok := node.AppliedTransaction("fork-1")
+	if !ok || tx.Revision != 7 {
+		t.Fatalf("transaction=(%+v, %t), want revision 7", tx, ok)
+	}
+	record, ok := node.AppliedNode("node-a")
+	if !ok || record.Incarnation != "inc-a" || record.State != NodeReady {
+		t.Fatalf("node=(%+v, %t), want ready inc-a", record, ok)
+	}
+	if _, ok := node.AppliedTransaction("missing"); ok {
+		t.Fatal("missing transaction was reported present")
+	}
+}
+
 func TestAuthorityPlainStreamToken(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -302,6 +323,68 @@ func TestAuthorityRaftPromotesOnlyReadyLearner(t *testing.T) {
 		}
 	}
 	t.Fatal("ready learner disappeared from configuration")
+}
+
+func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	open := func(id string, bootstrap bool) *AuthorityRaftNode {
+		t.Helper()
+		node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+			NodeID: id, LocalDir: filepath.Join(t.TempDir(), "raft"),
+			ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+			ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: bootstrap,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return node
+	}
+	a, b, c := open("node-a", true), open("node-b", false), open("node-c", false)
+	defer a.Close()
+	defer b.Close()
+	defer c.Close()
+	leader := waitAuthorityLeader(t, a)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, follower := range []*AuthorityRaftNode{b, c} {
+		if err := leader.AddNonvoter(ctx, follower.id, follower.Address()); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Promote(ctx, follower.id, follower.Address()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, node := range []*AuthorityRaftNode{a, b, c} {
+		registerReadyRaftNode(t, leader, node.id, "incarnation-"+node.id)
+	}
+	result, err := leader.Propose(ctx, "fence-node-c", AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-c", Incarnation: "incarnation-node-c", State: NodeOffline,
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("fencing node-c: result=%+v err=%v", result, err)
+	}
+	if err := leader.ReconcileVoters(ctx, 3); err != nil {
+		t.Fatalf("reconciling fenced voter: %v", err)
+	}
+	configuration, err := leader.Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range configuration.Servers {
+		if server.ID == "node-c" {
+			t.Fatalf("fenced voter remains in Raft configuration: %+v", configuration)
+		}
+	}
+	if err := leader.RetireMember(ctx, "node-b"); err != nil {
+		t.Fatalf("retiring second node after fenced-voter reconciliation: %v", err)
+	}
+	configuration, err = leader.Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configuration.Servers) != 1 || configuration.Servers[0].ID != "node-a" || configuration.Servers[0].Suffrage != raft.Voter {
+		t.Fatalf("final configuration = %+v, want sole voter node-a", configuration)
+	}
 }
 
 func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {

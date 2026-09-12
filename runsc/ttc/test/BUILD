@@ -88,6 +88,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts a three-node cluster, creates a configurable
+# high-fanout family across nodes, and retires a node through bulk migration.
+sh_binary(
+    name = "e2e_distributed_fanout",
+    srcs = ["e2e_distributed_fanout.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it starts a three-node cluster, migrates live branches, and
 # retires a node through scheduler-selected evacuation.
 sh_binary(

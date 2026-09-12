@@ -73,13 +73,17 @@ const (
 	daemonFrameTTYState    = byte('S')
 	daemonMaxFrame         = 1 << 20
 	daemonRootlessProbeArg = "_rootless-userns-probe"
+	// Batch remote fork reserves every sibling before pausing the source. Keep
+	// the default high enough for agent-harness fanout while retaining a bound
+	// against an accidentally unbounded number of unfinished transactions.
+	defaultClusterMaxTransactions = 4096
 )
 
 var daemonAPIFeatures = []string{
 	"batch-fork",
 	"durable-wait",
 	"elastic-cluster",
-	"filesystem-range-paging",
+	"filesystem-object-paging",
 	"named-exec",
 	"network-quarantine",
 	"storage-status",
@@ -315,7 +319,7 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4
 	policy.AckInterval = time.Millisecond
-	return daemonClusterOptions{MaxTransactions: 32, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy}
+	return daemonClusterOptions{MaxTransactions: defaultClusterMaxTransactions, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy}
 }
 
 type daemonClusterRuntime struct {
@@ -389,7 +393,66 @@ type daemonTargetRuntime struct {
 	authority   *cluster.RaftCatalog
 	done        <-chan struct{}
 	watch       sync.Map
+	watchCount  atomic.Int64
+	pollOnce    sync.Once
+	pollSlots   chan struct{}
 	locks       sync.Map
+}
+
+const dependencyMonitorConcurrency = 2
+
+func dependencyMonitorInterval(watchers int64) time.Duration {
+	if watchers < 1 {
+		watchers = 1
+	}
+	// Keep aggregate branch-status observation near 16 polls/second. The data
+	// plane remains fully asynchronous; this polling only drives adaptive hints,
+	// accounting, and eventual independence bookkeeping.
+	interval := time.Duration(watchers) * time.Second / 16
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	return interval
+}
+
+func (r *daemonTargetRuntime) tryDependencyPoll() (func(), bool) {
+	r.pollOnce.Do(func() { r.pollSlots = make(chan struct{}, dependencyMonitorConcurrency) })
+	select {
+	case r.pollSlots <- struct{}{}:
+		return func() { <-r.pollSlots }, true
+	default:
+		return nil, false
+	}
+}
+
+func (r *daemonTargetRuntime) monitorTransaction(id string) (*cluster.Transaction, error) {
+	if r.authority != nil {
+		transaction, ok := r.authority.AppliedTransaction(id)
+		if ok {
+			return &transaction, nil
+		}
+		// A forwarded proposal can return just before this follower applies the
+		// entry. Fall back to one linearizable lookup only for that narrow gap.
+	}
+	return r.store.Load(id)
+}
+
+func (r *daemonTargetRuntime) monitorSourceAvailable(id string) bool {
+	if r.authority != nil {
+		node, ok := r.authority.AppliedNode(id)
+		// Lease expiry is interpreted and committed by the authority leader.
+		// Comparing the leader's wall-clock deadline on another host would be
+		// unsafe; a locally applied non-offline record remains observable.
+		if ok {
+			return node.State != cluster.NodeOffline
+		}
+		// As above, tolerate local apply lag without declaring source loss.
+	}
+	node, err := r.directory.Lookup(id)
+	return err == nil && node.LeaseActive(time.Now()) && node.State != cluster.NodeOffline
 }
 
 func (r *daemonTargetRuntime) lockTarget(name string) func() {
@@ -549,17 +612,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err != nil {
 			return err
 		}
-		reader, writer, err := os.Pipe()
+		reader, err := newConfigMemFD("ttc-distributed-restore-config", encoded)
 		if err != nil {
-			return err
-		}
-		if _, err := writer.Write(encoded); err != nil {
-			reader.Close()
-			writer.Close()
-			return err
-		}
-		if err := writer.Close(); err != nil {
-			reader.Close()
 			return err
 		}
 		connectionCount := restoreArgs.FilesystemConnections
@@ -990,11 +1044,18 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 	if r == nil || r.backend == nil || tx == nil {
 		return nil
 	}
+	// Branches imported into one physical family share a Sentry and its TTC
+	// repositories. Transaction locks are deliberately scoped to one remote
+	// fork, so sibling handoffs can otherwise interleave the repository-wide
+	// materialization barrier with source-release acknowledgement. Serialize
+	// this complete release fence per family: source relays remain live until
+	// every filesystem dependency observed by this operation is local.
+	defer r.lockTarget(tx.Identity.TargetContainer)()
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	if err != nil {
+		return err
+	}
 	if tx.GraphHandoff != nil {
-		info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
-		if err != nil {
-			return err
-		}
 		output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
 		if err != nil {
 			return fmt.Errorf("reading graph memory handoff status: %w", err)
@@ -1012,11 +1073,7 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 		if status.Error != "" {
 			return fmt.Errorf("graph memory handoff failed: %s", status.Error)
 		}
-	} else {
-		info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
-		if err != nil {
-			return err
-		}
+	} else if branch.DependentMemoryBytes != 0 {
 		output, err := r.backend.command("timetravel", info.ID, "distributed-dependency", branch.ID)
 		if err != nil {
 			return fmt.Errorf("reading distributed memory drain status: %w", err)
@@ -1038,10 +1095,6 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 	// actually replaced every volatile filesystem source. Otherwise the source
 	// may close its relay after the state transition while the guest still has
 	// deferred files, permanently stranding the migrated branch.
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
-	if err != nil {
-		return err
-	}
 	if _, err := r.backend.command("timetravel", info.ID, "distributed-filesystem-drain", branch.ID); err != nil {
 		return fmt.Errorf("starting distributed filesystem drain: %w", err)
 	}
@@ -1190,24 +1243,24 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 	if _, loaded := r.watch.LoadOrStore(transactionID, struct{}{}); loaded {
 		return
 	}
+	r.watchCount.Add(1)
 	go func() {
-		defer r.watch.Delete(transactionID)
-		interval := 250 * time.Millisecond
-		if tx, err := r.store.Load(transactionID); err == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
-			interval = 50 * time.Millisecond
-		}
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+		defer func() {
+			r.watch.Delete(transactionID)
+			r.watchCount.Add(-1)
+		}()
 		failedPolls := 0
 		sourceFailedPolls := 0
 		var adaptive *adaptivePrefetchController
 		for {
+			timer := time.NewTimer(dependencyMonitorInterval(r.watchCount.Load()))
 			select {
 			case <-r.done:
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
-			tx, err := r.store.Load(transactionID)
+			tx, err := r.monitorTransaction(transactionID)
 			if err != nil || tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 				return
 			}
@@ -1222,7 +1275,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				continue
 			}
 			if tx.SourceNeeded && r.directory != nil {
-				if source, sourceErr := r.directory.Lookup(tx.Identity.SourceNodeID); sourceErr != nil || !source.LeaseActive(time.Now()) || source.State == cluster.NodeOffline {
+				if !r.monitorSourceAvailable(tx.Identity.SourceNodeID) {
 					sourceFailedPolls++
 					if sourceFailedPolls < 3 {
 						continue
@@ -1246,11 +1299,16 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			if !tx.Activated {
 				continue
 			}
+			releasePoll, admitted := r.tryDependencyPoll()
+			if !admitted {
+				continue
+			}
 			targetBranch := tx.Identity.VisibleTargetBranch()
 			if adaptive == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
 				adaptive = newAdaptivePrefetchController(tx.Negotiated.PagingPolicy)
 			}
 			output, statusErr := r.backend.command("timetravel", containerID, "distributed-dependency", targetBranch)
+			releasePoll()
 			if statusErr != nil {
 				// Process-free dehydration intentionally removes the target Kernel
 				// while exporting all of its pages. Do not confuse that durable
@@ -1314,11 +1372,19 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				return
 			}
 			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, filesystemBytes)
-			if filesystemBytes != 0 && tx.State != cluster.TransactionIndependent {
-				continue
-			}
 			if tx.State != cluster.TransactionIndependent {
-				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+				// Resource byte counters are accounting, not authorization. A
+				// metadata-only filesystem can have zero logical data bytes while
+				// its namespace still depends on a remote catalog. Execute the same
+				// target runtime release fence used by the control endpoint before
+				// committing independence; otherwise the source may close the only
+				// resolver for an empty-file tree.
+				if err := r.MarkIndependent(context.Background(), tx); err != nil {
+					continue
+				}
+				if _, err := r.store.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now()); err != nil {
+					continue
+				}
 			}
 			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
 			// The graph reference remains branch-scoped until the branch itself
@@ -1771,6 +1837,15 @@ func distributedSourceNoLongerNeeded(store cluster.TransactionCatalog, transacti
 }
 
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
+	return drainSourceDependenciesSelected(backend, source, store, nodeID, func(tx cluster.Transaction) bool {
+		if containerID != "" && tx.Identity.SourceContainer != containerID {
+			return false
+		}
+		return branchID == "" || tx.Identity.SourceBranch == branchID
+	})
+}
+
+func drainSourceDependenciesSelected(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID string, selected func(cluster.Transaction) bool) error {
 	if backend == nil || source == nil || store == nil || nodeID == "" {
 		return nil
 	}
@@ -1784,10 +1859,7 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
 			continue
 		}
-		if containerID != "" && tx.Identity.SourceContainer != containerID {
-			continue
-		}
-		if branchID != "" && tx.Identity.SourceBranch != branchID {
+		if selected != nil && !selected(tx) {
 			continue
 		}
 		peer, err := source.peer(tx.Identity.TargetNodeID, false)
@@ -1853,9 +1925,67 @@ func drainSourceDependenciesMatching(backend *runtimeBackend, source *distribute
 			}
 			return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, errors.Join(stepErr, statusErr))
 		}
-		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+		if tx.Identity.Migration {
+			// An evacuating daemon cannot leave physical cleanup to the ordinary
+			// asynchronous migration monitor: node-stop may close the daemon and
+			// discard its local root immediately after this barrier. Independence
+			// proves the target no longer reads the source, so synchronously release
+			// both the transfer pin and the paused source Kernel. Both operations
+			// are idempotent with a monitor that happened to win the race.
+			unlockSource := source.lockSourceFamily(tx.Identity.SourceContainer)
+			_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+			if err := backend.releaseDistributedGraphReferences(graphTransferReferenceOperation(tx.Identity.TransactionID)); err != nil {
+				unlockSource()
+				return fmt.Errorf("releasing migrated graph roots for %q: %w", tx.Identity.TransactionID, err)
+			}
+			if err := backend.releaseMigratedSourceRuntime(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err != nil {
+				unlockSource()
+				return fmt.Errorf("releasing migrated source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
+			}
+			unlockSource()
+		} else {
+			_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+		}
 	}
 	return nil
+}
+
+// settleDistributedSourceTransactions is the source-side barrier used before
+// a multi-node family mutation destroys any target. Family removal is
+// deliberately executed as branch-local child commands; without this barrier
+// an early target delete can make a later source drain fail, leaving a
+// half-removed family and retained source pages. Transaction IDs are validated
+// against Raft and this node's source authority before any work is performed.
+func (b *runtimeBackend) settleDistributedSourceTransactions(transactionIDs []string) error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
+		return nil
+	}
+	store, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	wanted := make(map[string]struct{}, len(transactionIDs))
+	for _, transactionID := range transactionIDs {
+		if transactionID == "" {
+			return errors.New("empty distributed transaction ID")
+		}
+		tx, err := store.Load(transactionID)
+		if errors.Is(err, os.ErrNotExist) {
+			// A retry after the terminal transaction was retired is complete.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("loading distributed transaction %q: %w", transactionID, err)
+		}
+		if tx.Identity.SourceNodeID != b.nodeID {
+			return fmt.Errorf("distributed transaction %q is sourced by node %q, not %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+		}
+		wanted[transactionID] = struct{}{}
+	}
+	return drainSourceDependenciesSelected(b, b.distributedSource, store, b.nodeID, func(tx cluster.Transaction) bool {
+		_, ok := wanted[tx.Identity.TransactionID]
+		return ok
+	})
 }
 
 // ensureDistributedSourceIndependent prevents branch-destructive operations
@@ -3683,21 +3813,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 						}
 					}
 					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
-					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) {
-						// Do not take the command lifecycle lock here. A drain holds it
-						// while completing peer dependencies after Raft cutover, exactly
-						// when this callback observes a revoked source placement. Waiting
-						// for that lock would stop lease renewal and self-fence the whole
-						// cluster. The enforcer is generation-fenced and its destroy paths
-						// explicitly tolerate racing migration cleanup.
-						enforceErr := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation)
-						if enforceErr != nil {
-							// A committed revocation must be enforced before this node may
-							// consume its renewed lease. Fail closed immediately rather than
-							// waiting for the guardian deadline.
-							_ = fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
-							return fmt.Errorf("enforcing Raft branch authority: %w", enforceErr)
-						}
+					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) &&
+						executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
+						// Never run a Sentry command on the heartbeat path. A busy family
+						// may take longer than the lease merely to enumerate its branches.
+						// Host-stop every local Sentry immediately; restart reconciliation
+						// later kills revoked branches before resuming authorized peers.
+						fenceErr := fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
+						return errors.Join(errors.New("Raft revoked live execution authority"), fenceErr)
 					}
 					lastExecutionGrants = currentExecutionGrants
 					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
@@ -3709,7 +3832,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 					// command can create new runnable work after the Sentry snapshot.
 					_ = listener.Close()
 					_ = clusterServer.Close()
-					return fenceElasticRuntimes(targetBackend, record.NodeID, record.Incarnation)
+					return fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
 				}, heartbeatFatal)
 			}(*elasticRecord)
 			go func() {
@@ -3904,21 +4027,48 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	if runtime == nil || runtime.raft == nil || runtime.source == nil {
 		return errors.New("raft retirement is unavailable")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	err := runtime.raft.RetireMember(ctx, nodeID)
-	for attempts := 0; attempts < 3; attempts++ {
+	var lastErr error
+	for {
+		leaderID := runtime.raft.LeaderID()
+		var err error
+		if leaderID == "" || leaderID == nodeID {
+			err = runtime.raft.RetireMember(ctx, nodeID)
+		} else {
+			peer, peerErr := runtime.source.peer(leaderID, false)
+			if peerErr != nil {
+				err = peerErr
+			} else {
+				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
+			}
+		}
+		if err == nil || strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
+			// The final voter is intentionally retained: its local Raft state is
+			// the restart point for a fully stopped cluster.
+			return nil
+		}
 		var redirect *cluster.AuthorityNotLeaderError
-		if !errors.As(err, &redirect) || redirect.LeaderID == "" {
-			return err
+		if errors.As(err, &redirect) && redirect.LeaderID != "" {
+			peer, peerErr := runtime.source.peer(redirect.LeaderID, false)
+			if peerErr == nil {
+				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
+				if err == nil || strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
+					return nil
+				}
+			} else {
+				err = peerErr
+			}
 		}
-		peer, peerErr := runtime.source.peer(redirect.LeaderID, false)
-		if peerErr != nil {
-			return peerErr
+		lastErr = err
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
 		}
-		err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
 	}
-	return err
 }
 
 func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
@@ -4414,8 +4564,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if err := s.claimUnplacedLifecycleTargets(mutationBackend, request.Args); err != nil {
 				fmt.Fprintf(&mutationStderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 				status = 1
-			} else if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
-				fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+			} else if daemonCommandNeedsMutationLock(request.Args) {
+				if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
+					fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+				}
 			}
 		}
 		completed, err := completeDaemonMutation(mutationRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
@@ -4445,8 +4597,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 			status = 1
-		} else if err := backend.reconcilePlacementCatalog(); err != nil {
-			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+		} else if daemonCommandNeedsMutationLock(request.Args) {
+			if err := backend.reconcilePlacementCatalog(); err != nil {
+				fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
+			}
 		}
 	}
 	unlock()

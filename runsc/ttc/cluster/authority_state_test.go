@@ -324,6 +324,30 @@ func TestAuthorityNodeReincarnationRevokesSharedGCLease(t *testing.T) {
 	}
 }
 
+func TestAuthorityCleanNodeRetirementRevokesSharedGCLease(t *testing.T) {
+	at := time.Unix(1850, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	lease := decodeAuthorityResultForTest[SharedGCLease](t, applyAuthorityForTest(t, state, "gc-acquire", at.Add(time.Second), AuthoritySharedGCAcquire, AuthoritySharedGCPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Lease: 10 * time.Second,
+	}))
+	if lease.NodeID == "" {
+		t.Fatal("node did not acquire shared GC lease")
+	}
+	applyAuthorityForTest(t, state, "draining", at.Add(2*time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeDraining, LeaseDuration: time.Hour,
+	})
+	applyAuthorityForTest(t, state, "offline", at.Add(3*time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeOffline,
+	})
+	if state.SharedGC != (SharedGCLease{}) {
+		t.Fatalf("clean retirement retained stale shared GC lease: %+v", state.SharedGC)
+	}
+	if state.NextSharedGCGeneration != lease.Generation+1 {
+		t.Fatalf("clean retirement changed generation sequence: next=%d, lease=%d", state.NextSharedGCGeneration, lease.Generation)
+	}
+}
+
 func mustAuthoritySnapshotForTest(t *testing.T, state *AuthorityState) []byte {
 	t.Helper()
 	data, err := state.SnapshotBytes()

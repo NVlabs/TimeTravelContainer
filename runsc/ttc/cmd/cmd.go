@@ -377,6 +377,17 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = purger.purgeRuntime(args[1])
+	case "_settle-source-transactions":
+		if len(args) < 2 {
+			err = errors.New("internal source-dependency settlement requires at least one transaction ID")
+			break
+		}
+		settler, ok := backend.(interface{ settleDistributedSourceTransactions([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support distributed source-dependency settlement")
+			break
+		}
+		err = settler.settleDistributedSourceTransactions(args[1:])
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -11227,20 +11238,11 @@ func (b *runtimeBackend) allocateFilesystemForkOrigins(containerID string, child
 }
 
 func filesystemOriginAssignmentsPipe(assignments []boot.FilesystemOriginAssignment) (*os.File, error) {
-	reader, writer, err := os.Pipe()
+	encoded, err := json.Marshal(assignments)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err := json.Marshal(assignments)
-	if err == nil {
-		_, err = writer.Write(encoded)
-	}
-	closeErr := writer.Close()
-	if err != nil || closeErr != nil {
-		reader.Close()
-		return nil, errors.Join(err, closeErr)
-	}
-	return reader, nil
+	return newConfigMemFD("ttc-filesystem-origin-assignments", encoded)
 }
 
 // retireFailedGraphSnapshot makes a Raft allocation resolve to a committed
@@ -11977,17 +11979,8 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if err != nil {
 		return err
 	}
-	configReader, configWriter, err := os.Pipe()
+	configReader, err := newConfigMemFD("ttc-dehydration-restore-config", encoded)
 	if err != nil {
-		return err
-	}
-	if _, err := configWriter.Write(encoded); err != nil {
-		configReader.Close()
-		configWriter.Close()
-		return err
-	}
-	if err := configWriter.Close(); err != nil {
-		configReader.Close()
 		return err
 	}
 	files := []*os.File{configReader, metadata}
@@ -12280,17 +12273,8 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if err != nil {
 		return err
 	}
-	configReader, configWriter, err := os.Pipe()
+	configReader, err := newConfigMemFD("ttc-dehydration-restore-config", encoded)
 	if err != nil {
-		return err
-	}
-	if _, err := configWriter.Write(encoded); err != nil {
-		configReader.Close()
-		configWriter.Close()
-		return err
-	}
-	if err := configWriter.Close(); err != nil {
-		configReader.Close()
 		return err
 	}
 	files := []*os.File{configReader, metadata}

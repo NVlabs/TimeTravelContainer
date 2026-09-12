@@ -1002,6 +1002,14 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 			return nil, err
 		}
 		s.Nodes[p.NodeID] = record
+		if p.State == NodeOffline && s.SharedGC.NodeID == p.NodeID && s.SharedGC.Incarnation == p.Incarnation {
+			// Clean retirement is an incarnation fence just like expiry or
+			// replacement. Revoke shared-data mutation authority in the same
+			// Raft entry so a successor does not have to wait for a lease owned
+			// by a process that has deliberately gone away. The retiring daemon
+			// completes its own collection before proposing NodeOffline.
+			s.SharedGC = SharedGCLease{}
+		}
 		if p.State == NodeReady || p.State == NodePressured {
 			// Recovery adopts every locally retained placement while the new
 			// incarnation is joining. Anything left behind when it becomes

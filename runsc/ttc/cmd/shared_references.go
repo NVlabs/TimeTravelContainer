@@ -38,6 +38,7 @@ import (
 type sharedReferenceService struct {
 	mu           sync.RWMutex
 	activationMu sync.Mutex
+	collectionMu sync.Mutex
 	claimMu      sync.Mutex
 	authority    *cluster.RaftCatalog
 	packs        *ttcsnapshot.SharedPackStore
@@ -478,7 +479,7 @@ func (s *sharedReferenceService) withLedger(fn func(*ttcsnapshot.ReferenceLedger
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.ledger == nil || s.lease.Generation == 0 || !time.Now().Before(s.lease.ExpiresAt) {
+	if s.ledger == nil || s.lease.Generation == 0 {
 		return errors.New("this daemon does not hold an active shared reference lease")
 	}
 	current, err := s.authority.SharedGCLease()
@@ -603,6 +604,153 @@ func (s *sharedReferenceService) mutateReference(operation, name string, object 
 	})
 }
 
+func isAuthoritativeColdReference(name string) bool {
+	return strings.HasPrefix(name, "root/cold-memory/") || strings.HasPrefix(name, "root/cold/")
+}
+
+func isProviderBaselineReference(name string) bool {
+	if isAuthoritativeColdReference(name) || strings.HasPrefix(name, "root/bridge/edge/") {
+		return false
+	}
+	return strings.HasPrefix(name, "root/") || strings.HasPrefix(name, "pin/")
+}
+
+func providerBaselineCanBeReleased(state *cluster.AuthorityState, name string, object ttcsnapshot.ObjectID) bool {
+	if state == nil || !isProviderBaselineReference(name) {
+		return false
+	}
+	_, volatile := state.VolatileOrigins[uint64(object.Snapshot)]
+	return !volatile
+}
+
+// authoritativeColdReferences derives the small mutable root set selected by
+// Raft. The immutable object graph and its per-edge counts remain outside
+// consensus; only these branch-level roots change when a durable branch is
+// published, replaced, or removed.
+func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.AuthorityState) (map[string]ttcsnapshot.ObjectID, error) {
+	if s == nil || state == nil || s.packs == nil {
+		return nil, errors.New("shared authority roots are unavailable")
+	}
+	desired := make(map[string]ttcsnapshot.ObjectID)
+	memory := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, branch := range state.Branches {
+		if branch.Corrupted {
+			continue
+		}
+		if branch.Roots.MemorySnapshot != 0 {
+			memory[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
+		}
+		if branch.Roots.FilesystemRoot == "" {
+			continue
+		}
+		path := filepath.Join(s.sharedRoot, branch.Roots.FilesystemRoot)
+		if err := validateColdManifestPath(s.sharedRoot, path); err != nil {
+			return nil, err
+		}
+		manifest, err := readColdBranchManifest(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, filesystem := range manifest.Filesystems {
+			root, err := ttcsnapshot.ParseObjectID(filesystem.Root.Root)
+			if err != nil {
+				return nil, err
+			}
+			identity := "branch\x00" + branch.FamilyID + "\x00" + branch.BranchID
+			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source))
+			name := fmt.Sprintf("root/cold/%x", nameHash)
+			if previous, ok := desired[name]; ok && previous != root {
+				return nil, fmt.Errorf("authority root %q selects both %s and %s", name, previous, root)
+			}
+			desired[name] = root
+		}
+	}
+	for snapshot := range memory {
+		manifest, err := s.packs.Manifest(snapshot)
+		if err != nil {
+			return nil, fmt.Errorf("reading authoritative memory origin %d: %w", snapshot, err)
+		}
+		for name, object := range manifest.References {
+			if !strings.HasPrefix(name, "root/") {
+				continue
+			}
+			digest := sha256.Sum256([]byte(name))
+			desired[fmt.Sprintf("root/cold-memory/%016x/%x", uint64(snapshot), digest)] = object
+		}
+	}
+	return desired, nil
+}
+
+// reconcileAuthoritativeColdReferences keeps coordinator-local reference
+// counts synchronized with the current Raft root set without rebuilding or
+// walking immutable objects. Retains precede releases so replacing one branch
+// root can never expose a transient zero-count graph.
+func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
+	state, err := s.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	desired, err := s.authoritativeColdReferences(state)
+	if err != nil {
+		return err
+	}
+	var current map[string]ttcsnapshot.ObjectID
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		current = ledger.References()
+		return nil
+	}); err != nil {
+		return err
+	}
+	retain := make([]string, 0)
+	release := make([]string, 0)
+	for name, object := range desired {
+		if previous, ok := current[name]; ok {
+			if previous != object {
+				return fmt.Errorf("authoritative reference %q changed from %s to %s", name, previous, object)
+			}
+			continue
+		}
+		retain = append(retain, name)
+	}
+	for name, object := range current {
+		if isAuthoritativeColdReference(name) {
+			if _, ok := desired[name]; !ok {
+				release = append(release, name)
+			}
+			continue
+		}
+		// PublishHandoff imports the provider's exact root/pin baseline so its
+		// counts remain correct until Raft moves the origin to shared storage.
+		// Once that move commits, branch durability is represented by desired
+		// cold roots above and live remote consumers by their durable remote/
+		// claims. Keeping the provider baseline would pin an otherwise-dead
+		// origin until coordinator turnover. Retains are applied before these
+		// releases below, so the replacement is atomic with respect to GC.
+		if providerBaselineCanBeReleased(state, name, object) {
+			release = append(release, name)
+		}
+	}
+	sort.Strings(retain)
+	sort.Strings(release)
+	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		for _, name := range retain {
+			object := desired[name]
+			digest := sha256.Sum256([]byte("retain\x00" + name + "\x00" + object.String()))
+			if err := ledger.ApplyReference(fmt.Sprintf("authority-root-retain/%x", digest), name, object, true); err != nil {
+				return err
+			}
+		}
+		for _, name := range release {
+			object := current[name]
+			digest := sha256.Sum256([]byte("release\x00" + name + "\x00" + object.String()))
+			if err := ledger.ApplyReference(fmt.Sprintf("authority-root-release/%x", digest), name, object, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // collectAndRetire performs the shared origin retirement protocol in its only
 // safe order: collect exact zero-count objects, deliver every resulting
 // cross-origin release, prove that no physical reader remains, fence the empty
@@ -614,6 +762,32 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if limit <= 0 {
 		return 0, nil
 	}
+	// The periodic maintenance loop and an explicit node shutdown may both run
+	// under this daemon's current lease. Reference-ledger calls are individually
+	// serialized, but collection also has a physical phase between calls: one
+	// pass may retire an origin while another has already selected that origin
+	// for compaction. Serialize the complete logical/physical transaction so a
+	// selected origin cannot disappear underneath a sibling pass.
+	s.collectionMu.Lock()
+	defer s.collectionMu.Unlock()
+	if err := s.reconcileAuthoritativeColdReferences(); err != nil {
+		return 0, err
+	}
+	// A freshly rebuilt ledger represents cross-origin parent edges as durable
+	// outbound retains. Deliver the complete finite retain frontier before
+	// examining zero-count objects. Collecting first can mark a child reclaiming
+	// and then reject its legitimate parent edge as an attempted resurrection.
+	// Mutations are serialized by collectionMu, so reaching an empty outbox is a
+	// stable barrier for this pass.
+	for {
+		delivered, err := s.drainOutbox(ctx, limit*4)
+		if err != nil {
+			return 0, err
+		}
+		if delivered == 0 {
+			break
+		}
+	}
 	collected := 0
 	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 		var err error
@@ -622,6 +796,9 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	}); err != nil {
 		return 0, err
 	}
+	// Collection creates cross-origin releases. These may be bounded here: a
+	// subsequent pass cannot reclaim their children until its leading outbox
+	// barrier has delivered the remainder.
 	if _, err := s.drainOutbox(ctx, limit*4); err != nil {
 		return collected, err
 	}
@@ -712,6 +889,58 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		}
 	}
 	return collected, nil
+}
+
+// drainBeforeShutdown finishes every immediately reachable shared-graph
+// collection batch when this daemon is the elected coordinator. Node stop is
+// the last guaranteed maintenance opportunity: relying on the periodic pass
+// leaves dead snapshot packs behind when a family removal is followed
+// immediately by cluster shutdown.
+func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context) error {
+	if s == nil || s.authority == nil {
+		return nil
+	}
+	const duration = 15 * time.Second
+	lease, err := s.authority.SharedGCLease()
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if lease.Generation == 0 || !now.Before(lease.ExpiresAt) {
+		lease, err = s.authority.AcquireSharedGCLease(s.nodeID, s.incarnation, duration)
+		if err != nil {
+			return err
+		}
+	}
+	if lease.NodeID != s.nodeID || lease.Incarnation != s.incarnation {
+		// A different live coordinator owns shared mutation. Its ordinary
+		// maintenance remains responsible; this node must not contend with it.
+		return nil
+	}
+	if err := s.activate(lease); err != nil {
+		return err
+	}
+	stopKeeper := keepSharedGCLeaseAlive(s.authority, lease, duration)
+	defer func() { _, _ = stopKeeper() }()
+	// One zero pass can follow a pass that only retired/compacted an origin.
+	// Require two stable passes so releases emitted by that boundary are also
+	// observed, while referenced live origins naturally make immediate exit.
+	zeroPasses := 0
+	for zeroPasses < 2 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		collected, err := s.collectAndRetire(ctx, lease, 4096)
+		if err != nil {
+			return err
+		}
+		if collected == 0 {
+			zeroPasses++
+		} else {
+			zeroPasses = 0
+		}
+	}
+	return nil
 }
 
 func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []ttcsnapshot.Object) bool {

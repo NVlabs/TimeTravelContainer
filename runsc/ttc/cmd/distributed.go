@@ -30,10 +30,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
@@ -44,6 +46,67 @@ import (
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
+
+// distributedBatchControlConcurrency bounds target-side control requests from
+// one sibling batch. Target runtime mutation is serialized per family anyway;
+// allowing every sibling to occupy an HTTP handler only queues Raft state
+// transitions behind slow Sentry work and can starve the target node's
+// execution-lease renewal. A small window retains network/Raft overlap without
+// making fan-out width part of the lease-safety envelope.
+const distributedBatchControlConcurrency = 8
+
+// distributedHandoffConcurrency keeps optional post-publication graph
+// consolidation from competing unboundedly with foreground Sentry commands.
+// A fan-out can publish thousands of children at once, but those children can
+// continue faulting through their live relays while this bounded background
+// queue makes them source-independent.
+const distributedHandoffConcurrency = 2
+
+func runBoundedBatch(count, limit int, fn func(int)) {
+	if count <= 0 {
+		return
+	}
+	if limit <= 0 || limit > count {
+		limit = count
+	}
+	work := make(chan int)
+	var workers sync.WaitGroup
+	for worker := 0; worker < limit; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range work {
+				fn(index)
+			}
+		}()
+	}
+	for index := 0; index < count; index++ {
+		work <- index
+	}
+	close(work)
+	workers.Wait()
+}
+
+// newConfigMemFD returns a seekable in-memory file positioned at the start of
+// payload. A pipe cannot be filled before commandWithFiles starts its reader:
+// sufficiently wide sibling batches exceed the host pipe capacity and would
+// otherwise deadlock the daemon while it still owns the family mutation lock.
+func newConfigMemFD(name string, payload []byte) (*os.File, error) {
+	fd, err := memutil.CreateMemFD(name, unix.MFD_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if _, err := file.Write(payload); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
 
 // publishRemoteTarget retries the idempotent publication boundary while a
 // restored target remains physically paused. A Raft leadership change renews
@@ -93,8 +156,141 @@ type distributedSourceRuntime struct {
 	authToken     string
 	peerMu        sync.Mutex
 	dynamicPeers  map[string]dynamicClusterPeer
+	handoffOnce   sync.Once
+	handoffSlots  chan struct{}
+	handoffGate   sync.RWMutex
+	collectNeeded atomic.Bool
+	collectActive atomic.Bool
+	monitorOnce   sync.Once
+	monitorSlots  chan struct{}
+	monitorCount  atomic.Int64
+	sourceLocks   [64]sync.Mutex
 	pageListen    string
 	pageAdvertise string
+}
+
+func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
+	if r == nil {
+		return func() {}
+	}
+	// Fixed stripes keep cleanup bookkeeping bounded even when a long-lived
+	// cluster creates and removes arbitrarily many family names.
+	hash := uint64(14695981039346656037)
+	for i := range len(family) {
+		hash ^= uint64(family[i])
+		hash *= 1099511628211
+	}
+	lock := &r.sourceLocks[hash%uint64(len(r.sourceLocks))]
+	lock.Lock()
+	return lock.Unlock
+}
+
+const distributedSourceMonitorConcurrency = 2
+
+func (r *distributedSourceRuntime) beginSourceMonitor() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.monitorCount.Add(1)
+	return func() { r.monitorCount.Add(-1) }
+}
+
+func (r *distributedSourceRuntime) sourceMonitorInterval() time.Duration {
+	if r == nil {
+		return 250 * time.Millisecond
+	}
+	watchers := r.monitorCount.Load()
+	if watchers < 1 {
+		watchers = 1
+	}
+	interval := time.Duration(watchers) * time.Second / 16
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	return interval
+}
+
+func (r *distributedSourceRuntime) trySourcePoll() (func(), bool) {
+	if r == nil {
+		return func() {}, true
+	}
+	r.monitorOnce.Do(func() { r.monitorSlots = make(chan struct{}, distributedSourceMonitorConcurrency) })
+	select {
+	case r.monitorSlots <- struct{}{}:
+		return func() { <-r.monitorSlots }, true
+	default:
+		return nil, false
+	}
+}
+
+func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
+	if fn == nil {
+		return
+	}
+	if r == nil {
+		go fn()
+		return
+	}
+	r.handoffOnce.Do(func() {
+		r.handoffSlots = make(chan struct{}, distributedHandoffConcurrency)
+	})
+	go func() {
+		r.handoffSlots <- struct{}{}
+		defer func() { <-r.handoffSlots }()
+		fn()
+	}()
+}
+
+func (r *distributedSourceRuntime) beginBackgroundSnapshotWork() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.handoffGate.RLock()
+	return r.handoffGate.RUnlock
+}
+
+// beginForegroundCapture prevents queued background graph handoffs from
+// starving a user-requested live capture. sync.RWMutex gives a waiting writer
+// priority over new readers, so the capture waits for at most the currently
+// active bounded handoffs rather than the entire queue.
+func (r *distributedSourceRuntime) beginForegroundCapture() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.handoffGate.Lock()
+	return r.handoffGate.Unlock
+}
+
+// scheduleColdCollection coalesces terminal handoff cleanup onto the same
+// bounded background queue. Collection traces the cluster's immutable roots;
+// running it once per sibling makes an N-way fan-out perform N near-identical
+// global scans and can delay foreground forks for minutes. The small loop
+// closes the race where another terminal handoff arrives during collection.
+func (r *distributedSourceRuntime) scheduleColdCollection(fn func()) {
+	if fn == nil {
+		return
+	}
+	if r == nil {
+		go fn()
+		return
+	}
+	r.collectNeeded.Store(true)
+	if !r.collectActive.CompareAndSwap(false, true) {
+		return
+	}
+	r.scheduleHandoff(func() {
+		for {
+			r.collectNeeded.Store(false)
+			fn()
+			r.collectActive.Store(false)
+			if !r.collectNeeded.Load() || !r.collectActive.CompareAndSwap(false, true) {
+				return
+			}
+		}
+	})
 }
 
 type dynamicClusterPeer struct {
@@ -802,8 +998,13 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		_ = reader.Close()
 		imported <- importResult{capture: capture, err: importErr}
 	}()
+	// Only the Sentry export competes with a foreground live capture. Shared
+	// publication and reference-ledger work may take arbitrarily long on a slow
+	// shared filesystem and must never hold the foreground-priority gate.
+	finishBackgroundWork := b.distributedSource.beginBackgroundSnapshotWork()
 	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", containerID, "distributed-export", transactionID)
 	_ = writer.Close()
+	finishBackgroundWork()
 	outcome := <-imported
 	if exportErr != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("streaming live graph memory: %w", exportErr)
@@ -889,6 +1090,41 @@ func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, reposit
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
+const targetPlacementTemporarilyUnavailable = "transaction target is not accepting placement"
+
+// reserveRemoteTarget hides the short authority gap after a Raft election.
+// A ready target cannot accept a new transaction until it has renewed its
+// execution lease in the new leader term, even though the request reaching
+// that target proves its control plane is alive. Retry the same transaction
+// identity until that renewal commits. Draining and offline are policy states,
+// so they remain immediate systematic rejections.
+func reserveRemoteTarget(ctx context.Context, targetNode string, lookup func(string) (*cluster.NodeRecord, error), reserve func(context.Context) (*cluster.Transaction, error)) (*cluster.Transaction, error) {
+	if reserve == nil {
+		return nil, errors.New("remote target reservation is unavailable")
+	}
+	delay := 50 * time.Millisecond
+	for {
+		tx, err := reserve(ctx)
+		if err == nil || !strings.Contains(err.Error(), targetPlacementTemporarilyUnavailable) || lookup == nil {
+			return tx, err
+		}
+		record, lookupErr := lookup(targetNode)
+		if lookupErr == nil && record != nil && record.State != cluster.NodeJoining && record.State != cluster.NodeReady && record.State != cluster.NodePressured {
+			return nil, err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		if delay < 500*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
 func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestination string, paused bool) (selector, error) {
 	if b.distributedSource == nil {
 		return selector{}, errors.New("ttcd is not configured for distributed forks")
@@ -920,6 +1156,13 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
 	}
+	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	foregroundCaptureActive := true
+	defer func() {
+		if foregroundCaptureActive {
+			finishForegroundCapture()
+		}
+	}()
 	transactionID, err := newDistributedTransactionID()
 	if err != nil {
 		return selector{}, fmt.Errorf("generating distributed transaction ID: %w", err)
@@ -938,9 +1181,11 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{
-		SourceCapabilities: b.distributedSource.capabilities,
-		Identity:           identity,
+	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
+		return peer.Reserve(ctx, cluster.ReserveRequest{
+			SourceCapabilities: b.distributedSource.capabilities,
+			Identity:           identity,
+		})
 	})
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
@@ -1017,6 +1262,8 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 			err = closeErr
 		}
 	}
+	finishForegroundCapture()
+	foregroundCaptureActive = false
 	if err != nil {
 		return selector{}, errors.Join(fmt.Errorf("capturing source: %w", err), finishFilesystemOrigins(false))
 	}
@@ -1055,7 +1302,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	monitorBackend.stdout = io.Discard
 	monitorBackend.stderr = io.Discard
 	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
-		go monitorBackend.handoffDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+		b.distributedSource.scheduleHandoff(func() {
+			monitorBackend.handoffDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+		})
 	} else {
 		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 	}
@@ -1090,7 +1339,9 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
+		return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+	})
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
 	}
@@ -1525,6 +1776,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 		return results, nil
 	}
+	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	foregroundCaptureActive := true
+	defer func() {
+		if foregroundCaptureActive {
+			finishForegroundCapture()
+		}
+	}()
 	rootfsDigest, err := distributedRootfsDigest(sourceInfo, source.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {
 		return nil, err
@@ -1579,7 +1837,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 			RepositoryID: b.distributedSource.capabilities.RepositoryID,
 		}
-		tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+		tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
+			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+		})
 		if err != nil {
 			return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
 		}
@@ -1636,25 +1896,18 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			AdvertiseAddress: children[i].advertise,
 		}
 	}
-	configReader, configWriter, err := os.Pipe()
-	if err != nil {
-		return nil, fmt.Errorf("creating distributed batch config pipe: %w", err)
-	}
 	encodedConfig, err := json.Marshal(&captureArgs)
-	if err == nil {
-		_, err = configWriter.Write(encodedConfig)
-	}
-	closeErr := configWriter.Close()
 	if err != nil {
-		configReader.Close()
-		return nil, fmt.Errorf("writing distributed batch config: %w", err)
+		return nil, fmt.Errorf("encoding distributed batch config: %w", err)
 	}
-	if closeErr != nil {
-		configReader.Close()
-		return nil, fmt.Errorf("closing distributed batch config: %w", closeErr)
+	configReader, err := newConfigMemFD("ttc-distributed-batch-config", encodedConfig)
+	if err != nil {
+		return nil, fmt.Errorf("creating distributed batch config: %w", err)
 	}
 	output, err := b.commandWithFiles([]*os.File{configReader}, "timetravel", "--distributed-config-fd=3",
 		source.container, "distributed-capture-many", children[0].transaction)
+	finishForegroundCapture()
+	foregroundCaptureActive = false
 	configReader.Close()
 	if err != nil {
 		return nil, fmt.Errorf("capturing %d distributed siblings: %w", len(children), err)
@@ -1696,34 +1949,20 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 	}
 	prepareErrors := make([]error, len(children))
-	var prepareWG sync.WaitGroup
-	for i := range children {
-		i := i
-		prepareWG.Add(1)
-		go func() {
-			defer prepareWG.Done()
-			child := &children[i]
-			child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
-		}()
-	}
-	prepareWG.Wait()
+	runBoundedBatch(len(children), distributedBatchControlConcurrency, func(i int) {
+		child := &children[i]
+		child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+	})
 	for i, prepareErr := range prepareErrors {
 		if prepareErr != nil {
 			return nil, fmt.Errorf("restoring target %s on node %s: %w", children[i].target, targetNode, prepareErr)
 		}
 	}
 	publishErrors := make([]error, len(children))
-	var publishWG sync.WaitGroup
-	for i := range children {
-		i := i
-		publishWG.Add(1)
-		go func() {
-			defer publishWG.Done()
-			child := &children[i]
-			child.tx, publishErrors[i] = publishRemoteTarget(ctx, peer, child.transaction, child.tx.Revision, paused)
-		}()
-	}
-	publishWG.Wait()
+	runBoundedBatch(len(children), distributedBatchControlConcurrency, func(i int) {
+		child := &children[i]
+		child.tx, publishErrors[i] = publishRemoteTarget(ctx, peer, child.transaction, child.tx.Revision, paused)
+	})
 	for i, publishErr := range publishErrors {
 		if publishErr != nil {
 			return nil, fmt.Errorf("publishing target %s on node %s: %w", children[i].target, targetNode, publishErr)
@@ -1740,7 +1979,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		monitorBackend.stdout = io.Discard
 		monitorBackend.stderr = io.Discard
 		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
-			go monitorBackend.handoffDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+			b.distributedSource.scheduleHandoff(func() {
+				monitorBackend.handoffDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+			})
 		} else {
 			go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
 		}
@@ -1758,10 +1999,14 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 	// unreachable. Collection must follow the terminal transition here rather
 	// than relying on the daemon's periodic maintenance loop: an elastic source
 	// may stop immediately after its last dependency becomes independent.
-	defer b.collectTerminalColdStorage()
+	defer b.distributedSource.scheduleColdCollection(b.collectTerminalColdStorage)
 	handoff, rootNames, rootObjects, err := b.exportDistributedGraph(sourceContainer, transactionID)
 	if err != nil {
-		b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
+		// Ordinary demand paging may remain live for the lifetime of the target
+		// when graph publication is unavailable. It must not occupy one of the
+		// bounded graph-export workers and prevent independent siblings from
+		// being consolidated.
+		go b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
 		return
 	}
 	var tx *cluster.Transaction
@@ -1825,7 +2070,7 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
 		// Retrying status/independence is safe; the target now has no source
 		// reads, while the source retains its snapshot until completion.
-		b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay, rootNames, rootObjects, handoff.GraphManifest)
+		go b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay, rootNames, rootObjects, handoff.GraphManifest)
 		return
 	}
 	_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
@@ -1904,9 +2149,11 @@ func (b *runtimeBackend) completeSharedDistributedFork(peer *cluster.Client, sou
 
 func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
 	defer relay.Close()
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
+	finishMonitor := b.distributedSource.beginSourceMonitor()
+	defer finishMonitor()
+	for {
+		timer := time.NewTimer(b.distributedSource.sourceMonitorInterval())
+		<-timer.C
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		peerStatus, statusErr := peer.Status(ctx, transactionID)
 		cancel()
@@ -1921,7 +2168,12 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 				return
 			}
 		}
+		releasePoll, admitted := b.distributedSource.trySourcePoll()
+		if !admitted {
+			continue
+		}
 		output, err := b.command("timetravel", sourceContainer, "distributed-status", transactionID)
+		releasePoll()
 		if err != nil {
 			return
 		}
@@ -2040,8 +2292,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
 					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
 			} else {
-				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil)
+				runtime.source.scheduleHandoff(func() {
+					monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
+						tx.Identity.TransactionID, tx.Revision, nil)
+				})
 			}
 		} else if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
 			if tx.State == cluster.TransactionDraining {
@@ -2052,8 +2306,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
 					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
 			} else {
-				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil)
+				runtime.source.scheduleHandoff(func() {
+					monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
+						tx.Identity.TransactionID, tx.Revision, nil)
+				})
 			}
 		} else {
 			go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,

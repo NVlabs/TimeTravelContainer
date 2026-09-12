@@ -140,6 +140,11 @@ branches before verifying their private contents. Set
 qualification runs this test with 256 siblings and requires zero remaining
 bulk objects after its cleanup.
 
+`e2e_distributed_fanout.sh` splits a configurable high-fanout family across
+three cluster nodes, dirties one private page in every remote branch, retires
+one owning node with `--migrate-all`, and verifies every value through unified
+command routing. Set `TTC_DISTRIBUTED_FANOUT_BRANCHES` to increase the fanout.
+
 `e2e_image_roundtrip.sh` commits running, paused, and exited branches to OCI
 images, saves and reloads those images through Docker-compatible archives, and
 verifies labels, file changes, and whiteout deletions after recreation. It uses

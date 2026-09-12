@@ -149,7 +149,7 @@ func (p *graphObjectProvider) OpenObject(_ context.Context, peer, objectText, tr
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := p.authorizeSnapshot(peer, id.Snapshot, transactionID, false); err != nil {
+	if err := p.authorizeSnapshot(peer, id.Snapshot, transactionID, "", false); err != nil {
 		return nil, 0, err
 	}
 	object, ok := p.graph.Object(id)
@@ -166,7 +166,7 @@ func (p *graphObjectProvider) OpenObject(_ context.Context, peer, objectText, tr
 	return file, object.BulkLength, nil
 }
 
-func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapshot.SnapshotID, transactionID string, allowTerminal bool) error {
+func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapshot.SnapshotID, transactionID, operation string, allowTerminal bool) error {
 	provider, found, err := p.authority.SnapshotProvider(uint64(snapshot))
 	if err != nil {
 		return err
@@ -204,7 +204,7 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 		// Raft's snapshot-origin mapping above proves that this node is the unique
 		// provider; the transaction must prove only that the authenticated caller
 		// is its target. Exact object IDs then bound the requested authority.
-		if transaction.Identity.TargetNodeID != peer {
+		if !snapshotReferenceRequesterAuthorized(transaction, peer, operation) {
 			return errors.New("snapshot transaction does not authorize this requester")
 		}
 		if !allowTerminal && (transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed) {
@@ -214,6 +214,17 @@ func (p *graphObjectProvider) authorizeSnapshot(peer string, snapshot ttcsnapsho
 	return nil
 }
 
+func snapshotReferenceRequesterAuthorized(transaction *cluster.Transaction, peer, operation string) bool {
+	if transaction == nil || peer == "" {
+		return false
+	}
+	if transaction.Identity.TargetNodeID == peer {
+		return true
+	}
+	return transaction.Identity.Migration && transaction.Identity.SourceNodeID == peer &&
+		operation == graphTransferReferenceOperation(transaction.Identity.TransactionID)
+}
+
 // OpenSnapshot serves graph metadata separately from bulk bytes. The catalog
 // is immutable after Seal and does not transfer the provider's refcounts.
 func (p *graphObjectProvider) OpenSnapshot(_ context.Context, peer string, snapshotID uint64, transactionID string) (io.ReadCloser, uint64, error) {
@@ -221,7 +232,7 @@ func (p *graphObjectProvider) OpenSnapshot(_ context.Context, peer string, snaps
 		return nil, 0, errors.New("snapshot graph provider is unavailable")
 	}
 	snapshot := ttcsnapshot.SnapshotID(snapshotID)
-	if err := p.authorizeSnapshot(peer, snapshot, transactionID, false); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transactionID, "", false); err != nil {
 		return nil, 0, err
 	}
 	record, ok := p.graph.Snapshot(snapshot)
@@ -257,7 +268,7 @@ func (p *graphObjectProvider) OpenSnapshotObject(_ context.Context, peer string,
 	if id.Snapshot != snapshot {
 		return nil, 0, fmt.Errorf("snapshot %d cannot serve object from origin %d", snapshot, id.Snapshot)
 	}
-	if err := p.authorizeSnapshot(peer, snapshot, transactionID, false); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transactionID, "", false); err != nil {
 		return nil, 0, err
 	}
 	record, ok := p.graph.Snapshot(snapshot)
@@ -337,12 +348,12 @@ func (p *graphObjectProvider) RetainSnapshotRoots(ctx context.Context, peer stri
 		return err
 	}
 	if !volatile {
-		if err := p.authorizeReferenceTransaction(peer, transaction, false); err != nil {
+		if err := p.authorizeReferenceTransaction(peer, transaction, operation, false); err != nil {
 			return err
 		}
 		return p.shared.mutateRoots(snapshot, operation, bindings, true)
 	}
-	if err := p.authorizeSnapshot(peer, snapshot, transaction, false); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transaction, operation, false); err != nil {
 		return err
 	}
 	roots, err := graphReferenceRoots(snapshot, operation, bindings)
@@ -362,12 +373,12 @@ func (p *graphObjectProvider) ReleaseSnapshotRoots(ctx context.Context, peer str
 		return err
 	}
 	if !volatile {
-		if err := p.authorizeReferenceTransaction(peer, transaction, true); err != nil {
+		if err := p.authorizeReferenceTransaction(peer, transaction, operation, true); err != nil {
 			return err
 		}
 		return p.shared.mutateRoots(snapshot, operation, bindings, false)
 	}
-	if err := p.authorizeSnapshot(peer, snapshot, transaction, true); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, transaction, operation, true); err != nil {
 		return err
 	}
 	roots, err := graphReferenceRoots(snapshot, operation, bindings)
@@ -400,7 +411,7 @@ func (p *graphObjectProvider) ApplySnapshotReference(ctx context.Context, peer s
 		}
 		return p.shared.mutateReference(operation, name, object, retain)
 	}
-	if err := p.authorizeSnapshot(peer, snapshot, "", true); err != nil {
+	if err := p.authorizeSnapshot(peer, snapshot, "", "", true); err != nil {
 		return err
 	}
 	if object.Snapshot != snapshot {
@@ -413,7 +424,7 @@ func (p *graphObjectProvider) ApplySnapshotReference(ctx context.Context, peer s
 	return p.graph.ReleaseRetainedRoots(bridge)
 }
 
-func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID string, allowTerminal bool) error {
+func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID, operation string, allowTerminal bool) error {
 	if transactionID == "" {
 		return nil
 	}
@@ -427,7 +438,7 @@ func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID 
 		}
 		return err
 	}
-	if transaction.Identity.TargetNodeID != peer {
+	if !snapshotReferenceRequesterAuthorized(transaction, peer, operation) {
 		return errors.New("snapshot transaction does not authorize this requester")
 	}
 	if !allowTerminal && (transaction.State == cluster.TransactionCanceled || transaction.State == cluster.TransactionFailed) {

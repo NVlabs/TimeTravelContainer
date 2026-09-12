@@ -1054,6 +1054,22 @@ func (ledger *ReferenceLedger) OriginCompactionManifest(origin SnapshotID) (obje
 	return ledger.originManifestLocked(origin)
 }
 
+// References returns the ledger's named roots without copying its potentially
+// much larger object table. Authority reconciliation is proportional to the
+// number of branch roots, not to resident memory or filesystem object count.
+func (ledger *ReferenceLedger) References() map[string]ObjectID {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	references := make(map[string]ObjectID, len(ledger.state.References))
+	for name, object := range ledger.state.References {
+		references[name] = object
+	}
+	return references
+}
+
 func (ledger *ReferenceLedger) originManifestLocked(origin SnapshotID) (objects []Object, references map[string]ObjectID, ok, ready bool) {
 	if _, ok := ledger.state.Origins[origin]; !ok {
 		return nil, nil, false, false

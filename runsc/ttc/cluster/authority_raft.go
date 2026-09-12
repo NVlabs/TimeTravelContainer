@@ -142,6 +142,20 @@ func (f *AuthorityFSM) copyState() (*AuthorityState, error) {
 	return RestoreAuthorityState(data)
 }
 
+func (f *AuthorityFSM) appliedTransaction(id string) (Transaction, bool) {
+	f.mu.RLock()
+	transaction, ok := f.state.Transactions[id]
+	f.mu.RUnlock()
+	return transaction, ok
+}
+
+func (f *AuthorityFSM) appliedNode(id string) (NodeRecord, bool) {
+	f.mu.RLock()
+	node, ok := f.state.Nodes[id]
+	f.mu.RUnlock()
+	return node, ok
+}
+
 type authorityFSMSnapshot []byte
 
 func (s authorityFSMSnapshot) Persist(sink raft.SnapshotSink) error {
@@ -485,6 +499,25 @@ func (n *AuthorityRaftNode) AppliedState() (*AuthorityState, error) {
 	return state, err
 }
 
+// AppliedTransaction returns one transaction from the local applied FSM. It
+// is intentionally non-linearizable and is suitable for high-rate background
+// observation, not ownership or publication decisions.
+func (n *AuthorityRaftNode) AppliedTransaction(id string) (Transaction, bool) {
+	if n == nil || n.fsm == nil {
+		return Transaction{}, false
+	}
+	return n.fsm.appliedTransaction(id)
+}
+
+// AppliedNode returns one node from the local applied FSM. Like
+// AppliedTransaction, callers may use it for monitoring only.
+func (n *AuthorityRaftNode) AppliedNode(id string) (NodeRecord, bool) {
+	if n == nil || n.fsm == nil {
+		return NodeRecord{}, false
+	}
+	return n.fsm.appliedNode(id)
+}
+
 // Apply appends one already timestamped deterministic command. Remote callers
 // should send an untimestamped proposal to the leader-facing API instead.
 func (n *AuthorityRaftNode) Apply(ctx context.Context, command AuthorityCommand) (AuthorityResult, error) {
@@ -621,10 +654,10 @@ func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) err
 	return n.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
 }
 
-// ReconcileVoters promotes admitted, healthy learners until the bounded
-// control-plane quorum reaches maxVoters. Joining itself never promotes: a
-// process that crashes before committing its NodeReady record must remain
-// unable to increase the quorum requirement.
+// ReconcileVoters removes authoritatively fenced voters and promotes admitted,
+// healthy learners until the bounded control-plane quorum reaches maxVoters.
+// Joining itself never promotes: a process that crashes before committing its
+// NodeReady record must remain unable to increase the quorum requirement.
 func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) error {
 	if !n.IsLeader() {
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
@@ -635,6 +668,38 @@ func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) 
 	configuration, err := n.Configuration()
 	if err != nil {
 		return err
+	}
+	state, err := n.AppliedState()
+	if err != nil {
+		return err
+	}
+	// NodeOffline is a replicated incarnation fence: the node's execution
+	// lease has expired (or it completed a clean drain), its placements and
+	// provider authority have been revoked, and it may no longer contribute
+	// useful state to quorum. Leaving such a server in the Raft configuration
+	// can strand the last live voter when another member subsequently drains.
+	// Remove one server at a time because each membership transition uses the
+	// preceding configuration's quorum.
+	for {
+		removed := false
+		for _, server := range configuration.Servers {
+			record, ok := state.Nodes[string(server.ID)]
+			if !ok || record.State != NodeOffline || string(server.ID) == n.id {
+				continue
+			}
+			if err := n.RemoveMember(ctx, string(server.ID)); err != nil {
+				return fmt.Errorf("removing fenced Raft member %q: %w", server.ID, err)
+			}
+			configuration, err = n.Configuration()
+			if err != nil {
+				return err
+			}
+			removed = true
+			break
+		}
+		if !removed {
+			break
+		}
 	}
 	voters := 0
 	var learners []raft.Server
@@ -648,10 +713,6 @@ func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) 
 	}
 	if voters >= maxVoters {
 		return nil
-	}
-	state, err := n.AppliedState()
-	if err != nil {
-		return err
 	}
 	sort.Slice(learners, func(i, j int) bool { return learners[i].ID < learners[j].ID })
 	for _, learner := range learners {

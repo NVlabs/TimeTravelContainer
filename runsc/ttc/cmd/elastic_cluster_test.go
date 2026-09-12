@@ -330,6 +330,42 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 }
 
+func TestLastOnlineClusterNode(t *testing.T) {
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(t.TempDir(), "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	register := func(id string) *cluster.NodeRecord {
+		record := testElasticCapacityRecord(id, 0, 1<<30)
+		registered, err := directory.Register(record, now, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready, err := directory.Transition(id, registered.Incarnation, cluster.NodeReady, now, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ready
+	}
+	a, b := register("node-a"), register("node-b")
+	if last, err := lastOnlineClusterNode(directory, a.NodeID); err != nil || last {
+		t.Fatalf("two-node result=(%t,%v), want (false,nil)", last, err)
+	}
+	if _, err := directory.Transition(b.NodeID, b.Incarnation, cluster.NodeDraining, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if last, err := lastOnlineClusterNode(directory, a.NodeID); err != nil || last {
+		t.Fatalf("draining-peer result=(%t,%v), want (false,nil)", last, err)
+	}
+	if _, err := directory.Transition(b.NodeID, b.Incarnation, cluster.NodeOffline, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if last, err := lastOnlineClusterNode(directory, a.NodeID); err != nil || !last {
+		t.Fatalf("offline-peer result=(%t,%v), want (true,nil)", last, err)
+	}
+}
+
 func TestRecoveredPublisherAdoptsAndUnplacesOldIncarnation(t *testing.T) {
 	root := t.TempDir()
 	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
@@ -630,5 +666,82 @@ func TestNodeExecutionGrantsOnlyRequireEnforcementOnRevocation(t *testing.T) {
 	}
 	if !executionGrantRevoked(provisional, nodeExecutionGrants(state, "node-a", "inc-a")) {
 		t.Fatal("provisional target cancellation was not classified as a revocation")
+	}
+}
+
+func TestExecutionRevocationSkipsPausedMigrationProviderCleanup(t *testing.T) {
+	const key = "family\x00branch"
+	previous := map[string]struct{}{key: {}}
+	current := map[string]struct{}{}
+	state := cluster.NewAuthorityState()
+	state.Transactions["move"] = cluster.Transaction{
+		Identity: cluster.ForkIdentity{
+			TransactionID: "move", Migration: true,
+			SourceNodeID: "node-a", SourceContainer: "family", SourceBranch: "branch",
+		},
+		SourceIncarnation:  "inc-a",
+		OwnershipCommitted: true,
+		State:              cluster.TransactionDraining,
+	}
+	if executionRevocationsRequireImmediateFence(previous, current, state, "node-a", "inc-a") {
+		t.Fatal("paused migration provider cleanup required an immediate node fence")
+	}
+	transaction := state.Transactions["move"]
+	transaction.OwnershipCommitted = false
+	state.Transactions["move"] = transaction
+	if !executionRevocationsRequireImmediateFence(previous, current, state, "node-a", "inc-a") {
+		t.Fatal("pre-cutover revocation did not require an immediate node fence")
+	}
+	transaction.OwnershipCommitted = true
+	transaction.SourceIncarnation = "inc-old"
+	state.Transactions["move"] = transaction
+	if !executionRevocationsRequireImmediateFence(previous, current, state, "node-a", "inc-a") {
+		t.Fatal("another incarnation's migration suppressed an immediate node fence")
+	}
+}
+
+func TestExecutionRevocationFencesUnrelatedGrant(t *testing.T) {
+	previous := map[string]struct{}{
+		"family\x00migrated": {},
+		"family\x00removed":  {},
+	}
+	state := cluster.NewAuthorityState()
+	state.Transactions["move"] = cluster.Transaction{
+		Identity: cluster.ForkIdentity{
+			TransactionID: "move", Migration: true,
+			SourceNodeID: "node-a", SourceContainer: "family", SourceBranch: "migrated",
+		},
+		SourceIncarnation: "inc-a", OwnershipCommitted: true,
+	}
+	if !executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("an unrelated grant revocation was hidden by migration cleanup")
+	}
+}
+
+func TestExecutionRevocationSkipsCompactedMigrationHandoff(t *testing.T) {
+	const key = "family\x00branch"
+	previous := map[string]struct{}{key: {}}
+	state := cluster.NewAuthorityState()
+	state.Placements["replacement"] = cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "branch",
+		OwnerNode: "node-b", OwnerIncarnation: "inc-b",
+		State: cluster.PlacementRunning,
+	}
+	if executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("completed ownership handoff required an immediate source-node fence")
+	}
+	placement := state.Placements["replacement"]
+	placement.State = cluster.PlacementCorrupted
+	state.Placements["replacement"] = placement
+	if !executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("corrupted replacement placement suppressed an immediate source-node fence")
+	}
+	delete(state.Placements, "replacement")
+	if executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("fully removed branch required an immediate source-node fence")
+	}
+	state.Branches["orphan"] = cluster.BranchAuthority{FamilyID: "family", BranchID: "branch"}
+	if !executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("branch without a placement suppressed an immediate source-node fence")
 	}
 }

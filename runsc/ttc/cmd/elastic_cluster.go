@@ -35,6 +35,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -435,10 +436,18 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims
 	if placements == nil {
 		return errors.New("placement authority is unavailable")
 	}
+	records, err := placements.List()
+	if err != nil {
+		return fmt.Errorf("loading placement authority: %w", err)
+	}
+	byBranch := make(map[string]cluster.PlacementRecord, len(records))
+	for _, record := range records {
+		byBranch[record.FamilyID+"\x00"+record.BranchID] = record
+	}
 	for _, claim := range claims {
-		record, err := placements.Lookup(claim.FamilyID, claim.BranchID)
-		if err != nil {
-			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, err)
+		record, ok := byBranch[claim.FamilyID+"\x00"+claim.BranchID]
+		if !ok {
+			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, os.ErrNotExist)
 		}
 		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused && !(claim.AllowMaterializing && record.State == cluster.PlacementMaterializing) {
 			return fmt.Errorf("stale routed command: branch %s@%s is %s", claim.FamilyID, claim.BranchID, record.State)
@@ -460,13 +469,51 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	if b == nil || b.dataRoot == "" || b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
 		return nil
 	}
-	current, err := b.distributedSource.directory.Lookup(b.nodeID)
-	if err != nil {
-		return err
-	}
 	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
+	}
+	// Reconciliation is a whole-catalog operation. Take one linearizable Raft
+	// snapshot and index it once; looking up every branch separately copied and
+	// revalidated the complete authority state O(branches) times. Under a wide
+	// family, concurrent exec requests could consequently spend minutes in
+	// post-command reconciliation despite changing no lifecycle state.
+	var authorityState *cluster.AuthorityState
+	var current cluster.NodeRecord
+	placementByBranch := make(map[string]cluster.PlacementRecord)
+	if b.distributedSource.authority != nil {
+		authorityState, err = b.distributedSource.authority.AuthorityState()
+		if err != nil {
+			return err
+		}
+		var ok bool
+		current, ok = authorityState.Nodes[b.nodeID]
+		if !ok {
+			return fmt.Errorf("cluster node %q is absent from placement authority", b.nodeID)
+		}
+		for key, record := range authorityState.Placements {
+			if branch, ok := authorityState.Branches[key]; ok && branch.Corrupted {
+				record.State = cluster.PlacementCorrupted
+				record.OwnerNode, record.OwnerIncarnation = "", ""
+				record.PhysicalContainer, record.PhysicalBranch = "", ""
+				record.OperationID, record.TargetNode, record.ResumeState = "", "", ""
+			}
+			placementByBranch[key] = record
+		}
+	} else {
+		currentRecord, lookupErr := b.distributedSource.directory.Lookup(b.nodeID)
+		err = lookupErr
+		if err != nil {
+			return err
+		}
+		current = *currentRecord
+		records, err := placements.List()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
+		}
 	}
 	containers, err := b.containerStore().ListContainers()
 	if err != nil {
@@ -494,8 +541,8 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if owner != b.nodeID || (state != cluster.PlacementRunning && state != cluster.PlacementPaused) {
 				continue
 			}
-			record, lookupErr := placements.Lookup(info.ID, branch.ID)
-			if errors.Is(lookupErr, os.ErrNotExist) {
+			record, found := placementByBranch[key]
+			if !found {
 				// During restart recovery, first adopt all existing placements
 				// while the node is still unschedulable. Previously untracked
 				// local branches are enrolled after the node becomes ready.
@@ -515,37 +562,35 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				}
 				continue
 			}
-			if lookupErr != nil {
-				result = errors.Join(result, lookupErr)
-				continue
-			}
 			if record.State == cluster.PlacementMigrating || record.OwnerNode != b.nodeID {
 				continue
 			}
 			if record.OwnerIncarnation != current.Incarnation {
-				record, err = placements.AdoptOwnerIncarnation(info.ID, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
+				adopted, adoptErr := placements.AdoptOwnerIncarnation(info.ID, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
+				err = adoptErr
 				if err != nil {
 					result = errors.Join(result, fmt.Errorf("adopting placement for %s@%s: %w", info.ID, branch.ID, err))
 					continue
 				}
+				record = *adopted
 			}
 			if record.State != state {
 				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
 					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
 				}
 			}
-			if b.distributedSource.authority != nil {
+			branchAuthority, authorityKnown := cluster.BranchAuthority{}, false
+			if authorityState != nil {
+				branchAuthority, authorityKnown = authorityState.Branches[key]
+			}
+			if b.distributedSource.authority != nil && (!authorityKnown || !branchAuthority.DependenciesInherited) {
 				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {
 					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
 				}
 			}
 		}
 	}
-	records, err := placements.List()
-	if err != nil {
-		return errors.Join(result, err)
-	}
-	for _, record := range records {
+	for _, record := range placementByBranch {
 		if _, ok := known[record.FamilyID+"\x00"+record.BranchID]; ok || record.State == cluster.PlacementMigrating {
 			continue
 		}
@@ -732,6 +777,26 @@ type distributedFamilyMutation struct {
 	targets []string
 }
 
+func distributedMutationSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) map[string]map[string]struct{} {
+	settleByNode := make(map[string]map[string]struct{})
+	for _, tx := range transactions {
+		if !tx.SourceNeeded || (tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+			continue
+		}
+		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
+			continue
+		}
+		if branchID != "" && tx.Identity.SourceBranch != branchID && tx.Identity.VisibleTargetBranch() != branchID {
+			continue
+		}
+		if settleByNode[tx.Identity.SourceNodeID] == nil {
+			settleByNode[tx.Identity.SourceNodeID] = make(map[string]struct{})
+		}
+		settleByNode[tx.Identity.SourceNodeID][tx.Identity.TransactionID] = struct{}{}
+	}
+	return settleByNode
+}
+
 // parseDistributedFamilyMutation recognizes the deliberately small set of
 // commands whose unqualified operands mean "all branches in this family".
 // It follows flag.FlagSet's ordering rule: options precede positional targets.
@@ -910,6 +975,53 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		args   []string
 		claims []daemonPlacementClaim
 	}
+	// Settle every source transaction whose target is about to be mutated
+	// before issuing any destructive child command. The family mutation below
+	// is sequential but spans independently locked daemons; a target deleted
+	// first cannot subsequently acknowledge its source's retained pages.
+	var preflight []child
+	transactions, err := s.clusterStore.List()
+	if err != nil {
+		return true, 1, nil, nil, fmt.Errorf("listing distributed transactions before family mutation: %w", err)
+	}
+	settleByNode := make(map[string]map[string]struct{})
+	for _, operand := range mutation.targets {
+		name := operand
+		branchID := ""
+		if strings.Contains(operand, "@") {
+			selected, err := parseSelector(operand)
+			if err != nil {
+				return true, 1, nil, nil, fmt.Errorf("invalid target %q: %w", operand, err)
+			}
+			name = selected.container
+			branchID = selected.branch
+		}
+		info, err := store.LoadContainer(name)
+		if err != nil {
+			return true, 1, nil, nil, err
+		}
+		for node, ids := range distributedMutationSourceTransactions(transactions, info, branchID) {
+			if settleByNode[node] == nil {
+				settleByNode[node] = make(map[string]struct{})
+			}
+			for transactionID := range ids {
+				settleByNode[node][transactionID] = struct{}{}
+			}
+		}
+	}
+	nodes := make([]string, 0, len(settleByNode))
+	for node := range settleByNode {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		ids := make([]string, 0, len(settleByNode[node]))
+		for transactionID := range settleByNode[node] {
+			ids = append(ids, transactionID)
+		}
+		sort.Strings(ids)
+		preflight = append(preflight, child{node: node, args: append([]string{"_settle-source-transactions"}, ids...)})
+	}
 	var children []child
 	for _, operand := range mutation.targets {
 		if strings.Contains(operand, "@") {
@@ -973,6 +1085,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			children = append(children, final)
 		}
 	}
+	children = append(preflight, children...)
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
@@ -1454,9 +1567,11 @@ func (b *runtimeBackend) restoreMigrationBranchSidecars(target selector, info tt
 }
 
 func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, containerID, branchID, transactionID string, relay *distributedPageRelay) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
+	finishMonitor := b.distributedSource.beginSourceMonitor()
+	defer finishMonitor()
+	for {
+		timer := time.NewTimer(b.distributedSource.sourceMonitorInterval())
+		<-timer.C
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		tx, err := peer.Status(ctx, transactionID)
 		cancel()
@@ -1465,6 +1580,7 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 		}
 		switch tx.State {
 		case cluster.TransactionIndependent:
+			unlockSource := b.distributedSource.lockSourceFamily(containerID)
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
 			relay.Close()
 			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil && b.stderr != nil {
@@ -1473,6 +1589,7 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: retaining source runtime after sparse migration %s@%s: %v\n", containerID, branchID, err)
 			}
+			unlockSource()
 			return
 		case cluster.TransactionCanceled, cluster.TransactionFailed:
 			// A published migration never rolls ownership backward. Retain the
@@ -2512,6 +2629,12 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if err != nil {
 		return moved, err
 	}
+	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer terminalCancel()
+	last, err := waitForTerminalClusterOwnership(terminalCtx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
+	if err != nil {
+		return moved, fmt.Errorf("waiting for terminal cluster storage ownership: %w", err)
+	}
 	// No maintenance iteration is guaranteed between the final successful
 	// node-stop command and listener shutdown. Perform the terminal shared-data
 	// sweep here so retired transaction packs and handoff manifests do not need
@@ -2523,8 +2646,78 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions); err != nil {
 		return moved, fmt.Errorf("collecting terminal shared storage: %w", err)
 	}
+	if b.sharedReferences != nil {
+		if err := b.sharedReferences.drainBeforeShutdown(context.Background()); err != nil {
+			return moved, fmt.Errorf("collecting terminal shared snapshot graph: %w", err)
+		}
+	}
+	if last {
+		// All clean peers have drained their publication queues before becoming
+		// offline, and expired peers have been fenced by Raft. With this daemon's
+		// own queue drained above, no publisher can still be between pack creation
+		// and manifest commit. Remove newly unreachable cold data immediately so
+		// a fully stopped cluster leaves no ten-minute grace residue.
+		if err := collectColdStorageOlderThan(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, time.Now().Add(time.Hour)); err != nil {
+			return moved, fmt.Errorf("collecting final cluster cold storage: %w", err)
+		}
+	}
 	b.daemonStopRequested = true
 	return moved, nil
+}
+
+// waitForTerminalClusterOwnership distinguishes a live peer, which can inherit
+// ordinary maintenance immediately, from an expired but not-yet-fenced peer.
+// The latter still contributes reference claims to the Raft state machine, so
+// the final daemon must remain online until leader-safe expiry reconciliation
+// commits. Comparing leases uses the leader's replicated observation time,
+// never this node's potentially skewed wall clock.
+func waitForTerminalClusterOwnership(ctx context.Context, authority *cluster.RaftCatalog, directory cluster.NodeCatalog, nodeID string) (bool, error) {
+	if authority == nil {
+		return lastOnlineClusterNode(directory, nodeID)
+	}
+	for {
+		state, err := authority.AuthorityState()
+		if err != nil {
+			return false, err
+		}
+		observed := state.LeaderObservedAt
+		unfenced := false
+		for _, record := range state.Nodes {
+			if record.NodeID == nodeID || record.State == cluster.NodeOffline {
+				continue
+			}
+			if record.LeaseActive(observed) {
+				return false, nil
+			}
+			unfenced = true
+		}
+		if !unfenced {
+			return true, nil
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func lastOnlineClusterNode(directory cluster.NodeCatalog, nodeID string) (bool, error) {
+	if directory == nil || nodeID == "" {
+		return false, errors.New("cluster node directory is unavailable")
+	}
+	records, err := directory.List()
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		if record.NodeID != nodeID && record.State != cluster.NodeOffline {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // drainNode implements the owner-local, restart-safe evacuation used by node
@@ -3097,10 +3290,8 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 }
 
 // nodeExecutionGrants returns the bounded set of logical runtimes that Raft
-// currently permits this exact node incarnation to host. Node heartbeats and
-// transfer accounting deliberately do not affect the set. The lease guardian
-// only needs a potentially blocking Sentry inventory pass after a grant is
-// revoked; additions cannot make an already-running local runtime unsafe.
+// currently permits this exact node incarnation to execute. Node heartbeats
+// and transfer accounting deliberately do not affect the set.
 func nodeExecutionGrants(state *cluster.AuthorityState, nodeID, incarnation string) map[string]struct{} {
 	grants := make(map[string]struct{})
 	if state == nil || nodeID == "" || incarnation == "" {
@@ -3148,6 +3339,100 @@ func executionGrantRevoked(previous, current map[string]struct{}) bool {
 		}
 	}
 	return false
+}
+
+// executionRevocationsRequireImmediateFence distinguishes an execution grant
+// revocation from the expected physical cleanup lag after migration cutover.
+// Cutover leaves the source branch paused and transaction-fenced as a sparse
+// data provider; destroying that branch is asynchronous and must not make the
+// heartbeat perform a potentially blocking Sentry inventory. Every other
+// revocation is conservatively fenced at the host-process boundary.
+func executionRevocationsRequireImmediateFence(previous, current map[string]struct{}, state *cluster.AuthorityState, nodeID, incarnation string) bool {
+	cleanupRevocations := 0
+	unknownRevocations := 0
+	for grant := range previous {
+		if _, retained := current[grant]; retained {
+			continue
+		}
+		separator := strings.IndexByte(grant, 0)
+		if separator <= 0 || separator == len(grant)-1 || state == nil {
+			return true
+		}
+		family, branch := grant[:separator], grant[separator+1:]
+		cleanupOnly := false
+		matchingMigration := false
+		for _, tx := range state.Transactions {
+			if !tx.Identity.Migration || tx.Identity.SourceNodeID != nodeID ||
+				tx.Identity.SourceContainer != family || tx.Identity.SourceBranch != branch {
+				continue
+			}
+			matchingMigration = true
+			if tx.OwnershipCommitted && tx.SourceIncarnation == incarnation {
+				cleanupOnly = true
+				break
+			}
+		}
+		// A matching pre-cutover transaction, or one from another daemon
+		// incarnation, cannot authorize this disappearance.
+		if matchingMigration && !cleanupOnly {
+			return true
+		}
+		// A heartbeat may observe migration only after its terminal
+		// transaction has been compacted. In that case the replacement
+		// placement is the durable proof that authority moved instead of
+		// disappearing. The source was paused and fenced before Raft was
+		// allowed to commit this ownership change, so only asynchronous
+		// physical cleanup remains.
+		placementFound := false
+		for _, placement := range state.Placements {
+			if placement.FamilyID != family || placement.BranchID != branch {
+				continue
+			}
+			placementFound = true
+			if placement.State == cluster.PlacementCorrupted {
+				return true
+			}
+			// A replacement owner proves migration cutover. An ownerless
+			// placement proves that stop/dehydration already removed the
+			// runtime before publishing its process-free state. A stable
+			// non-executing placement owned here is target materialization,
+			// which likewise has no guest instructions to fence.
+			if placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation ||
+				placement.State == cluster.PlacementMaterializing {
+				cleanupOnly = true
+			}
+			break
+		}
+		if cleanupOnly {
+			cleanupRevocations++
+			continue
+		}
+		branchFound := false
+		for _, authority := range state.Branches {
+			if authority.FamilyID != family || authority.BranchID != branch {
+				continue
+			}
+			branchFound = true
+			if authority.Corrupted {
+				return true
+			}
+			break
+		}
+		// Placement removal is committed only after local runtime deletion.
+		// Both records disappearing is therefore an expected completed rm,
+		// not an unexplained execution-authority loss.
+		if !placementFound && !branchFound {
+			unknownRevocations++
+			continue
+		}
+		return true
+	}
+	// A set consisting exclusively of fully absent records is an ordinary
+	// branch/family removal: local runtime deletion precedes the atomic Raft
+	// namespace deletion. Once another revoked grant is known to be migration
+	// cleanup, however, absence of a different grant is not explained by that
+	// migration and must fail closed.
+	return unknownRevocations != 0 && cleanupRevocations != 0
 }
 
 // runtimeBranchPresent resolves a failed idempotent eviction without parsing
@@ -3398,6 +3683,58 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 	}
 }
 
+type sharedGCLeaseKeeperResult struct {
+	lease cluster.SharedGCLease
+	err   error
+}
+
+// keepSharedGCLeaseAlive renews a lease independently of ledger rebuilding,
+// collection, compaction, and retirement. Those operations scale with the
+// live snapshot graph and must never starve the fixed-rate lease heartbeat.
+func keepSharedGCLeaseAlive(authority *cluster.RaftCatalog, initial cluster.SharedGCLease, duration time.Duration) func() (cluster.SharedGCLease, error) {
+	stop := make(chan struct{})
+	result := make(chan sharedGCLeaseKeeperResult, 1)
+	go func() {
+		lease := initial
+		delay := duration / 4
+		if delay < 100*time.Millisecond {
+			delay = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		for {
+			select {
+			case <-stop:
+				result <- sharedGCLeaseKeeperResult{lease: lease}
+				return
+			case <-timer.C:
+				renewed, err := authority.RenewSharedGCLease(lease, duration)
+				if err == nil {
+					lease = renewed
+					delay = duration / 4
+				} else {
+					remaining := time.Until(lease.ExpiresAt)
+					if remaining <= 0 {
+						result <- sharedGCLeaseKeeperResult{lease: lease, err: fmt.Errorf("shared GC lease expired after renewal failure: %w", err)}
+						return
+					}
+					delay = remaining / 4
+				}
+				if delay < 100*time.Millisecond {
+					delay = 100 * time.Millisecond
+				}
+				timer.Reset(delay)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() (cluster.SharedGCLease, error) {
+		once.Do(func() { close(stop) })
+		outcome := <-result
+		return outcome.lease, outcome.err
+	}
+}
+
 // maintainSharedGCCoordinator elects exactly one daemon for shared snapshot
 // reference accounting and pack mutation. Actual collection additionally
 // validates the lease generation at every retirement boundary; merely holding
@@ -3407,6 +3744,15 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 		return
 	}
 	const duration = 15 * time.Second
+	maintenanceContext, cancelMaintenance := context.WithCancel(context.Background())
+	defer cancelMaintenance()
+	go func() {
+		select {
+		case <-done:
+			cancelMaintenance()
+		case <-maintenanceContext.Done():
+		}
+	}()
 	ticker := time.NewTicker(duration / 3)
 	defer ticker.Stop()
 	var held cluster.SharedGCLease
@@ -3451,33 +3797,27 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 			}
 		}
 		if held.Generation != 0 && time.Now().Before(held.ExpiresAt) {
+			stopKeeper := keepSharedGCLeaseAlive(authority, held, duration)
+			var maintenanceErr error
 			if references != nil {
 				if err := references.activate(held); err != nil {
-					if stderr != nil {
-						fmt.Fprintf(stderr, "ttcd: warning: activating shared reference ledger: %v\n", err)
-					}
-					select {
-					case <-done:
-						return
-					case <-ticker.C:
-						continue
-					}
+					maintenanceErr = fmt.Errorf("activating shared reference ledger: %w", err)
 				}
 			}
-			if references != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), duration/3)
-				_, err := references.collectAndRetire(ctx, held, 4096)
-				cancel()
-				if err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: collecting shared snapshot graph: %v\n", err)
+			if references != nil && maintenanceErr == nil {
+				// Collection duration is proportional to the amount of newly dead
+				// graph state and to shared-filesystem latency. The independently
+				// renewed coordinator lease fences every irreversible boundary, so a
+				// short wall-clock timeout adds no safety and can starve a large
+				// family forever. Bound it by daemon lifetime instead.
+				_, err := references.collectAndRetire(maintenanceContext, held, 4096)
+				if err != nil {
+					maintenanceErr = fmt.Errorf("collecting shared snapshot graph: %w", err)
 				}
 			}
 			retirements, err := authority.RetiredSharedSnapshots()
-			if err == nil {
+			if err == nil && maintenanceErr == nil {
 				for _, retirement := range retirements {
-					if !time.Now().Before(held.ExpiresAt) {
-						break
-					}
 					var err error
 					if references != nil {
 						err = references.completeRetirement(ttcsnapshot.SnapshotID(retirement.SnapshotID))
@@ -3488,6 +3828,19 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 						fmt.Fprintf(stderr, "ttcd: warning: completing retirement of shared snapshot %d: %v\n", retirement.SnapshotID, err)
 					}
 				}
+			}
+			renewed, keeperErr := stopKeeper()
+			if keeperErr != nil {
+				held = cluster.SharedGCLease{}
+				deactivateReferences()
+				if stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: maintaining shared GC lease: %v\n", keeperErr)
+				}
+			} else {
+				held = renewed
+			}
+			if maintenanceErr != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: %v\n", maintenanceErr)
 			}
 		}
 		select {

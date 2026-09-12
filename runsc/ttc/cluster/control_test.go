@@ -26,6 +26,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -34,6 +35,53 @@ import (
 	"testing"
 	"time"
 )
+
+type testDaemonProxy struct {
+	delay time.Duration
+}
+
+func (p testDaemonProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if p.delay != 0 {
+		time.Sleep(p.delay)
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(append([]byte("proxied:"), data...))
+}
+
+func TestProxyDaemonUsesDedicatedNonReusedTransport(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := &ControlPlane{
+		Store: store, MaxTransactions: 1, Now: time.Now,
+		CommandProxy: testDaemonProxy{delay: 10 * time.Millisecond},
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.daemonHTTP.Transport.(*http.Transport)
+	if !ok || !transport.DisableKeepAlives {
+		t.Fatalf("daemon transport=%#v, want dedicated transport without keep-alives", client.daemonHTTP.Transport)
+	}
+	for _, input := range []string{"first\n", "second\n"} {
+		var output bytes.Buffer
+		if err := client.ProxyDaemon(context.Background(), strings.NewReader(input), &output); err != nil {
+			t.Fatalf("ProxyDaemon(%q): %v", input, err)
+		}
+		if got, want := output.String(), "proxied:"+input; got != want {
+			t.Fatalf("ProxyDaemon(%q) output=%q, want %q", input, got, want)
+		}
+	}
+}
 
 type testImmutableObjectProvider struct {
 	peer        string

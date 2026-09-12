@@ -1270,6 +1270,16 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 // reclaiming immutable packs. A grace period protects a publisher between
 // writing its pack and atomically committing its manifest.
 func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog) error {
+	return collectColdStorageOlderThan(sharedRoot, localRoot, publications, transactions, time.Now().Add(-10*time.Minute))
+}
+
+// collectColdStorageOlderThan is the common tracer with an explicit physical
+// publication grace. Periodic callers retain the ordinary ten-minute window
+// that protects pack-before-manifest publication. The last clean cluster node
+// may pass a future boundary after every node's publication queue has drained,
+// because no unfenced publisher remains that could still name an unreferenced
+// object.
+func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, olderThan time.Time) error {
 	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
 	containers, err := store.ListContainers()
 	if err != nil {
@@ -1359,7 +1369,6 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 			return err
 		}
 	}
-	grace := time.Now().Add(-10 * time.Minute)
 	root := filepath.Join(sharedRoot, "cold", "manifests")
 	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if errors.Is(walkErr, os.ErrNotExist) {
@@ -1378,14 +1387,14 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 		if err != nil {
 			return err
 		}
-		if info.ModTime().After(grace) {
+		if info.ModTime().After(olderThan) {
 			return nil
 		}
 		return os.Remove(path)
 	}); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, grace.UnixNano())
+	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, olderThan.UnixNano())
 	return err
 }
 

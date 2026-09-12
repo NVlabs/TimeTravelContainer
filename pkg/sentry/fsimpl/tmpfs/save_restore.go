@@ -222,8 +222,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			if _, err := repository.Branch(childBranch); err != nil {
 				return fmt.Errorf("TTC volume child branch %q was not prepared: %w", childBranch, err)
 			}
-			fs.diskVolume.Repository = repository
-			fs.diskVolume.Branch = childBranch
+			fs.installDiskVolumeRepository(repository, childBranch)
 			fs.registerDiskMaterializationHook()
 			fs.rebuildDiskInodeCache()
 			return nil
@@ -245,11 +244,21 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	if resource.Branch == "" {
 		return fmt.Errorf("TTC volume restore resource %q has no branch", fs.diskVolume.ResourceID)
 	}
-	fs.diskVolume.Repository = repository
-	fs.diskVolume.Branch = resource.Branch
+	fs.installDiskVolumeRepository(repository, resource.Branch)
 	fs.registerDiskMaterializationHook()
-	info := repository.Info()
-	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}
 	fs.rebuildDiskInodeCache()
 	return nil
+}
+
+// installDiskVolumeRepository canonicalizes a restored filesystem onto the
+// identity of the repository that is authoritative in this Sentry. In
+// particular, a distributed peer is serialized with the source node's
+// repository identity, but must export the target-local identity if it is
+// later selected as the source for another fork. Retaining the incoming ID
+// makes a multi-sibling restore depend on which peer the SandboxFamily happens
+// to select and eventually causes the daemon's local-to-incoming alias to miss.
+func (fs *filesystem) installDiskVolumeRepository(repository *ttcvolume.Repository, branch string) {
+	fs.diskVolume.Repository = repository
+	fs.diskVolume.Branch = branch
+	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
 }

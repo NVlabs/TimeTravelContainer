@@ -1584,6 +1584,7 @@ type Client struct {
 	BaseURL    string
 	HTTP       *http.Client
 	streamHTTP *http.Client
+	daemonHTTP *http.Client
 	nodeID     string
 	authToken  string
 }
@@ -1597,7 +1598,21 @@ func NewPlainClient(baseURL, nodeID, authToken string, timeout time.Duration) (*
 	if nodeID == "" || timeout <= 0 {
 		return nil, errors.New("cluster client requires a node ID and positive timeout")
 	}
-	return &Client{BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: timeout}, streamHTTP: &http.Client{}, nodeID: nodeID, authToken: authToken}, nil
+	// Daemon tunnels are deliberately not pooled with bounded control calls or
+	// immutable-object reads. A tunnel can remain open for an interactive exec
+	// or a whole node drain; reusing a stale HTTP/1 connection can strand one
+	// node retirement even though the peer's listener remains healthy.
+	return &Client{
+		BaseURL: strings.TrimSuffix(baseURL, "/"),
+		HTTP: &http.Client{
+			Transport: &http.Transport{},
+			Timeout:   timeout,
+		},
+		streamHTTP: &http.Client{Transport: &http.Transport{}},
+		daemonHTTP: &http.Client{Transport: &http.Transport{DisableKeepAlives: true}},
+		nodeID:     nodeID,
+		authToken:  authToken,
+	}, nil
 }
 
 func (c *Client) authenticate(req *http.Request) {
@@ -1808,10 +1823,12 @@ func NewClient(baseURL string, tlsConfig *tls.Config, timeout time.Duration) (*C
 	// daemon proxy streams retain HTTP/2 full duplex on their own connections.
 	controlTransport := &http.Transport{TLSClientConfig: tlsConfig.Clone()}
 	streamTransport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), ForceAttemptHTTP2: true}
+	daemonTransport := &http.Transport{TLSClientConfig: tlsConfig.Clone(), DisableKeepAlives: true}
 	return &Client{
 		BaseURL:    strings.TrimSuffix(baseURL, "/"),
 		HTTP:       &http.Client{Transport: controlTransport, Timeout: timeout},
 		streamHTTP: &http.Client{Transport: streamTransport},
+		daemonHTTP: &http.Client{Transport: daemonTransport},
 	}, nil
 }
 
@@ -1826,7 +1843,11 @@ func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Wri
 	c.authenticate(req)
 	// Streaming exec sessions may legitimately outlive the timeout used for
 	// individual transaction RPCs; their context is the lifetime bound.
-	resp, err := c.streamHTTP.Do(req)
+	client := c.daemonHTTP
+	if client == nil {
+		client = c.streamHTTP
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

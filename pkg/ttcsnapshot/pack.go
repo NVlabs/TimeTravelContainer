@@ -644,6 +644,14 @@ func (store *SharedPackStore) Manifests() ([]*SnapshotManifest, error) {
 	manifests := make([]*SnapshotManifest, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		manifest, err := store.Manifest(snapshot)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Enumeration is only a physical discovery pass. A preceding GC
+			// coordinator may have permanently fenced this origin in Raft and be
+			// finishing its directory rename/removal while a successor rebuilds
+			// disposable reference state. The absent directory is therefore no
+			// longer a candidate manifest, not evidence of a partial pack.
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("opening shared snapshot %d during enumeration: %w", snapshot, err)
 		}

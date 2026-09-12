@@ -50,6 +50,47 @@ type transactionListCatalog struct {
 	records []cluster.Transaction
 }
 
+func TestDependencyMonitorIntervalBoundsAggregatePolling(t *testing.T) {
+	for _, test := range []struct {
+		watchers int64
+		want     time.Duration
+	}{
+		{watchers: 1, want: 250 * time.Millisecond},
+		{watchers: 4, want: 250 * time.Millisecond},
+		{watchers: 16, want: time.Second},
+		{watchers: 80, want: 5 * time.Second},
+		{watchers: 1000, want: 5 * time.Second},
+	} {
+		if got := dependencyMonitorInterval(test.watchers); got != test.want {
+			t.Errorf("dependencyMonitorInterval(%d)=%s, want %s", test.watchers, got, test.want)
+		}
+	}
+}
+
+func TestDependencyMonitorPollAdmissionIsNonBlocking(t *testing.T) {
+	runtime := &daemonTargetRuntime{}
+	releases := make([]func(), 0, dependencyMonitorConcurrency)
+	for range dependencyMonitorConcurrency {
+		release, ok := runtime.tryDependencyPoll()
+		if !ok {
+			t.Fatal("poll slot rejected below the concurrency limit")
+		}
+		releases = append(releases, release)
+	}
+	if _, ok := runtime.tryDependencyPoll(); ok {
+		t.Fatal("poll slot admitted work above the concurrency limit")
+	}
+	releases[0]()
+	if release, ok := runtime.tryDependencyPoll(); !ok {
+		t.Fatal("released poll slot was not reusable")
+	} else {
+		release()
+	}
+	for _, release := range releases[1:] {
+		release()
+	}
+}
+
 func (c transactionListCatalog) List() ([]cluster.Transaction, error) {
 	return append([]cluster.Transaction(nil), c.records...), nil
 }
@@ -1134,6 +1175,8 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 	if status != 0 ||
 		!strings.Contains(stdout, `"build_id":"`+version.Version()+`"`) ||
 		!strings.Contains(stdout, `"features":["batch-fork"`) ||
+		!strings.Contains(stdout, `"filesystem-object-paging"`) ||
+		strings.Contains(stdout, `"filesystem-range-paging"`) ||
 		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
@@ -1279,6 +1322,12 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 	}
 	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "http://10.0.0.2:7443" || name != "" {
 		t.Fatalf("parseClusterPeer=(%q, %q, %q, %v)", node, url, name, err)
+	}
+}
+
+func TestDefaultClusterTransactionCapacitySupportsHighFanout(t *testing.T) {
+	if got := defaultDaemonClusterOptions().MaxTransactions; got < 1024 {
+		t.Fatalf("default max transactions=%d, want at least 1024 for batch remote fork", got)
 	}
 }
 

@@ -156,4 +156,20 @@ test "$(client "$source" exec "$NAME@grandchild" cat /tmp/shared-graph-child)" =
 test "$(client "$source" exec "$NAME@grandchild" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = GC-TURNOVER
 
 client "$target" rm -f "$NAME" >/dev/null
+
+# Stop both survivors through the protocol rather than relying on the trap's
+# best-effort process reaping. The final daemon must wait for the crashed
+# coordinator's lease to be authoritatively fenced, assume collection
+# ownership, and leave neither graph origins nor cold publication residue.
+client "$target" node stop "node-$target" --stop-all >/dev/null
+eval "target_pid=\$PID_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')"
+wait "$target_pid"
+eval "PID_$(printf '%s' "$target" | tr '[:lower:]' '[:upper:]')="
+client "$source" node stop "node-$source" --stop-all >/dev/null
+eval "source_pid=\$PID_$(printf '%s' "$source" | tr '[:lower:]' '[:upper:]')"
+wait "$source_pid"
+eval "PID_$(printf '%s' "$source" | tr '[:lower:]' '[:upper:]')="
+test "$(find "$SHARED/snapshot-packs/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" -eq 0
+test "$(find "$SHARED/cold/manifests" -type f 2>/dev/null | wc -l)" -eq 0
+test "$(find "$SHARED/cold/packs" -type f 2>/dev/null | wc -l)" -eq 0
 echo "TTC shared-GC coordinator crash and retain retry passed in ${elapsed}s"
