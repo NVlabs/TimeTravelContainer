@@ -619,6 +619,89 @@ func TestAuthorityIndependenceDropsDependencyBeforeExpiry(t *testing.T) {
 	}
 }
 
+func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing.T) {
+	at := time.Unix(3850, 0).UTC()
+	state := NewAuthorityState()
+	predecessor := Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "fork-old", SourceNodeID: "node-a", TargetNodeID: "node-b",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			TargetBranch: "old-hidden", TargetVisibleBranch: "main",
+		},
+		SourceNeeded: true, State: TransactionPublished, Revision: 6, CreatedAt: at, UpdatedAt: at,
+	}
+	migration := Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "move-new", SourceNodeID: "node-b", TargetNodeID: "node-c",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			TargetBranch: "move-hidden", TargetVisibleBranch: "main", Migration: true,
+		},
+		SourceNeeded: true, State: TransactionDraining, Revision: 8, CreatedAt: at, UpdatedAt: at,
+		OwnershipCommitted: true,
+	}
+	state.Transactions[predecessor.Identity.TransactionID] = predecessor
+	state.Transactions[migration.Identity.TransactionID] = migration
+	key := logicalBranchKey("family", "main")
+	state.Branches[key] = BranchAuthority{
+		FamilyID: "family", BranchID: "main", Generation: 3, Lifecycle: "running",
+		VolatileDependencies: []VolatileDependency{
+			{TransactionID: predecessor.Identity.TransactionID, SourceNode: "node-a", SourceIncarnation: "inc-a"},
+			{TransactionID: migration.Identity.TransactionID, SourceNode: "node-b", SourceIncarnation: "inc-b"},
+		},
+		DependenciesInherited: true, UpdatedAt: at,
+	}
+	applyAuthorityForTest(t, state, "independent-migration", at.Add(time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
+		ID: migration.Identity.TransactionID, Revision: migration.Revision, Next: TransactionIndependent,
+		Metrics: &TransferMetrics{PagesTotal: 2, PagesReleased: 2},
+	})
+	if dependencies := state.Branches[key].VolatileDependencies; len(dependencies) != 0 {
+		t.Fatalf("independent migrated branch retains dependencies: %+v", dependencies)
+	}
+	if got := state.Transactions[predecessor.Identity.TransactionID]; got.State != TransactionIndependent || got.SourceNeeded {
+		t.Fatalf("unreferenced predecessor remains source-backed: %+v", got)
+	}
+}
+
+func TestAuthorityMigrationIndependenceRetainsSharedPredecessor(t *testing.T) {
+	at := time.Unix(3875, 0).UTC()
+	state := NewAuthorityState()
+	predecessor := Transaction{
+		Identity:     ForkIdentity{TransactionID: "fork-shared"},
+		SourceNeeded: true, State: TransactionPublished, Revision: 4, CreatedAt: at, UpdatedAt: at,
+	}
+	migration := Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "move-one", SourceContainer: "family", SourceBranch: "main",
+			TargetVisibleBranch: "main", Migration: true,
+		},
+		SourceNeeded: true, State: TransactionPublished, Revision: 7, CreatedAt: at, UpdatedAt: at,
+		OwnershipCommitted: true,
+	}
+	state.Transactions[predecessor.Identity.TransactionID] = predecessor
+	state.Transactions[migration.Identity.TransactionID] = migration
+	dependency := VolatileDependency{TransactionID: predecessor.Identity.TransactionID, SourceNode: "node-a", SourceIncarnation: "inc-a"}
+	state.Branches[logicalBranchKey("family", "main")] = BranchAuthority{
+		FamilyID: "family", BranchID: "main", VolatileDependencies: []VolatileDependency{
+			dependency, {TransactionID: migration.Identity.TransactionID, SourceNode: "node-b", SourceIncarnation: "inc-b"},
+		},
+	}
+	state.Branches[logicalBranchKey("family", "sibling")] = BranchAuthority{
+		FamilyID: "family", BranchID: "sibling", VolatileDependencies: []VolatileDependency{dependency},
+	}
+	applyAuthorityForTest(t, state, "independent-one", at.Add(time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
+		ID: migration.Identity.TransactionID, Revision: migration.Revision, Next: TransactionIndependent,
+	})
+	if dependencies := state.Branches[logicalBranchKey("family", "main")].VolatileDependencies; len(dependencies) != 0 {
+		t.Fatalf("migrated branch retains dependencies: %+v", dependencies)
+	}
+	if got := state.Transactions[predecessor.Identity.TransactionID]; got.State != TransactionPublished || !got.SourceNeeded {
+		t.Fatalf("shared predecessor was released: %+v", got)
+	}
+	if dependencies := state.Branches[logicalBranchKey("family", "sibling")].VolatileDependencies; len(dependencies) != 1 || dependencies[0].TransactionID != predecessor.Identity.TransactionID {
+		t.Fatalf("sibling dependency changed: %+v", dependencies)
+	}
+}
+
 func TestAuthorityExpiryRevokesMaterializingWithoutCorruption(t *testing.T) {
 	at := time.Unix(3900, 0).UTC()
 	state := NewAuthorityState()

@@ -319,6 +319,17 @@ func removeVolatileDependency(dependencies []VolatileDependency, transactionID s
 	return result
 }
 
+func volatileDependencyReferenced(branches map[string]BranchAuthority, transactionID string) bool {
+	for _, branch := range branches {
+		for _, dependency := range branch.VolatileDependencies {
+			if dependency.TransactionID == transactionID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func authorityCommandDigest(command AuthorityCommand) (string, error) {
 	copy := command
 	// Request identity binds semantic input, not the leader-generated envelope.
@@ -1393,13 +1404,45 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			tx.Metrics = &copy
 		}
 		if p.Next == TransactionIndependent {
+			var inherited []VolatileDependency
 			for key, branch := range s.Branches {
 				updated := removeVolatileDependency(branch.VolatileDependencies, tx.Identity.TransactionID)
+				// A migration may capture a branch that is itself still backed by
+				// older remote-fork or migration transactions. The new target's
+				// independence fence proves that every one of those transitive
+				// dependencies has been materialized. Remove them from the moved
+				// logical branch in the same Raft entry; otherwise moving the branch
+				// again can orphan its predecessor transaction on the former node.
+				if tx.Identity.Migration && tx.OwnershipCommitted &&
+					branch.FamilyID == tx.Identity.SourceContainer && branch.BranchID == tx.Identity.SourceBranch {
+					inherited = append(inherited, updated...)
+					updated = nil
+				}
 				if len(updated) != len(branch.VolatileDependencies) {
 					branch.VolatileDependencies = updated
 					branch.UpdatedAt = command.IssuedAt
 					s.Branches[key] = branch
 				}
+			}
+			// A predecessor can be released only when no sibling branch retains
+			// its edge. Advancing it here is safe: the old target is no longer an
+			// execution owner, and the newly independent migration target is a
+			// complete replacement for every transitive read it could perform.
+			// Source and target cleanup workers observe this replicated terminal
+			// state and release their process-local sessions idempotently.
+			for _, dependency := range inherited {
+				if dependency.TransactionID == tx.Identity.TransactionID || volatileDependencyReferenced(s.Branches, dependency.TransactionID) {
+					continue
+				}
+				predecessor, ok := s.Transactions[dependency.TransactionID]
+				if !ok || !predecessor.SourceNeeded ||
+					(predecessor.State != TransactionPublished && predecessor.State != TransactionDraining) {
+					continue
+				}
+				if err := predecessor.Advance(TransactionIndependent, "", command.IssuedAt); err != nil {
+					return nil, fmt.Errorf("settling inherited dependency %q: %w", dependency.TransactionID, err)
+				}
+				s.Transactions[dependency.TransactionID] = predecessor
 			}
 		}
 	case AuthorityTransactionPublish:
