@@ -49,6 +49,7 @@ import (
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -5890,7 +5891,34 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			return ttcimages.Info{}, err
 		}
 		temporaryBranch = "commit-" + hex.EncodeToString(random[:])
-		if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
+		state := normalizeLifecycleState(branch.State)
+		if state == "running" || state == "paused" {
+			// The Sentry may still have a bounded metadata batch for this
+			// repository. Snapshot through the mounted filesystem so the guest is
+			// paused across metadata flush, mmap invalidation, and graph-root
+			// publication. Forking from this manager-side Repository directly can
+			// otherwise capture only the last durable batch and silently omit the
+			// most recent creates and writes.
+			cont, loadErr := container.Load(b.root, container.FullID{
+				SandboxID:   resolved.container,
+				ContainerID: resolved.container,
+			}, container.LoadOpts{Exact: true, SkipCheck: true})
+			if loadErr != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, fmt.Errorf("loading live branch for commit: %w", loadErr)
+			}
+			resource := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
+			if snapshotErr := cont.Sandbox.SnapshotFilesystemBranch(&boot.FilesystemBranchSnapshotArgs{
+				BranchID: resolved.branch, ResourceID: resource, Child: temporaryBranch,
+			}); snapshotErr != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, fmt.Errorf("snapshotting live rootfs upper: %w", snapshotErr)
+			}
+		} else if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
 			repository.Close()
 			reader.Close()
 			writer.Close()

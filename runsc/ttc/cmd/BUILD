@@ -35,6 +35,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/hostarch",
         "//pkg/memutil",
+		"//pkg/sentry/checkpoint",
         "//pkg/sentry/kernel",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/ttcchunk",

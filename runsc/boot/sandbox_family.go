@@ -3742,8 +3742,8 @@ func (f *SandboxFamily) DestroyNonLoaderBranches() {
 }
 
 // CloseLoaderDehydration releases the final process-local capture during Sentry
-// teardown. ttcd has already persisted immutable packed snapshots before it
-// requests deletion of a fully dehydrated family.
+// teardown. ttcd has already pinned the immutable snapshot-graph roots before
+// it requests deletion of a fully dehydrated family.
 func (f *SandboxFamily) CloseLoaderDehydration() {
 	f.mu.Lock()
 	b := f.branches[f.loaderBranchID]

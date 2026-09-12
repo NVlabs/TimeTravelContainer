@@ -181,7 +181,8 @@ const (
 
 	// ContMgrDehydrateBranch hibernates one live branch.
 	ContMgrDehydrateBranch = "containerManager.DehydrateBranch"
-	// ContMgrExportDehydratedBranch persists a dehydrated branch's packed memory.
+	// ContMgrExportDehydratedBranch exports a dehydrated branch into the
+	// snapshot graph's immutable memory objects.
 	ContMgrExportDehydratedBranch = "containerManager.ExportDehydratedBranch"
 
 	// ContMgrRehydrateBranch reconstructs one dehydrated branch.

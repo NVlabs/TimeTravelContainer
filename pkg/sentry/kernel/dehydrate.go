@@ -74,7 +74,8 @@ type DurableDehydrationMemory struct {
 }
 
 // DurableDehydrationMetadata is sufficient to reconstruct a Kernel in a new
-// Sentry when paired with one packed snapshot file per Memories entry.
+// Sentry when paired with immutable snapshot-graph objects for each Memories
+// entry.
 type DurableDehydrationMetadata struct {
 	Version        int                        `json:"version"`
 	KernelMetadata []byte                     `json:"kernel_metadata"`
