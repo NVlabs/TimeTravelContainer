@@ -5250,12 +5250,12 @@ func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 		{"node", "stop", "--_local", "--dehydrate-all", "node-a"},
 		{"node", "rebalance", "node-a"},
 	} {
-		owner, err := daemonCommandOwner(t.TempDir(), args)
+		owner, _, err := daemonCommandPlacementWithCatalog(t.TempDir(), nil, args)
 		if err != nil {
-			t.Fatalf("daemonCommandOwner(%v): %v", args, err)
+			t.Fatalf("daemonCommandPlacementWithCatalog(%v): %v", args, err)
 		}
 		if owner != "node-a" {
-			t.Errorf("daemonCommandOwner(%v)=%q, want node-a", args, owner)
+			t.Errorf("daemonCommandPlacementWithCatalog(%v)=%q, want node-a", args, owner)
 		}
 	}
 }

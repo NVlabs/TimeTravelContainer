@@ -326,19 +326,6 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func daemonCommandOwner(dataRoot string, args []string) (string, error) {
-	owner, _, err := daemonCommandPlacement(dataRoot, args)
-	return owner, err
-}
-
-func daemonCommandPlacement(dataRoot string, args []string) (string, []daemonPlacementClaim, error) {
-	placements, placementErr := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
-	if placementErr != nil {
-		return "", nil, placementErr
-	}
-	return daemonCommandPlacementWithCatalog(dataRoot, placements, args)
-}
-
 func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
 	if dataRoot == "" {
 		return "", nil, nil
@@ -439,14 +426,6 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		owner = branchOwner
 	}
 	return owner, claims, nil
-}
-
-func validateDaemonPlacementClaims(dataRoot, localNode string, claims []daemonPlacementClaim) error {
-	placements, err := cluster.OpenPlacementStore(filepath.Join(dataRoot, "cluster", "placements"))
-	if err != nil {
-		return err
-	}
-	return validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode, claims, placements)
 }
 
 func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {

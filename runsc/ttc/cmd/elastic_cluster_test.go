@@ -109,15 +109,15 @@ func TestDaemonCommandOwner(t *testing.T) {
 		{"cp", "web@main:/tmp/result", "/tmp/result"},
 		{"fork", "web@main", "child"},
 	} {
-		owner, err := daemonCommandOwner(root, args)
+		owner, _, err := daemonCommandPlacementWithCatalog(root, placements, args)
 		if err != nil || owner != "node-b" {
-			t.Fatalf("daemonCommandOwner(%v)=(%q, %v)", args, owner, err)
+			t.Fatalf("daemonCommandPlacementWithCatalog(%v)=(%q, %v)", args, owner, err)
 		}
 	}
-	if owner, err := daemonCommandOwner(root, []string{"images"}); err != nil || owner != "" {
+	if owner, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"images"}); err != nil || owner != "" {
 		t.Fatalf("image command owner=(%q, %v)", owner, err)
 	}
-	if owner, claims, err := daemonCommandPlacement(root, []string{"wait", "--condition=durable", "web@main"}); err != nil || owner != "" || len(claims) != 0 {
+	if owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"wait", "--condition=durable", "web@main"}); err != nil || owner != "" || len(claims) != 0 {
 		t.Fatalf("durable wait placement=(%q, %+v, %v)", owner, claims, err)
 	}
 }
@@ -150,23 +150,23 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, claims, err := daemonCommandPlacement(root, []string{"exec", "web@main", "true"})
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if owner != "node-b" || len(claims) != 1 || claims[0].Generation != created.Generation || claims[0].OwnerIncarnation != "boot-b" {
 		t.Fatalf("placement owner=%q claims=%+v", owner, claims)
 	}
-	if err := validateDaemonPlacementClaims(root, "node-b", claims); err != nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", claims, placements); err != nil {
 		t.Fatalf("valid claim rejected: %v", err)
 	}
 	if _, err := placements.BeginMigration("web", "main", "node-b", "boot-b", created.Generation, "move-one", "node-c", time.Unix(3, 0).UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateDaemonPlacementClaims(root, "node-b", claims); err == nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", claims, placements); err == nil {
 		t.Fatal("stale pre-migration claim remained valid")
 	}
-	if _, _, err := daemonCommandPlacement(root, []string{"exec", "web@main", "true"}); err == nil {
+	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
 		t.Fatal("new command was routed into an in-progress migration")
 	}
 }
@@ -214,8 +214,8 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)
 	}
-	// Keep the historical shared-root catalog empty. This models a
-	// current-format clustered root, where placements exist only in Raft.
+	// Current-format clustered roots resolve placements only through the
+	// injected Raft catalog.
 	raftPlacements, err := cluster.OpenPlacementStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -232,9 +232,6 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 	}
 	if owner != "node-b" || len(claims) != 1 || claims[0].BranchID != "main" {
 		t.Fatalf("placement owner=%q claims=%+v", owner, claims)
-	}
-	if _, _, err := daemonCommandPlacement(root, []string{"rm", "-f", "web@main"}); err == nil {
-		t.Fatal("empty legacy catalog unexpectedly resolved a current Raft placement")
 	}
 }
 
