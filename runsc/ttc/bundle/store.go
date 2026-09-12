@@ -5120,7 +5120,7 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 	return info, filepath.Join(finalDir, "rootfs"), nil
 }
 
-const sharedImagePackFormat = 1
+const sharedImagePackFormat = 2
 
 type sharedImagePackManifest struct {
 	Format int               `json:"format"`
@@ -5147,7 +5147,8 @@ func (s Store) publishSharedImagePack(key, imageDir string, info images.RootFSIn
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	pack, err := ttcpack.WriteDirectory(imageDir, root)
+	packID := ttcpack.IDForKey("image", key)
+	pack, err := ttcpack.WriteDirectory(imageDir, root, packID)
 	if err != nil {
 		return err
 	}

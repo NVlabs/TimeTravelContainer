@@ -4982,12 +4982,12 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 2") {
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 3") {
 		t.Fatalf("legacy cold manifest error=%v", err)
 	}
 	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
 	current := coldBranchManifest{
-		Version: 2, Container: "family", Branch: "main", Generation: 1, Kind: "stop",
+		Version: 3, Container: "family", Branch: "main", Generation: 1, Kind: "stop",
 		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
 			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
 			RestoreID: "0123456789abcdef0123456789abcdef",

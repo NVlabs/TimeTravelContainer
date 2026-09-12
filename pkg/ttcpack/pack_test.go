@@ -14,6 +14,48 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestLogicalPackIDIsStableAndUnambiguous(t *testing.T) {
+	got := IDForKey("image", "ab", "c")
+	if got != IDForKey("image", "ab", "c") {
+		t.Fatal("logical pack ID is not stable")
+	}
+	if got == IDForKey("image", "a", "bc") || got == IDForKey("memory-control", "ab", "c") {
+		t.Fatal("logical pack ID does not preserve component boundaries")
+	}
+}
+
+func TestLegacyPackFormatIsRejected(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack, err := os.OpenFile(Path(repository, id), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, Alignment)
+	if _, err := pack.ReadAt(header, 0); err != nil {
+		t.Fatal(err)
+	}
+	header = bytes.Replace(header, []byte(headerMagic), []byte("TTCPACK1"), 1)
+	if _, err := pack.WriteAt(header, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pack, _, err := Open(repository, id); err == nil {
+		pack.Close()
+		t.Fatal("legacy pack format was accepted")
+	}
+}
+
 func TestPackRoundTripAndRangeIndex(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -43,7 +85,7 @@ func TestPackRoundTripAndRangeIndex(t *testing.T) {
 		_ = os.Chmod(filepath.Join(source, "a", "b"), 0750)
 	})
 	repository := filepath.Join(root, "repository")
-	id, err := WriteDirectory(source, repository)
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +148,7 @@ func TestLazyDirectoryPopulatesWholeFileAfterCrashAndConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	repository := filepath.Join(root, "repository")
-	id, err := WriteDirectory(source, repository)
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +254,7 @@ func TestLazyDirectoryCapacityEvictionFencesActiveGofer(t *testing.T) {
 		t.Fatal(err)
 	}
 	repository := filepath.Join(root, "repository")
-	id, err := WriteDirectory(source, repository)
+	id, err := WriteDirectory(source, repository, IDForKey("test", t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}

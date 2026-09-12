@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package ttcpack stores immutable filesystem generations in range-readable,
-// content-addressed pack files. The format deliberately requires only ordinary
+// logically identified pack files. The format deliberately requires only ordinary
 // filesystem operations; it does not depend on reflinks, sparse files, xattrs,
 // or atomic writes larger than a pathname rename.
 package ttcpack
@@ -21,11 +21,11 @@ package ttcpack
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -40,13 +40,14 @@ import (
 const (
 	Alignment     = int64(4096)
 	MaxDataExtent = int64(1 << 20)
-	formatVersion = 1
-	headerMagic   = "TTCPACK1"
-	recordMagic   = "TTCREC01"
-	trailerMagic  = "TTCIDX01"
+	formatVersion = 2
+	headerMagic   = "TTCPACK2"
+	recordMagic   = "TTCREC02"
+	trailerMagic  = "TTCIDX02"
 )
 
-// ID is the SHA-256 digest of all bytes in a committed pack.
+// ID is the stable logical identity of a committed pack. It is derived from
+// small, transaction-fenced metadata rather than from bulk pack contents.
 type ID [sha256.Size]byte
 
 func (id ID) String() string { return hex.EncodeToString(id[:]) }
@@ -60,6 +61,27 @@ func ParseID(value string) (ID, error) {
 	}
 	copy(id[:], decoded)
 	return id, nil
+}
+
+// IDForKey deterministically derives a pack ID from a namespace and logical
+// identity components. Length-prefixing prevents delimiter ambiguity. This
+// hashes only small control metadata; normal pack reads and writes never hash
+// bulk data.
+func IDForKey(namespace string, components ...string) ID {
+	hash := sha256.New()
+	write := func(value string) {
+		var length [8]byte
+		binary.LittleEndian.PutUint64(length[:], uint64(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write([]byte(value))
+	}
+	write(namespace)
+	for _, component := range components {
+		write(component)
+	}
+	var id ID
+	copy(id[:], hash.Sum(nil))
+	return id
 }
 
 // Entry identifies one metadata or data record. Offset and StoredLength make
@@ -79,7 +101,6 @@ type Entry struct {
 	Length       int64             `json:"length,omitempty"`
 	RecordOffset int64             `json:"record_offset"`
 	StoredLength int64             `json:"stored_length"`
-	Checksum     string            `json:"checksum,omitempty"`
 }
 
 type packHeader struct {
@@ -97,28 +118,30 @@ type trailer struct {
 	Version     int    `json:"version"`
 	IndexOffset int64  `json:"index_offset"`
 	IndexLength int64  `json:"index_length"`
-	IndexSHA256 string `json:"index_sha256"`
 	RecordCount int    `json:"record_count"`
 }
 
-// Index is the verified footer of an opened pack.
+// Index is the structurally validated footer of an opened pack.
 type Index struct {
 	Entries []Entry `json:"entries"`
 }
 
-// WriteDirectory writes source as one immutable pack in repository/packs and
-// returns its content digest. An existing pack with the same digest is reused.
-func WriteDirectory(source, repository string) (ID, error) {
-	var zero ID
+// WriteDirectory writes source as the immutable pack id in repository/packs.
+// An existing structurally valid pack with the same transaction-fenced ID is
+// reused, making publication retries idempotent.
+func WriteDirectory(source, repository string, id ID) (ID, error) {
 	if !filepath.IsAbs(source) || !filepath.IsAbs(repository) {
-		return zero, errors.New("pack source and repository must be absolute")
+		return ID{}, errors.New("pack source and repository must be absolute")
+	}
+	if id == (ID{}) {
+		return ID{}, errors.New("pack ID must not be zero")
 	}
 	if err := os.MkdirAll(filepath.Join(repository, "packs"), 0700); err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	temporary, err := os.CreateTemp(filepath.Join(repository, "packs"), ".pack-*.tmp")
 	if err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	temporaryName := temporary.Name()
 	committed := false
@@ -128,41 +151,39 @@ func WriteDirectory(source, repository string) (ID, error) {
 			_ = os.Remove(temporaryName)
 		}
 	}()
-	writer := &writer{file: temporary, hash: sha256.New(), hardlinks: make(map[fileIdentity]string)}
+	writer := &writer{file: temporary, hardlinks: make(map[fileIdentity]string)}
 	if err := writer.writeBlock(packHeader{Magic: headerMagic, Version: formatVersion}); err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	if err := writer.walk(source); err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	indexOffset, _ := temporary.Seek(0, io.SeekCurrent)
 	indexData, err := json.Marshal(Index{Entries: writer.entries})
 	if err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	if err := writer.writeBytes(indexData); err != nil {
-		return zero, err
+		return ID{}, err
 	}
 	if err := writer.pad(); err != nil {
-		return zero, err
+		return ID{}, err
 	}
-	indexDigest := sha256.Sum256(indexData)
-	if err := writer.writeBlock(trailer{Magic: trailerMagic, Version: formatVersion, IndexOffset: indexOffset, IndexLength: int64(len(indexData)), IndexSHA256: hex.EncodeToString(indexDigest[:]), RecordCount: len(writer.entries)}); err != nil {
-		return zero, err
+	if err := writer.writeBlock(trailer{Magic: trailerMagic, Version: formatVersion, IndexOffset: indexOffset, IndexLength: int64(len(indexData)), RecordCount: len(writer.entries)}); err != nil {
+		return ID{}, err
 	}
 	if err := temporary.Sync(); err != nil {
-		return zero, err
+		return ID{}, err
 	}
-	copy(zero[:], writer.hash.Sum(nil))
 	if err := temporary.Close(); err != nil {
 		return ID{}, err
 	}
-	destination := Path(repository, zero)
+	destination := Path(repository, id)
 	if err := os.Link(temporaryName, destination); err != nil {
 		if !errors.Is(err, fs.ErrExist) {
 			return ID{}, err
 		}
-		existing, _, openErr := Open(repository, zero)
+		existing, _, openErr := Open(repository, id)
 		if openErr != nil {
 			return ID{}, fmt.Errorf("verifying existing pack: %w", openErr)
 		}
@@ -180,7 +201,7 @@ func WriteDirectory(source, repository string) (ID, error) {
 			return ID{}, err
 		}
 	}
-	return zero, nil
+	return id, nil
 }
 
 // Path returns the canonical pathname of id.
@@ -192,7 +213,6 @@ type fileIdentity struct{ dev, ino uint64 }
 
 type writer struct {
 	file      *os.File
-	hash      hash.Hash
 	entries   []Entry
 	hardlinks map[fileIdentity]string
 }
@@ -327,10 +347,6 @@ func (w *writer) record(entry Entry, data []byte) error {
 	}
 	entry.RecordOffset = offset
 	entry.StoredLength = Alignment + align(int64(len(data)))
-	if len(data) != 0 {
-		digest := sha256.Sum256(data)
-		entry.Checksum = hex.EncodeToString(digest[:])
-	}
 	if err := w.writeBlock(recordHeader{Magic: recordMagic, Entry: entry}); err != nil {
 		return err
 	}
@@ -364,8 +380,7 @@ func (w *writer) writeBytes(data []byte) error {
 	} else if n != len(data) {
 		return io.ErrShortWrite
 	}
-	_, err := w.hash.Write(data)
-	return err
+	return nil
 }
 
 func (w *writer) pad() error {
@@ -432,21 +447,18 @@ func readXattrs(path string, symlink bool) (map[string][]byte, error) {
 	return result, nil
 }
 
-// Open verifies the content digest, header, footer, and footer checksum. Use
-// OpenIndexed for demand-paged shared storage where reading the complete pack
-// would defeat range access.
+// Open validates the structural header, footer, and index of a pack.
 func Open(repository string, id ID) (*os.File, Index, error) {
-	return open(repository, id, true)
+	return open(repository, id)
 }
 
-// OpenIndexed reads only the fixed header, footer, and indexed metadata. The
-// authoritative manifest has already committed the content-addressed pack;
-// every subsequently read data extent is independently checksummed.
+// OpenIndexed is an explicit alias for Open used by demand-paged callers. Both
+// read only fixed framing and indexed metadata, never the bulk payload.
 func OpenIndexed(repository string, id ID) (*os.File, Index, error) {
-	return open(repository, id, false)
+	return open(repository, id)
 }
 
-func open(repository string, id ID, verifyContent bool) (*os.File, Index, error) {
+func open(repository string, id ID) (*os.File, Index, error) {
 	file, err := os.Open(Path(repository, id))
 	if err != nil {
 		return nil, Index{}, err
@@ -458,18 +470,6 @@ func open(repository string, id ID, verifyContent bool) (*os.File, Index, error)
 	stat, err := file.Stat()
 	if err != nil || stat.Size() < 2*Alignment || stat.Size()%Alignment != 0 {
 		return fail(fmt.Errorf("invalid pack size: %w", err))
-	}
-	if verifyContent {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return fail(err)
-		}
-		hash := sha256.New()
-		if _, err := io.Copy(hash, file); err != nil {
-			return fail(err)
-		}
-		if !bytes.Equal(hash.Sum(nil), id[:]) {
-			return fail(errors.New("pack content digest mismatch"))
-		}
 	}
 	index, err := ReadIndex(file)
 	if err != nil {
@@ -500,10 +500,6 @@ func ReadIndex(file *os.File) (Index, error) {
 	if _, err := file.ReadAt(indexData, tail.IndexOffset); err != nil {
 		return Index{}, err
 	}
-	digest := sha256.Sum256(indexData)
-	if hex.EncodeToString(digest[:]) != tail.IndexSHA256 {
-		return Index{}, errors.New("pack index checksum mismatch")
-	}
 	var index Index
 	if err := json.Unmarshal(indexData, &index); err != nil {
 		return Index{}, err
@@ -520,12 +516,6 @@ func ReadIndex(file *os.File) (Index, error) {
 		if entry.Length < 0 || entry.Length > MaxDataExtent ||
 			entry.Length > entry.StoredLength-Alignment {
 			return Index{}, fmt.Errorf("pack record %q has an invalid payload length", entry.Path)
-		}
-		if entry.Length != 0 {
-			checksum, err := hex.DecodeString(entry.Checksum)
-			if err != nil || len(checksum) != sha256.Size {
-				return Index{}, fmt.Errorf("pack record %q has an invalid checksum", entry.Path)
-			}
 		}
 	}
 	return index, nil
@@ -604,26 +594,16 @@ func readJSONBlock(file *os.File, offset int64, value any) error {
 	return json.Unmarshal(block, value)
 }
 
-// ReadEntry returns one verified data extent without reading adjacent extents.
+// ReadEntry returns one structurally bounded data extent without reading
+// adjacent extents or hashing payload data.
 func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 	if entry.Length < 0 || entry.Length > MaxDataExtent || int64(len(destination)) < entry.Length {
 		return 0, errors.New("invalid pack extent buffer")
 	}
 	if entry.Length == 0 {
-		if entry.Checksum != "" {
-			return 0, errors.New("empty pack extent has a checksum")
-		}
 		return 0, nil
 	}
-	n, err := file.ReadAt(destination[:entry.Length], entry.RecordOffset+Alignment)
-	if err != nil {
-		return n, err
-	}
-	digest := sha256.Sum256(destination[:n])
-	if hex.EncodeToString(digest[:]) != entry.Checksum {
-		return 0, errors.New("pack extent checksum mismatch")
-	}
-	return n, nil
+	return file.ReadAt(destination[:entry.Length], entry.RecordOffset+Alignment)
 }
 
 // Materialize reconstructs a pack below an existing empty destination. It is
