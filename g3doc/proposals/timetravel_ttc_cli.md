@@ -659,8 +659,8 @@ and reason.
 
 - [x] Replace the pre-release tmpfs/tar prototype with a direct-to-disk Sentry
       filesystem and remove its import/export/commit lifecycle.
-- [x] Probe `FICLONE` at daemon startup and require explicit
-      `--allow-slow-volume-copy` opt-in for whole-file first-write copying.
+- [x] Probe `FICLONE` opportunistically and transparently fall back to
+      whole-file first-write copying when reflinks are unavailable.
 - [x] Implement persistent immutable namespace/inode trees, opaque data
       objects, stable virtual inodes, hard links, symlinks, xattrs, truncate,
       fallocate, and fsync.

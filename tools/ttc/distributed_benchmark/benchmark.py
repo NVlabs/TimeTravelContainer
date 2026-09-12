@@ -41,25 +41,22 @@ def remove_tree(path, timeout=30):
             time.sleep(0.25)
 
 
-def make_certificates(root):
-    ca = root / "ca.pem"
-    if ca.exists():
-        return
-    run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-         "-days", "2", "-subj", "/CN=ttc-benchmark-ca",
-         "-keyout", root / "ca.key", "-out", ca])
-    for node in ("node-a", "node-b"):
-        run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
-             "-subj", f"/CN={node}", "-keyout", root / f"{node}.key",
-             "-out", root / f"{node}.csr"])
-        ext = root / f"{node}.ext"
-        ext.write_text(
-            f"subjectAltName=DNS:{node},IP:127.0.0.1\n"
-            "extendedKeyUsage=serverAuth,clientAuth\n", encoding="utf-8")
-        run(["openssl", "x509", "-req", "-days", "2",
-             "-in", root / f"{node}.csr", "-CA", ca,
-             "-CAkey", root / "ca.key", "-CAcreateserial",
-             "-extfile", ext, "-out", root / f"{node}.pem"])
+def processes_using_root(root):
+    """Returns processes whose argv still names this dedicated test root."""
+    needle = os.fsencode(str(root))
+    result = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        argv0 = command.split(b"\0", 1)[0].rsplit(b"/", 1)[-1]
+        is_runtime = argv0 in (b"ttcd", b"runsc", b"runsc-gofer") or argv0.startswith(b"ttc-sentry[")
+        if is_runtime and needle in command:
+            result.append((int(entry.name), command.replace(b"\0", b" ").decode(errors="replace")))
+    return result
 
 
 def make_worker(root):
@@ -85,15 +82,14 @@ class Experiment:
         self.data = args.data_dir or (root / "data")
         unique = f"{os.getpid()}-{repetition}-{time.time_ns()}"
         self.source = f"bench-source-{unique}"
-        self.targets = [f"bench-target-{unique}-{i}" for i in range(int(case.get("fanout", 1)))]
+        self.targets = [f"target-{i}" for i in range(int(case.get("fanout", 1)))]
         self.source_id = ""
         self.target_ids = []
         self.txids = []
         self.netem_active = False
 
-    @staticmethod
-    def branch(container):
-        return f"{container}@main"
+    def branch(self, branch):
+        return f"{self.source}@{branch}"
 
     def env(self, node):
         runtime = self.runtime_a if node == "a" else self.runtime_b
@@ -119,11 +115,8 @@ class Experiment:
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(0o700)
         common = [
-            "--unsafe-no-host-isolation", "--allow-slow-volume-copy",
+            "--unsafe-no-host-isolation",
             "--cluster-repository-id", "ttc-benchmark",
-            "--cluster-ca", self.root / "ca.pem",
-            "--cluster-page-listen", "127.0.0.1:0",
-            "--cluster-page-advertise", "127.0.0.1:0",
             "--cluster-lease", self.args.cluster_lease,
             "--cluster-transfer-bytes", self.case["transfer_bytes"],
             "--cluster-max-outstanding-bytes", self.case["max_outstanding_bytes"],
@@ -134,23 +127,13 @@ class Experiment:
             "--cluster-push", self.case["push"],
         ]
         node_a = [
-            "--cluster-listen", "127.0.0.1:27443",
-            "--cluster-node-id", "node-a",
-            "--cluster-cert", self.root / "node-a.pem",
-            "--cluster-key", self.root / "node-a.key",
+            "--cluster-init", "--listen", "127.0.0.1:27443",
+            "--node", "node-a", "--advertise", "127.0.0.1:27443",
         ]
         node_b = [
-            "--cluster-listen", "127.0.0.1:37443",
-            "--cluster-node-id", "node-b",
-            "--cluster-cert", self.root / "node-b.pem",
-            "--cluster-key", self.root / "node-b.key",
+            "--cluster-join", "127.0.0.1:27443", "--listen", "127.0.0.1:37443",
+            "--node", "node-b", "--advertise", "127.0.0.1:37443",
         ]
-        if self.args.dynamic_discovery:
-            node_a += ["--cluster-advertise", "https://127.0.0.1:27443,node-a"]
-            node_b += ["--cluster-advertise", "https://127.0.0.1:37443,node-b"]
-        else:
-            node_a += ["--cluster-peer", "node-b=https://127.0.0.1:37443,node-b"]
-            node_b += ["--cluster-peer", "node-a=https://127.0.0.1:27443,node-a"]
         self.ttc("a", "daemon", "start", *common, *node_a)
         try:
             self.ttc("b", "daemon", "start", *common, *node_b)
@@ -192,6 +175,9 @@ class Experiment:
             raise RuntimeError(f"inspect returned {len(records)} records")
         return records[0]
 
+    def stats(self, node):
+        return json.loads(self.ttc(node, "stats", "--json", self.branch("main")).stdout)
+
     def source_status(self, transaction):
         if not self.source_id or not transaction:
             return None
@@ -203,12 +189,12 @@ class Experiment:
             return None
         return json.loads(result.stdout)
 
-    def target_status(self, target_id):
-        if not target_id:
+    def target_status(self, branch):
+        if not self.source_id:
             return None
         result = run([
             self.args.ttcd, "runsc", "--root", self.runsc_root("b"),
-            "timetravel", target_id, "distributed-dependency", "main",
+            "timetravel", self.source_id, "distributed-dependency", branch,
         ], check=False, timeout=15)
         if result.returncode:
             return None
@@ -222,29 +208,33 @@ class Experiment:
             self.ttc("a", "pull", self.args.image, timeout=600)
         assets = make_worker(self.root)
         result = self.ttc(
-            "a", "run", "-d", "--name", self.source,
+            "a", "run", "--node", "node-a", "-d", "--name", self.source,
             "-v", f"{assets}:/bench:copy", self.args.image,
             "/bench/page-worker", self.case["memory_mib"], self.case["workload"],
             self.case["touch_fraction"], self.case["rounds"],
         )
         self.source_id = result.stdout.strip()
-        self.wait_exec("a", self.branch(self.source),
+        self.wait_exec("a", self.branch("main"),
                        "while [ ! -f /tmp/ttc-bench-ready ]; do sleep 0.05; done", 120)
         self.shape_network()
         fork_start = time.monotonic_ns()
         if self.case["capture_mode"] == "batch":
-            self.ttc("a", "fork", "--target", "node-b", self.branch(self.source),
-                     *(self.branch(target) for target in self.targets), timeout=300)
+            self.ttc("a", "fork", "--node", "node-b", self.branch("main"),
+                     *self.targets, timeout=300)
         elif self.case["capture_mode"] == "sequential":
             for target in self.targets:
-                self.ttc("a", "fork", "--target", "node-b", self.branch(self.source),
-                         self.branch(target), timeout=300)
+                self.ttc("a", "fork", "--node", "node-b", self.branch("main"),
+                         target, timeout=300)
         else:
             raise ValueError(f"unknown capture_mode {self.case['capture_mode']!r}")
         fork_end = time.monotonic_ns()
-        inspected = [self.inspect("b", target) for target in self.targets]
-        self.target_ids = [target["TTC"]["container"]["id"] for target in inspected]
-        self.txids = [target["TTC"]["distributed_fork"]["identity"]["transaction_id"] for target in inspected]
+        inspected = self.inspect("b", self.source)
+        branch_metadata = {
+            branch["id"]: branch
+            for branch in inspected["TTC"]["container"]["branches"]
+        }
+        self.target_ids = [self.source_id for _ in self.targets]
+        self.txids = [branch_metadata[target]["distributed_fork_transaction_id"] for target in self.targets]
         dehydrate_ms = None
         rehydrate_ms = None
         if self.args.verify_dehydrate:
@@ -269,16 +259,21 @@ class Experiment:
         work_end = time.monotonic_ns()
         independent_ms = None
         deadline = time.monotonic() + self.args.independence_timeout
-        final = inspected
+        final = []
         while time.monotonic() < deadline:
-            final = [self.inspect("b", target) for target in self.targets]
-            if all(target["TTC"]["distributed_fork"]["state"] == "independent" for target in final):
+            resource = self.stats("b")
+            by_target = {branch["target"]: branch for branch in resource["branches"]}
+            final = [by_target.get(self.branch(target)) for target in self.targets]
+            if all(status is not None and
+                   status.get("dependent_memory_bytes", 0) == 0 and
+                   status.get("dependent_filesystem_bytes", 0) == 0
+                   for status in final):
                 independent_ms = (time.monotonic_ns() - fork_start) / 1e6
                 break
             time.sleep(0.05)
         statuses = [self.source_status(txid) for txid in self.txids]
-        target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
-        source_probe = self.ttc("a", "exec", self.branch(self.source), "true", check=False)
+        target_statuses = [self.target_status(target) for target in self.targets]
+        source_probe = self.ttc("a", "exec", self.branch("main"), "true", check=False)
         target_probes = [self.ttc("b", "exec", self.branch(target), "true", check=False) for target in self.targets]
         routed_target_probes = [self.ttc("a", "exec", self.branch(target), "true", check=False) for target in self.targets]
         source_ok = source_probe.returncode == 0
@@ -309,7 +304,8 @@ class Experiment:
             "target_ok": target_ok,
             "routed_target_ok": routed_target_ok,
             "dynamic_discovery": self.args.dynamic_discovery,
-            "transactions": [target["TTC"]["distributed_fork"] for target in final],
+            "transaction_ids": self.txids,
+            "target_resources": final,
             "source_live_statuses": statuses,
             "target_loader_statuses": target_statuses,
             "wall_ms": (time.time_ns() - started) / 1e6,
@@ -325,12 +321,10 @@ class Experiment:
                 return self.ttc(node, *argv, check=False, timeout=timeout).returncode == 0
             except Exception:
                 return False
-        # Stop the source first while its peer is reachable. This lets ttcd
-        # request a complete target drain for demand-only runs; stopping the
-        # target first can intentionally make source shutdown refuse to lose
-        # remotely-owned pages.
-        stopped_a = safe_ttc("a", "daemon", "stop", timeout=120)
-        if not stopped_a and self.source_id:
+        # Remove the logical family while both owners and every dependency are
+        # reachable, then stop the now-empty daemons independently.
+        removed = safe_ttc("a", "rm", "-f", self.source, timeout=120)
+        if not removed and self.source_id:
             # Preserve teardown even when the experiment exposed a dependency
             # bug: explicitly cancel each source snapshot while its Sentry is
             # still reachable, then retry daemon shutdown after target removal.
@@ -342,12 +336,22 @@ class Experiment:
                     ], check=False, timeout=15)
                 except Exception:
                     pass
-        for target in self.targets:
-            safe_ttc("b", "rm", "-f", target)
-        stopped_b = safe_ttc("b", "daemon", "stop", timeout=60)
-        if not stopped_a:
-            safe_ttc("a", "rm", "-f", self.source)
-            stopped_a = safe_ttc("a", "daemon", "stop", timeout=60)
+            safe_ttc("b", "rm", "-f", self.source, timeout=120)
+        stopped_b = safe_ttc("b", "daemon", "stop", "--stop-all", timeout=60)
+        stopped_a = safe_ttc("a", "daemon", "stop", "--stop-all", timeout=60)
+        # A completed daemon response can precede the final Sentry/gofer reap.
+        # Never delete the dedicated roots while one of those children can still
+        # flush metadata or hold donated descriptors into them.
+        stopped_a = stopped_a or not (self.runtime_a / "run" / "ttcd.sock").exists()
+        stopped_b = stopped_b or not (self.runtime_b / "run" / "ttcd.sock").exists()
+        if stopped_a and stopped_b:
+            # The cluster HTTP server permits an in-flight proxied stop
+            # response to drain for up to 30 seconds before forcing close.
+            deadline = time.monotonic() + 45
+            while active := processes_using_root(self.root):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"test-root processes survived daemon shutdown: {active!r}")
+                time.sleep(0.1)
         if stopped_a:
             shutil.rmtree(self.runtime_a, ignore_errors=True)
         if stopped_b:
@@ -435,8 +439,8 @@ def main():
         if args.data_dir.exists():
             parser.error("--data-dir must name a new, dedicated test directory")
     root.mkdir(parents=True, exist_ok=True)
-    make_certificates(root)
     output = open(args.output, "a", encoding="utf-8") if args.output else None
+    preserve_root = False
     try:
         for case in load_cases(args.matrix):
             for repetition in range(args.repetitions):
@@ -452,12 +456,14 @@ def main():
                     }
                 finally:
                     if failed and args.preserve_on_failure:
+                        preserve_root = True
                         record["preserved_work_dir"] = str(root)
                         record["preserved_data_dir"] = str(experiment.data)
                     else:
                         try:
                             experiment.cleanup()
                         except Exception as cleanup_error:
+                            preserve_root = True
                             record["cleanup_error"] = str(cleanup_error)
                 line = json.dumps(record, sort_keys=True)
                 print(line, flush=True)
@@ -469,7 +475,7 @@ def main():
     finally:
         if output:
             output.close()
-        if not args.work_dir:
+        if not args.work_dir and not preserve_root:
             shutil.rmtree(root, ignore_errors=True)
     return 0
 

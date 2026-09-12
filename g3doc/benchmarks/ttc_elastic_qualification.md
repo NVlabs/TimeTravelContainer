@@ -358,6 +358,24 @@ and the target Sentry reported the same three edges and byte totals, proving
 that migration preserved the CoW topology. Removing the family and stopping
 both daemons left no workload, Sentry, gofer, or test directory.
 
+### High-fanout tmpfs pressure
+
+The pressure regression was extended to eight running sibling branches. Each
+branch independently dirtied a 48 MiB `/dev/shm` file, so accounting had to
+include linked tmpfs pages that were no longer mapped by a task and deduplicate
+them against mapped pages by their stable physical page-version identity. The
+source reported at least 384 MiB resident, crossed its configured target, and
+the scheduler moved a CoW-aware group across the two accepting peers. Every
+branch and every independently written tmpfs payload remained readable after
+migration.
+
+The original exact representation expanded to roughly 2.6 MiB when sibling
+writes interleaved allocator sequence numbers. TTC now sends one 256-version,
+32-byte bitmap per allocator window. The same run kept the complete planner
+payload below 512 KiB and completed with one migration. The 4,096-entry
+sharing-edge cap remains only on the diagnostic summary; planner correctness
+does not depend on that summary.
+
 ## NFS remote-fork matrix
 
 The test data root was exported by the host kernel NFS server and mounted over

@@ -138,6 +138,17 @@ different 4 KiB page in every branch, and dehydrates/rehydrates alternating
 branches before verifying their private contents. Set
 `TTC_FANOUT_TEST_BRANCHES` to increase the fanout.
 
+`e2e_image_roundtrip.sh` commits running, paused, and exited branches to OCI
+images, saves and reloads those images through Docker-compatible archives, and
+verifies labels, file changes, and whiteout deletions after recreation. It uses
+a fresh explicit root and cleans it on completion:
+
+```shell
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+  "$PWD/runsc/ttc/test/e2e_image_roundtrip.sh"
+```
+
 `e2e_distributed_multihop.sh` starts a fresh two-node cluster, remotely forks
 A-to-B, migrates the child B-to-A, and remotely forks it A-to-B again. It
 verifies a continuously running process, exact 32 MiB memory contents, sparse

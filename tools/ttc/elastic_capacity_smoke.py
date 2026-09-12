@@ -51,31 +51,6 @@ def provider_main():
     return 75
 
 
-def make_certificates(root):
-    run([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-days", "2", "-subj", "/CN=ttc-capacity-smoke-ca",
-        "-keyout", root / "ca.key", "-out", root / "ca.pem",
-    ])
-    for node in ("node-a", "node-b"):
-        run([
-            "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-            "-subj", f"/CN={node}", "-keyout", root / f"{node}.key",
-            "-out", root / f"{node}.csr",
-        ])
-        extension = root / f"{node}.ext"
-        extension.write_text(
-            f"subjectAltName=DNS:{node},IP:127.0.0.1\n"
-            "extendedKeyUsage=serverAuth,clientAuth\n", encoding="utf-8",
-        )
-        run([
-            "openssl", "x509", "-req", "-days", "2",
-            "-in", root / f"{node}.csr", "-CA", root / "ca.pem",
-            "-CAkey", root / "ca.key", "-CAcreateserial",
-            "-extfile", extension, "-out", root / f"{node}.pem",
-        ])
-
-
 def wait_for(description, predicate, timeout=180):
     deadline = time.monotonic() + timeout
     last = None
@@ -163,7 +138,6 @@ def main():
     runtime_b = root / "runtime-b"
     for path in (data, runtime_a, runtime_b):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    make_certificates(root)
     provider = pathlib.Path(__file__).resolve()
     provider.chmod(0o755)
 
@@ -182,25 +156,16 @@ def main():
     def ttc(runtime, *argv, check=True, timeout=180):
         return run([args.ttc, *argv], env=env(runtime), check=check, timeout=timeout)
 
-    common = [
-        "--unsafe-no-host-isolation", "--allow-slow-volume-copy",
-        "--cluster-repository-id", "capacity-smoke",
-        "--cluster-ca", root / "ca.pem",
-        "--cluster-page-listen", "127.0.0.1:0",
-        "--cluster-page-advertise", "127.0.0.1:0",
-        "--cluster-lease", args.cluster_lease,
-    ]
+    common = ["--unsafe-no-host-isolation", "--cluster-lease", args.cluster_lease]
     started_a = False
     started_b = False
     succeeded = False
     began = time.monotonic()
     try:
-        ttc(runtime_a, "daemon", "start", *common,
-            "--cluster-listen", "127.0.0.1:28443",
-            "--cluster-advertise", "https://127.0.0.1:28443,node-a",
-            "--cluster-node-id", "node-a",
-            "--cluster-cert", root / "node-a.pem", "--cluster-key", root / "node-a.key",
-            "--cluster-memory-target", "512GiB",
+        ttc(runtime_a, "daemon", "start", "--cluster-init", *common,
+            "--listen", "127.0.0.1:28443",
+            "--advertise", "127.0.0.1:28443", "--node", "node-a",
+            "--memory-target", "512GiB",
             "--cluster-capacity-command", provider)
         started_a = True
         run_args = ["run", "-d", "--name", "capacity-smoke"]
@@ -221,7 +186,7 @@ def main():
             prepare_seconds = round(time.monotonic() - prepare_began, 3)
         ttc(runtime_a, "fork", "capacity-smoke@main", "child")
 
-        drain = ttc(runtime_a, "node", "drain", "node-a", check=False)
+        drain = ttc(runtime_a, "node", "stop", "node-a", "--migrate-all", check=False)
         if drain.returncode == 0 or "capacity request" not in drain.stderr:
             raise RuntimeError(f"initial drain did not request capacity: {drain}")
 
@@ -230,35 +195,31 @@ def main():
             lambda: json.loads((root / "provider-accepted.json").read_text(encoding="utf-8")),
             timeout=30,
         )
-        ttc(runtime_b, "daemon", "start", *common,
-            "--cluster-listen", "127.0.0.1:38443",
-            "--cluster-advertise", "https://127.0.0.1:38443,node-b",
-            "--cluster-node-id", "node-b",
-            "--cluster-cert", root / "node-b.pem", "--cluster-key", root / "node-b.key",
-            "--cluster-memory-target", "2TiB",
+        ttc(runtime_b, "daemon", "start", "--cluster-join", "127.0.0.1:28443", *common,
+            "--listen", "127.0.0.1:38443",
+            "--advertise", "127.0.0.1:38443", "--node", "node-b",
+            "--memory-target", "2TiB",
             "--cluster-capacity-command", provider)
         started_b = True
 
         request_path = data / "cluster" / "capacity-requests" / "node-a.json"
         wait_for("membership-confirmed outbox consumption", lambda: not request_path.exists())
-        intent_path = data / "cluster" / "drains" / "node-a.json"
-        wait_for(
-            "automatic drain completion",
-            lambda: json.loads(intent_path.read_text(encoding="utf-8")).get("state") == "complete",
-            timeout=args.command_timeout,
-        )
-        inspected = json.loads(ttc(runtime_a, "inspect", "capacity-smoke").stdout)[0]
+        wait_for("automatic drain and daemon stop",
+                 lambda: not (runtime_a / "run" / "ttcd.sock").exists(),
+                 timeout=args.command_timeout)
+        started_a = False
+        inspected = json.loads(ttc(runtime_b, "inspect", "capacity-smoke").stdout)[0]
         branches = inspected["TTC"]["container"]["branches"]
         if {branch["id"]: branch.get("node_id") for branch in branches} != {"main": "node-b", "child": "node-b"}:
             raise RuntimeError(f"unexpected placements after drain: {branches!r}")
         verification_seconds = {}
         for branch in ("main", "child"):
-            counter = ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "cat", "/tmp/counter").stdout.strip()
+            counter = ttc(runtime_b, "exec", f"capacity-smoke@{branch}", "cat", "/tmp/counter").stdout.strip()
             if not counter.isdigit() or int(counter) <= 0:
                 raise RuntimeError(f"branch {branch} counter did not survive: {counter!r}")
             if args.verify_command:
                 verify_began = time.monotonic()
-                ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "sh", "-lc",
+                ttc(runtime_b, "exec", f"capacity-smoke@{branch}", "sh", "-lc",
                     args.verify_command, timeout=args.command_timeout)
                 verification_seconds[branch] = round(time.monotonic() - verify_began, 3)
         calls = [json.loads(line) for line in (root / "provider-calls.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -277,10 +238,7 @@ def main():
         if verification_seconds:
             result["verification_seconds"] = verification_seconds
         print(json.dumps(result, indent=2, sort_keys=True))
-        # Deliberately send this through the drained entry node: clustered
-        # family removal must coordinate every branch owner rather than depend
-        # on which daemon receives the client request.
-        ttc(runtime_a, "rm", "-f", "capacity-smoke", timeout=args.command_timeout)
+        ttc(runtime_b, "rm", "-f", "capacity-smoke", timeout=args.command_timeout)
         succeeded = True
     finally:
         if args.preserve_on_failure and not succeeded:
@@ -295,12 +253,12 @@ def main():
         # unaddressable Sentries and turns cleanup failure into misleading
         # migration failure. Source shutdown runs first so it can settle any
         # dependency still served to B.
-        if started_a and succeeded:
+        if started_b and succeeded:
             # Remove image-owned mapped-UID trees while a daemon can still
             # enter its extraction namespace. A plain host rmtree may not own
             # those inodes, even in unsafe-no-host-isolation test mode.
             # The family itself was already removed by its owner above.
-            ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=args.command_timeout)
+            ttc(runtime_b, "rmi", "--force", args.image, check=False, timeout=args.command_timeout)
         if started_a:
             ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=args.command_timeout)
         if started_b:

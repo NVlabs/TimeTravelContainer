@@ -1,19 +1,18 @@
 # TTC cluster-wide Raft control plane
 
-> **Planned data-plane replacement:** The
+> **Current data plane:** The
 > [snapshot-graph storage refactor](ttc_snapshot_graph_refactor.md) preserves
-> the single cluster-wide Raft group but replaces storage generations,
-> content-addressed TTC data objects, and the existing publication/ownership
-> details in the next incompatible root format.
+> this single cluster-wide Raft group and is authoritative for snapshot IDs,
+> immutable graph objects, publication, routing, and reference ownership.
 
 ## Status
 
 This document defines the implemented authoritative control-plane state
 machine for distributed TimeTravelContainer. It replaces shared-filesystem
 JSON records and advisory locks as the authority for membership, placement,
-distributed transactions, publication, and durable roots. Shared JSON remains
-as compatibility/materialization metadata in some data-plane paths, but it is
-not allowed to grant execution or storage authority.
+distributed transactions, publication, and durable roots. Node-local and
+shared materializations are data-plane records only; they cannot grant
+execution or storage authority.
 
 The cluster has exactly one Raft group. Families are keys in that state
 machine, not independent consensus groups. Memory pages, filesystem objects,
@@ -22,12 +21,14 @@ chunks, and packs never enter the Raft log.
 ## Design rules
 
 1. Ordinary guest memory and filesystem writes perform no Raft operation.
-2. Raft grants authority at branch and storage-generation granularity.
-3. Bulk data is immutable and content-addressed before Raft references it.
+2. Raft grants authority at branch, placement-generation, and snapshot-root
+   granularity.
+3. Bulk data is immutable and structurally identified before Raft references
+   its bounded logical roots.
 4. A node may execute a branch only while it holds the committed placement
    generation and a valid node execution lease.
-5. A root becomes durable only after all referenced objects are readable and
-   verified outside Raft.
+5. A root becomes durable only after all referenced objects are structurally
+   complete and readable outside Raft.
 6. Removing or superseding a generation revokes its publication authorization;
    a late worker cannot make it authoritative again.
 7. A state-machine command is deterministic, bounded, generation-fenced, and

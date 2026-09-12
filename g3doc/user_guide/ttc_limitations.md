@@ -83,9 +83,10 @@ non-forkable for its entire lifetime.
   by the source. Graceful drain resolves these dependencies; unexpected source
   loss before they are cached or published is reported as unrecoverable
   volatile-state loss.
-  Automatic rebalancing uses exact resident-memory sharing edges, coalesced by
-  branch membership and bounded at 4,096 distinct sets per family. TTC rejects
-  a plan if this bound is exceeded rather than using incomplete accounting.
+  Automatic rebalancing uses exact resident-page identities represented as
+  fixed-size bitmaps. The 4,096-edge bound applies only to the optional
+  human-readable sharing-edge diagnostic; truncating that diagnostic does not
+  truncate planner input or reject a placement plan.
   Capacity acquisition uses a durable shared-filesystem JSON outbox with
   executable and HTTP webhook adapters. An unsuccessful drain or rebalance
   remains safely retryable after a requested node joins.
