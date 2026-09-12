@@ -20,7 +20,50 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+// writeCurrentContainerFixture fills fields that every current-format writer
+// persists. Tests that intentionally exercise malformed metadata use writeJSON
+// directly instead.
+func writeCurrentContainerFixture(path string, input *ContainerInfo) error {
+	info := *input
+	info.Branches = append([]BranchInfo(nil), input.Branches...)
+	if info.ID == "" {
+		info.ID = filepath.Base(filepath.Dir(path))
+	}
+	if info.State == "" {
+		info.State = "created"
+	}
+	if len(info.Branches) == 0 {
+		info.Branches = []BranchInfo{{ID: "main", CreatedAt: info.CreatedAt}}
+	}
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.FilesystemBranch == "" {
+			if branch.ID == "main" {
+				branch.FilesystemBranch = ttcvolume.MainBranch
+			} else {
+				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
+			}
+		}
+		if branch.State == "" {
+			branch.State = info.State
+		}
+		if branch.StorageState == "" {
+			branch.StorageState = "local"
+		}
+	}
+	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+		if info.NetworkMode == "host" {
+			info.LiveForkWaiver = "test fixture explicitly waives live fork"
+		} else {
+			info.LiveForkEligible = true
+		}
+	}
+	return writeJSON(path, &info)
+}
 
 func TestMarkedRootRejectsLegacyContainerMetadata(t *testing.T) {
 	root := t.TempDir()
@@ -73,7 +116,7 @@ func TestCompareAndSwapNodeID(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir, NodeID: "node-a",
 	}); err != nil {
 		t.Fatal(err)
@@ -110,7 +153,7 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 	}
 	wantRoots := []string{"memory/7/resource-0000"}
 	wantObjects := []string{"0000000000000007-03-0000000000000001"}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir,
 		Branches: []BranchInfo{{
 			ID: "main", SnapshotID: 7, MemoryRoots: wantRoots,
@@ -148,7 +191,7 @@ func TestUpdateBranchQuarantinePersistsIndependentlyOfLifecycle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir,
 		Branches: []BranchInfo{{ID: "main", State: "dehydrated"}},
 	}); err != nil {
@@ -187,7 +230,7 @@ func TestCompareAndSwapBranchNodeIDClaimsUnplacedBranch(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir, NodeID: "node-a",
 		Branches: []BranchInfo{{ID: "cold", Unplaced: true, State: "dehydrated"}},
 	}); err != nil {
@@ -227,7 +270,7 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 			{ID: "remote", NodeID: "node-b", State: "running"},
 		},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	store := Store{Root: root}
@@ -274,7 +317,7 @@ func TestRenameBranchKeepsStableMemoryAndRenamesConsoleState(t *testing.T) {
 		ID: containerID, Name: "example", BundleDir: bundleDir, State: "dehydrated",
 		Branches: []BranchInfo{branch, {ID: "child", ParentID: "old", FilesystemBranch: "child-memory", State: "dehydrated"}},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(containerDir, "console", "old.log"), []byte("console"), 0600); err != nil {
@@ -333,7 +376,7 @@ func TestRemoveBranchArtifactsRemovesStableMemory(t *testing.T) {
 	if err := os.MkdirAll(containerDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	stableKey := MemoryBranchKey(branch)

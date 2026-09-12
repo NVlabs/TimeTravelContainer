@@ -43,6 +43,40 @@ import (
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 )
 
+func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
+	info := input
+	info.Branches = append([]ttcbundle.BranchInfo(nil), input.Branches...)
+	if info.ID == "" {
+		info.ID = filepath.Base(filepath.Dir(path))
+	}
+	if info.State == "" {
+		info.State = "created"
+	}
+	if len(info.Branches) == 0 {
+		info.Branches = []ttcbundle.BranchInfo{{ID: "main", CreatedAt: info.CreatedAt}}
+	}
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.FilesystemBranch == "" {
+			branch.FilesystemBranch = branch.ID
+		}
+		if branch.State == "" {
+			branch.State = info.State
+		}
+		if branch.StorageState == "" {
+			branch.StorageState = "local"
+		}
+	}
+	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+		info.LiveForkEligible = true
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, encoded, 0600)
+}
+
 func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3371,7 +3405,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 		exit 128
 	fi
 	if [ -e "$0.child" ]; then
-		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}},{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}]'
+		echo '[{"ID":"main","ParentID":"","FilesystemBranch":"main","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}},{"ID":"child","ParentID":"main","FilesystemBranch":"child","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}]'
 	else
 		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
 	fi
@@ -3379,7 +3413,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$6" = "--paused" ] && [ "$7" = "web" ] && [ "$8" = "fork" ] && [ "$9" = "child" ]; then
 	touch "$0.child"
-	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
+	echo '{"ID":"child","ParentID":"main","FilesystemBranch":"child","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$6" = "child" ]; then
@@ -3437,15 +3471,11 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		Name: "web", BundleDir: bundleDir, ImageSize: 2217006,
 		ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(),
 		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}},
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 	consoleDir := filepath.Join(containerDir, "console")
@@ -3624,13 +3654,9 @@ esac
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		ID: id, Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 
@@ -3938,18 +3964,14 @@ exit 2
 		t.Fatalf("writing config: %v", err)
 	}
 	createdAt := time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC)
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "demo", "container.json"), ttcbundle.ContainerInfo{
 		Name:      "demo",
 		Reference: "docker.io/library/alpine:3.20",
 		Digest:    "sha256:abcd",
 		BundleDir: bundleDir,
 		State:     "created",
 		CreatedAt: createdAt,
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "demo", "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 
@@ -4019,15 +4041,11 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "remote", "container.json"), ttcbundle.ContainerInfo{
 		ID: "remote", Name: "remote", NodeID: "node-b", BundleDir: bundleDir,
 		State: "running", CreatedAt: time.Now(),
 		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", CreatedAt: time.Now()}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "remote", "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a"}
@@ -4110,17 +4128,13 @@ exit 2
 		t.Fatal(err)
 	}
 	createdAt := time.Now().UTC()
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		ID: "web", Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: createdAt,
 		Branches: []ttcbundle.BranchInfo{
 			{ID: "main", State: "exited", CreatedAt: createdAt},
 			{ID: "test", ParentID: "main", State: "running", CreatedAt: createdAt},
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	store := ttcbundle.Store{Root: dataRoot}

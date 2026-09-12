@@ -383,11 +383,11 @@ type BranchInfo struct {
 	// Quarantined disconnects the branch's runtime-managed external network
 	// edge while preserving its Sentry-owned network and socket state.
 	Quarantined bool `json:"quarantined,omitempty"`
-	// NodeID overrides the legacy family-wide owner for elastic placements.
+	// NodeID overrides the family-wide initial owner for elastic placements.
 	// Empty inherits ContainerInfo.NodeID.
 	NodeID string `json:"node_id,omitempty"`
-	// Unplaced distinguishes a durable cold branch from legacy empty NodeID,
-	// which inherits the family owner.
+	// Unplaced distinguishes a durable cold branch from an empty NodeID that
+	// inherits the family owner.
 	Unplaced bool `json:"unplaced,omitempty"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
@@ -476,7 +476,7 @@ type DistributedForkImport struct {
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
-// An empty BranchID is the legacy representation of the main branch.
+// BranchID is always explicit; no branch, including main, is implicit.
 type PortBinding struct {
 	HostIP        string `json:"host_ip"`
 	HostPort      uint16 `json:"host_port"`
@@ -2515,13 +2515,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if err := json.Unmarshal(data, &info); err != nil {
 		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", key, err)
 	}
-	strict, err := s.currentFormatRoot()
-	if err != nil {
-		return ContainerInfo{}, fmt.Errorf("validating TTC root format for container %q: %w", key, err)
-	}
-	if info.ID == "" && !strict {
-		info.ID = key
-	}
 	if info.ID != key || info.Name == "" || info.BundleDir == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", key)
 	}
@@ -2529,16 +2522,10 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	if info.State == "" {
-		if strict {
-			return ContainerInfo{}, fmt.Errorf("container %q has no lifecycle state", key)
-		}
-		info.State = "created"
+		return ContainerInfo{}, fmt.Errorf("container %q has no lifecycle state", key)
 	}
 	if len(info.Branches) == 0 {
-		if strict {
-			return ContainerInfo{}, fmt.Errorf("container %q has no branch metadata", key)
-		}
-		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, StorageState: "local", CreatedAt: info.CreatedAt}}
+		return ContainerInfo{}, fmt.Errorf("container %q has no branch metadata", key)
 	}
 	seenBranches := make(map[string]struct{}, len(info.Branches))
 	for i := range info.Branches {
@@ -2554,33 +2541,16 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		}
 		seenBranches[branch.ID] = struct{}{}
 		if branch.FilesystemBranch == "" {
-			if strict {
-				return ContainerInfo{}, fmt.Errorf("container %q branch %q has no filesystem identity", key, branch.ID)
-			}
-			if branch.ID == "main" {
-				branch.FilesystemBranch = ttcvolume.MainBranch
-			} else {
-				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
-			}
+			return ContainerInfo{}, fmt.Errorf("container %q branch %q has no filesystem identity", key, branch.ID)
 		}
 		if branch.StorageState == "" {
-			if strict {
-				return ContainerInfo{}, fmt.Errorf("container %q branch %q has no storage state", key, branch.ID)
-			}
-			if branch.State == "dehydrated" {
-				branch.StorageState = "shared"
-			} else {
-				branch.StorageState = "local"
-			}
+			return ContainerInfo{}, fmt.Errorf("container %q branch %q has no storage state", key, branch.ID)
 		}
 	}
 	seenPortEndpoints := make(map[string]struct{}, len(info.PublishedPorts))
 	bindings := info.PublishedPorts[:0]
 	for i := range info.PublishedPorts {
 		candidate := info.PublishedPorts[i]
-		if candidate.BranchID == "" && !strict {
-			candidate.BranchID = "main"
-		}
 		binding, err := normalizePortBinding(candidate)
 		if err != nil {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
@@ -2602,13 +2572,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
-	if !strict && !info.LiveForkEligible && info.LiveForkWaiver == "" {
-		if networkMode == "host" {
-			info.LiveForkWaiver = "legacy host network configuration"
-		} else {
-			info.LiveForkEligible = true
-		}
-	}
 	if info.LiveForkEligible && info.LiveForkWaiver != "" {
 		return ContainerInfo{}, fmt.Errorf("container %q is live-fork eligible but records waiver %q", key, info.LiveForkWaiver)
 	}
@@ -2653,32 +2616,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
 	}
 	return info, nil
-}
-
-// currentFormatRoot reports whether Store is operating inside a daemon root
-// that has crossed TTC's destructive format boundary. Unit-level bundle users
-// without a daemon marker retain fixture normalization, but a marked root must
-// never synthesize missing legacy metadata.
-func (s Store) currentFormatRoot() (bool, error) {
-	data, err := os.ReadFile(filepath.Join(s.Root, ".ttc-root-format"))
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var marker struct {
-		Version int    `json:"version"`
-		Schema  string `json:"schema"`
-		Role    string `json:"role"`
-	}
-	if err := json.Unmarshal(data, &marker); err != nil {
-		return false, fmt.Errorf("decoding .ttc-root-format: %w", err)
-	}
-	if marker.Version == 0 || marker.Schema == "" || marker.Role == "" {
-		return false, errors.New(".ttc-root-format is incomplete")
-	}
-	return true, nil
 }
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
@@ -3460,6 +3397,15 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 			if branch.ID == branch.ParentID {
 				return false, fmt.Errorf("branch %q cannot be its own parent", branch.ID)
 			}
+			if branch.State == "" {
+				return false, fmt.Errorf("branch %q has no lifecycle state", branch.ID)
+			}
+			if branch.FilesystemBranch == "" {
+				return false, fmt.Errorf("branch %q has no filesystem identity", branch.ID)
+			}
+			if branch.StorageState == "" {
+				return false, fmt.Errorf("branch %q has no storage state", branch.ID)
+			}
 			if _, ok := seen[branch.ID]; ok {
 				return false, fmt.Errorf("branch %q is repeated", branch.ID)
 			}
@@ -3467,17 +3413,6 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 			if i, ok := index[branch.ID]; ok {
 				if info.Branches[i].ParentID != branch.ParentID {
 					return false, fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
-				}
-				if branch.StorageState == "" {
-					branch.Unplaced = info.Branches[i].Unplaced
-					branch.StorageState = info.Branches[i].StorageState
-					branch.StorageGeneration = info.Branches[i].StorageGeneration
-					branch.StorageError = info.Branches[i].StorageError
-					branch.StorageManifest = info.Branches[i].StorageManifest
-					branch.StorageRetryAt = info.Branches[i].StorageRetryAt
-					branch.SourceNode = info.Branches[i].SourceNode
-					branch.DependentMemoryBytes = info.Branches[i].DependentMemoryBytes
-					branch.DependentFilesystemBytes = info.Branches[i].DependentFilesystemBytes
 				}
 				info.Branches[i] = branch
 				continue

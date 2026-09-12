@@ -88,11 +88,7 @@ func TestDaemonCommandOwner(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal(ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: filepath.Join(containerDir, "bundle")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{ID: "web", Name: "web", NodeID: "node-b", BundleDir: filepath.Join(containerDir, "bundle")}); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := (ttcbundle.Store{Root: root}).LoadContainer("web"); err != nil || info.NodeID != "node-b" {
@@ -140,11 +136,7 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
-	encoded, err := json.Marshal(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)
 	}
 	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
@@ -193,11 +185,7 @@ func TestDaemonCommandPlacementRejectsMissingCurrentPlacement(t *testing.T) {
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
-	encoded, err := json.Marshal(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)
 	}
 	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
@@ -223,11 +211,7 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
-	encoded, err := json.Marshal(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)
 	}
 	// Keep the historical shared-root catalog empty. This models a
@@ -269,11 +253,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{ID: "main", Unplaced: true, State: "dehydrated", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
-	encoded, err := json.Marshal(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)
 	}
 	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))

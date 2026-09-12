@@ -70,11 +70,7 @@ func TestDaemonEventIncludesOutputRetentionSnapshot(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(containerDir, "console"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{ID: "demo", Name: "demo", BundleDir: bundleDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{ID: "demo", Name: "demo", BundleDir: bundleDir}); err != nil {
 		t.Fatal(err)
 	}
 	paths, err := (ttcbundle.Store{Root: root}).BranchConsolePaths("demo", "main")

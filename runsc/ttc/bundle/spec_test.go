@@ -90,7 +90,7 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.LoadContainer(info.ID); err == nil {
@@ -151,7 +151,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+		if err := writeCurrentContainerFixture(filepath.Join(dir, "container.json"), &info); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -243,7 +243,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(dir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 
@@ -341,7 +341,7 @@ func TestConcurrentDistributedMigrationReservationsPreserveImports(t *testing.T)
 		ID: "family-id", Name: "family", DistributedFamilyID: "family-id",
 		NodeID: "node-a", BundleDir: bundleDir, State: "running", Branches: branches,
 	}
-	if err := writeJSON(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 
@@ -392,7 +392,7 @@ func TestDistributedForkAddsRemoteBranchToExistingFamily(t *testing.T) {
 		ID: "family-id", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a", BundleDir: bundleDir,
 		State: "running", Branches: []BranchInfo{{ID: "main", NodeID: "node-a", FilesystemBranch: "main", State: "running"}},
 	}
-	if err := writeJSON(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
@@ -655,7 +655,7 @@ func TestBuildSpecRecordsImmutableLiveForkEligibility(t *testing.T) {
 	}
 }
 
-func TestLoadLegacyHostNetworkFamilyIsSystematicallyIneligible(t *testing.T) {
+func TestLoadRejectsLegacyHostNetworkMetadata(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "legacy-host")
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -671,12 +671,8 @@ func TestLoadLegacyHostNetworkFamilyIsSystematicallyIneligible(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := (Store{Root: root}).LoadContainer("legacy-host")
-	if err != nil {
-		t.Fatalf("LoadContainer: %v", err)
-	}
-	if info.LiveForkEligible || info.LiveForkWaiver != "legacy host network configuration" {
-		t.Fatalf("legacy host family eligibility=(%t, %q), want systematic legacy waiver", info.LiveForkEligible, info.LiveForkWaiver)
+	if _, err := (Store{Root: root}).LoadContainer("legacy-host"); err == nil {
+		t.Fatal("legacy host family metadata was accepted")
 	}
 }
 
@@ -1432,7 +1428,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["true"]}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	status := 17
@@ -1457,10 +1453,10 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 		t.Errorf("legacy branch history=%+v, want exited main", containers[0].Branches)
 	}
 	childCreated := time.Now().UTC()
-	child := BranchInfo{ID: "child", ParentID: "main", State: "running", CreatedAt: childCreated, ForkTotalNS: 123}
+	child := BranchInfo{ID: "child", ParentID: "main", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "child"), State: "running", StorageState: "local", CreatedAt: childCreated, ForkTotalNS: 123}
 	if err := store.RecordBranches("demo", []BranchInfo{
 		child,
-		{ID: "grandchild", ParentID: "child", State: "paused", DistributedGraphReferenceOperation: "branch-operation", CreatedAt: childCreated.Add(time.Second)},
+		{ID: "grandchild", ParentID: "child", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "grandchild"), State: "paused", StorageState: "local", DistributedGraphReferenceOperation: "branch-operation", CreatedAt: childCreated.Add(time.Second)},
 	}); err != nil {
 		t.Fatalf("RecordBranches: %v", err)
 	}
@@ -1474,7 +1470,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" || withHistory.Branches[1].DistributedGraphReferenceOperation != "branch-operation" {
 		t.Fatalf("persisted lineage=%+v", withHistory.Branches)
 	}
-	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", State: "running", CreatedAt: time.Now().UTC()}); err != nil {
+	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "child-reused"), State: "running", StorageState: "local", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("RecordBranch did not allow reuse: %v", err)
 	}
 	if err := store.UpdateState("demo", "exited", &status); err != nil {
@@ -1568,7 +1564,7 @@ func TestListContainersSkipsUnreadableDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(goodDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(goodDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(goodDir, "container.json"), &ContainerInfo{
 		ID: "good", Name: "good", BundleDir: filepath.Join(goodDir, "bundle"),
 		State: "created", CreatedAt: time.Now(),
 	}); err != nil {
@@ -1626,7 +1622,7 @@ func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1678,7 +1674,7 @@ func TestRemoveContainerRetriesTransientNetworkFilesystemCleanup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
@@ -1761,7 +1757,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
 		Branches: []BranchInfo{{ID: "child", ParentID: "main", State: "exited", FilesystemBranch: "fs-child"}},
 	}); err != nil {
@@ -1843,7 +1839,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 			{ID: "child", ParentID: "main", State: "running", CreatedAt: now},
 		},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RemoveBranchRecord("demo", "main"); err != nil {
@@ -1899,9 +1895,9 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	info := ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, NetworkMode: "ttc", State: "running", CreatedAt: time.Now(),
 		Branches:       []BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
-		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"}},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadContainer("demo")
@@ -1909,7 +1905,7 @@ func TestStoreBranchPortBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := loaded.PublishedPorts[0].BranchID; got != "main" {
-		t.Fatalf("legacy binding branch=%q, want main", got)
+		t.Fatalf("binding branch=%q, want main", got)
 	}
 	child := PortBinding{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 80, Protocol: "tcp", BranchID: "child"}
 	if err := store.AddPortBinding("demo", child); err != nil {
@@ -1986,7 +1982,7 @@ func TestContainerIdentityResolution(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 			ID: id, Name: name, BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
@@ -2532,7 +2528,7 @@ func TestGarbageCollectRepositoriesSkipsUnmaterializedPrivateRepository(t *testi
 		ID: containerID, Name: "remote-only", BundleDir: bundleDir, State: "running",
 		Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "running", NodeID: "other-node"}},
 	}
-	if err := writeJSON(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2710,7 +2706,7 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 		ID: id, Name: "demo", BundleDir: bundleDir, RootFS: spec.Root.Path, Digest: digest, Platform: "linux/amd64",
 		State: "created", LiveForkEligible: true, Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created"}},
 	}
-	if err := writeJSON(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadSpec(id)
@@ -2790,7 +2786,7 @@ func TestCommitActiveRepositoryRestoreIDsAdvancesOneShotAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	info := ContainerInfo{ID: id, Name: "demo", BundleDir: bundleDir, State: "paused"}
-	if err := writeJSON(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.WriteActiveRepositoryMap(id, []specutils.TTCVolumeRepository{{
