@@ -2458,6 +2458,22 @@ func TestInspect(t *testing.T) {
 	}
 }
 
+func TestPublishedPortStateUsesActiveRoot(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	backend := &runtimeBackend{dataRoot: shared, localRoot: local}
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: 18080, ContainerPort: 80, Protocol: "tcp"}
+	lockPath, logPath := portSidecarPaths(backend.activeDataRoot(), "container", binding)
+	for _, path := range []string{lockPath, logPath} {
+		if !strings.HasPrefix(path, local+string(os.PathSeparator)) {
+			t.Fatalf("sidecar path %q is not below active root %q", path, local)
+		}
+		if strings.HasPrefix(path, shared+string(os.PathSeparator)) {
+			t.Fatalf("sidecar path %q leaked into shared root %q", path, shared)
+		}
+	}
+}
+
 func TestBuildInspectInfo(t *testing.T) {
 	containerID := strings.Repeat("c", 64)
 	created := time.Date(2026, 7, 17, 1, 2, 3, 4, time.UTC)
@@ -4986,6 +5002,91 @@ func TestColdPackIntentReclaimsRetiredTransactionPack(t *testing.T) {
 	}
 	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retired transaction intent remains: %v", err)
+	}
+}
+
+func TestColdPackIntentTracksOnlyNonterminalTransaction(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state cluster.TransactionState
+		keep  bool
+	}{
+		{name: "captured", state: cluster.TransactionSourceCaptured, keep: true},
+		{name: "independent", state: cluster.TransactionIndependent},
+		{name: "canceled", state: cluster.TransactionCanceled},
+		{name: "failed", state: cluster.TransactionFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			shared, local := t.TempDir(), t.TempDir()
+			staging := t.TempDir()
+			if err := os.WriteFile(filepath.Join(staging, "snapshot.json"), []byte("metadata"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			const transaction = "fork-pack-lifecycle"
+			if err := beginColdPackIntent(shared, transaction); err != nil {
+				t.Fatal(err)
+			}
+			pack, err := ttcpack.WriteDirectory(staging, filepath.Join(shared, "cold"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := bindColdPackIntent(shared, transaction, pack); err != nil {
+				t.Fatal(err)
+			}
+			catalog := transactionListCatalog{records: []cluster.Transaction{{
+				Identity:               cluster.ForkIdentity{TransactionID: transaction},
+				State:                  test.state,
+				FilesystemMetadataPack: pack.String(),
+			}}}
+			if err := collectColdStorage(shared, local, nil, catalog); err != nil {
+				t.Fatal(err)
+			}
+			_, packErr := os.Stat(ttcpack.Path(filepath.Join(shared, "cold"), pack))
+			intent, err := coldPackIntentPath(shared, transaction)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, intentErr := os.Stat(intent)
+			if test.keep {
+				if packErr != nil || intentErr != nil {
+					t.Fatalf("nonterminal pack lifecycle = (%v, %v), want retained", packErr, intentErr)
+				}
+			} else if !errors.Is(packErr, os.ErrNotExist) || !errors.Is(intentErr, os.ErrNotExist) {
+				t.Fatalf("terminal pack lifecycle = (%v, %v), want reclaimed", packErr, intentErr)
+			}
+		})
+	}
+}
+
+func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	root := filepath.Join(shared, "cluster", "memory-manifests")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	retired := filepath.Join(root, "fork-retired.manifest")
+	live := filepath.Join(root, "fork-live.manifest")
+	unknown := filepath.Join(root, "operator-note.manifest")
+	for _, path := range []string{retired, live, unknown} {
+		if err := os.WriteFile(path, []byte("descriptor"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalog := transactionListCatalog{records: []cluster.Transaction{{
+		Identity: cluster.ForkIdentity{TransactionID: "fork-live"},
+		State:    cluster.TransactionPublished,
+	}}}
+	if err := collectColdStorage(shared, local, nil, catalog); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(retired); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired graph handoff manifest remains: %v", err)
+	}
+	if _, err := os.Stat(unknown); err != nil {
+		t.Fatalf("unknown file was not left untouched: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("nonterminal graph handoff manifest was reclaimed: %v", err)
 	}
 }
 

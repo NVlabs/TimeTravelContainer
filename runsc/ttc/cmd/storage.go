@@ -1463,7 +1463,10 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 		}
 		for _, tx := range records {
 			transactionsByID[tx.Identity.TransactionID] = tx
-			if tx.FilesystemMetadataPack == "" {
+			// The pack is a transaction-scoped bootstrap object. Once the
+			// target is independent, its live filesystem graph contains every
+			// required edge and the transaction must no longer root the pack.
+			if tx.Terminal() || tx.FilesystemMetadataPack == "" {
 				continue
 			}
 			id, err := ttcpack.ParseID(tx.FilesystemMetadataPack)
@@ -1514,7 +1517,7 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 			return fmt.Errorf("reading cold-pack intent %q: %w", entry.Name(), err)
 		}
 		tx, live := transactionsByID[intent.TransactionID]
-		if live {
+		if live && !tx.Terminal() {
 			if intent.Pack != "" {
 				id, err := ttcpack.ParseID(intent.Pack)
 				if err != nil {
@@ -1538,6 +1541,34 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 			immediate = append(immediate, id)
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	// Graph handoff manifests are transaction-scoped restore descriptors, not
+	// durable branch roots. Keep them through every nonterminal transaction
+	// state (including the interval before Handoff binds its descriptor), then
+	// reclaim them as soon as the transaction is terminal or retired. This is
+	// also the crash-recovery path for a source that died after publishing the
+	// target but before its completion monitor removed the manifest.
+	memoryManifestRoot := filepath.Join(sharedRoot, "cluster", "memory-manifests")
+	memoryManifests, err := os.ReadDir(memoryManifestRoot)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, entry := range memoryManifests {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".manifest" {
+			continue
+		}
+		transactionID := strings.TrimSuffix(entry.Name(), ".manifest")
+		if !strings.HasPrefix(transactionID, "fork-") || !transactionIDPatternForDaemon(transactionID) {
+			// Unknown files are never interpreted as TTC state or allowed to stop
+			// collection of recognized objects.
+			continue
+		}
+		if tx, exists := transactionsByID[transactionID]; exists && !tx.Terminal() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(memoryManifestRoot, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -1577,4 +1608,18 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 	}
 	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, grace.UnixNano())
 	return err
+}
+
+// collectTerminalColdStorage is the best-effort terminal hook for asynchronous
+// distributed transfers. Periodic maintenance remains the crash-recovery
+// fallback, but the ordinary path must leave no unreachable packs merely
+// because the source daemon shuts down before another timer tick.
+func (b *runtimeBackend) collectTerminalColdStorage() {
+	transactions, err := b.transactionCatalog()
+	if err == nil {
+		err = collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions)
+	}
+	if err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttcd: warning: collecting terminal distributed storage: %v\n", err)
+	}
 }

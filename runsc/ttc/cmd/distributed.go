@@ -1663,6 +1663,11 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 // Failure before the target acknowledges the switch falls back to ordinary
 // live paging; it never invalidates an already-published target.
 func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	// A successful handoff makes its transaction-scoped pack and intent
+	// unreachable. Collection must follow the terminal transition here rather
+	// than relying on the daemon's periodic maintenance loop: an elastic source
+	// may stop immediately after its last dependency becomes independent.
+	defer b.collectTerminalColdStorage()
 	handoff, rootNames, rootObjects, err := b.exportDistributedGraph(sourceContainer, transactionID)
 	if err != nil {
 		b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
@@ -1729,15 +1734,27 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
 		// Retrying status/independence is safe; the target now has no source
 		// reads, while the source retains its snapshot until completion.
-		b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay)
+		b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay, rootNames, rootObjects, handoff.GraphManifest)
 		return
 	}
 	_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
 	_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
 }
 
-func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay, rootNames, rootObjects []string, manifest string) {
 	defer relay.Close()
+	// This monitor owns the exported root after the synchronous completion path
+	// hands off to it. All of its return paths are terminal, so release both the
+	// authoritative reference and the transient restore manifest exactly once.
+	// Previously the lost-response path completed the Sentry session but leaked
+	// these two publication artifacts indefinitely.
+	defer func() {
+		_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+		if manifest != "" {
+			_ = os.Remove(filepath.Join(b.dataRoot, manifest))
+		}
+		b.collectTerminalColdStorage()
+	}()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -1925,16 +1942,24 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		monitorBackend.stderr = io.Discard
 		if tx.Identity.Migration {
 			if tx.State == cluster.TransactionDraining {
+				manifest := ""
+				if tx.GraphHandoff != nil {
+					manifest = tx.GraphHandoff.GraphManifest
+				}
 				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil)
+					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
 			} else {
 				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
 					tx.Identity.TransactionID, tx.Revision, nil)
 			}
 		} else if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
 			if tx.State == cluster.TransactionDraining {
+				manifest := ""
+				if tx.GraphHandoff != nil {
+					manifest = tx.GraphHandoff.GraphManifest
+				}
 				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil)
+					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
 			} else {
 				go monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
 					tx.Identity.TransactionID, tx.Revision, nil)

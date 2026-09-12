@@ -45,6 +45,15 @@ func (c transactionLoadCatalog) Load(id string) (*cluster.Transaction, error) {
 	return c.load(id)
 }
 
+type transactionListCatalog struct {
+	cluster.TransactionCatalog
+	records []cluster.Transaction
+}
+
+func (c transactionListCatalog) List() ([]cluster.Transaction, error) {
+	return append([]cluster.Transaction(nil), c.records...), nil
+}
+
 func TestDistributedSourceNoLongerNeeded(t *testing.T) {
 	for _, test := range []struct {
 		name string

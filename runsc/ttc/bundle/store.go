@@ -975,7 +975,11 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := s.resolveWritableHostMounts(activeContainerDir, &opts); err != nil {
 		return Prepared{}, err
 	}
-	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
+	// These files are bind-mounted into the live sandbox and remain open for
+	// the lifetime of its gofer. Keep them with the node-local active state,
+	// not in the shared catalog. Apart from avoiding hot shared-filesystem I/O,
+	// this ensures removing shared metadata never unlinks an open NFS file.
+	internalMounts, err := materializeNetworkFiles(activeContainerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -4322,12 +4326,35 @@ func (s Store) cleanupRemovedContainer(path string, known *ContainerInfo) error 
 	return s.removeAll(path)
 }
 
+// cleanupRemovedContainerAfterCommit absorbs only the short close-to-rmdir
+// visibility window exhibited by network filesystems. It does not inspect or
+// ignore directory entries: persistent busy/nonempty state remains a normal
+// deferred tombstone and cannot block removal of other families.
+func (s Store) cleanupRemovedContainerAfterCommit(path string, known *ContainerInfo) error {
+	deadline := time.Now().Add(time.Second)
+	delay := 10 * time.Millisecond
+	for {
+		err := s.cleanupRemovedContainer(path, known)
+		if err == nil || (!errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.ENOTEMPTY)) || !time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		if delay < 100*time.Millisecond {
+			delay *= 2
+		}
+		// Metadata may already have been unlinked by the preceding RemoveAll.
+		// Subsequent attempts therefore use the recovery path rather than a
+		// stale in-memory record.
+		known = nil
+	}
+}
+
 func (s Store) removeContainerInfo(info ContainerInfo) error {
 	tombstone, err := s.stageContainerRemoval(info.ID)
 	if err != nil {
 		return err
 	}
-	if err := s.cleanupRemovedContainer(tombstone, &info); err != nil {
+	if err := s.cleanupRemovedContainerAfterCommit(tombstone, &info); err != nil {
 		log.Warningf("Container %q was removed; deferred physical cleanup of %q: %v", info.Name, tombstone, err)
 	}
 	s.removeActiveContainer(info.ID)

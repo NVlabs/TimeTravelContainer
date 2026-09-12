@@ -8905,7 +8905,10 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	if info.NetworkMode != "ttc" {
 		return fmt.Errorf("container %s publishes ports with network mode %q", info.ID, info.NetworkMode)
 	}
-	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	// Listener locks and logs are live node-local state. Publishing them in the
+	// shared catalog both creates unnecessary small-file traffic and exposes
+	// removal to NFS open-unlink semantics.
+	lockPath, errorPath := portSidecarPaths(b.activeDataRoot(), info.ID, binding)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
 		return fmt.Errorf("creating published-port state: %w", err)
 	}
@@ -9116,7 +9119,7 @@ func cleanupPortSidecarFiles(lockPath, errorPath string) error {
 }
 
 func (b *runtimeBackend) stopPublishedPort(info ttcbundle.ContainerInfo, binding ttcbundle.PortBinding) error {
-	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	lockPath, errorPath := portSidecarPaths(b.activeDataRoot(), info.ID, binding)
 	if b.consoleSidecars != nil {
 		stopped, err := b.consoleSidecars.StopPortSidecar(lockPath)
 		if err != nil {

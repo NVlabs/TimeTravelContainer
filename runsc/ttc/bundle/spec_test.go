@@ -1632,14 +1632,13 @@ func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	failed := false
+	allowCleanup := false
 	store := Store{Root: root}
 	store.removeAllPath = func(path string) error {
-		if filepath.Dir(path) == store.removedContainersRoot() && !failed {
-			failed = true
+		if filepath.Dir(path) == store.removedContainersRoot() && !allowCleanup {
 			// Model RemoveAll having already unlinked metadata before NFS rejects
 			// the final rmdir because another descriptor is still open.
-			if err := os.Remove(filepath.Join(path, "container.json")); err != nil {
+			if err := os.Remove(filepath.Join(path, "container.json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatal(err)
 			}
 			return unix.ENOTEMPTY
@@ -1659,12 +1658,50 @@ func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
 	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
 		t.Fatalf("listing after deferred delete=%+v, err=%v", containers, err)
 	}
+	allowCleanup = true
 	removed, err := store.SweepRemovedContainers()
 	if err != nil || removed != 1 {
 		t.Fatalf("SweepRemovedContainers=(%d, %v), want (1, nil)", removed, err)
 	}
 	if _, err := os.Stat(tombstone); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("retried tombstone remains: %v", err)
+	}
+}
+
+func TestRemoveContainerRetriesTransientNetworkFilesystemCleanup(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	store := Store{Root: root}
+	store.removeAllPath = func(path string) error {
+		if filepath.Dir(path) == store.removedContainersRoot() {
+			attempts++
+			if attempts == 1 {
+				return unix.ENOTEMPTY
+			}
+		}
+		return os.RemoveAll(path)
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("cleanup attempts=%d, want 2", attempts)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "demo")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("transient tombstone remains: %v", err)
 	}
 }
 

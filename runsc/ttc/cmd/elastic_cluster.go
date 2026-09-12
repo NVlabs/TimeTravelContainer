@@ -2502,6 +2502,17 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if err != nil {
 		return moved, err
 	}
+	// No maintenance iteration is guaranteed between the final successful
+	// node-stop command and listener shutdown. Perform the terminal shared-data
+	// sweep here so retired transaction packs and handoff manifests do not need
+	// a future daemon restart to become reclaimable.
+	transactions, err := b.transactionCatalog()
+	if err != nil {
+		return moved, fmt.Errorf("opening transaction catalog for final storage collection: %w", err)
+	}
+	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions); err != nil {
+		return moved, fmt.Errorf("collecting terminal shared storage: %w", err)
+	}
 	b.daemonStopRequested = true
 	return moved, nil
 }
@@ -3566,7 +3577,17 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 			}
 			var drainErr error
 			moved, drainErr = backend.drainNode(nodeID, intent.TargetNode)
-			return drainErr
+			if drainErr != nil {
+				return drainErr
+			}
+			// This recovery path closes the daemon directly rather than returning
+			// through stopNode. Run the same terminal collection barrier before
+			// invoking completed, while the Raft catalog is still available.
+			transactions, catalogErr := backend.transactionCatalog()
+			if catalogErr != nil {
+				return catalogErr
+			}
+			return collectColdStorage(backend.dataRoot, backend.activeDataRoot(), backend.publicationQueue, transactions)
 		})
 		if err != nil {
 			consecutiveFailures++
