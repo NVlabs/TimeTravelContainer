@@ -127,6 +127,62 @@ func TestRemoteSnapshotFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotDescriptorNeedsNoStagingDirectory(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("descriptor-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "payload", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("path-free-graph-root\n"), 4096)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := source.BranchObjects("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(
+		filepath.Join(targetManager.root, "descriptor-target"), "descriptor-target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	server, client := net.Pipe()
+	var token RemoteToken
+	copy(token[:], []byte("descriptor-token"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Repository: source, Objects: objects}})
+	}()
+	if err := target.AttachRemoteObjectSource(client, token, key, "imported"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("path-free descriptor returned different file contents")
+	}
+	if err := target.MaterializeRemoteObjects(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+}
+
 func TestPackedSnapshotFetchesPortableObjectIdentity(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source-packed")

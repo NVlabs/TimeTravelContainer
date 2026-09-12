@@ -25,9 +25,11 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 2 adds incarnation-bound root inventory and
-	// coordinator-rebuild barriers for the disposable shared reference ledger.
-	ControlProtocolVersion = 2
+	// ControlProtocolVersion 3 replaces live filesystem metadata packs with
+	// bounded, path-free immutable graph-root descriptors. Peers fetch objects
+	// from the transaction-fenced provider instead of requiring a shared-root
+	// write before target execution.
+	ControlProtocolVersion = 3
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

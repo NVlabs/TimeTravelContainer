@@ -123,6 +123,20 @@ client_b exec "$NAME@remote2" sh -c "printf REMOTE-2 >/identity"
 test "$(client_a exec "$NAME@remote1" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-2
 
+# Live handoff descriptors are carried directly over the cluster protocol.
+# Creating a branch or migrating it must not synchronously stage a legacy
+# filesystem metadata pack on the shared filesystem.
+if test -d "$SHARED/cold/inflight" && find "$SHARED/cold/inflight" -type f -print -quit | grep -q .; then
+	echo "live handoff created a shared cold-pack intent" >&2
+	find "$SHARED/cold/inflight" -type f -print >&2
+	exit 1
+fi
+if test -d "$SHARED/cold/packs" && find "$SHARED/cold/packs" -name '*.pack' -print -quit | grep -q .; then
+	echo "live handoff created a shared cold filesystem pack" >&2
+	find "$SHARED/cold/packs" -name '*.pack' -print >&2
+	exit 1
+fi
+
 # Optional maintenance settling is useful for stress jobs that need to observe
 # publication, handoff, compaction, and GC after execution has gone idle.
 if test -n "${TTC_DISTRIBUTED_TEST_SETTLE:-}"; then

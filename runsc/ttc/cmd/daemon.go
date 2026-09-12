@@ -437,7 +437,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return fmt.Errorf("materializing target image cache: %w", err)
 	}
-	filesystemConnections, err := r.backend.materializeDistributedFilesystemMetadata(info, targetBranch.FilesystemBranch, tx.Identity.TransactionID, session.FilesystemMetadataPack, peer)
+	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer)
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}
@@ -449,7 +449,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
-	if session.SharedMetadata == "" || session.FilesystemMetadataPack != "" {
+	if session.SharedMetadata == "" || session.FilesystemMetadataPack != "" || len(session.FilesystemRoots) != 0 {
 		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
 		if err != nil || len(tokenBytes) != 16 {
 			return errors.New("invalid distributed snapshot token")

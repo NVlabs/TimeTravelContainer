@@ -1490,6 +1490,73 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	}
 }
 
+func TestLocalDataStoreConcurrentReclaimIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(filepath.Join(dir, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const objects = 128
+	for i := 0; i < objects; i++ {
+		id, err := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := data.Install(id, bytes.NewReader([]byte{byte(i)}), 1); err != nil {
+			t.Fatal(err)
+		}
+		pin := fmt.Sprintf("concurrent/%d", i)
+		if err := graph.CommitReservedObject(id, pin, 1, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.DeletePin(pin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := graph.Collect(objects); err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	errorsByWorker := make(chan error, 8)
+	removedByWorker := make(chan int, 8)
+	for i := 0; i < 8; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			removed, quarantined, err := data.ReclaimUnreferenced(graph)
+			if err == nil && quarantined != 0 {
+				err = fmt.Errorf("quarantined %d known objects", quarantined)
+			}
+			removedByWorker <- removed
+			errorsByWorker <- err
+		}()
+	}
+	wait.Wait()
+	close(errorsByWorker)
+	close(removedByWorker)
+	for err := range errorsByWorker {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed := 0
+	for count := range removedByWorker {
+		removed += count
+	}
+	if removed != objects {
+		t.Fatalf("concurrent reclaim removed %d objects, want %d", removed, objects)
+	}
+}
+
 func TestLocalDataStoreInstallCrashBoundaries(t *testing.T) {
 	dir := t.TempDir()
 	graph, err := Open(filepath.Join(dir, "graph"))

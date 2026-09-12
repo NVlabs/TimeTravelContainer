@@ -537,91 +537,58 @@ func newDistributedTransactionID() (string, error) {
 	return "fork-" + hex.EncodeToString(random[:]), nil
 }
 
-// prepareDistributedFilesystem seals metadata for the already-forked volume
-// generation into one immutable shared pack and configures the source relay to
-// serve only its allowlisted objects. Active object data remains node-local.
-func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch, transactionID string, relay *distributedPageRelay) (string, uint64, error) {
+// prepareDistributedFilesystem describes the already-forked immutable volume
+// roots and configures the source relay. The descriptor is bounded by the
+// number of mounted repositories and no shared-storage write is required on
+// the target time-to-execution path.
+func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch string, relay *distributedPageRelay) ([]cluster.FilesystemRootDescriptor, uint64, error) {
 	if filesystemBranch == "" {
-		return "", 0, errors.New("distributed capture omitted its filesystem generation")
+		return nil, 0, errors.New("distributed capture omitted its filesystem generation")
 	}
 	spec, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
 	configs, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
 	if len(configs) == 0 {
-		return "", 0, nil
+		return nil, 0, nil
 	}
-	if err := beginColdPackIntent(b.dataRoot, transactionID); err != nil {
-		return "", 0, fmt.Errorf("recording distributed filesystem pack intent: %w", err)
-	}
-	staging := filepath.Join(b.activeDataRoot(), "distributed-filesystem-staging", transactionID)
-	if err := os.RemoveAll(staging); err != nil {
-		return "", 0, err
-	}
-	if err := os.MkdirAll(staging, 0700); err != nil {
-		return "", 0, err
-	}
-	defer os.RemoveAll(staging)
-	var repositories []*ttcvolume.Repository
+	roots := make([]cluster.FilesystemRootDescriptor, 0, len(configs))
 	var dependentBytes uint64
-	countedRepositories := make(map[string]struct{})
-	closeRepositories := func() {
-		for _, repository := range repositories {
-			_ = repository.Close()
-		}
-	}
+	seenRepositories := make(map[string]struct{})
 	for _, config := range configs {
 		path := filepath.Clean(config.Path)
+		if _, seen := seenRepositories[path]; seen {
+			continue
+		}
+		seenRepositories[path] = struct{}{}
 		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
 		if err != nil {
-			closeRepositories()
-			return "", 0, err
+			return nil, 0, err
 		}
-		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		destination := filepath.Join(staging, hex.EncodeToString(key[:]))
-		snapshot, _, err := repository.ExportRemoteSnapshot(filesystemBranch, destination)
-		if err != nil {
-			repository.Close()
-			closeRepositories()
-			return "", 0, err
+		descriptor, describeErr := repository.DescribeRemoteSnapshot(filesystemBranch)
+		closeErr := repository.Close()
+		if describeErr != nil || closeErr != nil {
+			return nil, 0, errors.Join(describeErr, closeErr)
 		}
-		repositoryID := repository.Info().ID
-		if _, counted := countedRepositories[repositoryID]; !counted {
-			if snapshot.LogicalBytes > ^uint64(0)-dependentBytes {
-				repository.Close()
-				closeRepositories()
-				return "", 0, errors.New("distributed filesystem dependency byte count overflow")
-			}
-			dependentBytes += snapshot.LogicalBytes
-			countedRepositories[repositoryID] = struct{}{}
+		snapshot := descriptor.Snapshot
+		if snapshot.LogicalBytes > ^uint64(0)-dependentBytes {
+			return nil, 0, errors.New("distributed filesystem dependency byte count overflow")
 		}
-		repositories = append(repositories, repository)
+		dependentBytes += snapshot.LogicalBytes
+		roots = append(roots, cluster.FilesystemRootDescriptor{
+			Source: config.Source, RepositoryID: snapshot.RepositoryID,
+			BranchID: snapshot.BranchID, Root: descriptor.Root.String(),
+			NextInode: snapshot.NextInode, LogicalBytes: snapshot.LogicalBytes,
+		})
 	}
-	pack, err := ttcpack.WriteDirectory(staging, filepath.Join(b.dataRoot, "cold"))
-	if err != nil {
-		closeRepositories()
-		return "", 0, err
-	}
-	if err := bindColdPackIntent(b.dataRoot, transactionID, pack); err != nil {
-		closeRepositories()
-		return "", 0, fmt.Errorf("binding distributed filesystem pack intent: %w", err)
-	}
-	// The manager opens repositories only to publish the immutable root
-	// descriptors above. Runtime reads, including multihop reads inherited from
-	// another node, must be served by the source Sentry: it owns the live
-	// repositories and their transient upstream resolvers. Retaining duplicate
-	// manager-side handles here both wastes descriptors and loses that resolver
-	// state.
-	closeRepositories()
-	repositories = nil
 	if err := relay.ConfigureFilesystem(); err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
-	return pack.String(), dependentBytes, nil
+	return roots, dependentBytes, nil
 }
 
 func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle.ContainerInfo, filesystemBranch, transactionID, packText string, peer bool) (int, error) {
@@ -727,6 +694,115 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 		return 0, err
 	}
 	return len(configs), nil
+}
+
+// materializeDistributedFilesystemRoots installs the bounded graph-root
+// descriptors sent directly by the source. It performs no shared-storage I/O;
+// metadata below each root and whole-file bytes remain demand-fetched through
+// the transaction-fenced Sentry relay.
+func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer bool) (int, error) {
+	if len(roots) == 0 {
+		return 0, nil
+	}
+	bySource := make(map[string]cluster.FilesystemRootDescriptor, len(roots))
+	for _, root := range roots {
+		if _, exists := bySource[root.Source]; exists {
+			return 0, fmt.Errorf("distributed filesystem repeats source %q", root.Source)
+		}
+		bySource[root.Source] = root
+	}
+	store := b.containerStore()
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return 0, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return 0, err
+	}
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
+	if err != nil {
+		return 0, err
+	}
+	seenPaths := make(map[string]struct{})
+	installed := 0
+	for index := range configs {
+		config := &configs[index]
+		path := filepath.Clean(config.Path)
+		if _, seen := seenPaths[path]; seen {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		root, ok := bySource[config.Source]
+		if !ok {
+			return 0, fmt.Errorf("distributed filesystem omits repository %q", config.Source)
+		}
+		descriptor, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.NextInode, root.LogicalBytes)
+		if err != nil {
+			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
+		}
+		if peer {
+			var repository *ttcvolume.Repository
+			if _, statErr := os.Stat(filepath.Join(config.Path, "volume.json")); statErr == nil {
+				repository, err = ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+				if err == nil {
+					err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+				}
+			} else if errors.Is(statErr, os.ErrNotExist) {
+				repository, err = manager.ImportPrivateRemoteDescriptor(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
+			} else {
+				err = statErr
+			}
+			if err != nil {
+				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
+			}
+			if _, err := repository.Branch(filesystemBranch); err != nil {
+				_ = repository.Close()
+				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
+			}
+			config.Branch = filesystemBranch
+			config.CopyMode = string(manager.Capability().Mode)
+			config.RestoreID = root.RepositoryID
+			config.Private = true
+			if err := repository.Close(); err != nil {
+				return 0, err
+			}
+			installed++
+			continue
+		}
+		pathKey := sha256.Sum256([]byte(path))
+		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
+		var repository *ttcvolume.Repository
+		if _, statErr := os.Stat(destination); statErr == nil {
+			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
+			if err == nil {
+				err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+			}
+		} else if errors.Is(statErr, os.ErrNotExist) {
+			repository, err = manager.ImportPrivateRemoteDescriptor(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch)
+		} else {
+			err = statErr
+		}
+		if err != nil {
+			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
+		}
+		config.Path = destination
+		config.Branch = filesystemBranch
+		config.CopyMode = string(manager.Capability().Mode)
+		config.RestoreID = root.RepositoryID
+		config.Private = true
+		if err := repository.Close(); err != nil {
+			return 0, err
+		}
+		installed++
+	}
+	if installed != len(roots) {
+		return 0, fmt.Errorf("distributed filesystem installed %d roots, descriptor contains %d", installed, len(roots))
+	}
+	if err := store.WriteActiveRepositoryMap(info.ID, configs); err != nil {
+		return 0, err
+	}
+	return installed, nil
 }
 
 // exportDistributedGraph publishes the fork-time memory retained by session
@@ -981,15 +1057,15 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, transactionID, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
 	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes:       dataPlaneMax,
-		FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
+		MaxTransferBytes: dataPlaneMax,
+		FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -1154,7 +1230,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if _, err := rand.Read(filesystemToken[:]); err != nil {
 		return selector{}, err
 	}
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, transactionID, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem ranges: %w", err)
 	}
@@ -1180,7 +1256,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
 		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
 		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
-		DurableDehydration: true, FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
+		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -1593,15 +1669,15 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
-		filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.transaction, child.relay)
+		filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.relay)
 		if err != nil {
 			return nil, fmt.Errorf("sealing filesystem generation for target %s: %w", child.target, err)
 		}
 		descriptors[i] = cluster.RemoteSessionDescriptor{
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-			MaxTransferBytes:       child.dataPlaneMax,
-			FilesystemMetadataPack: filesystemPack, FilesystemBytes: filesystemBytes,
+			MaxTransferBytes: child.dataPlaneMax,
+			FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes,
 		}
 	}
 	prepareErrors := make([]error, len(children))

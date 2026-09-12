@@ -1336,14 +1336,14 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if session.SessionID != requestID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return abort(errors.New("sparse migration capture returned incomplete session metadata"))
 	}
-	filesystemPack, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, requestID, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, relay)
 	if err != nil {
 		return abort(fmt.Errorf("sealing sparse migration filesystem generation: %w", err))
 	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
-		MaxTransferBytes: dataPlaneMax, FilesystemMetadataPack: filesystemPack,
+		MaxTransferBytes: dataPlaneMax, FilesystemRoots: filesystemRoots,
 		FilesystemBytes: filesystemBytes,
 	}
 	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)

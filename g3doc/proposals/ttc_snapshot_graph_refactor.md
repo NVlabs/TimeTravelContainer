@@ -24,11 +24,11 @@ Those paths now contain short historical pointers instead of obsolete storage
 designs. The cluster-wide Raft control-plane principle remains: one Raft group
 governs the cluster, and bulk data never enters its log.
 
-## Implementation ledger
+## Milestone ledger
 
-This section is the authoritative progress tracker. A phase is marked complete
-only after its gate has passed; landing foundations for a later phase does not
-waive that phase's remaining migration or qualification work.
+This table records landed milestones. Completion is governed by the audited
+gate table below; a historical `complete` label here does not override a failed
+or unverified phase gate.
 
 | Phase | Status | Landed milestones | Remaining gate |
 | --- | --- | --- | --- |
@@ -43,6 +43,25 @@ waive that phase's remaining migration or qualification work.
 | 8: distributed references/GC | complete | The cluster authority format has a monotonically fenced, expiring shared-GC coordinator lease. Shared snapshot readers take directory leases; retirement records permanent Raft fencing before physical deletion and rolls crash residue forward. The owner-ledger engine imports parent edges once, applies idempotent named roots/incoming edges, and cascades exact zero-count collection. Provider-to-shared publication establishes a baseline, applies the ordered mutation suffix, and changes routing only after the final barrier. The elected ledger is disposable node-local state: each new lease generation rebuilds it from committed shared manifests, cold roots, and incarnation-bound reference inventories from every live node. Inventories include all unreleased intent groups; claim acknowledgement and durable intent update share one serialization boundary. Candidate roots are recorded in Raft before publication and cannot be retired while a transaction can still publish them. Shared packs now expose canonical manifest enumeration and compact partially live data without changing object IDs. Release intents remain durable and reserve their roots while a coordinator lease turns over; branch removal may continue, but node retirement is fenced until the successor coordinator consumes every pending release. A three-voter crash test kills the elected coordinator, waits through Raft/lease turnover, rebuilds the ledger from durable claims, forks a shared dehydrated branch, validates its memory, and removes it successfully. | Complete only the cross-phase release stress matrix. |
 | 9: elastic integration | complete | Existing scheduler/Raft groundwork predates this storage refactor. The lease heartbeat recognizes hidden imports and visible-before-placement publication through a nonterminal, target-incarnation-bound transaction. Completed history is retired after placement removal, node-local family state is reclaimed when unowned, and authority reads exclude replay-only history. Ordinary heartbeats compute an exact logical execution-grant set entirely from linearizable Raft state; they touch Sentry state only when a prior grant is revoked, so demand faults cannot starve lease renewal while revocations remain fail-closed. A 100-cycle two-node fork/exec/delete test retained zero transactions, placements, branches, and local family directories with flat latency. The three-node elastic lifecycle now covers join/promotion, A-to-B remote fork, runtime quarantine, B-to-C migration with quarantine preserved, scheduler-selected evacuation of A, execution-state validation after retirement, and family deletion during shared-GC lease turnover. Owner-local node stop renews in the current Raft term before cordoning, eliminating the former failover race. Raft renewals now derive `ready`/`pressured` in the same committed command as the memory sample; this fixed clustered nodes remaining ready above their target. A three-node, eight-branch stress retained independently dirtied tmpfs data, crossed the source target, moved a CoW-aware branch group across the accepting nodes, and validated every branch and its `/dev/shm` contents afterward. Resident accounting now enumerates linked and unlinked tmpfs/shmem files independently of task VMAs and deduplicates them against mapped pages by physical MemoryFile plus stable version. Fixed-size 256-version bitmaps bound the planner wire representation when concurrent sibling CoW faults interleave allocator sequences. The node incarnation identifies the exclusively locked local-root epoch rather than a daemon PID. Killing a drain after its durable intent, restarting the daemon, adopting its host-stopped Sentries, evacuating all eight branches, automatically stopping, deleting the retired local root, and executing every branch on its new owner passes. | Gate passed. |
 | 10: removal/qualification/docs | in progress | The pathname-backed `application.mem` startup sweeper, packed remote/dehydration formats, pre-tiered promoted-repository namespace, and visible-branch-name memory-directory promotion have been deleted. New-format deletion no longer scans or removes obsolete packed snapshot names. | Delete remaining legacy implementations, run the full non-KVM matrix, update all docs/SDKs/MCP, and install final static binaries. |
+
+## Audited phase gates
+
+This is the authoritative completion tracker. `unverified` is deliberately
+different from failure: it means current evidence does not cover the full gate.
+
+| Phase | Gate status | Evidence still required or implementation gap |
+| --- | --- | --- |
+| 0 | in progress | Add the machine-readable invariant checklist and a strict test mode that proves new-format tests cannot open legacy data paths. A real Lustre baseline is also unavailable. |
+| 1 | complete | Root/API boundary tests, SDK schemas, exact build negotiation, and static-client dependency/size evidence are present. |
+| 2 | complete | Random graph and filesystem models, crash-prefix replay, reference rebuilding, and cascading-GC tests cover the common graph. |
+| 3 | unverified | The graph-backed standalone data path is present, but the required fork-depth asymptotic package/source-build measurements and full reflink/non-reflink matrix have not been recorded. |
+| 4 | unverified | Graph-native memory and process-free dehydration are present; the gate requires hundreds of branches, overlapping-page churn, name reuse, RSS return, and daemon restart in one sustained run. Existing fan-out evidence covers 32 branches. |
+| 5 | in progress | Memory origins are globally allocated and origin-directed. Live filesystem handoff now carries bounded, path-free graph roots directly over the fenced peer protocol and performs no shared-storage write before target execution. Distributed filesystem repositories still allocate local snapshot IDs, so filesystem identity/routing does not yet satisfy the global origin model. |
+| 6 | unverified | Lazy complete-file image caching passed local and shaped-NFS tests. A real Lustre cold-cache run remains unavailable. |
+| 7 | in progress | Memory publication uses snapshot packs, but stopped/dehydrated filesystem publication still emits flattened parent-chained cold packs and storage generations. Replace it with origin-indexed graph packs and test restart/fork during publication. |
+| 8 | in progress | Shared reference ledgers and GC cover graph snapshot packs. Legacy filesystem cold packs remain outside the exact origin-ledger/zero-count model, so whole-system exact reclamation is not yet proved. |
+| 9 | unverified | Lifecycle, pressure, drain recovery, quarantine, and source-loss tests pass at small scale. The specified hundreds-of-branches gate and shared-filesystem outage/restore run remain outstanding. |
+| 10 | in progress | Static binaries and many suites pass, but legacy filesystem cold-pack paths remain reachable and the complete performance/filesystem qualification matrix has not passed. |
 
 ### Final non-KVM qualification (2026-09-12)
 
@@ -78,6 +97,19 @@ and interruption run remains an external qualification item rather than a
 substitute filesystem simulation.
 
 ### Current milestone
+
+Cluster control protocol 3 replaces live filesystem metadata packs with one
+bounded immutable root descriptor per repository. Remote fork, batch fork, and
+migration now install deferred graph roots directly and fault their metadata
+and file objects through the transaction-fenced provider. The two-node
+multihop test asserts that repeated live handoff creates neither an inflight
+cold intent nor a shared cold pack; source-loss fencing, elastic lifecycle, and
+interrupted drain recovery pass with the same protocol. Ten consecutive
+A-to-B-to-A-to-B runs exposed and fixed concurrent physical object sweeps
+after separately serialized zero-count transitions. This removes shared
+filesystem latency and a flattened tree walk from the live target activation
+path. It does not yet make filesystem origins globally unique: allocating
+those origins through the cluster state machine is the next phase-5 gate.
 
 Graph roots are now the sole standalone dehydration source, and the Sentry
 streams a bounded capture directly to the daemon that owns the graph. No

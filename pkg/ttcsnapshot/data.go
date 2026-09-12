@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -35,6 +36,11 @@ import (
 type LocalDataStore struct {
 	root   string
 	rootFD *os.File
+	// gcMu serializes directory reconciliation with other reconciliation
+	// goroutines using this store. Graph mutations are transactional, but the
+	// subsequent physical sweep is deliberately outside the graph lock; two
+	// independent lifecycle completions may therefore reach it concurrently.
+	gcMu sync.Mutex
 }
 
 // OpenLocalDataStore opens a standalone bulk-object directory.
@@ -740,6 +746,8 @@ func quarantineDataFile(path, quarantine string) error {
 // ReclaimUnreferenced removes complete bulk objects absent from graph and
 // quarantines unknown names. Callers serialize it with graph/data commits.
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {
+	store.gcMu.Lock()
+	defer store.gcMu.Unlock()
 	quarantine := filepath.Join(store.root, "quarantine")
 	for _, kind := range []string{"pages", "memory-chunks", "files"} {
 		base := filepath.Join(store.root, kind)
@@ -763,6 +771,9 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				// never authoritative and is safe to remove while reconciliation
 				// excludes active graph/data transactions.
 				if err := os.Remove(path); err != nil {
+					if errors.Is(err, fs.ErrNotExist) {
+						return nil
+					}
 					return err
 				}
 				removed++
@@ -781,6 +792,12 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 				return nil
 			}
 			if err := os.Remove(path); err != nil {
+				// A second LocalDataStore handle may have completed the same
+				// idempotent sweep after WalkDir observed the entry. The graph
+				// record is already absent, so ENOENT is the committed outcome.
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
 				return err
 			}
 			removed++

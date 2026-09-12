@@ -123,7 +123,11 @@ type RemoteSessionDescriptor struct {
 	StreamBytes            uint64 `json:"stream_bytes"`
 	MaxTransferBytes       uint64 `json:"max_transfer_bytes"`
 	FilesystemMetadataPack string `json:"filesystem_metadata_pack,omitempty"`
-	FilesystemBytes        uint64 `json:"filesystem_bytes,omitempty"`
+	// FilesystemRoots carries one bounded immutable graph root per repository.
+	// Unlike FilesystemMetadataPack, this does not require writing a shared
+	// filesystem object before target execution can begin.
+	FilesystemRoots []FilesystemRootDescriptor `json:"filesystem_roots,omitempty"`
+	FilesystemBytes uint64                     `json:"filesystem_bytes,omitempty"`
 	// SharedMetadata is a clean data-root-relative path containing the
 	// authenticated SessionMetadata envelope. It permits restoring a
 	// process-free dehydrated source without a source page server.
@@ -143,6 +147,18 @@ type RemoteSessionDescriptor struct {
 	GraphRootObjects []string `json:"graph_root_objects,omitempty"`
 }
 
+// FilesystemRootDescriptor is the path-free filesystem portion of a remote
+// handoff. Tree and file objects are fetched from the fenced provider by their
+// immutable IDs; the descriptor itself is O(number of mounted repositories).
+type FilesystemRootDescriptor struct {
+	Source       string `json:"source"`
+	RepositoryID string `json:"repository_id"`
+	BranchID     string `json:"branch_id"`
+	Root         string `json:"root"`
+	NextInode    uint64 `json:"next_inode"`
+	LogicalBytes uint64 `json:"logical_bytes,omitempty"`
+}
+
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
 	if s.SharedMetadata == "" {
 		host, port, err := net.SplitHostPort(s.Address)
@@ -159,7 +175,7 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		if filepath.IsAbs(s.SharedMetadata) || clean != s.SharedMetadata || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("invalid shared distributed metadata path %q", s.SharedMetadata)
 		}
-		if s.FilesystemMetadataPack == "" && (s.Address != "" || s.SnapshotToken != "") {
+		if s.FilesystemMetadataPack == "" && len(s.FilesystemRoots) == 0 && (s.Address != "" || s.SnapshotToken != "") {
 			return errors.New("shared distributed metadata must not include a page-server address or token")
 		}
 	}
@@ -173,6 +189,9 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		return fmt.Errorf("remote transfer size %d is outside negotiated bounds", s.MaxTransferBytes)
 	}
 	if s.FilesystemMetadataPack != "" {
+		if len(s.FilesystemRoots) != 0 {
+			return errors.New("filesystem handoff cannot mix graph roots with a metadata pack")
+		}
 		decoded, err := hex.DecodeString(s.FilesystemMetadataPack)
 		if err != nil || len(decoded) != sha256.Size {
 			return errors.New("filesystem metadata pack must be a SHA-256 hexadecimal ID")
@@ -188,6 +207,45 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		token, err := hex.DecodeString(s.SnapshotToken)
 		if err != nil || len(token) != 16 {
 			return errors.New("filesystem snapshot token must be 16 bytes encoded as hexadecimal")
+		}
+	}
+	if len(s.FilesystemRoots) > 4096 {
+		return errors.New("filesystem handoff has too many repository roots")
+	}
+	seenFilesystemSources := make(map[string]struct{}, len(s.FilesystemRoots))
+	var filesystemBytes uint64
+	for _, root := range s.FilesystemRoots {
+		if root.Source == "" || root.RepositoryID == "" || root.BranchID == "" || root.NextInode <= 1 {
+			return errors.New("filesystem handoff has an incomplete graph root")
+		}
+		if _, exists := seenFilesystemSources[root.Source]; exists {
+			return fmt.Errorf("filesystem handoff repeats source %q", root.Source)
+		}
+		seenFilesystemSources[root.Source] = struct{}{}
+		object, err := ttcsnapshot.ParseObjectID(root.Root)
+		if err != nil || object.Kind != ttcsnapshot.ObjectKindMetadata {
+			return fmt.Errorf("filesystem handoff source %q has invalid root %q", root.Source, root.Root)
+		}
+		if root.LogicalBytes > ^uint64(0)-filesystemBytes {
+			return errors.New("filesystem handoff byte count overflows")
+		}
+		filesystemBytes += root.LogicalBytes
+	}
+	if len(s.FilesystemRoots) != 0 {
+		if s.Address == "" || s.SnapshotToken == "" {
+			return errors.New("volatile filesystem graph roots require a peer address and token")
+		}
+		host, port, err := net.SplitHostPort(s.Address)
+		portNumber, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || host == "" || portErr != nil || portNumber == 0 {
+			return fmt.Errorf("invalid filesystem graph address %q", s.Address)
+		}
+		token, err := hex.DecodeString(s.SnapshotToken)
+		if err != nil || len(token) != 16 {
+			return errors.New("filesystem graph token must be 16 bytes encoded as hexadecimal")
+		}
+		if filesystemBytes != s.FilesystemBytes {
+			return fmt.Errorf("filesystem handoff reports %d bytes, roots contain %d", s.FilesystemBytes, filesystemBytes)
 		}
 	}
 	if s.GraphManifest != "" {

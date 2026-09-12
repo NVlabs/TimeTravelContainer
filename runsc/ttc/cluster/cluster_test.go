@@ -123,8 +123,11 @@ func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T)
 		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
 		SharedMetadata: "cluster/memory-metadata/tx.state", DurableDehydration: true,
 		GraphManifest: "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
-		GraphRootObjects:       []string{"0000000000000007-03-0000000000000001"},
-		FilesystemMetadataPack: strings.Repeat("cd", 32), FilesystemBytes: 1 << 20,
+		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
+		FilesystemRoots: []FilesystemRootDescriptor{{
+			Source: "rootfs-upper", RepositoryID: "repository-a", BranchID: "branch-a",
+			Root: "0000000000000008-07-0000000000000001", NextInode: 2, LogicalBytes: 1 << 20,
+		}}, FilesystemBytes: 1 << 20,
 	}
 	if err := descriptor.validate(negotiated); err != nil {
 		t.Fatalf("valid shared-memory/volatile-filesystem descriptor: %v", err)
@@ -133,6 +136,11 @@ func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T)
 	invalid.SnapshotToken = "bad"
 	if err := invalid.validate(negotiated); err == nil {
 		t.Fatal("accepted invalid filesystem range token")
+	}
+	invalid = descriptor
+	invalid.FilesystemRoots[0].LogicalBytes++
+	if err := invalid.validate(negotiated); err == nil {
+		t.Fatal("accepted mismatched filesystem dependency bytes")
 	}
 }
 
