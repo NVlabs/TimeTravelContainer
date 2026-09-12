@@ -4045,7 +4045,7 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "remote", "container.json"), ttcbundle.ContainerInfo{
 		ID: "remote", Name: "remote", NodeID: "node-b", BundleDir: bundleDir,
 		State: "running", CreatedAt: time.Now(),
-		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", CreatedAt: time.Now()}},
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, NodeID: "node-b", State: "running", CreatedAt: time.Now()}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -5227,7 +5227,7 @@ func TestPendingDistributedTargetProtectsHiddenRuntime(t *testing.T) {
 }
 
 func TestLocalFamilyStateNeeded(t *testing.T) {
-	info := ttcbundle.ContainerInfo{NodeID: "node-a", Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}}}
+	info := ttcbundle.ContainerInfo{NodeID: "node-a", Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running"}}}
 	if localFamilyStateNeeded(info, "node-b") {
 		t.Fatal("remote-only family retained node-local state")
 	}

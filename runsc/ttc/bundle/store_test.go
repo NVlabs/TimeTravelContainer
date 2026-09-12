@@ -106,7 +106,7 @@ func TestMarkedRootRejectsLegacyContainerMetadata(t *testing.T) {
 	}
 }
 
-func TestCompareAndSwapNodeID(t *testing.T) {
+func TestCompareAndSwapBranchNodeIDDoesNotInheritFamilyOwner(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "container-id")
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -118,26 +118,24 @@ func TestCompareAndSwapNodeID(t *testing.T) {
 	}
 	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir, NodeID: "node-a",
+		Branches: []BranchInfo{{ID: "main", NodeID: "node-b"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	store := Store{Root: root}
-	if err := store.CompareAndSwapNodeID("example", "node-a", "node-b"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CompareAndSwapNodeID("example", "node-a", "node-c"); err == nil {
-		t.Fatal("stale cluster owner changed metadata")
-	}
-	info, err := store.LoadContainer("example")
-	if err != nil || info.NodeID != "node-b" {
-		t.Fatalf("container=(%+v, %v)", info, err)
-	}
 	if err := store.CompareAndSwapBranchNodeID("example", "main", "node-b", "node-c"); err != nil {
 		t.Fatal(err)
 	}
-	info, err = store.LoadContainer("example")
-	if err != nil || info.BranchNodeID("main") != "node-c" || info.NodeID != "node-b" {
+	info, err := store.LoadContainer("example")
+	if err != nil || info.BranchNodeID("main") != "node-c" || info.NodeID != "node-a" {
 		t.Fatalf("branch placement=(%+v, %v)", info, err)
+	}
+	if err := store.RecordBranch("example", BranchInfo{ID: "child", ParentID: "main", FilesystemBranch: ttcvolume.ScopedBranchID("container-id", "child"), State: "running", StorageState: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err = store.LoadContainer("example")
+	if err != nil || info.BranchNodeID("child") != "" {
+		t.Fatalf("ownerless branch inherited family placement: (%+v, %v)", info, err)
 	}
 }
 

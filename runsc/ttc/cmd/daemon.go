@@ -1638,11 +1638,7 @@ func branchOwnedByBackend(backend backend, family Family, branch Branch) bool {
 	if !ok || runtime.nodeID == "" {
 		return true
 	}
-	owner := branch.NodeID
-	if owner == "" {
-		owner = family.NodeID
-	}
-	return owner == "" || owner == runtime.nodeID
+	return branch.NodeID == runtime.nodeID
 }
 
 func stopDaemonContainers(backend backend) error {

@@ -142,14 +142,14 @@ func (b *runtimeBackend) placementCatalog() (cluster.PlacementCatalog, error) {
 	if b != nil && b.distributedSource != nil && b.distributedSource.placements != nil {
 		return b.distributedSource.placements, nil
 	}
-	return nil, errors.New("Raft placement authority is unavailable")
+	return nil, errors.New("raft placement authority is unavailable")
 }
 
 func (b *runtimeBackend) transactionCatalog() (cluster.TransactionCatalog, error) {
 	if b != nil && b.distributedSource != nil && b.distributedSource.transactions != nil {
 		return b.distributedSource.transactions, nil
 	}
-	return nil, errors.New("Raft transaction authority is unavailable")
+	return nil, errors.New("raft transaction authority is unavailable")
 }
 
 func (r *distributedSourceRuntime) peer(nodeID string, forPlacement bool) (*cluster.Client, error) {

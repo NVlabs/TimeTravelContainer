@@ -9387,9 +9387,6 @@ func familyNodeID(info ttcbundle.ContainerInfo) string {
 		}
 		owner = branchOwner
 	}
-	if owner == "" {
-		return info.NodeID
-	}
 	return owner
 }
 
@@ -9399,7 +9396,7 @@ func containerHasBranchOnNode(info ttcbundle.ContainerInfo, nodeID string) bool 
 	}
 	for _, branch := range info.Branches {
 		owner := info.BranchNodeID(branch.ID)
-		if owner == "" || owner == nodeID {
+		if owner == nodeID {
 			return true
 		}
 	}
@@ -9449,13 +9446,12 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			LiveForkWaiver:   container.LiveForkWaiver,
 			State:            state,
 			CreatedAt:        container.CreatedAt,
-			Branches:         persistentBranches(container.Branches, container.NodeID),
+			Branches:         persistentBranches(container.Branches),
 		}
 	}
-	// A single catalog snapshot is authoritative for branches that have entered
-	// elastic placement. Persistent container metadata remains the compatibility
-	// source for older/cold branches, but must not expose a half-published target
-	// during ownership cutover.
+	// A single catalog snapshot is authoritative for elastically placed branches.
+	// Persistent container metadata describes cold branches, but must not expose
+	// a half-published target during ownership cutover.
 	if b.nodeID != "" {
 		if placements, err := b.placementCatalog(); err == nil {
 			if records, err := placements.List(); err == nil {
@@ -9515,7 +9511,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				for _, branch := range family.Branches {
 					owner := persistentByID[branch.ID].NodeID
-					if b.nodeID == "" || owner == "" || owner == b.nodeID {
+					if b.nodeID == "" || owner == b.nodeID {
 						liveLocal = append(liveLocal, branch)
 					}
 				}
@@ -9579,7 +9575,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
 				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
-				family.Branches = persistentBranches(reconciled.Branches, reconciled.NodeID)
+				family.Branches = persistentBranches(reconciled.Branches)
 				family.SandboxPID = 0
 				byID[container.ID] = family
 			}
@@ -9938,13 +9934,9 @@ func normalizeLifecycleState(state string) string {
 	return state
 }
 
-func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch {
-	nodeID := info.NodeID
-	if nodeID == "" && !info.Unplaced {
-		nodeID = fallbackNode
-	}
+func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
-		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
+		ID: info.ID, NodeID: info.NodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
 		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
 		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
 		MemoryRootObjects: append([]string(nil), info.MemoryRootObjects...),
@@ -9958,10 +9950,10 @@ func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch
 	}
 }
 
-func persistentBranches(infos []ttcbundle.BranchInfo, fallbackNode string) []Branch {
+func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 	branches := make([]Branch, 0, len(infos))
 	for _, info := range infos {
-		branches = append(branches, persistentBranchView(info, fallbackNode))
+		branches = append(branches, persistentBranchView(info))
 	}
 	return branches
 }
@@ -10175,6 +10167,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			records[i] = ttcbundle.BranchInfo{
 				ID: branch.ID, ParentID: branch.ParentID, FilesystemBranch: infos[i].FilesystemBranch,
 				Quarantined: branch.Quarantined,
+				NodeID:      b.nodeID,
 				State:       branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
 				ForkValidationNS: branch.ForkValidationNS, ForkSharedMemoryNS: branch.ForkSharedMemoryNS,

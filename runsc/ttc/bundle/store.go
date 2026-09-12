@@ -383,11 +383,10 @@ type BranchInfo struct {
 	// Quarantined disconnects the branch's runtime-managed external network
 	// edge while preserving its Sentry-owned network and socket state.
 	Quarantined bool `json:"quarantined,omitempty"`
-	// NodeID overrides the family-wide initial owner for elastic placements.
-	// Empty inherits ContainerInfo.NodeID.
+	// NodeID is the branch's physical owner in clustered mode. It is empty for
+	// standalone branches and for clustered branches marked Unplaced.
 	NodeID string `json:"node_id,omitempty"`
-	// Unplaced distinguishes a durable cold branch from an empty NodeID that
-	// inherits the family owner.
+	// Unplaced identifies a durable clustered branch with no physical owner.
 	Unplaced bool `json:"unplaced,omitempty"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
@@ -431,17 +430,14 @@ type BranchInfo struct {
 	CreatedAt                 time.Time `json:"created_at"`
 }
 
-// BranchNodeID returns the effective cluster owner of branchID.
+// BranchNodeID returns the explicit cluster owner of branchID.
 func (c ContainerInfo) BranchNodeID(branchID string) string {
 	for _, branch := range c.Branches {
 		if branch.ID == branchID {
 			if branch.Unplaced {
 				return ""
 			}
-			if branch.NodeID != "" {
-				return branch.NodeID
-			}
-			return c.NodeID
+			return branch.NodeID
 		}
 	}
 	return ""
@@ -2953,12 +2949,8 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					if branch.ID != pending.BranchID {
 						continue
 					}
-					owner := branch.NodeID
-					if owner == "" {
-						owner = current.NodeID
-					}
-					if owner != pending.SourceNode {
-						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
+					if branch.NodeID != pending.SourceNode {
+						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, branch.NodeID)
 					}
 					branch.FilesystemBranch = pending.FilesystemBranch
 					branch.Quarantined = pending.Quarantined
@@ -3382,15 +3374,6 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 		}
 		seen := make(map[string]struct{}, len(branches))
 		for _, branch := range branches {
-			if branch.NodeID == "" {
-				if i, ok := index[branch.ID]; ok && info.Branches[i].NodeID != "" {
-					branch.NodeID = info.Branches[i].NodeID
-				} else if branch.ParentID != "" && info.BranchNodeID(branch.ParentID) != "" {
-					branch.NodeID = info.BranchNodeID(branch.ParentID)
-				} else {
-					branch.NodeID = info.NodeID
-				}
-			}
 			if err := validateObjectName("branch", branch.ID); err != nil {
 				return false, err
 			}
@@ -3659,34 +3642,17 @@ func (s Store) AbandonBranchPublication(name, branchID string, generation uint64
 	})
 }
 
-// CompareAndSwapNodeID transfers whole-family cluster ownership while the
-// family is process-free. The per-container advisory lock serializes TTC
-// daemons sharing an NFS data root; higher-level placement generations fence
-// stale callers.
-func (s Store) CompareAndSwapNodeID(name, expected, replacement string) error {
-	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
-		if info.NodeID != expected {
-			return false, fmt.Errorf("container %q cluster owner changed from %q to %q", info.Name, expected, info.NodeID)
-		}
-		info.NodeID = replacement
-		return true, nil
-	})
-}
-
 // CompareAndSwapBranchNodeID transfers one process-free branch without
-// changing sibling placement. Empty legacy branch owners inherit NodeID.
+// changing sibling placement.
 func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement string) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			if info.Branches[i].ID != branchID {
 				continue
 			}
-			owner := ""
-			if !info.Branches[i].Unplaced {
-				owner = info.Branches[i].NodeID
-			}
-			if owner == "" && !info.Branches[i].Unplaced {
-				owner = info.NodeID
+			owner := info.Branches[i].NodeID
+			if info.Branches[i].Unplaced {
+				owner = ""
 			}
 			if owner != expected {
 				return false, fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
@@ -3913,7 +3879,7 @@ func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
 }
 
 // ReconcileNodeRuntimeUnavailable marks branches whose runtime was lost on
-// nodeID as exited. An empty nodeID retains the legacy whole-family behavior.
+// nodeID as exited. An empty nodeID selects all branches for standalone TTC.
 // Elastic families may have live siblings on other nodes, which this operation
 // must never rewrite merely because they are absent from the local runsc root.
 func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *int) error {

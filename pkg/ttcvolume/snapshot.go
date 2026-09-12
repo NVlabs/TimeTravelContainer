@@ -54,14 +54,11 @@ type snapshotDirectoryEntry struct {
 	DirectoryEntry
 }
 
-// remoteGraphMetadata is the graph-native control plane for a live remote
-// filesystem handoff. It preserves immutable object identities and bounded
-// B-tree structure; regular-file bytes remain on the source and are fetched
-// through the transaction-fenced object relay.
 // RemoteSnapshotDescriptor is the bounded, path-free metadata needed to
 // install an immutable filesystem root on another node. It intentionally does
-// not contain file bytes or a host path; those are resolved by ObjectID through
-// the transaction-fenced provider selected by the caller.
+// not contain file bytes or a host path. It preserves immutable object
+// identities and bounded B-tree structure while regular-file bytes are resolved
+// by ObjectID through the transaction-fenced provider selected by the caller.
 type RemoteSnapshotDescriptor struct {
 	Snapshot SnapshotInfo         `json:"snapshot"`
 	Root     ttcsnapshot.ObjectID `json:"root"`

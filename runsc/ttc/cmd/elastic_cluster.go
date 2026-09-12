@@ -454,9 +454,8 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims
 
 // reconcilePlacementCatalog enrolls every locally owned live branch in the
 // generation-fenced catalog and advances lifecycle generations after a local
-// pause/resume. Cold branches retain their last owner for compatibility until
-// an explicit drain or rehydration transaction claims them. Records for
-// deleted locally owned branches are reclaimed.
+// pause/resume. Every placed branch has an explicit owner; unplaced branches
+// have none. Records for deleted locally owned branches are reclaimed.
 func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	if b == nil || b.dataRoot == "" || b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
 		return nil
@@ -480,6 +479,16 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		for _, branch := range info.Branches {
 			key := info.ID + "\x00" + branch.ID
 			known[key] = struct{}{}
+			if branch.Unplaced {
+				if branch.NodeID != "" {
+					result = errors.Join(result, fmt.Errorf("branch %s@%s is unplaced but retains node owner %q", info.ID, branch.ID, branch.NodeID))
+				}
+				continue
+			}
+			if branch.NodeID == "" {
+				result = errors.Join(result, fmt.Errorf("branch %s@%s has no explicit cluster node owner", info.ID, branch.ID))
+				continue
+			}
 			owner := info.BranchNodeID(branch.ID)
 			state := cluster.PlacementState(normalizeLifecycleState(branch.State))
 			if owner != b.nodeID || (state != cluster.PlacementRunning && state != cluster.PlacementPaused) {
