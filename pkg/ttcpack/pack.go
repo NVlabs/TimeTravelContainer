@@ -106,120 +106,6 @@ type Index struct {
 	Entries []Entry `json:"entries"`
 }
 
-// Directory provides verified random access to the logical files in an
-// ordered pack chain. Packs must be ordered newest first. The first pack that
-// contains a path owns the complete file; older copies are ignored.
-type Directory struct {
-	files   []*os.File
-	entries map[string][]packExtent
-}
-
-type packExtent struct {
-	file  *os.File
-	entry Entry
-}
-
-// OpenDirectory opens a range-readable view over packs. It reads only pack
-// headers, indexes, and requested data records.
-func OpenDirectory(repository string, ids []ID) (*Directory, error) {
-	if len(ids) == 0 {
-		return nil, errors.New("pack directory requires at least one pack")
-	}
-	directory := &Directory{entries: make(map[string][]packExtent)}
-	seen := make(map[string]struct{})
-	for _, id := range ids {
-		file, index, err := OpenIndexed(repository, id)
-		if err != nil {
-			directory.Close()
-			return nil, err
-		}
-		directory.files = append(directory.files, file)
-		paths := make(map[string]struct{})
-		for _, entry := range index.Entries {
-			if entry.Kind == "file" {
-				paths[entry.Path] = struct{}{}
-			}
-		}
-		for path := range paths {
-			if _, ok := seen[path]; ok {
-				continue
-			}
-			seen[path] = struct{}{}
-			for _, entry := range index.Entries {
-				if entry.Kind == "file" && entry.Path == path {
-					directory.entries[path] = append(directory.entries[path], packExtent{file: file, entry: entry})
-				}
-			}
-			sort.Slice(directory.entries[path], func(i, j int) bool {
-				return directory.entries[path][i].entry.FileOffset < directory.entries[path][j].entry.FileOffset
-			})
-		}
-	}
-	return directory, nil
-}
-
-// ReadAt reads a logical file range without materializing adjacent extents.
-func (d *Directory) ReadAt(path string, destination []byte, offset int64) (int, error) {
-	if d == nil || offset < 0 {
-		return 0, os.ErrInvalid
-	}
-	extents, ok := d.entries[filepath.ToSlash(path)]
-	if !ok {
-		return 0, os.ErrNotExist
-	}
-	written := 0
-	for written < len(destination) {
-		position := offset + int64(written)
-		index := sort.Search(len(extents), func(i int) bool {
-			return extents[i].entry.FileOffset+extents[i].entry.Length > position
-		})
-		if index == len(extents) || position < extents[index].entry.FileOffset {
-			return written, io.EOF
-		}
-		extent := extents[index]
-		buffer := make([]byte, extent.entry.Length)
-		n, err := ReadEntry(extent.file, extent.entry, buffer)
-		if err != nil {
-			return written, err
-		}
-		within := position - extent.entry.FileOffset
-		copied := copy(destination[written:], buffer[within:int64(n)])
-		written += copied
-	}
-	return written, nil
-}
-
-// Size returns the logical size of path.
-func (d *Directory) Size(path string) (int64, error) {
-	if d == nil {
-		return 0, os.ErrInvalid
-	}
-	extents, ok := d.entries[filepath.ToSlash(path)]
-	if !ok {
-		return 0, os.ErrNotExist
-	}
-	var size int64
-	for _, extent := range extents {
-		if end := extent.entry.FileOffset + extent.entry.Length; end > size {
-			size = end
-		}
-	}
-	return size, nil
-}
-
-// Close releases every pack descriptor owned by d.
-func (d *Directory) Close() error {
-	if d == nil {
-		return nil
-	}
-	var result error
-	for _, file := range d.files {
-		result = errors.Join(result, file.Close())
-	}
-	d.files = nil
-	return result
-}
-
 // WriteDirectory writes source as one immutable pack in repository/packs and
 // returns its content digest. An existing pack with the same digest is reused.
 func WriteDirectory(source, repository string) (ID, error) {
@@ -745,14 +631,7 @@ func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 // resolution is unavailable; pack readers can instead call ReadEntry on
 // demand and cache individual 1 MiB ranges.
 func Materialize(repository string, id ID, destination string) error {
-	return materialize(repository, id, destination, false, nil)
-}
-
-// MaterializeMissing overlays only paths absent from destination. It is used
-// to fill content objects from ancestor packs after the newest delta has
-// installed authoritative metadata.
-func MaterializeMissing(repository string, id ID, destination string) error {
-	return materialize(repository, id, destination, true, nil)
+	return materialize(repository, id, destination, nil)
 }
 
 // MaterializeSkeleton reconstructs directory entries and non-regular objects,
@@ -767,21 +646,10 @@ func MaterializeSkeleton(repository string, id ID, destination string, eagerPath
 		}
 		eager[filepath.ToSlash(path)] = true
 	}
-	return materialize(repository, id, destination, false, eager)
+	return materialize(repository, id, destination, eager)
 }
 
-// MaterializeMetadata reconstructs metadata while omitting regular-file data
-// below omitPrefix. The omitted files are created later as sparse local cache
-// objects by the repository importer.
-func MaterializeMetadata(repository string, id ID, destination, omitPrefix string) error {
-	return materializeFiltered(repository, id, destination, false, filepath.ToSlash(strings.TrimSuffix(omitPrefix, "/"))+"/", nil)
-}
-
-func materialize(repository string, id ID, destination string, missingOnly bool, eager map[string]bool) error {
-	return materializeFiltered(repository, id, destination, missingOnly, "", eager)
-}
-
-func materializeFiltered(repository string, id ID, destination string, missingOnly bool, omitFilePrefix string, eager map[string]bool) error {
+func materialize(repository string, id ID, destination string, eager map[string]bool) error {
 	file, index, err := OpenIndexed(repository, id)
 	if err != nil {
 		return err
@@ -791,7 +659,6 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 		return err
 	}
 	created := make(map[string]bool)
-	preexisting := make(map[string]bool)
 	finalModes := make(map[string]os.FileMode)
 	buffer := make([]byte, MaxDataExtent)
 	for _, entry := range index.Entries {
@@ -806,19 +673,6 @@ func materializeFiltered(repository string, id ID, destination string, missingOn
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				return err
 			}
-		}
-		if _, checked := preexisting[entry.Path]; !checked {
-			_, statErr := os.Lstat(path)
-			preexisting[entry.Path] = statErr == nil
-			if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-				return statErr
-			}
-		}
-		if missingOnly && preexisting[entry.Path] {
-			continue
-		}
-		if entry.Kind == "file" && omitFilePrefix != "" && strings.HasPrefix(entry.Path, omitFilePrefix) {
-			continue
 		}
 		switch entry.Kind {
 		case "directory":

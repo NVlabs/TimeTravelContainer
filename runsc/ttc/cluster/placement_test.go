@@ -54,8 +54,8 @@ func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
 	if _, err := store.Lookup("family", "main"); !os.IsNotExist(err) {
 		t.Fatalf("removed placement lookup error=%v, want not exist", err)
 	}
-	legacy := strings.Repeat("a", 64) + ".lock"
-	if err := os.WriteFile(filepath.Join(root, legacy), nil, 0600); err != nil {
+	unknown := strings.Repeat("a", 64) + ".lock"
+	if err := os.WriteFile(filepath.Join(root, unknown), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 32; i++ {
@@ -78,10 +78,14 @@ func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	foundUnknown := false
 	for _, entry := range entries {
-		if isLegacyPlacementLock(entry.Name()) {
-			t.Fatalf("unbounded legacy record lock remains: %s", entry.Name())
+		if entry.Name() == unknown {
+			foundUnknown = true
 		}
+	}
+	if !foundUnknown {
+		t.Fatalf("unknown placement artifact %q was modified", unknown)
 	}
 }
 

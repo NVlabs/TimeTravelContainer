@@ -588,15 +588,7 @@ func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
 		return nil, err
 	}
 	result := make([]PlacementRecord, 0, len(entries))
-	removedLegacyLocks := false
 	for _, entry := range entries {
-		if isLegacyPlacementLock(entry.Name()) {
-			if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, err
-			}
-			removedLegacyLocks = true
-			continue
-		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
@@ -620,20 +612,7 @@ func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
 		}
 		return result[i].BranchID < result[j].BranchID
 	})
-	if removedLegacyLocks {
-		if err := syncDirectory(s.dir); err != nil {
-			return nil, err
-		}
-	}
 	return result, nil
-}
-
-func isLegacyPlacementLock(name string) bool {
-	if len(name) != sha256.Size*2+len(".lock") || !strings.HasSuffix(name, ".lock") {
-		return false
-	}
-	_, err := hex.DecodeString(strings.TrimSuffix(name, ".lock"))
-	return err == nil
 }
 
 func (s *PlacementStore) load(family, branch string) (PlacementRecord, error) {
