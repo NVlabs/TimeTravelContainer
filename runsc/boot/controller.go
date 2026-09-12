@@ -446,7 +446,13 @@ type containerManager struct {
 	restorer *restorer
 
 	filesystemDrainMu sync.Mutex
-	filesystemDrain   *distributedForkFilesystemDrain
+	// filesystemDrains is keyed by the branch whose source dependency is being
+	// released. A process-wide completed/in-progress flag is not a sufficient
+	// barrier: another distributed restore may attach a new remote catalog while
+	// an older branch is draining. The later branch must execute a fresh pass
+	// after its restore has completed, even when the repository-level operation
+	// lock serializes that pass behind an existing one.
+	filesystemDrains map[string]*distributedForkFilesystemDrain
 }
 
 type distributedForkFilesystemDrain struct {
@@ -1250,24 +1256,28 @@ func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDepe
 // without forcing memory already backed by a durable sparse repository to
 // become resident. Materialization is asynchronous so it cannot monopolize the
 // Sentry's control server while ordinary exec and branch operations continue.
-func (cm *containerManager) DrainDistributedForkFilesystems(_ *DistributedForkDependencyArgs, _ *struct{}) error {
+func (cm *containerManager) DrainDistributedForkFilesystems(args *DistributedForkDependencyArgs, _ *struct{}) error {
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed filesystem drain requires a branch")
+	}
 	cm.filesystemDrainMu.Lock()
-	if current := cm.filesystemDrain; current != nil {
+	if cm.filesystemDrains == nil {
+		cm.filesystemDrains = make(map[string]*distributedForkFilesystemDrain)
+	}
+	if current := cm.filesystemDrains[args.BranchID]; current != nil {
 		select {
 		case <-current.done:
-			// A completed drain is only a barrier for sources that were attached
-			// before that drain acquired the repository lifecycle lock. Another
-			// remote branch may have joined this physical Sentry afterward. Always
-			// establish a fresh barrier for a later request; concurrent callers
-			// still share the in-progress state below.
-			cm.filesystemDrain = nil
+			// A repeated request for the same branch establishes a fresh barrier.
+			// This makes retry correct even if a newer remote source was attached
+			// to the branch after an earlier transaction completed.
+			delete(cm.filesystemDrains, args.BranchID)
 		default:
 			cm.filesystemDrainMu.Unlock()
 			return nil
 		}
 	}
 	state := &distributedForkFilesystemDrain{done: make(chan struct{})}
-	cm.filesystemDrain = state
+	cm.filesystemDrains[args.BranchID] = state
 	cm.filesystemDrainMu.Unlock()
 	go func() {
 		err := cm.materializeDistributedFilesystems()
@@ -1281,12 +1291,15 @@ func (cm *containerManager) DrainDistributedForkFilesystems(_ *DistributedForkDe
 
 // DistributedForkFilesystemDrainStatus observes asynchronous filesystem
 // materialization without waiting for it on the control server.
-func (cm *containerManager) DistributedForkFilesystemDrainStatus(_ *DistributedForkDependencyArgs, out *DistributedForkFilesystemDrainStatus) error {
+func (cm *containerManager) DistributedForkFilesystemDrainStatus(args *DistributedForkDependencyArgs, out *DistributedForkFilesystemDrainStatus) error {
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed filesystem drain status requires a branch")
+	}
 	cm.filesystemDrainMu.Lock()
 	defer cm.filesystemDrainMu.Unlock()
-	state := cm.filesystemDrain
+	state := cm.filesystemDrains[args.BranchID]
 	if state == nil {
-		return errors.New("distributed filesystem drain has not been started")
+		return fmt.Errorf("distributed filesystem drain for branch %q has not been started", args.BranchID)
 	}
 	select {
 	case <-state.done:
