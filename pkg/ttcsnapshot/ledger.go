@@ -1041,7 +1041,10 @@ func (ledger *ReferenceLedger) OriginManifest(origin SnapshotID) ([]Object, map[
 	}
 	objects := make([]Object, 0)
 	for _, object := range ledger.state.Objects {
-		if object.ID.Snapshot == origin {
+		// A bounded collection may leave descendants in ObjectReclaiming until
+		// its next pass. They are already logically dead and must not be offered
+		// to shared-pack compaction as part of the live origin view.
+		if object.ID.Snapshot == origin && object.State == ObjectLive {
 			objects = append(objects, cloneObject(object))
 		}
 	}

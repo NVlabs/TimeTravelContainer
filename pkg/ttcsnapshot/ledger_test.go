@@ -612,6 +612,33 @@ func TestReferenceLedgerRetiresOnlyEmptyDrainedOrigin(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerOriginManifestExcludesPendingReclamation(t *testing.T) {
+	origin := SnapshotID(42)
+	child := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1}}
+	parent := Object{
+		ID:       ObjectID{Snapshot: origin, Kind: ObjectKindInode, Ordinal: 2},
+		Children: []Edge{{Slot: 0, Child: child.ID}},
+	}
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(origin, []Object{child, parent}, map[string]ObjectID{"root/branch/demo": parent.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyReference("release-demo", "root/branch/demo", parent.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ledger.Collect(1); err != nil || got != 1 {
+		t.Fatalf("Collect()=(%d, %v), want (1, nil)", got, err)
+	}
+	objects, references, ok := ledger.OriginManifest(origin)
+	if !ok || len(objects) != 0 || len(references) != 0 {
+		t.Fatalf("origin manifest exposes reclaiming descendants: objects=%+v references=%+v ok=%t", objects, references, ok)
+	}
+	inspection := ledger.Inspect()
+	if got := inspection.Objects[child.ID]; got != 0 {
+		t.Fatalf("pending child refcount=%d, want 0", got)
+	}
+}
+
 func TestReferenceLedgerRetirementRecovers(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "ledger")
 	origin := SnapshotID(52)
