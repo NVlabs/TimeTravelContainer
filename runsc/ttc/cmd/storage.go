@@ -191,7 +191,6 @@ type coldBranchManifest struct {
 	Generation uint64    `json:"generation"`
 	Kind       string    `json:"kind"`
 	CreatedAt  time.Time `json:"created_at"`
-	Parent     string    `json:"parent,omitempty"`
 	// MemorySnapshot names the graph-native immutable memory origin. Its bulk
 	// data and metadata live in snapshot-packs rather than the legacy cold pack.
 	MemorySnapshot uint64                   `json:"memory_snapshot,omitempty"`
@@ -946,7 +945,7 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if manifest.Version != 2 {
 		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 2", manifest.Version)
 	}
-	if manifest.Container == "" || manifest.Branch == "" || manifest.Generation == 0 || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") || manifest.Parent != "" {
+	if manifest.Container == "" || manifest.Branch == "" || manifest.Generation == 0 || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
 		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
 	}
 	seenSources := make(map[string]struct{}, len(manifest.Filesystems))
@@ -1372,9 +1371,6 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
-			if intent.ParentManifest != "" {
-				queue = append(queue, intent.ParentManifest)
-			}
 		}
 	}
 	manifests := make(map[string]struct{})
@@ -1414,9 +1410,6 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 			return fmt.Errorf("tracing cold manifest %q: %w", path, err)
 		}
 		manifests[path] = struct{}{}
-		if manifest.Parent != "" {
-			queue = append(queue, manifest.Parent)
-		}
 		for _, reference := range manifest.Packs {
 			id, err := ttcpack.ParseID(reference.Pack)
 			if err != nil {

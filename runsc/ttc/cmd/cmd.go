@@ -5605,20 +5605,10 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	if err != nil {
 		return err
 	}
-	prePublication, err := persistentBranchInfoFromStore(store, target)
-	if err != nil {
-		return err
-	}
 	captureBranch := fmt.Sprintf("ttc-publish-%016x", generation)
 	intent := ttcstorage.Intent{
 		Container: target.container, Branch: target.branch, Generation: generation, Kind: kind,
 		FilesystemBranch: captureBranch,
-		ParentManifest:   prePublication.StorageManifest,
-	}
-	if intent.ParentManifest == "" && prePublication.ParentID != "" {
-		if parent, parentErr := persistentBranchInfoFromStore(store, selector{container: target.container, branch: prePublication.ParentID}); parentErr == nil {
-			intent.ParentManifest = parent.StorageManifest
-		}
 	}
 	if kind == "dehydrate" {
 		intent.MemoryBranch = captureBranch

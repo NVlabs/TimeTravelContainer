@@ -28,7 +28,6 @@ type Intent struct {
 	FilesystemBranch string    `json:"filesystem_branch"`
 	MemoryBranch     string    `json:"memory_branch,omitempty"`
 	MemoryControl    string    `json:"memory_control,omitempty"`
-	ParentManifest   string    `json:"parent_manifest,omitempty"`
 	CaptureReady     bool      `json:"capture_ready"`
 	CreatedAt        time.Time `json:"created_at"`
 	Attempts         int       `json:"attempts,omitempty"`
