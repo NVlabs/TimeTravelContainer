@@ -126,6 +126,43 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 		_, _, _ = data.ReclaimUnreferenced(graph)
 	}()
 
+	// Path-copy a bounded group of logical chunks at once. Calling
+	// SetMemoryPages once per 1-MiB chunk rewrites the same upper radix path for
+	// every chunk and journals all of those immediately-obsolete roots. A
+	// 32-chunk group keeps the transaction bounded (at most 8192 distinct page
+	// leaves) while amortizing the upper levels across the group.
+	const radixChunksPerTransaction = 32
+	pendingPages := make(map[string]map[uint64]ttcsnapshot.ObjectID)
+	pendingUses := 0
+	flushPages := func() error {
+		if pendingUses == 0 {
+			return nil
+		}
+		keys := make([]string, 0, len(pendingPages))
+		for key := range pendingPages {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			name := fmt.Sprintf("%s/resource-%04x", rootPrefix, resourceIndexes[key])
+			if _, exists := graph.Root(name); !exists {
+				createdRoots = append(createdRoots, name)
+			}
+			if _, err := graph.SetMemoryPages(origin, name, pendingPages[key]); err != nil {
+				return err
+			}
+		}
+		if len(activePins) != 0 {
+			if err := graph.DeletePins(activePins); err != nil {
+				return fmt.Errorf("releasing memory construction pins: %w", err)
+			}
+		}
+		activePins = nil
+		pendingPages = make(map[string]map[uint64]ttcsnapshot.ObjectID)
+		pendingUses = 0
+		return nil
+	}
+
 	for objectIndex, use := range uses {
 		chunk, err := getChunk(use.id)
 		if err != nil {
@@ -202,7 +239,7 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 			if err := data.Install(chunkID, bytes.NewReader(raw), int64(len(raw))); err != nil {
 				return GraphImportResult{}, fmt.Errorf("installing graph memory chunk %s: %w", chunkID, err)
 			}
-			activePins = reservation.Pins
+			activePins = append(activePins, reservation.Pins...)
 			if err := graph.CommitMemoryChunk(reservation); err != nil {
 				return GraphImportResult{}, fmt.Errorf("committing graph memory chunk %s: %w", chunkID, err)
 			}
@@ -210,11 +247,10 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 				pageIDs[slot] = page
 			}
 		}
-		rootPages := make(map[string]map[uint64]ttcsnapshot.ObjectID)
 		for _, run := range use.runs {
 			key := resourceKey(run.ResourceID)
-			if rootPages[key] == nil {
-				rootPages[key] = make(map[uint64]ttcsnapshot.ObjectID)
+			if pendingPages[key] == nil {
+				pendingPages[key] = make(map[uint64]ttcsnapshot.ObjectID)
 			}
 			for delta := uint16(0); delta < run.Pages; delta++ {
 				slot := uint8(uint16(run.FirstSlot) + delta)
@@ -227,36 +263,18 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 					return GraphImportResult{}, fmt.Errorf("memory resource maps page index %d twice", index)
 				}
 				resources[key].pages[index] = ttcsnapshot.ObjectID(page)
-				rootPages[key][index] = ttcsnapshot.ObjectID(page)
+				pendingPages[key][index] = ttcsnapshot.ObjectID(page)
 			}
 		}
-		keys := make([]string, 0, len(rootPages))
-		for key := range rootPages {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			resource := resources[key]
-			if resource == nil {
-				return GraphImportResult{}, errors.New("memory graph resource disappeared")
-			}
-			if resource.pages == nil {
-				resource.pages = make(map[uint64]ttcsnapshot.ObjectID)
-			}
-			name := fmt.Sprintf("%s/resource-%04x", rootPrefix, resourceIndexes[key])
-			if _, exists := graph.Root(name); !exists {
-				createdRoots = append(createdRoots, name)
-			}
-			if _, err := graph.SetMemoryPages(origin, name, rootPages[key]); err != nil {
+		pendingUses++
+		if pendingUses == radixChunksPerTransaction {
+			if err := flushPages(); err != nil {
 				return GraphImportResult{}, err
 			}
 		}
-		if len(reservation.Pins) != 0 {
-			if err := graph.DeletePins(reservation.Pins); err != nil {
-				return GraphImportResult{}, fmt.Errorf("releasing memory construction pins: %w", err)
-			}
-		}
-		activePins = nil
+	}
+	if err := flushPages(); err != nil {
+		return GraphImportResult{}, err
 	}
 
 	result := GraphImportResult{Snapshot: origin, Chunks: uint64(len(uses))}
