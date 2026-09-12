@@ -333,10 +333,10 @@ func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
 	file.inode.nlink.Store(0)
 	file.inode.refs.InitRefs()
 	file.diskMmap.SetFD(-1)
-	file.diskMetadataDirty.Store(1)
-	file.inode.diskMetadataGeneration.Store(1)
 	fs.diskInodes[ino] = &file.inode
 	fs.liveForkFiles[file] = struct{}{}
+	fs.markDiskFileDirty(file)
+	fs.markDiskInodeDirty(&file.inode)
 
 	file.inode.decRef(contexttest.Context(t))
 	if _, ok := fs.diskInodes[ino]; ok {
@@ -375,15 +375,17 @@ func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
 	fs.root = &root.dentry
 	inactive := newFile()
 	active := newFile()
-	active.inode.incRef() // An open FD, cwd, mount, or equivalent VFS owner.
+	active.IncRef() // An open FD, cwd, mount, or equivalent VFS owner.
 	subdir := newDir()
-	subdir.inode.incRef() // Keep the directory itself live.
+	subdir.dentry.IncRef() // Keep the directory itself live.
 	root.childMap = map[string]*dentry{
 		"inactive": inactive,
 		"active":   active,
 		"subdir":   &subdir.dentry,
 	}
-	for _, child := range root.childMap {
+	for name, child := range root.childMap {
+		child.name = name
+		child.parent.Store(&root.dentry)
 		root.childList.PushBack(child)
 	}
 

@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -209,6 +210,62 @@ func TestExternallyCoordinatedStoresReload(t *testing.T) {
 	}
 	if _, ok := first.Snapshot(two); !ok {
 		t.Fatalf("first store did not observe snapshot %d after reload", two)
+	}
+}
+
+func TestExternallyCoordinatedReloadReplaysJournalSuffix(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	journal := reader.journal
+
+	origin, err := writer.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := writer.CreateObject(origin, "construction/leaf", ObjectKindFile, []byte("leaf"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := writer.CreateObject(origin, "construction/parent", ObjectKindMetadata, []byte("parent"), []Edge{{Slot: 0, Child: leaf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SetRoot("branch/main", parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.DeletePin("construction/leaf"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.DeletePin("construction/parent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.DeleteRoot("branch/main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Collect(16); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reader.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if reader.journal != journal {
+		t.Fatal("same-generation reload reopened the journal instead of replaying its suffix")
+	}
+	if err := reader.Verify(); err != nil {
+		t.Fatalf("incrementally replayed graph is invalid: %v", err)
+	}
+	if got, want := reader.Inspect(), writer.Inspect(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("incremental replay differs from writer:\nreader=%+v\nwriter=%+v", got, want)
 	}
 }
 

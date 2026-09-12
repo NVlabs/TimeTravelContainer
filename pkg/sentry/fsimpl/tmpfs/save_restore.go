@@ -17,6 +17,7 @@ package tmpfs
 import (
 	goContext "context"
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -86,6 +87,8 @@ func (i *inode) loadDefaultACL(_ goContext.Context, defaultACL *vfs.PosixACL) {
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	if pgalloc.IsLiveForkSource(ctx) {
+		prepareStarted := time.Now()
+		preparationMetrics := vfs.LiveForkPreparationMetricsFromContext(ctx)
 		if resource, filtered := vfs.LiveForkFilesystemResourceFromContext(ctx); filtered &&
 			(fs.diskVolume == nil || fs.diskVolume.ResourceID != resource) {
 			return nil
@@ -93,15 +96,26 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 		if err := fs.flushDiskWriteMetadataRaw(); err != nil {
 			return fmt.Errorf("flushing TTC volume metadata before live fork: %w", err)
 		}
+		metadataDone := time.Now()
 		fs.liveForkMu.Lock()
-		files := make([]*regularFile, 0, len(fs.liveForkFiles))
-		for file := range fs.liveForkFiles {
-			files = append(files, file)
+		var files []*regularFile
+		if fs.diskVolume == nil {
+			files = make([]*regularFile, 0, len(fs.liveForkFiles))
+			for file := range fs.liveForkFiles {
+				files = append(files, file)
+			}
+		} else {
+			files = make([]*regularFile, 0, len(fs.diskForkFiles))
+			for file := range fs.diskForkFiles {
+				files = append(files, file)
+			}
+			fs.diskForkFiles = nil
 		}
+		fs.liveForkMu.Unlock()
 		for _, file := range files {
 			file.prepareLiveFork()
 		}
-		fs.liveForkMu.Unlock()
+		filesDone := time.Now()
 		if fs.diskVolume != nil && vfs.LiveForkBranchesPreparedFromContext(ctx) {
 			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
 			if resources == nil {
@@ -149,10 +163,22 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			}
 			resources[fs.diskVolume.ResourceID] = fs.diskVolume.Repository
 		}
+		if fs.diskVolume != nil && preparationMetrics != nil {
+			preparationMetrics.MetadataFlush += metadataDone.Sub(prepareStarted)
+			preparationMetrics.RuntimeInvalidation += filesDone.Sub(metadataDone)
+			preparationMetrics.BranchSeal += time.Since(filesDone)
+		}
 	}
 	resourceID := fs.mf.ResourceID()
 	if !resourceID.Ok() {
-		fs.pruneDiskNamespaceForSave()
+		pruneStarted := time.Now()
+		candidates := fs.pruneDiskNamespaceForSave()
+		if fs.diskVolume != nil {
+			if preparationMetrics := vfs.LiveForkPreparationMetricsFromContext(ctx); preparationMetrics != nil {
+				preparationMetrics.NamespacePrune += time.Since(pruneStarted)
+				preparationMetrics.NamespaceCandidates += int64(candidates)
+			}
+		}
 		return nil
 	}
 	mfmap := pgalloc.MemoryFileMapFromContext(ctx)

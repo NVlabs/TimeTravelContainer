@@ -16,6 +16,7 @@ package vfs
 
 import (
 	goContext "context"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -73,7 +74,27 @@ const (
 	// pairs of Raft-allocated working snapshot IDs. Pair zero is consumed by
 	// the source-to-primary fork; later pairs are consumed by batch siblings.
 	CtxLiveForkFilesystemOrigins
+
+	// CtxLiveForkPreparationMetrics carries an optional accumulator for
+	// persistent filesystem seal costs.
+	CtxLiveForkPreparationMetrics
 )
+
+// LiveForkPreparationMetrics breaks persistent filesystem preparation into
+// mutation-proportional work.
+type LiveForkPreparationMetrics struct {
+	MetadataFlush       time.Duration
+	RuntimeInvalidation time.Duration
+	BranchSeal          time.Duration
+	NamespacePrune      time.Duration
+	NamespaceCandidates int64
+}
+
+// LiveForkPreparationMetricsFromContext returns the optional accumulator.
+func LiveForkPreparationMetricsFromContext(ctx goContext.Context) *LiveForkPreparationMetrics {
+	metrics, _ := ctx.Value(CtxLiveForkPreparationMetrics).(*LiveForkPreparationMetrics)
+	return metrics
+}
 
 // RestoreFilesystemResource associates an implementation-specific resource
 // with the persistent branch that should back the restored filesystem.

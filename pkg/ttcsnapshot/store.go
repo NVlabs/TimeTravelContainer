@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	journalHeader        = "TTCSGJ4\n"
+	journalHeader        = "TTCSGJ5\n"
 	maxJournalRecordSize = 8 << 20
 	headFileName         = "graph.head"
 )
@@ -112,9 +112,21 @@ type journalOp struct {
 }
 
 type journalRecord struct {
-	Version  int
-	Sequence uint64
-	Ops      []journalOp
+	Version    int
+	Sequence   uint64
+	Ops        []journalOp
+	References []journalReference
+}
+
+// journalReference records the final materialized reference count for an
+// immutable object changed by a transaction. Graph mutations keep these hot
+// counters out of PutObject operations so path-copying does not rewrite every
+// unchanged child. Recording the bounded changed set here lets another Store
+// replay an appended journal suffix without rescanning the entire graph.
+type journalReference struct {
+	Object ObjectID
+	Refs   uint64
+	State  ObjectState
 }
 
 // Store owns one authoritative logical snapshot graph.
@@ -330,8 +342,11 @@ func (s *Store) Reload() error {
 		if err != nil {
 			return err
 		}
-		if unchanged && s.journalEnd == info.Size() {
-			return nil
+		if unchanged && info.Size() >= s.journalEnd {
+			if info.Size() == s.journalEnd {
+				return nil
+			}
+			return s.replayJournalSuffix(false)
 		}
 	}
 	head, err := s.readHead()
@@ -365,8 +380,11 @@ func (s *Store) ReloadForWrite() error {
 		if err != nil {
 			return err
 		}
-		if unchanged && s.journalEnd == info.Size() {
-			return nil
+		if unchanged && info.Size() >= s.journalEnd {
+			if info.Size() == s.journalEnd {
+				return nil
+			}
+			return s.replayJournalSuffix(true)
 		}
 	}
 	head, err := s.readHead()
@@ -843,13 +861,6 @@ func (s *Store) replayJournal(repairTail bool) error {
 		}
 		s.journalEnd = offset
 	}
-	// Reference counts are a materialized index of immutable parent edges and
-	// stable roots/pins. Hot path-copy transactions intentionally omit updates
-	// that change only this index, so reconstruct it once after replay rather
-	// than writing every unchanged B-tree child back into the WAL.
-	if err := recomputeGraphReferences(&s.state); err != nil {
-		return fmt.Errorf("rebuilding TTC snapshot graph references after journal replay: %w", err)
-	}
 	if err := validateGraphState(&s.state); err != nil {
 		return fmt.Errorf("validating TTC snapshot graph after journal replay: %w", err)
 	}
@@ -857,44 +868,108 @@ func (s *Store) replayJournal(repairTail bool) error {
 	return err
 }
 
-func recomputeGraphReferences(state *graphState) error {
-	expected := make(map[string]uint64, len(state.Objects))
-	retain := func(id ObjectID) error {
-		key := id.key()
-		if _, ok := state.Objects[key]; !ok {
-			return fmt.Errorf("reference selects missing object %s", key)
+// replayJournalSuffix consumes transactions appended by another
+// externally-coordinated Store. The enclosing graph lock prevents a writer
+// from appending while the suffix is selected and decoded. Every v5 record
+// carries the bounded set of materialized reference-count changes that is not
+// otherwise represented by immutable PutObject operations, so replay work is
+// proportional to the appended transactions rather than total graph size.
+func (s *Store) replayJournalSuffix(repairTail bool) error {
+	start := s.journalEnd
+	offset := start
+	lengthBuffer := make([]byte, 4)
+	var records []journalRecord
+	for {
+		recordStart := offset
+		n, err := s.journal.ReadAt(lengthBuffer, offset)
+		if errors.Is(err, io.EOF) && n == 0 {
+			break
 		}
-		if expected[key] == math.MaxUint64 {
-			return fmt.Errorf("object %s reference count overflows", key)
-		}
-		expected[key]++
-		return nil
-	}
-	for _, id := range state.Roots {
-		if err := retain(id); err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
-	}
-	for _, id := range state.Pins {
-		if err := retain(id); err != nil {
+		if n != len(lengthBuffer) {
+			if repairTail {
+				if err := s.truncateJournal(recordStart); err != nil {
+					return err
+				}
+			}
+			offset = recordStart
+			break
+		}
+		offset += int64(len(lengthBuffer))
+		length := binary.BigEndian.Uint32(lengthBuffer)
+		if length == 0 || length > maxJournalRecordSize {
+			return fmt.Errorf("invalid TTC snapshot graph journal record length %d at %d", length, recordStart)
+		}
+		data := make([]byte, length)
+		n, err = s.journal.ReadAt(data, offset)
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
+		if n != len(data) {
+			if repairTail {
+				if err := s.truncateJournal(recordStart); err != nil {
+					return err
+				}
+			}
+			offset = recordStart
+			break
+		}
+		offset += int64(length)
+		var record journalRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			return fmt.Errorf("decoding TTC snapshot graph journal record at %d: %w", recordStart, err)
+		}
+		if err := validateJournalRecord(record); err != nil {
+			return fmt.Errorf("validating TTC snapshot graph journal record at %d: %w", recordStart, err)
+		}
+		want := s.state.Sequence + uint64(len(records)) + 1
+		if record.Sequence != want {
+			return fmt.Errorf("journal sequence %d follows %d", record.Sequence, want-1)
+		}
+		records = append(records, record)
 	}
-	for _, object := range state.Objects {
-		for _, edge := range object.Children {
-			if err := retain(edge.Child); err != nil {
-				return fmt.Errorf("object %s child: %w", object.ID.key(), err)
+	for _, record := range records {
+		if err := s.applyIncrementalJournalRecord(record); err != nil {
+			s.poisoned = fmt.Errorf("applying appended TTC graph journal sequence %d: %w", record.Sequence, err)
+			return s.poisoned
+		}
+	}
+	s.journalEnd = offset
+	_, err := s.journal.Seek(0, io.SeekEnd)
+	return err
+}
+
+func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
+	oldDeferred := make(map[string]Object, len(record.Ops))
+	for _, op := range record.Ops {
+		if op.PutObject != nil || op.DeleteObject != "" {
+			key := op.DeleteObject
+			if op.PutObject != nil {
+				key = op.PutObject.ID.key()
+			}
+			if object, ok := s.state.Objects[key]; ok {
+				oldDeferred[key] = object
 			}
 		}
 	}
-	for key, object := range state.Objects {
-		object.Refs = expected[key]
-		if object.Refs == 0 {
-			object.State = ObjectReclaiming
-		} else {
-			object.State = ObjectLive
+	if err := applyJournalRecord(&s.state, record); err != nil {
+		return err
+	}
+	for _, object := range oldDeferred {
+		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
+			delete(s.deferredObjects, deferredObjectKey(object.SourceCatalog, object.SourceObject))
 		}
-		state.Objects[key] = object
+	}
+	for _, op := range record.Ops {
+		if op.PutObject == nil {
+			continue
+		}
+		object, ok := s.state.Objects[op.PutObject.ID.key()]
+		if ok && object.SourceCatalog != "" && !object.SourceObject.IsZero() {
+			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
+		}
 	}
 	return nil
 }
@@ -1000,6 +1075,16 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			return errors.New("empty TTC snapshot graph journal operation")
 		}
 	}
+	for _, update := range record.References {
+		key := update.Object.key()
+		object, ok := state.Objects[key]
+		if !ok {
+			return fmt.Errorf("reference update selects missing object %s", key)
+		}
+		object.Refs = update.Refs
+		object.State = update.State
+		state.Objects[key] = object
+	}
 	state.Sequence = record.Sequence
 	return nil
 }
@@ -1087,6 +1172,20 @@ func validateJournalRecord(record journalRecord) error {
 		}
 		if selectors != 1 {
 			return errors.New("invalid TTC snapshot graph journal operation selector")
+		}
+	}
+	seenReferences := make(map[string]struct{}, len(record.References))
+	for _, update := range record.References {
+		if err := update.Object.validate(); err != nil {
+			return fmt.Errorf("invalid materialized reference update: %w", err)
+		}
+		key := update.Object.key()
+		if _, duplicate := seenReferences[key]; duplicate {
+			return fmt.Errorf("duplicate materialized reference update for %s", key)
+		}
+		seenReferences[key] = struct{}{}
+		if (update.Refs == 0) != (update.State == ObjectReclaiming) || (update.Refs != 0 && update.State != ObjectLive) {
+			return fmt.Errorf("materialized reference update for %s has %d references in state %q", key, update.Refs, update.State)
 		}
 	}
 	return nil
@@ -1265,7 +1364,17 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops}
+	referenceKeys := make([]string, 0, len(references))
+	for key := range references {
+		referenceKeys = append(referenceKeys, key)
+	}
+	sort.Strings(referenceKeys)
+	referenceUpdates := make([]journalReference, 0, len(referenceKeys))
+	for _, key := range referenceKeys {
+		object := references[key]
+		referenceUpdates = append(referenceUpdates, journalReference{Object: object.ID, Refs: object.Refs, State: object.State})
+	}
+	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops, References: referenceUpdates}
 	if err := validateJournalRecord(record); err != nil {
 		return err
 	}

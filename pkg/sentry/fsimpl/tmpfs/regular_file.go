@@ -109,7 +109,7 @@ type regularFile struct {
 	// creations and fsyncs per chunk. Linux does not make ordinary write(2)
 	// metadata durable until a later synchronization point, so TTC coalesces
 	// publication until close, fsync/sync, live fork, or filesystem teardown.
-	diskMetadataDirty atomicbitops.Uint32
+	diskMetadataDirty atomicbitops.Uint64
 
 	// initiallyUnlinked is true if this file was created using NewZeroFile or
 	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
@@ -170,6 +170,7 @@ func (fs *filesystem) registerLiveForkFile(file *regularFile) {
 func (fs *filesystem) unregisterLiveForkFile(file *regularFile) {
 	fs.liveForkMu.Lock()
 	delete(fs.liveForkFiles, file)
+	delete(fs.diskForkFiles, file)
 	fs.liveForkMu.Unlock()
 }
 
@@ -198,6 +199,9 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 			for mapping := range seg.Value() {
 				rf.diskMmap.AddMapping(mapping.AddrRange, seg.Start())
 			}
+		}
+		if !rf.mappings.IsEmpty() {
+			rf.inode.fs.markDiskForkFile(rf)
 		}
 	}
 	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
@@ -299,6 +303,7 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 	rf.diskIOFile = file
 	rf.diskIOObject = meta.Object
 	rf.diskIOWritable = writable
+	rf.inode.fs.markDiskForkFile(rf)
 	return file, cloned, nil
 }
 
@@ -344,7 +349,9 @@ func (rf *regularFile) resetDiskMmapLocked() {
 // markDiskMetadataDirty defers repository metadata publication. The flag is
 // atomic because atime may be updated by concurrent readers without inode.mu.
 func (rf *regularFile) markDiskMetadataDirty() {
-	rf.diskMetadataDirty.Store(1)
+	if rf.inode.fs.diskVolume != nil {
+		rf.inode.fs.markDiskFileDirty(rf)
+	}
 }
 
 // markDiskMetadataDirtyLocked is the write-side spelling used when inode.mu is
@@ -365,13 +372,17 @@ func (rf *regularFile) flushDiskMetadataLocked() error {
 //
 // Preconditions: rf.inode.mu is locked.
 func (rf *regularFile) flushDiskMetadataRawLocked() error {
-	if rf.inode.fs.diskVolume == nil || rf.diskMetadataDirty.Load() == 0 {
+	if rf.inode.fs.diskVolume == nil {
+		return nil
+	}
+	generation := rf.diskMetadataDirty.Load()
+	if generation == 0 {
 		return nil
 	}
 	if err := rf.inode.fs.persistDiskWriteMetadataRaw(&rf.inode); err != nil {
 		return err
 	}
-	rf.diskMetadataDirty.Store(0)
+	rf.inode.fs.finishDiskFileMetadata(rf, generation)
 	return nil
 }
 
@@ -382,6 +393,9 @@ func (rf *regularFile) flushDiskMetadata() error {
 }
 
 func (rf *regularFile) flushDiskMetadataRaw() error {
+	if rf.diskMetadataDirty.Load() == 0 {
+		return nil
+	}
 	rf.inode.mu.Lock()
 	defer rf.inode.mu.Unlock()
 	return rf.flushDiskMetadataRawLocked()
@@ -644,6 +658,7 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 	if rf.inode.fs.diskVolume != nil {
 		rf.diskMmap.AddMapping(ar, offset)
 		rf.mappings.AddMapping(ms, ar, offset, writable)
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	rf.dataMu.RLock()

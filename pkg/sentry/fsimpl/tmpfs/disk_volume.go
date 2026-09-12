@@ -81,10 +81,62 @@ func (fs *filesystem) registerDiskMaterializationHook() {
 	fs.unregisterMaterializationHook = fs.diskVolume.Repository.RegisterMaterializationHook(fs.invalidateMaterializedObject)
 }
 
+// markDiskForkFile records that file owns runtime-local cache state which must
+// be invalidated before the next repository seal. Entries are cleared by
+// PrepareSave, so repeated forks cost only the files touched since the prior
+// fork rather than every instantiated file in the namespace.
+func (fs *filesystem) markDiskForkFile(file *regularFile) {
+	if fs.diskVolume == nil {
+		return
+	}
+	fs.liveForkMu.Lock()
+	if fs.diskForkFiles == nil {
+		fs.diskForkFiles = make(map[*regularFile]struct{})
+	}
+	fs.diskForkFiles[file] = struct{}{}
+	fs.liveForkMu.Unlock()
+}
+
+func (fs *filesystem) markDiskInodeDirty(node *inode) {
+	fs.diskDirtyMu.Lock()
+	node.diskMetadataGeneration.Add(1)
+	if fs.diskDirtyInodes == nil {
+		fs.diskDirtyInodes = make(map[*inode]struct{})
+	}
+	fs.diskDirtyInodes[node] = struct{}{}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) finishDiskInodeMetadata(node *inode, generation uint64) {
+	fs.diskDirtyMu.Lock()
+	if node.diskMetadataGeneration.CompareAndSwap(generation, 0) {
+		delete(fs.diskDirtyInodes, node)
+	}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) markDiskFileDirty(file *regularFile) {
+	fs.diskDirtyMu.Lock()
+	file.diskMetadataDirty.Add(1)
+	if fs.diskDirtyFiles == nil {
+		fs.diskDirtyFiles = make(map[*regularFile]struct{})
+	}
+	fs.diskDirtyFiles[file] = struct{}{}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) finishDiskFileMetadata(file *regularFile, generation uint64) {
+	fs.diskDirtyMu.Lock()
+	if file.diskMetadataDirty.CompareAndSwap(generation, 0) {
+		delete(fs.diskDirtyFiles, file)
+	}
+	fs.diskDirtyMu.Unlock()
+}
+
 func (fs *filesystem) invalidateMaterializedObject(object string) {
 	fs.liveForkMu.Lock()
-	files := make([]*regularFile, 0, len(fs.liveForkFiles))
-	for file := range fs.liveForkFiles {
+	files := make([]*regularFile, 0, len(fs.diskForkFiles))
+	for file := range fs.diskForkFiles {
 		files = append(files, file)
 	}
 	fs.liveForkMu.Unlock()
@@ -294,9 +346,13 @@ func (fs *filesystem) applyDiskMetadata(node *inode, meta ttcvolume.Inode) {
 
 func (fs *filesystem) rebuildDiskInodeCache() {
 	inodes := make(map[uint64]*inode)
+	saveDentries := make(map[*dentry]struct{})
 	var visit func(*dentry)
 	visit = func(d *dentry) {
 		inodes[d.inode.ino] = d.inode
+		if d != fs.root && (d.diskSaveRefs.Load() != 0 || d.diskSavePersistent.Load() != 0) {
+			saveDentries[d] = struct{}{}
+		}
 		if dir, ok := d.inode.impl.(*directory); ok {
 			for _, child := range dir.childMap {
 				visit(child)
@@ -307,11 +363,21 @@ func (fs *filesystem) rebuildDiskInodeCache() {
 	fs.liveForkMu.Lock()
 	for file := range fs.liveForkFiles {
 		inodes[file.inode.ino] = &file.inode
+		// A restored regular file is present in the state graph only because it
+		// carries runtime state. Conservatively invalidate it at the next seal;
+		// subsequent seals use the touched-since-last-seal registry normally.
+		if fs.diskForkFiles == nil {
+			fs.diskForkFiles = make(map[*regularFile]struct{})
+		}
+		fs.diskForkFiles[file] = struct{}{}
 	}
 	fs.liveForkMu.Unlock()
 	fs.diskInodesMu.Lock()
 	fs.diskInodes = inodes
 	fs.diskInodesMu.Unlock()
+	fs.diskSaveMu.Lock()
+	fs.diskSaveDentries = saveDentries
+	fs.diskSaveMu.Unlock()
 }
 
 func (fs *filesystem) unregisterDiskInode(node *inode) {
@@ -323,6 +389,12 @@ func (fs *filesystem) unregisterDiskInode(node *inode) {
 		delete(fs.diskInodes, node.ino)
 	}
 	fs.diskInodesMu.Unlock()
+	fs.diskDirtyMu.Lock()
+	delete(fs.diskDirtyInodes, node)
+	if file, ok := node.impl.(*regularFile); ok {
+		delete(fs.diskDirtyFiles, file)
+	}
+	fs.diskDirtyMu.Unlock()
 }
 
 // pruneDiskNamespaceForSave makes state serialization proportional to live
@@ -330,45 +402,49 @@ func (fs *filesystem) unregisterDiskInode(node *inode) {
 // process. The complete source cache is restored by
 // restoreDiskNamespaceAfterSave; the clone resolves omitted entries from its
 // already-forked repository branch.
-func (fs *filesystem) pruneDiskNamespaceForSave() {
+func (fs *filesystem) pruneDiskNamespaceForSave() int {
 	if fs.diskVolume == nil || fs.diskSaveChildren != nil {
-		return
+		return 0
 	}
 	root, ok := fs.root.inode.impl.(*directory)
 	if !ok {
 		// A ttcvol may expose one regular file as its mount root. Such a
 		// filesystem has no cached directory namespace to prune; the root is
 		// already retained by the mount itself.
-		return
+		return 0
 	}
+	fs.diskSaveMu.Lock()
+	candidates := make([]*dentry, 0, len(fs.diskSaveDentries))
+	for d := range fs.diskSaveDentries {
+		candidates = append(candidates, d)
+	}
+	fs.diskSaveMu.Unlock()
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	fs.diskSaveChildren = make(map[*directory]map[string]*dentry)
-	var collect func(*directory)
-	collect = func(dir *directory) {
-		original := dir.childMap
-		fs.diskSaveChildren[dir] = original
-		for _, child := range original {
-			if childDir, ok := child.inode.impl.(*directory); ok {
-				collect(childDir)
+	filtered := map[*directory]map[string]*dentry{root: nil}
+	for _, candidate := range candidates {
+		child := candidate
+		for child != fs.root {
+			parent := child.parent.Load()
+			if parent == nil {
+				break
 			}
+			parentDir, ok := parent.inode.impl.(*directory)
+			if !ok || parentDir.childMap[child.name] != child {
+				break
+			}
+			children := filtered[parentDir]
+			if children == nil {
+				children = make(map[string]*dentry)
+				filtered[parentDir] = children
+			}
+			children[child.name] = child
+			child = parent
 		}
 	}
-	collect(root)
-	filtered := make(map[*directory]map[string]*dentry, len(fs.diskSaveChildren))
-	for dir, original := range fs.diskSaveChildren {
-		kept := make(map[string]*dentry)
-		for name, child := range original {
-			if diskDentryNeedsSave(child) {
-				kept[name] = child
-			}
-		}
-		if len(kept) == 0 {
-			kept = nil
-		}
-		filtered[dir] = kept
-	}
+	fs.diskSaveChildren = make(map[*directory]map[string]*dentry, len(filtered))
 	for dir, kept := range filtered {
+		fs.diskSaveChildren[dir] = dir.childMap
 		dir.childMap = kept
 		dir.childList.Reset()
 		for _, child := range kept {
@@ -377,6 +453,7 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 			dir.childList.PushBack(child)
 		}
 	}
+	return len(candidates)
 }
 
 func (fs *filesystem) restoreDiskNamespaceAfterSave() {
@@ -443,7 +520,7 @@ func (fs *filesystem) persistDiskMetadata(inode *inode) error {
 	if err := fs.diskVolume.Repository.UpdateMetadata(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
 		return diskVolumeError("update inode metadata", err)
 	}
-	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	fs.finishDiskInodeMetadata(inode, generation)
 	return nil
 }
 
@@ -463,7 +540,7 @@ func (fs *filesystem) persistDiskWriteMetadataRaw(inode *inode) error {
 	if err := fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
 		return err
 	}
-	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	fs.finishDiskInodeMetadata(inode, generation)
 	return nil
 }
 
@@ -480,21 +557,21 @@ func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 	if fs.diskVolume == nil {
 		return nil
 	}
-	fs.liveForkMu.Lock()
-	for file := range fs.liveForkFiles {
+	fs.diskDirtyMu.Lock()
+	files := make([]*regularFile, 0, len(fs.diskDirtyFiles))
+	for file := range fs.diskDirtyFiles {
+		files = append(files, file)
+	}
+	inodes := make([]*inode, 0, len(fs.diskDirtyInodes))
+	for node := range fs.diskDirtyInodes {
+		inodes = append(inodes, node)
+	}
+	fs.diskDirtyMu.Unlock()
+	for _, file := range files {
 		if err := file.flushDiskMetadataRaw(); err != nil {
-			fs.liveForkMu.Unlock()
 			return err
 		}
 	}
-	fs.liveForkMu.Unlock()
-
-	fs.diskInodesMu.Lock()
-	inodes := make([]*inode, 0, len(fs.diskInodes))
-	for _, node := range fs.diskInodes {
-		inodes = append(inodes, node)
-	}
-	fs.diskInodesMu.Unlock()
 	type pendingMetadata struct {
 		inode      *inode
 		generation uint64
@@ -523,7 +600,7 @@ func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 		return fmt.Errorf("updating inode metadata batch: %w", err)
 	}
 	for _, update := range pending {
-		update.inode.diskMetadataGeneration.CompareAndSwap(update.generation, 0)
+		fs.finishDiskInodeMetadata(update.inode, update.generation)
 	}
 	return nil
 }

@@ -416,11 +416,19 @@ type BranchInfo struct {
 	// MemoryRootObjects records the immutable object selected by each logical
 	// root name. Names are branch-local handles; object IDs remain stable when
 	// authority moves from a node to shared storage.
-	MemoryRootObjects []string  `json:"memory_root_objects,omitempty"`
-	ForkTotalNS       int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS  int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS      int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
+	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
 }
 
 // BranchNodeID returns the effective cluster owner of branchID.

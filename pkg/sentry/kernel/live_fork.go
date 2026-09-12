@@ -116,12 +116,21 @@ type LiveForkValidationOptions struct {
 // LiveForkMetrics separates parent preparation, metadata, and child restore
 // costs. Durations include only work performed by Kernel.LiveFork.
 type LiveForkMetrics struct {
-	Validation        time.Duration
-	ParentPreparation time.Duration
-	MetadataStream    time.Duration
-	MetadataBytes     int64
-	ChildRestore      time.Duration
-	Total             time.Duration
+	Validation                    time.Duration
+	ParentPreparation             time.Duration
+	SharedMemoryPreparation       time.Duration
+	MappingInvalidation           time.Duration
+	VFSPreparation                time.Duration
+	FilesystemMetadataFlush       time.Duration
+	FilesystemRuntimeInvalidation time.Duration
+	FilesystemBranchSeal          time.Duration
+	FilesystemNamespacePrune      time.Duration
+	FilesystemNamespaceCandidates int64
+	MemoryPreparation             time.Duration
+	MetadataStream                time.Duration
+	MetadataBytes                 int64
+	ChildRestore                  time.Duration
+	Total                         time.Duration
 }
 
 // LiveForkStage identifies a completed live-fork transaction stage.
@@ -266,7 +275,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		preparationStarted := time.Now()
+		sharedMemoryStarted := time.Now()
 		k.prepareSharedMemoryForLiveFork(ctx)
+		if opts.Metrics != nil {
+			opts.Metrics.SharedMemoryPreparation = time.Since(sharedMemoryStarted)
+		}
 		if err := injectLiveForkFailure(opts, LiveForkStageSharedMemoryPrepared); err != nil {
 			return err
 		}
@@ -274,8 +287,12 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		// such as a gofer MmapCachedFile. The VMAs remain and refault from their
 		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
 		// for the same reason as in Kernel.SaveTo.
+		mappingInvalidationStarted := time.Now()
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
+		}
+		if opts.Metrics != nil {
+			opts.Metrics.MappingInvalidation = time.Since(mappingInvalidationStarted)
 		}
 		if err := injectLiveForkFailure(opts, LiveForkStageMappingsInvalidated); err != nil {
 			return err
@@ -286,6 +303,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			fsResources = make(vfs.LiveForkFilesystemResources)
 		}
 		fsTransactions := &vfs.LiveForkTransactions{}
+		fsPreparationMetrics := &vfs.LiveForkPreparationMetrics{}
 		fsTransactionsCommitted := false
 		defer func() {
 			if fsTransactionsCommitted {
@@ -308,9 +326,19 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkChildBranchIDs:      opts.batchChildBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
 			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
+			vfs.CtxLiveForkPreparationMetrics:  fsPreparationMetrics,
 		})
+		vfsPreparationStarted := time.Now()
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
+		}
+		if opts.Metrics != nil {
+			opts.Metrics.VFSPreparation = time.Since(vfsPreparationStarted)
+			opts.Metrics.FilesystemMetadataFlush = fsPreparationMetrics.MetadataFlush
+			opts.Metrics.FilesystemRuntimeInvalidation = fsPreparationMetrics.RuntimeInvalidation
+			opts.Metrics.FilesystemBranchSeal = fsPreparationMetrics.BranchSeal
+			opts.Metrics.FilesystemNamespacePrune = fsPreparationMetrics.NamespacePrune
+			opts.Metrics.FilesystemNamespaceCandidates = fsPreparationMetrics.NamespaceCandidates
 		}
 		defer k.vfs.BeforeResume(saveCtx)
 		if err := injectLiveForkFailure(opts, LiveForkStageVFSPrepared); err != nil {
@@ -320,9 +348,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return fmt.Errorf("live fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
+		memoryPreparationStarted := time.Now()
 		pmaSnapshots, clearPMASnapshots := k.prepareMemoryManagersForLiveFork()
 		defer clearPMASnapshots()
 		k.mf.MarkSavable()
+		if opts.Metrics != nil {
+			opts.Metrics.MemoryPreparation = time.Since(memoryPreparationStarted)
+		}
 		childMemoryFile := k.mf
 		var remotePageLoad *pgalloc.AsyncPagesFileLoad
 		var remoteLoadRanges []pgalloc.RemoteLoadRange

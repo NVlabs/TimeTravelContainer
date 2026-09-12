@@ -133,6 +133,10 @@ type filesystem struct {
 	// that remain reachable through an FD or mapping.
 	liveForkMu    sync.Mutex                `state:"nosave"`
 	liveForkFiles map[*regularFile]struct{} `state:"nosave"`
+	// diskForkFiles is the subset whose runtime-local host descriptors or
+	// mappings have been touched since the last seal. Only these files need
+	// invalidation before the repository advances to a new immutable root.
+	diskForkFiles map[*regularFile]struct{} `state:"nosave"`
 
 	nextInoMinusOne atomicbitops.Uint64 // accessed using atomic memory operations
 
@@ -180,6 +184,20 @@ type filesystem struct {
 	// after restore and is intentionally not serialized.
 	diskInodesMu sync.Mutex        `state:"nosave"`
 	diskInodes   map[uint64]*inode `state:"nosave"`
+	// diskDirtyMu protects the exact sets of metadata changed since the last
+	// repository publication. Lifecycle barriers consume these sets directly;
+	// they never scan all instantiated inodes or regular files.
+	diskDirtyMu     sync.Mutex                `state:"nosave"`
+	diskDirtyInodes map[*inode]struct{}       `state:"nosave"`
+	diskDirtyFiles  map[*regularFile]struct{} `state:"nosave"`
+
+	// diskSaveDentries contains only namespace entries carrying runtime state
+	// outside the persistent repository, such as an open file description,
+	// cwd, mount, watch, or bound socket. It permits save preparation to build
+	// the serialized namespace in O(number of live runtime references * path
+	// depth), independent of the total cached directory tree.
+	diskSaveMu       sync.Mutex           `state:"nosave"`
+	diskSaveDentries map[*dentry]struct{} `state:"nosave"`
 
 	// diskSaveChildren temporarily holds the complete runtime namespace cache
 	// while state serialization sees only entries carrying live runtime state.
@@ -699,6 +717,86 @@ type dentry struct {
 	// because inode resources are released when all references are dropped.
 	// dentry therefore forwards reference counting directly to inode.
 	inode *inode
+
+	// diskSaveRefs counts references acquired through the VFS dentry API.
+	// Directory-link lifetime references are acquired directly on inode and
+	// are intentionally excluded. This value is serialized so a live-fork
+	// child can rebuild diskSaveDentries without walking the repository tree.
+	diskSaveRefs atomicbitops.Int64
+	// diskSavePersistent retains namespace-bound runtime objects, including
+	// Unix-domain socket endpoints and inotify watches, even when no VFS dentry
+	// reference exists. Bits are diskSavePersistent* below.
+	diskSavePersistent atomicbitops.Uint32
+}
+
+const (
+	diskSavePersistentSocket uint32 = 1 << iota
+	diskSavePersistentWatch
+)
+
+func (d *dentry) setDiskSavePersistent(flag uint32) {
+	fs := d.inode.fs
+	if fs.diskVolume == nil || d == fs.root {
+		return
+	}
+	fs.diskSaveMu.Lock()
+	old := d.diskSavePersistent.Load()
+	if old&flag == 0 {
+		d.diskSavePersistent.Store(old | flag)
+		if fs.diskSaveDentries == nil {
+			fs.diskSaveDentries = make(map[*dentry]struct{})
+		}
+		fs.diskSaveDentries[d] = struct{}{}
+	}
+	fs.diskSaveMu.Unlock()
+}
+
+func (d *dentry) clearDiskSavePersistent(flag uint32) {
+	fs := d.inode.fs
+	if fs.diskVolume == nil || d == fs.root {
+		return
+	}
+	fs.diskSaveMu.Lock()
+	old := d.diskSavePersistent.Load()
+	updated := old &^ flag
+	d.diskSavePersistent.Store(updated)
+	if updated == 0 && d.diskSaveRefs.Load() == 0 {
+		delete(fs.diskSaveDentries, d)
+	}
+	fs.diskSaveMu.Unlock()
+}
+
+func (d *dentry) incDiskSaveRef() {
+	fs := d.inode.fs
+	if fs.diskVolume == nil || d == fs.root {
+		return
+	}
+	fs.diskSaveMu.Lock()
+	d.diskSaveRefs.Add(1)
+	if fs.diskSaveDentries == nil {
+		fs.diskSaveDentries = make(map[*dentry]struct{})
+	}
+	fs.diskSaveDentries[d] = struct{}{}
+	fs.diskSaveMu.Unlock()
+}
+
+func (d *dentry) decDiskSaveRef() {
+	fs := d.inode.fs
+	if fs.diskVolume == nil || d == fs.root {
+		return
+	}
+	fs.diskSaveMu.Lock()
+	refs := d.diskSaveRefs.Load()
+	// Some structural VFS references are installed as part of mount setup
+	// without passing through DentryImpl.IncRef. Their matching DecRef must not
+	// be mistaken for a tracked runtime reference.
+	if refs != 0 {
+		d.diskSaveRefs.Store(refs - 1)
+		if refs == 1 && d.diskSavePersistent.Load() == 0 {
+			delete(fs.diskSaveDentries, d)
+		}
+	}
+	fs.diskSaveMu.Unlock()
 }
 
 func (fs *filesystem) newDentry(inode *inode) *dentry {
@@ -712,15 +810,21 @@ func (fs *filesystem) newDentry(inode *inode) *dentry {
 // IncRef implements vfs.DentryImpl.IncRef.
 func (d *dentry) IncRef() {
 	d.inode.incRef()
+	d.incDiskSaveRef()
 }
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
-	return d.inode.tryIncRef()
+	if !d.inode.tryIncRef() {
+		return false
+	}
+	d.incDiskSaveRef()
+	return true
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
+	d.decDiskSaveRef()
 	d.inode.decRef(ctx)
 }
 
@@ -746,11 +850,16 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
+	if d.inode.fs.diskVolume != nil {
+		d.setDiskSavePersistent(diskSavePersistentWatch)
+	}
 	return &d.inode.watches
 }
 
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
-func (d *dentry) OnZeroWatches(context.Context) {}
+func (d *dentry) OnZeroWatches(context.Context) {
+	d.clearDiskSavePersistent(diskSavePersistentWatch)
+}
 
 // inode represents a filesystem object.
 //
@@ -1228,7 +1337,7 @@ func (i *inode) touchCMtimeLocked() {
 
 func (i *inode) markDiskMetadataDirty() {
 	if i.fs.diskVolume != nil {
-		i.diskMetadataGeneration.Add(1)
+		i.fs.markDiskInodeDirty(i)
 	}
 }
 
