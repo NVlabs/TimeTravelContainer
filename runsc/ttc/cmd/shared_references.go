@@ -642,9 +642,10 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		}
 		var objects []ttcsnapshot.Object
 		var references map[string]ttcsnapshot.ObjectID
+		var ready bool
 		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
 			var ok bool
-			objects, references, ok = ledger.OriginManifest(origin)
+			objects, references, ok, ready = ledger.OriginCompactionManifest(origin)
 			if !ok {
 				return os.ErrNotExist
 			}
@@ -652,7 +653,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		}); err != nil {
 			return collected, err
 		}
-		if len(objects) == 0 {
+		if !ready || len(objects) == 0 {
 			continue
 		}
 		if _, busy, err := s.packs.Reconcile(origin); err != nil {

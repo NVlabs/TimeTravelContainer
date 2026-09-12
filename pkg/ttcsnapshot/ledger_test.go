@@ -633,9 +633,42 @@ func TestReferenceLedgerOriginManifestExcludesPendingReclamation(t *testing.T) {
 	if !ok || len(objects) != 0 || len(references) != 0 {
 		t.Fatalf("origin manifest exposes reclaiming descendants: objects=%+v references=%+v ok=%t", objects, references, ok)
 	}
+	if _, _, ok, ready := ledger.OriginCompactionManifest(origin); !ok || ready {
+		t.Fatalf("partially collected origin compaction readiness=(ok=%t, ready=%t), want (true, false)", ok, ready)
+	}
 	inspection := ledger.Inspect()
 	if got := inspection.Objects[child.ID]; got != 0 {
 		t.Fatalf("pending child refcount=%d, want 0", got)
+	}
+}
+
+func TestReferenceLedgerCompactionWaitsForAllDeadParentEdges(t *testing.T) {
+	origin := SnapshotID(43)
+	child := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1}}
+	parentA := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindInode, Ordinal: 2}, Children: []Edge{{Slot: 0, Child: child.ID}}}
+	parentB := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindInode, Ordinal: 3}, Children: []Edge{{Slot: 0, Child: child.ID}}}
+	ledger := NewReferenceLedger()
+	if err := ledger.ImportOrigin(origin, []Object{child, parentA, parentB}, map[string]ObjectID{"root/a": parentA.ID, "root/b": parentB.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyReference("release-a", "root/a", parentA.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyReference("release-b", "root/b", parentB.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ledger.Collect(1); err != nil || got != 1 {
+		t.Fatalf("Collect(1)=(%d, %v), want (1, nil)", got, err)
+	}
+	objects, references, ok, ready := ledger.OriginCompactionManifest(origin)
+	if !ok || ready || len(objects) != 1 || objects[0].ID != child.ID {
+		t.Fatalf("partial compaction view=(objects=%+v, ok=%t, ready=%t), want the live child and not ready", objects, ok, ready)
+	}
+	if got, err := ledger.Collect(8); err != nil || got != 2 {
+		t.Fatalf("final Collect=(%d, %v), want (2, nil)", got, err)
+	}
+	if objects, references, ok, ready = ledger.OriginCompactionManifest(origin); !ok || !ready || len(objects) != 0 || len(references) != 0 {
+		t.Fatalf("final compaction view=(objects=%+v references=%+v ok=%t ready=%t)", objects, references, ok, ready)
 	}
 }
 

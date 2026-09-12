@@ -589,7 +589,8 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 	impl := fd.Conn().Impl().(*connectionImpl)
 	if ftype == unix.S_IFREG && impl.config.LazyFiles != nil {
 		if err := impl.config.LazyFiles.Ensure(fd.virtualPath); err != nil {
-			return nil, -1, err
+			log.Warningf("materializing lazy image file %q before open: %v", fd.virtualPath, err)
+			return nil, -1, fmt.Errorf("materializing lazy image file %q: %w", fd.virtualPath, err)
 		}
 	}
 	switch ftype {

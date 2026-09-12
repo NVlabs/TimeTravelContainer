@@ -1036,20 +1036,47 @@ func (ledger *ReferenceLedger) OriginManifest(origin SnapshotID) ([]Object, map[
 	}
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
-	if _, ok := ledger.state.Origins[origin]; !ok {
-		return nil, nil, false
+	objects, references, ok, _ := ledger.originManifestLocked(origin)
+	return objects, references, ok
+}
+
+// OriginCompactionManifest returns an exact physical-compaction view. ready is
+// false while bounded collection has left any reclaiming object in the origin:
+// live descendants can still carry references from those logically dead
+// parents, so omitting the parents before their edge releases have cascaded
+// would produce an inconsistent compacted manifest.
+func (ledger *ReferenceLedger) OriginCompactionManifest(origin SnapshotID) (objects []Object, references map[string]ObjectID, ok, ready bool) {
+	if ledger == nil || origin == 0 {
+		return nil, nil, false, false
 	}
-	objects := make([]Object, 0)
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	return ledger.originManifestLocked(origin)
+}
+
+func (ledger *ReferenceLedger) originManifestLocked(origin SnapshotID) (objects []Object, references map[string]ObjectID, ok, ready bool) {
+	if _, ok := ledger.state.Origins[origin]; !ok {
+		return nil, nil, false, false
+	}
+	ready = true
+	objects = make([]Object, 0)
 	for _, object := range ledger.state.Objects {
 		// A bounded collection may leave descendants in ObjectReclaiming until
 		// its next pass. They are already logically dead and must not be offered
 		// to shared-pack compaction as part of the live origin view.
-		if object.ID.Snapshot == origin && object.State == ObjectLive {
+		if object.ID.Snapshot != origin {
+			continue
+		}
+		if object.State == ObjectReclaiming {
+			ready = false
+			continue
+		}
+		if object.State == ObjectLive {
 			objects = append(objects, cloneObject(object))
 		}
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
-	references := make(map[string]ObjectID)
+	references = make(map[string]ObjectID)
 	for name, object := range ledger.state.References {
 		if object.Snapshot == origin {
 			references[name] = object
@@ -1065,7 +1092,7 @@ func (ledger *ReferenceLedger) OriginManifest(origin SnapshotID) ([]Object, map[
 			}
 		}
 	}
-	return objects, references, true
+	return objects, references, true, ready
 }
 
 // Inspect reports exact owner-local counts without exposing mutable maps.
