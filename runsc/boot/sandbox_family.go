@@ -1254,7 +1254,7 @@ func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandof
 	if err != nil {
 		return fmt.Errorf("reading distributed graph handoff manifest: %w", err)
 	}
-	manifest, err := ttcchunk.DecodeManifest(encoded, nil)
+	manifest, err := ttcchunk.DecodeManifest(encoded)
 	if err != nil {
 		return fmt.Errorf("decoding distributed graph handoff manifest: %w", err)
 	}

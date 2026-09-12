@@ -16,9 +16,7 @@ package ttcchunk
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,23 +34,6 @@ const (
 )
 
 var manifestMagic = [16]byte{'T', 'T', 'C', 'M', 'E', 'M', 'M', 'A', 'N', 'I', 'F', 'E', 'S', 'T', 0, 1}
-
-// ManifestID is the content address of an encoded memory manifest.
-type ManifestID [sha256.Size]byte
-
-// String returns the lowercase hexadecimal manifest content address.
-func (id ManifestID) String() string { return hex.EncodeToString(id[:]) }
-
-// ParseManifestID parses a manifest content address.
-func ParseManifestID(value string) (ManifestID, error) {
-	var id ManifestID
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != len(id) {
-		return id, fmt.Errorf("invalid TTC memory manifest ID %q", value)
-	}
-	copy(id[:], decoded)
-	return id, nil
-}
 
 // ManifestRun maps a contiguous source MemoryFile range and logical identity
 // run to slots in one immutable object.
@@ -72,6 +53,15 @@ type ManifestRun struct {
 type Manifest struct {
 	Runs []ManifestRun
 }
+
+// StoredBinding extends a branch binding with the transaction-local object
+// carrying its page bytes in the capture stream.
+type StoredBinding struct {
+	Binding pgalloc.CapturedPageBinding
+	Object  ID
+}
+
+func compareAllocator(a, b pgalloc.LogicalAllocatorID) int { return bytes.Compare(a[:], b[:]) }
 
 func bindingLess(left, right *StoredBinding) bool {
 	if left.Binding.ResourceID.ContainerName != right.Binding.ResourceID.ContainerName {
@@ -170,9 +160,9 @@ func appendString(dst []byte, value string) ([]byte, error) {
 }
 
 // EncodeManifest validates and deterministically encodes manifest.
-func EncodeManifest(manifest Manifest) ([]byte, ManifestID, error) {
+func EncodeManifest(manifest Manifest) ([]byte, error) {
 	if uint64(len(manifest.Runs)) > maxManifestRuns {
-		return nil, ManifestID{}, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
+		return nil, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
 	}
 	data := append([]byte(nil), manifestMagic[:]...)
 	data = appendUint32(data, manifestVersion)
@@ -180,20 +170,20 @@ func EncodeManifest(manifest Manifest) ([]byte, ManifestID, error) {
 	data = appendUint64(data, uint64(len(manifest.Runs)))
 	for i, run := range manifest.Runs {
 		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk || run.References == 0 || run.Object == (ID{}) || !hostarch.IsPageAligned(run.OldOffset) {
-			return nil, ManifestID{}, fmt.Errorf("invalid memory manifest run %d: %+v", i, run)
+			return nil, fmt.Errorf("invalid memory manifest run %d: %+v", i, run)
 		}
 		chunk, slot := run.FirstPage.Chunk()
 		if chunk != run.Logical || slot != run.FirstSlot || run.FirstVersion.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, ManifestID{}, fmt.Errorf("inconsistent memory manifest run %d: %+v", i, run)
+			return nil, fmt.Errorf("inconsistent memory manifest run %d: %+v", i, run)
 		}
 		var err error
 		data, err = appendString(data, run.ResourceID.ContainerName)
 		if err != nil {
-			return nil, ManifestID{}, err
+			return nil, err
 		}
 		data, err = appendString(data, run.ResourceID.Path)
 		if err != nil {
-			return nil, ManifestID{}, err
+			return nil, err
 		}
 		data = appendUint64(data, run.OldOffset)
 		data = appendUint64(data, run.References)
@@ -207,8 +197,7 @@ func EncodeManifest(manifest Manifest) ([]byte, ManifestID, error) {
 		data = appendUint32(data, uint32(run.Pages))
 		data = append(data, run.Object[:]...)
 	}
-	id := sha256.Sum256(data)
-	return data, id, nil
+	return data, nil
 }
 
 type manifestReader struct {
@@ -254,10 +243,7 @@ func (r *manifestReader) string() (string, error) {
 }
 
 // DecodeManifest verifies and decodes one manifest.
-func DecodeManifest(data []byte, expected *ManifestID) (Manifest, error) {
-	if expected != nil && ManifestID(sha256.Sum256(data)) != *expected {
-		return Manifest{}, errors.New("memory manifest content address mismatch")
-	}
+func DecodeManifest(data []byte) (Manifest, error) {
 	r := manifestReader{data: data}
 	magic, err := r.take(len(manifestMagic))
 	if err != nil || !bytes.Equal(magic, manifestMagic[:]) {
@@ -334,7 +320,7 @@ func DecodeManifest(data []byte, expected *ManifestID) (Manifest, error) {
 		return Manifest{}, errors.New("memory manifest has trailing bytes")
 	}
 	// Reuse the encoder's complete structural validation.
-	if _, _, err := EncodeManifest(manifest); err != nil {
+	if _, err := EncodeManifest(manifest); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil

@@ -17,7 +17,6 @@ package ttcchunk
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -27,10 +26,8 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -65,11 +62,11 @@ func testChunk() Chunk {
 
 func TestChunkRoundTrip(t *testing.T) {
 	want := testChunk()
-	data, id, err := Encode(want)
+	data, err := Encode(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Decode(data, &id)
+	got, err := Decode(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,9 +78,9 @@ func TestChunkRoundTrip(t *testing.T) {
 			t.Fatalf("decoded page %d = %+v, want %+v", i, got.Pages[i], want.Pages[i])
 		}
 	}
-	data[len(data)-1] ^= 1
-	if _, err := Decode(data, &id); err == nil {
-		t.Fatal("corrupted chunk passed content-address verification")
+	data[0] ^= 1
+	if _, err := Decode(data); err == nil {
+		t.Fatal("invalid chunk header passed structural validation")
 	}
 }
 
@@ -136,17 +133,21 @@ func TestGraphChunkReaderRelaysMissingObject(t *testing.T) {
 
 func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
 	chunk := testChunk()
-	encoded, chunkID, err := Encode(chunk)
+	encoded, err := Encode(chunk)
 	if err != nil {
 		t.Fatal(err)
 	}
+	chunkID := graphCaptureObjectID(1)
 	page := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)}
 	stored := []StoredBinding{
 		{Binding: pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
 		{Binding: pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
 	}
 	var stream bytes.Buffer
-	if err := writeGraphCapture(&stream, []Object{{ID: chunkID, Logical: chunk.Logical, Data: encoded}}, stored); err != nil {
+	if err := writeGraphCaptureHeader(&stream, stored, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGraphCaptureObject(&stream, chunkID, encoded); err != nil {
 		t.Fatal(err)
 	}
 	directory := t.TempDir()
@@ -206,125 +207,11 @@ func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
 	}
 }
 
-func TestAssembleSeparatesDivergedSlotVersions(t *testing.T) {
-	allocator := testAllocator(1)
-	logicalChunk := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 7}
-	pageAt := func(slot uint8, version uint64, fill byte) SourcePage {
-		return SourcePage{
-			Binding: pgalloc.CapturedPageBinding{
-				OldOffset:  uint64(version) * hostarch.PageSize,
-				References: 1,
-				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logicalChunk.Sequence*PagesPerChunk + uint64(slot)},
-				Version:    pgalloc.PageVersionID{Allocator: testAllocator(5), Sequence: version},
-				Chunk:      logicalChunk,
-				Slot:       slot,
-			},
-			Data: bytes.Repeat([]byte{fill}, hostarch.PageSize),
-		}
-	}
-	source := []SourcePage{
-		pageAt(3, 30, 0x30),
-		pageAt(3, 31, 0x31),
-		pageAt(9, 90, 0x90),
-	}
-	objects, bindings, err := Assemble(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(objects) != 2 || len(bindings) != 3 {
-		t.Fatalf("Assemble produced %d objects and %d bindings, want 2 and 3", len(objects), len(bindings))
-	}
-	objectForVersion := make(map[uint64]ID)
-	for _, binding := range bindings {
-		objectForVersion[binding.Binding.Version.Sequence] = binding.Object
-	}
-	if objectForVersion[30] == objectForVersion[31] {
-		t.Fatal("two versions of one logical slot were packed into the same object")
-	}
-	if objectForVersion[90] != objectForVersion[30] {
-		t.Fatal("first-fit deterministic packing did not coalesce a non-conflicting slot")
-	}
-	for _, object := range objects {
-		if got := sha256ID(object.Data); got != object.ID {
-			t.Fatalf("object ID = %s, content hash = %s", object.ID, got)
-		}
-	}
-}
-
-func sha256ID(data []byte) ID {
-	return ID(sha256.Sum256(data))
-}
-
-func TestReadSnapshotBuildsObjectsWithoutAcknowledging(t *testing.T) {
-	file, err := os.CreateTemp("", "ttc-chunk-snapshot-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(file.Name()); err != nil {
-		t.Fatal(err)
-	}
-	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
-		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
-		DisableIMAWorkAround:    true,
-		DisableMemoryAccounting: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mf.Destroy()
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{
-		Kind: usage.Anonymous,
-		Mode: pgalloc.AllocateAndWritePopulate,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mf.DecRef(fr)
-	firstPage := bytes.Repeat([]byte{0x7b}, hostarch.PageSize)
-	dst, err := mf.MapInternal(fr, hostarch.Write)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, err := safemem.CopySeq(dst.TakeFirst64(hostarch.PageSize), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(firstPage))); err != nil || n != hostarch.PageSize {
-		t.Fatalf("writing source page: n=%d err=%v", n, err)
-	}
-	capture := pgalloc.NewMemoryRangeCapture()
-	if err := capture.Record(mf, fr); err != nil {
-		t.Fatal(err)
-	}
-	layout, err := capture.SnapshotLayout()
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	objects, bindings, err := ReadSnapshot(snapshot, layout.Bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(objects) != 1 || len(bindings) != 2 {
-		t.Fatalf("ReadSnapshot produced %d objects and %d bindings", len(objects), len(bindings))
-	}
-	decoded, err := Decode(objects[0].Data, &objects[0].ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(decoded.Pages) != 2 || decoded.Pages[0].Zero || !bytes.Equal(decoded.Pages[0].Data, firstPage) || !decoded.Pages[1].Zero {
-		t.Fatalf("decoded snapshot pages = %+v", decoded.Pages)
-	}
-	if stats := snapshot.Stats(); stats.PagesReleased != 0 || stats.PagesOutstanding != 2 {
-		t.Fatalf("ReadSnapshot acknowledged source pages: %+v", stats)
-	}
-}
-
 func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	allocator := testAllocator(11)
 	versionAllocator := testAllocator(22)
 	logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 9}
-	object := ID(sha256.Sum256([]byte("dense-object")))
+	object := graphCaptureObjectID(9)
 	stored := make([]StoredBinding, PagesPerChunk)
 	for i := range stored {
 		stored[i] = StoredBinding{
@@ -346,14 +233,14 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	if len(manifest.Runs) != 1 || manifest.Runs[0].Pages != PagesPerChunk {
 		t.Fatalf("dense chunk compacted to %+v, want one 256-page run", manifest.Runs)
 	}
-	data, id, err := EncodeManifest(manifest)
+	data, err := EncodeManifest(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(data) >= 512 {
 		t.Fatalf("one dense chunk manifest uses %d bytes, want less than 512", len(data))
 	}
-	decoded, err := DecodeManifest(data, &id)
+	decoded, err := DecodeManifest(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,8 +250,8 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	if expanded := decoded.Expand(); !reflect.DeepEqual(expanded, stored) {
 		t.Fatalf("expanded bindings differ from source")
 	}
-	data[len(data)-1] ^= 1
-	if _, err := DecodeManifest(data, &id); err == nil {
-		t.Fatal("corrupt manifest passed content-address verification")
+	data[0] ^= 1
+	if _, err := DecodeManifest(data); err == nil {
+		t.Fatal("invalid manifest header passed structural validation")
 	}
 }

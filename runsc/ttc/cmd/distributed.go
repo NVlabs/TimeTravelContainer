@@ -831,7 +831,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
-	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
+	encoded, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
@@ -1146,7 +1146,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated graph manifest: %w", err)
 	}
-	decodedGraphManifest, err := ttcchunk.DecodeManifest(graphManifest, nil)
+	decodedGraphManifest, err := ttcchunk.DecodeManifest(graphManifest)
 	if err != nil {
 		return selector{}, fmt.Errorf("decoding dehydrated graph manifest: %w", err)
 	}

@@ -208,7 +208,7 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 	if readErr != nil {
 		return nil, fmt.Errorf("reading graph memory manifest: %w", readErr)
 	}
-	manifest, decodeErr := ttcchunk.DecodeManifest(manifestData, nil)
+	manifest, decodeErr := ttcchunk.DecodeManifest(manifestData)
 	if decodeErr != nil {
 		return nil, fmt.Errorf("decoding graph memory manifest: %w", decodeErr)
 	}
@@ -425,7 +425,7 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		if err != nil {
 			return nil, fmt.Errorf("reading graph peer memory manifest: %w", err)
 		}
-		graphManifest, err := ttcchunk.DecodeManifest(manifestData, nil)
+		graphManifest, err := ttcchunk.DecodeManifest(manifestData)
 		if err != nil {
 			return nil, fmt.Errorf("decoding graph peer memory manifest: %w", err)
 		}

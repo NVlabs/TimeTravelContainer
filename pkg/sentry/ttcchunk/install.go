@@ -130,11 +130,11 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 			return InstallResult{}, fmt.Errorf("manifest resource %s does not match destination MemoryFile %s", run.ResourceID, mf.ResourceID())
 		}
 	}
-	// The manifest is content-addressed and contains all identity metadata
+	// The manifest contains all identity metadata
 	// required by InstallSparseChunks. Do not open object payloads here: for a
 	// cold remote restore that would eagerly fetch every 1 MiB chunk before the
-	// first guest instruction. Payload hashes and page contents are verified by
-	// ChunkReader when the corresponding resident range first faults in.
+	// first guest instruction. Page contents are loaded by ChunkReader when the
+	// corresponding resident range first faults in.
 	objects := make(map[ID]pgalloc.LogicalChunkID)
 	for _, run := range manifest.Runs {
 		if logical, ok := objects[run.Object]; ok {

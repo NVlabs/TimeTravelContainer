@@ -153,7 +153,7 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		if readErr != nil {
 			return nil, fmt.Errorf("reading distributed graph manifest: %w", readErr)
 		}
-		graphManifest, readErr = ttcchunk.DecodeManifest(encodedManifest, nil)
+		graphManifest, readErr = ttcchunk.DecodeManifest(encodedManifest)
 		if readErr != nil {
 			return nil, fmt.Errorf("decoding distributed graph manifest: %w", readErr)
 		}
@@ -750,7 +750,7 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 	if err != nil {
 		return nil, err
 	}
-	graphManifest, err = ttcchunk.DecodeManifest(encoded, nil)
+	graphManifest, err = ttcchunk.DecodeManifest(encoded)
 	if err != nil {
 		return nil, err
 	}

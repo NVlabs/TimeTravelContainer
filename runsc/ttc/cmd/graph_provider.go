@@ -47,7 +47,7 @@ func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, transact
 	if _, err := manifest.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	decoded, err := ttcchunk.DecodeManifest(encoded, nil)
+	decoded, err := ttcchunk.DecodeManifest(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("decoding distributed graph manifest: %w", err)
 	}

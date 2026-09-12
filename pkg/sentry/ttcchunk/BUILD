@@ -8,7 +8,6 @@ package(
 go_library(
     name = "ttcchunk",
     srcs = [
-        "assemble.go",
         "chunk.go",
         "graph.go",
         "graph_stream.go",
@@ -35,10 +34,8 @@ go_test(
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",
-        "//pkg/safemem",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
-        "//pkg/sentry/usage",
         "//pkg/ttcsnapshot",
     ],
 )

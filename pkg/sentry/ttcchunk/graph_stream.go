@@ -68,25 +68,11 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 			}
 			chunk.Pages = append(chunk.Pages, page)
 		}
-		encoded, _, err := Encode(chunk)
+		encoded, err := Encode(chunk)
 		if err != nil {
 			return err
 		}
 		if err := writeGraphCaptureObject(w, group.id, encoded); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeGraphCapture(w io.Writer, objects []Object, stored []StoredBinding) error {
-	if err := writeGraphCaptureHeader(w, stored, len(objects)); err != nil {
-		return err
-	}
-	objects = append([]Object(nil), objects...)
-	sort.Slice(objects, func(i, j int) bool { return bytes.Compare(objects[i].ID[:], objects[j].ID[:]) < 0 })
-	for _, object := range objects {
-		if err := writeGraphCaptureObject(w, object.ID, object.Data); err != nil {
 			return err
 		}
 	}
@@ -98,7 +84,7 @@ func writeGraphCaptureHeader(w io.Writer, stored []StoredBinding, objectCount in
 	if err != nil {
 		return err
 	}
-	manifestData, _, err := EncodeManifest(manifest)
+	manifestData, err := EncodeManifest(manifest)
 	if err != nil {
 		return err
 	}
@@ -269,7 +255,7 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 	if _, err := io.ReadFull(r, manifestData); err != nil {
 		return GraphImportResult{}, fmt.Errorf("reading graph memory manifest: %w", err)
 	}
-	manifest, err := DecodeManifest(manifestData, nil)
+	manifest, err := DecodeManifest(manifestData)
 	if err != nil {
 		return GraphImportResult{}, fmt.Errorf("decoding graph memory manifest: %w", err)
 	}
@@ -303,7 +289,7 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 		if _, err := io.ReadFull(r, encoded); err != nil {
 			return Chunk{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
 		}
-		chunk, err := Decode(encoded, nil)
+		chunk, err := Decode(encoded)
 		if err != nil {
 			return Chunk{}, fmt.Errorf("decoding graph memory object %s: %w", id, err)
 		}

@@ -12167,7 +12167,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		}
 		missing[objectID] = object
 	}
-	encoded, _, err := ttcchunk.EncodeManifest(adapted.Manifest)
+	encoded, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
 		return nil, err
 	}
