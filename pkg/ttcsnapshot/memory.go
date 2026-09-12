@@ -60,6 +60,38 @@ type MemoryPageDescriptor struct {
 	Identity MemoryPageIdentity
 }
 
+// ExistingMemoryPages resolves already-live immutable pages by the stable
+// guest logical/version identity captured by the memory manager. References
+// is deliberately part of the key: it is branch-scoped restore metadata, so
+// a page record with a different value may share bytes but cannot share the
+// same PageID. Missing identities are omitted from the result.
+func (s *Store) ExistingMemoryPages(pages []MemoryPageDescriptor) (map[uint8]PageID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[uint8]PageID, len(pages))
+	seen := make(map[uint8]struct{}, len(pages))
+	for _, descriptor := range pages {
+		if _, ok := seen[descriptor.Slot]; ok {
+			return nil, fmt.Errorf("memory page lookup repeats slot %d", descriptor.Slot)
+		}
+		seen[descriptor.Slot] = struct{}{}
+		identity := descriptor.Identity
+		if identity.LogicalAllocator == ([16]byte{}) || identity.VersionAllocator == ([16]byte{}) || identity.References == 0 {
+			return nil, fmt.Errorf("memory page lookup slot %d has incomplete identity", descriptor.Slot)
+		}
+		var selected ObjectID
+		for id := range s.memoryPages[identity] {
+			if selected.IsZero() || id.key() < selected.key() {
+				selected = id
+			}
+		}
+		if !selected.IsZero() {
+			result[descriptor.Slot] = PageID(selected)
+		}
+	}
+	return result, nil
+}
+
 func memorySlot(pageIndex uint64, level int) uint16 {
 	return uint16((pageIndex >> (8 * level)) & 0xff)
 }

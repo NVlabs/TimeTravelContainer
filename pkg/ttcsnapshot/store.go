@@ -38,7 +38,13 @@ import (
 const (
 	journalHeader        = "TTCSGJ5\n"
 	maxJournalRecordSize = 8 << 20
-	headFileName         = "graph.head"
+	// maxCollectObjectsPerTransaction bounds the fan-out of reference updates
+	// emitted by one GC transaction. An object may have maxObjectEdges
+	// children, so an arbitrarily large caller limit can exceed the journal
+	// record ceiling even though every individual object is valid. Callers
+	// already repeat Collect until it returns zero.
+	maxCollectObjectsPerTransaction = 128
+	headFileName                    = "graph.head"
 )
 
 type graphHead struct {
@@ -152,6 +158,12 @@ type Store struct {
 	externallyCoordinated bool
 	deferredResolvers     map[string]deferredResolver
 	deferredObjects       map[string]ObjectID
+	// memoryPages is a derived index over live graph-native page records. It
+	// makes repeated captures reuse the immutable PageID selected by the
+	// guest's stable logical/version identity instead of scanning the graph or
+	// storing the same 4-KiB page again. It is rebuilt from authoritative graph
+	// metadata on open and is never persisted separately.
+	memoryPages map[MemoryPageIdentity]map[ObjectID]struct{}
 	// deferredLoads serializes provider I/O for one foreign immutable object.
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
@@ -300,7 +312,7 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 	store := &Store{
 		dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated,
 		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[string]ObjectID),
-		deferredLoads: make(map[string]*deferredLoad),
+		deferredLoads: make(map[string]*deferredLoad), memoryPages: make(map[MemoryPageIdentity]map[ObjectID]struct{}),
 	}
 	if externallyCoordinated {
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
@@ -660,6 +672,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		_ = previous.Close()
 	}
 	s.rebuildDeferredObjectsLocked()
+	s.rebuildMemoryPagesLocked()
 	return nil
 }
 
@@ -669,6 +682,49 @@ func (s *Store) rebuildDeferredObjectsLocked() {
 		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
+	}
+}
+
+func (s *Store) rebuildMemoryPagesLocked() {
+	s.memoryPages = make(map[MemoryPageIdentity]map[ObjectID]struct{})
+	for _, object := range s.state.Objects {
+		s.indexMemoryPageLocked(object)
+	}
+}
+
+func memoryPageIdentity(object Object) (MemoryPageIdentity, bool) {
+	if object.ID.Kind != ObjectKindPage || object.State != ObjectLive || object.Refs == 0 || object.Deferred || len(object.Children) != 1 || object.Children[0].Slot != 0 || object.Children[0].Child.Kind != ObjectKindMemoryChunk {
+		return MemoryPageIdentity{}, false
+	}
+	_, identity, err := decodeMemoryPageRecord(object.Data)
+	if err != nil || identity.LogicalAllocator == ([16]byte{}) || identity.VersionAllocator == ([16]byte{}) || identity.References == 0 {
+		return MemoryPageIdentity{}, false
+	}
+	return identity, true
+}
+
+func (s *Store) indexMemoryPageLocked(object Object) {
+	identity, ok := memoryPageIdentity(object)
+	if !ok {
+		return
+	}
+	pages := s.memoryPages[identity]
+	if pages == nil {
+		pages = make(map[ObjectID]struct{})
+		s.memoryPages[identity] = pages
+	}
+	pages[object.ID] = struct{}{}
+}
+
+func (s *Store) unindexMemoryPageLocked(object Object) {
+	identity, ok := memoryPageIdentity(object)
+	if !ok {
+		return
+	}
+	pages := s.memoryPages[identity]
+	delete(pages, object.ID)
+	if len(pages) == 0 {
+		delete(s.memoryPages, identity)
 	}
 }
 
@@ -942,7 +998,7 @@ func (s *Store) replayJournalSuffix(repairTail bool) error {
 }
 
 func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
-	oldDeferred := make(map[string]Object, len(record.Ops))
+	oldObjects := make(map[string]Object, len(record.Ops)+len(record.References))
 	for _, op := range record.Ops {
 		if op.PutObject != nil || op.DeleteObject != "" {
 			key := op.DeleteObject
@@ -950,25 +1006,48 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 				key = op.PutObject.ID.key()
 			}
 			if object, ok := s.state.Objects[key]; ok {
-				oldDeferred[key] = object
+				oldObjects[key] = object
 			}
+		}
+	}
+	for _, reference := range record.References {
+		key := reference.Object.key()
+		if object, ok := s.state.Objects[key]; ok {
+			oldObjects[key] = object
 		}
 	}
 	if err := applyJournalRecord(&s.state, record); err != nil {
 		return err
 	}
-	for _, object := range oldDeferred {
+	for _, object := range oldObjects {
 		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			delete(s.deferredObjects, deferredObjectKey(object.SourceCatalog, object.SourceObject))
+		}
+		s.unindexMemoryPageLocked(object)
+	}
+	for key := range oldObjects {
+		object, ok := s.state.Objects[key]
+		if ok && object.SourceCatalog != "" && !object.SourceObject.IsZero() {
+			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
+		}
+		if ok {
+			s.indexMemoryPageLocked(object)
 		}
 	}
 	for _, op := range record.Ops {
 		if op.PutObject == nil {
 			continue
 		}
-		object, ok := s.state.Objects[op.PutObject.ID.key()]
+		key := op.PutObject.ID.key()
+		if _, existed := oldObjects[key]; existed {
+			continue
+		}
+		object, ok := s.state.Objects[key]
 		if ok && object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
+		}
+		if ok {
+			s.indexMemoryPageLocked(object)
 		}
 	}
 	return nil
@@ -1374,6 +1453,30 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		object := references[key]
 		referenceUpdates = append(referenceUpdates, journalReference{Object: object.ID, Refs: object.Refs, State: object.State})
 	}
+	// Preserve the old derived-index entries until the durable transaction has
+	// been applied successfully. Reference-only updates can move a Page object
+	// between live and reclaiming without a PutObject operation.
+	affectedObjects := make(map[string]Object, len(ops)+len(referenceKeys))
+	affectedKeys := make(map[string]struct{}, len(ops)+len(referenceKeys))
+	for _, op := range ops {
+		key := op.DeleteObject
+		if op.PutObject != nil {
+			key = op.PutObject.ID.key()
+		}
+		if key == "" {
+			continue
+		}
+		affectedKeys[key] = struct{}{}
+		if object, ok := s.state.Objects[key]; ok {
+			affectedObjects[key] = object
+		}
+	}
+	for _, key := range referenceKeys {
+		affectedKeys[key] = struct{}{}
+		if object, ok := s.state.Objects[key]; ok {
+			affectedObjects[key] = object
+		}
+	}
 	record := journalRecord{Version: formatVersion, Sequence: s.state.Sequence + 1, Ops: ops, References: referenceUpdates}
 	if err := validateJournalRecord(record); err != nil {
 		return err
@@ -1483,6 +1586,14 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 			return s.poisoned
 		}
 		s.state.Objects[key] = cloneObject(object)
+	}
+	for _, object := range affectedObjects {
+		s.unindexMemoryPageLocked(object)
+	}
+	for key := range affectedKeys {
+		if object, ok := s.state.Objects[key]; ok {
+			s.indexMemoryPageLocked(object)
+		}
 	}
 	return nil
 }
@@ -2615,6 +2726,9 @@ func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 func (s *Store) Collect(limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
+	}
+	if limit > maxCollectObjectsPerTransaction {
+		limit = maxCollectObjectsPerTransaction
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

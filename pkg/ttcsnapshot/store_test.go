@@ -1234,6 +1234,70 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	}
 }
 
+func TestExistingMemoryPagesRebuildAndReclaim(t *testing.T) {
+	directory := t.TempDir()
+	graphDirectory := filepath.Join(directory, "graph")
+	store, err := Open(graphDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 7, VersionAllocator: [16]byte{2}, VersionSequence: 11, References: 3}
+	descriptor := MemoryPageDescriptor{Slot: 5, Identity: identity}
+	reservation, err := store.ReserveMemoryChunkPages(origin, "reuse/build", []MemoryPageDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitMemoryChunk(reservation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetMemoryPages(origin, "reuse/root", map[uint64]ObjectID{99: ObjectID(reservation.Pages[5])}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(reservation.Pins); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor})
+	if err != nil || got[5] != reservation.Pages[5] {
+		t.Fatalf("ExistingMemoryPages()=(%v,%v), want slot 5=%s", got, err, ObjectID(reservation.Pages[5]))
+	}
+	differentReferences := descriptor
+	differentReferences.Identity.References++
+	if got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{differentReferences}); err != nil || len(got) != 0 {
+		t.Fatalf("ExistingMemoryPages(different references)=(%v,%v), want empty", got, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(graphDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err = store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor})
+	if err != nil || got[5] != reservation.Pages[5] {
+		t.Fatalf("ExistingMemoryPages() after reopen=(%v,%v), want slot 5=%s", got, err, ObjectID(reservation.Pages[5]))
+	}
+	if err := store.DeleteRoot("reuse/root"); err != nil {
+		t.Fatal(err)
+	}
+	for store.Stats().Objects != 0 {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			t.Fatalf("GC stalled with stats %+v", store.Stats())
+		}
+	}
+	if got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor}); err != nil || len(got) != 0 {
+		t.Fatalf("ExistingMemoryPages() after reclaim=(%v,%v), want empty", got, err)
+	}
+}
+
 func TestCloneRootsIsAtomicAndReferenceCounted(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {
@@ -1657,6 +1721,30 @@ func TestLocalDataStoreConcurrentReclaimIsIdempotent(t *testing.T) {
 	}
 	if removed != objects {
 		t.Fatalf("concurrent reclaim removed %d objects, want %d", removed, objects)
+	}
+}
+
+func TestCollectInternallyBatchesLargeRequests(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const objects = maxCollectObjectsPerTransaction + 1
+	for i := 0; i < objects; i++ {
+		pin := fmt.Sprintf("batch/%d", i)
+		if _, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeletePin(pin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := store.Collect(4096); err != nil || got != maxCollectObjectsPerTransaction {
+		t.Fatalf("Collect(4096)=(%d,%v), want internally bounded batch %d", got, err, maxCollectObjectsPerTransaction)
+	}
+	if got, err := store.Collect(4096); err != nil || got != 1 {
+		t.Fatalf("second Collect(4096)=(%d,%v), want (1,nil)", got, err)
 	}
 }
 

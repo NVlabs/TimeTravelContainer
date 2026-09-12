@@ -207,6 +207,76 @@ func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
 	}
 }
 
+func TestGraphImportReusesStableMemoryPages(t *testing.T) {
+	chunk := testChunk()
+	object := graphCaptureObjectID(1)
+	stored := make([]StoredBinding, 0, len(chunk.Pages))
+	for _, page := range chunk.Pages {
+		logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
+		stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
+			Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, Object: object})
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	firstOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := importSnapshotGraph(graph, data, firstOrigin, manifest, "reuse/first", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPages, err := graph.MemoryPages(first.Roots[0].Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunksBefore := 0
+	for _, object := range graph.Inspect().Objects {
+		if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+			chunksBefore++
+		}
+	}
+	secondOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := importSnapshotGraph(graph, data, secondOrigin, manifest, "reuse/second", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPages, err := graph.MemoryPages(second.Roots[0].Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(secondPages, firstPages) {
+		t.Fatalf("second capture pages=%v, want reused PageIDs %v", secondPages, firstPages)
+	}
+	chunksAfter := 0
+	for _, object := range graph.Inspect().Objects {
+		if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+			chunksAfter++
+		}
+	}
+	if chunksAfter != chunksBefore {
+		t.Fatalf("second capture stored %d chunks, want unchanged %d", chunksAfter, chunksBefore)
+	}
+}
+
 func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	allocator := testAllocator(11)
 	versionAllocator := testAllocator(22)

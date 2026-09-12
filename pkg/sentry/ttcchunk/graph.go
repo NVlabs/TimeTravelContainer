@@ -149,6 +149,16 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 		pages := make([]ttcsnapshot.MemoryPageDescriptor, 0, len(chunk.Pages))
 		raw := make([]byte, ttcsnapshot.MemoryChunkBytes)
 		for _, page := range chunk.Pages {
+			pageReferences, ok := references[page.Slot]
+			if !ok {
+				// A transport chunk may contain pages not selected by this
+				// manifest (for example, a filtered resource capture). They are
+				// not part of this graph import.
+				continue
+			}
+			if pageReferences == 0 {
+				return GraphImportResult{}, fmt.Errorf("memory chunk %s slot %d has zero references", use.id, page.Slot)
+			}
 			logicalSequence := chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)
 			pages = append(pages, ttcsnapshot.MemoryPageDescriptor{
 				Slot: page.Slot,
@@ -157,25 +167,48 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 					LogicalSequence:  logicalSequence,
 					VersionAllocator: [16]byte(page.Version.Allocator),
 					VersionSequence:  page.Version.Sequence,
-					References:       references[page.Slot],
+					References:       pageReferences,
 				},
 			})
 			if !page.Zero {
 				copy(raw[int(page.Slot)*hostarch.PageSize:], page.Data)
 			}
 		}
-		pinPrefix := fmt.Sprintf("%s/construction/%08x", rootPrefix, objectIndex)
-		reservation, err := graph.ReserveMemoryChunkPages(origin, pinPrefix, pages)
+		if len(pages) != len(references) {
+			return GraphImportResult{}, fmt.Errorf("memory chunk %s contains %d pages, manifest references %d slots", use.id, len(pages), len(references))
+		}
+		existing, err := graph.ExistingMemoryPages(pages)
 		if err != nil {
 			return GraphImportResult{}, err
 		}
-		chunkID := ttcsnapshot.ObjectID(reservation.Chunk)
-		if err := data.Install(chunkID, bytes.NewReader(raw), int64(len(raw))); err != nil {
-			return GraphImportResult{}, fmt.Errorf("installing graph memory chunk %s: %w", chunkID, err)
+		pageIDs := make(map[uint8]ttcsnapshot.PageID, len(pages))
+		for slot, page := range existing {
+			pageIDs[slot] = page
 		}
-		activePins = reservation.Pins
-		if err := graph.CommitMemoryChunk(reservation); err != nil {
-			return GraphImportResult{}, fmt.Errorf("committing graph memory chunk %s: %w", chunkID, err)
+		missing := make([]ttcsnapshot.MemoryPageDescriptor, 0, len(pages)-len(existing))
+		for _, page := range pages {
+			if _, ok := existing[page.Slot]; !ok {
+				missing = append(missing, page)
+			}
+		}
+		var reservation ttcsnapshot.MemoryChunkReservation
+		if len(missing) != 0 {
+			pinPrefix := fmt.Sprintf("%s/construction/%08x", rootPrefix, objectIndex)
+			reservation, err = graph.ReserveMemoryChunkPages(origin, pinPrefix, missing)
+			if err != nil {
+				return GraphImportResult{}, err
+			}
+			chunkID := ttcsnapshot.ObjectID(reservation.Chunk)
+			if err := data.Install(chunkID, bytes.NewReader(raw), int64(len(raw))); err != nil {
+				return GraphImportResult{}, fmt.Errorf("installing graph memory chunk %s: %w", chunkID, err)
+			}
+			activePins = reservation.Pins
+			if err := graph.CommitMemoryChunk(reservation); err != nil {
+				return GraphImportResult{}, fmt.Errorf("committing graph memory chunk %s: %w", chunkID, err)
+			}
+			for slot, page := range reservation.Pages {
+				pageIDs[slot] = page
+			}
 		}
 		rootPages := make(map[string]map[uint64]ttcsnapshot.ObjectID)
 		for _, run := range use.runs {
@@ -185,7 +218,7 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 			}
 			for delta := uint16(0); delta < run.Pages; delta++ {
 				slot := uint8(uint16(run.FirstSlot) + delta)
-				page, ok := reservation.Pages[slot]
+				page, ok := pageIDs[slot]
 				if !ok {
 					return GraphImportResult{}, fmt.Errorf("manifest references missing slot %d in chunk %s", slot, use.id)
 				}
@@ -218,8 +251,10 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 				return GraphImportResult{}, err
 			}
 		}
-		if err := graph.DeletePins(reservation.Pins); err != nil {
-			return GraphImportResult{}, fmt.Errorf("releasing memory construction pins: %w", err)
+		if len(reservation.Pins) != 0 {
+			if err := graph.DeletePins(reservation.Pins); err != nil {
+				return GraphImportResult{}, fmt.Errorf("releasing memory construction pins: %w", err)
+			}
 		}
 		activePins = nil
 	}
