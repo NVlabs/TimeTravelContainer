@@ -132,6 +132,62 @@ func TestRemoteDescriptorFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	finishTestRemote(t, target, serverErr)
 }
 
+func TestMaterializationHookMayEnterRepositoryMutation(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("remote data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	unregister := target.RegisterMaterializationHook(func(string) {
+		// Runtime hooks acquire their own file locks before repository mutation.
+		// Entering withLock here is a compact regression model for that ordering.
+		if err := target.withLock(func() error { return nil }); err != nil {
+			t.Errorf("hook repository mutation: %v", err)
+		}
+	})
+	defer unregister()
+	done := make(chan error, 1)
+	go func() { done <- target.MaterializeRemoteObjects() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote materialization deadlocked with its runtime invalidation hook")
+	}
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source stream remained open after target materialization")
+	}
+}
+
 func TestRemoteDescriptorReadsCatalogAndFilesFromSharedPacks(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

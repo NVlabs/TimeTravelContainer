@@ -386,11 +386,13 @@ func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
 // share the same catalog origin. Once complete, sealing that origin is safe:
 // all of its objects are immutable and no branch needs further expansion.
 func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.SnapshotID, error) {
+	r.remoteLifecycleMu.Lock()
+	defer r.remoteLifecycleMu.Unlock()
+	if err := r.materializeRemoteObjects(); err != nil {
+		return nil, fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
+	}
 	var origins []ttcsnapshot.SnapshotID
 	err := r.withLock(func() error {
-		if err := r.materializeRemoteObjectsLocked(); err != nil {
-			return fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
-		}
 		branch, err := r.readBranch(branchID)
 		if err != nil {
 			return err

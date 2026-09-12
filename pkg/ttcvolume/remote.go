@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -525,20 +526,70 @@ func (r *Repository) BranchRemoteSourceObjects(branchID string) (map[string]int6
 // MaterializeRemoteObjects fetches all still-remote objects for a clean
 // source handoff or local durable publication.
 func (r *Repository) MaterializeRemoteObjects() error {
-	// The cross-instance repository lock is also a guest-mutation fence. A
-	// running target may otherwise path-copy an unexpanded deferred child after
-	// the scan below but before its resolver is detached, leaving an apparently
-	// independent branch that still needs the source.
-	return r.withLock(r.materializeRemoteObjectsLocked)
-}
-
-func (r *Repository) materializeRemoteObjectsLocked() error {
 	// Multiple distributed transactions in one physical Sentry share this
 	// repository. Their eager drains may arrive concurrently, but detaching
 	// remote catalogs is a repository-wide barrier and must execute exactly one
 	// at a time.
 	r.remoteLifecycleMu.Lock()
 	defer r.remoteLifecycleMu.Unlock()
+	return r.materializeRemoteObjects()
+}
+
+// materializeRemoteObjects implements MaterializeRemoteObjects while the
+// caller retains remoteLifecycleMu across a larger lifecycle transaction.
+//
+// Preconditions: remoteLifecycleMu is held.
+func (r *Repository) materializeRemoteObjects() error {
+	for {
+		var work []remoteMaterialization
+		var detached []*remoteObjectClient
+		if err := r.withLock(func() error {
+			var err error
+			work, detached, err = r.materializeRemoteObjectsPassLocked()
+			return err
+		}); err != nil {
+			return err
+		}
+		if len(work) != 0 {
+			// Runtime materialization hooks acquire file and mapping locks. Guest
+			// writes acquire those locks before entering repository mutation, so
+			// invoking a hook while withLock is held would invert the order and
+			// deadlock. Immutable bytes may be fetched and atomically installed
+			// outside the mutation fence; the next pass revalidates the graph.
+			for _, item := range work {
+				if err := item.remote.ensure(item.object, item.size, 0, item.size); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		var closeErr error
+		for _, remote := range detached {
+			// A reader may have selected this client immediately before it was
+			// removed from remoteByObject. Wait for every such pinned selection
+			// before closing the stream; remoteMu prevents a new user from being
+			// added after the detach pass.
+			remote.users.Wait()
+			remote.mu.Lock()
+			closeErr = errors.Join(closeErr, remote.conn.Close())
+			remote.mu.Unlock()
+		}
+		return closeErr
+	}
+}
+
+type remoteMaterialization struct {
+	remote *remoteObjectClient
+	object string
+	size   int64
+}
+
+// materializeRemoteObjectsPassLocked expands every deferred namespace and
+// returns unresolved bulk objects. If none remain, it detaches every provider
+// while the repository mutation fence is still held.
+//
+// Preconditions: Repository.withLock and remoteLifecycleMu are held.
+func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterialization, []*remoteObjectClient, error) {
 	// Resolve every still-foreign namespace before detaching its provider.
 	// This is an explicit independence barrier and is allowed to be O(total
 	// metadata); ordinary remote start and pathname access remain lazy.
@@ -556,19 +607,19 @@ func (r *Repository) materializeRemoteObjectsLocked() error {
 		// bounded metadata tail directly and construct the same authoritative
 		// graph-root view while the mutation fence remains held.
 		if err := r.flushMetadataBatchLocked(branch); err != nil {
-			return err
+			return nil, nil, err
 		}
 		branchRecord, err := r.readBranch(branch)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		root, ok := r.graph.Root(graphRootName(branch))
 		if !ok {
-			return fmt.Errorf("branch %q has no snapshot graph root", branch)
+			return nil, nil, fmt.Errorf("branch %q has no snapshot graph root", branch)
 		}
 		branchRecord.Root = root.String()
 		if _, err := r.branchObjects(branchRecord); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 	r.remoteMu.Lock()
@@ -578,25 +629,33 @@ func (r *Repository) materializeRemoteObjectsLocked() error {
 	}
 	r.remoteMu.Unlock()
 	if len(remotes) == 0 {
-		return nil
+		return nil, nil, nil
 	}
+	var work []remoteMaterialization
 	for _, remote := range remotes {
 		// A newer branch may have replaced this client's source attachment. Do
 		// not contact a stale connection for it; the current owner below will
 		// materialize the same immutable bytes.
+		remote.mu.Lock()
 		r.remoteMu.Lock()
-		owned := make(map[string]int64)
 		for object, size := range remote.objects {
-			if r.remoteByObject[object] == remote {
-				owned[object] = size
+			if r.remoteByObject[object] == remote && !remote.complete[object] {
+				work = append(work, remoteMaterialization{remote: remote, object: object, size: size})
 			}
 		}
 		r.remoteMu.Unlock()
-		for object, size := range owned {
-			if err := remote.ensure(object, size, 0, size); err != nil {
-				return err
+		remote.mu.Unlock()
+	}
+	if len(work) != 0 {
+		sort.Slice(work, func(i, j int) bool {
+			if work[i].remote.branchID != work[j].remote.branchID {
+				return work[i].remote.branchID < work[j].remote.branchID
 			}
-		}
+			return work[i].object < work[j].object
+		})
+		return work, nil, nil
+	}
+	for _, remote := range remotes {
 		// Serialize behind any reader that obtained remote before the final
 		// extent completed. Once detached, all future reads are local.
 		remote.mu.Lock()
@@ -614,20 +673,9 @@ func (r *Repository) materializeRemoteObjectsLocked() error {
 			}
 		}
 		r.remoteMu.Unlock()
-		// A reader may have selected this client immediately before it was
-		// removed from remoteByObject. Wait for every such pinned selection
-		// before closing the stream; c.mu alone cannot distinguish a queued
-		// pre-detach reader from a new use of an already closed connection.
 		remote.mu.Unlock()
-		remote.users.Wait()
-		remote.mu.Lock()
-		err := remote.conn.Close()
-		remote.mu.Unlock()
-		if err != nil {
-			return err
-		}
 	}
-	return nil
+	return nil, remotes, nil
 }
 
 func (c *remoteObjectClient) pullMetadata(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
