@@ -113,9 +113,17 @@ those origins through the cluster state machine is the next phase-5 gate.
 The common graph and repository APIs now accept exact externally allocated
 working origins during initial repository creation and atomic seal/fork. They
 reject zero, repeated, or already-present IDs and advance the local high-water
-mark without inventing an intermediate ID. Existing standalone entry points
-retain local monotonic allocation. Passing Raft allocations through every
-container lifecycle call remains the next integration milestone.
+mark without inventing an intermediate ID. Cluster creation, live fork, batch
+fork, managed-volume snapshots, remote fork, migration, target import,
+dehydrated fork, and publication capture all reserve their filesystem origins
+through the single Raft allocator before entering the Sentry/repository
+transaction. Failed, unused reservations are explicitly abandoned without ID
+reuse. Existing standalone entry points retain local monotonic allocation.
+Focused graph/kernel/boot/command tests, an eight-way standalone batch fork,
+the A-to-B-to-A-to-B multihop test, and the elastic migration/quarantine/drain
+lifecycle pass with this origin transport. The remaining filesystem gate is
+to publish sealed origins into shared graph packs and remove the flattened
+cold-pack/storage-generation layer.
 
 Graph roots are now the sole standalone dehydration source, and the Sentry
 streams a bounded capture directly to the daemon that owns the graph. No

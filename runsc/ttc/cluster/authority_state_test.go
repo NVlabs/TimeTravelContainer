@@ -178,6 +178,15 @@ func TestAuthoritySnapshotOriginAllocationAndPublish(t *testing.T) {
 	if provider := state.VolatileOrigins[1]; provider.NodeID != "node-a" {
 		t.Fatal("publishing one origin changed another")
 	}
+	abandon := AuthoritySnapshotPayload{NodeID: "node-a", Incarnation: "incarnation-a", SnapshotID: 3}
+	applyAuthorityForTest(t, state, "abandon-snapshot-3", at.Add(2*time.Second), AuthoritySnapshotAbandon, abandon)
+	applyAuthorityForTest(t, state, "abandon-snapshot-3-retry", at.Add(3*time.Second), AuthoritySnapshotAbandon, abandon)
+	if _, ok := state.VolatileOrigins[3]; ok {
+		t.Fatal("abandoned snapshot retained a volatile provider")
+	}
+	if state.NextSnapshotID != 4 {
+		t.Fatalf("abandonment reused or rewound snapshot IDs: next=%d", state.NextSnapshotID)
+	}
 }
 
 func TestAuthoritySharedGCLeaseFencesGenerations(t *testing.T) {

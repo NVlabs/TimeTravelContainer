@@ -5629,6 +5629,8 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		return err
 	}
 	captureComplete := false
+	originsCommitted := false
+	finishFilesystemOrigins := func(bool) error { return nil }
 	var forks []*ttcvolume.ForkTransaction
 	var repositories []*ttcvolume.Repository
 	memoryControlCaptured := false
@@ -5645,6 +5647,9 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 			if memoryControlCaptured {
 				cause = errors.Join(cause, os.RemoveAll(publicationMemoryControlPath(b.activeDataRoot(), captureBranch)))
 			}
+		}
+		if !originsCommitted {
+			cause = errors.Join(cause, finishFilesystemOrigins(false))
 		}
 		cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, generation))
 		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "local", "", time.Time{})
@@ -5670,6 +5675,15 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	if err != nil {
 		return rollback(err)
 	}
+	assignments, finishOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
+	finishFilesystemOrigins = finishOrigins
+	if err != nil {
+		return rollback(err)
+	}
+	originsByRepository := make(map[string][]uint64, len(assignments))
+	for _, assignment := range assignments {
+		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
+	}
 	seen := make(map[string]struct{})
 	for _, config := range configs {
 		path := filepath.Clean(config.Path)
@@ -5682,7 +5696,13 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 			return rollback(err)
 		}
 		repositories = append(repositories, repository)
-		fork, err := repository.BeginFork(repositoryPhysicalBranch(config, filesystemBranch), captureBranch)
+		var fork *ttcvolume.ForkTransaction
+		if origins := originsByRepository[repository.Info().ID]; len(origins) != 0 {
+			fork, err = repository.BeginForkWithOrigins(repositoryPhysicalBranch(config, filesystemBranch), captureBranch,
+				ttcsnapshot.SnapshotID(origins[0]), ttcsnapshot.SnapshotID(origins[1]))
+		} else {
+			fork, err = repository.BeginFork(repositoryPhysicalBranch(config, filesystemBranch), captureBranch)
+		}
 		if err != nil {
 			return rollback(fmt.Errorf("sealing repository %q: %w", config.Source, err))
 		}
@@ -5703,11 +5723,21 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		}
 		memoryControlCaptured = true
 	}
+	committedForks := 0
 	for _, fork := range forks {
 		if err := fork.Commit(); err != nil {
+			if committedForks != 0 {
+				originsCommitted = true
+				_ = finishFilesystemOrigins(true)
+			}
 			return rollback(err)
 		}
+		committedForks++
 	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return rollback(err)
+	}
+	originsCommitted = true
 	captureComplete = true
 	if err := b.publicationQueue.Activate(target.container, target.branch, generation); err != nil {
 		// The committed hidden roots are immutable and safe for retry. Keep the
@@ -6190,8 +6220,12 @@ func (b *runtimeBackend) initialConsoleSize(enabled bool) (*specs.Box, error) {
 	return &specs.Box{Height: uint(rows), Width: uint(cols)}, nil
 }
 
-func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volumeID, childBranch string) error {
-	_, err := b.command("timetravel", ownerContainer, "filesystem-snapshot", ownerBranch, volumeID, childBranch)
+func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volumeID, childBranch string, sourceWorking, childWorking ttcsnapshot.SnapshotID) error {
+	args := []string{"timetravel", ownerContainer, "filesystem-snapshot", ownerBranch, volumeID, childBranch}
+	if sourceWorking != 0 || childWorking != 0 {
+		args = append(args, strconv.FormatUint(uint64(sourceWorking), 10), strconv.FormatUint(uint64(childWorking), 10))
+	}
+	_, err := b.command(args...)
 	return err
 }
 
@@ -6201,6 +6235,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, err
 	}
 	store := b.containerStore()
+	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6236,27 +6271,31 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:             request.reference,
-		PullPolicy:            request.pullPolicy,
-		LogDriver:             request.logDriver,
-		LogOptions:            request.logOptions,
-		ConsoleLogMaxBytes:    request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles:    request.consoleLogMaxFiles,
-		OpenStdin:             request.interactive,
-		AutoRemove:            request.autoRemove,
-		StopTimeout:           &request.stopTimeout,
-		NetworkNAT:            request.networkNAT,
-		NetworkIP:             request.networkIP,
-		NetworkMAC:            request.networkMAC,
-		PublishedPorts:        request.publishedPorts,
-		WaiveLiveFork:         !request.liveForkEligible,
-		LiveForkWaiver:        request.liveForkWaiver,
-		Progress:              b.imageProgress(),
-		VolumeCopyMode:        b.volumeCopyMode,
-		NodeID:                b.nodeID,
-		SnapshotManagedVolume: b.snapshotManagedVolume,
+		Reference:               request.reference,
+		PullPolicy:              request.pullPolicy,
+		LogDriver:               request.logDriver,
+		LogOptions:              request.logOptions,
+		ConsoleLogMaxBytes:      request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles:      request.consoleLogMaxFiles,
+		OpenStdin:               request.interactive,
+		AutoRemove:              request.autoRemove,
+		StopTimeout:             &request.stopTimeout,
+		NetworkNAT:              request.networkNAT,
+		NetworkIP:               request.networkIP,
+		NetworkMAC:              request.networkMAC,
+		PublishedPorts:          request.publishedPorts,
+		WaiveLiveFork:           !request.liveForkEligible,
+		LiveForkWaiver:          request.liveForkWaiver,
+		Progress:                b.imageProgress(),
+		VolumeCopyMode:          b.volumeCopyMode,
+		NodeID:                  b.nodeID,
+		AllocateSnapshotOrigins: filesystemOrigins,
+		SnapshotManagedVolume:   b.snapshotManagedVolume,
 	})
 	if err != nil {
+		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
 		return containerRunResult{}, err
 	}
 	id := prepared.Container.ID
@@ -6277,6 +6316,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		return "", err
 	}
 	store := b.containerStore()
+	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6312,27 +6352,31 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:             request.reference,
-		PullPolicy:            request.pullPolicy,
-		LogDriver:             request.logDriver,
-		LogOptions:            request.logOptions,
-		ConsoleLogMaxBytes:    request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles:    request.consoleLogMaxFiles,
-		OpenStdin:             request.interactive,
-		AutoRemove:            request.autoRemove,
-		StopTimeout:           &request.stopTimeout,
-		NetworkNAT:            request.networkNAT,
-		NetworkIP:             request.networkIP,
-		NetworkMAC:            request.networkMAC,
-		PublishedPorts:        request.publishedPorts,
-		WaiveLiveFork:         !request.liveForkEligible,
-		LiveForkWaiver:        request.liveForkWaiver,
-		Progress:              b.imageProgress(),
-		VolumeCopyMode:        b.volumeCopyMode,
-		NodeID:                b.nodeID,
-		SnapshotManagedVolume: b.snapshotManagedVolume,
+		Reference:               request.reference,
+		PullPolicy:              request.pullPolicy,
+		LogDriver:               request.logDriver,
+		LogOptions:              request.logOptions,
+		ConsoleLogMaxBytes:      request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles:      request.consoleLogMaxFiles,
+		OpenStdin:               request.interactive,
+		AutoRemove:              request.autoRemove,
+		StopTimeout:             &request.stopTimeout,
+		NetworkNAT:              request.networkNAT,
+		NetworkIP:               request.networkIP,
+		NetworkMAC:              request.networkMAC,
+		PublishedPorts:          request.publishedPorts,
+		WaiveLiveFork:           !request.liveForkEligible,
+		LiveForkWaiver:          request.liveForkWaiver,
+		Progress:                b.imageProgress(),
+		VolumeCopyMode:          b.volumeCopyMode,
+		NodeID:                  b.nodeID,
+		AllocateSnapshotOrigins: filesystemOrigins,
+		SnapshotManagedVolume:   b.snapshotManagedVolume,
 	})
 	if err != nil {
+		return "", errors.Join(err, finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
 		return "", err
 	}
 	return prepared.Container.ID, nil
@@ -10068,8 +10112,29 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	}
 	args = append(args, source.container, "fork")
 	args = append(args, destinations...)
-	output, err := b.command(args...)
+	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(containerInfo.ID, len(destinations))
 	if err != nil {
+		return nil, err
+	}
+	var output []byte
+	if len(filesystemOrigins) == 0 {
+		output, err = b.command(args...)
+	} else {
+		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+		if pipeErr != nil {
+			return nil, errors.Join(pipeErr, finishFilesystemOrigins(false))
+		}
+		args = append([]string{"timetravel", "--filesystem-origins-fd=3"}, args[1:]...)
+		output, err = b.commandWithFiles([]*os.File{originsReader}, args...)
+		closeErr := originsReader.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return nil, errors.Join(err, finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
 		return nil, err
 	}
 	infos := make([]runscBranchInfo, 0, len(destinations))
@@ -10278,7 +10343,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		branch.MemoryRoots = graphRoots
 		branch.MemoryRootObjects = append([]string(nil), sourceBranch.MemoryRootObjects...)
 		children[len(children)-1].branch = branch
-		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
+		transactions, finishFilesystemOrigins, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
 			return nil, fmt.Errorf("forking filesystems for %s@%s: %w", source.container, destination, err)
 		}
@@ -10287,8 +10352,11 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				for abortIndex := len(transactions) - 1; abortIndex > index; abortIndex-- {
 					_ = transactions[abortIndex].abort()
 				}
-				return nil, fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err)
+				return nil, errors.Join(fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err), finishFilesystemOrigins(false))
 			}
+		}
+		if err := finishFilesystemOrigins(true); err != nil {
+			return nil, fmt.Errorf("committing filesystem origins for %s@%s: %w", source.container, destination, err)
 		}
 		childCapture := capture
 		childCapture.FilesystemBranch = filesystemBranch
@@ -11036,6 +11104,128 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, 
 		return 0, "", fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
 	}
 	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
+}
+
+// newFilesystemOriginScope returns a bundle allocator and a completion
+// function. A failed bundle preparation abandons every otherwise-unreachable
+// Raft allocation without reusing its ID; success transfers those origins to
+// the created repositories.
+func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot.SnapshotID, error), func(bool) error) {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil, func(bool) error { return nil }
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	incarnation := b.distributedSource.incarnation
+	var allocated []ttcsnapshot.SnapshotID
+	allocate := func(count uint32) ([]ttcsnapshot.SnapshotID, error) {
+		if node == "" || incarnation == "" {
+			return nil, errors.New("cluster filesystem snapshot allocation lacks node incarnation")
+		}
+		allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, incarnation, count)
+		if err != nil {
+			return nil, fmt.Errorf("allocating Raft filesystem origins: %w", err)
+		}
+		if allocation.Count != count || allocation.First == 0 {
+			return nil, fmt.Errorf("raft returned invalid filesystem snapshot allocation %+v", allocation)
+		}
+		origins := make([]ttcsnapshot.SnapshotID, count)
+		for index := range origins {
+			origins[index] = ttcsnapshot.SnapshotID(allocation.First + uint64(index))
+		}
+		allocated = append(allocated, origins...)
+		return origins, nil
+	}
+	finish := func(committed bool) error {
+		if committed {
+			allocated = nil
+			return nil
+		}
+		var result error
+		for _, origin := range allocated {
+			if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, incarnation, uint64(origin)); err != nil {
+				result = errors.Join(result, fmt.Errorf("abandoning filesystem origin %d: %w", origin, err))
+			}
+		}
+		allocated = nil
+		return result
+	}
+	return allocate, finish
+}
+
+// allocateFilesystemForkOrigins reserves the exact working origins consumed
+// by one Sentry filesystem fork. Each repository consumes a source/child pair
+// for every destination; the assignment is keyed by the repository identity
+// embedded in the guest mount, never by a host path.
+func (b *runtimeBackend) allocateFilesystemForkOrigins(containerID string, childCount int) ([]boot.FilesystemOriginAssignment, func(bool) error, error) {
+	finishNoop := func(bool) error { return nil }
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil, finishNoop, nil
+	}
+	if childCount <= 0 || childCount > 2048 {
+		return nil, finishNoop, fmt.Errorf("invalid filesystem fork fanout %d", childCount)
+	}
+	spec, err := b.containerStore().LoadSpec(containerID)
+	if err != nil {
+		return nil, finishNoop, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, finishNoop, err
+	}
+	allocate, finish := b.newFilesystemOriginScope()
+	assignments := make([]boot.FilesystemOriginAssignment, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return nil, finish, errors.Join(err, finish(false))
+		}
+		repositoryID := repository.Info().ID
+		closeErr := repository.Close()
+		if closeErr != nil {
+			return nil, finish, errors.Join(closeErr, finish(false))
+		}
+		if _, ok := seen[repositoryID]; ok {
+			continue
+		}
+		seen[repositoryID] = struct{}{}
+		origins, err := allocate(uint32(2 * childCount))
+		if err != nil {
+			return nil, finish, errors.Join(err, finish(false))
+		}
+		encoded := make([]uint64, len(origins))
+		for i, origin := range origins {
+			encoded[i] = uint64(origin)
+		}
+		assignments = append(assignments, boot.FilesystemOriginAssignment{
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repositoryID},
+			Origins:    encoded,
+		})
+	}
+	sort.Slice(assignments, func(i, j int) bool {
+		return assignments[i].ResourceID.Path < assignments[j].ResourceID.Path
+	})
+	return assignments, finish, nil
+}
+
+func filesystemOriginAssignmentsPipe(assignments []boot.FilesystemOriginAssignment) (*os.File, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(assignments)
+	if err == nil {
+		_, err = writer.Write(encoded)
+	}
+	closeErr := writer.Close()
+	if err != nil || closeErr != nil {
+		reader.Close()
+		return nil, errors.Join(err, closeErr)
+	}
+	return reader, nil
 }
 
 // retireFailedGraphSnapshot makes a Raft allocation resolve to a committed

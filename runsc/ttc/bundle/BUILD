@@ -16,6 +16,7 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/log",
         "//pkg/ttcpack",
+        "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/specutils",
         "//runsc/ttc/console",

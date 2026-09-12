@@ -75,6 +75,7 @@ const (
 	AuthorityBranchInherit         AuthorityCommandKind = "branch-inherit-dependencies"
 	AuthorityBranchRemoveCorrupted AuthorityCommandKind = "branch-remove-corrupted"
 	AuthoritySnapshotAllocate      AuthorityCommandKind = "snapshot-allocate"
+	AuthoritySnapshotAbandon       AuthorityCommandKind = "snapshot-abandon"
 	AuthoritySnapshotPublish       AuthorityCommandKind = "snapshot-publish"
 	AuthoritySharedGCAcquire       AuthorityCommandKind = "shared-gc-acquire"
 	AuthoritySharedGCRenew         AuthorityCommandKind = "shared-gc-renew"
@@ -444,7 +445,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
-	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
+	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
 	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
 		// SharedGC is copied by value with AuthorityState.
@@ -620,7 +621,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyPublication(command)
 	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchRemoveCorrupted:
 		return s.applyBranch(command)
-	case AuthoritySnapshotAllocate, AuthoritySnapshotPublish:
+	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		return s.applySnapshot(command)
 	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease, AuthoritySharedGCRetire:
 		return s.applySharedGC(command)
@@ -729,6 +730,19 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 		}
 		s.NextSnapshotID += uint64(p.Count)
 		return authorityValue(allocation)
+	case AuthoritySnapshotAbandon:
+		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
+			return nil, errors.New("invalid snapshot abandonment request")
+		}
+		provider, ok := s.VolatileOrigins[p.SnapshotID]
+		if !ok {
+			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+		}
+		if provider.NodeID != p.NodeID {
+			return nil, errors.New("snapshot origin is owned by another provider")
+		}
+		delete(s.VolatileOrigins, p.SnapshotID)
+		return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
 	case AuthoritySnapshotPublish:
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
 			return nil, errors.New("invalid snapshot publication request")

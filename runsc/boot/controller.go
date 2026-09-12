@@ -793,9 +793,11 @@ type BranchCheckpointArgs struct {
 // FilesystemBranchSnapshotArgs selects a live branch, one persistent
 // filesystem resource, and the new repository branch pointer to create.
 type FilesystemBranchSnapshotArgs struct {
-	BranchID   string
-	ResourceID checkpoint.ResourceID
-	Child      string
+	BranchID      string
+	ResourceID    checkpoint.ResourceID
+	Child         string
+	SourceWorking uint64
+	ChildWorking  uint64
 }
 
 // Restore loads a container from a statefile.
@@ -1372,7 +1374,7 @@ func (cm *containerManager) SnapshotFilesystemBranch(args *FilesystemBranchSnaps
 	if args == nil {
 		return errors.New("missing filesystem snapshot arguments")
 	}
-	return cm.l.family.SnapshotFilesystemBranch(args.BranchID, args.ResourceID, args.Child)
+	return cm.l.family.SnapshotFilesystemBranch(args.BranchID, args.ResourceID, args.Child, args.SourceWorking, args.ChildWorking)
 }
 
 // SetBranchQuarantine changes one branch's external-connectivity bit.

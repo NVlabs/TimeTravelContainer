@@ -221,6 +221,15 @@ func (c *RaftCatalog) AllocateSnapshotOrigins(node, incarnation string, count ui
 	return *value, nil
 }
 
+// AbandonSnapshotOrigin removes an unused allocation from the volatile
+// provider directory. IDs remain below NextSnapshotID and are never reused;
+// this operation is only for rolling back work that published no root.
+func (c *RaftCatalog) AbandonSnapshotOrigin(node, incarnation string, snapshotID uint64) error {
+	return applyRaftNoValue(c, time.Now().UTC(), AuthoritySnapshotAbandon, AuthoritySnapshotPayload{
+		NodeID: node, Incarnation: incarnation, SnapshotID: snapshotID,
+	})
+}
+
 // PublishSnapshotOrigin commits the final provider-to-shared authority switch.
 // The caller must durably install and validate the shared manifest first.
 func (c *RaftCatalog) PublishSnapshotOrigin(node, incarnation string, snapshotID uint64) error {

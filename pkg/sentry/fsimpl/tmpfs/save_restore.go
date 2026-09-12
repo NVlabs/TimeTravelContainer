@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
@@ -127,8 +128,20 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			if transactions == nil {
 				return fmt.Errorf("CtxLiveForkTransactions was not provided for TTC volume")
 			}
-			for _, childBranch := range childBranches {
-				tx, err := fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+			originPlan := vfs.LiveForkFilesystemOriginsFromContext(ctx)
+			origins, clustered := originPlan[fs.diskVolume.ResourceID]
+			if clustered && len(origins) != 2*len(childBranches) {
+				return fmt.Errorf("TTC volume %q has %d clustered origins, want %d", fs.diskVolume.ResourceID, len(origins), 2*len(childBranches))
+			}
+			for index, childBranch := range childBranches {
+				var tx *ttcvolume.ForkTransaction
+				var err error
+				if clustered {
+					tx, err = fs.diskVolume.Repository.BeginForkWithOrigins(fs.diskVolume.Branch, childBranch,
+						ttcsnapshot.SnapshotID(origins[2*index]), ttcsnapshot.SnapshotID(origins[2*index+1]))
+				} else {
+					tx, err = fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+				}
 				if err != nil {
 					return fmt.Errorf("forking TTC volume %q as branch %q: %w", fs.diskVolume.ResourceID, childBranch, err)
 				}

@@ -112,7 +112,38 @@ type ForkBranchArgs struct {
 	// connections are left up rather than reset, so nothing inside notices it
 	// is a copy; what it writes is accepted and dropped and what it reads never
 	// arrives, so nothing outside notices it exists.
-	Quarantine bool
+	Quarantine        bool
+	FilesystemOrigins []FilesystemOriginAssignment
+}
+
+// FilesystemOriginAssignment is the JSON/uRPC-safe form of one clustered
+// persistent-filesystem origin plan.
+type FilesystemOriginAssignment struct {
+	ResourceID checkpoint.ResourceID `json:"resource_id"`
+	Origins    []uint64              `json:"origins"`
+}
+
+func filesystemOriginPlan(assignments []FilesystemOriginAssignment) (vfs.LiveForkFilesystemOrigins, error) {
+	if len(assignments) == 0 {
+		return nil, nil
+	}
+	plan := make(vfs.LiveForkFilesystemOrigins, len(assignments))
+	for _, assignment := range assignments {
+		if !assignment.ResourceID.Ok() || len(assignment.Origins) == 0 {
+			return nil, errors.New("filesystem origin assignment is empty")
+		}
+		if _, exists := plan[assignment.ResourceID]; exists {
+			return nil, fmt.Errorf("filesystem origin assignment repeats %q", assignment.ResourceID)
+		}
+		origins := append([]uint64(nil), assignment.Origins...)
+		for _, origin := range origins {
+			if origin == 0 {
+				return nil, fmt.Errorf("filesystem origin assignment for %q contains zero", assignment.ResourceID)
+			}
+		}
+		plan[assignment.ResourceID] = origins
+	}
+	return plan, nil
 }
 
 // ForkBranchesArgs selects one source and multiple sibling destinations for a
@@ -126,6 +157,9 @@ type ForkBranchesArgs struct {
 	Paused bool
 	// Quarantine cuts every new branch off from outside the sandbox.
 	Quarantine bool
+	// FilesystemOrigins maps each persistent filesystem to
+	// [newSource,newChild] pairs in IDs order.
+	FilesystemOrigins []FilesystemOriginAssignment
 }
 
 // BranchQuarantineArgs changes the external-connectivity quarantine bit.
@@ -153,6 +187,7 @@ type DistributedForkCaptureArgs struct {
 	// LeaveSourcePaused turns a fork capture into a migration cutover capture.
 	// Errors still restore the source's original state.
 	LeaveSourcePaused bool
+	FilesystemOrigins []FilesystemOriginAssignment
 }
 
 // DistributedForkCaptureChildArgs identifies one target in a coordinated
@@ -166,12 +201,13 @@ type DistributedForkCaptureChildArgs struct {
 // DistributedForkCaptureManyArgs starts independent page sessions backed by
 // one paused Kernel capture and one set of source page references.
 type DistributedForkCaptureManyArgs struct {
-	Source           string
-	FamilyID         string
-	Children         []DistributedForkCaptureChildArgs
-	MaxTransferBytes uint64
-	PushPolicy       ttcremote.TCPPushPolicy
-	PushHighWater    uint64
+	Source            string
+	FamilyID          string
+	Children          []DistributedForkCaptureChildArgs
+	MaxTransferBytes  uint64
+	PushPolicy        ttcremote.TCPPushPolicy
+	PushHighWater     uint64
+	FilesystemOrigins []FilesystemOriginAssignment
 }
 
 // DistributedForkSessionInfo is safe to return through the runsc control
@@ -763,7 +799,7 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		SessionID: args.SessionID, TargetBranchID: args.TargetBranchID,
 		AdvertiseAddress: args.AdvertiseAddress,
 	}}
-	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener, args.LeaveSourcePaused)
+	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener, args.LeaveSourcePaused, args.FilesystemOrigins)
 	if err != nil {
 		if listener != nil {
 			listener.Close()
@@ -779,15 +815,19 @@ func (f *SandboxFamily) CaptureDistributedForkMany(args *DistributedForkCaptureM
 	if args == nil {
 		return nil, errors.New("missing distributed fork batch arguments")
 	}
-	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil, false)
+	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil, false, args.FilesystemOrigins)
 }
 
-func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener, leaveSourcePaused bool) ([]DistributedForkSessionInfo, error) {
+func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener, leaveSourcePaused bool, filesystemAssignments []FilesystemOriginAssignment) ([]DistributedForkSessionInfo, error) {
 	if familyID == "" || len(children) == 0 || maxTransferBytes == 0 {
 		return nil, errors.New("distributed fork capture is missing family, children, or transfer limit")
 	}
 	if len(children) != 1 && listener != nil {
 		return nil, errors.New("a shared listener is valid only for a singular distributed capture")
+	}
+	filesystemOrigins, err := filesystemOriginPlan(filesystemAssignments)
+	if err != nil {
+		return nil, err
 	}
 	seenSessions := make(map[string]struct{}, len(children))
 	seenBranches := make(map[string]struct{}, len(children))
@@ -850,6 +890,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	capture, err := source.k.CaptureDistributedFork(source.k.SupervisorContext(), kernel.DistributedForkCaptureOptions{
 		ChildBranchIDs:                 volumeBranches,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+		FilesystemOrigins:              filesystemOrigins,
 	})
 	if err != nil {
 		if resumeErr := resume(); resumeErr != nil {
@@ -1677,10 +1718,11 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return nil, fmt.Errorf("missing live-fork arguments")
 	}
 	infos, err := f.ForkMany(&ForkBranchesArgs{
-		Source:     args.Source,
-		IDs:        []string{args.ID},
-		Paused:     args.Paused,
-		Quarantine: args.Quarantine,
+		Source:            args.Source,
+		IDs:               []string{args.ID},
+		Paused:            args.Paused,
+		Quarantine:        args.Quarantine,
+		FilesystemOrigins: args.FilesystemOrigins,
 	})
 	if err != nil {
 		return nil, err
@@ -1699,6 +1741,10 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	}
 	if len(args.IDs) == 0 {
 		return nil, fmt.Errorf("at least one branch ID is required")
+	}
+	originPlan, err := filesystemOriginPlan(args.FilesystemOrigins)
+	if err != nil {
+		return nil, err
 	}
 	if !f.liveForkEligible {
 		return nil, fmt.Errorf("container family explicitly waived live fork eligibility at creation")
@@ -1817,6 +1863,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 			Quarantine:                     args.Quarantine,
 			Metrics:                        &metrics[i].Kernel,
+			FilesystemOrigins:              originPlan,
 		}
 	}
 	children, err := source.k.LiveForkMany(source.k.SupervisorContext(), kernelOpts, resumeSource)
@@ -1978,9 +2025,12 @@ func (f *SandboxFamily) Pause(id string) error {
 // paused across metadata flushing, mmap invalidation, and branch publication,
 // so an attachment in another Sentry cannot observe a torn filesystem or
 // leave the source writing through a pre-fork object generation.
-func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.ResourceID, child string) (retErr error) {
+func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.ResourceID, child string, sourceWorking, childWorking uint64) (retErr error) {
 	if !resource.Ok() || child == "" {
 		return errors.New("filesystem snapshot requires a resource and child branch")
+	}
+	if (sourceWorking == 0) != (childWorking == 0) || (sourceWorking != 0 && sourceWorking == childWorking) {
+		return errors.New("filesystem snapshot requires two distinct clustered working origins")
 	}
 	b, err := f.branch(id)
 	if err != nil {
@@ -2015,13 +2065,19 @@ func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.
 
 	resources := make(vfs.LiveForkFilesystemResources)
 	transactions := &vfs.LiveForkTransactions{}
-	ctx := context.WithValues(b.k.SupervisorContext(), map[any]any{
+	ctxValues := map[any]any{
 		pgalloc.CtxLiveForkSource:          true,
 		vfs.CtxLiveForkFilesystemResources: resources,
 		vfs.CtxLiveForkChildBranchID:       child,
 		vfs.CtxLiveForkTransactions:        transactions,
 		vfs.CtxLiveForkFilesystemResource:  resource,
-	})
+	}
+	if sourceWorking != 0 {
+		ctxValues[vfs.CtxLiveForkFilesystemOrigins] = vfs.LiveForkFilesystemOrigins{
+			resource: []uint64{sourceWorking, childWorking},
+		}
+	}
+	ctx := context.WithValues(b.k.SupervisorContext(), ctxValues)
 	if err := b.k.VFS().PrepareSave(ctx); err != nil {
 		_ = transactions.Abort()
 		return fmt.Errorf("preparing filesystem resource %q: %w", resource, err)

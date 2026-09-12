@@ -43,6 +43,7 @@ type DistributedForkCaptureOptions struct {
 	// the first element. A singular caller may continue using ChildBranchID.
 	ChildBranchIDs                 []string
 	AllowSharedFilesystemResources bool
+	FilesystemOrigins              vfs.LiveForkFilesystemOrigins
 }
 
 // DistributedForkCapture is the source-side product of a distributed fork.
@@ -179,6 +180,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			vfs.CtxLiveForkChildBranchID:       childBranchIDs[0],
 			vfs.CtxLiveForkChildBranchIDs:      childBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
+			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for distributed fork: %w", err)

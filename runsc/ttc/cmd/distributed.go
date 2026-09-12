@@ -38,6 +38,7 @@ import (
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcpack"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -700,10 +701,36 @@ func (b *runtimeBackend) materializeDistributedFilesystemMetadata(info ttcbundle
 // descriptors sent directly by the source. It performs no shared-storage I/O;
 // metadata below each root and whole-file bytes remain demand-fetched through
 // the transaction-fenced Sentry relay.
-func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer bool) (int, error) {
+func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.ContainerInfo, filesystemBranch string, roots []cluster.FilesystemRootDescriptor, peer bool) (_ int, retErr error) {
 	if len(roots) == 0 {
 		return 0, nil
 	}
+	allocateOrigins, finishOrigins := b.newFilesystemOriginScope()
+	originsCommitted := false
+	type importedFilesystem struct {
+		path     string
+		copyMode ttcvolume.CopyMode
+		created  bool
+	}
+	var imported []importedFilesystem
+	defer func() {
+		if !originsCommitted {
+			for i := len(imported) - 1; i >= 0; i-- {
+				entry := imported[i]
+				if entry.created {
+					retErr = errors.Join(retErr, os.RemoveAll(entry.path))
+					continue
+				}
+				repository, err := ttcvolume.OpenRepository(entry.path, entry.copyMode)
+				if err == nil {
+					err = repository.RemoveBranch(filesystemBranch)
+					err = errors.Join(err, repository.Close())
+				}
+				retErr = errors.Join(retErr, err)
+			}
+			retErr = errors.Join(retErr, finishOrigins(false))
+		}
+	}()
 	bySource := make(map[string]cluster.FilesystemRootDescriptor, len(roots))
 	for _, root := range roots {
 		if _, exists := bySource[root.Source]; exists {
@@ -737,19 +764,36 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		if !ok {
 			return 0, fmt.Errorf("distributed filesystem omits repository %q", config.Source)
 		}
+		var origins []ttcsnapshot.SnapshotID
+		if allocateOrigins != nil {
+			origins, err = allocateOrigins(2)
+			if err != nil {
+				return 0, fmt.Errorf("allocating target filesystem origins for %q: %w", config.Source, err)
+			}
+		}
 		descriptor, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.NextInode, root.LogicalBytes)
 		if err != nil {
 			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
 		}
 		if peer {
 			var repository *ttcvolume.Repository
+			created := false
 			if _, statErr := os.Stat(filepath.Join(config.Path, "volume.json")); statErr == nil {
 				repository, err = ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
 				if err == nil {
-					err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+					if len(origins) == 0 {
+						err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+					} else {
+						err = repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, filesystemBranch, origins[0], origins[1])
+					}
 				}
 			} else if errors.Is(statErr, os.ErrNotExist) {
-				repository, err = manager.ImportPrivateRemoteDescriptor(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
+				created = true
+				if len(origins) == 0 {
+					repository, err = manager.ImportPrivateRemoteDescriptor(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
+				} else {
+					repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
+				}
 			} else {
 				err = statErr
 			}
@@ -767,19 +811,30 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			if err := repository.Close(); err != nil {
 				return 0, err
 			}
+			imported = append(imported, importedFilesystem{path: config.Path, copyMode: ttcvolume.CopyMode(config.CopyMode), created: created})
 			installed++
 			continue
 		}
 		pathKey := sha256.Sum256([]byte(path))
 		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
 		var repository *ttcvolume.Repository
+		created := false
 		if _, statErr := os.Stat(destination); statErr == nil {
 			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
 			if err == nil {
-				err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+				if len(origins) == 0 {
+					err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
+				} else {
+					err = repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, filesystemBranch, origins[0], origins[1])
+				}
 			}
 		} else if errors.Is(statErr, os.ErrNotExist) {
-			repository, err = manager.ImportPrivateRemoteDescriptor(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch)
+			created = true
+			if len(origins) == 0 {
+				repository, err = manager.ImportPrivateRemoteDescriptor(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch)
+			} else {
+				repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
+			}
 		} else {
 			err = statErr
 		}
@@ -794,6 +849,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		if err := repository.Close(); err != nil {
 			return 0, err
 		}
+		imported = append(imported, importedFilesystem{path: destination, copyMode: manager.Capability().Mode, created: created})
 		installed++
 	}
 	if installed != len(roots) {
@@ -802,6 +858,10 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 	if err := store.WriteActiveRepositoryMap(info.ID, configs); err != nil {
 		return 0, err
 	}
+	if err := finishOrigins(true); err != nil {
+		return 0, err
+	}
+	originsCommitted = true
 	return installed, nil
 }
 
@@ -1045,9 +1105,30 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		"--distributed-push-high-water", fmt.Sprint(tx.Negotiated.PagingPolicy.MaxOutstandingBytes),
 	}
 	args = append(args, source.container, "distributed-capture", transactionID)
-	output, err := b.command(args...)
+	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(sourceInfo.ID, 1)
 	if err != nil {
-		return selector{}, fmt.Errorf("capturing source: %w", err)
+		return selector{}, err
+	}
+	var output []byte
+	if len(filesystemOrigins) == 0 {
+		output, err = b.command(args...)
+	} else {
+		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+		if pipeErr != nil {
+			return selector{}, errors.Join(pipeErr, finishFilesystemOrigins(false))
+		}
+		args = append([]string{"timetravel", "--filesystem-origins-fd=3"}, args[1:]...)
+		output, err = b.commandWithFiles([]*os.File{originsReader}, args...)
+		closeErr := originsReader.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return selector{}, errors.Join(fmt.Errorf("capturing source: %w", err), finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return selector{}, err
 	}
 	captured = true
 	var session boot.DistributedForkSessionInfo
@@ -1179,7 +1260,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 
 	childFilesystemBranch := ttcvolume.ScopedBranchID(sourceInfo.ID, transactionID)
 
-	filesystemForks, err := b.forkDehydratedDistributedFilesystems(sourceInfo.ID, capture.FilesystemBranch, childFilesystemBranch)
+	filesystemForks, finishFilesystemOrigins, err := b.forkDehydratedDistributedFilesystems(sourceInfo.ID, capture.FilesystemBranch, childFilesystemBranch)
 	if err != nil {
 		return selector{}, err
 	}
@@ -1198,12 +1279,16 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		if committedFilesystemForks != 0 {
 			_ = b.removeDistributedFilesystemBranch(sourceInfo.ID, childFilesystemBranch)
 		}
+		_ = finishFilesystemOrigins(false)
 	}()
 	for _, fork := range filesystemForks {
 		if err := fork.commit(); err != nil {
 			return selector{}, fmt.Errorf("committing distributed filesystem fork: %w", err)
 		}
 		committedFilesystemForks++
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return selector{}, fmt.Errorf("committing distributed filesystem origins: %w", err)
 	}
 	filesystemCommitted = true
 	listener, err := net.Listen("tcp", b.distributedSource.pageListen)
@@ -1394,14 +1479,22 @@ func (f *distributedFilesystemFork) abort() error {
 	return err
 }
 
-func (b *runtimeBackend) forkDehydratedDistributedFilesystems(containerID, sourceBranch, childBranch string) ([]*distributedFilesystemFork, error) {
+func (b *runtimeBackend) forkDehydratedDistributedFilesystems(containerID, sourceBranch, childBranch string) ([]*distributedFilesystemFork, func(bool) error, error) {
+	assignments, finishOrigins, err := b.allocateFilesystemForkOrigins(containerID, 1)
+	if err != nil {
+		return nil, func(bool) error { return nil }, err
+	}
+	originsByRepository := make(map[string][]uint64, len(assignments))
+	for _, assignment := range assignments {
+		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
+	}
 	spec, err := b.containerStore().LoadSpec(containerID)
 	if err != nil {
-		return nil, err
+		return nil, finishOrigins, errors.Join(err, finishOrigins(false))
 	}
 	configs, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
-		return nil, err
+		return nil, finishOrigins, errors.Join(err, finishOrigins(false))
 	}
 	transactions := make([]*distributedFilesystemFork, 0, len(configs))
 	seen := make(map[string]bool)
@@ -1412,23 +1505,29 @@ func (b *runtimeBackend) forkDehydratedDistributedFilesystems(containerID, sourc
 		seen[config.Path] = true
 		dir, err := os.Open(config.Path)
 		if err != nil {
-			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+			return transactions, finishOrigins, errors.Join(err, abortFilesystemForks(transactions), finishOrigins(false))
 		}
 		repository, err := ttcvolume.OpenRepositoryFD(dir, ttcvolume.CopyMode(config.CopyMode))
 		_ = dir.Close()
 		if err != nil {
-			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+			return transactions, finishOrigins, errors.Join(err, abortFilesystemForks(transactions), finishOrigins(false))
 		}
-		tx, err := repository.BeginFork(repositoryPhysicalBranch(config, sourceBranch), childBranch)
+		var tx *ttcvolume.ForkTransaction
+		if origins := originsByRepository[repository.Info().ID]; len(origins) != 0 {
+			tx, err = repository.BeginForkWithOrigins(repositoryPhysicalBranch(config, sourceBranch), childBranch,
+				ttcsnapshot.SnapshotID(origins[0]), ttcsnapshot.SnapshotID(origins[1]))
+		} else {
+			tx, err = repository.BeginFork(repositoryPhysicalBranch(config, sourceBranch), childBranch)
+		}
 		if err != nil {
 			repository.Close()
-			return transactions, errors.Join(err, abortFilesystemForks(transactions))
+			return transactions, finishOrigins, errors.Join(err, abortFilesystemForks(transactions), finishOrigins(false))
 		}
 		// ForkTransaction retains its repository; close after Commit/Abort is not
 		// currently exposed, so keep the donated descriptor for transaction life.
 		transactions = append(transactions, &distributedFilesystemFork{tx: tx, repository: repository})
 	}
-	return transactions, nil
+	return transactions, finishOrigins, nil
 }
 
 func abortFilesystemForks(transactions []*distributedFilesystemFork) error {
@@ -1619,6 +1718,17 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		PushHighWater: commonPolicy.MaxOutstandingBytes,
 		Children:      make([]boot.DistributedForkCaptureChildArgs, len(children)),
 	}
+	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(sourceInfo.ID, len(children))
+	if err != nil {
+		return nil, err
+	}
+	filesystemOriginsCommitted := false
+	defer func() {
+		if !filesystemOriginsCommitted {
+			_ = finishFilesystemOrigins(false)
+		}
+	}()
+	captureArgs.FilesystemOrigins = filesystemOrigins
 	for i := range children {
 		captureArgs.Children[i] = boot.DistributedForkCaptureChildArgs{
 			SessionID: children[i].transaction, TargetBranchID: children[i].transaction,
@@ -1648,6 +1758,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	if err != nil {
 		return nil, fmt.Errorf("capturing %d distributed siblings: %w", len(children), err)
 	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return nil, err
+	}
+	filesystemOriginsCommitted = true
 	var sessions []boot.DistributedForkSessionInfo
 	if err := json.Unmarshal(output, &sessions); err != nil {
 		return nil, fmt.Errorf("decoding distributed sibling capture: %w", err)

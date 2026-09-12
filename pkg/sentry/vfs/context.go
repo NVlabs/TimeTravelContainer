@@ -68,6 +68,11 @@ const (
 	// persistent resource. It is used to snapshot a named volume for a new
 	// read-only attachment without cloning the source Kernel.
 	CtxLiveForkFilesystemResource
+
+	// CtxLiveForkFilesystemOrigins maps a persistent filesystem resource to
+	// pairs of Raft-allocated working snapshot IDs. Pair zero is consumed by
+	// the source-to-primary fork; later pairs are consumed by batch siblings.
+	CtxLiveForkFilesystemOrigins
 )
 
 // RestoreFilesystemResource associates an implementation-specific resource
@@ -102,12 +107,29 @@ func MountNamespaceFromContext(ctx goContext.Context) *MountNamespace {
 // specific resources borrowed by an in-process clone.
 type LiveForkFilesystemResources map[checkpoint.ResourceID]any
 
+// LiveForkFilesystemOrigins carries exact clustered working origins. Each
+// resource value contains [newSource, newChild] pairs in fork order.
+type LiveForkFilesystemOrigins map[checkpoint.ResourceID][]uint64
+
+// LiveForkFilesystemOriginsFromContext returns clustered origin assignments,
+// or nil for standalone repository-local allocation.
+func LiveForkFilesystemOriginsFromContext(ctx goContext.Context) LiveForkFilesystemOrigins {
+	origins, _ := ctx.Value(CtxLiveForkFilesystemOrigins).(LiveForkFilesystemOrigins)
+	return origins
+}
+
 // LiveForkBranchingResource is a persistent filesystem resource whose
 // immutable metadata root can be forked after the original source resumes.
 // The new source branch belongs to a paused primary child.
 type LiveForkBranchingResource interface {
 	Fork(source, child string) error
 	RemoveBranch(branch string) error
+}
+
+// LiveForkOriginBranchingResource accepts exact working origins allocated by
+// the cluster authority state machine.
+type LiveForkOriginBranchingResource interface {
+	ForkWithOrigins(source, child string, sourceWorking, childWorking uint64) error
 }
 
 // DehydrationFilesystemResource keeps a process-local filesystem transport

@@ -22,9 +22,9 @@
     {
       "id": "identity.distributed-filesystem-global",
       "requirement": "Distributed filesystem objects use Raft-allocated snapshot origins and route directly by origin.",
-            "status": "partial",
-      "evidence": ["pkg/ttcvolume/repository.go", "runsc/ttc/cmd/distributed.go"],
-            "gap": "Live handoff uses path-free graph roots, but filesystem repositories still allocate local origins and stopped/dehydrated filesystem publication still uses cold packs."
+      "status": "implemented-live-path",
+      "evidence": ["pkg/ttcvolume/repository.go", "runsc/ttc/bundle/store.go", "runsc/ttc/cmd/distributed.go", "runsc/ttc/cmd/elastic_cluster.go"],
+      "gap": "All clustered live and lifecycle operations use Raft-global origins, but stopped/dehydrated filesystem publication still serializes those origins through legacy cold packs."
     },
     {
       "id": "immutability.sealed",

@@ -56,6 +56,10 @@ type LiveForkOptions struct {
 	// filesystems.
 	ChildBranchID string
 
+	// FilesystemOrigins contains Raft-allocated [newSource,newChild] pairs for
+	// every persistent filesystem. Nil selects standalone local allocation.
+	FilesystemOrigins vfs.LiveForkFilesystemOrigins
+
 	// RestoreOptions are passed to filesystem restore completion hooks.
 	RestoreOptions vfs.CompleteRestoreOptions
 
@@ -303,6 +307,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
 			vfs.CtxLiveForkChildBranchIDs:      opts.batchChildBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
+			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
@@ -520,6 +525,15 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	primaryOpts := opts[0]
 	primaryOpts.batchChildBranchIDs = ids[:1]
 	primaryOpts.batchFilesystemResources = fsResources
+	if primaryOpts.FilesystemOrigins != nil {
+		primaryOpts.FilesystemOrigins = make(vfs.LiveForkFilesystemOrigins, len(opts[0].FilesystemOrigins))
+		for resource, origins := range opts[0].FilesystemOrigins {
+			if len(origins) != 2*len(opts) {
+				return nil, fmt.Errorf("filesystem resource %q has %d clustered origins, want %d", resource, len(origins), 2*len(opts))
+			}
+			primaryOpts.FilesystemOrigins[resource] = append([]uint64(nil), origins[:2]...)
+		}
+	}
 	primary, err := k.LiveFork(ctx, primaryOpts)
 	if err != nil {
 		return nil, err
@@ -550,7 +564,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 			return nil, fmt.Errorf("making live-fork source ready: %w", err)
 		}
 	}
-	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:]); err != nil {
+	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:], opts[0].FilesystemOrigins); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -598,14 +612,29 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 // forkPreparedFilesystemBranches creates remaining persistent siblings from
 // the paused primary child. Its metadata root is the exact root captured from
 // the original source, but this work no longer contributes to source downtime.
-func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, primary string, siblings []string) error {
+func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, primary string, siblings []string, originPlan vfs.LiveForkFilesystemOrigins) error {
 	for resourceID, resource := range resources {
 		brancher, ok := resource.(vfs.LiveForkBranchingResource)
 		if !ok {
 			continue
 		}
-		for _, sibling := range siblings {
-			if err := brancher.Fork(primary, sibling); err != nil {
+		origins, clustered := originPlan[resourceID]
+		if clustered && len(origins) != 2*(len(siblings)+1) {
+			return fmt.Errorf("filesystem resource %q has %d clustered origins, want %d", resourceID, len(origins), 2*(len(siblings)+1))
+		}
+		for index, sibling := range siblings {
+			var err error
+			if clustered {
+				originBrancher, ok := resource.(vfs.LiveForkOriginBranchingResource)
+				if !ok {
+					return fmt.Errorf("filesystem resource %q cannot accept clustered snapshot origins", resourceID)
+				}
+				offset := 2 * (index + 1)
+				err = originBrancher.ForkWithOrigins(primary, sibling, origins[offset], origins[offset+1])
+			} else {
+				err = brancher.Fork(primary, sibling)
+			}
+			if err != nil {
 				return fmt.Errorf("forking prepared filesystem resource %q from %q as %q: %w", resourceID, primary, sibling, err)
 			}
 		}

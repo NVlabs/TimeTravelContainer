@@ -93,6 +93,7 @@ type TimeTravel struct {
 	distributedAdvertise          string
 	distributedMaxTransfer        uint64
 	distributedConfigFD           int
+	filesystemOriginsFD           int
 	distributedMetadataFD         int
 	distributedExternal           bool
 	distributedConnectionFD       int
@@ -187,6 +188,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&t.distributedAdvertise, "distributed-advertise", "", "page server address advertised to the target")
 	f.Uint64Var(&t.distributedMaxTransfer, "distributed-max-transfer", 0, "maximum bytes in one remote page transfer")
 	f.IntVar(&t.distributedConfigFD, "distributed-config-fd", -1, "inherited FD containing a secret distributed restore request")
+	f.IntVar(&t.filesystemOriginsFD, "filesystem-origins-fd", -1, "inherited FD containing clustered filesystem snapshot origins")
 	f.IntVar(&t.distributedMetadataFD, "distributed-metadata-fd", -1, "inherited immutable distributed restore metadata")
 	f.BoolVar(&t.distributedExternal, "distributed-external-listener", false, "ttcd owns and relays the page listener")
 	f.IntVar(&t.distributedConnectionFD, "distributed-connection-fd", -1, "inherited connected page stream")
@@ -258,7 +260,11 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		// The old name and the new one.
 		wantArgs = 4
 	case "filesystem-snapshot":
-		wantArgs = 5
+		if f.NArg() != 5 && f.NArg() != 7 {
+			f.Usage()
+			return subcommands.ExitUsageError
+		}
+		wantArgs = f.NArg()
 	}
 	if (action == "fork" && f.NArg() < wantArgs) || (action != "fork" && f.NArg() != wantArgs) {
 		f.Usage()
@@ -270,6 +276,26 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	if err != nil {
 		util.Fatalf("loading container: %v", err)
 	}
+	var filesystemOrigins []boot.FilesystemOriginAssignment
+	if t.filesystemOriginsFD >= 0 {
+		originsFile := os.NewFile(uintptr(t.filesystemOriginsFD), "filesystem-snapshot-origins")
+		if originsFile == nil {
+			util.Fatalf("invalid filesystem snapshot origins FD")
+		}
+		decoder := json.NewDecoder(io.LimitReader(originsFile, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&filesystemOrigins); err != nil {
+			originsFile.Close()
+			util.Fatalf("decoding filesystem snapshot origins: %v", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			originsFile.Close()
+			util.Fatalf("filesystem snapshot origins contain trailing data")
+		}
+		if err := originsFile.Close(); err != nil {
+			util.Fatalf("closing filesystem snapshot origins: %v", err)
+		}
+	}
 
 	var output any
 	switch action {
@@ -279,17 +305,15 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		destinations := f.Args()[2:]
 		if len(destinations) == 1 {
 			output, err = cont.Sandbox.ForkBranch(&boot.ForkBranchArgs{
-				Source:     t.source,
-				ID:         destinations[0],
-				Paused:     t.paused,
-				Quarantine: t.quarantine,
+				Source: t.source, ID: destinations[0], Paused: t.paused, Quarantine: t.quarantine,
+				FilesystemOrigins: filesystemOrigins,
 			})
 		} else {
 			output, err = cont.Sandbox.ForkBranches(&boot.ForkBranchesArgs{
 				Source:     t.source,
 				IDs:        destinations,
 				Paused:     t.paused,
-				Quarantine: t.quarantine,
+				Quarantine: t.quarantine, FilesystemOrigins: filesystemOrigins,
 			})
 		}
 	case "distributed-capture":
@@ -306,6 +330,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				MaxTransferBytes: t.distributedMaxTransfer, ExternalListener: true,
 				PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
 				LeaveSourcePaused: t.distributedLeaveSourcePaused,
+				FilesystemOrigins: filesystemOrigins,
 			})
 			break
 		}
@@ -338,6 +363,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			TargetBranchID: f.Arg(2), AdvertiseAddress: advertise, MaxTransferBytes: t.distributedMaxTransfer,
 			PushPolicy: ttcremote.TCPPushPolicy(t.distributedPushPolicy), PushHighWater: t.distributedPushHighWater,
 			LeaveSourcePaused: t.distributedLeaveSourcePaused,
+			FilesystemOrigins: filesystemOrigins,
 		})
 		listenerFile.Close()
 		listener.Close()
@@ -531,10 +557,23 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	case "resume":
 		err = cont.Sandbox.ResumeBranch(f.Arg(2))
 	case "filesystem-snapshot":
+		var sourceWorking, childWorking uint64
+		if f.NArg() >= 7 {
+			var parseErr error
+			sourceWorking, parseErr = strconv.ParseUint(f.Arg(5), 10, 64)
+			if parseErr == nil {
+				childWorking, parseErr = strconv.ParseUint(f.Arg(6), 10, 64)
+			}
+			if parseErr != nil {
+				util.Fatalf("invalid filesystem snapshot origins: %v", parseErr)
+			}
+		}
 		err = cont.Sandbox.SnapshotFilesystemBranch(&boot.FilesystemBranchSnapshotArgs{
-			BranchID:   f.Arg(2),
-			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: f.Arg(3)},
-			Child:      f.Arg(4),
+			BranchID:      f.Arg(2),
+			ResourceID:    checkpoint.ResourceID{ContainerName: "ttc-volume", Path: f.Arg(3)},
+			Child:         f.Arg(4),
+			SourceWorking: sourceWorking,
+			ChildWorking:  childWorking,
 		})
 	case "quarantine":
 		err = cont.Sandbox.SetBranchQuarantine(f.Arg(2), true)

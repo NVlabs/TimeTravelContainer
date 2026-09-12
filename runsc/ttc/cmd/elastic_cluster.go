@@ -1314,7 +1314,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
 		dataPlaneMax = tx.Negotiated.MaxTransferSize
 	}
-	output, err := b.command(
+	commandArgs := []string{
 		"timetravel", "--source", target.branch,
 		"--distributed-session", requestID,
 		"--distributed-family", info.ID,
@@ -1324,9 +1324,31 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		"--distributed-push-high-water", fmt.Sprint(tx.Negotiated.PagingPolicy.MaxOutstandingBytes),
 		"--distributed-leave-source-paused",
 		info.ID, "distributed-capture", requestID,
-	)
+	}
+	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
 	if err != nil {
-		return abort(fmt.Errorf("capturing sparse migration source: %w", err))
+		return abort(err)
+	}
+	var output []byte
+	if len(filesystemOrigins) == 0 {
+		output, err = b.command(commandArgs...)
+	} else {
+		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+		if pipeErr != nil {
+			return abort(errors.Join(pipeErr, finishFilesystemOrigins(false)))
+		}
+		commandArgs = append([]string{"timetravel", "--filesystem-origins-fd=3"}, commandArgs[1:]...)
+		output, err = b.commandWithFiles([]*os.File{originsReader}, commandArgs...)
+		closeErr := originsReader.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return abort(errors.Join(fmt.Errorf("capturing sparse migration source: %w", err), finishFilesystemOrigins(false)))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return abort(err)
 	}
 	captured = true
 	var session boot.DistributedForkSessionInfo

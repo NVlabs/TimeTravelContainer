@@ -41,6 +41,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -296,10 +297,32 @@ type PrepareOptions struct {
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
 	NodeID         string
+	// AllocateSnapshotOrigins returns globally monotonic working origins in
+	// cluster mode. Nil selects the standalone repository-local allocator.
+	AllocateSnapshotOrigins func(count uint32) ([]ttcsnapshot.SnapshotID, error)
 	// SnapshotManagedVolume snapshots a named volume through its live owning
 	// Sentry. This preserves bounded process-local metadata batching and mmap
 	// CoW correctness when a second family attaches read-only.
-	SnapshotManagedVolume func(ownerContainer, ownerBranch, volumeID, childBranch string) error
+	SnapshotManagedVolume func(ownerContainer, ownerBranch, volumeID, childBranch string, sourceWorking, childWorking ttcsnapshot.SnapshotID) error
+}
+
+func allocateRepositoryOrigins(opts *PrepareOptions, count uint32) ([]ttcsnapshot.SnapshotID, error) {
+	if opts == nil || opts.AllocateSnapshotOrigins == nil {
+		return nil, nil
+	}
+	origins, err := opts.AllocateSnapshotOrigins(count)
+	if err != nil {
+		return nil, err
+	}
+	if len(origins) != int(count) {
+		return nil, fmt.Errorf("snapshot allocator returned %d origins, want %d", len(origins), count)
+	}
+	for i, origin := range origins {
+		if origin == 0 {
+			return nil, fmt.Errorf("snapshot allocator returned zero origin at index %d", i)
+		}
+	}
+	return origins, nil
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -961,7 +984,16 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
 			return Prepared{}, fmt.Errorf("volume backing capability changed while preparing rootfs: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 		}
-		rootfsUpper, err := manager.CreatePrivate(filepath.Join(activeContainerDir, rootfsUpperRepositoryDir), "rootfs")
+		origins, err := allocateRepositoryOrigins(&opts, 1)
+		if err != nil {
+			return Prepared{}, fmt.Errorf("allocating rootfs working snapshot: %w", err)
+		}
+		var rootfsUpper *ttcvolume.Repository
+		if len(origins) == 0 {
+			rootfsUpper, err = manager.CreatePrivate(filepath.Join(activeContainerDir, rootfsUpperRepositoryDir), "rootfs")
+		} else {
+			rootfsUpper, err = manager.CreatePrivateWithOrigin(filepath.Join(activeContainerDir, rootfsUpperRepositoryDir), "rootfs", origins[0])
+		}
 		if err != nil {
 			return Prepared{}, fmt.Errorf("creating persistent rootfs upper: %w", err)
 		}
@@ -1735,7 +1767,15 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 		repository, err := manager.Open(volumes[i].Name)
 		created := false
 		if errors.Is(err, os.ErrNotExist) {
-			repository, err = manager.Create(volumes[i].Name)
+			origins, allocationErr := allocateRepositoryOrigins(&opts, 1)
+			if allocationErr != nil {
+				return nil, nil, fmt.Errorf("allocating managed-volume working snapshot: %w", allocationErr)
+			}
+			if len(origins) == 0 {
+				repository, err = manager.Create(volumes[i].Name)
+			} else {
+				repository, err = manager.CreateWithOrigin(volumes[i].Name, origins[0])
+			}
 			created = err == nil
 		}
 		if err != nil {
@@ -1767,11 +1807,19 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 			}
 			child := "a-" + nonce
 			owner, ownerBranch := managedVolumeWritableOwner(info.ID, containers)
+			origins, allocationErr := allocateRepositoryOrigins(&opts, 2)
+			if allocationErr != nil {
+				return nil, nil, fmt.Errorf("allocating readonly volume snapshot origins: %w", allocationErr)
+			}
 			if owner != nil && (ownerBranch.State == "running" || ownerBranch.State == "paused") {
 				if opts.SnapshotManagedVolume == nil {
 					return nil, nil, fmt.Errorf("managed volume %q requires a live snapshot from container %q", volumes[i].Name, owner.Name)
 				}
-				if err := opts.SnapshotManagedVolume(owner.ID, ownerBranch.ID, info.ID, child); err != nil {
+				var sourceWorking, childWorking ttcsnapshot.SnapshotID
+				if len(origins) != 0 {
+					sourceWorking, childWorking = origins[0], origins[1]
+				}
+				if err := opts.SnapshotManagedVolume(owner.ID, ownerBranch.ID, info.ID, child, sourceWorking, childWorking); err != nil {
 					return nil, nil, fmt.Errorf("snapshotting managed volume %q from %s@%s: %w", volumes[i].Name, owner.Name, ownerBranch.ID, err)
 				}
 			} else {
@@ -1779,7 +1827,13 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 				if err != nil {
 					return nil, nil, err
 				}
-				tx, forkErr := repository.BeginFork(ttcvolume.MainBranch, child)
+				var tx *ttcvolume.ForkTransaction
+				var forkErr error
+				if len(origins) == 0 {
+					tx, forkErr = repository.BeginFork(ttcvolume.MainBranch, child)
+				} else {
+					tx, forkErr = repository.BeginForkWithOrigins(ttcvolume.MainBranch, child, origins[0], origins[1])
+				}
 				if forkErr == nil {
 					forkErr = tx.Commit()
 				}
@@ -1860,7 +1914,16 @@ func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptio
 			hostMountRootCreated = true
 		}
 		repositoryPath := filepath.Join(containerDir, hostMountRepositoryDir, strconv.Itoa(index))
-		repository, err := manager.CreatePrivate(repositoryPath, fmt.Sprintf("host-%d", index))
+		origins, err := allocateRepositoryOrigins(opts, 1)
+		if err != nil {
+			return fmt.Errorf("allocating host-mount working snapshot: %w", err)
+		}
+		var repository *ttcvolume.Repository
+		if len(origins) == 0 {
+			repository, err = manager.CreatePrivate(repositoryPath, fmt.Sprintf("host-%d", index))
+		} else {
+			repository, err = manager.CreatePrivateWithOrigin(repositoryPath, fmt.Sprintf("host-%d", index), origins[0])
+		}
 		if err != nil {
 			return fmt.Errorf("creating persistent upper for host mount %q: %w", mount.Destination, err)
 		}

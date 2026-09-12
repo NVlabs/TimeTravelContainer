@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -164,6 +165,19 @@ func (r *Repository) ExportRemoteSnapshot(branchID, destination string) (Snapsho
 // graph root. Unlike ImportRemoteBranchSnapshot it requires no temporary host
 // directory and therefore keeps a live remote fork off shared storage.
 func (r *Repository) ImportRemoteBranchDescriptor(descriptor RemoteSnapshotDescriptor, targetBranch string) error {
+	return r.importRemoteBranchDescriptor(descriptor, targetBranch, 0, 0)
+}
+
+// ImportRemoteBranchDescriptorWithOrigins installs a deferred root using
+// exact Raft-allocated working and catalog origins.
+func (r *Repository) ImportRemoteBranchDescriptorWithOrigins(descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) error {
+	if working == 0 || catalogWorking == 0 || working == catalogWorking {
+		return errors.New("clustered remote filesystem import requires two distinct working origins")
+	}
+	return r.importRemoteBranchDescriptor(descriptor, targetBranch, working, catalogWorking)
+}
+
+func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescriptor, targetBranch string, externalWorking, externalCatalog ttcsnapshot.SnapshotID) error {
 	if err := validateName(targetBranch, "branch"); err != nil {
 		return err
 	}
@@ -178,11 +192,19 @@ func (r *Repository) ImportRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		working, err := r.graph.AllocateWorking()
-		if err != nil {
-			return err
+		working, catalogWorking := externalWorking, externalCatalog
+		var err error
+		if working == 0 {
+			working, err = r.graph.AllocateWorking()
+			if err == nil {
+				catalogWorking, err = r.graph.AllocateWorking()
+			}
+		} else {
+			err = r.graph.AdoptWorking(working)
+			if err == nil {
+				err = r.graph.AdoptWorking(catalogWorking)
+			}
 		}
-		catalogWorking, err := r.graph.AllocateWorking()
 		if err != nil {
 			return err
 		}
@@ -474,6 +496,20 @@ func (m *Manager) ImportPrivateRemoteSnapshot(path, name, source, targetBranch s
 // branch is backed by descriptor. It is the path-free equivalent of
 // ImportPrivateRemoteSnapshot used by live cluster handoff.
 func (m *Manager) ImportPrivateRemoteDescriptor(path, name string, descriptor RemoteSnapshotDescriptor, targetBranch string) (*Repository, error) {
+	return m.importPrivateRemoteDescriptor(path, name, descriptor, targetBranch, 0, 0)
+}
+
+// ImportPrivateRemoteDescriptorWithOrigins creates a clustered private
+// repository and deferred branch using exact branch and catalog origins
+// allocated by Raft. No dummy main branch or local snapshot origin is created.
+func (m *Manager) ImportPrivateRemoteDescriptorWithOrigins(path, name string, descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) (*Repository, error) {
+	if working == 0 || catalogWorking == 0 || working == catalogWorking {
+		return nil, errors.New("clustered private remote import requires two distinct working origins")
+	}
+	return m.importPrivateRemoteDescriptor(path, name, descriptor, targetBranch, working, catalogWorking)
+}
+
+func (m *Manager) importPrivateRemoteDescriptor(path, name string, descriptor RemoteSnapshotDescriptor, targetBranch string, working, catalogWorking ttcsnapshot.SnapshotID) (*Repository, error) {
 	if err := validateName(targetBranch, "branch"); err != nil {
 		return nil, err
 	}
@@ -500,11 +536,36 @@ func (m *Manager) ImportPrivateRemoteDescriptor(path, name string, descriptor Re
 			_ = os.RemoveAll(stage)
 		}
 	}()
-	repository, err := m.CreatePrivate(stage, name)
+	for _, dir := range []string{stage, filepath.Join(stage, "staging"), filepath.Join(stage, "branches"), filepath.Join(stage, "graph"), filepath.Join(stage, "data")} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			return nil, fmt.Errorf("creating remote volume repository: %w", err)
+		}
+	}
+	id, err := randomID()
 	if err != nil {
 		return nil, err
 	}
-	importErr := repository.ImportRemoteBranchDescriptor(descriptor, targetBranch)
+	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1}
+	repository, err := m.openPath(stage, info)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeJSONAtomic(filepath.Join(stage, "staging"), filepath.Join(stage, "volume.json"), info); err != nil {
+		repository.Close()
+		return nil, err
+	}
+	var importErr error
+	if working == 0 {
+		importErr = repository.ImportRemoteBranchDescriptor(descriptor, targetBranch)
+	} else {
+		importErr = repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, targetBranch, working, catalogWorking)
+	}
+	if importErr == nil {
+		importErr = atomicWriteFile(filepath.Join(stage, "staging"), filepath.Join(stage, "format"), []byte(strconv.Itoa(formatVersion)+"\n"), 0600)
+	}
+	if importErr == nil {
+		importErr = repository.SyncMetadata()
+	}
 	closeErr := repository.Close()
 	if importErr != nil || closeErr != nil {
 		return nil, errors.Join(importErr, closeErr)

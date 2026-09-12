@@ -1404,6 +1404,16 @@ func (r *Repository) Fork(source, child string) error {
 	return tx.Commit()
 }
 
+// ForkWithOrigins creates and commits a clustered fork using exact
+// Raft-allocated fresh working origins.
+func (r *Repository) ForkWithOrigins(source, child string, sourceWorking, childWorking uint64) error {
+	tx, err := r.BeginForkWithOrigins(source, child, ttcsnapshot.SnapshotID(sourceWorking), ttcsnapshot.SnapshotID(childWorking))
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // CreateRegular creates one empty regular file.
 func (r *Repository) CreateRegular(branchID string, parent uint64, name string, mode uint32, uid, gid uint32) (uint64, error) {
 	if err := validateEntryName(name); err != nil {
