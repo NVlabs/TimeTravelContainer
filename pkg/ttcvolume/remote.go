@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -594,13 +595,42 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 	// This is an explicit independence barrier and is allowed to be O(total
 	// metadata); ordinary remote start and pathname access remain lazy.
 	r.remoteMu.Lock()
-	var deferredBranches []string
+	deferredCatalogs := make(map[string]struct{})
 	for remote := range r.remotes {
 		if remote.catalog != "" {
-			deferredBranches = append(deferredBranches, remote.branchID)
+			deferredCatalogs[remote.catalog] = struct{}{}
 		}
 	}
 	r.remoteMu.Unlock()
+	var deferredBranches []string
+	if len(deferredCatalogs) != 0 {
+		directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		entries, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil || closeErr != nil {
+			return nil, nil, errors.Join(readErr, closeErr)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(entry.Name(), ".json")
+			if validateName(id, "branch") != nil {
+				continue
+			}
+			branch, err := r.readBranch(id)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, ok := deferredCatalogs[branch.RemoteCatalog]; ok {
+				deferredBranches = append(deferredBranches, id)
+			}
+		}
+		sort.Strings(deferredBranches)
+	}
 	for _, branch := range deferredBranches {
 		// MaterializeRemoteObjects holds the repository operation lock, so using
 		// the public Branch helper here would recursively acquire it. Flush the

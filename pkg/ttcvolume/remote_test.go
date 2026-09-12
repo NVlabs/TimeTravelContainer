@@ -314,3 +314,48 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMaterializeRemoteObjectsAfterImportedBranchRemoval(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("inherited lazy data\n"), 100000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	tx, err := target.BeginForkWithOrigins("imported", "survivor", 102, 103)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.RemoveBranch("imported"); err != nil {
+		t.Fatal(err)
+	}
+	finishTestRemote(t, target, serverErr)
+	if got := readAll(t, target, "survivor", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("surviving child lost data after its imported parent was removed")
+	}
+}

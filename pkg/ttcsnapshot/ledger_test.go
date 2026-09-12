@@ -660,14 +660,15 @@ func TestReferenceLedgerCompactionWaitsForAllDeadParentEdges(t *testing.T) {
 	if got, err := ledger.Collect(1); err != nil || got != 1 {
 		t.Fatalf("Collect(1)=(%d, %v), want (1, nil)", got, err)
 	}
-	objects, references, ok, ready := ledger.OriginCompactionManifest(origin)
+	objects, _, ok, ready := ledger.OriginCompactionManifest(origin)
 	if !ok || ready || len(objects) != 1 || objects[0].ID != child.ID {
 		t.Fatalf("partial compaction view=(objects=%+v, ok=%t, ready=%t), want the live child and not ready", objects, ok, ready)
 	}
 	if got, err := ledger.Collect(8); err != nil || got != 2 {
 		t.Fatalf("final Collect=(%d, %v), want (2, nil)", got, err)
 	}
-	if objects, references, ok, ready = ledger.OriginCompactionManifest(origin); !ok || !ready || len(objects) != 0 || len(references) != 0 {
+	objects, references, ok, ready := ledger.OriginCompactionManifest(origin)
+	if !ok || !ready || len(objects) != 0 || len(references) != 0 {
 		t.Fatalf("final compaction view=(objects=%+v references=%+v ok=%t ready=%t)", objects, references, ok, ready)
 	}
 }
