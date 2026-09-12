@@ -361,17 +361,23 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	filesystemBranch := ""
 	for _, donated := range l.ttcVolumeRepositories {
 		info := donated.repository.Info()
-		restoreID := donated.config.RestoreID
-		if restoreID == "" {
-			restoreID = info.ID
+		resource := vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+		// Always publish the physical node-local identity. The bundle config can
+		// carry the identity used by an earlier restore, so retain that as an
+		// alias rather than letting it replace the current identity.
+		resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}] = resource
+		if restoreID := donated.config.RestoreID; restoreID != "" {
+			resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
 		}
-		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
-		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
 		if filesystemBranch == "" {
 			filesystemBranch = donated.config.Branch
 		} else if filesystemBranch != donated.config.Branch {
 			return nil, fmt.Errorf("distributed target repositories use inconsistent branches %q and %q", filesystemBranch, donated.config.Branch)
 		}
+	}
+	resources, err = aliasRestoreFilesystemResources(resources, args.FilesystemRestoreIDs)
+	if err != nil {
+		return nil, err
 	}
 	targetMFOwned = false
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
@@ -504,6 +510,31 @@ func aliasLiveForkFilesystemResources(resources vfs.LiveForkFilesystemResources,
 		resource, ok := resources[currentID]
 		if !ok {
 			return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
+		}
+		aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+	}
+	return aliased, nil
+}
+
+// aliasRestoreFilesystemResources is the process-bootstrap counterpart of
+// aliasLiveForkFilesystemResources. A returning multi-hop branch may be
+// serialized against node A's repository while node B's unstarted bundle
+// still names an older node-B identity. The daemon supplies the current-local
+// to incoming identity edge explicitly; accepting both keys makes the mapping
+// independent of how many nodes the branch has crossed.
+func aliasRestoreFilesystemResources(resources vfs.RestoreFilesystemResources, restoreIDs map[string]string) (vfs.RestoreFilesystemResources, error) {
+	if len(restoreIDs) == 0 {
+		return resources, nil
+	}
+	aliased := make(vfs.RestoreFilesystemResources, len(resources)+len(restoreIDs))
+	for id, resource := range resources {
+		aliased[id] = resource
+	}
+	for current, restoreID := range restoreIDs {
+		currentID := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: current}
+		resource, ok := resources[currentID]
+		if !ok {
+			return nil, fmt.Errorf("active TTC volume restore resource %q was not exported", current)
 		}
 		aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
 	}

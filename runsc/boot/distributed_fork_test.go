@@ -48,3 +48,31 @@ func TestAliasLiveForkFilesystemResourcesRejectsMissingCurrent(t *testing.T) {
 		t.Fatal("aliasLiveForkFilesystemResources succeeded without the active resource")
 	}
 }
+
+func TestAliasRestoreFilesystemResourcesAcrossReturnHop(t *testing.T) {
+	current := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: "node-b-current"}
+	stale := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: "node-b-first-import"}
+	incoming := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: "node-a-return-hop"}
+	resource := vfs.RestoreFilesystemResource{Resource: new(int), Branch: "branch"}
+	resources := vfs.RestoreFilesystemResources{current: resource, stale: resource}
+
+	aliased, err := aliasRestoreFilesystemResources(resources, map[string]string{current.Path: incoming.Path})
+	if err != nil {
+		t.Fatalf("aliasRestoreFilesystemResources: %v", err)
+	}
+	for _, id := range []checkpoint.ResourceID{current, stale, incoming} {
+		if got, ok := aliased[id]; !ok || got.Resource != resource.Resource || got.Branch != resource.Branch {
+			t.Fatalf("identity %q maps to %+v, want %+v", id, got, resource)
+		}
+	}
+	if _, ok := resources[incoming]; ok {
+		t.Fatal("aliasing mutated the caller's resource map")
+	}
+}
+
+func TestAliasRestoreFilesystemResourcesRejectsMissingCurrent(t *testing.T) {
+	_, err := aliasRestoreFilesystemResources(vfs.RestoreFilesystemResources{}, map[string]string{"missing": "incoming"})
+	if err == nil {
+		t.Fatal("aliasRestoreFilesystemResources succeeded without the active resource")
+	}
+}
