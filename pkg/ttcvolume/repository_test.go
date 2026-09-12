@@ -552,6 +552,47 @@ func TestForkTransactionCommitRetainsBranches(t *testing.T) {
 	}
 }
 
+func TestClusteredRepositoryUsesExternallyAllocatedOrigins(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.CreateWithOrigin("clustered", 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	main, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.WorkingSnapshot != 1001 {
+		t.Fatalf("initial working origin=%d, want 1001", main.WorkingSnapshot)
+	}
+	tx, err := repo.BeginForkWithOrigins(MainBranch, "child", 1002, 1003)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	main, err = repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := repo.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.WorkingSnapshot != 1002 || child.WorkingSnapshot != 1003 {
+		t.Fatalf("fork working origins=(%d,%d), want (1002,1003)", main.WorkingSnapshot, child.WorkingSnapshot)
+	}
+	sealed, ok := repo.graph.Snapshot(1001)
+	if !ok || sealed.State != ttcsnapshot.SnapshotSealedVolatile {
+		t.Fatalf("sealed clustered origin=(%+v,%t)", sealed, ok)
+	}
+}
+
 func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
 	manager, err := OpenManager(t.TempDir())
 	if err != nil {

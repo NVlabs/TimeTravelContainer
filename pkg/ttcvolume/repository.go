@@ -361,6 +361,19 @@ type cachedBranch struct {
 
 // Create creates a new volume with an empty main branch.
 func (m *Manager) Create(name string) (*Repository, error) {
+	return m.create(name, 0)
+}
+
+// CreateWithOrigin creates a named clustered repository whose initial working
+// origin was already allocated by the cluster authority state machine.
+func (m *Manager) CreateWithOrigin(name string, working ttcsnapshot.SnapshotID) (*Repository, error) {
+	if working == 0 {
+		return nil, errors.New("clustered repository requires an allocated working snapshot origin")
+	}
+	return m.create(name, working)
+}
+
+func (m *Manager) create(name string, working ttcsnapshot.SnapshotID) (*Repository, error) {
 	if err := validateName(name, "volume"); err != nil {
 		return nil, err
 	}
@@ -378,12 +391,25 @@ func (m *Manager) Create(name string) (*Repository, error) {
 		return nil, err
 	}
 	path := filepath.Join(m.volumes, id)
-	return m.createAt(path, name, id)
+	return m.createAt(path, name, id, working)
 }
 
 // CreatePrivate creates a repository at path without adding it to the named
 // volume catalog. TTC uses this for a container-family-owned rootfs upper.
 func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
+	return m.createPrivate(path, name, 0)
+}
+
+// CreatePrivateWithOrigin creates a family-private clustered repository using
+// an initial working origin committed by Raft.
+func (m *Manager) CreatePrivateWithOrigin(path, name string, working ttcsnapshot.SnapshotID) (*Repository, error) {
+	if working == 0 {
+		return nil, errors.New("clustered repository requires an allocated working snapshot origin")
+	}
+	return m.createPrivate(path, name, working)
+}
+
+func (m *Manager) createPrivate(path, name string, working ttcsnapshot.SnapshotID) (*Repository, error) {
 	if err := validateName(name, "repository"); err != nil {
 		return nil, err
 	}
@@ -401,10 +427,10 @@ func (m *Manager) CreatePrivate(path, name string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.createAt(path, name, id)
+	return m.createAt(path, name, id, working)
 }
 
-func (m *Manager) createAt(path, name, id string) (*Repository, error) {
+func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.SnapshotID) (*Repository, error) {
 	for _, dir := range []string{path, filepath.Join(path, "staging"), filepath.Join(path, "branches"), filepath.Join(path, "graph"), filepath.Join(path, "data")} {
 		if err := os.Mkdir(dir, 0700); err != nil {
 			_ = os.RemoveAll(path)
@@ -427,7 +453,12 @@ func (m *Manager) createAt(path, name, id string) (*Repository, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
-	working, err := repo.graph.AllocateWorking()
+	working := workingOrigin
+	if working == 0 {
+		working, err = repo.graph.AllocateWorking()
+	} else {
+		err = repo.graph.AdoptWorking(working)
+	}
 	if err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
@@ -1204,6 +1235,19 @@ type ForkTransaction struct {
 // both branch generations ensures that either side's next regular-file write
 // clones.
 func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
+	return r.beginFork(source, child, nil)
+}
+
+// BeginForkWithOrigins performs the same O(1) repository fork using the exact
+// fresh source and child working origins already committed by cluster Raft.
+func (r *Repository) BeginForkWithOrigins(source, child string, sourceWorking, childWorking ttcsnapshot.SnapshotID) (*ForkTransaction, error) {
+	if sourceWorking == 0 || childWorking == 0 || sourceWorking == childWorking {
+		return nil, errors.New("clustered repository fork requires two distinct working snapshot origins")
+	}
+	return r.beginFork(source, child, []ttcsnapshot.SnapshotID{sourceWorking, childWorking})
+}
+
+func (r *Repository) beginFork(source, child string, externalOrigins []ttcsnapshot.SnapshotID) (*ForkTransaction, error) {
 	if err := validateName(child, "branch"); err != nil {
 		return nil, err
 	}
@@ -1234,16 +1278,24 @@ func (r *Repository) BeginFork(source, child string) (*ForkTransaction, error) {
 		}
 		tx.source = sourceBranch
 		sealedOrigin := sourceBranch.WorkingSnapshot
-		working, err := r.graph.SealAndFork(
-			ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
-			ttcsnapshot.SnapshotSealedLocal,
-			map[string]string{
-				graphRootName(child):      graphRootName(source),
-				graphBaseRootName(source): graphRootName(source),
-				graphBaseRootName(child):  graphRootName(source),
-			},
-			2,
-		)
+		copies := map[string]string{
+			graphRootName(child):      graphRootName(source),
+			graphBaseRootName(source): graphRootName(source),
+			graphBaseRootName(child):  graphRootName(source),
+		}
+		var working []ttcsnapshot.SnapshotID
+		if len(externalOrigins) == 0 {
+			working, err = r.graph.SealAndFork(
+				ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
+				ttcsnapshot.SnapshotSealedLocal, copies, 2,
+			)
+		} else {
+			working = externalOrigins
+			err = r.graph.SealAndForkWithOrigins(
+				ttcsnapshot.SnapshotID(sourceBranch.WorkingSnapshot),
+				ttcsnapshot.SnapshotSealedVolatile, copies, working,
+			)
+		}
 		if err != nil {
 			return err
 		}

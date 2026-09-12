@@ -1555,29 +1555,73 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if uint64(workingOrigins) > math.MaxUint64-uint64(s.state.NextSnapshot) {
+		return nil, errors.New("TTC snapshot ID space exhausted")
+	}
+	allocated := make([]SnapshotID, workingOrigins)
+	for index := range allocated {
+		allocated[index] = s.state.NextSnapshot + SnapshotID(index)
+	}
+	if err := s.sealAndForkLocked(source, state, copies, allocated); err != nil {
+		return nil, err
+	}
+	return allocated, nil
+}
+
+// SealAndForkWithOrigins is the clustered counterpart to SealAndFork. The
+// caller must first commit every supplied working origin in the cluster Raft
+// state machine. Installing the exact IDs and sealing the source occur in one
+// local graph transaction, so no branch can resume with an untracked origin.
+func (s *Store) SealAndForkWithOrigins(source SnapshotID, state SnapshotState, copies map[string]string, workingOrigins []SnapshotID) error {
+	if state != SnapshotSealedLocal && state != SnapshotSealedVolatile {
+		return fmt.Errorf("invalid seal target %q", state)
+	}
+	if len(copies) == 0 || len(workingOrigins) == 0 {
+		return errors.New("TTC snapshot fork requires roots and fresh working origins")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sealAndForkLocked(source, state, copies, workingOrigins)
+}
+
+func (s *Store) sealAndForkLocked(source SnapshotID, state SnapshotState, copies map[string]string, workingOrigins []SnapshotID) error {
 	snapshot, ok := s.state.Snapshots[snapshotKey(source)]
 	if !ok || snapshot.State != SnapshotWorking {
-		return nil, fmt.Errorf("snapshot %d is not working", source)
+		return fmt.Errorf("snapshot %d is not working", source)
+	}
+	seenOrigins := make(map[SnapshotID]struct{}, len(workingOrigins))
+	next := s.state.NextSnapshot
+	for _, id := range workingOrigins {
+		if id == 0 || id == SnapshotID(math.MaxUint64) {
+			return fmt.Errorf("invalid fresh working snapshot ID %d", id)
+		}
+		if _, duplicate := seenOrigins[id]; duplicate {
+			return fmt.Errorf("fresh working snapshot ID %d is repeated", id)
+		}
+		seenOrigins[id] = struct{}{}
+		if existing, exists := s.state.Snapshots[snapshotKey(id)]; exists {
+			return fmt.Errorf("fresh working snapshot ID %d is already %s", id, existing.State)
+		}
+		if id >= next {
+			next = id + 1
+		}
 	}
 	destinations := make([]string, 0, len(copies))
 	for destination, sourceName := range copies {
 		if err := validateRootName(destination); err != nil {
-			return nil, err
+			return err
 		}
 		if err := validateRootName(sourceName); err != nil {
-			return nil, err
+			return err
 		}
 		if _, exists := s.state.Roots[sourceName]; !exists {
-			return nil, fmt.Errorf("source root %q does not exist", sourceName)
+			return fmt.Errorf("source root %q does not exist", sourceName)
 		}
 		destinations = append(destinations, destination)
 	}
-	if uint64(workingOrigins) > math.MaxUint64-uint64(s.state.NextSnapshot) {
-		return nil, errors.New("TTC snapshot ID space exhausted")
-	}
 	sort.Strings(destinations)
 	touched := make(map[string]Object)
-	ops := make([]journalOp, 0, len(copies)*2+workingOrigins+2)
+	ops := make([]journalOp, 0, len(copies)*2+len(workingOrigins)+2)
 	for _, destination := range destinations {
 		id := s.state.Roots[copies[destination]]
 		object, ok := touched[id.key()]
@@ -1585,7 +1629,7 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 			object = s.state.Objects[id.key()]
 		}
 		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
-			return nil, fmt.Errorf("fork root object %s cannot be retained", id.key())
+			return fmt.Errorf("fork root object %s cannot be retained", id.key())
 		}
 		object.Refs++
 		touched[id.key()] = object
@@ -1597,7 +1641,7 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 			var err error
 			old, err = releaseObject(old)
 			if err != nil {
-				return nil, fmt.Errorf("replacing destination root %q: %w", destination, err)
+				return fmt.Errorf("replacing destination root %q: %w", destination, err)
 			}
 			touched[previous.key()] = old
 		}
@@ -1616,19 +1660,17 @@ func (s *Store) SealAndFork(source SnapshotID, state SnapshotState, copies map[s
 	ops = append(objectOps, ops...)
 	snapshot.State = state
 	ops = append(ops, journalOp{PutSnapshot: &snapshot})
-	allocated := make([]SnapshotID, workingOrigins)
-	next := s.state.NextSnapshot
-	for index := range allocated {
-		allocated[index] = next
-		working := Snapshot{ID: next, State: SnapshotWorking, NextOrdinal: 1}
+	for _, id := range workingOrigins {
+		working := Snapshot{ID: id, State: SnapshotWorking, NextOrdinal: 1}
 		ops = append(ops, journalOp{PutSnapshot: &working})
-		next++
 	}
-	ops = append(ops, journalOp{SetNextSnapshot: &next})
+	if next != s.state.NextSnapshot {
+		ops = append(ops, journalOp{SetNextSnapshot: &next})
+	}
 	if err := s.commitLocked(ops); err != nil {
-		return nil, err
+		return err
 	}
-	return allocated, nil
+	return nil
 }
 
 // CreateObject creates an object and a named construction pin. Every child

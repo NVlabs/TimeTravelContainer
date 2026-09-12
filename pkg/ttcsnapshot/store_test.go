@@ -665,6 +665,53 @@ func TestSealAndBatchForkIsOneTransaction(t *testing.T) {
 	}
 }
 
+func TestSealAndForkWithExternallyAllocatedOrigins(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.CreateObject(origin, "build/page", ObjectKindPage, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.SetMemoryPage(origin, "family/main/memory", 7, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("build/page"); err != nil {
+		t.Fatal(err)
+	}
+	before := store.Stats().Sequence
+	working := []SnapshotID{1001, 1002}
+	if err := store.SealAndForkWithOrigins(origin, SnapshotSealedVolatile, map[string]string{
+		"family/child/memory": "family/main/memory",
+	}, working); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Stats().Sequence - before; got != 1 {
+		t.Fatalf("external seal/fork used %d journal records, want 1", got)
+	}
+	for _, id := range working {
+		snapshot, ok := store.Snapshot(id)
+		if !ok || snapshot.State != SnapshotWorking {
+			t.Fatalf("external working snapshot %d=(%+v,%t)", id, snapshot, ok)
+		}
+	}
+	object, _ := store.Object(root)
+	if object.Refs != 2 {
+		t.Fatalf("shared root references=%d, want 2", object.Refs)
+	}
+	if next, err := store.AllocateWorking(); err != nil || next != 1003 {
+		t.Fatalf("next local allocation=(%d,%v), want (1003,nil)", next, err)
+	}
+	if err := store.SealAndForkWithOrigins(working[0], SnapshotSealedVolatile, map[string]string{
+		"family/duplicate/memory": "family/main/memory",
+	}, []SnapshotID{working[1]}); err == nil {
+		t.Fatal("accepted an already-present external working origin")
+	}
+}
+
 func TestRetainRootsIsAtomicAndIdempotent(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()

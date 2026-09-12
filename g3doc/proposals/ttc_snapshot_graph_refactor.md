@@ -110,6 +110,12 @@ after separately serialized zero-count transitions. This removes shared
 filesystem latency and a flattened tree walk from the live target activation
 path. It does not yet make filesystem origins globally unique: allocating
 those origins through the cluster state machine is the next phase-5 gate.
+The common graph and repository APIs now accept exact externally allocated
+working origins during initial repository creation and atomic seal/fork. They
+reject zero, repeated, or already-present IDs and advance the local high-water
+mark without inventing an intermediate ID. Existing standalone entry points
+retain local monotonic allocation. Passing Raft allocations through every
+container lifecycle call remains the next integration milestone.
 
 Graph roots are now the sole standalone dehydration source, and the Sentry
 streams a bounded capture directly to the daemon that owns the graph. No
