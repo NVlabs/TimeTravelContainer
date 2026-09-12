@@ -314,7 +314,7 @@ type Repository struct {
 
 	// materializationMu serializes installation of remotely inherited objects
 	// with runtime backing-cache invalidation. Hooks are invoked while this
-	// mutex is held, immediately before the placeholder pathname is replaced.
+	// mutex is held, immediately before the complete object is installed.
 	materializationMu       sync.Mutex
 	materializationHooks    map[uint64]func(string)
 	nextMaterializationHook uint64
@@ -2193,9 +2193,8 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if inode.DataGeneration == branch.WorkingSnapshot {
 		return false, nil
 	}
-	// A remotely inherited object starts as an incomplete target placeholder.
-	// Materialize the complete immutable file before creating its private
-	// writable generation.
+	// Materialize a remotely inherited immutable file before creating its
+	// private writable generation.
 	if err := r.ensureObjectRange(inode.Object, inode.Size, 0, inode.Size); err != nil {
 		return false, err
 	}

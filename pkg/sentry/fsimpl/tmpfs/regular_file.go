@@ -324,7 +324,7 @@ func (rf *regularFile) invalidateDiskIO() {
 }
 
 // ensureDiskData materializes a remotely inherited whole-file object before
-// any runtime cache can open its placeholder inode. Materialization is
+// any runtime cache can open it. Materialization is
 // deliberately outside mapsMu and diskIOMu: repository callbacks acquire
 // those locks to invalidate caches in every branch sharing the repository.
 func (rf *regularFile) ensureDiskData() error {

@@ -308,62 +308,6 @@ func (store *LocalDataStore) ReplaceDeferred(id ObjectID, source io.Reader, leng
 	return os.Rename(temporaryPath, destination)
 }
 
-// CreateSparsePlaceholder creates an incomplete, zero-block cache file with
-// the final object's logical length. Callers must track incompleteness
-// separately and never expose placeholder bytes. It exists only so mmap/open
-// paths have a stable inode that can later be atomically replaced.
-func (store *LocalDataStore) CreateSparsePlaceholder(id ObjectID, length int64) error {
-	if length < 0 {
-		return errors.New("negative TTC bulk-object placeholder length")
-	}
-	relative, err := objectRelativePath(id)
-	if err != nil {
-		return err
-	}
-	if store.rootFD != nil {
-		directory := filepath.Dir(relative)
-		if err := store.mkdirAllRelative(directory); err != nil {
-			return err
-		}
-		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".placeholder-")
-		if err != nil {
-			return err
-		}
-		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
-		truncateErr := temporary.Truncate(length)
-		closeErr := temporary.Close()
-		if truncateErr != nil || closeErr != nil {
-			return errors.Join(truncateErr, closeErr)
-		}
-		if err := unix.Linkat(int(store.rootFD.Fd()), temporaryName, int(store.rootFD.Fd()), relative, 0); err != nil && !errors.Is(err, unix.EEXIST) {
-			return err
-		}
-		return nil
-	}
-	destination, err := store.objectPath(id)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(destination), ".placeholder-")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	truncateErr := temporary.Truncate(length)
-	closeErr := temporary.Close()
-	if truncateErr != nil || closeErr != nil {
-		return errors.Join(truncateErr, closeErr)
-	}
-	if err := os.Link(temporaryPath, destination); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	return nil
-}
-
 func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64, durable bool) error {
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")

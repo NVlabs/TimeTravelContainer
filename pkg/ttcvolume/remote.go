@@ -155,9 +155,8 @@ func (r *Repository) remoteGraphObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Obj
 	// later hop before any guest pathname has reached this file. Resolving graph
 	// metadata alone does not run prepareDeferredInode, so register the bulk
 	// object's inherited source here as well. Otherwise the later hop receives a
-	// valid immutable object ID whose local sparse placeholder and relay mapping
-	// were never installed, and a returning A-to-B-to-A path fails as a missing
-	// local file (or waits forever on the relay that requested it).
+	// valid immutable object ID with no relay mapping, and a returning A-to-B-to-A
+	// path fails as a missing local file (or waits forever on its own relay).
 	if object.ID.Kind == ttcsnapshot.ObjectKindFile {
 		if err := r.prepareDeferredFileObject(object.ID, int64(object.BulkLength)); err != nil {
 			return ttcsnapshot.Object{}, err
@@ -359,11 +358,6 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	if remote == nil {
 		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
 	}
-	if openErr != nil {
-		if err := r.data.CreateSparsePlaceholder(id, size); err != nil {
-			return err
-		}
-	}
 	if err := r.markRemoteObjectPending(id.String(), sourceID.String()); err != nil {
 		return err
 	}
@@ -426,9 +420,9 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 		}
 		remote.objects[object] = size
 		remote.sources[object] = sourceObject
-		// Object IDs are content-addressed, so any authorized source for the
-		// same object is equivalent. Prefer the newest live attachment over a
-		// reader retained by an older branch.
+		// The immutable graph object identifies the authorized source bytes.
+		// Prefer the newest live attachment over a reader retained by an older
+		// branch.
 		r.remoteByObject[object] = remote
 	}
 	// Target-local IDs are not content hashes. A newer attachment for the
@@ -587,9 +581,9 @@ func (r *Repository) materializeRemoteObjectsLocked() error {
 		return nil
 	}
 	for _, remote := range remotes {
-		// A newer branch may have replaced this client's ownership of a
-		// content-addressed object. Do not contact a stale connection for it;
-		// the current owner below will materialize the same immutable bytes.
+		// A newer branch may have replaced this client's source attachment. Do
+		// not contact a stale connection for it; the current owner below will
+		// materialize the same immutable bytes.
 		r.remoteMu.Lock()
 		owned := make(map[string]int64)
 		for object, size := range remote.objects {
