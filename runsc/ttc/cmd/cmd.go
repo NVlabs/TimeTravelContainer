@@ -5748,6 +5748,15 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	}
 	originsCommitted = true
 	captureComplete = true
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		lifecycle := "exited"
+		if kind == "dehydrate" {
+			lifecycle = "dehydrated"
+		}
+		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(target.container, target.branch, generation, lifecycle); err != nil {
+			return rollback(fmt.Errorf("authorizing asynchronous publication: %w", err))
+		}
+	}
 	if err := b.publicationQueue.Activate(target.container, target.branch, generation); err != nil {
 		// The committed hidden roots are immutable and safe for retry. Keep the
 		// pending intent so daemon restart can validate and activate it.
@@ -12179,13 +12188,35 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	if len(missing) == 0 {
 		return restore, nil
 	}
-	if b.snapshotResolver == nil {
-		restore.close()
-		return nil, errors.New("graph memory has non-local chunks and no distributed resolver")
-	}
 	if _, err := rand.Read(restore.token[:]); err != nil {
 		restore.close()
 		return nil, err
+	}
+	// Cold graph objects that are already authoritative in shared storage are
+	// served by a detached helper. Do not make a live Sentry's future page
+	// faults depend on the lifetime of the control daemon that rehydrated it.
+	shared := b.snapshotShared != nil
+	if shared {
+		for id, object := range missing {
+			stored, err := b.snapshotShared.Object(id)
+			if err != nil || stored.BulkLength != object.BulkLength {
+				shared = false
+				break
+			}
+		}
+	}
+	if shared {
+		client, _, err := startSharedMemoryRelay(b.dataRoot, missing, restore.token)
+		if err != nil {
+			restore.close()
+			return nil, fmt.Errorf("starting shared graph memory relay: %w", err)
+		}
+		restore.remote = client
+		return restore, nil
+	}
+	if b.snapshotResolver == nil {
+		restore.close()
+		return nil, errors.New("graph memory has non-local chunks and no distributed resolver")
 	}
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {

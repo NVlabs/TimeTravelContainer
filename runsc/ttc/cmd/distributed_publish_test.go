@@ -51,6 +51,27 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	}
 }
 
+func TestSharedSnapshotReaderScopesRestartedRelayToManifestOrigins(t *testing.T) {
+	root := ttcsnapshot.ObjectID{Snapshot: 7, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	reader := &sharedSnapshotObjectReader{
+		allowed:        map[ttcsnapshot.ObjectID]struct{}{root: {}},
+		allowedOrigins: map[ttcsnapshot.SnapshotID]struct{}{3: {}},
+	}
+	if !reader.authorize(root) {
+		t.Fatal("root was not authorized")
+	}
+	// A restarted resolver may request a deep immutable source object directly,
+	// without first walking from the exported root in this relay session.
+	deepSource := ttcsnapshot.ObjectID{Snapshot: 3, Kind: ttcsnapshot.ObjectKindFile, Ordinal: 4096}
+	if !reader.authorize(deepSource) {
+		t.Fatal("object from a manifest origin was not authorized")
+	}
+	outside := ttcsnapshot.ObjectID{Snapshot: 4, Kind: ttcsnapshot.ObjectKindFile, Ordinal: 4096}
+	if reader.authorize(outside) {
+		t.Fatal("object outside the manifest origin scope was authorized")
+	}
+}
+
 func TestConfigMemFDSupportsWideBatchPayload(t *testing.T) {
 	payload := bytes.Repeat([]byte("wide-sibling-batch\n"), 1<<16)
 	file, err := newConfigMemFD("ttc-config-test", payload)

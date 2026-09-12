@@ -77,6 +77,33 @@ type ledgerImportRecord struct {
 	References map[string]ObjectID
 }
 
+type ledgerImportBeginRecord struct {
+	Origin     SnapshotID
+	Objects    uint64
+	References uint64
+}
+
+type ledgerImportObjectsRecord struct {
+	Origin  SnapshotID
+	Offset  uint64
+	Objects []Object
+}
+
+type ledgerNamedReference struct {
+	Name   string
+	Object ObjectID
+}
+
+type ledgerImportReferencesRecord struct {
+	Origin     SnapshotID
+	Offset     uint64
+	References []ledgerNamedReference
+}
+
+type ledgerImportCommitRecord struct {
+	Origin SnapshotID
+}
+
 type ledgerReferenceRecord struct {
 	Operation string
 	Name      string
@@ -91,15 +118,27 @@ type ledgerHandoffRecord struct {
 }
 
 type referenceLedgerRecord struct {
-	Version   int
-	Sequence  uint64
-	Import    *ledgerImportRecord
-	Reference *ledgerReferenceRecord
-	Handoff   *ledgerHandoffRecord
-	Ack       *uint64
-	Collect   *int
-	Collected int
-	Retire    *SnapshotID
+	Version          int
+	Sequence         uint64
+	Import           *ledgerImportRecord
+	ImportBegin      *ledgerImportBeginRecord
+	ImportObjects    *ledgerImportObjectsRecord
+	ImportReferences *ledgerImportReferencesRecord
+	ImportCommit     *ledgerImportCommitRecord
+	Reference        *ledgerReferenceRecord
+	Handoff          *ledgerHandoffRecord
+	Ack              *uint64
+	Collect          *int
+	Collected        int
+	Retire           *SnapshotID
+}
+
+type pendingLedgerImport struct {
+	begin         ledgerImportBeginRecord
+	objects       []Object
+	references    map[string]ObjectID
+	journalOffset int64
+	priorSequence uint64
 }
 
 func newReferenceLedgerState() referenceLedgerState {
@@ -240,6 +279,19 @@ func (ledger *ReferenceLedger) replay() error {
 	}
 	temporary := &ReferenceLedger{state: cloneReferenceLedgerState(ledger.state), sequence: ledger.sequence}
 	offset := int64(len(referenceLedgerHeader))
+	var pending *pendingLedgerImport
+	truncateTail := func(tail int64) error {
+		if pending != nil {
+			tail = pending.journalOffset
+			temporary.sequence = pending.priorSequence
+			pending = nil
+		}
+		if err := ledger.journal.Truncate(tail); err != nil {
+			return err
+		}
+		offset = tail
+		return ledger.journal.Sync()
+	}
 	for {
 		var framing [8]byte
 		n, err := ledger.journal.ReadAt(framing[:], offset)
@@ -247,7 +299,7 @@ func (ledger *ReferenceLedger) replay() error {
 			break
 		}
 		if err != nil || n != len(framing) {
-			if err := ledger.journal.Truncate(offset); err != nil {
+			if err := truncateTail(offset); err != nil {
 				return err
 			}
 			break
@@ -259,7 +311,7 @@ func (ledger *ReferenceLedger) replay() error {
 		data := make([]byte, length)
 		n, err = ledger.journal.ReadAt(data, offset+8)
 		if err != nil || uint64(n) != length {
-			if err := ledger.journal.Truncate(offset); err != nil {
+			if err := truncateTail(offset); err != nil {
 				return err
 			}
 			break
@@ -276,12 +328,17 @@ func (ledger *ReferenceLedger) replay() error {
 			if record.Sequence != temporary.sequence+1 {
 				return fmt.Errorf("reference ledger record %d follows %d", record.Sequence, temporary.sequence)
 			}
-			if err := replayReferenceLedgerRecord(temporary, record); err != nil {
+			if err := replayReferenceLedgerRecordWithImport(temporary, record, offset, &pending); err != nil {
 				return fmt.Errorf("replaying reference ledger record %d: %w", record.Sequence, err)
 			}
 			temporary.sequence = record.Sequence
 		}
 		offset += 8 + int64(length)
+	}
+	if pending != nil {
+		if err := truncateTail(pending.journalOffset); err != nil {
+			return err
+		}
 	}
 	ledger.state = cloneReferenceLedgerState(temporary.state)
 	ledger.sequence = temporary.sequence
@@ -289,36 +346,105 @@ func (ledger *ReferenceLedger) replay() error {
 	return err
 }
 
+func replayReferenceLedgerRecordWithImport(ledger *ReferenceLedger, record referenceLedgerRecord, offset int64, pending **pendingLedgerImport) error {
+	if *pending == nil {
+		if record.ImportBegin == nil {
+			if record.ImportObjects != nil || record.ImportReferences != nil || record.ImportCommit != nil {
+				return errors.New("chunked import record has no matching begin")
+			}
+			return replayReferenceLedgerRecord(ledger, record)
+		}
+		if referenceLedgerMutationCount(record) != 1 || record.ImportBegin.Origin == 0 {
+			return errors.New("invalid chunked import begin")
+		}
+		*pending = &pendingLedgerImport{
+			begin:         *record.ImportBegin,
+			objects:       nil,
+			references:    make(map[string]ObjectID),
+			journalOffset: offset,
+			priorSequence: record.Sequence - 1,
+		}
+		return nil
+	}
+	p := *pending
+	if referenceLedgerMutationCount(record) != 1 {
+		return errors.New("chunked import contains an interleaved mutation")
+	}
+	switch {
+	case record.ImportObjects != nil:
+		chunk := record.ImportObjects
+		if chunk.Origin != p.begin.Origin || chunk.Offset != uint64(len(p.objects)) || len(chunk.Objects) == 0 || uint64(len(p.objects))+uint64(len(chunk.Objects)) > p.begin.Objects {
+			return errors.New("chunked import object range is not contiguous")
+		}
+		p.objects = append(p.objects, chunk.Objects...)
+		return nil
+	case record.ImportReferences != nil:
+		chunk := record.ImportReferences
+		if chunk.Origin != p.begin.Origin || chunk.Offset != uint64(len(p.references)) || len(chunk.References) == 0 || uint64(len(p.references))+uint64(len(chunk.References)) > p.begin.References {
+			return errors.New("chunked import reference range is not contiguous")
+		}
+		for _, reference := range chunk.References {
+			if _, exists := p.references[reference.Name]; exists {
+				return fmt.Errorf("chunked import repeats reference %q", reference.Name)
+			}
+			p.references[reference.Name] = reference.Object
+		}
+		return nil
+	case record.ImportCommit != nil:
+		if record.ImportCommit.Origin != p.begin.Origin || uint64(len(p.objects)) != p.begin.Objects || uint64(len(p.references)) != p.begin.References {
+			return errors.New("chunked import commit is incomplete")
+		}
+		next, err := importOriginState(ledger.state, p.begin.Origin, p.objects, p.references)
+		if err != nil {
+			return err
+		}
+		ledger.state = next
+		*pending = nil
+		return nil
+	default:
+		return errors.New("chunked import contains an interleaved mutation")
+	}
+}
+
+func referenceLedgerMutationCount(record referenceLedgerRecord) int {
+	count := 0
+	for _, set := range []bool{
+		record.Import != nil, record.ImportBegin != nil, record.ImportObjects != nil,
+		record.ImportReferences != nil, record.ImportCommit != nil, record.Reference != nil,
+		record.Handoff != nil, record.Ack != nil, record.Collect != nil, record.Retire != nil,
+	} {
+		if set {
+			count++
+		}
+	}
+	return count
+}
+
 func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedgerRecord) error {
-	set := 0
+	set := referenceLedgerMutationCount(record)
 	if record.Import != nil {
-		set++
 		if err := ledger.ImportOrigin(record.Import.Origin, record.Import.Objects, record.Import.References); err != nil {
 			return err
 		}
 	}
 	if record.Reference != nil {
-		set++
 		r := record.Reference
 		if err := ledger.ApplyReference(r.Operation, r.Name, r.Object, r.Retain); err != nil {
 			return err
 		}
 	}
 	if record.Handoff != nil {
-		set++
 		h := record.Handoff
 		if err := ledger.ApplyHandoff(h.Origin, h.From, h.Mutations); err != nil {
 			return err
 		}
 	}
 	if record.Ack != nil {
-		set++
 		if err := ledger.AcknowledgeOutbound(*record.Ack); err != nil {
 			return err
 		}
 	}
 	if record.Collect != nil {
-		set++
 		collected, err := ledger.Collect(*record.Collect)
 		if err != nil {
 			return err
@@ -328,7 +454,6 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 		}
 	}
 	if record.Retire != nil {
-		set++
 		if err := ledger.RetireOrigin(*record.Retire); err != nil {
 			return err
 		}
@@ -350,22 +475,12 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 	if ledger.sequence == math.MaxUint64 {
 		return errors.New("reference ledger sequence exhausted")
 	}
-	record.Version = referenceLedgerVersion
 	record.Sequence = ledger.sequence + 1
-	data, err := json.Marshal(record)
+	encoded, err := encodeReferenceLedgerRecord(record)
 	if err != nil {
-		return fmt.Errorf("encoding reference ledger record: %w", err)
+		return err
 	}
-	if len(data) == 0 || len(data) > maxReferenceLedgerRecord {
-		return fmt.Errorf("reference ledger record has invalid length %d", len(data))
-	}
-	var framing [8]byte
-	binary.BigEndian.PutUint64(framing[:], uint64(len(data)))
-	encoded := append(framing[:], data...)
-	var written int
-	if written, err = ledger.journal.Write(encoded); err == nil && written != len(encoded) {
-		err = io.ErrShortWrite
-	}
+	err = writeFull(ledger.journal, encoded)
 	if err == nil {
 		err = ledger.journal.Sync()
 	}
@@ -374,6 +489,123 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 		return err
 	}
 	ledger.sequence = record.Sequence
+	ledger.state = next
+	return nil
+}
+
+func encodeReferenceLedgerRecord(record referenceLedgerRecord) ([]byte, error) {
+	record.Version = referenceLedgerVersion
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("encoding reference ledger record: %w", err)
+	}
+	if len(data) == 0 || len(data) > maxReferenceLedgerRecord {
+		return nil, fmt.Errorf("reference ledger record has invalid length %d", len(data))
+	}
+	encoded := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint64(encoded[:8], uint64(len(data)))
+	copy(encoded[8:], data)
+	return encoded, nil
+}
+
+// commitChunkedImportLocked makes an arbitrarily large origin import atomic
+// without weakening the bounded-WAL invariant. The commit marker is synced
+// separately from its payload. Replay rolls an incomplete prefix back to the
+// begin offset, so the new graph is never partially visible.
+func (ledger *ReferenceLedger) commitChunkedImportLocked(origin SnapshotID, objects []Object, references map[string]ObjectID, next referenceLedgerState) error {
+	if ledger.poisoned != nil {
+		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
+	}
+	if ledger.journal == nil {
+		ledger.state = next
+		return nil
+	}
+	names := make([]string, 0, len(references))
+	for name := range references {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	named := make([]ledgerNamedReference, 0, len(names))
+	for _, name := range names {
+		named = append(named, ledgerNamedReference{Name: name, Object: references[name]})
+	}
+	records := []referenceLedgerRecord{{ImportBegin: &ledgerImportBeginRecord{
+		Origin: origin, Objects: uint64(len(objects)), References: uint64(len(named)),
+	}}}
+	appendBatches := func(total int, makeRecord func(offset, end int) referenceLedgerRecord) error {
+		for offset := 0; offset < total; {
+			end := offset + 256
+			if end > total {
+				end = total
+			}
+			for {
+				record := makeRecord(offset, end)
+				// MaxUint64 has the widest JSON representation of Sequence, so
+				// a record that fits this preview also fits its real sequence.
+				record.Sequence = math.MaxUint64
+				if _, err := encodeReferenceLedgerRecord(record); err == nil {
+					records = append(records, record)
+					offset = end
+					break
+				} else if end-offset == 1 {
+					return err
+				}
+				end = offset + (end-offset)/2
+			}
+		}
+		return nil
+	}
+	if err := appendBatches(len(objects), func(offset, end int) referenceLedgerRecord {
+		return referenceLedgerRecord{ImportObjects: &ledgerImportObjectsRecord{
+			Origin: origin, Offset: uint64(offset), Objects: objects[offset:end],
+		}}
+	}); err != nil {
+		return err
+	}
+	if err := appendBatches(len(named), func(offset, end int) referenceLedgerRecord {
+		return referenceLedgerRecord{ImportReferences: &ledgerImportReferencesRecord{
+			Origin: origin, Offset: uint64(offset), References: named[offset:end],
+		}}
+	}); err != nil {
+		return err
+	}
+	commit := referenceLedgerRecord{ImportCommit: &ledgerImportCommitRecord{Origin: origin}}
+	if uint64(len(records))+1 > math.MaxUint64-ledger.sequence {
+		return errors.New("reference ledger sequence exhausted")
+	}
+	encoded := make([][]byte, 0, len(records)+1)
+	for index := range records {
+		records[index].Sequence = ledger.sequence + uint64(index) + 1
+		data, err := encodeReferenceLedgerRecord(records[index])
+		if err != nil {
+			return err
+		}
+		encoded = append(encoded, data)
+	}
+	commit.Sequence = ledger.sequence + uint64(len(records)) + 1
+	commitData, err := encodeReferenceLedgerRecord(commit)
+	if err != nil {
+		return err
+	}
+	for _, data := range encoded {
+		if err := writeFull(ledger.journal, data); err != nil {
+			ledger.poisoned = err
+			return err
+		}
+	}
+	if err := ledger.journal.Sync(); err != nil {
+		ledger.poisoned = err
+		return err
+	}
+	if err := writeFull(ledger.journal, commitData); err != nil {
+		ledger.poisoned = err
+		return err
+	}
+	if err := ledger.journal.Sync(); err != nil {
+		ledger.poisoned = err
+		return err
+	}
+	ledger.sequence = commit.Sequence
 	ledger.state = next
 	return nil
 }
@@ -637,20 +869,42 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 	if _, exists := ledger.state.Origins[origin]; exists {
 		return nil
 	}
-	next := cloneReferenceLedgerState(ledger.state)
+	next, err := importOriginState(ledger.state, origin, objects, references)
+	if err != nil {
+		return err
+	}
+	record := referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}
+	if ledger.journal == nil {
+		return ledger.commitLocked(record, next)
+	}
+	record.Sequence = ledger.sequence + 1
+	if _, err := encodeReferenceLedgerRecord(record); err == nil {
+		return ledger.commitLocked(record, next)
+	}
+	return ledger.commitChunkedImportLocked(origin, objects, references, next)
+}
+
+func importOriginState(state referenceLedgerState, origin SnapshotID, objects []Object, references map[string]ObjectID) (referenceLedgerState, error) {
+	if origin == 0 {
+		return referenceLedgerState{}, errors.New("invalid reference-ledger origin import")
+	}
+	if _, exists := state.Origins[origin]; exists {
+		return cloneReferenceLedgerState(state), nil
+	}
+	next := cloneReferenceLedgerState(state)
 	next.Origins[origin] = struct{}{}
 	next.HandoffCursor[origin] = 0
 	for _, input := range objects {
 		object := cloneObject(input)
 		if object.ID.Snapshot != origin {
-			return fmt.Errorf("origin %d import contains foreign object %s", origin, object.ID)
+			return referenceLedgerState{}, fmt.Errorf("origin %d import contains foreign object %s", origin, object.ID)
 		}
 		object.State, object.Refs = ObjectLive, 0
 		if err := validateObject(object); err != nil {
-			return err
+			return referenceLedgerState{}, err
 		}
 		if _, exists := next.Objects[object.ID.key()]; exists {
-			return fmt.Errorf("origin import repeats object %s", object.ID)
+			return referenceLedgerState{}, fmt.Errorf("origin import repeats object %s", object.ID)
 		}
 		next.Objects[object.ID.key()] = object
 	}
@@ -660,12 +914,12 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 			if next.owns(edge.Child) {
 				child, ok := next.Objects[edge.Child.key()]
 				if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
-					return fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
+					return referenceLedgerState{}, fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
 				}
 				bridge := edgeReferenceName(parent.ID, edge.Slot)
 				if bridged, ok := next.References[bridge]; ok {
 					if bridged != edge.Child {
-						return fmt.Errorf("incoming edge bridge %q selects %s, want %s", bridge, bridged, edge.Child)
+						return referenceLedgerState{}, fmt.Errorf("incoming edge bridge %q selects %s, want %s", bridge, bridged, edge.Child)
 					}
 					// Replace the external named reference with the now-internal
 					// structural edge. The child's count is unchanged.
@@ -675,7 +929,7 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 					next.Objects[edge.Child.key()] = child
 				}
 			} else if err := next.enqueue(parent.ID, edge, true); err != nil {
-				return err
+				return referenceLedgerState{}, err
 			}
 		}
 	}
@@ -691,7 +945,7 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 				if parent.ID.Snapshot != origin {
 					child, ok := next.Objects[edge.Child.key()]
 					if !ok || child.Refs == math.MaxUint64 {
-						return fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
+						return referenceLedgerState{}, fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
 					}
 					child.State = ObjectLive
 					child.Refs++
@@ -712,13 +966,13 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 		}
 		if internal, ok := internalIncoming[effectiveName]; ok {
 			if references[name] != internal {
-				return fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
+				return referenceLedgerState{}, fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
 			}
 			// The already-owned parent edge supplies this count directly.
 			continue
 		}
 		if err := next.retain(effectiveName, references[name]); err != nil {
-			return fmt.Errorf("importing reference %q: %w", effectiveName, err)
+			return referenceLedgerState{}, fmt.Errorf("importing reference %q: %w", effectiveName, err)
 		}
 	}
 	for key, object := range next.Objects {
@@ -727,7 +981,7 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 			next.Objects[key] = object
 		}
 	}
-	return ledger.commitLocked(referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}, next)
+	return next, nil
 }
 
 // ApplyReference applies one idempotent local root or delivered cross-owner

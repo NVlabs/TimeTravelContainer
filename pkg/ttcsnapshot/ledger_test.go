@@ -15,6 +15,8 @@
 package ttcsnapshot
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -223,6 +225,137 @@ func TestReferenceLedgerDurableReplayAndPartialTail(t *testing.T) {
 	defer final.Close()
 	if got := len(final.Inspect().Objects); got != 0 {
 		t.Fatalf("objects after collection replay=%d, want 0", got)
+	}
+}
+
+func largeLedgerImport(t *testing.T, origin SnapshotID) ([]Object, map[string]ObjectID) {
+	t.Helper()
+	objects := make([]Object, 4)
+	references := make(map[string]ObjectID, len(objects))
+	for index := range objects {
+		objects[index] = ledgerObject(origin, uint64(index+1), ObjectKindMetadata)
+		objects[index].Data = make([]byte, 2<<20)
+		objects[index].Data[0] = byte(index + 1)
+		references["root/large/"+string(rune('a'+index))] = objects[index].ID
+	}
+	record, err := json.Marshal(referenceLedgerRecord{Version: referenceLedgerVersion, Sequence: 1, Import: &ledgerImportRecord{
+		Origin: origin, Objects: objects, References: references,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record) <= maxReferenceLedgerRecord {
+		t.Fatalf("fixture import is %d bytes, want more than %d", len(record), maxReferenceLedgerRecord)
+	}
+	return objects, references
+}
+
+func referenceLedgerFrameOffsets(t *testing.T, data []byte) []int {
+	t.Helper()
+	offsets := []int{len(referenceLedgerHeader)}
+	for offset := len(referenceLedgerHeader); offset < len(data); {
+		if len(data)-offset < 8 {
+			t.Fatalf("partial frame at %d", offset)
+		}
+		length := int(binary.BigEndian.Uint64(data[offset : offset+8]))
+		offset += 8 + length
+		if offset > len(data) {
+			t.Fatalf("frame ends at %d past %d", offset, len(data))
+		}
+		offsets = append(offsets, offset)
+	}
+	return offsets
+}
+
+func TestReferenceLedgerLargeImportIsBoundedAtomicAndDurable(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	objects, references := largeLedgerImport(t, 71)
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ImportOrigin(71, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ledger.Inspect().Objects); got != len(objects) {
+		t.Fatalf("objects=%d, want %d", got, len(objects))
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "ledger.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets := referenceLedgerFrameOffsets(t, data)
+	if len(offsets) < 4 {
+		t.Fatalf("large import used %d frames, want begin, payload, and commit", len(offsets)-1)
+	}
+	for index := 1; index < len(offsets); index++ {
+		if size := offsets[index] - offsets[index-1] - 8; size <= 0 || size > maxReferenceLedgerRecord {
+			t.Fatalf("frame %d size=%d", index, size)
+		}
+	}
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := len(reopened.Inspect().Objects); got != len(objects) {
+		t.Fatalf("replayed objects=%d, want %d", got, len(objects))
+	}
+	if err := reopened.ImportOrigin(71, objects, references); err != nil {
+		t.Fatalf("idempotent import retry: %v", err)
+	}
+}
+
+func TestReferenceLedgerIncompleteLargeImportRollsBack(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "source")
+	objects, references := largeLedgerImport(t, 72)
+	ledger, err := OpenReferenceLedger(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ImportOrigin(72, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(source, "ledger.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offsets := referenceLedgerFrameOffsets(t, data)
+	for name, length := range map[string]int{
+		"before-commit":   offsets[len(offsets)-2],
+		"partial-payload": offsets[1] + (offsets[2]-offsets[1])/2,
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := filepath.Join(t.TempDir(), "ledger")
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "ledger.log"), data[:length], 0600); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenReferenceLedger(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := reopened.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 {
+				t.Fatalf("partial import became visible: %+v", got)
+			}
+			if got := reopened.JournalBytes(); got != int64(len(referenceLedgerHeader)) {
+				t.Fatalf("rolled-back journal is %d bytes", got)
+			}
+			if err := reopened.ImportOrigin(72, objects, references); err != nil {
+				t.Fatalf("retry after rollback: %v", err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

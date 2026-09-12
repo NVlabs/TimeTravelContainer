@@ -448,6 +448,9 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "exited", BranchGeneration: created.Generation, StorageGeneration: 1,
 	}))
+	if begin.PreviousLifecycle != "paused" || state.Branches[logicalBranchKey("family", "main")].Lifecycle != "exited" {
+		t.Fatalf("publication begin did not expose terminal transition: record=%+v branch=%+v", begin, state.Branches[logicalBranchKey("family", "main")])
+	}
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
 		Roots: DurableRoots{MemorySnapshot: 7},
@@ -463,6 +466,29 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	branch := state.Branches[logicalBranchKey("family", "main")]
 	if branch.Corrupted || branch.Lifecycle != "exited" || branch.Roots.MemorySnapshot != 7 {
 		t.Fatalf("durable healthy branch authority = %+v", branch)
+	}
+}
+
+func TestAuthorityCanceledDehydrationRestoresPriorLifecycle(t *testing.T) {
+	at := time.Unix(3600, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}}))
+	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation, StorageGeneration: 1,
+	}))
+	if begin.PreviousLifecycle != "running" || state.Branches[logicalBranchKey("family", "main")].Lifecycle != "dehydrating" {
+		t.Fatalf("dehydration transition=%+v branch=%+v", begin, state.Branches[logicalBranchKey("family", "main")])
+	}
+	applyAuthorityForTest(t, state, "publish-cancel", at.Add(2*time.Second), AuthorityPublicationCancel, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", Operation: begin.OperationID, BranchGeneration: created.Generation,
+		StorageGeneration: 1, Revision: begin.Revision,
+	})
+	if got := state.Branches[logicalBranchKey("family", "main")].Lifecycle; got != "running" {
+		t.Fatalf("canceled dehydration lifecycle=%q, want running", got)
 	}
 }
 

@@ -345,38 +345,49 @@ func publicationOperationID(generation uint64) string {
 	return "publication-" + time.Unix(int64(generation), 0).UTC().Format("20060102T150405")
 }
 
-// EnsurePublicationReady authorizes one generation and records that its
-// node-local capture fence is complete. It is intentionally retryable after a
-// daemon crash; no shared bytes may be uploaded before it succeeds.
-func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGeneration uint64, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
+// EnsurePublicationPreparing commits the user-visible lifecycle transition
+// before any asynchronous shared bytes are written. The branch remains owned
+// by its current node until CommitPublication atomically installs durable
+// roots and releases placement.
+func (c *RaftCatalog) EnsurePublicationPreparing(family, branch string, storageGeneration uint64, lifecycle string) (*PublicationRecord, error) {
 	state, err := c.state()
 	if err != nil {
 		return nil, err
 	}
 	key := publicationKey(family, branch, storageGeneration)
-	record, exists := state.Publications[key]
 	operation := publicationOperationID(storageGeneration)
-	if !exists {
-		branchAuthority, ok := state.Branches[logicalBranchKey(family, branch)]
-		if !ok {
-			return nil, os.ErrNotExist
+	if record, exists := state.Publications[key]; exists {
+		if record.OperationID != operation || record.Lifecycle != lifecycle {
+			return nil, errors.New("publication generation has conflicting authority")
 		}
-		created, err := applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationBegin, AuthorityPublicationPayload{
-			Family: family, Branch: branch, Operation: operation, Lifecycle: lifecycle,
-			BranchGeneration: branchAuthority.Generation, StorageGeneration: storageGeneration,
-		})
-		if err != nil {
-			return nil, err
+		if record.State == PublicationCanceled || record.State == PublicationFailed {
+			return nil, errors.New("publication generation is not usable")
 		}
-		record = *created
+		return &record, nil
 	}
-	if record.OperationID != operation || record.Lifecycle != lifecycle {
-		return nil, errors.New("publication generation has conflicting authority")
+	branchAuthority, ok := state.Branches[logicalBranchKey(family, branch)]
+	if !ok {
+		return nil, os.ErrNotExist
 	}
+	return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: family, Branch: branch, Operation: operation, Lifecycle: lifecycle,
+		BranchGeneration: branchAuthority.Generation, StorageGeneration: storageGeneration,
+	})
+}
+
+// EnsurePublicationReady authorizes one generation and records that its
+// node-local capture fence is complete. It is intentionally retryable after a
+// daemon crash; no shared bytes may be uploaded before it succeeds.
+func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGeneration uint64, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
+	recordPointer, err := c.EnsurePublicationPreparing(family, branch, storageGeneration, lifecycle)
+	if err != nil {
+		return nil, err
+	}
+	record := *recordPointer
 	switch record.State {
 	case PublicationPreparing:
 		return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationReady, AuthorityPublicationPayload{
-			Family: family, Branch: branch, Operation: operation,
+			Family: family, Branch: branch, Operation: record.OperationID,
 			BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision, Roots: captureRoots,
 		})
 	case PublicationReady, PublicationCommitted:

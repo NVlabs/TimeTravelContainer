@@ -323,23 +323,24 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 }
 
 type daemonClusterRuntime struct {
-	listen          string
-	authToken       string
-	mux             *cluster.ProtocolMux
-	controlListener net.Listener
-	controlPlane    *cluster.ControlPlane
-	source          *distributedSourceRuntime
-	directory       cluster.NodeCatalog
-	placements      cluster.PlacementCatalog
-	transactions    cluster.TransactionCatalog
-	raft            *cluster.AuthorityRaftNode
-	raftLocalDir    string
-	raftCatalog     *cluster.RaftCatalog
-	nodeRecord      cluster.NodeRecord
-	lease           time.Duration
-	clusterID       string
-	autoRebalance   bool
-	capacitySink    elasticCapacitySink
+	listen            string
+	authToken         string
+	mux               *cluster.ProtocolMux
+	controlListener   net.Listener
+	controlPlane      *cluster.ControlPlane
+	source            *distributedSourceRuntime
+	directory         cluster.NodeCatalog
+	placements        cluster.PlacementCatalog
+	transactions      cluster.TransactionCatalog
+	raft              *cluster.AuthorityRaftNode
+	raftLocalDir      string
+	raftCatalog       *cluster.RaftCatalog
+	nodeRecord        cluster.NodeRecord
+	lease             time.Duration
+	clusterID         string
+	recoverMembership func(context.Context) error
+	autoRebalance     bool
+	capacitySink      elasticCapacitySink
 }
 
 const daemonNodeIncarnationVersion = 1
@@ -3077,13 +3078,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		}
 	}()
 	if raftNode.HadExistingState() {
-		deadline := time.Now().Add(15 * time.Second)
-		for raftNode.Leader() == "" && time.Now().Before(deadline) {
-			time.Sleep(20 * time.Millisecond)
-		}
-		if raftNode.Leader() == "" {
-			return nil, errors.New("existing TTC Raft member could not discover a leader")
-		}
+		// Keep the Raft listener alive even when this is the first member being
+		// restarted after a whole-cluster outage. Waiting for a leader here and
+		// then exiting makes sequential service startup impossible: no process
+		// survives long enough to form a quorum. The control server is installed
+		// before registerClusterNodeWithRetry, which supplies the bounded
+		// readiness wait once the remaining members return.
 	} else if opts.RaftBootstrap {
 		deadline := time.Now().Add(15 * time.Second)
 		for !raftNode.IsLeader() && time.Now().Before(deadline) {
@@ -3172,6 +3172,21 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
 		raft: raftNode, raftLocalDir: raftLocalDir, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
+		recoverMembership: func(ctx context.Context) error {
+			if len(clients) == 0 {
+				return errors.New("no cluster seed is configured for Raft membership recovery")
+			}
+			request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
+			var result error
+			for _, peer := range clients {
+				if err := joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken); err == nil {
+					return nil
+				} else {
+					result = errors.Join(result, err)
+				}
+			}
+			return result
+		},
 		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink,
 	}, nil
 }
@@ -3724,7 +3739,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				clusterListener.Close()
 				return fmt.Errorf("loading elastic drain recovery state: %w", err)
 			}
-			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease)
+			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, clusterRuntime.recoverMembership)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
@@ -4000,7 +4015,7 @@ func shutdownClusterServer(server *http.Server) {
 // restarted quorum elects a leader and waits out execution leases granted in
 // the prior term. Exiting during this interval can collapse the quorum before
 // any member is able to re-register and expose its control endpoint.
-func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration) (*cluster.NodeRecord, error) {
+func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration, recoverMembership func(context.Context) error) (*cluster.NodeRecord, error) {
 	if directory == nil {
 		return nil, errors.New("cluster node directory is unavailable")
 	}
@@ -4018,6 +4033,16 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 		lastErr = err
 		if !time.Now().Before(deadline) {
 			return nil, lastErr
+		}
+		// An offline server may have been removed from the live Raft
+		// configuration while this daemon was absent. Re-adding the same ID and
+		// address is idempotent for an existing voter and revives a removed
+		// member as a learner. The cluster HTTP listener is already serving, so
+		// simultaneous restarts cannot deadlock on these recovery attempts.
+		if recoverMembership != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = recoverMembership(ctx)
+			cancel()
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

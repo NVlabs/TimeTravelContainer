@@ -35,6 +35,12 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "_lease-guardian" {
 		os.Exit(cmd.RunLeaseGuardian(os.Args[2:], os.Stderr))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "_shared-fs-relay" {
+		os.Exit(cmd.RunSharedFilesystemRelay(os.Args[2:], os.Stderr))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "_shared-memory-relay" {
+		os.Exit(cmd.RunSharedMemoryRelay(os.Args[2:], os.Stderr))
+	}
 	runscMode := os.Getenv("TTC_EMBEDDED_RUNTIME") == "1" || embeddedRuntimeArgv0(os.Args[0])
 	if len(os.Args) >= 2 && os.Args[1] == "runsc" {
 		runscMode = true

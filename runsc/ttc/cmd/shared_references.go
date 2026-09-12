@@ -228,16 +228,24 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			if err != nil {
 				return err
 			}
+			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
+				continue
+			}
 			if coldFilesystemReferences[root.Snapshot] == nil {
 				coldFilesystemReferences[root.Snapshot] = make(map[string]ttcsnapshot.ObjectID)
 			}
-			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source))
+			// Include the immutable root in the name. Replacing a branch's cold
+			// generation must retain the new graph before releasing the old one;
+			// a stable branch-only name would require an unsafe in-place reference
+			// replacement in the ledger.
+			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source + "\x00" + root.String()))
 			coldFilesystemReferences[root.Snapshot][fmt.Sprintf("root/cold/%x", nameHash)] = root
 		}
 		return nil
 	}
 	for _, branch := range state.Branches {
-		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 {
+		_, memoryVolatile := state.VolatileOrigins[branch.Roots.MemorySnapshot]
+		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile {
 			coldOrigins[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
 		}
 		if !branch.Corrupted {
@@ -246,13 +254,33 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			}
 		}
 	}
-	// Preparing and capture-ready publications are still volatile origins.
-	// Their source daemon's inventory retains the local graph roots until the
-	// same Raft command that commits the branch's durable roots routes those
-	// origins to shared storage. CandidateRoots intentionally names the future
-	// manifest before it exists, so treating it as an already-cold root both
-	// races publication and incorrectly splits one reference authority between
-	// the provider and this shared ledger.
+	// Complete() transfers each origin's reference authority before it commits
+	// the branch roots. A coordinator rebuild in that interval must retain the
+	// publication's already-shared candidate roots; otherwise it can discard a
+	// graph after provider handoff but immediately before the final branch CAS.
+	// The candidate uses the final branch reference names, so commit changes no
+	// counts. Origins that are still volatile remain protected by the provider.
+	for _, publication := range state.Publications {
+		if publication.State != cluster.PublicationReady || (publication.CandidateRoots.MemorySnapshot == 0 && publication.CandidateRoots.FilesystemRoot == "") {
+			continue
+		}
+		_, memoryVolatile := state.VolatileOrigins[publication.CandidateRoots.MemorySnapshot]
+		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile {
+			coldOrigins[ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)] = struct{}{}
+		}
+		if publication.CandidateRoots.FilesystemRoot != "" {
+			identity := "branch\x00" + publication.FamilyID + "\x00" + publication.BranchID
+			if err := addFilesystemRoots(identity, publication.CandidateRoots.FilesystemRoot); err != nil {
+				// Ready is committed before the publisher creates the cold
+				// manifest. Until the first origin handoff, the provider remains
+				// authoritative, so a missing candidate manifest is expected and
+				// must not prevent coordinator activation.
+				if !errors.Is(err, os.ErrNotExist) {
+					return fail(fmt.Errorf("reading publication filesystem roots: %w", err))
+				}
+			}
+		}
+	}
 
 	// Query every unfenced execution incarnation. If one cannot prove its
 	// claims, GC remains unavailable, but normal reads and execution continue.
@@ -324,6 +352,14 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	imported := make(map[ttcsnapshot.SnapshotID]struct{}, len(manifests))
 	for _, manifest := range manifests {
 		if _, retired := state.RetiredOrigins[uint64(manifest.Snapshot)]; retired {
+			continue
+		}
+		// Publication writes immutable pack bytes before authority handoff.
+		// While Raft still names a volatile provider, that provider's ledger is
+		// authoritative and a coordinator must not pre-import a speculative pack:
+		// doing so with no local roots would make its objects reclaiming and cause
+		// the later exact handoff to look like an idempotent import.
+		if _, volatile := state.VolatileOrigins[uint64(manifest.Snapshot)]; volatile {
 			continue
 		}
 		objects := make([]ttcsnapshot.Object, len(manifest.Objects))
@@ -505,18 +541,21 @@ func (s *sharedReferenceService) authorizeProvider(peer string, snapshot uint64)
 
 func (s *sharedReferenceService) ImportSharedSnapshot(_ context.Context, peer string, snapshotID uint64) error {
 	if err := s.authorizeProvider(peer, snapshotID); err != nil {
-		return err
+		return fmt.Errorf("authorizing provider: %w", err)
 	}
 	manifest, err := s.packs.Manifest(ttcsnapshot.SnapshotID(snapshotID))
 	if err != nil {
-		return err
+		return fmt.Errorf("reading shared pack manifest: %w", err)
 	}
 	objects := make([]ttcsnapshot.Object, len(manifest.Objects))
 	for index, packed := range manifest.Objects {
 		objects[index] = packed.Object
 	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return ledger.ImportOrigin(ttcsnapshot.SnapshotID(snapshotID), objects, manifest.References)
+		if err := ledger.ImportOrigin(ttcsnapshot.SnapshotID(snapshotID), objects, manifest.References); err != nil {
+			return fmt.Errorf("importing origin into reference ledger: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -633,36 +672,67 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 	}
 	desired := make(map[string]ttcsnapshot.ObjectID)
 	memory := make(map[ttcsnapshot.SnapshotID]struct{})
-	for _, branch := range state.Branches {
-		if branch.Corrupted {
-			continue
+	addMemory := func(snapshot uint64) {
+		if snapshot == 0 {
+			return
 		}
-		if branch.Roots.MemorySnapshot != 0 {
-			memory[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
+		if _, volatile := state.VolatileOrigins[snapshot]; !volatile {
+			memory[ttcsnapshot.SnapshotID(snapshot)] = struct{}{}
 		}
-		if branch.Roots.FilesystemRoot == "" {
-			continue
+	}
+	addFilesystem := func(identity, relative string) error {
+		if relative == "" {
+			return nil
 		}
-		path := filepath.Join(s.sharedRoot, branch.Roots.FilesystemRoot)
+		path := filepath.Join(s.sharedRoot, relative)
 		if err := validateColdManifestPath(s.sharedRoot, path); err != nil {
-			return nil, err
+			return err
 		}
 		manifest, err := readColdBranchManifest(path)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, filesystem := range manifest.Filesystems {
 			root, err := ttcsnapshot.ParseObjectID(filesystem.Root.Root)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			identity := "branch\x00" + branch.FamilyID + "\x00" + branch.BranchID
-			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source))
+			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
+				continue
+			}
+			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source + "\x00" + root.String()))
 			name := fmt.Sprintf("root/cold/%x", nameHash)
 			if previous, ok := desired[name]; ok && previous != root {
-				return nil, fmt.Errorf("authority root %q selects both %s and %s", name, previous, root)
+				return fmt.Errorf("authority root %q selects both %s and %s", name, previous, root)
 			}
 			desired[name] = root
+		}
+		return nil
+	}
+	for _, branch := range state.Branches {
+		if branch.Corrupted {
+			continue
+		}
+		addMemory(branch.Roots.MemorySnapshot)
+		identity := "branch\x00" + branch.FamilyID + "\x00" + branch.BranchID
+		if err := addFilesystem(identity, branch.Roots.FilesystemRoot); err != nil {
+			return nil, err
+		}
+	}
+	// Candidate roots bridge the committed provider-to-shared switch and the
+	// final branch-root CAS. A candidate and its final branch root have the same
+	// immutable-object-qualified reference name, making that transition
+	// count-neutral while still permitting generation replacement.
+	for _, publication := range state.Publications {
+		if publication.State != cluster.PublicationReady {
+			continue
+		}
+		addMemory(publication.CandidateRoots.MemorySnapshot)
+		identity := "branch\x00" + publication.FamilyID + "\x00" + publication.BranchID
+		if err := addFilesystem(identity, publication.CandidateRoots.FilesystemRoot); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
 		}
 	}
 	for snapshot := range memory {

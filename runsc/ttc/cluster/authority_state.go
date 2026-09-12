@@ -225,6 +225,7 @@ type PublicationRecord struct {
 	StorageGeneration uint64           `json:"storage_generation"`
 	OperationID       string           `json:"operation_id"`
 	Lifecycle         string           `json:"lifecycle"`
+	PreviousLifecycle string           `json:"previous_lifecycle,omitempty"`
 	State             PublicationState `json:"state"`
 	CandidateRoots    DurableRoots     `json:"candidate_roots,omitempty"`
 	Failure           string           `json:"failure,omitempty"`
@@ -1604,8 +1605,15 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			}
 			return authorityValue(old)
 		}
-		record := PublicationRecord{FamilyID: p.Family, BranchID: p.Branch, BranchGeneration: p.BranchGeneration, StorageGeneration: p.StorageGeneration, OperationID: p.Operation, Lifecycle: p.Lifecycle, State: PublicationPreparing, Revision: 1, UpdatedAt: command.IssuedAt}
+		record := PublicationRecord{FamilyID: p.Family, BranchID: p.Branch, BranchGeneration: p.BranchGeneration, StorageGeneration: p.StorageGeneration, OperationID: p.Operation, Lifecycle: p.Lifecycle, PreviousLifecycle: branch.Lifecycle, State: PublicationPreparing, Revision: 1, UpdatedAt: command.IssuedAt}
 		s.Publications[key] = record
+		if p.Lifecycle == "dehydrated" {
+			branch.Lifecycle = "dehydrating"
+		} else {
+			branch.Lifecycle = p.Lifecycle
+		}
+		branch.UpdatedAt = command.IssuedAt
+		s.Branches[branchKey] = branch
 		return authorityValue(record)
 	}
 	record, ok := s.Publications[key]
@@ -1672,11 +1680,26 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			return nil, errors.New("invalid publication failure")
 		}
 		record.State, record.Failure = PublicationFailed, p.Failure
+		current := s.Branches[branchKey]
+		if current.Generation == record.BranchGeneration && !current.Corrupted {
+			current.Lifecycle, current.UpdatedAt = "failed", command.IssuedAt
+			s.Branches[branchKey] = current
+		}
 	case AuthorityPublicationCancel:
 		if record.State == PublicationCommitted {
 			return nil, errors.New("committed publication cannot be canceled")
 		}
 		record.State = PublicationCanceled
+		current := s.Branches[branchKey]
+		if current.Generation == record.BranchGeneration && !current.Corrupted {
+			if record.Lifecycle == "dehydrated" {
+				current.Lifecycle = record.PreviousLifecycle
+			} else {
+				current.Lifecycle = record.Lifecycle
+			}
+			current.UpdatedAt = command.IssuedAt
+			s.Branches[branchKey] = current
+		}
 	}
 	record.Revision++
 	record.UpdatedAt = command.IssuedAt

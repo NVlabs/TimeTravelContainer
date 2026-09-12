@@ -12,10 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,9 +33,10 @@ import (
 )
 
 type sharedSnapshotObjectReader struct {
-	store   *ttcsnapshot.SharedPackStore
-	mu      sync.Mutex
-	allowed map[ttcsnapshot.ObjectID]struct{}
+	store          *ttcsnapshot.SharedPackStore
+	mu             sync.Mutex
+	allowed        map[ttcsnapshot.ObjectID]struct{}
+	allowedOrigins map[ttcsnapshot.SnapshotID]struct{}
 }
 
 func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root string) (*sharedSnapshotObjectReader, error) {
@@ -48,6 +50,9 @@ func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root stri
 func (r *sharedSnapshotObjectReader) authorize(id ttcsnapshot.ObjectID) bool {
 	r.mu.Lock()
 	_, ok := r.allowed[id]
+	if !ok {
+		_, ok = r.allowedOrigins[id.Snapshot]
+	}
 	r.mu.Unlock()
 	return ok
 }
@@ -86,6 +91,234 @@ type coldFilesystemRelays struct {
 	token   ttcvolume.RemoteToken
 	clients []*os.File
 	done    []<-chan error
+}
+
+const sharedMemoryRelayCatalogVersion = 1
+
+type sharedMemoryRelayObject struct {
+	ID     string `json:"id"`
+	Length uint64 `json:"length"`
+}
+
+type sharedMemoryRelayCatalog struct {
+	Version int                       `json:"version"`
+	Objects []sharedMemoryRelayObject `json:"objects"`
+}
+
+// RunSharedMemoryRelay serves immutable graph-memory chunks from shared packs
+// over inherited fd 3. The bounded allowlist is read from inherited fd 4.
+// Like the filesystem relay, this helper is detached from the control daemon:
+// a rehydrated Sentry may continue faulting cold pages across ttcd restarts.
+func RunSharedMemoryRelay(args []string, stderr io.Writer) int {
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: invalid arguments")
+		return 2
+	}
+	store, err := ttcsnapshot.OpenSharedPackStore(args[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd shared memory relay: opening packs: %v\n", err)
+		return 1
+	}
+	var token ttcsnapshot.ObjectRelayToken
+	if decoded, decodeErr := hex.DecodeString(args[1]); decodeErr != nil || len(decoded) != len(token) {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: invalid token")
+		return 2
+	} else {
+		copy(token[:], decoded)
+	}
+	catalogFile := os.NewFile(4, "ttcd-shared-memory-catalog")
+	if catalogFile == nil {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: inherited catalog is unavailable")
+		return 2
+	}
+	defer catalogFile.Close()
+	var catalog sharedMemoryRelayCatalog
+	decoder := json.NewDecoder(io.LimitReader(catalogFile, 64<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&catalog); err != nil || decoder.Decode(&struct{}{}) != io.EOF || catalog.Version != sharedMemoryRelayCatalogVersion || len(catalog.Objects) == 0 {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: invalid catalog")
+		return 2
+	}
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(catalog.Objects))
+	for _, encoded := range catalog.Objects {
+		id, err := ttcsnapshot.ParseObjectID(encoded.ID)
+		if err != nil || encoded.Length == 0 || encoded.Length > ttcsnapshot.MemoryChunkBytes {
+			fmt.Fprintln(stderr, "ttcd shared memory relay: invalid catalog object")
+			return 2
+		}
+		if _, duplicate := allowed[id]; duplicate {
+			fmt.Fprintln(stderr, "ttcd shared memory relay: duplicate catalog object")
+			return 2
+		}
+		object, err := store.Object(id)
+		if err != nil || object.BulkLength != encoded.Length {
+			fmt.Fprintln(stderr, "ttcd shared memory relay: catalog object is unavailable")
+			return 1
+		}
+		allowed[id] = encoded.Length
+	}
+	connection := os.NewFile(3, "ttcd-shared-memory-relay")
+	if connection == nil {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: inherited connection is unavailable")
+		return 2
+	}
+	err = ttcsnapshot.ServeObjectRelay(connection, token, store, allowed)
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return 0
+	}
+	fmt.Fprintf(stderr, "ttcd shared memory relay: %v\n", err)
+	return 1
+}
+
+func startSharedMemoryRelay(sharedRoot string, objects map[ttcsnapshot.ObjectID]ttcsnapshot.Object, token ttcsnapshot.ObjectRelayToken) (*os.File, <-chan error, error) {
+	if len(objects) == 0 {
+		return nil, nil, errors.New("shared memory relay has no immutable objects")
+	}
+	catalog := sharedMemoryRelayCatalog{Version: sharedMemoryRelayCatalogVersion, Objects: make([]sharedMemoryRelayObject, 0, len(objects))}
+	for id, object := range objects {
+		if id.IsZero() || object.ID != id || object.BulkLength == 0 || object.BulkLength > ttcsnapshot.MemoryChunkBytes {
+			return nil, nil, fmt.Errorf("invalid shared memory relay object %s", id)
+		}
+		catalog.Objects = append(catalog.Objects, sharedMemoryRelayObject{ID: id.String(), Length: object.BulkLength})
+	}
+	sort.Slice(catalog.Objects, func(i, j int) bool { return catalog.Objects[i].ID < catalog.Objects[j].ID })
+	encoded, err := json.Marshal(&catalog)
+	if err != nil {
+		return nil, nil, err
+	}
+	catalogFile, err := newConfigMemFD("ttc-shared-memory-catalog", encoded)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer catalogFile.Close()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	server := os.NewFile(uintptr(fds[0]), "ttc-shared-memory-server")
+	client := os.NewFile(uintptr(fds[1]), "ttc-shared-memory-client")
+	executable, err := os.Executable()
+	if err != nil {
+		server.Close()
+		client.Close()
+		return nil, nil, err
+	}
+	command := exec.Command(executable, "_shared-memory-relay", filepath.Join(sharedRoot, "snapshot-packs"), hex.EncodeToString(token[:]))
+	command.ExtraFiles = []*os.File{server, catalogFile}
+	command.Stdin, command.Stdout, command.Stderr = nil, nil, os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		server.Close()
+		client.Close()
+		return nil, nil, err
+	}
+	server.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- command.Wait()
+		close(done)
+	}()
+	return client, done, nil
+}
+
+// RunSharedFilesystemRelay serves one immutable filesystem tree from shared
+// packs over inherited fd 3. It runs in a tiny detached ttcd helper so a live
+// Sentry's lazy reads do not depend on the control daemon's process lifetime.
+func RunSharedFilesystemRelay(args []string, stderr io.Writer) int {
+	if len(args) != 5 {
+		fmt.Fprintln(stderr, "ttcd shared filesystem relay: invalid arguments")
+		return 2
+	}
+	store, err := ttcsnapshot.OpenSharedPackStore(args[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd shared filesystem relay: opening packs: %v\n", err)
+		return 1
+	}
+	reader, err := newSharedSnapshotObjectReader(store, args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "ttcd shared filesystem relay: opening root: %v\n", err)
+		return 1
+	}
+	reader.allowedOrigins = make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, encoded := range strings.Split(args[4], ",") {
+		origin, parseErr := strconv.ParseUint(encoded, 16, 64)
+		if parseErr != nil || origin == 0 {
+			fmt.Fprintln(stderr, "ttcd shared filesystem relay: invalid origin scope")
+			return 2
+		}
+		reader.allowedOrigins[ttcsnapshot.SnapshotID(origin)] = struct{}{}
+	}
+	var token ttcvolume.RemoteToken
+	var source ttcvolume.RemoteSourceKey
+	if decoded, decodeErr := hex.DecodeString(args[2]); decodeErr != nil || len(decoded) != len(token) {
+		fmt.Fprintln(stderr, "ttcd shared filesystem relay: invalid token")
+		return 2
+	} else {
+		copy(token[:], decoded)
+	}
+	if decoded, decodeErr := hex.DecodeString(args[3]); decodeErr != nil || len(decoded) != len(source) {
+		fmt.Fprintln(stderr, "ttcd shared filesystem relay: invalid source key")
+		return 2
+	} else {
+		copy(source[:], decoded)
+	}
+	connection := os.NewFile(3, "ttcd-shared-filesystem-relay")
+	if connection == nil {
+		fmt.Fprintln(stderr, "ttcd shared filesystem relay: inherited connection is unavailable")
+		return 2
+	}
+	err = ttcvolume.ServeRemoteObjects(connection, token, []ttcvolume.RemoteObjectSource{{
+		Key: source, Reader: reader, Catalog: reader,
+	}})
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return 0
+	}
+	fmt.Fprintf(stderr, "ttcd shared filesystem relay: %v\n", err)
+	return 1
+}
+
+func startSharedFilesystemRelay(sharedRoot, root, sourceName string, origins []uint64, token ttcvolume.RemoteToken) (*os.File, <-chan error, error) {
+	if len(origins) == 0 {
+		return nil, nil, errors.New("shared filesystem relay has no immutable origin scope")
+	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	server := os.NewFile(uintptr(fds[0]), "ttc-cold-graph-server")
+	client := os.NewFile(uintptr(fds[1]), "ttc-cold-graph-client")
+	key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(sourceName)))
+	executable, err := os.Executable()
+	if err != nil {
+		server.Close()
+		client.Close()
+		return nil, nil, err
+	}
+	encodedOrigins := make([]string, len(origins))
+	for index, origin := range origins {
+		if origin == 0 {
+			server.Close()
+			client.Close()
+			return nil, nil, errors.New("shared filesystem relay contains zero origin")
+		}
+		encodedOrigins[index] = fmt.Sprintf("%016x", origin)
+	}
+	command := exec.Command(executable, "_shared-fs-relay", filepath.Join(sharedRoot, "snapshot-packs"), root, hex.EncodeToString(token[:]), hex.EncodeToString(key[:]), strings.Join(encodedOrigins, ","))
+	command.ExtraFiles = []*os.File{server}
+	command.Stdin, command.Stdout, command.Stderr = nil, nil, os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		server.Close()
+		client.Close()
+		return nil, nil, err
+	}
+	server.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- command.Wait()
+		close(done)
+	}()
+	return client, done, nil
 }
 
 func (b *runtimeBackend) reportColdRelayError(kind string, err error) {
@@ -194,6 +427,20 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ttcstorage.Result{}, err
 	}
+	// A branch rehydrated lazily from an older cold generation may still contain
+	// deferred graph nodes. Reattach their immutable shared source before
+	// sealing the next generation; resolver attachments are intentionally
+	// process-local and must be reconstructible after a daemon restart.
+	priorFilesystems := make(map[string]coldFilesystemSnapshot)
+	if branch.StorageManifest != "" {
+		prior, err := readColdBranchManifest(branch.StorageManifest)
+		if err != nil {
+			return ttcstorage.Result{}, fmt.Errorf("reading prior cold filesystem manifest: %w", err)
+		}
+		for _, filesystem := range prior.Filesystems {
+			priorFilesystems[filesystem.Root.Source] = filesystem
+		}
+	}
 	staging := filepath.Join(p.localRoot, "publication-staging", intent.ID)
 	if err := os.RemoveAll(staging); err != nil {
 		return ttcstorage.Result{}, err
@@ -223,6 +470,26 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			return ttcstorage.Result{}, fmt.Errorf("opening active repository %q: %w", config.Source, err)
 		}
 		physicalBranch := repositoryPhysicalBranch(config, intent.FilesystemBranch)
+		var relayClient *os.File
+		if prior, ok := priorFilesystems[config.Source]; ok {
+			var token ttcvolume.RemoteToken
+			if _, err := rand.Read(token[:]); err != nil {
+				repository.Close()
+				return ttcstorage.Result{}, err
+			}
+			client, _, err := startSharedFilesystemRelay(p.sharedRoot, prior.Root.Root, config.Source, prior.Origins, token)
+			if err != nil {
+				repository.Close()
+				return ttcstorage.Result{}, fmt.Errorf("starting shared filesystem resolver for %q: %w", config.Source, err)
+			}
+			key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
+			if err := repository.AttachRemoteObjectSource(client, token, key, physicalBranch); err != nil {
+				client.Close()
+				repository.Close()
+				return ttcstorage.Result{}, fmt.Errorf("attaching shared filesystem resolver for %q: %w", config.Source, err)
+			}
+			relayClient = client
+		}
 		descriptor, snapshotErr := repository.DescribeRemoteSnapshot(physicalBranch)
 		origins, originsErr := repository.PrepareBranchPublication(physicalBranch)
 		snapshotErr = errors.Join(snapshotErr, originsErr)
@@ -232,6 +499,11 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			}
 		}
 		closeErr := repository.Close()
+		if relayClient != nil {
+			if err := relayClient.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				closeErr = errors.Join(closeErr, err)
+			}
+		}
 		if snapshotErr != nil || closeErr != nil {
 			return ttcstorage.Result{}, errors.Join(snapshotErr, closeErr)
 		}
@@ -776,7 +1048,10 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	if err := importOrigin(ctx, uint64(snapshot)); err != nil {
 		return err
 	}
-	const batchSize = 4096
+	// A mutation includes stable string identities and is substantially larger
+	// than an ObjectID. Keep batches below both the 8 MiB ledger record bound
+	// and the 1 MiB peer control-body bound even for maximum-length names.
+	const batchSize = 256
 	from := uint64(0)
 	for len(changes) != 0 {
 		count := min(len(changes), batchSize)
@@ -1142,26 +1417,10 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		if !ok {
 			return fail(fmt.Errorf("cold manifest omits repository %q", config.Source))
 		}
-		reader, err := newSharedSnapshotObjectReader(b.snapshotShared, filesystem.Root.Root)
+		client, done, err := startSharedFilesystemRelay(b.dataRoot, filesystem.Root.Root, config.Source, filesystem.Origins, relays.token)
 		if err != nil {
 			return fail(err)
 		}
-		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-		if err != nil {
-			return fail(err)
-		}
-		server := os.NewFile(uintptr(fds[0]), "ttc-cold-graph-server")
-		client := os.NewFile(uintptr(fds[1]), "ttc-cold-graph-client")
-		done := make(chan error, 1)
-		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		go func(reader *sharedSnapshotObjectReader) {
-			err := ttcvolume.ServeRemoteObjects(server, relays.token, []ttcvolume.RemoteObjectSource{{
-				Key: key, Reader: reader, Catalog: reader,
-			}})
-			b.reportColdRelayError("filesystem", err)
-			done <- err
-			close(done)
-		}(reader)
 		relays.clients = append(relays.clients, client)
 		relays.done = append(relays.done, done)
 	}
@@ -1228,29 +1487,23 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 		if !ok {
 			return fail(fmt.Errorf("cold manifest omits repository %q", config.Source))
 		}
-		reader, err := newSharedSnapshotObjectReader(b.snapshotShared, filesystem.Root.Root)
-		if err != nil {
-			return fail(err)
-		}
 		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
 		if err != nil {
 			return fail(err)
 		}
 		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
-		server, client := net.Pipe()
 		var token ttcvolume.RemoteToken
 		if _, err := rand.Read(token[:]); err != nil {
 			repository.Close()
-			server.Close()
-			client.Close()
 			return fail(err)
 		}
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		go func(reader *sharedSnapshotObjectReader) {
-			_ = ttcvolume.ServeRemoteObjects(server, token, []ttcvolume.RemoteObjectSource{{Key: key, Reader: reader, Catalog: reader}})
-		}(reader)
+		client, _, err := startSharedFilesystemRelay(b.dataRoot, filesystem.Root.Root, config.Source, filesystem.Origins, token)
+		if err != nil {
+			repository.Close()
+			return fail(err)
+		}
 		if err := repository.AttachRemoteObjectSource(client, token, key, physicalBranch); err != nil {
-			server.Close()
 			client.Close()
 			repository.Close()
 			return fail(err)
