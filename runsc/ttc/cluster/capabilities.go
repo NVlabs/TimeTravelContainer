@@ -25,11 +25,9 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 3 replaces live filesystem metadata packs with
-	// bounded, path-free immutable graph-root descriptors. Peers fetch objects
-	// from the transaction-fenced provider instead of requiring a shared-root
-	// write before target execution.
-	ControlProtocolVersion = 3
+	// ControlProtocolVersion 4 adds shared snapshot-graph filesystem roots to
+	// durable publication and removes flattened cold filesystem packs.
+	ControlProtocolVersion = 4
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

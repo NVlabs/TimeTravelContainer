@@ -151,8 +151,13 @@ type RemoteSessionDescriptor struct {
 // handoff. Tree and file objects are fetched from the fenced provider by their
 // immutable IDs; the descriptor itself is O(number of mounted repositories).
 type FilesystemRootDescriptor struct {
-	Source       string `json:"source"`
+	Source string `json:"source"`
+	// RepositoryID identifies the repository catalog that provides Root.
 	RepositoryID string `json:"repository_id"`
+	// RestoreID is the canonical repository identity encoded in the Sentry
+	// state. It remains stable across target-local repository imports and
+	// multi-hop remote handoffs.
+	RestoreID    string `json:"restore_id"`
 	BranchID     string `json:"branch_id"`
 	Root         string `json:"root"`
 	NextInode    uint64 `json:"next_inode"`
@@ -215,8 +220,14 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 	seenFilesystemSources := make(map[string]struct{}, len(s.FilesystemRoots))
 	var filesystemBytes uint64
 	for _, root := range s.FilesystemRoots {
-		if root.Source == "" || root.RepositoryID == "" || root.BranchID == "" || root.NextInode <= 1 {
+		if root.Source == "" || root.RepositoryID == "" || root.RestoreID == "" || root.BranchID == "" || root.NextInode <= 1 {
 			return errors.New("filesystem handoff has an incomplete graph root")
+		}
+		for label, id := range map[string]string{"repository": root.RepositoryID, "restore": root.RestoreID} {
+			decoded, err := hex.DecodeString(id)
+			if err != nil || len(decoded) != 16 {
+				return fmt.Errorf("filesystem handoff source %q has invalid %s identity %q", root.Source, label, id)
+			}
 		}
 		if _, exists := seenFilesystemSources[root.Source]; exists {
 			return fmt.Errorf("filesystem handoff repeats source %q", root.Source)
@@ -454,6 +465,22 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			}
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
 			return
+		}
+		// A joining daemon commits its execution record through this endpoint.
+		// Do not acknowledge the admission transition while the member can still
+		// be only a learner: callers may immediately place work on it or lose the
+		// bootstrap node after the request returns. ReconcileVoters independently
+		// revalidates that the learner is admitted, healthy, and at the advertised
+		// Raft address before promotion. The periodic reconciler remains the crash
+		// recovery path if this response is interrupted after the state commit.
+		if proposal.Kind == AuthorityNodeTransition {
+			if err := a.Node.ReconcileVoters(r.Context(), a.MaxVoters); err != nil {
+				if notLeader(err) {
+					return
+				}
+				writeControlError(w, http.StatusServiceUnavailable, fmt.Sprintf("reconciling admitted Raft voters: %v", err))
+				return
+			}
 		}
 		writeControlJSON(w, http.StatusOK, result)
 	case controlAuthorityStatePath:

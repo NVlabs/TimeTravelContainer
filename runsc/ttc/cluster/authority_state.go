@@ -24,14 +24,16 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 7
+	AuthorityFormatVersion = 8
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -1543,11 +1545,17 @@ func transactionTargetsPlacement(tx Transaction, placement PlacementRecord) bool
 }
 
 func validateDurableRoots(roots DurableRoots) error {
-	for name, value := range map[string]string{"memory": roots.MemoryRoot, "filesystem": roots.FilesystemRoot, "object-set": roots.ObjectSetDigest} {
+	for name, value := range map[string]string{"memory": roots.MemoryRoot, "object-set": roots.ObjectSetDigest} {
 		if value != "" {
 			if err := validateSHA256Digest(value); err != nil {
 				return fmt.Errorf("%s root: %w", name, err)
 			}
+		}
+	}
+	if roots.FilesystemRoot != "" {
+		clean := filepath.Clean(roots.FilesystemRoot)
+		if filepath.IsAbs(roots.FilesystemRoot) || clean != roots.FilesystemRoot || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return errors.New("filesystem root is not a clean shared-root-relative manifest")
 		}
 	}
 	if roots.MemoryRoot != "" && roots.MemorySnapshot != 0 {

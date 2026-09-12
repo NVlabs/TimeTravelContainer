@@ -19,6 +19,7 @@ package ttcvolume
 
 import (
 	"archive/tar"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -357,6 +358,303 @@ type cachedBranch struct {
 	inode     uint64
 	size      int64
 	mtimeNsec int64
+}
+
+// VolatileOrigins returns every sealed provider-owned origin in deterministic
+// order. Working origins are mutable and shared origins are already durable.
+func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
+	inspection := r.graph.Inspect()
+	origins := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots))
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotSealedVolatile {
+			origins = append(origins, snapshot.ID)
+		}
+	}
+	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
+	return origins
+}
+
+// PrepareBranchPublication makes every local origin reachable from branch's
+// immutable root publishable, then returns the provider-owned origins in
+// deterministic order. A lazily imported filesystem uses a separate working
+// catalog origin for bounded metadata expansion. Before a durable root may
+// reference that catalog, all remaining remote objects are materialized and
+// the catalog is sealed. This is an asynchronous publication operation; it is
+// deliberately outside the stop/dehydration capture fence.
+//
+// Materialization is repository-wide because locally forked branches may
+// share the same catalog origin. Once complete, sealing that origin is safe:
+// all of its objects are immutable and no branch needs further expansion.
+func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.SnapshotID, error) {
+	var origins []ttcsnapshot.SnapshotID
+	err := r.withLock(func() error {
+		if err := r.materializeRemoteObjectsLocked(); err != nil {
+			return fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
+		}
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		// A manager-side publisher may open the repository after the Sentry has
+		// completed its independence barrier. It has no live remote client to
+		// detach, so retire the durable catalog marker only after independently
+		// proving that every branch sharing it has local namespace metadata and
+		// file bytes. The catalog expansion origin is repository-wide; leaving a
+		// sibling bound to it before sealing would make the sibling's next fork
+		// attempt to mutate an immutable origin.
+		if branch.RemoteCatalog != "" {
+			catalog := branch.RemoteCatalog
+			directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+			if err != nil {
+				return err
+			}
+			entries, readErr := directory.ReadDir(-1)
+			closeErr := directory.Close()
+			if readErr != nil || closeErr != nil {
+				return errors.Join(readErr, closeErr)
+			}
+			var independent []Branch
+			for _, entry := range entries {
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+				id := strings.TrimSuffix(entry.Name(), ".json")
+				if validateName(id, "branch") != nil {
+					continue
+				}
+				candidate, err := r.readBranch(id)
+				if err != nil {
+					return err
+				}
+				if candidate.RemoteCatalog != catalog {
+					continue
+				}
+				objects, err := r.branchObjects(candidate)
+				if err != nil {
+					return fmt.Errorf("proving branch %q filesystem independence: %w", candidate.ID, err)
+				}
+				for object := range objects {
+					pending, err := r.remoteObjectPending(object)
+					if err != nil {
+						return err
+					}
+					if pending {
+						return fmt.Errorf("branch %q still depends on remote filesystem object %s", candidate.ID, object)
+					}
+				}
+				independent = append(independent, candidate)
+			}
+			for _, candidate := range independent {
+				candidate.RemoteCatalog = ""
+				candidate.RemoteCatalogSnapshot = 0
+				candidate.RemoteLogicalBytes = 0
+				if err := r.writeBranch(candidate); err != nil {
+					return fmt.Errorf("retiring branch %q remote filesystem catalog: %w", candidate.ID, err)
+				}
+				if candidate.ID == branchID {
+					branch = candidate
+				}
+			}
+		}
+		root, ok := r.graph.Root(graphRootName(branchID))
+		if !ok {
+			return os.ErrNotExist
+		}
+		wanted := make(map[ttcsnapshot.SnapshotID]struct{})
+		dependencies := make(map[ttcsnapshot.SnapshotID]map[ttcsnapshot.SnapshotID]struct{})
+		seen := make(map[ttcsnapshot.ObjectID]struct{})
+		stack := []ttcsnapshot.ObjectID{root}
+		for len(stack) != 0 {
+			index := len(stack) - 1
+			id := stack[index]
+			stack = stack[:index]
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			object, ok := r.graph.Object(id)
+			if !ok || object.State != ttcsnapshot.ObjectLive || object.Deferred {
+				return fmt.Errorf("filesystem graph object %s is missing, deferred, or not live", id)
+			}
+			snapshot, ok := r.graph.Snapshot(id.Snapshot)
+			if !ok {
+				return fmt.Errorf("filesystem graph object %s has no origin", id)
+			}
+			switch snapshot.State {
+			case ttcsnapshot.SnapshotWorking:
+				// The branch's writable origin must have been sealed by its
+				// capture transaction before asynchronous publication begins.
+				// A distinct reachable working origin is the lazy catalog.
+				if id.Snapshot == ttcsnapshot.SnapshotID(branch.WorkingSnapshot) {
+					return fmt.Errorf("filesystem root still references writable origin %d", id.Snapshot)
+				}
+				if err := r.graph.Seal(id.Snapshot, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+					return fmt.Errorf("sealing filesystem catalog origin %d: %w", id.Snapshot, err)
+				}
+				wanted[id.Snapshot] = struct{}{}
+			case ttcsnapshot.SnapshotSealedVolatile:
+				wanted[id.Snapshot] = struct{}{}
+			case ttcsnapshot.SnapshotShared:
+				// Shared origins are already durable and are retained through
+				// explicit cross-origin edges in the shared reference ledger.
+			case ttcsnapshot.SnapshotSealedLocal:
+				return fmt.Errorf("cluster publication reached standalone origin %d", id.Snapshot)
+			default:
+				return fmt.Errorf("filesystem graph origin %d is %s", id.Snapshot, snapshot.State)
+			}
+			for _, edge := range object.Children {
+				if edge.Child.Snapshot != id.Snapshot {
+					if dependencies[id.Snapshot] == nil {
+						dependencies[id.Snapshot] = make(map[ttcsnapshot.SnapshotID]struct{})
+					}
+					dependencies[id.Snapshot][edge.Child.Snapshot] = struct{}{}
+				}
+				stack = append(stack, edge.Child)
+			}
+			if !object.SourceObject.IsZero() {
+				// SourceObject identifies a foreign immutable alias. It is not
+				// necessarily present in the node-local graph, and publication
+				// path-compresses it through the shared/peer source.
+				if _, local := r.graph.Object(object.SourceObject); local {
+					if object.SourceObject.Snapshot != id.Snapshot {
+						if dependencies[id.Snapshot] == nil {
+							dependencies[id.Snapshot] = make(map[ttcsnapshot.SnapshotID]struct{})
+						}
+						dependencies[id.Snapshot][object.SourceObject.Snapshot] = struct{}{}
+					}
+					stack = append(stack, object.SourceObject)
+				}
+			}
+		}
+		// Handoff dependencies before their parents. Otherwise importing a
+		// parent into the shared ledger may need to retain a child that is still
+		// provider-owned, forcing a transient cross-store bridge and deadlocking
+		// publication before the child can itself become shared.
+		ordered := make([]ttcsnapshot.SnapshotID, 0, len(wanted))
+		for origin := range wanted {
+			ordered = append(ordered, origin)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+		visiting := make(map[ttcsnapshot.SnapshotID]bool)
+		visited := make(map[ttcsnapshot.SnapshotID]bool)
+		var visit func(ttcsnapshot.SnapshotID) error
+		visit = func(origin ttcsnapshot.SnapshotID) error {
+			if visited[origin] {
+				return nil
+			}
+			if visiting[origin] {
+				return fmt.Errorf("filesystem snapshot origins contain a dependency cycle at %d", origin)
+			}
+			visiting[origin] = true
+			children := make([]ttcsnapshot.SnapshotID, 0, len(dependencies[origin]))
+			for child := range dependencies[origin] {
+				if _, publish := wanted[child]; publish {
+					children = append(children, child)
+				}
+			}
+			sort.Slice(children, func(i, j int) bool { return children[i] < children[j] })
+			for _, child := range children {
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+			visiting[origin] = false
+			visited[origin] = true
+			origins = append(origins, origin)
+			return nil
+		}
+		for _, origin := range ordered {
+			if err := visit(origin); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return origins, err
+}
+
+// BranchVolatileOrigins reports the already-sealed provider-owned immutable
+// origins reachable from branch. It performs no materialization or sealing;
+// callers preparing a durable publication must use PrepareBranchPublication.
+func (r *Repository) BranchVolatileOrigins(branchID string) ([]ttcsnapshot.SnapshotID, error) {
+	root, ok := r.graph.Root(graphRootName(branchID))
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	wanted := make(map[ttcsnapshot.SnapshotID]struct{})
+	seen := make(map[ttcsnapshot.ObjectID]struct{})
+	stack := []ttcsnapshot.ObjectID{root}
+	for len(stack) != 0 {
+		index := len(stack) - 1
+		id := stack[index]
+		stack = stack[:index]
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		object, ok := r.graph.Object(id)
+		if !ok {
+			// A deferred source already owned by shared storage is deliberately
+			// absent from this node-local cache graph. Shared publication resolves
+			// that immutable identity from its pack when path-compressing the stub.
+			continue
+		}
+		if object.State != ttcsnapshot.ObjectLive {
+			return nil, fmt.Errorf("filesystem graph object %s is missing or not live", id)
+		}
+		snapshot, ok := r.graph.Snapshot(id.Snapshot)
+		if ok && snapshot.State == ttcsnapshot.SnapshotSealedVolatile {
+			wanted[id.Snapshot] = struct{}{}
+		}
+		for _, edge := range object.Children {
+			stack = append(stack, edge.Child)
+		}
+		if object.Deferred && !object.SourceObject.IsZero() {
+			stack = append(stack, object.SourceObject)
+		}
+	}
+	origins := make([]ttcsnapshot.SnapshotID, 0, len(wanted))
+	for origin := range wanted {
+		origins = append(origins, origin)
+	}
+	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
+	return origins, nil
+}
+
+// PublishOriginHandoff writes one immutable repository origin to the common
+// shared pack store while retaining provider-side reference authority.
+func (r *Repository) PublishOriginHandoff(ctx context.Context, shared *ttcsnapshot.SharedPackStore, origin ttcsnapshot.SnapshotID) error {
+	if shared == nil {
+		return errors.New("shared snapshot pack store is unavailable")
+	}
+	if err := r.SyncMetadata(); err != nil {
+		return err
+	}
+	return shared.PublishHandoff(ctx, r.graph, origin, r.data)
+}
+
+// FreezeOriginHandoff closes the provider reference-mutation suffix.
+func (r *Repository) FreezeOriginHandoff(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.SnapshotReferenceMutation, error) {
+	if _, _, err := r.graph.FreezeSnapshotLedger(origin); err != nil {
+		return nil, err
+	}
+	changes, _, frozen, err := r.graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		return nil, err
+	}
+	if !frozen {
+		return nil, fmt.Errorf("filesystem snapshot origin %d handoff is not frozen", origin)
+	}
+	return changes, nil
+}
+
+// CompleteOriginHandoff changes the local graph into a non-authoritative
+// shared cache view after Raft has committed the provider-to-shared switch.
+func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error {
+	if err := r.graph.MarkShared(origin); err != nil {
+		return err
+	}
+	return r.graph.UnfreezeSnapshotLedger(origin)
 }
 
 // Create creates a new volume with an empty main branch.

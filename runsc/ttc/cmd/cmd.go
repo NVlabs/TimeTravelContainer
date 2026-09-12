@@ -9622,7 +9622,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				family.Branches[i].State = authority.Lifecycle
 				if authority.Roots.FilesystemRoot != "" {
-					family.Branches[i].StorageManifest = authority.Roots.FilesystemRoot
+					family.Branches[i].StorageManifest = filepath.Join(b.dataRoot, authority.Roots.FilesystemRoot)
 				}
 				placement, placed := placementByBranch[authority.FamilyID+"\x00"+authority.BranchID]
 				if !placed || placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {

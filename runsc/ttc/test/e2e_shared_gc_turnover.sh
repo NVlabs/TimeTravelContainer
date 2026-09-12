@@ -21,6 +21,7 @@ PORT_B=${TTC_SHARED_GC_TEST_PORT_B:-20193}
 PORT_C=${TTC_SHARED_GC_TEST_PORT_C:-20203}
 KEEP_ROOT=${TTC_SHARED_GC_TEST_KEEP_ROOT:-}
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
+CLUSTER_LEASE=${TTC_SHARED_GC_TEST_CLUSTER_LEASE:-30s}
 PID_A=
 PID_B=
 PID_C=
@@ -44,9 +45,11 @@ stop_session() {
 
 cleanup() {
 	set +e
-	for node in a b c; do
-		if test -S "$(socket "$node")"; then client "$node" rm -f "$NAME" >/dev/null 2>&1; fi
-	done
+	if test -z "$KEEP_ROOT"; then
+		for node in a b c; do
+			if test -S "$(socket "$node")"; then client "$node" rm -f "$NAME" >/dev/null 2>&1; fi
+		done
+	fi
 	for node in c b a; do
 		if test -S "$(socket "$node")"; then client "$node" node stop "node-$node" --stop-all >/dev/null 2>&1; fi
 	done
@@ -87,7 +90,7 @@ start_node() {
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
-		--memory-target 64GiB --cluster-lease 6s --unsafe-no-host-isolation "$@" \
+		--memory-target 64GiB --cluster-lease "$CLUSTER_LEASE" --unsafe-no-host-isolation "$@" \
 		>"$ROOT/run-$node/ttcd.log" 2>&1 &
 	eval "PID_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')=$!"
 	wait_ready "$node"
@@ -130,14 +133,27 @@ client "$source" wait --condition durable "$NAME@main" >/dev/null
 # shared snapshot retain requires its successor. TTC must wait/retry across
 # the fenced lease expiry and ledger rebuild without exposing a dynamic fork
 # rejection.
-eval "coordinator_pid=\$PID_$(printf '%s' "$coordinator" | tr '[:lower:]' '[:upper:]')"
-stop_session "$coordinator_pid"
-eval "PID_$(printf '%s' "$coordinator" | tr '[:lower:]' '[:upper:]')="
+if test -z "${TTC_SHARED_GC_TEST_SKIP_CRASH:-}"; then
+	eval "coordinator_pid=\$PID_$(printf '%s' "$coordinator" | tr '[:lower:]' '[:upper:]')"
+	stop_session "$coordinator_pid"
+	eval "PID_$(printf '%s' "$coordinator" | tr '[:lower:]' '[:upper:]')="
+fi
 started=$(date +%s)
 client "$source" fork --node "node-$target" "$NAME@main" child >/dev/null
 elapsed=$(( $(date +%s) - started ))
 test "$elapsed" -lt 45
 test "$(client "$target" exec "$NAME@child" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = GC-TURNOVER
+
+# Publish a second-generation branch whose filesystem graph is lazily backed
+# by the first shared origin, then fork it back across the cluster. This covers
+# publication-time path compression and cross-origin reference rebuilding
+# after the original shared-GC coordinator has disappeared.
+client "$target" exec "$NAME@child" sh -c 'printf SECOND-GENERATION >/tmp/shared-graph-child'
+client "$target" dehydrate "$NAME@child" >/dev/null
+client "$target" wait --condition durable "$NAME@child" >/dev/null
+client "$target" fork --node "node-$source" "$NAME@child" grandchild >/dev/null
+test "$(client "$source" exec "$NAME@grandchild" cat /tmp/shared-graph-child)" = SECOND-GENERATION
+test "$(client "$source" exec "$NAME@grandchild" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = GC-TURNOVER
 
 client "$target" rm -f "$NAME" >/dev/null
 echo "TTC shared-GC coordinator crash and retain retry passed in ${elapsed}s"

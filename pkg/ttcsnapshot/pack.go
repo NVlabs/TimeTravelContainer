@@ -87,6 +87,11 @@ type cachedSharedManifest struct {
 	info     os.FileInfo
 }
 
+type publicationBulkSource struct {
+	id     ObjectID
+	source ObjectSource
+}
+
 // OpenSharedPackStore opens a shared pack repository.
 func OpenSharedPackStore(root string) (*SharedPackStore, error) {
 	if !filepath.IsAbs(root) {
@@ -207,6 +212,24 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err != nil {
 		return err
 	}
+	bulkSources := make(map[string]publicationBulkSource)
+	for index := range objects {
+		object := objects[index]
+		if !object.Deferred {
+			if object.BulkLength != 0 {
+				bulkSources[object.ID.key()] = publicationBulkSource{id: object.ID, source: source}
+			}
+			continue
+		}
+		resolved, bulk, err := store.resolveDeferredForPublication(graph, source, object)
+		if err != nil {
+			return fmt.Errorf("resolving deferred object %s for publication: %w", object.ID, err)
+		}
+		objects[index] = resolved
+		if resolved.BulkLength != 0 {
+			bulkSources[resolved.ID.key()] = bulk
+		}
+	}
 	directory := store.snapshotDirectory(snapshot)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return err
@@ -231,7 +254,12 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		}
 		packed := PackedObject{Object: object}
 		if object.BulkLength != 0 {
-			reader, length, err := source.Fetch(ctx, object.ID)
+			bulk := bulkSources[object.ID.key()]
+			if bulk.source == nil || bulk.id.IsZero() {
+				temporary.Close()
+				return fmt.Errorf("object %s has no publication bulk source", object.ID)
+			}
+			reader, length, err := bulk.source.Fetch(ctx, bulk.id)
 			if err != nil {
 				temporary.Close()
 				return fmt.Errorf("fetching %s for publication: %w", object.ID.key(), err)
@@ -317,6 +345,53 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	delete(store.manifests, snapshot)
 	store.mu.Unlock()
 	return nil
+}
+
+// resolveDeferredForPublication path-compresses an inherited immutable stub
+// into the pack being published. This prevents a cold snapshot from depending
+// on a manager-side resolver that disappears with its Sentry. The alias keeps
+// its current stable ID and reference count, while its immutable payload and
+// child edges come from the terminal source object. Cross-origin child edges
+// are then visible to the shared reference ledger.
+func (store *SharedPackStore) resolveDeferredForPublication(graph *Store, local ObjectSource, alias Object) (Object, publicationBulkSource, error) {
+	requested := alias.ID
+	current := alias.SourceObject
+	seen := make(map[ObjectID]struct{})
+	for !current.IsZero() {
+		if _, duplicate := seen[current]; duplicate {
+			return Object{}, publicationBulkSource{}, errors.New("deferred object source cycle")
+		}
+		seen[current] = struct{}{}
+		var object Object
+		var bulk ObjectSource
+		if shared, err := store.Object(current); err == nil {
+			object, bulk = shared, store
+		} else {
+			localObject, ok := graph.Object(current)
+			if !ok {
+				return Object{}, publicationBulkSource{}, fmt.Errorf("source object %s is unavailable", current)
+			}
+			object, bulk = localObject, local
+		}
+		if object.State != ObjectLive {
+			return Object{}, publicationBulkSource{}, fmt.Errorf("source object %s is not live", current)
+		}
+		if object.Deferred {
+			current = object.SourceObject
+			continue
+		}
+		terminal := object.ID
+		object.ID = requested
+		object.Refs = alias.Refs
+		object.SourceCatalog = alias.SourceCatalog
+		object.SourceObject = alias.SourceObject
+		object.Deferred = false
+		if err := validateObject(object); err != nil {
+			return Object{}, publicationBulkSource{}, err
+		}
+		return object, publicationBulkSource{id: terminal, source: bulk}, nil
+	}
+	return Object{}, publicationBulkSource{}, errors.New("deferred object has no source identity")
 }
 
 func writeAtomicJSON(path string, value any) error {
@@ -432,6 +507,108 @@ func (store *SharedPackStore) Manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	store.manifests[snapshot] = cachedSharedManifest{manifest: cloneManifest(&manifest), info: info}
 	store.mu.Unlock()
 	return cloneManifest(&manifest), nil
+}
+
+func packedObjectByID(manifest *SnapshotManifest, id ObjectID) (PackedObject, bool) {
+	index := sort.Search(len(manifest.Objects), func(index int) bool {
+		return manifest.Objects[index].Object.ID.key() >= id.key()
+	})
+	if index == len(manifest.Objects) || manifest.Objects[index].Object.ID != id {
+		return PackedObject{}, false
+	}
+	return manifest.Objects[index], true
+}
+
+// Object returns immutable metadata for id without reading its bulk payload.
+// It is the shared-storage counterpart of Store.ResolveObject and is used by
+// lazy filesystem catalogs.
+func (store *SharedPackStore) Object(id ObjectID) (Object, error) {
+	manifest, err := store.Manifest(id.Snapshot)
+	if err != nil {
+		return Object{}, err
+	}
+	packed, ok := packedObjectByID(manifest, id)
+	if !ok {
+		return Object{}, os.ErrNotExist
+	}
+	return cloneObject(packed.Object), nil
+}
+
+// ReadObjectRange reads only the extents intersecting [offset, offset+len).
+// Guest reads remain arbitrary-sized even though shared packs use 1 MiB
+// extents, and no preceding bytes in a large file are scanned.
+func (store *SharedPackStore) ReadObjectRange(ctx context.Context, id ObjectID, destination []byte, offset int64) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if offset < 0 {
+		return 0, os.ErrInvalid
+	}
+	lease, err := store.acquireSnapshotReadLease(ctx, id.Snapshot)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		_ = lease.Close()
+	}()
+	manifest, err := store.Manifest(id.Snapshot)
+	if err != nil {
+		return 0, err
+	}
+	packed, ok := packedObjectByID(manifest, id)
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+	if uint64(offset) >= packed.Object.BulkLength {
+		if len(destination) == 0 && uint64(offset) == packed.Object.BulkLength {
+			return 0, nil
+		}
+		return 0, io.EOF
+	}
+	want := len(destination)
+	if remaining := packed.Object.BulkLength - uint64(offset); uint64(want) > remaining {
+		want = int(remaining)
+	}
+	written := 0
+	objectOffset := int64(0)
+	for _, extent := range packed.Extents {
+		if written == want {
+			break
+		}
+		extentEnd := objectOffset + extent.Length
+		if offset >= extentEnd {
+			objectOffset = extentEnd
+			continue
+		}
+		within := int64(0)
+		if offset > objectOffset {
+			within = offset - objectOffset
+		}
+		amount := min(int64(want-written), extent.Length-within)
+		file, err := os.Open(filepath.Join(store.snapshotDirectory(id.Snapshot), packName(extent.Pack)))
+		if err != nil {
+			return written, err
+		}
+		n, readErr := file.ReadAt(destination[written:written+int(amount)], extent.Offset+within)
+		closeErr := file.Close()
+		written += n
+		offset += int64(n)
+		if readErr != nil && !(errors.Is(readErr, io.EOF) && n == int(amount)) {
+			return written, errors.Join(readErr, closeErr)
+		}
+		if closeErr != nil {
+			return written, closeErr
+		}
+		if n != int(amount) {
+			return written, io.ErrUnexpectedEOF
+		}
+		objectOffset = extentEnd
+	}
+	if written != len(destination) {
+		return written, io.EOF
+	}
+	return written, nil
 }
 
 // Manifests enumerates committed snapshot manifests without treating staging,
@@ -630,15 +807,12 @@ func (store *SharedPackStore) Fetch(ctx context.Context, id ObjectID) (io.ReadCl
 		lease.Close()
 		return nil, 0, err
 	}
-	index := sort.Search(len(manifest.Objects), func(index int) bool {
-		return manifest.Objects[index].Object.ID.key() >= id.key()
-	})
-	if index == len(manifest.Objects) || manifest.Objects[index].Object.ID != id {
+	packed, ok := packedObjectByID(manifest, id)
+	if !ok {
 		syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
 		lease.Close()
 		return nil, 0, os.ErrNotExist
 	}
-	packed := manifest.Objects[index]
 	readers := make([]io.Reader, 0, len(packed.Extents))
 	files := make([]*os.File, 0, len(packed.Extents))
 	for _, extent := range packed.Extents {

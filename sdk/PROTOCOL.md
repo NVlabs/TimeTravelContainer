@@ -28,7 +28,7 @@ The client writes one newline-terminated JSON object:
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "action": "command",
   "request_id": "optional-32-character-hex-id",
   "args": ["ls", "--json"],

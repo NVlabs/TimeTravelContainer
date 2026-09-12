@@ -118,7 +118,21 @@ type RemoteObjectSource struct {
 	// Reader may serve immutable content from a shared pack rather than a live
 	// repository. Exactly one of Reader and Repository must be set.
 	Reader  RemoteObjectReader
+	Catalog RemoteObjectCatalog
 	Objects map[string]int64
+}
+
+// RemoteObjectCatalog resolves immutable graph metadata without exposing the
+// provider's filesystem layout. Shared snapshot packs and live repositories
+// both implement this boundary.
+type RemoteObjectCatalog interface {
+	RemoteObject(ttcsnapshot.ObjectID) (ttcsnapshot.Object, error)
+}
+
+type repositoryObjectCatalog struct{ repository *Repository }
+
+func (c repositoryObjectCatalog) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	return c.repository.remoteGraphObject(id)
 }
 
 func (r *Repository) remoteGraphObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
@@ -185,6 +199,9 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 		if source.Reader == nil && source.Repository != nil {
 			source.Reader = repositoryObjectReader{repository: source.Repository}
 		}
+		if source.Catalog == nil && source.Repository != nil {
+			source.Catalog = repositoryObjectCatalog{repository: source.Repository}
+		}
 		if source.Reader == nil {
 			continue
 		}
@@ -205,10 +222,10 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 			return writeRemoteFailure(conn, request, "filesystem object or range is outside the captured generation")
 		}
 		if request.type_ == remoteMetadataPull {
-			if request.offset != 0 || request.length != 0 || source.Repository == nil {
+			if request.offset != 0 || request.length != 0 || source.Catalog == nil {
 				return writeRemoteFailure(conn, request, "invalid filesystem metadata request")
 			}
-			metadata, err := source.Repository.remoteGraphObject(id)
+			metadata, err := source.Catalog.RemoteObject(id)
 			if err != nil {
 				return writeRemoteFailure(conn, request, err.Error())
 			}
@@ -227,8 +244,8 @@ func ServeRemoteObjects(conn io.ReadWriteCloser, token RemoteToken, sources []Re
 			return writeRemoteFailure(conn, request, "invalid or unauthorized filesystem range request")
 		}
 		size, allowed := source.Objects[object]
-		if !allowed && source.Repository != nil {
-			metadata, err := source.Repository.remoteGraphObject(id)
+		if !allowed && source.Catalog != nil {
+			metadata, err := source.Catalog.RemoteObject(id)
 			if err == nil && metadata.BulkLength <= uint64(^uint64(0)>>1) {
 				size, allowed = int64(metadata.BulkLength), true
 			}

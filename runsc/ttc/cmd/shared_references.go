@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -42,6 +43,7 @@ type sharedReferenceService struct {
 	packs        *ttcsnapshot.SharedPackStore
 	directory    string
 	localRoot    string
+	sharedRoot   string
 	nodeID       string
 	incarnation  string
 	graph        *ttcsnapshot.Store
@@ -50,10 +52,10 @@ type sharedReferenceService struct {
 	ledger       *ttcsnapshot.ReferenceLedger
 }
 
-func newSharedReferenceService(localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
+func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
 	return &sharedReferenceService{
 		authority: authority, packs: packs, nodeID: nodeID, incarnation: incarnation,
-		directory: filepath.Join(localRoot, "snapshot-graph", "shared-reference-ledger"), localRoot: localRoot,
+		directory: filepath.Join(localRoot, "snapshot-graph", "shared-reference-ledger"), localRoot: localRoot, sharedRoot: sharedRoot,
 		graph: graph, peers: peers,
 	}
 }
@@ -207,16 +209,49 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	// names its immutable memory snapshot. Cross-origin tree edges are rebuilt
 	// from immutable objects, never copied reference counters.
 	coldOrigins := make(map[ttcsnapshot.SnapshotID]struct{})
+	coldFilesystemReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
+	addFilesystemRoots := func(identity, relative string) error {
+		if relative == "" {
+			return nil
+		}
+		path := filepath.Join(s.sharedRoot, relative)
+		if err := validateColdManifestPath(s.sharedRoot, path); err != nil {
+			return err
+		}
+		manifest, err := readColdBranchManifest(path)
+		if err != nil {
+			return err
+		}
+		for _, filesystem := range manifest.Filesystems {
+			root, err := ttcsnapshot.ParseObjectID(filesystem.Root.Root)
+			if err != nil {
+				return err
+			}
+			if coldFilesystemReferences[root.Snapshot] == nil {
+				coldFilesystemReferences[root.Snapshot] = make(map[string]ttcsnapshot.ObjectID)
+			}
+			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source))
+			coldFilesystemReferences[root.Snapshot][fmt.Sprintf("root/cold/%x", nameHash)] = root
+		}
+		return nil
+	}
 	for _, branch := range state.Branches {
 		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 {
 			coldOrigins[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
 		}
-	}
-	for _, publication := range state.Publications {
-		if (publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady) && publication.CandidateRoots.MemorySnapshot != 0 {
-			coldOrigins[ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)] = struct{}{}
+		if !branch.Corrupted {
+			if err := addFilesystemRoots("branch\x00"+branch.FamilyID+"\x00"+branch.BranchID, branch.Roots.FilesystemRoot); err != nil {
+				return fail(fmt.Errorf("reading branch filesystem roots: %w", err))
+			}
 		}
 	}
+	// Preparing and capture-ready publications are still volatile origins.
+	// Their source daemon's inventory retains the local graph roots until the
+	// same Raft command that commits the branch's durable roots routes those
+	// origins to shared storage. CandidateRoots intentionally names the future
+	// manifest before it exists, so treating it as an already-cold root both
+	// races publication and incorrectly splits one reference authority between
+	// the provider and this shared ledger.
 
 	// Query every unfenced execution incarnation. If one cannot prove its
 	// claims, GC remains unavailable, but normal reads and execution continue.
@@ -294,15 +329,35 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		for index, packed := range manifest.Objects {
 			objects[index] = packed.Object
 		}
-		references := make(map[string]ttcsnapshot.ObjectID)
+		// Bootstrap every provider baseline long enough to import all origins.
+		// Parent origins may sort after their children, and ImportOrigin correctly
+		// forbids resurrecting a zero-count object. Namespacing ordinary roots
+		// avoids collisions between repositories; incoming-edge bridge names stay
+		// canonical so a subsequently imported parent can replace them in place.
+		references := make(map[string]ttcsnapshot.ObjectID, len(manifest.References))
+		for name, object := range manifest.References {
+			if strings.HasPrefix(name, "root/bridge/edge/") {
+				references[name] = object
+			} else {
+				digest := sha256.Sum256([]byte(name))
+				references[fmt.Sprintf("bootstrap/%016x/%x", uint64(manifest.Snapshot), digest)] = object
+			}
+		}
 		if _, live := coldOrigins[manifest.Snapshot]; live {
 			for name, object := range manifest.References {
 				if strings.HasPrefix(name, "root/") {
-					references[name] = object
+					digest := sha256.Sum256([]byte(name))
+					references[fmt.Sprintf("root/cold-memory/%016x/%x", uint64(manifest.Snapshot), digest)] = object
 				}
 			}
 		}
 		for name, object := range claimReferences[manifest.Snapshot] {
+			if previous, exists := references[name]; exists && previous != object {
+				return fail(fmt.Errorf("reference %q selects both %s and %s", name, previous, object))
+			}
+			references[name] = object
+		}
+		for name, object := range coldFilesystemReferences[manifest.Snapshot] {
 			if previous, exists := references[name]; exists && previous != object {
 				return fail(fmt.Errorf("reference %q selects both %s and %s", name, previous, object))
 			}
@@ -313,9 +368,27 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		}
 		imported[manifest.Snapshot] = struct{}{}
 	}
+	// All structural cross-origin edges and authoritative roots are now
+	// present. Remove the temporary provider baselines; only Raft-selected cold
+	// roots and incarnation-bound active claims remain.
+	inspection := ledger.Inspect()
+	for name, object := range inspection.References {
+		if !strings.HasPrefix(name, "bootstrap/") {
+			continue
+		}
+		operation := fmt.Sprintf("rebuild/%016x/release/%s", lease.Generation, name)
+		if err := ledger.ApplyReference(operation, name, object, false); err != nil {
+			return fail(fmt.Errorf("releasing bootstrap reference %q: %w", name, err))
+		}
+	}
 	for origin := range claimReferences {
 		if _, ok := imported[origin]; !ok {
 			return fail(fmt.Errorf("active references select shared origin %d without a committed manifest", origin))
+		}
+	}
+	for origin := range coldFilesystemReferences {
+		if _, ok := imported[origin]; !ok {
+			return fail(fmt.Errorf("cold filesystem references shared origin %d without a committed manifest", origin))
 		}
 	}
 	if err := ledger.Checkpoint(); err != nil {

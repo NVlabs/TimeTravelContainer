@@ -619,7 +619,7 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "run", "create", "start", "fork", "rehydrate", "restore":
+	case "run", "create", "start", "rehydrate", "restore":
 		return true
 	case "container":
 		return len(args) > 1 && (args[1] == "run" || args[1] == "create")

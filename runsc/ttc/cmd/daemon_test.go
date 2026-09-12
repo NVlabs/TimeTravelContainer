@@ -1208,6 +1208,15 @@ func TestExtractPlacementNode(t *testing.T) {
 	}
 }
 
+func TestForkPlacementIsSelectedByForkCommand(t *testing.T) {
+	if daemonCommandNeedsPlacementAdmission([]string{"fork", "--node", "node-b", "demo@main", "child"}) {
+		t.Fatal("fork was pre-routed as placement admission; --node is its destination")
+	}
+	if !daemonCommandNeedsPlacementAdmission([]string{"rehydrate", "--node", "node-b", "demo@main"}) {
+		t.Fatal("rehydrate must retain placement admission routing")
+	}
+}
+
 func TestConsumeDaemonClusterOptions(t *testing.T) {
 	args := []string{
 		"--cluster-listen=127.0.0.1:7443",

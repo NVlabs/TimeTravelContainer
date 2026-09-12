@@ -57,7 +57,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 6
+	daemonAPIVersion       = 7
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -742,7 +742,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			file.Close()
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("%w (filesystem restore aliases: %v)", err, restoreArgs.FilesystemRestoreIDs)
 		}
 		keepDurableTargets = true
 		if runtimeCreated {
@@ -3410,7 +3410,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 	}
 	var sharedReferences *sharedReferenceService
 	if clusterRuntime != nil {
-		sharedReferences = newSharedReferenceService(localRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
+		sharedReferences = newSharedReferenceService(dataRoot, localRoot, clusterRuntime.nodeRecord.NodeID, clusterRuntime.nodeRecord.Incarnation, clusterRuntime.raftCatalog, sharedObjects, snapshotGraph, clusterRuntime.source)
 		server.sharedReferences = sharedReferences
 	}
 	var publicationQueue *ttcstorage.Queue
@@ -3541,9 +3541,15 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		// provider or the shared-reference coordinator. Serve those requests
 		// before doing any recovery ourselves so simultaneous daemon restarts
 		// cannot deadlock waiting for peers that are waiting on us.
+		// Restore, durability, and drain requests may deliberately wait through
+		// a full authority-lease fence before completing. Do not impose a server
+		// WriteTimeout that can expire first and turn a structured retry/result
+		// into a transport EOF. Request bodies are bounded, ReadHeaderTimeout
+		// protects admission, and each operation has its own transactional and
+		// client-side deadline.
 		clusterServer = &http.Server{
 			Handler: clusterRuntime.controlPlane, ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute,
+			ReadTimeout: 30 * time.Second, IdleTimeout: time.Minute,
 		}
 		go func() {
 			err := clusterServer.Serve(clusterListener)

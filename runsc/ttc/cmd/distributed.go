@@ -576,13 +576,18 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 			return nil, 0, errors.Join(describeErr, closeErr)
 		}
 		snapshot := descriptor.Snapshot
+		restoreID := config.RestoreID
+		if restoreID == "" {
+			restoreID = snapshot.RepositoryID
+		}
 		if snapshot.LogicalBytes > ^uint64(0)-dependentBytes {
 			return nil, 0, errors.New("distributed filesystem dependency byte count overflow")
 		}
 		dependentBytes += snapshot.LogicalBytes
 		roots = append(roots, cluster.FilesystemRootDescriptor{
 			Source: config.Source, RepositoryID: snapshot.RepositoryID,
-			BranchID: snapshot.BranchID, Root: descriptor.Root.String(),
+			RestoreID: restoreID,
+			BranchID:  snapshot.BranchID, Root: descriptor.Root.String(),
 			NextInode: snapshot.NextInode, LogicalBytes: snapshot.LogicalBytes,
 		})
 	}
@@ -806,7 +811,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			}
 			config.Branch = filesystemBranch
 			config.CopyMode = string(manager.Capability().Mode)
-			config.RestoreID = root.RepositoryID
+			config.RestoreID = root.RestoreID
 			config.Private = true
 			if err := repository.Close(); err != nil {
 				return 0, err
@@ -844,7 +849,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 		config.Path = destination
 		config.Branch = filesystemBranch
 		config.CopyMode = string(manager.Capability().Mode)
-		config.RestoreID = root.RepositoryID
+		config.RestoreID = root.RestoreID
 		config.Private = true
 		if err := repository.Close(); err != nil {
 			return 0, err
@@ -1367,6 +1372,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 func (b *runtimeBackend) completeDehydratedFilesystemTransfer(peer *cluster.Client, transactionID string, revision uint64, containerID, filesystemBranch string, relay *distributedPageRelay) {
 	defer relay.Close()
 	defer b.removeDistributedFilesystemBranch(containerID, filesystemBranch)
+	lastDiagnostic := ""
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		tx, err := peer.Drain(ctx, transactionID, revision)
@@ -1388,6 +1394,13 @@ func (b *runtimeBackend) completeDehydratedFilesystemTransfer(peer *cluster.Clie
 			switch status.State {
 			case cluster.TransactionIndependent, cluster.TransactionCanceled, cluster.TransactionFailed:
 				return
+			}
+		}
+		diagnostic := errors.Join(err, statusErr)
+		if text := fmt.Sprint(diagnostic); diagnostic != nil && text != lastDiagnostic {
+			lastDiagnostic = text
+			if b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttcd: warning: distributed filesystem independence for %s is retrying: %v\n", transactionID, diagnostic)
 			}
 		}
 		time.Sleep(500 * time.Millisecond)

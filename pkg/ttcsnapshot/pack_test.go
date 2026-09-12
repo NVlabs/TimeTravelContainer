@@ -99,6 +99,30 @@ func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
 	if err != nil || length != uint64(len(data)) || !bytes.Equal(got, data) {
 		t.Fatalf("fetched length=%d bytes=%d err=%v", length, len(got), err)
 	}
+	for _, test := range []struct {
+		name   string
+		offset int64
+		length int
+	}{
+		{name: "unaligned-4k", offset: 37, length: 4096},
+		{name: "cross-extent", offset: sharedPackExtent - 127, length: 8192},
+		{name: "third-extent", offset: 2*sharedPackExtent + 91, length: 4096},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buffer := make([]byte, test.length)
+			n, err := shared.ReadObjectRange(context.Background(), id, buffer, test.offset)
+			if err != nil || n != len(buffer) {
+				t.Fatalf("ReadObjectRange(%d, %d) = %d, %v", test.offset, test.length, n, err)
+			}
+			if !bytes.Equal(buffer, data[test.offset:test.offset+int64(test.length)]) {
+				t.Fatal("range contents differ")
+			}
+		})
+	}
+	object, err := shared.Object(id)
+	if err != nil || object.ID != id || object.BulkLength != uint64(len(data)) {
+		t.Fatalf("Object(%s) = %+v, %v", id, object, err)
+	}
 	reader, length, err = shared.Fetch(context.Background(), metadata)
 	if err != nil {
 		t.Fatal(err)

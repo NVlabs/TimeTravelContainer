@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,7 +31,56 @@ import (
 	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 )
 
-type coldPackObjectReader struct{ directory *ttcpack.Directory }
+type sharedSnapshotObjectReader struct {
+	store   *ttcsnapshot.SharedPackStore
+	mu      sync.Mutex
+	allowed map[ttcsnapshot.ObjectID]struct{}
+}
+
+func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root string) (*sharedSnapshotObjectReader, error) {
+	id, err := ttcsnapshot.ParseObjectID(root)
+	if err != nil {
+		return nil, err
+	}
+	return &sharedSnapshotObjectReader{store: store, allowed: map[ttcsnapshot.ObjectID]struct{}{id: {}}}, nil
+}
+
+func (r *sharedSnapshotObjectReader) authorize(id ttcsnapshot.ObjectID) bool {
+	r.mu.Lock()
+	_, ok := r.allowed[id]
+	r.mu.Unlock()
+	return ok
+}
+
+func (r *sharedSnapshotObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return 0, err
+	}
+	if !r.authorize(id) {
+		return 0, os.ErrPermission
+	}
+	return r.store.ReadObjectRange(context.Background(), id, destination, offset)
+}
+
+func (r *sharedSnapshotObjectReader) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	if !r.authorize(id) {
+		return ttcsnapshot.Object{}, os.ErrPermission
+	}
+	object, err := r.store.Object(id)
+	if err != nil {
+		return ttcsnapshot.Object{}, err
+	}
+	r.mu.Lock()
+	for _, edge := range object.Children {
+		r.allowed[edge.Child] = struct{}{}
+	}
+	if object.Deferred && !object.SourceObject.IsZero() {
+		r.allowed[object.SourceObject] = struct{}{}
+	}
+	r.mu.Unlock()
+	return object, nil
+}
 
 const coldPackIntentVersion = 1
 
@@ -100,10 +150,6 @@ func readColdPackIntent(path string) (coldPackIntent, error) {
 	return intent, nil
 }
 
-func (r coldPackObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
-	return r.directory.ReadAt("objects/"+object, destination, offset)
-}
-
 type coldFilesystemRelays struct {
 	token   ttcvolume.RemoteToken
 	clients []*os.File
@@ -133,6 +179,11 @@ type coldPackReference struct {
 	Pack   string `json:"pack"`
 }
 
+type coldFilesystemSnapshot struct {
+	Root    cluster.FilesystemRootDescriptor `json:"root"`
+	Origins []uint64                         `json:"origins"`
+}
+
 type coldBranchManifest struct {
 	Version    int       `json:"version"`
 	Container  string    `json:"container"`
@@ -143,8 +194,9 @@ type coldBranchManifest struct {
 	Parent     string    `json:"parent,omitempty"`
 	// MemorySnapshot names the graph-native immutable memory origin. Its bulk
 	// data and metadata live in snapshot-packs rather than the legacy cold pack.
-	MemorySnapshot uint64              `json:"memory_snapshot,omitempty"`
-	Packs          []coldPackReference `json:"packs"`
+	MemorySnapshot uint64                   `json:"memory_snapshot,omitempty"`
+	Packs          []coldPackReference      `json:"packs"`
+	Filesystems    []coldFilesystemSnapshot `json:"filesystems,omitempty"`
 }
 
 type branchPublisher struct {
@@ -194,6 +246,16 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				return ttcstorage.Result{}, err
 			}
 		}
+		for _, filesystem := range existing.Filesystems {
+			if filesystem.Root.Root == "" || len(filesystem.Origins) == 0 {
+				return ttcstorage.Result{}, errors.New("existing cold manifest has an incomplete filesystem snapshot")
+			}
+			for _, origin := range filesystem.Origins {
+				if _, err := p.graphShared.Manifest(ttcsnapshot.SnapshotID(origin)); err != nil {
+					return ttcstorage.Result{}, fmt.Errorf("validating published filesystem origin %d: %w", origin, err)
+				}
+			}
+		}
 		if existing.MemorySnapshot != 0 {
 			if existing.MemorySnapshot != branch.SnapshotID || p.graphShared == nil {
 				return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting graph memory snapshot")
@@ -214,7 +276,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	defer os.RemoveAll(staging)
-	manifest := coldBranchManifest{Version: 1, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC(), Parent: intent.ParentManifest}
+	manifest := coldBranchManifest{Version: 2, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
 	spec, err := store.LoadSpec(info.ID)
 	if err != nil {
 		return ttcstorage.Result{}, err
@@ -224,7 +286,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	seen := make(map[string]struct{})
-	for index, config := range repositories {
+	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, ok := seen[path]; ok {
 			continue
@@ -234,25 +296,36 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		if err != nil {
 			return ttcstorage.Result{}, fmt.Errorf("opening active repository %q: %w", config.Source, err)
 		}
-		var inherited map[string]struct{}
-		if intent.ParentManifest != "" {
-			inherited, err = p.inheritedObjectIDs(intent.ParentManifest, config.Source)
-			if err != nil {
-				repository.Close()
-				return ttcstorage.Result{}, err
+		physicalBranch := repositoryPhysicalBranch(config, intent.FilesystemBranch)
+		descriptor, snapshotErr := repository.DescribeRemoteSnapshot(physicalBranch)
+		origins, originsErr := repository.PrepareBranchPublication(physicalBranch)
+		snapshotErr = errors.Join(snapshotErr, originsErr)
+		for _, origin := range origins {
+			if snapshotErr == nil {
+				snapshotErr = repository.PublishOriginHandoff(context.Background(), p.graphShared, origin)
 			}
 		}
-		snapshotPath := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
-		_, snapshotErr := repository.ExportSnapshotDelta(repositoryPhysicalBranch(config, intent.FilesystemBranch), snapshotPath, inherited)
 		closeErr := repository.Close()
 		if snapshotErr != nil || closeErr != nil {
 			return ttcstorage.Result{}, errors.Join(snapshotErr, closeErr)
 		}
-		pack, err := ttcpack.WriteDirectory(snapshotPath, filepath.Join(p.sharedRoot, "cold"))
-		if err != nil {
-			return ttcstorage.Result{}, err
+		encodedOrigins := make([]uint64, len(origins))
+		for i, origin := range origins {
+			encodedOrigins[i] = uint64(origin)
 		}
-		manifest.Packs = append(manifest.Packs, coldPackReference{Source: config.Source, Pack: pack.String()})
+		restoreID := config.RestoreID
+		if restoreID == "" {
+			restoreID = descriptor.Snapshot.RepositoryID
+		}
+		manifest.Filesystems = append(manifest.Filesystems, coldFilesystemSnapshot{
+			Root: cluster.FilesystemRootDescriptor{
+				Source: config.Source, RepositoryID: descriptor.Snapshot.RepositoryID,
+				RestoreID: restoreID,
+				BranchID:  descriptor.Snapshot.BranchID, Root: descriptor.Root.String(),
+				NextInode: descriptor.Snapshot.NextInode, LogicalBytes: descriptor.Snapshot.LogicalBytes,
+			},
+			Origins: encodedOrigins,
+		})
 	}
 	if intent.Kind == "dehydrate" {
 		memory := publicationMemoryControlPath(p.localRoot, intent.MemoryControl)
@@ -278,6 +351,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		}
 	}
 	sort.Slice(manifest.Packs, func(i, j int) bool { return manifest.Packs[i].Source < manifest.Packs[j].Source })
+	sort.Slice(manifest.Filesystems, func(i, j int) bool { return manifest.Filesystems[i].Root.Source < manifest.Filesystems[j].Root.Source })
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return ttcstorage.Result{}, err
@@ -286,51 +360,6 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	return ttcstorage.Result{Manifest: path}, nil
-}
-
-func (p *branchPublisher) inheritedObjectIDs(manifestPath, source string) (map[string]struct{}, error) {
-	result := make(map[string]struct{})
-	seen := make(map[string]struct{})
-	for manifestPath != "" {
-		if err := validateColdManifestPath(p.sharedRoot, manifestPath); err != nil {
-			return nil, err
-		}
-		if _, ok := seen[manifestPath]; ok {
-			return nil, errors.New("cold manifest parent cycle")
-		}
-		seen[manifestPath] = struct{}{}
-		manifest, err := readColdBranchManifest(manifestPath)
-		if err != nil {
-			return nil, err
-		}
-		for _, reference := range manifest.Packs {
-			if reference.Source != source {
-				continue
-			}
-			id, err := ttcpack.ParseID(reference.Pack)
-			if err != nil {
-				return nil, err
-			}
-			file, index, err := ttcpack.OpenIndexed(filepath.Join(p.sharedRoot, "cold"), id)
-			if err != nil {
-				return nil, err
-			}
-			closeErr := file.Close()
-			if closeErr != nil {
-				return nil, closeErr
-			}
-			for _, entry := range index.Entries {
-				if strings.HasPrefix(entry.Path, "objects/") {
-					name := strings.TrimPrefix(entry.Path, "objects/")
-					if !strings.ContainsRune(name, '/') && name != "" {
-						result[name] = struct{}{}
-					}
-				}
-			}
-		}
-		manifestPath = manifest.Parent
-	}
-	return result, nil
 }
 
 func validateColdManifestPath(sharedRoot, path string) error {
@@ -419,7 +448,12 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	}
 	if p.authority != nil {
 		lifecycle := "exited"
-		captureRoots := cluster.DurableRoots{}
+		manifestPath := coldManifestPath(p.sharedRoot, info.ID, intent.Branch, intent.Generation)
+		relativeManifest, err := filepath.Rel(p.sharedRoot, manifestPath)
+		if err != nil || filepath.IsAbs(relativeManifest) || strings.HasPrefix(relativeManifest, ".."+string(filepath.Separator)) {
+			return false, fmt.Errorf("cold manifest %q is outside shared root", manifestPath)
+		}
+		captureRoots := cluster.DurableRoots{FilesystemRoot: relativeManifest}
 		if intent.Kind == "dehydrate" {
 			lifecycle = "dehydrated"
 			branch, err := persistentBranchInfo(info, intent.Branch)
@@ -646,18 +680,77 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				}
 			}
 		}
-		digest, err := fileSHA256Digest(result.Manifest)
+		manifest, err := readColdBranchManifest(result.Manifest)
 		if err != nil {
-			return fmt.Errorf("digesting cold manifest: %w", err)
+			return fmt.Errorf("reading committed cold manifest: %w", err)
 		}
-		roots := cluster.DurableRoots{FilesystemRoot: digest}
-		if intent.Kind == "dehydrate" {
-			if branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
-				// Snapshot identity, not a runtime checksum, is the protocol root.
-				roots.MemorySnapshot = branch.SnapshotID
-			} else {
-				roots.MemoryRoot = digest
+		spec, err := store.LoadSpec(info.ID)
+		if err != nil {
+			return err
+		}
+		configs, err := specutils.TTCVolumeRepositories(spec)
+		if err != nil {
+			return err
+		}
+		configBySource := make(map[string]specutils.TTCVolumeRepository, len(configs))
+		for _, config := range configs {
+			configBySource[config.Source] = config
+		}
+		for _, filesystem := range manifest.Filesystems {
+			config, ok := configBySource[filesystem.Root.Source]
+			if !ok {
+				return fmt.Errorf("published filesystem source %q is absent from the container spec", filesystem.Root.Source)
 			}
+			repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+			if err != nil {
+				return err
+			}
+			for _, encodedOrigin := range filesystem.Origins {
+				origin := ttcsnapshot.SnapshotID(encodedOrigin)
+				if _, err := p.graphShared.Manifest(origin); err != nil {
+					repository.Close()
+					return fmt.Errorf("validating filesystem snapshot origin %d: %w", origin, err)
+				}
+				_, volatile, err := p.authority.SnapshotProvider(encodedOrigin)
+				if err != nil {
+					repository.Close()
+					return err
+				}
+				if volatile {
+					changes, err := repository.FreezeOriginHandoff(origin)
+					if err != nil {
+						repository.Close()
+						return fmt.Errorf("freezing filesystem snapshot origin %d: %w", origin, err)
+					}
+					if err := p.publishSharedReferenceLedger(origin, changes); err != nil {
+						repository.Close()
+						return fmt.Errorf("transferring filesystem snapshot origin %d reference authority: %w", origin, err)
+					}
+					if err := p.authority.PublishSnapshotOrigin(p.nodeID, p.incarnation, encodedOrigin); err != nil {
+						repository.Close()
+						return fmt.Errorf("publishing filesystem snapshot origin %d in Raft: %w", origin, err)
+					}
+				}
+				if err := repository.CompleteOriginHandoff(origin); err != nil {
+					repository.Close()
+					return fmt.Errorf("completing filesystem snapshot origin %d handoff: %w", origin, err)
+				}
+			}
+			if err := repository.Close(); err != nil {
+				return err
+			}
+		}
+		relativeManifest, err := filepath.Rel(p.sharedRoot, result.Manifest)
+		if err != nil || filepath.IsAbs(relativeManifest) || strings.HasPrefix(relativeManifest, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("cold manifest %q is outside shared root", result.Manifest)
+		}
+		roots := cluster.DurableRoots{FilesystemRoot: relativeManifest}
+		if intent.Kind == "dehydrate" {
+			if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+				return errors.New("new-format dehydration branch lacks graph-native snapshot identity")
+			}
+			// Snapshot identity, not a runtime checksum, is the protocol root.
+			roots.MemorySnapshot = branch.SnapshotID
 		}
 		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.Generation, roots); err != nil {
 			return fmt.Errorf("committing publication roots in Raft: %w", err)
@@ -850,7 +943,56 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return coldBranchManifest{}, err
 	}
+	if manifest.Version != 2 {
+		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 2", manifest.Version)
+	}
+	if manifest.Container == "" || manifest.Branch == "" || manifest.Generation == 0 || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") || manifest.Parent != "" {
+		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
+	}
+	seenSources := make(map[string]struct{}, len(manifest.Filesystems))
+	seenOrigins := make(map[uint64]struct{})
+	for _, filesystem := range manifest.Filesystems {
+		root := filesystem.Root
+		if root.Source == "" || root.RepositoryID == "" || root.RestoreID == "" || root.BranchID == "" || root.Root == "" || root.NextInode < 2 {
+			return coldBranchManifest{}, errors.New("cold manifest contains an incomplete filesystem root")
+		}
+		if _, duplicate := seenSources[root.Source]; duplicate {
+			return coldBranchManifest{}, fmt.Errorf("cold manifest repeats filesystem source %q", root.Source)
+		}
+		seenSources[root.Source] = struct{}{}
+		if _, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.NextInode, root.LogicalBytes); err != nil {
+			return coldBranchManifest{}, fmt.Errorf("validating filesystem source %q: %w", root.Source, err)
+		}
+		for _, origin := range filesystem.Origins {
+			if origin == 0 {
+				return coldBranchManifest{}, errors.New("cold manifest contains snapshot origin zero")
+			}
+			if _, duplicate := seenOrigins[origin]; duplicate {
+				return coldBranchManifest{}, fmt.Errorf("cold manifest repeats snapshot origin %d", origin)
+			}
+			seenOrigins[origin] = struct{}{}
+		}
+	}
+	for _, pack := range manifest.Packs {
+		if pack.Source != "memory-control" || pack.Pack == "" {
+			return coldBranchManifest{}, fmt.Errorf("cold manifest contains unsupported compatibility pack %q", pack.Source)
+		}
+		if _, err := ttcpack.ParseID(pack.Pack); err != nil {
+			return coldBranchManifest{}, fmt.Errorf("validating memory-control pack: %w", err)
+		}
+	}
+	if manifest.Kind == "dehydrate" && manifest.MemorySnapshot == 0 {
+		return coldBranchManifest{}, errors.New("dehydration manifest omits graph-native memory snapshot")
+	}
 	return manifest, nil
+}
+
+func coldFilesystemRoots(manifest coldBranchManifest) []cluster.FilesystemRootDescriptor {
+	roots := make([]cluster.FilesystemRootDescriptor, len(manifest.Filesystems))
+	for index := range manifest.Filesystems {
+		roots[index] = manifest.Filesystems[index].Root
+	}
+	return roots
 }
 
 func localGraphCaptureMatches(path string, branch ttcbundle.BranchInfo) bool {
@@ -925,81 +1067,24 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
 		return errors.New("cold manifest identity does not match branch generation")
 	}
-	packBySource := make(map[string]ttcpack.ID, len(manifest.Packs))
-	for _, reference := range manifest.Packs {
-		id, err := ttcpack.ParseID(reference.Pack)
-		if err != nil {
-			return err
-		}
-		packBySource[reference.Source] = id
-	}
 	if err := os.MkdirAll(filepath.Join(b.activeDataRoot(), "containers", info.ID), 0700); err != nil {
 		return err
 	}
-	staging := filepath.Join(b.activeDataRoot(), "materialization-staging", fmt.Sprintf("%s-%s-%016x", info.ID, hex.EncodeToString([]byte(branch.ID)), branch.StorageGeneration))
-	if err := os.RemoveAll(staging); err != nil {
+	if len(manifest.Filesystems) == 0 {
+		return errors.New("cold manifest omits filesystem graph roots")
+	}
+	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(staging, 0700); err != nil {
-		return err
-	}
-	defer os.RemoveAll(staging)
-	spec, err := store.LoadSpec(info.ID)
-	if err != nil {
-		return err
-	}
-	repositories, err := specutils.TTCVolumeRepositories(spec)
-	if err != nil {
-		return err
-	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
-	if err != nil {
-		return err
-	}
-	for index := range repositories {
-		repository := &repositories[index]
-		_, ok := packBySource[repository.Source]
-		if !ok {
-			return fmt.Errorf("cold manifest omits repository %q", repository.Source)
-		}
-		_, statErr := os.Stat(repository.Path)
-		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return statErr
-		}
-		snapshot := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
-		if err := b.materializeColdSourceMetadata(manifest, repository.Source, snapshot); err != nil {
-			return fmt.Errorf("materializing repository %q: %w", repository.Source, err)
-		}
-		if errors.Is(statErr, os.ErrNotExist) {
-			if err := os.MkdirAll(filepath.Dir(repository.Path), 0700); err != nil {
-				return err
-			}
-			imported, snapshotInfo, err := manager.ImportPrivatePackedSnapshot(repository.Path, fmt.Sprintf("cold-%d", index), snapshot, branch.FilesystemBranch)
-			if err != nil {
-				return err
-			}
-			repository.RestoreID = snapshotInfo.RepositoryID
-			repository.CopyMode = string(manager.Capability().Mode)
-			if err := imported.Close(); err != nil {
-				return err
-			}
-		} else {
-			opened, err := ttcvolume.OpenRepository(repository.Path, ttcvolume.CopyMode(repository.CopyMode))
-			if err != nil {
-				return err
-			}
-			snapshotInfo, importErr := opened.ImportPackedBranchSnapshot(snapshot, branch.FilesystemBranch)
-			closeErr := opened.Close()
-			if importErr != nil || closeErr != nil {
-				return errors.Join(importErr, closeErr)
-			}
-			repository.RestoreID = snapshotInfo.RepositoryID
+	var controlPack ttcpack.ID
+	var ok bool
+	for _, reference := range manifest.Packs {
+		if reference.Source == "memory-control" {
+			controlPack, err = ttcpack.ParseID(reference.Pack)
+			ok = err == nil
+			break
 		}
 	}
-	if err := store.WriteActiveRepositoryMap(info.ID, repositories); err != nil {
-		return err
-	}
-	controlPack, ok := packBySource["memory-control"]
 	if !ok {
 		return errors.New("cold manifest omits dehydration control state")
 	}
@@ -1053,89 +1138,11 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
 		return errors.New("cold manifest identity does not match branch generation")
 	}
-	packBySource := make(map[string]ttcpack.ID, len(manifest.Packs))
-	for _, reference := range manifest.Packs {
-		id, err := ttcpack.ParseID(reference.Pack)
-		if err != nil {
-			return err
-		}
-		packBySource[reference.Source] = id
+	if len(manifest.Filesystems) == 0 {
+		return errors.New("cold manifest omits filesystem graph roots")
 	}
-	if err := os.MkdirAll(filepath.Join(b.activeDataRoot(), "containers", info.ID), 0700); err != nil {
-		return err
-	}
-	staging := filepath.Join(b.activeDataRoot(), "materialization-staging", fmt.Sprintf("fs-%s-%s-%016x", info.ID, hex.EncodeToString([]byte(branch.ID)), branch.StorageGeneration))
-	if err := os.RemoveAll(staging); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(staging, 0700); err != nil {
-		return err
-	}
-	defer os.RemoveAll(staging)
-	spec, err := store.LoadSpec(info.ID)
-	if err != nil {
-		return err
-	}
-	repositories, err := specutils.TTCVolumeRepositories(spec)
-	if err != nil {
-		return err
-	}
-	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
-	if err != nil {
-		return err
-	}
-	for index := range repositories {
-		repository := &repositories[index]
-		if _, ok := packBySource[repository.Source]; !ok {
-			return fmt.Errorf("cold manifest omits repository %q", repository.Source)
-		}
-		snapshot := filepath.Join(staging, fmt.Sprintf("repository-%04d", index))
-		if err := b.materializeColdSourceMetadata(manifest, repository.Source, snapshot); err != nil {
-			return fmt.Errorf("materializing repository %q: %w", repository.Source, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(repository.Path), 0700); err != nil {
-			return err
-		}
-		if _, statErr := os.Stat(filepath.Join(repository.Path, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
-			imported, snapshotInfo, err := manager.ImportPrivatePackedSnapshot(repository.Path, fmt.Sprintf("cold-fs-%d", index), snapshot, branch.FilesystemBranch)
-			if err != nil {
-				return err
-			}
-			repository.RestoreID = snapshotInfo.RepositoryID
-			repository.CopyMode = string(manager.Capability().Mode)
-			if err := imported.Close(); err != nil {
-				return err
-			}
-		} else if statErr != nil {
-			return statErr
-		} else {
-			opened, err := ttcvolume.OpenRepository(repository.Path, ttcvolume.CopyMode(repository.CopyMode))
-			if err != nil {
-				return err
-			}
-			snapshotInfo, importErr := opened.ImportPackedBranchSnapshot(snapshot, branch.FilesystemBranch)
-			closeErr := opened.Close()
-			if importErr != nil || closeErr != nil {
-				return errors.Join(importErr, closeErr)
-			}
-			repository.RestoreID = snapshotInfo.RepositoryID
-		}
-	}
-	return store.WriteActiveRepositoryMap(info.ID, repositories)
-}
-
-func (b *runtimeBackend) materializeColdSourceMetadata(manifest coldBranchManifest, source, destination string) error {
-	for _, reference := range manifest.Packs {
-		if reference.Source != source {
-			continue
-		}
-		id, err := ttcpack.ParseID(reference.Pack)
-		if err != nil {
-			return err
-		}
-		return ttcpack.MaterializeMetadata(filepath.Join(b.dataRoot, "cold"), id, destination, "objects")
-	}
-	return fmt.Errorf("cold manifest omits source %q", source)
+	_, err = b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true)
+	return err
 }
 
 func (b *runtimeBackend) filesystemRestoreIDs(container string) (map[string]string, error) {
@@ -1161,44 +1168,6 @@ func (b *runtimeBackend) filesystemRestoreIDs(container string) (map[string]stri
 			return nil, fmt.Errorf("closing active repository %q: %w", repository.Source, err)
 		}
 		ids[current] = repository.RestoreID
-	}
-	return ids, nil
-}
-
-func (b *runtimeBackend) coldPackChain(manifest coldBranchManifest, source string) ([]ttcpack.ID, error) {
-	var ids []ttcpack.ID
-	seen := make(map[string]struct{})
-	current := manifest
-	for {
-		for _, reference := range current.Packs {
-			if reference.Source != source {
-				continue
-			}
-			id, err := ttcpack.ParseID(reference.Pack)
-			if err != nil {
-				return nil, err
-			}
-			ids = append(ids, id)
-			break
-		}
-		if current.Parent == "" {
-			break
-		}
-		if err := validateColdManifestPath(b.dataRoot, current.Parent); err != nil {
-			return nil, err
-		}
-		if _, ok := seen[current.Parent]; ok {
-			return nil, errors.New("cold manifest parent cycle")
-		}
-		seen[current.Parent] = struct{}{}
-		parent, err := readColdBranchManifest(current.Parent)
-		if err != nil {
-			return nil, err
-		}
-		current = parent
-	}
-	if len(ids) == 0 {
-		return nil, fmt.Errorf("cold manifest chain omits source %q", source)
 	}
 	return ids, nil
 }
@@ -1232,44 +1201,44 @@ func (b *runtimeBackend) prepareColdFilesystemRelays(info ttcbundle.ContainerInf
 		relays.close()
 		return nil, err
 	}
+	if b.snapshotShared == nil {
+		return fail(errors.New("shared snapshot graph store is unavailable"))
+	}
+	bySource := make(map[string]coldFilesystemSnapshot, len(manifest.Filesystems))
+	for _, filesystem := range manifest.Filesystems {
+		bySource[filesystem.Root.Source] = filesystem
+	}
+	seenPaths := make(map[string]struct{})
 	for _, config := range repositories {
-		ids, err := b.coldPackChain(manifest, config.Source)
+		path := filepath.Clean(config.Path)
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		filesystem, ok := bySource[config.Source]
+		if !ok {
+			return fail(fmt.Errorf("cold manifest omits repository %q", config.Source))
+		}
+		reader, err := newSharedSnapshotObjectReader(b.snapshotShared, filesystem.Root.Root)
 		if err != nil {
 			return fail(err)
-		}
-		directory, err := ttcpack.OpenDirectory(filepath.Join(b.dataRoot, "cold"), ids)
-		if err != nil {
-			return fail(err)
-		}
-		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
-		if err != nil {
-			directory.Close()
-			return fail(err)
-		}
-		objects, objectErr := repository.BranchRemoteSourceObjects(branch.FilesystemBranch)
-		closeErr := repository.Close()
-		if objectErr != nil || closeErr != nil {
-			directory.Close()
-			return fail(errors.Join(objectErr, closeErr))
 		}
 		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 		if err != nil {
-			directory.Close()
 			return fail(err)
 		}
-		server := os.NewFile(uintptr(fds[0]), "ttc-cold-pack-server")
-		client := os.NewFile(uintptr(fds[1]), "ttc-cold-pack-client")
+		server := os.NewFile(uintptr(fds[0]), "ttc-cold-graph-server")
+		client := os.NewFile(uintptr(fds[1]), "ttc-cold-graph-client")
 		done := make(chan error, 1)
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		go func() {
+		go func(reader *sharedSnapshotObjectReader) {
 			err := ttcvolume.ServeRemoteObjects(server, relays.token, []ttcvolume.RemoteObjectSource{{
-				Key: key, Reader: coldPackObjectReader{directory: directory}, Objects: objects,
+				Key: key, Reader: reader, Catalog: reader,
 			}})
 			b.reportColdRelayError("filesystem", err)
 			done <- err
-			_ = directory.Close()
 			close(done)
-		}()
+		}(reader)
 		relays.clients = append(relays.clients, client)
 		relays.done = append(relays.done, done)
 	}
@@ -1318,41 +1287,45 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 		return nil, nil, err
 	}
 	sources := make([]ttcvolume.RemoteObjectSource, 0, len(configs))
+	if b.snapshotShared == nil {
+		return fail(errors.New("shared snapshot graph store is unavailable"))
+	}
+	bySource := make(map[string]coldFilesystemSnapshot, len(manifest.Filesystems))
+	for _, filesystem := range manifest.Filesystems {
+		bySource[filesystem.Root.Source] = filesystem
+	}
+	seenPaths := make(map[string]struct{})
 	for _, config := range configs {
-		ids, err := b.coldPackChain(manifest, config.Source)
-		if err != nil {
-			return fail(err)
+		path := filepath.Clean(config.Path)
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
 		}
-		directory, err := ttcpack.OpenDirectory(filepath.Join(b.dataRoot, "cold"), ids)
+		seenPaths[path] = struct{}{}
+		filesystem, ok := bySource[config.Source]
+		if !ok {
+			return fail(fmt.Errorf("cold manifest omits repository %q", config.Source))
+		}
+		reader, err := newSharedSnapshotObjectReader(b.snapshotShared, filesystem.Root.Root)
 		if err != nil {
 			return fail(err)
 		}
 		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
 		if err != nil {
-			directory.Close()
 			return fail(err)
 		}
 		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
-		objects, err := repository.BranchRemoteSourceObjects(physicalBranch)
-		if err != nil {
-			repository.Close()
-			directory.Close()
-			return fail(err)
-		}
 		server, client := net.Pipe()
 		var token ttcvolume.RemoteToken
 		if _, err := rand.Read(token[:]); err != nil {
 			repository.Close()
-			directory.Close()
 			server.Close()
 			client.Close()
 			return fail(err)
 		}
 		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
-		go func() {
-			_ = ttcvolume.ServeRemoteObjects(server, token, []ttcvolume.RemoteObjectSource{{Key: key, Reader: coldPackObjectReader{directory: directory}, Objects: objects}})
-			_ = directory.Close()
-		}()
+		go func(reader *sharedSnapshotObjectReader) {
+			_ = ttcvolume.ServeRemoteObjects(server, token, []ttcvolume.RemoteObjectSource{{Key: key, Reader: reader, Catalog: reader}})
+		}(reader)
 		if err := repository.AttachRemoteObjectSource(client, token, key, physicalBranch); err != nil {
 			server.Close()
 			client.Close()
@@ -1368,55 +1341,6 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 		return nil, nil, errors.New("dehydrated branch has no managed filesystem repositories")
 	}
 	return sources, cleanup, nil
-}
-
-func (b *runtimeBackend) materializeColdSource(manifest coldBranchManifest, source, destination string) error {
-	current := manifest
-	first := true
-	seen := make(map[string]struct{})
-	for {
-		var found *coldPackReference
-		for i := range current.Packs {
-			if current.Packs[i].Source == source {
-				found = &current.Packs[i]
-				break
-			}
-		}
-		if found != nil {
-			id, err := ttcpack.ParseID(found.Pack)
-			if err != nil {
-				return err
-			}
-			if first {
-				err = ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), id, destination)
-			} else {
-				err = ttcpack.MaterializeMissing(filepath.Join(b.dataRoot, "cold"), id, destination)
-			}
-			if err != nil {
-				return err
-			}
-			first = false
-		}
-		if current.Parent == "" {
-			break
-		}
-		if err := validateColdManifestPath(b.dataRoot, current.Parent); err != nil {
-			return err
-		}
-		if _, ok := seen[current.Parent]; ok {
-			return errors.New("cold manifest parent cycle")
-		}
-		seen[current.Parent] = struct{}{}
-		parent, err := readColdBranchManifest(current.Parent)
-		if err != nil {
-			return err
-		}
-		current = parent
-	}
-	if first {
-		return fmt.Errorf("cold manifest chain omits source %q", source)
-	}
-	return nil
 }
 
 // collectColdStorage traces every authoritative and pending manifest before

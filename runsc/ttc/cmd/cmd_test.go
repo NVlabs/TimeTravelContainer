@@ -5005,6 +5005,40 @@ func TestColdPackIntentReclaimsRetiredTransactionPack(t *testing.T) {
 	}
 }
 
+func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	legacy := coldBranchManifest{Version: 1, Container: "family", Branch: "main", Generation: 1, Kind: "stop"}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 2") {
+		t.Fatalf("legacy cold manifest error=%v", err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	current := coldBranchManifest{
+		Version: 2, Container: "family", Branch: "main", Generation: 1, Kind: "stop",
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef",
+			BranchID:  "main", Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{17}}},
+	}
+	data, err = json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 {
+		t.Fatalf("current cold manifest=%+v, %v", got, err)
+	}
+}
+
 func TestColdPackIntentTracksOnlyNonterminalTransaction(t *testing.T) {
 	for _, test := range []struct {
 		name  string

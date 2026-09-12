@@ -5,6 +5,7 @@ package ttcvolume
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -12,11 +13,28 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
+
+type testSharedCatalog struct{ store *ttcsnapshot.SharedPackStore }
+
+func (c testSharedCatalog) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
+	return c.store.Object(id)
+}
+
+func (c testSharedCatalog) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return 0, err
+	}
+	return c.store.ReadObjectRange(context.Background(), id, destination, offset)
+}
 
 func TestRemoteSnapshotFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	sourceManager := openTestManager(t)
@@ -177,6 +195,170 @@ func TestRemoteSnapshotDescriptorNeedsNoStagingDirectory(t *testing.T) {
 	}
 	if err := target.MaterializeRemoteObjects(); err != nil {
 		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+}
+
+func TestRemoteSnapshotReadsCatalogAndFilesFromSharedGraphPacks(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("shared-pack-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("shared graph range\n"), 140000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range source.graph.Inspect().Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotWorking {
+			continue
+		}
+		if err := shared.Publish(context.Background(), source.graph, snapshot.ID, source.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	server, client := net.Pipe()
+	var token RemoteToken
+	copy(token[:], []byte("shared-pack-token"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	catalog := testSharedCatalog{store: shared}
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Reader: catalog, Catalog: catalog}})
+	}()
+	if err := target.AttachRemoteObjectSource(client, token, key, "imported"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("shared graph pack returned different file contents")
+	}
+	if err := target.MaterializeRemoteObjects(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("publication-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("published through lazy catalog"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range source.graph.Inspect().Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotWorking {
+			continue
+		}
+		if err := shared.Publish(context.Background(), source.graph, snapshot.ID, source.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(
+		filepath.Join(targetManager.root, "target"), "target", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	server, client := net.Pipe()
+	var token RemoteToken
+	copy(token[:], []byte("publication-token"))
+	key := RemoteSourceKey(sha256.Sum256([]byte("rootfs-upper")))
+	catalog := testSharedCatalog{store: shared}
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- ServeRemoteObjects(server, token, []RemoteObjectSource{{Key: key, Reader: catalog, Catalog: catalog}})
+	}()
+	if err := target.AttachRemoteObjectSource(client, token, key, "imported"); err != nil {
+		t.Fatal(err)
+	}
+	// Expand only the lookup path before sealing. Preparation must finish the
+	// rest of the catalog rather than publishing a root with working children.
+	if _, err := target.Lookup("imported", RootInode, "artifact"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.CreateRegular("imported", RootInode, "target-local", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := target.BeginForkWithOrigins("imported", "published", 102, 103)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	origins, err := target.PrepareBranchPublication("published")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := target.Branch("published")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.RemoteCatalog != "" || branch.RemoteCatalogSnapshot != 0 || branch.RemoteLogicalBytes != 0 {
+		t.Fatalf("published branch retained remote catalog state: %+v", branch)
+	}
+	sourceBranch, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceBranch.RemoteCatalog != "" || sourceBranch.RemoteCatalogSnapshot != 0 || sourceBranch.RemoteLogicalBytes != 0 {
+		t.Fatalf("independent sibling retained shared remote catalog state: %+v", sourceBranch)
+	}
+	if want := []ttcsnapshot.SnapshotID{101, 100}; !slices.Equal(origins, want) {
+		t.Fatalf("publication origins=%v, want %v", origins, want)
+	}
+	for _, origin := range origins {
+		record, ok := target.graph.Snapshot(origin)
+		if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+			t.Fatalf("origin %d = (%+v,%t), want sealed-volatile", origin, record, ok)
+		}
 	}
 	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
 		t.Fatal(err)

@@ -125,7 +125,8 @@ func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T)
 		GraphManifest: "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
 		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
 		FilesystemRoots: []FilesystemRootDescriptor{{
-			Source: "rootfs-upper", RepositoryID: "repository-a", BranchID: "branch-a",
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "fedcba9876543210fedcba9876543210", BranchID: "branch-a",
 			Root: "0000000000000008-07-0000000000000001", NextInode: 2, LogicalBytes: 1 << 20,
 		}}, FilesystemBytes: 1 << 20,
 	}

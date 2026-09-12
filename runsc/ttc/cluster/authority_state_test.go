@@ -430,7 +430,7 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	}))
 	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
-		Roots: DurableRoots{MemorySnapshot: 7, FilesystemRoot: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Roots: DurableRoots{MemorySnapshot: 7, FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"},
 	})
 	placement := state.Placements[logicalBranchKey("family", "main")]
 	if placement.State != PlacementUnplaced {

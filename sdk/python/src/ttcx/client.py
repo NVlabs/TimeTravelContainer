@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-API_VERSION = 6
+API_VERSION = 7
 MAX_FRAME = 1 << 20
 STDIN_WINDOW = 1 << 20
 
