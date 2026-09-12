@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
@@ -45,10 +46,13 @@ func TestCappedCapacityOutputDoesNotPadShortWrites(t *testing.T) {
 }
 
 func testElasticCapacityCapabilities(node string) cluster.Capabilities {
+	policy := ttcremote.DefaultPolicy()
+	policy.PageSize = 4096
 	return cluster.Capabilities{
 		NodeID: node, ProtocolMin: 1, ProtocolMax: 1, BuildID: "test", Architecture: "amd64",
 		BasePageSize: 4096, MaxTransferSize: 2 << 20, RepositoryID: "shared",
-		Features: []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
+		Features:     []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
+		PagingPolicy: policy,
 	}
 }
 

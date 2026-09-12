@@ -24,6 +24,8 @@ import (
 )
 
 func testCapabilities(node string) Capabilities {
+	policy := ttcremote.DefaultPolicy()
+	policy.PageSize = 4096
 	return Capabilities{
 		NodeID: node, ProtocolMin: 1, ProtocolMax: 2, BuildID: "test-build",
 		Architecture: "amd64", BasePageSize: 4096, MaxTransferSize: 2 << 20,
@@ -33,6 +35,7 @@ func testCapabilities(node string) Capabilities {
 			FeatureNetworkRecreate, FeatureRuntimePrefetch, FeatureFilesystemBranch,
 			FeatureSharedMemorySnapshot,
 		},
+		PagingPolicy: policy,
 	}
 }
 
@@ -58,16 +61,11 @@ func TestNegotiateCapabilities(t *testing.T) {
 	}
 }
 
-func TestLegacyCapabilitiesReceiveDefaultPagingPolicy(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := negotiated.PagingPolicy.TransferBytes, uint64(1<<20); got != want {
-		t.Fatalf("transfer bytes=%d, want %d", got, want)
-	}
-	if got, want := negotiated.PagingPolicy.PageSize, uint64(4096); got != want {
-		t.Fatalf("page size=%d, want %d", got, want)
+func TestCapabilitiesRequireExplicitPagingPolicy(t *testing.T) {
+	capabilities := testCapabilities("source")
+	capabilities.PagingPolicy = ttcremote.Policy{}
+	if err := capabilities.Validate(); err == nil {
+		t.Fatal("capabilities without an explicit paging policy were accepted")
 	}
 }
 
@@ -150,7 +148,8 @@ func testForkIdentity() ForkIdentity {
 	return ForkIdentity{
 		TransactionID: "tx-1", SourceNodeID: "source", TargetNodeID: "target",
 		SourceContainer: "app", SourceBranch: "main", TargetContainer: "app-copy", TargetBranch: "main",
-		ImageDigest: digest, RootfsDigest: digest, RepositoryID: "shared-repository",
+		TargetVisibleBranch: "main",
+		ImageDigest:         digest, RootfsDigest: digest, RepositoryID: "shared-repository",
 	}
 }
 

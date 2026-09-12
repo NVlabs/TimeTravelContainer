@@ -25,10 +25,9 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 5 makes graph-root descriptors the only
-	// filesystem handoff representation and removes the compatibility metadata
-	// pack field from transaction and session state.
-	ControlProtocolVersion = 5
+	// ControlProtocolVersion 6 requires explicit branch identities and paging
+	// policy in every peer capability/transaction record.
+	ControlProtocolVersion = 6
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"
@@ -74,7 +73,7 @@ func (c Capabilities) Validate() error {
 	if c.MaxTransferSize < c.BasePageSize || c.MaxTransferSize%c.BasePageSize != 0 || c.MaxTransferSize > 2<<20 {
 		return fmt.Errorf("invalid maximum transfer size %d for page size %d", c.MaxTransferSize, c.BasePageSize)
 	}
-	if err := validatePagingPolicy(c, normalizedPagingPolicy(c)); err != nil {
+	if err := validatePagingPolicy(c, c.PagingPolicy); err != nil {
 		return fmt.Errorf("paging policy: %w", err)
 	}
 	seen := make(map[string]struct{}, len(c.Features))
@@ -100,18 +99,6 @@ type NegotiatedCapabilities struct {
 	SourceBuildID   string           `json:"source_build_id"`
 	TargetBuildID   string           `json:"target_build_id"`
 	PagingPolicy    ttcremote.Policy `json:"paging_policy"`
-}
-
-func normalizedPagingPolicy(c Capabilities) ttcremote.Policy {
-	p := c.PagingPolicy
-	if p.PageSize == 0 {
-		p = ttcremote.DefaultPolicy()
-		p.PageSize = c.BasePageSize
-	}
-	if p.TransferBytes > c.MaxTransferSize {
-		p.TransferBytes = c.MaxTransferSize
-	}
-	return p
 }
 
 func validatePagingPolicy(c Capabilities, p ttcremote.Policy) error {
@@ -167,8 +154,8 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 			return NegotiatedCapabilities{}, fmt.Errorf("target lacks required common feature %q", required)
 		}
 	}
-	policy := normalizedPagingPolicy(target)
-	policy.Push = normalizedPagingPolicy(source).Push
+	policy := target.PagingPolicy
+	policy.Push = source.PagingPolicy.Push
 	policy.TransferBytes = min(policy.TransferBytes, source.MaxTransferSize, target.MaxTransferSize)
 	if policy.MaxOutstandingBytes < policy.TransferBytes {
 		policy.MaxOutstandingBytes = policy.TransferBytes

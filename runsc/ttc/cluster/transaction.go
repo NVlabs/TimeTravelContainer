@@ -50,10 +50,10 @@ type ForkIdentity struct {
 	SourceBranch    string `json:"source_branch"`
 	TargetContainer string `json:"target_container"`
 	TargetBranch    string `json:"target_branch"`
-	// TargetVisibleBranch is the user-facing branch name on the target. Empty
-	// is the legacy spelling of main. TargetBranch remains the transaction-
-	// unique filesystem/state identity embedded in captured metadata.
-	TargetVisibleBranch string `json:"target_visible_branch,omitempty"`
+	// TargetVisibleBranch is the explicit user-facing branch name on the
+	// target. TargetBranch remains the transaction-unique filesystem/state
+	// identity embedded in captured metadata.
+	TargetVisibleBranch string `json:"target_visible_branch"`
 	ImageDigest         string `json:"image_digest"`
 	RootfsDigest        string `json:"rootfs_digest"`
 	RepositoryID        string `json:"repository_id"`
@@ -65,9 +65,6 @@ type ForkIdentity struct {
 
 // VisibleTargetBranch returns the external target-family branch identity.
 func (i ForkIdentity) VisibleTargetBranch() string {
-	if i.TargetVisibleBranch == "" {
-		return "main"
-	}
 	return i.TargetVisibleBranch
 }
 
@@ -112,7 +109,7 @@ func (i ForkIdentity) Validate() error {
 	if i.SourceNodeID == "" || i.TargetNodeID == "" || i.SourceNodeID == i.TargetNodeID {
 		return errors.New("fork identity requires distinct source and target node IDs")
 	}
-	if i.SourceContainer == "" || i.SourceBranch == "" || i.TargetContainer == "" || i.TargetBranch == "" || i.RepositoryID == "" {
+	if i.SourceContainer == "" || i.SourceBranch == "" || i.TargetContainer == "" || i.TargetBranch == "" || i.TargetVisibleBranch == "" || i.RepositoryID == "" {
 		return errors.New("fork identity omits a container, branch, or repository field")
 	}
 	if i.Migration && (i.TargetContainer != i.SourceContainer || i.VisibleTargetBranch() != i.SourceBranch) {
