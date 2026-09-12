@@ -4573,7 +4573,7 @@ func (s Store) PruneImageCache(targetBytes uint64) (ImageCachePruneResult, error
 	return result, nil
 }
 
-var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)
+var imageRootDirectoryPattern = regexp.MustCompile(`^` + imageRootFormatVersion + `-sha256-[0-9a-f]{64}-.+$`)
 
 // nodeLocalImageCacheGrace closes the short interval between publishing a
 // freshly materialized image root and publishing the active container that
@@ -4582,11 +4582,8 @@ var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f
 // is retained for one maintenance interval and reconsidered later.
 const nodeLocalImageCacheGrace = time.Minute
 
-// PruneImageRoots removes materialized image roots that are no longer usable
-// by either the current image catalog or a persistent container. In
-// particular, this collects roots left behind when imageRootFormatVersion is
-// advanced. Container references are authoritative so that an older stopped
-// container remains startable until RefreshContainerImageRoot migrates it.
+// PruneImageRoots removes current-format materialized image roots that are no
+// longer usable by either the image catalog or a persistent container.
 func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
@@ -4616,19 +4613,10 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 				return 0, err
 			}
 		}
-		if container.Digest != "" && container.Platform != "" {
-			keep[imageRootKey(container.Digest, container.Platform)] = struct{}{}
-			continue
+		if container.Digest == "" || container.Platform == "" {
+			return 0, fmt.Errorf("container %q has no image identity", container.Name)
 		}
-		// Compatibility for tests and old records that predate image identity.
-		rootfs := filepath.Clean(container.RootFS)
-		if filepath.Base(rootfs) != "rootfs" {
-			continue
-		}
-		relative, err := filepath.Rel(imagesDir, filepath.Dir(rootfs))
-		if err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !strings.ContainsRune(relative, filepath.Separator) {
-			keep[relative] = struct{}{}
-		}
+		keep[imageRootKey(container.Digest, container.Platform)] = struct{}{}
 	}
 
 	removed := 0
@@ -4749,12 +4737,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 		return 0, fmt.Errorf("invalid image digest %q", digest)
 	}
 	imagesDir := s.imageRootDir()
-	prefixes := []string{
-		safeComponent(digest + "-"),
-		safeComponent("v2-" + digest + "-"),
-		safeComponent("v3-" + digest + "-"),
-		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
-	}
+	prefix := safeComponent(imageRootFormatVersion + "-" + digest + "-")
 	removed := 0
 	err := s.withImageRootLock(func() error {
 		entries, err := os.ReadDir(imagesDir)
@@ -4765,14 +4748,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 			return fmt.Errorf("listing image roots: %w", err)
 		}
 		for _, entry := range entries {
-			matches := false
-			for _, prefix := range prefixes {
-				if strings.HasPrefix(entry.Name(), prefix) {
-					matches = true
-					break
-				}
-			}
-			if !entry.IsDir() || !matches {
+			if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
 				continue
 			}
 			path := filepath.Join(imagesDir, entry.Name())

@@ -1995,11 +1995,11 @@ func TestContainerIdentityResolution(t *testing.T) {
 	alphaDir := writeRecord(idAlpha, idAlpha, "alpha")
 	betaDir := writeRecord(idBeta, idBeta, "beta")
 	writeRecord(idNamedPrefix, idNamedPrefix, "abc")
-	legacyDir := writeRecord("legacy", "", "legacy")
+	nameKeyDir := writeRecord("name-key", "", "name-key")
 
 	for identifier, wantID := range map[string]string{
 		"alpha": idAlpha, idAlpha: idAlpha, idAlpha[:4]: idAlpha,
-		"abc": idNamedPrefix, "legacy": "legacy", idNamedPrefix: idNamedPrefix, idNamedPrefix[:8]: idNamedPrefix,
+		"abc": idNamedPrefix, "name-key": "name-key", idNamedPrefix: idNamedPrefix, idNamedPrefix[:8]: idNamedPrefix,
 	} {
 		info, err := store.LoadContainer(identifier)
 		if err != nil {
@@ -2031,11 +2031,11 @@ func TestContainerIdentityResolution(t *testing.T) {
 	if _, err := os.Stat(betaDir); !os.IsNotExist(err) {
 		t.Errorf("removed ID directory still exists: %v", err)
 	}
-	if info, err := store.LoadContainer("legacy"); err != nil || info.ID != "legacy" {
-		t.Fatalf("legacy record=%+v, err=%v", info, err)
+	if info, err := store.LoadContainer("name-key"); err != nil || info.ID != "name-key" {
+		t.Fatalf("name-key record=%+v, err=%v", info, err)
 	}
-	if _, err := os.Stat(legacyDir); err != nil {
-		t.Errorf("legacy directory changed: %v", err)
+	if _, err := os.Stat(nameKeyDir); err != nil {
+		t.Errorf("name-key directory changed: %v", err)
 	}
 }
 
@@ -2063,19 +2063,7 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	amd64 := makeRoot(digest, "linux/amd64")
 	arm64 := makeRoot(digest, "linux/arm64/v8")
 	other := makeRoot(otherDigest, "linux/amd64")
-	legacy := filepath.Join(root, "images", safeComponent("v2-"+digest+"-linux/386"))
-	if err := os.MkdirAll(filepath.Join(legacy, "rootfs"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "image.json"), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	legacyManifest := ownership.NewManifest()
-	legacyManifest.Entries["."] = ownership.Owner{}
-	if err := ownership.Write(ownership.ManifestPath(filepath.Join(legacy, "rootfs")), legacyManifest); err != nil {
-		t.Fatal(err)
-	}
-	for _, dir := range []string{amd64, arm64, legacy} {
+	for _, dir := range []string{amd64, arm64} {
 		restricted := filepath.Join(dir, "rootfs", "restricted")
 		if err := os.Mkdir(restricted, 0750); err != nil {
 			t.Fatal(err)
@@ -2118,10 +2106,10 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveImageRoots: %v", err)
 	}
-	if removed != 3 {
-		t.Errorf("RemoveImageRoots removed %d roots, want 3", removed)
+	if removed != 2 {
+		t.Errorf("RemoveImageRoots removed %d roots, want 2", removed)
 	}
-	for _, dir := range []string{amd64, arm64, legacy} {
+	for _, dir := range []string{amd64, arm64} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Errorf("removed image root %q still exists: %v", dir, err)
 		}
@@ -2299,9 +2287,10 @@ func TestPruneImageRoots(t *testing.T) {
 	store := Store{Root: root}
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	oldDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	staleDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	currentName := imageRootKey(digest, "linux/amd64")
-	referencedOldName := safeComponent("v3-" + oldDigest + "-linux/amd64")
-	staleOldName := safeComponent("v3-" + digest + "-linux/amd64")
+	referencedName := imageRootKey(oldDigest, "linux/amd64")
+	staleName := imageRootKey(staleDigest, "linux/amd64")
 	tempName := currentName + ".tmp-interrupted"
 
 	makeRoot := func(name string) string {
@@ -2323,12 +2312,12 @@ func TestPruneImageRoots(t *testing.T) {
 		return rootfs
 	}
 	currentRoot := makeRoot(currentName)
-	referencedOldRoot := makeRoot(referencedOldName)
-	staleOldRoot := makeRoot(staleOldName)
+	referencedRoot := makeRoot(referencedName)
+	staleRoot := makeRoot(staleName)
 	tempRoot := makeRoot(tempName)
 	t.Cleanup(func() {
 		_ = removeImageRoot(filepath.Join(root, "images", currentName))
-		_ = removeImageRoot(filepath.Join(root, "images", referencedOldName))
+		_ = removeImageRoot(filepath.Join(root, "images", referencedName))
 	})
 	unrelated := filepath.Join(root, "images", "operator-notes")
 	if err := os.MkdirAll(unrelated, 0700); err != nil {
@@ -2337,7 +2326,7 @@ func TestPruneImageRoots(t *testing.T) {
 
 	removed, err := store.pruneImageRoots(
 		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
-		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+		[]ContainerInfo{{Name: "referenced", Digest: oldDigest, Platform: "linux/amd64"}},
 	)
 	if err != nil {
 		t.Fatalf("pruneImageRoots: %v", err)
@@ -2345,19 +2334,19 @@ func TestPruneImageRoots(t *testing.T) {
 	if removed != 2 {
 		t.Fatalf("pruneImageRoots removed %d roots, want 2", removed)
 	}
-	for _, path := range []string{currentRoot, referencedOldRoot, unrelated} {
+	for _, path := range []string{currentRoot, referencedRoot, unrelated} {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("preserved path %q is unavailable: %v", path, err)
 		}
 	}
-	for _, path := range []string{staleOldRoot, tempRoot} {
+	for _, path := range []string{staleRoot, tempRoot} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("stale path %q remains: %v", path, err)
 		}
 	}
 	if removed, err := store.pruneImageRoots(
 		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
-		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+		[]ContainerInfo{{Name: "referenced", Digest: oldDigest, Platform: "linux/amd64"}},
 	); err != nil || removed != 0 {
 		t.Errorf("second pruneImageRoots = (%d, %v), want (0, nil)", removed, err)
 	}

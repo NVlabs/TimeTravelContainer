@@ -299,7 +299,7 @@ func hostXattrs(path string, symlink bool) (map[string][]byte, error) {
 }
 
 // MaterializeFilesystem reconstructs a logical filesystem into an empty host
-// directory. It is used by standalone image preparation and compatibility
+// directory. It is used by standalone image preparation and portable
 // export, not by the clustered lazy read path.
 func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataStore, root ObjectID, destination string) error {
 	if graph == nil || data == nil || !filepath.IsAbs(destination) {

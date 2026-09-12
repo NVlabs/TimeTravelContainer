@@ -92,7 +92,7 @@ covers:
   projection, rejection of log reads for `none`, and label/environment attributes
   in `logs --details`;
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
-  over versioned timestamped records, including filtering and legacy-record decoding;
+  over versioned timestamped records, including filtering and malformed-record rejection;
 - `exec`, selective stdin/stdout/stderr `attach`, transactional `fork`
   behavior, live `fork`, `pause`,
   `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
