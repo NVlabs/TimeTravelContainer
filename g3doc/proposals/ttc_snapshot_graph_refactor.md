@@ -54,14 +54,14 @@ different from failure: it means current evidence does not cover the full gate.
 | 0 | unverified | The machine-readable invariant checklist and `TTC_SNAPSHOT_GRAPH_STRICT=1` legacy-artifact guard are present. A real Lustre baseline remains unavailable. |
 | 1 | complete | Root/API boundary tests, SDK schemas, exact build negotiation, and static-client dependency/size evidence are present. |
 | 2 | complete | Random graph and filesystem models, crash-prefix replay, reference rebuilding, and cascading-GC tests cover the common graph. |
-| 3 | unverified | The graph-backed standalone data path is present, but the required fork-depth asymptotic package/source-build measurements and full reflink/non-reflink matrix have not been recorded. |
+| 3 | complete | The complete standalone rootfs/volume/mount/checkpoint matrix passes on XFS with reflinks and ext4 with automatic whole-file fallback. Five live-fork samples had the same 0.07-second median for an empty writable tree, after creating 10,000 files across 100 directories, and after additionally faulting the default 64 MiB `/dev/shm`; the observed ranges were 0.07–0.12, 0.06–0.08, and 0.06–0.07 seconds respectively. Real Rocky RPM installation and 1,100-generation build-tree-style replacement churn cover the mutating package/source path. |
 | 4 | complete | A 256-sibling run covers disjoint 4 KiB CoW writes, process-free dehydration/rehydration, PageID reuse, bounded GC, and zero bulk residue. The public-image and randomized graph suites add overlapping-page churn, branch-name reuse, RSS/object reclamation, and daemon restart recovery. |
 | 5 | complete | Memory and filesystem origins are Raft-allocated and origin-directed. Live handoff carries bounded, path-free graph roots directly over the fenced peer protocol and performs no shared-storage write before target execution. |
 | 6 | unverified | Lazy complete-file image caching passed local and shaped-NFS tests. A real Lustre cold-cache run remains unavailable. |
 | 7 | complete | Memory and filesystem publication use origin-indexed graph packs. Restart, fork, migration, and return-hop tests cover publication and peer dependencies. |
 | 8 | complete | Shared reference ledgers and GC cover memory and filesystem graph packs with exact zero-count reclamation. Coordinator crash/rebuild and second-generation filesystem publication pass. |
-| 9 | unverified | Lifecycle, pressure, drain recovery, quarantine, and source-loss tests pass. A 64-branch, three-node shaped-NFS fan-out/retirement run passes with exact data verification and disposable retired scratch. The specified hundreds-of-branches gate and shared-filesystem outage/restore run remain outstanding. |
-| 10 | in progress | Directory-based remote import/export, filesystem metadata-pack protocol fields, and cold-pack intents have been removed. Current code and SDK suites pass; documentation and final static binary installation remain. Lustre qualification is externally blocked by the lack of a client, mount, or reachable test node. |
+| 9 | complete | Lifecycle, pressure, drain recovery, quarantine, and source-loss tests pass. A 64-branch, three-node shaped-NFS fan-out/retirement run and a clean 128-branch NFS run both pass with exact private-page verification, restart recovery, and disposable retired scratch. An independent NFS outage/restore run kept all daemons alive, recovered publication after the export returned, and verified all eight branches before zero-residue removal. |
+| 10 | unverified | Legacy storage paths and stale protocol fields are removed; the focused code and SDK suites, static binaries, NFS stress, nested Docker, and TTC-in-TTC qualification pass. The only unmet external gate is a real Lustre run: no Lustre client, mount, or reachable Lustre host was available. |
 
 ### Final non-KVM qualification (2026-09-12)
 
@@ -97,6 +97,20 @@ gates:
   unrecoverable `draining` wait. The regression run now re-drives that immutable
   handoff, completes in 45 seconds with the network limiter active, and leaves
   no image-ingest, graph-pack, `.nfs`, or container-family residue; and
+* a clean 128-branch, three-node NFS fan-out: all branches dirtied distinct
+  4 KiB values, retiring one node migrated its 64 branches, every value was
+  verified after placement, and family removal plus a full control-plane
+  restart left zero local family directories and zero snapshot-pack
+  namespaces. An earlier scale attempt exposed duplicate active and retirement
+  dependency drains, which serialized redundant 30-second independence calls;
+  retirement now uses one eager drain and transaction-keyed single-flight.
+  Cancellation and crash residue also exposed empty uncommitted snapshot
+  namespaces; publication now removes its uncommitted namespace and retirement
+  reaps incomplete pre-manifest handoffs; and
+* an eight-branch shared-NFS outage/restore run: the export was stopped for ten
+  seconds while publication was active, all daemons remained live, publication
+  recovered after the export returned, and all branch data, retirement,
+  restart, and zero-residue checks passed; and
 * rootless TTC in an ordinary unprivileged Docker container and a complete
   TTC-in-TTC run in which the inner daemon loaded an OCI archive and executed
   a nested Ubuntu container.

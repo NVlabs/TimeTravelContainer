@@ -5,9 +5,11 @@ The follow-up
 is the authoritative replacement plan. This document remains the audit of the
 pre-refactor implementation and the evidence for that plan.
 
-Status: audit of commit `8f7a3a327` (2026-09-09). This document records
-current behavior and design requirements. It does not prescribe the replacement
-architecture yet.
+Status: historical audit of commit `8f7a3a327` (2026-09-09). The findings
+below describe the pre-format-2/format-5 implementation and must not be read as
+current behavior. Their replacement architecture, implementation ledger, and
+qualification evidence live in the snapshot-graph refactor document linked
+above.
 
 Audit method: the review traced data placement, authority, lifecycle, transfer,
 recovery, and garbage collection across the CLI/daemon, bundle and image stores,
@@ -17,10 +19,11 @@ storage. The existing targeted suites for `ttcchunk`, `ttcpack`, `ttcvolume`,
 bundle, images, and publication storage all pass; the findings below are gaps in
 the behavior and invariants those suites currently specify.
 
-## Executive summary
+## Historical executive summary
 
-TTC has most of the *pieces* of tiered storage, but not yet a consistently
-demand-driven tiered data plane. Active writable filesystems and dehydration
+At the audited commit, TTC had most of the *pieces* of tiered storage, but not
+a consistently demand-driven tiered data plane. Active writable filesystems
+and dehydration
 captures are node-local; OCI blobs and immutable cold packs are shared; memory
 and remote filesystem data can be fetched lazily in 1 MiB units. Those are good
 foundations.
