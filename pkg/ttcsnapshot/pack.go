@@ -239,7 +239,18 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		return err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	committed := false
+	defer func() {
+		_ = os.Remove(temporaryPath)
+		if !committed {
+			// A provider is uniquely authorized to publish this snapshot. If
+			// it is canceled before manifest-last commit, none of the staging
+			// namespace is authoritative. Remove it now instead of leaving an
+			// empty numeric directory for distributed GC to rediscover.
+			_ = os.RemoveAll(directory)
+			_ = syncDirectory(filepath.Dir(directory))
+		}
+	}()
 	const packNumber = uint32(0)
 	if err := writePackHeader(temporary, snapshot, packNumber); err != nil {
 		temporary.Close()
@@ -341,6 +352,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err := writeAtomicJSON(filepath.Join(directory, sharedManifestName), manifest); err != nil {
 		return err
 	}
+	committed = true
 	store.mu.Lock()
 	delete(store.manifests, snapshot)
 	store.mu.Unlock()

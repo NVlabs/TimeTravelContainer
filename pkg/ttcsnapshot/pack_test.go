@@ -324,6 +324,49 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	}
 }
 
+func TestCanceledSharedPackPublicationRemovesNamespace(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := OpenSharedPackStore(filepath.Join(directory, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0xa5}, 1<<20)
+	if err := local.Install(id, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(id, "chunk", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := shared.Publish(ctx, graph, origin, local); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Publish(canceled) error=%v, want context cancellation", err)
+	}
+	if _, err := os.Stat(shared.snapshotDirectory(origin)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled publication namespace stat error=%v, want not-exist", err)
+	}
+}
+
 func TestSharedPackDiscardHandoffWaitsForReaders(t *testing.T) {
 	directory := t.TempDir()
 	graph, err := Open(filepath.Join(directory, "graph"))
