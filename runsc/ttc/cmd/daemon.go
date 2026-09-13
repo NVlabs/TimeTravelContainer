@@ -398,6 +398,12 @@ type daemonTargetRuntime struct {
 	pollOnce    sync.Once
 	pollSlots   chan struct{}
 	locks       sync.Map
+	// independence prevents a caller whose HTTP deadline expired from
+	// enqueueing another copy of the same release fence while the original
+	// handler is still materializing the target. Different transactions may
+	// still make progress concurrently up to the per-family serialization in
+	// lockTarget.
+	independence sync.Map
 }
 
 const dependencyMonitorConcurrency = 2
@@ -1049,6 +1055,10 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 	if r == nil || r.backend == nil || tx == nil {
 		return nil
 	}
+	if _, loaded := r.independence.LoadOrStore(tx.Identity.TransactionID, struct{}{}); loaded {
+		return errors.New("distributed independence operation is already in progress")
+	}
+	defer r.independence.Delete(tx.Identity.TransactionID)
 	// Branches imported into one physical family share a Sentry and its TTC
 	// repositories. Transaction locks are deliberately scoped to one remote
 	// fork, so sibling handoffs can otherwise interleave the repository-wide

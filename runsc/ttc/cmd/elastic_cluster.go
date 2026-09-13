@@ -1510,11 +1510,15 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	// filesystem walk is still using the source stream. Use the direct drain
 	// path exclusively for retirement; target execution is already active, and
 	// node shutdown must wait for complete materialization in either case.
-	if sourceRecord.State == cluster.NodeDraining {
-		go monitorBackend.monitorDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
-	} else {
+	if sourceRecord.State != cluster.NodeDraining {
 		go monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
 	}
+	// monitorSparseMigrationCleanup is deliberately passive until the eager
+	// retirement barrier has made the target independent. It keeps the relay
+	// alive, then closes it and releases the physical source branch. Starting
+	// monitorDistributedFork here as well would create a second active drain
+	// driver; after either caller timed out, its still-running HTTP handler and
+	// retries could form an O(branches^2) target-lock convoy.
 	go monitorBackend.monitorSparseMigrationCleanup(peer, info.ID, target.branch, requestID, relay)
 	return nil
 }
