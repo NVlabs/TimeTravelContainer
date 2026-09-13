@@ -949,6 +949,10 @@ func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) 
 
 func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
+	return r.handoffLocked(tx, graph)
+}
+
+func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return err
@@ -1059,7 +1063,14 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 	if tx.GraphHandoff != nil {
 		output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
 		if err != nil {
-			return fmt.Errorf("reading graph memory handoff status: %w", err)
+			// Raft may contain a bound handoff intent whose first runtime attempt
+			// failed before the Sentry recorded it. Reinstall the exact immutable
+			// descriptor and let the ordinary retry observe completion. This also
+			// repairs transactions produced by older daemons with this race.
+			if retryErr := r.handoffLocked(tx, *tx.GraphHandoff); retryErr != nil {
+				return fmt.Errorf("reading graph memory handoff status: %w; reinstalling handoff: %v", err, retryErr)
+			}
+			return errors.New("graph memory handoff was reinstalled and is still in progress")
 		}
 		var status boot.DistributedForkHandoffStatus
 		if err := json.Unmarshal(output, &status); err != nil {
@@ -3649,11 +3660,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			}
 			if server.cleanStop.Load() {
 				if intent, err := loadElasticDrainIntent(dataRoot, elasticRecord.NodeID); err == nil && intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
-					if err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation); err != nil {
+					retired, err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation)
+					if err != nil {
 						if stderr != nil {
 							fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
 						}
-					} else {
+					} else if retired {
 						removeRetiredRaftState = true
 					}
 				}
@@ -4055,9 +4067,9 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 	}
 }
 
-func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation string) error {
+func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation string) (bool, error) {
 	if runtime == nil || runtime.raft == nil || runtime.source == nil {
-		return errors.New("raft retirement is unavailable")
+		return false, errors.New("raft retirement is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -4075,18 +4087,24 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
 			}
 		}
-		if err == nil || strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
+		if err == nil {
+			return true, nil
+		}
+		if strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
 			// The final voter is intentionally retained: its local Raft state is
 			// the restart point for a fully stopped cluster.
-			return nil
+			return false, nil
 		}
 		var redirect *cluster.AuthorityNotLeaderError
 		if errors.As(err, &redirect) && redirect.LeaderID != "" {
 			peer, peerErr := runtime.source.peer(redirect.LeaderID, false)
 			if peerErr == nil {
 				err = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
-				if err == nil || strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
-					return nil
+				if err == nil {
+					return true, nil
+				}
+				if strings.Contains(err.Error(), "refusing to retire the last Raft voter") {
+					return false, nil
 				}
 			} else {
 				err = peerErr
@@ -4097,7 +4115,7 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return errors.Join(lastErr, ctx.Err())
+			return false, errors.Join(lastErr, ctx.Err())
 		case <-timer.C:
 		}
 	}

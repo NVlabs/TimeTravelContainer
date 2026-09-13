@@ -1780,6 +1780,39 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	return os.RemoveAll(filepath.Join(b.localRoot, "containers", containerID))
 }
 
+// reclaimUnownedLocalFamilyState completes an evacuation's local-tier fence.
+// Moving Raft placement is not enough: the source may still have a paused
+// Sentry serving sparse state. First remove every physical branch whose source
+// dependency has reached the independent transaction state, then discard the
+// family-local filesystem and console cache only after no runtime remains.
+//
+// This intentionally operates on the bounded set of cluster families, not a
+// recursive filesystem discovery. Unknown entries in the local containers
+// directory remain visible for the ordinary quarantine/recovery path instead
+// of being silently deleted as though they were TTC family IDs.
+func (b *runtimeBackend) reclaimUnownedLocalFamilyState() error {
+	if b.localRoot == "" || b.nodeID == "" {
+		return nil
+	}
+	if err := b.cleanupNonOwnedRuntimeBranches(); err != nil {
+		return err
+	}
+	containers, err := b.containerStore().ListContainersForGC()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, info := range containers {
+		if localFamilyStateNeeded(info, b.nodeID) {
+			continue
+		}
+		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {
+			result = errors.Join(result, fmt.Errorf("reclaiming node-local family %q: %w", info.ID, err))
+		}
+	}
+	return result
+}
+
 // provisionalRaftTargetAuthorized validates the Raft execution grant for a
 // physical target that does not have a public placement yet. Container
 // metadata identifies the transaction that created the local Kernel; Raft
@@ -2647,7 +2680,7 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 		return moved, fmt.Errorf("collecting terminal shared storage: %w", err)
 	}
 	if b.sharedReferences != nil {
-		if err := b.sharedReferences.drainBeforeShutdown(context.Background()); err != nil {
+		if err := b.sharedReferences.drainBeforeShutdown(terminalCtx, last); err != nil {
 			return moved, fmt.Errorf("collecting terminal shared snapshot graph: %w", err)
 		}
 	}
@@ -2788,6 +2821,9 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 		if err := b.flushGraphReferenceReleases(2 * lease); err != nil {
 			return nil, fmt.Errorf("flushing graph-reference releases: %w", err)
 		}
+		if err := b.reclaimUnownedLocalFamilyState(); err != nil {
+			return nil, fmt.Errorf("reclaiming evacuated node-local families: %w", err)
+		}
 		return nil, nil
 	}
 	targets, err := b.drainTargets(targetNode)
@@ -2861,6 +2897,9 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 	}
 	if err := b.flushGraphReferenceReleases(2 * lease); err != nil {
 		return moved, fmt.Errorf("flushing graph-reference releases: %w", err)
+	}
+	if err := b.reclaimUnownedLocalFamilyState(); err != nil {
+		return moved, fmt.Errorf("reclaiming evacuated node-local families: %w", err)
 	}
 	return moved, nil
 }

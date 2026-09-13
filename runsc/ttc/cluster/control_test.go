@@ -386,6 +386,7 @@ type testTargetRuntime struct {
 	canceled      int
 	independent   int
 	prepareErr    error
+	handoffErr    error
 	cancelErr     error
 }
 
@@ -502,6 +503,11 @@ func (r *testTargetRuntime) Handoff(context.Context, *Transaction, GraphHandoffD
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handedOff++
+	if r.handoffErr != nil {
+		err := r.handoffErr
+		r.handoffErr = nil
+		return err
+	}
 	return nil
 }
 
@@ -1041,17 +1047,26 @@ func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 		GraphManifest: "cluster/memory-manifests/tx-1.manifest", GraphSnapshot: 17,
 		GraphRootObjects: "0000000000000011-03-0000000000000001",
 	}
-	draining, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse)
-	if err != nil || draining.State != TransactionDraining || draining.GraphHandoff == nil || *draining.GraphHandoff != sparse {
-		t.Fatalf("handoff=%+v err=%v", draining, err)
+	runtime.mu.Lock()
+	runtime.handoffErr = errors.New("injected target handoff failure")
+	runtime.mu.Unlock()
+	if _, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse); err == nil {
+		t.Fatal("initial target handoff unexpectedly succeeded")
 	}
 	reopened, err := OpenStore(store.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	persisted, err := reopened.Load(tx.Identity.TransactionID)
-	if err != nil || persisted.GraphHandoff == nil || *persisted.GraphHandoff != sparse {
+	if err != nil || persisted.State != TransactionPublished || persisted.GraphHandoff == nil || *persisted.GraphHandoff != sparse {
 		t.Fatalf("persisted handoff=%+v err=%v", persisted, err)
+	}
+	// Eager drain must recover the bound-but-not-installed handoff before it
+	// advances. Otherwise a later independence request has no target-local
+	// completion status and can retry forever.
+	draining, err := client.Drain(context.Background(), tx.Identity.TransactionID, persisted.Revision)
+	if err != nil || draining.State != TransactionDraining {
+		t.Fatalf("drain recovery=%+v err=%v", draining, err)
 	}
 	// A replay with the pre-handoff revision models a lost HTTP response.
 	retried, err := client.Handoff(context.Background(), tx.Identity.TransactionID, published.Revision, sparse)
@@ -1060,8 +1075,8 @@ func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.handedOff != 2 {
-		t.Fatalf("runtime handoff calls=%d, want 2 (a draining retry must re-drive target-local async state)", runtime.handedOff)
+	if runtime.handedOff != 3 || runtime.drained != 1 {
+		t.Fatalf("runtime handoff/drain calls=(%d,%d), want (3,1)", runtime.handedOff, runtime.drained)
 	}
 }
 

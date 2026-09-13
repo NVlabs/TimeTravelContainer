@@ -966,26 +966,44 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 // the last guaranteed maintenance opportunity: relying on the periodic pass
 // leaves dead snapshot packs behind when a family removal is followed
 // immediately by cluster shutdown.
-func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context) error {
+func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context, requireOwnership bool) error {
 	if s == nil || s.authority == nil {
 		return nil
 	}
 	const duration = 15 * time.Second
-	lease, err := s.authority.SharedGCLease()
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	if lease.Generation == 0 || !now.Before(lease.ExpiresAt) {
-		lease, err = s.authority.AcquireSharedGCLease(s.nodeID, s.incarnation, duration)
+	var lease cluster.SharedGCLease
+	for {
+		var err error
+		lease, err = s.authority.SharedGCLease()
 		if err != nil {
 			return err
 		}
-	}
-	if lease.NodeID != s.nodeID || lease.Incarnation != s.incarnation {
-		// A different live coordinator owns shared mutation. Its ordinary
-		// maintenance remains responsible; this node must not contend with it.
-		return nil
+		now := time.Now()
+		if lease.Generation == 0 || !now.Before(lease.ExpiresAt) {
+			lease, err = s.authority.AcquireSharedGCLease(s.nodeID, s.incarnation, duration)
+			if err == nil {
+				break
+			}
+			if !requireOwnership {
+				return nil
+			}
+		} else if lease.NodeID == s.nodeID && lease.Incarnation == s.incarnation {
+			break
+		} else if !requireOwnership {
+			// A different live coordinator owns shared mutation. Its ordinary
+			// maintenance remains responsible; this node must not contend with it.
+			return nil
+		}
+		// A final cluster node has no successor that can rebuild the disposable
+		// ledger. Wait out a concurrently retiring coordinator's bounded lease,
+		// then acquire a fresh generation and leave shared packs residue-free.
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	if err := s.activate(lease); err != nil {
 		return err

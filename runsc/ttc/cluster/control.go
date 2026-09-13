@@ -1351,7 +1351,19 @@ func (c *ControlPlane) independent(w http.ResponseWriter, r *http.Request, id, p
 func (c *ControlPlane) drain(w http.ResponseWriter, r *http.Request, id, peer string) {
 	var operation func(context.Context, *Transaction) error
 	if c.TargetRuntime != nil {
-		operation = c.TargetRuntime.Drain
+		operation = func(ctx context.Context, tx *Transaction) error {
+			// BindGraphHandoff commits intent before the target-local reader switch.
+			// If that first attempt fails, a later eager drain must re-drive the
+			// immutable handoff before advancing the transaction to Draining;
+			// otherwise independence waits forever for status that was never
+			// installed in the Sentry.
+			if tx.GraphHandoff != nil {
+				if err := c.TargetRuntime.Handoff(ctx, tx, *tx.GraphHandoff); err != nil {
+					return err
+				}
+			}
+			return c.TargetRuntime.Drain(ctx, tx)
+		}
 	}
 	c.advanceRuntime(w, r, id, peer, TransactionPublished, TransactionDraining, operation)
 }

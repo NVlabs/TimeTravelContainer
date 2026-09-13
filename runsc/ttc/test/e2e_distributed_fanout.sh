@@ -16,6 +16,7 @@ COUNT=${TTC_DISTRIBUTED_FANOUT_BRANCHES:-64}
 NAME=${TTC_DISTRIBUTED_FANOUT_NAME:-ttc-distributed-fanout-$$}
 ROOT=${TTC_DISTRIBUTED_FANOUT_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-distributed-fanout.XXXXXX")}
 SHARED=${TTC_DISTRIBUTED_FANOUT_SHARED_ROOT:-$ROOT/shared}
+LOCAL_BASE=${TTC_DISTRIBUTED_FANOUT_LOCAL_ROOT:-$ROOT}
 TOKEN=ttc-distributed-fanout-$NAME
 PORT_A=${TTC_DISTRIBUTED_FANOUT_PORT_A:-22483}
 PORT_B=${TTC_DISTRIBUTED_FANOUT_PORT_B:-22493}
@@ -90,8 +91,8 @@ start_node() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$ROOT/local-$node" "$ROOT/run-$node"
-	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
+	mkdir -p "$LOCAL_BASE/local-$node" "$ROOT/run-$node"
+	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_BASE/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 15s --unsafe-no-host-isolation "$@" \
@@ -184,6 +185,10 @@ wait "$PID_B"
 PID_B=
 test "$(node_branch_count node-b)" -eq 0
 test "$(branch_count)" -eq $((COUNT + 1))
+# A retired node's scratch is disposable. In particular, evacuation must not
+# retain the migrated family's rootfs repository or console cache after every
+# sparse dependency has crossed the independence fence.
+test -z "$(find "$LOCAL_BASE/local-b/containers" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)"
 
 # Bound verification concurrency just like the dirtying phase. At hundreds of
 # branches a serial loop mostly measures command startup; interleaved reads are
@@ -221,6 +226,24 @@ PID_C=
 client a node stop node-a --stop-all >/dev/null
 wait "$PID_A"
 PID_A=
+
+# Cleanly stopping the whole cluster must retain exactly one restart seed, not
+# delete every Raft database. Restart that final voter without --cluster-init;
+# startup also exercises a fresh shared-reference-ledger reconstruction.
+test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
+test ! -f "$LOCAL_BASE/local-b/cluster/raft/raft.db"
+test ! -f "$LOCAL_BASE/local-c/cluster/raft/raft.db"
+start_node a "$PORT_A"
+test "$(client a ls --json | jq 'length')" -eq 0
+for attempt in $(seq 1 600); do
+	test -z "$(find "$SHARED/snapshot-packs/snapshots" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" && break
+	sleep 0.1
+done
+test -z "$(find "$SHARED/snapshot-packs/snapshots" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)"
+client a node stop node-a --stop-all >/dev/null
+wait "$PID_A"
+PID_A=
+test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
 
 SUCCESS=1
 echo "TTC $COUNT-branch distributed fanout and retirement lifecycle passed"
