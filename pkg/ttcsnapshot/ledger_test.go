@@ -161,6 +161,68 @@ func TestReferenceLedgerCrossOwnerOrderingAndDeduplication(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerBatchedDeliveryAndReplay(t *testing.T) {
+	childOwner := NewReferenceLedger()
+	childA := ledgerObject(1, 1, ObjectKindFile)
+	childB := ledgerObject(1, 2, ObjectKindFile)
+	if err := childOwner.ImportOrigin(1, []Object{childA, childB}, map[string]ObjectID{
+		"source/a": childA.ID, "source/b": childB.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(t.TempDir(), "ledger")
+	parentOwner, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := ledgerObject(2, 1, ObjectKindInode,
+		Edge{Slot: 1, Child: childA.ID}, Edge{Slot: 2, Child: childB.ID})
+	if err := parentOwner.ImportOrigin(2, []Object{parent}, map[string]ObjectID{"target": parent.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := parentOwner.PendingOutboundBatch(1); len(got) != 1 {
+		t.Fatalf("bounded pending outbound has %d entries, want 1", len(got))
+	}
+	pending := parentOwner.PendingOutboundBatch(8)
+	if len(pending) != 2 {
+		t.Fatalf("pending outbound has %d entries, want 2", len(pending))
+	}
+	mutations := make([]SnapshotReferenceMutation, len(pending))
+	for i, outbound := range pending {
+		mutations[i] = SnapshotReferenceMutation{
+			Operation: outbound.Operation, Name: outbound.Name,
+			Object: outbound.Child, Retain: outbound.Retain,
+		}
+	}
+	if err := childOwner.ApplyReferences(mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := parentOwner.AcknowledgeOutboundThrough(pending[1].Sequence); err != nil {
+		t.Fatal(err)
+	}
+	if got := parentOwner.PendingOutbound(); len(got) != 0 {
+		t.Fatalf("pending outbound after batch acknowledgement=%+v", got)
+	}
+	if err := parentOwner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	parentOwner, err = OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentOwner.Close()
+	inspection := parentOwner.Inspect()
+	if len(inspection.PendingOutbound) != 0 {
+		t.Fatalf("replayed pending outbound=%+v", inspection.PendingOutbound)
+	}
+	if inspection.Objects[parent.ID] != 1 {
+		t.Fatalf("replayed parent references=%d, want 1", inspection.Objects[parent.ID])
+	}
+	if err := parentOwner.AcknowledgeOutboundThrough(pending[1].Sequence); err != nil {
+		t.Fatalf("repeated batch acknowledgement: %v", err)
+	}
+}
+
 func TestReferenceLedgerImportRequiresCompleteBaseline(t *testing.T) {
 	ledger := NewReferenceLedger()
 	object := ledgerObject(1, 1, ObjectKindMetadata)

@@ -126,6 +126,7 @@ type referenceLedgerRecord struct {
 	ImportReferences *ledgerImportReferencesRecord
 	ImportCommit     *ledgerImportCommitRecord
 	Reference        *ledgerReferenceRecord
+	References       []ledgerReferenceRecord
 	Handoff          *ledgerHandoffRecord
 	Ack              *uint64
 	Collect          *int
@@ -411,7 +412,7 @@ func referenceLedgerMutationCount(record referenceLedgerRecord) int {
 	for _, set := range []bool{
 		record.Import != nil, record.ImportBegin != nil, record.ImportObjects != nil,
 		record.ImportReferences != nil, record.ImportCommit != nil, record.Reference != nil,
-		record.Handoff != nil, record.Ack != nil, record.Collect != nil, record.Retire != nil,
+		len(record.References) != 0, record.Handoff != nil, record.Ack != nil, record.Collect != nil, record.Retire != nil,
 	} {
 		if set {
 			count++
@@ -433,6 +434,18 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 			return err
 		}
 	}
+	if len(record.References) != 0 {
+		mutations := make([]SnapshotReferenceMutation, len(record.References))
+		for i, reference := range record.References {
+			mutations[i] = SnapshotReferenceMutation{
+				Operation: reference.Operation, Name: reference.Name,
+				Object: reference.Object, Retain: reference.Retain,
+			}
+		}
+		if err := ledger.ApplyReferences(mutations); err != nil {
+			return err
+		}
+	}
 	if record.Handoff != nil {
 		h := record.Handoff
 		if err := ledger.ApplyHandoff(h.Origin, h.From, h.Mutations); err != nil {
@@ -440,7 +453,7 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 		}
 	}
 	if record.Ack != nil {
-		if err := ledger.AcknowledgeOutbound(*record.Ack); err != nil {
+		if err := ledger.AcknowledgeOutboundThrough(*record.Ack); err != nil {
 			return err
 		}
 	}
@@ -987,32 +1000,59 @@ func importOriginState(state referenceLedgerState, origin SnapshotID, objects []
 // ApplyReference applies one idempotent local root or delivered cross-owner
 // edge. Reusing an operation identity with different input is rejected.
 func (ledger *ReferenceLedger) ApplyReference(operation, name string, object ObjectID, retain bool) error {
-	if ledger == nil || operation == "" {
-		return errors.New("invalid reference-ledger operation")
+	return ledger.ApplyReferences([]SnapshotReferenceMutation{{
+		Operation: operation, Name: name, Object: object, Retain: retain,
+	}})
+}
+
+// ApplyReferences applies an ordered batch of independent idempotent root or
+// cross-owner edge mutations in one durable transaction. This is semantically
+// equivalent to ApplyReference for every element, but clones and fsyncs the
+// ledger only once. A failure rejects the entire batch.
+func (ledger *ReferenceLedger) ApplyReferences(mutations []SnapshotReferenceMutation) error {
+	if ledger == nil {
+		return errors.New("invalid reference-ledger mutation batch")
+	}
+	if len(mutations) == 0 {
+		return nil
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	want := appliedReference{Name: name, Object: object, Retain: retain}
-	if previous, ok := ledger.state.Applied[operation]; ok {
-		if previous != want {
-			return fmt.Errorf("reference operation %q was reused with different input", operation)
+	next := cloneReferenceLedgerState(ledger.state)
+	records := make([]ledgerReferenceRecord, 0, len(mutations))
+	for _, mutation := range mutations {
+		if mutation.Operation == "" {
+			return errors.New("invalid reference-ledger operation")
 		}
+		want := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
+		if previous, ok := next.Applied[mutation.Operation]; ok {
+			if previous != want {
+				return fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+			}
+			continue
+		}
+		var err error
+		if mutation.Retain {
+			err = next.retain(mutation.Name, mutation.Object)
+		} else {
+			err = next.release(mutation.Name, mutation.Object)
+		}
+		if err != nil {
+			return err
+		}
+		next.Applied[mutation.Operation] = want
+		records = append(records, ledgerReferenceRecord{
+			Operation: mutation.Operation, Name: mutation.Name,
+			Object: mutation.Object, Retain: mutation.Retain,
+		})
+	}
+	if len(records) == 0 {
 		return nil
 	}
-	next := cloneReferenceLedgerState(ledger.state)
-	var err error
-	if retain {
-		err = next.retain(name, object)
-	} else {
-		err = next.release(name, object)
+	if len(records) == 1 {
+		return ledger.commitLocked(referenceLedgerRecord{Reference: &records[0]}, next)
 	}
-	if err != nil {
-		return err
-	}
-	next.Applied[operation] = want
-	return ledger.commitLocked(referenceLedgerRecord{Reference: &ledgerReferenceRecord{
-		Operation: operation, Name: name, Object: object, Retain: retain,
-	}}, next)
+	return ledger.commitLocked(referenceLedgerRecord{References: records}, next)
 }
 
 // ApplyHandoff atomically advances one provider-to-owner catch-up cursor.
@@ -1086,9 +1126,18 @@ func (ledger *ReferenceLedger) ApplyHandoff(origin SnapshotID, from uint64, muta
 
 // PendingOutbound returns the ordered, unacknowledged cross-owner mutations.
 func (ledger *ReferenceLedger) PendingOutbound() []OutboundReference {
+	return ledger.PendingOutboundBatch(0)
+}
+
+// PendingOutboundBatch returns at most limit ordered, unacknowledged
+// cross-owner mutations. A non-positive limit returns the complete outbox.
+func (ledger *ReferenceLedger) PendingOutboundBatch(limit int) []OutboundReference {
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
-	return append([]OutboundReference(nil), ledger.state.Outbox...)
+	if limit <= 0 || limit > len(ledger.state.Outbox) {
+		limit = len(ledger.state.Outbox)
+	}
+	return append([]OutboundReference(nil), ledger.state.Outbox[:limit]...)
 }
 
 // OwnsEdge reports whether parent and child are both owned by this ledger and
@@ -1119,6 +1168,27 @@ func (ledger *ReferenceLedger) OwnsEdge(parent ObjectID, slot uint16, child Obje
 // AcknowledgeOutbound removes only the oldest mutation. Serial acknowledgement
 // ensures a release can never overtake its edge's retain after retries.
 func (ledger *ReferenceLedger) AcknowledgeOutbound(sequence uint64) error {
+	ledger.mu.RLock()
+	if sequence <= ledger.state.Acknowledged {
+		ledger.mu.RUnlock()
+		return nil
+	}
+	if len(ledger.state.Outbox) == 0 || ledger.state.Outbox[0].Sequence != sequence {
+		var oldest uint64
+		if len(ledger.state.Outbox) != 0 {
+			oldest = ledger.state.Outbox[0].Sequence
+		}
+		ledger.mu.RUnlock()
+		return fmt.Errorf("outbox acknowledgement %d does not select oldest sequence %d", sequence, oldest)
+	}
+	ledger.mu.RUnlock()
+	return ledger.AcknowledgeOutboundThrough(sequence)
+}
+
+// AcknowledgeOutboundThrough atomically removes the contiguous delivered
+// prefix ending at sequence. Repeating a committed acknowledgement succeeds;
+// skipping beyond the current outbox is rejected.
+func (ledger *ReferenceLedger) AcknowledgeOutboundThrough(sequence uint64) error {
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
 	if len(ledger.state.Outbox) == 0 {
@@ -1130,11 +1200,14 @@ func (ledger *ReferenceLedger) AcknowledgeOutbound(sequence uint64) error {
 	if sequence <= ledger.state.Acknowledged {
 		return nil
 	}
-	if ledger.state.Outbox[0].Sequence != sequence {
-		return fmt.Errorf("outbox acknowledgement %d does not select oldest sequence %d", sequence, ledger.state.Outbox[0].Sequence)
+	index := sort.Search(len(ledger.state.Outbox), func(i int) bool {
+		return ledger.state.Outbox[i].Sequence >= sequence
+	})
+	if index == len(ledger.state.Outbox) || ledger.state.Outbox[index].Sequence != sequence {
+		return fmt.Errorf("outbox acknowledgement %d is not pending", sequence)
 	}
 	next := cloneReferenceLedgerState(ledger.state)
-	next.Outbox = append([]OutboundReference(nil), next.Outbox[1:]...)
+	next.Outbox = append([]OutboundReference(nil), next.Outbox[index+1:]...)
 	next.Acknowledged = sequence
 	return ledger.commitLocked(referenceLedgerRecord{Ack: &sequence}, next)
 }

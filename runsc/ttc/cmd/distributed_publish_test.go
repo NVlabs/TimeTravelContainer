@@ -51,6 +51,46 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	}
 }
 
+func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
+	provider := ttcsnapshot.NewReferenceLedger()
+	shared := ttcsnapshot.NewReferenceLedger()
+	origin := ttcsnapshot.SnapshotID(17)
+	root := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	objects := []ttcsnapshot.Object{{ID: root, Kind: ttcsnapshot.ObjectKindMetadata, State: ttcsnapshot.ObjectLive}}
+	baseline := map[string]ttcsnapshot.ObjectID{"root/branch/main": root}
+	if err := provider.ImportOrigin(origin, objects, baseline); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.ImportOrigin(origin, objects, baseline); err != nil {
+		t.Fatal(err)
+	}
+	bridges := publicationBridgeReferences(origin, baseline)
+	if len(bridges) != 1 {
+		t.Fatalf("bridges=%+v, want one", bridges)
+	}
+	bridge := bridges[0]
+	if err := shared.ApplyReference(bridge.Operation, bridge.Name, bridge.Object, true); err != nil {
+		t.Fatal(err)
+	}
+	// This is the mutation that raced the bulk pack write: the provider's
+	// branch root disappeared before the final publication commit.
+	if err := shared.ApplyHandoff(origin, 0, []ttcsnapshot.SnapshotReferenceMutation{{
+		Sequence: 1, Operation: "release-provider-root", Name: "root/branch/main", Object: root, Retain: false,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.ApplyReference("retain-cold-root", "root/cold/branch", root, true); err != nil {
+		t.Fatalf("cold root could not replace publication bridge: %v", err)
+	}
+	if err := shared.ApplyReference("release-publication-bridge", bridge.Name, root, false); err != nil {
+		t.Fatal(err)
+	}
+	inspection := shared.Inspect()
+	if got := inspection.Objects[root]; got != 1 {
+		t.Fatalf("root refs=%d, want one durable cold root; inspection=%+v", got, inspection)
+	}
+}
+
 func TestSharedSnapshotReaderScopesRestartedRelayToManifestOrigins(t *testing.T) {
 	root := ttcsnapshot.ObjectID{Snapshot: 7, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
 	reader := &sharedSnapshotObjectReader{

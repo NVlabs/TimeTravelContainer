@@ -1074,11 +1074,19 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 		return errors.New("shared reference coordinator has no active lease")
 	}
 	var importOrigin func(context.Context, uint64) error
+	var retainBridge func(context.Context, uint64, string, string, string) error
 	var applyHandoff func(context.Context, uint64, uint64, []cluster.SharedReferenceMutation) error
 	var flushOrigin func(context.Context, uint64) error
 	if lease.NodeID == p.nodeID && lease.Incarnation == p.incarnation {
 		importOrigin = func(ctx context.Context, snapshot uint64) error {
 			return p.sharedRefs.ImportSharedSnapshot(ctx, p.nodeID, snapshot)
+		}
+		retainBridge = func(_ context.Context, _ uint64, operation, name, object string) error {
+			parsed, err := ttcsnapshot.ParseObjectID(object)
+			if err != nil {
+				return err
+			}
+			return p.sharedRefs.mutateReference(operation, name, parsed, true)
 		}
 		applyHandoff = func(ctx context.Context, snapshot, from uint64, mutations []cluster.SharedReferenceMutation) error {
 			return p.sharedRefs.ApplySharedSnapshotHandoff(ctx, p.nodeID, snapshot, from, mutations)
@@ -1095,6 +1103,9 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 			return err
 		}
 		importOrigin = peer.ImportSharedSnapshot
+		retainBridge = func(ctx context.Context, snapshot uint64, operation, name, object string) error {
+			return peer.ApplySnapshotReference(ctx, snapshot, operation, name, object, true)
+		}
 		applyHandoff = peer.ApplySharedSnapshotHandoff
 		flushOrigin = peer.FlushSharedSnapshot
 	}
@@ -1102,6 +1113,23 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	defer cancel()
 	if err := importOrigin(ctx, uint64(snapshot)); err != nil {
 		return err
+	}
+	// The pack baseline may contain roots that disappear while bulk data is
+	// being written (for example when a stopped branch releases its runtime
+	// roots). Pin those roots under publication-owned names before replaying the
+	// handoff delta. Otherwise the last provider-root release can put an object
+	// into the irreversible reclaiming state immediately before Raft publishes
+	// the equivalent cold branch root. Authority reconciliation retains the
+	// final cold roots before releasing these bridge roots after the atomic
+	// provider-to-shared transition.
+	manifest, err := p.graphShared.Manifest(snapshot)
+	if err != nil {
+		return fmt.Errorf("reading publication bridge roots: %w", err)
+	}
+	for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+		if err := retainBridge(ctx, uint64(snapshot), bridge.Operation, bridge.Name, bridge.Object.String()); err != nil {
+			return fmt.Errorf("retaining publication bridge %q: %w", bridge.Name, err)
+		}
 	}
 	// A mutation includes stable string identities and is substantially larger
 	// than an ObjectID. Keep batches below both the 8 MiB ledger record bound
@@ -1124,6 +1152,30 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 		changes = changes[count:]
 	}
 	return flushOrigin(ctx, uint64(snapshot))
+}
+
+type publicationBridgeReference struct {
+	Operation string
+	Name      string
+	Object    ttcsnapshot.ObjectID
+}
+
+func publicationBridgeReferences(snapshot ttcsnapshot.SnapshotID, references map[string]ttcsnapshot.ObjectID) []publicationBridgeReference {
+	bridges := make([]publicationBridgeReference, 0)
+	for name, object := range references {
+		if !strings.HasPrefix(name, "root/") && !strings.HasPrefix(name, "pin/") {
+			continue
+		}
+		digest := sha256.Sum256([]byte(name + "\x00" + object.String()))
+		bridgeName := fmt.Sprintf("root/publication-bridge/%016x/%x", uint64(snapshot), digest)
+		bridges = append(bridges, publicationBridgeReference{
+			Operation: "publication-bridge-retain/" + bridgeName,
+			Name:      bridgeName,
+			Object:    object,
+		})
+	}
+	sort.Slice(bridges, func(i, j int) bool { return bridges[i].Name < bridges[j].Name })
+	return bridges
 }
 
 func fileSHA256Digest(path string) (string, error) {

@@ -113,58 +113,96 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 	}
 	delivered := 0
 	for delivered < limit {
-		var outbound *ttcsnapshot.OutboundReference
+		batchLimit := limit - delivered
+		if batchLimit > 512 {
+			batchLimit = 512
+		}
+		var pending []ttcsnapshot.OutboundReference
 		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-			pending := ledger.PendingOutbound()
-			if len(pending) != 0 {
-				item := pending[0]
-				outbound = &item
-			}
+			pending = ledger.PendingOutboundBatch(batchLimit)
 			return nil
 		}); err != nil {
 			return delivered, err
 		}
-		if outbound == nil {
+		if len(pending) == 0 {
 			return delivered, nil
 		}
-		provider, volatile, err := s.authority.SnapshotProvider(uint64(outbound.Child.Snapshot))
+		state, err := s.authority.AuthorityState()
 		if err != nil {
 			return delivered, err
 		}
-		if !volatile {
-			err = s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-				if outbound.Retain && ledger.OwnsEdge(outbound.Parent, outboundSlot(outbound.Name), outbound.Child) {
-					return nil
+		for offset := 0; offset < len(pending); {
+			outbound := pending[offset]
+			provider, volatile := state.VolatileOrigins[uint64(outbound.Child.Snapshot)]
+			end := offset + 1
+			if !volatile {
+				err = s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+					mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(pending)-offset)
+					for end = offset; end < len(pending); end++ {
+						candidate := pending[end]
+						if _, candidateVolatile := state.VolatileOrigins[uint64(candidate.Child.Snapshot)]; candidateVolatile {
+							break
+						}
+						if candidate.Retain && ledger.OwnsEdge(candidate.Parent, outboundSlot(candidate.Name), candidate.Child) {
+							continue
+						}
+						mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+							Operation: candidate.Operation, Name: candidate.Name,
+							Object: candidate.Child, Retain: candidate.Retain,
+						})
+					}
+					return ledger.ApplyReferences(mutations)
+				})
+			} else if provider.NodeID == s.nodeID {
+				roots := make(map[string]ttcsnapshot.ObjectID)
+				for end = offset; end < len(pending); end++ {
+					candidate := pending[end]
+					candidateProvider, candidateVolatile := state.VolatileOrigins[uint64(candidate.Child.Snapshot)]
+					if !candidateVolatile || candidateProvider.NodeID != s.nodeID || candidate.Retain != outbound.Retain {
+						break
+					}
+					roots["bridge/"+candidate.Name] = candidate.Child
 				}
-				return ledger.ApplyReference(outbound.Operation, outbound.Name, outbound.Child, outbound.Retain)
-			})
-		} else if provider.NodeID == s.nodeID {
-			bridge := map[string]ttcsnapshot.ObjectID{"bridge/" + outbound.Name: outbound.Child}
-			if outbound.Retain {
-				err = s.graph.RetainRoots(bridge)
+				if outbound.Retain {
+					err = s.graph.RetainRoots(roots)
+				} else {
+					err = s.graph.ReleaseRetainedRoots(roots)
+				}
 			} else {
-				err = s.graph.ReleaseRetainedRoots(bridge)
+				if s.peers == nil {
+					return delivered, errors.New("cluster peer routing is unavailable")
+				}
+				peer, peerErr := s.peers.peer(provider.NodeID, false)
+				if peerErr != nil {
+					return delivered, peerErr
+				}
+				// The wire API remains element-addressed because a provider may
+				// change at an origin boundary. Delivery is idempotent, while the
+				// source acknowledgement below still commits the whole prefix once.
+				for end = offset; end < len(pending); end++ {
+					candidate := pending[end]
+					candidateProvider, candidateVolatile := state.VolatileOrigins[uint64(candidate.Child.Snapshot)]
+					if !candidateVolatile || candidateProvider.NodeID != provider.NodeID {
+						break
+					}
+					wireOperation := fmt.Sprintf("edge-%016x-%016x", uint64(candidate.Parent.Snapshot), candidate.Sequence)
+					if err = peer.ApplySnapshotReference(ctx, uint64(candidate.Child.Snapshot), wireOperation, candidate.Name, candidate.Child.String(), candidate.Retain); err != nil {
+						break
+					}
+				}
 			}
-		} else {
-			if s.peers == nil {
-				return delivered, errors.New("cluster peer routing is unavailable")
+			if err != nil {
+				return delivered, err
 			}
-			peer, peerErr := s.peers.peer(provider.NodeID, false)
-			if peerErr != nil {
-				return delivered, peerErr
-			}
-			wireOperation := fmt.Sprintf("edge-%016x-%016x", uint64(outbound.Parent.Snapshot), outbound.Sequence)
-			err = peer.ApplySnapshotReference(ctx, uint64(outbound.Child.Snapshot), wireOperation, outbound.Name, outbound.Child.String(), outbound.Retain)
+			offset = end
 		}
-		if err != nil {
-			return delivered, err
-		}
+		last := pending[len(pending)-1].Sequence
 		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-			return ledger.AcknowledgeOutbound(outbound.Sequence)
+			return ledger.AcknowledgeOutboundThrough(last)
 		}); err != nil {
 			return delivered, err
 		}
-		delivered++
+		delivered += len(pending)
 	}
 	return delivered, nil
 }
