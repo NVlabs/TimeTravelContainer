@@ -20,7 +20,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"reflect"
 	"testing"
 	"time"
 
@@ -28,7 +27,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -38,7 +36,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -92,6 +89,10 @@ func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
+	// testutil.Boot leaves the externally supplied host mount unset. Kernel
+	// teardown requires one, so use the ordinary test stand-in before Release.
+	k.PipeMount().IncRef()
+	k.SetHostMount(k.PipeMount())
 	defer k.Release()
 	ctx := k.SupervisorContext()
 	creds := auth.CredentialsFromContext(ctx)
