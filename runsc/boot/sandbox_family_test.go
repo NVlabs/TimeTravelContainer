@@ -573,7 +573,17 @@ func TestSandboxFamilyDestroyReclaimsReleasedFilesystemBranch(t *testing.T) {
 		t.Fatalf("Fork: %v", err)
 	}
 	if err := family.Destroy(child.ID); err != nil {
-		t.Fatalf("Destroy: %v", err)
+		t.Fatalf("Destroy without reclaim: %v", err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("runtime-only destroy reclaimed filesystem branches=%q", reclaimed)
+	}
+	child, err = family.Fork(&ForkBranchArgs{ID: "reclaimed", Paused: true})
+	if err != nil {
+		t.Fatalf("second Fork: %v", err)
+	}
+	if err := family.DestroyAndReclaim(child.ID); err != nil {
+		t.Fatalf("DestroyAndReclaim: %v", err)
 	}
 	if len(reclaimed) != 1 || reclaimed[0] != child.FilesystemBranch {
 		t.Fatalf("reclaimed filesystem branches=%q, want [%q]", reclaimed, child.FilesystemBranch)

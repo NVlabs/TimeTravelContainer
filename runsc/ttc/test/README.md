@@ -319,13 +319,13 @@ the registry is stopped. It makes no public network request.
 ```shell
 bazel build //runsc:runsc //runsc/ttc:ttc \
   //runsc/ttc/test/registry_fixture:registry_fixture \
-  //runsc/ttc/test/registry_fixture/guest:guest \
+  //runsc/ttc/test/registry_fixture/guest:guest_fixture \
   //runsc/ttc/test:e2e_local_registry
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
 TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/registry_fixture_/registry_fixture" \
-FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_/guest" \
+FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_fixture_/guest_fixture" \
   "$PWD/runsc/ttc/test/e2e_local_registry.sh"
 ```
 

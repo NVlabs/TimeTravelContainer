@@ -622,7 +622,9 @@ func (fs *filesystem) Release(ctx context.Context) {
 	}
 	fs.vfsfs.VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.mu.Lock()
-	if fs.root.inode.isDir() {
+	// GetFilesystem drops its initial reference when persistent-volume loading
+	// fails. In that constructor-error path no root has been installed yet.
+	if fs.root != nil && fs.root.inode.isDir() {
 		fs.root.releaseChildrenLocked(ctx)
 	}
 	if fs.ovlWhiteout != nil {

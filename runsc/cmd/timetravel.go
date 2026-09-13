@@ -679,6 +679,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		err = cont.Sandbox.RehydrateBranch(f.Arg(2))
 	case "destroy":
 		err = cont.Sandbox.DestroyBranch(f.Arg(2))
+	case "destroy-reclaim":
+		err = cont.Sandbox.DestroyBranchAndReclaim(f.Arg(2))
 	case "prepare-stop":
 		err = cont.Sandbox.PrepareStopBranch(f.Arg(2))
 	case "checkpoint":

@@ -10239,7 +10239,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			var cleanupErr error
 			store := b.containerStore()
 			for i, cleanupDestination := range destinations {
-				if _, destroyErr := b.command("timetravel", source.container, "destroy", cleanupDestination); destroyErr != nil {
+				if _, destroyErr := b.command("timetravel", source.container, "destroy-reclaim", cleanupDestination); destroyErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
 					continue
 				}
@@ -10264,7 +10264,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				cleanupErr = errors.Join(cleanupErr, b.releaseGraphMemoryRoots(roots))
 			}
 			for i, cleanupDestination := range destinations {
-				if _, destroyErr := b.command("timetravel", source.container, "destroy", cleanupDestination); destroyErr != nil {
+				if _, destroyErr := b.command("timetravel", source.container, "destroy-reclaim", cleanupDestination); destroyErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
 					continue
 				}
@@ -12777,7 +12777,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return nil
 			}
 		}
-		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
+		if _, err := b.command("timetravel", target.container, "destroy-reclaim", target.branch); err == nil {
 			return nil
 		} else {
 			destroyErr := err

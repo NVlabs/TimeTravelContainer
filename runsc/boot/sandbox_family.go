@@ -2606,6 +2606,17 @@ func (f *SandboxFamily) reclaimReleasedFilesystem(branch string) error {
 // occupies the loader bookkeeping role, that role moves to an established
 // peer first. This role transfer has no guest-visible or lineage semantics.
 func (f *SandboxFamily) Destroy(id string) error {
+	return f.destroy(id, false)
+}
+
+// DestroyAndReclaim destroys a branch and releases its persistent filesystem
+// roots after all Kernel and open-file references have been released. It must
+// only be used for logical branch deletion, never stop or migration.
+func (f *SandboxFamily) DestroyAndReclaim(id string) error {
+	return f.destroy(id, true)
+}
+
+func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
 	b, err := f.branch(id)
@@ -2695,7 +2706,12 @@ func (f *SandboxFamily) Destroy(id string) error {
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
-		err := errors.Join(image.image.Close(), f.reclaimReleasedFilesystem(b.filesystemBranch))
+		err := image.image.Close()
+		if reclaimFilesystem {
+			err = errors.Join(err, f.reclaimReleasedFilesystem(b.filesystemBranch))
+		} else if f.forgetFilesystemBranch != nil {
+			f.forgetFilesystemBranch(b.filesystemBranch)
+		}
 		f.mu.Lock()
 		delete(f.branches, id)
 		delete(f.distributedHandoffs, id)
@@ -2704,13 +2720,18 @@ func (f *SandboxFamily) Destroy(id string) error {
 		return err
 	}
 	if b.k == nil {
-		reclaimErr := f.reclaimReleasedFilesystem(b.filesystemBranch)
+		var releaseErr error
+		if reclaimFilesystem {
+			releaseErr = f.reclaimReleasedFilesystem(b.filesystemBranch)
+		} else if f.forgetFilesystemBranch != nil {
+			f.forgetFilesystemBranch(b.filesystemBranch)
+		}
 		f.mu.Lock()
 		delete(f.branches, id)
 		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return reclaimErr
+		return releaseErr
 	}
 
 	if dog != nil {
@@ -2728,13 +2749,18 @@ func (f *SandboxFamily) Destroy(id string) error {
 	b.k.Release()
 	familyMF.ReclaimUnusedSparseChunks()
 	familyMF.Destroy()
-	reclaimErr := f.reclaimReleasedFilesystem(b.filesystemBranch)
+	var releaseErr error
+	if reclaimFilesystem {
+		releaseErr = f.reclaimReleasedFilesystem(b.filesystemBranch)
+	} else if f.forgetFilesystemBranch != nil {
+		f.forgetFilesystemBranch(b.filesystemBranch)
+	}
 
 	f.mu.Lock()
 	delete(f.branches, id)
 	delete(f.distributedHandoffs, id)
 	f.mu.Unlock()
-	return reclaimErr
+	return releaseErr
 }
 
 // Processes returns processes from one branch's kernel task graph.

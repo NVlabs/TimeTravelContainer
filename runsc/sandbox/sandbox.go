@@ -2406,6 +2406,15 @@ func (s *Sandbox) DestroyBranch(id string) error {
 	return nil
 }
 
+// DestroyBranchAndReclaim destroys one in-memory branch and releases its
+// persistent filesystem roots after its Kernel references are gone.
+func (s *Sandbox) DestroyBranchAndReclaim(id string) error {
+	if err := s.call(boot.ContMgrDestroyBranchAndReclaim, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("destroying and reclaiming live branch %q: %w", id, err)
+	}
+	return nil
+}
+
 // PrepareStopBranch moves process-local Loader bookkeeping away from a branch
 // before its init process is terminated.
 func (s *Sandbox) PrepareStopBranch(id string) error {

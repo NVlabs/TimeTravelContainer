@@ -203,7 +203,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	hiddenExists := true
 	defer func() {
 		if hiddenExists {
-			if _, err := b.command("timetravel", info.ID, "destroy", hiddenBranch); err != nil && retErr == nil {
+			if _, err := b.command("timetravel", info.ID, "destroy-reclaim", hiddenBranch); err != nil && retErr == nil {
 				retErr = fmt.Errorf("destroying checkpoint snapshot branch: %w", err)
 			}
 		}
@@ -278,7 +278,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 			Path:       relative,
 		})
 	}
-	if _, err := b.command("timetravel", info.ID, "destroy", hiddenBranch); err != nil {
+	if _, err := b.command("timetravel", info.ID, "destroy-reclaim", hiddenBranch); err != nil {
 		return fmt.Errorf("destroying checkpoint snapshot branch: %w", err)
 	}
 	hiddenExists = false

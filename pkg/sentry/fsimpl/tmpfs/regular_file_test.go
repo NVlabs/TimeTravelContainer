@@ -68,7 +68,7 @@ func (ms *lockDetectingMappingSpace) Invalidate(_ hostarch.AddrRange, _ memmap.I
 		ms.reentrant = true
 		return
 	}
-	ms.io.mu.Unlock()
+	ms.io.mu.Unlock() // +checklocksforce: TryLock acquired the write lock.
 }
 
 func (ms *recordingMappingSpace) Invalidate(_ hostarch.AddrRange, opts memmap.InvalidateOpts) {

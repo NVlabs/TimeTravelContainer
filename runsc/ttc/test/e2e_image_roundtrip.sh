@@ -35,8 +35,8 @@ else
 fi
 BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
-ln -sf "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
-ln -sf "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
 TTC="$BIN_DIR/ttc"
 export TTC_ROOT="$TTC_E2E_ROOT/data"
 SOCKET="$TTC_E2E_ROOT/ttcd.sock"

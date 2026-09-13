@@ -193,6 +193,9 @@ const (
 
 	// ContMgrDestroyBranch destroys one in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
+	// ContMgrDestroyBranchAndReclaim destroys one in-memory branch and releases
+	// its persistent filesystem roots after all runtime references are gone.
+	ContMgrDestroyBranchAndReclaim = "containerManager.DestroyBranchAndReclaim"
 	// ContMgrPrepareStopBranch moves branch-unaware loader bookkeeping away
 	// from a branch that is about to terminate, when a peer survives.
 	ContMgrPrepareStopBranch = "containerManager.PrepareStopBranch"
@@ -1450,6 +1453,13 @@ func (cm *containerManager) RenameBranch(args *BranchRenameArgs, _ *struct{}) er
 // DestroyBranch destroys one branch.
 func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Destroy(args.ID)
+}
+
+// DestroyBranchAndReclaim destroys one branch and its persistent filesystem
+// roots. This is reserved for logical branch deletion; stop and migration use
+// DestroyBranch so that the filesystem can be restarted or handed off.
+func (cm *containerManager) DestroyBranchAndReclaim(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.DestroyAndReclaim(args.ID)
 }
 
 // PrepareStopBranch makes stopping one branch independent from its peers.

@@ -3893,7 +3893,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 						// Host-stop every local Sentry immediately; restart reconciliation
 						// later kills revoked branches before resuming authorized peers.
 						fenceErr := fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
-						return errors.Join(errors.New("Raft revoked live execution authority"), fenceErr)
+						return errors.Join(errors.New("raft revoked live execution authority"), fenceErr)
 					}
 					lastExecutionGrants = currentExecutionGrants
 					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
