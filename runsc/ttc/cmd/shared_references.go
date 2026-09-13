@@ -597,6 +597,24 @@ func (s *sharedReferenceService) ImportSharedSnapshot(_ context.Context, peer st
 	})
 }
 
+// ApplySharedSnapshotReference records an idempotent publication bridge at
+// the shared-GC coordinator. Only the current volatile provider may create or
+// remove such a bridge, and the referenced object must belong to the origin
+// being published.
+func (s *sharedReferenceService) ApplySharedSnapshotReference(_ context.Context, peer string, snapshotID uint64, operation, name, objectText string, retain bool) error {
+	if err := s.authorizeProvider(peer, snapshotID); err != nil {
+		return err
+	}
+	object, err := ttcsnapshot.ParseObjectID(objectText)
+	if err != nil {
+		return err
+	}
+	if uint64(object.Snapshot) != snapshotID {
+		return fmt.Errorf("shared reference object %s does not belong to snapshot %d", object, snapshotID)
+	}
+	return s.mutateReference(operation, name, object, retain)
+}
+
 func (s *sharedReferenceService) ApplySharedSnapshotHandoff(_ context.Context, peer string, snapshotID, from uint64, wire []cluster.SharedReferenceMutation) error {
 	if err := s.authorizeProvider(peer, snapshotID); err != nil {
 		return err

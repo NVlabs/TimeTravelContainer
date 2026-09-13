@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +70,9 @@ func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 		t.Fatalf("bridges=%+v, want one", bridges)
 	}
 	bridge := bridges[0]
+	if matched := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(bridge.Operation); !matched {
+		t.Fatalf("publication bridge operation %q is not a valid cluster operation ID", bridge.Operation)
+	}
 	if err := shared.ApplyReference(bridge.Operation, bridge.Name, bridge.Object, true); err != nil {
 		t.Fatal(err)
 	}

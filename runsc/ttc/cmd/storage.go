@@ -1104,7 +1104,7 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 		}
 		importOrigin = peer.ImportSharedSnapshot
 		retainBridge = func(ctx context.Context, snapshot uint64, operation, name, object string) error {
-			return peer.ApplySnapshotReference(ctx, snapshot, operation, name, object, true)
+			return peer.ApplySharedSnapshotReference(ctx, snapshot, operation, name, object, true)
 		}
 		applyHandoff = peer.ApplySharedSnapshotHandoff
 		flushOrigin = peer.FlushSharedSnapshot
@@ -1169,7 +1169,10 @@ func publicationBridgeReferences(snapshot ttcsnapshot.SnapshotID, references map
 		digest := sha256.Sum256([]byte(name + "\x00" + object.String()))
 		bridgeName := fmt.Sprintf("root/publication-bridge/%016x/%x", uint64(snapshot), digest)
 		bridges = append(bridges, publicationBridgeReference{
-			Operation: "publication-bridge-retain/" + bridgeName,
+			// Operation crosses the cluster control protocol and therefore uses
+			// its bounded opaque-ID alphabet. Name is ledger-local and may retain
+			// the hierarchical spelling.
+			Operation: fmt.Sprintf("publication-bridge-retain-%016x-%x", uint64(snapshot), digest),
 			Name:      bridgeName,
 			Object:    object,
 		})

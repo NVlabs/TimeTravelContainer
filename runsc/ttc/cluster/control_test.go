@@ -104,6 +104,10 @@ type testSnapshotReferenceProvider struct {
 type testSharedReferenceProvider struct {
 	peer      string
 	snapshot  uint64
+	operation string
+	name      string
+	object    string
+	retain    bool
 	from      uint64
 	mutations []SharedReferenceMutation
 	imports   int
@@ -124,6 +128,12 @@ func (inventory *testReferenceInventory) SnapshotReferenceInventory(_ context.Co
 func (provider *testSharedReferenceProvider) ImportSharedSnapshot(_ context.Context, peer string, snapshot uint64) error {
 	provider.peer, provider.snapshot = peer, snapshot
 	provider.imports++
+	return nil
+}
+
+func (provider *testSharedReferenceProvider) ApplySharedSnapshotReference(_ context.Context, peer string, snapshot uint64, operation, name, object string, retain bool) error {
+	provider.peer, provider.snapshot = peer, snapshot
+	provider.operation, provider.name, provider.object, provider.retain = operation, name, object, retain
 	return nil
 }
 
@@ -220,6 +230,9 @@ func TestSharedReferenceProviderReceivesImportAndCatchup(t *testing.T) {
 	if err := client.ImportSharedSnapshot(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
+	if err := client.ApplySharedSnapshotReference(context.Background(), 42, "publication-bridge-0001", "root/publication-bridge/0001", "000000000000002a-03-0000000000000001", true); err != nil {
+		t.Fatal(err)
+	}
 	mutations := []SharedReferenceMutation{{Sequence: 8, Operation: "op", Name: "root/x", Object: "000000000000002a-03-0000000000000001", Retain: true}}
 	if err := client.ApplySharedSnapshotHandoff(context.Background(), 42, 7, mutations); err != nil {
 		t.Fatal(err)
@@ -227,7 +240,7 @@ func TestSharedReferenceProviderReceivesImportAndCatchup(t *testing.T) {
 	if err := client.FlushSharedSnapshot(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
-	if provider.imports != 1 || provider.peer != "target" || provider.snapshot != 42 || provider.from != 7 || len(provider.mutations) != 1 || provider.mutations[0] != mutations[0] {
+	if provider.imports != 1 || provider.peer != "target" || provider.snapshot != 42 || provider.operation != "publication-bridge-0001" || provider.name != "root/publication-bridge/0001" || provider.object != "000000000000002a-03-0000000000000001" || !provider.retain || provider.from != 7 || len(provider.mutations) != 1 || provider.mutations[0] != mutations[0] {
 		t.Fatalf("shared provider state=%+v", provider)
 	}
 }

@@ -663,6 +663,7 @@ type SharedReferenceMutation struct {
 // holds the Raft shared-GC lease.
 type SharedSnapshotReferenceProvider interface {
 	ImportSharedSnapshot(context.Context, string, uint64) error
+	ApplySharedSnapshotReference(context.Context, string, uint64, string, string, string, bool) error
 	ApplySharedSnapshotHandoff(context.Context, string, uint64, uint64, []SharedReferenceMutation) error
 	FlushSharedSnapshot(context.Context, string, uint64) error
 }
@@ -840,6 +841,20 @@ func (c *ControlPlane) serveSharedLedger(w http.ResponseWriter, r *http.Request,
 	switch action {
 	case "import":
 		if err := c.SharedReferences.ImportSharedSnapshot(r.Context(), peer, snapshot); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+	case "reference":
+		var request snapshotReferenceRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !transactionIDPattern.MatchString(request.Operation) || request.Transaction != "" || request.Action != "" || len(request.Roots) != 0 || request.Name == "" || request.Object == "" {
+			writeControlError(w, http.StatusBadRequest, "invalid shared reference mutation")
+			return
+		}
+		if err := c.SharedReferences.ApplySharedSnapshotReference(r.Context(), peer, snapshot, request.Operation, request.Name, request.Object, request.Retain); err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -1797,6 +1812,19 @@ func (c *Client) ImportSharedSnapshot(ctx context.Context, snapshot uint64) erro
 	}
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlSharedLedgerPrefix+strconv.FormatUint(snapshot, 10)+"/import", struct{}{}, &response)
+}
+
+// ApplySharedSnapshotReference delivers one idempotent bridge reference to
+// the shared-GC coordinator while the caller still owns the volatile origin.
+// This is intentionally distinct from ApplySnapshotReference, which targets
+// the volatile provider rather than the shared ledger.
+func (c *Client) ApplySharedSnapshotReference(ctx context.Context, snapshot uint64, operation, name, object string, retain bool) error {
+	if snapshot == 0 || !transactionIDPattern.MatchString(operation) || name == "" || object == "" {
+		return errors.New("invalid shared reference mutation")
+	}
+	var response map[string]any
+	request := snapshotReferenceRequest{Operation: operation, Name: name, Object: object, Retain: retain}
+	return c.call(ctx, http.MethodPost, controlSharedLedgerPrefix+strconv.FormatUint(snapshot, 10)+"/reference", request, &response)
 }
 
 // ApplySharedSnapshotHandoff advances the coordinator's durable exact cursor.
