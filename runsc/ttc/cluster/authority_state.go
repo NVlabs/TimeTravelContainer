@@ -333,6 +333,40 @@ func volatileDependencyReferenced(branches map[string]BranchAuthority, transacti
 	return false
 }
 
+// volatileDependencyForwarded reports the narrow interval in which a branch
+// has moved off formerNode through a newer migration, but that migration has
+// not yet committed independence and atomically retired its inherited
+// dependencies. The former target runtime may already be absent in this
+// interval; the predecessor source must wait for the successor fence rather
+// than treating that absence as corruption.
+func volatileDependencyForwarded(state *AuthorityState, family, branch, transactionID, formerNode string) bool {
+	if state == nil || family == "" || branch == "" || transactionID == "" || formerNode == "" {
+		return false
+	}
+	authority, ok := state.Branches[logicalBranchKey(family, branch)]
+	if !ok {
+		return false
+	}
+	predecessor, successor := false, false
+	for _, dependency := range authority.VolatileDependencies {
+		if dependency.TransactionID == transactionID {
+			predecessor = true
+			continue
+		}
+		if dependency.SourceNode != formerNode {
+			continue
+		}
+		tx, ok := state.Transactions[dependency.TransactionID]
+		if ok && tx.Identity.Migration && tx.OwnershipCommitted &&
+			tx.Identity.SourceContainer == family && tx.Identity.SourceBranch == branch &&
+			(tx.State == TransactionPublished || tx.State == TransactionDraining) {
+			successor = true
+		}
+	}
+	placement, ok := state.Placements[logicalBranchKey(family, branch)]
+	return predecessor && successor && ok && placement.OwnerNode != formerNode
+}
+
 func authorityCommandDigest(command AuthorityCommand) (string, error) {
 	copy := command
 	// Request identity binds semantic input, not the leader-generated envelope.

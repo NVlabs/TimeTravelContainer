@@ -940,10 +940,25 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 	return nil
 }
 
+func (r *daemonTargetRuntime) forwardedDependencyError(tx *cluster.Transaction, err error) error {
+	if !errors.Is(err, os.ErrNotExist) || r.authority == nil || tx == nil {
+		return err
+	}
+	forwarded, authorityErr := r.authority.VolatileDependencyForwarded(
+		tx.Identity.SourceContainer, tx.Identity.VisibleTargetBranch(), tx.Identity.TransactionID, r.nodeID)
+	if authorityErr != nil {
+		return errors.Join(err, fmt.Errorf("checking forwarded dependency: %w", authorityErr))
+	}
+	if forwarded {
+		return errors.New("distributed dependency forwarding is still in progress")
+	}
+	return err
+}
+
 func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) error {
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
-		return err
+		return r.forwardedDependencyError(tx, err)
 	}
 	action := "distributed-drain"
 	if branch.DependentMemoryBytes == 0 {
@@ -961,7 +976,7 @@ func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction
 func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
-		return err
+		return r.forwardedDependencyError(tx, err)
 	}
 	objects := strings.Split(graph.GraphRootObjects, ",")
 	if err := validateGraphRootObjects(graph.GraphSnapshot, graphMemoryRootNames(branch.FilesystemBranch, len(objects)), objects); err != nil {
@@ -1068,7 +1083,7 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
-		return err
+		return r.forwardedDependencyError(tx, err)
 	}
 	if tx.GraphHandoff != nil {
 		output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
@@ -1885,6 +1900,21 @@ func distributedDrainRetryable(err error) bool {
 	return false
 }
 
+// distributedDrainStepAdvanced reports the only successful state advances a
+// concurrent target worker may commit between a drain RPC and the following
+// status read. In that case an RPC revision conflict describes stale input,
+// not a failed drain, and the source should continue from the newer state.
+func distributedDrainStepAdvanced(previous, current cluster.TransactionState) bool {
+	switch previous {
+	case cluster.TransactionPublished:
+		return current == cluster.TransactionDraining || current == cluster.TransactionIndependent
+	case cluster.TransactionDraining:
+		return current == cluster.TransactionIndependent
+	default:
+		return false
+	}
+}
+
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	return drainSourceDependenciesSelected(backend, source, store, nodeID, func(tx cluster.Transaction) bool {
 		if containerID != "" && tx.Identity.SourceContainer != containerID {
@@ -1948,6 +1978,7 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			current *cluster.Transaction
 			stepErr error
 		)
+		previousState := tx.State
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		switch tx.State {
 		case cluster.TransactionPublished:
@@ -1977,6 +2008,9 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			tx = *current
 			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+			}
+			if distributedDrainStepAdvanced(previousState, tx.State) {
+				continue
 			}
 			if !distributedDrainRetryable(stepErr) {
 				return fmt.Errorf("draining distributed target %q failed permanently while transaction remained %s: %w", tx.Identity.TargetContainer, tx.State, stepErr)

@@ -709,7 +709,7 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 	predecessor := Transaction{
 		Identity: ForkIdentity{
 			TransactionID: "fork-old", SourceNodeID: "node-a", TargetNodeID: "node-b",
-			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "display-name",
 			TargetBranch: "old-hidden", TargetVisibleBranch: "main",
 		},
 		SourceNeeded: true, State: TransactionPublished, Revision: 6, CreatedAt: at, UpdatedAt: at,
@@ -734,6 +734,13 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 		},
 		DependenciesInherited: true, UpdatedAt: at,
 	}
+	state.Placements[key] = PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-c", OwnerIncarnation: "inc-c", Generation: 3, State: PlacementRunning, Revision: 3, UpdatedAt: at,
+	}
+	if !volatileDependencyForwarded(state, "family", "main", predecessor.Identity.TransactionID, "node-b") {
+		t.Fatal("predecessor dependency was not recognized as forwarded")
+	}
 	applyAuthorityForTest(t, state, "independent-migration", at.Add(time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
 		ID: migration.Identity.TransactionID, Revision: migration.Revision, Next: TransactionIndependent,
 		Metrics: &TransferMetrics{PagesTotal: 2, PagesReleased: 2},
@@ -743,6 +750,9 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 	}
 	if got := state.Transactions[predecessor.Identity.TransactionID]; got.State != TransactionIndependent || got.SourceNeeded {
 		t.Fatalf("unreferenced predecessor remains source-backed: %+v", got)
+	}
+	if volatileDependencyForwarded(state, "family", "main", predecessor.Identity.TransactionID, "node-b") {
+		t.Fatal("settled predecessor remained classified as forwarded")
 	}
 }
 

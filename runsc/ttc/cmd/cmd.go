@@ -8493,6 +8493,11 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 }
 
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
+	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+			return fmt.Errorf("renewing removal execution authority: %w", err)
+		}
+	}
 	store := b.containerStore()
 	info, err := store.LoadContainer(name)
 	if err != nil {
@@ -11100,6 +11105,13 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	if node == "" || b.distributedSource.incarnation == "" {
 		return 0, errors.New("cluster snapshot reconciliation lacks node incarnation")
 	}
+	// Snapshot-provider mutations are fenced to the current Raft leader term.
+	// A node may remain healthy across a leadership change while its periodic
+	// heartbeat has not yet renewed that term. Reconcile synchronously so an
+	// otherwise successful branch removal cannot fail in this transient window.
+	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+		return 0, fmt.Errorf("renewing snapshot reconciliation authority: %w", err)
+	}
 	live := make(map[ttcsnapshot.SnapshotID]struct{})
 	if b.snapshotGraph != nil {
 		for _, snapshot := range b.snapshotGraph.Inspect().Snapshots {
@@ -12692,6 +12704,11 @@ func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndR
 }
 
 func (b *runtimeBackend) destroy(target selector, force bool) error {
+	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+			return fmt.Errorf("renewing branch removal execution authority: %w", err)
+		}
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err

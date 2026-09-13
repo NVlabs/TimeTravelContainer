@@ -503,6 +503,18 @@ func (c *RaftCatalog) Branch(family, branch string) (*BranchAuthority, error) {
 	return &record, nil
 }
 
+// VolatileDependencyForwarded reports whether transactionID's former target
+// has been superseded by an in-flight downstream migration. It is evaluated
+// from one applied Raft snapshot so placement and dependency edges cannot be
+// observed from different revisions.
+func (c *RaftCatalog) VolatileDependencyForwarded(family, branch, transactionID, formerNode string) (bool, error) {
+	state, err := c.state()
+	if err != nil {
+		return false, err
+	}
+	return volatileDependencyForwarded(state, family, branch, transactionID, formerNode), nil
+}
+
 // RemoveCorruptedBranch removes a permanently fenced branch from authority.
 // Healthy branches must use the ordinary lifecycle/placement transaction.
 func (c *RaftCatalog) RemoveCorruptedBranch(family, branch string) error {

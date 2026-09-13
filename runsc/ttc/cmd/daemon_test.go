@@ -141,6 +141,25 @@ func TestDistributedDrainRetryable(t *testing.T) {
 	}
 }
 
+func TestDistributedDrainStepAdvanced(t *testing.T) {
+	for _, test := range []struct {
+		previous cluster.TransactionState
+		current  cluster.TransactionState
+		want     bool
+	}{
+		{cluster.TransactionPublished, cluster.TransactionDraining, true},
+		{cluster.TransactionPublished, cluster.TransactionIndependent, true},
+		{cluster.TransactionDraining, cluster.TransactionIndependent, true},
+		{cluster.TransactionPublished, cluster.TransactionPublished, false},
+		{cluster.TransactionDraining, cluster.TransactionDraining, false},
+		{cluster.TransactionDraining, cluster.TransactionFailed, false},
+	} {
+		if got := distributedDrainStepAdvanced(test.previous, test.current); got != test.want {
+			t.Errorf("distributedDrainStepAdvanced(%q, %q)=%t, want %t", test.previous, test.current, got, test.want)
+		}
+	}
+}
+
 func TestLocalNodeIncarnationPersistsForRootEpoch(t *testing.T) {
 	root := t.TempDir()
 	first, err := localNodeIncarnation(root, "node-a")
