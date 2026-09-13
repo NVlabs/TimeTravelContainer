@@ -117,6 +117,16 @@ test "$(client a node ls --json | jq 'length')" -eq 3
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" --shm-size 32m "$IMAGE" sh -c \
 	'dd if=/dev/zero of=/dev/shm/resident bs=1M count=16 2>/dev/null; printf ELASTIC-MARK | dd of=/dev/shm/resident conv=notrunc 2>/dev/null; exec sleep 3600' >/dev/null
+# Detached run returns once the runtime starts, before the guest entrypoint is
+# required to finish its setup. Wait for the fork point explicitly so the
+# reference digest cannot race the initial zero fill and marker write.
+attempt=0
+while test "$attempt" -lt 300; do
+	if test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null' 2>/dev/null || true)" = ELASTIC-MARK; then break; fi
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 source_digest=$(client a exec "$NAME@main" sha256sum /dev/shm/resident | awk '{print $1}')
 client a fork --node node-b "$NAME@main" child >/dev/null
 test "$(client b exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
