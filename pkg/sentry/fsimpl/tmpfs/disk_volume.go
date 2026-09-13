@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	stdfs "io/fs"
+	"os"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -65,6 +66,10 @@ func diskVolumeError(op string, err error) error {
 		return linuxerr.EINVAL
 	}
 	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
+	// Sentries normally discard informational logs, but preserve fd 2 in the
+	// daemon-local panic log. Keep invariant diagnostics beside fatal runtime
+	// failures so a guest-visible EIO remains actionable in production.
+	fmt.Fprintf(os.Stderr, "TTC persistent filesystem %s failed: %v\n", op, err)
 	return linuxerr.EIO
 }
 

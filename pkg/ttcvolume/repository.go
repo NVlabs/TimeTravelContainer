@@ -295,6 +295,12 @@ type Repository struct {
 	allocNext  uint64
 	allocEnd   uint64
 
+	// viewMu keeps a read-side metadata traversal on one immutable graph
+	// generation. Writers replace a branch root and may immediately reclaim the
+	// preceding path-copied nodes; without this barrier a reader can select the
+	// old root immediately before it disappears. Readers remain concurrent with
+	// each other, and bulk data I/O continues after this short metadata section.
+	viewMu      sync.RWMutex
 	operationMu sync.Mutex
 	lockFile    *os.File
 	// activeLock holds a shared lifecycle lease for descriptor-backed
@@ -1215,6 +1221,8 @@ func (r *Repository) HostPath() string {
 }
 
 func (r *Repository) withLock(fn func() error) (result error) {
+	r.viewMu.Lock()
+	defer r.viewMu.Unlock()
 	r.operationMu.Lock()
 	defer r.operationMu.Unlock()
 	if r.lockFile == nil {
@@ -1519,6 +1527,8 @@ func (r *Repository) ForgetBranch(id string) {
 	if r == nil || validateName(id, "branch") != nil {
 		return
 	}
+	r.viewMu.Lock()
+	defer r.viewMu.Unlock()
 	r.operationMu.Lock()
 	defer r.operationMu.Unlock()
 
@@ -1896,6 +1906,8 @@ func (r *Repository) Lookup(branchID string, parent uint64, name string) (uint64
 	if err := validateEntryName(name); err != nil {
 		return 0, err
 	}
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return 0, err
@@ -1909,6 +1921,8 @@ func (r *Repository) Lookup(branchID string, parent uint64, name string) (uint64
 
 // Inode returns branch-local inode metadata.
 func (r *Repository) Inode(branchID string, ino uint64) (Inode, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return Inode{}, err
@@ -2315,6 +2329,8 @@ func (r *Repository) ReadAt(branchID string, ino uint64, data []byte, offset int
 	if offset < 0 {
 		return 0, syscall.EINVAL
 	}
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return 0, err
@@ -2409,7 +2425,9 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 	if writable {
 		err = r.withLock(open)
 	} else {
+		r.viewMu.RLock()
 		err = open()
+		r.viewMu.RUnlock()
 	}
 	if err != nil {
 		if file != nil {
@@ -2742,6 +2760,8 @@ func (r *Repository) AllocateWithCoW(branchID string, ino uint64, offset, length
 
 // ListDirectory returns entries in deterministic name order.
 func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryEntry, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return nil, err
@@ -2756,6 +2776,8 @@ func (r *Repository) ListDirectory(branchID string, parent uint64) ([]DirectoryE
 // ListDirectoryItems returns a directory's entries and inode metadata in
 // deterministic name order from one coherent metadata snapshot.
 func (r *Repository) ListDirectoryItems(branchID string, parent uint64) ([]DirectoryItem, error) {
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return nil, err

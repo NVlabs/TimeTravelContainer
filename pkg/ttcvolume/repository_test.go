@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -77,6 +78,83 @@ func write(t *testing.T, repo *Repository, branch string, ino uint64, value stri
 		t.Fatalf("WriteAt wrote %d bytes, want %d", n, len(value))
 	}
 	return cloned
+}
+
+func TestConcurrentMetadataReadsStayOnLiveGraphGeneration(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("concurrent-reads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	const files = 48
+	inodes := make([]uint64, 0, files)
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("file-%03d", i)
+		ino, err := repository.CreateRegular(MainBranch, RootInode, name, 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := repository.WriteAt(MainBranch, ino, []byte(name), 0); err != nil {
+			t.Fatal(err)
+		}
+		inodes = append(inodes, ino)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errorsCh := make(chan error, 16)
+	var readers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		readers.Add(1)
+		go func(seed int) {
+			defer readers.Done()
+			<-start
+			for iteration := 0; iteration < 500; iteration++ {
+				index := (iteration + seed) % files
+				name := fmt.Sprintf("file-%03d", index)
+				ino, err := repository.Lookup(MainBranch, RootInode, name)
+				if err == nil {
+					_, err = repository.Inode(MainBranch, ino)
+				}
+				if err == nil {
+					err = repository.EnsureDataRange(MainBranch, ino, 0, 1)
+				}
+				if err != nil {
+					select {
+					case errorsCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}(worker)
+	}
+	close(start)
+	for iteration := 0; iteration < 40; iteration++ {
+		updates := make([]Inode, 0, files)
+		for _, ino := range inodes {
+			inode, err := repository.Inode(MainBranch, ino)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inode.AtimeNsec++
+			updates = append(updates, inode)
+		}
+		if err := repository.UpdateMetadataBatch(MainBranch, updates); err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.SyncMetadata(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readers.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Fatalf("concurrent metadata read crossed a reclaimed graph generation: %v", err)
+	}
 }
 
 func TestForkWritesDivergeAcrossGenerations(t *testing.T) {

@@ -733,6 +733,8 @@ func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length
 	if offset < 0 || length < 0 {
 		return os.ErrInvalid
 	}
+	r.viewMu.RLock()
+	defer r.viewMu.RUnlock()
 	branch, err := r.readBranch(branchID)
 	if err != nil {
 		return err
