@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -725,6 +726,91 @@ func TestDaemonStorageRootRejectsOldMarkerWithoutMutation(t *testing.T) {
 				t.Fatalf("old marker changed from %q to %q", original, after)
 			}
 		})
+	}
+}
+
+func TestDaemonStorageRootRejectsMalformedMarkerWithoutMutation(t *testing.T) {
+	root := t.TempDir()
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	original := []byte("{not-json\n")
+	if err := os.WriteFile(markerPath, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectDaemonStorageRoot(root, daemonRootRoleStandaloneAuthority); err == nil || !strings.Contains(err.Error(), "invalid root marker") {
+		t.Fatalf("malformed root marker error=%v", err)
+	}
+	after, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("malformed marker changed from %q to %q", original, after)
+	}
+}
+
+func TestPrepareDaemonStorageRootConcurrentInitialization(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared")
+	const initializers = 32
+	errorsByInitializer := make([]error, initializers)
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for i := range errorsByInitializer {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			errorsByInitializer[index] = prepareDaemonStorageRoot(root, daemonRootRoleClusterShared, "repository", "")
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+	for i, err := range errorsByInitializer {
+		if err != nil {
+			t.Fatalf("initializer %d: %v", i, err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".ttc-root-format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got daemonRootMarker
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	want, err := daemonRootMarkerFor(daemonRootRoleClusterShared, "repository", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("concurrent marker=%+v, want %+v", got, want)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != ".ttc-root-format" {
+		t.Fatalf("concurrent initialization residue=%v", entries)
+	}
+}
+
+func TestPrepareDaemonStorageRootConcurrentConflictDoesNotReplaceWinner(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared")
+	if err := prepareDaemonStorageRoot(root, daemonRootRoleClusterShared, "winner", ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(root, ".ttc-root-format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareDaemonStorageRoot(root, daemonRootRoleClusterShared, "loser", ""); err == nil || !strings.Contains(err.Error(), "does not match requested") {
+		t.Fatalf("conflicting initialization error=%v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(root, ".ttc-root-format"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("conflicting initializer changed marker from %q to %q", before, after)
 	}
 }
 
