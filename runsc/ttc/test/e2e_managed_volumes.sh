@@ -64,7 +64,7 @@ ttc() {
 }
 
 cleanup() {
-  ttc daemon stop >/dev/null 2>&1 || true
+  ttc daemon stop --stop-all >/dev/null 2>&1 || true
   if [ "$owned_root" = true ]; then
     rm -rf "$TTC_E2E_ROOT"
   fi
