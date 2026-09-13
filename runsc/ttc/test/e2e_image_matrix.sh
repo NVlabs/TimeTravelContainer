@@ -554,7 +554,7 @@ while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
 done
 
 echo "== daemon restart reconciliation =="
-ttc daemon status | grep -q '"version":8' || fail "ttcd did not report API version 8"
+ttc daemon status | grep -q '"version":9' || fail "ttcd did not report API version 9"
 ttc_daemon_crash
 if ttc daemon status >/dev/null 2>&1; then
   fail "ttcd remained reachable after crash"

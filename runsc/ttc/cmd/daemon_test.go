@@ -748,6 +748,32 @@ func TestDaemonStorageRootRejectsMalformedMarkerWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestDaemonStorageRootRejectsPreviousSnapshotGraphSchema(t *testing.T) {
+	root := t.TempDir()
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	old := daemonRootMarker{
+		Version: daemonClusterRootFormatVersion, Schema: "snapshot-graph-v1",
+		Role: daemonRootRoleClusterShared, RepositoryID: "repo",
+	}
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectDaemonStorageRoot(root, daemonRootRoleClusterShared); err == nil || !strings.Contains(err.Error(), "schema/role") {
+		t.Fatalf("previous snapshot-graph schema error=%v", err)
+	}
+	after, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatalf("previous-schema marker was modified: got %q, want %q", after, data)
+	}
+}
+
 func TestPrepareDaemonStorageRootConcurrentInitialization(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "shared")
 	const initializers = 32

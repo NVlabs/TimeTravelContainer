@@ -57,7 +57,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 8
+	daemonAPIVersion       = 9
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -93,7 +93,7 @@ var daemonAPIFeatures = []string{
 const repositoryMaintenanceInterval = 5 * time.Minute
 
 const (
-	daemonRootSchema                  = "snapshot-graph-v1"
+	daemonRootSchema                  = "snapshot-graph-v2"
 	daemonStandaloneRootFormatVersion = 2
 	daemonClusterRootFormatVersion    = 5
 	daemonRootRoleStandaloneAuthority = "standalone-authority"

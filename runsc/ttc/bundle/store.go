@@ -400,10 +400,10 @@ type BranchInfo struct {
 	DistributedGraphReferenceOperation string `json:"distributed_graph_reference_operation,omitempty"`
 	DistributedMigration               bool   `json:"distributed_migration,omitempty"`
 	State                              string `json:"state"`
-	// StorageState describes where the authoritative captured generation is.
+	// StorageState describes where the authoritative captured snapshot is.
 	// It is independent of the process lifecycle in State.
 	StorageState             string    `json:"storage_state,omitempty"`
-	StorageGeneration        uint64    `json:"storage_generation,omitempty"`
+	PublicationID            string    `json:"publication_id,omitempty"`
 	StorageError             string    `json:"storage_error,omitempty"`
 	StorageManifest          string    `json:"storage_manifest,omitempty"`
 	StorageRetryAt           time.Time `json:"storage_retry_at,omitempty"`
@@ -504,7 +504,6 @@ type ContainerInfo struct {
 	BundleDir                    string                           `json:"bundle_dir"`
 	RootFS                       string                           `json:"rootfs"`
 	Branches                     []BranchInfo                     `json:"branches,omitempty"`
-	NextStorageGeneration        uint64                           `json:"next_storage_generation,omitempty"`
 	NetworkMode                  string                           `json:"network_mode,omitempty"`
 	LiveForkEligible             bool                             `json:"live_fork_eligible"`
 	LiveForkWaiver               string                           `json:"live_fork_waiver,omitempty"`
@@ -3554,37 +3553,37 @@ func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64
 	return cleared, err
 }
 
-// BeginBranchPublication allocates a family-monotonic generation and marks a
-// branch as publishing. Generations are never reused, including after a branch
-// name is removed and later recreated.
-func (s Store) BeginBranchPublication(name, branchID string) (uint64, error) {
-	var generation uint64
-	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
-		info.NextStorageGeneration++
-		if info.NextStorageGeneration == 0 {
-			return false, errors.New("storage generation space exhausted")
-		}
+// BeginBranchPublication allocates an immutable transaction identity and marks
+// a branch as publishing. Identity is independent of branch names and ordering;
+// a stale worker can never become current again after cancellation or name
+// reuse.
+func (s Store) BeginBranchPublication(name, branchID string) (string, error) {
+	nonce, err := randomObjectID("publication", 16)
+	if err != nil {
+		return "", err
+	}
+	publicationID := "publication-" + nonce
+	err = s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			branch := &info.Branches[i]
 			if branch.ID != branchID {
 				continue
 			}
-			branch.StorageGeneration = info.NextStorageGeneration
+			branch.PublicationID = publicationID
 			branch.StorageState = "publishing"
 			branch.StorageError = ""
 			branch.StorageRetryAt = time.Time{}
-			generation = branch.StorageGeneration
 			return true, nil
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)
 	})
-	return generation, err
+	return publicationID, err
 }
 
-// UpdateBranchStorage publishes a generation-fenced storage transition. A
-// worker from an older generation cannot overwrite a newer capture or
-// resurrect a branch whose generation was canceled and removed.
-func (s Store) UpdateBranchStorage(name, branchID string, generation uint64, state, storageError string, retryAt time.Time) error {
+// UpdateBranchStorage publishes an identity-fenced storage transition. A
+// worker from an older transaction cannot overwrite a newer capture or
+// resurrect a branch whose publication was canceled and removed.
+func (s Store) UpdateBranchStorage(name, branchID, publicationID, state, storageError string, retryAt time.Time) error {
 	switch state {
 	case "local", "publishing", "shared", "materializing", "error":
 	default:
@@ -3596,10 +3595,9 @@ func (s Store) UpdateBranchStorage(name, branchID string, generation uint64, sta
 			if branch.ID != branchID {
 				continue
 			}
-			if generation != branch.StorageGeneration {
-				return false, fmt.Errorf("branch %q storage generation is %d, worker has %d", branchID, branch.StorageGeneration, generation)
+			if publicationID == "" || publicationID != branch.PublicationID {
+				return false, fmt.Errorf("branch %q publication is %q, worker has %q", branchID, branch.PublicationID, publicationID)
 			}
-			branch.StorageGeneration = generation
 			branch.StorageState = state
 			branch.StorageError = storageError
 			branch.StorageRetryAt = retryAt
@@ -3611,15 +3609,15 @@ func (s Store) UpdateBranchStorage(name, branchID string, generation uint64, sta
 
 // CompleteBranchPublication atomically commits shared durability and the
 // lifecycle transition that was waiting on it.
-func (s Store) CompleteBranchPublication(name, branchID string, generation uint64, manifest, lifecycle string, unplace bool) error {
+func (s Store) CompleteBranchPublication(name, branchID, publicationID, manifest, lifecycle string, unplace bool) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			branch := &info.Branches[i]
 			if branch.ID != branchID {
 				continue
 			}
-			if branch.StorageGeneration != generation {
-				return false, fmt.Errorf("branch %q storage generation is %d, worker has %d", branchID, branch.StorageGeneration, generation)
+			if publicationID == "" || branch.PublicationID != publicationID {
+				return false, fmt.Errorf("branch %q publication is %q, worker has %q", branchID, branch.PublicationID, publicationID)
 			}
 			branch.StorageState = "shared"
 			branch.StorageError = ""
@@ -3643,21 +3641,17 @@ func (s Store) CompleteBranchPublication(name, branchID string, generation uint6
 // capture is consumed to make the branch active again. The old shared
 // manifest remains a valid immutable ancestor, but the active branch is no
 // longer represented by the publication being abandoned.
-func (s Store) AbandonBranchPublication(name, branchID string, generation uint64) error {
+func (s Store) AbandonBranchPublication(name, branchID, publicationID string) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			branch := &info.Branches[i]
 			if branch.ID != branchID {
 				continue
 			}
-			if branch.StorageGeneration != generation {
-				return false, fmt.Errorf("branch %q storage generation is %d, cancel has %d", branchID, branch.StorageGeneration, generation)
+			if branch.PublicationID != publicationID {
+				return false, fmt.Errorf("branch %q publication is %q, cancel has %q", branchID, branch.PublicationID, publicationID)
 			}
-			info.NextStorageGeneration++
-			if info.NextStorageGeneration == 0 {
-				return false, errors.New("storage generation space exhausted")
-			}
-			branch.StorageGeneration = info.NextStorageGeneration
+			branch.PublicationID = ""
 			branch.StorageState = "local"
 			branch.StorageError = ""
 			branch.StorageRetryAt = time.Time{}

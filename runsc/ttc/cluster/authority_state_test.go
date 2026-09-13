@@ -398,7 +398,7 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	}
 }
 
-func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
+func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()
 	state.NextSnapshotID = 8
@@ -408,10 +408,16 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
 	}}))
 	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation, StorageGeneration: 1,
+		Family: "family", Branch: "main", PublicationID: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation,
 	}))
+	conflicting, _ := NewAuthorityCommand("publish-conflict", at.Add(1500*time.Millisecond), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", PublicationID: "publication-2", Lifecycle: "dehydrated", BranchGeneration: created.Generation,
+	})
+	if result := state.Apply(conflicting); result.Err() == nil {
+		t.Fatal("a second publication bypassed the active immutable identity fence")
+	}
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
+		Family: "family", Branch: "main", PublicationID: "publication-1", BranchGeneration: created.Generation, Revision: begin.Revision,
 		Roots: DurableRoots{MemorySnapshot: 7},
 	}))
 	if ready.CandidateRoots.MemorySnapshot != 7 {
@@ -421,7 +427,7 @@ func TestAuthorityPublicationGenerationPreventsLateResurrection(t *testing.T) {
 		Family: "family", Branch: "main", BranchGeneration: created.Generation, Failure: "authoritative node-local state was lost",
 	})
 	late, _ := NewAuthorityCommand("publish-late", at.Add(4*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
+		Family: "family", Branch: "main", PublicationID: "publication-1", BranchGeneration: created.Generation, Revision: ready.Revision,
 		Roots: DurableRoots{MemoryRoot: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	})
 	if result := state.Apply(late); result.Err() == nil {
@@ -448,17 +454,17 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
 	}}))
 	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "exited", BranchGeneration: created.Generation, StorageGeneration: 1,
+		Family: "family", Branch: "main", PublicationID: "publication-1", Lifecycle: "exited", BranchGeneration: created.Generation,
 	}))
 	if begin.PreviousLifecycle != "paused" || state.Branches[logicalBranchKey("family", "main")].Lifecycle != "exited" {
 		t.Fatalf("publication begin did not expose terminal transition: record=%+v branch=%+v", begin, state.Branches[logicalBranchKey("family", "main")])
 	}
 	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: begin.Revision,
+		Family: "family", Branch: "main", PublicationID: "publication-1", BranchGeneration: created.Generation, Revision: begin.Revision,
 		Roots: DurableRoots{MemorySnapshot: 7},
 	}))
 	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", BranchGeneration: created.Generation, StorageGeneration: 1, Revision: ready.Revision,
+		Family: "family", Branch: "main", PublicationID: "publication-1", BranchGeneration: created.Generation, Revision: ready.Revision,
 		Roots:        DurableRoots{MemorySnapshot: 7, FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"},
 		ProviderNode: "node-a", ProviderIncarnation: "incarnation-a", SnapshotOrigins: []uint64{6, 7},
 	})
@@ -487,18 +493,22 @@ func TestAuthorityCanceledDehydrationRestoresPriorLifecycle(t *testing.T) {
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
 	}}))
 	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation, StorageGeneration: 1,
+		Family: "family", Branch: "main", PublicationID: "publication-1", Lifecycle: "dehydrated", BranchGeneration: created.Generation,
 	}))
 	if begin.PreviousLifecycle != "running" || state.Branches[logicalBranchKey("family", "main")].Lifecycle != "dehydrating" {
 		t.Fatalf("dehydration transition=%+v branch=%+v", begin, state.Branches[logicalBranchKey("family", "main")])
 	}
 	applyAuthorityForTest(t, state, "publish-cancel", at.Add(2*time.Second), AuthorityPublicationCancel, AuthorityPublicationPayload{
-		Family: "family", Branch: "main", Operation: begin.OperationID, BranchGeneration: created.Generation,
-		StorageGeneration: 1, Revision: begin.Revision,
+		Family: "family", Branch: "main", PublicationID: begin.PublicationID, BranchGeneration: created.Generation,
+		Revision: begin.Revision,
 	})
-	if got := state.Branches[logicalBranchKey("family", "main")].Lifecycle; got != "running" {
-		t.Fatalf("canceled dehydration lifecycle=%q, want running", got)
+	branch := state.Branches[logicalBranchKey("family", "main")]
+	if branch.Lifecycle != "running" || branch.PublicationID != "" {
+		t.Fatalf("canceled dehydration branch=%+v, want running with no publication", branch)
 	}
+	applyAuthorityForTest(t, state, "publish-new", at.Add(3*time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", PublicationID: "publication-2", Lifecycle: "dehydrated", BranchGeneration: created.Generation,
+	})
 }
 
 func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
@@ -565,8 +575,8 @@ func TestAuthorityRetiresTerminalTransactionOnlyAfterTargetRemoval(t *testing.T)
 		State: PlacementRunning, Revision: 1, UpdatedAt: at,
 	}
 	state.Branches[key] = BranchAuthority{FamilyID: "family", BranchID: "child", Generation: 1, Lifecycle: "running", UpdatedAt: at}
-	publication := PublicationRecord{FamilyID: "family", BranchID: "child", BranchGeneration: 1, StorageGeneration: 7, OperationID: "publication-7", State: PublicationCanceled}
-	state.Publications[publicationKey("family", "child", 7)] = publication
+	publication := PublicationRecord{FamilyID: "family", BranchID: "child", BranchGeneration: 1, PublicationID: "publication-7", State: PublicationCanceled}
+	state.Publications[publicationKey("family", "child", "publication-7")] = publication
 	command, err := NewAuthorityCommand("retire-live", at.Add(time.Second), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: "fork-1", Revision: 9})
 	if err != nil {
 		t.Fatal(err)
@@ -823,5 +833,37 @@ func TestAuthoritySnapshotRoundTrip(t *testing.T) {
 	}
 	if string(data) != string(reencoded) {
 		t.Fatalf("snapshot changed across round trip\nfirst: %s\nsecond: %s", data, reencoded)
+	}
+}
+
+func TestAuthoritySnapshotRejectsUnfencedPublication(t *testing.T) {
+	at := time.Unix(4050, 0).UTC()
+	state := NewAuthorityState()
+	key := logicalBranchKey("family", "main")
+	state.Branches[key] = BranchAuthority{
+		FamilyID: "family", BranchID: "main", Generation: 1,
+		PublicationID: "publication-one", Lifecycle: "dehydrating", UpdatedAt: at,
+	}
+	state.Publications[publicationKey("family", "main", "publication-one")] = PublicationRecord{
+		FamilyID: "family", BranchID: "main", BranchGeneration: 1,
+		PublicationID: "publication-one", Lifecycle: "dehydrated", PreviousLifecycle: "paused",
+		State: PublicationReady, Revision: 2, UpdatedAt: at,
+	}
+	data, err := state.SnapshotBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreAuthorityState(data); err != nil {
+		t.Fatalf("valid publication fence was rejected: %v", err)
+	}
+	branch := state.Branches[key]
+	branch.PublicationID = "publication-missing"
+	state.Branches[key] = branch
+	data, err = state.SnapshotBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreAuthorityState(data); err == nil {
+		t.Fatal("snapshot restored a branch with a missing publication fence")
 	}
 }

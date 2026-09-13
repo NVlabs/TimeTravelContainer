@@ -344,12 +344,12 @@ type coldFilesystemSnapshot struct {
 }
 
 type coldBranchManifest struct {
-	Version    int       `json:"version"`
-	Container  string    `json:"container"`
-	Branch     string    `json:"branch"`
-	Generation uint64    `json:"generation"`
-	Kind       string    `json:"kind"`
-	CreatedAt  time.Time `json:"created_at"`
+	Version       int       `json:"version"`
+	Container     string    `json:"container"`
+	Branch        string    `json:"branch"`
+	PublicationID string    `json:"publication_id"`
+	Kind          string    `json:"kind"`
+	CreatedAt     time.Time `json:"created_at"`
 	// MemorySnapshot names the graph-native immutable capture origin. Its
 	// ControlRoot is a filesystem-tree object in that same origin containing
 	// serialized process/kernel state; pages and auxiliary state therefore use
@@ -381,7 +381,7 @@ func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	if p.authority == nil {
 		return nil
 	}
-	return p.authority.CancelPublication(intent.Container, intent.Branch, intent.Generation)
+	return p.authority.CancelPublication(intent.Container, intent.Branch, intent.PublicationID)
 }
 
 func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
@@ -394,12 +394,12 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 	if err != nil {
 		return ttcstorage.Result{}, err
 	}
-	if branch.StorageGeneration != intent.Generation {
-		return ttcstorage.Result{}, fmt.Errorf("storage generation changed to %d", branch.StorageGeneration)
+	if branch.PublicationID != intent.PublicationID {
+		return ttcstorage.Result{}, fmt.Errorf("publication identity changed to %q", branch.PublicationID)
 	}
-	path := coldManifestPath(p.sharedRoot, info.ID, branch.ID, intent.Generation)
+	path := coldManifestPath(p.sharedRoot, info.ID, branch.ID, intent.PublicationID)
 	if existing, err := readColdBranchManifest(path); err == nil {
-		if existing.Container != info.ID || existing.Branch != branch.ID || existing.Generation != intent.Generation || existing.Kind != intent.Kind {
+		if existing.Container != info.ID || existing.Branch != branch.ID || existing.PublicationID != intent.PublicationID || existing.Kind != intent.Kind {
 			return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting identity")
 		}
 		for _, filesystem := range existing.Filesystems {
@@ -439,9 +439,9 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ttcstorage.Result{}, err
 	}
-	// A branch rehydrated lazily from an older cold generation may still contain
+	// A branch rehydrated lazily from an older cold snapshot may still contain
 	// deferred graph nodes. Reattach their immutable shared source before
-	// sealing the next generation; resolver attachments are intentionally
+	// sealing the next snapshot; resolver attachments are intentionally
 	// process-local and must be reconstructible after a daemon restart.
 	priorFilesystems := make(map[string]coldFilesystemSnapshot)
 	if branch.StorageManifest != "" {
@@ -461,7 +461,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	defer os.RemoveAll(staging)
-	manifest := coldBranchManifest{Version: 4, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
+	manifest := coldBranchManifest{Version: 5, Container: info.ID, Branch: branch.ID, PublicationID: intent.PublicationID, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
 	spec, err := store.LoadSpec(info.ID)
 	if err != nil {
 		return ttcstorage.Result{}, err
@@ -575,8 +575,8 @@ func validateColdManifestPath(sharedRoot, path string) error {
 	return nil
 }
 
-func coldManifestPath(sharedRoot, container, branch string, generation uint64) string {
-	return filepath.Join(sharedRoot, "cold", "manifests", hex.EncodeToString([]byte(container)), hex.EncodeToString([]byte(branch)), fmt.Sprintf("%016x.json", generation))
+func coldManifestPath(sharedRoot, container, branch, publicationID string) string {
+	return filepath.Join(sharedRoot, "cold", "manifests", hex.EncodeToString([]byte(container)), hex.EncodeToString([]byte(branch)), hex.EncodeToString([]byte(publicationID))+".json")
 }
 
 func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, error) {
@@ -644,7 +644,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	}
 	if p.authority != nil {
 		lifecycle := "exited"
-		manifestPath := coldManifestPath(p.sharedRoot, info.ID, intent.Branch, intent.Generation)
+		manifestPath := coldManifestPath(p.sharedRoot, info.ID, intent.Branch, intent.PublicationID)
 		relativeManifest, err := filepath.Rel(p.sharedRoot, manifestPath)
 		if err != nil || filepath.IsAbs(relativeManifest) || strings.HasPrefix(relativeManifest, ".."+string(filepath.Separator)) {
 			return false, fmt.Errorf("cold manifest %q is outside shared root", manifestPath)
@@ -661,7 +661,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			}
 			captureRoots.MemorySnapshot = branch.SnapshotID
 		}
-		if _, err := p.authority.EnsurePublicationReady(info.ID, intent.Branch, intent.Generation, lifecycle, captureRoots); err != nil {
+		if _, err := p.authority.EnsurePublicationReady(info.ID, intent.Branch, intent.PublicationID, lifecycle, captureRoots); err != nil {
 			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
 		}
 	}
@@ -671,16 +671,16 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 	canceled := p.authority != nil
 	if p.authority != nil {
-		if err := p.authority.CancelPublication(intent.Container, intent.Branch, intent.Generation); err != nil {
+		if err := p.authority.CancelPublication(intent.Container, intent.Branch, intent.PublicationID); err != nil {
 			return fmt.Errorf("canceling publication authority: %w", err)
 		}
-		record, ok, err := p.authority.Publication(intent.Container, intent.Branch, intent.Generation)
+		record, ok, err := p.authority.Publication(intent.Container, intent.Branch, intent.PublicationID)
 		if err != nil {
 			return fmt.Errorf("reading publication authority after cleanup fence: %w", err)
 		}
 		canceled = ok && record.State == cluster.PublicationCanceled
 	}
-	manifestPath := coldManifestPath(p.sharedRoot, intent.Container, intent.Branch, intent.Generation)
+	manifestPath := coldManifestPath(p.sharedRoot, intent.Container, intent.Branch, intent.PublicationID)
 	var published coldBranchManifest
 	haveManifest := false
 	if manifest, err := readColdBranchManifest(manifestPath); err == nil {
@@ -805,11 +805,11 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		if err := os.Remove(manifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		// The generation manifest is authoritative; its branch/family
+		// The publication manifest is authoritative; its branch/family
 		// directories are only namespace scaffolding. Remove empty scaffolding
 		// after cancellation so repeated branch creation does not leave one
 		// directory per historical name. Non-empty directories contain another
-		// live generation or branch and are retained.
+		// live publication or branch and are retained.
 		for _, directory := range []string{filepath.Dir(manifestPath), filepath.Dir(filepath.Dir(manifestPath))} {
 			if err := os.Remove(directory); err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
 				return err
@@ -977,7 +977,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		// installs branch roots, releases placement, and changes every prepared
 		// origin from provider-owned to shared together. Cancellation before it
 		// reverses every handoff; cancellation after it is a no-op.
-		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.Generation, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
+		if _, err := p.authority.CommitPublication(info.ID, intent.Branch, intent.PublicationID, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
 			return fmt.Errorf("committing publication roots in Raft: %w", err)
 		}
 		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && p.graph != nil {
@@ -1019,7 +1019,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	// Publish branch-visible durability only after the placement is unplaced.
 	// Thus wait --condition=durable cannot return during the narrow interval in
 	// which a cold branch is still routed to a dead runtime incarnation.
-	if err := store.CompleteBranchPublication(intent.Container, intent.Branch, intent.Generation, result.Manifest, lifecycle, true); err != nil {
+	if err := store.CompleteBranchPublication(intent.Container, intent.Branch, intent.PublicationID, result.Manifest, lifecycle, true); err != nil {
 		return err
 	}
 	if intent.Kind != "dehydrate" {
@@ -1140,7 +1140,7 @@ func fileSHA256Digest(path string) (string, error) {
 // branch has become durable. A daemon that recovered an activated publication
 // intent may have a new incarnation. Node admission already proves that the
 // previous incarnation of the same node ID has expired, so adopt it before
-// releasing the placement. Both transitions are generation-fenced and a
+// releasing the placement. Both transitions are identity-fenced and a
 // crash between them is safe to retry from the next incarnation.
 func (p *branchPublisher) releasePublishedPlacement(placements cluster.PlacementCatalog, family, branch string) error {
 	record, err := placements.Lookup(family, branch)
@@ -1169,7 +1169,7 @@ func (p *branchPublisher) releasePublishedPlacement(placements cluster.Placement
 
 func (p *branchPublisher) Failed(intent ttcstorage.Intent, cause error, retryAt time.Time) error {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
-	err := store.UpdateBranchStorage(intent.Container, intent.Branch, intent.Generation, "error", cause.Error(), retryAt)
+	err := store.UpdateBranchStorage(intent.Container, intent.Branch, intent.PublicationID, "error", cause.Error(), retryAt)
 	if err == nil {
 		p.recordStorageEvent(intent, "error", cause.Error(), "")
 	}
@@ -1180,7 +1180,7 @@ func (p *branchPublisher) recordStorageEvent(intent ttcstorage.Intent, state, st
 	if p.event == nil {
 		return
 	}
-	attributes := map[string]string{"state": state, "generation": fmt.Sprint(intent.Generation), "kind": intent.Kind}
+	attributes := map[string]string{"state": state, "publication_id": intent.PublicationID, "kind": intent.Kind}
 	if storageError != "" {
 		attributes["error"] = storageError
 	}
@@ -1199,10 +1199,10 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return coldBranchManifest{}, err
 	}
-	if manifest.Version != 4 {
-		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 4", manifest.Version)
+	if manifest.Version != 5 {
+		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 5", manifest.Version)
 	}
-	if manifest.Container == "" || manifest.Branch == "" || manifest.Generation == 0 || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
+	if manifest.Container == "" || manifest.Branch == "" || !transactionIDPatternForDaemon(manifest.PublicationID) || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
 		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
 	}
 	seenSources := make(map[string]struct{}, len(manifest.Filesystems))
@@ -1320,9 +1320,9 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 			return nil
 		}
 		// A branch may return to a node after another node captured a newer
-		// generation. Branch-name-only local control paths are caches, not
+		// snapshot. Branch-name-only local control paths are caches, not
 		// authority; discard an old or malformed tree before materializing the
-		// manifest selected by the persistent branch generation.
+		// manifest selected by the persistent branch publication identity.
 		if err := os.RemoveAll(localImage); err != nil {
 			return fmt.Errorf("discarding stale local dehydration control state: %w", err)
 		}
@@ -1339,20 +1339,20 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		return err
 	}
 	store := b.containerStore()
-	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{}); err != nil {
+	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{}); err != nil {
 		return err
 	}
 	defer func() {
 		if retErr != nil {
-			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "error", retErr.Error(), time.Time{})
+			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "error", retErr.Error(), time.Time{})
 		}
 	}()
 	manifest, err := readColdBranchManifest(branch.StorageManifest)
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
-		return errors.New("cold manifest identity does not match branch generation")
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
+		return errors.New("cold manifest identity does not match branch publication")
 	}
 	if manifest.MemorySnapshot != branch.SnapshotID || manifest.ControlRoot != branch.ControlRootObject {
 		return errors.New("cold manifest process-state roots do not match branch metadata")
@@ -1386,7 +1386,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		if _, err := b.snapshotShared.Manifest(ttcsnapshot.SnapshotID(manifest.MemorySnapshot)); err != nil {
 			return fmt.Errorf("opening shared graph memory snapshot: %w", err)
 		}
-		return store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{})
+		return store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{})
 	}
 	return errors.New("new-format cold manifest omits graph-native memory snapshot")
 }
@@ -1404,20 +1404,20 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 		return err
 	}
 	store := b.containerStore()
-	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "materializing", "", time.Time{}); err != nil {
+	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{}); err != nil {
 		return err
 	}
 	defer func() {
 		if retErr != nil {
-			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.StorageGeneration, "error", retErr.Error(), time.Time{})
+			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "error", retErr.Error(), time.Time{})
 		}
 	}()
 	manifest, err := readColdBranchManifest(branch.StorageManifest)
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
-		return errors.New("cold manifest identity does not match branch generation")
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
+		return errors.New("cold manifest identity does not match branch publication")
 	}
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")
@@ -1635,7 +1635,7 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 			return err
 		}
 		for _, intent := range pending {
-			path := coldManifestPath(sharedRoot, intent.Container, intent.Branch, intent.Generation)
+			path := coldManifestPath(sharedRoot, intent.Container, intent.Branch, intent.PublicationID)
 			if _, err := os.Stat(path); err == nil {
 				queue = append(queue, path)
 			} else if !errors.Is(err, os.ErrNotExist) {

@@ -72,7 +72,7 @@ class ClientTest(unittest.TestCase):
     def test_ping_uses_direct_protocol(self):
         def handler(conn, request):
             self.assertEqual(request, {"version": API_VERSION, "action": "ping"})
-            conn.sendall(frame(b"O", b'{"version":8,"isolation_mode":"rootless"}\n'))
+            conn.sendall(frame(b"O", b'{"version":9,"isolation_mode":"rootless"}\n'))
             conn.sendall(frame(b"X", struct.pack(">I", 0)))
 
         with __import__("tempfile").TemporaryDirectory() as directory:

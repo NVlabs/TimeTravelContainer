@@ -86,11 +86,11 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := Intent{Container: "family", Branch: "main", Generation: 7, Kind: "dehydrate", FilesystemBranch: "capture"}
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-7", Kind: "dehydrate", FilesystemBranch: "capture"}
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Activate("family", "main", 7); err != nil {
+	if err := queue.Activate("family", "main", "publication-7"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -120,7 +120,7 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	defer queue.Close()
 	select {
 	case completed := <-publisher.completed:
-		if completed.Generation != 7 {
+		if completed.PublicationID != "publication-7" {
 			t.Fatalf("completed %+v", completed)
 		}
 	case <-time.After(5 * time.Second):
@@ -128,7 +128,7 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	}
 }
 
-func TestCancelWithoutPendingGenerationIsNoop(t *testing.T) {
+func TestCancelWithoutPendingPublicationIsNoop(t *testing.T) {
 	publisher := &testPublisher{completed: make(chan Intent, 1)}
 	root := t.TempDir()
 	queue, err := Open(root, publisher)
@@ -136,7 +136,7 @@ func TestCancelWithoutPendingGenerationIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer queue.Close()
-	if err := queue.Cancel("family", "reused", 3); err != nil {
+	if err := queue.Cancel("family", "reused", "publication-3"); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "publication-queue", "canceled"))
@@ -148,20 +148,20 @@ func TestCancelWithoutPendingGenerationIsNoop(t *testing.T) {
 	}
 }
 
-func TestCancelBranchRemovesSupersededGenerations(t *testing.T) {
+func TestCancelBranchRemovesSupersededPublications(t *testing.T) {
 	publisher := &testPublisher{failed: true, completed: make(chan Intent, 2)}
 	queue, err := Open(t.TempDir(), publisher)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer queue.Close()
-	for _, generation := range []uint64{1, 2} {
-		intent := Intent{Container: "family", Branch: "main", Generation: generation, Kind: "stop", FilesystemBranch: "capture"}
+	for _, publicationID := range []string{"publication-1", "publication-2"} {
+		intent := Intent{Container: "family", Branch: "main", PublicationID: publicationID, Kind: "stop", FilesystemBranch: "capture"}
 		if err := queue.Enqueue(intent); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := queue.Enqueue(Intent{Container: "family", Branch: "peer", Generation: 3, Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "peer", PublicationID: "publication-3", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := queue.CancelBranch("family", "main"); err != nil {
@@ -192,11 +192,11 @@ func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer queue.Close()
-	intent := Intent{Container: "family", Branch: "main", Generation: 1, Kind: "stop", FilesystemBranch: "capture"}
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop", FilesystemBranch: "capture"}
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Activate("family", "main", 1); err != nil {
+	if err := queue.Activate("family", "main", "publication-1"); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -205,7 +205,7 @@ func TestCancelDuringPublishDoesNotRaceCleanupOrResurrectIntent(t *testing.T) {
 		t.Fatal("publication did not start")
 	}
 	canceled := make(chan error, 1)
-	go func() { canceled <- queue.Cancel("family", "main", 1) }()
+	go func() { canceled <- queue.Cancel("family", "main", "publication-1") }()
 	select {
 	case <-publisher.cleaned:
 		t.Fatal("capture was cleaned while publisher was using it")
@@ -240,11 +240,11 @@ func TestCanceledCleanupRetriesFromDurableIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer queue.Close()
-	intent := Intent{Container: "family", Branch: "main", Generation: 9, Kind: "stop", FilesystemBranch: "capture"}
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-9", Kind: "stop", FilesystemBranch: "capture"}
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Cancel("family", "main", 9); err == nil {
+	if err := queue.Cancel("family", "main", "publication-9"); err == nil {
 		t.Fatal("Cancel succeeded despite injected cleanup failure")
 	}
 	pending, err := queue.Pending()
@@ -272,7 +272,7 @@ func TestOpenRejectsIncompleteRecoveredCapture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := Intent{Container: "family", Branch: "main", Generation: 9, Kind: "stop", FilesystemBranch: "capture"}
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-9", Kind: "stop", FilesystemBranch: "capture"}
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +296,7 @@ func TestOpenRejectsIncompleteRecoveredCapture(t *testing.T) {
 	}
 	select {
 	case cleaned := <-recovery.cleaned:
-		if cleaned.Generation != 9 {
+		if cleaned.PublicationID != "publication-9" {
 			t.Fatalf("cleaned %+v", cleaned)
 		}
 	default:

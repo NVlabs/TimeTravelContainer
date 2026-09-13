@@ -19,12 +19,12 @@ import (
 	"time"
 )
 
-// Intent is a durable, generation-fenced request to publish a branch.
+// Intent is a durable, immutable-identity-fenced request to publish a branch.
 type Intent struct {
 	ID               string    `json:"id"`
 	Container        string    `json:"container"`
 	Branch           string    `json:"branch"`
-	Generation       uint64    `json:"generation"`
+	PublicationID    string    `json:"publication_id"`
 	Kind             string    `json:"kind"`
 	FilesystemBranch string    `json:"filesystem_branch"`
 	CaptureReady     bool      `json:"capture_ready"`
@@ -99,8 +99,8 @@ func Open(localRoot string, publisher Publisher) (*Queue, error) {
 
 // Activate commits the local capture fence. Workers never inspect the
 // snapshot roots before this durable transition.
-func (q *Queue) Activate(container, branch string, generation uint64) error {
-	id := intentID(container, branch, generation)
+func (q *Queue) Activate(container, branch, publicationID string) error {
+	id := intentID(container, branch, publicationID)
 	intent, err := q.read(id + ".json")
 	if err != nil {
 		return err
@@ -123,10 +123,10 @@ func (q *Queue) Activate(container, branch string, generation uint64) error {
 // Enqueue durably records an intent. The lifecycle operation may return once
 // this succeeds because daemon restart will resume publication.
 func (q *Queue) Enqueue(intent Intent) error {
-	if intent.Container == "" || intent.Branch == "" || intent.Generation == 0 || intent.Kind == "" || intent.FilesystemBranch == "" {
+	if intent.Container == "" || intent.Branch == "" || intent.PublicationID == "" || intent.Kind == "" || intent.FilesystemBranch == "" {
 		return errors.New("invalid publication intent")
 	}
-	intent.ID = intentID(intent.Container, intent.Branch, intent.Generation)
+	intent.ID = intentID(intent.Container, intent.Branch, intent.PublicationID)
 	if intent.CreatedAt.IsZero() {
 		intent.CreatedAt = time.Now().UTC()
 	}
@@ -137,9 +137,9 @@ func (q *Queue) Enqueue(intent Intent) error {
 	return nil
 }
 
-// Cancel fences one exact generation before removing its pending intent.
-func (q *Queue) Cancel(container, branch string, generation uint64) error {
-	id := intentID(container, branch, generation)
+// Cancel fences one exact publication before removing its pending intent.
+func (q *Queue) Cancel(container, branch, publicationID string) error {
+	id := intentID(container, branch, publicationID)
 	intent, readErr := q.read(id + ".json")
 	if errors.Is(readErr, os.ErrNotExist) {
 		readErr = nil
@@ -203,22 +203,22 @@ func (q *Queue) Cancel(container, branch string, generation uint64) error {
 	return readErr
 }
 
-// CancelPending cancels generation only when it still has a durable pending
-// intent. Successfully completed generations need no tombstone and may have
+// CancelPending cancels a publication only when it still has a durable pending
+// intent. Successfully completed publications need no tombstone and may have
 // already discarded their local capture.
-func (q *Queue) CancelPending(container, branch string, generation uint64) error {
-	id := intentID(container, branch, generation)
+func (q *Queue) CancelPending(container, branch, publicationID string) error {
+	id := intentID(container, branch, publicationID)
 	if _, err := q.read(id + ".json"); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return q.Cancel(container, branch, generation)
+	return q.Cancel(container, branch, publicationID)
 }
 
-// CancelBranch fences and removes all pending generations for one branch.
-// This is intentionally broader than the generation recorded in current
-// branch metadata: a previously failed generation must not keep daemon drain
+// CancelBranch fences and removes all pending publications for one branch.
+// This is intentionally broader than the identity recorded in current branch
+// metadata: a previously failed publication must not keep daemon drain
 // alive after a later publication supersedes it or the branch is removed.
 func (q *Queue) CancelBranch(container, branch string) error {
 	intents, err := q.Pending()
@@ -228,7 +228,7 @@ func (q *Queue) CancelBranch(container, branch string) error {
 	var result error
 	for _, intent := range intents {
 		if intent.Container == container && intent.Branch == branch {
-			result = errors.Join(result, q.Cancel(intent.Container, intent.Branch, intent.Generation))
+			result = errors.Join(result, q.Cancel(intent.Container, intent.Branch, intent.PublicationID))
 		}
 	}
 	return result
@@ -475,7 +475,7 @@ func (q *Queue) recoverCaptures() error {
 			cause = fmt.Errorf("recovering publication capture: %w", readyErr)
 		}
 		_ = q.publisher.Failed(intent, cause, time.Time{})
-		if err := q.Cancel(intent.Container, intent.Branch, intent.Generation); err != nil {
+		if err := q.Cancel(intent.Container, intent.Branch, intent.PublicationID); err != nil {
 			return err
 		}
 	}
@@ -518,8 +518,8 @@ func (q *Queue) signal() {
 	}
 }
 
-func intentID(container, branch string, generation uint64) string {
-	return hex.EncodeToString([]byte(container)) + "-" + hex.EncodeToString([]byte(branch)) + fmt.Sprintf("-%016x", generation)
+func intentID(container, branch, publicationID string) string {
+	return hex.EncodeToString([]byte(container)) + "-" + hex.EncodeToString([]byte(branch)) + "-" + hex.EncodeToString([]byte(publicationID))
 }
 
 func writeJSONAtomic(path string, value any) error {

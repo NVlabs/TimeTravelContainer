@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
-pub const API_VERSION: u32 = 8;
+pub const API_VERSION: u32 = 9;
 const MAX_FRAME: usize = 1 << 20;
 const STDIN_WINDOW: usize = 1 << 20;
 
@@ -1244,7 +1244,7 @@ mod tests {
         let path = temporary_socket("ping");
         let server = mock_server(&path, |mut stream, request| {
             assert_eq!(request, json!({"version": API_VERSION, "action": "ping"}));
-            write_frame(&mut stream, b'O', br#"{"version":8}"#).unwrap();
+            write_frame(&mut stream, b'O', br#"{"version":9}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
         assert_eq!(Client::new(&path).ping().unwrap()["version"], API_VERSION);

@@ -45,7 +45,7 @@ function mockDaemon(path: string) {
       requests.push(request);
       const args = request.args as string[] | undefined;
       const output = request.action === "ping"
-        ? '{"version":8,"isolation_mode":"rootless"}\n'
+        ? '{"version":9,"isolation_mode":"rootless"}\n'
         : args?.join(" ") === "ls --json"
           ? '[{"id":"demo","branches":[{"id":"main"},{"id":"child","parent":"main"}]}]\n'
           : `ran:${args?.join(" ")}\n`;
@@ -89,7 +89,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
 
     const status = await client.callTool({ name: "ttc_status", arguments: {} });
     assert.equal(status.isError, undefined);
-    assert.match((status.content[0] as { text: string }).text, /"version": 8/);
+    assert.match((status.content[0] as { text: string }).text, /"version": 9/);
 
     const families = await client.callTool({
       name: "ttc_list",

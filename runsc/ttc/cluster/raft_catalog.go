@@ -341,27 +341,22 @@ func (c *RaftCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, error) {
 	return result, nil
 }
 
-func publicationOperationID(generation uint64) string {
-	return "publication-" + time.Unix(int64(generation), 0).UTC().Format("20060102T150405")
-}
-
 // EnsurePublicationPreparing commits the user-visible lifecycle transition
 // before any asynchronous shared bytes are written. The branch remains owned
 // by its current node until CommitPublication atomically installs durable
 // roots and releases placement.
-func (c *RaftCatalog) EnsurePublicationPreparing(family, branch string, storageGeneration uint64, lifecycle string) (*PublicationRecord, error) {
+func (c *RaftCatalog) EnsurePublicationPreparing(family, branch, publicationID, lifecycle string) (*PublicationRecord, error) {
 	state, err := c.state()
 	if err != nil {
 		return nil, err
 	}
-	key := publicationKey(family, branch, storageGeneration)
-	operation := publicationOperationID(storageGeneration)
+	key := publicationKey(family, branch, publicationID)
 	if record, exists := state.Publications[key]; exists {
-		if record.OperationID != operation || record.Lifecycle != lifecycle {
-			return nil, errors.New("publication generation has conflicting authority")
+		if record.PublicationID != publicationID || record.Lifecycle != lifecycle {
+			return nil, errors.New("publication identity has conflicting authority")
 		}
 		if record.State == PublicationCanceled || record.State == PublicationFailed {
-			return nil, errors.New("publication generation is not usable")
+			return nil, errors.New("publication identity is not usable")
 		}
 		return &record, nil
 	}
@@ -370,16 +365,16 @@ func (c *RaftCatalog) EnsurePublicationPreparing(family, branch string, storageG
 		return nil, os.ErrNotExist
 	}
 	return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationBegin, AuthorityPublicationPayload{
-		Family: family, Branch: branch, Operation: operation, Lifecycle: lifecycle,
-		BranchGeneration: branchAuthority.Generation, StorageGeneration: storageGeneration,
+		Family: family, Branch: branch, PublicationID: publicationID, Lifecycle: lifecycle,
+		BranchGeneration: branchAuthority.Generation,
 	})
 }
 
-// EnsurePublicationReady authorizes one generation and records that its
+// EnsurePublicationReady authorizes one immutable publication and records that its
 // node-local capture fence is complete. It is intentionally retryable after a
 // daemon crash; no shared bytes may be uploaded before it succeeds.
-func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGeneration uint64, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
-	recordPointer, err := c.EnsurePublicationPreparing(family, branch, storageGeneration, lifecycle)
+func (c *RaftCatalog) EnsurePublicationReady(family, branch, publicationID, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
+	recordPointer, err := c.EnsurePublicationPreparing(family, branch, publicationID, lifecycle)
 	if err != nil {
 		return nil, err
 	}
@@ -387,8 +382,8 @@ func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGener
 	switch record.State {
 	case PublicationPreparing:
 		return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationReady, AuthorityPublicationPayload{
-			Family: family, Branch: branch, Operation: record.OperationID,
-			BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision, Roots: captureRoots,
+			Family: family, Branch: branch, PublicationID: record.PublicationID,
+			BranchGeneration: record.BranchGeneration, Revision: record.Revision, Roots: captureRoots,
 		})
 	case PublicationReady, PublicationCommitted:
 		if record.State == PublicationReady && record.CandidateRoots != captureRoots {
@@ -396,19 +391,19 @@ func (c *RaftCatalog) EnsurePublicationReady(family, branch string, storageGener
 		}
 		return &record, nil
 	default:
-		return nil, errors.New("publication generation is not usable")
+		return nil, errors.New("publication identity is not usable")
 	}
 }
 
 // CommitPublication atomically installs immutable roots and releases runtime
 // placement. A worker cannot resurrect a removed/superseded branch because
-// both branch and storage generations are checked by the Raft state machine.
-func (c *RaftCatalog) CommitPublication(family, branch string, storageGeneration uint64, roots DurableRoots, providerNode, providerIncarnation string, snapshotOrigins []uint64) (*PublicationRecord, error) {
+// both the branch incarnation and publication identity are checked by Raft.
+func (c *RaftCatalog) CommitPublication(family, branch, publicationID string, roots DurableRoots, providerNode, providerIncarnation string, snapshotOrigins []uint64) (*PublicationRecord, error) {
 	state, err := c.state()
 	if err != nil {
 		return nil, err
 	}
-	record, ok := state.Publications[publicationKey(family, branch, storageGeneration)]
+	record, ok := state.Publications[publicationKey(family, branch, publicationID)]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
@@ -419,37 +414,37 @@ func (c *RaftCatalog) CommitPublication(family, branch string, storageGeneration
 		return &record, nil
 	}
 	return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationCommit, AuthorityPublicationPayload{
-		Family: family, Branch: branch, Operation: record.OperationID,
-		BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration,
-		Revision: record.Revision, Roots: roots, ProviderNode: providerNode, ProviderIncarnation: providerIncarnation,
+		Family: family, Branch: branch, PublicationID: record.PublicationID,
+		BranchGeneration: record.BranchGeneration,
+		Revision:         record.Revision, Roots: roots, ProviderNode: providerNode, ProviderIncarnation: providerIncarnation,
 		SnapshotOrigins: append([]uint64(nil), snapshotOrigins...),
 	})
 }
 
 // CancelPublication fences an uncommitted worker. A successful publication is
 // immutable and remains reachable from the committed branch roots.
-func (c *RaftCatalog) CancelPublication(family, branch string, storageGeneration uint64) error {
+func (c *RaftCatalog) CancelPublication(family, branch, publicationID string) error {
 	state, err := c.state()
 	if err != nil {
 		return err
 	}
-	record, ok := state.Publications[publicationKey(family, branch, storageGeneration)]
+	record, ok := state.Publications[publicationKey(family, branch, publicationID)]
 	if !ok || record.State == PublicationCommitted || record.State == PublicationCanceled {
 		return nil
 	}
 	return applyRaftNoValue(c, time.Now().UTC(), AuthorityPublicationCancel, AuthorityPublicationPayload{
-		Family: family, Branch: branch, Operation: record.OperationID,
-		BranchGeneration: record.BranchGeneration, StorageGeneration: storageGeneration, Revision: record.Revision,
+		Family: family, Branch: branch, PublicationID: record.PublicationID,
+		BranchGeneration: record.BranchGeneration, Revision: record.Revision,
 	})
 }
 
-// Publication returns one generation's authoritative publication state.
-func (c *RaftCatalog) Publication(family, branch string, storageGeneration uint64) (PublicationRecord, bool, error) {
+// Publication returns one immutable publication's authoritative state.
+func (c *RaftCatalog) Publication(family, branch, publicationID string) (PublicationRecord, bool, error) {
 	state, err := c.state()
 	if err != nil {
 		return PublicationRecord{}, false, err
 	}
-	record, ok := state.Publications[publicationKey(family, branch, storageGeneration)]
+	record, ok := state.Publications[publicationKey(family, branch, publicationID)]
 	return record, ok, nil
 }
 

@@ -904,7 +904,7 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		}
 		merged.Branches = append(merged.Branches, BranchResourceStats{
 			Target: merged.Container + "@" + branch.ID, State: state,
-			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration,
+			StorageState: branch.StorageState, PublicationID: branch.PublicationID,
 			SourceNode: branch.SourceNode, DependentMemoryBytes: branch.DependentMemoryBytes,
 			DependentFilesystemBytes: branch.DependentFilesystemBytes,
 		})

@@ -4953,7 +4953,7 @@ type Branch struct {
 	ParentID                  string    `json:"parent,omitempty"`
 	State                     string    `json:"state"`
 	StorageState              string    `json:"storage_state"`
-	StorageGeneration         uint64    `json:"storage_generation,omitempty"`
+	PublicationID             string    `json:"publication_id,omitempty"`
 	StorageError              string    `json:"storage_error,omitempty"`
 	StorageManifest           string    `json:"storage_manifest,omitempty"`
 	StorageRetryAt            time.Time `json:"storage_retry_at,omitempty"`
@@ -5130,7 +5130,7 @@ type BranchResourceStats struct {
 	NodeID                   string        `json:"node_id,omitempty"`
 	Quarantined              bool          `json:"quarantined,omitempty"`
 	StorageState             string        `json:"storage_state"`
-	StorageGeneration        uint64        `json:"storage_generation,omitempty"`
+	PublicationID            string        `json:"publication_id,omitempty"`
 	StorageError             string        `json:"storage_error,omitempty"`
 	StorageRetryAt           time.Time     `json:"storage_retry_at,omitempty"`
 	SnapshotID               uint64        `json:"snapshot_id,omitempty"`
@@ -5608,7 +5608,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	// Publication intents are durable and may outlive the user-facing name or
 	// the daemon process that created them. Key them by the immutable container
 	// ID so publish completion, branch removal fencing, and restart recovery all
-	// address the same generation even when the lifecycle command used a name
+	// address the same immutable publication even when the lifecycle command used a name
 	// or ID prefix.
 	container, err := store.LoadContainer(target.container)
 	if err != nil {
@@ -5619,22 +5619,22 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	if err != nil {
 		return err
 	}
-	if previous.StorageGeneration != 0 {
-		if err := b.publicationQueue.CancelPending(target.container, target.branch, previous.StorageGeneration); err != nil {
+	if previous.PublicationID != "" {
+		if err := b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID); err != nil {
 			return fmt.Errorf("canceling superseded publication for %s: %w", target, err)
 		}
 	}
-	generation, err := store.BeginBranchPublication(target.container, target.branch)
+	publicationID, err := store.BeginBranchPublication(target.container, target.branch)
 	if err != nil {
 		return err
 	}
-	captureBranch := fmt.Sprintf("ttc-publish-%016x", generation)
+	captureBranch := "ttc-publish-" + strings.TrimPrefix(publicationID, "publication-")
 	intent := ttcstorage.Intent{
-		Container: target.container, Branch: target.branch, Generation: generation, Kind: kind,
+		Container: target.container, Branch: target.branch, PublicationID: publicationID, Kind: kind,
 		FilesystemBranch: captureBranch,
 	}
 	if err := b.publicationQueue.Enqueue(intent); err != nil {
-		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "error", err.Error(), time.Time{})
+		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "error", err.Error(), time.Time{})
 		return err
 	}
 	captureComplete := false
@@ -5656,8 +5656,8 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if !originsCommitted {
 			cause = errors.Join(cause, finishFilesystemOrigins(false))
 		}
-		cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, generation))
-		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "local", "", time.Time{})
+		cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, publicationID))
+		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "local", "", time.Time{})
 		return cause
 	}
 	info, err := store.LoadContainer(target.container)
@@ -5746,14 +5746,14 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if kind == "dehydrate" {
 			lifecycle = "dehydrated"
 		}
-		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(target.container, target.branch, generation, lifecycle); err != nil {
+		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(target.container, target.branch, publicationID, lifecycle); err != nil {
 			return rollback(fmt.Errorf("authorizing asynchronous publication: %w", err))
 		}
 	}
-	if err := b.publicationQueue.Activate(target.container, target.branch, generation); err != nil {
+	if err := b.publicationQueue.Activate(target.container, target.branch, publicationID); err != nil {
 		// The committed hidden roots are immutable and safe for retry. Keep the
 		// pending intent so daemon restart can validate and activate it.
-		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "error", err.Error(), time.Time{})
+		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "error", err.Error(), time.Time{})
 		return err
 	}
 	return nil
@@ -9963,7 +9963,7 @@ func normalizeLifecycleState(state string) string {
 func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
 		ID: info.ID, NodeID: info.NodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
-		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
+		StorageState: info.StorageState, PublicationID: info.PublicationID, StorageError: info.StorageError,
 		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
 		MemoryRootObjects: append([]string(nil), info.MemoryRootObjects...),
 		ControlRoot:       info.ControlRoot, ControlRootObject: info.ControlRootObject,
@@ -10023,7 +10023,7 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			branch.Quarantined = recorded.Quarantined
 			branch.NodeID = recorded.NodeID
 			branch.StorageState = recorded.StorageState
-			branch.StorageGeneration = recorded.StorageGeneration
+			branch.PublicationID = recorded.PublicationID
 			branch.StorageError = recorded.StorageError
 			branch.StorageManifest = recorded.StorageManifest
 			branch.StorageRetryAt = recorded.StorageRetryAt
@@ -11918,20 +11918,18 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		return fmt.Errorf("branch %q is not recorded", target.branch)
 	}
 	if persistentBranch.State == "dehydrating" {
-		if b.publicationQueue == nil || persistentBranch.StorageGeneration == 0 {
+		if b.publicationQueue == nil || persistentBranch.PublicationID == "" {
 			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
 		}
-		generation := persistentBranch.StorageGeneration
-		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, generation); err != nil {
+		publicationID := persistentBranch.PublicationID
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
 			return fmt.Errorf("fencing dehydration publication for %s: %w", target, err)
 		}
-		if err := b.publicationQueue.Cancel(info.ID, target.branch, generation); err != nil {
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, publicationID); err != nil {
 			return fmt.Errorf("canceling dehydration publication for %s: %w", target, err)
 		}
-		// AbandonBranchPublication advances the generation fence. The cold
-		// restore must carry that new generation into its final storage update;
-		// using the BranchInfo loaded before cancellation would successfully
-		// restore the runtime and then report a stale-worker failure.
+		// AbandonBranchPublication clears the immutable publication fence. Reload
+		// so the cold restore cannot accidentally reuse the canceled identity.
 		info, err = b.containerStore().LoadContainer(info.ID)
 		if err != nil {
 			return fmt.Errorf("reloading canceled dehydration for %s: %w", target, err)
@@ -12284,8 +12282,10 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return err
 	}
 	if relays == nil {
-		if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.StorageGeneration, "local", "", time.Time{}); err != nil {
-			return err
+		if branch.PublicationID != "" {
+			if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.PublicationID, "local", "", time.Time{}); err != nil {
+				return err
+			}
 		}
 	}
 	// The live runtime and its persistent state are now committed. Failures in
@@ -12595,8 +12595,10 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 		return err
 	}
 	if relays == nil {
-		if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.StorageGeneration, "local", "", time.Time{}); err != nil {
-			return err
+		if branch.PublicationID != "" {
+			if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.PublicationID, "local", "", time.Time{}); err != nil {
+				return err
+			}
 		}
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
@@ -12994,7 +12996,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		account := BranchResourceStats{
 			Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State),
 			NodeID: info.BranchNodeID(branch.ID), Quarantined: branch.Quarantined,
-			StorageState: branch.StorageState, StorageGeneration: branch.StorageGeneration,
+			StorageState: branch.StorageState, PublicationID: branch.PublicationID,
 			StorageError: branch.StorageError, StorageRetryAt: branch.StorageRetryAt,
 			SnapshotID: branch.SnapshotID, MemoryRoots: append([]string(nil), branch.MemoryRoots...),
 			MemoryRootObjects: append([]string(nil), branch.MemoryRootObjects...), FilesystemRoot: branch.StorageManifest,

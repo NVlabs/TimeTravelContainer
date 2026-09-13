@@ -70,7 +70,7 @@ test("ping uses the direct protocol", async () => {
   await withServer(
     (socket, request) => {
       assert.deepEqual(request, { version: API_VERSION, action: "ping" });
-      socket.write(frame("O", Buffer.from('{"version":8}\n')));
+      socket.write(frame("O", Buffer.from('{"version":9}\n')));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
     async (path) => {

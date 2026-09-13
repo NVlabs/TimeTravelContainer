@@ -33,7 +33,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 8
+	AuthorityFormatVersion = 9
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -181,14 +181,14 @@ type SharedPackRetirement struct {
 // BranchAuthority is the cluster-wide authority record that is not already
 // represented by PlacementRecord.
 type BranchAuthority struct {
-	FamilyID          string       `json:"family_id"`
-	BranchID          string       `json:"branch_id"`
-	Generation        uint64       `json:"generation"`
-	StorageGeneration uint64       `json:"storage_generation"`
-	Lifecycle         string       `json:"lifecycle"`
-	Roots             DurableRoots `json:"roots,omitempty"`
-	Corrupted         bool         `json:"corrupted,omitempty"`
-	CorruptionReason  string       `json:"corruption_reason,omitempty"`
+	FamilyID         string       `json:"family_id"`
+	BranchID         string       `json:"branch_id"`
+	Generation       uint64       `json:"generation"`
+	PublicationID    string       `json:"publication_id,omitempty"`
+	Lifecycle        string       `json:"lifecycle"`
+	Roots            DurableRoots `json:"roots,omitempty"`
+	Corrupted        bool         `json:"corrupted,omitempty"`
+	CorruptionReason string       `json:"corruption_reason,omitempty"`
 	// VolatileDependencies are coarse authority edges, not page records. The
 	// immutable transaction describes the detailed memory/filesystem snapshot.
 	// An edge disappears only when that transaction commits independence.
@@ -217,13 +217,12 @@ const (
 )
 
 // PublicationRecord fences asynchronous upload completion by the exact branch
-// and storage generations that authorized it.
+// incarnation and immutable publication identity that authorized it.
 type PublicationRecord struct {
 	FamilyID          string           `json:"family_id"`
 	BranchID          string           `json:"branch_id"`
 	BranchGeneration  uint64           `json:"branch_generation"`
-	StorageGeneration uint64           `json:"storage_generation"`
-	OperationID       string           `json:"operation_id"`
+	PublicationID     string           `json:"publication_id"`
 	Lifecycle         string           `json:"lifecycle"`
 	PreviousLifecycle string           `json:"previous_lifecycle,omitempty"`
 	State             PublicationState `json:"state"`
@@ -297,8 +296,8 @@ func (s *AuthorityState) initMaps() {
 }
 
 func logicalBranchKey(family, branch string) string { return family + "\x00" + branch }
-func publicationKey(family, branch string, generation uint64) string {
-	return fmt.Sprintf("%s\x00%s\x00%020d", family, branch, generation)
+func publicationKey(family, branch, publicationID string) string {
+	return family + "\x00" + branch + "\x00" + publicationID
 }
 
 func appendVolatileDependency(dependencies []VolatileDependency, dependency VolatileDependency) []VolatileDependency {
@@ -543,13 +542,13 @@ type AuthorityTransactionPayload struct {
 
 // AuthorityPublicationPayload carries a durable publication command.
 type AuthorityPublicationPayload struct {
-	Family, Branch, Operation                     string
-	Lifecycle                                     string
-	BranchGeneration, StorageGeneration, Revision uint64
-	Roots                                         DurableRoots
-	ProviderNode, ProviderIncarnation             string
-	SnapshotOrigins                               []uint64
-	Failure                                       string
+	Family, Branch, PublicationID     string
+	Lifecycle                         string
+	BranchGeneration, Revision        uint64
+	Roots                             DurableRoots
+	ProviderNode, ProviderIncarnation string
+	SnapshotOrigins                   []uint64
+	Failure                           string
 }
 
 type AuthorityBranchInheritPayload struct {
@@ -1294,7 +1293,7 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		delete(s.Placements, key)
 		delete(s.Branches, key)
-		// Publication records are generation fences only while their logical
+		// Publication records are identity fences only while their logical
 		// branch exists. Keeping terminal history after removal would make the
 		// bounded Raft state grow with every stop/dehydrate/name-reuse cycle.
 		for publicationKey, publication := range s.Publications {
@@ -1313,6 +1312,12 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 	if branch, ok := s.Branches[key]; ok {
 		branch.Generation = record.Generation
 		branch.Lifecycle = string(record.State)
+		if command.Kind == AuthorityPlacementClaim {
+			// Claiming a durable snapshot creates a new mutable runtime. The
+			// committed publication remains immutable history, not the identity
+			// of the next stop/dehydrate transaction.
+			branch.PublicationID = ""
+		}
 		branch.UpdatedAt = command.IssuedAt
 		s.Branches[key] = branch
 	}
@@ -1400,11 +1405,6 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			}
 			if transactionTargetsPlacement(tx, placement) {
 				return nil, errors.New("transaction target placement still exists")
-			}
-		}
-		for _, publication := range s.Publications {
-			if publication.OperationID == p.ID && publication.State != PublicationCommitted && publication.State != PublicationCanceled && publication.State != PublicationFailed {
-				return nil, errors.New("transaction remains an active publication")
 			}
 		}
 		delete(s.Transactions, p.ID)
@@ -1604,19 +1604,23 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 	if !ok && command.Kind != AuthorityPublicationCancel {
 		return nil, os.ErrNotExist
 	}
-	key := publicationKey(p.Family, p.Branch, p.StorageGeneration)
+	key := publicationKey(p.Family, p.Branch, p.PublicationID)
 	if command.Kind == AuthorityPublicationBegin {
-		if branch.Corrupted || branch.Generation != p.BranchGeneration || p.StorageGeneration <= branch.StorageGeneration || !transactionIDPattern.MatchString(p.Operation) || (p.Lifecycle != "exited" && p.Lifecycle != "dehydrated") {
+		if branch.Corrupted || branch.Generation != p.BranchGeneration || !transactionIDPattern.MatchString(p.PublicationID) || (p.Lifecycle != "exited" && p.Lifecycle != "dehydrated") {
 			return nil, errors.New("stale or invalid publication authorization")
 		}
 		if old, ok := s.Publications[key]; ok {
-			if old.OperationID != p.Operation || old.BranchGeneration != p.BranchGeneration {
-				return nil, errors.New("publication generation reused")
+			if old.PublicationID != p.PublicationID || old.BranchGeneration != p.BranchGeneration {
+				return nil, errors.New("publication identity reused")
 			}
 			return authorityValue(old)
 		}
-		record := PublicationRecord{FamilyID: p.Family, BranchID: p.Branch, BranchGeneration: p.BranchGeneration, StorageGeneration: p.StorageGeneration, OperationID: p.Operation, Lifecycle: p.Lifecycle, PreviousLifecycle: branch.Lifecycle, State: PublicationPreparing, Revision: 1, UpdatedAt: command.IssuedAt}
+		if branch.PublicationID != "" && branch.PublicationID != p.PublicationID {
+			return nil, errors.New("branch already has an active publication")
+		}
+		record := PublicationRecord{FamilyID: p.Family, BranchID: p.Branch, BranchGeneration: p.BranchGeneration, PublicationID: p.PublicationID, Lifecycle: p.Lifecycle, PreviousLifecycle: branch.Lifecycle, State: PublicationPreparing, Revision: 1, UpdatedAt: command.IssuedAt}
 		s.Publications[key] = record
+		branch.PublicationID = p.PublicationID
 		if p.Lifecycle == "dehydrated" {
 			branch.Lifecycle = "dehydrating"
 		} else {
@@ -1630,7 +1634,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	if record.OperationID != p.Operation || record.BranchGeneration != p.BranchGeneration || record.Revision != p.Revision {
+	if record.PublicationID != p.PublicationID || record.BranchGeneration != p.BranchGeneration || record.Revision != p.Revision {
 		return nil, errors.New("stale publication authority")
 	}
 	switch command.Kind {
@@ -1683,7 +1687,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			}
 		}
 		current := s.Branches[branchKey]
-		if current.Generation != record.BranchGeneration || current.StorageGeneration >= record.StorageGeneration || current.Corrupted {
+		if current.Generation != record.BranchGeneration || current.PublicationID != record.PublicationID || current.Corrupted {
 			return nil, errors.New("publication authority was superseded")
 		}
 		record.State, record.CandidateRoots = PublicationCommitted, p.Roots
@@ -1701,7 +1705,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 			return nil, err
 		}
 		s.Placements[branchKey] = placement
-		current.Generation, current.StorageGeneration = placement.Generation, record.StorageGeneration
+		current.Generation, current.PublicationID = placement.Generation, record.PublicationID
 		current.Roots, current.Lifecycle, current.UpdatedAt = p.Roots, record.Lifecycle, command.IssuedAt
 		s.Branches[branchKey] = current
 		for _, origin := range p.SnapshotOrigins {
@@ -1724,11 +1728,15 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		record.State = PublicationCanceled
 		current := s.Branches[branchKey]
 		if current.Generation == record.BranchGeneration && !current.Corrupted {
+			if current.PublicationID != record.PublicationID {
+				return nil, errors.New("publication authority was superseded")
+			}
 			if record.Lifecycle == "dehydrated" {
 				current.Lifecycle = record.PreviousLifecycle
 			} else {
 				current.Lifecycle = record.Lifecycle
 			}
+			current.PublicationID = ""
 			current.UpdatedAt = command.IssuedAt
 			s.Branches[branchKey] = current
 		}
@@ -1809,6 +1817,7 @@ func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) B
 		return branch
 	}
 	branch.Corrupted, branch.CorruptionReason, branch.Lifecycle = true, reason, "corrupted"
+	branch.PublicationID = ""
 	branch.Generation++
 	branch.UpdatedAt = at
 	s.Branches[key] = branch
@@ -1865,6 +1874,111 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	for _, placement := range state.Placements {
 		if err := placement.validate(); err != nil {
 			return nil, err
+		}
+	}
+	for key, branch := range state.Branches {
+		if key != logicalBranchKey(branch.FamilyID, branch.BranchID) ||
+			!transactionIDPattern.MatchString(branch.FamilyID) || !transactionIDPattern.MatchString(branch.BranchID) ||
+			branch.Generation == 0 || branch.UpdatedAt.IsZero() {
+			return nil, errors.New("authority snapshot has invalid branch authority")
+		}
+		if branch.PublicationID != "" && !transactionIDPattern.MatchString(branch.PublicationID) {
+			return nil, errors.New("authority snapshot branch has invalid publication identity")
+		}
+		if branch.Corrupted != (branch.Lifecycle == "corrupted") || (branch.Corrupted && branch.CorruptionReason == "") {
+			return nil, errors.New("authority snapshot has inconsistent branch corruption state")
+		}
+		if branch.Roots != (DurableRoots{}) {
+			if err := validateDurableRoots(branch.Roots); err != nil {
+				return nil, fmt.Errorf("authority snapshot branch roots: %w", err)
+			}
+			if err := state.validateSnapshotRootAuthority(branch.Roots); err != nil {
+				return nil, fmt.Errorf("authority snapshot branch roots: %w", err)
+			}
+		}
+		for _, dependency := range branch.VolatileDependencies {
+			if !transactionIDPattern.MatchString(dependency.TransactionID) ||
+				!transactionIDPattern.MatchString(dependency.SourceNode) ||
+				!transactionIDPattern.MatchString(dependency.SourceIncarnation) {
+				return nil, errors.New("authority snapshot branch has invalid volatile dependency")
+			}
+			if _, ok := state.Transactions[dependency.TransactionID]; !ok {
+				return nil, errors.New("authority snapshot branch references missing transaction")
+			}
+		}
+	}
+	for key, publication := range state.Publications {
+		if key != publicationKey(publication.FamilyID, publication.BranchID, publication.PublicationID) ||
+			!transactionIDPattern.MatchString(publication.FamilyID) || !transactionIDPattern.MatchString(publication.BranchID) ||
+			!transactionIDPattern.MatchString(publication.PublicationID) || publication.BranchGeneration == 0 ||
+			publication.Revision == 0 || publication.UpdatedAt.IsZero() ||
+			(publication.Lifecycle != "exited" && publication.Lifecycle != "dehydrated") {
+			return nil, errors.New("authority snapshot has invalid publication record")
+		}
+		switch publication.State {
+		case PublicationPreparing:
+			if publication.CandidateRoots != (DurableRoots{}) || publication.Failure != "" {
+				return nil, errors.New("authority snapshot preparing publication retains output")
+			}
+		case PublicationReady:
+			if publication.Failure != "" {
+				return nil, errors.New("authority snapshot ready publication retains failure")
+			}
+			if publication.CandidateRoots != (DurableRoots{}) {
+				if err := validateDurableRoots(publication.CandidateRoots); err != nil {
+					return nil, fmt.Errorf("authority snapshot ready publication roots: %w", err)
+				}
+				if err := state.validateSnapshotRootAuthority(publication.CandidateRoots); err != nil {
+					return nil, fmt.Errorf("authority snapshot ready publication roots: %w", err)
+				}
+			}
+		case PublicationCommitted:
+			if publication.Failure != "" {
+				return nil, errors.New("authority snapshot committed publication retains failure")
+			}
+			if err := validateDurableRoots(publication.CandidateRoots); err != nil {
+				return nil, fmt.Errorf("authority snapshot committed publication roots: %w", err)
+			}
+			if err := state.validateSnapshotRootAuthority(publication.CandidateRoots); err != nil {
+				return nil, fmt.Errorf("authority snapshot committed publication roots: %w", err)
+			}
+		case PublicationFailed:
+			if publication.Failure == "" {
+				return nil, errors.New("authority snapshot failed publication lacks failure")
+			}
+			if publication.CandidateRoots != (DurableRoots{}) {
+				if err := validateDurableRoots(publication.CandidateRoots); err != nil {
+					return nil, fmt.Errorf("authority snapshot failed publication roots: %w", err)
+				}
+				if err := state.validateSnapshotRootAuthority(publication.CandidateRoots); err != nil {
+					return nil, fmt.Errorf("authority snapshot failed publication roots: %w", err)
+				}
+			}
+		case PublicationCanceled:
+			if publication.Failure != "" {
+				return nil, errors.New("authority snapshot canceled publication retains failure")
+			}
+		default:
+			return nil, errors.New("authority snapshot has unknown publication state")
+		}
+		branch, ok := state.Branches[logicalBranchKey(publication.FamilyID, publication.BranchID)]
+		if !ok {
+			return nil, errors.New("authority snapshot publication references missing branch")
+		}
+		if publication.State == PublicationPreparing || publication.State == PublicationReady || publication.State == PublicationFailed {
+			if branch.Generation != publication.BranchGeneration || branch.PublicationID != publication.PublicationID {
+				return nil, errors.New("authority snapshot active publication is not fenced by its branch")
+			}
+		}
+	}
+	for _, branch := range state.Branches {
+		if branch.PublicationID == "" {
+			continue
+		}
+		publication, ok := state.Publications[publicationKey(branch.FamilyID, branch.BranchID, branch.PublicationID)]
+		if !ok || (publication.State != PublicationPreparing && publication.State != PublicationReady &&
+			publication.State != PublicationFailed && publication.State != PublicationCommitted) {
+			return nil, errors.New("authority snapshot branch references missing or inactive publication")
 		}
 	}
 	for id, tx := range state.Transactions {

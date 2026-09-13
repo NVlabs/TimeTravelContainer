@@ -40,7 +40,7 @@ import (
 )
 
 const (
-	daemonAPIVersion      = 8
+	daemonAPIVersion      = 9
 	daemonFrameStdin      = byte('I')
 	daemonFrameStdinAck   = byte('A')
 	daemonFrameEOF        = byte('C')
