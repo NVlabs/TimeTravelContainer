@@ -4626,6 +4626,14 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 			switch branch.StorageState {
 			case "shared":
 				return waitResult{}
+			case "local":
+				// Standalone TTC has no cache tier: TTC_ROOT is authoritative,
+				// so a local stopped/dehydrated capture is already durable.
+				// Clustered local state remains node-authoritative and must wait
+				// for publication to the shared root.
+				if durability, ok := backend.(localDurabilityBackend); ok && durability.localStorageIsDurable() {
+					return waitResult{}
+				}
 			case "materializing":
 				if branch.StorageManifest != "" {
 					return waitResult{}
@@ -5408,6 +5416,14 @@ type dehydrationBackend interface {
 
 type quarantineBackend interface {
 	setQuarantine(target selector, enabled bool) error
+}
+
+type localDurabilityBackend interface {
+	localStorageIsDurable() bool
+}
+
+func (b *runtimeBackend) localStorageIsDurable() bool {
+	return b != nil && b.distributedSource == nil
 }
 
 type consoleSidecarOwner interface {

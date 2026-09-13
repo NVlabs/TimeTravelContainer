@@ -2827,6 +2827,22 @@ func TestWaitPrintsDockerExitCodesInArgumentOrder(t *testing.T) {
 	}
 }
 
+func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
+	b := &fakeBackend{
+		localDurable: true,
+		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+			Metadata: Branch{ID: "child", State: "dehydrated", StorageState: "local"},
+		}}}},
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("wait durable status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("wait durable output=%q, want %q", got, want)
+	}
+}
+
 func containsSelector(values []selector, target selector) bool {
 	for _, value := range values {
 		if value == target {
@@ -4207,6 +4223,7 @@ type startCall struct {
 
 type fakeBackend struct {
 	loadedBytes         int
+	localDurable       bool
 	loadedPlatform      string
 	savedIdentifiers    []string
 	savedPlatform       string
@@ -4304,6 +4321,8 @@ type fakeBackend struct {
 	restoreName         string
 	renamed             []string
 }
+
+func (b *fakeBackend) localStorageIsDurable() bool { return b.localDurable }
 
 func (b *fakeBackend) migrate(target selector, node string) error {
 	b.migrateTarget = target
