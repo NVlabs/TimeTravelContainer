@@ -156,8 +156,14 @@ type Store struct {
 	// its whole lifetime. Callers must invoke Reload while holding that flock
 	// before every mutation that may race another process.
 	externallyCoordinated bool
-	deferredResolvers     map[string]deferredResolver
-	deferredObjects       map[string]ObjectID
+	// externalTransaction is true while the enclosing repository holds this
+	// graph's cross-process writer fence. Repository transactions retain the
+	// fence from reload through their final graph mutation; otherwise a lazy
+	// deferred expansion from another Sentry can allocate from the same stale
+	// snapshot ordinal or interleave journal framing bytes.
+	externalTransaction bool
+	deferredResolvers   map[string]deferredResolver
+	deferredObjects     map[string]ObjectID
 	// memoryPages is a derived index over live graph-native page records. It
 	// makes repeated captures reuse the immutable PageID selected by the
 	// guest's stable logical/version identity instead of scanning the graph or
@@ -339,7 +345,7 @@ func (s *Store) Reload() error {
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
-	if s.externallyCoordinated {
+	if s.externallyCoordinated && !s.externalTransaction {
 		if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_SH); err != nil {
 			return err
 		}
@@ -406,6 +412,95 @@ func (s *Store) ReloadForWrite() error {
 	return s.loadGeneration(head, true)
 }
 
+// BeginExternalTransaction acquires an externally-coordinated graph's writer
+// fence and reloads the latest committed state. The caller must pair a
+// successful call with EndExternalTransaction. This is used by an enclosing
+// repository to keep graph preparation and journal append in one
+// cross-process critical section.
+func (s *Store) BeginExternalTransaction() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.externallyCoordinated {
+		return errors.New("external transaction requires an externally-coordinated TTC graph")
+	}
+	if s.externalTransaction {
+		return errors.New("TTC snapshot graph external transaction is already active")
+	}
+	if s.poisoned != nil {
+		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
+	}
+	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	if err := s.reloadForExternalWriteLocked(); err != nil {
+		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+		return err
+	}
+	s.externalTransaction = true
+	return nil
+}
+
+// EndExternalTransaction releases the writer fence acquired by
+// BeginExternalTransaction.
+func (s *Store) EndExternalTransaction() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.externalTransaction {
+		return errors.New("TTC snapshot graph external transaction is not active")
+	}
+	s.externalTransaction = false
+	return syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+}
+
+// reloadForExternalWriteLocked reloads the published generation while the
+// caller holds both s.mu and graph.lock exclusively.
+func (s *Store) reloadForExternalWriteLocked() error {
+	if s.journal != nil {
+		unchanged, err := s.headUnchanged()
+		if err != nil {
+			return err
+		}
+		info, err := s.journal.Stat()
+		if err != nil {
+			return err
+		}
+		if unchanged && info.Size() >= s.journalEnd {
+			if info.Size() == s.journalEnd {
+				return nil
+			}
+			return s.replayJournalSuffix(true)
+		}
+	}
+	head, err := s.readHead()
+	if err != nil {
+		return err
+	}
+	return s.loadGeneration(head, true)
+}
+
+// beginImplicitExternalMutationLocked fences a graph mutation reached from a
+// nominal read path, such as lazy expansion of a foreign immutable object.
+// s.mu must be held. It returns true when the caller must release the fence.
+func (s *Store) beginImplicitExternalMutationLocked() (bool, error) {
+	if !s.externallyCoordinated || s.externalTransaction {
+		return false, nil
+	}
+	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+		return false, err
+	}
+	if err := s.reloadForExternalWriteLocked(); err != nil {
+		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) endImplicitExternalMutationLocked(acquired bool) {
+	if acquired {
+		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	}
+}
+
 func (s *Store) headUnchanged() (bool, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstatat(int(s.dirFD.Fd()), headFileName, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
@@ -437,10 +532,11 @@ func (s *Store) Close() error {
 		s.journal = nil
 	}
 	if s.lock != nil {
-		if !s.externallyCoordinated {
+		if !s.externallyCoordinated || s.externalTransaction {
 			if unlockErr := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN); err == nil {
 				err = unlockErr
 			}
+			s.externalTransaction = false
 		}
 		if closeErr := s.lock.Close(); err == nil {
 			err = closeErr
@@ -2881,10 +2977,16 @@ func (s *Store) CheckpointExternallyCoordinated() error {
 	if !s.externallyCoordinated {
 		return errors.New("graph is not externally coordinated")
 	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
-		return err
+	acquired := false
+	if !s.externalTransaction {
+		if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX); err != nil {
+			return err
+		}
+		acquired = true
 	}
-	defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	if acquired {
+		defer syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+	}
 	head, err := s.readHead()
 	if err != nil {
 		return err

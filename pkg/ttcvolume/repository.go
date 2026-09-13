@@ -1214,7 +1214,7 @@ func (r *Repository) HostPath() string {
 	return r.path
 }
 
-func (r *Repository) withLock(fn func() error) error {
+func (r *Repository) withLock(fn func() error) (result error) {
 	r.operationMu.Lock()
 	defer r.operationMu.Unlock()
 	if r.lockFile == nil {
@@ -1229,9 +1229,12 @@ func (r *Repository) withLock(fn func() error) error {
 	}
 	defer unix.Flock(int(r.lockFile.Fd()), unix.LOCK_UN)
 	if r.graph != nil {
-		if err := r.graph.ReloadForWrite(); err != nil {
+		if err := r.graph.BeginExternalTransaction(); err != nil {
 			return err
 		}
+		defer func() {
+			result = errors.Join(result, r.graph.EndExternalTransaction())
+		}()
 	}
 	return fn()
 }

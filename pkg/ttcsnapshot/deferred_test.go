@@ -129,6 +129,105 @@ func TestDeferredFilesystemRootLoadsOnlyTraversedMetadata(t *testing.T) {
 	}
 }
 
+func TestDeferredExpansionWaitsForExternalWriterFence(t *testing.T) {
+	source, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	sourceOrigin, err := source.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoot, err := source.CreateObject(sourceOrigin, "source-root", ObjectKindMetadata, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetRoot("source", sourceRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.DeletePin("source-root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Seal(sourceOrigin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	writer, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	targetOrigin, err := writer.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot, err := writer.ImportDeferredFilesystemRoot(targetOrigin, "target", "peer", sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := OpenExternallyCoordinated(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if err := reader.AttachDeferredResolver("peer", targetOrigin, func(id ObjectID) (Object, error) {
+		object, ok := source.Object(id)
+		if !ok {
+			return Object{}, fmt.Errorf("source object %s is absent", id)
+		}
+		return object, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writer.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := writer.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := reader.ResolveObject(targetRoot)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("deferred expansion bypassed active writer fence: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := writer.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deferred expansion did not proceed after writer fence release")
+	}
+	if err := reader.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reader.Snapshot(next); !ok {
+		t.Fatalf("deferred expansion lost concurrently committed snapshot %d", next)
+	}
+	if err := reader.Verify(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeferredResolutionAllowsReentrantAncestorLookup(t *testing.T) {
 	source, err := Open(t.TempDir())
 	if err != nil {

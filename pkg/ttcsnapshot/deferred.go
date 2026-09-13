@@ -209,6 +209,17 @@ func (s *Store) resolveDeferredLockedAfter(id ObjectID, ordinalFloor uint64) (Ob
 		close(inFlight.done)
 		return Object{}, false, ordinalFloor, inFlight.err
 	}
+	// Provider I/O deliberately ran without s.mu. Before allocating local
+	// object IDs or appending the expansion, join the same cross-process writer
+	// critical section as ordinary repository mutations and replay anything
+	// committed while the provider request was in flight.
+	acquired, coordinateErr := s.beginImplicitExternalMutationLocked()
+	if coordinateErr != nil {
+		inFlight.err = fmt.Errorf("coordinating deferred TTC object expansion %s: %w", sourceID, coordinateErr)
+		close(inFlight.done)
+		return Object{}, false, ordinalFloor, inFlight.err
+	}
+	defer s.endImplicitExternalMutationLocked(acquired)
 	// The graph may have advanced while provider I/O was in flight. Another
 	// path can only have expanded this exact immutable stub to the same value.
 	object, ok = s.state.Objects[id.key()]
