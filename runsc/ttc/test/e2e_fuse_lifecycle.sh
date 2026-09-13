@@ -16,11 +16,35 @@
 set -eu
 
 TTC=${TTC:-ttc}
+TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_FUSE_TEST_IMAGE:-ubuntu:24.04}
 NAME=${TTC_FUSE_TEST_NAME:-ttc-fuse-lifecycle-$$}
+ROOT=${TTC_FUSE_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-fuse-lifecycle.XXXXXX")}
+OWNED_ROOT=1
+if test -n "${TTC_FUSE_TEST_ROOT:-}"; then
+	OWNED_ROOT=0
+fi
+SOCKET=$ROOT/ttcd.sock
+BIN_DIR=$ROOT/bin
+
+test -x "$TTC" || { echo "TTC FUSE lifecycle: TTC is not executable: $TTC" >&2; exit 1; }
+test -x "$TTCD" || { echo "TTC FUSE lifecycle: TTCD is not executable: $TTCD" >&2; exit 1; }
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+TTC=$BIN_DIR/ttc
+export TTC_ROOT=$ROOT/data
+
+ttc() {
+	"$TTC" --daemon-socket "$SOCKET" "$@"
+}
 
 cleanup() {
-	"$TTC" rm -f "$NAME" >/dev/null 2>&1 || true
+	ttc rm -f "$NAME" >/dev/null 2>&1 || true
+	ttc daemon stop --stop-all >/dev/null 2>&1 || true
+	if test "$OWNED_ROOT" -eq 1; then
+		rm -rf "$ROOT"
+	fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -29,10 +53,11 @@ fail() {
 	exit 1
 }
 
-"$TTC" run -d --cap-add SYS_ADMIN --network=ttc --nat --name "$NAME" "$IMAGE" sleep infinity >/dev/null
-"$TTC" exec "$NAME@main" sh -lc \
+ttc daemon start
+ttc run -d --cap-add SYS_ADMIN --network=ttc --nat --name "$NAME" "$IMAGE" sleep infinity >/dev/null
+ttc exec "$NAME@main" sh -lc \
 	'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse-overlayfs'
-"$TTC" exec "$NAME@main" sh -lc '
+ttc exec "$NAME@main" sh -lc '
 	mkdir -p /tmp/fuse/lower /tmp/fuse/upper /tmp/fuse/work /tmp/fuse/merged
 	echo base >/tmp/fuse/lower/base
 	fuse-overlayfs -f -o lowerdir=/tmp/fuse/lower,upperdir=/tmp/fuse/upper,workdir=/tmp/fuse/work /tmp/fuse/merged >/tmp/fuse/server.log 2>&1 &
@@ -44,19 +69,19 @@ fail() {
 	echo parent >/tmp/fuse/merged/branch
 '
 
-"$TTC" fork "$NAME@main" child >/dev/null
-child_before=$("$TTC" exec "$NAME@child" cat /tmp/fuse/merged/branch)
+ttc fork "$NAME@main" child >/dev/null
+child_before=$(ttc exec "$NAME@child" cat /tmp/fuse/merged/branch)
 test "$child_before" = parent || fail "child initially read $child_before"
-"$TTC" exec "$NAME@child" sh -lc 'echo child >/tmp/fuse/merged/branch'
-parent_after=$("$TTC" exec "$NAME@main" cat /tmp/fuse/merged/branch)
+ttc exec "$NAME@child" sh -lc 'echo child >/tmp/fuse/merged/branch'
+parent_after=$(ttc exec "$NAME@main" cat /tmp/fuse/merged/branch)
 test "$parent_after" = parent || fail "child FUSE write leaked into parent: $parent_after"
 
-"$TTC" dehydrate "$NAME@child" >/dev/null
-"$TTC" rehydrate "$NAME@child" >/dev/null
-child_after=$("$TTC" exec "$NAME@child" cat /tmp/fuse/merged/branch)
+ttc dehydrate "$NAME@child" >/dev/null
+ttc rehydrate "$NAME@child" >/dev/null
+child_after=$(ttc exec "$NAME@child" cat /tmp/fuse/merged/branch)
 test "$child_after" = child || fail "rehydrated child read $child_after"
-"$TTC" exec "$NAME@child" sh -lc 'echo rehydrated >/tmp/fuse/merged/branch'
-parent_final=$("$TTC" exec "$NAME@main" cat /tmp/fuse/merged/branch)
+ttc exec "$NAME@child" sh -lc 'echo rehydrated >/tmp/fuse/merged/branch'
+parent_final=$(ttc exec "$NAME@main" cat /tmp/fuse/merged/branch)
 test "$parent_final" = parent || fail "rehydrated FUSE write leaked into parent: $parent_final"
 
 echo "TTC in-sandbox FUSE fork/dehydrate/rehydrate lifecycle passed"
