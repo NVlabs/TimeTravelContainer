@@ -1140,6 +1140,13 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 
 // AsyncPagesFileLoad holds async page loading state for a single pages file.
 type AsyncPagesFileLoad struct {
+	// owners keeps the asynchronous reader alive while either a Kernel or a
+	// source-side RemoteSnapshot may still fault retained pages through it.
+	// Page references alone are insufficient: an unloaded page remains
+	// allocated after capture, but loses its contents if the last reader owner
+	// cancels the load.
+	owners atomic.Int64
+
 	mu apflMutex
 
 	// If errVal is not nil, it is an error that has terminated asynchronous
@@ -1544,6 +1551,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		ops:                        make([]aplOp, maxParallel),
 		done:                       make(chan struct{}),
 	}
+	apfl.owners.Store(1)
 	apfl.prefetchAheadBytes.Store(opts.PrefetchBytes)
 	apfl.prefetchBehindBytes.Store(opts.PrefetchBehindBytes)
 	apfl.demandOnly.Store(opts.DemandOnly)
@@ -1561,6 +1569,35 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+// IncOwner retains apfl's asynchronous reader. The caller must already own a
+// reference, which prevents resurrection after the final owner has canceled
+// the load.
+func (apfl *AsyncPagesFileLoad) IncOwner() {
+	for {
+		owners := apfl.owners.Load()
+		if owners <= 0 {
+			panic("retaining released asynchronous page load")
+		}
+		if apfl.owners.CompareAndSwap(owners, owners+1) {
+			return
+		}
+	}
+}
+
+// DecOwner releases one asynchronous-reader owner. The last release cancels
+// any unresolved reads and waits until the reader has closed.
+func (apfl *AsyncPagesFileLoad) DecOwner() error {
+	owners := apfl.owners.Add(-1)
+	if owners < 0 {
+		panic("negative asynchronous page load owner count")
+	}
+	if owners != 0 {
+		return nil
+	}
+	apfl.Cancel()
+	return apfl.Wait()
 }
 
 // SwitchReader atomically replaces the backing page source without loading

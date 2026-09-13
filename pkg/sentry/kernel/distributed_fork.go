@@ -264,6 +264,16 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
+		// A remotely backed source may be destroyed as soon as migration cuts
+		// over, while these snapshots must remain readable until their targets
+		// become independent. Retain the upstream loaders in each independently
+		// owned snapshot group so page pins also retain their data source.
+		pageLoads := k.distributedForkMemorySources()
+		for _, group := range [][]*pgalloc.RemoteSnapshot{snapshots, sparseSnapshots, handoffSnapshots} {
+			if err := group[0].RetainPageLoads(pageLoads); err != nil {
+				return fmt.Errorf("retaining distributed-fork upstream page sources: %w", err)
+			}
+		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
@@ -306,6 +316,15 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		return nil, err
 	}
 	return capture, nil
+}
+
+func (k *Kernel) distributedForkMemorySources() []*pgalloc.AsyncPagesFileLoad {
+	loads := make([]*pgalloc.AsyncPagesFileLoad, 0, 1+len(k.auxiliaryRemotePageLoads))
+	if k.remotePageLoad != nil {
+		loads = append(loads, k.remotePageLoad)
+	}
+	loads = append(loads, k.auxiliaryRemotePageLoads...)
+	return loads
 }
 
 // DistributedForkLoadOptions controls target reconstruction.

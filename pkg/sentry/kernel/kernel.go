@@ -2457,15 +2457,13 @@ func (k *Kernel) Release() {
 	k.rootCgroupNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
 	if k.remotePageLoad != nil {
-		k.remotePageLoad.Cancel()
-		_ = k.remotePageLoad.Wait()
+		_ = k.remotePageLoad.DecOwner()
 		k.remotePageLoad = nil
 	}
 	k.remoteLoadRanges = nil
 	k.remoteHandoffSnapshot = 0
 	for _, load := range k.auxiliaryRemotePageLoads {
-		load.Cancel()
-		_ = load.Wait()
+		_ = load.DecOwner()
 	}
 	k.auxiliaryRemotePageLoads = nil
 	k.mf.Destroy()

@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +120,24 @@ func TestDistributedSourceNoLongerNeeded(t *testing.T) {
 				t.Fatalf("distributedSourceNoLongerNeeded=%t, want %t", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDistributedDrainRetryable(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want bool
+	}{
+		{err: context.DeadlineExceeded, want: true},
+		{err: io.EOF, want: true},
+		{err: errors.New("cluster peer: distributed memory drain is still in progress"), want: true},
+		{err: errors.New("graph memory handoff was reinstalled and is still in progress"), want: true},
+		{err: errors.New("distributed memory drain failed: remote page server: I/O error")},
+		{err: errors.New("distributed filesystem drain failed: object is missing")},
+	} {
+		if got := distributedDrainRetryable(test.err); got != test.want {
+			t.Errorf("distributedDrainRetryable(%q)=%t, want %t", test.err, got, test.want)
+		}
 	}
 }
 

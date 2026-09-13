@@ -1858,6 +1858,33 @@ func distributedSourceNoLongerNeeded(store cluster.TransactionCatalog, transacti
 	return !tx.SourceNeeded || tx.Terminal(), nil
 }
 
+// distributedDrainRetryable reports target-local states that are expected to
+// settle without operator intervention. The transaction status alone cannot
+// distinguish a target that is still copying from one whose asynchronous page
+// loader has terminated permanently: both remain Draining until the runtime
+// fence succeeds. Retrying a permanent error forever wedges node retirement.
+func distributedDrainRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	message := err.Error()
+	for _, transient := range []string{
+		"still in progress",
+		"already in progress",
+		"was reinstalled",
+		"has not been started",
+	} {
+		if strings.Contains(message, transient) {
+			return true
+		}
+	}
+	return false
+}
+
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	return drainSourceDependenciesSelected(backend, source, store, nodeID, func(tx cluster.Transaction) bool {
 		if containerID != "" && tx.Identity.SourceContainer != containerID {
@@ -1950,6 +1977,9 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 			tx = *current
 			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+			}
+			if !distributedDrainRetryable(stepErr) {
+				return fmt.Errorf("draining distributed target %q failed permanently while transaction remained %s: %w", tx.Identity.TargetContainer, tx.State, stepErr)
 			}
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -2701,6 +2731,27 @@ func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return err
+	}
+	// The marker may have appeared after the read above returned ENOENT. Since
+	// publication uses link(2), observing its directory entry also observes the
+	// complete marker; validate the winner rather than treating it as legacy
+	// residue.
+	for _, entry := range entries {
+		if entry.Name() != ".ttc-root-format" {
+			continue
+		}
+		published, readErr := os.ReadFile(markerPath)
+		if readErr != nil {
+			return readErr
+		}
+		var got daemonRootMarker
+		if decodeErr := json.Unmarshal(published, &got); decodeErr != nil {
+			return fmt.Errorf("invalid concurrently-created root marker: %w", decodeErr)
+		}
+		if got != want {
+			return fmt.Errorf("root marker %+v does not match requested %+v", got, want)
+		}
+		return syncDaemonRootDirectory(root)
 	}
 	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {

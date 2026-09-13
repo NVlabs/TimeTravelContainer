@@ -1207,6 +1207,66 @@ func TestRemoteSnapshotCloseWaitsForLease(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotRetainsUpstreamPageLoad(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*29 + 3)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	target := newEmptyRemoteTestMemoryFile(t)
+	targetHasRefs := false
+	t.Cleanup(func() {
+		if targetHasRefs {
+			target.DecRef(sourceFR)
+		}
+		target.Destroy()
+	})
+	regions, loads, err := CloneMemoryFileMetadataForRemote(context.Background(), source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHasRefs = true
+	upstream, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(upstream, sourceFR.Length(), 16, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	downstream, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := downstream.RetainPageLoads([]*AsyncPagesFileLoad{pages}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate destruction of the source Kernel. The downstream snapshot is
+	// now the only lifecycle owner of the upstream reader.
+	if err := pages.DecOwner(); err != nil {
+		t.Fatalf("releasing Kernel page-load owner: %v", err)
+	}
+
+	got := make([]byte, len(want))
+	if n, err := downstream.CopyStreamAt(got, 0); err != nil || n != len(got) {
+		t.Fatalf("reading chained snapshot after Kernel release: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("chained snapshot returned incorrect contents")
+	}
+	if err := downstream.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRemoteSnapshotAcquireReleaseRace(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 1)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})

@@ -96,7 +96,10 @@ type RemoteSnapshot struct {
 type remoteSnapshotShared struct {
 	views  map[*RemoteSnapshot]struct{}
 	owners []*MemoryFile
-	active sync.WaitGroup
+	// pageLoads keep upstream sparse readers alive when this snapshot captures
+	// a remotely backed Kernel and subsequently outlives that Kernel.
+	pageLoads []*AsyncPagesFileLoad
+	active    sync.WaitGroup
 }
 
 // RemotePushHint identifies fork-time bytes that became especially valuable
@@ -346,6 +349,36 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 		}
 	}
 	return snapshots, nil
+}
+
+// RetainPageLoads keeps upstream asynchronous readers alive for all sibling
+// views of s. It must be called at most once for a snapshot sibling group and
+// while the caller still owns every load.
+func (s *RemoteSnapshot) RetainPageLoads(loads []*AsyncPagesFileLoad) error {
+	if s == nil || len(loads) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("remote snapshot is closed")
+	}
+	if len(s.shared.pageLoads) != 0 {
+		return errors.New("remote snapshot page loads were already retained")
+	}
+	seen := make(map[*AsyncPagesFileLoad]struct{}, len(loads))
+	for _, load := range loads {
+		if load == nil {
+			return errors.New("remote snapshot cannot retain a nil page load")
+		}
+		if _, ok := seen[load]; ok {
+			continue
+		}
+		seen[load] = struct{}{}
+		load.IncOwner()
+		s.shared.pageLoads = append(s.shared.pageLoads, load)
+	}
+	return nil
 }
 
 // ExportMemoryFileMetadataForRemote captures allocator metadata and the packed
@@ -964,6 +997,9 @@ func (s *RemoteSnapshot) Close() error {
 	s.active.Wait()
 	if lastView {
 		s.shared.active.Wait()
+		for _, load := range s.shared.pageLoads {
+			_ = load.DecOwner()
+		}
 		for _, file := range s.owners {
 			file.Destroy()
 		}
@@ -1426,7 +1462,7 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		src, err := lease.File().MapInternal(lease.Range(), hostarch.Read)
 		if err != nil {
 			lease.Close()
-			return written, err
+			return written, fmt.Errorf("mapping remote snapshot region %d source range %v for stream offset %#x: %w", region.ID, lease.Range(), streamOff, err)
 		}
 		dstSeq := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(dst[written : written+int(length)]))
 		copied, copyErr := safemem.CopySeq(dstSeq, src)
