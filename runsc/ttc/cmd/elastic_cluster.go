@@ -574,14 +574,21 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				}
 				record = *adopted
 			}
-			if record.State != state {
-				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
-					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
-				}
-			}
 			branchAuthority, authorityKnown := cluster.BranchAuthority{}, false
 			if authorityState != nil {
 				branchAuthority, authorityKnown = authorityState.Branches[key]
+			}
+			// Publication changes the branch authority lifecycle before its
+			// irreversible commit, while the physical placement intentionally
+			// remains on the current node. Canceling that publication and starting
+			// or rehydrating the branch can therefore leave the placement already
+			// in the desired stable state but the branch authority at the terminal
+			// publication state. Re-propose the idempotent stable placement update
+			// when either view differs; Raft then repairs both atomically.
+			if record.State != state || (authorityKnown && branchAuthority.Lifecycle != string(state)) {
+				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
+					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
+				}
 			}
 			if b.distributedSource.authority != nil && (!authorityKnown || !branchAuthority.DependenciesInherited) {
 				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {

@@ -6410,6 +6410,31 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	default:
 		return 1, fmt.Errorf("branch %s is %s", target, normalizeLifecycleState(branch.State))
 	}
+	// A stopped branch becomes locally restartable before its immutable capture
+	// is necessarily shared. Fence that exact capture before executing a fresh
+	// process incarnation. Otherwise its late completion could still release the
+	// placement or overwrite storage metadata belonging to the new runtime.
+	// A committed capture has a manifest and no active worker; materialize it
+	// below before changing the local storage view.
+	if branch.PublicationID != "" && branch.StorageManifest == "" {
+		if b.publicationQueue == nil {
+			return 1, fmt.Errorf("branch %s has publication %q but no publication queue", target, branch.PublicationID)
+		}
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, branch.PublicationID); err != nil {
+			return 1, fmt.Errorf("fencing stopped snapshot publication for %s: %w", target, err)
+		}
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, branch.PublicationID); err != nil {
+			return 1, fmt.Errorf("retiring stopped snapshot publication for %s: %w", target, err)
+		}
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return 1, err
+		}
+		branch, err = persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return 1, err
+		}
+	}
 	preservedPeers, err := freshStartPeers(info, target)
 	if err != nil {
 		return 1, err
@@ -11922,11 +11947,11 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
 		}
 		publicationID := persistentBranch.PublicationID
-		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, publicationID); err != nil {
 			return fmt.Errorf("fencing dehydration publication for %s: %w", target, err)
 		}
-		if err := b.publicationQueue.Cancel(info.ID, target.branch, publicationID); err != nil {
-			return fmt.Errorf("canceling dehydration publication for %s: %w", target, err)
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
+			return fmt.Errorf("retiring dehydration publication for %s: %w", target, err)
 		}
 		// AbandonBranchPublication clears the immutable publication fence. Reload
 		// so the cold restore cannot accidentally reuse the canceled identity.

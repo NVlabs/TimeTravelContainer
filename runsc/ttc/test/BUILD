@@ -138,6 +138,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts a clustered daemon and deliberately races fresh
+# start and rehydration against asynchronous cold publication.
+sh_binary(
+    name = "e2e_publication_restart",
+    srcs = ["e2e_publication_restart.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",
