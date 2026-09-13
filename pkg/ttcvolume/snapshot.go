@@ -173,7 +173,18 @@ func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 				return err
 			}
 		}
-		catalog := snapshot.RepositoryID + ":" + snapshot.Root
+		// A deferred catalog is a local expansion namespace, not merely the
+		// identity of the foreign root. Independent imports of the same foreign
+		// root may coexist in one repository (for example, remote fan-out into
+		// sibling branches). They have distinct range streams and distinct
+		// catalog-working origins. Reusing the repository/root pair would make
+		// ImportDeferredFilesystemRoot reuse an object owned by the first
+		// origin, leaving the later origin empty and eligible for collection;
+		// it would also make the later resolver replace the first one. Include
+		// the never-reused expansion origin to keep both ownership and resolver
+		// lifetime exact. Local forks continue to share this catalog string and
+		// its expansion origin intentionally.
+		catalog := fmt.Sprintf("%s:%s:%d", snapshot.RepositoryID, snapshot.Root, catalogWorking)
 		root, err := r.graph.ImportDeferredFilesystemRoot(catalogWorking, graphRootName(targetBranch), catalog, descriptor.Root)
 		if err != nil {
 			return err

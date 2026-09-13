@@ -315,6 +315,71 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	}
 }
 
+func TestIndependentRemoteImportsOfSameRootHaveDistinctCatalogs(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("independent imported catalog\n"), 10000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target"), "target", descriptor, "first", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.ImportRemoteBranchDescriptorWithOrigins(descriptor, "second", 102, 103); err != nil {
+		t.Fatal(err)
+	}
+	first, err := target.Branch("first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := target.Branch("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RemoteCatalog == second.RemoteCatalog {
+		t.Fatalf("independent imports share catalog %q", first.RemoteCatalog)
+	}
+	if first.RemoteCatalogSnapshot != 101 || second.RemoteCatalogSnapshot != 103 {
+		t.Fatalf("catalog origins first=%d second=%d, want 101 and 103", first.RemoteCatalogSnapshot, second.RemoteCatalogSnapshot)
+	}
+	for _, origin := range []ttcsnapshot.SnapshotID{101, 103} {
+		snapshot, ok := target.graph.Snapshot(origin)
+		if !ok || snapshot.State != ttcsnapshot.SnapshotWorking {
+			t.Fatalf("catalog origin %d=(%+v,%t), want working", origin, snapshot, ok)
+		}
+	}
+
+	firstServer := attachTestRemote(t, source, target, "sealed", "first", nil)
+	secondServer := attachTestRemote(t, source, target, "sealed", "second", nil)
+	if got := readAll(t, target, "first", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("first import returned different contents")
+	}
+	if got := readAll(t, target, "second", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("second import returned different contents")
+	}
+	finishTestRemote(t, target, firstServer)
+	finishTestRemote(t, target, secondServer)
+}
+
 func TestMaterializeRemoteObjectsAfterImportedBranchRemoval(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")
