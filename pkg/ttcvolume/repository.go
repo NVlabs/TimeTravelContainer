@@ -1498,6 +1498,20 @@ func (r *Repository) RemoveBranch(id string) error {
 	})
 }
 
+// RemoveBranchAndCollect is the runtime-side teardown operation for a branch
+// whose Kernel and open file descriptions have already been released. It
+// removes the persistent root before collecting, so surviving branches are
+// protected solely by their own graph edges. Collection may be deferred when
+// another Sentry has the same repository open; daemon-side cleanup remains an
+// idempotent fallback.
+func (r *Repository) RemoveBranchAndCollect(id string) error {
+	if err := r.RemoveBranch(id); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err := r.GarbageCollectActive()
+	return err
+}
+
 // ForgetBranch releases process-local caches for a branch whose Kernel has
 // been released. It does not alter the persistent branch pointer; ttcd removes
 // that pointer separately, or a later rehydration reloads it on demand.

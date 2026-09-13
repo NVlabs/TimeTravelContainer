@@ -687,11 +687,112 @@ func quarantineDataFile(path, quarantine string) error {
 	return fmt.Errorf("allocating quarantine name for unknown TTC object %q", path)
 }
 
+func (store *LocalDataStore) quarantineRelative(relative string) error {
+	if err := unix.Mkdirat(int(store.rootFD.Fd()), "quarantine", 0700); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	quarantine, err := store.openRelative("quarantine", unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("opening TTC object quarantine: %w", err)
+	}
+	defer quarantine.Close()
+	for attempts := 0; attempts < 100; attempts++ {
+		destination := fmt.Sprintf("unknown-%016x-%s", dataTemporarySequence.Add(1), filepath.Base(relative))
+		if err := unix.Renameat(int(store.rootFD.Fd()), relative, int(quarantine.Fd()), destination); err != nil {
+			if errors.Is(err, unix.EEXIST) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("allocating quarantine name for unknown TTC object %q", relative)
+}
+
+// reclaimRelative walks one known bulk-data subtree using only the donated
+// repository descriptor. It intentionally never follows symlinks. Unknown
+// non-directory entries are quarantined just like the path-backed collector,
+// while empty implementation-owned shard directories are removed bottom-up.
+func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (removed, quarantined int, err error) {
+	directory, err := store.openRelative(relative, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return 0, 0, errors.Join(readErr, closeErr)
+	}
+	for _, entry := range entries {
+		child := filepath.Join(relative, entry.Name())
+		var stat unix.Stat_t
+		if err := unix.Fstatat(int(store.rootFD.Fd()), child, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return removed, quarantined, err
+		}
+		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+			r, q, err := store.reclaimRelative(graph, child)
+			removed += r
+			quarantined += q
+			if err != nil {
+				return removed, quarantined, err
+			}
+			if err := unix.Unlinkat(int(store.rootFD.Fd()), child, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTEMPTY) {
+				return removed, quarantined, err
+			}
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), ".object-") || strings.HasPrefix(entry.Name(), ".clone-") || strings.HasPrefix(entry.Name(), ".replace-") {
+			if err := unix.Unlinkat(int(store.rootFD.Fd()), child, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+				return removed, quarantined, err
+			}
+			removed++
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), ".data")
+		id, parseErr := ParseObjectID(name)
+		if parseErr != nil || name == entry.Name() || stat.Mode&unix.S_IFMT != unix.S_IFREG {
+			if err := store.quarantineRelative(child); err != nil {
+				return removed, quarantined, err
+			}
+			quarantined++
+			continue
+		}
+		if _, ok := graph.Object(id); ok {
+			continue
+		}
+		if err := unix.Unlinkat(int(store.rootFD.Fd()), child, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			return removed, quarantined, err
+		}
+		removed++
+	}
+	return removed, quarantined, nil
+}
+
 // ReclaimUnreferenced removes complete bulk objects absent from graph and
 // quarantines unknown names. Callers serialize it with graph/data commits.
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {
 	store.gcMu.Lock()
 	defer store.gcMu.Unlock()
+	if store.rootFD != nil {
+		for _, kind := range []string{"pages", "memory-chunks", "files"} {
+			r, q, reclaimErr := store.reclaimRelative(graph, kind)
+			removed += r
+			quarantined += q
+			if reclaimErr != nil {
+				return removed, quarantined, reclaimErr
+			}
+			if err := unix.Unlinkat(int(store.rootFD.Fd()), kind, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENOTEMPTY) {
+				return removed, quarantined, err
+			}
+		}
+		return removed, quarantined, nil
+	}
 	quarantine := filepath.Join(store.root, "quarantine")
 	for _, kind := range []string{"pages", "memory-chunks", "files"} {
 		base := filepath.Join(store.root, kind)

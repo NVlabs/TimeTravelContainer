@@ -67,24 +67,69 @@ func (r *Repository) GarbageCollect() error {
 	return r.withLock(r.garbageCollectLocked)
 }
 
+// GarbageCollectActive performs collection from a descriptor-backed runtime
+// repository when this runtime is its only active user. The lifecycle lock is
+// upgraded while holding the repository mutation lock, so another Sentry's
+// unpublished metadata tail can never be mistaken for unreachable data. If a
+// peer runtime also has the repository open, collection is safely deferred to
+// a later branch teardown or manager-side pass.
+func (r *Repository) GarbageCollectActive() (collected bool, result error) {
+	if r == nil || r.activeLock == nil {
+		return false, errors.New("active garbage collection requires a donated runtime repository")
+	}
+	err := r.withLock(func() (innerErr error) {
+		fd := int(r.activeLock.Fd())
+		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			// flock upgrades are not guaranteed to retain the old shared lock
+			// after a failed conversion. Reacquire it before returning.
+			relockErr := unix.Flock(fd, unix.LOCK_SH)
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				return relockErr
+			}
+			return errors.Join(fmt.Errorf("upgrading repository lifecycle lock: %w", err), relockErr)
+		}
+		defer func() {
+			innerErr = errors.Join(innerErr, unix.Flock(fd, unix.LOCK_SH))
+		}()
+		if err := r.garbageCollectLocked(); err != nil {
+			return err
+		}
+		collected = true
+		return nil
+	})
+	return collected, err
+}
+
+func (r *Repository) branchNamesLocked() ([]string, error) {
+	branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	names, readErr := branchDir.Readdirnames(-1)
+	closeErr := branchDir.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	return names, nil
+}
+
 func (r *Repository) garbageCollectLocked() error {
 	if err := r.flushAllMetadataBatchesLocked(); err != nil {
 		return fmt.Errorf("publishing metadata before garbage collection: %w", err)
 	}
-	branchDir := filepath.Join(r.path, "branches")
-	entries, err := os.ReadDir(branchDir)
+	names, err := r.branchNamesLocked()
 	if err != nil {
 		return err
 	}
 	liveBranchIDs := make(map[string]struct{})
 	var workingSnapshots []ttcsnapshot.SnapshotID
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".json")
+		id := strings.TrimSuffix(name, ".json")
 		if err := validateName(id, "branch"); err != nil {
-			return fmt.Errorf("invalid branch pointer %q during garbage collection: %w", entry.Name(), err)
+			return fmt.Errorf("invalid branch pointer %q during garbage collection: %w", name, err)
 		}
 		branch, err := r.readBranch(id)
 		if err != nil {

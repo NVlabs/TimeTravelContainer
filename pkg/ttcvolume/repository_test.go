@@ -1538,6 +1538,129 @@ func TestGarbageCollectSkipsLiveDonatedRepositoryMetadataTail(t *testing.T) {
 	}
 }
 
+func TestActiveGarbageCollectBoundsDonatedBranchChurn(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("active-branch-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "main", 0)
+	directory, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := OpenRepositoryFD(directory, CopyModeFull)
+	directory.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	for round := 0; round < 160; round++ {
+		childID := fmt.Sprintf("temporary-%04d", round)
+		if err := runtime.Fork(MainBranch, childID); err != nil {
+			t.Fatalf("round %d Fork: %v", round, err)
+		}
+		if _, _, err := runtime.WriteAt(childID, ino, []byte("child"), 0); err != nil {
+			t.Fatalf("round %d child WriteAt: %v", round, err)
+		}
+		child, err := runtime.Inode(childID, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		childObject := filepath.Join(path, runtime.objectPath(child.Object))
+		if err := runtime.RemoveBranchAndCollect(childID); err != nil {
+			t.Fatalf("round %d RemoveBranchAndCollect: %v", round, err)
+		}
+		if _, err := os.Stat(childObject); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("round %d child object survived active collection: %v", round, err)
+		}
+		if got := readAll(t, runtime, MainBranch, ino); got != "main" {
+			t.Fatalf("round %d main data=%q", round, got)
+		}
+	}
+
+	if stats := runtime.graph.Stats(); stats.Roots != 2 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("active graph after churn=%+v, want current+diff roots, at most two live origins, and no reclaiming objects", stats)
+	}
+	runtime.metadataMu.Lock()
+	metadataEntries := len(runtime.metadata)
+	runtime.metadataMu.Unlock()
+	if metadataEntries > 1 {
+		t.Fatalf("active runtime retained %d historical metadata entries", metadataEntries)
+	}
+}
+
+func TestActiveGarbageCollectDefersForPeerRuntimeTail(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("active-peer-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryA, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryB, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtimeA, err := OpenRepositoryFD(directoryA, CopyModeFull)
+	directoryA.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeA.Close()
+	runtimeB, err := OpenRepositoryFD(directoryB, CopyModeFull)
+	directoryB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeB.Close()
+
+	ino, err := runtimeA.CreateRegular(MainBranch, RootInode, "pending", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runtimeA.WriteAt(MainBranch, ino, []byte("peer-tail"), 0); err != nil {
+		t.Fatal(err)
+	}
+	inode, err := runtimeA.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(path, "data", "files", fmt.Sprintf("%016x", objectID.Snapshot), fmt.Sprintf("%02x", byte(objectID.Ordinal)), inode.Object+".data")
+	collected, err := runtimeB.GarbageCollectActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected {
+		t.Fatal("active collection succeeded while a peer runtime held an unpublished metadata tail")
+	}
+	if _, err := os.Stat(objectPath); err != nil {
+		t.Fatalf("deferred active collection removed peer-tail data: %v", err)
+	}
+	if got := readAll(t, runtimeA, MainBranch, ino); got != "peer-tail" {
+		t.Fatalf("peer-tail data=%q", got)
+	}
+}
+
 func TestMetadataDurabilityFenceReclaimsObsoleteBulkByID(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("bounded-bulk-churn")

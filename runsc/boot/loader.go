@@ -947,6 +947,15 @@ func New(args Args) (*Loader, error) {
 				volume.repository.ForgetBranch(branch)
 			}
 		},
+		ReclaimFilesystemBranch: func(branch string) error {
+			var result error
+			for source, volume := range l.ttcVolumeRepositories {
+				if err := volume.repository.RemoveBranchAndCollect(branch); err != nil {
+					result = errors.Join(result, fmt.Errorf("reclaiming TTC filesystem %q branch %q: %w", source, branch, err))
+				}
+			}
+			return result
+		},
 		InitialBranchID:         initialBranchID,
 		InitialBranchParentID:   initialBranchParentID,
 		InitialFilesystemBranch: initialFilesystemBranch,

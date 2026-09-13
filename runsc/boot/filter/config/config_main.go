@@ -501,10 +501,17 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
 			seccomp.AnyValue{},
 		},
-		unix.SYS_UNLINKAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.EqualTo(0),
+		unix.SYS_UNLINKAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.EqualTo(unix.AT_REMOVEDIR),
+			},
 		},
 		unix.SYS_MKDIRAT: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
@@ -551,6 +558,10 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(unix.LOCK_EX),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.LOCK_EX | unix.LOCK_NB),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},

@@ -543,6 +543,43 @@ func TestSandboxFamilyInitialBranchIdentity(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyDestroyReclaimsReleasedFilesystemBranch(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	var reclaimed []string
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		LiveForkEligible: true,
+		ReclaimFilesystemBranch: func(branch string) error {
+			reclaimed = append(reclaimed, branch)
+			return nil
+		},
+	})
+	child, err := family.Fork(&ForkBranchArgs{ID: "short-lived", Paused: true})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := family.Destroy(child.ID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0] != child.FilesystemBranch {
+		t.Fatalf("reclaimed filesystem branches=%q, want [%q]", reclaimed, child.FilesystemBranch)
+	}
+}
+
 func TestDestroyLoaderPrefersLivePeerOverExitedPeer(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {

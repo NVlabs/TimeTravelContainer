@@ -102,6 +102,33 @@ func TestTTCVolumeAllowsSharedRepositoryLock(t *testing.T) {
 	}
 }
 
+func TestTTCVolumeAllowsActiveRepositoryCollection(t *testing.T) {
+	rules, _ := Rules(Options{
+		Platform:  (&systrap.Systrap{}).SeccompInfo(),
+		TTCVolume: true,
+	})
+	for _, operation := range []uint64{unix.LOCK_EX | unix.LOCK_NB, unix.AT_REMOVEDIR} {
+		syscall := uintptr(unix.SYS_FLOCK)
+		argument := 1
+		if operation == unix.AT_REMOVEDIR {
+			syscall = unix.SYS_UNLINKAT
+			argument = 2
+		}
+		found := false
+		if err := rules.ForSingleArgument(syscall, argument, func(matcher seccomp.ValueMatcher) error {
+			if equal, ok := matcher.(seccomp.EqualTo); ok && equal == seccomp.EqualTo(operation) {
+				found = true
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("inspecting syscall %d operation %#x: %v", syscall, operation, err)
+		}
+		if !found {
+			t.Fatalf("TTC volume seccomp rules reject syscall %d operation %#x", syscall, operation)
+		}
+	}
+}
+
 // TestOptionsConfigKey verifies the behavior of `Options.ConfigKey`.
 func TestOptionsConfigKey(t *testing.T) {
 	// mutateFn mutates the value of a specific Options field.

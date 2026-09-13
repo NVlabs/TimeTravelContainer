@@ -627,6 +627,7 @@ type SandboxFamily struct {
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 	forgetFilesystemBranch         func(string)
+	reclaimFilesystemBranch        func(string) error
 }
 
 type distributedForkSession struct {
@@ -673,9 +674,13 @@ type SandboxFamilyOptions struct {
 	ConfigureNetwork      func(*kernel.Kernel, inet.Stack) error
 	OnLoaderKernelChanged func(*kernel.Kernel, *watchdog.Watchdog)
 	// ForgetFilesystemBranch releases process-local TTC repository caches once
-	// a branch no longer has a Kernel. Persistent branch pointers are managed by
-	// ttcd and are intentionally unaffected by this callback.
+	// a branch becomes process-free but remains a live family member.
 	ForgetFilesystemBranch func(string)
+	// ReclaimFilesystemBranch removes the persistent filesystem root after a
+	// branch Kernel and all of its open file descriptions have been released.
+	// It also performs runtime-side graph collection when this is the only
+	// Sentry using the repository.
+	ReclaimFilesystemBranch func(string) error
 	// InitialBranchID and InitialFilesystemBranch identify the branch represented
 	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
 	// defaults used by ordinary OCI creation.
@@ -735,6 +740,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		configureNetwork:               opts.ConfigureNetwork,
 		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
+		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
 		distributedHandoffs:            make(map[string]*distributedForkHandoff),
@@ -2586,6 +2592,16 @@ func (f *SandboxFamily) PrepareStop(id string) error {
 	return nil
 }
 
+func (f *SandboxFamily) reclaimReleasedFilesystem(branch string) error {
+	if f.reclaimFilesystemBranch != nil {
+		return f.reclaimFilesystemBranch(branch)
+	}
+	if f.forgetFilesystemBranch != nil {
+		f.forgetFilesystemBranch(branch)
+	}
+	return nil
+}
+
 // Destroy destroys a branch and removes it from the family. If id currently
 // occupies the loader bookkeeping role, that role moves to an established
 // peer first. This role transfer has no guest-visible or lineage semantics.
@@ -2679,10 +2695,7 @@ func (f *SandboxFamily) Destroy(id string) error {
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
-		if f.forgetFilesystemBranch != nil {
-			f.forgetFilesystemBranch(b.filesystemBranch)
-		}
-		err := image.image.Close()
+		err := errors.Join(image.image.Close(), f.reclaimReleasedFilesystem(b.filesystemBranch))
 		f.mu.Lock()
 		delete(f.branches, id)
 		delete(f.distributedHandoffs, id)
@@ -2691,15 +2704,13 @@ func (f *SandboxFamily) Destroy(id string) error {
 		return err
 	}
 	if b.k == nil {
-		if f.forgetFilesystemBranch != nil {
-			f.forgetFilesystemBranch(b.filesystemBranch)
-		}
+		reclaimErr := f.reclaimReleasedFilesystem(b.filesystemBranch)
 		f.mu.Lock()
 		delete(f.branches, id)
 		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return nil
+		return reclaimErr
 	}
 
 	if dog != nil {
@@ -2717,15 +2728,13 @@ func (f *SandboxFamily) Destroy(id string) error {
 	b.k.Release()
 	familyMF.ReclaimUnusedSparseChunks()
 	familyMF.Destroy()
-	if f.forgetFilesystemBranch != nil {
-		f.forgetFilesystemBranch(b.filesystemBranch)
-	}
+	reclaimErr := f.reclaimReleasedFilesystem(b.filesystemBranch)
 
 	f.mu.Lock()
 	delete(f.branches, id)
 	delete(f.distributedHandoffs, id)
 	f.mu.Unlock()
-	return nil
+	return reclaimErr
 }
 
 // Processes returns processes from one branch's kernel task graph.
