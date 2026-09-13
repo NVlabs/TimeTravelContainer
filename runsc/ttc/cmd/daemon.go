@@ -1865,6 +1865,7 @@ func drainSourceDependenciesSelected(backend *runtimeBackend, source *distribute
 	if err != nil {
 		return fmt.Errorf("listing distributed dependencies: %w", err)
 	}
+	pending := make([]cluster.Transaction, 0, len(transactions))
 	for i := range transactions {
 		tx := transactions[i]
 		if tx.Identity.SourceNodeID != nodeID || !tx.SourceNeeded ||
@@ -1874,90 +1875,105 @@ func drainSourceDependenciesSelected(backend *runtimeBackend, source *distribute
 		if selected != nil && !selected(tx) {
 			continue
 		}
-		peer, err := source.peer(tx.Identity.TargetNodeID, false)
-		if err != nil {
-			return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
-		}
-		// Drive both halves of the independence barrier. Drain materializes
-		// remote memory and advances Published -> Draining. MarkIndependent
-		// verifies memory completion, materializes every deferred filesystem
-		// object, and only then advances Draining -> Independent. Merely polling
-		// after Drain leaves filesystem-backed transactions in Draining forever.
-		//
-		// Each RPC is bounded so a lost peer is observable, but the operation as
-		// a whole has no data-size timeout: a healthy target on a throttled shared
-		// filesystem may legitimately need longer than any fixed deadline. Both
-		// transitions and their runtime operations are idempotent, so a request
-		// whose response was lost can be retried safely.
-		for tx.State != cluster.TransactionIndependent {
-			var (
-				current *cluster.Transaction
-				stepErr error
-			)
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			switch tx.State {
-			case cluster.TransactionPublished:
-				current, stepErr = peer.Drain(ctx, tx.Identity.TransactionID, tx.Revision)
-			case cluster.TransactionDraining:
-				current, stepErr = peer.MarkIndependent(ctx, tx.Identity.TransactionID, tx.Revision)
-			case cluster.TransactionCanceled, cluster.TransactionFailed:
-				cancel()
-				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
-			default:
-				cancel()
-				return fmt.Errorf("distributed target %q is unexpectedly %s while draining", tx.Identity.TargetContainer, tx.State)
-			}
-			cancel()
-			if stepErr == nil && current != nil {
-				tx = *current
-				continue
-			}
+		pending = append(pending, tx)
+	}
+	// Memory drains are branch-local and may run concurrently. Filesystem
+	// materialization remains protected by daemonTargetRuntime's per-family
+	// lock, so siblings converge through one repository-wide barrier rather
+	// than racing it. Bounded parallelism is essential during node retirement:
+	// serially waiting for every remote branch makes evacuation time grow by a
+	// full network round trip (and often a 30-second retry window) per branch.
+	errs := make([]error, len(pending))
+	runBoundedBatch(len(pending), distributedBatchControlConcurrency, func(i int) {
+		errs[i] = drainSourceDependency(backend, source, store, pending[i])
+	})
+	return errors.Join(errs...)
+}
 
-			// The target may have committed the transition after the caller's
-			// deadline or returned the expected "still in progress" conflict.
-			// Re-read its state before deciding whether the retry is necessary.
-			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-			current, statusErr := peer.Status(ctx, tx.Identity.TransactionID)
+func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, tx cluster.Transaction) error {
+	peer, err := source.peer(tx.Identity.TargetNodeID, false)
+	if err != nil {
+		return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
+	}
+	// Drive both halves of the independence barrier. Drain materializes
+	// remote memory and advances Published -> Draining. MarkIndependent
+	// verifies memory completion, materializes every deferred filesystem
+	// object, and only then advances Draining -> Independent. Merely polling
+	// after Drain leaves filesystem-backed transactions in Draining forever.
+	//
+	// Each RPC is bounded so a lost peer is observable, but the operation as
+	// a whole has no data-size timeout: a healthy target on a throttled shared
+	// filesystem may legitimately need longer than any fixed deadline. Both
+	// transitions and their runtime operations are idempotent, so a request
+	// whose response was lost can be retried safely.
+	for tx.State != cluster.TransactionIndependent {
+		var (
+			current *cluster.Transaction
+			stepErr error
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		switch tx.State {
+		case cluster.TransactionPublished:
+			current, stepErr = peer.Drain(ctx, tx.Identity.TransactionID, tx.Revision)
+		case cluster.TransactionDraining:
+			current, stepErr = peer.MarkIndependent(ctx, tx.Identity.TransactionID, tx.Revision)
+		case cluster.TransactionCanceled, cluster.TransactionFailed:
 			cancel()
-			if statusErr == nil {
-				tx = *current
-				if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
-					return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
-				}
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
-			if authorityErr != nil {
-				return fmt.Errorf("rechecking distributed target %q while draining: %w", tx.Identity.TargetContainer, authorityErr)
-			}
-			if settled {
-				tx.State = cluster.TransactionIndependent
-				break
-			}
-			return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, errors.Join(stepErr, statusErr))
+			return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
+		default:
+			cancel()
+			return fmt.Errorf("distributed target %q is unexpectedly %s while draining", tx.Identity.TargetContainer, tx.State)
 		}
-		if tx.Identity.Migration {
-			// An evacuating daemon cannot leave physical cleanup to the ordinary
-			// asynchronous migration monitor: node-stop may close the daemon and
-			// discard its local root immediately after this barrier. Independence
-			// proves the target no longer reads the source, so synchronously release
-			// both the transfer pin and the paused source Kernel. Both operations
-			// are idempotent with a monitor that happened to win the race.
-			unlockSource := source.lockSourceFamily(tx.Identity.SourceContainer)
-			_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
-			if err := backend.releaseDistributedGraphReferences(graphTransferReferenceOperation(tx.Identity.TransactionID)); err != nil {
-				unlockSource()
-				return fmt.Errorf("releasing migrated graph roots for %q: %w", tx.Identity.TransactionID, err)
+		cancel()
+		if stepErr == nil && current != nil {
+			tx = *current
+			continue
+		}
+
+		// The target may have committed the transition after the caller's
+		// deadline or returned the expected "still in progress" conflict.
+		// Re-read its state before deciding whether the retry is necessary.
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		current, statusErr := peer.Status(ctx, tx.Identity.TransactionID)
+		cancel()
+		if statusErr == nil {
+			tx = *current
+			if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+				return fmt.Errorf("distributed target %q became %s while draining: %s", tx.Identity.TargetContainer, tx.State, tx.Failure)
 			}
-			if err := backend.releaseMigratedSourceRuntime(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err != nil {
-				unlockSource()
-				return fmt.Errorf("releasing migrated source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
-			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		settled, authorityErr := distributedSourceNoLongerNeeded(store, tx.Identity.TransactionID)
+		if authorityErr != nil {
+			return fmt.Errorf("rechecking distributed target %q while draining: %w", tx.Identity.TargetContainer, authorityErr)
+		}
+		if settled {
+			tx.State = cluster.TransactionIndependent
+			break
+		}
+		return fmt.Errorf("draining distributed target %q: %w", tx.Identity.TargetContainer, errors.Join(stepErr, statusErr))
+	}
+	if tx.Identity.Migration {
+		// An evacuating daemon cannot leave physical cleanup to the ordinary
+		// asynchronous migration monitor: node-stop may close the daemon and
+		// discard its local root immediately after this barrier. Independence
+		// proves the target no longer reads the source, so synchronously release
+		// both the transfer pin and the paused source Kernel. Both operations
+		// are idempotent with a monitor that happened to win the race.
+		unlockSource := source.lockSourceFamily(tx.Identity.SourceContainer)
+		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+		if err := backend.releaseDistributedGraphReferences(graphTransferReferenceOperation(tx.Identity.TransactionID)); err != nil {
 			unlockSource()
-		} else {
-			_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+			return fmt.Errorf("releasing migrated graph roots for %q: %w", tx.Identity.TransactionID, err)
 		}
+		if err := backend.releaseMigratedSourceRuntime(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err != nil {
+			unlockSource()
+			return fmt.Errorf("releasing migrated source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
+		}
+		unlockSource()
+	} else {
+		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
 	}
 	return nil
 }

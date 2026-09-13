@@ -2444,18 +2444,34 @@ func (b *runtimeBackend) executePlacementPlan(plan cluster.FixedTerminalPlan, re
 	for index := range reservations {
 		byNode[reservations[index].node] = &reservations[index]
 	}
-	var executionErr error
-	for _, move := range plan.Moves {
+	// A plan contains independent branch cutovers. Execute a bounded set in
+	// parallel so evacuating a high-fanout family does not pay target startup
+	// and network latency serially for every branch. Each migration has its own
+	// Raft transaction and placement CAS; failures leave the node cordoned and
+	// retryable, while successful siblings remain valid completed moves.
+	const migrationConcurrency = 4
+	moveErrors := make([]error, len(plan.Moves))
+	moved := make([]bool, len(plan.Moves))
+	runBoundedBatch(len(plan.Moves), migrationConcurrency, func(i int) {
+		move := plan.Moves[i]
 		target, err := parseSelector(move.Branch)
 		if err != nil {
-			executionErr = err
-			break
+			moveErrors[i] = err
+			return
 		}
 		if err := b.migrate(target, move.ToNode); err != nil {
-			executionErr = fmt.Errorf("executing placement move %s to %s: %w", target, move.ToNode, err)
-			break
+			moveErrors[i] = fmt.Errorf("executing placement move %s to %s: %w", target, move.ToNode, err)
+			return
 		}
-		if reservation := byNode[move.ToNode]; reservation != nil {
+		moved[i] = true
+	})
+	var executionErr error
+	for i, moveErr := range moveErrors {
+		executionErr = errors.Join(executionErr, moveErr)
+		if !moved[i] {
+			continue
+		}
+		if reservation := byNode[plan.Moves[i].ToNode]; reservation != nil {
 			reservation.moved++
 		}
 	}
