@@ -415,7 +415,13 @@ type BranchInfo struct {
 	// MemoryRootObjects records the immutable object selected by each logical
 	// root name. Names are branch-local handles; object IDs remain stable when
 	// authority moves from a node to shared storage.
-	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
+	MemoryRootObjects []string `json:"memory_root_objects,omitempty"`
+	// ControlRoot and ControlRootObject retain the immutable filesystem tree
+	// containing a process-free branch's kernel/process metadata. They are
+	// present only while a branch is dehydrated; live branches have already
+	// consumed this auxiliary snapshot root.
+	ControlRoot               string    `json:"control_root,omitempty"`
+	ControlRootObject         string    `json:"control_root_object,omitempty"`
 	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
 	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
 	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
@@ -3476,8 +3482,21 @@ func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) e
 // roots for a branch. Physical provider/cache locations are deliberately not
 // part of this record.
 func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots, objects []string, referenceOperation string) error {
+	return s.updateBranchSnapshotGraph(name, branchID, snapshotID, roots, objects, "", "", referenceOperation, false)
+}
+
+// UpdateBranchSnapshotGraph atomically records all immutable process-state
+// roots selected by one dehydration capture.
+func (s Store) UpdateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string) error {
+	return s.updateBranchSnapshotGraph(name, branchID, snapshotID, roots, objects, controlRoot, controlObject, referenceOperation, true)
+}
+
+func (s Store) updateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string, replaceControl bool) error {
 	if len(roots) != len(objects) {
 		return fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
+	}
+	if replaceControl && (controlRoot == "") != (controlObject == "") {
+		return errors.New("control graph root name and object must be set together")
 	}
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
@@ -3488,6 +3507,10 @@ func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64,
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = append([]string(nil), roots...)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
+			if replaceControl {
+				branch.ControlRoot = controlRoot
+				branch.ControlRootObject = controlObject
+			}
 			branch.DistributedGraphReferenceOperation = referenceOperation
 			return true, nil
 		}
@@ -3520,6 +3543,8 @@ func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64
 			branch.SnapshotID = 0
 			branch.MemoryRoots = nil
 			branch.MemoryRootObjects = nil
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
 			branch.DistributedGraphReferenceOperation = ""
 			cleared = true
 			return true, nil

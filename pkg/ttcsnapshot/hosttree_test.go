@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -74,6 +75,20 @@ func TestHostTreeImportMaterializeRoundTrip(t *testing.T) {
 	destination := filepath.Join(directory, "destination")
 	if err := MaterializeFilesystem(context.Background(), graph, data, root, destination); err != nil {
 		t.Fatal(err)
+	}
+	resolvedDestination := filepath.Join(directory, "resolved-destination")
+	resolved := 0
+	if err := MaterializeFilesystemFrom(context.Background(), graph, func(_ context.Context, id ObjectID, length int64) (io.ReadCloser, error) {
+		resolved++
+		return data.Open(id, length)
+	}, root, resolvedDestination); err != nil {
+		t.Fatal(err)
+	}
+	if resolved != 1 {
+		t.Fatalf("resolver opened %d bulk objects, want 1 hardlink-shared file", resolved)
+	}
+	if got, err := os.ReadFile(filepath.Join(resolvedDestination, "hardlink")); err != nil || !bytes.Equal(got, contents) {
+		t.Fatalf("resolver-backed materialization=%q err=%v", got, err)
 	}
 	got, err := os.ReadFile(filepath.Join(destination, "a", "file"))
 	if err != nil || !bytes.Equal(got, contents) {

@@ -151,11 +151,14 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 	}
 	wantRoots := []string{"memory/7/resource-0000"}
 	wantObjects := []string{"0000000000000007-03-0000000000000001"}
+	wantControlRoot := "control/capture/0000000000000007"
+	wantControlObject := "0000000000000007-07-0000000000000002"
 	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "container-id", Name: "example", BundleDir: bundleDir,
 		Branches: []BranchInfo{{
 			ID: "main", SnapshotID: 7, MemoryRoots: wantRoots,
 			MemoryRootObjects: wantObjects, DistributedGraphReferenceOperation: "retain-7",
+			ControlRoot: wantControlRoot, ControlRootObject: wantControlObject,
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -174,7 +177,7 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	branch := info.Branches[0]
-	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.DistributedGraphReferenceOperation != "" {
+	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.ControlRoot != "" || branch.ControlRootObject != "" || branch.DistributedGraphReferenceOperation != "" {
 		t.Fatalf("cleared branch retained memory graph: %+v", branch)
 	}
 }

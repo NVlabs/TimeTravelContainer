@@ -305,6 +305,25 @@ func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataSto
 	if graph == nil || data == nil || !filepath.IsAbs(destination) {
 		return errors.New("invalid TTC filesystem materialization")
 	}
+	return MaterializeFilesystemFrom(ctx, graph, func(_ context.Context, id ObjectID, length int64) (io.ReadCloser, error) {
+		return data.Open(id, length)
+	}, root, destination)
+}
+
+// ObjectReader opens one complete immutable bulk object with the expected
+// logical length. Implementations may read authoritative local data, populate
+// a node-local cache through Resolver, or range-read a shared snapshot pack.
+// The filesystem graph never depends on the physical storage choice.
+type ObjectReader func(context.Context, ObjectID, int64) (io.ReadCloser, error)
+
+// MaterializeFilesystemFrom reconstructs a logical filesystem using the
+// supplied immutable catalog and bulk-object reader. This is the common
+// materialization path for standalone authority, volatile peers, and shared
+// packs; callers do not need a directory-pack compatibility layer.
+func MaterializeFilesystemFrom(ctx context.Context, catalog FilesystemCatalog, reader ObjectReader, root ObjectID, destination string) error {
+	if catalog == nil || reader == nil || !filepath.IsAbs(destination) {
+		return errors.New("invalid TTC filesystem materialization source")
+	}
 	if entries, err := os.ReadDir(destination); err == nil && len(entries) != 0 {
 		return errors.New("TTC filesystem materialization destination is not empty")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -313,7 +332,7 @@ func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataSto
 	if err := os.MkdirAll(destination, 0700); err != nil {
 		return err
 	}
-	rootInode, ok, err := graph.FilesystemInode(root, 1)
+	rootInode, ok, err := catalog.FilesystemInode(root, 1)
 	if err != nil || !ok || rootInode.Type != "directory" {
 		return fmt.Errorf("logical filesystem has no root directory: %w", err)
 	}
@@ -337,12 +356,12 @@ func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataSto
 			continue
 		}
 		firstPath[current.inode.Number] = current.path
-		if err := materializeInode(data, current.inode, current.path); err != nil {
+		if err := materializeInode(ctx, reader, current.inode, current.path); err != nil {
 			return err
 		}
 		if current.inode.Type == "directory" {
 			directories = append(directories, current)
-			entries, err := graph.FilesystemDirectory(root, current.inode.Number)
+			entries, err := catalog.FilesystemDirectory(root, current.inode.Number)
 			if err != nil {
 				return err
 			}
@@ -350,7 +369,7 @@ func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataSto
 				if entry.Name == "" || entry.Name == "." || entry.Name == ".." || filepath.Base(entry.Name) != entry.Name {
 					return fmt.Errorf("invalid logical directory name %q", entry.Name)
 				}
-				inode, ok, err := graph.FilesystemInode(root, entry.Inode)
+				inode, ok, err := catalog.FilesystemInode(root, entry.Inode)
 				if err != nil || !ok {
 					return fmt.Errorf("resolving inode %d: %w", entry.Inode, err)
 				}
@@ -367,14 +386,14 @@ func MaterializeFilesystem(ctx context.Context, graph *Store, data *LocalDataSto
 	return nil
 }
 
-func materializeInode(data *LocalDataStore, inode InodeRecord, path string) error {
+func materializeInode(ctx context.Context, reader ObjectReader, inode InodeRecord, path string) error {
 	switch inode.Type {
 	case "directory":
 		if err := os.Mkdir(path, 0700); err != nil && !errors.Is(err, fs.ErrExist) {
 			return err
 		}
 	case "regular":
-		source, err := data.Open(inode.File, inode.Size)
+		source, err := reader(ctx, inode.File, inode.Size)
 		if err != nil {
 			return err
 		}

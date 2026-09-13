@@ -1319,7 +1319,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	}
 	transferRetained := false
 	if len(persistentBranch.MemoryRootObjects) != 0 {
-		if err := b.retainDistributedGraphTransfer(requestID, info.ID, target.branch, persistentBranch.MemoryRootObjects); err != nil {
+		if err := b.retainDistributedGraphTransfer(requestID, info.ID, target.branch, branchGraphRootObjects(persistentBranch)); err != nil {
 			_, _ = peer.Cancel(ctx, requestID, tx.Revision)
 			_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
 			return fmt.Errorf("retaining sparse migration source graph: %w", err)

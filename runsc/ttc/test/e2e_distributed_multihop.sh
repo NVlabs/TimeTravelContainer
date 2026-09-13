@@ -131,9 +131,9 @@ if test -d "$SHARED/cold/inflight" && find "$SHARED/cold/inflight" -type f -prin
 	find "$SHARED/cold/inflight" -type f -print >&2
 	exit 1
 fi
-if test -d "$SHARED/cold/packs" && find "$SHARED/cold/packs" -name '*.pack' -print -quit | grep -q .; then
-	echo "live handoff created a shared cold filesystem pack" >&2
-	find "$SHARED/cold/packs" -name '*.pack' -print >&2
+if test -e "$SHARED/cold/packs"; then
+	echo "live handoff recreated the removed legacy cold-pack path" >&2
+	find "$SHARED/cold/packs" -print >&2
 	exit 1
 fi
 

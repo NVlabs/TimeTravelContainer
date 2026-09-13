@@ -27,8 +27,6 @@ type Intent struct {
 	Generation       uint64    `json:"generation"`
 	Kind             string    `json:"kind"`
 	FilesystemBranch string    `json:"filesystem_branch"`
-	MemoryBranch     string    `json:"memory_branch,omitempty"`
-	MemoryControl    string    `json:"memory_control,omitempty"`
 	CaptureReady     bool      `json:"capture_ready"`
 	CreatedAt        time.Time `json:"created_at"`
 	Attempts         int       `json:"attempts,omitempty"`

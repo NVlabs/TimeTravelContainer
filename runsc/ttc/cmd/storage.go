@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -351,11 +350,13 @@ type coldBranchManifest struct {
 	Generation uint64    `json:"generation"`
 	Kind       string    `json:"kind"`
 	CreatedAt  time.Time `json:"created_at"`
-	// MemorySnapshot names the graph-native immutable memory origin. The
-	// separate control pack contains only the serialized process/kernel state.
-	MemorySnapshot    uint64                   `json:"memory_snapshot,omitempty"`
-	MemoryControlPack string                   `json:"memory_control_pack,omitempty"`
-	Filesystems       []coldFilesystemSnapshot `json:"filesystems,omitempty"`
+	// MemorySnapshot names the graph-native immutable capture origin. Its
+	// ControlRoot is a filesystem-tree object in that same origin containing
+	// serialized process/kernel state; pages and auxiliary state therefore use
+	// one authority, resolver, publication, and GC protocol.
+	MemorySnapshot uint64                   `json:"memory_snapshot,omitempty"`
+	ControlRoot    string                   `json:"control_root,omitempty"`
+	Filesystems    []coldFilesystemSnapshot `json:"filesystems,omitempty"`
 }
 
 type branchPublisher struct {
@@ -401,19 +402,6 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		if existing.Container != info.ID || existing.Branch != branch.ID || existing.Generation != intent.Generation || existing.Kind != intent.Kind {
 			return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting identity")
 		}
-		if existing.MemoryControlPack != "" {
-			id, err := ttcpack.ParseID(existing.MemoryControlPack)
-			if err != nil {
-				return ttcstorage.Result{}, err
-			}
-			file, _, err := ttcpack.Open(filepath.Join(p.sharedRoot, "cold"), id)
-			if err != nil {
-				return ttcstorage.Result{}, err
-			}
-			if err := file.Close(); err != nil {
-				return ttcstorage.Result{}, err
-			}
-		}
 		for _, filesystem := range existing.Filesystems {
 			if filesystem.Root.Root == "" || len(filesystem.Origins) == 0 {
 				return ttcstorage.Result{}, errors.New("existing cold manifest has an incomplete filesystem snapshot")
@@ -428,8 +416,23 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 			if existing.MemorySnapshot != branch.SnapshotID || p.graphShared == nil {
 				return ttcstorage.Result{}, errors.New("existing cold manifest has a conflicting graph memory snapshot")
 			}
-			if _, err := p.graphShared.Manifest(ttcsnapshot.SnapshotID(existing.MemorySnapshot)); err != nil {
+			published, err := p.graphShared.Manifest(ttcsnapshot.SnapshotID(existing.MemorySnapshot))
+			if err != nil {
 				return ttcstorage.Result{}, fmt.Errorf("validating published graph memory snapshot: %w", err)
+			}
+			control, err := ttcsnapshot.ParseObjectID(existing.ControlRoot)
+			if err != nil {
+				return ttcstorage.Result{}, fmt.Errorf("validating published graph control root: %w", err)
+			}
+			found := false
+			for _, object := range published.Objects {
+				if object.Object.ID == control {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return ttcstorage.Result{}, fmt.Errorf("published graph control root %s is missing", control)
 			}
 		}
 		return ttcstorage.Result{Manifest: path}, nil
@@ -458,7 +461,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	defer os.RemoveAll(staging)
-	manifest := coldBranchManifest{Version: 3, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
+	manifest := coldBranchManifest{Version: 4, Container: info.ID, Branch: branch.ID, Generation: intent.Generation, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
 	spec, err := store.LoadSpec(info.ID)
 	if err != nil {
 		return ttcstorage.Result{}, err
@@ -535,16 +538,6 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		})
 	}
 	if intent.Kind == "dehydrate" {
-		memory := publicationMemoryControlPath(p.localRoot, intent.MemoryControl)
-		if _, err := os.Stat(memory); err != nil {
-			return ttcstorage.Result{}, fmt.Errorf("opening local dehydration image: %w", err)
-		}
-		packID := ttcpack.IDForKey("memory-control", info.ID, branch.ID, fmt.Sprint(intent.Generation))
-		pack, err := ttcpack.WriteDirectory(memory, filepath.Join(p.sharedRoot, "cold"), packID)
-		if err != nil {
-			return ttcstorage.Result{}, err
-		}
-		manifest.MemoryControlPack = pack.String()
 		if branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
 			if p.graph == nil || p.graphData == nil || p.graphShared == nil {
 				return ttcstorage.Result{}, errors.New("graph-native snapshot publication is unavailable")
@@ -554,6 +547,10 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				return ttcstorage.Result{}, fmt.Errorf("publishing graph memory snapshot %d: %w", snapshot, err)
 			}
 			manifest.MemorySnapshot = branch.SnapshotID
+			if err := validateGraphControlRoot(branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject); err != nil {
+				return ttcstorage.Result{}, fmt.Errorf("validating graph-native control root: %w", err)
+			}
+			manifest.ControlRoot = branch.ControlRootObject
 		} else {
 			return ttcstorage.Result{}, errors.New("new-format dehydration branch lacks graph-native snapshot identity")
 		}
@@ -617,17 +614,6 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 		}
 	}
 	if intent.Kind == "dehydrate" {
-		if intent.MemoryControl == "" {
-			return false, errors.New("dehydration publication omits sealed control state")
-		}
-		if stat, err := os.Stat(publicationMemoryControlPath(p.localRoot, intent.MemoryControl)); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return false, nil
-			}
-			return false, err
-		} else if !stat.IsDir() {
-			return false, errors.New("sealed dehydration control state is not a directory")
-		}
 		branch, branchErr := persistentBranchInfo(info, intent.Branch)
 		if branchErr != nil {
 			return false, branchErr
@@ -648,6 +634,9 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 					}
 					return false, err
 				}
+			}
+			if err := validateGraphControlRoot(branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject); err != nil {
+				return false, err
 			}
 		} else {
 			return false, errors.New("new-format dehydration branch lacks graph-native snapshot identity")
@@ -813,19 +802,6 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		}
 	}
 	if canceled && haveManifest {
-		if published.MemoryControlPack != "" {
-			pack, err := ttcpack.ParseID(published.MemoryControlPack)
-			if err != nil {
-				return err
-			}
-			busy, err := ttcpack.Discard(filepath.Join(p.sharedRoot, "cold"), pack)
-			if err != nil {
-				return fmt.Errorf("discarding canceled memory control pack: %w", err)
-			}
-			if busy {
-				return errors.New("discarding canceled memory control pack: pack is busy")
-			}
-		}
 		if err := os.Remove(manifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -840,18 +816,7 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 			}
 		}
 	}
-	if intent.MemoryBranch != "" {
-		branch, branchErr := persistentBranchInfo(info, intent.Branch)
-		if branchErr == nil && branch.SnapshotID != 0 && len(branch.MemoryRoots) != 0 {
-			return os.RemoveAll(publicationMemoryControlPath(p.localRoot, intent.MemoryControl))
-		}
-		return errors.Join(branchErr, errors.New("new-format dehydration cleanup lacks graph-native snapshot identity"))
-	}
 	return nil
-}
-
-func publicationMemoryControlPath(localRoot, capture string) string {
-	return filepath.Join(localRoot, "publication-captures", "memory-control", capture)
 }
 
 // releasePublishedProviderGraphRoots drops the temporary roots installed for
@@ -899,63 +864,6 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 		}
 	}
 	return nil
-}
-
-// snapshotImmutableTree seals the small process/control portion of a
-// dehydration image independently of the user-visible local image. Regular
-// files are hard-linked within TTC_LOCAL_ROOT and copied only if the backing
-// filesystem rejects links. The sparse memory payload is rooted separately in
-// the graph object store, so this tree normally contains only metadata and
-// control JSON.
-func snapshotImmutableTree(source, destination string) error {
-	if err := os.RemoveAll(destination); err != nil {
-		return err
-	}
-	if err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(source, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(destination, relative)
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		switch {
-		case entry.IsDir():
-			return os.MkdirAll(target, info.Mode().Perm())
-		case entry.Type().IsRegular():
-			if err := os.Link(path, target); err == nil {
-				return nil
-			} else if !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EOPNOTSUPP) {
-				return err
-			}
-			input, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer input.Close()
-			output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(output, input)
-			return errors.Join(copyErr, output.Sync(), output.Close())
-		default:
-			return fmt.Errorf("unsupported dehydration control entry %q (%s)", relative, info.Mode())
-		}
-	}); err != nil {
-		_ = os.RemoveAll(destination)
-		return err
-	}
-	directory, err := os.Open(destination)
-	if err != nil {
-		return err
-	}
-	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.Result) error {
@@ -1080,7 +988,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			if err := p.graph.UnfreezeSnapshotLedger(snapshot); err != nil {
 				return fmt.Errorf("consuming snapshot origin %d reference handoff: %w", branch.SnapshotID, err)
 			}
-			if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot, branch.MemoryRoots); err != nil {
+			if err := releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot, branchGraphRootNames(branch)); err != nil {
 				return fmt.Errorf("releasing volatile provider roots for snapshot origin %d: %w", branch.SnapshotID, err)
 			}
 		}
@@ -1291,8 +1199,8 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return coldBranchManifest{}, err
 	}
-	if manifest.Version != 3 {
-		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 3", manifest.Version)
+	if manifest.Version != 4 {
+		return coldBranchManifest{}, fmt.Errorf("cold manifest format %d is unsupported; TTC requires snapshot-graph format 4", manifest.Version)
 	}
 	if manifest.Container == "" || manifest.Branch == "" || manifest.Generation == 0 || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
 		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
@@ -1321,17 +1229,13 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 			seenOrigins[origin] = struct{}{}
 		}
 	}
-	if manifest.MemoryControlPack != "" {
-		if _, err := ttcpack.ParseID(manifest.MemoryControlPack); err != nil {
-			return coldBranchManifest{}, fmt.Errorf("validating memory-control pack: %w", err)
-		}
-	}
 	if manifest.Kind == "dehydrate" {
 		if manifest.MemorySnapshot == 0 {
 			return coldBranchManifest{}, errors.New("dehydration manifest omits graph-native memory snapshot")
 		}
-		if manifest.MemoryControlPack == "" {
-			return coldBranchManifest{}, errors.New("dehydration manifest omits memory control state")
+		controlRoot, err := ttcsnapshot.ParseObjectID(manifest.ControlRoot)
+		if err != nil || controlRoot.Kind != ttcsnapshot.ObjectKindMetadata || uint64(controlRoot.Snapshot) != manifest.MemorySnapshot {
+			return coldBranchManifest{}, errors.New("dehydration manifest omits graph-native control state")
 		}
 	}
 	return manifest, nil
@@ -1371,6 +1275,39 @@ func localGraphCaptureMatches(path string, branch ttcbundle.BranchInfo) bool {
 		delete(wanted, root.Name)
 	}
 	return len(wanted) == 0
+}
+
+func materializeSharedGraphFilesystem(ctx context.Context, shared *ttcsnapshot.SharedPackStore, snapshot ttcsnapshot.SnapshotID, encodedRoot, destination string) error {
+	if shared == nil {
+		return errors.New("shared graph snapshot repository is unavailable")
+	}
+	root, err := ttcsnapshot.ParseObjectID(encodedRoot)
+	if err != nil || root.Snapshot != snapshot || root.Kind != ttcsnapshot.ObjectKindMetadata {
+		return fmt.Errorf("invalid graph filesystem root %q for snapshot %d", encodedRoot, snapshot)
+	}
+	manifest, err := shared.Manifest(snapshot)
+	if err != nil {
+		return err
+	}
+	objects := make([]ttcsnapshot.Object, len(manifest.Objects))
+	for index := range manifest.Objects {
+		objects[index] = manifest.Objects[index].Object
+	}
+	catalog, err := ttcsnapshot.NewImmutableCatalog(objects)
+	if err != nil {
+		return err
+	}
+	return ttcsnapshot.MaterializeFilesystemFrom(ctx, catalog, func(ctx context.Context, id ttcsnapshot.ObjectID, expected int64) (io.ReadCloser, error) {
+		reader, length, err := shared.Fetch(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if length != uint64(expected) {
+			_ = reader.Close()
+			return nil, fmt.Errorf("graph object %s has length %d, want %d", id, length, expected)
+		}
+		return reader, nil
+	}, root, destination)
 }
 
 func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
@@ -1417,6 +1354,9 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.Generation != branch.StorageGeneration {
 		return errors.New("cold manifest identity does not match branch generation")
 	}
+	if manifest.MemorySnapshot != branch.SnapshotID || manifest.ControlRoot != branch.ControlRootObject {
+		return errors.New("cold manifest process-state roots do not match branch metadata")
+	}
 	if err := os.MkdirAll(filepath.Join(b.activeDataRoot(), "containers", info.ID), 0700); err != nil {
 		return err
 	}
@@ -1426,15 +1366,11 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
 		return err
 	}
-	if manifest.MemoryControlPack == "" {
+	if manifest.ControlRoot == "" {
 		return errors.New("cold manifest omits dehydration control state")
 	}
-	controlPack, err := ttcpack.ParseID(manifest.MemoryControlPack)
-	if err != nil {
-		return err
-	}
 	if _, err := os.Stat(localImage); errors.Is(err, os.ErrNotExist) {
-		if err := ttcpack.Materialize(filepath.Join(b.dataRoot, "cold"), controlPack, localImage); err != nil {
+		if err := materializeSharedGraphFilesystem(context.Background(), b.snapshotShared, ttcsnapshot.SnapshotID(manifest.MemorySnapshot), manifest.ControlRoot, localImage); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -1708,7 +1644,6 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 		}
 	}
 	manifests := make(map[string]struct{})
-	packs := make(map[ttcpack.ID]struct{})
 	transactionsByID := make(map[string]cluster.Transaction)
 	if transactions != nil {
 		records, err := transactions.List()
@@ -1728,18 +1663,10 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 		if err := validateColdManifestPath(sharedRoot, path); err != nil {
 			return err
 		}
-		manifest, err := readColdBranchManifest(path)
-		if err != nil {
+		if _, err := readColdBranchManifest(path); err != nil {
 			return fmt.Errorf("tracing cold manifest %q: %w", path, err)
 		}
 		manifests[path] = struct{}{}
-		if manifest.MemoryControlPack != "" {
-			id, err := ttcpack.ParseID(manifest.MemoryControlPack)
-			if err != nil {
-				return err
-			}
-			packs[id] = struct{}{}
-		}
 	}
 	// Graph handoff manifests are transaction-scoped restore descriptors, not
 	// durable branch roots. Keep them through every nonterminal transaction
@@ -1797,8 +1724,7 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 	if err := pruneEmptyColdManifestDirectories(root); err != nil {
 		return err
 	}
-	_, err = ttcpack.Collect(filepath.Join(sharedRoot, "cold"), packs, olderThan.UnixNano())
-	return err
+	return nil
 }
 
 func pruneEmptyColdManifestDirectories(root string) error {

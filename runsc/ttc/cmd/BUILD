@@ -41,7 +41,6 @@ go_library(
         "//pkg/sentry/ttcchunk",
         "//pkg/sentry/ttcremote",
         "//pkg/ttcremote",
-        "//pkg/ttcpack",
         "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/boot",
@@ -81,7 +80,6 @@ go_test(
     library = ":cmd",
     deps = [
         "//pkg/ttcremote",
-		"//pkg/ttcpack",
 		"//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/specutils",

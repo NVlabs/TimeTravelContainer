@@ -313,10 +313,10 @@ func graphReferenceRoots(snapshot ttcsnapshot.SnapshotID, operation string, bind
 	return result, nil
 }
 
-// groupGraphRootBindings partitions a branch's bounded logical roots by their
-// immutable origin. Fork remains O(number of memory resources), not O(pages):
-// every provider receives only the radix roots it owns and accounts all
-// descendants through the graph's lazy edge references.
+// groupGraphRootBindings partitions a branch's bounded memory and auxiliary
+// control roots by immutable origin. Fork remains O(number of logical roots),
+// not O(pages or serialized kernel objects): every provider receives only the
+// roots it owns and accounts descendants through lazy edge references.
 func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]cluster.SnapshotRootBinding, error) {
 	if len(objects) == 0 || len(objects) > 4096 {
 		return nil, errors.New("invalid graph root binding count")
@@ -327,8 +327,8 @@ func groupGraphRootBindings(objects []string) (map[ttcsnapshot.SnapshotID][]clus
 		if err != nil {
 			return nil, fmt.Errorf("parsing graph root slot %d: %w", slot, err)
 		}
-		if id.Snapshot == 0 || id.Kind != ttcsnapshot.ObjectKindMemoryNode {
-			return nil, fmt.Errorf("graph root slot %d selects non-memory-root object %s", slot, id)
+		if id.Snapshot == 0 || (id.Kind != ttcsnapshot.ObjectKindMemoryNode && id.Kind != ttcsnapshot.ObjectKindMetadata) {
+			return nil, fmt.Errorf("graph root slot %d selects unsupported root object %s", slot, id)
 		}
 		groups[id.Snapshot] = append(groups[id.Snapshot], cluster.SnapshotRootBinding{
 			Slot: uint32(slot), Object: id.String(),
@@ -513,6 +513,10 @@ func (b *runtimeBackend) immutableSnapshotCatalog(ctx context.Context, roots []t
 	})
 }
 
+func localSnapshotObjectsAuthoritative(state ttcsnapshot.SnapshotState) bool {
+	return state == ttcsnapshot.SnapshotSealedLocal || state == ttcsnapshot.SnapshotSealedVolatile
+}
+
 // lazyImmutableSnapshotCatalog resolves one metadata object at a time from its
 // immutable origin. It is the filesystem lookup path; memory reconstruction
 // continues using immutableSnapshotCatalog because building a process image
@@ -528,7 +532,7 @@ func (b *runtimeBackend) lazyImmutableSnapshotCatalog(ctx context.Context, roots
 	}
 	return ttcsnapshot.NewLazyImmutableCatalog(func(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {
 		if b.snapshotGraph != nil {
-			if record, ok := b.snapshotGraph.Snapshot(id.Snapshot); ok && record.State != ttcsnapshot.SnapshotWorking {
+			if record, ok := b.snapshotGraph.Snapshot(id.Snapshot); ok && localSnapshotObjectsAuthoritative(record.State) {
 				object, ok := b.snapshotGraph.Object(id)
 				if !ok {
 					return ttcsnapshot.Object{}, os.ErrNotExist
@@ -576,7 +580,7 @@ func (b *runtimeBackend) lazyImmutableSnapshotCatalog(ctx context.Context, roots
 
 func (b *runtimeBackend) immutableSnapshotOriginObjects(ctx context.Context, snapshot ttcsnapshot.SnapshotID, transaction string) ([]ttcsnapshot.Object, error) {
 	if b.snapshotGraph != nil {
-		if record, ok := b.snapshotGraph.Snapshot(snapshot); ok && record.State != ttcsnapshot.SnapshotWorking {
+		if record, ok := b.snapshotGraph.Snapshot(snapshot); ok && localSnapshotObjectsAuthoritative(record.State) {
 			return b.snapshotGraph.SnapshotObjects(snapshot)
 		}
 	}

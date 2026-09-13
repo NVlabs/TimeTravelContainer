@@ -4960,6 +4960,8 @@ type Branch struct {
 	SnapshotID                uint64    `json:"snapshot_id,omitempty"`
 	MemoryRoots               []string  `json:"memory_roots,omitempty"`
 	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
+	ControlRoot               string    `json:"control_root,omitempty"`
+	ControlRootObject         string    `json:"control_root_object,omitempty"`
 	SourceNode                string    `json:"source_node,omitempty"`
 	DependentMemoryBytes      uint64    `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes  uint64    `json:"dependent_filesystem_bytes,omitempty"`
@@ -5134,6 +5136,8 @@ type BranchResourceStats struct {
 	SnapshotID               uint64        `json:"snapshot_id,omitempty"`
 	MemoryRoots              []string      `json:"memory_roots,omitempty"`
 	MemoryRootObjects        []string      `json:"memory_root_objects,omitempty"`
+	ControlRoot              string        `json:"control_root,omitempty"`
+	ControlRootObject        string        `json:"control_root_object,omitempty"`
 	FilesystemRoot           string        `json:"filesystem_root,omitempty"`
 	SourceNode               string        `json:"source_node,omitempty"`
 	DependentMemoryBytes     uint64        `json:"dependent_memory_bytes,omitempty"`
@@ -5629,10 +5633,6 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		Container: target.container, Branch: target.branch, Generation: generation, Kind: kind,
 		FilesystemBranch: captureBranch,
 	}
-	if kind == "dehydrate" {
-		intent.MemoryBranch = captureBranch
-		intent.MemoryControl = captureBranch
-	}
 	if err := b.publicationQueue.Enqueue(intent); err != nil {
 		_ = store.UpdateBranchStorage(target.container, target.branch, generation, "error", err.Error(), time.Time{})
 		return err
@@ -5642,7 +5642,6 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	finishFilesystemOrigins := func(bool) error { return nil }
 	var forks []*ttcvolume.ForkTransaction
 	var repositories []*ttcvolume.Repository
-	memoryControlCaptured := false
 	defer func() {
 		for _, repository := range repositories {
 			_ = repository.Close()
@@ -5652,9 +5651,6 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if !captureComplete {
 			for i := len(forks) - 1; i >= 0; i-- {
 				cause = errors.Join(cause, forks[i].Abort())
-			}
-			if memoryControlCaptured {
-				cause = errors.Join(cause, os.RemoveAll(publicationMemoryControlPath(b.activeDataRoot(), captureBranch)))
 			}
 		}
 		if !originsCommitted {
@@ -5721,16 +5717,13 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
 			return rollback(errors.New("new-format dehydrated branch has no graph memory roots"))
 		}
+		if err := validateGraphControlRoot(branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject); err != nil {
+			return rollback(fmt.Errorf("new-format dehydrated branch has no graph control root: %w", err))
+		}
 		record, ok := b.snapshotGraph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
 		if !ok || (record.State != ttcsnapshot.SnapshotSealedLocal && record.State != ttcsnapshot.SnapshotSealedVolatile) {
 			return rollback(fmt.Errorf("graph memory snapshot %d is not sealed", branch.SnapshotID))
 		}
-		source := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
-		destination := publicationMemoryControlPath(b.activeDataRoot(), captureBranch)
-		if err := snapshotImmutableTree(source, destination); err != nil {
-			return rollback(fmt.Errorf("sealing dehydration control state: %w", err))
-		}
-		memoryControlCaptured = true
 	}
 	committedForks := 0
 	for _, fork := range forks {
@@ -6608,7 +6601,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	} else {
 		return fmt.Errorf("querying active peers before starting %s: %w", target, err)
 	}
-	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.DistributedGraphReferenceOperation != "" {
+	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.ControlRoot != "" || branch.ControlRootObject != "" || branch.DistributedGraphReferenceOperation != "" {
 		return fmt.Errorf("fresh branch %s unexpectedly retains an older memory snapshot", target)
 	}
 	if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, capture.SnapshotID, graphRoots, graphObjects, ""); err != nil {
@@ -6616,7 +6609,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	}
 	defer func() {
 		if !graphRecorded {
-			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil, "")
+			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", "")
 		}
 	}()
 	capture.Resume = true
@@ -8522,7 +8515,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	graphRoots := make([]string, 0)
 	seenGraphRoots := make(map[string]struct{})
 	for _, branch := range info.Branches {
-		for _, root := range branch.MemoryRoots {
+		for _, root := range branchGraphRootNames(branch) {
 			if _, exists := seenGraphRoots[root]; exists {
 				continue
 			}
@@ -8532,7 +8525,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	}
 	for _, branch := range info.Branches {
 		if graphReferenceOperationForBranch(info, branch) == "" {
-			if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s@%s: %w", info.Name, branch.ID, err)
 			}
 		}
@@ -9973,7 +9966,8 @@ func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 		StorageState: info.StorageState, StorageGeneration: info.StorageGeneration, StorageError: info.StorageError,
 		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
 		MemoryRootObjects: append([]string(nil), info.MemoryRootObjects...),
-		StorageRetryAt:    info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
+		ControlRoot:       info.ControlRoot, ControlRootObject: info.ControlRootObject,
+		StorageRetryAt: info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
 		DependentFilesystemBytes: info.DependentFilesystemBytes,
 		ForkTotalNS:              info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
 		ForkValidationNS: info.ForkValidationNS, ForkSharedMemoryNS: info.ForkSharedMemoryNS,
@@ -10036,6 +10030,8 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			branch.SnapshotID = recorded.SnapshotID
 			branch.MemoryRoots = append([]string(nil), recorded.MemoryRoots...)
 			branch.MemoryRootObjects = append([]string(nil), recorded.MemoryRootObjects...)
+			branch.ControlRoot = recorded.ControlRoot
+			branch.ControlRootObject = recorded.ControlRootObject
 			branch.SourceNode = recorded.SourceNode
 			branch.DependentMemoryBytes = recorded.DependentMemoryBytes
 			branch.DependentFilesystemBytes = recorded.DependentFilesystemBytes
@@ -10264,7 +10260,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			if records[i].DistributedGraphReferenceOperation == "" {
 				continue
 			}
-			if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, records[i].MemoryRootObjects); err != nil {
+			if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 				var cleanupErr error
 				for _, cleanupDestination := range destinations {
 					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
@@ -10357,7 +10353,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				}
 			}
 			result = errors.Join(result, os.RemoveAll(child.dir))
-			result = errors.Join(result, b.releaseGraphMemoryRoots(child.branch.MemoryRoots))
+			result = errors.Join(result, b.releaseBranchGraphRoots(child.branch))
 			result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, child.branch))
 		}
 		return result
@@ -10390,6 +10386,12 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		}
 		branch.MemoryRoots = graphRoots
 		branch.MemoryRootObjects = append([]string(nil), sourceBranch.MemoryRootObjects...)
+		controlRoot, err := b.cloneGraphControlRoot(sourceBranch.ControlRoot, sourceBranch.ControlRootObject, sourceBranch.SnapshotID, filesystemBranch)
+		if err != nil {
+			return nil, fmt.Errorf("rooting graph control state for %s@%s: %w", source.container, destination, err)
+		}
+		branch.ControlRoot = controlRoot
+		branch.ControlRootObject = sourceBranch.ControlRootObject
 		children[len(children)-1].branch = branch
 		transactions, finishFilesystemOrigins, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
@@ -10452,7 +10454,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		if records[i].DistributedGraphReferenceOperation == "" {
 			continue
 		}
-		if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, records[i].MemoryRootObjects); err != nil {
+		if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 			return nil, fmt.Errorf("retaining graph origins for dehydrated branch %q: %w", records[i].ID, err)
 		}
 	}
@@ -10734,6 +10736,54 @@ func graphMemoryRootNames(filesystemBranch string, count int) []string {
 	return result
 }
 
+func graphControlRootName(filesystemBranch string) string {
+	return "control/branch/" + filesystemBranch
+}
+
+func graphCaptureControlRootName(snapshotID uint64) string {
+	return fmt.Sprintf("control/capture/%016x", snapshotID)
+}
+
+func branchGraphRootObjects(branch ttcbundle.BranchInfo) []string {
+	objects := append([]string(nil), branch.MemoryRootObjects...)
+	if branch.ControlRootObject != "" {
+		objects = append(objects, branch.ControlRootObject)
+	}
+	return objects
+}
+
+func branchGraphRootNames(branch ttcbundle.BranchInfo) []string {
+	roots := append([]string(nil), branch.MemoryRoots...)
+	if branch.ControlRoot != "" {
+		roots = append(roots, branch.ControlRoot)
+	}
+	return roots
+}
+
+func appendGraphRoot(roots []string, root string) []string {
+	if root == "" {
+		return roots
+	}
+	return append(roots, root)
+}
+
+func validateGraphControlRoot(snapshotID uint64, root, object string) error {
+	if root == "" && object == "" {
+		return nil
+	}
+	if snapshotID == 0 || root == "" || object == "" {
+		return errors.New("control root requires a snapshot, logical name, and immutable object")
+	}
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return fmt.Errorf("parsing control root object: %w", err)
+	}
+	if id.Snapshot == 0 || uint64(id.Snapshot) != snapshotID || id.Kind != ttcsnapshot.ObjectKindMetadata {
+		return fmt.Errorf("control root object %s is not a filesystem root", id)
+	}
+	return nil
+}
+
 // cloneGraphMemoryRoots gives a branch O(1)-with-respect-to-memory references
 // to the same immutable radix roots as its source. No page or radix node is
 // walked or copied.
@@ -10861,6 +10911,46 @@ func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots, sourceObjects []
 		return nil, err
 	}
 	return result, nil
+}
+
+func (b *runtimeBackend) cloneGraphControlRoot(sourceRoot, sourceObject string, snapshotID uint64, targetFilesystemBranch string) (string, error) {
+	if sourceRoot == "" && sourceObject == "" {
+		return "", nil
+	}
+	if b.snapshotGraph == nil || targetFilesystemBranch == "" {
+		return "", errors.New("snapshot graph is unavailable for control-root fork")
+	}
+	if err := validateGraphControlRoot(snapshotID, sourceRoot, sourceObject); err != nil {
+		return "", err
+	}
+	destination := graphControlRootName(targetFilesystemBranch)
+	if _, ok := b.snapshotGraph.Root(sourceRoot); ok {
+		if err := b.snapshotGraph.CloneRoots(map[string]string{destination: sourceRoot}); err != nil {
+			return "", err
+		}
+		return destination, nil
+	}
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return "", errors.New("control root is absent from the authoritative local graph")
+	}
+	id, _ := ttcsnapshot.ParseObjectID(sourceObject)
+	_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+	if err != nil {
+		return "", fmt.Errorf("resolving control origin %d authority: %w", id.Snapshot, err)
+	}
+	if !volatile {
+		if b.snapshotShared == nil {
+			return "", errors.New("shared snapshot repository is unavailable")
+		}
+		if _, err := b.snapshotShared.Manifest(id.Snapshot); err != nil {
+			return "", fmt.Errorf("opening shared control origin %d: %w", id.Snapshot, err)
+		}
+	}
+	return destination, nil
+}
+
+func (b *runtimeBackend) releaseBranchGraphRoots(branch ttcbundle.BranchInfo) error {
+	return b.releaseGraphMemoryRoots(branchGraphRootNames(branch))
 }
 
 // releaseGraphMemoryRoots drops logical branch reachability, cascades exact
@@ -11039,10 +11129,10 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 			if branch.SnapshotID != 0 {
 				retainedSnapshots[ttcsnapshot.SnapshotID(branch.SnapshotID)] = struct{}{}
 			}
-			for _, name := range branch.MemoryRoots {
+			for _, name := range branchGraphRootNames(branch) {
 				liveRoots[name] = struct{}{}
 				if _, ok := b.snapshotGraph.Root(name); !ok {
-					return fmt.Errorf("branch %s@%s references missing memory root %q", container.Name, branch.ID, name)
+					return fmt.Errorf("branch %s@%s references missing snapshot root %q", container.Name, branch.ID, name)
 				}
 			}
 		}
@@ -11050,7 +11140,7 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 	inspection := b.snapshotGraph.Inspect()
 	var orphanRoots []string
 	for name := range inspection.Roots {
-		if strings.HasPrefix(name, "memory/") {
+		if strings.HasPrefix(name, "memory/") || strings.HasPrefix(name, "control/") {
 			if _, live := liveRoots[name]; !live {
 				orphanRoots = append(orphanRoots, name)
 			}
@@ -11062,7 +11152,7 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 	}
 	var orphanPins []string
 	for name := range inspection.Pins {
-		if strings.HasPrefix(name, "memory/") {
+		if strings.HasPrefix(name, "memory/") || strings.HasPrefix(name, "control/") || strings.HasPrefix(name, "import/") {
 			orphanPins = append(orphanPins, name)
 		}
 	}
@@ -11194,18 +11284,18 @@ func (b *runtimeBackend) discard(target selector) error {
 		}
 	}
 	if graphReferenceOperationForBranch(info, branch) == "" {
-		if err := b.releaseSharedGraphMemoryRoots(branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+		if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
 			return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
 		}
 	}
-	if err := b.releaseGraphMemoryRoots(branch.MemoryRoots); err != nil {
+	if err := b.releaseBranchGraphRoots(branch); err != nil {
 		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 	}
 	if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
 		return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
 	}
 	if len(branch.MemoryRoots) != 0 {
-		if err := store.UpdateBranchMemoryGraph(info.ID, target.branch, 0, nil, nil, ""); err != nil {
+		if err := store.UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", ""); err != nil {
 			return err
 		}
 	}
@@ -11456,12 +11546,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	finalPublished := false
 	var graphMemoryRoots []string
 	var graphMemoryRootObjects []string
+	var graphControlRoot string
+	var graphControlRootObject string
 	var graphMemorySnapshot uint64
 	var graphMemorySealState ttcsnapshot.SnapshotState
 	graphMemoryRecorded := false
 	previousGraphMemorySnapshot := persistentBranch.SnapshotID
 	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
 	previousGraphMemoryRootObjects := append([]string(nil), persistentBranch.MemoryRootObjects...)
+	previousGraphControlRoot := persistentBranch.ControlRoot
+	previousGraphControlRootObject := persistentBranch.ControlRootObject
 	previousGraphReferenceOperation := persistentBranch.DistributedGraphReferenceOperation
 	defer func() {
 		if dehydrated {
@@ -11471,15 +11565,15 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
 		}
 		if graphMemoryRecorded {
-			_ = b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphReferenceOperation)
+			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphControlRoot, previousGraphControlRootObject, previousGraphReferenceOperation)
 		}
 		if graphMemorySnapshot != 0 && b.distributedSource != nil {
 			if graphErr := b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: retiring failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
 			}
 		}
-		if len(graphMemoryRoots) != 0 {
-			if graphErr := b.releaseGraphMemoryRoots(graphMemoryRoots); graphErr != nil && b.stderr != nil {
+		if len(graphMemoryRoots) != 0 || graphControlRoot != "" {
+			if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), graphMemoryRoots...), graphControlRoot)); graphErr != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
 			}
 		}
@@ -11594,9 +11688,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			graphMemoryRoots = append(graphMemoryRoots, root.Name)
 			graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
 		}
-		if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
-			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
-		}
 		capture.SnapshotID = uint64(origin)
 		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
 			return fmt.Errorf("persisting dehydration control state: %w", err)
@@ -11608,6 +11699,15 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return fmt.Errorf("closing dehydration metadata: %w", err)
 		}
 		metadataFile = nil
+		graphControlRoot = graphCaptureControlRootName(uint64(origin))
+		controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
+		if err != nil {
+			return fmt.Errorf("importing graph-native dehydration control state: %w", err)
+		}
+		graphControlRootObject = controlObject.String()
+		if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
+			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+		}
 		if _, err := os.Stat(finalDir); err == nil {
 			return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
 		} else if !os.IsNotExist(err) {
@@ -11623,7 +11723,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = dir.Close()
 		}
 		if graphMemorySnapshot != 0 {
-			if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, ""); err != nil {
+			if err := b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, graphControlRoot, graphControlRootObject, ""); err != nil {
 				return fmt.Errorf("recording graph-native dehydration roots: %w", err)
 			}
 			graphMemoryRecorded = true
@@ -11653,11 +11753,17 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	graphMemoryRoots = nil
 	if graphMemorySnapshot != 0 && len(previousGraphMemoryRoots) != 0 {
 		if graphReferenceOperationForBranch(info, persistentBranch) == "" {
-			if err := b.releaseSharedGraphMemoryRoots(previousGraphMemoryRoots, previousGraphMemoryRootObjects); err != nil && b.stderr != nil {
+			previousBranch := persistentBranch
+			previousBranch.MemoryRoots = previousGraphMemoryRoots
+			previousBranch.MemoryRootObjects = previousGraphMemoryRootObjects
+			previousBranch.ControlRoot = previousGraphControlRoot
+			previousBranch.ControlRootObject = previousGraphControlRootObject
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(previousBranch), branchGraphRootObjects(previousBranch)); err != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded shared memory roots for %s: %v\n", target, err)
 			}
 		}
-		if err := b.releaseGraphMemoryRoots(previousGraphMemoryRoots); err != nil && b.stderr != nil {
+		previousRoots := appendGraphRoot(append([]string(nil), previousGraphMemoryRoots...), previousGraphControlRoot)
+		if err := b.releaseGraphMemoryRoots(previousRoots); err != nil && b.stderr != nil {
 			// The new roots are already authoritative. Retaining the superseded
 			// roots is a safe leak that standalone graph reconciliation retries;
 			// it must not turn a successful dehydration into an ambiguous failure.
@@ -11954,7 +12060,7 @@ func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector,
 		target.container, target.branch, branch.SnapshotID, branch.MemoryRoots,
 		branch.MemoryRootObjects, branch.DistributedGraphReferenceOperation)
 	if err == nil && cleared {
-		err = b.releaseGraphMemoryRoots(branch.MemoryRoots)
+		err = b.releaseBranchGraphRoots(branch)
 	}
 	if err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttc: warning: releasing consumed memory backing for %s: %v\n", target, err)
@@ -12690,11 +12796,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
 		if graphReferenceOperationForBranch(info, *recorded) == "" {
-			if err := b.releaseSharedGraphMemoryRoots(recorded.MemoryRoots, recorded.MemoryRootObjects); err != nil {
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(*recorded), branchGraphRootObjects(*recorded)); err != nil {
 				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
 			}
 		}
-		if err := b.releaseGraphMemoryRoots(recorded.MemoryRoots); err != nil {
+		if err := b.releaseBranchGraphRoots(*recorded); err != nil {
 			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
 		}
 		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, *recorded)); err != nil {
@@ -12892,6 +12998,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			StorageError: branch.StorageError, StorageRetryAt: branch.StorageRetryAt,
 			SnapshotID: branch.SnapshotID, MemoryRoots: append([]string(nil), branch.MemoryRoots...),
 			MemoryRootObjects: append([]string(nil), branch.MemoryRootObjects...), FilesystemRoot: branch.StorageManifest,
+			ControlRoot: branch.ControlRoot, ControlRootObject: branch.ControlRootObject,
 			SourceNode:           branch.SourceNode,
 			DependentMemoryBytes: branch.DependentMemoryBytes, DependentFilesystemBytes: branch.DependentFilesystemBytes,
 		}

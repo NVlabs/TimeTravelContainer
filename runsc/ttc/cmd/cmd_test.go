@@ -4812,6 +4812,19 @@ func TestValidateGraphRootObjectsAllowsInheritedOrigin(t *testing.T) {
 	}
 }
 
+func TestSharedSnapshotNeverUsesReclaimedLocalObjectsAsAuthority(t *testing.T) {
+	for _, state := range []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedLocal, ttcsnapshot.SnapshotSealedVolatile} {
+		if !localSnapshotObjectsAuthoritative(state) {
+			t.Errorf("%s should use local authoritative objects", state)
+		}
+	}
+	for _, state := range []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotShared} {
+		if localSnapshotObjectsAuthoritative(state) {
+			t.Errorf("%s must resolve through its provider/shared authority", state)
+		}
+	}
+}
+
 func TestGraphReferenceRootsPreserveLogicalSlots(t *testing.T) {
 	bindings := []cluster.SnapshotRootBinding{
 		{Slot: 7, Object: "000000000000002a-03-0000000000000001"},
@@ -4997,12 +5010,12 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 3") {
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 4") {
 		t.Fatalf("legacy cold manifest error=%v", err)
 	}
 	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
 	current := coldBranchManifest{
-		Version: 3, Container: "family", Branch: "main", Generation: 1, Kind: "stop",
+		Version: 4, Container: "family", Branch: "main", Generation: 1, Kind: "stop",
 		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
 			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
 			RestoreID: "0123456789abcdef0123456789abcdef",
@@ -5018,6 +5031,33 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	}
 	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 {
 		t.Fatalf("current cold manifest=%+v, %v", got, err)
+	}
+}
+
+func TestColdDehydrationManifestRequiresSameOriginControlRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	manifest := coldBranchManifest{
+		Version: 4, Container: "family", Branch: "main", Generation: 1, Kind: "dehydrate",
+		MemorySnapshot: 17,
+		ControlRoot:    ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 9, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	}
+	write := func() {
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	if _, err := readColdBranchManifest(path); err != nil {
+		t.Fatalf("graph-native dehydration manifest rejected: %v", err)
+	}
+	manifest.ControlRoot = ttcsnapshot.ObjectID{Snapshot: 18, Ordinal: 9, Kind: ttcsnapshot.ObjectKindMetadata}.String()
+	write()
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "graph-native control state") {
+		t.Fatalf("foreign control origin error=%v", err)
 	}
 }
 

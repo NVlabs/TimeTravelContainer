@@ -57,7 +57,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 7
+	daemonAPIVersion       = 8
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -2664,11 +2664,20 @@ func validateStrictSnapshotGraphRoot(root string) error {
 }
 
 func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
-	if err := inspectDaemonStorageRoot(root, role); err != nil {
-		return err
-	}
 	want, err := daemonRootMarkerFor(role, repositoryID, nodeID)
 	if err != nil {
+		return err
+	}
+	if err := inspectDaemonStorageRoot(root, role); err != nil {
+		// A concurrent initializer may publish the marker after inspection's
+		// stat but before its directory read. Accept only the exact marker this
+		// caller intended; every other inspection error remains fail-closed.
+		if data, readErr := os.ReadFile(filepath.Join(root, ".ttc-root-format")); readErr == nil {
+			var got daemonRootMarker
+			if decodeErr := json.Unmarshal(data, &got); decodeErr == nil && got == want {
+				return syncDaemonRootDirectory(root)
+			}
+		}
 		return err
 	}
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -2684,7 +2693,7 @@ func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
 		if got != want {
 			return fmt.Errorf("root marker %+v does not match requested %+v", got, want)
 		}
-		return nil
+		return syncDaemonRootDirectory(root)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -2743,6 +2752,10 @@ func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
 	if err := os.Remove(temporaryPath); err != nil {
 		return err
 	}
+	return syncDaemonRootDirectory(root)
+}
+
+func syncDaemonRootDirectory(root string) error {
 	directory, err := os.Open(root)
 	if err != nil {
 		return err
@@ -4023,7 +4036,7 @@ func validatePersistedMemoryGraph(store ttcbundle.Store) error {
 	}
 	for _, container := range containers {
 		for _, branch := range container.Branches {
-			if branch.SnapshotID == 0 && len(branch.MemoryRoots) == 0 && len(branch.MemoryRootObjects) == 0 {
+			if branch.SnapshotID == 0 && len(branch.MemoryRoots) == 0 && len(branch.MemoryRootObjects) == 0 && branch.ControlRoot == "" && branch.ControlRootObject == "" {
 				continue
 			}
 			if err := validateGraphRootObjects(branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
@@ -4038,6 +4051,12 @@ func validatePersistedMemoryGraph(store ttcbundle.Store) error {
 					return fmt.Errorf("%s@%s repeats memory root %q", container.Name, branch.ID, name)
 				}
 				names[name] = struct{}{}
+			}
+			if err := validateGraphControlRoot(branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject); err != nil {
+				return fmt.Errorf("%s@%s: %w; this root predates graph-native process control state and is not migrated", container.Name, branch.ID, err)
+			}
+			if normalizeLifecycleState(branch.State) == "dehydrated" && branch.ControlRoot == "" {
+				return fmt.Errorf("%s@%s: dehydrated branch omits graph-native process control state; this root is not migrated", container.Name, branch.ID)
 			}
 		}
 	}
