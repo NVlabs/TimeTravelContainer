@@ -29,7 +29,7 @@ chunks, and packs never enter the Raft log.
    generation and a valid node execution lease.
 5. A root becomes durable only after all referenced objects are structurally
    complete and readable outside Raft.
-6. Removing or superseding a generation revokes its publication authorization;
+6. Removing or reactivating a branch revokes its immutable publication identity;
    a late worker cannot make it authoritative again.
 7. A state-machine command is deterministic, bounded, generation-fenced, and
    idempotent under a caller-supplied operation ID.
@@ -62,7 +62,7 @@ ClusterState
     branches[branch ID]
       lifecycle and lineage hint
       placement owner/incarnation/generation
-      storage generation/status
+      immutable publication identity/status
       authoritative memory/filesystem roots
       volatile dependency summary
   transactions[operation ID]
@@ -70,7 +70,7 @@ ClusterState
     phase and revision
     source/target placement generations
     session digest and non-secret handoff root
-  publications[family, branch, storage generation]
+  publications[family, branch, publication ID]
     authorization, capture fence, candidate roots, status
 ```
 
@@ -264,7 +264,7 @@ without putting range reads or page faults through Raft.
 ## Publication and durable roots
 
 A publisher first uploads immutable objects and verifies them. It then proposes
-`publication-commit-roots` with its authorization generation, memory root,
+`publication-commit-roots` with its immutable publication identity, memory root,
 filesystem root, and object-set digest. The state machine checks that the
 publication is still authorized and atomically replaces the branch roots.
 
@@ -273,8 +273,8 @@ final command produces harmless unreachable objects. A committed root without
 its objects is a protocol violation detected by verification and marks the
 branch corrupted rather than silently falling back to an older generation.
 
-Branch deletion or name reuse commits a newer generation and cancels all older
-publication authorizations in the same state-machine transition.
+Branch deletion, name reuse, restart, or rehydration fences the exact active
+publication identity before the newer runtime incarnation can execute.
 
 ## Garbage collection
 

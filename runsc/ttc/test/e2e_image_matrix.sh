@@ -562,7 +562,7 @@ fi
 ttc_daemon_start
 [ "$(ttc inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
   fail "restarted ttcd did not reconcile the running container"
-ttc daemon status | grep -q '"version":7' || fail "ttcd did not restart"
+ttc daemon status | grep -q '"version":9' || fail "ttcd did not restart"
 deadline=$(( $(date +%s) + 15 ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"

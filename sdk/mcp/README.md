@@ -66,7 +66,8 @@ omitting it delegates placement to TTC. `ttc_stop_node` requires an explicit
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
 take longer. Set `ttc_wait.condition` to `durable` when an orchestrator must
-wait until the branch generation is committed to shared storage.
+wait until the branch's current immutable publication is committed to shared
+storage.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
 errors. `ttc_list` includes each non-root branch's `parent`, allowing MCP hosts

@@ -4,7 +4,7 @@
     "standalone": 2,
     "cluster_shared": 5,
     "cluster_local": 5,
-    "storage_schema": "snapshot-graph-v1"
+    "storage_schema": "snapshot-graph-v2"
   },
   "invariants": [
     {
@@ -63,13 +63,13 @@
     },
     {
       "id": "publication.lifecycle-independent",
-      "requirement": "Snapshot publication cannot mutate branch lifecycle or placement.",
+      "requirement": "A late snapshot publication cannot mutate a newer branch lifecycle or placement incarnation.",
       "status": "implemented",
-      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cluster/authority_state_test.go"]
+      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cluster/authority_state_test.go", "runsc/ttc/test/e2e_publication_restart.sh"]
     },
     {
       "id": "publication.restartable",
-      "requirement": "Publication is restartable, idempotent, generation-fenced, and cancelable by removal.",
+      "requirement": "Publication is restartable, idempotent, immutable-identity-fenced, and cancelable by reactivation or removal.",
       "status": "implemented",
       "evidence": ["runsc/ttc/storage/queue.go", "runsc/ttc/cmd/storage.go", "runsc/ttc/cmd/shared_references.go"]
     },
@@ -88,9 +88,8 @@
     {
       "id": "asymptotic.fork-constant",
       "requirement": "Fork and seal are O(1) in resident pages and recursive file count.",
-      "status": "implemented-unverified-at-scale",
-      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcvolume/repository.go"],
-      "gap": "Independent page-count, file-count, directory-width, and fork-depth distributions remain to be recorded."
+      "status": "implemented-and-scale-qualified",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcvolume/repository.go", "runsc/ttc/test/e2e_fanout_lifecycle.sh", "runsc/ttc/test/e2e_distributed_fanout.sh"]
     },
     {
       "id": "standalone.no-cluster-tier",

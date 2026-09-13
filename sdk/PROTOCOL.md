@@ -28,7 +28,7 @@ The client writes one newline-terminated JSON object:
 
 ```json
 {
-  "version": 7,
+  "version": 9,
   "action": "command",
   "request_id": "optional-32-character-hex-id",
   "args": ["ls", "--json"],
@@ -56,7 +56,8 @@ dependencies. `inspect` accepts a family name and returns branch records under
 `TTC.branches`; `stats --json` accepts a full branch selector and reports
 placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
 and private/shared resource bytes. `wait --condition durable` completes only
-after the selected generation is committed to shared storage.
+after the branch's current immutable publication is committed to shared
+storage.
 
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`
