@@ -1184,5 +1184,15 @@ func (store *SharedPackStore) CompleteRetirement(snapshot SnapshotID) (busy bool
 	} else if err != nil {
 		return false, err
 	}
+	// Publication creates the snapshot directory before its temporary pack and
+	// commits the manifest last. A canceled or crashed publisher may therefore
+	// leave an empty (or temporary-only) namespace. Once Raft has permanently
+	// retired this origin, that namespace is no more authoritative than an
+	// interrupted handoff and must not survive as shared-root residue.
+	if _, err := os.Stat(filepath.Join(store.snapshotDirectory(snapshot), sharedManifestName)); errors.Is(err, fs.ErrNotExist) {
+		return store.DiscardHandoff(snapshot)
+	} else if err != nil {
+		return false, err
+	}
 	return store.Retire(snapshot)
 }

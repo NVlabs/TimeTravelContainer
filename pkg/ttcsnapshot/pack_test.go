@@ -300,6 +300,19 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	if _, err := os.Stat(crashResidue); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("retirement residue stat error=%v, want not-exist", err)
 	}
+	// A publisher interrupted immediately after creating its namespace has no
+	// manifest for Retire to inspect. Permanent retirement still authorizes
+	// removal of the entire incomplete namespace.
+	incomplete := origin + 1
+	if err := os.MkdirAll(shared.snapshotDirectory(incomplete), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if busy, err := shared.CompleteRetirement(incomplete); err != nil || busy {
+		t.Fatalf("CompleteRetirement(incomplete) = (busy=%t, err=%v)", busy, err)
+	}
+	if _, err := os.Stat(shared.snapshotDirectory(incomplete)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete snapshot namespace stat error=%v, want not-exist", err)
+	}
 	err = filepath.WalkDir(filepath.Join(sharedRoot, "snapshots"), func(path string, entry os.DirEntry, err error) error {
 		if err == nil && len(entry.Name()) > 4 && entry.Name()[:4] == ".nfs" {
 			t.Errorf("unexpected NFS tombstone %q", path)
