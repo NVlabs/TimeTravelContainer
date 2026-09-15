@@ -39,11 +39,45 @@ func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
 }
 
 func TestHelpAndCompletionAreOffline(t *testing.T) {
-	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	socket := filepath.Join(t.TempDir(), "absent.sock")
+	t.Setenv("TTC_SOCKET", socket)
 	for _, args := range [][]string{{"--help"}, {"run", "--help"}, {"completion", "bash"}} {
 		var stdout, stderr bytes.Buffer
 		if status := Run(args, strings.NewReader(""), &stdout, &stderr); status != 0 || stdout.Len() == 0 || stderr.Len() != 0 {
 			t.Fatalf("Run(%q): status=%d stdout=%q stderr=%q", args, status, stdout.String(), stderr.String())
+		}
+	}
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("offline help/completion touched daemon socket %q: %v", socket, err)
+	}
+}
+
+func TestDetailedHelpIsClientLocal(t *testing.T) {
+	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	tests := []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"daemon", "--help"}, []string{"Usage: ttc daemon COMMAND", "Commands:", "request inspect ID"}},
+		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "--cluster-init", "--memory-target"}},
+		{[]string{"help", "daemon", "stop"}, []string{"Usage: ttc daemon stop", "build mismatches"}},
+		{[]string{"image", "--help"}, []string{"Manage Docker/OCI images", "load [OPTIONS]", "rm [OPTIONS]"}},
+		{[]string{"exec", "--help"}, []string{"named detached session", "--session NAME", "--process FILE"}},
+		{[]string{"node", "--help"}, []string{"distributed TTC cluster", "rebalance NODE"}},
+		{[]string{"tty", "--help"}, []string{"terminal state", "watch"}},
+	}
+	for _, test := range tests {
+		var stdout, stderr bytes.Buffer
+		if status := Run(test.args, strings.NewReader(""), &stdout, &stderr); status != 0 {
+			t.Fatalf("Run(%q): status=%d stderr=%q", test.args, status, stderr.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("Run(%q): stderr=%q", test.args, stderr.String())
+		}
+		for _, want := range test.want {
+			if !strings.Contains(stdout.String(), want) {
+				t.Errorf("Run(%q): help missing %q:\n%s", test.args, want, stdout.String())
+			}
 		}
 	}
 }

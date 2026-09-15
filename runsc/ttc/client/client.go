@@ -199,47 +199,247 @@ TTC_LOCAL_ROOT.
 }
 
 var commandHelp = map[string]string{
-	"run": "Usage: ttc run [--node NODE] [OPTIONS] IMAGE [COMMAND] [ARG...]", "create": "Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]",
-	"start": "Usage: ttc start [--node NODE] [OPTIONS] CONTAINER@BRANCH", "stop": "Usage: ttc stop [OPTIONS] TARGET...",
-	"restart": "Usage: ttc restart [OPTIONS] TARGET...", "rm": "Usage: ttc rm [OPTIONS] TARGET...",
-	"exec": "Usage: ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND [ARG...]", "attach": "Usage: ttc attach [OPTIONS] CONTAINER@BRANCH",
-	"logs": "Usage: ttc logs [OPTIONS] CONTAINER@BRANCH", "cp": "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
-	"pull": "Usage: ttc pull [OPTIONS] IMAGE", "load": "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
-	"save": "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]", "commit": "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
-	"fork": "Usage: ttc fork [--paused] [--quarantine] [--node NODE] CONTAINER@BRANCH DEST...", "migrate": "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
-	"pause": "Usage: ttc pause TARGET...", "resume": "Usage: ttc resume TARGET...", "unpause": "Usage: ttc unpause TARGET...",
-	"quarantine": "Usage: ttc quarantine CONTAINER@BRANCH...", "unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
-	"dehydrate": "Usage: ttc dehydrate TARGET...", "rehydrate": "Usage: ttc rehydrate [--node NODE] TARGET...",
-	"checkpoint": "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE", "restore": "Usage: ttc restore [--node NODE] [--name NAME] FILE",
-	"ls": "Usage: ttc ls [--tree|--json]", "ps": "Usage: ttc ps [OPTIONS]", "inspect": "Usage: ttc inspect [OPTIONS] CONTAINER...",
-	"top": "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]", "stats": "Usage: ttc stats [--json] CONTAINER@BRANCH",
-	"diff": "Usage: ttc diff [--json] CONTAINER@BRANCH", "events": "Usage: ttc events [OPTIONS]",
-	"wait": "Usage: ttc wait [--condition not-running|durable] TARGET...", "port": "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-	"volume": "Usage: ttc volume create|ls|inspect|rm [OPTIONS]", "node": "Usage: ttc node ls|stop|rebalance [OPTIONS]",
-	"tty": "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]", "rename": "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
-	"kill": "Usage: ttc kill [OPTIONS] TARGET...", "image": "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
-	"images": "Usage: ttc images [OPTIONS]", "rmi": "Usage: ttc rmi [OPTIONS] IMAGE...", "container": "Usage: ttc container COMMAND",
+	"daemon": `Usage: ttc daemon COMMAND [OPTIONS]
+
+Manage the local ttcd service. These commands use TTC_SOCKET or the global
+--daemon-socket override; only "start" reads TTC_ROOT and TTC_LOCAL_ROOT.
+
+Commands:
+  start [OPTIONS]        Start ttcd and wait until it is ready
+  status                 Show daemon build, mode, roots, and cluster state
+  stop [POLICY]          Stop ttcd, optionally disposing of live branches
+  requests [OPTIONS]     List durable mutation requests
+  request inspect ID     Inspect an interrupted mutation
+  request resolve ID     Record an operator-verified outcome
+
+Run 'ttc daemon COMMAND --help' for command-specific usage.`,
+	"daemon start": `Usage: ttc daemon start [OPTIONS]
+
+Start the sibling ttcd binary and wait until it is ready. TTC_ROOT must name
+an explicitly configured, new-format data root. Cluster mode additionally
+requires TTC_LOCAL_ROOT for node-local active state and cache data.
+
+Options:
+  --platform systrap|kvm          Select the gVisor execution platform
+  --unsafe-no-host-isolation      Disable host namespace/chroot isolation
+  --cluster-init                  Create a new distributed TTC cluster
+  --cluster-join HOST:PORT        Join an existing cluster through a seed node
+  --node NAME                     Set this cluster node's stable name
+  --listen ADDR                   Listen for cluster traffic
+  --advertise HOST:PORT           Address advertised to other cluster nodes
+  --memory-target SIZE            Target resident memory for this node
+  --cluster-auto-rebalance        Automatically relieve memory pressure
+  --cluster-capacity-command PATH Invoke a trusted node provisioner
+  --cluster-capacity-webhook URL  Invoke a trusted node provisioner webhook
+
+Cluster membership, transport, and capacity options are fixed for the daemon
+lifetime. --cluster-init and --cluster-join are mutually exclusive.`,
+	"daemon status": `Usage: ttc daemon status
+
+Show the running daemon's build ID, runtime mode, root format, and cluster
+membership. The client and daemon must have exactly matching builds.`,
+	"daemon stop": `Usage: ttc daemon stop [--dehydrate-all|--stop-all|--migrate-all]
+
+Stop the local daemon. With live branches, select exactly one policy:
+  --dehydrate-all  Persist complete process state, then stop
+  --stop-all       Terminate all local branches, then stop
+  --migrate-all    Move local branches to other cluster nodes, then stop
+
+This command remains available across client/daemon API or build mismatches.`,
+	"daemon requests": `Usage: ttc daemon requests [--json] [--state pending|completed]
+
+List durable mutation requests, including requests whose outcome needs manual
+inspection after a client disconnect or daemon failure.`,
+	"daemon request": `Usage: ttc daemon request inspect|resolve [OPTIONS] REQUEST_ID
+
+Inspect an interrupted durable mutation or record its verified outcome.`,
+	"daemon request inspect": `Usage: ttc daemon request inspect [--json] REQUEST_ID
+
+Show the command, state, timestamps, result, and operator note for one durable
+mutation request.`,
+	"daemon request resolve": `Usage: ttc daemon request resolve --outcome OUTCOME [--note TEXT] REQUEST_ID
+
+Record an operator-verified outcome without re-executing the mutation.
+OUTCOME must be succeeded, failed, or abandoned.`,
+
+	"image": `Usage: ttc image COMMAND [OPTIONS]
+
+Manage Docker/OCI images.
+
+Commands:
+  ls                         List images (alias: images)
+  pull IMAGE                 Pull an image from a registry
+  load [OPTIONS]             Load images from a Docker-compatible tar archive
+  save [OPTIONS] IMAGE...    Save images to a Docker-compatible tar archive
+  inspect IMAGE...           Show image configuration and TTC metadata
+  rm [OPTIONS] IMAGE...      Remove images (aliases: remove, rmi)
+
+Run 'ttc image COMMAND --help' for command-specific usage.`,
+	"image ls":      "Usage: ttc image ls [-q|--quiet] [--no-trunc] [--json]",
+	"image list":    "Usage: ttc image list [-q|--quiet] [--no-trunc] [--json]",
+	"image pull":    "Usage: ttc image pull [OPTIONS] IMAGE",
+	"image load":    "Usage: ttc image load [-i|--input FILE] [--platform PLATFORM] [-q|--quiet]",
+	"image save":    "Usage: ttc image save [-o|--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
+	"image inspect": "Usage: ttc image inspect IMAGE [IMAGE...]",
+	"image rm":      "Usage: ttc image rm [-f|--force] IMAGE [IMAGE...]",
+	"image remove":  "Usage: ttc image remove [-f|--force] IMAGE [IMAGE...]",
+
+	"container": `Usage: ttc container COMMAND [OPTIONS]
+
+Use Docker-style container command aliases. Branch-taking commands require a
+full CONTAINER@BRANCH selector.
+
+Commands:
+  run, create, start, stop, restart, rm
+  exec, attach, logs, cp, inspect, ls, ps, top
+  pause, unpause, kill, wait
+
+The same commands are also available without the "container" prefix.`,
+
+	"exec": `Usage: ttc exec [OPTIONS] CONTAINER@BRANCH COMMAND [ARG...]
+       ttc exec [OPTIONS] --process FILE CONTAINER@BRANCH
+       ttc exec ls|wait|kill [OPTIONS]
+
+Execute a command in a running branch. A named detached session remains
+reattachable after the client disconnects and retains output in its ring
+buffer.
+
+Common options:
+  -d                         Run detached
+  -i                         Keep standard input open
+  -t                         Allocate a terminal
+  -e, --env KEY=VALUE        Set an environment variable
+  -u, --user USER[:GROUP]    Select the guest user
+  -w, --workdir DIR          Set the working directory
+  --session NAME             Create a named, reattachable session
+  --process FILE             Read an OCI process specification`,
+	"exec ls":   "Usage: ttc exec ls [--json] CONTAINER@BRANCH",
+	"exec wait": "Usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID",
+	"exec kill": "Usage: ttc exec kill [--signal SIGNAL] CONTAINER@BRANCH:EXEC_ID",
+
+	"port": `Usage: ttc port COMMAND [OPTIONS]
+
+Manage user-mode TCP forwarding for existing branches.
+
+Commands:
+  publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]
+  ls [--json] CONTAINER@BRANCH
+  unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]`,
+	"port publish":   "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+	"port ls":        "Usage: ttc port ls [--json] CONTAINER@BRANCH",
+	"port unpublish": "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+
+	"volume": `Usage: ttc volume COMMAND [OPTIONS]
+
+Manage TTC-owned persistent volumes.
+
+Commands:
+  create NAME          Create a volume
+  ls                   List volumes
+  inspect NAME...      Inspect volumes
+  rm [-f] NAME...      Remove volumes (alias: remove)`,
+	"volume create":  "Usage: ttc volume create NAME",
+	"volume ls":      "Usage: ttc volume ls",
+	"volume list":    "Usage: ttc volume list",
+	"volume inspect": "Usage: ttc volume inspect NAME [NAME...]",
+	"volume rm":      "Usage: ttc volume rm [-f|--force] NAME [NAME...]",
+	"volume remove":  "Usage: ttc volume remove [-f|--force] NAME [NAME...]",
+
+	"node": `Usage: ttc node COMMAND [OPTIONS]
+
+Inspect and manage nodes in a distributed TTC cluster.
+
+Commands:
+  ls [--json]                List nodes, load, capacity, state, and lease
+  stop NODE [POLICY]         Evacuate or dispose of workloads and stop a node
+  rebalance NODE             Relieve a node's configured memory pressure
+
+Node stop policies are --migrate-all, --dehydrate-all, and --stop-all.`,
+	"node ls":        "Usage: ttc node ls [--json]",
+	"node stop":      "Usage: ttc node stop NODE [--stop-all|--dehydrate-all|--migrate-all]",
+	"node rebalance": "Usage: ttc node rebalance NODE",
+
+	"tty": `Usage: ttc tty COMMAND CONTAINER@BRANCH --session NAME [--json]
+
+Observe named exec-session terminal state without attaching to it.
+
+Commands:
+  stat     Print one terminal observation
+  watch    Stream coalesced terminal changes`,
+	"tty stat":  "Usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]",
+	"tty watch": "Usage: ttc tty watch CONTAINER@BRANCH --session NAME [--json]",
+
+	"run":          "Usage: ttc run [--node NODE] [OPTIONS] IMAGE [COMMAND] [ARG...]",
+	"create":       "Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]",
+	"start":        "Usage: ttc start [--node NODE] [OPTIONS] CONTAINER@BRANCH",
+	"stop":         "Usage: ttc stop [OPTIONS] TARGET...",
+	"restart":      "Usage: ttc restart [OPTIONS] TARGET...",
+	"rm":           "Usage: ttc rm [OPTIONS] TARGET...",
+	"attach":       "Usage: ttc attach [OPTIONS] CONTAINER@BRANCH",
+	"logs":         "Usage: ttc logs [OPTIONS] CONTAINER@BRANCH",
+	"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
+	"pull":         "Usage: ttc pull [OPTIONS] IMAGE",
+	"load":         "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
+	"save":         "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
+	"commit":       "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
+	"fork":         "Usage: ttc fork [--paused] [--quarantine] [--node NODE] CONTAINER@BRANCH DEST...",
+	"migrate":      "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
+	"pause":        "Usage: ttc pause TARGET...",
+	"resume":       "Usage: ttc resume TARGET...",
+	"unpause":      "Usage: ttc unpause TARGET...",
+	"quarantine":   "Usage: ttc quarantine CONTAINER@BRANCH...",
+	"unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
+	"dehydrate":    "Usage: ttc dehydrate TARGET...",
+	"rehydrate":    "Usage: ttc rehydrate [--node NODE] TARGET...",
+	"checkpoint":   "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE",
+	"restore":      "Usage: ttc restore [--node NODE] [--name NAME] FILE",
+	"ls":           "Usage: ttc ls [--tree|--json]",
+	"ps":           "Usage: ttc ps [OPTIONS]",
+	"inspect":      "Usage: ttc inspect [OPTIONS] CONTAINER...",
+	"top":          "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+	"stats":        "Usage: ttc stats [--json] CONTAINER@BRANCH",
+	"diff":         "Usage: ttc diff [--json] CONTAINER@BRANCH",
+	"events":       "Usage: ttc events [OPTIONS]",
+	"wait":         "Usage: ttc wait [--condition not-running|durable] TARGET...",
+	"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
+	"kill":         "Usage: ttc kill [OPTIONS] TARGET...",
+	"images":       "Usage: ttc images [OPTIONS]",
+	"rmi":          "Usage: ttc rmi [OPTIONS] IMAGE...",
+	"completion": `Usage: ttc completion bash|zsh|fish
+
+Generate a shell completion script on standard output. This command is fully
+client-local and does not require a running daemon.`,
 }
 
 func localHelp(args []string, stdout io.Writer) bool {
 	if args[0] == "help" {
-		printUsage(stdout)
+		if len(args) == 1 {
+			printUsage(stdout)
+			return true
+		}
+		printHelpTopic(args[1:], stdout)
 		return true
 	}
 	if len(args) >= 2 && (args[len(args)-1] == "--help" || args[len(args)-1] == "-h") {
-		key := strings.Join(args[:len(args)-1], " ")
-		if text, ok := commandHelp[key]; ok {
-			fmt.Fprintln(stdout, text)
-			return true
-		}
-		if text, ok := commandHelp[args[0]]; ok {
-			fmt.Fprintln(stdout, text)
-			return true
-		}
-		fmt.Fprintf(stdout, "Usage: ttc %s [OPTIONS]\n", key)
+		printHelpTopic(args[:len(args)-1], stdout)
 		return true
 	}
 	return false
+}
+
+func printHelpTopic(topic []string, stdout io.Writer) {
+	key := strings.Join(topic, " ")
+	if text, ok := commandHelp[key]; ok {
+		fmt.Fprintln(stdout, text)
+		return
+	}
+	if len(topic) != 0 {
+		if text, ok := commandHelp[topic[0]]; ok {
+			fmt.Fprintln(stdout, text)
+			return
+		}
+	}
+	fmt.Fprintf(stdout, "Usage: ttc %s [OPTIONS]\n", key)
 }
 
 func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
