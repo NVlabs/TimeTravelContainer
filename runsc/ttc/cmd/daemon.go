@@ -946,6 +946,9 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 	if err != nil {
 		return fmt.Errorf("publishing distributed target ownership: %w", err)
 	}
+	if info.DistributedForkTransactionID == tx.Identity.TransactionID && info.DistributedFamilyID != "" {
+		defer r.backend.containerStore().HideDistributedForkRuntime(tx.Identity.TransactionID)
+	}
 	if !tx.DesiredPaused && state == "paused" {
 		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
 			return fmt.Errorf("resuming distributed target: %w", err)

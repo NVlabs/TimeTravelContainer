@@ -227,8 +227,11 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !published.DistributedForkHidden {
-		t.Fatal("publishing logical placement exposed its physical runtime")
+	if published.DistributedForkHidden {
+		t.Fatal("target was not temporarily exposed for activation sidecars")
+	}
+	if err := store.HideDistributedForkRuntime("tx-hidden"); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := store.LoadContainer(info.ID); err == nil {
 		t.Fatal("ordinary lookup exposed physical runtime after publication")

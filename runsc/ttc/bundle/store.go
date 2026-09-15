@@ -3146,14 +3146,6 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 	var published ContainerInfo
 	err = s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
 		if current.DistributedForkTransactionID == transactionID {
-			// A standalone physical target is an implementation detail of its
-			// Raft-visible family. Placement makes the logical branch visible;
-			// exposing this record as well produces duplicate fork-* zombies once
-			// ownership migrates again.
-			if current.DistributedFamilyID != "" {
-				published = *current
-				return false, nil
-			}
 			if !current.DistributedForkHidden {
 				published = *current
 				return false, nil
@@ -3226,6 +3218,29 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 		return ContainerInfo{}, err
 	}
 	return published, nil
+}
+
+// HideDistributedForkRuntime removes a standalone physical target from
+// ordinary inventory after activation sidecars have been installed. Raft
+// placement, not this implementation record, exposes its logical branch.
+func (s Store) HideDistributedForkRuntime(transactionID string) error {
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return err
+	}
+	if info.DistributedForkTransactionID != transactionID || info.DistributedFamilyID == "" {
+		return nil
+	}
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID != transactionID {
+			return false, errors.New("distributed physical runtime identity changed")
+		}
+		if current.DistributedForkHidden {
+			return false, nil
+		}
+		current.DistributedForkHidden = true
+		return true, nil
+	})
 }
 
 // UpdateDistributedForkDependencies records volatile source bytes while a

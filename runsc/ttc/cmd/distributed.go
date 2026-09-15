@@ -201,6 +201,11 @@ func activateRemoteMigration(ctx context.Context, peer *cluster.Client, transact
 				}
 				return nil, err
 			}
+			if status.Revision == revision {
+				// The target rejected activation for a runtime reason, not an
+				// optimistic-revision race. Repeating cannot make progress.
+				return nil, err
+			}
 			revision = status.Revision
 		}
 		timer := time.NewTimer(50 * time.Millisecond)
