@@ -3062,7 +3062,16 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
-	return s.listContainersWithPolicy(false, true)
+	return s.listContainersWithPolicy(false, false, true)
+}
+
+// ListContainersForPlacement returns every published runtime-bearing
+// container, including the physical containers that back distributed logical
+// branches. Unlike ListContainers, this is an authority view rather than a
+// user-facing inventory. Prepared targets remain hidden until their placement
+// publication boundary commits.
+func (s Store) ListContainersForPlacement() ([]ContainerInfo, error) {
+	return s.listContainersWithPolicy(false, true, false)
 }
 
 // ListContainersForGC returns every durable container, including internal
@@ -3073,7 +3082,7 @@ func (s Store) ListContainersForGC() ([]ContainerInfo, error) {
 }
 
 func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
-	return s.listContainersWithPolicy(includeHidden, false)
+	return s.listContainersWithPolicy(includeHidden, true, false)
 }
 
 // listContainersWithPolicy separates availability-oriented discovery from
@@ -3081,7 +3090,7 @@ func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 // unreadable record so that an isolated damaged directory cannot hide every
 // healthy container. Mutations and garbage collection remain strict: they
 // must not infer that unreadable state is unreferenced.
-func (s Store) listContainersWithPolicy(includeHidden, tolerateUnreadable bool) ([]ContainerInfo, error) {
+func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerateUnreadable bool) ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
@@ -3127,7 +3136,7 @@ func (s Store) listContainersWithPolicy(includeHidden, tolerateUnreadable bool) 
 		// lifecycle helpers, but Raft placement is its only user-visible identity.
 		// Never duplicate it in ordinary family inventory.
 		physicalDistributedRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
-		if includeHidden || (!info.DistributedForkHidden && !physicalDistributedRuntime) {
+		if includeHidden || (!info.DistributedForkHidden && (includePhysical || !physicalDistributedRuntime)) {
 			containers = append(containers, info)
 		}
 	}

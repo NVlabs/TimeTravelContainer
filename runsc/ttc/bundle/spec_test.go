@@ -185,6 +185,9 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if _, err := store.LoadContainer(info.ID); err == nil {
 		t.Fatal("ordinary lookup unexpectedly exposed hidden target")
 	}
+	if listed, err := store.ListContainersForPlacement(); err != nil || len(listed) != 0 {
+		t.Fatalf("prepared target placement inventory=(%+v, %v), want empty", listed, err)
+	}
 	if runtime, err := store.LoadRuntimeContainer(info.ID); err != nil || runtime.ID != info.ID {
 		t.Fatalf("exact runtime lookup=(%q, %v), want hidden target", runtime.ID, err)
 	}
@@ -239,6 +242,13 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	}
 	if len(listed) != 0 {
 		t.Fatalf("ordinary inventory exposed physical runtime: %+v", listed)
+	}
+	placementInventory, err := store.ListContainersForPlacement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placementInventory) != 1 || placementInventory[0].ID != info.ID {
+		t.Fatalf("placement inventory = %+v, want published physical runtime %q", placementInventory, info.ID)
 	}
 }
 

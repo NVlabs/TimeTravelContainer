@@ -553,7 +553,11 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
 		}
 	}
-	containers, err := b.containerStore().ListContainers()
+	// Placement reconciliation needs the physical runtime behind every remote
+	// logical branch. The user-facing inventory deliberately hides those
+	// containers, so using ListContainers here made a newly committed fork look
+	// absent and allowed the target node to delete its own Raft placement.
+	containers, err := b.containerStore().ListContainersForPlacement()
 	if err != nil {
 		return err
 	}
