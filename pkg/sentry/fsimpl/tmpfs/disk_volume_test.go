@@ -231,6 +231,12 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	if !ms.invalidated {
 		t.Fatal("prepareLiveFork did not invalidate the application mapping")
 	}
+	// Filesystem PrepareSave removes the current invalidation set before it
+	// calls prepareLiveFork. Existing VMAs survive, so their next fault reaches
+	// Translate without another AddMapping call. Model that boundary here.
+	fs.liveForkMu.Lock()
+	fs.diskForkFiles = nil
+	fs.liveForkMu.Unlock()
 	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
 		t.Fatalf("Fork: %v", err)
 	}
@@ -242,6 +248,12 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	}
 	if got := file.diskMmap.FD(); got < 0 {
 		t.Fatal("mmap cache did not install a new FD after fork")
+	}
+	fs.liveForkMu.Lock()
+	_, trackedAfterRefault := fs.diskForkFiles[file]
+	fs.liveForkMu.Unlock()
+	if !trackedAfterRefault {
+		t.Fatal("post-fork mmap refault was not tracked for the next lifecycle fence")
 	}
 	file.RemoveMapping(ctx, ms, ar, 0, false)
 	file.diskMmap.MappableRelease()

@@ -252,6 +252,10 @@ func (rf *regularFile) prepareLiveFork() {
 // diskMmap may remain valid when diskObject is empty.
 func (rf *regularFile) ensureDiskMmapLocked() error {
 	if rf.diskObject != "" && rf.diskMmap.FD() >= 0 {
+		// AddMapping is not called again when an existing VMA refaults after
+		// prepareLiveFork invalidated its PMAs. Keep the file in the next
+		// lifecycle fence's invalidation set even on this fast path.
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	volume := rf.inode.fs.diskVolume
@@ -270,6 +274,7 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 	}
 	defer file.Close()
 	if rf.diskObject == meta.Object && rf.diskMmap.FD() >= 0 {
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	newFD, err := unix.Dup(int(file.Fd()))
@@ -281,6 +286,12 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		return err
 	}
 	rf.diskObject = meta.Object
+	// An existing VMA can reach Translate after a fork without another
+	// AddMapping call. Record the newly installed host-backed translation so
+	// the next fork, checkpoint, or dehydration invalidates it before PMA
+	// serialization. Otherwise an idle-then-refaulted branch can retain an
+	// fsutil.MmapCachedFile PMA that the memory graph cannot serialize.
+	rf.inode.fs.markDiskForkFile(rf)
 	return nil
 }
 

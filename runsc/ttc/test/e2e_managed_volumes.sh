@@ -89,6 +89,22 @@ ttc run -d --name "$ROOTFS_CONTAINER" "$BUSYBOX_IMAGE" \
 ttc fork "$ROOTFS_CONTAINER@main" child >/dev/null
 ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
 ttc exec "$ROOTFS_CONTAINER@main" test ! -e /rootfs-child
+# An existing VMA does not receive another AddMapping call when it refaults
+# after a fork. Execute an upper-layer file after that boundary and require the
+# next dehydration to invalidate its host-backed PMAs and retain the process.
+ttc exec "$ROOTFS_CONTAINER@main" mkdir -p /tmp/upper
+ttc exec "$ROOTFS_CONTAINER@main" cp /bin/busybox /tmp/upper/busybox
+ttc fork "$ROOTFS_CONTAINER@main" mapped-child >/dev/null
+ttc exec -d --session upper-mmap "$ROOTFS_CONTAINER@main" \
+  /tmp/upper/busybox sh -c 'while :; do sleep 60; done'
+ttc exec ls "$ROOTFS_CONTAINER@main" | grep -E \
+  '^upper-mmap[[:space:]]+[0-9]+[[:space:]]+running' >/dev/null ||
+  fail "upper-layer executable session did not remain running"
+ttc dehydrate "$ROOTFS_CONTAINER@main" >/dev/null
+ttc rehydrate "$ROOTFS_CONTAINER@main" >/dev/null
+ttc exec ls "$ROOTFS_CONTAINER@main" | grep -E \
+  '^upper-mmap[[:space:]]+[0-9]+[[:space:]]+running' >/dev/null ||
+  fail "upper-layer executable session did not survive dehydration"
 ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
 find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/data/files" -type f -size +0c | grep . >/dev/null ||
   fail "running rootfs did not create a non-empty disk object"
@@ -96,6 +112,7 @@ if find "$DATA_ROOT/containers/$ROOTFS_ID" -type f -name '*.tar' | grep . >/dev/
   fail "writable rootfs unexpectedly created a tar persistence image"
 fi
 ttc stop "$ROOTFS_CONTAINER@child" >/dev/null
+ttc stop "$ROOTFS_CONTAINER@mapped-child" >/dev/null
 ttc stop "$ROOTFS_CONTAINER@main" >/dev/null
 ttc cp "$ROOTFS_CONTAINER@child:/rootfs-child" "$CHILD_EXPORT"
 [ "$(cat "$CHILD_EXPORT")" = child ] ||
