@@ -25,6 +25,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1567,6 +1569,21 @@ func TestStandaloneCPUProfileIsImmutable(t *testing.T) {
 	adopted, err := applyStandaloneCPUProfile(root, "host", "", "systrap", false)
 	if err != nil || !reflect.DeepEqual(adopted, profile) {
 		t.Fatalf("implicit restart profile=(%+v, %v), want %+v", adopted, err, profile)
+	}
+}
+
+func TestPortableCPUProfileIsHostIndependent(t *testing.T) {
+	profile, err := resolveDaemonCPUProfile("portable", "", "systrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOARCH == "amd64" && !slices.Equal(profile.Features, portableAMD64Features) {
+		t.Fatalf("portable features=%v, want fixed baseline %v", profile.Features, portableAMD64Features)
+	}
+	for _, feature := range profile.Features {
+		if strings.HasPrefix(feature, "avx") || strings.HasPrefix(feature, "amx_") {
+			t.Fatalf("portable profile exposed optional extended-state feature %q", feature)
+		}
 	}
 }
 

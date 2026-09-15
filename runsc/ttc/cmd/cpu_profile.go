@@ -23,6 +23,17 @@ import (
 
 const daemonCPUProfileVersion = 1
 
+// portableAMD64Features is an x86-64-v2-class guest contract expressed using
+// gVisor's Linux-compatible feature names. It is deliberately independent of
+// the bootstrap host's vendor and model so an AMD-initialized cluster can
+// admit an Intel node (and vice versa). Newer instructions are available via
+// the immutable host or explicit profiles.
+var portableAMD64Features = []string{
+	"apic", "cmov", "cx16", "cx8", "fpu", "fxsr", "lahf_lm", "lm",
+	"mmx", "nx", "pae", "pat", "pge", "pni", "popcnt", "pse", "pse36",
+	"sep", "sse", "sse2", "sse4_1", "sse4_2", "ssse3", "syscall", "tsc",
+}
+
 // daemonCPUProfile is the exact guest-visible instruction contract. Mode is
 // descriptive; Features is authoritative and is never recomputed after a
 // root or cluster has been initialized.
@@ -50,6 +61,12 @@ func hostCPUFeatureNames(runtimePlatform string) []string {
 		if runtimePlatform == "systrap" && name == "fsgsbase" {
 			continue
 		}
+		// gVisor does not currently preserve AMX tile state. Never advertise
+		// instructions whose architectural state cannot survive a TTC fork or
+		// migration, including in the host profile.
+		if strings.HasPrefix(name, "amx_") {
+			continue
+		}
 		features = append(features, name)
 	}
 	slices.Sort(features)
@@ -72,14 +89,18 @@ func resolveDaemonCPUProfile(mode, explicit, runtimePlatform string) (daemonCPUP
 		if strings.TrimSpace(explicit) != "" {
 			return daemonCPUProfile{}, errors.New("--cpu-features requires --cpu-profile=explicit")
 		}
-		// Portable is deliberately conservative about large, optional XSAVE
-		// components. The exact resulting list is persisted at cluster init;
-		// later nodes must contain it rather than silently narrowing it.
-		for _, feature := range host {
-			if strings.HasPrefix(feature, "avx512") || strings.HasPrefix(feature, "amx_") {
-				continue
+		if runtime.GOARCH == "amd64" {
+			features = append(features, portableAMD64Features...)
+		} else {
+			// There is not yet a TTC cross-vendor baseline for other
+			// architectures. Persisting the exact host set still fails closed at
+			// admission rather than silently changing guest-visible features.
+			features = append(features, host...)
+		}
+		for _, feature := range features {
+			if _, ok := hostSet[feature]; !ok {
+				return daemonCPUProfile{}, fmt.Errorf("host does not support portable CPU feature %q", feature)
 			}
-			features = append(features, feature)
 		}
 	case "host":
 		if strings.TrimSpace(explicit) != "" {
