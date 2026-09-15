@@ -4137,6 +4137,49 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	}
 }
 
+func TestListFamiliesHidesCompletedPhysicalMigrationRuntime(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	const physicalID = "fork-0123456789abcdef"
+	script := `#!/bin/sh
+if [ "$3" = "list" ]; then
+	echo '[{"id":"` + physicalID + `","pid":2468,"status":"paused"}]'
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "` + physicalID + `" ] && [ "$5" = "branches" ]; then
+	echo '[{"ID":"main","State":"paused"}]'
+	exit 0
+fi
+exit 2
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", physicalID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", physicalID, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, BundleDir: bundleDir, State: "paused", CreatedAt: time.Now(),
+		DistributedFamilyID: "logical-family", DistributedForkTransactionID: "completed-migration",
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "paused", CreatedAt: time.Now()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a"}
+	families, err := b.listFamilies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(families) != 0 {
+		t.Fatalf("completed physical migration runtime leaked into inventory: %+v", families)
+	}
+}
+
 func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		NodeID: "node-a",

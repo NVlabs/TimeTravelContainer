@@ -37,6 +37,7 @@ go_library(
         "//pkg/abi/linux",
 		"//pkg/cpuid",
         "//pkg/hostarch",
+		"//pkg/log",
         "//pkg/memutil",
 		"//pkg/sentry/checkpoint",
         "//pkg/sentry/kernel",

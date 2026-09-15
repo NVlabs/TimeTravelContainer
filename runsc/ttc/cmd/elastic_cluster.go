@@ -39,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/log"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -1654,11 +1655,11 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			unlockSource := b.distributedSource.lockSourceFamily(containerID)
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
 			relay.Close()
-			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: retaining completed migration transfer roots for retry %s@%s: %v\n", containerID, branchID, err)
+			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+				log.Warningf("TTC: retaining completed migration transfer roots for retry %s@%s: %v", containerID, branchID, err)
 			}
-			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: retaining source runtime after sparse migration %s@%s: %v\n", containerID, branchID, err)
+			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil {
+				log.Warningf("TTC: retaining source runtime after sparse migration %s@%s: %v", containerID, branchID, err)
 			}
 			unlockSource()
 			return

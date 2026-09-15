@@ -9662,6 +9662,8 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
+			runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
+			physicalRuntime := runtimeInfoErr == nil && runtimeInfo.DistributedFamilyID != "" && runtimeInfo.DistributedForkTransactionID != ""
 			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
 				physicalID := family.ID
 				family.ID = placements[0].FamilyID
@@ -9673,6 +9675,13 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 						}
 					}
 				}
+			} else if physicalRuntime {
+				// Raft only retains the current physical placement for a logical
+				// branch. A completed migration's source runtime can therefore
+				// remain visible to runsc briefly while its asynchronous cleanup
+				// is retrying. It is internal implementation state, never a new
+				// user-visible family.
+				continue
 			}
 			// A runsc state directory can outlive its Sentry after SIGKILL, which
 			// is common when a batch scheduler terminates a whole job. Merely
