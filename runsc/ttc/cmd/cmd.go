@@ -9219,6 +9219,12 @@ func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, e
 		if err != nil {
 			return nil, err
 		}
+		if b.portIngress.server.clusterPlacements != nil {
+			// Cluster ingress bindings are intentionally node-local and
+			// ephemeral. A remote branch's physical bundle is not present on
+			// this ingress node and must not be consulted for display.
+			return ephemeral, nil
+		}
 		info, err := b.resolveContainer(container)
 		if err != nil {
 			return nil, err

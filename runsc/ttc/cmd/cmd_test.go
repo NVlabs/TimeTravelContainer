@@ -78,6 +78,44 @@ func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error
 	return os.WriteFile(path, encoded, 0600)
 }
 
+func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "physical", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPort := uint16(probe.Addr().(*net.TCPAddr).Port)
+	probe.Close()
+	server := &daemonServer{clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 8080, Protocol: "tcp"}
+	if err := manager.Publish(selector{container: "web", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := manager.List("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].HostPort != hostPort {
+		t.Fatalf("listed bindings=%+v", listed)
+	}
+	if err := manager.Unpublish(selector{container: "web", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

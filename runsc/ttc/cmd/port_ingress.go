@@ -57,24 +57,39 @@ func (m *portIngressManager) Publish(target selector, binding ttcbundle.PortBind
 	if binding.Protocol != "tcp" {
 		return fmt.Errorf("unsupported published-port protocol %q", binding.Protocol)
 	}
-	info, err := m.serverStore().LoadContainer(target.container)
-	if err != nil {
-		return err
+	if m.server.clusterPlacements != nil {
+		family, err := resolvePlacementFamily(m.server.clusterPlacements, target.container)
+		if err != nil {
+			return fmt.Errorf("resolving placement family %q: %w", target.container, err)
+		}
+		placement, err := m.server.clusterPlacements.Lookup(family, target.branch)
+		if err != nil {
+			return err
+		}
+		if placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused {
+			return fmt.Errorf("branch %q is %s", target.branch, placement.State)
+		}
+		target.container = family
+	} else {
+		info, err := m.serverStore().LoadContainer(target.container)
+		if err != nil {
+			return err
+		}
+		branch, err := persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return err
+		}
+		if branch.State != "running" && branch.State != "paused" {
+			return fmt.Errorf("branch %q is %s", target.branch, branch.State)
+		}
+		if branch.Quarantined {
+			return fmt.Errorf("branch %q is quarantined", target.branch)
+		}
+		if info.NetworkMode != "ttc" {
+			return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+		}
+		target.container = info.ID
 	}
-	branch, err := persistentBranchInfo(info, target.branch)
-	if err != nil {
-		return err
-	}
-	if branch.State != "running" && branch.State != "paused" {
-		return fmt.Errorf("branch %q is %s", target.branch, branch.State)
-	}
-	if branch.Quarantined {
-		return fmt.Errorf("branch %q is quarantined", target.branch)
-	}
-	if info.NetworkMode != "ttc" {
-		return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
-	}
-	target.container = info.ID
 	binding.BranchID = target.branch
 	key := ingressPortKey(binding)
 	m.mu.Lock()
@@ -144,15 +159,25 @@ func (m *portIngressManager) forward(ctx context.Context, target selector, port 
 }
 
 func (m *portIngressManager) List(container string) ([]ttcbundle.PortBinding, error) {
-	info, err := m.serverStore().LoadContainer(container)
-	if err != nil {
-		return nil, err
+	family := ""
+	if m.server.clusterPlacements != nil {
+		resolved, err := resolvePlacementFamily(m.server.clusterPlacements, container)
+		if err != nil {
+			return nil, err
+		}
+		family = resolved
+	} else {
+		info, err := m.serverStore().LoadContainer(container)
+		if err != nil {
+			return nil, err
+		}
+		family = info.ID
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var result []ttcbundle.PortBinding
 	for _, entry := range m.ports {
-		if entry.target.container == info.ID {
+		if entry.target.container == family {
 			result = append(result, entry.binding)
 		}
 	}
@@ -160,15 +185,25 @@ func (m *portIngressManager) List(container string) ([]ttcbundle.PortBinding, er
 }
 
 func (m *portIngressManager) Unpublish(target selector, binding ttcbundle.PortBinding) error {
-	info, err := m.serverStore().LoadContainer(target.container)
-	if err != nil {
-		return err
+	family := ""
+	if m.server.clusterPlacements != nil {
+		resolved, err := resolvePlacementFamily(m.server.clusterPlacements, target.container)
+		if err != nil {
+			return err
+		}
+		family = resolved
+	} else {
+		info, err := m.serverStore().LoadContainer(target.container)
+		if err != nil {
+			return err
+		}
+		family = info.ID
 	}
 	binding.BranchID = target.branch
 	key := ingressPortKey(binding)
 	m.mu.Lock()
 	entry := m.ports[key]
-	if entry == nil || entry.target.container != info.ID || entry.target.branch != target.branch || entry.binding.ContainerPort != binding.ContainerPort {
+	if entry == nil || entry.target.container != family || entry.target.branch != target.branch || entry.binding.ContainerPort != binding.ContainerPort {
 		m.mu.Unlock()
 		return errIngressPortNotFound
 	}
