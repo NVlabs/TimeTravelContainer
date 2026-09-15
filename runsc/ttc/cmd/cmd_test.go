@@ -78,6 +78,23 @@ func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error
 	return os.WriteFile(path, encoded, 0600)
 }
 
+func TestLogicalFamilyID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info ttcbundle.ContainerInfo
+		want string
+	}{
+		{name: "local physical identity", info: ttcbundle.ContainerInfo{ID: "physical"}, want: "physical"},
+		{name: "migrated logical identity", info: ttcbundle.ContainerInfo{ID: "physical", DistributedFamilyID: "family"}, want: "family"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := logicalFamilyID(tc.info); got != tc.want {
+				t.Fatalf("logicalFamilyID(%+v) = %q, want %q", tc.info, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing.T) {
 	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
 	if err != nil {

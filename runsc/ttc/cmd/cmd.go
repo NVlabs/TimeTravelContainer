@@ -5767,7 +5767,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if kind == "dehydrate" {
 			lifecycle = "dehydrated"
 		}
-		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(target.container, target.branch, publicationID, lifecycle); err != nil {
+		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(logicalFamilyID(info), target.branch, publicationID, lifecycle); err != nil {
 			return rollback(fmt.Errorf("authorizing asynchronous publication: %w", err))
 		}
 	}
@@ -5786,6 +5786,17 @@ func persistentBranchInfoFromStore(store ttcbundle.Store, target selector) (ttcb
 		return ttcbundle.BranchInfo{}, err
 	}
 	return persistentBranchInfo(info, target.branch)
+}
+
+// logicalFamilyID returns the cluster identity used by Raft. A branch that
+// has migrated may be materialized in a node-local container whose physical
+// ID differs from the family ID; physical IDs must never escape into the
+// control-plane state machine.
+func logicalFamilyID(info ttcbundle.ContainerInfo) string {
+	if info.DistributedFamilyID != "" {
+		return info.DistributedFamilyID
+	}
+	return info.ID
 }
 
 func (b *runtimeBackend) imageProgress() ttcimages.ProgressFunc {
