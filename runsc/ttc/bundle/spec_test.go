@@ -230,11 +230,15 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if published.DistributedForkHidden {
 		t.Fatal("target was not temporarily exposed for activation sidecars")
 	}
-	if err := store.HideDistributedForkRuntime("tx-hidden"); err != nil {
+	if exact, err := store.LoadContainer(info.ID); err != nil || exact.ID != info.ID {
+		t.Fatalf("published physical runtime exact lookup=(%q, %v)", exact.ID, err)
+	}
+	listed, err := store.ListContainers()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.LoadContainer(info.ID); err == nil {
-		t.Fatal("ordinary lookup exposed physical runtime after publication")
+	if len(listed) != 0 {
+		t.Fatalf("ordinary inventory exposed physical runtime: %+v", listed)
 	}
 }
 

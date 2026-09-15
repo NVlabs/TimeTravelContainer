@@ -3123,7 +3123,11 @@ func (s Store) listContainersWithPolicy(includeHidden, tolerateUnreadable bool) 
 			return nil, err
 		}
 		warnedUnreadableContainers.Delete(filepath.Join(containersDir, entry.Name()))
-		if includeHidden || !info.DistributedForkHidden {
+		// A published physical runtime must remain exactly addressable by daemon
+		// lifecycle helpers, but Raft placement is its only user-visible identity.
+		// Never duplicate it in ordinary family inventory.
+		physicalDistributedRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+		if includeHidden || (!info.DistributedForkHidden && !physicalDistributedRuntime) {
 			containers = append(containers, info)
 		}
 	}
@@ -3218,29 +3222,6 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 		return ContainerInfo{}, err
 	}
 	return published, nil
-}
-
-// HideDistributedForkRuntime removes a standalone physical target from
-// ordinary inventory after activation sidecars have been installed. Raft
-// placement, not this implementation record, exposes its logical branch.
-func (s Store) HideDistributedForkRuntime(transactionID string) error {
-	info, err := s.LoadDistributedForkTarget(transactionID)
-	if err != nil {
-		return err
-	}
-	if info.DistributedForkTransactionID != transactionID || info.DistributedFamilyID == "" {
-		return nil
-	}
-	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
-		if current.DistributedForkTransactionID != transactionID {
-			return false, errors.New("distributed physical runtime identity changed")
-		}
-		if current.DistributedForkHidden {
-			return false, nil
-		}
-		current.DistributedForkHidden = true
-		return true, nil
-	})
 }
 
 // UpdateDistributedForkDependencies records volatile source bytes while a
