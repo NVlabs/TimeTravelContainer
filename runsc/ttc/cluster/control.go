@@ -48,6 +48,9 @@ const (
 	controlSnapshotPrefix      = "/v1/snapshots/"
 	controlSharedLedgerPrefix  = "/v1/shared-ledger/"
 	controlReferenceClaimsPath = "/v1/reference-claims"
+	controlTopologyProbePath   = "/v1/topology/probe"
+	controlTopologyEchoPath    = "/v1/topology/echo"
+	controlPortProxyPath       = "/v1/ports/connect"
 	maxControlBody             = 1 << 20
 	controlNodeHeader          = "X-TTC-Node"
 	controlObjectLengthHeader  = "X-TTC-Object-Length"
@@ -442,6 +445,21 @@ type AuthorityRetireRequest struct {
 	Incarnation string `json:"incarnation"`
 }
 
+// TopologyProbeRequest asks an existing member to connect back to a joining
+// member. The authenticated request proves joining->existing reachability;
+// the nonce-bearing callback proves existing->joining reachability.
+type TopologyProbeRequest struct {
+	NodeID      string `json:"node_id"`
+	Incarnation string `json:"incarnation"`
+	ControlURL  string `json:"control_url"`
+	Nonce       string `json:"nonce"`
+}
+
+type topologyEchoRequest struct {
+	ExpectedPeer string `json:"expected_peer"`
+	Nonce        string `json:"nonce"`
+}
+
 // AuthorityService exposes leader proposals and membership changes over the
 // existing token-authenticated cluster HTTP endpoint on the trusted private
 // cluster network.
@@ -657,6 +675,9 @@ type ControlPlane struct {
 	// CommandProxy forwards the TTC daemon wire protocol after peer
 	// authentication. It is optional for non-elastic deployments.
 	CommandProxy http.Handler
+	// PortProxy opens one branch-local guest TCP connection and bridges it to
+	// the authenticated full-duplex request stream.
+	PortProxy http.Handler
 	// ObjectProvider serves immutable graph objects owned by this node. Reads
 	// are fenced by the provider's current Raft authority and transaction.
 	ObjectProvider ImmutableObjectProvider
@@ -786,6 +807,35 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeControlError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+	if r.URL.Path == controlTopologyEchoPath {
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "topology echo requires POST")
+			return
+		}
+		var request topologyEchoRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if request.ExpectedPeer != peer || !transactionIDPattern.MatchString(request.Nonce) {
+			writeControlError(w, http.StatusForbidden, "invalid topology echo identity or nonce")
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]string{"nonce": request.Nonce})
+		return
+	}
+	if r.URL.Path == controlTopologyProbePath {
+		c.serveTopologyProbe(w, r, peer)
+		return
+	}
+	if r.URL.Path == controlPortProxyPath && r.Method == http.MethodPost {
+		if c.PortProxy == nil {
+			writeControlError(w, http.StatusNotImplemented, "port tunnel is unavailable")
+			return
+		}
+		c.PortProxy.ServeHTTP(w, r)
+		return
+	}
 	if r.URL.Path == controlProxyPath && r.Method == http.MethodPost {
 		if c.CommandProxy == nil {
 			writeControlError(w, http.StatusNotImplemented, "daemon command proxy is unavailable")
@@ -879,6 +929,51 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeControlError(w, http.StatusNotFound, "unknown cluster endpoint")
+}
+
+func (c *ControlPlane) serveTopologyProbe(w http.ResponseWriter, r *http.Request, peer string) {
+	if r.Method != http.MethodPost {
+		writeControlError(w, http.StatusMethodNotAllowed, "topology probe requires POST")
+		return
+	}
+	var request TopologyProbeRequest
+	if err := decodeControlJSON(r.Body, &request); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.NodeID != peer || !transactionIDPattern.MatchString(request.Incarnation) || !transactionIDPattern.MatchString(request.Nonce) {
+		writeControlError(w, http.StatusForbidden, "invalid topology probe identity")
+		return
+	}
+	if c.Authority == nil || c.Authority.Node == nil {
+		writeControlError(w, http.StatusServiceUnavailable, "topology authority is unavailable")
+		return
+	}
+	state, err := c.Authority.Node.AppliedState()
+	if err != nil {
+		writeControlError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	record, ok := state.Nodes[request.NodeID]
+	if !ok || record.Incarnation != request.Incarnation || record.ControlURL != request.ControlURL || record.State == NodeOffline {
+		writeControlError(w, http.StatusConflict, "joining node topology identity is not committed")
+		return
+	}
+	callback, err := NewPlainClient(request.ControlURL, c.Capabilities.NodeID, c.AuthToken, 5*time.Second)
+	if err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var response map[string]string
+	if err := callback.call(r.Context(), http.MethodPost, controlTopologyEchoPath, topologyEchoRequest{ExpectedPeer: c.Capabilities.NodeID, Nonce: request.Nonce}, &response); err != nil {
+		writeControlError(w, http.StatusBadGateway, "reverse topology probe failed: "+err.Error())
+		return
+	}
+	if response["nonce"] != request.Nonce {
+		writeControlError(w, http.StatusBadGateway, "reverse topology probe returned the wrong nonce")
+		return
+	}
+	writeControlJSON(w, http.StatusOK, map[string]string{"node_id": c.Capabilities.NodeID, "nonce": request.Nonce})
 }
 
 func (c *ControlPlane) serveSharedLedger(w http.ResponseWriter, r *http.Request, peer string) {
@@ -1967,6 +2062,39 @@ func (c *Client) ProxyDaemon(ctx context.Context, input io.Reader, output io.Wri
 	return err
 }
 
+// ProxyPort bridges one byte stream to a TCP listener in the selected guest.
+func (c *Client) ProxyPort(ctx context.Context, family, branch string, port uint16, input io.Reader, output io.Writer) error {
+	if family == "" || branch == "" || port == 0 {
+		return errors.New("invalid guest port tunnel target")
+	}
+	endpoint := c.BaseURL + controlPortProxyPath + "?family=" + url.QueryEscape(family) + "&branch=" + url.QueryEscape(branch) + "&port=" + strconv.Itoa(int(port))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, input)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/vnd.ttc.port-stream")
+	c.authenticate(req)
+	client := c.daemonHTTP
+	if client == nil {
+		client = c.streamHTTP
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		limited := io.LimitReader(resp.Body, maxControlBody+1)
+		var remote controlError
+		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {
+			return fmt.Errorf("cluster peer returned HTTP %s", resp.Status)
+		}
+		return fmt.Errorf("cluster peer: %s", remote.Error)
+	}
+	_, err = io.Copy(output, resp.Body)
+	return err
+}
+
 // ProposeAuthority forwards a deterministic mutation envelope to the current
 // cluster leader. The leader supplies the command timestamp.
 func (c *Client) ProposeAuthority(ctx context.Context, proposal AuthorityProposal) (AuthorityResult, error) {
@@ -2001,6 +2129,19 @@ func (c *Client) SnapshotReferenceInventory(ctx context.Context) (*SnapshotRefer
 func (c *Client) JoinAuthority(ctx context.Context, request AuthorityJoinRequest) error {
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlAuthorityJoinPath, request, &response)
+}
+
+// ProbeTopology proves bidirectional control reachability between this
+// client's server and the joining node described by request.
+func (c *Client) ProbeTopology(ctx context.Context, request TopologyProbeRequest) error {
+	var response map[string]string
+	if err := c.call(ctx, http.MethodPost, controlTopologyProbePath, request, &response); err != nil {
+		return err
+	}
+	if response["nonce"] != request.Nonce {
+		return errors.New("topology probe returned the wrong nonce")
+	}
+	return nil
 }
 
 func (c *Client) RetireAuthority(ctx context.Context, request AuthorityRetireRequest) error {

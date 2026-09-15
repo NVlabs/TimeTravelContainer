@@ -86,6 +86,7 @@ type options struct {
 	dataRoot              string
 	localRoot             string
 	runtimePlatform       string
+	cpuFeatures           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	daemonSocket          string
@@ -251,7 +252,8 @@ Commands:
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
-  daemon start [--platform systrap|kvm] [--unsafe-no-host-isolation]
+  daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
+               [--cpu-features FEATURE,...] [--unsafe-no-host-isolation]
                [--cluster-init | --cluster-join HOST:PORT]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
@@ -276,7 +278,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"commit":       "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":         "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"completion":   "Usage: ttc completion bash|zsh|fish",
-			"daemon":       "Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [OPTIONS] | status | stop [--migrate-all|--dehydrate-all|--stop-all]",
+			"daemon":       "Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [--cpu-profile portable|host|explicit] [--cpu-features FEATURE,...] [OPTIONS] | status | stop [--migrate-all|--dehydrate-all|--stop-all]",
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
 			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
@@ -5520,6 +5522,7 @@ type runtimeBackend struct {
 	localRoot             string
 	daemonSocket          string
 	runtimePlatform       string
+	cpuFeatures           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	volumeCopyMode        ttcvolume.CopyMode
@@ -5531,6 +5534,7 @@ type runtimeBackend struct {
 	stderr                io.Writer
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
+	portIngress           *portIngressManager
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
@@ -5600,7 +5604,7 @@ func environmentHasKey(env []string, key string) bool {
 }
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
-	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot()}
+	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot(), CPUFeatures: b.cpuFeatures}
 	if b.root != "" {
 		store.TransientRoot = filepath.Join(b.root, "ttc-transient-bundles")
 	}
@@ -9168,6 +9172,9 @@ func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
 }
 
 func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBinding) error {
+	if b.portIngress != nil {
+		return b.portIngress.Publish(target, binding)
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -9207,6 +9214,17 @@ func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBind
 }
 
 func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, error) {
+	if b.portIngress != nil {
+		ephemeral, err := b.portIngress.List(container)
+		if err != nil {
+			return nil, err
+		}
+		info, err := b.resolveContainer(container)
+		if err != nil {
+			return nil, err
+		}
+		return append(append([]ttcbundle.PortBinding(nil), info.PublishedPorts...), ephemeral...), nil
+	}
 	info, err := b.resolveContainer(container)
 	if err != nil {
 		return nil, err
@@ -9358,6 +9376,11 @@ func (b *runtimeBackend) stopPublishedPorts(info ttcbundle.ContainerInfo) error 
 }
 
 func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBinding) error {
+	if b.portIngress != nil {
+		if err := b.portIngress.Unpublish(target, binding); !errors.Is(err, errIngressPortNotFound) {
+			return err
+		}
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err

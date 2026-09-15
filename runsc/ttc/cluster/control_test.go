@@ -84,6 +84,92 @@ func TestProxyDaemonUsesDedicatedNonReusedTransport(t *testing.T) {
 	}
 }
 
+func TestProxyPortCarriesBidirectionalStream(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := &ControlPlane{
+		Store: store, MaxTransactions: 1, Now: time.Now,
+		PortProxy: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("family") + "@" + r.URL.Query().Get("branch") + ":" + r.URL.Query().Get("port"); got != "web@main:8080" {
+				t.Errorf("port target=%q", got)
+			}
+			payload, _ := io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/vnd.ttc.port-stream")
+			_, _ = w.Write(append([]byte("guest:"), payload...))
+		}),
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := client.ProxyPort(context.Background(), "web", "main", 8080, strings.NewReader("hello"), &output); err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); got != "guest:hello" {
+		t.Fatalf("port response=%q", got)
+	}
+}
+
+func TestProxyPortIsFullDuplexBeforeUploadEOF(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := &ControlPlane{
+		Store: store, MaxTransactions: 1, Now: time.Now,
+		PortProxy: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			controller := http.NewResponseController(w)
+			if err := controller.EnableFullDuplex(); err != nil {
+				t.Errorf("EnableFullDuplex: %v", err)
+				return
+			}
+			request := make([]byte, 4)
+			if _, err := io.ReadFull(r.Body, request); err != nil {
+				t.Errorf("reading request: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.ttc.port-stream")
+			_, _ = w.Write(bytes.ToUpper(request))
+			w.(http.Flusher).Flush()
+		}),
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, tunnel := net.Pipe()
+	defer application.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- client.ProxyPort(context.Background(), "web", "main", 8080, tunnel, tunnel)
+		_ = tunnel.Close()
+	}()
+	if _, err := application.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 4)
+	if _, err := io.ReadFull(application, response); err != nil {
+		t.Fatalf("reading response before upload EOF: %v", err)
+	}
+	if got := string(response); got != "PING" {
+		t.Fatalf("response=%q", got)
+	}
+	_ = application.Close()
+	if err := <-done; err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+}
+
 type testImmutableObjectProvider struct {
 	peer        string
 	object      string

@@ -21,7 +21,7 @@
 #define FAULT_OPCODE 0x06
 
 // LINT.IfChange
-#define XCR0_EAX 0x7UL
+#define XCR0_EAX 0xe7UL
 #define XCR0_EDX 0
 #define XCR0_DISABLED_MASK (~XCR0_EAX)
 // LINT.ThenChange(../../../arch/fpu/fpu_amd64.go)

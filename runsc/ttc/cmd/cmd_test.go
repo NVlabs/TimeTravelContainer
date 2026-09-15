@@ -4223,7 +4223,7 @@ type startCall struct {
 
 type fakeBackend struct {
 	loadedBytes         int
-	localDurable       bool
+	localDurable        bool
 	loadedPlatform      string
 	savedIdentifiers    []string
 	savedPlatform       string
@@ -5348,6 +5348,7 @@ func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 		policy.PageSize = 4096
 		return cluster.Capabilities{
 			NodeID: node, ProtocolMin: 1, ProtocolMax: 1, BuildID: "test", Architecture: "amd64",
+			CPUProfile: "portable", CPUFeatures: []string{"sse", "sse2"},
 			BasePageSize: 4096, MaxTransferSize: 2 << 20, RepositoryID: "shared",
 			Features:     []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
 			PagingPolicy: policy,

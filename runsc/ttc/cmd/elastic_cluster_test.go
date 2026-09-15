@@ -120,6 +120,9 @@ func TestDaemonCommandOwner(t *testing.T) {
 	if owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"wait", "--condition=durable", "web@main"}); err != nil || owner != "" || len(claims) != 0 {
 		t.Fatalf("durable wait placement=(%q, %+v, %v)", owner, claims, err)
 	}
+	if owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"port", "publish", "web@main", "8080:80"}); err != nil || owner != "" || len(claims) != 0 {
+		t.Fatalf("port ingress placement=(%q, %+v, %v), want local daemon", owner, claims, err)
+	}
 }
 
 func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {

@@ -1516,7 +1516,7 @@ func TestSimpleClusterOptions(t *testing.T) {
 }
 
 func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
-	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir())
+	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir(), "systrap")
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
 	}
@@ -1529,6 +1529,7 @@ func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	bootstrap.LeaseDuration = 23 * time.Second
 	bootstrap.MaxTransactions = 41
 	bootstrap.AutoRebalance = true
+	bootstrap.ResolvedCPU = daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "portable", Features: []string{"sse", "sse2"}}
 	if err := applyImmutableClusterConfig(root, true, false, &bootstrap); err != nil {
 		t.Fatal(err)
 	}
@@ -1543,6 +1544,29 @@ func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	mismatch := defaultDaemonClusterOptions()
 	if err := applyImmutableClusterConfig(root, true, true, &mismatch); err == nil || !strings.Contains(err.Error(), "differs") {
 		t.Fatalf("bootstrap mismatch error=%v", err)
+	}
+}
+
+func TestStandaloneCPUProfileIsImmutable(t *testing.T) {
+	root := t.TempDir()
+	profile, err := applyStandaloneCPUProfile(root, "portable", "", "systrap", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Mode != "portable" || len(profile.Features) == 0 {
+		t.Fatalf("profile=%+v", profile)
+	}
+	for _, feature := range profile.Features {
+		if strings.HasPrefix(feature, "avx512") || feature == "fsgsbase" {
+			t.Fatalf("portable systrap profile exposed %q", feature)
+		}
+	}
+	if _, err := applyStandaloneCPUProfile(root, "host", "", "systrap", true); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("changed immutable CPU profile error=%v", err)
+	}
+	adopted, err := applyStandaloneCPUProfile(root, "host", "", "systrap", false)
+	if err != nil || !reflect.DeepEqual(adopted, profile) {
+		t.Fatalf("implicit restart profile=(%+v, %v), want %+v", adopted, err, profile)
 	}
 }
 

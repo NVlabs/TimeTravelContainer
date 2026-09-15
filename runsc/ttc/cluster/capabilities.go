@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 6 requires explicit branch identities and paging
-	// policy in every peer capability/transaction record.
-	ControlProtocolVersion = 6
+	// ControlProtocolVersion 7 adds an immutable, exact guest CPU profile to
+	// cluster admission and migration negotiation.
+	ControlProtocolVersion = 7
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"
@@ -52,6 +52,8 @@ type Capabilities struct {
 	ProtocolMax     uint32           `json:"protocol_max"`
 	BuildID         string           `json:"build_id"`
 	Architecture    string           `json:"architecture"`
+	CPUProfile      string           `json:"cpu_profile"`
+	CPUFeatures     []string         `json:"cpu_features"`
 	BasePageSize    uint64           `json:"base_page_size"`
 	MaxTransferSize uint64           `json:"max_transfer_size"`
 	RepositoryID    string           `json:"repository_id"`
@@ -61,7 +63,7 @@ type Capabilities struct {
 
 // Validate checks capability bounds before negotiation.
 func (c Capabilities) Validate() error {
-	if c.NodeID == "" || c.BuildID == "" || c.Architecture == "" || c.RepositoryID == "" {
+	if c.NodeID == "" || c.BuildID == "" || c.Architecture == "" || c.RepositoryID == "" || c.CPUProfile == "" {
 		return errors.New("cluster capabilities omit node, build, architecture, or repository identity")
 	}
 	if c.ProtocolMin == 0 || c.ProtocolMax < c.ProtocolMin {
@@ -83,6 +85,22 @@ func (c Capabilities) Validate() error {
 		}
 		if _, ok := seen[feature]; ok {
 			return fmt.Errorf("duplicate feature %q", feature)
+		}
+		seen[feature] = struct{}{}
+	}
+	if !slices.IsSorted(c.CPUFeatures) {
+		return errors.New("CPU feature profile is not sorted")
+	}
+	if len(c.CPUFeatures) == 0 {
+		return errors.New("CPU feature profile is empty")
+	}
+	seen = make(map[string]struct{}, len(c.CPUFeatures))
+	for _, feature := range c.CPUFeatures {
+		if feature == "" || strings.TrimSpace(feature) != feature || strings.Contains(feature, ",") {
+			return fmt.Errorf("invalid CPU feature %q", feature)
+		}
+		if _, ok := seen[feature]; ok {
+			return fmt.Errorf("duplicate CPU feature %q", feature)
 		}
 		seen[feature] = struct{}{}
 	}
@@ -123,6 +141,9 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 	}
 	if source.Architecture != target.Architecture {
 		return NegotiatedCapabilities{}, fmt.Errorf("architecture mismatch: source=%s target=%s", source.Architecture, target.Architecture)
+	}
+	if source.CPUProfile != target.CPUProfile || !slices.Equal(source.CPUFeatures, target.CPUFeatures) {
+		return NegotiatedCapabilities{}, fmt.Errorf("guest CPU profile mismatch: source=%s target=%s", source.CPUProfile, target.CPUProfile)
 	}
 	if source.BasePageSize != target.BasePageSize {
 		return NegotiatedCapabilities{}, fmt.Errorf("base page size mismatch: source=%d target=%d", source.BasePageSize, target.BasePageSize)

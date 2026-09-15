@@ -69,6 +69,9 @@ const containerCreationMarker = ".creating"
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
 	Root string
+	// CPUFeatures is the daemon-owned, comma-separated guest CPU feature
+	// profile installed into every newly created or restored OCI spec.
+	CPUFeatures string
 	// ActiveRoot holds node-local mutable data for running workloads. Root is
 	// the durable catalog and immutable image store and may be a shared
 	// filesystem in cluster mode. Empty preserves the standalone layout.
@@ -1159,6 +1162,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
+	if s.CPUFeatures != "" {
+		if spec.Annotations == nil {
+			spec.Annotations = make(map[string]string)
+		}
+		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
+	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
 		return Prepared{}, err
@@ -1396,6 +1405,9 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	}
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
+	}
+	if s.CPUFeatures != "" {
+		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
 	}
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs

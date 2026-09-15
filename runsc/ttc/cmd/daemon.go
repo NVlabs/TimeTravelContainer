@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -58,7 +59,7 @@ import (
 )
 
 const (
-	daemonAPIVersion       = 9
+	daemonAPIVersion       = 10
 	defaultRuntimePlatform = "systrap"
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
@@ -234,6 +235,8 @@ type daemonServer struct {
 	listener              net.Listener
 	socket                string
 	runtimePlatform       string
+	cpuProfileName        string
+	cpuFeatures           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
 	hostKernelRelease     string
@@ -254,6 +257,7 @@ type daemonServer struct {
 	snapshotResolver      *ttcsnapshot.Resolver
 	snapshotShared        *ttcsnapshot.SharedPackStore
 	sharedReferences      *sharedReferenceService
+	portIngress           *portIngressManager
 
 	stopOnce  sync.Once
 	cleanStop atomic.Bool
@@ -314,13 +318,17 @@ type daemonClusterOptions struct {
 	Peers           []string
 	RaftBootstrap   bool
 	PagingPolicy    ttcpolicy.Policy
+	CPUProfileMode  string
+	CPUFeatures     string
+	CPUProfileSet   bool
+	ResolvedCPU     daemonCPUProfile
 }
 
 func defaultDaemonClusterOptions() daemonClusterOptions {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4
 	policy.AckInterval = time.Millisecond
-	return daemonClusterOptions{MaxTransactions: defaultClusterMaxTransactions, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy}
+	return daemonClusterOptions{MaxTransactions: defaultClusterMaxTransactions, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy, CPUProfileMode: "portable"}
 }
 
 type daemonClusterRuntime struct {
@@ -342,6 +350,7 @@ type daemonClusterRuntime struct {
 	recoverMembership func(context.Context) error
 	autoRebalance     bool
 	capacitySink      elasticCapacitySink
+	cpuProfile        daemonCPUProfile
 }
 
 const daemonNodeIncarnationVersion = 1
@@ -1743,6 +1752,7 @@ func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *run
 		localRoot:             opts.localRoot,
 		daemonSocket:          opts.daemonSocket,
 		runtimePlatform:       opts.runtimePlatform,
+		cpuFeatures:           opts.cpuFeatures,
 		unsafeNoHostIsolation: opts.unsafeNoHostIsolation,
 		disableHostGSO:        opts.disableHostGSO,
 		clientTERM:            os.Getenv("TERM"),
@@ -1762,6 +1772,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotResolver = s.snapshotResolver
 	backend.snapshotShared = s.snapshotShared
 	backend.sharedReferences = s.sharedReferences
+	backend.portIngress = s.portIngress
 }
 
 type daemonStopTarget struct {
@@ -2147,6 +2158,7 @@ func (s *daemonServer) optionsFromRequest() options {
 	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
+	opts.cpuFeatures = s.cpuFeatures
 	opts.dataRoot = s.dataRoot
 	opts.localRoot = s.localRoot
 	opts.daemonSocket = s.socket
@@ -2321,6 +2333,14 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			runtimePlatform = strings.TrimPrefix(args[0], "--platform=")
 			args = args[1:]
 		default:
+			if consumed, err := consumeDaemonCPUOption(args, &clusterOpts); consumed != 0 || err != nil {
+				if err != nil {
+					fmt.Fprintf(stderr, "ttcd: %v\n", err)
+					return 2
+				}
+				args = args[consumed:]
+				continue
+			}
 			consumed, err := consumeDaemonClusterOption(args, &clusterOpts)
 			if err != nil {
 				fmt.Fprintf(stderr, "ttcd: %v\n", err)
@@ -2413,6 +2433,14 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
 		return 1
 	}
+	var cpuProfile daemonCPUProfile
+	if !clusterOpts.Configured {
+		cpuProfile, err = applyStandaloneCPUProfile(roots.shared, clusterOpts.CPUProfileMode, clusterOpts.CPUFeatures, runtimePlatform, clusterOpts.CPUProfileSet)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttcd: configuring CPU profile: %v\n", err)
+			return 1
+		}
+	}
 	if clusterOpts.Configured {
 		if err := prepareDaemonStorageRoot(roots.local, daemonRootRoleClusterLocal, clusterOpts.RepositoryID, clusterOpts.NodeID); err != nil {
 			fmt.Fprintf(stderr, "ttcd: preparing TTC_LOCAL_ROOT: %v\n", err)
@@ -2448,12 +2476,15 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
 	}
-	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local)
+	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local, runtimePlatform)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
 		return 1
 	}
-	if err := serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
+	if clusterRuntime != nil {
+		cpuProfile = clusterRuntime.cpuProfile
+	}
+	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
@@ -3110,7 +3141,7 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 	return 0, nil
 }
 
-func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string) (*daemonClusterRuntime, error) {
+func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtimePlatform string) (*daemonClusterRuntime, error) {
 	if !opts.Configured {
 		return nil, nil
 	}
@@ -3130,8 +3161,16 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	if !opts.RaftBootstrap && !localRaftState && len(opts.Peers) == 0 {
 		return nil, errors.New("a new Raft member requires --cluster-peer; use --cluster-raft-bootstrap only for the first node")
 	}
+	resolvedCPU, err := resolveDaemonCPUProfile(opts.CPUProfileMode, opts.CPUFeatures, runtimePlatform)
+	if err != nil {
+		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
+	}
+	opts.ResolvedCPU = resolvedCPU
 	if err := applyImmutableClusterConfig(dataRoot, opts.RaftBootstrap, localRaftState, &opts); err != nil {
 		return nil, err
+	}
+	if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
+		return nil, fmt.Errorf("validating cluster CPU profile: %w", err)
 	}
 	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID, opts.RaftBootstrap, localRaftState)
 	if err != nil {
@@ -3179,6 +3218,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 	capabilities := cluster.Capabilities{
 		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
 		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
+		CPUProfile: opts.ResolvedCPU.Mode, CPUFeatures: append([]string(nil), opts.ResolvedCPU.Features...),
 		MaxTransferSize: 2 << 20, RepositoryID: opts.RepositoryID, PagingPolicy: opts.PagingPolicy,
 		Features: []string{
 			cluster.FeatureRemotePull, cluster.FeatureReversePush, cluster.FeatureAckBatch,
@@ -3354,11 +3394,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot string)
 			}
 			return result
 		},
-		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink,
+		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
 	}, nil
 }
 
-const daemonImmutableClusterConfigVersion = 1
+const daemonImmutableClusterConfigVersion = 2
 
 // daemonImmutableClusterConfig contains only cluster-wide policy. Addresses,
 // node names, local capacity and provisioning hooks are deliberately absent:
@@ -3369,6 +3409,7 @@ type daemonImmutableClusterConfig struct {
 	LeaseDuration   time.Duration    `json:"lease_duration_ns"`
 	MaxTransactions int              `json:"max_transactions"`
 	AutoRebalance   bool             `json:"auto_rebalance"`
+	CPUProfile      daemonCPUProfile `json:"cpu_profile"`
 }
 
 func immutableClusterConfigFromOptions(opts daemonClusterOptions) daemonImmutableClusterConfig {
@@ -3376,7 +3417,15 @@ func immutableClusterConfigFromOptions(opts daemonClusterOptions) daemonImmutabl
 		Version: daemonImmutableClusterConfigVersion, PagingPolicy: opts.PagingPolicy,
 		LeaseDuration: opts.LeaseDuration, MaxTransactions: opts.MaxTransactions,
 		AutoRebalance: opts.AutoRebalance,
+		CPUProfile:    opts.ResolvedCPU,
 	}
+}
+
+func equalImmutableClusterConfig(a, b daemonImmutableClusterConfig) bool {
+	return a.Version == b.Version && a.PagingPolicy == b.PagingPolicy &&
+		a.LeaseDuration == b.LeaseDuration && a.MaxTransactions == b.MaxTransactions &&
+		a.AutoRebalance == b.AutoRebalance && a.CPUProfile.Version == b.CPUProfile.Version &&
+		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features)
 }
 
 // applyImmutableClusterConfig creates the cluster policy once on bootstrap.
@@ -3416,13 +3465,21 @@ func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, 
 	if got.Version != daemonImmutableClusterConfigVersion {
 		return fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
 	}
-	if bootstrap && got != want {
+	if opts.CPUProfileSet && (got.CPUProfile.Mode != want.CPUProfile.Mode || !slices.Equal(got.CPUProfile.Features, want.CPUProfile.Features)) {
+		return fmt.Errorf("requested CPU profile differs from immutable cluster profile %q", got.CPUProfile.Mode)
+	}
+	compareWant := want
+	if !opts.CPUProfileSet {
+		compareWant.CPUProfile = got.CPUProfile
+	}
+	if bootstrap && !equalImmutableClusterConfig(got, compareWant) {
 		return errors.New("cluster-wide paging, lease, transaction, or rebalance policy differs from the initialized cluster")
 	}
 	opts.PagingPolicy = got.PagingPolicy
 	opts.LeaseDuration = got.LeaseDuration
 	opts.MaxTransactions = got.MaxTransactions
 	opts.AutoRebalance = got.AutoRebalance
+	opts.ResolvedCPU = got.CPUProfile
 	return nil
 }
 
@@ -3653,10 +3710,14 @@ func prepareDaemonRuntimeStorage(socket, root string) error {
 }
 
 func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, root, runsc string, volumeCapability ttcvolume.Capability, stdout, stderr io.Writer) error {
-	return serveDaemonWithCluster(socket, runtimePlatform, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
+	profile, err := applyStandaloneCPUProfile(dataRoot, "portable", "", runtimePlatform, false)
+	if err != nil {
+		return err
+	}
+	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -3731,6 +3792,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		listener:              listener,
 		socket:                socket,
 		runtimePlatform:       runtimePlatform,
+		cpuProfileName:        cpuProfile.Mode,
+		cpuFeatures:           cpuProfile.annotation(),
 		unsafeNoHostIsolation: unsafeNoHostIsolation,
 		disableHostGSO:        kernelCompatibility.disableHostGSO,
 		hostKernelRelease:     kernelCompatibility.release,
@@ -3744,6 +3807,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
+	server.portIngress = newPortIngressManager(server)
+	defer server.portIngress.Close()
 	if err := compactDaemonMutations(server.mutationRoot(), daemonMutationRetention); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: compacting daemon mutation history: %v\n", err)
 	}
@@ -3858,6 +3923,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		targetBackend := directBackend(options{
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,
+			cpuFeatures:           server.cpuFeatures,
 			unsafeNoHostIsolation: server.unsafeNoHostIsolation,
 			disableHostGSO:        server.disableHostGSO,
 		}, strings.NewReader(""), io.Discard, io.Discard)
@@ -3873,6 +3939,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
+		clusterRuntime.controlPlane.PortProxy = daemonPortProxy{backend: targetBackend}
 		clusterListener := clusterRuntime.controlListener
 		if clusterListener == nil {
 			return errors.New("cluster protocol multiplexer has no HTTP listener")
@@ -3912,6 +3979,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
 			}
+			// From this point the node has a committed incarnation and must be
+			// taken offline by the shutdown defer if any subsequent admission
+			// check fails.
+			elasticRecord = registered
 			leaseGuardian, err = startLeaseGuardian(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation, clusterRuntime.lease)
 			if err != nil {
 				_ = fenceElasticRuntimes(targetBackend, registered.NodeID, registered.Incarnation)
@@ -3938,6 +4009,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("recovering fenced branch placements: %w", err)
+			}
+			if err := validateClusterTopology(clusterRuntime, *registered); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("validating full-mesh cluster topology: %w", err)
 			}
 			admittedState := cluster.NodeReady
 			if drainIntent != nil {
@@ -4095,6 +4170,79 @@ func serveDaemonWithCluster(socket, runtimePlatform string, unsafeNoHostIsolatio
 		}
 		go server.handle(conn, stderr)
 	}
+}
+
+func topologyMemberSet(records []cluster.NodeRecord, now time.Time) map[string]string {
+	members := make(map[string]string)
+	for _, record := range records {
+		if record.State != cluster.NodeOffline && record.LeaseActive(now) {
+			members[record.NodeID] = record.Incarnation + "\x00" + record.ControlURL
+		}
+	}
+	return members
+}
+
+// validateClusterTopology proves that every currently live member can reach
+// the joining daemon and that the joining daemon can reach each member. It
+// repeats when membership changes during the probe, so readiness is never
+// committed from a stale partial view.
+func validateClusterTopology(runtime *daemonClusterRuntime, self cluster.NodeRecord) error {
+	if runtime == nil || runtime.directory == nil || runtime.source == nil {
+		return errors.New("cluster topology services are unavailable")
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		records, err := runtime.directory.List()
+		if err != nil {
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		before := topologyMemberSet(records, time.Now())
+		failed := false
+		for _, record := range records {
+			if record.NodeID == self.NodeID || before[record.NodeID] == "" {
+				continue
+			}
+			peer, err := runtime.source.peerForRecord(record)
+			if err == nil {
+				nonce, nonceErr := newDaemonRequestID()
+				if nonceErr != nil {
+					return nonceErr
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				err = peer.ProbeTopology(ctx, cluster.TopologyProbeRequest{
+					NodeID: self.NodeID, Incarnation: self.Incarnation,
+					ControlURL: self.ControlURL, Nonce: nonce,
+				})
+				cancel()
+			}
+			if err != nil {
+				lastErr = fmt.Errorf("node %q is not bidirectionally reachable: %w", record.NodeID, err)
+				failed = true
+				break
+			}
+		}
+		if failed {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		afterRecords, err := runtime.directory.List()
+		if err != nil {
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if after := topologyMemberSet(afterRecords, time.Now()); maps.Equal(before, after) {
+			return nil
+		}
+		lastErr = errors.New("cluster membership changed during topology validation")
+	}
+	if lastErr == nil {
+		lastErr = errors.New("topology validation timed out")
+	}
+	return lastErr
 }
 
 func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Writer, done <-chan struct{}, lock func() func()) {
@@ -4434,6 +4582,8 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			"features":                 daemonAPIFeatures,
 			"pid":                      os.Getpid(),
 			"runtime_platform":         s.runtimePlatform,
+			"cpu_profile":              s.cpuProfileName,
+			"cpu_features":             strings.Split(s.cpuFeatures, ","),
 			"isolation_mode":           daemonIsolationMode(s.unsafeNoHostIsolation),
 			"unsafe_no_host_isolation": s.unsafeNoHostIsolation,
 			"host_kernel_release":      s.hostKernelRelease,
@@ -5517,6 +5667,10 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 		return "", nil, fmt.Errorf("ttc build %q does not match %s", version.Version(), strings.TrimSpace(string(output)))
 	}
 	commandArgs := []string{"--socket", socket, "--platform", runtimePlatform}
+	commandArgs = append(commandArgs, "--cpu-profile", clusterOpts.CPUProfileMode)
+	if clusterOpts.CPUFeatures != "" {
+		commandArgs = append(commandArgs, "--cpu-features", clusterOpts.CPUFeatures)
+	}
 	if unsafeNoHostIsolation {
 		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
 	}
@@ -5639,6 +5793,14 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 				opts.unsafeNoHostIsolation = true
 				startArgs = startArgs[1:]
 			default:
+				if consumed, err := consumeDaemonCPUOption(startArgs, &clusterOpts); consumed != 0 || err != nil {
+					if err != nil {
+						fmt.Fprintf(stderr, "ttc: %v\n", err)
+						return 2
+					}
+					startArgs = startArgs[consumed:]
+					continue
+				}
 				consumed, err := consumeDaemonClusterOption(startArgs, &clusterOpts)
 				if err != nil {
 					fmt.Fprintf(stderr, "ttc: %v\n", err)

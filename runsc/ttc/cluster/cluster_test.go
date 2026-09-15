@@ -28,7 +28,7 @@ func testCapabilities(node string) Capabilities {
 	policy.PageSize = 4096
 	return Capabilities{
 		NodeID: node, ProtocolMin: 1, ProtocolMax: 2, BuildID: "test-build",
-		Architecture: "amd64", BasePageSize: 4096, MaxTransferSize: 2 << 20,
+		Architecture: "amd64", CPUProfile: "portable", CPUFeatures: []string{"sse", "sse2"}, BasePageSize: 4096, MaxTransferSize: 2 << 20,
 		RepositoryID: "shared-repository",
 		Features: []string{
 			FeatureRemotePull, FeatureReversePush, FeatureAckBatch,
@@ -79,6 +79,19 @@ func TestNegotiateRejectsRepositoryAndRequiredFeatureMismatch(t *testing.T) {
 	target.Features = target.Features[:len(target.Features)-2]
 	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), FeatureFilesystemBranch) {
 		t.Fatalf("feature mismatch error=%v", err)
+	}
+}
+
+func TestNegotiateRejectsCPUProfileMismatch(t *testing.T) {
+	source, target := testCapabilities("source"), testCapabilities("target")
+	target.CPUFeatures = []string{"avx512f", "sse", "sse2"}
+	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), "CPU profile") {
+		t.Fatalf("CPU feature mismatch error=%v", err)
+	}
+	target = testCapabilities("target")
+	target.CPUProfile = "host"
+	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), "CPU profile") {
+		t.Fatalf("CPU profile-name mismatch error=%v", err)
 	}
 }
 

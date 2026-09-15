@@ -12,6 +12,7 @@ go_library(
         "cmd.go",
         "completion.go",
         "cp.go",
+		"cpu_profile.go",
 		"elastic_capacity.go",
 		"graph_provider.go",
 		"graph_references.go",
@@ -24,6 +25,7 @@ go_library(
 		"elastic_cluster.go",
         "events.go",
         "idempotency.go",
+		"port_ingress.go",
         "runtime_command.go",
 		"storage.go",
     ],
@@ -33,6 +35,7 @@ go_library(
     ],
     deps = [
         "//pkg/abi/linux",
+		"//pkg/cpuid",
         "//pkg/hostarch",
         "//pkg/memutil",
 		"//pkg/sentry/checkpoint",

@@ -331,6 +331,12 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	if dataRoot == "" {
 		return "", nil, nil
 	}
+	// Published ports are ingress-node resources. Keep the command on the
+	// daemon contacted by the client; each accepted connection resolves and
+	// tunnels to the branch's current placement.
+	if len(args) != 0 && args[0] == "port" {
+		return "", nil, nil
+	}
 	// Durable wait observes Raft publication state and shared metadata; it does
 	// not operate on a runtime. Routing it with the branch's old running
 	// placement creates a race with the publication commit that deliberately
