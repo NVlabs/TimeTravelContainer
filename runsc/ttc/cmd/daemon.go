@@ -61,6 +61,7 @@ import (
 const (
 	daemonAPIVersion       = 10
 	defaultRuntimePlatform = "systrap"
+	daemonStartTimeout     = 45 * time.Second
 	kvmGetAPIVersion       = uintptr(0xae00)
 	kvmCreateVM            = uintptr(0xae01)
 	kvmAPIVersion          = uintptr(12)
@@ -5867,7 +5868,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 1
 		}
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(daemonStartTimeout)
 		for time.Now().Before(deadline) {
 			if conn, err := connectDaemon(opts.daemonSocket); err == nil {
 				conn.Close()

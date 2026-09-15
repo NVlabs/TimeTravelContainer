@@ -39,6 +39,10 @@ import (
 	"gvisor.dev/gvisor/runsc/version"
 )
 
+// daemonStartTimeout includes cluster Raft startup and the bidirectional
+// topology admission check, whose own bounded retry window is 20 seconds.
+const daemonStartTimeout = 45 * time.Second
+
 const (
 	daemonAPIVersion      = 9
 	daemonFrameStdin      = byte('I')
@@ -221,6 +225,9 @@ requires TTC_LOCAL_ROOT for node-local active state and cache data.
 
 Options:
   --platform systrap|kvm          Select the gVisor execution platform
+  --cpu-profile portable|host|explicit
+                                  Select the immutable guest CPU contract
+  --cpu-features FEATURE,...      Features for --cpu-profile=explicit
   --unsafe-no-host-isolation      Disable host namespace/chroot isolation
   --cluster-init                  Create a new distributed TTC cluster
   --cluster-join HOST:PORT        Join an existing cluster through a seed node
@@ -649,7 +656,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 		status, err := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard)
 		return err == nil && status == 0
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(daemonStartTimeout)
 	for time.Now().Before(deadline) {
 		if ready() {
 			fmt.Fprintln(stdout, "ttcd started")
