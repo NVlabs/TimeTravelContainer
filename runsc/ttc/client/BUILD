@@ -13,6 +13,7 @@ go_library(
     ],
     visibility = ["//runsc/ttc:__pkg__"],
     deps = [
+        "//runsc/ttc/protocol",
         "//runsc/version",
         "@org_golang_x_term//:go_default_library",
     ],

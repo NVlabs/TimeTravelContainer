@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -44,7 +45,7 @@ import (
 const daemonStartTimeout = 45 * time.Second
 
 const (
-	daemonAPIVersion      = 9
+	daemonAPIVersion      = protocol.DaemonAPIVersion
 	daemonFrameStdin      = byte('I')
 	daemonFrameStdinAck   = byte('A')
 	daemonFrameEOF        = byte('C')

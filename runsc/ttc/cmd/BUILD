@@ -56,6 +56,7 @@ go_library(
         "//runsc/ttc/cluster",
         "//runsc/ttc/console",
         "//runsc/ttc/images",
+		"//runsc/ttc/protocol",
 		"//runsc/ttc/storage",
         "//runsc/version",
         "@com_github_moby_sys_signal//:go_default_library",

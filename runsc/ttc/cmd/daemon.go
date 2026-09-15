@@ -54,12 +54,13 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 const (
-	daemonAPIVersion       = 10
+	daemonAPIVersion       = protocol.DaemonAPIVersion
 	defaultRuntimePlatform = "systrap"
 	daemonStartTimeout     = 45 * time.Second
 	kvmGetAPIVersion       = uintptr(0xae00)
