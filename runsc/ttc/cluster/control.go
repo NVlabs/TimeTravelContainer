@@ -104,8 +104,32 @@ func loadPeerTLSMaterial(certFile, keyFile, caFile string) (tls.Certificate, *x5
 // ReserveRequest asks the target to create a hidden transaction. The target
 // independently negotiates capabilities rather than trusting a client result.
 type ReserveRequest struct {
-	SourceCapabilities Capabilities `json:"source_capabilities"`
-	Identity           ForkIdentity `json:"identity"`
+	SourceCapabilities Capabilities           `json:"source_capabilities"`
+	Identity           ForkIdentity           `json:"identity"`
+	Family             RemoteFamilyDescriptor `json:"family"`
+}
+
+// RemoteFamilyDescriptor carries the small immutable configuration needed to
+// reserve a target runtime. It deliberately travels over the peer control
+// connection: requiring a target to discover newly-created metadata through a
+// shared filesystem makes correctness depend on NFS/Lustre cache convergence.
+type RemoteFamilyDescriptor struct {
+	Container json.RawMessage `json:"container"`
+	Spec      json.RawMessage `json:"spec"`
+}
+
+func (d RemoteFamilyDescriptor) validate() error {
+	const maxDescriptorBytes = 4 << 20
+	if len(d.Container) == 0 || len(d.Spec) == 0 {
+		return errors.New("remote family descriptor is incomplete")
+	}
+	if len(d.Container) > maxDescriptorBytes || len(d.Spec) > maxDescriptorBytes {
+		return errors.New("remote family descriptor is too large")
+	}
+	if !json.Valid(d.Container) || !json.Valid(d.Spec) {
+		return errors.New("remote family descriptor contains invalid JSON")
+	}
+	return nil
 }
 
 // CancelRequest uses optimistic revision checking.
@@ -144,6 +168,19 @@ type RemoteSessionDescriptor struct {
 	// reconstructed from the target filesystem-branch identity.
 	GraphSnapshot    uint64   `json:"graph_snapshot,omitempty"`
 	GraphRootObjects []string `json:"graph_root_objects,omitempty"`
+	// InternalMounts carries the small TTC-generated files that are bind-mounted
+	// into the guest (currently hostname, hosts, and resolv.conf). Their source
+	// paths are node-local and therefore cannot be reused by a remote gofer.
+	InternalMounts []InternalMountDescriptor `json:"internal_mounts,omitempty"`
+}
+
+// InternalMountDescriptor is portable content for one TTC-generated mount.
+// User bind mounts are deliberately excluded; those follow their own mount
+// policy and are never smuggled through the control plane.
+type InternalMountDescriptor struct {
+	Destination string `json:"destination"`
+	Contents    []byte `json:"contents"`
+	Mode        uint32 `json:"mode"`
 }
 
 // FilesystemRootDescriptor is the path-free filesystem portion of a remote
@@ -164,6 +201,28 @@ type FilesystemRootDescriptor struct {
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
+	if len(s.InternalMounts) > 64 {
+		return errors.New("remote session has too many internal mounts")
+	}
+	seenInternalMounts := make(map[string]struct{}, len(s.InternalMounts))
+	internalMountBytes := 0
+	for _, mount := range s.InternalMounts {
+		clean := filepath.Clean(mount.Destination)
+		if !filepath.IsAbs(mount.Destination) || clean != mount.Destination || clean == "/" {
+			return fmt.Errorf("invalid internal mount destination %q", mount.Destination)
+		}
+		if _, ok := seenInternalMounts[clean]; ok {
+			return fmt.Errorf("remote session repeats internal mount %q", clean)
+		}
+		seenInternalMounts[clean] = struct{}{}
+		if mount.Mode&^0777 != 0 {
+			return fmt.Errorf("internal mount %q has invalid mode %#o", clean, mount.Mode)
+		}
+		internalMountBytes += len(mount.Contents)
+		if internalMountBytes > 1<<20 {
+			return errors.New("remote session internal mounts exceed 1 MiB")
+		}
+	}
 	if s.SharedMetadata == "" {
 		host, port, err := net.SplitHostPort(s.Address)
 		portNumber, portErr := strconv.ParseUint(port, 10, 16)
@@ -329,7 +388,7 @@ type PublishRequest struct {
 // method is keyed by tx.Identity.TransactionID and may be called again after a
 // lost response or daemon restart.
 type TargetRuntime interface {
-	Reserve(context.Context, *Transaction) error
+	Reserve(context.Context, *Transaction, RemoteFamilyDescriptor) error
 	Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error
 	Publish(context.Context, *Transaction, bool) error
 	Activate(context.Context, *Transaction) error
@@ -1045,6 +1104,10 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if err := request.Family.validate(); err != nil {
+		writeControlError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	advanceReserved := func(tx *Transaction) (*Transaction, error) {
 		advanced, err := c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionTargetReserved, "", c.Now())
 		if err == nil {
@@ -1079,7 +1142,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 					writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
 					return
 				}
-				if err := c.TargetRuntime.Reserve(r.Context(), existing); err != nil {
+				if err := c.TargetRuntime.Reserve(r.Context(), existing, request.Family); err != nil {
 					writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
 					return
 				}
@@ -1123,7 +1186,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
 		return
 	}
-	if err := c.TargetRuntime.Reserve(r.Context(), tx); err != nil {
+	if err := c.TargetRuntime.Reserve(r.Context(), tx, request.Family); err != nil {
 		_, _ = c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionFailed, err.Error(), c.Now())
 		writeControlError(w, http.StatusConflict, "reserving target runtime: "+err.Error())
 		return

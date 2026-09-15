@@ -62,6 +62,36 @@ const distributedBatchControlConcurrency = 8
 // queue makes them source-independent.
 const distributedHandoffConcurrency = 2
 
+func (b *runtimeBackend) portableDistributedInternalMounts(container string) ([]cluster.InternalMountDescriptor, error) {
+	mounts, err := b.containerStore().PortableInternalMounts(container)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]cluster.InternalMountDescriptor, len(mounts))
+	for i, mount := range mounts {
+		result[i] = cluster.InternalMountDescriptor{
+			Destination: mount.Destination, Contents: append([]byte(nil), mount.Contents...), Mode: uint32(mount.Mode.Perm()),
+		}
+	}
+	return result, nil
+}
+
+func (b *runtimeBackend) portableDistributedFamily(info ttcbundle.ContainerInfo) (cluster.RemoteFamilyDescriptor, error) {
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return cluster.RemoteFamilyDescriptor{}, fmt.Errorf("loading distributed family specification: %w", err)
+	}
+	containerJSON, err := json.Marshal(info)
+	if err != nil {
+		return cluster.RemoteFamilyDescriptor{}, fmt.Errorf("encoding distributed family metadata: %w", err)
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		return cluster.RemoteFamilyDescriptor{}, fmt.Errorf("encoding distributed family specification: %w", err)
+	}
+	return cluster.RemoteFamilyDescriptor{Container: containerJSON, Spec: specJSON}, nil
+}
+
 func runBoundedBatch(count, limit int, fn func(int)) {
 	if count <= 0 {
 		return
@@ -1137,12 +1167,15 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("invalid distributed destination %q: %w", targetDestination, err)
 	}
-	targetContainer := target.container
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return selector{}, err
 	}
 	source = resolved
+	logicalSourceContainer := sourceInfo.DistributedFamilyID
+	if logicalSourceContainer == "" {
+		logicalSourceContainer = sourceInfo.ID
+	}
 	if !sourceInfo.LiveForkEligible {
 		return selector{}, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
 	}
@@ -1173,11 +1206,15 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	}
 	identity := cluster.ForkIdentity{
 		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
-		TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
-		TargetContainer: targetContainer, TargetBranch: transactionID,
+		TargetNodeID: targetNode, SourceContainer: logicalSourceContainer, SourceBranch: source.branch,
+		TargetContainer: logicalSourceContainer, TargetBranch: transactionID,
 		TargetVisibleBranch: target.branch,
 		ImageDigest:         sourceInfo.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID,
+	}
+	family, err := b.portableDistributedFamily(sourceInfo)
+	if err != nil {
+		return selector{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -1185,6 +1222,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return peer.Reserve(ctx, cluster.ReserveRequest{
 			SourceCapabilities: b.distributedSource.capabilities,
 			Identity:           identity,
+			Family:             family,
 		})
 	})
 	if err != nil {
@@ -1235,7 +1273,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	args := []string{
 		"timetravel", "--source", source.branch,
 		"--distributed-session", transactionID,
-		"--distributed-family", source.container,
+		"--distributed-family", logicalSourceContainer,
 		"--distributed-external-listener",
 		"--distributed-advertise", advertise,
 		"--distributed-max-transfer", fmt.Sprint(dataPlaneMax),
@@ -1282,11 +1320,15 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
 	}
+	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
+	if err != nil {
+		return selector{}, fmt.Errorf("capturing portable internal mounts: %w", err)
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
-		FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes,
+		FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -1337,10 +1379,14 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID,
 	}
+	family, err := b.portableDistributedFamily(sourceInfo)
+	if err != nil {
+		return selector{}, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-		return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+		return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
 	})
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
@@ -1463,6 +1509,10 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
 	}
+	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
+	if err != nil {
+		return selector{}, fmt.Errorf("capturing portable internal mounts: %w", err)
+	}
 	directSources, directCleanup, err := b.prepareColdDirectFilesystemSources(sourceInfo, sourceBranch, childFilesystemBranch)
 	if err != nil {
 		return selector{}, fmt.Errorf("opening durable filesystem sources: %w", err)
@@ -1485,7 +1535,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
 		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
 		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
-		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes,
+		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -1825,6 +1875,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 
 	var commonPolicy *ttcpolicy.Policy
 	var commonDataPlaneMax uint64
+	family, err := b.portableDistributedFamily(sourceInfo)
+	if err != nil {
+		return nil, err
+	}
 	for i, target := range destinations {
 		transactionID, err := newDistributedTransactionID()
 		if err != nil {
@@ -1838,7 +1892,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			RepositoryID: b.distributedSource.capabilities.RepositoryID,
 		}
 		tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
 		})
 		if err != nil {
 			return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
@@ -1931,6 +1985,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		sessionByID[session.SessionID] = session
 	}
 	descriptors := make([]cluster.RemoteSessionDescriptor, len(children))
+	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
+	if err != nil {
+		return nil, fmt.Errorf("capturing portable internal mounts: %w", err)
+	}
 	for i := range children {
 		child := &children[i]
 		session, ok := sessionByID[child.transaction]
@@ -1945,7 +2003,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
-			FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes,
+			FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 		}
 	}
 	prepareErrors := make([]error, len(children))

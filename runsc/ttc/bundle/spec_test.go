@@ -72,6 +72,93 @@ func TestRehomeInternalMountsSurviveSourceRemoval(t *testing.T) {
 	}
 }
 
+func TestMaterializePortableInternalMountsDoesNotReadSourcePath(t *testing.T) {
+	bundleDir := t.TempDir()
+	internal, err := json.Marshal([]string{"/etc/hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Annotations: map[string]string{InternalMountsAnnotation: string(internal)},
+		Mounts: []specs.Mount{{
+			Source: "/source-node-private-tmp/hostname", Destination: "/etc/hostname",
+		}},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializePortableInternalMounts(bundleDir, []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("portable\n"), Mode: 0444,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got specs.Spec
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mounts) != 1 || !strings.HasPrefix(got.Mounts[0].Source, bundleDir+string(filepath.Separator)) {
+		t.Fatalf("rewritten mount=%+v", got.Mounts)
+	}
+	contents, err := os.ReadFile(got.Mounts[0].Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "portable\n" {
+		t.Fatalf("portable contents=%q", contents)
+	}
+}
+
+func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
+	root := t.TempDir()
+	active := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "target")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	internal, err := json.Marshal([]string{"/etc/hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Annotations: map[string]string{InternalMountsAnnotation: string(internal)},
+		Mounts:      []specs.Mount{{Destination: "/etc/hostname", Source: "/source-node/private/hostname", Type: "bind"}},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "target", Name: "target", BundleDir: bundleDir, State: "running", LiveForkEligible: true,
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "running", StorageState: "local"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root, ActiveRoot: active}
+	if err := store.InstallPortableInternalMounts("target", []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("target-host\n"), Mode: 0644,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.LoadSpec("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mounts) != 1 || !strings.HasPrefix(got.Mounts[0].Source, filepath.Join(active, "containers", "target", "internal-mounts")) {
+		t.Fatalf("persistent mount source = %q, want node-local active root", got.Mounts[0].Source)
+	}
+	contents, err := os.ReadFile(got.Mounts[0].Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "target-host\n" {
+		t.Fatalf("persistent mount contents = %q", contents)
+	}
+}
+
 func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

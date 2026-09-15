@@ -21,6 +21,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -476,11 +477,15 @@ func (s *staleReservationStore) Advance(id string, revision uint64, next Transac
 	return s.TransactionCatalog.Advance(id, revision, next, failure, now)
 }
 
-func (r *testTargetRuntime) Reserve(context.Context, *Transaction) error {
+func (r *testTargetRuntime) Reserve(context.Context, *Transaction, RemoteFamilyDescriptor) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.reserved++
 	return nil
+}
+
+func testRemoteFamilyDescriptor() RemoteFamilyDescriptor {
+	return RemoteFamilyDescriptor{Container: json.RawMessage(`{}`), Spec: json.RawMessage(`{}`)}
 }
 
 func (r *testTargetRuntime) Prepare(context.Context, *Transaction, RemoteSessionDescriptor) error {
@@ -633,7 +638,7 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()}
+	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()}
 	tx, err := client.Reserve(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -680,7 +685,7 @@ func TestControlPlaneReservationResolvesLostAdvanceResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +721,7 @@ func TestCancelFailedPreparationReclaimsTargetWithoutRewritingFailure(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +778,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,7 +821,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	migrationIdentity.TargetBranch = "tx-migration"
 	migrationIdentity.TargetVisibleBranch = migrationIdentity.SourceBranch
 	migrationIdentity.Migration = true
-	migration, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: migrationIdentity})
+	migration, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: migrationIdentity, Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -867,7 +872,7 @@ func TestMigrationPublishRetryCannotActivateBeforeCutover(t *testing.T) {
 	identity.TargetBranch = identity.TransactionID
 	identity.TargetVisibleBranch = identity.SourceBranch
 	identity.Migration = true
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: identity})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: identity, Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +931,7 @@ func TestTransactionLostResponsesRecoverAtEveryPersistentBoundary(t *testing.T) 
 		}
 		return store
 	}
-	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()}
+	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()}
 
 	// Target reservation committed, but the first daemon disappeared before
 	// acknowledging it. The handler resolves the committed state immediately,
@@ -1040,7 +1045,7 @@ func TestMutualTLSControlPlaneGraphHandoffIsDurableAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1154,7 +1159,7 @@ func TestPrepareRejectsChangedSessionAfterLostResponse(t *testing.T) {
 	server.StartTLS()
 	defer server.Close()
 	client, _ := NewClient(server.URL, clientTLS, 5*time.Second)
-	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity()})
+	tx, err := client.Reserve(context.Background(), ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1194,7 +1199,7 @@ func TestControlPlaneRejectsCertificateNodeMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = client.Reserve(context.Background(), ReserveRequest{
-		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(),
+		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("certificate mismatch error=%v", err)
@@ -1217,7 +1222,7 @@ func TestPlainControlPlaneOptionalToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := good.Reserve(context.Background(), ReserveRequest{
-		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(),
+		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor(),
 	}); err != nil {
 		t.Fatalf("authenticated plaintext request: %v", err)
 	}
@@ -1228,7 +1233,7 @@ func TestPlainControlPlaneOptionalToken(t *testing.T) {
 	identity := testForkIdentity()
 	identity.TransactionID = "tx-rejected-token"
 	if _, err := bad.Reserve(context.Background(), ReserveRequest{
-		SourceCapabilities: testCapabilities("source"), Identity: identity,
+		SourceCapabilities: testCapabilities("source"), Identity: identity, Family: testRemoteFamilyDescriptor(),
 	}); err == nil || !strings.Contains(err.Error(), "authentication token") {
 		t.Fatalf("wrong token error=%v", err)
 	}

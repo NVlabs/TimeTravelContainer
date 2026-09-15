@@ -47,6 +47,13 @@ func (*Systrap) PrepareGuestGSBase(ctx context.Context, mm platform.MemoryManage
 // must request GS changes through arch_prctl so systrap can observe and retire
 // those trampolines first.
 func (*Systrap) SanitizeFeatureSet(fs cpuid.FeatureSet) cpuid.FeatureSet {
+	// The systrap context switch saves only x87, SSE, and AVX state. Keeping
+	// AVX-512 out of guest CPUID makes the saved state portable between x86
+	// hosts whose kernels enable different optional XSAVE components. This is
+	// particularly important for TTC remote fork and migration: preserving a
+	// host-only component and dropping it at restore would silently corrupt the
+	// guest, while saving it makes an otherwise portable process unrestorable.
+	fs = fs.WithoutAVX512()
 	if disableSyscallPatching {
 		return fs
 	}

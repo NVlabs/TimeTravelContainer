@@ -375,6 +375,12 @@ type DistributedForkOptions struct {
 	NodeID          string
 	SourceNode      string
 	Migration       bool
+	TargetID        string
+	// Source and Spec are supplied by the source daemon over the authenticated
+	// cluster control connection. They avoid using shared-filesystem directory
+	// visibility as a target-reservation synchronization primitive.
+	Source *ContainerInfo
+	Spec   *specs.Spec
 }
 
 // BranchInfo is branch display lineage plus its last known lifecycle state.
@@ -791,6 +797,126 @@ func rehomeInternalMounts(spec *specs.Spec, targetContainerDir string) error {
 		mount.Source = name
 	}
 	return nil
+}
+
+// PortableInternalMount is the content of a TTC-generated bind mount without
+// its node-local source pathname.
+type PortableInternalMount struct {
+	Destination string
+	Contents    []byte
+	Mode        os.FileMode
+}
+
+// PortableInternalMounts captures TTC-generated mounts from this store's
+// node-local OCI view. It never includes user-supplied host mounts.
+func (s Store) PortableInternalMounts(name string) ([]PortableInternalMount, error) {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return nil, err
+	}
+	if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+		return nil, nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+		return nil, fmt.Errorf("decoding TTC internal mounts: %w", err)
+	}
+	internal := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		internal[filepath.Clean(destination)] = struct{}{}
+	}
+	result := make([]PortableInternalMount, 0, len(destinations))
+	for _, mount := range spec.Mounts {
+		if _, ok := internal[filepath.Clean(mount.Destination)]; !ok {
+			continue
+		}
+		contents, err := os.ReadFile(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("reading TTC internal mount %q: %w", mount.Destination, err)
+		}
+		info, err := os.Stat(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("stating TTC internal mount %q: %w", mount.Destination, err)
+		}
+		result = append(result, PortableInternalMount{
+			Destination: filepath.Clean(mount.Destination), Contents: contents, Mode: info.Mode().Perm(),
+		})
+	}
+	if len(result) != len(internal) {
+		return nil, fmt.Errorf("OCI spec describes %d TTC internal mounts but only %d sources", len(internal), len(result))
+	}
+	return result, nil
+}
+
+// InstallPortableInternalMounts replaces node-local sources in a container's
+// persistent OCI specification. The files themselves are kept in the active
+// node-local root. This is required for a migrated container to act as the
+// source of a later remote fork without referring back to the previous node's
+// private scratch filesystem.
+func (s Store) InstallPortableInternalMounts(name string, mounts []PortableInternalMount) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	return materializePortableInternalMounts(info.BundleDir, filepath.Join(s.activeContainerDir(info.ID), "internal-mounts"), mounts)
+}
+
+// MaterializePortableInternalMounts replaces node-local sources in a prepared
+// transient bundle with target-local files. The caller must supply exactly the
+// destinations declared by the bundle annotation.
+func MaterializePortableInternalMounts(bundleDir string, mounts []PortableInternalMount) error {
+	return materializePortableInternalMounts(bundleDir, filepath.Join(bundleDir, "internal-mounts"), mounts)
+}
+
+func materializePortableInternalMounts(bundleDir, directory string, mounts []PortableInternalMount) error {
+	configPath := filepath.Join(bundleDir, "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return err
+	}
+	if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+		if len(mounts) != 0 {
+			return errors.New("remote session supplied undeclared TTC internal mounts")
+		}
+		return nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+		return fmt.Errorf("decoding TTC internal mounts: %w", err)
+	}
+	provided := make(map[string]PortableInternalMount, len(mounts))
+	for _, mount := range mounts {
+		provided[filepath.Clean(mount.Destination)] = mount
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	rewritten := 0
+	for i := range spec.Mounts {
+		mount := &spec.Mounts[i]
+		portable, ok := provided[filepath.Clean(mount.Destination)]
+		if !ok {
+			continue
+		}
+		name := filepath.Join(directory, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
+		if err := os.WriteFile(name, portable.Contents, portable.Mode.Perm()); err != nil {
+			return fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
+		}
+		mount.Source = name
+		rewritten++
+	}
+	if rewritten != len(destinations) || rewritten != len(provided) {
+		return fmt.Errorf("portable TTC internal mounts do not match OCI declarations: declared=%d supplied=%d matched=%d", len(destinations), len(provided), rewritten)
+	}
+	return writeJSON(configPath, &spec)
 }
 
 // ConsolePaths are persistent host-side files for one branch-local console.
@@ -1407,14 +1533,31 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return Prepared{}, err
 	}
-	source, err := s.LoadContainer(opts.SourceContainer)
-	if err != nil {
-		return Prepared{}, err
+	var source ContainerInfo
+	if opts.Source != nil {
+		source = *opts.Source
+		portableFamily := source.DistributedFamilyID
+		if portableFamily == "" {
+			portableFamily = source.ID
+		}
+		if source.ID != opts.SourceContainer && portableFamily != opts.SourceContainer {
+			return Prepared{}, fmt.Errorf("portable source ID %q does not match transaction source %q", source.ID, opts.SourceContainer)
+		}
+	} else {
+		var err error
+		source, err = s.LoadContainer(opts.SourceContainer)
+		if err != nil {
+			return Prepared{}, err
+		}
 	}
 	sourceQuarantined := false
+	targetParent := opts.ParentBranch
 	for _, branch := range source.Branches {
 		if branch.ID == opts.ParentBranch {
 			sourceQuarantined = branch.Quarantined
+			if opts.Migration {
+				targetParent = branch.ParentID
+			}
 			break
 		}
 	}
@@ -1493,15 +1636,22 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		}
 		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
 	}
-	if opts.Migration {
-		return Prepared{}, fmt.Errorf("migration target family %q is unavailable", opts.TargetName)
-	}
-	if opts.VisibleBranch != "main" {
-		return Prepared{}, fmt.Errorf("new distributed target family %q must start with @main", opts.TargetName)
-	}
-	spec, err := s.LoadSpec(source.ID)
-	if err != nil {
-		return Prepared{}, err
+	var spec *specs.Spec
+	if opts.Spec != nil {
+		encoded, err := json.Marshal(opts.Spec)
+		if err != nil {
+			return Prepared{}, err
+		}
+		spec = &specs.Spec{}
+		if err := json.Unmarshal(encoded, spec); err != nil {
+			return Prepared{}, err
+		}
+	} else {
+		var err error
+		spec, err = s.LoadSpec(source.ID)
+		if err != nil {
+			return Prepared{}, err
+		}
 	}
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
@@ -1527,7 +1677,30 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	} else {
 		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
 	}
-	id, containerDir, err := s.createContainerDir(containers)
+	var id, containerDir string
+	if opts.TargetID != "" {
+		if err := validateObjectName("distributed target container", opts.TargetID); err != nil {
+			return Prepared{}, err
+		}
+		id = opts.TargetID
+		containerDir = filepath.Join(s.Root, "containers", id)
+		// Do not rely on immediate directory-cache visibility from the node that
+		// initialized the shared root. MkdirAll is idempotent when the parent is
+		// visible and establishes it locally when an NFS client still has a stale
+		// negative lookup cached.
+		if err := os.MkdirAll(filepath.Dir(containerDir), 0700); err != nil {
+			return Prepared{}, fmt.Errorf("preparing distributed container directory: %w", err)
+		}
+		if err := os.Mkdir(containerDir, 0700); err != nil {
+			return Prepared{}, fmt.Errorf("creating distributed target container %q: %w", id, err)
+		}
+		if err := os.WriteFile(filepath.Join(containerDir, containerCreationMarker), []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0600); err != nil {
+			_ = os.Remove(containerDir)
+			return Prepared{}, err
+		}
+	} else {
+		id, containerDir, err = s.createContainerDir(containers)
+	}
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1536,10 +1709,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		s.discardIncompleteContainer(id)
 		return Prepared{}, fmt.Errorf("creating distributed target active directory: %w", err)
 	}
-	if err := rehomeInternalMounts(spec, activeContainerDir); err != nil {
-		s.discardIncompleteContainer(id)
-		return Prepared{}, err
-	}
+	// TTC-generated bind mounts still name the source node here. Their small
+	// contents arrive with the authenticated remote session and are rewritten
+	// in the transient runtime bundle immediately before runsc create. Trying
+	// to read these paths during reservation breaks when nodes use private /tmp
+	// mounts, even if their TTC_LOCAL_ROOT strings happen to be identical.
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
 	keep := false
@@ -1579,7 +1753,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	now := time.Now().UTC()
 	target.ID = id
-	target.Name = opts.TargetName
+	// A remote runtime is a physical implementation detail of the logical
+	// distributed family. Give its persistent record an internal unique name;
+	// exposing the source family name here makes ordinary name lookup ambiguous
+	// after migration. Raft placement maps it back to the logical family.
+	target.Name = id
 	target.LeaseID = leaseID
 	target.BundleDir = bundleDir
 	target.PublishedPorts = nil
@@ -1589,7 +1767,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode, CreatedAt: now}}
+	target.Branches = []BranchInfo{{ID: opts.VisibleBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode, ParentID: targetParent, CreatedAt: now}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
@@ -1601,6 +1779,13 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &target); err != nil {
 		return Prepared{}, err
+	}
+	// Reservation immediately resolves this hidden record by transaction ID on
+	// the same node. Finalize the creation marker synchronously; waiting for a
+	// periodic recovery sweep makes the just-created target invisible to the
+	// following Prepare request.
+	if err := os.Remove(filepath.Join(containerDir, containerCreationMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return Prepared{}, fmt.Errorf("finalizing distributed target metadata: %w", err)
 	}
 	keep = true
 	return Prepared{BundleDir: bundleDir, RootFS: target.RootFS, Container: target}, nil
@@ -3025,12 +3210,10 @@ func (s Store) UpdateDistributedForkDependencies(transactionID string, memoryByt
 	}
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
 		if current.DistributedForkTransactionID == transactionID {
-			for i := range current.Branches {
-				if current.Branches[i].ID == "main" {
-					current.Branches[i].DependentMemoryBytes = memoryBytes
-					current.Branches[i].DependentFilesystemBytes = filesystemBytes
-					return true, nil
-				}
+			if len(current.Branches) == 1 {
+				current.Branches[0].DependentMemoryBytes = memoryBytes
+				current.Branches[0].DependentFilesystemBytes = filesystemBytes
+				return true, nil
 			}
 		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.DependentMemoryBytes = memoryBytes
@@ -3060,11 +3243,10 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
 		if current.DistributedForkTransactionID == transactionID {
 			current.State = state
-			for i := range current.Branches {
-				if current.Branches[i].ID == "main" {
-					current.Branches[i].State = state
-				}
+			if len(current.Branches) != 1 {
+				return false, errors.New("hidden distributed target has invalid branch cardinality")
 			}
+			current.Branches[0].State = state
 		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.State = state
 			current.DistributedForkImports[transactionID] = pending
@@ -3147,12 +3329,10 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 	}
 	if info.DistributedForkTransactionID == transactionID {
 		for _, candidate := range info.Branches {
-			if candidate.ID == "main" {
-				candidate.DistributedForkTransactionID = transactionID
-				return info, candidate, false, nil
-			}
+			candidate.DistributedForkTransactionID = transactionID
+			return info, candidate, false, nil
 		}
-		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no main branch")
+		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no branch")
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
 		branch = BranchInfo{ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}

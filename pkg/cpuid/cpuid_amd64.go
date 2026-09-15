@@ -546,6 +546,37 @@ func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
 	return masked
 }
 
+// WithoutAVX512 returns fs without advertising AVX-512 instructions. This is
+// useful for execution backends that intentionally preserve only the portable
+// x87/SSE/AVX subset of userspace XSAVE state.
+func (fs FeatureSet) WithoutAVX512() FeatureSet {
+	static := fs.ToStatic()
+	for _, feature := range []Feature{
+		X86FeatureAVX512F,
+		X86FeatureAVX512DQ,
+		X86FeatureAVX512IFMA,
+		X86FeatureAVX512PF,
+		X86FeatureAVX512ER,
+		X86FeatureAVX512CD,
+		X86FeatureAVX512BW,
+		X86FeatureAVX512VL,
+		X86FeatureAVX512VBMI,
+		X86FeatureAVX512_VBMI2,
+		X86FeatureAVX512_VNNI,
+		X86FeatureAVX512_BITALG,
+		X86FeatureAVX512_VPOPCNTDQ,
+		X86FeatureAVX512_4VNNIW,
+		X86FeatureAVX512_4FMAPS,
+		X86FeatureAVX512_VP2INTERSECT,
+		X86FeatureAVX512_FP16,
+	} {
+		static.Remove(feature)
+	}
+	masked := static.ToFeatureSet()
+	masked.hwCap = fs.hwCap
+	return masked
+}
+
 // archCheckHostCompatible checks for compatibility.
 func (fs FeatureSet) archCheckHostCompatible(hfs FeatureSet) error {
 	// The size of a cache line must match, as it is critical to correctly

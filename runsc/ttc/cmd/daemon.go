@@ -41,6 +41,7 @@ import (
 	"syscall"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -469,7 +470,7 @@ func (r *daemonTargetRuntime) lockTarget(name string) func() {
 	return mu.Unlock
 }
 
-func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction) error {
+func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transaction, family cluster.RemoteFamilyDescriptor) error {
 	if r == nil || r.backend == nil || tx == nil {
 		return errors.New("distributed target runtime is unavailable")
 	}
@@ -482,13 +483,50 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 			return fmt.Errorf("cluster node %q is not accepting placement (state=%s)", r.nodeID, record.State)
 		}
 	}
+	var source ttcbundle.ContainerInfo
+	if err := json.Unmarshal(family.Container, &source); err != nil {
+		return fmt.Errorf("decoding remote family metadata: %w", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(family.Spec, &spec); err != nil {
+		return fmt.Errorf("decoding remote runtime specification: %w", err)
+	}
+	targetName := tx.Identity.TargetContainer
+	targetID := ""
+	if r.authority != nil {
+		// Shared container metadata describes the whole logical family and may
+		// retain a former owner after migration. Reuse only a physical Sentry
+		// that Raft currently places on this node; otherwise create an isolated
+		// transaction-scoped target. This prevents a remote fork from racing the
+		// teardown of an old migration source on the destination node.
+		targetName = tx.Identity.TransactionID
+		targetID = tx.Identity.TransactionID
+		if !tx.Identity.Migration {
+			records, listErr := r.authority.Placements().List()
+			if listErr != nil {
+				return fmt.Errorf("selecting distributed target runtime: %w", listErr)
+			}
+			for _, record := range records {
+				if record.FamilyID != tx.Identity.TargetContainer || record.OwnerNode != r.nodeID ||
+					(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) || record.PhysicalContainer == "" {
+					continue
+				}
+				if targetID == "" && targetName != record.PhysicalContainer {
+					return fmt.Errorf("family %q has multiple physical runtimes on node %q", record.FamilyID, r.nodeID)
+				}
+				targetName = record.PhysicalContainer
+				targetID = ""
+			}
+		}
+	}
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
-		SourceContainer: tx.Identity.SourceContainer, TargetName: tx.Identity.TargetContainer,
+		SourceContainer: tx.Identity.SourceContainer, TargetName: targetName,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
 		ParentBranch:  tx.Identity.SourceBranch,
 		TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
 		SourceNode: tx.Identity.SourceNodeID, Migration: tx.Identity.Migration,
+		Source: &source, Spec: &spec, TargetID: targetID,
 	})
 	return err
 }
@@ -502,6 +540,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	info, err = r.backend.containerStore().RefreshContainerImageRoot(ctx, info.ID)
 	if err != nil {
 		return fmt.Errorf("materializing target image cache: %w", err)
+	}
+	portableMounts := make([]ttcbundle.PortableInternalMount, len(session.InternalMounts))
+	for i, mount := range session.InternalMounts {
+		portableMounts[i] = ttcbundle.PortableInternalMount{
+			Destination: mount.Destination, Contents: append([]byte(nil), mount.Contents...), Mode: os.FileMode(mount.Mode),
+		}
+	}
+	if err := r.backend.containerStore().InstallPortableInternalMounts(info.ID, portableMounts); err != nil {
+		return fmt.Errorf("installing target-local internal mounts: %w", err)
 	}
 	filesystemConnections, err := r.backend.materializeDistributedFilesystemRoots(info, targetBranch.FilesystemBranch, session.FilesystemRoots, peer)
 	if err != nil {
@@ -576,25 +623,16 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return fmt.Errorf("decoding target runtime state: %w", err)
 		}
 	} else {
-		var bundleDir string
-		var cleanup func()
-		if peer {
-			// This is either a migration or the first physical branch of an
-			// existing logical family on this node. Bootstrap the exact visible
-			// branch and filesystem identities. Later forks into the same node use
-			// the ordinary peer-import path in the running Sentry.
-			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedBranchRestoreBundle(info.ID, targetBranch.ID, targetBranch.FilesystemBranch)
-			if err != nil {
-				return fmt.Errorf("preparing distributed peer target bundle: %w", err)
-			}
-			defer cleanup()
-		} else {
-			bundleDir, cleanup, err = r.backend.containerStore().PrepareDistributedTargetBundle(info.ID, targetBranch.FilesystemBranch)
-			if err != nil {
-				return fmt.Errorf("preparing distributed target bundle: %w", err)
-			}
-			defer cleanup()
+		// A new physical Sentry must bootstrap the exact visible branch and
+		// filesystem identities regardless of whether this transaction was
+		// reserved as a peer import. In particular, the first remote child of a
+		// family on a node is represented by a transaction-scoped container, so
+		// peer is false even though its visible branch is not "main".
+		bundleDir, cleanup, err := r.backend.containerStore().PrepareDistributedBranchRestoreBundle(info.ID, targetBranch.ID, targetBranch.FilesystemBranch)
+		if err != nil {
+			return fmt.Errorf("preparing distributed target bundle: %w", err)
 		}
+		defer cleanup()
 		var diagnostic bytes.Buffer
 		commandBackend := *r.backend
 		commandBackend.stderr = &diagnostic
@@ -850,21 +888,11 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 		// that compare-and-swap succeeds.
 		return nil
 	}
-	if _, err := r.backend.ensureConsoleDrain(selector{container: info.ID, branch: branch.ID}, true); err != nil {
-		return fmt.Errorf("starting distributed target console drain: %w", err)
-	}
-	sessions, err := r.backend.execSessions(selector{container: info.ID, branch: branch.ID})
-	if err != nil {
-		return fmt.Errorf("listing distributed target exec sessions: %w", err)
-	}
-	for _, session := range sessions {
-		if session.State != "running" {
-			continue
-		}
-		if _, err := r.backend.ensureExecConsoleDrain(selector{container: info.ID, branch: branch.ID}, session.ID, session.ConsoleID, true); err != nil {
-			return fmt.Errorf("starting distributed target exec console %q: %w", session.ID, err)
-		}
-	}
+	// Console followers are recoverable sidecars, not part of branch authority.
+	// In particular, a detached restored init may have no attachable console.
+	// Starting followers here would delay publication by the control timeout;
+	// normal daemon reconciliation starts every attachable init/exec follower
+	// after the Raft placement is visible.
 	r.monitorDependency(tx.Identity.TransactionID, info.ID)
 	return nil
 }
@@ -879,7 +907,11 @@ func (r *daemonTargetRuntime) PublishedTarget(tx *cluster.Transaction) (family, 
 		err = loadErr
 		return
 	}
-	return info.ID, targetBranch.ID, info.ID, targetBranch.ID, r.incarnation, nil
+	family = info.DistributedFamilyID
+	if family == "" {
+		family = info.ID
+	}
+	return family, targetBranch.ID, info.ID, targetBranch.ID, r.incarnation, nil
 }
 
 func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transaction) error {
@@ -2452,11 +2484,11 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		} else {
-			id, err := newDaemonRequestID()
-			if err != nil {
-				return err
+			hostname, err := os.Hostname()
+			if err != nil || strings.TrimSpace(hostname) == "" {
+				return errors.New("cannot derive cluster node name from hostname; set --node")
 			}
-			opts.NodeID = "node-" + strings.TrimPrefix(id, "req-")
+			opts.NodeID = strings.TrimSpace(hostname)
 		}
 	}
 	if opts.RepositoryID == "" {

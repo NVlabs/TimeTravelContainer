@@ -844,6 +844,17 @@ func (s *AuthorityState) applyForkPublish(command AuthorityCommand) (json.RawMes
 		OwnerNode: tx.Identity.TargetNodeID, OwnerIncarnation: p.TargetIncarnation,
 		Generation: 1, State: state, Revision: 1, UpdatedAt: command.IssuedAt,
 	}
+	if source, ok := s.Placements[logicalBranchKey(tx.Identity.SourceContainer, tx.Identity.SourceBranch)]; ok {
+		placement.FamilyName = source.FamilyName
+		placement.ImageReference = source.ImageReference
+		placement.ImageDigest = source.ImageDigest
+		placement.ImageSize = source.ImageSize
+		placement.LiveForkEligible = source.LiveForkEligible
+		placement.LiveForkWaiver = source.LiveForkWaiver
+		placement.FamilyCreatedAt = source.FamilyCreatedAt
+		placement.ParentBranch = tx.Identity.SourceBranch
+		placement.BranchCreatedAt = command.IssuedAt
+	}
 	if err := placement.validate(); err != nil {
 		return nil, err
 	}
@@ -877,7 +888,7 @@ func (s *AuthorityState) applyMigrationCutover(command AuthorityCommand) (json.R
 		return nil, errors.New("migration transaction is not published and awaiting cutover")
 	}
 	if tx.Identity.TransactionID != p.Operation || tx.Identity.SourceContainer != p.Family || tx.Identity.SourceBranch != p.Branch ||
-		tx.Identity.TargetNodeID != p.Target || tx.Identity.TargetContainer != p.PhysicalContainer || tx.Identity.VisibleTargetBranch() != p.PhysicalBranch {
+		tx.Identity.TargetNodeID != p.Target || tx.Identity.TargetBranch != p.PhysicalContainer || tx.Identity.VisibleTargetBranch() != p.PhysicalBranch {
 		return nil, errors.New("migration transaction does not match placement cutover")
 	}
 	if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
@@ -1326,6 +1337,12 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 			return nil, errors.New("stale or migrating placement cannot be removed")
 		}
 		delete(s.Placements, key)
+		for childKey, child := range s.Placements {
+			if child.FamilyID == record.FamilyID && child.ParentBranch == record.BranchID {
+				child.ParentBranch = record.ParentBranch
+				s.Placements[childKey] = child
+			}
+		}
 		delete(s.Branches, key)
 		// Publication records are identity fences only while their logical
 		// branch exists. Keeping terminal history after removal would make the

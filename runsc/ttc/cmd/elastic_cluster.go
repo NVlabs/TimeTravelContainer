@@ -383,7 +383,11 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		}
 		info, err := store.LoadContainer(selected.container)
 		if err != nil {
-			continue
+			familyID, resolveErr := resolvePlacementFamily(placements, selected.container)
+			if resolveErr != nil {
+				continue
+			}
+			info.ID = familyID
 		}
 		branchOwner := ""
 		placement, err := placements.Lookup(info.ID, selected.branch)
@@ -427,6 +431,33 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		owner = branchOwner
 	}
 	return owner, claims, nil
+}
+
+// resolvePlacementFamily resolves the same useful subset of container naming
+// as Store.LoadContainer without depending on shared-filesystem cache
+// convergence. Placement display metadata is committed in the same Raft entry
+// that first makes a branch routable.
+func resolvePlacementFamily(placements cluster.PlacementCatalog, identifier string) (string, error) {
+	if placements == nil {
+		return "", os.ErrNotExist
+	}
+	records, err := placements.List()
+	if err != nil {
+		return "", err
+	}
+	matched := make(map[string]struct{})
+	for _, record := range records {
+		if record.FamilyID == identifier || record.FamilyName == identifier || strings.HasPrefix(record.FamilyID, identifier) {
+			matched[record.FamilyID] = struct{}{}
+		}
+	}
+	if len(matched) != 1 {
+		return "", os.ErrNotExist
+	}
+	for id := range matched {
+		return id, nil
+	}
+	panic("unreachable")
 }
 
 func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
@@ -523,8 +554,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	var result error
 	now := time.Now()
 	for _, info := range containers {
+		logicalFamily := info.ID
+		if info.DistributedFamilyID != "" {
+			logicalFamily = info.DistributedFamilyID
+		}
 		for _, branch := range info.Branches {
-			key := info.ID + "\x00" + branch.ID
+			key := logicalFamily + "\x00" + branch.ID
 			known[key] = struct{}{}
 			if branch.Unplaced {
 				if branch.NodeID != "" {
@@ -550,14 +585,17 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 					continue
 				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
-					FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+					FamilyID: logicalFamily, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
 					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
+					FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
+					LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
+					FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
 				}, now)
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
 					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
 				} else if createErr == nil && b.distributedSource.authority != nil {
-					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {
-						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
+					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(logicalFamily, branch.ID, branch.ParentID); inheritErr != nil {
+						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", logicalFamily, branch.ID, inheritErr))
 					}
 				}
 				continue
@@ -566,7 +604,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				continue
 			}
 			if record.OwnerIncarnation != current.Incarnation {
-				adopted, adoptErr := placements.AdoptOwnerIncarnation(info.ID, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
+				adopted, adoptErr := placements.AdoptOwnerIncarnation(logicalFamily, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
 				err = adoptErr
 				if err != nil {
 					result = errors.Join(result, fmt.Errorf("adopting placement for %s@%s: %w", info.ID, branch.ID, err))
@@ -586,12 +624,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			// publication state. Re-propose the idempotent stable placement update
 			// when either view differs; Raft then repairs both atomically.
 			if record.State != state || (authorityKnown && branchAuthority.Lifecycle != string(state)) {
-				if _, err := placements.UpdateStableState(info.ID, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
+				if _, err := placements.UpdateStableState(logicalFamily, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
 					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
 				}
 			}
 			if b.distributedSource.authority != nil && (!authorityKnown || !branchAuthority.DependenciesInherited) {
-				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(info.ID, branch.ID, branch.ParentID); inheritErr != nil {
+				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(logicalFamily, branch.ID, branch.ParentID); inheritErr != nil {
 					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
 				}
 			}
@@ -1243,6 +1281,10 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		return err
 	}
 	target = resolved
+	logicalFamily := info.DistributedFamilyID
+	if logicalFamily == "" {
+		logicalFamily = info.ID
+	}
 	persistentBranch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
 		return err
@@ -1282,18 +1324,21 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
-	placement, err := placements.Lookup(info.ID, target.branch)
+	placement, err := placements.Lookup(logicalFamily, target.branch)
 	if errors.Is(err, os.ErrNotExist) {
 		placement, err = placements.Create(cluster.PlacementRecord{
-			FamilyID: info.ID, BranchID: target.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
+			FamilyID: logicalFamily, BranchID: target.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
 			OwnerNode: b.nodeID, OwnerIncarnation: sourceRecord.Incarnation, State: cluster.PlacementState(state),
+			FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
+			LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
+			FamilyCreatedAt: info.CreatedAt, ParentBranch: persistentBranch.ParentID, BranchCreatedAt: persistentBranch.CreatedAt,
 		}, time.Now())
 	}
 	if err != nil {
 		return err
 	}
 	if placement.OwnerNode == b.nodeID && placement.OwnerIncarnation != sourceRecord.Incarnation {
-		placement, err = placements.AdoptOwnerIncarnation(info.ID, target.branch, b.nodeID, placement.OwnerIncarnation, sourceRecord.Incarnation, placement.Generation, time.Now())
+		placement, err = placements.AdoptOwnerIncarnation(logicalFamily, target.branch, b.nodeID, placement.OwnerIncarnation, sourceRecord.Incarnation, placement.Generation, time.Now())
 		if err != nil {
 			return fmt.Errorf("adopting placement after node restart: %w", err)
 		}
@@ -1302,33 +1347,38 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := placements.BeginMigration(info.ID, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
+	if _, err := placements.BeginMigration(logicalFamily, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
 		return err
 	}
 	rootfsDigest, err := distributedRootfsDigest(info, target.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {
-		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
 		return err
 	}
 	identity := cluster.ForkIdentity{
 		TransactionID: requestID, SourceNodeID: b.nodeID, TargetNodeID: targetNode,
-		SourceContainer: info.ID, SourceBranch: target.branch,
-		TargetContainer: info.ID, TargetBranch: requestID, TargetVisibleBranch: target.branch,
+		SourceContainer: logicalFamily, SourceBranch: target.branch,
+		TargetContainer: logicalFamily, TargetBranch: requestID, TargetVisibleBranch: target.branch,
 		ImageDigest: info.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID, Migration: true,
 	}
+	family, err := b.portableDistributedFamily(info)
+	if err != nil {
+		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity})
+	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
 	if err != nil {
-		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
 		return fmt.Errorf("reserving sparse migration target %q: %w", targetNode, err)
 	}
 	transferRetained := false
 	if len(persistentBranch.MemoryRootObjects) != 0 {
 		if err := b.retainDistributedGraphTransfer(requestID, info.ID, target.branch, branchGraphRootObjects(persistentBranch)); err != nil {
 			_, _ = peer.Cancel(ctx, requestID, tx.Revision)
-			_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+			_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
 			return fmt.Errorf("retaining sparse migration source graph: %w", err)
 		}
 		transferRetained = true
@@ -1337,7 +1387,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	execSessions, sidecarErr := b.stopMigrationBranchSidecars(target, info)
 	if sidecarErr != nil {
 		_, _ = peer.Cancel(ctx, requestID, tx.Revision)
-		_, _ = placements.AbortMigration(info.ID, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
 		if transferRetained {
 			_ = b.releaseDistributedGraphReferences(graphTransferReferenceOperation(requestID))
 		}
@@ -1390,7 +1440,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			// attempt to collide with it.
 			return fmt.Errorf("%w; restoring sparse migration source: %v; canceling sparse migration target: %v", cause, restoreErr, cancelErr)
 		}
-		if _, abortErr := placements.AbortMigration(info.ID, target.branch, requestID, time.Now()); abortErr != nil {
+		if _, abortErr := placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now()); abortErr != nil {
 			return fmt.Errorf("%w; restoring sparse migration source: %v; aborting placement: %v", cause, restoreErr, abortErr)
 		}
 		if restoreErr != nil {
@@ -1425,7 +1475,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	commandArgs := []string{
 		"timetravel", "--source", target.branch,
 		"--distributed-session", requestID,
-		"--distributed-family", info.ID,
+		"--distributed-family", logicalFamily,
 		"--distributed-external-listener", "--distributed-advertise", advertise,
 		"--distributed-max-transfer", fmt.Sprint(dataPlaneMax),
 		"--distributed-push-policy", string(tx.Negotiated.PagingPolicy.Push),
@@ -1470,11 +1520,15 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return abort(fmt.Errorf("sealing sparse migration filesystem generation: %w", err))
 	}
+	internalMounts, err := b.portableDistributedInternalMounts(info.ID)
+	if err != nil {
+		return abort(fmt.Errorf("capturing portable internal mounts: %w", err))
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax, FilesystemRoots: filesystemRoots,
-		FilesystemBytes: filesystemBytes,
+		FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 	}
 	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)
 	if err != nil {
@@ -1491,7 +1545,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
 		return abort(errors.New("raft migration authority is unavailable"))
 	}
-	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, info.ID, target.branch, requestID, targetNode, targetRecord.Incarnation, info.ID, target.branch)
+	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, logicalFamily, target.branch, requestID, targetNode, targetRecord.Incarnation, requestID, target.branch)
 	if err != nil {
 		return abort(fmt.Errorf("publishing migration placement: %w", err))
 	}

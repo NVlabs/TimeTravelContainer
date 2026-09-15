@@ -380,7 +380,7 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	cutover := decodeAuthorityResultForTest[MigrationCutoverResult](t, applyAuthorityForTest(t, state, "cutover", at.Add(2*time.Second), AuthorityMigrationCutover, AuthorityMigrationCutoverPayload{
 		TransactionID: "migration-1", TransactionRevision: 6,
 		Family: "family", Branch: "main", Operation: "migration-1", Target: "node-b",
-		TargetIncarnation: "incarnation-b", PhysicalContainer: "family", PhysicalBranch: "main",
+		TargetIncarnation: "incarnation-b", PhysicalContainer: "physical-main", PhysicalBranch: "main",
 	}))
 	committed := cutover.Placement
 	if committed.OwnerNode != "node-b" || committed.Generation != begin.Generation+1 || committed.State != PlacementRunning {

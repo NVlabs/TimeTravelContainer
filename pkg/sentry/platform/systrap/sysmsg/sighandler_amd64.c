@@ -282,6 +282,16 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     gregs_to_ptregs(ucontext, &ctx->ptregs);
     memcpy(ctx->fpstate, (uint8_t *)ucontext->uc_mcontext.fpregs,
            __export_arch_state.fp_len);
+    // The host kernel's signal frame contains every XSAVE component enabled
+    // by the host, including components that systrap deliberately does not
+    // expose to the application. Keep the saved context consistent with the
+    // mask used by the fast syscall path and XRSTOR. Otherwise an interrupt
+    // on an AVX-512 host can make a completely ordinary guest context
+    // unrestorable on an AVX-only host.
+    if (__export_arch_state.xsave_mode != XSAVE_MODE_FXSAVE &&
+        __export_arch_state.fp_len >= 520) {
+      *(uint64_t *)(ctx->fpstate + 512) &= XCR0_EAX;
+    }
   }
 
   switch (signo) {

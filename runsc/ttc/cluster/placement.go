@@ -49,8 +49,20 @@ const (
 // PlacementRecord maps a stable logical branch to its current physical
 // runtime. Generation is the fencing token presented by routed commands.
 type PlacementRecord struct {
-	FamilyID          string         `json:"family_id"`
-	BranchID          string         `json:"branch_id"`
+	FamilyID string `json:"family_id"`
+	BranchID string `json:"branch_id"`
+	// Display metadata is replicated with placement so name resolution and
+	// cluster-wide inventory never depend on shared-filesystem directory-cache
+	// convergence. It is not part of execution authority.
+	FamilyName        string         `json:"family_name,omitempty"`
+	ImageReference    string         `json:"image_reference,omitempty"`
+	ImageDigest       string         `json:"image_digest,omitempty"`
+	ImageSize         int64          `json:"image_size,omitempty"`
+	LiveForkEligible  bool           `json:"live_fork_eligible,omitempty"`
+	LiveForkWaiver    string         `json:"live_fork_waiver,omitempty"`
+	FamilyCreatedAt   time.Time      `json:"family_created_at,omitempty"`
+	ParentBranch      string         `json:"parent_branch,omitempty"`
+	BranchCreatedAt   time.Time      `json:"branch_created_at,omitempty"`
 	PhysicalContainer string         `json:"physical_container,omitempty"`
 	PhysicalBranch    string         `json:"physical_branch,omitempty"`
 	OwnerNode         string         `json:"owner_node,omitempty"`

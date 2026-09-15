@@ -498,14 +498,15 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 			return encoder.Encode(records)
 		}
 		writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "NODE\tSTATE\tMEMORY\tTARGET\tRESERVED\tLEASE")
+		fmt.Fprintln(writer, "NODE\tADDRESS\tSTATE\tMEMORY\tTARGET\tRESERVED\tLEASE")
 		now := time.Now()
 		for _, record := range records {
 			lease := "expired"
 			if remaining := record.LeaseExpiresAt.Sub(now); remaining > 0 {
 				lease = remaining.Round(time.Second).String()
 			}
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", record.NodeID, record.State,
+			address := strings.TrimPrefix(strings.TrimPrefix(record.ControlURL, "http://"), "https://")
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", record.NodeID, address, record.State,
 				formatImageSize(int64(record.MemoryCurrentBytes)), formatImageSize(int64(record.MemoryTargetBytes)),
 				formatImageSize(int64(record.IncomingReservedBytes)), lease)
 		}
@@ -5812,6 +5813,37 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
 			}
 		}
+		if placements, placementErr := b.placementCatalog(); placementErr == nil {
+			logicalFamily := info.ID
+			if info.DistributedFamilyID != "" {
+				logicalFamily = info.DistributedFamilyID
+			}
+			if placement, lookupErr := placements.Lookup(logicalFamily, target.branch); lookupErr == nil {
+				if placement.OwnerNode != "" && placement.OwnerNode != b.nodeID {
+					return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, placement.OwnerNode)
+				}
+				if placement.PhysicalContainer != "" && placement.PhysicalContainer != info.ID {
+					physical, loadErr := b.containerStore().LoadContainer(placement.PhysicalContainer)
+					if loadErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime for %s: %w", target, loadErr)
+					}
+					physicalBranch := placement.PhysicalBranch
+					if physicalBranch == "" {
+						physicalBranch = target.branch
+					}
+					if _, branchErr := persistentBranchInfo(physical, physicalBranch); branchErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime branch for %s: %w", target, branchErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				target.container = info.ID
+				return target, info, nil
+			} else if !errors.Is(lookupErr, os.ErrNotExist) {
+				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving placement for %s: %w", target, lookupErr)
+			}
+		}
 		owner := info.BranchNodeID(target.branch)
 		if owner != "" && owner != b.nodeID {
 			return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, owner)
@@ -9503,6 +9535,11 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
+		if container.DistributedFamilyID != "" && container.DistributedFamilyID != container.ID {
+			// Per-node target records are addressed through Raft placement. They
+			// must not appear as additional user-visible families.
+			continue
+		}
 		state := normalizeLifecycleState(container.State)
 		if state == "" {
 			state = "created"
@@ -9524,19 +9561,45 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	// A single catalog snapshot is authoritative for elastically placed branches.
 	// Persistent container metadata describes cold branches, but must not expose
 	// a half-published target during ownership cutover.
+	physicalPlacements := make(map[string][]cluster.PlacementRecord)
 	if b.nodeID != "" {
 		if placements, err := b.placementCatalog(); err == nil {
 			if records, err := placements.List(); err == nil {
 				for _, record := range records {
+					if record.PhysicalContainer != "" {
+						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
+					}
 					family, ok := byID[record.FamilyID]
-					if !ok || record.State == cluster.PlacementUnplaced {
+					if !ok && record.FamilyName != "" {
+						family = Family{
+							ID: record.FamilyID, Name: record.FamilyName, Image: record.ImageReference,
+							Digest: record.ImageDigest, ImageSize: record.ImageSize,
+							LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
+							CreatedAt: record.FamilyCreatedAt,
+						}
+						ok = true
+					}
+					if !ok {
 						continue
 					}
+					foundBranch := false
 					for i := range family.Branches {
 						if family.Branches[i].ID == record.BranchID {
 							family.Branches[i].NodeID = record.OwnerNode
+							family.Branches[i].State = string(record.State)
+							foundBranch = true
 							break
 						}
+					}
+					if !foundBranch {
+						storageState := "local"
+						if record.State == cluster.PlacementUnplaced {
+							storageState = "shared"
+						}
+						family.Branches = append(family.Branches, Branch{
+							ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
+							State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
+						})
 					}
 					owner := ""
 					for _, branch := range family.Branches {
@@ -9550,6 +9613,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 						owner = branch.NodeID
 					}
 					family.NodeID = owner
+					family.State = familyStateFromBranches(family.Branches)
 					byID[record.FamilyID] = family
 				}
 			}
@@ -9558,6 +9622,18 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
+			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
+				physicalID := family.ID
+				family.ID = placements[0].FamilyID
+				for i := range family.Branches {
+					for _, placement := range placements {
+						if placement.PhysicalContainer == physicalID && placement.PhysicalBranch == family.Branches[i].ID {
+							family.Branches[i].ID = placement.BranchID
+							break
+						}
+					}
+				}
+			}
 			// A runsc state directory can outlive its Sentry after SIGKILL, which
 			// is common when a batch scheduler terminates a whole job. Merely
 			// appearing in `runsc list` does not make that runtime available.
@@ -9612,7 +9688,11 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if b.nodeID != "" && !containerHasBranchOnNode(container, b.nodeID) {
 				continue
 			}
-			if _, ok := runtimeIDs[container.ID]; ok {
+			displayID := container.ID
+			if container.DistributedFamilyID != "" {
+				displayID = container.DistributedFamilyID
+			}
+			if _, ok := runtimeIDs[displayID]; ok {
 				continue
 			}
 			// Process-free states intentionally have no live Sentry. This also
@@ -9645,11 +9725,17 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
-				family := byID[container.ID]
+				family := byID[displayID]
+				if family.ID == "" {
+					// A per-node physical runtime record is not itself a
+					// user-visible family. If the logical catalog is temporarily
+					// unavailable, do not manufacture an empty zombie row for it.
+					continue
+				}
 				family.State = normalizeLifecycleState(reconciled.State)
 				family.Branches = persistentBranches(reconciled.Branches)
 				family.SandboxPID = 0
-				byID[container.ID] = family
+				byID[displayID] = family
 			}
 		}
 	} else {
