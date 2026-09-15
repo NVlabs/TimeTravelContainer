@@ -388,6 +388,47 @@ func TestPublishRemoteTargetRetriesPausedAuthorityGap(t *testing.T) {
 	}
 }
 
+func TestActivateRemoteMigrationRetriesAdvancedIndependentRevision(t *testing.T) {
+	const transactionID = "fork-activate-retry"
+	var activates atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tx := cluster.Transaction{
+			Identity: cluster.ForkIdentity{TransactionID: transactionID, Migration: true},
+			State:    cluster.TransactionIndependent, Revision: 8, OwnershipCommitted: true,
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/forks/"+transactionID:
+			_ = json.NewEncoder(w).Encode(tx)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/forks/"+transactionID+"/activate":
+			if activates.Add(1) == 1 {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "stale transaction revision"})
+				return
+			}
+			tx.Activated = true
+			tx.Revision++
+			_ = json.NewEncoder(w).Encode(tx)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	peer, err := cluster.NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tx, err := activateRemoteMigration(ctx, peer, transactionID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tx.Activated || tx.Revision != 9 || activates.Load() != 2 {
+		t.Fatalf("activation result=(activated=%t, revision=%d, attempts=%d), want (true, 9, 2)", tx.Activated, tx.Revision, activates.Load())
+	}
+}
+
 func TestReserveRemoteTargetWaitsForNewLeaderLease(t *testing.T) {
 	var attempts atomic.Int32
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

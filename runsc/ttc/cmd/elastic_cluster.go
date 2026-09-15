@@ -1557,7 +1557,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	}
 	tx = &cutover.Transaction
 	published = true
-	tx, err = peer.Activate(ctx, requestID, tx.Revision)
+	tx, err = activateRemoteMigration(ctx, peer, requestID, tx.Revision)
 	if err != nil {
 		status, statusErr := peer.Status(ctx, requestID)
 		if statusErr != nil || !status.Activated {

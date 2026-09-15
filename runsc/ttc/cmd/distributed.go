@@ -175,6 +175,44 @@ func publishRemoteTarget(ctx context.Context, peer *cluster.Client, transactionI
 	}
 }
 
+// activateRemoteMigration rolls a committed placement forward even if target
+// dependency processing advances the transaction between cutover and the
+// activation RPC. Published, draining, and independent all preserve the same
+// target execution authority; only their revision changes. Fetching the
+// current revision and retrying is therefore required for progress, while a
+// canceled or failed transaction remains terminal.
+func activateRemoteMigration(ctx context.Context, peer *cluster.Client, transactionID string, revision uint64) (*cluster.Transaction, error) {
+	var lastErr error
+	for {
+		tx, err := peer.Activate(ctx, transactionID, revision)
+		if err == nil {
+			return tx, nil
+		}
+		lastErr = err
+		status, statusErr := peer.Status(ctx, transactionID)
+		if statusErr == nil {
+			if status.Activated {
+				return status, nil
+			}
+			activatable := status.State == cluster.TransactionPublished || status.State == cluster.TransactionDraining || status.State == cluster.TransactionIndependent
+			if !status.Identity.Migration || !status.OwnershipCommitted || !activatable {
+				if status.State == cluster.TransactionCanceled || status.State == cluster.TransactionFailed {
+					return nil, fmt.Errorf("migration target became %s while activating: %s", status.State, status.Failure)
+				}
+				return nil, err
+			}
+			revision = status.Revision
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("activating committed migration target: %w (last attempt: %v)", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
 type distributedSourceRuntime struct {
 	capabilities  cluster.Capabilities
 	incarnation   string
@@ -2330,7 +2368,7 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 		}
 		if tx.Identity.Migration && tx.State == cluster.TransactionPublished && tx.OwnershipCommitted && !tx.Activated {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			activated, activateErr := peer.Activate(ctx, tx.Identity.TransactionID, tx.Revision)
+			activated, activateErr := activateRemoteMigration(ctx, peer, tx.Identity.TransactionID, tx.Revision)
 			cancel()
 			if activateErr != nil || activated == nil || !activated.Activated {
 				continue
