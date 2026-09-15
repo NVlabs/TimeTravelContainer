@@ -1000,6 +1000,37 @@ func (s *Stack) CreateNIC(id tcpip.NICID, ep LinkEndpoint) tcpip.Error {
 	return s.CreateNICWithOptions(id, ep, NICOptions{})
 }
 
+// ReplaceNICLinkEndpoint replaces only the runtime-owned link endpoint for an
+// existing NIC. Addresses, routes, network endpoints, and transport demuxer
+// registrations remain intact. The caller must quiesce the Stack; this is
+// intended for save/restore users whose serialized NIC graph contains a link
+// endpoint with non-serializable host-side state.
+func (s *Stack) ReplaceNICLinkEndpoint(id tcpip.NICID, ep LinkEndpoint) tcpip.Error {
+	s.mu.Lock()
+	n, ok := s.nics[id]
+	if !ok {
+		s.mu.Unlock()
+		return &tcpip.ErrUnknownNICID{}
+	}
+	n.enableDisableMu.Lock()
+	oldEP := n.NetworkLinkEndpoint
+	oldQDisc := n.qDisc
+	oldEP.SetOnCloseAction(nil)
+	oldEP.Attach(nil)
+	n.NetworkLinkEndpoint = ep
+	n.qDisc = &delegatingQueueingDiscipline{LinkWriter: ep}
+	ep.Attach(n)
+	ep.SetOnCloseAction(func() {
+		s.RemoveNIC(id)
+	})
+	n.enableDisableMu.Unlock()
+	s.mu.Unlock()
+
+	oldQDisc.Close()
+	oldEP.Close()
+	return nil
+}
+
 // GetLinkEndpointByName gets the link endpoint specified by name.
 func (s *Stack) GetLinkEndpointByName(name string) LinkEndpoint {
 	s.mu.RLock()

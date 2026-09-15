@@ -218,6 +218,43 @@ func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
 	}
 }
 
+func TestTimeTravelNetworkRuntimeLinkReplacementPreservesListener(t *testing.T) {
+	s := newTimeTravelNetworkTestStack(t, true)
+	listener, err := gonet.ListenTCP(s.Stack, tcpip.FullAddress{Addr: timeTravelGuestAddress}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("gonet.ListenTCP: %v", err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+
+	// Distributed restore replaces the runtime-only side of ttc0 after the
+	// guest's complete netstack, including this listener, has been decoded.
+	s.Pause()
+	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false, false); err != nil {
+		t.Fatalf("replacing TTC runtime link: %v", err)
+	}
+	s.Resume()
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, s.Stack, tcpip.FullAddress{Addr: timeTravelGuestAddress, Port: port}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("dial after TTC runtime-link replacement: %v", err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("accept after TTC runtime-link replacement: %v", err)
+	}
+}
+
 func TestTimeTravelNetworkQuarantineCanBeChangedAtRuntime(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

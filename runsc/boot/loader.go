@@ -1118,11 +1118,6 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 		// setup would discard or collide with interfaces and routes created by
 		// the workload after container start.
 		if networkArgs.TimeTravel != nil {
-			if _, ok := eps.Interfaces()[int32(timeTravelNICID)]; ok {
-				if err := eps.Stack.RemoveNIC(timeTravelNICID); err != nil {
-					return fmt.Errorf("removing restored TTC interface: %v", err)
-				}
-			}
 			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, k.LiveForkQuarantine())
 		}
 		return nil
