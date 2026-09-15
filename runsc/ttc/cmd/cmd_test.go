@@ -133,6 +133,48 @@ func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing
 	}
 }
 
+func TestDistributedPortIngressCanPrecedeInitialPlacement(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPort := uint16(probe.Addr().(*net.TCPAddr).Port)
+	probe.Close()
+	server := &daemonServer{clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	info := ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", NetworkMode: "ttc",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "creating"}},
+	}
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 8080, Protocol: "tcp"}
+	if err := manager.PublishPrepared(info, "main", binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := manager.List("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].HostPort != hostPort {
+		t.Fatalf("listed pre-placement bindings=%+v", listed)
+	}
+	if err := manager.Unpublish(selector{container: "family", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

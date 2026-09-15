@@ -90,6 +90,29 @@ func (m *portIngressManager) Publish(target selector, binding ttcbundle.PortBind
 		}
 		target.container = info.ID
 	}
+	return m.publishResolved(target, binding)
+}
+
+// PublishPrepared installs a node-local ingress listener for a container that
+// this daemon has prepared locally. A new clustered run reaches this point
+// before its first Raft placement record exists, so Publish cannot resolve it
+// through the placement catalog yet. Connections accepted after publication
+// still resolve placement on every dial and therefore follow later migration.
+func (m *portIngressManager) PublishPrepared(info ttcbundle.ContainerInfo, branch string, binding ttcbundle.PortBinding) error {
+	if info.NetworkMode != "ttc" {
+		return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+	}
+	record, err := persistentBranchInfo(info, branch)
+	if err != nil {
+		return err
+	}
+	if record.Quarantined {
+		return fmt.Errorf("branch %q is quarantined", branch)
+	}
+	return m.publishResolved(selector{container: logicalFamilyID(info), branch: branch}, binding)
+}
+
+func (m *portIngressManager) publishResolved(target selector, binding ttcbundle.PortBinding) error {
 	binding.BranchID = target.branch
 	key := ingressPortKey(binding)
 	m.mu.Lock()

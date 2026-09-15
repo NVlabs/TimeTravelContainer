@@ -6310,6 +6310,12 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	}
 	store := b.containerStore()
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
+	persistedPorts := request.publishedPorts
+	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+		// Cluster ingress is deliberately local to the daemon that receives the
+		// run request and does not survive its restart.
+		persistedPorts = nil
+	}
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6357,7 +6363,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		NetworkNAT:              request.networkNAT,
 		NetworkIP:               request.networkIP,
 		NetworkMAC:              request.networkMAC,
-		PublishedPorts:          request.publishedPorts,
+		PublishedPorts:          persistedPorts,
 		WaiveLiveFork:           !request.liveForkEligible,
 		LiveForkWaiver:          request.liveForkWaiver,
 		Progress:                b.imageProgress(),
@@ -6374,7 +6380,24 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	}
 	id := prepared.Container.ID
 	target := selector{container: id, branch: defaultBranchID}
+	var ingressBindings []ttcbundle.PortBinding
+	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+		for _, binding := range request.publishedPorts {
+			if err := b.portIngress.PublishPrepared(prepared.Container, defaultBranchID, binding); err != nil {
+				for _, installed := range ingressBindings {
+					_ = b.portIngress.Unpublish(target, installed)
+				}
+				return containerRunResult{}, fmt.Errorf("publishing ingress port: %w", err)
+			}
+			ingressBindings = append(ingressBindings, binding)
+		}
+	}
 	status, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
+	if err != nil {
+		for _, binding := range ingressBindings {
+			_ = b.portIngress.Unpublish(target, binding)
+		}
+	}
 	if err == nil {
 		b.recordLaunchState(target, request.detach, status)
 	}
@@ -9072,6 +9095,12 @@ func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding)
 }
 
 func (b *runtimeBackend) ensurePublishedPortsForBranch(info ttcbundle.ContainerInfo, branch string) error {
+	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+		// Cluster ingress listeners are explicit node-local ephemeral objects.
+		// They are created by run -p or `ttc port publish`, not reconstructed
+		// from shared container metadata on a target or daemon restart.
+		return nil
+	}
 	record, err := persistentBranchInfo(info, branch)
 	if err != nil {
 		return err
@@ -9394,7 +9423,11 @@ func (b *runtimeBackend) stopPublishedPorts(info ttcbundle.ContainerInfo) error 
 
 func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBinding) error {
 	if b.portIngress != nil {
-		if err := b.portIngress.Unpublish(target, binding); !errors.Is(err, errIngressPortNotFound) {
+		if err := b.portIngress.Unpublish(target, binding); err == nil {
+			if b.portIngress.server.clusterPlacements != nil {
+				return nil
+			}
+		} else if !errors.Is(err, errIngressPortNotFound) {
 			return err
 		}
 	}
