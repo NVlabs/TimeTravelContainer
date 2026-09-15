@@ -2626,6 +2626,14 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 // lookups, but runtime preparation must be able to consume their private bundle
 // before the target is atomically published.
 func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
+	return s.LoadRuntimeContainer(identifier)
+}
+
+// LoadRuntimeContainer resolves ordinary containers and exact internal
+// distributed runtime IDs. Callers must already possess an authority-derived
+// physical ID; this method deliberately does not expose hidden targets through
+// names or ID prefixes.
+func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
 	info, err := s.LoadContainer(identifier)
 	if err == nil {
 		return info, nil
@@ -3138,6 +3146,14 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 	var published ContainerInfo
 	err = s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
 		if current.DistributedForkTransactionID == transactionID {
+			// A standalone physical target is an implementation detail of its
+			// Raft-visible family. Placement makes the logical branch visible;
+			// exposing this record as well produces duplicate fork-* zombies once
+			// ownership migrates again.
+			if current.DistributedFamilyID != "" {
+				published = *current
+				return false, nil
+			}
 			if !current.DistributedForkHidden {
 				published = *current
 				return false, nil

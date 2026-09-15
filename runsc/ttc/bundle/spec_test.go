@@ -165,6 +165,7 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	info := ContainerInfo{
 		ID: "hidden-target-id", Name: "hidden-target", Digest: "sha256:" + strings.Repeat("a", 64),
 		Platform: "linux/amd64", DistributedForkHidden: true,
+		DistributedForkTransactionID: "tx-hidden", DistributedFamilyID: "logical-family",
 		BundleDir: filepath.Join(root, "containers", "hidden-target-id", "bundle"),
 	}
 	info.RootFS = filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
@@ -183,6 +184,9 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	}
 	if _, err := store.LoadContainer(info.ID); err == nil {
 		t.Fatal("ordinary lookup unexpectedly exposed hidden target")
+	}
+	if runtime, err := store.LoadRuntimeContainer(info.ID); err != nil || runtime.ID != info.ID {
+		t.Fatalf("exact runtime lookup=(%q, %v), want hidden target", runtime.ID, err)
 	}
 	if _, err := store.LoadSpec(info.ID); err != nil {
 		t.Fatalf("loading hidden target runtime spec: %v", err)
@@ -218,6 +222,16 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	}
 	if refreshed.State != "paused" {
 		t.Fatalf("refreshed target state=%q, want paused", refreshed.State)
+	}
+	published, err := store.PublishDistributedForkTarget("tx-hidden")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !published.DistributedForkHidden {
+		t.Fatal("publishing logical placement exposed its physical runtime")
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("ordinary lookup exposed physical runtime after publication")
 	}
 }
 

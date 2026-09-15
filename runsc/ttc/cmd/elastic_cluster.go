@@ -1698,7 +1698,13 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 		return nil
 	}
 	if physicalPeers == 0 {
-		return b.purgeRuntime(info.ID)
+		if err := b.purgeRuntime(info.ID); err != nil {
+			return err
+		}
+		if info.DistributedFamilyID != "" && info.DistributedForkTransactionID != "" {
+			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
+		}
+		return nil
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
 		families, listErr := b.listRuntimeFamilies()

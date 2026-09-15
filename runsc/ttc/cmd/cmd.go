@@ -5838,7 +5838,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 					return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, placement.OwnerNode)
 				}
 				if placement.PhysicalContainer != "" && placement.PhysicalContainer != info.ID {
-					physical, loadErr := b.containerStore().LoadContainer(placement.PhysicalContainer)
+					physical, loadErr := b.containerStore().LoadRuntimeContainer(placement.PhysicalContainer)
 					if loadErr != nil {
 						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime for %s: %w", target, loadErr)
 					}
