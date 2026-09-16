@@ -928,6 +928,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
+	lastPublicationID := ""
 	for {
 		info, err := store.LoadRuntimeContainer(containerID)
 		if err != nil {
@@ -937,10 +938,12 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		if err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
-		if branch.PublicationID != authority.PublicationID {
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s publication is %q, committed authority has %q", branchID, branch.PublicationID, authority.PublicationID)
-		}
-		if branch.StorageState == "shared" && branch.StorageManifest != "" {
+		lastPublicationID = branch.PublicationID
+		// Raft publication commit is irreversible and precedes this derived
+		// metadata update. An empty or older ID therefore means the publisher
+		// has not completed its shared-catalog write yet, not that the committed
+		// roots are invalid. Poll until the exact authoritative identity appears.
+		if branch.PublicationID == authority.PublicationID && branch.StorageState == "shared" && branch.StorageManifest != "" {
 			if filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
 				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", branchID, branch.StorageManifest, expectedManifest)
 			}
@@ -954,7 +957,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		}
 		select {
 		case <-ctx.Done():
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata: %w", ctx.Err())
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q, want %q): %w", lastPublicationID, authority.PublicationID, ctx.Err())
 		case <-ticker.C:
 		}
 	}

@@ -347,13 +347,17 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	if err := os.WriteFile(manifest, []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+	metadataPath := filepath.Join(containerDir, "container.json")
+	initial := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{
-			ID: "cold", State: "dehydrated", StorageState: "publishing", PublicationID: publicationID,
+			// Model metadata from before BeginBranchPublication reached the
+			// shared catalog. Raft has already committed this publication below.
+			ID: "cold", State: "running", StorageState: "local",
 			SnapshotID: 17, NodeID: "node-old", CreatedAt: time.Unix(1, 0).UTC(),
 		}},
-	}); err != nil {
+	}
+	if err := writeCurrentBundleFixture(metadataPath, initial); err != nil {
 		t.Fatal(err)
 	}
 	relativeManifest, err := filepath.Rel(root, manifest)
@@ -368,7 +372,17 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	completed := make(chan error, 1)
 	go func() {
 		time.Sleep(75 * time.Millisecond)
-		completed <- store.CompleteBranchPublication("family-id", "cold", publicationID, manifest, "dehydrated", true)
+		complete := initial
+		complete.State = "dehydrated"
+		complete.Branches = append([]ttcbundle.BranchInfo(nil), initial.Branches...)
+		branch := &complete.Branches[0]
+		branch.State = "dehydrated"
+		branch.StorageState = "shared"
+		branch.PublicationID = publicationID
+		branch.StorageManifest = manifest
+		branch.NodeID = ""
+		branch.Unplaced = true
+		completed <- writeCurrentBundleFixture(metadataPath, complete)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
