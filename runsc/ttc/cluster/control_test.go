@@ -289,10 +289,22 @@ func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
 	if provider.retained != 1 || provider.released != 1 {
 		t.Fatalf("release provider state=%+v", provider)
 	}
+	// Descendant branches have their own durable, unguessable operation and
+	// exact immutable root bindings; they deliberately do not remain coupled
+	// to the transaction that first imported an ancestor.
+	if err := client.RetainSnapshotRoots(context.Background(), 42, "", "branch-request", roots); err != nil {
+		t.Fatalf("retaining descendant roots without ancestor transaction: %v", err)
+	}
+	if err := client.ReleaseSnapshotRoots(context.Background(), 42, "", "branch-request", roots); err != nil {
+		t.Fatalf("releasing descendant roots without ancestor transaction: %v", err)
+	}
+	if provider.retained != 2 || provider.released != 2 {
+		t.Fatalf("descendant provider state=%+v", provider)
+	}
 	if err := client.ApplySnapshotReference(context.Background(), 42, "edge-0000000000000001-0000000000000001", "edge/0000000000000001-04-0000000000000001/0003", roots[0].Object, true); err != nil {
 		t.Fatal(err)
 	}
-	if provider.retained != 2 || provider.operation != "edge-0000000000000001-0000000000000001" {
+	if provider.retained != 3 || provider.operation != "edge-0000000000000001-0000000000000001" {
 		t.Fatalf("owner reference provider state=%+v", provider)
 	}
 }

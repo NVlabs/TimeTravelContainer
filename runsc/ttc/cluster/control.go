@@ -1174,13 +1174,13 @@ func (c *ControlPlane) serveSnapshotReferences(w http.ResponseWriter, r *http.Re
 	var err error
 	switch request.Action {
 	case "retain":
-		if !transactionIDPattern.MatchString(request.Transaction) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
+		if (request.Transaction != "" && !transactionIDPattern.MatchString(request.Transaction)) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
 			writeControlError(w, http.StatusBadRequest, "invalid snapshot root retain")
 			return
 		}
 		err = c.SnapshotReferences.RetainSnapshotRoots(r.Context(), peer, snapshot, request.Transaction, request.Operation, request.Roots)
 	case "release":
-		if !transactionIDPattern.MatchString(request.Transaction) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
+		if (request.Transaction != "" && !transactionIDPattern.MatchString(request.Transaction)) || len(request.Roots) == 0 || request.Name != "" || request.Object != "" || request.Retain {
 			writeControlError(w, http.StatusBadRequest, "invalid snapshot root release")
 			return
 		}
@@ -1983,7 +1983,7 @@ func (c *Client) ReleaseSnapshotRoots(ctx context.Context, snapshot uint64, tran
 }
 
 func (c *Client) mutateSnapshotRoots(ctx context.Context, snapshot uint64, request snapshotReferenceRequest) error {
-	if snapshot == 0 || !transactionIDPattern.MatchString(request.Transaction) || !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) == 0 || len(request.Roots) > 4096 {
+	if snapshot == 0 || (request.Transaction != "" && !transactionIDPattern.MatchString(request.Transaction)) || !transactionIDPattern.MatchString(request.Operation) || len(request.Roots) == 0 || len(request.Roots) > 4096 {
 		return errors.New("invalid snapshot reference operation")
 	}
 	var response map[string]any
