@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -273,6 +274,61 @@ func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
 	}
 	if daemonCommandMayAwaitColdUnplacement(root, []string{"rehydrate", "web@cold"}) {
 		t.Fatal("running branch may wait for conflicting placement")
+	}
+}
+
+func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const publicationID = "publication-test"
+	manifest := coldManifestPath(root, "family-id", "cold", publicationID)
+	if err := os.MkdirAll(filepath.Dir(manifest), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "cold", State: "dehydrated", StorageState: "publishing", PublicationID: publicationID,
+			SnapshotID: 17, NodeID: "node-old", CreatedAt: time.Unix(1, 0).UTC(),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family-id", BranchID: "cold", PublicationID: publicationID, Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest, MemorySnapshot: 17},
+	}
+	store := ttcbundle.Store{Root: root}
+	completed := make(chan error, 1)
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		completed <- store.CompleteBranchPublication("family-id", "cold", publicationID, manifest, "dehydrated", true)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	info, branch, err := waitForCommittedColdBranchMetadata(ctx, store, "family-id", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-completed; err != nil {
+		t.Fatal(err)
+	}
+	if info.ID != "family-id" || branch.StorageState != "shared" || branch.StorageManifest != manifest || !branch.Unplaced {
+		t.Fatalf("completed metadata info=%+v branch=%+v", info, branch)
 	}
 }
 

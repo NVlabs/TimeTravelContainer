@@ -847,6 +847,59 @@ func daemonCommandMayAwaitColdUnplacement(dataRoot string, args []string) bool {
 	return found
 }
 
+// waitForCommittedColdBranchMetadata closes the deliberately small gap between
+// the authoritative Raft publication commit and its derived container.json
+// update. CommitPublication first makes the immutable roots authoritative and
+// unplaces the branch in one Raft entry; the publishing node then records the
+// shared manifest in container.json. A different node must not claim the
+// branch in between those steps, because materialization reads the derived
+// manifest path.
+//
+// Waiting is preferable to reconstructing container.json on the claimant: it
+// also orders the old publisher's queue completion before rehydration clears
+// the publication identity for the new mutable runtime.
+func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Store, containerID, branchID string, authority cluster.BranchAuthority) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+	if authority.PublicationID == "" || authority.Roots.FilesystemRoot == "" {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, errors.New("unplaced branch has no committed publication roots")
+	}
+	expectedManifest := filepath.Join(store.Root, filepath.FromSlash(authority.Roots.FilesystemRoot))
+	if err := validateColdManifestPath(store.Root, expectedManifest); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		info, err := store.LoadRuntimeContainer(containerID)
+		if err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+		}
+		branch, err := persistentBranchInfo(info, branchID)
+		if err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+		}
+		if branch.PublicationID != authority.PublicationID {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s publication is %q, committed authority has %q", branchID, branch.PublicationID, authority.PublicationID)
+		}
+		if branch.StorageState == "shared" && branch.StorageManifest != "" {
+			if filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", branchID, branch.StorageManifest, expectedManifest)
+			}
+			if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", branchID, branch.SnapshotID, authority.Roots.MemorySnapshot)
+			}
+			if _, err := os.Stat(expectedManifest); err != nil {
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("opening committed cold manifest: %w", err)
+			}
+			return info, branch, nil
+		}
+		select {
+		case <-ctx.Done():
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // claimUnplacedLifecycleTargets turns admission of a durable cold branch into
 // a generation-fenced placement before its runtime is reconstructed. Without
 // this claim, two entry daemons may independently start or rehydrate the same
@@ -903,6 +956,26 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 				}
 			}
 			continue
+		}
+		// Raft is authoritative and intentionally unplaces a publication before
+		// the publisher rewrites derived shared metadata. Do not let a claimant
+		// clear the publication identity while that queue completion is still in
+		// flight. Local test catalogs have no BranchAuthority and therefore keep
+		// the legacy direct-claim behavior.
+		if authority, ok := placements.(interface {
+			Branch(family, branch string) (*cluster.BranchAuthority, error)
+		}); ok {
+			committed, authorityErr := authority.Branch(familyID, target.branch)
+			if authorityErr != nil {
+				return fmt.Errorf("loading cold-branch authority for %s: %w", target, authorityErr)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			persistent, persistentBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, store, info.ID, resolved.branch, *committed)
+			cancel()
+			if waitErr != nil {
+				return fmt.Errorf("waiting to claim cold branch %s: %w", target, waitErr)
+			}
+			info, branch = persistent, persistentBranch
 		}
 		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {
