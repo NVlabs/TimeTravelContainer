@@ -5303,6 +5303,58 @@ func TestFinalColdStorageCollectionHasNoPublicationGraceResidue(t *testing.T) {
 	}
 }
 
+func TestColdStorageRetainsDistributedPhysicalBranchManifest(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	const physicalID = "fork-physical-child"
+	manifestPath := coldManifestPath(shared, physicalID, "child", "publication-child")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	manifest := coldBranchManifest{
+		Version: 5, Container: physicalID, Branch: "child", PublicationID: "publication-child", Kind: "stop",
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef", BranchID: "child",
+			Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{17}}},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(manifestPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(shared, "containers", physicalID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, BundleDir: bundleDir,
+		DistributedFamilyID: "logical-family", DistributedForkTransactionID: "fork-child",
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "child", State: "dehydrated", StorageState: "shared", PublicationID: "publication-child", StorageManifest: manifestPath,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("distributed physical branch manifest was reclaimed: %v", err)
+	}
+}
+
 func TestEmitCapacityRequestCoalescesUntilAcknowledged(t *testing.T) {
 	dataRoot := t.TempDir()
 	backend := &runtimeBackend{

@@ -1698,7 +1698,10 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 // object.
 func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, olderThan time.Time) error {
 	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
-	containers, err := store.ListContainers()
+	// Destructive tracing must include internal distributed physical records.
+	// User-facing ListContainers intentionally hides them, but their cold
+	// manifests remain authoritative after Raft unplaces a remote branch.
+	containers, err := store.ListContainersForGC()
 	if err != nil {
 		return err
 	}
