@@ -652,38 +652,58 @@ func (r *Repository) PublishOriginHandoff(ctx context.Context, shared *ttcsnapsh
 	if err := r.SyncMetadata(); err != nil {
 		return err
 	}
+	// Install the handoff baseline while retaining the same cross-process
+	// writer fence as live Sentry mutations. The bulk pack write below is
+	// intentionally outside this short fence; reference changes that race it
+	// are recorded in the handoff suffix and consumed by FreezeOriginHandoff.
+	if err := r.withLock(func() error {
+		_, _, _, err := r.graph.BeginSnapshotLedgerHandoff(origin)
+		return err
+	}); err != nil {
+		return err
+	}
 	return shared.PublishHandoff(ctx, r.graph, origin, r.data)
 }
 
 // FreezeOriginHandoff closes the provider reference-mutation suffix.
 func (r *Repository) FreezeOriginHandoff(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.SnapshotReferenceMutation, error) {
-	if _, _, err := r.graph.FreezeSnapshotLedger(origin); err != nil {
-		return nil, err
-	}
-	changes, _, frozen, err := r.graph.SnapshotLedgerHandoffChanges(origin, 0)
-	if err != nil {
-		return nil, err
-	}
-	if !frozen {
-		return nil, fmt.Errorf("filesystem snapshot origin %d handoff is not frozen", origin)
-	}
-	return changes, nil
+	var changes []ttcsnapshot.SnapshotReferenceMutation
+	err := r.withLock(func() error {
+		if _, _, err := r.graph.FreezeSnapshotLedger(origin); err != nil {
+			return err
+		}
+		var frozen bool
+		var err error
+		changes, _, frozen, err = r.graph.SnapshotLedgerHandoffChanges(origin, 0)
+		if err != nil {
+			return err
+		}
+		if !frozen {
+			return fmt.Errorf("filesystem snapshot origin %d handoff is not frozen", origin)
+		}
+		return nil
+	})
+	return changes, err
 }
 
 // CompleteOriginHandoff changes the local graph into a non-authoritative
 // shared cache view after Raft has committed the provider-to-shared switch.
 func (r *Repository) CompleteOriginHandoff(origin ttcsnapshot.SnapshotID) error {
-	if err := r.graph.MarkShared(origin); err != nil {
-		return err
-	}
-	return r.graph.UnfreezeSnapshotLedger(origin)
+	return r.withLock(func() error {
+		if err := r.graph.MarkShared(origin); err != nil {
+			return err
+		}
+		return r.graph.UnfreezeSnapshotLedger(origin)
+	})
 }
 
 // CancelOriginHandoff restores ordinary provider-side mutation and collection
 // after a publication was canceled before Raft routed origin to shared
 // storage. It is idempotent so crash recovery may repeat cleanup.
 func (r *Repository) CancelOriginHandoff(origin ttcsnapshot.SnapshotID) error {
-	return r.graph.UnfreezeSnapshotLedger(origin)
+	return r.withLock(func() error {
+		return r.graph.UnfreezeSnapshotLedger(origin)
+	})
 }
 
 // OriginEmpty reports whether origin owns no remaining graph objects. Missing
@@ -791,27 +811,27 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 		return nil, err
 	}
 	working := workingOrigin
-	if working == 0 {
-		working, err = repo.graph.AllocateWorking()
-	} else {
-		err = repo.graph.AdoptWorking(working)
-	}
-	if err != nil {
-		_ = os.RemoveAll(path)
-		return nil, err
-	}
-	now := time.Now().UnixNano()
-	rootMeta := Inode{
-		Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2,
-		AtimeNsec: now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
-	}
-	branch := Branch{ID: mainBranch, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
-	state := newBranchMetadata(branch)
-	if err := repo.commitMetadata(&state.branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &rootMeta}}); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, err
-	}
-	if err := repo.writeBranch(state.branch); err != nil {
+	if err := repo.withLock(func() error {
+		if working == 0 {
+			working, err = repo.graph.AllocateWorking()
+		} else {
+			err = repo.graph.AdoptWorking(working)
+		}
+		if err != nil {
+			return err
+		}
+		now := time.Now().UnixNano()
+		rootMeta := Inode{
+			Number: rootInode, Type: "directory", Mode: 0755, Nlink: 2,
+			AtimeNsec: now, BtimeNsec: now, CtimeNsec: now, MtimeNsec: now,
+		}
+		branch := Branch{ID: mainBranch, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+		state := newBranchMetadata(branch)
+		if err := repo.commitMetadata(&state.branch, state, []metadataOp{{Kind: metadataSetInode, Inode: &rootMeta}}); err != nil {
+			return err
+		}
+		return repo.writeBranch(state.branch)
+	}); err != nil {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}

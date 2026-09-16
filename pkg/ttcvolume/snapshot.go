@@ -425,7 +425,13 @@ func (m *Manager) ImportSnapshot(name, source string) (*Repository, SnapshotInfo
 }
 
 func (r *Repository) importSnapshot(source string) (SnapshotInfo, error) {
-	return r.importPortableSnapshotMode(source, mainBranch)
+	var snapshot SnapshotInfo
+	err := r.withLock(func() error {
+		var err error
+		snapshot, err = r.importPortableSnapshotMode(source, mainBranch)
+		return err
+	})
+	return snapshot, err
 }
 
 func (r *Repository) importPortableSnapshotMode(source, targetBranch string) (SnapshotInfo, error) {

@@ -162,8 +162,13 @@ type Store struct {
 	// deferred expansion from another Sentry can allocate from the same stale
 	// snapshot ordinal or interleave journal framing bytes.
 	externalTransaction bool
-	deferredResolvers   map[string]deferredResolver
-	deferredObjects     map[string]ObjectID
+	// implicitExternalTransaction is true while a nominal read operation is
+	// committing a lazy deferred-object expansion under graph.lock. Keep this
+	// distinct from externalTransaction: the latter is an explicit repository
+	// transaction that may span multiple Store calls.
+	implicitExternalTransaction bool
+	deferredResolvers           map[string]deferredResolver
+	deferredObjects             map[string]ObjectID
 	// memoryPages is a derived index over live graph-native page records. It
 	// makes repeated captures reuse the immutable PageID selected by the
 	// guest's stable logical/version identity instead of scanning the graph or
@@ -492,11 +497,13 @@ func (s *Store) beginImplicitExternalMutationLocked() (bool, error) {
 		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 		return false, err
 	}
+	s.implicitExternalTransaction = true
 	return true, nil
 }
 
 func (s *Store) endImplicitExternalMutationLocked(acquired bool) {
 	if acquired {
+		s.implicitExternalTransaction = false
 		_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 	}
 }
@@ -1539,6 +1546,15 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 	if s.poisoned != nil {
 		return fmt.Errorf("TTC snapshot graph requires reopen after an uncertain journal commit: %w", s.poisoned)
 	}
+	// An externally-coordinated Store may coexist with manager and Sentry
+	// handles for the same graph. Every mutation must retain graph.lock from
+	// the reload that selected its input state through the journal append. A
+	// reload followed by an unlocked mutation is not sufficient: another
+	// handle can begin writing a record in between, causing this Store to
+	// observe a partial tail or append from a stale position.
+	if s.externallyCoordinated && !s.externalTransaction && !s.implicitExternalTransaction {
+		return errors.New("externally-coordinated TTC graph mutation requires an active writer transaction")
+	}
 	referenceKeys := make([]string, 0, len(references))
 	for key := range references {
 		referenceKeys = append(referenceKeys, key)
@@ -1623,22 +1639,25 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 	}
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
-	start, err := s.journal.Seek(0, io.SeekCurrent)
+	start := s.journalEnd
+	info, err := s.journal.Stat()
 	if err != nil {
 		return err
+	}
+	if info.Size() != start {
+		return fmt.Errorf("TTC snapshot graph journal size %d disagrees with committed end %d", info.Size(), start)
 	}
 	rollback := func(cause error) error {
 		if err := s.journal.Truncate(start); err != nil {
 			s.poisoned = fmt.Errorf("%v; journal rollback failed: %w", cause, err)
 			return s.poisoned
 		}
-		_, _ = s.journal.Seek(start, io.SeekStart)
 		return cause
 	}
-	if err := writeFull(s.journal, length[:]); err != nil {
-		return rollback(err)
-	}
-	if err := writeFull(s.journal, data); err != nil {
+	frame := make([]byte, len(length)+len(data))
+	copy(frame, length[:])
+	copy(frame[len(length):], data)
+	if err := writeFullAt(s.journal, frame, start); err != nil {
 		return rollback(err)
 	}
 	// A Store embedded in a filesystem repository follows ordinary Linux
@@ -1690,6 +1709,21 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		if object, ok := s.state.Objects[key]; ok {
 			s.indexMemoryPageLocked(object)
 		}
+	}
+	return nil
+}
+
+func writeFullAt(file *os.File, data []byte, offset int64) error {
+	for len(data) != 0 {
+		n, err := file.WriteAt(data, offset)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+		offset += int64(n)
 	}
 	return nil
 }

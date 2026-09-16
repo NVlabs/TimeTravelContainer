@@ -17,6 +17,7 @@ package ttcvolume
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1290,13 +1291,18 @@ func TestOpenRecoversCommittedGraphBeforeBranchPointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := repository.graph.ApplyFilesystem(
-		ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
-		graphRootName(MainBranch),
-		[]ttcsnapshot.FilesystemOperation{{PutInode: &ttcsnapshot.InodeRecord{
-			Number: 99, Type: "directory", Mode: 0755, Nlink: 2,
-		}}},
-	)
+	var root ttcsnapshot.ObjectID
+	err = repository.withLock(func() error {
+		var applyErr error
+		root, applyErr = repository.graph.ApplyFilesystem(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			graphRootName(MainBranch),
+			[]ttcsnapshot.FilesystemOperation{{PutInode: &ttcsnapshot.InodeRecord{
+				Number: 99, Type: "directory", Mode: 0755, Nlink: 2,
+			}}},
+		)
+		return applyErr
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1379,12 +1385,15 @@ func TestOpenRecoversInterruptedForkGraphTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.graph.SealAndFork(
-		ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
-		ttcsnapshot.SnapshotSealedLocal,
-		map[string]string{graphRootName("unpublished"): graphRootName(MainBranch)},
-		2,
-	); err != nil {
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.SealAndFork(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			ttcsnapshot.SnapshotSealedLocal,
+			map[string]string{graphRootName("unpublished"): graphRootName(MainBranch)},
+			2,
+		)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// Model a crash before either branch pointer is published.
@@ -1425,13 +1434,18 @@ func TestOpenReleasesInterruptedConstructionPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := repository.graph.CreateObject(
-		ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
-		"construct/interrupted",
-		ttcsnapshot.ObjectKindFile,
-		nil,
-		nil,
-	)
+	var id ttcsnapshot.ObjectID
+	err = repository.withLock(func() error {
+		var createErr error
+		id, createErr = repository.graph.CreateObject(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			"construct/interrupted",
+			ttcsnapshot.ObjectKindFile,
+			nil,
+			nil,
+		)
+		return createErr
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1449,6 +1463,41 @@ func TestOpenReleasesInterruptedConstructionPins(t *testing.T) {
 	object, ok := repository.graph.Object(id)
 	if !ok || object.State != ttcsnapshot.ObjectReclaiming || object.Refs != 0 {
 		t.Fatalf("interrupted object=%+v, found=%t", object, ok)
+	}
+}
+
+func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("handoff-fence", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, ok := repository.graph.Snapshot(100); !ok || snapshot.State != ttcsnapshot.SnapshotShared {
+		t.Fatalf("published snapshot=(%+v,%t), want shared", snapshot, ok)
 	}
 }
 

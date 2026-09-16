@@ -42,6 +42,17 @@ func openTestStore(t *testing.T) *Store {
 	return store
 }
 
+func withExternalTransaction(t *testing.T, store *Store, fn func()) {
+	t.Helper()
+	if err := store.BeginExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	fn()
+	if err := store.EndExternalTransaction(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSnapshotIDsNeverReuse(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -190,17 +201,23 @@ func TestExternallyCoordinatedStoresReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	one, err := first.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var one SnapshotID
+	withExternalTransaction(t, first, func() {
+		one, err = first.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 	if err := second.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	two, err := second.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var two SnapshotID
+	withExternalTransaction(t, second, func() {
+		two, err = second.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 	if two != one+1 {
 		t.Fatalf("second snapshot = %d, want %d", two, one+1)
 	}
@@ -210,6 +227,22 @@ func TestExternallyCoordinatedStoresReload(t *testing.T) {
 	if _, ok := first.Snapshot(two); !ok {
 		t.Fatalf("first store did not observe snapshot %d after reload", two)
 	}
+}
+
+func TestExternallyCoordinatedMutationRequiresWriterTransaction(t *testing.T) {
+	store, err := OpenExternallyCoordinated(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.AllocateWorking(); err == nil {
+		t.Fatal("unfenced externally-coordinated mutation succeeded")
+	}
+	withExternalTransaction(t, store, func() {
+		if _, err := store.AllocateWorking(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestExternallyCoordinatedReloadReplaysJournalSuffix(t *testing.T) {
@@ -226,33 +259,35 @@ func TestExternallyCoordinatedReloadReplaysJournalSuffix(t *testing.T) {
 	defer reader.Close()
 	journal := reader.journal
 
-	origin, err := writer.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaf, err := writer.CreateObject(origin, "construction/leaf", ObjectKindFile, []byte("leaf"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent, err := writer.CreateObject(origin, "construction/parent", ObjectKindMetadata, []byte("parent"), []Edge{{Slot: 0, Child: leaf}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.SetRoot("branch/main", parent); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.DeletePin("construction/leaf"); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.DeletePin("construction/parent"); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.DeleteRoot("branch/main"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.Collect(16); err != nil {
-		t.Fatal(err)
-	}
+	withExternalTransaction(t, writer, func() {
+		origin, err := writer.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := writer.CreateObject(origin, "construction/leaf", ObjectKindFile, []byte("leaf"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent, err := writer.CreateObject(origin, "construction/parent", ObjectKindMetadata, []byte("parent"), []Edge{{Slot: 0, Child: leaf}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.SetRoot("branch/main", parent); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.DeletePin("construction/leaf"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.DeletePin("construction/parent"); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.DeleteRoot("branch/main"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Collect(16); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	if err := reader.Reload(); err != nil {
 		t.Fatal(err)
@@ -280,10 +315,13 @@ func TestExternallyCoordinatedCheckpointSwitchesGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	origin, err := writer.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var origin SnapshotID
+	withExternalTransaction(t, writer, func() {
+		origin, err = writer.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 	if err := writer.CheckpointExternallyCoordinated(); err != nil {
 		t.Fatal(err)
 	}
@@ -302,13 +340,13 @@ func TestExternallyCoordinatedCheckpointSwitchesGeneration(t *testing.T) {
 	if _, ok := reader.Snapshot(origin); !ok {
 		t.Fatalf("reader lost snapshot %d across generation switch", origin)
 	}
-	if err := reader.ReloadForWrite(); err != nil {
-		t.Fatal(err)
-	}
-	next, err := reader.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
+	var next SnapshotID
+	withExternalTransaction(t, reader, func() {
+		next, err = reader.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 	if next != origin+1 {
 		t.Fatalf("snapshot after generation switch=%d, want %d", next, origin+1)
 	}
@@ -363,17 +401,16 @@ func TestExternalReaderSurvivesConcurrentAppendAndCompaction(t *testing.T) {
 		}
 	}()
 	for index := 0; index < snapshots; index++ {
-		if err := writer.ReloadForWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := writer.AllocateWorking(); err != nil {
-			t.Fatal(err)
-		}
-		if index%7 == 6 {
-			if err := writer.CheckpointExternallyCoordinated(); err != nil {
+		withExternalTransaction(t, writer, func() {
+			if _, err := writer.AllocateWorking(); err != nil {
 				t.Fatal(err)
 			}
-		}
+			if index%7 == 6 {
+				if err := writer.CheckpointExternallyCoordinated(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 	close(done)
 	wait.Wait()
