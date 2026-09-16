@@ -2462,14 +2462,17 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error {
 	file, _, _, err := r.OpenDataFile(branchID, ino, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolving branch %q inode %d for data sync: %w", branchID, ino, err)
 	}
 	defer file.Close()
 	if dataOnly {
-		return unix.Fdatasync(int(file.Fd()))
+		if err := unix.Fdatasync(int(file.Fd())); err != nil {
+			return fmt.Errorf("fdatasync branch %q inode %d: %w", branchID, ino, err)
+		}
+		return nil
 	}
 	if err := file.Sync(); err != nil {
-		return err
+		return fmt.Errorf("fsync branch %q inode %d: %w", branchID, ino, err)
 	}
 	return nil
 }
@@ -3581,9 +3584,20 @@ func (r *Repository) clearRemoteObjectPending(id string) error {
 	}
 	err = unix.Unlinkat(int(r.dir.Fd()), marker, 0)
 	if errors.Is(err, os.ErrNotExist) {
+		r.dirtyMu.Lock()
+		delete(r.dirtyFiles, marker)
+		r.dirtyMu.Unlock()
 		return nil
 	}
 	if err == nil {
+		// markRemoteObjectPending may have queued the marker itself for the next
+		// repository durability fence. Once the complete immutable object has
+		// replaced its remote placeholder, the marker is intentionally absent;
+		// retaining its pathname here would make an unrelated later fsync try to
+		// reopen the deleted file and incorrectly return ENOENT to the guest.
+		r.dirtyMu.Lock()
+		delete(r.dirtyFiles, marker)
+		r.dirtyMu.Unlock()
 		r.markDirtyDirectory(filepath.Dir(marker))
 	}
 	return err

@@ -1501,6 +1501,27 @@ func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
 	}
 }
 
+func TestMaterializedRemoteMarkerDoesNotPoisonLaterSync(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("materialized-marker-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	local := "0000000000000001-02-0000000000000010"
+	source := "0000000000000002-02-0000000000000020"
+	if err := repository.markRemoteObjectPending(local, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.clearRemoteObjectPending(local); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatalf("SyncMetadata after materialization: %v", err)
+	}
+}
+
 func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("branch-churn")
