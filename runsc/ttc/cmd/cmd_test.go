@@ -3116,11 +3116,17 @@ func TestWaitPrintsDockerExitCodesInArgumentOrder(t *testing.T) {
 }
 
 func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
-	b := &fakeBackend{
-		localDurable: true,
-		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
-			Metadata: Branch{ID: "child", State: "dehydrated", StorageState: "local"},
-		}}}},
+	b := &authoritativeWaitBackend{
+		fakeBackend: &fakeBackend{
+			localDurable: true,
+			inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+				Metadata: Branch{ID: "child", State: "dehydrated", StorageState: "local"},
+			}}}},
+		},
+		// runtimeBackend has this method even in standalone mode. Its false
+		// result means that Raft is inapplicable, not that local durability can
+		// never converge.
+		durable: false,
 	}
 	var stdout, stderr bytes.Buffer
 	if status := runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b); status != 0 {

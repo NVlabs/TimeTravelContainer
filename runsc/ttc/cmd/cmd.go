@@ -4635,7 +4635,16 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if authority, ok := backend.(authoritativeDurabilityBackend); ok {
+		// runtimeBackend implements both interfaces in every mode. Select Raft
+		// authority only for clustered storage; in standalone mode TTC_ROOT is
+		// the authoritative store and a local capture is already durable. Merely
+		// testing the authority interface here made standalone waits poll a
+		// deliberately inapplicable method forever.
+		localAuthoritative := false
+		if durability, ok := backend.(localDurabilityBackend); ok {
+			localAuthoritative = durability.localStorageIsDurable()
+		}
+		if authority, ok := backend.(authoritativeDurabilityBackend); ok && !localAuthoritative {
 			durable, err := authority.authoritativeBranchDurable(target)
 			if err != nil {
 				return waitResult{err: err}
@@ -4670,7 +4679,7 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 				// so a local stopped/dehydrated capture is already durable.
 				// Clustered local state remains node-authoritative and must wait
 				// for publication to the shared root.
-				if durability, ok := backend.(localDurabilityBackend); ok && durability.localStorageIsDurable() {
+				if localAuthoritative {
 					return waitResult{}
 				}
 			case "materializing":
