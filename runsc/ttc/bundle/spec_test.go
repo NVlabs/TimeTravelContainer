@@ -334,6 +334,62 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 	}
 }
 
+func TestAuthoritativeMigrationReplacesStalePhysicalOwner(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created := time.Now().UTC().Add(-time.Hour)
+	source := ContainerInfo{ID: "source-runtime", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-b",
+		Branches: []BranchInfo{{ID: "moving", ParentID: "ancestor", NodeID: "node-b", State: "running", CreatedAt: created}}}
+	target := ContainerInfo{ID: "target-runtime", Name: "target-runtime", DistributedFamilyID: "family-id", NodeID: "node-a",
+		BundleDir: filepath.Join(root, "containers", "target-runtime", "bundle"),
+		Branches: []BranchInfo{
+			{ID: "sibling", NodeID: "node-a", State: "running", CreatedAt: created},
+			// Model a branch that migrated away earlier. The physical family kept
+			// derived metadata for its former local branch, while Raft now
+			// authorizes importing that branch back from node-b.
+			{ID: "moving", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created},
+		}}
+	if err := os.MkdirAll(target.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", target.ID, "container.json"), &target); err != nil {
+		t.Fatal(err)
+	}
+	base := DistributedForkOptions{
+		SourceContainer: "family-id", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
+		ParentBranch: "moving", TransactionID: "tx-move", NodeID: "node-a", SourceNode: "node-b", Migration: true, Source: &source,
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), base); err == nil {
+		t.Fatal("non-authoritative migration ignored stale physical owner")
+	}
+	base.AuthoritativeMigration = true
+	if _, err := store.PrepareDistributedFork(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	published, err := store.PublishDistributedForkTarget("tx-move")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Branches) != 2 {
+		t.Fatalf("publication duplicated stale branch: %+v", published.Branches)
+	}
+	for _, branch := range published.Branches {
+		if branch.ID == "moving" {
+			if branch.NodeID != "node-a" || branch.FilesystemBranch != ttcvolume.ScopedBranchID(source.ID, "tx-move") || !branch.DistributedMigration {
+				t.Fatalf("authoritative migration did not replace stale metadata: %+v", branch)
+			}
+			return
+		}
+	}
+	t.Fatal("published family lost moving branch")
+}
+
 func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

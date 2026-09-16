@@ -379,7 +379,12 @@ type DistributedForkOptions struct {
 	NodeID          string
 	SourceNode      string
 	Migration       bool
-	TargetID        string
+	// AuthoritativeMigration means the target daemon has already validated the
+	// exact source, target, and operation against cluster authority. Physical
+	// family metadata may retain the branch's former local owner after an
+	// earlier migration and must not override that placement decision.
+	AuthoritativeMigration bool
+	TargetID               string
 	// Source and Spec are supplied by the source daemon over the authenticated
 	// cluster control connection. They avoid using shared-filesystem directory
 	// visibility as a target-reservation synchronization primitive.
@@ -479,6 +484,7 @@ type DistributedForkImport struct {
 	SourceNode               string    `json:"source_node,omitempty"`
 	TargetNode               string    `json:"target_node,omitempty"`
 	Migration                bool      `json:"migration,omitempty"`
+	AuthoritativeMigration   bool      `json:"authoritative_migration,omitempty"`
 	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
 	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
 	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
@@ -1691,11 +1697,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 				if !opts.Migration {
 					return false, fmt.Errorf("branch %s@%s already exists", current.Name, opts.VisibleBranch)
 				}
-				if current.BranchNodeID(branch.ID) != opts.SourceNode {
+				if !opts.AuthoritativeMigration && current.BranchNodeID(branch.ID) != opts.SourceNode {
 					return false, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", current.Name, branch.ID, current.BranchNodeID(branch.ID), opts.SourceNode)
 				}
 			}
-			if opts.Migration && !branchExists && (migrationSource == nil || source.BranchNodeID(opts.VisibleBranch) != opts.SourceNode) {
+			if opts.Migration && !opts.AuthoritativeMigration && !branchExists && (migrationSource == nil || source.BranchNodeID(opts.VisibleBranch) != opts.SourceNode) {
 				return false, fmt.Errorf("migration source branch %s@%s is absent from the source-owned family metadata", current.Name, opts.VisibleBranch)
 			}
 			if current.DistributedForkImports == nil {
@@ -1713,6 +1719,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
 				BranchID: opts.VisibleBranch, ParentID: targetParent, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
 				State: "created", CreatedAt: targetCreated, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
+				AuthoritativeMigration: opts.AuthoritativeMigration,
 			}
 			existing = *current
 			return true, nil
@@ -3287,7 +3294,7 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					if branch.ID != pending.BranchID {
 						continue
 					}
-					if branch.NodeID != pending.SourceNode {
+					if !pending.AuthoritativeMigration && branch.NodeID != pending.SourceNode {
 						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, branch.NodeID)
 					}
 					branch.FilesystemBranch = pending.FilesystemBranch

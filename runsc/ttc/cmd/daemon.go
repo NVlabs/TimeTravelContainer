@@ -504,6 +504,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	}
 	targetName := tx.Identity.TargetContainer
 	targetID := ""
+	authoritativeMigration := false
 	if r.authority != nil {
 		// Shared container metadata describes the whole logical family and may
 		// retain a former owner after migration. Reuse only a physical Sentry
@@ -525,6 +526,22 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 			targetName = physical
 			targetID = ""
 		}
+		if tx.Identity.Migration {
+			placement, placementErr := r.authority.LookupPlacement(tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+			if placementErr != nil {
+				return fmt.Errorf("validating migration placement: %w", placementErr)
+			}
+			authoritativeTx, transactionErr := r.authority.LoadTransaction(tx.Identity.TransactionID)
+			if transactionErr != nil {
+				return fmt.Errorf("validating migration transaction: %w", transactionErr)
+			}
+			if authoritativeTx.Identity != tx.Identity || placement.State != cluster.PlacementMigrating ||
+				placement.OwnerNode != tx.Identity.SourceNodeID || placement.OwnerIncarnation != authoritativeTx.SourceIncarnation ||
+				placement.TargetNode != r.nodeID || placement.OperationID != tx.Identity.TransactionID {
+				return fmt.Errorf("migration %q does not own the authoritative %s@%s placement", tx.Identity.TransactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+			}
+			authoritativeMigration = true
+		}
 	}
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
@@ -533,7 +550,8 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		ParentBranch:  tx.Identity.SourceBranch,
 		TransactionID: tx.Identity.TransactionID, NodeID: r.nodeID,
 		SourceNode: tx.Identity.SourceNodeID, Migration: tx.Identity.Migration,
-		Source: &source, Spec: &spec, TargetID: targetID,
+		AuthoritativeMigration: authoritativeMigration,
+		Source:                 &source, Spec: &spec, TargetID: targetID,
 	})
 	return err
 }
