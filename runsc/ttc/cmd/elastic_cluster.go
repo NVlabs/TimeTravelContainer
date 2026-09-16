@@ -2241,6 +2241,15 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 	if b.dataRoot == "" || b.nodeID == "" {
 		return false
 	}
+	// A distributed family may use a transaction-scoped physical container on
+	// this node. Transactions and placements name the stable logical family,
+	// while Sentry inventory and cleanup name that physical container. Normalize
+	// before testing the source lease; otherwise cleanup can mistake a still-
+	// authoritative sparse provider for an unrelated runtime.
+	logicalFamily := containerID
+	if info, err := b.containerStore().LoadContainer(containerID); err == nil && info.DistributedFamilyID != "" {
+		logicalFamily = info.DistributedFamilyID
+	}
 	transactions, err := b.transactionCatalog()
 	if err != nil {
 		return false
@@ -2250,7 +2259,7 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 		return false
 	}
 	for _, tx := range records {
-		if !tx.Identity.Migration || tx.Identity.SourceNodeID != b.nodeID || tx.Identity.SourceContainer != containerID || tx.Identity.SourceBranch != branchID ||
+		if !tx.Identity.Migration || tx.Identity.SourceNodeID != b.nodeID || tx.Identity.SourceContainer != logicalFamily || tx.Identity.SourceBranch != branchID ||
 			tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 			continue
 		}

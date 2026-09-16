@@ -513,6 +513,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	targetName := tx.Identity.TargetContainer
 	targetID := ""
 	authoritativeMigration := false
+	reusedPhysicalTarget := false
 	if r.authority != nil {
 		// Shared container metadata describes the whole logical family and may
 		// retain a former owner after migration. Reuse only a physical Sentry
@@ -533,6 +534,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		} else if found {
 			targetName = physical
 			targetID = ""
+			reusedPhysicalTarget = true
 		}
 		if tx.Identity.Migration {
 			placement, placementErr := r.authority.LookupPlacement(tx.Identity.SourceContainer, tx.Identity.SourceBranch)
@@ -552,6 +554,11 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		}
 	}
 	defer r.lockTarget(physicalFamily)()
+	if authoritativeMigration && reusedPhysicalTarget {
+		if err := r.releasePreviousMigrationSource(ctx, targetName, tx.Identity.VisibleTargetBranch()); err != nil {
+			return fmt.Errorf("preparing reusable migration target runtime: %w", err)
+		}
+	}
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: targetName,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),
@@ -562,6 +569,48 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		Source:                 &source, Spec: &spec, TargetID: targetID,
 	})
 	return err
+}
+
+// releasePreviousMigrationSource makes immediate reverse/repeated migration
+// well-defined. A completed cutover may leave the old source branch paused in
+// a Sentry that also hosts locally-owned siblings while its sparse dependency
+// drains. If the next migration selects that Sentry before asynchronous source
+// cleanup runs, restoring the same visible branch would otherwise collide with
+// the dormant provider. Wait for Raft to release the provider lease, then reap
+// only its runtime branch; its immutable filesystem roots remain available to
+// the new transaction through the ordinary snapshot graph.
+func (r *daemonTargetRuntime) releasePreviousMigrationSource(ctx context.Context, physicalContainer, branch string) error {
+	for {
+		present, err := runtimeBranchPresent(r.backend, physicalContainer, branch)
+		if err != nil {
+			return err
+		}
+		if !present {
+			return nil
+		}
+		if !r.backend.activeSparseMigrationSource(physicalContainer, branch) {
+			if err := r.backend.releaseMigratedSourceRuntime(physicalContainer, branch); err != nil {
+				return err
+			}
+			present, err = runtimeBranchPresent(r.backend, physicalContainer, branch)
+			if err != nil {
+				return err
+			}
+			if present {
+				return fmt.Errorf("stale source branch %s@%s survived runtime release", physicalContainer, branch)
+			}
+			return nil
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("waiting for previous sparse source dependency: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // reusablePhysicalTarget returns the single active physical Sentry for family
