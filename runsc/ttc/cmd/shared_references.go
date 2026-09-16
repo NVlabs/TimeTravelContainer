@@ -752,8 +752,30 @@ func applySharedRootMutation(ledger *ttcsnapshot.ReferenceLedger, names []string
 
 func (s *sharedReferenceService) mutateReference(operation, name string, object ttcsnapshot.ObjectID, retain bool) error {
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return ledger.ApplyReference(operation, name, object, retain)
+		return applySharedReferenceMutation(ledger, operation, name, object, retain)
 	})
+}
+
+// applySharedReferenceMutation applies a single reference mutation while
+// preserving release idempotency across coordinator rebuilds. A rebuilt
+// shared ledger contains the authoritative reference set, but intentionally
+// does not retain every historical operation receipt. Consequently, replaying
+// a completed release against an absent exact name is success. A conflicting
+// live binding remains an error and retains are always strict.
+func applySharedReferenceMutation(ledger *ttcsnapshot.ReferenceLedger, operation, name string, object ttcsnapshot.ObjectID, retain bool) error {
+	if ledger == nil {
+		return errors.New("shared reference ledger is unavailable")
+	}
+	if !retain {
+		current, exists := ledger.References()[name]
+		if !exists {
+			return nil
+		}
+		if current != object {
+			return fmt.Errorf("reference %q selects %s, not %s", name, current, object)
+		}
+	}
+	return ledger.ApplyReference(operation, name, object, retain)
 }
 
 func isAuthoritativeColdReference(name string) bool {

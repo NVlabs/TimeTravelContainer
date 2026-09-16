@@ -258,6 +258,32 @@ func TestSharedRootReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
 	}
 }
 
+func TestSharedSingleReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
+	ledger := ttcsnapshot.NewReferenceLedger()
+	origin := ttcsnapshot.SnapshotID(23)
+	object := ttcsnapshot.Object{ID: ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 1}}
+	if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{object}, map[string]ttcsnapshot.ObjectID{"root/source": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	name := "root/memory/branch-test"
+	if err := applySharedReferenceMutation(ledger, "retain-single", name, object.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedReferenceMutation(ledger, "release-single", name, object.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedReferenceMutation(ledger, "release-single-replayed", name, object.ID, false); err != nil {
+		t.Fatalf("release replay against an absent exact name: %v", err)
+	}
+	if err := applySharedReferenceMutation(ledger, "retain-conflict", name, object.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	wrong := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 2}
+	if err := applySharedReferenceMutation(ledger, "release-wrong-object", name, wrong, false); err == nil {
+		t.Fatal("release of a conflicting live binding succeeded")
+	}
+}
+
 func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	localRoot := t.TempDir()
 	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
