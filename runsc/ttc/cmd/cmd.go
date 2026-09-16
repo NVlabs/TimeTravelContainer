@@ -5850,7 +5850,7 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 	}
 	switch len(candidates) {
 	case 0:
-		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q does not exist in distributed family %q", branchID, logical.Name)
+		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q does not exist in distributed family %q: %w", branchID, logical.Name, os.ErrNotExist)
 	case 1:
 		return candidates[0].info, candidates[0].branch, nil
 	default:
@@ -5867,6 +5867,21 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 		var publicationID string
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
 			if authority, authorityErr := b.distributedSource.authority.Branch(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
+				// Corruption clears physical placement because no node may execute
+				// the branch, but its last materialization may still contain graph,
+				// filesystem, and console objects that rm must reclaim. Resolve that
+				// durable record without treating it as execution authority.
+				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")
+					if resolveErr == nil {
+						target.container = physical.ID
+						target.branch = physicalBranch
+						return target, physical, nil
+					}
+					if !errors.Is(resolveErr, os.ErrNotExist) {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving corrupted branch storage for %s: %w", target, resolveErr)
+					}
+				}
 				target.container = info.ID
 				return target, info, nil
 			} else if authorityErr == nil {
@@ -12950,13 +12965,29 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("renewing branch removal execution authority: %w", err)
 		}
 	}
+	requested := target
+	logicalInfo, err := b.resolveContainer(requested.container)
+	if err != nil {
+		return err
+	}
+	logicalFamily := logicalFamilyID(logicalInfo)
+	corrupted := false
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		if authority, authorityErr := b.distributedSource.authority.Branch(logicalFamily, requested.branch); authorityErr == nil {
+			corrupted = authority.Corrupted
+		} else if !errors.Is(authorityErr, os.ErrNotExist) {
+			return fmt.Errorf("loading branch authority for %s: %w", requested, authorityErr)
+		}
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
 	target = resolved
-	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
-		return fmt.Errorf("settling remote branches before removing %s: %w", target, err)
+	if !corrupted {
+		if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
+			return fmt.Errorf("settling remote branches before removing %s: %w", target, err)
+		}
 	}
 	var recorded *ttcbundle.BranchInfo
 	for i := range info.Branches {
@@ -12966,6 +12997,12 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	if recorded == nil {
+		// A failed node may lose its only physical catalog before Raft can mark
+		// the branch corrupted. The control-plane tombstone is then the only
+		// remaining object, and removing it is both necessary and sufficient.
+		if corrupted {
+			return b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch)
+		}
 		return fmt.Errorf("branch %q does not exist", target.branch)
 	}
 	switch normalizeLifecycleState(recorded.State) {
@@ -12998,7 +13035,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
 		// without --volumes.
-		return b.remove(target.container, true, false)
+		if err := b.remove(target.container, true, false); err != nil {
+			return err
+		}
+		if corrupted && logicalFamily != info.ID {
+			return b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch)
+		}
+		return nil
 	}
 	releaseClients, err := b.quiesceConsoleClients(target)
 	if err != nil {
@@ -13129,8 +13172,8 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
 		}
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			if authority, err := b.distributedSource.authority.Branch(info.ID, target.branch); err == nil && authority.Corrupted {
-				if err := b.distributedSource.authority.RemoveCorruptedBranch(info.ID, target.branch); err != nil {
+			if authority, err := b.distributedSource.authority.Branch(logicalFamily, requested.branch); err == nil && authority.Corrupted {
+				if err := b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch); err != nil {
 					return fmt.Errorf("removing corrupted branch authority for %s: %w", target, err)
 				}
 			}
