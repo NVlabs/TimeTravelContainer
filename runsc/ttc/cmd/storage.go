@@ -354,9 +354,10 @@ type coldBranchManifest struct {
 	// ControlRoot is a filesystem-tree object in that same origin containing
 	// serialized process/kernel state; pages and auxiliary state therefore use
 	// one authority, resolver, publication, and GC protocol.
-	MemorySnapshot uint64                   `json:"memory_snapshot,omitempty"`
-	ControlRoot    string                   `json:"control_root,omitempty"`
-	Filesystems    []coldFilesystemSnapshot `json:"filesystems,omitempty"`
+	MemorySnapshot uint64                            `json:"memory_snapshot,omitempty"`
+	ControlRoot    string                            `json:"control_root,omitempty"`
+	Filesystems    []coldFilesystemSnapshot          `json:"filesystems,omitempty"`
+	InternalMounts []cluster.InternalMountDescriptor `json:"internal_mounts,omitempty"`
 }
 
 type branchPublisher struct {
@@ -467,6 +468,18 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 	}
 	defer os.RemoveAll(staging)
 	manifest := coldBranchManifest{Version: 5, Container: info.ID, Branch: branch.ID, PublicationID: intent.PublicationID, Kind: intent.Kind, CreatedAt: time.Now().UTC()}
+	internalMounts, err := store.PortableInternalMounts(info.ID)
+	if err != nil {
+		return ttcstorage.Result{}, fmt.Errorf("capturing portable internal mounts: %w", err)
+	}
+	manifest.InternalMounts = make([]cluster.InternalMountDescriptor, len(internalMounts))
+	for i, mount := range internalMounts {
+		manifest.InternalMounts[i] = cluster.InternalMountDescriptor{
+			Destination: mount.Destination,
+			Contents:    append([]byte(nil), mount.Contents...),
+			Mode:        uint32(mount.Mode.Perm()),
+		}
+	}
 	spec, err := store.LoadSpec(info.ID)
 	if err != nil {
 		return ttcstorage.Result{}, err
@@ -1272,6 +1285,22 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if manifest.Container == "" || manifest.Branch == "" || !transactionIDPatternForDaemon(manifest.PublicationID) || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
 		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
 	}
+	seenMounts := make(map[string]struct{}, len(manifest.InternalMounts))
+	totalMountBytes := 0
+	for _, mount := range manifest.InternalMounts {
+		destination := filepath.Clean(mount.Destination)
+		if destination != mount.Destination || !filepath.IsAbs(destination) || destination == "/" || mount.Mode&^0777 != 0 || len(mount.Contents) > 1<<20 {
+			return coldBranchManifest{}, fmt.Errorf("cold manifest contains invalid internal mount %q", mount.Destination)
+		}
+		if _, duplicate := seenMounts[destination]; duplicate {
+			return coldBranchManifest{}, fmt.Errorf("cold manifest repeats internal mount %q", destination)
+		}
+		seenMounts[destination] = struct{}{}
+		totalMountBytes += len(mount.Contents)
+		if totalMountBytes > 4<<20 {
+			return coldBranchManifest{}, errors.New("cold manifest internal mounts exceed 4 MiB")
+		}
+	}
 	seenSources := make(map[string]struct{}, len(manifest.Filesystems))
 	seenOrigins := make(map[uint64]struct{})
 	for _, filesystem := range manifest.Filesystems {
@@ -1377,7 +1406,43 @@ func materializeSharedGraphFilesystem(ctx context.Context, shared *ttcsnapshot.S
 	}, root, destination)
 }
 
+func portableInternalMountsFromColdManifest(manifest coldBranchManifest) []ttcbundle.PortableInternalMount {
+	mounts := make([]ttcbundle.PortableInternalMount, len(manifest.InternalMounts))
+	for i, mount := range manifest.InternalMounts {
+		mounts[i] = ttcbundle.PortableInternalMount{
+			Destination: mount.Destination,
+			Contents:    append([]byte(nil), mount.Contents...),
+			Mode:        os.FileMode(mount.Mode),
+		}
+	}
+	return mounts
+}
+
+func (b *runtimeBackend) installColdInternalMounts(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	if branch.StorageManifest == "" {
+		return nil
+	}
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return err
+	}
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
+		return errors.New("cold manifest identity does not match branch publication")
+	}
+	if err := b.containerStore().InstallPortableInternalMounts(info.ID, portableInternalMountsFromColdManifest(manifest)); err != nil {
+		return fmt.Errorf("materializing portable internal mounts: %w", err)
+	}
+	return nil
+}
+
 func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
+	// Portable internal mounts are not part of a TTC volume repository. Restore
+	// them even when a valid local control image is already cached: the branch
+	// may have returned to a node after its prior authoritative local state was
+	// reclaimed.
+	if err := b.installColdInternalMounts(info, branch); err != nil {
+		return err
+	}
 	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	if _, err := os.Stat(localImage); err == nil {
 		if branch.SnapshotID == 0 {

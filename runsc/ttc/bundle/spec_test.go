@@ -158,6 +158,17 @@ func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
+	var canonical specs.Spec
+	canonicalData, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(canonicalData, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Mounts[0].Source; got != "/source-node/private/hostname" {
+		t.Fatalf("canonical shared mount source = %q, want original source", got)
+	}
 	got, err := store.LoadSpec("target")
 	if err != nil {
 		t.Fatal(err)

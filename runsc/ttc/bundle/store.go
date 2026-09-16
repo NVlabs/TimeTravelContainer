@@ -866,7 +866,25 @@ func (s Store) InstallPortableInternalMounts(name string, mounts []PortableInter
 	if err != nil {
 		return err
 	}
-	return materializePortableInternalMounts(info.BundleDir, filepath.Join(s.activeContainerDir(info.ID), "internal-mounts"), mounts)
+	configPath := filepath.Join(info.BundleDir, "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return err
+	}
+	if err := installPortableInternalMounts(&spec, filepath.Join(s.activeContainerDir(info.ID), "internal-mounts"), mounts); err != nil {
+		return err
+	}
+	if s.activeRoot() != s.Root {
+		// The canonical OCI bundle is shared cluster metadata. Node-local mount
+		// paths must never be written into it: LoadSpec overlays the local paths
+		// whenever this node has materialized the portable files.
+		return nil
+	}
+	return writeJSON(configPath, &spec)
 }
 
 // MaterializePortableInternalMounts replaces node-local sources in a prepared
@@ -886,6 +904,13 @@ func materializePortableInternalMounts(bundleDir, directory string, mounts []Por
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return err
 	}
+	if err := installPortableInternalMounts(&spec, directory, mounts); err != nil {
+		return err
+	}
+	return writeJSON(configPath, &spec)
+}
+
+func installPortableInternalMounts(spec *specs.Spec, directory string, mounts []PortableInternalMount) error {
 	if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
 		if len(mounts) != 0 {
 			return errors.New("remote session supplied undeclared TTC internal mounts")
@@ -920,7 +945,7 @@ func materializePortableInternalMounts(bundleDir, directory string, mounts []Por
 	if rewritten != len(destinations) || rewritten != len(provided) {
 		return fmt.Errorf("portable TTC internal mounts do not match OCI declarations: declared=%d supplied=%d matched=%d", len(destinations), len(provided), rewritten)
 	}
-	return writeJSON(configPath, &spec)
+	return nil
 }
 
 // replacePortableInternalMount atomically installs an immutable internal
@@ -2911,6 +2936,43 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("loading node-local lazy image descriptor: %w", err)
 			}
+		}
+		// TTC-generated bind mounts are small node-private files (hostname,
+		// hosts, and resolv.conf). A cold publication stores their contents,
+		// and materialization installs them under the active root. Overlay those
+		// paths in memory just like the image root and volume repositories; the
+		// canonical shared OCI bundle must remain free of node-local paths.
+		internalDir := filepath.Join(s.activeContainerDir(info.ID), "internal-mounts")
+		if _, err := os.Stat(internalDir); err == nil {
+			if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+				return nil, fmt.Errorf("container %q has node-local internal mounts but no declaration", info.Name)
+			}
+			var destinations []string
+			if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+				return nil, fmt.Errorf("decoding TTC internal mounts: %w", err)
+			}
+			declared := make(map[string]struct{}, len(destinations))
+			for _, destination := range destinations {
+				declared[filepath.Clean(destination)] = struct{}{}
+			}
+			rewritten := 0
+			for i := range spec.Mounts {
+				mount := &spec.Mounts[i]
+				if _, ok := declared[filepath.Clean(mount.Destination)]; !ok {
+					continue
+				}
+				path := filepath.Join(internalDir, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
+				if _, err := os.Stat(path); err != nil {
+					return nil, fmt.Errorf("opening node-local TTC internal mount %q: %w", mount.Destination, err)
+				}
+				mount.Source = path
+				rewritten++
+			}
+			if rewritten != len(declared) {
+				return nil, fmt.Errorf("OCI spec declares %d TTC internal mounts but matched %d", len(declared), rewritten)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("checking node-local TTC internal mounts: %w", err)
 		}
 		repositories, err := specutils.TTCVolumeRepositories(&spec)
 		if err != nil {

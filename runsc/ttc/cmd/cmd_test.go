@@ -5203,6 +5203,7 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
 	current := coldBranchManifest{
 		Version: 5, Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop",
+		InternalMounts: []cluster.InternalMountDescriptor{{Destination: "/etc/hostname", Contents: []byte("worker\n"), Mode: 0644}},
 		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
 			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
 			RestoreID: "0123456789abcdef0123456789abcdef",
@@ -5216,8 +5217,19 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 {
+	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 || len(got.InternalMounts) != 1 || string(got.InternalMounts[0].Contents) != "worker\n" {
 		t.Fatalf("current cold manifest=%+v, %v", got, err)
+	}
+	current.InternalMounts = append(current.InternalMounts, current.InternalMounts[0])
+	data, err = json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "repeats internal mount") {
+		t.Fatalf("duplicate internal mount error=%v", err)
 	}
 }
 
