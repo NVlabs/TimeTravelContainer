@@ -1185,17 +1185,17 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 			return nil, 0, errors.Join(describeErr, closeErr)
 		}
 		snapshot := descriptor.Snapshot
-		restoreID := config.RestoreID
-		if restoreID == "" {
-			restoreID = snapshot.RepositoryID
-		}
 		if snapshot.LogicalBytes > ^uint64(0)-dependentBytes {
 			return nil, 0, errors.New("distributed filesystem dependency byte count overflow")
 		}
 		dependentBytes += snapshot.LogicalBytes
 		roots = append(roots, cluster.FilesystemRootDescriptor{
 			Source: config.Source, RepositoryID: snapshot.RepositoryID,
-			RestoreID: restoreID,
+			// CompleteRestore rewrites the live filesystem's ResourceID to
+			// the repository installed on this node. The snapshot repository
+			// ID is therefore the identity encoded by a new capture; carrying
+			// config.RestoreID here would extend a stale multi-hop alias.
+			RestoreID: snapshot.RepositoryID,
 			BranchID:  snapshot.BranchID, Root: descriptor.Root.String(),
 			NextInode: snapshot.NextInode, LogicalBytes: snapshot.LogicalBytes,
 		})

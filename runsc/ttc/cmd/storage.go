@@ -555,14 +555,13 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		for i, origin := range origins {
 			encodedOrigins[i] = uint64(origin)
 		}
-		restoreID := config.RestoreID
-		if restoreID == "" {
-			restoreID = descriptor.Snapshot.RepositoryID
-		}
 		manifest.Filesystems = append(manifest.Filesystems, coldFilesystemSnapshot{
 			Root: cluster.FilesystemRootDescriptor{
 				Source: config.Source, RepositoryID: descriptor.Snapshot.RepositoryID,
-				RestoreID: restoreID,
+				// The captured Sentry has already canonicalized this filesystem
+				// to its node-local repository. Persist that exact identity;
+				// config.RestoreID may still describe an earlier import hop.
+				RestoreID: descriptor.Snapshot.RepositoryID,
 				BranchID:  descriptor.Snapshot.BranchID, Root: descriptor.Root.String(),
 				NextInode: descriptor.Snapshot.NextInode, LogicalBytes: descriptor.Snapshot.LogicalBytes,
 			},

@@ -221,9 +221,10 @@ type FilesystemRootDescriptor struct {
 	Source string `json:"source"`
 	// RepositoryID identifies the repository catalog that provides Root.
 	RepositoryID string `json:"repository_id"`
-	// RestoreID is the canonical repository identity encoded in the Sentry
-	// state. It remains stable across target-local repository imports and
-	// multi-hop remote handoffs.
+	// RestoreID is the repository identity encoded in the source Sentry state.
+	// A successful restore canonicalizes that state to the target-local
+	// repository, so every later handoff advertises its current physical ID
+	// rather than extending an alias chain across nodes.
 	RestoreID    string `json:"restore_id"`
 	BranchID     string `json:"branch_id"`
 	Root         string `json:"root"`

@@ -6648,6 +6648,13 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
 				return 1, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
 			}
+			// A fresh start does not restore serialized Sentry state: its VFS
+			// is constructed directly from the newly materialized local
+			// repository. Retire the one-shot source alias before this runtime
+			// can become a later migration source.
+			if err := store.CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+				return 1, fmt.Errorf("canonicalizing fresh filesystem identities for %s: %w", target, err)
+			}
 		}
 	}
 	filesystemBranch := branch.FilesystemBranch
