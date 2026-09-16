@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -28,6 +29,44 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+func TestMaterializationDoesNotLockUnrelatedFile(t *testing.T) {
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	target := &regularFile{}
+	target.inode.fs = fs
+	target.diskMmap.SetFD(-1)
+	target.mapsMu.Lock()
+	target.setDiskMmapObjectLocked("target-object")
+	target.mapsMu.Unlock()
+
+	unrelated := &regularFile{}
+	unrelated.inode.fs = fs
+	unrelated.diskMmap.SetFD(-1)
+	unrelated.mapsMu.Lock()
+	unrelated.setDiskMmapObjectLocked("unrelated-object")
+	// Model an unrelated write that holds mapsMu while waiting for the remote
+	// client. Materializing target-object must not wait for this file.
+	done := make(chan struct{})
+	go func() {
+		fs.invalidateMaterializedObject("target-object")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		unrelated.mapsMu.Unlock()
+		t.Fatal("materialization waited for an unrelated file cache")
+	}
+	if target.diskObject != "" {
+		unrelated.mapsMu.Unlock()
+		t.Fatalf("target cache was not invalidated: %q", target.diskObject)
+	}
+	if unrelated.diskObject != "unrelated-object" {
+		unrelated.mapsMu.Unlock()
+		t.Fatalf("unrelated cache changed: %q", unrelated.diskObject)
+	}
+	unrelated.mapsMu.Unlock()
+}
 
 func TestInstallDiskVolumeRepositoryCanonicalizesRemoteIdentity(t *testing.T) {
 	manager, err := ttcvolume.OpenManager(t.TempDir())

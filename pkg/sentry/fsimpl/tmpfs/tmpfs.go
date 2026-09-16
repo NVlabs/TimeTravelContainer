@@ -137,6 +137,13 @@ type filesystem struct {
 	// mappings have been touched since the last seal. Only these files need
 	// invalidation before the repository advances to a new immutable root.
 	diskForkFiles map[*regularFile]struct{} `state:"nosave"`
+	// These maps index runtime-local host caches by immutable repository
+	// object. Remote materialization must not lock every touched file merely to
+	// discover which ones use one object: an unrelated file may be holding
+	// mapsMu while it waits for the same remote transport, creating a lock
+	// cycle. Protected by liveForkMu.
+	diskMmapObjectFiles map[string]map[*regularFile]struct{} `state:"nosave"`
+	diskIOObjectFiles   map[string]map[*regularFile]struct{} `state:"nosave"`
 
 	nextInoMinusOne atomicbitops.Uint64 // accessed using atomic memory operations
 

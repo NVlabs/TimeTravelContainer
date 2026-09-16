@@ -171,7 +171,18 @@ func (fs *filesystem) unregisterLiveForkFile(file *regularFile) {
 	fs.liveForkMu.Lock()
 	delete(fs.liveForkFiles, file)
 	delete(fs.diskForkFiles, file)
+	removeDiskCacheFileLocked(fs.diskMmapObjectFiles, file)
+	removeDiskCacheFileLocked(fs.diskIOObjectFiles, file)
 	fs.liveForkMu.Unlock()
+}
+
+func removeDiskCacheFileLocked(index map[string]map[*regularFile]struct{}, file *regularFile) {
+	for object, files := range index {
+		delete(files, file)
+		if len(files) == 0 {
+			delete(index, object)
+		}
+	}
 }
 
 // afterLoad is invoked by stateify.
@@ -231,7 +242,7 @@ func (rf *regularFile) prepareLiveFork() {
 		// still pinned by this runtime cache. The restored child starts without
 		// a runtime-local mmap FD via afterLoad.
 		rf.diskMmap.ResetFD()
-		rf.diskObject = ""
+		rf.setDiskMmapObjectLocked("")
 		rf.diskIOMu.Unlock()
 		rf.mapsMu.Unlock()
 		return
@@ -267,7 +278,7 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		// while repository GC is excluded by the mutation lock.
 		rf.invalidateDiskIOLocked()
 		rf.diskMmap.ResetFD()
-		rf.diskObject = ""
+		rf.setDiskMmapObjectLocked("")
 	})
 	if err != nil {
 		return diskVolumeError("open mmap backing", err)
@@ -285,7 +296,7 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		unix.Close(newFD)
 		return err
 	}
-	rf.diskObject = meta.Object
+	rf.setDiskMmapObjectLocked(meta.Object)
 	// An existing VMA can reach Translate after a fork without another
 	// AddMapping call. Record the newly installed host-backed translation so
 	// the next fork, checkpoint, or dehydration invalidates it before PMA
@@ -312,7 +323,7 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 		return nil, false, diskVolumeError("open regular-file data", err)
 	}
 	rf.diskIOFile = file
-	rf.diskIOObject = meta.Object
+	rf.setDiskIOObjectLocked(meta.Object)
 	rf.diskIOWritable = writable
 	rf.inode.fs.markDiskForkFile(rf)
 	return file, cloned, nil
@@ -324,7 +335,7 @@ func (rf *regularFile) invalidateDiskIOLocked() {
 		_ = rf.diskIOFile.Close()
 		rf.diskIOFile = nil
 	}
-	rf.diskIOObject = ""
+	rf.setDiskIOObjectLocked("")
 	rf.diskIOWritable = false
 }
 
@@ -354,7 +365,7 @@ func (rf *regularFile) ensureDiskData() error {
 func (rf *regularFile) resetDiskMmapLocked() {
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	rf.diskMmap.ResetFD()
-	rf.diskObject = ""
+	rf.setDiskMmapObjectLocked("")
 }
 
 // markDiskMetadataDirty defers repository metadata publication. The flag is
@@ -599,7 +610,7 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 				rf.invalidateDiskIOLocked()
 				rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
 				rf.diskMmap.ResetFD()
-				rf.diskObject = ""
+				rf.setDiskMmapObjectLocked("")
 			})
 		rf.diskIOMu.Unlock()
 		if err != nil {

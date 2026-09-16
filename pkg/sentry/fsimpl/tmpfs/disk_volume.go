@@ -102,6 +102,54 @@ func (fs *filesystem) markDiskForkFile(file *regularFile) {
 	fs.liveForkMu.Unlock()
 }
 
+func updateDiskCacheIndexLocked(index *map[string]map[*regularFile]struct{}, file *regularFile, oldObject, newObject string) {
+	if oldObject == newObject {
+		return
+	}
+	if oldObject != "" {
+		files := (*index)[oldObject]
+		delete(files, file)
+		if len(files) == 0 {
+			delete(*index, oldObject)
+		}
+	}
+	if newObject != "" {
+		if *index == nil {
+			*index = make(map[string]map[*regularFile]struct{})
+		}
+		files := (*index)[newObject]
+		if files == nil {
+			files = make(map[*regularFile]struct{})
+			(*index)[newObject] = files
+		}
+		files[file] = struct{}{}
+	}
+}
+
+// setDiskMmapObjectLocked updates the mmap cache identity and its exact
+// materialization index. rf.mapsMu must be held.
+func (rf *regularFile) setDiskMmapObjectLocked(object string) {
+	fs := rf.inode.fs
+	if fs != nil && fs.diskVolume != nil {
+		fs.liveForkMu.Lock()
+		updateDiskCacheIndexLocked(&fs.diskMmapObjectFiles, rf, rf.diskObject, object)
+		fs.liveForkMu.Unlock()
+	}
+	rf.diskObject = object
+}
+
+// setDiskIOObjectLocked updates the read/write cache identity and its exact
+// materialization index. rf.diskIOMu must be held.
+func (rf *regularFile) setDiskIOObjectLocked(object string) {
+	fs := rf.inode.fs
+	if fs != nil && fs.diskVolume != nil {
+		fs.liveForkMu.Lock()
+		updateDiskCacheIndexLocked(&fs.diskIOObjectFiles, rf, rf.diskIOObject, object)
+		fs.liveForkMu.Unlock()
+	}
+	rf.diskIOObject = object
+}
+
 func (fs *filesystem) markDiskInodeDirty(node *inode) {
 	fs.diskDirtyMu.Lock()
 	node.diskMetadataGeneration.Add(1)
@@ -140,8 +188,15 @@ func (fs *filesystem) finishDiskFileMetadata(file *regularFile, generation uint6
 
 func (fs *filesystem) invalidateMaterializedObject(object string) {
 	fs.liveForkMu.Lock()
-	files := make([]*regularFile, 0, len(fs.diskForkFiles))
-	for file := range fs.diskForkFiles {
+	selected := make(map[*regularFile]struct{})
+	for file := range fs.diskMmapObjectFiles[object] {
+		selected[file] = struct{}{}
+	}
+	for file := range fs.diskIOObjectFiles[object] {
+		selected[file] = struct{}{}
+	}
+	files := make([]*regularFile, 0, len(selected))
+	for file := range selected {
 		files = append(files, file)
 	}
 	fs.liveForkMu.Unlock()
@@ -156,7 +211,7 @@ func (fs *filesystem) invalidateMaterializedObject(object string) {
 			// translations to fault against the newly installed backing inode.
 			file.mappings.InvalidateAll(memmap.InvalidateOpts{})
 			file.diskMmap.ResetFD()
-			file.diskObject = ""
+			file.setDiskMmapObjectLocked("")
 		}
 		file.diskIOMu.Unlock()
 		file.mapsMu.Unlock()
