@@ -654,11 +654,11 @@ func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T)
 	})
 	writeContainer(ttcbundle.ContainerInfo{
 		ID: "physical-old", Name: "physical-old", State: "exited", DistributedFamilyID: "family",
-		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "exited", StorageState: "shared", PublicationID: "publication-old"}},
+		Branches: []ttcbundle.BranchInfo{{ID: "transaction-old", State: "exited", StorageState: "shared", PublicationID: "publication-old"}},
 	})
 	writeContainer(ttcbundle.ContainerInfo{
 		ID: "physical-current", Name: "physical-current", State: "dehydrated", DistributedFamilyID: "family",
-		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "dehydrated", StorageState: "shared", PublicationID: "publication-current"}},
+		Branches: []ttcbundle.BranchInfo{{ID: "transaction-current", State: "dehydrated", StorageState: "shared", PublicationID: "publication-current"}},
 	})
 	store := ttcbundle.Store{Root: root}
 	logical, err := store.LoadContainer("web")
@@ -670,8 +670,8 @@ func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if physical.ID != "physical-current" || branch != "main" {
-		t.Fatalf("resolved %s@%s, want physical-current@main", physical.ID, branch)
+	if physical.ID != "physical-current" || branch != "transaction-current" {
+		t.Fatalf("resolved %s@%s, want physical-current@transaction-current", physical.ID, branch)
 	}
 }
 

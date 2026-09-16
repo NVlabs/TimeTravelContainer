@@ -5906,11 +5906,21 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 		if logicalFamilyID(container) != logicalID {
 			continue
 		}
-		branch, err := persistentBranchInfo(container, branchID)
-		if err != nil || (publicationID != "" && branch.PublicationID != publicationID) {
-			continue
+		for _, branch := range container.Branches {
+			// A migrated runtime's physical branch is a transaction ID. Once
+			// publication commits, Raft deliberately clears physical placement,
+			// so the immutable publication ID is the only ancestry-independent
+			// locator for its cold record. Match the logical name only when no
+			// authoritative publication identity is available.
+			if publicationID != "" {
+				if branch.PublicationID != publicationID {
+					continue
+				}
+			} else if branch.ID != branchID {
+				continue
+			}
+			candidates = append(candidates, candidate{info: container, branch: branch.ID})
 		}
-		candidates = append(candidates, candidate{info: container, branch: branch.ID})
 	}
 	switch len(candidates) {
 	case 0:
