@@ -4380,6 +4380,23 @@ exit 2
 	}
 }
 
+func TestVisiblePhysicalRuntimeBranchesHidesSparseProviders(t *testing.T) {
+	branches := []Branch{
+		{ID: "main", State: "paused"},
+		{ID: "migration-current", State: "running"},
+		{ID: "migration-provisional", State: "paused"},
+	}
+	placements := []cluster.PlacementRecord{{
+		FamilyID: "logical-family", BranchID: "main",
+		PhysicalContainer: "physical-family", PhysicalBranch: "migration-current",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}}
+	visible := visiblePhysicalRuntimeBranches(branches, placements, "physical-family")
+	if len(visible) != 1 || visible[0].ID != "main" || visible[0].State != "running" {
+		t.Fatalf("visible physical branches = %+v, want only logical main", visible)
+	}
+}
+
 func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		NodeID: "node-a",

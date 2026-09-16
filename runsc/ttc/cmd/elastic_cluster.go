@@ -2043,7 +2043,13 @@ func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerIn
 	var result error
 	result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, branch))
 	result = errors.Join(result, b.containerStore().RemoveBranchArtifacts(info.ID, branch))
-	if result == nil {
+	// The original container record is the stable logical family catalog used
+	// for name resolution. Its branch entry remains as lineage/configuration
+	// metadata after its physical runtime and filesystem pointer are retired;
+	// Raft placement resolves every live or durable operation to the current
+	// physical record. Transaction-scoped physical family records have no such
+	// catalog role and can discard their retired branch entry completely.
+	if result == nil && info.DistributedFamilyID != "" {
 		result = b.containerStore().RemoveBranchRecord(info.ID, branchID)
 	}
 	return result

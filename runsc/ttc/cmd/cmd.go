@@ -9845,14 +9845,11 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
 				physicalID := family.ID
 				family.ID = placements[0].FamilyID
-				for i := range family.Branches {
-					for _, placement := range placements {
-						if placement.PhysicalContainer == physicalID && placement.PhysicalBranch == family.Branches[i].ID {
-							family.Branches[i].ID = placement.BranchID
-							break
-						}
-					}
-				}
+				// Unmapped runtime branches are paused sparse providers from an
+				// older migration incarnation or provisional targets whose Raft
+				// placement has not committed. They are implementation state, not
+				// additional user-visible branches.
+				family.Branches = visiblePhysicalRuntimeBranches(family.Branches, placements, physicalID)
 			} else if physicalRuntime {
 				// Raft only retains the current physical placement for a logical
 				// branch. A completed migration's source runtime can therefore
@@ -10035,6 +10032,21 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	return families, nil
+}
+
+func visiblePhysicalRuntimeBranches(branches []Branch, placements []cluster.PlacementRecord, physicalContainer string) []Branch {
+	visible := make([]Branch, 0, len(branches))
+	for _, branch := range branches {
+		for _, placement := range placements {
+			if placement.PhysicalContainer != physicalContainer || placement.PhysicalBranch != branch.ID {
+				continue
+			}
+			branch.ID = placement.BranchID
+			visible = append(visible, branch)
+			break
+		}
+	}
+	return visible
 }
 
 // runtimeFamilyUnavailable reports whether a runsc list entry is only stale
