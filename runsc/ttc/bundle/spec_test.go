@@ -220,6 +220,12 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if _, err := store.LoadSpec(info.ID); err != nil {
 		t.Fatalf("loading hidden target runtime spec: %v", err)
 	}
+	if paths, err := store.BranchConsolePaths(info.ID, "main"); err != nil || paths.Log == "" {
+		t.Fatalf("preparing hidden target branch console paths: %+v, %v", paths, err)
+	}
+	if paths, err := store.ExecConsolePaths(info.ID, "main", "build"); err != nil || paths.Log == "" {
+		t.Fatalf("preparing hidden target exec console paths: %+v, %v", paths, err)
+	}
 	targetBundle, cleanup, err := store.PrepareDistributedTargetBundle(info.ID, "remote-filesystem")
 	if err != nil {
 		t.Fatalf("preparing hidden target runtime bundle: %v", err)

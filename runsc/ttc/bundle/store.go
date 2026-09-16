@@ -5129,7 +5129,10 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	if err := validateObjectName("branch", branch); err != nil {
 		return ConsolePaths{}, err
 	}
-	info, err := s.LoadContainer(container)
+	// Console sidecars are prepared before a distributed target is published.
+	// Exact physical IDs are authority-derived here, so hidden runtime records
+	// must be resolvable without exposing them through ordinary user lookup.
+	info, err := s.LoadRuntimeContainer(container)
 	if err != nil {
 		return ConsolePaths{}, err
 	}
@@ -5161,7 +5164,7 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	if err := validateObjectName("exec session", execID); err != nil {
 		return ConsolePaths{}, err
 	}
-	info, err := s.LoadContainer(container)
+	info, err := s.LoadRuntimeContainer(container)
 	if err != nil {
 		return ConsolePaths{}, err
 	}

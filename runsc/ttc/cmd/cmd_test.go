@@ -72,6 +72,44 @@ func TestRemoteExecSessionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDistributedConsoleLogRelay(t *testing.T) {
+	dir := t.TempDir()
+	older := filepath.Join(dir, "older.log")
+	newer := filepath.Join(dir, "newer.log")
+	if err := os.WriteFile(older, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newer, []byte("newer\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "", "")
+	defer relay.Close()
+	var token [16]byte
+	copy(token[:], "console-log-test")
+	if err := relay.ConfigureConsoleLogs(token, map[string][]string{"build": {older, newer}}); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(dir, "target", "build.log")
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "older\nnewer\n"; string(got) != want {
+		t.Fatalf("retained output=%q, want %q", got, want)
+	}
+	// Installation is idempotent after a lost Prepare response.
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len(got)), destination); err != nil {
+		t.Fatalf("idempotent fetch: %v", err)
+	}
+}
+
 func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
 	info := input
 	info.Branches = append([]ttcbundle.BranchInfo(nil), input.Branches...)

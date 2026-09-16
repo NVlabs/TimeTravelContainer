@@ -141,7 +141,8 @@ func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 	base := RemoteSessionDescriptor{
 		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
 		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
-		ExecSessions: []RemoteExecSessionDescriptor{{ID: "build", PID: 42, State: "running"}},
+		ExecSessions:    []RemoteExecSessionDescriptor{{ID: "build", PID: 42, State: "running"}},
+		ExecConsoleLogs: []RemoteConsoleLogDescriptor{{ExecID: "build", Size: 4096}},
 	}
 	if err := base.validate(negotiated); err != nil {
 		t.Fatalf("valid exec session: %v", err)
@@ -151,9 +152,13 @@ func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].PID = 0 },
 		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].State = "exited" },
 		func(d *RemoteSessionDescriptor) { d.ExecSessions = append(d.ExecSessions, d.ExecSessions[0]) },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].ExecID = "unknown" },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].Size = 0 },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs = append(d.ExecConsoleLogs, d.ExecConsoleLogs[0]) },
 	} {
 		invalid := base
 		invalid.ExecSessions = append([]RemoteExecSessionDescriptor(nil), base.ExecSessions...)
+		invalid.ExecConsoleLogs = append([]RemoteConsoleLogDescriptor(nil), base.ExecConsoleLogs...)
 		mutate(&invalid)
 		if err := invalid.validate(negotiated); err == nil {
 			t.Fatalf("accepted invalid exec sessions: %+v", invalid.ExecSessions)

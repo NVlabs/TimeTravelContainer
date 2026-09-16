@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -178,6 +179,10 @@ type RemoteSessionDescriptor struct {
 	// ExecSessions names managed exec task groups contained in the captured
 	// Kernel. The processes themselves remain part of Kernel state.
 	ExecSessions []RemoteExecSessionDescriptor `json:"exec_sessions,omitempty"`
+	// ExecConsoleLogs names retained host-side output rings that must move with
+	// their managed exec sessions. Bytes are streamed from Address rather than
+	// embedded in this control descriptor.
+	ExecConsoleLogs []RemoteConsoleLogDescriptor `json:"exec_console_logs,omitempty"`
 }
 
 // RemoteExecSessionDescriptor is the transport-neutral identity of a managed
@@ -190,6 +195,14 @@ type RemoteExecSessionDescriptor struct {
 	State      string    `json:"state"`
 	CreatedAt  time.Time `json:"created_at"`
 	ExitStatus *uint32   `json:"exit_status,omitempty"`
+}
+
+// RemoteConsoleLogDescriptor describes one immutable-at-capture console log.
+// ExecID identifies the target-side managed exec session; Size fences the
+// streamed response and prevents a peer from writing unbounded local data.
+type RemoteConsoleLogDescriptor struct {
+	ExecID string `json:"exec_id"`
+	Size   uint64 `json:"size"`
 }
 
 // InternalMountDescriptor is portable content for one TTC-generated mount.
@@ -231,6 +244,22 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return fmt.Errorf("remote session repeats exec session %q", session.ID)
 		}
 		seenExecSessions[session.ID] = struct{}{}
+	}
+	if len(s.ExecConsoleLogs) > len(s.ExecSessions) {
+		return errors.New("remote session has more exec console logs than exec sessions")
+	}
+	seenConsoleLogs := make(map[string]struct{}, len(s.ExecConsoleLogs))
+	for _, log := range s.ExecConsoleLogs {
+		if log.ExecID == "" || log.Size == 0 || log.Size > math.MaxInt64 {
+			return fmt.Errorf("remote session has invalid exec console log %q", log.ExecID)
+		}
+		if _, ok := seenExecSessions[log.ExecID]; !ok {
+			return fmt.Errorf("remote session has console log for unknown exec session %q", log.ExecID)
+		}
+		if _, ok := seenConsoleLogs[log.ExecID]; ok {
+			return fmt.Errorf("remote session repeats exec console log %q", log.ExecID)
+		}
+		seenConsoleLogs[log.ExecID] = struct{}{}
 	}
 	if len(s.InternalMounts) > 64 {
 		return errors.New("remote session has too many internal mounts")

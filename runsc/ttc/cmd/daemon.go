@@ -884,6 +884,17 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	} else if runtimeState.Status != "running" {
 		return fmt.Errorf("distributed target runtime is unexpectedly %q", runtimeState.Status)
 	}
+	if len(session.ExecConsoleLogs) != 0 {
+		var consoleToken [16]byte
+		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
+		if err != nil || len(tokenBytes) != len(consoleToken) {
+			return errors.New("invalid distributed console snapshot token")
+		}
+		copy(consoleToken[:], tokenBytes)
+		if err := r.backend.installRemoteExecConsoleLogs(ctx, session.Address, consoleToken, info.ID, targetBranch.ID, session.ExecConsoleLogs); err != nil {
+			return err
+		}
+	}
 	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "paused")
 }
 

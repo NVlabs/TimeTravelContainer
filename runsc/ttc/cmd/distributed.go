@@ -15,15 +15,18 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -593,6 +596,8 @@ type distributedPageRelay struct {
 	directToken          ttcvolume.RemoteToken
 	directCleanup        func()
 	directWG             sync.WaitGroup
+	consoleToken         [16]byte
+	consoleLogs          map[string][]string
 }
 
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
@@ -669,12 +674,206 @@ func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
 		r.serveFilesystemFile(file)
 		return
 	}
+	if magic == [4]byte{'T', 'T', 'C', 'L'} {
+		r.serveConsoleLog(tcp)
+		return
+	}
 	file, err := tcp.File()
 	tcp.Close()
 	if err != nil {
 		return
 	}
 	r.serveFile(file)
+}
+
+// ConfigureConsoleLogs exposes stable, stopped-follower log generations over
+// the same authenticated point-to-point listener as memory and filesystem
+// paging. The paths never cross the wire and are valid only for this relay's
+// lifetime.
+func (r *distributedPageRelay) ConfigureConsoleLogs(token [16]byte, logs map[string][]string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || len(r.consoleLogs) != 0 {
+		return errors.New("distributed console relay is closed or already configured")
+	}
+	r.consoleToken = token
+	r.consoleLogs = make(map[string][]string, len(logs))
+	for id, paths := range logs {
+		r.consoleLogs[id] = append([]string(nil), paths...)
+	}
+	return nil
+}
+
+func (r *distributedPageRelay) serveConsoleLog(conn *net.TCPConn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(reader, magic); err != nil || string(magic) != "TTCL" {
+		return
+	}
+	var token [16]byte
+	if _, err := io.ReadFull(reader, token[:]); err != nil {
+		return
+	}
+	var idLength uint16
+	if err := binary.Read(reader, binary.BigEndian, &idLength); err != nil || idLength == 0 || idLength > 4096 {
+		return
+	}
+	idBytes := make([]byte, idLength)
+	if _, err := io.ReadFull(reader, idBytes); err != nil {
+		return
+	}
+	r.mu.Lock()
+	paths := append([]string(nil), r.consoleLogs[string(idBytes)]...)
+	authorized := token == r.consoleToken && len(paths) != 0 && !r.closed
+	r.mu.Unlock()
+	if !authorized {
+		return
+	}
+	var size uint64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() < 0 {
+			return
+		}
+		if uint64(info.Size()) > math.MaxUint64-size {
+			return
+		}
+		size += uint64(info.Size())
+	}
+	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
+		return
+	}
+	for _, path := range paths {
+		file, err := os.Open(path)
+		if err != nil {
+			return
+		}
+		_, copyErr := io.Copy(conn, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil {
+			return
+		}
+	}
+}
+
+func fetchRemoteConsoleLog(ctx context.Context, address string, token [16]byte, execID string, expected uint64, destination string) (retErr error) {
+	if execID == "" || len(execID) > 4096 || expected == 0 || expected > math.MaxInt64 {
+		return errors.New("invalid remote console log descriptor")
+	}
+	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	var request bytes.Buffer
+	request.WriteString("TTCL")
+	request.Write(token[:])
+	if err := binary.Write(&request, binary.BigEndian, uint16(len(execID))); err != nil {
+		return err
+	}
+	request.WriteString(execID)
+	if _, err := conn.Write(request.Bytes()); err != nil {
+		return err
+	}
+	var size uint64
+	if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
+		return err
+	}
+	if size != expected {
+		return fmt.Errorf("remote console log size is %d, want %d", size, expected)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	temporary := destination + ".remote-partial"
+	if info, err := os.Stat(destination); err == nil && uint64(info.Size()) == expected {
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = os.Remove(temporary)
+	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+		if retErr != nil {
+			_ = os.Remove(temporary)
+		}
+	}()
+	if _, err := io.CopyN(file, conn, int64(size)); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporary, destination); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, sessions []boot.ExecSessionInfo) ([]cluster.RemoteConsoleLogDescriptor, map[string][]string, error) {
+	_, maxFiles, err := b.consoleRetention(container)
+	if err != nil {
+		return nil, nil, err
+	}
+	store := b.containerStore()
+	descriptors := make([]cluster.RemoteConsoleLogDescriptor, 0, len(sessions))
+	files := make(map[string][]string)
+	for _, session := range sessions {
+		if session.State != boot.ExecSessionRunning {
+			continue
+		}
+		paths, err := store.ExecConsolePaths(container, branch, session.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		generations, err := listConsoleLogGenerations(paths.Log, maxFiles)
+		if err != nil {
+			return nil, nil, err
+		}
+		var size uint64
+		generationPaths := make([]string, 0, len(generations))
+		for _, generation := range generations {
+			if generation.info.Size() < 0 {
+				return nil, nil, fmt.Errorf("exec console log %q has a negative size", session.ID)
+			}
+			if uint64(generation.info.Size()) > math.MaxUint64-size {
+				return nil, nil, fmt.Errorf("exec console log %q is too large", session.ID)
+			}
+			size += uint64(generation.info.Size())
+			generationPaths = append(generationPaths, generation.path)
+		}
+		if size == 0 {
+			continue
+		}
+		descriptors = append(descriptors, cluster.RemoteConsoleLogDescriptor{ExecID: session.ID, Size: size})
+		files[session.ID] = generationPaths
+	}
+	return descriptors, files, nil
+}
+
+func (b *runtimeBackend) installRemoteExecConsoleLogs(ctx context.Context, address string, token [16]byte, container, branch string, logs []cluster.RemoteConsoleLogDescriptor) error {
+	store := b.containerStore()
+	for _, log := range logs {
+		paths, err := store.ExecConsolePaths(container, branch, log.ExecID)
+		if err != nil {
+			return err
+		}
+		if err := fetchRemoteConsoleLog(ctx, address, token, log.ExecID, log.Size, paths.Log); err != nil {
+			return fmt.Errorf("fetching retained output for exec session %q: %w", log.ExecID, err)
+		}
+	}
+	return nil
 }
 
 func peekDistributedMagic(tcp *net.TCPConn) ([4]byte, error) {
