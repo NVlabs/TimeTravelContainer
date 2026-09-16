@@ -1165,7 +1165,14 @@ type AsyncPagesFileLoad struct {
 	// demandOnly is true while unawaited pages must not be loaded. It may
 	// transition from true to false exactly once when Drain is called.
 	demandOnly atomic.Bool
-	drainOnce  sync.Once
+
+	// durableBacking is true after the volatile reader has been replaced by
+	// an immutable snapshot-graph reader. Multiple TTC branches can share one
+	// sparse residency unit and therefore the same loader; this bit lets every
+	// owner observe that the shared loader no longer depends on its original
+	// source node.
+	durableBacking atomic.Bool
+	drainOnce      sync.Once
 
 	// logicalChunkDemand makes every fault wait for all extant pages in the
 	// same stable logical 1 MiB chunk. The source stream must place each
@@ -1633,15 +1640,27 @@ func (apfl *AsyncPagesFileLoad) SwitchReader(replacement stateio.AsyncReader) er
 	apfl.lfStatus.Notify(aplLFSwitchReader)
 	select {
 	case err := <-request.done:
+		if err == nil {
+			apfl.durableBacking.Store(true)
+		}
 		return err
 	case <-apfl.done:
 		select {
 		case err := <-request.done:
+			if err == nil {
+				apfl.durableBacking.Store(true)
+			}
 			return err
 		default:
 			return errors.New("async page loader stopped during reader handoff")
 		}
 	}
+}
+
+// HasDurableBacking reports whether unresolved pages are backed by an
+// immutable graph rather than a live source runtime.
+func (apfl *AsyncPagesFileLoad) HasDurableBacking() bool {
+	return apfl != nil && apfl.durableBacking.Load()
 }
 
 // ReaderGeometry returns the queue shape required for a reader handoff.

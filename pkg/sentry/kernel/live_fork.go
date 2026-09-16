@@ -454,6 +454,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			if opts.RemotePageReaderFactory == nil {
 				pgalloc.StartLoopbackRemotePush(remoteSnapshot, remotePageLoad, 256<<10)
 			}
+		} else {
+			// An ordinary local fork shares the source MemoryFile, including any
+			// not-yet-resident chunks. Give the child an explicit owner of those
+			// readers; page references alone do not preserve their lifetime.
+			child.InheritDistributedForkMemorySources(k, k.remoteLoadRanges)
 		}
 		if opts.Metrics != nil {
 			opts.Metrics.MetadataStream = time.Since(metadataStarted)

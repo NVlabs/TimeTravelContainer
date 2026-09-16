@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -327,6 +328,45 @@ func (k *Kernel) distributedForkMemorySources() []*pgalloc.AsyncPagesFileLoad {
 	return loads
 }
 
+// InheritDistributedForkMemorySources retains page loaders that back sparse
+// chunks reused from source's family MemoryFile. Reusing a chunk is useful
+// only if its unresolved contents remain reachable: page references keep the
+// allocation alive, but they do not own the asynchronous reader. The first
+// inherited loader remains the branch's primary control target; additional
+// loaders are dependencies inherited from earlier imports.
+func (k *Kernel) InheritDistributedForkMemorySources(source *Kernel, packedLoadRanges []pgalloc.RemoteLoadRange) {
+	if k == nil || source == nil || k == source {
+		return
+	}
+	has := func(load *pgalloc.AsyncPagesFileLoad) bool {
+		if load == nil || k.remotePageLoad == load {
+			return true
+		}
+		for _, existing := range k.auxiliaryRemotePageLoads {
+			if existing == load {
+				return true
+			}
+		}
+		return false
+	}
+	inherit := func(load *pgalloc.AsyncPagesFileLoad, primary bool) {
+		if has(load) {
+			return
+		}
+		load.IncOwner()
+		if primary && k.remotePageLoad == nil {
+			k.remotePageLoad = load
+			k.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), packedLoadRanges...)
+			return
+		}
+		k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
+	}
+	inherit(source.remotePageLoad, true)
+	for _, load := range source.auxiliaryRemotePageLoads {
+		inherit(load, k.remotePageLoad == nil)
+	}
+}
+
 // DistributedForkLoadOptions controls target reconstruction.
 type DistributedForkLoadOptions struct {
 	Clocks                     sentrytime.Clocks
@@ -606,6 +646,24 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		closeInputs()
 		return errors.New("kernel has no active distributed remote-memory load")
 	}
+	// A branch may own a new loader while also referring to sparse chunks
+	// supplied by an older family loader. The new transaction cannot become
+	// independent until every inherited loader is either fully resident or has
+	// itself switched to durable graph backing.
+	for _, load := range k.auxiliaryRemotePageLoads {
+		if load.HasDurableBacking() {
+			continue
+		}
+		stats := load.Stats()
+		if stats.Done && stats.Error == "" {
+			continue
+		}
+		closeInputs()
+		if stats.Error != "" {
+			return fmt.Errorf("inherited distributed memory load failed before graph handoff: %s", stats.Error)
+		}
+		return errors.New("inherited distributed memory load is not durable yet")
+	}
 	if stats := k.remotePageLoad.Stats(); stats.Done {
 		closeInputs()
 		if stats.Error != "" {
@@ -663,16 +721,44 @@ func (k *Kernel) TryInstallRemotePagesState(offset uint64, data []byte) (pgalloc
 // DistributedForkDependencyStatus reports whether this Kernel still depends
 // on a remote memory source.
 func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {
-	if k.remotePageLoad == nil {
+	loads := k.distributedForkMemorySources()
+	if len(loads) == 0 {
 		return pgalloc.AsyncPagesFileLoadStats{Done: true}
 	}
-	return k.remotePageLoad.Stats()
+	result := pgalloc.AsyncPagesFileLoadStats{Done: true}
+	var diagnostics []string
+	for _, load := range loads {
+		if load.HasDurableBacking() {
+			continue
+		}
+		status := load.Stats()
+		result.Done = result.Done && status.Done
+		result.DemandOnly = result.DemandOnly || status.DemandOnly
+		result.BytesLoaded += status.BytesLoaded
+		result.BytesOutstanding += status.BytesOutstanding
+		result.BytesWaited += status.BytesWaited
+		result.WaitDuration = max(result.WaitDuration, status.WaitDuration)
+		result.AggregateWaitDuration += status.AggregateWaitDuration
+		result.PrefetchBytes = max(result.PrefetchBytes, status.PrefetchBytes)
+		result.PrefetchBehindBytes = max(result.PrefetchBehindBytes, status.PrefetchBehindBytes)
+		result.Waiters += status.Waiters
+		result.TotalWaiters += status.TotalWaiters
+		result.Faults += status.Faults
+		result.SequentialFaults += status.SequentialFaults
+		if status.Error != "" {
+			diagnostics = append(diagnostics, status.Error)
+		}
+	}
+	result.Error = strings.Join(diagnostics, "; ")
+	return result
 }
 
 // DrainDistributedForkMemory eagerly materializes all remaining remote pages.
 func (k *Kernel) DrainDistributedForkMemory() {
-	if k.remotePageLoad != nil {
-		k.remotePageLoad.Drain()
+	for _, load := range k.distributedForkMemorySources() {
+		if !load.HasDurableBacking() {
+			load.Drain()
+		}
 	}
 }
 

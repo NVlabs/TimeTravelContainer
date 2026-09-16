@@ -703,6 +703,11 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		if loadErr != nil {
 			return nil, loadErr
 		}
+		// InstallRemoteBindings intentionally reuses identical chunks already
+		// present in the family MemoryFile. Retain the peer's loaders as well as
+		// its pages so an unresolved reused chunk cannot lose its only backing
+		// reader when another branch or source transaction completes.
+		child.InheritDistributedForkMemorySources(source, metadata.LoadRanges)
 		for _, task := range child.TaskSet().Root.Tasks() {
 			task.RestoreContainerID(l.sandboxID)
 		}

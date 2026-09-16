@@ -352,6 +352,9 @@ func TestAttachRemotePageLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if pages.HasDurableBacking() {
+		t.Fatal("live reader unexpectedly reported durable backing")
+	}
 	if got := target.AsyncLoadingMapUnit(); got != 0 {
 		t.Fatalf("background-load map unit=%d, want default cap", got)
 	}
@@ -778,6 +781,9 @@ func TestDemandOnlyRemotePageLoadSwitchesReaderAtQuiescence(t *testing.T) {
 	replacement := stateio.NewIOReader(bytes.NewReader(secondData), hostarch.PageSize, 1, 1)
 	if err := pages.SwitchReader(replacement); err != nil {
 		t.Fatal(err)
+	}
+	if !pages.HasDurableBacking() {
+		t.Fatal("replacement reader did not report durable backing")
 	}
 	if got := readPage(1); got != 0x22 {
 		t.Fatalf("replacement reader page=%#x, want %#x", got, 0x22)
