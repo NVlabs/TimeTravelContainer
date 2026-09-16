@@ -4030,9 +4030,22 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				clusterListener.Close()
 				return fmt.Errorf("recovering distributed graph references: %w", err)
 			}
+			// The detached lease guardian host-stops Sentries when the previous
+			// daemon exits. Placement reconciliation inventories runsc state and may
+			// need a container lock that an in-flight console follower or control
+			// command held when the Sentry was stopped. Re-authorize the exact
+			// PID/start-time set against the replicated placement catalog before
+			// taking those locks; otherwise restart can deadlock behind its own
+			// execution fence. This does not admit new work: the node is still
+			// Joining and the Unix command listener has not entered its accept loop.
+			if err := resumeFencedElasticRuntimes(targetBackend, registered.NodeID, registered.Incarnation); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("resuming placement-authorized fenced runtimes for recovery: %w", err)
+			}
 			// While joining, recover every retained placement into this exact
-			// incarnation. The ready transition then fences any old placement
-			// that was not found locally; only afterward may new work arrive.
+			// incarnation. The ready transition then fences any old placement that
+			// was not found locally; only afterward may new work arrive. The early
+			// resume above is physical lock recovery, not scheduler admission.
 			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("recovering fenced branch placements: %w", err)
@@ -4066,8 +4079,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				return fmt.Errorf("reconciling volatile snapshot origins: %w", err)
 			}
 			// Enroll any legacy/untracked local branch now that ordinary placement
-			// creation is authorized. A prior lease failure may have left every
-			// Sentry physically stopped, so resume only after both passes succeed.
+			// creation is authorized. Repeat the resume idempotently in case a
+			// concurrent guardian fence landed after the first recovery pass.
 			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("re-authorizing fenced branch placements: %w", err)
