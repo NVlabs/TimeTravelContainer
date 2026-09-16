@@ -6021,12 +6021,16 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	// its old physical shell. Reclaim only runtimes and branches this node no
 	// longer owns; shared metadata remains authoritative.
 	_ = backend.cleanupNonOwnedRuntimeBranches()
+	lifecycleReconciled, lifecycleErr := backend.reconcileInterruptedStandaloneLifecycles()
+	if lifecycleErr != nil && backend.stderr != nil {
+		fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling interrupted standalone lifecycle: %v\n", lifecycleErr)
+	}
 	// listFamilies reconciles stale persisted running/paused state against runsc.
 	families, err := backend.listFamilies()
 	if err != nil {
 		return
 	}
-	quarantineReconciled := true
+	quarantineReconciled := lifecycleErr == nil && lifecycleReconciled
 	for _, family := range families {
 		container, containerErr := backend.containerStore().LoadContainer(family.ID)
 		if containerErr != nil {

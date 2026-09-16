@@ -27,6 +27,7 @@ go_library(
 		"elastic_cluster.go",
         "events.go",
         "idempotency.go",
+        "lifecycle_recovery.go",
 		"port_ingress.go",
         "runtime_command.go",
 		"storage.go",

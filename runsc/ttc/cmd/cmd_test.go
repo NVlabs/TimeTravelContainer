@@ -4250,6 +4250,184 @@ exit 2
 	}
 }
 
+func TestReconcileInterruptedStandaloneDehydrationRollsBackLiveCapture(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
+	;;
+timetravel)
+	if [ "$4" != "web" ]; then
+		echo "unexpected family: $*" >&2
+		exit 2
+	fi
+	case "$5" in
+	branches)
+		state=dehydrated
+		[ -f "$0.rehydrated" ] && state=running
+		printf '[{"ID":"main","State":"%s"}]\n' "$state"
+		;;
+	rehydrate)
+		[ "$6" = "main" ] || exit 2
+		touch "$0.rehydrated"
+		;;
+	*)
+		echo "unexpected timetravel command: $*" >&2
+		exit 2
+		;;
+	esac
+	;;
+delete)
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{ID: "main", FilesystemBranch: "main", State: "dehydrating"}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: bundleDir, State: "dehydrating", Branches: []ttcbundle.BranchInfo{branch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	memoryRoot := filepath.Join(containerDir, "memory", "dehydrated")
+	key := ttcbundle.MemoryBranchKey(branch)
+	for _, name := range []string{key, "." + key + "-interrupted"} {
+		if err := os.MkdirAll(filepath.Join(memoryRoot, name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if !complete {
+		t.Fatal("completed rollback was reported as still transitioning")
+	}
+	if _, err := os.Stat(runsc + ".rehydrated"); err != nil {
+		t.Fatalf("Sentry capture was not rehydrated: %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); !os.IsNotExist(err) {
+		t.Fatalf("live rolled-back runtime was deleted: %v", err)
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "running" {
+		t.Fatalf("persistent branch state=%q, want running", got)
+	}
+	for _, name := range []string{key, "." + key + "-interrupted"} {
+		if _, err := os.Stat(filepath.Join(memoryRoot, name)); !os.IsNotExist(err) {
+			t.Fatalf("interrupted dehydration path %q remains: %v", name, err)
+		}
+	}
+}
+
+func TestReconcileInterruptedStandaloneDehydrationCommitsCompleteCapture(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
+	;;
+timetravel)
+	[ "$4" = "web" ] && [ "$5" = "branches" ] || exit 2
+	printf '[{"ID":"main","State":"dehydrated"}]\n'
+	;;
+delete)
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{
+		ID: "main", FilesystemBranch: "main", State: "dehydrating",
+		SnapshotID: 7, MemoryRoots: []string{"memory/7/root"}, MemoryRootObjects: []string{"object-7"},
+		ControlRoot: "control/7", ControlRootObject: "control-object-7",
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: bundleDir, State: "dehydrating", Branches: []ttcbundle.BranchInfo{branch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	captureDir := memoryBranchDir(dataRoot, "web", "dehydrated", branch)
+	if err := os.MkdirAll(captureDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"control.json", "metadata.state"} {
+		if err := os.WriteFile(filepath.Join(captureDir, name), []byte("complete\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if !complete {
+		t.Fatal("completed capture was reported as still transitioning")
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Fatalf("process-free runtime shell was not deleted: %v", err)
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "dehydrated" {
+		t.Fatalf("persistent branch state=%q, want dehydrated", got)
+	}
+	for _, name := range []string{"control.json", "metadata.state"} {
+		if _, err := os.Stat(filepath.Join(captureDir, name)); err != nil {
+			t.Fatalf("complete dehydration image %q was removed: %v", name, err)
+		}
+	}
+}
+
 func TestSetCommandStdinDoesNotHoldWaitOpen(t *testing.T) {
 	input, inputWriter := io.Pipe()
 	command := exec.Command("/bin/sh", "-c", "exit 0")
