@@ -593,10 +593,14 @@ func (c *RaftCatalog) HeartbeatState(ctx context.Context, nodeID, incarnation st
 		return nil, nil, err
 	}
 	// A forwarded proposal may receive the leader's response just before this
-	// follower applies the same committed entry. Wait only for the local FSM;
-	// no network or shared-storage operation is involved.
+	// follower applies the same committed entry. Prefer the local FSM so an
+	// ordinary healthy follower adds no round trip. A newly re-admitted learner
+	// may still be replaying the removal/rejoin portion of its WAL, however; in
+	// that bounded state it must use a linearizable leader snapshot rather than
+	// self-fence merely because local application trails the granted lease.
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
+	localDeadline := time.Now().Add(100 * time.Millisecond)
 	for {
 		state, err := c.node.AppliedState()
 		if err != nil {
@@ -604,6 +608,16 @@ func (c *RaftCatalog) HeartbeatState(ctx context.Context, nodeID, incarnation st
 		}
 		if state.Revision >= result.Revision {
 			return &record, state, nil
+		}
+		if !time.Now().Before(localDeadline) {
+			authoritative, err := c.linearizableState(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			if authoritative.Revision < result.Revision {
+				return nil, nil, errors.New("linearizable authority state predates committed heartbeat")
+			}
+			return &record, authoritative, nil
 		}
 		select {
 		case <-ctx.Done():
