@@ -245,6 +245,30 @@ func outboundSlot(name string) uint16 {
 	return uint16(value)
 }
 
+// providerBaselineReferenceName scopes provider-local roots and pins to the
+// immutable origin whose handoff journal mutates them. Repository branch names
+// are intentionally stable across generations, so two simultaneously live
+// origins may otherwise select different objects with the same root name.
+// Structural incoming-edge bridges remain canonical: they identify the parent
+// object and slot globally and are replaced by that exact edge when the parent
+// origin is imported.
+func providerBaselineReferenceName(origin ttcsnapshot.SnapshotID, name string) string {
+	if strings.HasPrefix(name, "root/bridge/edge/") ||
+		(!strings.HasPrefix(name, "root/") && !strings.HasPrefix(name, "pin/")) {
+		return name
+	}
+	digest := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("root/provider/%016x/%x", uint64(origin), digest)
+}
+
+func providerBaselineReferences(origin ttcsnapshot.SnapshotID, references map[string]ttcsnapshot.ObjectID) map[string]ttcsnapshot.ObjectID {
+	result := make(map[string]ttcsnapshot.ObjectID, len(references))
+	for name, object := range references {
+		result[providerBaselineReferenceName(origin, name)] = object
+	}
+	return result
+}
+
 func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*ttcsnapshot.ReferenceLedger, error) {
 	if s == nil || s.authority == nil || s.packs == nil || s.peers == nil {
 		return nil, errors.New("shared reference rebuild is unavailable")
@@ -457,7 +481,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		for index, packed := range manifest.Objects {
 			objects[index] = packed.Object
 		}
-		// Bootstrap every provider baseline long enough to import all origins.
+		// Retain every provider baseline long enough to import all origins.
 		// Parent origins may sort after their children, and ImportOrigin correctly
 		// forbids resurrecting a zero-count object. Namespacing ordinary roots
 		// avoids collisions between repositories; incoming-edge bridge names stay
@@ -467,8 +491,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			if strings.HasPrefix(name, "root/bridge/edge/") {
 				references[name] = object
 			} else {
-				digest := sha256.Sum256([]byte(name))
-				references[fmt.Sprintf("bootstrap/%016x/%x", uint64(manifest.Snapshot), digest)] = object
+				references[providerBaselineReferenceName(manifest.Snapshot, name)] = object
 			}
 		}
 		for name, object := range coldMemoryReferences[manifest.Snapshot] {
@@ -496,12 +519,12 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	// roots and incarnation-bound active claims remain.
 	inspection := ledger.Inspect()
 	for name, object := range inspection.References {
-		if !strings.HasPrefix(name, "bootstrap/") {
+		if !strings.HasPrefix(name, "root/provider/") {
 			continue
 		}
 		operation := fmt.Sprintf("rebuild/%016x/release/%s", lease.Generation, name)
 		if err := ledger.ApplyReference(operation, name, object, false); err != nil {
-			return fail(fmt.Errorf("releasing bootstrap reference %q: %w", name, err))
+			return fail(fmt.Errorf("releasing provider baseline reference %q: %w", name, err))
 		}
 	}
 	for origin := range claimReferences {
@@ -643,7 +666,8 @@ func (s *sharedReferenceService) ImportSharedSnapshot(_ context.Context, peer st
 		objects[index] = packed.Object
 	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		if err := ledger.ImportOrigin(ttcsnapshot.SnapshotID(snapshotID), objects, manifest.References); err != nil {
+		origin := ttcsnapshot.SnapshotID(snapshotID)
+		if err := ledger.ImportOrigin(origin, objects, providerBaselineReferences(origin, manifest.References)); err != nil {
 			return fmt.Errorf("importing origin into reference ledger: %w", err)
 		}
 		return nil
@@ -679,7 +703,9 @@ func (s *sharedReferenceService) ApplySharedSnapshotHandoff(_ context.Context, p
 			return err
 		}
 		mutations[index] = ttcsnapshot.SnapshotReferenceMutation{
-			Sequence: input.Sequence, Operation: input.Operation, Name: input.Name, Object: object, Retain: input.Retain,
+			Sequence: input.Sequence, Operation: input.Operation,
+			Name:   providerBaselineReferenceName(ttcsnapshot.SnapshotID(snapshotID), input.Name),
+			Object: object, Retain: input.Retain,
 		}
 	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {

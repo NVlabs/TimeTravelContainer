@@ -71,6 +71,29 @@ func TestColdReferenceIdentityIsScopedToPublication(t *testing.T) {
 	}
 }
 
+func TestProviderBaselineReferencesAreOriginScoped(t *testing.T) {
+	ledger := ttcsnapshot.NewReferenceLedger()
+	const providerName = "root/filesystem-base/stable-branch"
+	for _, origin := range []ttcsnapshot.SnapshotID{11, 13} {
+		root := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+		references := providerBaselineReferences(origin, map[string]ttcsnapshot.ObjectID{providerName: root})
+		if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{{ID: root, Kind: ttcsnapshot.ObjectKindMetadata, State: ttcsnapshot.ObjectLive}}, references); err != nil {
+			t.Fatalf("import origin %d: %v", origin, err)
+		}
+		wantName := providerBaselineReferenceName(origin, providerName)
+		if got := ledger.References()[wantName]; got != root {
+			t.Fatalf("origin %d provider reference=%s, want %s", origin, got, root)
+		}
+	}
+	if first, second := providerBaselineReferenceName(11, providerName), providerBaselineReferenceName(13, providerName); first == second {
+		t.Fatalf("provider generations reused reference name %q", first)
+	}
+	bridge := "root/bridge/edge/parent/0000"
+	if got := providerBaselineReferenceName(13, bridge); got != bridge {
+		t.Fatalf("structural bridge was namespaced as %q", got)
+	}
+}
+
 func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 	provider := ttcsnapshot.NewReferenceLedger()
 	shared := ttcsnapshot.NewReferenceLedger()
