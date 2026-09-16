@@ -5683,11 +5683,11 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	// ID so publish completion, branch removal fencing, and restart recovery all
 	// address the same immutable publication even when the lifecycle command used a name
 	// or ID prefix.
-	container, err := store.LoadContainer(target.container)
+	resolved, container, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
-	target.container = container.ID
+	target = resolved
 	previous, err := persistentBranchInfo(container, target.branch)
 	if err != nil {
 		return err
