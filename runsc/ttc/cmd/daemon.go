@@ -503,6 +503,13 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	if err := json.Unmarshal(family.Spec, &spec); err != nil {
 		return fmt.Errorf("decoding remote runtime specification: %w", err)
 	}
+	physicalFamily := source.DistributedFamilyID
+	if physicalFamily == "" {
+		physicalFamily = source.ID
+	}
+	if physicalFamily == "" {
+		return errors.New("remote family metadata has no immutable family ID")
+	}
 	targetName := tx.Identity.TargetContainer
 	targetID := ""
 	authoritativeMigration := false
@@ -521,7 +528,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		if listErr != nil {
 			return fmt.Errorf("selecting distributed target runtime: %w", listErr)
 		}
-		if physical, found, selectErr := reusablePhysicalTarget(records, tx.Identity.TargetContainer, r.nodeID); selectErr != nil {
+		if physical, found, selectErr := reusablePhysicalTarget(records, physicalFamily, r.nodeID); selectErr != nil {
 			return selectErr
 		} else if found {
 			targetName = physical
@@ -544,7 +551,7 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 			authoritativeMigration = true
 		}
 	}
-	defer r.lockTarget(tx.Identity.TargetContainer)()
+	defer r.lockTarget(physicalFamily)()
 	_, err := r.backend.containerStore().PrepareDistributedFork(ctx, ttcbundle.DistributedForkOptions{
 		SourceContainer: tx.Identity.SourceContainer, TargetName: targetName,
 		TargetBranch: tx.Identity.TargetBranch, VisibleBranch: tx.Identity.VisibleTargetBranch(),

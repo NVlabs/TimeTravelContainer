@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -87,6 +88,25 @@ func TestReusablePhysicalTarget(t *testing.T) {
 	})
 	if _, _, err := reusablePhysicalTarget(records, "family", "target-node"); err == nil {
 		t.Fatal("reusablePhysicalTarget accepted multiple physical runtimes")
+	}
+}
+
+func TestRemoteForkTargetUsesImmutableFamilyID(t *testing.T) {
+	// A new branch is named as FAMILY@BRANCH by the client, so its transaction
+	// may carry the user-facing family name even though placement authority is
+	// keyed by the immutable ID from authenticated family metadata.
+	source := ttcbundle.ContainerInfo{ID: "family-id", Name: "friendly-name"}
+	physicalFamily := source.DistributedFamilyID
+	if physicalFamily == "" {
+		physicalFamily = source.ID
+	}
+	records := []cluster.PlacementRecord{{
+		FamilyID: "family-id", BranchID: "first", OwnerNode: "target-node",
+		PhysicalContainer: "target-runtime", State: cluster.PlacementRunning,
+	}}
+	got, found, err := reusablePhysicalTarget(records, physicalFamily, "target-node")
+	if err != nil || !found || got != "target-runtime" {
+		t.Fatalf("reusablePhysicalTarget=%q,%t,%v, want target-runtime,true,nil", got, found, err)
 	}
 }
 
