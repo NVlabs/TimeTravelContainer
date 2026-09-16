@@ -5915,8 +5915,23 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 					target.branch = physicalBranch
 					return target, physical, nil
 				}
-				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
+				// Publication commit deliberately removes physical placement from
+				// Raft: a cold branch has no execution owner. Its immutable
+				// publication identity is then the only authoritative way to select
+				// among the physical records retained by repeated migrations. Never
+				// let an older family record win merely because it also contains a
+				// stale branch with the same user-visible name.
+				if placement.State == cluster.PlacementUnplaced && publicationID != "" {
 					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, publicationID)
+					if resolveErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")
 					if resolveErr != nil {
 						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
 					}

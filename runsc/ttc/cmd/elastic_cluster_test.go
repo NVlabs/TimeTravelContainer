@@ -573,6 +573,49 @@ func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 	}
 }
 
+func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T) {
+	root := t.TempDir()
+	writeContainer := func(info ttcbundle.ContainerInfo) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", info.ID)
+		info.BundleDir = filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeContainer(ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", State: "running",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running", StorageState: "local"}},
+	})
+	writeContainer(ttcbundle.ContainerInfo{
+		ID: "physical-old", Name: "physical-old", State: "exited", DistributedFamilyID: "family",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "exited", StorageState: "shared", PublicationID: "publication-old"}},
+	})
+	writeContainer(ttcbundle.ContainerInfo{
+		ID: "physical-current", Name: "physical-current", State: "dehydrated", DistributedFamilyID: "family",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "dehydrated", StorageState: "shared", PublicationID: "publication-current"}},
+	})
+	store := ttcbundle.Store{Root: root}
+	logical, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root}
+	physical, branch, err := backend.resolveDistributedPersistentBranch(logical, "main", "publication-current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if physical.ID != "physical-current" || branch != "main" {
+		t.Fatalf("resolved %s@%s, want physical-current@main", physical.ID, branch)
+	}
+}
+
 func TestLastOnlineClusterNode(t *testing.T) {
 	directory, err := cluster.OpenNodeDirectory(filepath.Join(t.TempDir(), "nodes"))
 	if err != nil {
