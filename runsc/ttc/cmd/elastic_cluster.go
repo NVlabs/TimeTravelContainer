@@ -639,7 +639,23 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			logicalFamily = info.DistributedFamilyID
 		}
 		for _, branch := range info.Branches {
-			key := logicalFamily + "\x00" + branch.ID
+			placementFamily, placementBranch := logicalFamily, branch.ID
+			internalPhysical := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+			if internalPhysical {
+				// A sparse fork or migration target exists physically before its
+				// Raft publication/cutover. It must never enroll its transaction
+				// branch as a new logical branch in that window. Once authority is
+				// committed, bind the runtime only to the logical identity named by
+				// the transaction. This is also deliberately independent of branch
+				// names: migration runtimes use transaction IDs while remote-fork
+				// runtimes may use a user-visible destination name.
+				var found bool
+				placementFamily, placementBranch, found = logicalPlacementForPhysicalTransaction(authorityState, info.DistributedForkTransactionID)
+				if !found {
+					continue
+				}
+			}
+			key := placementFamily + "\x00" + placementBranch
 			known[key] = struct{}{}
 			if branch.Unplaced {
 				if branch.NodeID != "" {
@@ -658,6 +674,11 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			}
 			record, found := placementByBranch[key]
 			if !found {
+				if internalPhysical {
+					// The transaction is known but publication has not installed its
+					// placement yet. Only the Raft publish/cutover operation may do so.
+					continue
+				}
 				// During restart recovery, first adopt all existing placements
 				// while the node is still unschedulable. Previously untracked
 				// local branches are enrolled after the node becomes ready.
@@ -665,7 +686,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 					continue
 				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
-					FamilyID: logicalFamily, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+					FamilyID: placementFamily, BranchID: placementBranch, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
 					OwnerNode: b.nodeID, OwnerIncarnation: current.Incarnation, State: state,
 					FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
 					LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
@@ -674,8 +695,8 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
 					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
 				} else if createErr == nil && b.distributedSource.authority != nil {
-					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(logicalFamily, branch.ID, branch.ParentID); inheritErr != nil {
-						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", logicalFamily, branch.ID, inheritErr))
+					if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(placementFamily, placementBranch, branch.ParentID); inheritErr != nil {
+						result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", placementFamily, placementBranch, inheritErr))
 					}
 				}
 				continue
@@ -684,7 +705,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				continue
 			}
 			if record.OwnerIncarnation != current.Incarnation {
-				adopted, adoptErr := placements.AdoptOwnerIncarnation(logicalFamily, branch.ID, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
+				adopted, adoptErr := placements.AdoptOwnerIncarnation(placementFamily, placementBranch, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now)
 				err = adoptErr
 				if err != nil {
 					result = errors.Join(result, fmt.Errorf("adopting placement for %s@%s: %w", info.ID, branch.ID, err))
@@ -704,13 +725,13 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			// publication state. Re-propose the idempotent stable placement update
 			// when either view differs; Raft then repairs both atomically.
 			if record.State != state || (authorityKnown && branchAuthority.Lifecycle != string(state)) {
-				if _, err := placements.UpdateStableState(logicalFamily, branch.ID, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
+				if _, err := placements.UpdateStableState(placementFamily, placementBranch, b.nodeID, current.Incarnation, record.Generation, state, now); err != nil {
 					result = errors.Join(result, fmt.Errorf("updating placement state for %s@%s: %w", info.ID, branch.ID, err))
 				}
 			}
 			if b.distributedSource.authority != nil && (!authorityKnown || !branchAuthority.DependenciesInherited) {
-				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(logicalFamily, branch.ID, branch.ParentID); inheritErr != nil {
-					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", info.ID, branch.ID, inheritErr))
+				if _, inheritErr := b.distributedSource.authority.InheritBranchDependencies(placementFamily, placementBranch, branch.ParentID); inheritErr != nil {
+					result = errors.Join(result, fmt.Errorf("recording dependencies for %s@%s: %w", placementFamily, placementBranch, inheritErr))
 				}
 			}
 		}
@@ -731,6 +752,24 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 	}
 	return result
+}
+
+// logicalPlacementForPhysicalTransaction resolves transaction-scoped runtime
+// identity to the stable logical branch whose authority the transaction moves
+// or creates. Returning false before Raft knows the transaction is intentional:
+// target preparation must remain invisible until its atomic publication.
+func logicalPlacementForPhysicalTransaction(state *cluster.AuthorityState, transactionID string) (string, string, bool) {
+	if state == nil || transactionID == "" {
+		return "", "", false
+	}
+	tx, ok := state.Transactions[transactionID]
+	if !ok {
+		return "", "", false
+	}
+	if tx.Identity.Migration {
+		return tx.Identity.SourceContainer, tx.Identity.SourceBranch, true
+	}
+	return tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch(), true
 }
 
 // placementHasProcessFreePublication reports whether Raft has authorized the

@@ -573,6 +573,39 @@ func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 	}
 }
 
+func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
+	state := &cluster.AuthorityState{Transactions: map[string]cluster.Transaction{
+		"migration": {Identity: cluster.ForkIdentity{
+			TransactionID: "migration", Migration: true,
+			SourceContainer: "family", SourceBranch: "main",
+			TargetContainer: "family", TargetBranch: "physical-migration",
+		}},
+		"fork": {Identity: cluster.ForkIdentity{
+			TransactionID: "fork", SourceContainer: "family", SourceBranch: "main",
+			TargetContainer: "family", TargetBranch: "physical-fork", TargetVisibleBranch: "child",
+		}},
+	}}
+	for _, tc := range []struct {
+		name, transaction, family, branch string
+		found                             bool
+	}{
+		{name: "migration", transaction: "migration", family: "family", branch: "main", found: true},
+		{name: "fork", transaction: "fork", family: "family", branch: "child", found: true},
+		{name: "unknown", transaction: "unknown"},
+		{name: "empty", transaction: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			family, branch, found := logicalPlacementForPhysicalTransaction(state, tc.transaction)
+			if family != tc.family || branch != tc.branch || found != tc.found {
+				t.Fatalf("resolved (%q,%q,%t), want (%q,%q,%t)", family, branch, found, tc.family, tc.branch, tc.found)
+			}
+		})
+	}
+	if family, branch, found := logicalPlacementForPhysicalTransaction(nil, "migration"); family != "" || branch != "" || found {
+		t.Fatalf("nil authority resolved (%q,%q,%t)", family, branch, found)
+	}
+}
+
 func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T) {
 	root := t.TempDir()
 	writeContainer := func(info ttcbundle.ContainerInfo) {
