@@ -173,6 +173,13 @@ type Transaction struct {
 	TargetPhysicalContainer   string `json:"target_physical_container,omitempty"`
 	TargetPhysicalBranch      string `json:"target_physical_branch,omitempty"`
 	TargetPhysicalIncarnation string `json:"target_physical_incarnation,omitempty"`
+	// InheritedDependencies is the exact set of older volatile transactions
+	// captured by a migration. It is frozen at ownership cutover, before this
+	// transaction's own dependency is appended. A later migration may begin
+	// before this one finishes draining; recording the set explicitly prevents
+	// the older completion from mistaking that newer dependency for an ancestor
+	// and releasing its source prematurely.
+	InheritedDependencies []string `json:"inherited_dependencies,omitempty"`
 	// OwnershipCommitted is set in the same Raft entry that moves a migrated
 	// branch's placement. It separates a physically prepared target from the
 	// sole authoritative target before activation.

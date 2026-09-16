@@ -721,17 +721,28 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
 			TargetBranch: "move-hidden", TargetVisibleBranch: "main", Migration: true,
 		},
-		SourceNeeded: true, State: TransactionDraining, Revision: 8, CreatedAt: at, UpdatedAt: at,
+		SourceNeeded: true, State: TransactionDraining, Revision: 8, CreatedAt: at.Add(time.Second), UpdatedAt: at.Add(time.Second),
+		OwnershipCommitted: true, InheritedDependencies: []string{predecessor.Identity.TransactionID},
+	}
+	successor := Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "move-later", SourceNodeID: "node-c", TargetNodeID: "node-d",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			TargetBranch: "later-hidden", TargetVisibleBranch: "main", Migration: true,
+		},
+		SourceNeeded: true, State: TransactionPublished, Revision: 6, CreatedAt: at.Add(2 * time.Second), UpdatedAt: at.Add(2 * time.Second),
 		OwnershipCommitted: true,
 	}
 	state.Transactions[predecessor.Identity.TransactionID] = predecessor
 	state.Transactions[migration.Identity.TransactionID] = migration
+	state.Transactions[successor.Identity.TransactionID] = successor
 	key := logicalBranchKey("family", "main")
 	state.Branches[key] = BranchAuthority{
 		FamilyID: "family", BranchID: "main", Generation: 3, Lifecycle: "running",
 		VolatileDependencies: []VolatileDependency{
 			{TransactionID: predecessor.Identity.TransactionID, SourceNode: "node-a", SourceIncarnation: "inc-a"},
 			{TransactionID: migration.Identity.TransactionID, SourceNode: "node-b", SourceIncarnation: "inc-b"},
+			{TransactionID: successor.Identity.TransactionID, SourceNode: "node-c", SourceIncarnation: "inc-c"},
 		},
 		DependenciesInherited: true, UpdatedAt: at,
 	}
@@ -742,18 +753,21 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 	if !volatileDependencyForwarded(state, "family", "main", predecessor.Identity.TransactionID, "node-b") {
 		t.Fatal("predecessor dependency was not recognized as forwarded")
 	}
-	applyAuthorityForTest(t, state, "independent-migration", at.Add(time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
+	applyAuthorityForTest(t, state, "independent-migration", at.Add(3*time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
 		ID: migration.Identity.TransactionID, Revision: migration.Revision, Next: TransactionIndependent,
 		Metrics: &TransferMetrics{PagesTotal: 2, PagesReleased: 2},
 	})
-	if dependencies := state.Branches[key].VolatileDependencies; len(dependencies) != 0 {
-		t.Fatalf("independent migrated branch retains dependencies: %+v", dependencies)
+	if dependencies := state.Branches[key].VolatileDependencies; len(dependencies) != 1 || dependencies[0].TransactionID != successor.Identity.TransactionID {
+		t.Fatalf("independent migrated branch did not preserve its newer dependency: %+v", dependencies)
 	}
 	if got := state.Transactions[predecessor.Identity.TransactionID]; got.State != TransactionIndependent || got.SourceNeeded {
 		t.Fatalf("unreferenced predecessor remains source-backed: %+v", got)
 	}
 	if volatileDependencyForwarded(state, "family", "main", predecessor.Identity.TransactionID, "node-b") {
 		t.Fatal("settled predecessor remained classified as forwarded")
+	}
+	if got := state.Transactions[successor.Identity.TransactionID]; got.State != TransactionPublished || !got.SourceNeeded {
+		t.Fatalf("newer migration was prematurely settled: %+v", got)
 	}
 }
 
@@ -770,7 +784,7 @@ func TestAuthorityMigrationIndependenceRetainsSharedPredecessor(t *testing.T) {
 			TargetVisibleBranch: "main", Migration: true,
 		},
 		SourceNeeded: true, State: TransactionPublished, Revision: 7, CreatedAt: at, UpdatedAt: at,
-		OwnershipCommitted: true,
+		OwnershipCommitted: true, InheritedDependencies: []string{predecessor.Identity.TransactionID},
 	}
 	state.Transactions[predecessor.Identity.TransactionID] = predecessor
 	state.Transactions[migration.Identity.TransactionID] = migration

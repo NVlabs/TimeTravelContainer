@@ -921,8 +921,16 @@ func (s *AuthorityState) applyMigrationCutover(command AuthorityCommand) (json.R
 	tx.OwnershipCommitted = true
 	tx.Revision++
 	tx.UpdatedAt = command.IssuedAt
-	s.Transactions[p.TransactionID] = tx
 	if branch, ok := s.Branches[key]; ok {
+		// Freeze the transitive dependencies represented by the source state at
+		// cutover. Newer migrations append their own edge afterward and must not
+		// be settled when this transaction becomes independent.
+		tx.InheritedDependencies = tx.InheritedDependencies[:0]
+		for _, dependency := range branch.VolatileDependencies {
+			if dependency.TransactionID != tx.Identity.TransactionID {
+				tx.InheritedDependencies = append(tx.InheritedDependencies, dependency.TransactionID)
+			}
+		}
 		if tx.SourceNeeded {
 			branch.VolatileDependencies = appendVolatileDependency(branch.VolatileDependencies, VolatileDependency{
 				TransactionID: tx.Identity.TransactionID, SourceNode: tx.Identity.SourceNodeID,
@@ -934,6 +942,7 @@ func (s *AuthorityState) applyMigrationCutover(command AuthorityCommand) (json.R
 		branch.UpdatedAt = command.IssuedAt
 		s.Branches[key] = branch
 	}
+	s.Transactions[p.TransactionID] = tx
 	return authorityValue(MigrationCutoverResult{Transaction: tx, Placement: placement})
 }
 
@@ -1495,19 +1504,18 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			tx.Metrics = &copy
 		}
 		if p.Next == TransactionIndependent {
-			var inherited []VolatileDependency
 			for key, branch := range s.Branches {
 				updated := removeVolatileDependency(branch.VolatileDependencies, tx.Identity.TransactionID)
 				// A migration may capture a branch that is itself still backed by
-				// older remote-fork or migration transactions. The new target's
-				// independence fence proves that every one of those transitive
-				// dependencies has been materialized. Remove them from the moved
-				// logical branch in the same Raft entry; otherwise moving the branch
-				// again can orphan its predecessor transaction on the former node.
+				// older remote-fork or migration transactions. The exact inherited
+				// set was frozen at cutover. Remove only those ancestors here. A
+				// newer migration may already have appended another dependency to
+				// the same logical branch and must complete its own release fence.
 				if tx.Identity.Migration && tx.OwnershipCommitted &&
 					branch.FamilyID == tx.Identity.SourceContainer && branch.BranchID == tx.Identity.SourceBranch {
-					inherited = append(inherited, updated...)
-					updated = nil
+					for _, inheritedID := range tx.InheritedDependencies {
+						updated = removeVolatileDependency(updated, inheritedID)
+					}
 				}
 				if len(updated) != len(branch.VolatileDependencies) {
 					branch.VolatileDependencies = updated
@@ -1521,19 +1529,19 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 			// complete replacement for every transitive read it could perform.
 			// Source and target cleanup workers observe this replicated terminal
 			// state and release their process-local sessions idempotently.
-			for _, dependency := range inherited {
-				if dependency.TransactionID == tx.Identity.TransactionID || volatileDependencyReferenced(s.Branches, dependency.TransactionID) {
+			for _, inheritedID := range tx.InheritedDependencies {
+				if inheritedID == tx.Identity.TransactionID || volatileDependencyReferenced(s.Branches, inheritedID) {
 					continue
 				}
-				predecessor, ok := s.Transactions[dependency.TransactionID]
+				predecessor, ok := s.Transactions[inheritedID]
 				if !ok || !predecessor.SourceNeeded ||
 					(predecessor.State != TransactionPublished && predecessor.State != TransactionDraining) {
 					continue
 				}
 				if err := predecessor.Advance(TransactionIndependent, "", command.IssuedAt); err != nil {
-					return nil, fmt.Errorf("settling inherited dependency %q: %w", dependency.TransactionID, err)
+					return nil, fmt.Errorf("settling inherited dependency %q: %w", inheritedID, err)
 				}
-				s.Transactions[dependency.TransactionID] = predecessor
+				s.Transactions[inheritedID] = predecessor
 			}
 		}
 	case AuthorityTransactionPublish:
@@ -2055,6 +2063,19 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 		}
 		if err := tx.Identity.Validate(); err != nil {
 			return nil, err
+		}
+		if len(tx.InheritedDependencies) != 0 && !tx.Identity.Migration {
+			return nil, errors.New("non-migration transaction has inherited dependencies")
+		}
+		seenInherited := make(map[string]struct{}, len(tx.InheritedDependencies))
+		for _, dependency := range tx.InheritedDependencies {
+			if !transactionIDPattern.MatchString(dependency) || dependency == tx.Identity.TransactionID {
+				return nil, errors.New("transaction snapshot has invalid inherited dependency")
+			}
+			if _, duplicate := seenInherited[dependency]; duplicate {
+				return nil, errors.New("transaction snapshot repeats inherited dependency")
+			}
+			seenInherited[dependency] = struct{}{}
 		}
 	}
 	for id, provider := range state.VolatileOrigins {
