@@ -2589,45 +2589,68 @@ func (b *runtimeBackend) drainTargets(forced string) ([]cluster.NodeRecord, erro
 
 func (b *runtimeBackend) localPlannerSnapshot() (cluster.PlannerSnapshot, error) {
 	snapshot := cluster.PlannerSnapshot{NodeID: b.nodeID}
-	containers, err := b.containerStore().ListContainers()
+	placements, err := b.placementCatalog()
 	if err != nil {
 		return snapshot, err
 	}
-	for _, info := range containers {
-		name := info.Name
-		if name == "" {
-			name = info.ID
-		}
-		var local []ttcbundle.BranchInfo
-		for _, branch := range info.Branches {
-			state := normalizeLifecycleState(branch.State)
-			if info.BranchNodeID(branch.ID) == b.nodeID && (state == "running" || state == "paused") {
-				local = append(local, branch)
-			}
-		}
-		if len(local) == 0 {
+	records, err := placements.List()
+	if err != nil {
+		return snapshot, err
+	}
+	// The shared family bundle is display metadata and can retain an earlier
+	// node after migration. Raft placement identifies both the logical branch
+	// and the physical Sentry that currently owns its resident pages.
+	byPhysical := make(map[string][]cluster.PlacementRecord)
+	for _, record := range records {
+		if record.OwnerNode != b.nodeID || (record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) {
 			continue
 		}
-		output, err := b.command("timetravel", info.ID, "stats", local[0].ID)
+		physical := record.PhysicalContainer
+		if physical == "" {
+			physical = record.FamilyID
+		}
+		byPhysical[physical] = append(byPhysical[physical], record)
+	}
+	physicalIDs := make([]string, 0, len(byPhysical))
+	for physical := range byPhysical {
+		physicalIDs = append(physicalIDs, physical)
+	}
+	sort.Strings(physicalIDs)
+	for _, physical := range physicalIDs {
+		local := byPhysical[physical]
+		sort.Slice(local, func(i, j int) bool { return local[i].BranchID < local[j].BranchID })
+		firstPhysicalBranch := local[0].PhysicalBranch
+		if firstPhysicalBranch == "" {
+			firstPhysicalBranch = local[0].BranchID
+		}
+		output, err := b.command("timetravel", physical, "stats", firstPhysicalBranch)
 		if err != nil {
-			return snapshot, fmt.Errorf("accounting resident memory for %q: %w", name, err)
+			return snapshot, fmt.Errorf("accounting resident memory for physical runtime %q: %w", physical, err)
 		}
 		var resident boot.FamilyResidentMemory
 		if err := json.Unmarshal(output, &resident); err != nil {
-			return snapshot, fmt.Errorf("decoding resident memory for %q: %w", name, err)
+			return snapshot, fmt.Errorf("decoding resident memory for physical runtime %q: %w", physical, err)
 		}
 		byID := make(map[string]boot.BranchResidentMemory, len(resident.Branches))
 		for _, memory := range resident.Branches {
 			byID[memory.ID] = memory
 		}
 		localIDs := make(map[string]string, len(local))
-		for _, branch := range local {
-			memory, ok := byID[branch.ID]
-			if !ok {
-				return snapshot, fmt.Errorf("runtime omitted resident accounting for %s@%s", name, branch.ID)
+		for _, record := range local {
+			physicalBranch := record.PhysicalBranch
+			if physicalBranch == "" {
+				physicalBranch = record.BranchID
 			}
-			id := selector{container: name, branch: branch.ID}.String()
-			localIDs[branch.ID] = id
+			memory, ok := byID[physicalBranch]
+			if !ok {
+				return snapshot, fmt.Errorf("physical runtime %q omitted resident accounting for branch %q", physical, physicalBranch)
+			}
+			name := record.FamilyName
+			if name == "" {
+				name = record.FamilyID
+			}
+			id := selector{container: name, branch: record.BranchID}.String()
+			localIDs[physicalBranch] = id
 			snapshot.Branches = append(snapshot.Branches, cluster.PlannerBranchSnapshot{ID: id, TotalBytes: memory.TotalBytes})
 		}
 		for _, run := range resident.VersionRuns {
@@ -3143,9 +3166,9 @@ func lastOnlineClusterNode(directory cluster.NodeCatalog, nodeID string) (bool, 
 
 // drainNode implements the owner-local, restart-safe evacuation used by node
 // stop and crash recovery. It rejects new
-// placements first, then migrates active branches and transfers cold branch
-// ownership. A failed step leaves the node draining so retry cannot race new
-// work onto it.
+// placements first, then migrates active branches. Process-free durable
+// branches are already unplaced in Raft and require no node-to-node transfer.
+// A failed step leaves the node draining so retry cannot race new work onto it.
 func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selector, retErr error) {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return nil, errors.New("elastic node drain requires dynamic cluster discovery")
@@ -3182,19 +3205,18 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 	// stop-all and dehydrate-all publish their process-free state and release
 	// placement ownership before they reach this point. An empty node can stop
 	// without requiring a second node merely to accept no work.
-	containers, err := b.containerStore().ListContainers()
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return nil, err
+	}
+	placementRecords, err := placements.List()
 	if err != nil {
 		return nil, err
 	}
 	ownsBranches := false
-	for _, info := range containers {
-		for _, branch := range info.Branches {
-			if info.BranchNodeID(branch.ID) == b.nodeID {
-				ownsBranches = true
-				break
-			}
-		}
-		if ownsBranches {
+	for _, record := range placementRecords {
+		if record.OwnerNode == b.nodeID {
+			ownsBranches = true
 			break
 		}
 	}
@@ -3240,7 +3262,7 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 		}
 		moved = append(moved, selected)
 	}
-	containers, err = b.containerStore().ListContainers()
+	placementRecords, err = placements.List()
 	if err != nil {
 		return nil, err
 	}
@@ -3249,32 +3271,26 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 		state  string
 	}
 	var pending []work
-	for _, info := range containers {
-		name := info.Name
-		if name == "" {
-			name = info.ID
-		}
-		for _, branch := range info.Branches {
-			if info.BranchNodeID(branch.ID) == b.nodeID {
-				pending = append(pending, work{target: selector{container: name, branch: branch.ID}, state: normalizeLifecycleState(branch.State)})
+	for _, record := range placementRecords {
+		if record.OwnerNode == b.nodeID {
+			name := record.FamilyName
+			if name == "" {
+				name = record.FamilyID
 			}
+			pending = append(pending, work{target: selector{container: name, branch: record.BranchID}, state: string(record.State)})
 		}
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].target.String() < pending[j].target.String() })
 	moved = append(make([]selector, 0, len(moved)+len(pending)), moved...)
-	for index, item := range pending {
-		destination := targets[index%len(targets)].NodeID
+	for _, item := range pending {
 		switch item.state {
 		case "running", "paused":
 			return moved, fmt.Errorf("active branch %s remained on drained node after placement execution", item.target)
-		case "created", "dehydrated", "exited", "failed", "dead":
-			if err := b.containerStore().CompareAndSwapBranchNodeID(item.target.container, item.target.branch, b.nodeID, destination); err != nil {
-				return moved, fmt.Errorf("transferring cold branch %s to %q: %w", item.target, destination, err)
-			}
+		case "materializing", "migrating":
+			return moved, fmt.Errorf("branch %s remains transiently %s on drained node", item.target, item.state)
 		default:
-			return moved, fmt.Errorf("branch %s is transiently %s; retry the drain after it settles", item.target, item.state)
+			return moved, fmt.Errorf("branch %s retains unexpected placement state %s on drained node", item.target, item.state)
 		}
-		moved = append(moved, item.target)
 	}
 	transactionStore, err := b.transactionCatalog()
 	if err != nil {
