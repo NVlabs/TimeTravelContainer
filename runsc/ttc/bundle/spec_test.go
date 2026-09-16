@@ -289,7 +289,7 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 	store := Store{Root: root}
 	created := time.Now().UTC().Add(-time.Hour)
 	source := ContainerInfo{ID: "source-runtime", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a",
-		Branches: []BranchInfo{{ID: "moving", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created, Quarantined: true}}}
+		Branches: []BranchInfo{{ID: "old-incarnation", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created, Quarantined: true}}}
 	target := ContainerInfo{ID: "target-runtime", Name: "target-runtime", DistributedFamilyID: "family-id", NodeID: "node-b",
 		BundleDir: filepath.Join(root, "containers", "target-runtime", "bundle"),
 		Branches:  []BranchInfo{{ID: "sibling", NodeID: "node-b", State: "running", CreatedAt: created}}}
@@ -303,7 +303,7 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
-		SourceContainer: "family-id", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
+		SourceContainer: "family-id", SourcePhysicalBranch: "old-incarnation", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
 		ParentBranch: "moving", TransactionID: "tx-move", NodeID: "node-b", SourceNode: "node-a", Migration: true, Source: &source,
 	}); err != nil {
 		t.Fatal(err)
@@ -327,7 +327,7 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 			t.Fatalf("publication lost sibling or duplicated migration: %+v", published.Branches)
 		}
 		branch := published.Branches[1]
-		if branch.ID != "moving" || branch.ParentID != "ancestor" || branch.NodeID != "node-b" ||
+		if branch.ID != "tx-move" || branch.ParentID != "ancestor" || branch.NodeID != "node-b" ||
 			!branch.CreatedAt.Equal(created) || !branch.Quarantined || !branch.DistributedMigration || branch.State != "paused" {
 			t.Fatalf("migration lost branch metadata: %+v", branch)
 		}
@@ -376,11 +376,11 @@ func TestAuthoritativeMigrationReplacesStalePhysicalOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(published.Branches) != 2 {
-		t.Fatalf("publication duplicated stale branch: %+v", published.Branches)
+	if len(published.Branches) != 3 {
+		t.Fatalf("publication lost stale provider or new incarnation: %+v", published.Branches)
 	}
 	for _, branch := range published.Branches {
-		if branch.ID == "moving" {
+		if branch.ID == "tx-move" {
 			if branch.NodeID != "node-a" || branch.FilesystemBranch != ttcvolume.ScopedBranchID(source.ID, "tx-move") || !branch.DistributedMigration {
 				t.Fatalf("authoritative migration did not replace stale metadata: %+v", branch)
 			}
@@ -583,8 +583,8 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err := json.Unmarshal(encoded, &spec); err != nil {
 		t.Fatal(err)
 	}
-	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "child" {
-		t.Fatalf("cold migration branch annotation=%q, want child", got)
+	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "tx-cancel" {
+		t.Fatalf("cold migration branch annotation=%q, want tx-cancel", got)
 	}
 	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]; got != "main" {
 		t.Fatalf("cold migration parent annotation=%q, want main", got)
@@ -608,18 +608,18 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(published.Branches) != 2 {
-		t.Fatalf("migration added a branch instead of replacing it: %+v", published.Branches)
+	if len(published.Branches) != 3 {
+		t.Fatalf("migration did not retain its sparse source incarnation: %+v", published.Branches)
 	}
 	for _, branch := range published.Branches {
-		if branch.ID == "child" {
+		if branch.ID == "tx-publish" {
 			if branch.ParentID != "main" || !branch.CreatedAt.Equal(created.Add(time.Second)) || branch.NodeID != "node-b" || branch.FilesystemBranch == "fs-child-old" || !branch.DistributedMigration {
 				t.Fatalf("published migration branch=%+v", branch)
 			}
 			return
 		}
 	}
-	t.Fatal("published migration lost child branch")
+	t.Fatal("published migration lost physical target branch")
 }
 
 func TestConcurrentDistributedMigrationReservationsPreserveImports(t *testing.T) {

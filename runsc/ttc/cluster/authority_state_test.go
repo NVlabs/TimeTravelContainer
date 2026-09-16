@@ -399,6 +399,38 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	}
 }
 
+func TestAuthorityMigrationTransactionBindsPhysicalSource(t *testing.T) {
+	at := time.Unix(2500, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "source", "incarnation-a", at.Add(-time.Second))
+	registerReadyAuthorityNode(t, state, "target", "incarnation-b", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "app", BranchID: "main", PhysicalContainer: "runtime-a", PhysicalBranch: "migration-old",
+		OwnerNode: "source", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}}))
+	applyAuthorityForTest(t, state, "begin", at.Add(time.Second), AuthorityPlacementBegin, AuthorityPlacementPayload{
+		Family: "app", Branch: "main", Owner: "source", Incarnation: "incarnation-a", Generation: created.Generation, Operation: "migration-next", Target: "target",
+	})
+	identity := testForkIdentity()
+	identity.TransactionID = "migration-next"
+	identity.Migration = true
+	identity.TargetContainer = identity.SourceContainer
+	identity.TargetBranch = "migration-next"
+	identity.TargetVisibleBranch = identity.SourceBranch
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := NewTransaction(identity, negotiated, at.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdTx := decodeAuthorityResultForTest[Transaction](t, applyAuthorityForTest(t, state, "transaction", at.Add(time.Second), AuthorityTransactionCreate, AuthorityTransactionPayload{Transaction: *tx}))
+	if createdTx.SourcePhysicalContainer != "runtime-a" || createdTx.SourcePhysicalBranch != "migration-old" {
+		t.Fatalf("transaction physical source = %s@%s, want runtime-a@migration-old", createdTx.SourcePhysicalContainer, createdTx.SourcePhysicalBranch)
+	}
+}
+
 func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()

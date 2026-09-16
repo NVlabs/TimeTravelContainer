@@ -148,10 +148,16 @@ type Transaction struct {
 	// SourceIncarnation is assigned by the replicated state machine when the
 	// transaction is created. Reusing a human node ID cannot satisfy an old
 	// target's volatile dependency.
-	SourceIncarnation string           `json:"source_incarnation,omitempty"`
-	TargetIncarnation string           `json:"target_incarnation,omitempty"`
-	SourceNeeded      bool             `json:"source_needed"`
-	Metrics           *TransferMetrics `json:"metrics,omitempty"`
+	SourceIncarnation string `json:"source_incarnation,omitempty"`
+	TargetIncarnation string `json:"target_incarnation,omitempty"`
+	// SourcePhysical* binds a migration's paused sparse provider to the exact
+	// runtime incarnation selected by placement when the transaction began.
+	// SourceBranch remains the stable logical identity and may be reused by
+	// later migrations before this provider becomes independent.
+	SourcePhysicalContainer string           `json:"source_physical_container,omitempty"`
+	SourcePhysicalBranch    string           `json:"source_physical_branch,omitempty"`
+	SourceNeeded            bool             `json:"source_needed"`
+	Metrics                 *TransferMetrics `json:"metrics,omitempty"`
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`

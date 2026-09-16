@@ -221,8 +221,12 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 				// BranchInfo. It must nevertheless be the bootstrap identity when
 				// this is the first physical Sentry for the family on this node.
 				for _, pending := range info.DistributedForkImports {
-					if pending.BranchID == branchID && pending.FilesystemBranch == filesystemBranch {
-						branch = &BranchInfo{ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch}
+					physicalBranch := pending.PhysicalBranchID
+					if physicalBranch == "" {
+						physicalBranch = pending.BranchID
+					}
+					if physicalBranch == branchID && pending.FilesystemBranch == filesystemBranch {
+						branch = &BranchInfo{ID: physicalBranch, ParentID: pending.ParentID, FilesystemBranch: pending.FilesystemBranch}
 						break
 					}
 				}
@@ -371,14 +375,17 @@ type RestoreOptions struct {
 // target stores must name the same shared TTC repository.
 type DistributedForkOptions struct {
 	SourceContainer string
-	TargetName      string
-	TargetBranch    string
-	VisibleBranch   string
-	ParentBranch    string
-	TransactionID   string
-	NodeID          string
-	SourceNode      string
-	Migration       bool
+	// SourcePhysicalBranch identifies the exact source Sentry branch for a
+	// migration whose logical branch has already crossed nodes before.
+	SourcePhysicalBranch string
+	TargetName           string
+	TargetBranch         string
+	VisibleBranch        string
+	ParentBranch         string
+	TransactionID        string
+	NodeID               string
+	SourceNode           string
+	Migration            bool
 	// AuthoritativeMigration means the target daemon has already validated the
 	// exact source, target, and operation against cluster authority. Physical
 	// family metadata may retain the branch's former local owner after an
@@ -475,7 +482,12 @@ func MemoryBranchKey(branch BranchInfo) string {
 // DistributedForkImport is a reserved but not yet visible branch imported
 // into an already-running target family.
 type DistributedForkImport struct {
-	BranchID                 string    `json:"branch_id"`
+	BranchID string `json:"branch_id"`
+	// PhysicalBranchID is the transaction-scoped Sentry branch that implements
+	// BranchID. It differs for migrations so an older, paused source incarnation
+	// can continue serving sparse pages while a newer incarnation returns to the
+	// same Sentry. BranchID remains the stable user-visible Raft identity.
+	PhysicalBranchID         string    `json:"physical_branch_id,omitempty"`
 	Quarantined              bool      `json:"quarantined,omitempty"`
 	ParentID                 string    `json:"parent_id,omitempty"`
 	FilesystemBranch         string    `json:"filesystem_branch"`
@@ -1636,8 +1648,12 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	targetParent := opts.ParentBranch
 	targetCreated := time.Now().UTC()
 	var migrationSource *BranchInfo
+	sourcePhysicalBranch := opts.SourcePhysicalBranch
+	if sourcePhysicalBranch == "" {
+		sourcePhysicalBranch = opts.VisibleBranch
+	}
 	for _, branch := range source.Branches {
-		if opts.Migration && branch.ID == opts.VisibleBranch {
+		if opts.Migration && branch.ID == sourcePhysicalBranch {
 			copy := branch
 			migrationSource = &copy
 			targetParent = branch.ParentID
@@ -1701,7 +1717,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 					return false, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", current.Name, branch.ID, current.BranchNodeID(branch.ID), opts.SourceNode)
 				}
 			}
-			if opts.Migration && !opts.AuthoritativeMigration && !branchExists && (migrationSource == nil || source.BranchNodeID(opts.VisibleBranch) != opts.SourceNode) {
+			if opts.Migration && !opts.AuthoritativeMigration && !branchExists && (migrationSource == nil || source.BranchNodeID(sourcePhysicalBranch) != opts.SourceNode) {
 				return false, fmt.Errorf("migration source branch %s@%s is absent from the source-owned family metadata", current.Name, opts.VisibleBranch)
 			}
 			if current.DistributedForkImports == nil {
@@ -1716,8 +1732,12 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 					return false, fmt.Errorf("branch %s@%s is already being imported", current.Name, opts.VisibleBranch)
 				}
 			}
+			physicalBranch := ""
+			if opts.Migration {
+				physicalBranch = opts.TargetBranch
+			}
 			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-				BranchID: opts.VisibleBranch, ParentID: targetParent, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
+				BranchID: opts.VisibleBranch, PhysicalBranchID: physicalBranch, ParentID: targetParent, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
 				State: "created", CreatedAt: targetCreated, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
 				AuthoritativeMigration: opts.AuthoritativeMigration,
 			}
@@ -1860,8 +1880,12 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
+	physicalBranch := opts.VisibleBranch
+	if opts.Migration {
+		physicalBranch = opts.TargetBranch
+	}
 	target.Branches = []BranchInfo{{
-		ID: opts.VisibleBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch,
+		ID: physicalBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch,
 		Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode,
 		ParentID: targetParent, CreatedAt: now, DistributedForkTransactionID: opts.TransactionID,
 	}}
@@ -3287,11 +3311,15 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 			}
 			current.DistributedForkHidden = false
 		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			physicalBranch := pending.PhysicalBranchID
+			if physicalBranch == "" {
+				physicalBranch = pending.BranchID
+			}
 			if pending.Migration {
 				found := false
 				for i := range current.Branches {
 					branch := &current.Branches[i]
-					if branch.ID != pending.BranchID {
+					if branch.ID != physicalBranch {
 						continue
 					}
 					if !pending.AuthoritativeMigration && branch.NodeID != pending.SourceNode {
@@ -3319,7 +3347,7 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					// the same branch set. Import the migrating branch alongside the
 					// existing local siblings only after placement has cut over.
 					current.Branches = append(current.Branches, BranchInfo{
-						ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt,
+						ID: physicalBranch, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt,
 						FilesystemBranch: pending.FilesystemBranch, Quarantined: pending.Quarantined,
 						NodeID: pending.TargetNode, State: pending.State, StorageState: "local", SourceNode: pending.SourceNode,
 						DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
@@ -3475,13 +3503,17 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		return info, candidate, info.DistributedForkTransactionID != transactionID || len(info.Branches) > 1, nil
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		branch = BranchInfo{ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}
+		physicalBranch := pending.PhysicalBranchID
+		if physicalBranch == "" {
+			physicalBranch = pending.BranchID
+		}
+		branch = BranchInfo{ID: physicalBranch, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}
 		// A migration replaces an existing logical branch. Preserve its display
 		// lineage and other stable metadata while the pending import supplies the
 		// new runtime/filesystem identities.
 		if pending.Migration {
 			for _, candidate := range info.Branches {
-				if candidate.ID == pending.BranchID {
+				if candidate.ID == physicalBranch {
 					branch = candidate
 					break
 				}

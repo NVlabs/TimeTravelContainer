@@ -1564,6 +1564,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return errors.New("elastic migration requires dynamic cluster discovery")
 	}
+	logicalTarget := target
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -1612,10 +1613,10 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
-	placement, err := placements.Lookup(logicalFamily, target.branch)
+	placement, err := placements.Lookup(logicalFamily, logicalTarget.branch)
 	if errors.Is(err, os.ErrNotExist) {
 		placement, err = placements.Create(cluster.PlacementRecord{
-			FamilyID: logicalFamily, BranchID: target.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
+			FamilyID: logicalFamily, BranchID: logicalTarget.branch, PhysicalContainer: info.ID, PhysicalBranch: target.branch,
 			OwnerNode: b.nodeID, OwnerIncarnation: sourceRecord.Incarnation, State: cluster.PlacementState(state),
 			FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
 			LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
@@ -1626,7 +1627,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		return err
 	}
 	if placement.OwnerNode == b.nodeID && placement.OwnerIncarnation != sourceRecord.Incarnation {
-		placement, err = placements.AdoptOwnerIncarnation(logicalFamily, target.branch, b.nodeID, placement.OwnerIncarnation, sourceRecord.Incarnation, placement.Generation, time.Now())
+		placement, err = placements.AdoptOwnerIncarnation(logicalFamily, logicalTarget.branch, b.nodeID, placement.OwnerIncarnation, sourceRecord.Incarnation, placement.Generation, time.Now())
 		if err != nil {
 			return fmt.Errorf("adopting placement after node restart: %w", err)
 		}
@@ -1635,38 +1636,38 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := placements.BeginMigration(logicalFamily, target.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
+	if _, err := placements.BeginMigration(logicalFamily, logicalTarget.branch, b.nodeID, sourceRecord.Incarnation, placement.Generation, requestID, targetNode, time.Now()); err != nil {
 		return err
 	}
 	rootfsDigest, err := distributedRootfsDigest(info, target.branch, b.distributedSource.capabilities.RepositoryID)
 	if err != nil {
-		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 		return err
 	}
 	identity := cluster.ForkIdentity{
 		TransactionID: requestID, SourceNodeID: b.nodeID, TargetNodeID: targetNode,
-		SourceContainer: logicalFamily, SourceBranch: target.branch,
-		TargetContainer: logicalFamily, TargetBranch: requestID, TargetVisibleBranch: target.branch,
+		SourceContainer: logicalFamily, SourceBranch: logicalTarget.branch,
+		TargetContainer: logicalFamily, TargetBranch: requestID, TargetVisibleBranch: logicalTarget.branch,
 		ImageDigest: info.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID, Migration: true,
 	}
 	family, err := b.portableDistributedFamily(info)
 	if err != nil {
-		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
 	if err != nil {
-		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 		return fmt.Errorf("reserving sparse migration target %q: %w", targetNode, err)
 	}
 	transferRetained := false
 	if len(persistentBranch.MemoryRootObjects) != 0 {
 		if err := b.retainDistributedGraphTransfer(requestID, info.ID, target.branch, branchGraphRootObjects(persistentBranch)); err != nil {
 			_, _ = peer.Cancel(ctx, requestID, tx.Revision)
-			_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+			_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 			return fmt.Errorf("retaining sparse migration source graph: %w", err)
 		}
 		transferRetained = true
@@ -1675,7 +1676,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	execSessions, sidecarErr := b.stopMigrationBranchSidecars(target, info)
 	if sidecarErr != nil {
 		_, _ = peer.Cancel(ctx, requestID, tx.Revision)
-		_, _ = placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now())
+		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 		if transferRetained {
 			_ = b.releaseDistributedGraphReferences(graphTransferReferenceOperation(requestID))
 		}
@@ -1728,7 +1729,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			// attempt to collide with it.
 			return fmt.Errorf("%w; restoring sparse migration source: %v; canceling sparse migration target: %v", cause, restoreErr, cancelErr)
 		}
-		if _, abortErr := placements.AbortMigration(logicalFamily, target.branch, requestID, time.Now()); abortErr != nil {
+		if _, abortErr := placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now()); abortErr != nil {
 			return fmt.Errorf("%w; restoring sparse migration source: %v; aborting placement: %v", cause, restoreErr, abortErr)
 		}
 		if restoreErr != nil {
@@ -1846,7 +1847,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if tx.TargetPhysicalContainer == "" || tx.TargetPhysicalBranch == "" || tx.TargetPhysicalIncarnation != targetRecord.Incarnation {
 		return abort(errors.New("published migration target omitted or changed its physical runtime identity"))
 	}
-	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, logicalFamily, target.branch, requestID, targetNode, targetRecord.Incarnation, tx.TargetPhysicalContainer, tx.TargetPhysicalBranch)
+	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, logicalFamily, logicalTarget.branch, requestID, targetNode, targetRecord.Incarnation, tx.TargetPhysicalContainer, tx.TargetPhysicalBranch)
 	if err != nil {
 		return abort(fmt.Errorf("publishing migration placement: %w", err))
 	}
@@ -1999,7 +2000,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 		if info.DistributedFamilyID != "" && info.DistributedForkTransactionID != "" {
 			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
 		}
-		return nil
+		return b.removeMigratedSourceMetadata(info, branchID)
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
 		families, listErr := b.listRuntimeFamilies()
@@ -2017,9 +2018,35 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 			}
 		}
 		// An idempotent retry may observe that the branch is already absent.
+		return b.removeMigratedSourceMetadata(info, branchID)
+	}
+	return b.removeMigratedSourceMetadata(info, branchID)
+}
+
+// removeMigratedSourceMetadata drops the retired physical incarnation after
+// its sparse consumers have become independent. Logical identity and current
+// placement live in Raft; retaining this record would leak one branch, one
+// filesystem pointer, and its console artifacts per migration and would make a
+// later return to this Sentry collide with an obsolete name.
+func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerInfo, branchID string) error {
+	var branch ttcbundle.BranchInfo
+	found := false
+	for _, candidate := range info.Branches {
+		if candidate.ID == branchID {
+			branch, found = candidate, true
+			break
+		}
+	}
+	if !found {
 		return nil
 	}
-	return nil
+	var result error
+	result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, branch))
+	result = errors.Join(result, b.containerStore().RemoveBranchArtifacts(info.ID, branch))
+	if result == nil {
+		result = b.containerStore().RemoveBranchRecord(info.ID, branchID)
+	}
+	return result
 }
 
 func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
@@ -2095,7 +2122,11 @@ func pendingDistributedTarget(info ttcbundle.ContainerInfo, branchID, nodeID str
 		}
 	}
 	for _, pending := range info.DistributedForkImports {
-		if pending.BranchID == branchID && pending.TargetNode == nodeID {
+		physicalBranch := pending.PhysicalBranchID
+		if physicalBranch == "" {
+			physicalBranch = pending.BranchID
+		}
+		if physicalBranch == branchID && pending.TargetNode == nodeID {
 			return true
 		}
 	}
@@ -2218,7 +2249,7 @@ func provisionalRaftTargetAuthorized(info ttcbundle.ContainerInfo, branchID, nod
 		tx, err := load(transactionID)
 		if err != nil || tx == nil || tx.Identity.TransactionID != transactionID ||
 			tx.Identity.TargetNodeID != nodeID || tx.TargetIncarnation != incarnation ||
-			tx.Identity.VisibleTargetBranch() != branchID ||
+			(tx.Identity.VisibleTargetBranch() != branchID && tx.Identity.TargetBranch != branchID) ||
 			(tx.Identity.TargetContainer != info.ID && tx.Identity.TargetContainer != info.Name) {
 			continue
 		}
@@ -2259,7 +2290,12 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 		return false
 	}
 	for _, tx := range records {
-		if !tx.Identity.Migration || tx.Identity.SourceNodeID != b.nodeID || tx.Identity.SourceContainer != logicalFamily || tx.Identity.SourceBranch != branchID ||
+		sourcePhysicalBranch := tx.SourcePhysicalBranch
+		if sourcePhysicalBranch == "" {
+			sourcePhysicalBranch = tx.Identity.SourceBranch
+		}
+		if !tx.Identity.Migration || tx.Identity.SourceNodeID != b.nodeID || tx.Identity.SourceContainer != logicalFamily ||
+			(tx.SourcePhysicalContainer != "" && tx.SourcePhysicalContainer != containerID) || sourcePhysicalBranch != branchID ||
 			tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 			continue
 		}
