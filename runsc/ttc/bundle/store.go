@@ -15,6 +15,7 @@
 package bundle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -910,7 +911,7 @@ func materializePortableInternalMounts(bundleDir, directory string, mounts []Por
 			continue
 		}
 		name := filepath.Join(directory, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
-		if err := os.WriteFile(name, portable.Contents, portable.Mode.Perm()); err != nil {
+		if err := replacePortableInternalMount(name, portable.Contents, portable.Mode.Perm()); err != nil {
 			return fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
 		}
 		mount.Source = name
@@ -920,6 +921,44 @@ func materializePortableInternalMounts(bundleDir, directory string, mounts []Por
 		return fmt.Errorf("portable TTC internal mounts do not match OCI declarations: declared=%d supplied=%d matched=%d", len(destinations), len(provided), rewritten)
 	}
 	return writeJSON(configPath, &spec)
+}
+
+// replacePortableInternalMount atomically installs an immutable internal
+// mount. These files are commonly mode 0444, so a later remote fork imported
+// into the same physical family cannot update them with os.WriteFile: opening
+// the existing inode for truncation fails with EACCES. Replacing the directory
+// entry also avoids exposing a partially rewritten hostname/hosts/resolv.conf
+// to a concurrently starting branch.
+func replacePortableInternalMount(path string, contents []byte, mode os.FileMode) error {
+	if existing, err := os.ReadFile(path); err == nil {
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().Perm() == mode && bytes.Equal(existing, contents) {
+			return nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(mode); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(contents); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
 }
 
 // ConsolePaths are persistent host-side files for one branch-local console.

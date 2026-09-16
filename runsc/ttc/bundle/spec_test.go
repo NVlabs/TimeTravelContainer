@@ -110,6 +110,21 @@ func TestMaterializePortableInternalMountsDoesNotReadSourcePath(t *testing.T) {
 	if string(contents) != "portable\n" {
 		t.Fatalf("portable contents=%q", contents)
 	}
+	// Repeated imports into one physical distributed family reuse these
+	// read-only files. A changed value must replace rather than truncate the
+	// immutable inode.
+	if err := MaterializePortableInternalMounts(bundleDir, []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("second\n"), Mode: 0444,
+	}}); err != nil {
+		t.Fatalf("replacing read-only portable mount: %v", err)
+	}
+	contents, err = os.ReadFile(filepath.Join(bundleDir, "internal-mounts", "0-hostname"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "second\n" {
+		t.Fatalf("replacement contents=%q", contents)
+	}
 }
 
 func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
