@@ -45,3 +45,43 @@ func TestConvertXstateLayoutRelocatesComponents(t *testing.T) {
 		t.Fatal("AVX component remained at its source offset")
 	}
 }
+
+func TestConvertXstateLayoutRelocatesAVX512Components(t *testing.T) {
+	tests := []struct {
+		name                       string
+		feature                    uint64
+		sourceOffset, targetOffset uint32
+		size                       uint32
+		fill                       byte
+	}{
+		{name: "avx", feature: cpuid.XSAVEFeatureAVX, sourceOffset: 576, targetOffset: 640, size: 256, fill: 0x22},
+		{name: "avx512-opmask", feature: cpuid.XSAVEFeatureAVX512op, sourceOffset: 896, targetOffset: 960, size: 64, fill: 0x55},
+		{name: "avx512-zmm0-15", feature: cpuid.XSAVEFeatureAVX512zmm0, sourceOffset: 1024, targetOffset: 1152, size: 512, fill: 0x66},
+		{name: "avx512-zmm16-31", feature: cpuid.XSAVEFeatureAVX512zmm16, sourceOffset: 1664, targetOffset: 1792, size: 1024, fill: 0x77},
+	}
+	source := XstateLayout{UseXsave: true, Size: 3072}
+	target := XstateLayout{UseXsave: true, Size: 3072}
+	src := make([]byte, source.Size)
+	dst := make([]byte, target.Size)
+	savedBV := uint64(fxsaveBV)
+	for _, test := range tests {
+		bit := uint(0)
+		for test.feature != uint64(1)<<bit {
+			bit++
+		}
+		source.Components[bit] = XstateComponent{Offset: test.sourceOffset, Size: test.size}
+		target.Components[bit] = XstateComponent{Offset: test.targetOffset, Size: test.size}
+		copy(src[test.sourceOffset:test.sourceOffset+test.size], bytes.Repeat([]byte{test.fill}, int(test.size)))
+		savedBV |= test.feature
+	}
+
+	convertXstateLayout(dst, src, source, target, savedBV)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := dst[test.targetOffset : test.targetOffset+test.size]
+			if !bytes.Equal(got, bytes.Repeat([]byte{test.fill}, int(test.size))) {
+				t.Fatalf("component was not relocated from offset %d to %d", test.sourceOffset, test.targetOffset)
+			}
+		})
+	}
+}
