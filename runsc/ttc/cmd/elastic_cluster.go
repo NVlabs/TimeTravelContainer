@@ -605,6 +605,17 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if _, alive := liveSandboxes[physicalContainer]; alive {
 				continue
 			}
+			// Stop and dehydration deliberately release the physical runtime
+			// before their immutable capture has finished publishing. The Raft
+			// placement remains live until publication commit atomically installs
+			// the durable roots and unplaces the branch. Do not confuse that
+			// generation-fenced process-free interval with unexpected runtime
+			// loss. Local lifecycle strings are intentionally insufficient proof:
+			// after a daemon crash they may be stale or describe an incomplete
+			// capture. Only the exact active Raft publication authorizes it.
+			if placementHasProcessFreePublication(authorityState, record) {
+				continue
+			}
 			reason := fmt.Sprintf("physical runtime %q on node %q was lost while branch was %s", physicalContainer, b.nodeID, record.State)
 			if _, corruptErr := b.distributedSource.authority.MarkBranchCorrupted(record.FamilyID, record.BranchID, reason); corruptErr != nil {
 				result = errors.Join(result, fmt.Errorf("fencing lost placement %s@%s: %w", record.FamilyID, record.BranchID, corruptErr))
@@ -720,6 +731,28 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 	}
 	return result
+}
+
+// placementHasProcessFreePublication reports whether Raft has authorized the
+// exact placement generation to be temporarily process-free while its sealed
+// state is published. Publication commit atomically changes the placement to
+// unplaced, so committed or terminal publications never need this exception.
+func placementHasProcessFreePublication(state *cluster.AuthorityState, placement cluster.PlacementRecord) bool {
+	branch, ok := state.Branches[placement.FamilyID+"\x00"+placement.BranchID]
+	if !ok || branch.Corrupted || branch.Generation != placement.Generation || branch.PublicationID == "" {
+		return false
+	}
+	if branch.Lifecycle != "dehydrating" && branch.Lifecycle != "exited" {
+		return false
+	}
+	for _, publication := range state.Publications {
+		if publication.FamilyID != placement.FamilyID || publication.BranchID != placement.BranchID ||
+			publication.BranchGeneration != placement.Generation || publication.PublicationID != branch.PublicationID {
+			continue
+		}
+		return publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady
+	}
+	return false
 }
 
 // liveRuntimeSandboxes returns physical runsc container IDs whose Sentry host

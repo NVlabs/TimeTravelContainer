@@ -877,6 +877,50 @@ func TestExecutionRevocationSkipsPausedMigrationProviderCleanup(t *testing.T) {
 	}
 }
 
+func TestPlacementHasProcessFreePublication(t *testing.T) {
+	placement := cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "main", Generation: 7,
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}
+	state := cluster.NewAuthorityState()
+	state.Branches["family\x00main"] = cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "main", Generation: 7,
+		Lifecycle: "dehydrating", PublicationID: "publication-1",
+	}
+	state.Publications["arbitrary-map-key"] = cluster.PublicationRecord{
+		FamilyID: "family", BranchID: "main", BranchGeneration: 7,
+		PublicationID: "publication-1", Lifecycle: "dehydrated", State: cluster.PublicationPreparing,
+	}
+	if !placementHasProcessFreePublication(state, placement) {
+		t.Fatal("exact preparing dehydration publication did not authorize a process-free placement")
+	}
+	publication := state.Publications["arbitrary-map-key"]
+	publication.State = cluster.PublicationReady
+	state.Publications["arbitrary-map-key"] = publication
+	if !placementHasProcessFreePublication(state, placement) {
+		t.Fatal("capture-ready dehydration publication did not authorize a process-free placement")
+	}
+	publication.State = cluster.PublicationCommitted
+	state.Publications["arbitrary-map-key"] = publication
+	if placementHasProcessFreePublication(state, placement) {
+		t.Fatal("committed publication authorized a stale live placement")
+	}
+	publication.State = cluster.PublicationPreparing
+	publication.BranchGeneration++
+	state.Publications["arbitrary-map-key"] = publication
+	if placementHasProcessFreePublication(state, placement) {
+		t.Fatal("another generation's publication authorized the placement")
+	}
+	publication.BranchGeneration = placement.Generation
+	state.Publications["arbitrary-map-key"] = publication
+	branch := state.Branches["family\x00main"]
+	branch.Corrupted = true
+	state.Branches["family\x00main"] = branch
+	if placementHasProcessFreePublication(state, placement) {
+		t.Fatal("corrupted branch publication authorized the placement")
+	}
+}
+
 func TestExecutionRevocationAcceptsMigrationCleanupWithCompletedRemoval(t *testing.T) {
 	previous := map[string]struct{}{
 		"family\x00migrated": {},
