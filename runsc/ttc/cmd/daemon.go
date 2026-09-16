@@ -4867,7 +4867,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			writeError(err)
 			return
 		}
-		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode && daemonCommandMayAwaitColdUnplacement(s.dataRoot, request.Args) {
+		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode && daemonCommandMayAwaitColdUnplacement(s.dataRoot, s.clusterPlacements, request.Args) {
 			// Dehydrate/stop return after the process-free local capture is safe,
 			// while publication to shared storage is intentionally asynchronous.
 			// Wait outside every lifecycle lock for its atomic Raft commit, then

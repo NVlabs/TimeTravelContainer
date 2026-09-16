@@ -258,10 +258,10 @@ func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !daemonCommandMayAwaitColdUnplacement(root, []string{"rehydrate", "web@cold"}) {
+	if !daemonCommandMayAwaitColdUnplacement(root, nil, []string{"rehydrate", "web@cold"}) {
 		t.Fatal("cold rehydrate was not recognized as an asynchronous publication race")
 	}
-	if daemonCommandMayAwaitColdUnplacement(root, []string{"exec", "web@cold", "true"}) {
+	if daemonCommandMayAwaitColdUnplacement(root, nil, []string{"exec", "web@cold", "true"}) {
 		t.Fatal("non-lifecycle command may wait for cold unplacement")
 	}
 	info, err := (ttcbundle.Store{Root: root}).LoadContainer("web")
@@ -272,8 +272,60 @@ func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
 	if err := writeCurrentBundleFixture(path, info); err != nil {
 		t.Fatal(err)
 	}
-	if daemonCommandMayAwaitColdUnplacement(root, []string{"rehydrate", "web@cold"}) {
+	if daemonCommandMayAwaitColdUnplacement(root, nil, []string{"rehydrate", "web@cold"}) {
 		t.Fatal("running branch may wait for conflicting placement")
+	}
+}
+
+type branchAwarePlacementCatalog struct {
+	cluster.PlacementCatalog
+	branches map[string]cluster.BranchAuthority
+}
+
+func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.BranchAuthority, error) {
+	record, ok := c.branches[family+"\x00"+branch]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &record, nil
+}
+
+func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "containers", "family-id", "container.json")
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(path), "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(filepath.Dir(path), "bundle")
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately stale derived metadata still describes a running branch.
+	if err := writeCurrentBundleFixture(path, ttcbundle.ContainerInfo{
+		ID: "family-id", Name: "web", State: "running", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "cold", State: "running"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base, err := cluster.OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := branchAwarePlacementCatalog{
+		PlacementCatalog: base,
+		branches: map[string]cluster.BranchAuthority{"family-id\x00cold": {
+			FamilyID: "family-id", BranchID: "cold", Generation: 3,
+			Lifecycle: "dehydrating", PublicationID: "publication-3",
+		}},
+	}
+	if !daemonCommandMayAwaitColdUnplacement(root, catalog, []string{"rehydrate", "web@cold"}) {
+		t.Fatal("Raft-authorized process-free publication was hidden by stale derived metadata")
+	}
+	branch := catalog.branches["family-id\x00cold"]
+	branch.Lifecycle = "running"
+	catalog.branches["family-id\x00cold"] = branch
+	if daemonCommandMayAwaitColdUnplacement(root, catalog, []string{"rehydrate", "web@cold"}) {
+		t.Fatal("running Raft branch may wait for conflicting placement")
 	}
 }
 

@@ -851,29 +851,56 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 // its Raft commit. Running branches must still reject a conflicting --node
 // immediately; only process-free lifecycle operations may wait for ownership
 // to become unplaced.
-func daemonCommandMayAwaitColdUnplacement(dataRoot string, args []string) bool {
+func daemonCommandMayAwaitColdUnplacement(dataRoot string, placements cluster.PlacementCatalog, args []string) bool {
 	if dataRoot == "" || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start") {
 		return false
 	}
 	store := ttcbundle.Store{Root: dataRoot}
+	authority, authoritative := placements.(interface {
+		Branch(family, branch string) (*cluster.BranchAuthority, error)
+	})
 	found := false
 	for _, operand := range args[1:] {
 		target, err := parseSelector(operand)
 		if err != nil {
 			continue
 		}
-		info, err := store.LoadContainer(target.container)
-		if err != nil {
-			return false
+		info, loadErr := store.LoadContainer(target.container)
+		familyID := ""
+		if loadErr == nil {
+			familyID = logicalFamilyID(info)
+		} else {
+			familyID, err = resolvePlacementFamily(placements, target.container)
+			if err != nil {
+				return false
+			}
 		}
-		branch, err := persistentBranchInfo(info, target.branch)
-		if err != nil {
-			return false
-		}
-		switch normalizeLifecycleState(branch.State) {
-		case "dehydrating", "dehydrated", "exited", "materializing":
-		default:
-			return false
+		if authoritative {
+			branch, err := authority.Branch(familyID, target.branch)
+			if err != nil || branch.Corrupted || branch.PublicationID == "" {
+				return false
+			}
+			switch normalizeLifecycleState(branch.Lifecycle) {
+			case "dehydrating", "exited":
+			default:
+				return false
+			}
+		} else {
+			// Non-Raft catalogs are used by standalone compatibility tests. In
+			// production, never let eventually updated filesystem metadata
+			// override the linearizable branch authority above.
+			if loadErr != nil {
+				return false
+			}
+			branch, err := persistentBranchInfo(info, target.branch)
+			if err != nil {
+				return false
+			}
+			switch normalizeLifecycleState(branch.State) {
+			case "dehydrating", "dehydrated", "exited", "materializing":
+			default:
+				return false
+			}
 		}
 		found = true
 	}
