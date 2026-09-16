@@ -1074,53 +1074,18 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 	f := fd.inode().impl.(*regularFile)
 	if f.inode.fs.diskVolume != nil {
-		if err := f.ensureDiskData(); err != nil {
-			return 0, err
-		}
-		f.diskIOMu.Lock()
-		defer f.diskIOMu.Unlock()
-		file, _, err := f.openDiskIOLocked(false, nil)
-		if err != nil {
-			return 0, err
-		}
-		const maxBounce = 64 << 10
-		buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
-		var done int64
-		for dst.NumBytes() != 0 {
-			want := min(dst.NumBytes(), int64(len(buf)))
-			n, readErr := file.ReadAt(buf[:want], offset+done)
-			if n != 0 {
-				copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
-				done += int64(copied)
-				dst = dst.DropFirst(copied)
-				if copyErr != nil {
-					return done, copyErr
-				}
-				if copied != n {
-					return done, io.ErrShortWrite
-				}
-			}
-			if readErr != nil {
-				if readErr == io.EOF && done != 0 {
-					readErr = nil
-				}
-				oldAtime := f.inode.atime.Load()
-				f.inode.touchAtime(fd.vfsfd.Mount())
-				if f.inode.atime.Load() != oldAtime {
-					f.markDiskMetadataDirty()
-				}
-				return done, readErr
-			}
-			if n == 0 {
-				return done, io.ErrNoProgress
+		n, err, updateAtime := f.preadDisk(ctx, dst, offset)
+		// Writers take inode.mu before diskIOMu. Release diskIOMu before
+		// touchAtime takes inode.mu to preserve that global order; retaining
+		// diskIOMu here deadlocks a growing writer against a concurrent reader.
+		if updateAtime {
+			oldAtime := f.inode.atime.Load()
+			f.inode.touchAtime(fd.vfsfd.Mount())
+			if f.inode.atime.Load() != oldAtime {
+				f.markDiskMetadataDirty()
 			}
 		}
-		oldAtime := f.inode.atime.Load()
-		f.inode.touchAtime(fd.vfsfd.Mount())
-		if f.inode.atime.Load() != oldAtime {
-			f.markDiskMetadataDirty()
-		}
-		return done, nil
+		return n, err
 	}
 	// memCgID can be 0 here because regularFileReadWriter.ReadToBlocks() never
 	// allocates from pgalloc.
@@ -1129,6 +1094,48 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	putRegularFileReadWriter(rw)
 	fd.inode().touchAtime(fd.vfsfd.Mount())
 	return n, err
+}
+
+// preadDisk reads from the branch's current disk object. updateAtime reports
+// whether the read reached an ordinary completion point. The caller must apply
+// that metadata update only after this method releases diskIOMu.
+func (f *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, offset int64) (done int64, err error, updateAtime bool) {
+	if err := f.ensureDiskData(); err != nil {
+		return 0, err, false
+	}
+	f.diskIOMu.Lock()
+	defer f.diskIOMu.Unlock()
+	file, _, err := f.openDiskIOLocked(false, nil)
+	if err != nil {
+		return 0, err, false
+	}
+	const maxBounce = 64 << 10
+	buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
+	for dst.NumBytes() != 0 {
+		want := min(dst.NumBytes(), int64(len(buf)))
+		n, readErr := file.ReadAt(buf[:want], offset+done)
+		if n != 0 {
+			copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
+			done += int64(copied)
+			dst = dst.DropFirst(copied)
+			if copyErr != nil {
+				return done, copyErr, false
+			}
+			if copied != n {
+				return done, io.ErrShortWrite, false
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF && done != 0 {
+				readErr = nil
+			}
+			return done, readErr, true
+		}
+		if n == 0 {
+			return done, io.ErrNoProgress, false
+		}
+	}
+	return done, nil, true
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

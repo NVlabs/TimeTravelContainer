@@ -15,6 +15,7 @@
 package tmpfs
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 func TestMaterializationDoesNotLockUnrelatedFile(t *testing.T) {
@@ -216,6 +218,68 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	}
 	if currentObject != after.Object {
 		t.Fatalf("current read cache object=%q, want %q", currentObject, after.Object)
+	}
+}
+
+func TestDiskVolumeReadDataPathDoesNotTakeInodeLock(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("read-lock-order-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "growing", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	want := bytes.Repeat([]byte("x"), 64<<10)
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, want, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	fs := &filesystem{diskVolume: &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch}}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	file.inode.nlink.Store(1)
+	file.size.Store(uint64(len(want)))
+	defer file.invalidateDiskIO()
+	ctx := contexttest.Context(t)
+
+	// A growing write holds inode.mu and then takes diskIOMu. The read data
+	// path must therefore finish without inode.mu; PRead applies atime only
+	// after preadDisk has released diskIOMu. The former reverse order deadlocked
+	// a reader against the final growing write of a large file.
+	file.inode.mu.Lock()
+	type result struct {
+		data        []byte
+		n           int64
+		err         error
+		updateAtime bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		got := make([]byte, len(want))
+		n, err, updateAtime := file.preadDisk(ctx, usermem.BytesIOSequence(got), 0)
+		done <- result{data: got, n: n, err: err, updateAtime: updateAtime}
+	}()
+	select {
+	case got := <-done:
+		file.inode.mu.Unlock()
+		if got.err != nil || got.n != int64(len(want)) || !got.updateAtime {
+			t.Fatalf("preadDisk: n=%d updateAtime=%t err=%v", got.n, got.updateAtime, got.err)
+		}
+		if !bytes.Equal(got.data, want) {
+			t.Fatal("preadDisk data mismatch")
+		}
+	case <-time.After(time.Second):
+		file.inode.mu.Unlock()
+		t.Fatal("disk read data path waited for inode.mu")
 	}
 }
 
