@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -345,6 +346,59 @@ func TestAuthorityCleanNodeRetirementRevokesSharedGCLease(t *testing.T) {
 	}
 	if state.NextSharedGCGeneration != lease.Generation+1 {
 		t.Fatalf("clean retirement changed generation sequence: next=%d, lease=%d", state.NextSharedGCGeneration, lease.Generation)
+	}
+}
+
+func TestAuthorityCleanNodeRetirementRemovesDiscoveryRecord(t *testing.T) {
+	at := time.Unix(1875, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	applyAuthorityForTest(t, state, "draining", at.Add(time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeDraining, LeaseDuration: time.Hour,
+	})
+	applyAuthorityForTest(t, state, "offline", at.Add(2*time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeOffline,
+	})
+	record := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "remove", at.Add(3*time.Second), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: record.NodeID, Incarnation: record.Incarnation, Revision: record.Revision,
+	})
+	if _, ok := state.Nodes["node-a"]; ok {
+		t.Fatal("cleanly retired node remains in discovery state")
+	}
+}
+
+func TestAuthorityClusterPolicyChangesOnlyWhenFullyStopped(t *testing.T) {
+	at := time.Unix(1880, 0).UTC()
+	state := NewAuthorityState()
+	policy := ClusterRuntimePolicy{
+		Version: 1, PagingPolicy: testCapabilities("node-a").PagingPolicy,
+		LeaseDuration: 15 * time.Second, MaxTransactions: 32, AutoRebalance: true,
+	}
+	applyAuthorityForTest(t, state, "policy-initial", at, AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{Policy: policy})
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(time.Second))
+	changed := policy
+	changed.AutoRebalance = false
+	command, err := NewAuthorityCommand("policy-live", at.Add(2*time.Second), AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{
+		ExpectedRevision: state.ClusterPolicy.Revision, Policy: changed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Apply(command).Err(); err == nil || !strings.Contains(err.Error(), "live execution lease") {
+		t.Fatalf("live policy change error=%v", err)
+	}
+	applyAuthorityForTest(t, state, "draining", at.Add(3*time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeDraining, LeaseDuration: time.Hour,
+	})
+	applyAuthorityForTest(t, state, "offline", at.Add(4*time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeOffline,
+	})
+	updated := decodeAuthorityResultForTest[ClusterRuntimePolicy](t, applyAuthorityForTest(t, state, "policy-stopped", at.Add(5*time.Second), AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{
+		ExpectedRevision: state.ClusterPolicy.Revision, Policy: changed,
+	}))
+	if updated.AutoRebalance || updated.Revision != 2 {
+		t.Fatalf("updated policy=%+v", updated)
 	}
 }
 

@@ -28,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcremote"
 )
 
 const (
@@ -46,6 +48,8 @@ const (
 	AuthorityNodeRenew             AuthorityCommandKind = "node-renew"
 	AuthorityNodeTransition        AuthorityCommandKind = "node-transition"
 	AuthorityNodeExpire            AuthorityCommandKind = "node-expire"
+	AuthorityNodeRemove            AuthorityCommandKind = "node-remove"
+	AuthorityClusterPolicySet      AuthorityCommandKind = "cluster-policy-set"
 	AuthorityCapacityReserve       AuthorityCommandKind = "capacity-reserve"
 	AuthorityCapacityComplete      AuthorityCommandKind = "capacity-complete"
 	AuthorityCapacityRelease       AuthorityCommandKind = "capacity-release"
@@ -243,6 +247,7 @@ type AuthorityState struct {
 	// zero in the replicated FSM and snapshots, and lets remote readers convert
 	// lease deadlines without assuming wall-clock synchronization.
 	LeaderObservedAt time.Time                          `json:"leader_observed_at,omitempty"`
+	ClusterPolicy    ClusterRuntimePolicy               `json:"cluster_policy,omitempty"`
 	Nodes            map[string]NodeRecord              `json:"nodes,omitempty"`
 	Placements       map[string]PlacementRecord         `json:"placements,omitempty"`
 	Transactions     map[string]Transaction             `json:"transactions,omitempty"`
@@ -450,6 +455,10 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
+	case AuthorityNodeRemove:
+		s.Nodes = cloneAuthorityMap(s.Nodes)
+	case AuthorityClusterPolicySet:
+		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
 		AuthorityPlacementCommit, AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
 		AuthorityPlacementStableState, AuthorityPlacementRemove:
@@ -540,6 +549,41 @@ type AuthorityNodeTransitionPayload struct {
 type AuthorityNodeExpirePayload struct {
 	NodeID, Incarnation string
 	Revision            uint64
+}
+
+type AuthorityNodeRemovePayload struct {
+	NodeID, Incarnation string
+	Revision            uint64
+}
+
+// ClusterRuntimePolicy is the small operational policy replicated by Raft.
+// It may change only while no daemon has a live execution lease. CPU state is
+// intentionally absent: the CPU profile is an immutable snapshot ABI.
+type ClusterRuntimePolicy struct {
+	Version         int              `json:"version"`
+	Revision        uint64           `json:"revision"`
+	PagingPolicy    ttcremote.Policy `json:"paging_policy"`
+	LeaseDuration   time.Duration    `json:"lease_duration_ns"`
+	MaxTransactions int              `json:"max_transactions"`
+	AutoRebalance   bool             `json:"auto_rebalance"`
+}
+
+func (p ClusterRuntimePolicy) Validate() error {
+	if p.Version != 1 {
+		return fmt.Errorf("unsupported cluster runtime policy version %d", p.Version)
+	}
+	if p.LeaseDuration <= 0 {
+		return errors.New("cluster lease duration must be positive")
+	}
+	if p.MaxTransactions <= 0 {
+		return errors.New("cluster transaction limit must be positive")
+	}
+	return p.PagingPolicy.Validate()
+}
+
+type AuthorityClusterPolicyPayload struct {
+	ExpectedRevision uint64               `json:"expected_revision"`
+	Policy           ClusterRuntimePolicy `json:"policy"`
 }
 type AuthorityCapacityPayload struct {
 	NodeID, Incarnation, OperationID, SourceNode string
@@ -640,9 +684,11 @@ type ForkPublishResult struct {
 
 func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error) {
 	switch command.Kind {
-	case AuthorityNodeRegister, AuthorityNodeRenew, AuthorityNodeTransition, AuthorityNodeExpire,
+	case AuthorityNodeRegister, AuthorityNodeRenew, AuthorityNodeTransition, AuthorityNodeExpire, AuthorityNodeRemove,
 		AuthorityCapacityReserve, AuthorityCapacityComplete, AuthorityCapacityRelease:
 		return s.applyNode(command)
+	case AuthorityClusterPolicySet:
+		return s.applyClusterPolicy(command)
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover, AuthorityPlacementCommit,
 		AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
 		AuthorityPlacementStableState, AuthorityPlacementRemove:
@@ -667,6 +713,27 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 	default:
 		return nil, fmt.Errorf("unknown authority command %q", command.Kind)
 	}
+}
+
+func (s *AuthorityState) applyClusterPolicy(command AuthorityCommand) (json.RawMessage, error) {
+	p, err := decodeAuthorityPayload[AuthorityClusterPolicyPayload](command)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.Policy.Validate(); err != nil {
+		return nil, err
+	}
+	if s.ClusterPolicy.Revision != p.ExpectedRevision {
+		return nil, errors.New("stale cluster runtime policy revision")
+	}
+	for _, node := range s.Nodes {
+		if node.State != NodeOffline && node.LeaseActive(command.IssuedAt) {
+			return nil, fmt.Errorf("cluster runtime policy cannot change while node %q has a live execution lease", node.NodeID)
+		}
+	}
+	p.Policy.Revision = s.ClusterPolicy.Revision + 1
+	s.ClusterPolicy = p.Policy
+	return authorityValue(p.Policy)
 }
 
 func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessage, error) {
@@ -1104,6 +1171,59 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		s.Nodes[p.NodeID] = record
 		s.invalidateNodeIncarnation(p.NodeID, p.Incarnation, true,
 			"authoritative node state was lost after its execution lease expired", command.IssuedAt)
+		return authorityValue(record)
+	case AuthorityNodeRemove:
+		p, err := decodeAuthorityPayload[AuthorityNodeRemovePayload](command)
+		if err != nil {
+			return nil, err
+		}
+		record, ok := s.Nodes[p.NodeID]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		if record.Incarnation != p.Incarnation || record.Revision != p.Revision {
+			return nil, errors.New("stale node retirement fence")
+		}
+		if record.State != NodeOffline {
+			return nil, errors.New("node must be offline before removing its membership record")
+		}
+		if s.SharedGC.NodeID == p.NodeID && s.SharedGC.Incarnation == p.Incarnation {
+			return nil, errors.New("node still owns the shared GC lease")
+		}
+		for _, placement := range s.Placements {
+			if placement.OwnerNode == p.NodeID && placement.OwnerIncarnation == p.Incarnation {
+				return nil, errors.New("node still owns branch placements")
+			}
+		}
+		for _, tx := range s.Transactions {
+			if tx.Terminal() {
+				continue
+			}
+			if (tx.Identity.SourceNodeID == p.NodeID && tx.SourceIncarnation == p.Incarnation && tx.SourceNeeded) ||
+				(tx.Identity.TargetNodeID == p.NodeID && tx.TargetIncarnation == p.Incarnation) {
+				return nil, errors.New("node still participates in a nonterminal distributed transaction")
+			}
+		}
+		for _, branch := range s.Branches {
+			for _, dependency := range branch.VolatileDependencies {
+				if dependency.SourceNode == p.NodeID && dependency.SourceIncarnation == p.Incarnation {
+					return nil, errors.New("node still provides volatile branch state")
+				}
+			}
+		}
+		for _, origin := range s.VolatileOrigins {
+			if origin.NodeID == p.NodeID {
+				return nil, errors.New("node still provides volatile snapshot origins")
+			}
+		}
+		for _, other := range s.Nodes {
+			for _, reservation := range other.IncomingReservations {
+				if reservation.SourceNode == p.NodeID && reservation.CompletedAt.IsZero() {
+					return nil, errors.New("node still owns an incoming-capacity reservation")
+				}
+			}
+		}
+		delete(s.Nodes, p.NodeID)
 		return authorityValue(record)
 	default:
 		p, err := decodeAuthorityPayload[AuthorityCapacityPayload](command)
@@ -1976,6 +2096,11 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 		return nil, errors.New("authority snapshot has invalid monotonic allocator state")
 	}
 	state.initMaps()
+	if state.ClusterPolicy.Revision != 0 {
+		if err := state.ClusterPolicy.Validate(); err != nil {
+			return nil, fmt.Errorf("authority snapshot cluster runtime policy: %w", err)
+		}
+	}
 	for _, node := range state.Nodes {
 		if err := node.Validate(); err != nil {
 			return nil, err

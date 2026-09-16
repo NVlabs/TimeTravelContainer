@@ -499,6 +499,36 @@ func localNodeIncarnation(localRoot, nodeID string) (string, error) {
 	return incarnation, nil
 }
 
+// removeLocalNodeIncarnation completes a clean identity retirement. A later
+// daemon start on the same scratch root is intentionally a new incarnation;
+// crash recovery, by contrast, retains this file and resumes the fenced epoch.
+func removeLocalNodeIncarnation(localRoot, nodeID, incarnation string) error {
+	path := filepath.Join(localRoot, "cluster", "node-incarnation.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var record daemonNodeIncarnation
+	if err := json.Unmarshal(data, &record); err != nil {
+		return fmt.Errorf("decoding retired local node incarnation: %w", err)
+	}
+	if record.NodeID != nodeID || record.Incarnation != incarnation {
+		return errors.New("refusing to remove a different local node incarnation")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	return errors.Join(syncErr, directory.Close())
+}
+
 type daemonTargetRuntime struct {
 	backend     *runtimeBackend
 	nodeID      string
@@ -3414,7 +3444,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
 	}
 	opts.ResolvedCPU = resolvedCPU
-	if err := applyImmutableClusterConfig(dataRoot, opts.RaftBootstrap, localRaftState, &opts); err != nil {
+	pendingClusterPolicy, err := applyImmutableClusterConfig(dataRoot, opts.RaftBootstrap, localRaftState, &opts)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
@@ -3637,6 +3668,18 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, errors.New("joined TTC Raft member could not discover the elected leader")
 		}
 	}
+	if opts.RaftBootstrap || localRaftState {
+		base := immutableClusterConfigFromOptions(opts)
+		policy, err := reconcileClusterRuntimePolicy(raftNode, dataRoot, base, pendingClusterPolicy)
+		if err != nil {
+			return nil, err
+		}
+		applyClusterRuntimePolicy(&opts, policy)
+		capabilities.PagingPolicy = opts.PagingPolicy
+		if err := capabilities.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	catalog, err := cluster.NewRaftCatalog(raftNode)
 	if err != nil {
 		return nil, err
@@ -3747,59 +3790,137 @@ func equalImmutableClusterConfig(a, b daemonImmutableClusterConfig) bool {
 		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features) && a.CPUProfile.XsaveABI == b.CPUProfile.XsaveABI
 }
 
-// applyImmutableClusterConfig creates the cluster policy once on bootstrap.
-// Joining nodes adopt it from the common repository, so operators do not have
-// to repeat transport and paging knobs on every daemon command line.
-func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, opts *daemonClusterOptions) error {
+func clusterRuntimePolicy(config daemonImmutableClusterConfig) cluster.ClusterRuntimePolicy {
+	return cluster.ClusterRuntimePolicy{
+		Version: 1, PagingPolicy: config.PagingPolicy, LeaseDuration: config.LeaseDuration,
+		MaxTransactions: config.MaxTransactions, AutoRebalance: config.AutoRebalance,
+	}
+}
+
+func applyClusterRuntimePolicy(opts *daemonClusterOptions, policy cluster.ClusterRuntimePolicy) {
+	opts.PagingPolicy = policy.PagingPolicy
+	opts.LeaseDuration = policy.LeaseDuration
+	opts.MaxTransactions = policy.MaxTransactions
+	opts.AutoRebalance = policy.AutoRebalance
+}
+
+func equalClusterRuntimePolicy(a, b cluster.ClusterRuntimePolicy) bool {
+	a.Revision, b.Revision = 0, 0
+	return a == b
+}
+
+// applyImmutableClusterConfig reads the shared bootstrap record. It returns a
+// requested operational-policy change instead of applying it: only the Raft
+// state machine can prove that every execution lease is inactive.
+func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, opts *daemonClusterOptions) (*daemonImmutableClusterConfig, error) {
 	path := filepath.Join(sharedRoot, ".ttc-cluster-config.json")
 	want := immutableClusterConfigFromOptions(*opts)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if !bootstrap || localState {
-			return errors.New("shared TTC_ROOT has no immutable cluster configuration; only a fresh first node may create it")
+			return nil, errors.New("shared TTC_ROOT has no immutable cluster configuration; only a fresh first node may create it")
 		}
 		encoded, err := json.Marshal(want)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
-			return fmt.Errorf("creating immutable cluster configuration: %w", err)
+			return nil, fmt.Errorf("creating immutable cluster configuration: %w", err)
 		}
 		_, writeErr := file.Write(append(encoded, '\n'))
 		closeErr := errors.Join(file.Sync(), file.Close())
 		if writeErr != nil || closeErr != nil {
 			_ = os.Remove(path)
-			return errors.Join(writeErr, closeErr)
+			return nil, errors.Join(writeErr, closeErr)
 		}
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var got daemonImmutableClusterConfig
 	if err := json.Unmarshal(data, &got); err != nil {
-		return fmt.Errorf("decoding immutable cluster configuration: %w", err)
+		return nil, fmt.Errorf("decoding immutable cluster configuration: %w", err)
 	}
 	if got.Version != daemonImmutableClusterConfigVersion {
-		return fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
+		return nil, fmt.Errorf("unsupported immutable cluster configuration version %d", got.Version)
 	}
 	if opts.CPUProfileSet && (got.CPUProfile.Mode != want.CPUProfile.Mode || !slices.Equal(got.CPUProfile.Features, want.CPUProfile.Features)) {
-		return fmt.Errorf("requested CPU profile differs from immutable cluster profile %q", got.CPUProfile.Mode)
+		return nil, fmt.Errorf("requested CPU profile differs from immutable cluster profile %q", got.CPUProfile.Mode)
 	}
 	compareWant := want
 	if !opts.CPUProfileSet {
 		compareWant.CPUProfile = got.CPUProfile
 	}
+	var pending *daemonImmutableClusterConfig
 	if bootstrap && !equalImmutableClusterConfig(got, compareWant) {
-		return errors.New("cluster-wide paging, lease, transaction, or rebalance policy differs from the initialized cluster")
+		if !localState {
+			return nil, errors.New("cluster-wide paging, lease, transaction, or rebalance policy differs from the initialized cluster")
+		}
+		pending = &compareWant
 	}
 	opts.PagingPolicy = got.PagingPolicy
 	opts.LeaseDuration = got.LeaseDuration
 	opts.MaxTransactions = got.MaxTransactions
 	opts.AutoRebalance = got.AutoRebalance
 	opts.ResolvedCPU = got.CPUProfile
-	return nil
+	return pending, nil
+}
+
+func persistClusterRuntimePolicy(sharedRoot string, base daemonImmutableClusterConfig, policy cluster.ClusterRuntimePolicy) error {
+	base.PagingPolicy = policy.PagingPolicy
+	base.LeaseDuration = policy.LeaseDuration
+	base.MaxTransactions = policy.MaxTransactions
+	base.AutoRebalance = policy.AutoRebalance
+	return writeDurableJSON(filepath.Join(sharedRoot, ".ttc-cluster-config.json"), base)
+}
+
+func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot string, base daemonImmutableClusterConfig, pending *daemonImmutableClusterConfig) (cluster.ClusterRuntimePolicy, error) {
+	state, err := node.AppliedState()
+	if err != nil {
+		return cluster.ClusterRuntimePolicy{}, err
+	}
+	effective := state.ClusterPolicy
+	desired := clusterRuntimePolicy(base)
+	changeRequested := pending != nil
+	if pending != nil {
+		desired = clusterRuntimePolicy(*pending)
+	}
+	if effective.Revision == 0 || (changeRequested && !equalClusterRuntimePolicy(effective, desired)) {
+		deadline := time.Now().Add(15 * time.Second)
+		for !node.IsLeader() && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !node.IsLeader() {
+			return cluster.ClusterRuntimePolicy{}, errors.New("cluster operational policy can only change after the fully stopped cluster's surviving Raft member becomes leader")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		latest, err := node.LinearizableState(ctx)
+		cancel()
+		if err != nil {
+			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("reading cluster operational policy after leader election: %w", err)
+		}
+		effective = latest.ClusterPolicy
+		catalog, err := cluster.NewRaftCatalog(node)
+		if err != nil {
+			return cluster.ClusterRuntimePolicy{}, err
+		}
+		if effective.Revision == 0 || (changeRequested && !equalClusterRuntimePolicy(effective, desired)) {
+			configured, err := catalog.ConfigureClusterPolicy(effective.Revision, desired)
+			if err != nil {
+				return cluster.ClusterRuntimePolicy{}, fmt.Errorf("configuring cluster operational policy: %w", err)
+			}
+			effective = *configured
+		}
+	}
+	if err := effective.Validate(); err != nil {
+		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("replicated cluster operational policy: %w", err)
+	}
+	if err := persistClusterRuntimePolicy(sharedRoot, base, effective); err != nil {
+		return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisting replicated cluster operational policy: %w", err)
+	}
+	return effective, nil
 }
 
 // joinAuthorityThroughSeed follows Raft-leader redirects at the control-plane
@@ -4385,8 +4506,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 						if stderr != nil {
 							fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
 						}
-					} else if retired {
-						removeRetiredRaftState = true
+					} else {
+						removeRetiredRaftState = retired
+						if err := removeLocalNodeIncarnation(localRoot, offline.NodeID, offline.Incarnation); err != nil && stderr != nil {
+							fmt.Fprintf(stderr, "ttcd: warning: rotating retired node incarnation: %v\n", err)
+						}
 					}
 				}
 				if err := removeCompletedElasticDrainIntent(dataRoot, elasticRecord.NodeID); err != nil && stderr != nil {
@@ -4919,6 +5043,18 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	record, err := runtime.directory.Lookup(nodeID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("reading retiring node authority: %w", err)
+	}
+	if err == nil {
+		if record.Incarnation != incarnation || record.State != cluster.NodeOffline {
+			return false, errors.New("node must commit its exact incarnation offline before identity retirement")
+		}
+		if _, err := runtime.raftCatalog.RemoveNode(nodeID, incarnation, record.Revision); err != nil {
+			return false, fmt.Errorf("removing retired node identity: %w", err)
+		}
+	}
 	var lastErr error
 	for {
 		leaderID := runtime.raft.LeaderID()

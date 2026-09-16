@@ -725,36 +725,19 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		node, ok := state.Nodes[request.NodeID]
-		if !ok || node.Incarnation != request.Incarnation || node.State != NodeOffline {
-			writeControlError(w, http.StatusConflict, "node must commit its exact incarnation offline before Raft retirement")
-			return
-		}
-		for _, placement := range state.Placements {
-			if placement.OwnerNode == request.NodeID {
-				writeControlError(w, http.StatusConflict, "node still owns branch placements")
+		if node, ok := state.Nodes[request.NodeID]; ok {
+			if node.Incarnation != request.Incarnation || node.State != NodeOffline {
+				writeControlError(w, http.StatusConflict, "node must commit its exact incarnation offline before Raft retirement")
 				return
 			}
-		}
-		for _, tx := range state.Transactions {
-			if tx.Terminal() {
-				continue
-			}
-			if (tx.Identity.SourceNodeID == request.NodeID && tx.SourceIncarnation == request.Incarnation && tx.SourceNeeded) ||
-				(tx.Identity.TargetNodeID == request.NodeID && tx.TargetIncarnation == request.Incarnation) {
-				writeControlError(w, http.StatusConflict, "node still participates in a nonterminal distributed transaction")
+			catalog, err := NewRaftCatalog(a.Node)
+			if err != nil {
+				writeControlError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
-		}
-		for _, other := range state.Nodes {
-			for _, reservation := range other.IncomingReservations {
-				// A completed reservation only keeps the destination's capacity
-				// charged until its next memory heartbeat. The source no longer
-				// owns it and must not be prevented from retiring.
-				if reservation.SourceNode == request.NodeID && reservation.CompletedAt.IsZero() {
-					writeControlError(w, http.StatusConflict, "node still owns an incoming-capacity reservation")
-					return
-				}
+			if _, err := catalog.RemoveNode(node.NodeID, node.Incarnation, node.Revision); err != nil {
+				writeControlError(w, http.StatusConflict, err.Error())
+				return
 			}
 		}
 		if err := a.Node.RetireMember(r.Context(), request.NodeID); err != nil {

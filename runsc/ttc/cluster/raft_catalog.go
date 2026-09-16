@@ -560,6 +560,21 @@ func (c *RaftCatalog) ExpireNode(nodeID, incarnation string, revision uint64) (*
 	})
 }
 
+// RemoveNode permanently removes a cleanly retired daemon incarnation from
+// cluster discovery. It is distinct from expiry: abnormal, expired identities
+// remain visible for diagnosis until an operator completes a clean retirement.
+func (c *RaftCatalog) RemoveNode(nodeID, incarnation string, revision uint64) (*NodeRecord, error) {
+	return applyRaftValue[NodeRecord](c, time.Now().UTC(), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: nodeID, Incarnation: incarnation, Revision: revision,
+	})
+}
+
+func (c *RaftCatalog) ConfigureClusterPolicy(expectedRevision uint64, policy ClusterRuntimePolicy) (*ClusterRuntimePolicy, error) {
+	return applyRaftValue[ClusterRuntimePolicy](c, time.Now().UTC(), AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{
+		ExpectedRevision: expectedRevision, Policy: policy,
+	})
+}
+
 func (c *RaftCatalog) Register(record NodeRecord, now time.Time, lease time.Duration) (*NodeRecord, error) {
 	return applyRaftValue[NodeRecord](c, now, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: record, LeaseDuration: lease})
 }

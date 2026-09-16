@@ -221,6 +221,24 @@ func TestLocalNodeIncarnationPersistsForRootEpoch(t *testing.T) {
 	}
 }
 
+func TestCleanRetirementRotatesLocalNodeIncarnation(t *testing.T) {
+	root := t.TempDir()
+	first, err := localNodeIncarnation(root, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeLocalNodeIncarnation(root, "node-a", first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := localNodeIncarnation(root, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatalf("cleanly retired incarnation was reused: %q", first)
+	}
+}
+
 func TestLocalNodeIncarnationRejectsMalformedRecord(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "cluster", "node-incarnation.json")
@@ -1702,11 +1720,11 @@ func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	bootstrap.MaxTransactions = 41
 	bootstrap.AutoRebalance = true
 	bootstrap.ResolvedCPU = daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "portable", Features: []string{"sse", "sse2"}}
-	if err := applyImmutableClusterConfig(root, true, false, &bootstrap); err != nil {
+	if pending, err := applyImmutableClusterConfig(root, true, false, &bootstrap); err != nil || pending != nil {
 		t.Fatal(err)
 	}
 	join := defaultDaemonClusterOptions()
-	if err := applyImmutableClusterConfig(root, false, false, &join); err != nil {
+	if pending, err := applyImmutableClusterConfig(root, false, false, &join); err != nil || pending != nil {
 		t.Fatal(err)
 	}
 	if join.PagingPolicy != bootstrap.PagingPolicy || join.LeaseDuration != bootstrap.LeaseDuration || join.MaxTransactions != bootstrap.MaxTransactions || join.AutoRebalance != bootstrap.AutoRebalance {
@@ -1714,8 +1732,9 @@ func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	}
 
 	mismatch := defaultDaemonClusterOptions()
-	if err := applyImmutableClusterConfig(root, true, true, &mismatch); err == nil || !strings.Contains(err.Error(), "differs") {
-		t.Fatalf("bootstrap mismatch error=%v", err)
+	pending, err := applyImmutableClusterConfig(root, true, true, &mismatch)
+	if err != nil || pending == nil {
+		t.Fatalf("bootstrap policy change=(%+v, %v), want pending change", pending, err)
 	}
 }
 
@@ -1782,7 +1801,7 @@ func TestExplicitCPUProfileXsaveABI(t *testing.T) {
 
 func TestImmutableClusterConfigRequiresBootstrap(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
-	if err := applyImmutableClusterConfig(t.TempDir(), false, false, &opts); err == nil || !strings.Contains(err.Error(), "fresh first node") {
+	if _, err := applyImmutableClusterConfig(t.TempDir(), false, false, &opts); err == nil || !strings.Contains(err.Error(), "fresh first node") {
 		t.Fatalf("missing config error=%v", err)
 	}
 }
