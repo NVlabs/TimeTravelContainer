@@ -3176,6 +3176,36 @@ func syncDaemonRootDirectory(root string) error {
 	return directory.Sync()
 }
 
+// rotateRetiredLocalNodeIncarnation gives an administratively forgotten node
+// a new execution epoch when it later rejoins from the same scratch disk. A
+// failed daemon merely retaining an expired NodeRecord must keep its identity
+// for fenced runtime recovery; only the replicated retirement tombstone is
+// sufficient authorization to rotate it.
+func rotateRetiredLocalNodeIncarnation(localRoot, nodeID, incarnation string, clients map[string]*cluster.Client) (string, error) {
+	ids := make([]string, 0, len(clients))
+	for id := range clients {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		state, err := clients[id].AuthorityState(ctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		retired, ok := state.RetiredNodes[nodeID]
+		if !ok || retired != incarnation {
+			return incarnation, nil
+		}
+		if err := removeLocalNodeIncarnation(localRoot, nodeID, incarnation); err != nil {
+			return "", fmt.Errorf("rotating administratively retired node incarnation: %w", err)
+		}
+		return localNodeIncarnation(localRoot, nodeID)
+	}
+	return incarnation, nil
+}
+
 func lockDaemonLocalRoot(root string) (*os.File, error) {
 	lock, err := os.OpenFile(filepath.Join(root, ".ttcd.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -3606,6 +3636,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil {
 		return nil, err
 	}
+	if !opts.RaftBootstrap && localRaftState {
+		incarnation, err = rotateRetiredLocalNodeIncarnation(localRoot, opts.NodeID, incarnation, clients)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if raftNode.HadExistingState() {
 		// Keep the Raft listener alive even when this is the first member being
 		// restarted after a whole-cluster outage. Waiting for a leader here and
@@ -3668,13 +3704,26 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, errors.New("joined TTC Raft member could not discover the elected leader")
 		}
 	}
-	if opts.RaftBootstrap || localRaftState {
+	if opts.RaftBootstrap {
 		base := immutableClusterConfigFromOptions(opts)
 		policy, err := reconcileClusterRuntimePolicy(raftNode, dataRoot, base, pendingClusterPolicy)
 		if err != nil {
 			return nil, err
 		}
 		applyClusterRuntimePolicy(&opts, policy)
+		capabilities.PagingPolicy = opts.PagingPolicy
+		if err := capabilities.Validate(); err != nil {
+			return nil, err
+		}
+	} else if localRaftState {
+		// A node that was removed while offline may restart with a stale local
+		// Raft log in which no leader (and sometimes no ClusterPolicy) is yet
+		// visible. It is a joining node, not the authority allowed to change
+		// policy. applyImmutableClusterConfig already loaded the successfully
+		// published cluster policy from the shared root; retain that policy until
+		// membership recovery re-adds this process as a learner and catches its
+		// log up. Requiring this stale process to become leader deadlocks exactly
+		// the supported remove-then-rejoin path.
 		capabilities.PagingPolicy = opts.PagingPolicy
 		if err := capabilities.Validate(); err != nil {
 			return nil, err
@@ -5089,6 +5138,34 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 					return false, nil
 				}
 			} else {
+				err = peerErr
+			}
+		}
+		// A re-admitted member's local LeaderID may transiently name the leader
+		// from its stale pre-removal log. Do not make graceful shutdown wait for
+		// the full two-minute retirement deadline in that case. Ask every
+		// currently discoverable peer; only the leader will perform the removal,
+		// and RetireMember is idempotent once this server has disappeared from the
+		// configuration.
+		records, listErr := runtime.directory.List()
+		if listErr == nil {
+			sort.Slice(records, func(i, j int) bool { return records[i].NodeID < records[j].NodeID })
+			for _, record := range records {
+				if record.NodeID == nodeID || record.State == cluster.NodeOffline {
+					continue
+				}
+				peer, peerErr := runtime.source.peer(record.NodeID, false)
+				if peerErr != nil {
+					err = peerErr
+					continue
+				}
+				peerErr = peer.RetireAuthority(ctx, cluster.AuthorityRetireRequest{NodeID: nodeID, Incarnation: incarnation})
+				if peerErr == nil {
+					return true, nil
+				}
+				if strings.Contains(peerErr.Error(), "refusing to retire the last Raft voter") {
+					return false, nil
+				}
 				err = peerErr
 			}
 		}

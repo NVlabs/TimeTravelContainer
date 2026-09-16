@@ -426,8 +426,19 @@ func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) 
 	if err != nil || result.Err() != nil {
 		t.Fatalf("fencing node-c: result=%+v err=%v", result, err)
 	}
+	state, err := leader.AppliedState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := state.Nodes["node-c"]
+	result, err = leader.Propose(ctx, "remove-node-c", AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: record.NodeID, Incarnation: record.Incarnation, Revision: record.Revision,
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("removing node-c discovery identity: result=%+v err=%v", result, err)
+	}
 	if err := leader.ReconcileVoters(ctx, 3); err != nil {
-		t.Fatalf("reconciling fenced voter: %v", err)
+		t.Fatalf("reconciling removed voter: %v", err)
 	}
 	configuration, err := leader.Configuration()
 	if err != nil {

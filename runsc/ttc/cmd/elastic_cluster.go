@@ -2630,6 +2630,21 @@ func (b *runtimeBackend) clusterNodes() ([]cluster.NodeRecord, error) {
 	return b.distributedSource.directory.List()
 }
 
+func (b *runtimeBackend) removeNode(nodeID string) error {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return errors.New("cluster authority is not configured")
+	}
+	record, err := b.distributedSource.directory.Lookup(nodeID)
+	if err != nil {
+		return err
+	}
+	if record.State != cluster.NodeOffline || record.LeaseActive(time.Now()) {
+		return fmt.Errorf("node %q is not offline with an expired execution lease", nodeID)
+	}
+	_, err = b.distributedSource.authority.RemoveNode(record.NodeID, record.Incarnation, record.Revision)
+	return err
+}
+
 func nodeLoadLess(left, right cluster.NodeRecord) bool {
 	leftBytes := left.MemoryCurrentBytes + left.IncomingReservedBytes
 	rightBytes := right.MemoryCurrentBytes + right.IncomingReservedBytes

@@ -235,6 +235,7 @@ Commands:
   fork [--node NODE] [--paused] SOURCE [DEST...] Fork SOURCE into live branches
   migrate --node NODE TARGET     Move a running branch to another cluster node
   node ls [--json]                 List elastic cluster nodes and memory load
+  node rm NODE                    Forget an offline, expired node identity
   node stop [POLICY] NODE         Evacuate a node and stop its daemon
   node rebalance [--node NODE] NODE Relieve a node's configured memory pressure
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
@@ -303,7 +304,7 @@ TTC_LOCAL_ROOT is not required.`,
 			"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint":   "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
 			"migrate":      "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
-			"node":         "Usage: ttc node ls [--json] | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance [--node NODE] NODE",
+			"node":         "Usage: ttc node ls [--json] | ttc node rm NODE | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE",
 			"restore":      "Usage: ttc restore [--node NODE] [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
@@ -475,6 +476,7 @@ type elasticMigrationBackend interface {
 
 type elasticNodeBackend interface {
 	clusterNodes() ([]cluster.NodeRecord, error)
+	removeNode(node string) error
 	stopNode(sourceNode, mode string, local bool) ([]selector, error)
 	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.FixedTerminalPlan, error)
 	plannerSnapshot(node string, local bool) (cluster.PlannerSnapshot, error)
@@ -482,7 +484,7 @@ type elasticNodeBackend interface {
 
 func runNode(args []string, stdout io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttc node ls [--json] | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE")
+		return errors.New("usage: ttc node ls [--json] | ttc node rm NODE | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE")
 	}
 	nodes, ok := backend.(elasticNodeBackend)
 	if !ok {
@@ -522,6 +524,15 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 				formatImageSize(int64(record.IncomingReservedBytes)), lease)
 		}
 		return writer.Flush()
+	case "rm":
+		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
+			return errors.New("usage: ttc node rm NODE")
+		}
+		if err := nodes.removeNode(args[1]); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, args[1])
+		return nil
 	case "stop":
 		var sourceNode string
 		var stopAll, dehydrateAll, migrateAll, local bool

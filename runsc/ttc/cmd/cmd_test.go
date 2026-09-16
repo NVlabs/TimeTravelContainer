@@ -974,9 +974,14 @@ type fakeElasticNodeBackend struct {
 	stoppedNode  string
 	stoppedMode  string
 	stoppedLocal bool
+	removedNode  string
 }
 
 func (*fakeElasticNodeBackend) clusterNodes() ([]cluster.NodeRecord, error) { return nil, nil }
+func (b *fakeElasticNodeBackend) removeNode(node string) error {
+	b.removedNode = node
+	return nil
+}
 func (b *fakeElasticNodeBackend) stopNode(node, mode string, local bool) ([]selector, error) {
 	b.stoppedNode, b.stoppedMode, b.stoppedLocal = node, mode, local
 	return nil, nil
@@ -996,6 +1001,17 @@ func TestNodeStopAcceptsPolicyAfterNode(t *testing.T) {
 	}
 	if b.stoppedNode != "node-b" || b.stoppedMode != "migrate" || b.stoppedLocal {
 		t.Fatalf("node stop call=(%q, %q, %t)", b.stoppedNode, b.stoppedMode, b.stoppedLocal)
+	}
+}
+
+func TestNodeRemoveForgetsOfflineIdentity(t *testing.T) {
+	b := &fakeElasticNodeBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"node", "rm", "node-b"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("node rm status=%d stderr=%q", status, stderr.String())
+	}
+	if b.removedNode != "node-b" || stdout.String() != "node-b\n" {
+		t.Fatalf("node rm target=%q stdout=%q", b.removedNode, stdout.String())
 	}
 }
 

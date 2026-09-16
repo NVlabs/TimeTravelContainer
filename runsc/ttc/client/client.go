@@ -197,9 +197,17 @@ Commands:
   daemon start|status|stop|requests|request
   completion bash|zsh|fish
 
-Branch selectors use CONTAINER@BRANCH. Run 'ttc COMMAND --help' for command
-usage. ttcd requires TTC_ROOT; clustered compute daemons additionally require
-TTC_LOCAL_ROOT.
+Branch selectors use CONTAINER@BRANCH. SIZE values accept raw bytes or Docker
+units such as 512MiB and 8GiB. DURATION values use forms such as 250ms, 15s,
+and 2m. Defaults are stated in command-specific help.
+
+Global options:
+  --daemon-socket PATH   Unix socket to use (default: TTC_SOCKET, then
+                         $XDG_RUNTIME_DIR/ttc/ttcd.sock, then
+                         /tmp/ttc-<numeric-uid>/ttcd.sock)
+
+Run 'ttc COMMAND --help' for command usage. ttcd requires TTC_ROOT; clustered
+compute daemons additionally require TTC_LOCAL_ROOT.
 `)
 }
 
@@ -226,24 +234,57 @@ additionally requires TTC_LOCAL_ROOT for node-local active state and cache
 data; control-only mode does not.
 
 Options:
-  --platform systrap|kvm          Select the gVisor execution platform
+  --platform systrap|kvm          Execution platform (default: systrap)
   --cpu-profile portable|host|explicit
-                                  Select the immutable guest CPU contract
-  --cpu-features FEATURE,...      Features for --cpu-profile=explicit
-  --unsafe-no-host-isolation      Disable host namespace/chroot isolation
-  --cluster-init                  Create a new distributed TTC cluster
-  --cluster-join HOST:PORT        Join an existing cluster through a seed node
-  --control-only                  Outbound-only login-node control gateway
-  --node NAME                     Set this cluster node's stable name
-  --listen ADDR                   Listen for cluster traffic
-  --advertise HOST:PORT           Address advertised to other cluster nodes
-  --memory-target SIZE            Target resident memory for this node
-  --cluster-auto-rebalance        Automatically relieve memory pressure
-  --cluster-capacity-command PATH Invoke a trusted node provisioner
-  --cluster-capacity-webhook URL  Invoke a trusted node provisioner webhook
+                                  Guest CPU contract (default: portable)
+  --cpu-features NAME,...         Required with explicit profile; no default
+  --unsafe-no-host-isolation      Disable namespace/chroot isolation
+                                  (default: false)
+  --cluster-init                  Create/restart the cluster's surviving Raft
+                                  member (default: standalone mode)
+  --cluster-join HOST:PORT        Seed address; repeatable (default: none)
+  --control-only                  Outbound-only login-node gateway
+                                  (default: false)
+  --node NAME                     Node name: [A-Za-z0-9._-]+ (default: hostname;
+                                  control-only default: control-HOSTNAME)
+  --listen IP:PORT                Cluster/Raft listener
+                                  (default: 0.0.0.0:7443)
+  --advertise HOST:PORT           Peer-reachable address (default: hostname and
+                                  the --listen port)
+  --memory-target SIZE            Resident-memory placement target; SIZE is raw
+                                  bytes or e.g. 512MiB/8GiB (default: disabled;
+                                  an explicitly supplied value must be positive)
+  --cluster-auto-rebalance        Relieve memory pressure automatically
+                                  (default: false)
+  --cluster-capacity-command PATH Trusted provisioner executable
+                                  (default: disabled)
+  --cluster-capacity-webhook URL  Trusted provisioner HTTP endpoint
+                                  (default: disabled)
+
+Advanced cluster policy:
+  --cluster-lease DURATION        Execution lease, 1s..10m (default: 15s)
+  --cluster-max-transactions N    Concurrent transaction bound (default: 4096)
+  --cluster-transfer-bytes N      Preferred transfer bytes (default: 1048576)
+  --cluster-max-outstanding-bytes N
+                                  In-flight byte bound (default: 67108864)
+  --cluster-max-parallel N        Parallel transfers (default: 4)
+  --cluster-ack-interval DURATION ACK coalescing interval (default: 1ms)
+  --cluster-ack-batch-pages N     ACK batch size in 4KiB pages (default: 256)
+  --cluster-prefetch MODE         none|sequential|fixed-window|adaptive
+                                  (default: none)
+  --cluster-push MODE             demand-only|dirty-orphan|memory-pressure|
+                                  eager-drain (default: demand-only)
 
 Cluster membership, transport, and capacity options are fixed for the daemon
-lifetime. --cluster-init and --cluster-join are mutually exclusive.
+lifetime. Operational policy may change only while the cluster has no live
+node leases. The CPU profile remains immutable. --cluster-init and
+--cluster-join are mutually exclusive.
+
+Environment:
+  TTC_ROOT          Required data root; shared root in cluster mode
+  TTC_LOCAL_ROOT    Required node-local root for cluster compute daemons
+  TTC_SOCKET        Unix socket (see the global default above)
+  TTC_CLUSTER_TOKEN Optional shared cluster authentication token (default: none)
 
 With --control-only, repeat --cluster-join for optional seed redundancy. The
 daemon opens only TTC_SOCKET: it does not advertise a TCP endpoint, join Raft,
@@ -289,14 +330,32 @@ Commands:
   rm [OPTIONS] IMAGE...      Remove images (aliases: remove, rmi)
 
 Run 'ttc image COMMAND --help' for command-specific usage.`,
-	"image ls":      "Usage: ttc image ls [-q|--quiet] [--no-trunc] [--json]",
-	"image list":    "Usage: ttc image list [-q|--quiet] [--no-trunc] [--json]",
-	"image pull":    "Usage: ttc image pull [OPTIONS] IMAGE",
-	"image load":    "Usage: ttc image load [-i|--input FILE] [--platform PLATFORM] [-q|--quiet]",
-	"image save":    "Usage: ttc image save [-o|--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
-	"image inspect": "Usage: ttc image inspect IMAGE [IMAGE...]",
-	"image rm":      "Usage: ttc image rm [-f|--force] IMAGE [IMAGE...]",
-	"image remove":  "Usage: ttc image remove [-f|--force] IMAGE [IMAGE...]",
+	"image ls": `Usage: ttc image ls [-q|--quiet] [--no-trunc] [--json]
+
+All options default to false. --quiet prints IDs only; --no-trunc prints full
+digests; --json emits stable machine-readable records.`,
+	"image list": `Usage: ttc image list [-q|--quiet] [--no-trunc] [--json]
+
+Alias for 'ttc image ls'.`,
+	"image pull": `Usage: ttc image pull [--platform OS/ARCH] [-q|--quiet] IMAGE
+
+The registry defaults to Docker Hub and an omitted tag defaults to latest.
+--platform defaults to the daemon's native OCI platform; --quiet defaults to
+false and prints only the pulled digest when enabled.`,
+	"image load": `Usage: ttc image load [-i|--input FILE] [--platform OS/ARCH] [-q|--quiet]
+
+Read a Docker-compatible tar from FILE (default: standard input). Platform
+defaults to all compatible archive content; --quiet defaults to false.`,
+	"image save": `Usage: ttc image save [-o|--output FILE] [--platform OS/ARCH] IMAGE [IMAGE...]
+
+Write a Docker-compatible tar to FILE (default: standard output). Platform
+defaults to each image's stored platform.`,
+	"image inspect": "Usage: ttc image inspect IMAGE [IMAGE...]\n\nPrint Docker-compatible JSON metadata for each image.",
+	"image rm": `Usage: ttc image rm [-f|--force] IMAGE [IMAGE...]
+
+--force defaults to false and is required when a container still references
+the image.`,
+	"image remove": "Usage: ttc image remove [-f|--force] IMAGE [IMAGE...]\n\nAlias for 'ttc image rm'.",
 
 	"container": `Usage: ttc container COMMAND [OPTIONS]
 
@@ -319,17 +378,18 @@ reattachable after the client disconnects and retains output in its ring
 buffer.
 
 Common options:
-  -d                         Run detached
-  -i                         Keep standard input open
-  -t                         Allocate a terminal
-  -e, --env KEY=VALUE        Set an environment variable
-  -u, --user USER[:GROUP]    Select the guest user
-  -w, --workdir DIR          Set the working directory
-  --session NAME             Create a named, reattachable session
-  --process FILE             Read an OCI process specification`,
+  -d, --detach               Run detached (default: false)
+  -i, --interactive          Keep standard input open (default: false)
+  -t, --tty                  Allocate a terminal (default: false)
+  -e, --env NAME=VALUE       Set an environment variable; repeatable
+  -u, --user USER[:GROUP]    Guest name/UID and optional group/GID
+                             (default: container user)
+  -w, --workdir DIR          Guest working directory (default: container cwd)
+  --session NAME             Durable branch-local session name (default: none)
+  --process FILE             OCI process JSON; replaces command overrides`,
 	"exec ls":   "Usage: ttc exec ls [--json] CONTAINER@BRANCH",
 	"exec wait": "Usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID",
-	"exec kill": "Usage: ttc exec kill [--signal SIGNAL] CONTAINER@BRANCH:EXEC_ID",
+	"exec kill": "Usage: ttc exec kill [--signal SIGNAL] CONTAINER@BRANCH:EXEC_ID\n\nSIGNAL accepts a name such as TERM or SIGKILL, or a number (default: KILL).",
 
 	"port": `Usage: ttc port COMMAND [OPTIONS]
 
@@ -352,11 +412,11 @@ Commands:
   ls                   List volumes
   inspect NAME...      Inspect volumes
   rm [-f] NAME...      Remove volumes (alias: remove)`,
-	"volume create":  "Usage: ttc volume create NAME",
-	"volume ls":      "Usage: ttc volume ls",
+	"volume create":  "Usage: ttc volume create NAME\n\nCreate an empty TTC-managed persistent volume.",
+	"volume ls":      "Usage: ttc volume ls\n\nList all managed volumes (alias: volume list).",
 	"volume list":    "Usage: ttc volume list",
 	"volume inspect": "Usage: ttc volume inspect NAME [NAME...]",
-	"volume rm":      "Usage: ttc volume rm [-f|--force] NAME [NAME...]",
+	"volume rm":      "Usage: ttc volume rm [-f|--force] NAME [NAME...]\n\n--force removes referenced volumes and defaults to false.",
 	"volume remove":  "Usage: ttc volume remove [-f|--force] NAME [NAME...]",
 
 	"node": `Usage: ttc node COMMAND [OPTIONS]
@@ -365,13 +425,32 @@ Inspect and manage nodes in a distributed TTC cluster.
 
 Commands:
   ls [--json]                List nodes, load, capacity, state, and lease
+  rm NODE                    Forget a fenced, offline, expired node identity
   stop NODE [POLICY]         Evacuate or dispose of workloads and stop a node
   rebalance NODE             Relieve a node's configured memory pressure
 
-Node stop policies are --migrate-all, --dehydrate-all, and --stop-all.`,
-	"node ls":        "Usage: ttc node ls [--json]",
-	"node stop":      "Usage: ttc node stop NODE [--stop-all|--dehydrate-all|--migrate-all]",
-	"node rebalance": "Usage: ttc node rebalance NODE",
+Node stop policies are --migrate-all, --dehydrate-all, and --stop-all. With no
+policy, stop rejects a node that still owns branches. 'node rm' never fences a
+live daemon; it succeeds only after lease expiry/offline fencing and after all
+placements, volatile snapshots, transactions, reservations, and GC authority
+have been released.`,
+	"node ls": `Usage: ttc node ls [--json]
+
+Options:
+  --json   Emit complete NodeRecord objects (default: human-readable table)`,
+	"node rm": `Usage: ttc node rm NODE
+
+Permanently remove an already-offline node from cluster discovery. A later
+join using the same node name is a new incarnation. There is no force option:
+live nodes and nodes that still provide authoritative state are rejected.`,
+	"node stop": `Usage: ttc node stop NODE [--stop-all|--dehydrate-all|--migrate-all]
+
+Stop NODE after applying at most one branch policy (default: reject if work
+remains). --migrate-all lets the scheduler choose destinations.`,
+	"node rebalance": `Usage: ttc node rebalance NODE
+
+Move a pressure-relieving subset of branches away from NODE. Destinations are
+selected by the cluster scheduler; the resulting plan is printed as JSON.`,
 
 	"tty": `Usage: ttc tty COMMAND CONTAINER@BRANCH --session NAME [--json]
 
@@ -383,42 +462,159 @@ Commands:
 	"tty stat":  "Usage: ttc tty stat CONTAINER@BRANCH --session NAME [--json]",
 	"tty watch": "Usage: ttc tty watch CONTAINER@BRANCH --session NAME [--json]",
 
-	"run":          "Usage: ttc run [--node NODE] [OPTIONS] IMAGE [COMMAND] [ARG...]",
-	"create":       "Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]",
-	"start":        "Usage: ttc start [--node NODE] [OPTIONS] CONTAINER@BRANCH",
-	"stop":         "Usage: ttc stop [OPTIONS] TARGET...",
-	"restart":      "Usage: ttc restart [OPTIONS] TARGET...",
-	"rm":           "Usage: ttc rm [OPTIONS] TARGET...",
-	"attach":       "Usage: ttc attach [OPTIONS] CONTAINER@BRANCH",
-	"logs":         "Usage: ttc logs [OPTIONS] CONTAINER@BRANCH",
-	"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
-	"pull":         "Usage: ttc pull [OPTIONS] IMAGE",
-	"load":         "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
-	"save":         "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
-	"commit":       "Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]",
-	"fork":         "Usage: ttc fork [--paused] [--quarantine] [--node NODE] CONTAINER@BRANCH DEST...",
-	"migrate":      "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
-	"pause":        "Usage: ttc pause TARGET...",
-	"resume":       "Usage: ttc resume TARGET...",
+	"run": `Usage: ttc run [--node NODE] [OPTIONS] IMAGE [COMMAND] [ARG...]
+
+Create and start a container. In cluster mode, omit --node to let the scheduler
+choose a compute node. Important options:
+  --name NAME                 Container family name (default: generated ID)
+  --pull missing|always|never Image pull policy (default: missing)
+  -d, --detach                Run in background (default: false)
+  -i, --interactive           Keep standard input open (default: false)
+  -t, --tty                   Allocate a terminal (default: false)
+  --rm                        Remove after exit (default: false)
+  --read-only                 Read-only rootfs (default: false)
+  --stop-signal SIGNAL        Stop signal (default: image STOPSIGNAL, then TERM)
+  --stop-timeout SECONDS      Grace period; -1 waits forever (default: 10)
+  --pids-limit N              Maximum tasks; -1 or 0 is unlimited (default: 0)
+  -m, --memory SIZE           Memory limit; 0 is unlimited (default: 0)
+  --cpus DECIMAL              CPU quota, e.g. 0.5 or 2 (default: 0, unlimited)
+  --shm-size SIZE             Size of memory-backed /dev/shm (default: 64m)
+  --network none|host|ttc     Network mode (default: none)
+  --nat                       Permit outbound NAT for --network=ttc (default: false)
+  --ip IPv4                   Virtual NIC address (default: allocated)
+  --mac-address MAC           Virtual NIC address (default: generated)
+  -p, --publish SPEC          [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]; repeatable
+  -v, --volume SPEC           VOLUME:PATH[:ro] or HOST:PATH[:ro|rw|copy]; repeatable
+  --tmpfs PATH[:OPTIONS]      Add an explicitly memory-backed mount; repeatable
+  -e, --env NAME[=VALUE]      Set/import an environment variable; repeatable
+  -u, --user USER[:GROUP]     Guest user (default: image user)
+  -w, --workdir DIR           Guest cwd (default: image working directory)
+  --hostname NAME             Guest hostname (default: container name)
+  --log-driver DRIVER         local|json-file|none (default: local)
+  --waive-live-fork           Permit a non-forkable configuration (default: false)`,
+	"create": `Usage: ttc create [OPTIONS] IMAGE [COMMAND] [ARG...]
+
+Create but do not start a container. It accepts the same configuration options
+as 'ttc run' except --detach and --node. Defaults include --pull=missing,
+--network=none, --shm-size=64m, --stop-timeout=10, and --log-driver=local.`,
+	"start": `Usage: ttc start [--node NODE] [-a|--attach] [-i|--interactive] CONTAINER@BRANCH...
+
+Start an exited branch. In cluster mode, omit --node to let the scheduler pick
+a compute node. --attach defaults to false; --interactive requires --attach,
+and attaching accepts exactly one branch.`,
+	"stop": `Usage: ttc stop [-t|--time|--timeout SECONDS] TARGET...
+
+TARGET may be a family or CONTAINER@BRANCH. The timeout defaults to the
+container stop policy (normally 10 seconds); -1 waits forever.`,
+	"restart": `Usage: ttc restart [-t|--time|--timeout SECONDS] TARGET...
+
+Restart branches using their configured stop signal. The timeout defaults to
+the container stop policy (normally 10 seconds); -1 waits forever.`,
+	"rm": `Usage: ttc rm [-f|--force] [-v|--volumes] TARGET...
+
+Without --force (default), running branches are rejected. --volumes applies
+only to whole-family removal; both options default to false.`,
+	"attach": `Usage: ttc attach [OPTIONS] CONTAINER@BRANCH
+
+Options:
+  -i, --interactive       Forward standard input (default: false)
+  --no-stdin              Never forward input (default: false)
+  --no-stdout             Do not attach stdout (default: false)
+  --no-stderr             Do not attach stderr (default: false)
+  --exec EXEC_ID          Attach to a managed exec (default: init process)
+  --detach-keys KEYS      Comma-separated key sequence (default: ctrl-p,ctrl-q)
+  --takeover              Replace an existing input attachment (default: false)`,
+	"logs": `Usage: ttc logs [OPTIONS] CONTAINER@BRANCH
+
+Options:
+  -f, --follow            Follow new records (default: false)
+  --exec EXEC_ID          Select managed exec logs (default: init process)
+  -n, --tail all|N        Lines from the end (default: all)
+  --since TIME            RFC3339 timestamp, Unix time, or relative duration
+  --until TIME            RFC3339 timestamp, Unix time, or relative duration
+  -t, --timestamps        Prefix timestamps (default: false)
+  --details               Include configured attributes (default: false)`,
+	"cp": `Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH
+
+Exactly one endpoint must use CONTAINER@BRANCH:PATH. Use '-' for a tar stream.
+--archive preserves ownership and --follow-link follows the source symlink;
+both default to false. Paused and dehydrated branches are supported.`,
+	"pull": `Usage: ttc pull [--platform OS/ARCH] [-q|--quiet] IMAGE
+
+Alias for 'ttc image pull'. Docker Hub and tag latest are the defaults;
+--platform defaults to the daemon's native OCI platform.`,
+	"load": `Usage: ttc load [-i|--input FILE] [--platform OS/ARCH] [-q|--quiet]
+
+Alias for 'ttc image load'. FILE defaults to standard input and --quiet to
+false.`,
+	"save": `Usage: ttc save [-o|--output FILE] [--platform OS/ARCH] IMAGE [IMAGE...]
+
+Alias for 'ttc image save'. FILE defaults to standard output.`,
+	"commit": `Usage: ttc commit [OPTIONS] CONTAINER@BRANCH REPOSITORY[:TAG]
+
+Options:
+  -a, --author TEXT       Image author (default: empty)
+  -m, --message TEXT      Commit message (default: empty)
+  -c, --change DIRECTIVE  Dockerfile-style metadata change; repeatable
+  -p, --pause=BOOL        Pause during capture (default: true)`,
+	"fork": `Usage: ttc fork [--paused] [--quarantine] [--node NODE] CONTAINER@BRANCH [DEST...]
+
+DEST values are new branch names in the same family; omit them to generate one
+name. Multiple destinations share one source pause. --paused and --quarantine
+default to false. In cluster mode, omitted --node invokes placement; a
+quarantined fork always remains local and therefore rejects --node.`,
+	"migrate": `Usage: ttc migrate --node NODE CONTAINER@BRANCH
+
+Move the branch to the named compute node. --node is required; use 'ttc node
+ls' to discover valid node names.`,
+	"pause":        "Usage: ttc pause TARGET...\n\nTARGET may be a family or CONTAINER@BRANCH; no options are required.",
+	"resume":       "Usage: ttc resume TARGET...\n\nTARGET may be a family or CONTAINER@BRANCH; no options are required.",
 	"unpause":      "Usage: ttc unpause TARGET...",
 	"quarantine":   "Usage: ttc quarantine CONTAINER@BRANCH...",
 	"unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH...",
-	"dehydrate":    "Usage: ttc dehydrate TARGET...",
-	"rehydrate":    "Usage: ttc rehydrate [--node NODE] TARGET...",
-	"checkpoint":   "Usage: ttc checkpoint [--compression MODE] CONTAINER@BRANCH FILE",
-	"restore":      "Usage: ttc restore [--node NODE] [--name NAME] FILE",
-	"ls":           "Usage: ttc ls [--tree|--json]",
-	"ps":           "Usage: ttc ps [OPTIONS]",
-	"inspect":      "Usage: ttc inspect [OPTIONS] CONTAINER...",
-	"top":          "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
-	"stats":        "Usage: ttc stats [--json] CONTAINER@BRANCH",
-	"diff":         "Usage: ttc diff [--json] CONTAINER@BRANCH",
-	"events":       "Usage: ttc events [OPTIONS]",
-	"wait":         "Usage: ttc wait [--condition not-running|durable] TARGET...",
-	"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
-	"kill":         "Usage: ttc kill [OPTIONS] TARGET...",
-	"images":       "Usage: ttc images [OPTIONS]",
-	"rmi":          "Usage: ttc rmi [OPTIONS] IMAGE...",
+	"dehydrate":    "Usage: ttc dehydrate TARGET...\n\nTARGET may be a family or CONTAINER@BRANCH; no options are required.",
+	"rehydrate": `Usage: ttc rehydrate [--node NODE] TARGET...
+
+Reconstruct dehydrated branches. In cluster mode, omitted --node lets the
+scheduler choose a compute node.`,
+	"checkpoint": `Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE
+
+Write a portable standalone checkpoint. Compression defaults to
+flate-best-speed.`,
+	"restore": `Usage: ttc restore [--node NODE] [--name NAME] FILE
+
+Restore as a new family unrelated to the checkpoint source. NAME defaults to
+restored-<UTC timestamp>; in cluster mode an omitted --node uses placement.`,
+	"ls": "Usage: ttc ls [--tree|--json]\n\nTree output is the default; --json emits stable machine-readable records.",
+	"ps": `Usage: ttc ps [OPTIONS]
+
+By default show running and paused branches. Options: --all (all states),
+--quiet (selectors only), --size, --no-trunc, --filter KEY=VALUE (repeatable),
+--format TEMPLATE|json, --latest, and --last N. All are disabled by default;
+--last defaults to -1 (no count limit).`,
+	"inspect": `Usage: ttc inspect [--format TEMPLATE|json] [--type container] CONTAINER...
+
+Inspect whole families; branch selectors are rejected. The default is indented
+JSON for all requested containers.`,
+	"top":   "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]\n\n--json defaults to false; remaining arguments are guest ps options.",
+	"stats": "Usage: ttc stats [--json] CONTAINER@BRANCH\n\nShow branch and family private/shared resource accounting; --json defaults to false.",
+	"diff":  "Usage: ttc diff [--json] CONTAINER@BRANCH\n\nShow writable-layer changes against the branch base; --json defaults to false.",
+	"events": `Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]
+
+Without --follow, replay existing matching events and return. TIME accepts the
+same timestamp/relative forms as 'ttc logs'. Filters are repeatable and accept
+type, event, action, subject, or container. Options default to unset/false.`,
+	"wait": `Usage: ttc wait [--condition not-running|durable] TARGET...
+
+Wait for each branch concurrently. The default condition is not-running and
+prints exit codes; durable waits for authoritative persistent storage.`,
+	"rename": "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
+	"kill": `Usage: ttc kill [--signal SIGNAL] [--all] TARGET...
+
+SIGNAL is a name or number (default: KILL). --all signals every process in the
+branch instead of only init (default: false).`,
+	"images": "Usage: ttc images [-q|--quiet] [--no-trunc] [--json]\n\nAlias for 'ttc image ls'; all options default to false.",
+	"rmi":    "Usage: ttc rmi [-f|--force] IMAGE...\n\nAlias for 'ttc image rm'; --force defaults to false.",
 	"completion": `Usage: ttc completion bash|zsh|fish
 
 Generate a shell completion script on standard output. This command is fully

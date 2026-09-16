@@ -76,8 +76,8 @@ func registerReadyAuthorityNode(t *testing.T, state *AuthorityState, id, incarna
 	t.Helper()
 	node := testAuthorityNode(at)
 	node.NodeID, node.Incarnation, node.Capabilities.NodeID = id, incarnation, id
-	registered := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "register-"+id, at, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: node, LeaseDuration: time.Hour}))
-	applyAuthorityForTest(t, state, "ready-"+id, at.Add(time.Millisecond), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+	registered := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "register-"+id+"-"+incarnation, at, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: node, LeaseDuration: time.Hour}))
+	applyAuthorityForTest(t, state, "ready-"+id+"-"+incarnation, at.Add(time.Millisecond), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
 		NodeID: registered.NodeID, Incarnation: registered.Incarnation, State: NodeReady, LeaseDuration: time.Hour,
 	})
 }
@@ -365,6 +365,13 @@ func TestAuthorityCleanNodeRetirementRemovesDiscoveryRecord(t *testing.T) {
 	})
 	if _, ok := state.Nodes["node-a"]; ok {
 		t.Fatal("cleanly retired node remains in discovery state")
+	}
+	if got := state.RetiredNodes["node-a"]; got != "incarnation-a" {
+		t.Fatalf("retired-node fence=%q, want incarnation-a", got)
+	}
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-b", at.Add(4*time.Second))
+	if _, ok := state.RetiredNodes["node-a"]; ok {
+		t.Fatal("new node incarnation retained obsolete retirement fence")
 	}
 }
 

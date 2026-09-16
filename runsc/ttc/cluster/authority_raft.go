@@ -725,7 +725,8 @@ func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) 
 		removed := false
 		for _, server := range configuration.Servers {
 			record, ok := state.Nodes[string(server.ID)]
-			if !ok || record.State != NodeOffline || string(server.ID) == n.id {
+			_, retired := state.RetiredNodes[string(server.ID)]
+			if (!ok && !retired) || (ok && record.State != NodeOffline) || string(server.ID) == n.id {
 				continue
 			}
 			if err := n.RemoveMember(ctx, string(server.ID)); err != nil {

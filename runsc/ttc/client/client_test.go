@@ -59,11 +59,13 @@ func TestDetailedHelpIsClientLocal(t *testing.T) {
 		want []string
 	}{
 		{[]string{"daemon", "--help"}, []string{"Usage: ttc daemon COMMAND", "Commands:", "request inspect ID"}},
-		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "--cluster-init", "--control-only", "does not advertise a TCP endpoint"}},
+		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "--cluster-init", "--control-only", "512MiB/8GiB", "default: 15s", "does not advertise a TCP endpoint"}},
 		{[]string{"help", "daemon", "stop"}, []string{"Usage: ttc daemon stop", "build mismatches"}},
 		{[]string{"image", "--help"}, []string{"Manage Docker/OCI images", "load [OPTIONS]", "rm [OPTIONS]"}},
 		{[]string{"exec", "--help"}, []string{"named detached session", "--session NAME", "--process FILE"}},
-		{[]string{"node", "--help"}, []string{"distributed TTC cluster", "rebalance NODE"}},
+		{[]string{"node", "--help"}, []string{"distributed TTC cluster", "rm NODE", "offline", "rebalance NODE"}},
+		{[]string{"run", "--help"}, []string{"--memory SIZE", "default: 64m", "HOST_PORT:CONTAINER_PORT", "default: image user"}},
+		{[]string{"logs", "--help"}, []string{"default: all", "relative duration", "default: false"}},
 		{[]string{"tty", "--help"}, []string{"terminal state", "watch"}},
 	}
 	for _, test := range tests {

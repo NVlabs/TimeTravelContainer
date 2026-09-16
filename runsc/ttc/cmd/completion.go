@@ -238,6 +238,14 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 			return familyCompletionCandidates(backend, true, true)
 		}
 		return nil, nil
+	case "node":
+		if len(rest) == 0 {
+			return []string{"ls", "rebalance", "rm", "stop"}, nil
+		}
+		if rest[0] == "rm" || rest[0] == "stop" || rest[0] == "rebalance" {
+			return nodeCompletionCandidates(backend)
+		}
+		return nil, nil
 	case "exec":
 		return execCompletionCandidates(rest, backend)
 	case "pull", "run", "create":
@@ -260,6 +268,22 @@ func completionCandidates(words []string, backend backend) ([]string, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func nodeCompletionCandidates(backend backend) ([]string, error) {
+	nodes, ok := backend.(elasticNodeBackend)
+	if !ok {
+		return nil, nil
+	}
+	records, err := nodes.clusterNodes()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(records))
+	for _, record := range records {
+		result = append(result, record.NodeID)
+	}
+	return result, nil
 }
 
 func familyAndBranchCompletionCandidates(backend backend) ([]string, error) {

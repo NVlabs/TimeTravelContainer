@@ -249,6 +249,7 @@ type AuthorityState struct {
 	LeaderObservedAt time.Time                          `json:"leader_observed_at,omitempty"`
 	ClusterPolicy    ClusterRuntimePolicy               `json:"cluster_policy,omitempty"`
 	Nodes            map[string]NodeRecord              `json:"nodes,omitempty"`
+	RetiredNodes     map[string]string                  `json:"retired_nodes,omitempty"`
 	Placements       map[string]PlacementRecord         `json:"placements,omitempty"`
 	Transactions     map[string]Transaction             `json:"transactions,omitempty"`
 	Branches         map[string]BranchAuthority         `json:"branches,omitempty"`
@@ -270,6 +271,9 @@ func NewAuthorityState() *AuthorityState {
 func (s *AuthorityState) initMaps() {
 	if s.Nodes == nil {
 		s.Nodes = make(map[string]NodeRecord)
+	}
+	if s.RetiredNodes == nil {
+		s.RetiredNodes = make(map[string]string)
 	}
 	if s.Placements == nil {
 		s.Placements = make(map[string]PlacementRecord)
@@ -445,6 +449,9 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Nodes = cloneAuthorityMap(s.Nodes)
 	case AuthorityNodeRegister, AuthorityNodeTransition:
 		s.Nodes = cloneAuthorityMap(s.Nodes)
+		if kind == AuthorityNodeRegister {
+			s.RetiredNodes = cloneAuthorityMap(s.RetiredNodes)
+		}
 		s.Transactions = cloneAuthorityMap(s.Transactions)
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
@@ -457,6 +464,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Publications = cloneAuthorityMap(s.Publications)
 	case AuthorityNodeRemove:
 		s.Nodes = cloneAuthorityMap(s.Nodes)
+		s.RetiredNodes = cloneAuthorityMap(s.RetiredNodes)
 	case AuthorityClusterPolicySet:
 		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
@@ -1060,6 +1068,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 			return nil, err
 		}
 		s.Nodes[record.NodeID] = record
+		delete(s.RetiredNodes, record.NodeID)
 		return authorityValue(record)
 	case AuthorityNodeRenew:
 		p, err := decodeAuthorityPayload[AuthorityNodeRenewPayload](command)
@@ -1224,6 +1233,7 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 			}
 		}
 		delete(s.Nodes, p.NodeID)
+		s.RetiredNodes[p.NodeID] = p.Incarnation
 		return authorityValue(record)
 	default:
 		p, err := decodeAuthorityPayload[AuthorityCapacityPayload](command)
@@ -2104,6 +2114,14 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	for _, node := range state.Nodes {
 		if err := node.Validate(); err != nil {
 			return nil, err
+		}
+	}
+	for nodeID, incarnation := range state.RetiredNodes {
+		if !transactionIDPattern.MatchString(nodeID) || !transactionIDPattern.MatchString(incarnation) {
+			return nil, errors.New("authority snapshot has invalid retired node identity")
+		}
+		if _, live := state.Nodes[nodeID]; live {
+			return nil, errors.New("authority snapshot node is both registered and retired")
 		}
 	}
 	for _, placement := range state.Placements {
