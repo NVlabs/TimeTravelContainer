@@ -70,6 +70,18 @@ func (m *portIngressManager) Publish(target selector, binding ttcbundle.PortBind
 			return fmt.Errorf("branch %q is %s", target.branch, placement.State)
 		}
 		target.container = family
+		// Placement is sufficient to create a listener before a local image or
+		// physical runtime exists, but when the shared family record is present it
+		// must still enforce the same network-mode contract as standalone TTC.
+		// Otherwise --network=none accepts a published port that can only reset
+		// every connection later in the asynchronous forwarding path.
+		if info, loadErr := m.serverStore().LoadContainer(family); loadErr == nil {
+			if info.NetworkMode != "ttc" {
+				return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+			}
+		} else if !errors.Is(loadErr, os.ErrNotExist) && m.server.dataRoot != "" {
+			return fmt.Errorf("loading published-port family metadata: %w", loadErr)
+		}
 	} else {
 		info, err := m.serverStore().LoadContainer(target.container)
 		if err != nil {

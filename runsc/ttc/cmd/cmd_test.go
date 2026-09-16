@@ -199,6 +199,45 @@ func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing
 	}
 }
 
+func TestDistributedPortIngressRejectsKnownNonTTCNetwork(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir, NetworkMode: "none",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{dataRoot: root, clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	err = manager.Publish(selector{container: "web", branch: "main"}, ttcbundle.PortBinding{
+		HostIP: "127.0.0.1", HostPort: 1, ContainerPort: 8080, Protocol: "tcp",
+	})
+	if err == nil || !strings.Contains(err.Error(), `network mode "none", not ttc`) {
+		t.Fatalf("Publish() error=%v, want network-mode rejection", err)
+	}
+}
+
 func TestDistributedPortIngressCanPrecedeInitialPlacement(t *testing.T) {
 	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
 	if err != nil {
