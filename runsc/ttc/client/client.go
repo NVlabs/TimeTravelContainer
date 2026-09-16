@@ -198,7 +198,7 @@ Commands:
   completion bash|zsh|fish
 
 Branch selectors use CONTAINER@BRANCH. Run 'ttc COMMAND --help' for command
-usage. ttcd requires TTC_ROOT; clustered ttcd additionally requires
+usage. ttcd requires TTC_ROOT; clustered compute daemons additionally require
 TTC_LOCAL_ROOT.
 `)
 }
@@ -221,8 +221,9 @@ Run 'ttc daemon COMMAND --help' for command-specific usage.`,
 	"daemon start": `Usage: ttc daemon start [OPTIONS]
 
 Start the sibling ttcd binary and wait until it is ready. TTC_ROOT must name
-an explicitly configured, new-format data root. Cluster mode additionally
-requires TTC_LOCAL_ROOT for node-local active state and cache data.
+an explicitly configured, new-format data root. Cluster compute mode
+additionally requires TTC_LOCAL_ROOT for node-local active state and cache
+data; control-only mode does not.
 
 Options:
   --platform systrap|kvm          Select the gVisor execution platform
@@ -232,6 +233,7 @@ Options:
   --unsafe-no-host-isolation      Disable host namespace/chroot isolation
   --cluster-init                  Create a new distributed TTC cluster
   --cluster-join HOST:PORT        Join an existing cluster through a seed node
+  --control-only                  Outbound-only login-node control gateway
   --node NAME                     Set this cluster node's stable name
   --listen ADDR                   Listen for cluster traffic
   --advertise HOST:PORT           Address advertised to other cluster nodes
@@ -241,7 +243,11 @@ Options:
   --cluster-capacity-webhook URL  Invoke a trusted node provisioner webhook
 
 Cluster membership, transport, and capacity options are fixed for the daemon
-lifetime. --cluster-init and --cluster-join are mutually exclusive.`,
+lifetime. --cluster-init and --cluster-join are mutually exclusive.
+
+With --control-only, repeat --cluster-join for optional seed redundancy. The
+daemon opens only TTC_SOCKET: it does not advertise a TCP endpoint, join Raft,
+accept container placement, or require TTC_LOCAL_ROOT.`,
 	"daemon status": `Usage: ttc daemon status
 
 Show the running daemon's build ID, runtime mode, root format, and cluster

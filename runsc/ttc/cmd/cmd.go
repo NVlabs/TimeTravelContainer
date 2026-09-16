@@ -255,6 +255,7 @@ Commands:
   daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
                [--cpu-features FEATURE,...] [--unsafe-no-host-isolation]
                [--cluster-init | --cluster-join HOST:PORT]
+               [--control-only --cluster-join HOST:PORT]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
                                   Start the per-user service in one fixed mode
@@ -271,14 +272,22 @@ set; omitting DEST generates a branch ID.
 func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 	if len(args) == 2 && args[1] == "--help" {
 		usage := map[string]string{
-			"container":    "Usage: ttc container COMMAND",
-			"image":        "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
-			"load":         "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
-			"save":         "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
-			"commit":       "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
-			"port":         "Usage: ttc port publish|ls|unpublish [OPTIONS]",
-			"completion":   "Usage: ttc completion bash|zsh|fish",
-			"daemon":       "Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [--cpu-profile portable|host|explicit] [--cpu-features FEATURE,...] [OPTIONS] | status | stop [--migrate-all|--dehydrate-all|--stop-all]",
+			"container":  "Usage: ttc container COMMAND",
+			"image":      "Usage: ttc image ls|pull|load|save|inspect|rm [OPTIONS]",
+			"load":       "Usage: ttc load [--input FILE] [--platform PLATFORM] [--quiet]",
+			"save":       "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
+			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
+			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
+			"completion": "Usage: ttc completion bash|zsh|fish",
+			"daemon": `Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [OPTIONS]
+       ttc daemon start --control-only --cluster-join HOST:PORT [--cluster-join HOST:PORT...]
+       ttc daemon status
+       ttc daemon stop [--migrate-all|--dehydrate-all|--stop-all]
+
+--control-only starts an outbound-only login-node gateway. It accepts commands
+on TTC_SOCKET but advertises no TCP endpoint, joins no Raft group, and accepts
+no container placement. TTC_ROOT must identify the cluster shared root;
+TTC_LOCAL_ROOT is not required.`,
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
 			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",

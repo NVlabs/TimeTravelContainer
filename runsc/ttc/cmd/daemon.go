@@ -304,6 +304,7 @@ type daemonConsoleClient struct {
 
 type daemonClusterOptions struct {
 	Configured      bool
+	ControlOnly     bool
 	Listen          string
 	NodeID          string
 	RepositoryID    string
@@ -354,6 +355,106 @@ type daemonClusterRuntime struct {
 	autoRebalance     bool
 	capacitySink      elasticCapacitySink
 	cpuProfile        daemonCPUProfile
+}
+
+// controlOnlyCluster is an outbound-only cluster gateway. It deliberately has
+// no Raft node, NodeRecord, placement capacity, TCP listener, or data-plane
+// provider. Commands arriving on its per-user Unix socket are tunneled to a
+// compute daemon, which performs the ordinary authoritative routing.
+type controlOnlyCluster struct {
+	nodeID       string
+	repositoryID string
+	seeds        []string
+	clients      []*cluster.Client
+	active       atomic.Uint64
+}
+
+type controlOnlyPeerStatus struct {
+	BuildID string `json:"build_id"`
+	Cluster *struct {
+		Capabilities cluster.Capabilities `json:"capabilities"`
+	} `json:"cluster"`
+}
+
+func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*controlOnlyCluster, error) {
+	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID}
+	seen := make(map[string]struct{})
+	var probeErrors error
+	for _, peerSpec := range opts.Peers {
+		_, baseURL, _, err := parseClusterPeer(peerSpec)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[baseURL]; ok {
+			continue
+		}
+		seen[baseURL] = struct{}{}
+		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, os.Getenv("TTC_CLUSTER_TOKEN"), 2*time.Minute)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		status, probeErr := probeControlOnlyPeer(ctx, client)
+		cancel()
+		if probeErr != nil {
+			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: %w", baseURL, probeErr))
+			continue
+		}
+		if status.Cluster == nil {
+			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: peer is not a clustered TTC daemon", baseURL))
+			continue
+		}
+		if status.Cluster.Capabilities.RepositoryID != opts.RepositoryID {
+			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: repository %q does not match TTC_ROOT repository %q", baseURL, status.Cluster.Capabilities.RepositoryID, opts.RepositoryID))
+			continue
+		}
+		control.seeds = append(control.seeds, baseURL)
+		control.clients = append(control.clients, client)
+	}
+	if len(control.clients) == 0 {
+		return nil, fmt.Errorf("no control seed is reachable and compatible with %q: %w", sharedRoot, probeErrors)
+	}
+	return control, nil
+}
+
+func probeControlOnlyPeer(ctx context.Context, client *cluster.Client) (controlOnlyPeerStatus, error) {
+	request, err := json.Marshal(daemonRequest{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"})
+	if err != nil {
+		return controlOnlyPeerStatus{}, err
+	}
+	var response bytes.Buffer
+	if err := client.ProxyDaemon(ctx, bytes.NewReader(append(request, '\n')), &response); err != nil {
+		return controlOnlyPeerStatus{}, err
+	}
+	reader := bufio.NewReader(&response)
+	var stdout, stderr bytes.Buffer
+	for {
+		typ, payload, err := readDaemonFrame(reader)
+		if err != nil {
+			return controlOnlyPeerStatus{}, fmt.Errorf("reading seed daemon response: %w", err)
+		}
+		switch typ {
+		case daemonFrameStdout:
+			stdout.Write(payload)
+		case daemonFrameStderr:
+			stderr.Write(payload)
+		case daemonFrameStatus:
+			if len(payload) != 4 {
+				return controlOnlyPeerStatus{}, fmt.Errorf("invalid seed status frame length %d", len(payload))
+			}
+			if status := binary.BigEndian.Uint32(payload); status != 0 {
+				return controlOnlyPeerStatus{}, fmt.Errorf("seed rejected control client: %s", strings.TrimSpace(stderr.String()))
+			}
+			var result controlOnlyPeerStatus
+			if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+				return controlOnlyPeerStatus{}, fmt.Errorf("decoding seed status: %w", err)
+			}
+			if result.BuildID != version.Version() {
+				return controlOnlyPeerStatus{}, fmt.Errorf("seed build %q does not match control daemon build %q", result.BuildID, version.Version())
+			}
+			return result, nil
+		}
+	}
 }
 
 const daemonNodeIncarnationVersion = 1
@@ -2430,7 +2531,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd: socket path must not be empty")
 		return 2
 	}
-	roots, err := daemonRootsFromEnvironment(clusterOpts.Configured)
+	roots, err := daemonRootsFromEnvironment(clusterOpts.Configured && !clusterOpts.ControlOnly)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 2
@@ -2443,7 +2544,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: validating TTC_ROOT: %v\n", err)
 		return 1
 	}
-	if clusterOpts.Configured {
+	if clusterOpts.Configured && !clusterOpts.ControlOnly {
 		if err := inspectDaemonStorageRoot(roots.local, daemonRootRoleClusterLocal); err != nil {
 			fmt.Fprintf(stderr, "ttcd: validating TTC_LOCAL_ROOT: %v\n", err)
 			return 1
@@ -2454,7 +2555,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ttcd: validating strict TTC_ROOT: %v\n", err)
 			return 1
 		}
-		if clusterOpts.Configured {
+		if clusterOpts.Configured && !clusterOpts.ControlOnly {
 			if err := validateStrictSnapshotGraphRoot(roots.local); err != nil {
 				fmt.Fprintf(stderr, "ttcd: validating strict TTC_LOCAL_ROOT: %v\n", err)
 				return 1
@@ -2466,6 +2567,22 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ttcd: configuring cluster identity: %v\n", err)
 			return 2
 		}
+	}
+	if clusterOpts.ControlOnly {
+		if unsafeNoHostIsolation {
+			fmt.Fprintln(stderr, "ttcd: --unsafe-no-host-isolation is not applicable to a control-only daemon")
+			return 2
+		}
+		control, err := prepareControlOnlyCluster(clusterOpts, roots.shared)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttcd: configuring control-only cluster access: %v\n", err)
+			return 1
+		}
+		if err := serveControlOnlyDaemon(socket, roots.shared, control, stdout, stderr); err != nil {
+			fmt.Fprintf(stderr, "ttcd: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	daemonDataRoot := roots.shared
 	daemonRoot := roots.runtime
@@ -2571,6 +2688,50 @@ type daemonRoots struct {
 }
 
 func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) error {
+	if opts.ControlOnly {
+		if opts.RaftBootstrap {
+			return errors.New("--control-only cannot be combined with --cluster-init")
+		}
+		if len(opts.Peers) == 0 {
+			return errors.New("--control-only requires at least one --cluster-join HOST:PORT")
+		}
+		if opts.Listen != "" || opts.Advertise != "" || opts.PageAdvertise != "" {
+			return errors.New("a control-only daemon is outbound-only; --listen, --advertise, and --cluster-page-advertise are not permitted")
+		}
+		if opts.MemoryTarget != 0 || opts.AutoRebalance || opts.CapacityCommand != "" || opts.CapacityWebhook != "" {
+			return errors.New("placement capacity and automatic rebalancing options are not applicable to a control-only daemon")
+		}
+		if opts.NodeID == "" {
+			hostname, err := os.Hostname()
+			if err != nil || strings.TrimSpace(hostname) == "" {
+				return errors.New("cannot derive control client name from hostname; set --node")
+			}
+			opts.NodeID = "control-" + strings.TrimSpace(hostname)
+		}
+		if !transactionIDPatternForDaemon(opts.NodeID) {
+			return fmt.Errorf("invalid control client name %q; set --node to letters, digits, '.', '_', or '-'", opts.NodeID)
+		}
+		markerData, err := os.ReadFile(filepath.Join(roots.shared, ".ttc-root-format"))
+		if err != nil {
+			return fmt.Errorf("control-only mode requires an initialized cluster TTC_ROOT: %w", err)
+		}
+		var marker daemonRootMarker
+		if err := json.Unmarshal(markerData, &marker); err != nil {
+			return fmt.Errorf("decoding cluster TTC_ROOT marker: %w", err)
+		}
+		want, err := daemonRootMarkerFor(daemonRootRoleClusterShared, marker.RepositoryID, "")
+		if err != nil || marker != want {
+			return fmt.Errorf("TTC_ROOT is not a current-format clustered shared root")
+		}
+		if opts.RepositoryID != "" && opts.RepositoryID != marker.RepositoryID {
+			return fmt.Errorf("configured repository %q does not match TTC_ROOT repository %q", opts.RepositoryID, marker.RepositoryID)
+		}
+		opts.RepositoryID = marker.RepositoryID
+		// No peer may dial this daemon. In particular it owns neither a page
+		// listener nor a Raft/control address.
+		opts.PageListen = ""
+		return nil
+	}
 	if opts.RaftBootstrap && len(opts.Peers) != 0 {
 		return errors.New("--cluster-init and --cluster-join are mutually exclusive")
 	}
@@ -3013,6 +3174,11 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 	}
 	if args[0] == "--cluster-init" {
 		opts.RaftBootstrap = true
+		opts.Configured = true
+		return 1, nil
+	}
+	if args[0] == "--control-only" {
+		opts.ControlOnly = true
 		opts.Configured = true
 		return 1, nil
 	}
@@ -3860,6 +4026,139 @@ func secureDaemonDirectory(dir string) error {
 		return fmt.Errorf("socket directory %q permissions %04o allow access by other users", dir, info.Mode().Perm())
 	}
 	return nil
+}
+
+type countingDaemonWriter struct {
+	writer io.Writer
+	bytes  int64
+}
+
+func (w *countingDaemonWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	w.bytes += int64(n)
+	return n, err
+}
+
+type controlOnlyDaemonServer struct {
+	listener net.Listener
+	cluster  *controlOnlyCluster
+	root     string
+	stopOnce sync.Once
+}
+
+// serveControlOnlyDaemon exposes only the local Unix API. It never opens a TCP
+// listener and never registers a cluster node, so compute nodes cannot select
+// it for placement or initiate a connection to it.
+func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyCluster, stdout, stderr io.Writer) error {
+	if control == nil || len(control.clients) == 0 {
+		return errors.New("control-only cluster has no compute seed")
+	}
+	dir := filepath.Dir(socket)
+	if err := secureDaemonDirectory(dir); err != nil {
+		return err
+	}
+	startLock, err := os.OpenFile(socket+".start.lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening daemon startup lock: %w", err)
+	}
+	defer startLock.Close()
+	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking daemon startup: %w", err)
+	}
+	if conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond); err == nil {
+		conn.Close()
+		return fmt.Errorf("daemon is already listening on %s", socket)
+	}
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale socket: %w", err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", socket, err)
+	}
+	defer listener.Close()
+	defer os.Remove(socket)
+	if err := os.Chmod(socket, 0600); err != nil {
+		return fmt.Errorf("securing daemon socket: %w", err)
+	}
+	if err := syscall.Flock(int(startLock.Fd()), syscall.LOCK_UN); err != nil {
+		return fmt.Errorf("unlocking daemon startup: %w", err)
+	}
+	server := &controlOnlyDaemonServer{listener: listener, cluster: control, root: sharedRoot}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "ttcd control-only gateway listening on %s (repository=%s, seed=%s)\n", socket, control.repositoryID, control.seeds[0])
+	}
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("accepting client: %w", err)
+		}
+		go server.handle(conn, stderr)
+	}
+}
+
+func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) {
+	defer conn.Close()
+	if err := checkDaemonPeer(conn); err != nil {
+		if serverErrors != nil {
+			fmt.Fprintf(serverErrors, "ttcd: rejecting peer: %v\n", err)
+		}
+		return
+	}
+	reader := bufio.NewReader(conn)
+	header, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	var request daemonRequest
+	if err := json.Unmarshal([]byte(header), &request); err != nil {
+		return
+	}
+	var writeMu sync.Mutex
+	writeError := func(err error) {
+		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStderr, []byte("ttcd: "+err.Error()+"\n"))
+		_ = writeDaemonStatus(conn, &writeMu, 1)
+	}
+	if request.Action != "stop" && request.Version != daemonAPIVersion {
+		writeError(fmt.Errorf("unsupported API version %d (server uses %d)", request.Version, daemonAPIVersion))
+		return
+	}
+	if request.Action != "stop" && request.ClientBuildID != "" && request.ClientBuildID != version.Version() {
+		writeError(fmt.Errorf("client build %q does not match daemon build %q; only 'ttc daemon stop' is allowed across versions", request.ClientBuildID, version.Version()))
+		return
+	}
+	switch request.Action {
+	case "ping":
+		payload, _ := json.Marshal(map[string]any{
+			"version": daemonAPIVersion, "build_id": version.Version(), "features": daemonAPIFeatures,
+			"pid": os.Getpid(), "role": "control-only", "control_only": true,
+			"shared_root": s.root,
+			"cluster":     map[string]any{"control_only": true, "repository_id": s.cluster.repositoryID, "seeds": s.cluster.seeds},
+		})
+		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
+		_ = writeDaemonStatus(conn, &writeMu, 0)
+		return
+	case "stop":
+		if len(request.Args) != 0 {
+			writeError(errors.New("container stop policies are not applicable to a control-only daemon"))
+			return
+		}
+		_ = writeDaemonStatus(conn, &writeMu, 0)
+		s.stopOnce.Do(func() { _ = s.listener.Close() })
+		return
+	}
+	index := s.cluster.active.Load() % uint64(len(s.cluster.clients))
+	client := s.cluster.clients[index]
+	output := &countingDaemonWriter{writer: conn}
+	if err := client.ProxyDaemon(context.Background(), io.MultiReader(strings.NewReader(header), reader), output); err != nil {
+		s.cluster.active.CompareAndSwap(index, (index+1)%uint64(len(s.cluster.clients)))
+		if output.bytes == 0 {
+			writeError(fmt.Errorf("proxying through compute seed %s: %w", s.cluster.seeds[index], err))
+		}
+	}
 }
 
 // prepareDaemonRuntimeStorage ensures that control sockets and runsc's live
@@ -5919,53 +6218,65 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 	if strings.TrimSpace(string(output)) != wantVersion {
 		return "", nil, fmt.Errorf("ttc build %q does not match %s", version.Version(), strings.TrimSpace(string(output)))
 	}
-	commandArgs := []string{"--socket", socket, "--platform", runtimePlatform}
-	commandArgs = append(commandArgs, "--cpu-profile", clusterOpts.CPUProfileMode)
-	if clusterOpts.CPUFeatures != "" {
-		commandArgs = append(commandArgs, "--cpu-features", clusterOpts.CPUFeatures)
-	}
-	if unsafeNoHostIsolation {
-		commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
+	commandArgs := []string{"--socket", socket}
+	if !clusterOpts.ControlOnly {
+		commandArgs = append(commandArgs, "--platform", runtimePlatform, "--cpu-profile", clusterOpts.CPUProfileMode)
+		if clusterOpts.CPUFeatures != "" {
+			commandArgs = append(commandArgs, "--cpu-features", clusterOpts.CPUFeatures)
+		}
+		if unsafeNoHostIsolation {
+			commandArgs = append(commandArgs, "--unsafe-no-host-isolation")
+		}
 	}
 	if clusterOpts.Configured {
-		commandArgs = append(commandArgs,
-			"--cluster-listen", clusterOpts.Listen,
-			"--cluster-node-id", clusterOpts.NodeID,
-			"--cluster-repository-id", clusterOpts.RepositoryID,
-			"--cluster-lease", clusterOpts.LeaseDuration.String(),
-			"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
-			"--cluster-page-listen", clusterOpts.PageListen,
-			"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
-			"--cluster-max-outstanding-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.MaxOutstandingBytes, 10),
-			"--cluster-max-parallel", strconv.Itoa(clusterOpts.PagingPolicy.MaxConcurrency),
-			"--cluster-ack-batch-pages", strconv.Itoa(clusterOpts.PagingPolicy.AckBatchPages),
-			"--cluster-ack-interval", clusterOpts.PagingPolicy.AckInterval.String(),
-			"--cluster-prefetch", string(clusterOpts.PagingPolicy.Prefetch),
-			"--cluster-push", string(clusterOpts.PagingPolicy.Push),
-		)
-		if clusterOpts.Advertise != "" {
-			commandArgs = append(commandArgs, "--cluster-advertise", clusterOpts.Advertise)
-		}
-		if clusterOpts.MemoryTarget != 0 {
-			commandArgs = append(commandArgs, "--cluster-memory-target", strconv.FormatUint(clusterOpts.MemoryTarget, 10))
-		}
-		if clusterOpts.AutoRebalance {
-			commandArgs = append(commandArgs, "--cluster-auto-rebalance")
-		}
-		if clusterOpts.RaftBootstrap {
-			commandArgs = append(commandArgs, "--cluster-raft-bootstrap")
-		}
-		if clusterOpts.CapacityCommand != "" {
-			commandArgs = append(commandArgs, "--cluster-capacity-command", clusterOpts.CapacityCommand)
-		}
-		if clusterOpts.CapacityWebhook != "" {
-			commandArgs = append(commandArgs, "--cluster-capacity-webhook", clusterOpts.CapacityWebhook)
-		}
-		if clusterOpts.PageAdvertise != "" {
-			commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
-		}
-		for _, peer := range clusterOpts.Peers {
-			commandArgs = append(commandArgs, "--cluster-peer", peer)
+		if clusterOpts.ControlOnly {
+			commandArgs = append(commandArgs, "--control-only")
+			if clusterOpts.NodeID != "" {
+				commandArgs = append(commandArgs, "--cluster-node-id", clusterOpts.NodeID)
+			}
+			for _, peer := range clusterOpts.Peers {
+				commandArgs = append(commandArgs, "--cluster-peer", peer)
+			}
+		} else {
+			commandArgs = append(commandArgs,
+				"--cluster-listen", clusterOpts.Listen,
+				"--cluster-node-id", clusterOpts.NodeID,
+				"--cluster-repository-id", clusterOpts.RepositoryID,
+				"--cluster-lease", clusterOpts.LeaseDuration.String(),
+				"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
+				"--cluster-page-listen", clusterOpts.PageListen,
+				"--cluster-transfer-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.TransferBytes, 10),
+				"--cluster-max-outstanding-bytes", strconv.FormatUint(clusterOpts.PagingPolicy.MaxOutstandingBytes, 10),
+				"--cluster-max-parallel", strconv.Itoa(clusterOpts.PagingPolicy.MaxConcurrency),
+				"--cluster-ack-batch-pages", strconv.Itoa(clusterOpts.PagingPolicy.AckBatchPages),
+				"--cluster-ack-interval", clusterOpts.PagingPolicy.AckInterval.String(),
+				"--cluster-prefetch", string(clusterOpts.PagingPolicy.Prefetch),
+				"--cluster-push", string(clusterOpts.PagingPolicy.Push),
+			)
+			if clusterOpts.Advertise != "" {
+				commandArgs = append(commandArgs, "--cluster-advertise", clusterOpts.Advertise)
+			}
+			if clusterOpts.MemoryTarget != 0 {
+				commandArgs = append(commandArgs, "--cluster-memory-target", strconv.FormatUint(clusterOpts.MemoryTarget, 10))
+			}
+			if clusterOpts.AutoRebalance {
+				commandArgs = append(commandArgs, "--cluster-auto-rebalance")
+			}
+			if clusterOpts.RaftBootstrap {
+				commandArgs = append(commandArgs, "--cluster-raft-bootstrap")
+			}
+			if clusterOpts.CapacityCommand != "" {
+				commandArgs = append(commandArgs, "--cluster-capacity-command", clusterOpts.CapacityCommand)
+			}
+			if clusterOpts.CapacityWebhook != "" {
+				commandArgs = append(commandArgs, "--cluster-capacity-webhook", clusterOpts.CapacityWebhook)
+			}
+			if clusterOpts.PageAdvertise != "" {
+				commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
+			}
+			for _, peer := range clusterOpts.Peers {
+				commandArgs = append(commandArgs, "--cluster-peer", peer)
+			}
 		}
 	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
@@ -6072,6 +6383,10 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 2
 		}
 		opts.runtimePlatform = runtimePlatform
+		if clusterOpts.ControlOnly && opts.unsafeNoHostIsolation {
+			fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation is not applicable to --control-only")
+			return 2
+		}
 		args = args[:1]
 	}
 	if len(args) != 0 && (args[0] == "requests" || args[0] == "request") {

@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1573,6 +1575,103 @@ func TestSimpleClusterOptions(t *testing.T) {
 	}
 	if !reflect.DeepEqual(join.Peers, []string{"seed=node-a.example:7443"}) {
 		t.Fatalf("equals-form join peers=%q", join.Peers)
+	}
+}
+
+func TestControlOnlyClusterOptions(t *testing.T) {
+	shared := t.TempDir()
+	if err := prepareDaemonStorageRoot(shared, daemonRootRoleClusterShared, "repo-control", ""); err != nil {
+		t.Fatal(err)
+	}
+	roots := daemonRoots{shared: shared, local: shared}
+	opts := defaultDaemonClusterOptions()
+	args := []string{"--control-only", "--cluster-join", "compute-a.example:7443", "--node", "login-gateway"}
+	for len(args) != 0 {
+		consumed, err := consumeDaemonClusterOption(args, &opts)
+		if err != nil || consumed == 0 {
+			t.Fatalf("consuming %q: consumed=%d err=%v", args[0], consumed, err)
+		}
+		args = args[consumed:]
+	}
+	if err := resolveSimpleClusterOptions(&opts, roots); err != nil {
+		t.Fatal(err)
+	}
+	if !opts.ControlOnly || opts.NodeID != "login-gateway" || opts.RepositoryID != "repo-control" || opts.Listen != "" || opts.Advertise != "" || opts.PageListen != "" || opts.PageAdvertise != "" {
+		t.Fatalf("control-only options=%+v", opts)
+	}
+
+	for _, test := range []struct {
+		name string
+		edit func(*daemonClusterOptions)
+		want string
+	}{
+		{name: "bootstrap", edit: func(o *daemonClusterOptions) { o.RaftBootstrap = true }, want: "cluster-init"},
+		{name: "listen", edit: func(o *daemonClusterOptions) { o.Listen = "0.0.0.0:7443" }, want: "outbound-only"},
+		{name: "advertise", edit: func(o *daemonClusterOptions) { o.Advertise = "login.example:7443" }, want: "outbound-only"},
+		{name: "capacity", edit: func(o *daemonClusterOptions) { o.MemoryTarget = 1 << 30 }, want: "capacity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bad := defaultDaemonClusterOptions()
+			bad.ControlOnly, bad.Configured = true, true
+			bad.Peers = []string{"seed=compute-a.example:7443"}
+			bad.NodeID = "login-gateway"
+			test.edit(&bad)
+			if err := resolveSimpleClusterOptions(&bad, roots); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("resolve error=%v, want substring %q", err, test.want)
+			}
+		})
+	}
+
+	missingSeed := defaultDaemonClusterOptions()
+	missingSeed.ControlOnly, missingSeed.Configured = true, true
+	if err := resolveSimpleClusterOptions(&missingSeed, roots); err == nil || !strings.Contains(err.Error(), "cluster-join") {
+		t.Fatalf("missing seed error=%v", err)
+	}
+}
+
+func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
+	var gotNode string
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotNode = r.Header.Get("X-TTC-Node")
+		if r.URL.Path != "/v1/daemon" {
+			http.NotFound(w, r)
+			return
+		}
+		var request daemonRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if request.Action != "ping" || request.ClientBuildID != version.Version() {
+			http.Error(w, "unexpected probe", http.StatusBadRequest)
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"build_id": version.Version(),
+			"cluster": map[string]any{"capabilities": cluster.Capabilities{
+				NodeID: "compute-a", RepositoryID: "repo-control",
+			}},
+		})
+		var mu sync.Mutex
+		_ = writeDaemonFrame(w, &mu, daemonFrameStdout, append(payload, '\n'))
+		_ = writeDaemonStatus(w, &mu, 0)
+	}))
+	defer seed.Close()
+
+	opts := defaultDaemonClusterOptions()
+	opts.Configured, opts.ControlOnly = true, true
+	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.Peers = []string{"seed=" + strings.TrimPrefix(seed.URL, "http://")}
+	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNode != "login-gateway" || len(control.clients) != 1 || control.repositoryID != "repo-control" {
+		t.Fatalf("probe node=%q control=%+v", gotNode, control)
+	}
+	opts.RepositoryID = "another-repository"
+	if _, err := prepareControlOnlyCluster(opts, "/shared/ttc"); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched repository error=%v", err)
 	}
 }
 

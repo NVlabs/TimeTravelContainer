@@ -206,11 +206,12 @@ ttc daemon start --cluster-init --node node-a \
   --listen 0.0.0.0:7443 --advertise node-a.example:7443
 ```
 
-`TTC_LOCAL_ROOT` is required in cluster mode, must differ from `TTC_ROOT`, and
-is exclusively locked to one daemon. Active filesystems, runtime state,
-console/exec buffers, caches, and publication staging remain local. Sealed
-generations publish asynchronously as immutable indexed packs; after a clean
-node stop, remaining local files are disposable caches or staging residue.
+`TTC_LOCAL_ROOT` is required on cluster compute nodes, must differ from
+`TTC_ROOT`, and is exclusively locked to one daemon. Active filesystems,
+runtime state, console/exec buffers, caches, and publication staging remain
+local. Sealed generations publish asynchronously as immutable indexed packs;
+after a clean node stop, remaining local files are disposable caches or
+staging residue.
 
 The client locates the daemon through `TTC_SOCKET`, then
 `$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
@@ -417,6 +418,31 @@ ttc daemon start --cluster-join node-a.example:7443 --node node-b \
   --listen 0.0.0.0:7443 --advertise node-b.example:7443 \
   --memory-target 64GiB
 ```
+
+A login node that should control the cluster but never execute containers can
+run an outbound-only gateway:
+
+```shell
+export TTC_ROOT=/shared/ttc
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
+ttc daemon start --control-only --cluster-join node-a.example:7443
+```
+
+This mode does not require `TTC_LOCAL_ROOT`. It opens only the per-user Unix
+socket selected by `TTC_SOCKET`; it does not open or advertise a TCP port,
+join Raft, create a cluster `NodeRecord`, provide page data, or accept branch
+placement. The login host therefore needs outbound connectivity to one compute
+seed, but compute nodes never initiate connections to it. Commands such as
+`run`, `exec`, `fork`, `migrate`, `ps`, and `node ls` are tunneled to the seed
+and then routed by the normal cluster placement authority. `ttc daemon stop`
+stops only the login-node gateway; use `ttc node stop` to retire a compute
+node. The shared `TTC_ROOT` marker is read to prevent accidentally controlling
+a different repository, but the gateway does not write container data there.
+
+For seed redundancy, repeat `--cluster-join HOST:PORT`. TTC verifies at least
+one seed and exact build/repository compatibility before publishing its local
+Unix socket. A failed stream is never replayed ambiguously; the next command
+rotates to another configured seed.
 
 Only one seed is needed. Membership and leader discovery come from Raft after
 admission. HTTP control requests and Raft streams share the single TCP port
