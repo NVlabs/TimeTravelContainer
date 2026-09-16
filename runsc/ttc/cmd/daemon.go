@@ -3890,12 +3890,8 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	var leaseGuardian *os.File
 	defer func() {
 		close(clusterDone)
-		if elasticHeartbeatStopped != nil {
-			<-elasticHeartbeatStopped
-		}
-		if sharedGCStopped != nil {
-			<-sharedGCStopped
-		}
+		waitDaemonWorker(elasticHeartbeatStopped, "elastic heartbeat", stderr)
+		waitDaemonWorker(sharedGCStopped, "shared GC coordinator", stderr)
 		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
 			if !server.cleanStop.Load() && clusterTargetBackend != nil {
 				if err := fenceElasticRuntimes(clusterTargetBackend, elasticRecord.NodeID, elasticRecord.Incarnation); err != nil && stderr != nil {
@@ -4377,6 +4373,27 @@ func shutdownClusterServer(server *http.Server) {
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		_ = server.Close()
+	}
+}
+
+// waitDaemonWorker keeps an unavailable Raft leader from turning an ordinary
+// startup failure or daemon stop into an immortal half-started process. Some
+// catalog interfaces predate context-aware reads, so a worker may be blocked
+// inside a linearizable barrier even after clusterDone closes. The process is
+// already committed to exit at this point; bounding the join lets subsequent
+// deferred cleanup close the Raft transport and local stores.
+func waitDaemonWorker(done <-chan struct{}, name string, stderr io.Writer) {
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		if stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: %s did not stop before shutdown; closing its cluster resources\n", name)
+		}
 	}
 }
 
