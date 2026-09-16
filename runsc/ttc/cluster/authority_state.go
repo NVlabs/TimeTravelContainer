@@ -1384,6 +1384,20 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 			// of the next stop/dehydrate transaction.
 			branch.PublicationID = ""
 		}
+		if command.Kind == AuthorityPlacementStableState {
+			// Materialization has established a mutable runtime and transferred
+			// every lazy page/file dependency into the ordinary snapshot ledgers.
+			// The cold publication is no longer an authority root. Keeping it in
+			// BranchAuthority or terminal publication history causes shared GC to
+			// retain it forever and, worse, makes a later legitimate retirement
+			// render the next Raft snapshot unrestorable.
+			branch.Roots = DurableRoots{}
+			for publicationKey, publication := range s.Publications {
+				if publication.FamilyID == branch.FamilyID && publication.BranchID == branch.BranchID && publication.State == PublicationCommitted {
+					delete(s.Publications, publicationKey)
+				}
+			}
+		}
 		branch.UpdatedAt = command.IssuedAt
 		s.Branches[key] = branch
 	}

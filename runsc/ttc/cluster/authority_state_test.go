@@ -483,6 +483,35 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	if _, ok := state.VolatileOrigins[7]; ok {
 		t.Fatal("memory origin remained volatile after atomic publication")
 	}
+	claimed := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "claim-publication", at.Add(4*time.Second), AuthorityPlacementClaim, AuthorityPlacementPayload{
+		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a",
+		PhysicalContainer: "family", PhysicalBranch: "main", Generation: placement.Generation, State: PlacementMaterializing,
+	}))
+	materializing := state.Branches[logicalBranchKey("family", "main")]
+	if materializing.PublicationID != "" || materializing.Roots.MemorySnapshot != 7 {
+		t.Fatalf("materializing branch lost its retry roots or publication fence: %+v", materializing)
+	}
+	applyAuthorityForTest(t, state, "stabilize-publication", at.Add(5*time.Second), AuthorityPlacementStableState, AuthorityPlacementPayload{
+		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: claimed.Generation, State: PlacementRunning,
+	})
+	active := state.Branches[logicalBranchKey("family", "main")]
+	if active.Roots != (DurableRoots{}) {
+		t.Fatalf("active branch retained consumed cold roots: %+v", active)
+	}
+	if len(state.Publications) != 0 {
+		t.Fatalf("active branch retained committed publication history: %+v", state.Publications)
+	}
+	// Once the live runtime releases its lazy graph references, retiring the
+	// old snapshot must not make the Raft state unrestorable.
+	state.NextSharedGCGeneration = 2
+	state.RetiredOrigins[7] = SharedPackRetirement{SnapshotID: 7, GCGeneration: 1, RetiredAt: at.Add(6 * time.Second)}
+	encoded, err := state.SnapshotBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreAuthorityState(encoded); err != nil {
+		t.Fatalf("restoring authority after consumed snapshot retirement: %v", err)
+	}
 }
 
 func TestAuthorityCanceledDehydrationRestoresPriorLifecycle(t *testing.T) {
