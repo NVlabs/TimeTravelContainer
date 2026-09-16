@@ -13593,6 +13593,23 @@ func (b *runtimeBackend) rootfsSize(target selector) (uint64, error) {
 	return size.WritableBytes, nil
 }
 
+// publishLiveFilesystemMetadata establishes a manager-observation boundary
+// for branch filesystems that keep a bounded metadata tail inside the Sentry.
+// This deliberately does not fsync file payloads: diff and accounting require
+// a current coherent graph view, not a guest-visible durability operation.
+func (b *runtimeBackend) publishLiveFilesystemMetadata(container string, branches ...ttcbundle.BranchInfo) error {
+	for _, branch := range branches {
+		state := normalizeLifecycleState(branch.State)
+		if state != "running" && state != "paused" {
+			continue
+		}
+		if _, err := b.command("timetravel", container, "filesystem-publish", branch.ID); err != nil {
+			return fmt.Errorf("publishing live filesystem metadata for %s@%s: %w", container, branch.ID, err)
+		}
+	}
+	return nil
+}
+
 func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -13600,6 +13617,9 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	}
 	branch, err := persistentBranchInfo(info, resolved.branch)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.publishLiveFilesystemMetadata(resolved.container, branch); err != nil {
 		return nil, err
 	}
 	filesystemBranch := branch.FilesystemBranch
@@ -13692,6 +13712,9 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			}
 		}
 		branches = filtered
+	}
+	if err := b.publishLiveFilesystemMetadata(info.ID, branches...); err != nil {
+		return FamilyResourceStats{}, err
 	}
 	sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
 	result.Branches = make([]BranchResourceStats, 0, len(branches))

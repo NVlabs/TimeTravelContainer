@@ -913,6 +913,22 @@ func (vfs *VirtualFilesystem) SyncAllFilesystems(ctx context.Context) error {
 	return retErr
 }
 
+// PublishFilesystemMetadata flushes process-local metadata tails so an
+// external observer can read a coherent current view without imposing the
+// data-durability cost of sync(2). Filesystems without such a tail are ignored.
+func (vfs *VirtualFilesystem) PublishFilesystemMetadata(ctx context.Context) error {
+	var retErr error
+	for _, fs := range vfs.GetFilesystems() {
+		if publisher, ok := fs.impl.(FilesystemMetadataPublisher); ok {
+			if err := publisher.PublishFilesystemMetadata(ctx); err != nil && retErr == nil {
+				retErr = err
+			}
+		}
+		fs.DecRef(ctx)
+	}
+	return retErr
+}
+
 // GetFilesystems returns a slice containing all Filesystems. It takes a
 // reference on each Filesystem.
 func (vfs *VirtualFilesystem) GetFilesystems() []*Filesystem {

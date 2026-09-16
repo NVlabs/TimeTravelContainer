@@ -2359,6 +2359,15 @@ func (s *Sandbox) SnapshotFilesystemBranch(args *boot.FilesystemBranchSnapshotAr
 	return nil
 }
 
+// PublishBranchFilesystemMetadata publishes completed TTC filesystem metadata
+// for manager-side observations such as diff and resource accounting.
+func (s *Sandbox) PublishBranchFilesystemMetadata(id string) error {
+	if err := s.call(boot.ContMgrPublishBranchFilesystemMetadata, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("publishing filesystem metadata for branch %q: %w", id, err)
+	}
+	return nil
+}
+
 // SetBranchQuarantine changes one branch's external-connectivity bit.
 func (s *Sandbox) SetBranchQuarantine(id string, enabled bool) error {
 	args := boot.BranchQuarantineArgs{ID: id, Enabled: enabled}

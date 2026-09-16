@@ -2139,6 +2139,55 @@ func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	}
 }
 
+// A live Sentry and ttcd observe a repository through different handles. The
+// Sentry keeps a bounded metadata tail in memory, so manager-side inspection
+// must not accidentally report the preceding graph root until the next fsync,
+// fork, or lifecycle transition. PublishMetadata is the inexpensive
+// visibility boundary used before observations such as `ttc diff`.
+func TestPublishMetadataMakesLiveTailVisibleToAnotherHandle(t *testing.T) {
+	manager := openTestManager(t)
+	writer, err := manager.Create("publish-metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.CreateRegular("child", RootInode, "visible", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	observer, err := manager.Open("publish-metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	changes, err := observer.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path == "/visible" {
+			t.Fatalf("unpublished process-local metadata became visible: %+v", changes)
+		}
+	}
+
+	if err := writer.PublishMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = observer.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path == "/visible" && change.Kind == "add" && change.Type == "regular" {
+			return
+		}
+	}
+	t.Fatalf("published metadata is missing from second handle's diff: %+v", changes)
+}
+
 func TestDiffBaseIsAnAuthoritativeGraphRoot(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("diff-root-lifetime")

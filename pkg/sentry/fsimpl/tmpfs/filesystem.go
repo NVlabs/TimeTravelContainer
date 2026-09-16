@@ -71,6 +71,19 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	return nil
 }
 
+// PublishFilesystemMetadata makes disk-backed TTC namespace and inode
+// mutations visible to other repository handles without fsyncing payload
+// objects. It is an observation boundary, not a guest durability boundary.
+func (fs *filesystem) PublishFilesystemMetadata(context.Context) error {
+	if fs.diskVolume == nil {
+		return nil
+	}
+	if err := fs.flushDiskWriteMetadataRaw(); err != nil {
+		return diskVolumeError("flush write metadata", err)
+	}
+	return diskVolumeError("publish filesystem metadata", fs.diskVolume.Repository.PublishMetadata())
+}
+
 // stepLocked resolves rp.Component() to an existing file, starting from the
 // given directory.
 //

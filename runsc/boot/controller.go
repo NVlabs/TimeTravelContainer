@@ -176,6 +176,10 @@ const (
 	// resource while preserving the selected branch's run/pause state.
 	ContMgrSnapshotFilesystemBranch = "containerManager.SnapshotFilesystemBranch"
 
+	// ContMgrPublishBranchFilesystemMetadata publishes completed branch-local
+	// TTC filesystem mutations for manager-side observation.
+	ContMgrPublishBranchFilesystemMetadata = "containerManager.PublishBranchFilesystemMetadata"
+
 	// ContMgrSetBranchQuarantine changes one branch's external-connectivity bit.
 	ContMgrSetBranchQuarantine = "containerManager.SetBranchQuarantine"
 
@@ -1391,6 +1395,15 @@ func (cm *containerManager) SnapshotFilesystemBranch(args *FilesystemBranchSnaps
 		return errors.New("missing filesystem snapshot arguments")
 	}
 	return cm.l.family.SnapshotFilesystemBranch(args.BranchID, args.ResourceID, args.Child, args.SourceWorking, args.ChildWorking)
+}
+
+// PublishBranchFilesystemMetadata makes completed filesystem mutations
+// visible to manager-side graph readers without imposing sync(2) durability.
+func (cm *containerManager) PublishBranchFilesystemMetadata(args *BranchArgs, _ *struct{}) error {
+	if args == nil || args.ID == "" {
+		return errors.New("missing branch filesystem metadata arguments")
+	}
+	return cm.l.family.PublishFilesystemMetadata(args.ID)
 }
 
 // SetBranchQuarantine changes one branch's external-connectivity bit.

@@ -133,6 +133,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-restore <session-id>\n" +
 		"timetravel [flags] <container-id> pause|resume|quarantine|unquarantine|destroy <branch-id>\n" +
 		"timetravel [flags] <container-id> filesystem-snapshot <branch-id> <volume-id> <child-filesystem-branch>\n" +
+		"timetravel [flags] <container-id> filesystem-publish <branch-id>\n" +
 		"timetravel [flags] <container-id> rename <branch-id> <new-branch-id>\n" +
 		"timetravel [flags] <container-id> checkpoint <branch-id>\n" +
 		"timetravel [flags] <container-id> dehydrate-export <branch-id>\n" +
@@ -575,6 +576,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			SourceWorking: sourceWorking,
 			ChildWorking:  childWorking,
 		})
+	case "filesystem-publish":
+		err = cont.Sandbox.PublishBranchFilesystemMetadata(f.Arg(2))
 	case "quarantine":
 		err = cont.Sandbox.SetBranchQuarantine(f.Arg(2), true)
 	case "unquarantine":

@@ -2500,6 +2500,16 @@ func (r *Repository) SyncMetadata() error {
 	return r.withLock(r.syncMetadataLocked)
 }
 
+// PublishMetadata makes this repository handle's bounded metadata batches
+// visible through the immutable snapshot graph without creating a data or
+// metadata durability boundary. Manager-side observations such as TTC diff
+// use this after asking the live Sentry to publish its process-local tail.
+// Guest fsync(2), sync(2), fork, and lifecycle operations continue to use
+// SyncMetadata when persistence is required.
+func (r *Repository) PublishMetadata() error {
+	return r.withLock(r.flushAllMetadataBatchesLocked)
+}
+
 // syncMetadataLocked persists files before the directories that make their
 // current names reachable. Repository mutations and this flush are serialized
 // by the repository flock, so a successful call covers every mutation that
