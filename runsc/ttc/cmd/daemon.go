@@ -4737,18 +4737,28 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			s.configureCommandBackend(backend)
 			unlock := s.lockDataRoot(opts.dataRoot)
 			var err error
-			migrateAll := slices.Contains(request.Args, "--migrate-all")
-			if s.clusterCapabilities != nil && !migrateAll {
-				err = drainSourceDependencies(backend, s.distributedSource, s.clusterStore, s.clusterCapabilities.NodeID)
-			}
-			if err == nil {
+			if s.clusterCapabilities != nil {
+				// A distributed daemon stop is also a node retirement. Reuse the
+				// node-stop state machine so the node is cordoned, all authoritative
+				// state and peer dependencies are drained, its offline record is
+				// committed, and deferred shutdown can transfer leadership and
+				// remove the retiring Raft member. Merely applying the branch policy
+				// here would leave a cleanly stopped voter in the quorum and strand a
+				// surviving two-node cluster.
+				mode := ""
 				switch {
-				case migrateAll:
-					if s.clusterCapabilities == nil {
-						err = errors.New("--migrate-all requires distributed mode")
-					} else {
-						_, err = backend.stopNode(s.clusterCapabilities.NodeID, "migrate", true)
-					}
+				case slices.Contains(request.Args, "--migrate-all"):
+					mode = "migrate"
+				case slices.Contains(request.Args, "--dehydrate-all"):
+					mode = "dehydrate"
+				case slices.Contains(request.Args, "--stop-all"):
+					mode = "stop"
+				}
+				_, err = backend.stopNode(s.clusterCapabilities.NodeID, mode, true)
+			} else {
+				switch {
+				case slices.Contains(request.Args, "--migrate-all"):
+					err = errors.New("--migrate-all requires distributed mode")
 				case slices.Contains(request.Args, "--dehydrate-all"):
 					err = dehydrateDaemonContainers(backend)
 				case slices.Contains(request.Args, "--stop-all"):
