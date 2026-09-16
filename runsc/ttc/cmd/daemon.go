@@ -3411,8 +3411,22 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 	}
 	catalog.SetLeaderClientResolver(func(nodeID string) (*cluster.Client, error) {
-		if peer := clients[nodeID]; peer != nil {
-			return peer, nil
+		if nodeID != "" {
+			if peer := clients[nodeID]; peer != nil {
+				return peer, nil
+			}
+		} else {
+			// A re-admitted learner may not have observed the current leader yet.
+			// Any seed can answer directly or return the ordinary leader redirect.
+			// Sort the IDs to keep restart behavior and diagnostics deterministic.
+			ids := make([]string, 0, len(clients))
+			for id := range clients {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			if len(ids) != 0 {
+				return clients[ids[0]], nil
+			}
 		}
 		// A node only needs one seed to join. After elections, discover any
 		// leader from the replicated membership map rather than requiring every

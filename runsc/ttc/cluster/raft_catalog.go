@@ -64,7 +64,7 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 			result, err = c.node.Propose(ctx, requestID, kind, payload)
 			continue
 		}
-		if redirect.LeaderID == "" || c.leaderClient == nil {
+		if c.leaderClient == nil {
 			select {
 			case <-ctx.Done():
 				return AuthorityResult{}, ctx.Err()
@@ -73,6 +73,10 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 			result, err = c.node.Propose(ctx, requestID, kind, payload)
 			continue
 		}
+		// LeaderWithID may briefly be empty while a removed learner catches up
+		// through the configuration entry that re-admits it. Let the resolver
+		// choose any configured seed in that case; a non-leader seed returns the
+		// ordinary redirect carrying the elected leader's identity.
 		peer, resolveErr := c.leaderClient(redirect.LeaderID)
 		if resolveErr != nil {
 			select {
@@ -106,7 +110,7 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 			state, err = c.node.LinearizableState(ctx)
 			continue
 		}
-		if redirect.LeaderID == "" || c.leaderClient == nil {
+		if c.leaderClient == nil {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
