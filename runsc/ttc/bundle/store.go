@@ -1828,7 +1828,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: opts.VisibleBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode, ParentID: targetParent, CreatedAt: now}}
+	target.Branches = []BranchInfo{{
+		ID: opts.VisibleBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch,
+		Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode,
+		ParentID: targetParent, CreatedAt: now, DistributedForkTransactionID: opts.TransactionID,
+	}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
@@ -3303,25 +3307,16 @@ func (s Store) UpdateDistributedForkDependencies(transactionID string, memoryByt
 		return err
 	}
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
-		if current.DistributedForkTransactionID == transactionID {
-			if len(current.Branches) == 1 {
-				current.Branches[0].DependentMemoryBytes = memoryBytes
-				current.Branches[0].DependentFilesystemBytes = filesystemBytes
-				return true, nil
-			}
-		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			current.Branches[index].DependentMemoryBytes = memoryBytes
+			current.Branches[index].DependentFilesystemBytes = filesystemBytes
+			return true, nil
+		}
+		if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.DependentMemoryBytes = memoryBytes
 			pending.DependentFilesystemBytes = filesystemBytes
 			current.DistributedForkImports[transactionID] = pending
 			return true, nil
-		} else {
-			for i := range current.Branches {
-				if current.Branches[i].DistributedForkTransactionID == transactionID {
-					current.Branches[i].DependentMemoryBytes = memoryBytes
-					current.Branches[i].DependentFilesystemBytes = filesystemBytes
-					return true, nil
-				}
-			}
 		}
 		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 	})
@@ -3335,27 +3330,14 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 		return err
 	}
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
-		if current.DistributedForkTransactionID == transactionID {
-			current.State = state
-			if len(current.Branches) != 1 {
-				return false, errors.New("hidden distributed target has invalid branch cardinality")
-			}
-			current.Branches[0].State = state
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			current.Branches[index].State = state
+			recomputeContainerState(current)
 		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.State = state
 			current.DistributedForkImports[transactionID] = pending
 		} else {
-			found := false
-			for i := range current.Branches {
-				if current.Branches[i].DistributedForkTransactionID == transactionID {
-					current.Branches[i].State = state
-					found = true
-				}
-			}
-			if !found {
-				return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-			}
-			recomputeContainerState(current)
+			return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 		}
 		return true, nil
 	})
@@ -3380,11 +3362,8 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 		return roots
 	}
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
-		if current.DistributedForkTransactionID == transactionID {
-			if len(current.Branches) != 1 {
-				return false, errors.New("hidden distributed target has invalid branch cardinality")
-			}
-			branch := &current.Branches[0]
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			branch := &current.Branches[index]
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
@@ -3421,12 +3400,10 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 	if err != nil {
 		return ContainerInfo{}, BranchInfo{}, false, err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		for _, candidate := range info.Branches {
-			candidate.DistributedForkTransactionID = transactionID
-			return info, candidate, false, nil
-		}
-		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no branch")
+	if index, ok := distributedForkBranchIndex(info, transactionID); ok {
+		candidate := info.Branches[index]
+		candidate.DistributedForkTransactionID = transactionID
+		return info, candidate, info.DistributedForkTransactionID != transactionID || len(info.Branches) > 1, nil
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
 		branch = BranchInfo{ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}
@@ -3454,6 +3431,22 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		}
 	}
 	return ContainerInfo{}, BranchInfo{}, false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+}
+
+// distributedForkBranchIndex resolves the branch originally created by a
+// transaction even after its physical Sentry begins hosting imported sibling
+// branches. New records always carry the branch-level marker. The singleton
+// fallback supports a target while it is still in its initial hidden form.
+func distributedForkBranchIndex(info ContainerInfo, transactionID string) (int, bool) {
+	for index := range info.Branches {
+		if info.Branches[index].DistributedForkTransactionID == transactionID {
+			return index, true
+		}
+	}
+	if info.DistributedForkTransactionID == transactionID && len(info.Branches) == 1 {
+		return 0, true
+	}
+	return 0, false
 }
 
 // RemoveDistributedForkTarget removes a transaction target and its image

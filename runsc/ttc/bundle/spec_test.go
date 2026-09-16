@@ -317,6 +317,52 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 	}
 }
 
+func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "physical", Name: "physical", State: "running",
+		BundleDir:                    filepath.Join(root, "containers", "physical", "bundle"),
+		DistributedForkTransactionID: "fork-original",
+		Branches: []BranchInfo{
+			{ID: "original", State: "running", DistributedForkTransactionID: "fork-original"},
+			{ID: "sibling", State: "running", DistributedForkTransactionID: "fork-sibling", DistributedMigration: true},
+		},
+	}
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	resolved, branch, peer, err := store.DistributedForkTargetBranch("fork-original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ID != info.ID || branch.ID != "original" || !peer {
+		t.Fatalf("resolved=%q branch=%+v peer=%t", resolved.ID, branch, peer)
+	}
+	if err := store.UpdateDistributedForkDependencies("fork-original", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkTargetState("fork-original", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkMemoryGraph("fork-original", 9, []string{"0000000000000009-03-0000000000000001"}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Branches[0].State != "paused" || updated.Branches[0].SnapshotID != 9 || updated.Branches[1].State != "running" || updated.Branches[1].SnapshotID != 0 {
+		t.Fatalf("branch states changed incorrectly: %+v", updated.Branches)
+	}
+}
+
 func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
