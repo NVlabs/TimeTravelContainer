@@ -3305,6 +3305,38 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil {
 		return nil, err
 	}
+	// A restarted server may have been removed from the current Raft
+	// configuration after its execution lease expired. Its local WAL still
+	// contains the last configuration it observed, including the addresses of
+	// surviving members, but a bootstrap node normally has no --cluster-join
+	// seed in its command line. Reuse those persisted addresses as recovery
+	// seeds. The leader treats AddNonvoter for an existing voter as a no-op and
+	// admits a removed server as a learner, so the same path safely covers both
+	// an ordinary restart and a restart after authoritative removal.
+	if raftNode.HadExistingState() {
+		configuration, configErr := raftNode.Configuration()
+		if configErr != nil {
+			raftNode.Close()
+			return nil, fmt.Errorf("reading persisted Raft peer configuration: %w", configErr)
+		}
+		for _, server := range configuration.Servers {
+			peerID := string(server.ID)
+			if peerID == opts.NodeID || clients[peerID] != nil {
+				continue
+			}
+			address := string(server.Address)
+			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
+				raftNode.Close()
+				return nil, fmt.Errorf("invalid persisted Raft peer %q address %q: %w", peerID, address, splitErr)
+			}
+			client, clientErr := cluster.NewPlainClient("http://"+address, opts.NodeID, opts.AuthToken, 2*time.Minute)
+			if clientErr != nil {
+				raftNode.Close()
+				return nil, fmt.Errorf("configuring persisted Raft recovery peer %q: %w", peerID, clientErr)
+			}
+			clients[peerID] = client
+		}
+	}
 	closeRaft := true
 	defer func() {
 		if closeRaft {
