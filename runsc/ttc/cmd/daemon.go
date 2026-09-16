@@ -5780,7 +5780,7 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		}
 	}
 	switch args[0] {
-	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove-now", "_purge-runtime", "pause", "resume", "unpause", "quarantine", "unquarantine", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
+	case "create", "pull", "load", "save", "commit", "rmi", "rm", "_auto-remove-now", "_purge-runtime", "_remove-family-record", "pause", "resume", "unpause", "quarantine", "unquarantine", "dehydrate", "rehydrate", "kill", "stop", "restart", "fork", "checkpoint", "restore", "migrate":
 		return true
 	case "node":
 		return len(args) > 1 && args[1] != "ls" && args[1] != "_planner-resources"

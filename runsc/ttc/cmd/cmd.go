@@ -389,6 +389,25 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = purger.purgeRuntime(args[1])
+	case "_remove-family-record":
+		removeVolumes := false
+		operands := args[1:]
+		if len(operands) != 0 && operands[0] == "--volumes" {
+			removeVolumes = true
+			operands = operands[1:]
+		}
+		if len(operands) != 1 {
+			err = errors.New("internal family-record removal requires one family ID")
+			break
+		}
+		remover, ok := backend.(interface {
+			removeDistributedFamilyRecord(string, bool) error
+		})
+		if !ok {
+			err = errors.New("this backend does not support distributed family-record removal")
+			break
+		}
+		err = remover.removeDistributedFamilyRecord(operands[0], removeVolumes)
 	case "_settle-source-transactions":
 		if len(args) < 2 {
 			err = errors.New("internal source-dependency settlement requires at least one transaction ID")
@@ -8973,7 +8992,12 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 		}
 		_, logicalMatch := physicalBranches[record.BranchID]
 		_, physicalMatch := physicalBranches[record.PhysicalBranch]
-		if !logicalMatch && !(record.PhysicalContainer == info.ID && physicalMatch) {
+		exactPhysicalMatch := record.PhysicalContainer == info.ID && physicalMatch
+		physicalRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+		if physicalRuntime && !exactPhysicalMatch {
+			continue
+		}
+		if !physicalRuntime && !logicalMatch && !exactPhysicalMatch {
 			continue
 		}
 		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
@@ -8989,6 +9013,68 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 		if err := b.retireTransactionsForRemovedPlacement(record); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// removeDistributedFamilyRecord deletes the canonical, non-executing family
+// record after every Raft placement has been removed through its exact
+// physical branch. A family whose canonical container hosted the final branch
+// is already absent, making this operation naturally idempotent.
+func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volumes bool) error {
+	store := b.containerStore()
+	info, err := store.LoadRuntimeContainer(containerID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.DistributedForkTransactionID != "" || (info.DistributedFamilyID != "" && info.DistributedFamilyID != info.ID) {
+		return fmt.Errorf("container %q is a physical distributed runtime, not a canonical family record", containerID)
+	}
+	if b.nodeID != "" {
+		placements, err := b.placementCatalog()
+		if err != nil {
+			return err
+		}
+		records, err := placements.List()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if record.FamilyID == info.ID {
+				return fmt.Errorf("cannot remove family record %q while branch %q still has placement state %s", info.Name, record.BranchID, record.State)
+			}
+		}
+		containers, err := store.ListContainersForPlacement()
+		if err != nil {
+			return err
+		}
+		for _, candidate := range containers {
+			if candidate.ID != info.ID && logicalFamilyID(candidate) == info.ID {
+				return fmt.Errorf("cannot remove family record %q while physical runtime %q remains", info.Name, candidate.ID)
+			}
+		}
+	}
+	if err := store.RemoveContainer(info.ID); err != nil {
+		return err
+	}
+	if volumes {
+		manager, err := b.volumeManager()
+		if err != nil {
+			return err
+		}
+		for _, volume := range info.Volumes {
+			if volume.Anonymous {
+				if err := manager.Remove(volume.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("removing anonymous volume %q: %w", volume.Name, err)
+				}
+			}
+		}
+	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
+		return fmt.Errorf("pruning unreferenced image roots: %w", err)
 	}
 	return nil
 }

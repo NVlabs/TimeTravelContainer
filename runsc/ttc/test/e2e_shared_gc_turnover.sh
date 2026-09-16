@@ -173,4 +173,6 @@ eval "PID_$(printf '%s' "$source" | tr '[:lower:]' '[:upper:]')="
 test "$(find "$SHARED/snapshot-packs/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" -eq 0
 test "$(find "$SHARED/cold/manifests" -type f 2>/dev/null | wc -l)" -eq 0
 test ! -e "$SHARED/cold/packs"
+test "$(find "$SHARED/containers" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" -eq 0
+test "$(find "$SHARED/removed-containers" -mindepth 1 2>/dev/null | wc -l)" -eq 0
 echo "TTC shared-GC coordinator crash and retain retry passed in ${elapsed}s"

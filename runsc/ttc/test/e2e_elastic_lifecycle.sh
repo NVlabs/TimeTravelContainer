@@ -176,4 +176,10 @@ client b node stop node-b --stop-all >/dev/null
 wait "$PID_B"
 PID_B=
 
+# Private distributed-fork and migration containers are implementation
+# details, but they still own image leases and graph roots. A successful
+# family removal must reclaim them rather than merely hiding them from ls.
+test "$(find "$SHARED/containers" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" -eq 0
+test "$(find "$SHARED/removed-containers" -mindepth 1 2>/dev/null | wc -l)" -eq 0
+
 echo "TTC elastic join, migration, quarantine, and retirement lifecycle passed"

@@ -1200,8 +1200,29 @@ func executeRemoteDaemonRequest(ctx context.Context, peer *cluster.Client, reque
 }
 
 type distributedFamilyMutation struct {
-	prefix  []string
-	targets []string
+	prefix        []string
+	targets       []string
+	removeVolumes bool
+}
+
+// branchPrefix returns the command prefix for one physical branch. A
+// family-level --volumes flag is deliberately consumed by the final metadata
+// cleanup: runRemove rejects it for branch selectors, and anonymous volumes
+// must not disappear while another placement in the family is still live.
+func (m distributedFamilyMutation) branchPrefix() []string {
+	if len(m.prefix) == 0 || m.prefix[0] != "rm" {
+		return append([]string(nil), m.prefix...)
+	}
+	prefix := []string{"rm"}
+	for _, arg := range m.prefix[1:] {
+		switch arg {
+		case "-f", "--force", "-fv", "-vf":
+			if len(prefix) == 1 {
+				prefix = append(prefix, "-f")
+			}
+		}
+	}
+	return prefix
 }
 
 func distributedMutationSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) map[string]map[string]struct{} {
@@ -1232,12 +1253,16 @@ func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, b
 		return distributedFamilyMutation{}, false
 	}
 	i := 1
+	removeVolumes := false
 	for i < len(args) && strings.HasPrefix(args[i], "-") && args[i] != "-" {
 		arg := args[i]
 		switch args[0] {
 		case "rm":
 			if arg != "-f" && arg != "--force" && arg != "-v" && arg != "--volumes" && arg != "-fv" && arg != "-vf" {
 				return distributedFamilyMutation{}, false
+			}
+			if arg == "-v" || arg == "--volumes" || arg == "-fv" || arg == "-vf" {
+				removeVolumes = true
 			}
 		case "stop":
 			if strings.HasPrefix(arg, "--time=") || strings.HasPrefix(arg, "--timeout=") || strings.HasPrefix(arg, "-t=") {
@@ -1267,7 +1292,9 @@ func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, b
 	if !hasFamily {
 		return distributedFamilyMutation{}, false
 	}
-	return distributedFamilyMutation{prefix: append([]string(nil), args[:i]...), targets: append([]string(nil), args[i:]...)}, true
+	return distributedFamilyMutation{
+		prefix: append([]string(nil), args[:i]...), targets: append([]string(nil), args[i:]...), removeVolumes: removeVolumes,
+	}, true
 }
 
 func distributedChildRequestID(parent string, ordinal int, args []string) string {
@@ -1540,36 +1567,26 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if finalNode == "" {
 			finalNode = s.clusterCapabilities.NodeID
 		}
-		formerOwners := make(map[string]struct{})
-		for i, placement := range placements {
+		branchPrefix := mutation.branchPrefix()
+		for _, placement := range placements {
 			node := placement.OwnerNode
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
 			}
 			target := operand + "@" + placement.BranchID
-			// The final rm must run as a family removal so it can reclaim the
-			// family record and anonymous volumes after every peer runtime is gone.
-			if request.Args[0] == "rm" && i == len(placements)-1 {
-				target = operand
-			} else if request.Args[0] == "rm" && node != finalNode {
-				formerOwners[node] = struct{}{}
-			}
-			children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), target)})
+			children = append(children, child{node: node, args: append(append([]string(nil), branchPrefix...), target)})
 		}
-		if request.Args[0] == "rm" && len(formerOwners) != 0 {
-			// Run owner-local branch deletes first, then purge physical shells on
-			// former owners, and only then let the final owner delete metadata.
-			final := children[len(children)-1]
-			children = children[:len(children)-1]
-			owners := make([]string, 0, len(formerOwners))
-			for node := range formerOwners {
-				owners = append(owners, node)
+		if request.Args[0] == "rm" {
+			// Every logical branch above is removed through its exact Raft physical
+			// identity. Only then may the canonical family record and its optional
+			// anonymous volumes disappear. The finalizer is idempotent because a
+			// canonical physical branch may already have removed that record.
+			args := []string{"_remove-family-record"}
+			if mutation.removeVolumes {
+				args = append(args, "--volumes")
 			}
-			sort.Strings(owners)
-			for _, node := range owners {
-				children = append(children, child{node: node, args: []string{"_purge-runtime", info.ID}})
-			}
-			children = append(children, final)
+			args = append(args, info.ID)
+			children = append(children, child{node: finalNode, args: args})
 		}
 	}
 	children = append(preflight, children...)
@@ -2536,22 +2553,41 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 			continue
 		}
 		oldOwnerActive := lookupErr == nil && oldOwner.Incarnation == placement.OwnerIncarnation && oldOwner.LeaseActive(now)
-		info, loadErr := b.containerStore().LoadContainer(placement.FamilyID)
+		// A healthy source owns the in-flight operation. Other nodes must not
+		// interpret its transaction-scoped physical branch as interrupted state.
+		if oldOwnerActive && b.nodeID != placement.OwnerNode {
+			continue
+		}
+		logicalInfo, loadErr := b.containerStore().LoadContainer(placement.FamilyID)
 		if loadErr != nil {
 			result = errors.Join(result, fmt.Errorf("loading interrupted migration %s@%s: %w", placement.FamilyID, placement.BranchID, loadErr))
 			continue
 		}
-		branch, branchErr := persistentBranchInfo(info, placement.BranchID)
+		info := logicalInfo
+		physicalBranch := placement.BranchID
+		branch, branchErr := persistentBranchInfo(info, physicalBranch)
+		if branchErr != nil && placement.PhysicalContainer != "" && placement.PhysicalBranch != "" {
+			// A remote fork followed by migration has no logical branch record in
+			// the canonical container. Raft points at the exact transaction-scoped
+			// runtime; recovery must inspect that physical branch instead of
+			// treating the intentionally private identity as missing state.
+			physical, physicalErr := b.containerStore().LoadRuntimeContainer(placement.PhysicalContainer)
+			if physicalErr == nil {
+				info = physical
+				physicalBranch = placement.PhysicalBranch
+				branch, branchErr = persistentBranchInfo(info, physicalBranch)
+			}
+		}
 		if branchErr != nil {
 			result = errors.Join(result, fmt.Errorf("loading interrupted migration branch %s@%s: %w", placement.FamilyID, placement.BranchID, branchErr))
 			continue
 		}
-		name := info.Name
+		name := logicalInfo.Name
 		if name == "" {
-			name = info.ID
+			name = logicalInfo.ID
 		}
 		target := selector{container: name, branch: placement.BranchID}
-		actualOwner := info.BranchNodeID(placement.BranchID)
+		actualOwner := info.BranchNodeID(physicalBranch)
 		switch actualOwner {
 		case placement.OwnerNode:
 			// Only the source daemon may restore and roll back a source-owned
@@ -2609,9 +2645,9 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 				continue
 			}
 			_, _ = b.command("timetravel", info.ID, "distributed-cancel", tx.Identity.TransactionID)
-			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, physicalBranch)
 			if placement.ResumeState == cluster.PlacementRunning && runtimeErr == nil && runtimeState == "paused" {
-				if _, err := b.command("timetravel", info.ID, "resume", placement.BranchID); err != nil {
+				if _, err := b.command("timetravel", info.ID, "resume", physicalBranch); err != nil {
 					result = errors.Join(result, fmt.Errorf("resuming interrupted sparse migration source %s: %w", target, err))
 					continue
 				}
@@ -2638,14 +2674,14 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 					result = errors.Join(result, fmt.Errorf("reloading restored migration source %s: %w", target, loadErr))
 					continue
 				}
-				branch, branchErr = persistentBranchInfo(info, placement.BranchID)
+				branch, branchErr = persistentBranchInfo(info, physicalBranch)
 				if branchErr != nil {
 					result = errors.Join(result, branchErr)
 					continue
 				}
 				state = normalizeLifecycleState(branch.State)
 			}
-			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, physicalBranch)
 			if state != string(placement.ResumeState) || runtimeErr != nil || runtimeState != string(placement.ResumeState) {
 				result = errors.Join(result, fmt.Errorf("restored migration source %s has persistent state %q and runtime state %q, want %q: %v", target, state, runtimeState, placement.ResumeState, runtimeErr))
 				continue
@@ -2681,7 +2717,7 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 				continue
 			}
 			state := normalizeLifecycleState(branch.State)
-			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			runtimeState, runtimeErr := b.runtimeBranchLifecycle(info.ID, physicalBranch)
 			if state == "dehydrated" || runtimeErr == nil && runtimeState == "dehydrated" {
 				if err := b.rehydrate(target); err != nil {
 					result = errors.Join(result, fmt.Errorf("restoring interrupted migration target %s: %w", target, err))
@@ -2692,14 +2728,14 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 					result = errors.Join(result, fmt.Errorf("reloading restored migration target %s: %w", target, loadErr))
 					continue
 				}
-				branch, branchErr = persistentBranchInfo(info, placement.BranchID)
+				branch, branchErr = persistentBranchInfo(info, physicalBranch)
 				if branchErr != nil {
 					result = errors.Join(result, branchErr)
 					continue
 				}
 				state = normalizeLifecycleState(branch.State)
 			}
-			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, placement.BranchID)
+			runtimeState, runtimeErr = b.runtimeBranchLifecycle(info.ID, physicalBranch)
 			if state != string(placement.ResumeState) || runtimeErr != nil || runtimeState != string(placement.ResumeState) {
 				result = errors.Join(result, fmt.Errorf("restored migration target %s has persistent state %q and runtime state %q, want %q: %v", target, state, runtimeState, placement.ResumeState, runtimeErr))
 				continue
@@ -2715,7 +2751,7 @@ func (b *runtimeBackend) recoverInterruptedMigrations() ([]selector, error) {
 			}
 			if _, err := b.distributedSource.authority.CutoverMigration(placement.OperationID, tx.Revision,
 				placement.FamilyID, placement.BranchID, placement.OperationID, placement.TargetNode,
-				current.Incarnation, info.ID, placement.BranchID); err != nil {
+				current.Incarnation, info.ID, physicalBranch); err != nil {
 				result = errors.Join(result, fmt.Errorf("publishing recovered migration target %s: %w", target, err))
 				continue
 			}

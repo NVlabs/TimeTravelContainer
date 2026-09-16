@@ -6118,6 +6118,13 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 		if ok && (!slices.Equal(got.prefix, test.prefix) || !slices.Equal(got.targets, test.targets)) {
 			t.Errorf("parseDistributedFamilyMutation(%v)=%+v, want prefix=%v targets=%v", test.args, got, test.prefix, test.targets)
 		}
+		if ok && got.removeVolumes != slices.Contains(test.args, "-fv") {
+			t.Errorf("parseDistributedFamilyMutation(%v) removeVolumes=%t", test.args, got.removeVolumes)
+		}
+	}
+	mutation, ok := parseDistributedFamilyMutation([]string{"rm", "-fv", "demo"})
+	if !ok || !slices.Equal(mutation.branchPrefix(), []string{"rm", "-f"}) {
+		t.Fatalf("distributed branch removal prefix=%v, want [rm -f]", mutation.branchPrefix())
 	}
 	first := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"})
 	if _, err := daemonMutationPath(t.TempDir(), first); err != nil {

@@ -340,6 +340,35 @@ func TestRemoveContainerPlacementsResolvesMigratedPhysicalBranch(t *testing.T) {
 	}
 }
 
+func TestRemoveContainerPlacementsDoesNotMatchStaleLogicalNameInPhysicalRuntime(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "physical", PhysicalBranch: "migration-current",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{
+		placements: placements, transactions: transactions,
+	}}
+	if err := backend.removeContainerPlacements(ttcbundle.ContainerInfo{
+		ID: "physical", DistributedFamilyID: "family", DistributedForkTransactionID: "fork-original",
+		Branches: []ttcbundle.BranchInfo{{ID: "child"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Lookup("family", "child"); err != nil {
+		t.Fatalf("stale physical branch removed current placement: %v", err)
+	}
+}
+
 func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.BranchAuthority, error) {
 	record, ok := c.branches[family+"\x00"+branch]
 	if !ok {
