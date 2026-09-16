@@ -17,6 +17,7 @@ set -eu
 
 TTC=${TTC:-ttc}
 TTCD=${TTCD:-ttcd}
+TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 IMAGE=${TTC_FUSE_TEST_IMAGE:-ubuntu:24.04}
 NAME=${TTC_FUSE_TEST_NAME:-ttc-fuse-lifecycle-$$}
 ROOT=${TTC_FUSE_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-fuse-lifecycle.XXXXXX")}
@@ -53,7 +54,11 @@ fail() {
 	exit 1
 }
 
-ttc daemon start
+set -- daemon start
+if test "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1; then
+	set -- "$@" --unsafe-no-host-isolation
+fi
+ttc "$@"
 ttc run -d --cap-add SYS_ADMIN --network=ttc --nat --name "$NAME" "$IMAGE" sleep infinity >/dev/null
 ttc exec "$NAME@main" sh -lc \
 	'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse-overlayfs'

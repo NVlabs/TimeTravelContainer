@@ -9426,7 +9426,7 @@ func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
 }
 
 func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBinding) error {
-	if b.portIngress != nil {
+	if b.usesEphemeralPortIngress() {
 		return b.portIngress.Publish(target, binding)
 	}
 	resolved, info, err := b.resolveSelector(target)
@@ -9468,22 +9468,15 @@ func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBind
 }
 
 func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, error) {
-	if b.portIngress != nil {
+	if b.usesEphemeralPortIngress() {
 		ephemeral, err := b.portIngress.List(container)
 		if err != nil {
 			return nil, err
 		}
-		if b.portIngress.server.clusterPlacements != nil {
-			// Cluster ingress bindings are intentionally node-local and
-			// ephemeral. A remote branch's physical bundle is not present on
-			// this ingress node and must not be consulted for display.
-			return ephemeral, nil
-		}
-		info, err := b.resolveContainer(container)
-		if err != nil {
-			return nil, err
-		}
-		return append(append([]ttcbundle.PortBinding(nil), info.PublishedPorts...), ephemeral...), nil
+		// Cluster ingress bindings are intentionally node-local and
+		// ephemeral. A remote branch's physical bundle is not present on
+		// this ingress node and must not be consulted for display.
+		return ephemeral, nil
 	}
 	info, err := b.resolveContainer(container)
 	if err != nil {
@@ -9636,11 +9629,9 @@ func (b *runtimeBackend) stopPublishedPorts(info ttcbundle.ContainerInfo) error 
 }
 
 func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBinding) error {
-	if b.portIngress != nil {
+	if b.usesEphemeralPortIngress() {
 		if err := b.portIngress.Unpublish(target, binding); err == nil {
-			if b.portIngress.server.clusterPlacements != nil {
-				return nil
-			}
+			return nil
 		} else if !errors.Is(err, errIngressPortNotFound) {
 			return err
 		}
@@ -9672,6 +9663,16 @@ func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBi
 		return fmt.Errorf("persisting removal: %w; listener was restored", err)
 	}
 	return nil
+}
+
+// usesEphemeralPortIngress reports whether published ports belong only to the
+// daemon process that accepted the request. Cluster ingress is deliberately
+// node-local: each accepted connection resolves the branch's current Raft
+// placement, so it follows migration without rewriting container metadata.
+// Standalone TTC has no placement catalog and therefore persists bindings in
+// the container record so daemon reconciliation can restore their listeners.
+func (b *runtimeBackend) usesEphemeralPortIngress() bool {
+	return b.portIngress != nil && b.portIngress.server != nil && b.portIngress.server.clusterPlacements != nil
 }
 
 func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcimages.Info, error) {

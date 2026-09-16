@@ -189,6 +189,28 @@ func TestLogicalFamilyID(t *testing.T) {
 	}
 }
 
+func TestPortIngressPersistencePolicy(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		backend *runtimeBackend
+		want    bool
+	}{
+		{name: "no manager", backend: &runtimeBackend{}},
+		{name: "standalone manager", backend: &runtimeBackend{portIngress: newPortIngressManager(&daemonServer{})}},
+		{name: "cluster manager", backend: &runtimeBackend{portIngress: newPortIngressManager(&daemonServer{clusterPlacements: placements})}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.backend.usesEphemeralPortIngress(); got != tc.want {
+				t.Fatalf("usesEphemeralPortIngress()=%t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing.T) {
 	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
 	if err != nil {
