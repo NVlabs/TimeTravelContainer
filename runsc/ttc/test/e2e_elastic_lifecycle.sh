@@ -116,8 +116,8 @@ done
 test "$(client a node ls --json | jq 'length')" -eq 3
 
 client a pull "$IMAGE" >/dev/null
-client a run -d --node node-a --name "$NAME" --shm-size 32m "$IMAGE" sh -c \
-	'dd if=/dev/zero of=/dev/shm/resident bs=1M count=16 2>/dev/null; printf ELASTIC-MARK | dd of=/dev/shm/resident conv=notrunc 2>/dev/null; exec sleep 3600' >/dev/null
+client a run -d --node node-a --name "$NAME" --shm-size 32m -v /work "$IMAGE" sh -c \
+	'dd if=/dev/zero of=/dev/shm/resident bs=1M count=16 2>/dev/null; printf ELASTIC-MARK | dd of=/dev/shm/resident conv=notrunc 2>/dev/null; printf VOLUME-MARK >/work/marker; exec sleep 3600' >/dev/null
 # Detached run returns once the runtime starts, before the guest entrypoint is
 # required to finish its setup. Wait for the fork point explicitly so the
 # reference digest cannot race the initial zero fill and marker write.
@@ -143,6 +143,7 @@ if test "$quarantined" != true; then
 fi
 test "$(client c exec "$NAME@child" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 test "$(client c exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
+test "$(client c exec "$NAME@child" cat /work/marker)" = VOLUME-MARK
 test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 
 # Retiring node-a must move its remaining running branch, preserve its state,
@@ -164,11 +165,12 @@ case "$owner" in
 esac
 test "$(client "$owner_client" exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 test "$(client "$owner_client" exec "$NAME@main" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
+test "$(client "$owner_client" exec "$NAME@main" cat /work/marker)" = VOLUME-MARK
 client c unquarantine "$NAME@child" >/dev/null
 # False boolean fields are omitted from the compact JSON representation.
 test "$(branch_field c child quarantined)" != true
 
-client c rm -f "$NAME" >/dev/null
+client c rm -fv "$NAME" >/dev/null
 client c node stop node-c --stop-all >/dev/null
 wait "$PID_C"
 PID_C=

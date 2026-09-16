@@ -2907,6 +2907,66 @@ func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing
 	}
 }
 
+func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	manager, err := ttcvolume.OpenManager(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumes, err := manager.List()
+	if err != nil || len(volumes) != 1 {
+		t.Fatalf("listing volume: entries=%+v err=%v", volumes, err)
+	}
+	physicalBranch := ttcvolume.ScopedBranchID("logical-family", "migration")
+	if err := repository.Fork(ttcvolume.MainBranch, physicalBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch(ttcvolume.MainBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(local, "filesystems", "volumes", volumes[0].ID)
+	containerID := "fork-physical"
+	bundleDir := filepath.Join(shared, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	encodedRepositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: "/run/ttc/volumes/" + volumes[0].ID, Path: repositoryPath,
+		Branch: physicalBranch, CopyMode: string(ttcvolume.CopyModeFull),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(encodedRepositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{ID: "migration", FilesystemBranch: physicalBranch, State: "running"}
+	info := ContainerInfo{
+		ID: containerID, Name: containerID, BundleDir: bundleDir,
+		DistributedFamilyID: "logical-family", DistributedForkTransactionID: containerID,
+		Branches: []BranchInfo{branch},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Root: shared, ActiveRoot: local}).RemoveBranchFilesystems(containerID, branch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(repositoryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete distributed volume repository still exists: %v", err)
+	}
+}
+
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}

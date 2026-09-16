@@ -4375,6 +4375,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		return err
 	}
 	seen := make(map[string]struct{}, len(repositories))
+	physicalDistributedRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
 	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, duplicate := seen[path]; duplicate {
@@ -4399,14 +4400,22 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		if errors.Is(removeErr, fs.ErrNotExist) {
 			removeErr = nil
 		}
-		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) && repositoryCanonicalBranchBelongsToFamily(config)
+		// A transaction-scoped distributed container is a node-local physical
+		// materialization. Even a named volume repository belongs to that
+		// materialization once its last branch pointer is gone; the logical
+		// volume survives in the source/target authority, not in this obsolete
+		// node-local repository. Ordinary family removal must still preserve a
+		// named volume's canonical main pointer.
+		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) &&
+			(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime)
 		if removeRepository {
 			removeErr = nil
 		}
 		if removeErr == nil {
 			if !removeRepository {
 				removeErr = repository.GarbageCollect()
-				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) && repositoryCanonicalBranchBelongsToFamily(config) {
+				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) &&
+					(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime) {
 					// The Sentry may have committed its own branch-pointer
 					// deletion before daemon-side artifact cleanup begins. An
 					// empty family-private repository is therefore the same
