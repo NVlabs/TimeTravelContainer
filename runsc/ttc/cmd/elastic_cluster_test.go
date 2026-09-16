@@ -819,7 +819,7 @@ func TestExecutionRevocationSkipsPausedMigrationProviderCleanup(t *testing.T) {
 	}
 }
 
-func TestExecutionRevocationFencesUnrelatedGrant(t *testing.T) {
+func TestExecutionRevocationAcceptsMigrationCleanupWithCompletedRemoval(t *testing.T) {
 	previous := map[string]struct{}{
 		"family\x00migrated": {},
 		"family\x00removed":  {},
@@ -832,8 +832,8 @@ func TestExecutionRevocationFencesUnrelatedGrant(t *testing.T) {
 		},
 		SourceIncarnation: "inc-a", OwnershipCommitted: true,
 	}
-	if !executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
-		t.Fatal("an unrelated grant revocation was hidden by migration cleanup")
+	if executionRevocationsRequireImmediateFence(previous, map[string]struct{}{}, state, "node-a", "inc-a") {
+		t.Fatal("independently safe migration cleanup and completed removal required a node fence")
 	}
 }
 

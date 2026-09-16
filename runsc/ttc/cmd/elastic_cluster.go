@@ -3629,8 +3629,6 @@ func executionGrantRevoked(previous, current map[string]struct{}) bool {
 // heartbeat perform a potentially blocking Sentry inventory. Every other
 // revocation is conservatively fenced at the host-process boundary.
 func executionRevocationsRequireImmediateFence(previous, current map[string]struct{}, state *cluster.AuthorityState, nodeID, incarnation string) bool {
-	cleanupRevocations := 0
-	unknownRevocations := 0
 	for grant := range previous {
 		if _, retained := current[grant]; retained {
 			continue
@@ -3685,7 +3683,6 @@ func executionRevocationsRequireImmediateFence(previous, current map[string]stru
 			break
 		}
 		if cleanupOnly {
-			cleanupRevocations++
 			continue
 		}
 		branchFound := false
@@ -3703,17 +3700,15 @@ func executionRevocationsRequireImmediateFence(previous, current map[string]stru
 		// Both records disappearing is therefore an expected completed rm,
 		// not an unexplained execution-authority loss.
 		if !placementFound && !branchFound {
-			unknownRevocations++
 			continue
 		}
 		return true
 	}
-	// A set consisting exclusively of fully absent records is an ordinary
-	// branch/family removal: local runtime deletion precedes the atomic Raft
-	// namespace deletion. Once another revoked grant is known to be migration
-	// cleanup, however, absence of a different grant is not explained by that
-	// migration and must fail closed.
-	return unknownRevocations != 0 && cleanupRevocations != 0
+	// Every revoked grant was independently proven safe. Their coexistence in
+	// one heartbeat does not create a new authority violation: Raft serializes
+	// migration cutover and branch removal, and removal deletes its placement
+	// and branch authority only after local runtime destruction succeeds.
+	return false
 }
 
 // runtimeBranchPresent resolves a failed idempotent eviction without parsing
