@@ -747,15 +747,16 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		if err != nil {
 			return err
 		}
-		info, err := store.LoadContainer(target.container)
+		resolved, info, err := backend.resolveSelector(target)
 		if err != nil {
 			return err
 		}
-		branch, err := persistentBranchInfo(info, target.branch)
+		branch, err := persistentBranchInfo(info, resolved.branch)
 		if err != nil {
 			return err
 		}
-		record, err := placements.Lookup(info.ID, branch.ID)
+		familyID := logicalFamilyID(info)
+		record, err := placements.Lookup(familyID, target.branch)
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("loading placement for %s: current-format clustered branch has no Raft placement record", target)
 		}
@@ -767,18 +768,18 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 				return fmt.Errorf("cold-branch placement for %s belongs to %s/%s", target, record.OwnerNode, record.OwnerIncarnation)
 			}
 			if branch.Unplaced {
-				if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
+				if err := store.CompareAndSwapBranchNodeID(info.ID, resolved.branch, "", node.NodeID); err != nil {
 					return fmt.Errorf("repairing claimed cold-branch owner for %s: %w", target, err)
 				}
 			}
 			continue
 		}
-		claimed, err := placements.ClaimUnplaced(info.ID, branch.ID, node.NodeID, node.Incarnation, info.ID, branch.ID, record.Generation, cluster.PlacementMaterializing, time.Now())
+		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {
 			return fmt.Errorf("claiming cold-branch placement for %s: %w", target, err)
 		}
-		if err := store.CompareAndSwapBranchNodeID(info.ID, branch.ID, "", node.NodeID); err != nil {
-			_, releaseErr := placements.Unplace(info.ID, branch.ID, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
+		if err := store.CompareAndSwapBranchNodeID(info.ID, resolved.branch, "", node.NodeID); err != nil {
+			_, releaseErr := placements.Unplace(familyID, target.branch, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
 			if releaseErr != nil {
 				return fmt.Errorf("recording cold-branch owner for %s: %w; releasing placement also failed: %v", target, err, releaseErr)
 			}

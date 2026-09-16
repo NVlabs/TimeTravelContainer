@@ -333,6 +333,84 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 }
 
+func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
+	root := t.TempDir()
+	local := t.TempDir()
+	writeContainer := func(info ttcbundle.ContainerInfo) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", info.ID)
+		info.BundleDir = filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeContainer(ttcbundle.ContainerInfo{
+		ID: "family", Name: "web",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-b", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	})
+	writeContainer(ttcbundle.ContainerInfo{
+		ID: "physical-child", Name: "physical-child", DistributedFamilyID: "family", DistributedForkTransactionID: "fork-child",
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "child", Unplaced: true, State: "dehydrated", StorageState: "shared",
+			PublicationID: "publication-child", CreatedAt: time.Unix(2, 0).UTC(),
+		}},
+	})
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{FamilyID: "family", FamilyName: "web", BranchID: "child", State: cluster.PlacementUnplaced}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<30), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{clusterDirectory: directory, clusterCapabilities: &node.Capabilities}
+	backend := &runtimeBackend{
+		dataRoot: root, localRoot: local, nodeID: "node-a",
+		distributedSource: &distributedSourceRuntime{directory: directory, placements: placements},
+	}
+	resolved, info, err := backend.resolveSelector(selector{container: "web", branch: "child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != (selector{container: "physical-child", branch: "child"}) || info.ID != "physical-child" {
+		t.Fatalf("resolved=%+v info=%q, want physical-child@child", resolved, info.ID)
+	}
+	if err := server.claimUnplacedLifecycleTargets(backend, []string{"rehydrate", "web@child"}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := placements.Lookup("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.OwnerNode != "node-a" || record.State != cluster.PlacementMaterializing || record.PhysicalContainer != "physical-child" || record.PhysicalBranch != "child" {
+		t.Fatalf("claimed placement=%+v", record)
+	}
+	physical, err := (ttcbundle.Store{Root: root, ActiveRoot: local}).LoadRuntimeContainer("physical-child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := physical.BranchNodeID("child"); owner != "node-a" || physical.Branches[0].Unplaced {
+		t.Fatalf("physical metadata owner=%q unplaced=%t", owner, physical.Branches[0].Unplaced)
+	}
+}
+
 func TestLastOnlineClusterNode(t *testing.T) {
 	directory, err := cluster.OpenNodeDirectory(filepath.Join(t.TempDir(), "nodes"))
 	if err != nil {

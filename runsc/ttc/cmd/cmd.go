@@ -5814,16 +5814,63 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	return info, nil
 }
 
+// resolveDistributedPersistentBranch maps one logical family branch to the
+// shared catalog record that contains its durable node-local/cold metadata.
+//
+// A distributed fork may place a branch in a physical container whose ID is
+// deliberately hidden from the user. While the branch is live, Raft placement
+// names that physical container. Durable publication makes the branch
+// unplaced and clears execution identity, but commands such as cp, rehydrate,
+// and fork-from-dehydrated must still find its immutable publication record.
+// The physical records are in TTC_ROOT, so every node can resolve them without
+// assigning execution ownership first.
+func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.ContainerInfo, branchID, publicationID string) (ttcbundle.ContainerInfo, string, error) {
+	if branch, err := persistentBranchInfo(logical, branchID); err == nil && (publicationID == "" || branch.PublicationID == publicationID) {
+		return logical, branchID, nil
+	}
+	containers, err := b.containerStore().ListContainersForPlacement()
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, "", err
+	}
+	logicalID := logicalFamilyID(logical)
+	type candidate struct {
+		info   ttcbundle.ContainerInfo
+		branch string
+	}
+	var candidates []candidate
+	for _, container := range containers {
+		if logicalFamilyID(container) != logicalID {
+			continue
+		}
+		branch, err := persistentBranchInfo(container, branchID)
+		if err != nil || (publicationID != "" && branch.PublicationID != publicationID) {
+			continue
+		}
+		candidates = append(candidates, candidate{info: container, branch: branch.ID})
+	}
+	switch len(candidates) {
+	case 0:
+		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q does not exist in distributed family %q", branchID, logical.Name)
+	case 1:
+		return candidates[0].info, candidates[0].branch, nil
+	default:
+		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q has %d durable physical records in distributed family %q", branchID, len(candidates), logical.Name)
+	}
+}
+
 func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.ContainerInfo, error) {
 	info, err := b.resolveContainer(target.container)
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	}
 	if b.nodeID != "" {
+		var publicationID string
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
 			if authority, authorityErr := b.distributedSource.authority.Branch(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
 				target.container = info.ID
 				return target, info, nil
+			} else if authorityErr == nil {
+				publicationID = authority.PublicationID
 			} else if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) {
 				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
 			}
@@ -5848,6 +5895,15 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 					}
 					if _, branchErr := persistentBranchInfo(physical, physicalBranch); branchErr != nil {
 						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime branch for %s: %w", target, branchErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, publicationID)
+					if resolveErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
 					}
 					target.container = physical.ID
 					target.branch = physicalBranch
