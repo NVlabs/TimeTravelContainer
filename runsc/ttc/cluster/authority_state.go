@@ -1385,13 +1385,17 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 			branch.PublicationID = ""
 		}
 		if command.Kind == AuthorityPlacementStableState {
-			// Materialization has established a mutable runtime and transferred
-			// every lazy page/file dependency into the ordinary snapshot ledgers.
-			// The cold publication is no longer an authority root. Keeping it in
-			// BranchAuthority or terminal publication history causes shared GC to
-			// retain it forever and, worse, makes a later legitimate retirement
-			// render the next Raft snapshot unrestorable.
-			branch.Roots = DurableRoots{}
+			// Materialization establishes a mutable runtime, but it deliberately
+			// does not eagerly read every immutable page and file from the cold
+			// snapshot. Keep those roots as the runtime's backing roots until a
+			// later publication atomically replaces them or branch removal drops
+			// them. In particular, filesystem relays do not create per-file
+			// reference intents: clearing Roots here would allow shared GC to
+			// reclaim a pack while the live runtime could still fault from it.
+			//
+			// The committed publication record is only transaction history and can
+			// still be discarded. BranchAuthority is the single reachability root
+			// for the active branch.
 			for publicationKey, publication := range s.Publications {
 				if publication.FamilyID == branch.FamilyID && publication.BranchID == branch.BranchID && publication.State == PublicationCommitted {
 					delete(s.Publications, publicationKey)

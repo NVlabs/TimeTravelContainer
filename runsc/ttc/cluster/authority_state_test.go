@@ -495,16 +495,12 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: claimed.Generation, State: PlacementRunning,
 	})
 	active := state.Branches[logicalBranchKey("family", "main")]
-	if active.Roots != (DurableRoots{}) {
-		t.Fatalf("active branch retained consumed cold roots: %+v", active)
+	if active.Roots.MemorySnapshot != 7 || active.Roots.FilesystemRoot != "cold/manifests/family/main/0000000000000001.json" {
+		t.Fatalf("active branch lost lazy backing roots: %+v", active)
 	}
 	if len(state.Publications) != 0 {
 		t.Fatalf("active branch retained committed publication history: %+v", state.Publications)
 	}
-	// Once the live runtime releases its lazy graph references, retiring the
-	// old snapshot must not make the Raft state unrestorable.
-	state.NextSharedGCGeneration = 2
-	state.RetiredOrigins[7] = SharedPackRetirement{SnapshotID: 7, GCGeneration: 1, RetiredAt: at.Add(6 * time.Second)}
 	encoded, err := state.SnapshotBytes()
 	if err != nil {
 		t.Fatal(err)
