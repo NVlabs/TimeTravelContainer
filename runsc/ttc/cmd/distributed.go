@@ -2246,6 +2246,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	type childState struct {
 		target       selector
 		transaction  string
+		identity     cluster.ForkIdentity
 		tx           *cluster.Transaction
 		relay        *distributedPageRelay
 		advertise    string
@@ -2260,9 +2261,14 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !cleanup {
 			return
 		}
-		for i := range children {
+		// Imported siblings share the first child's physical Sentry. Remove
+		// imports before their loader branch so rollback never deletes a runtime
+		// that still contains a later sibling's pending metadata.
+		for i := len(children) - 1; i >= 0; i-- {
 			child := &children[i]
-			child.relay.Close()
+			if child.relay != nil {
+				child.relay.Close()
+			}
 			if child.transaction == "" {
 				continue
 			}
@@ -2279,7 +2285,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 	}()
 
-	var commonPolicy *ttcpolicy.Policy
+	var commonPolicy ttcpolicy.Policy
 	var commonDataPlaneMax uint64
 	family, err := b.portableDistributedFamily(sourceInfo)
 	if err != nil {
@@ -2297,22 +2303,19 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 			RepositoryID: b.distributedSource.capabilities.RepositoryID,
 		}
-		tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
-		})
-		if err != nil {
-			return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
-		}
-		dataPlaneMax := tx.Negotiated.PagingPolicy.TransferBytes
-		if tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
-			dataPlaneMax = tx.Negotiated.MaxTransferSize
-		}
-		if commonPolicy == nil {
-			policy := tx.Negotiated.PagingPolicy
-			commonPolicy = &policy
-			commonDataPlaneMax = dataPlaneMax
-		} else if *commonPolicy != tx.Negotiated.PagingPolicy || commonDataPlaneMax != dataPlaneMax {
-			return nil, fmt.Errorf("target %s negotiated a different paging policy within one sibling batch", target)
+		var tx *cluster.Transaction
+		if i == 0 {
+			tx, err = reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
+				return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
+			})
+			if err != nil {
+				return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
+			}
+			commonPolicy = tx.Negotiated.PagingPolicy
+			commonDataPlaneMax = commonPolicy.TransferBytes
+			if commonPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+				commonDataPlaneMax = tx.Negotiated.MaxTransferSize
+			}
 		}
 		listener, err := net.Listen("tcp", b.distributedSource.pageListen)
 		if err != nil {
@@ -2328,9 +2331,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		relayBackend.stdout = io.Discard
 		relayBackend.stderr = io.Discard
 		children[i] = childState{
-			target: target, transaction: transactionID, tx: tx,
+			target: target, transaction: transactionID, identity: identity, tx: tx,
 			relay:     newDistributedPageRelay(listener, &relayBackend, source.container, transactionID),
-			advertise: advertise, dataPlaneMax: dataPlaneMax,
+			advertise: advertise, dataPlaneMax: commonDataPlaneMax,
 		}
 	}
 	captureArgs := boot.DistributedForkCaptureManyArgs{
@@ -2413,23 +2416,62 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			ExecSessions: remoteExecSessions(session.ExecSessions),
 		}
 	}
-	prepareErrors := make([]error, len(children))
-	runBoundedBatch(len(children), distributedBatchControlConcurrency, func(i int) {
+	prepareChild := func(i int) error {
 		child := &children[i]
-		child.tx, prepareErrors[i] = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+		var err error
+		child.tx, err = peer.Prepare(ctx, child.transaction, child.tx.Revision, descriptors[i])
+		return err
+	}
+	publishChild := func(i int) error {
+		child := &children[i]
+		var err error
+		child.tx, err = publishRemoteTarget(ctx, peer, child.transaction, child.tx.Revision, paused)
+		return err
+	}
+	// Establish one authoritative physical Sentry before reserving the other
+	// siblings. Their reservations then resolve through the first placement and
+	// become branch imports into that Sentry. Reserving the whole batch up front
+	// would create one hidden physical runtime per transaction because no
+	// placement exists yet.
+	if err := prepareChild(0); err != nil {
+		return nil, fmt.Errorf("restoring target %s on node %s: %w", children[0].target, targetNode, err)
+	}
+	if err := publishChild(0); err != nil {
+		return nil, fmt.Errorf("publishing target %s on node %s: %w", children[0].target, targetNode, err)
+	}
+	for i := 1; i < len(children); i++ {
+		child := &children[i]
+		child.tx, err = reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
+			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: child.identity, Family: family})
+		})
+		if err != nil {
+			return nil, fmt.Errorf("reserving target %s on node %s: %w", child.target, targetNode, err)
+		}
+		dataPlaneMax := child.tx.Negotiated.PagingPolicy.TransferBytes
+		if child.tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
+			dataPlaneMax = child.tx.Negotiated.MaxTransferSize
+		}
+		if child.tx.Negotiated.PagingPolicy != commonPolicy || dataPlaneMax != commonDataPlaneMax {
+			return nil, fmt.Errorf("target %s negotiated a different paging policy within one sibling batch", child.target)
+		}
+	}
+	prepareErrors := make([]error, len(children)-1)
+	runBoundedBatch(len(children)-1, distributedBatchControlConcurrency, func(index int) {
+		prepareErrors[index] = prepareChild(index + 1)
 	})
-	for i, prepareErr := range prepareErrors {
+	for index, prepareErr := range prepareErrors {
 		if prepareErr != nil {
+			i := index + 1
 			return nil, fmt.Errorf("restoring target %s on node %s: %w", children[i].target, targetNode, prepareErr)
 		}
 	}
-	publishErrors := make([]error, len(children))
-	runBoundedBatch(len(children), distributedBatchControlConcurrency, func(i int) {
-		child := &children[i]
-		child.tx, publishErrors[i] = publishRemoteTarget(ctx, peer, child.transaction, child.tx.Revision, paused)
+	publishErrors := make([]error, len(children)-1)
+	runBoundedBatch(len(children)-1, distributedBatchControlConcurrency, func(index int) {
+		publishErrors[index] = publishChild(index + 1)
 	})
-	for i, publishErr := range publishErrors {
+	for index, publishErr := range publishErrors {
 		if publishErr != nil {
+			i := index + 1
 			return nil, fmt.Errorf("publishing target %s on node %s: %w", children[i].target, targetNode, publishErr)
 		}
 	}
