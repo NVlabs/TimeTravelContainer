@@ -790,9 +790,7 @@ func fetchRemoteConsoleLog(ctx context.Context, address string, token [16]byte, 
 		return err
 	}
 	temporary := destination + ".remote-partial"
-	if info, err := os.Stat(destination); err == nil && uint64(info.Size()) == expected {
-		return nil
-	} else if err != nil && !os.IsNotExist(err) {
+	if _, err := os.Stat(destination); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	_ = os.Remove(temporary)
@@ -815,10 +813,121 @@ func fetchRemoteConsoleLog(ctx context.Context, address string, token [16]byte, 
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, destination); err != nil {
+	if err := reconcileRemoteConsoleLog(destination, temporary); err != nil {
 		return err
 	}
 	return nil
+}
+
+// reconcileRemoteConsoleLog installs one immutable-at-capture remote output
+// stream without discarding output retained from an earlier residence on this
+// node. A migration can return to a node before its previous local cache has
+// been reclaimed. Byte length alone cannot identify that cache: fixed-size
+// terminal records frequently give two disjoint histories the same size.
+func reconcileRemoteConsoleLog(destination, remote string) error {
+	if _, err := os.Stat(destination); err != nil {
+		if os.IsNotExist(err) {
+			return os.Rename(remote, destination)
+		}
+		return err
+	}
+	destinationPrefixesRemote, err := fileContentPrefix(destination, remote)
+	if err != nil {
+		return err
+	}
+	if destinationPrefixesRemote {
+		return os.Rename(remote, destination)
+	}
+	remotePrefixesDestination, err := fileContentPrefix(remote, destination)
+	if err != nil {
+		return err
+	}
+	if remotePrefixesDestination {
+		return os.Remove(remote)
+	}
+	// The target cache is from the branch's previous residence; the currently
+	// authoritative source segment happened later. Preserve that ordering.
+	merged := remote + ".merged"
+	_ = os.Remove(merged)
+	out, err := os.OpenFile(merged, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	copyFile := func(path string) error {
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		return errors.Join(copyErr, in.Close())
+	}
+	if err := copyFile(destination); err != nil {
+		out.Close()
+		_ = os.Remove(merged)
+		return err
+	}
+	if err := copyFile(remote); err != nil {
+		out.Close()
+		_ = os.Remove(merged)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		_ = os.Remove(merged)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(merged)
+		return err
+	}
+	if err := os.Rename(merged, destination); err != nil {
+		_ = os.Remove(merged)
+		return err
+	}
+	return os.Remove(remote)
+}
+
+func fileContentPrefix(prefixPath, completePath string) (bool, error) {
+	prefixInfo, err := os.Stat(prefixPath)
+	if err != nil {
+		return false, err
+	}
+	completeInfo, err := os.Stat(completePath)
+	if err != nil {
+		return false, err
+	}
+	if prefixInfo.Size() > completeInfo.Size() {
+		return false, nil
+	}
+	prefix, err := os.Open(prefixPath)
+	if err != nil {
+		return false, err
+	}
+	defer prefix.Close()
+	complete, err := os.Open(completePath)
+	if err != nil {
+		return false, err
+	}
+	defer complete.Close()
+	left, right := make([]byte, 64<<10), make([]byte, 64<<10)
+	remaining := prefixInfo.Size()
+	for remaining != 0 {
+		length := int64(len(left))
+		if length > remaining {
+			length = remaining
+		}
+		if _, err := io.ReadFull(prefix, left[:length]); err != nil {
+			return false, err
+		}
+		if _, err := io.ReadFull(complete, right[:length]); err != nil {
+			return false, err
+		}
+		if !bytes.Equal(left[:length], right[:length]) {
+			return false, nil
+		}
+		remaining -= length
+	}
+	return true, nil
 }
 
 func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, sessions []boot.ExecSessionInfo) ([]cluster.RemoteConsoleLogDescriptor, map[string][]string, error) {

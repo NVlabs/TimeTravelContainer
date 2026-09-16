@@ -108,6 +108,34 @@ func TestDistributedConsoleLogRelay(t *testing.T) {
 	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len(got)), destination); err != nil {
 		t.Fatalf("idempotent fetch: %v", err)
 	}
+	got, err = os.ReadFile(destination)
+	if err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("idempotent retained output=%q, err=%v", got, err)
+	}
+	// Returning to a node can find an older disjoint segment of the same
+	// session. It precedes the current source segment and must not be replaced.
+	disjoint := filepath.Join(dir, "target", "disjoint.log")
+	if err := os.WriteFile(disjoint, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), disjoint); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(disjoint); err != nil || string(got) != "previous\nolder\nnewer\n" {
+		t.Fatalf("merged retained output=%q, err=%v", got, err)
+	}
+	// An existing prefix is already included by the source and must not be
+	// duplicated.
+	prefix := filepath.Join(dir, "target", "prefix.log")
+	if err := os.WriteFile(prefix, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), prefix); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(prefix); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("prefix retained output=%q, err=%v", got, err)
+	}
 }
 
 func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
