@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
@@ -358,6 +360,18 @@ type coldBranchManifest struct {
 	ControlRoot    string                            `json:"control_root,omitempty"`
 	Filesystems    []coldFilesystemSnapshot          `json:"filesystems,omitempty"`
 	InternalMounts []cluster.InternalMountDescriptor `json:"internal_mounts,omitempty"`
+	// ExecConsoleLogs indexes immutable retained-output byte ranges in the
+	// publication's adjacent .console.pack file. Console output is runtime
+	// state, not guest filesystem state; publishing it here keeps named exec
+	// sessions reattachable when a cold branch is claimed on another node.
+	ExecConsoleLogs []coldExecConsoleLog `json:"exec_console_logs,omitempty"`
+	ConsolePackSize uint64               `json:"console_pack_size,omitempty"`
+}
+
+type coldExecConsoleLog struct {
+	ExecID string `json:"exec_id"`
+	Offset uint64 `json:"offset"`
+	Length uint64 `json:"length"`
 }
 
 type branchPublisher struct {
@@ -574,6 +588,14 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		}
 	}
 	sort.Slice(manifest.Filesystems, func(i, j int) bool { return manifest.Filesystems[i].Root.Source < manifest.Filesystems[j].Root.Source })
+	activeRoot := p.localRoot
+	if activeRoot == "" {
+		activeRoot = p.sharedRoot
+	}
+	manifest.ExecConsoleLogs, manifest.ConsolePackSize, err = captureColdExecConsolePack(activeRoot, info, branch.ID, path)
+	if err != nil {
+		return ttcstorage.Result{}, fmt.Errorf("capturing retained exec output: %w", err)
+	}
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return ttcstorage.Result{}, err
@@ -595,6 +617,181 @@ func validateColdManifestPath(sharedRoot, path string) error {
 
 func coldManifestPath(sharedRoot, container, branch, publicationID string) string {
 	return filepath.Join(sharedRoot, "cold", "manifests", hex.EncodeToString([]byte(container)), hex.EncodeToString([]byte(branch)), hex.EncodeToString([]byte(publicationID))+".json")
+}
+
+func coldConsolePackPath(manifestPath string) string {
+	return strings.TrimSuffix(manifestPath, filepath.Ext(manifestPath)) + ".console.pack"
+}
+
+func validColdExecID(value string) bool {
+	if value == "" || len(value) > 4096 {
+		return false
+	}
+	for index, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || (index > 0 && strings.ContainsRune("_.-", r)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func coldExecConsoleDir(activeRoot, container, branch string) string {
+	return filepath.Join(activeRoot, "containers", container, "console", "exec", branch)
+}
+
+// captureColdExecConsolePack serializes the retained output streams while
+// their followers are stopped. Generations are concatenated oldest-first so
+// the pack preserves exactly the byte stream observed by `ttc logs`.
+func captureColdExecConsolePack(activeRoot string, info ttcbundle.ContainerInfo, branch, manifestPath string) ([]coldExecConsoleLog, uint64, error) {
+	directory := coldExecConsoleDir(activeRoot, info.ID, branch)
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(coldConsolePackPath(manifestPath))
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("listing retained exec output: %w", err)
+	}
+	maxFiles := info.ConsoleLogMaxFiles
+	if maxFiles < 1 {
+		maxFiles = defaultConsoleLogFiles
+	}
+	var execIDs []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".error.log") {
+			continue
+		}
+		execID := strings.TrimSuffix(name, ".log")
+		if validColdExecID(execID) {
+			execIDs = append(execIDs, execID)
+		}
+	}
+	sort.Strings(execIDs)
+	packPath := coldConsolePackPath(manifestPath)
+	if err := os.MkdirAll(filepath.Dir(packPath), 0700); err != nil {
+		return nil, 0, err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(packPath), "."+filepath.Base(packPath)+".tmp-")
+	if err != nil {
+		return nil, 0, err
+	}
+	temporaryPath := temporary.Name()
+	keep := false
+	defer func() {
+		_ = temporary.Close()
+		if !keep {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return nil, 0, err
+	}
+	var descriptors []coldExecConsoleLog
+	var offset uint64
+	for _, execID := range execIDs {
+		generations, err := listConsoleLogGenerations(filepath.Join(directory, execID+".log"), maxFiles)
+		if err != nil {
+			return nil, 0, fmt.Errorf("listing retained output for exec session %q: %w", execID, err)
+		}
+		start := offset
+		for _, generation := range generations {
+			if generation.info.Size() < 0 || uint64(generation.info.Size()) > ^uint64(0)-offset {
+				return nil, 0, fmt.Errorf("retained output for exec session %q is too large", execID)
+			}
+			input, err := os.Open(generation.path)
+			if err != nil {
+				return nil, 0, err
+			}
+			written, copyErr := io.Copy(temporary, input)
+			closeErr := input.Close()
+			if copyErr != nil || closeErr != nil {
+				return nil, 0, errors.Join(copyErr, closeErr)
+			}
+			if written != generation.info.Size() {
+				return nil, 0, fmt.Errorf("retained output for exec session %q changed during capture", execID)
+			}
+			offset += uint64(written)
+		}
+		if offset != start {
+			descriptors = append(descriptors, coldExecConsoleLog{ExecID: execID, Offset: start, Length: offset - start})
+		}
+	}
+	if offset == 0 {
+		if err := temporary.Close(); err != nil {
+			return nil, 0, err
+		}
+		_ = os.Remove(temporaryPath)
+		_ = os.Remove(packPath)
+		keep = true
+		return nil, 0, nil
+	}
+	if err := temporary.Sync(); err != nil {
+		return nil, 0, err
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, 0, err
+	}
+	if err := os.Rename(temporaryPath, packPath); err != nil {
+		return nil, 0, err
+	}
+	directoryFile, err := os.Open(filepath.Dir(packPath))
+	if err != nil {
+		return nil, 0, err
+	}
+	syncErr := directoryFile.Sync()
+	closeErr := directoryFile.Close()
+	if syncErr != nil || closeErr != nil {
+		return nil, 0, errors.Join(syncErr, closeErr)
+	}
+	keep = true
+	return descriptors, offset, nil
+}
+
+// installColdExecConsolePack restores retained output before console followers
+// are restarted. Existing node-local bytes can be an older prefix or segment
+// from a previous residence, so use the same idempotent merge as migration.
+func installColdExecConsolePack(activeRoot string, info ttcbundle.ContainerInfo, branch string, manifest coldBranchManifest, manifestPath string) error {
+	if len(manifest.ExecConsoleLogs) == 0 {
+		return nil
+	}
+	pack, err := os.Open(coldConsolePackPath(manifestPath))
+	if err != nil {
+		return fmt.Errorf("opening retained exec output pack: %w", err)
+	}
+	defer pack.Close()
+	directory := coldExecConsoleDir(activeRoot, info.ID, branch)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	for _, descriptor := range manifest.ExecConsoleLogs {
+		destination := filepath.Join(directory, descriptor.ExecID+".log")
+		temporary := destination + ".cold-partial"
+		_ = os.Remove(temporary)
+		output, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		reader := io.NewSectionReader(pack, int64(descriptor.Offset), int64(descriptor.Length))
+		written, copyErr := io.Copy(output, reader)
+		syncErr := output.Sync()
+		closeErr := output.Close()
+		if copyErr != nil || syncErr != nil || closeErr != nil || uint64(written) != descriptor.Length {
+			_ = os.Remove(temporary)
+			return errors.Join(copyErr, syncErr, closeErr, func() error {
+				if uint64(written) != descriptor.Length {
+					return io.ErrUnexpectedEOF
+				}
+				return nil
+			}())
+		}
+		if err := reconcileRemoteConsoleLog(destination, temporary); err != nil {
+			_ = os.Remove(temporary)
+			return fmt.Errorf("installing retained output for exec session %q: %w", descriptor.ExecID, err)
+		}
+	}
+	return nil
 }
 
 func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, error) {
@@ -821,6 +1018,9 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		}
 	}
 	if canceled && haveManifest {
+		if err := os.Remove(coldConsolePackPath(manifestPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		if err := os.Remove(manifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -1285,6 +1485,37 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 	if manifest.Container == "" || manifest.Branch == "" || !transactionIDPatternForDaemon(manifest.PublicationID) || (manifest.Kind != "stop" && manifest.Kind != "dehydrate") {
 		return coldBranchManifest{}, errors.New("cold manifest has invalid identity or lifecycle metadata")
 	}
+	if len(manifest.ExecConsoleLogs) == 0 {
+		if manifest.ConsolePackSize != 0 {
+			return coldBranchManifest{}, errors.New("cold manifest has an unindexed exec console pack")
+		}
+	} else {
+		if manifest.ConsolePackSize == 0 || manifest.ConsolePackSize > math.MaxInt64 {
+			return coldBranchManifest{}, errors.New("cold manifest has an invalid exec console pack size")
+		}
+		seenExec := make(map[string]struct{}, len(manifest.ExecConsoleLogs))
+		var end uint64
+		for _, descriptor := range manifest.ExecConsoleLogs {
+			if !validColdExecID(descriptor.ExecID) || descriptor.Length == 0 || descriptor.Offset != end || descriptor.Offset > manifest.ConsolePackSize || descriptor.Length > manifest.ConsolePackSize-descriptor.Offset {
+				return coldBranchManifest{}, fmt.Errorf("cold manifest contains invalid retained output for exec session %q", descriptor.ExecID)
+			}
+			if _, duplicate := seenExec[descriptor.ExecID]; duplicate {
+				return coldBranchManifest{}, fmt.Errorf("cold manifest repeats retained output for exec session %q", descriptor.ExecID)
+			}
+			seenExec[descriptor.ExecID] = struct{}{}
+			end = descriptor.Offset + descriptor.Length
+		}
+		if end != manifest.ConsolePackSize {
+			return coldBranchManifest{}, errors.New("cold manifest does not cover its exec console pack")
+		}
+		packInfo, err := os.Stat(coldConsolePackPath(path))
+		if err != nil {
+			return coldBranchManifest{}, fmt.Errorf("opening cold exec console pack: %w", err)
+		}
+		if packInfo.Size() < 0 || uint64(packInfo.Size()) != manifest.ConsolePackSize {
+			return coldBranchManifest{}, fmt.Errorf("cold exec console pack has size %d, want %d", packInfo.Size(), manifest.ConsolePackSize)
+		}
+	}
 	seenMounts := make(map[string]struct{}, len(manifest.InternalMounts))
 	totalMountBytes := 0
 	for _, mount := range manifest.InternalMounts {
@@ -1435,12 +1666,32 @@ func (b *runtimeBackend) installColdInternalMounts(info ttcbundle.ContainerInfo,
 	return nil
 }
 
+func (b *runtimeBackend) installColdExecConsoleLogs(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	if branch.StorageManifest == "" {
+		return nil
+	}
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return err
+	}
+	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
+		return errors.New("cold manifest identity does not match branch publication")
+	}
+	if err := installColdExecConsolePack(b.activeDataRoot(), info, branch.ID, manifest, branch.StorageManifest); err != nil {
+		return fmt.Errorf("materializing retained exec output: %w", err)
+	}
+	return nil
+}
+
 func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
 	// Portable internal mounts are not part of a TTC volume repository. Restore
 	// them even when a valid local control image is already cached: the branch
 	// may have returned to a node after its prior authoritative local state was
 	// reclaimed.
 	if err := b.installColdInternalMounts(info, branch); err != nil {
+		return err
+	}
+	if err := b.installColdExecConsoleLogs(info, branch); err != nil {
 		return err
 	}
 	localImage := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
@@ -1531,6 +1782,9 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
 	if branch.StorageManifest == "" {
 		return nil
+	}
+	if err := b.installColdExecConsoleLogs(info, branch); err != nil {
+		return err
 	}
 	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
 		return err
@@ -1884,6 +2138,39 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 		}
 		if _, ok := manifests[path]; ok {
 			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().After(olderThan) {
+			return nil
+		}
+		if err := os.Remove(coldConsolePackPath(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return os.Remove(path)
+	}); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	// A crash may leave a fully-written console pack before its manifest was
+	// atomically published. Reclaim only TTC-named orphan packs after the same
+	// grace boundary used for manifests; unknown files remain untouched.
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".console.pack") {
+			return nil
+		}
+		manifestPath := strings.TrimSuffix(path, ".console.pack") + ".json"
+		if _, err := os.Stat(manifestPath); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
 		info, err := entry.Info()
 		if err != nil {

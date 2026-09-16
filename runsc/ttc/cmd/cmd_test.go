@@ -5338,6 +5338,63 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	}
 }
 
+func TestColdExecConsolePackRoundTrip(t *testing.T) {
+	shared, active := t.TempDir(), t.TempDir()
+	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}
+	directory := coldExecConsoleDir(active, info.ID, "main")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(directory, "build.log")
+	if err := os.WriteFile(ttcconsole.GenerationPath(logPath, 1), []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("newer\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(shared, info.ID, "main", "publication-console")
+	logs, size, err := captureColdExecConsolePack(active, info, "main", manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].ExecID != "build" || logs[0].Offset != 0 || logs[0].Length != uint64(len("older\nnewer\n")) || size != logs[0].Length {
+		t.Fatalf("console descriptors=%+v size=%d", logs, size)
+	}
+	manifest := coldBranchManifest{
+		Version: 5, Container: info.ID, Branch: "main", PublicationID: "publication-console", Kind: "stop",
+		ExecConsoleLogs: logs, ConsolePackSize: size,
+	}
+	if err := writeDurableJSON(manifestPath, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readColdBranchManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A previous residence may leave a prefix in this node's disposable cache.
+	if err := os.WriteFile(logPath, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installColdExecConsolePack(active, info, "main", loaded, manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("restored console output=%q, err=%v", got, err)
+	}
+	if err := installColdExecConsolePack(active, info, "main", loaded, manifestPath); err != nil {
+		t.Fatalf("idempotent restore: %v", err)
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("idempotent restored console output=%q, err=%v", got, err)
+	}
+}
+
 func TestColdDehydrationManifestRequiresSameOriginControlRoot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "manifest.json")
 	manifest := coldBranchManifest{
