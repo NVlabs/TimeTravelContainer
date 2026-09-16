@@ -52,6 +52,25 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	}
 }
 
+func TestColdReferenceIdentityIsScopedToPublication(t *testing.T) {
+	first := coldBranchReferenceIdentity("family", "main", "publication-first")
+	second := coldBranchReferenceIdentity("family", "main", "publication-second")
+	if first == second {
+		t.Fatal("two durable activations reused one reference identity")
+	}
+	origin := ttcsnapshot.SnapshotID(17)
+	object := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	if coldMemoryReferenceName(origin, first, "root/control", object) == coldMemoryReferenceName(origin, second, "root/control", object) {
+		t.Fatal("two durable memory activations reused one named reference")
+	}
+	// Ready and Committed both carry the same publication ID, so the candidate
+	// pin and final branch pin are deliberately identical across the atomic Raft
+	// transition.
+	if got := coldBranchReferenceIdentity("family", "main", "publication-first"); got != first {
+		t.Fatalf("stable publication identity=%q, want %q", got, first)
+	}
+}
+
 func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 	provider := ttcsnapshot.NewReferenceLedger()
 	shared := ttcsnapshot.NewReferenceLedger()

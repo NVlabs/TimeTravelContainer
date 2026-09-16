@@ -273,7 +273,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	// A cold branch's original canonical roots remain live exactly while Raft
 	// names its immutable memory snapshot. Cross-origin tree edges are rebuilt
 	// from immutable objects, never copied reference counters.
-	coldOrigins := make(map[ttcsnapshot.SnapshotID]struct{})
+	coldMemoryReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
 	coldFilesystemReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
 	addFilesystemRoots := func(identity, relative string) error {
 		if relative == "" {
@@ -310,10 +310,24 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	for _, branch := range state.Branches {
 		_, memoryVolatile := state.VolatileOrigins[branch.Roots.MemorySnapshot]
 		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile {
-			coldOrigins[ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)] = struct{}{}
+			origin := ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)
+			manifest, err := s.packs.Manifest(origin)
+			if err != nil {
+				return fail(fmt.Errorf("reading branch memory roots: %w", err))
+			}
+			if coldMemoryReferences[origin] == nil {
+				coldMemoryReferences[origin] = make(map[string]ttcsnapshot.ObjectID)
+			}
+			identity := coldBranchReferenceIdentity(branch.FamilyID, branch.BranchID, branch.PublicationID)
+			for name, object := range manifest.References {
+				if strings.HasPrefix(name, "root/") {
+					coldMemoryReferences[origin][coldMemoryReferenceName(origin, identity, name, object)] = object
+				}
+			}
 		}
 		if !branch.Corrupted {
-			if err := addFilesystemRoots("branch\x00"+branch.FamilyID+"\x00"+branch.BranchID, branch.Roots.FilesystemRoot); err != nil {
+			identity := coldBranchReferenceIdentity(branch.FamilyID, branch.BranchID, branch.PublicationID)
+			if err := addFilesystemRoots(identity, branch.Roots.FilesystemRoot); err != nil {
 				return fail(fmt.Errorf("reading branch filesystem roots: %w", err))
 			}
 		}
@@ -330,10 +344,23 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		}
 		_, memoryVolatile := state.VolatileOrigins[publication.CandidateRoots.MemorySnapshot]
 		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile {
-			coldOrigins[ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)] = struct{}{}
+			origin := ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)
+			manifest, err := s.packs.Manifest(origin)
+			if err != nil {
+				return fail(fmt.Errorf("reading publication memory roots: %w", err))
+			}
+			if coldMemoryReferences[origin] == nil {
+				coldMemoryReferences[origin] = make(map[string]ttcsnapshot.ObjectID)
+			}
+			identity := coldBranchReferenceIdentity(publication.FamilyID, publication.BranchID, publication.PublicationID)
+			for name, object := range manifest.References {
+				if strings.HasPrefix(name, "root/") {
+					coldMemoryReferences[origin][coldMemoryReferenceName(origin, identity, name, object)] = object
+				}
+			}
 		}
 		if publication.CandidateRoots.FilesystemRoot != "" {
-			identity := "branch\x00" + publication.FamilyID + "\x00" + publication.BranchID
+			identity := coldBranchReferenceIdentity(publication.FamilyID, publication.BranchID, publication.PublicationID)
 			if err := addFilesystemRoots(identity, publication.CandidateRoots.FilesystemRoot); err != nil {
 				// Ready is committed before the publisher creates the cold
 				// manifest. Until the first origin handoff, the provider remains
@@ -444,13 +471,8 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 				references[fmt.Sprintf("bootstrap/%016x/%x", uint64(manifest.Snapshot), digest)] = object
 			}
 		}
-		if _, live := coldOrigins[manifest.Snapshot]; live {
-			for name, object := range manifest.References {
-				if strings.HasPrefix(name, "root/") {
-					digest := sha256.Sum256([]byte(name))
-					references[fmt.Sprintf("root/cold-memory/%016x/%x", uint64(manifest.Snapshot), digest)] = object
-				}
-			}
+		for name, object := range coldMemoryReferences[manifest.Snapshot] {
+			references[name] = object
 		}
 		for name, object := range claimReferences[manifest.Snapshot] {
 			if previous, exists := references[name]; exists && previous != object {
@@ -490,6 +512,11 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	for origin := range coldFilesystemReferences {
 		if _, ok := imported[origin]; !ok {
 			return fail(fmt.Errorf("cold filesystem references shared origin %d without a committed manifest", origin))
+		}
+	}
+	for origin := range coldMemoryReferences {
+		if _, ok := imported[origin]; !ok {
+			return fail(fmt.Errorf("cold memory references shared origin %d without a committed manifest", origin))
 		}
 	}
 	if err := ledger.Checkpoint(); err != nil {
@@ -797,6 +824,21 @@ func providerBaselineCanBeReleased(state *cluster.AuthorityState, name string, o
 	return !volatile
 }
 
+// coldBranchReferenceIdentity makes a durable branch root activation unique.
+// A branch may stop, restart, and stop again without changing an immutable
+// filesystem root or memory snapshot. PublicationID distinguishes those
+// lifetimes while remaining identical on both sides of the Ready->Committed
+// Raft transition, so replacement is count-neutral and an old retain receipt
+// can never suppress a later activation.
+func coldBranchReferenceIdentity(family, branch, publicationID string) string {
+	return "branch\x00" + family + "\x00" + branch + "\x00" + publicationID
+}
+
+func coldMemoryReferenceName(origin ttcsnapshot.SnapshotID, identity, source string, object ttcsnapshot.ObjectID) string {
+	digest := sha256.Sum256([]byte(identity + "\x00" + source + "\x00" + object.String()))
+	return fmt.Sprintf("root/cold-memory/%016x/%x", uint64(origin), digest)
+}
+
 // authoritativeColdReferences derives the small mutable root set selected by
 // Raft. The immutable object graph and its per-edge counts remain outside
 // consensus; only these branch-level roots change when a durable branch is
@@ -806,13 +848,17 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 		return nil, errors.New("shared authority roots are unavailable")
 	}
 	desired := make(map[string]ttcsnapshot.ObjectID)
-	memory := make(map[ttcsnapshot.SnapshotID]struct{})
-	addMemory := func(snapshot uint64) {
+	memory := make(map[ttcsnapshot.SnapshotID]map[string]struct{})
+	addMemory := func(snapshot uint64, identity string) {
 		if snapshot == 0 {
 			return
 		}
 		if _, volatile := state.VolatileOrigins[snapshot]; !volatile {
-			memory[ttcsnapshot.SnapshotID(snapshot)] = struct{}{}
+			origin := ttcsnapshot.SnapshotID(snapshot)
+			if memory[origin] == nil {
+				memory[origin] = make(map[string]struct{})
+			}
+			memory[origin][identity] = struct{}{}
 		}
 	}
 	addFilesystem := func(identity, relative string) error {
@@ -848,8 +894,8 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 		if branch.Corrupted {
 			continue
 		}
-		addMemory(branch.Roots.MemorySnapshot)
-		identity := "branch\x00" + branch.FamilyID + "\x00" + branch.BranchID
+		identity := coldBranchReferenceIdentity(branch.FamilyID, branch.BranchID, branch.PublicationID)
+		addMemory(branch.Roots.MemorySnapshot, identity)
 		if err := addFilesystem(identity, branch.Roots.FilesystemRoot); err != nil {
 			return nil, err
 		}
@@ -862,25 +908,26 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 		if publication.State != cluster.PublicationReady {
 			continue
 		}
-		addMemory(publication.CandidateRoots.MemorySnapshot)
-		identity := "branch\x00" + publication.FamilyID + "\x00" + publication.BranchID
+		identity := coldBranchReferenceIdentity(publication.FamilyID, publication.BranchID, publication.PublicationID)
+		addMemory(publication.CandidateRoots.MemorySnapshot, identity)
 		if err := addFilesystem(identity, publication.CandidateRoots.FilesystemRoot); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return nil, err
 			}
 		}
 	}
-	for snapshot := range memory {
+	for snapshot, identities := range memory {
 		manifest, err := s.packs.Manifest(snapshot)
 		if err != nil {
 			return nil, fmt.Errorf("reading authoritative memory origin %d: %w", snapshot, err)
 		}
-		for name, object := range manifest.References {
-			if !strings.HasPrefix(name, "root/") {
-				continue
+		for identity := range identities {
+			for name, object := range manifest.References {
+				if !strings.HasPrefix(name, "root/") {
+					continue
+				}
+				desired[coldMemoryReferenceName(snapshot, identity, name, object)] = object
 			}
-			digest := sha256.Sum256([]byte(name))
-			desired[fmt.Sprintf("root/cold-memory/%016x/%x", uint64(snapshot), digest)] = object
 		}
 	}
 	return desired, nil
