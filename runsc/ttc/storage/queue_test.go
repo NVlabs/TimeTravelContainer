@@ -8,10 +8,25 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestIntentIDBoundsMigrationFilename(t *testing.T) {
+	short := intentID("family", "main", "publication-1")
+	if strings.HasPrefix(short, "sha256-") {
+		t.Fatalf("short intent identity unexpectedly hashed: %q", short)
+	}
+	long := intentID(strings.Repeat("f", 64), "fork-"+strings.Repeat("a", 32), "publication-"+strings.Repeat("b", 32))
+	if !strings.HasPrefix(long, "sha256-") || len(long)+len(".json") > 240 {
+		t.Fatalf("long intent identity = %q (%d bytes)", long, len(long))
+	}
+	if long == intentID(strings.Repeat("f", 64), "fork-"+strings.Repeat("c", 32), "publication-"+strings.Repeat("b", 32)) {
+		t.Fatal("distinct long publication identities collided")
+	}
+}
 
 type testPublisher struct {
 	mu        sync.Mutex

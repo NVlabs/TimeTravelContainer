@@ -2727,7 +2727,7 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	if len(ids) > 1 {
 		return ContainerInfo{}, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
 	}
-	return ContainerInfo{}, fmt.Errorf("container %q does not exist", identifier)
+	return ContainerInfo{}, fmt.Errorf("container %q does not exist: %w", identifier, os.ErrNotExist)
 }
 
 // loadRuntimeContainer resolves ordinary containers and an exact hidden

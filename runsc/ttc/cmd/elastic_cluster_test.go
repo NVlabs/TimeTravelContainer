@@ -573,6 +573,49 @@ func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 	}
 }
 
+func TestResolveSelectorMapsPrivateBranchInSamePhysicalFamily(t *testing.T) {
+	root := t.TempDir()
+	local := t.TempDir()
+	bundleDir := filepath.Join(root, "containers", "family", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(root, "containers", "family", "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", NodeID: "node-a", State: "running"},
+			{ID: "fork-migration", NodeID: "node-a", State: "running", DistributedMigration: true},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "test",
+		PhysicalContainer: "family", PhysicalBranch: "fork-migration",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{
+		dataRoot: root, localRoot: local, nodeID: "node-a",
+		distributedSource: &distributedSourceRuntime{placements: placements},
+	}
+	resolved, info, err := backend.resolveSelector(selector{container: "web", branch: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != (selector{container: "family", branch: "fork-migration"}) || info.ID != "family" {
+		t.Fatalf("resolved=%+v info=%q, want family@fork-migration", resolved, info.ID)
+	}
+}
+
 func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 	state := &cluster.AuthorityState{
 		Transactions: map[string]cluster.Transaction{

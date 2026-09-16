@@ -775,7 +775,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return fmt.Errorf("resolving distributed filesystem identities: %w", err)
 	}
-	if restoreArgs.GraphSparse {
+	hasGraphIdentity := session.GraphSnapshot != 0 || len(session.GraphRootObjects) != 0
+	if hasGraphIdentity {
 		rootNames := graphMemoryRootNames(targetBranch.FilesystemBranch, len(session.GraphRootObjects))
 		if err := validateGraphRootObjects(session.GraphSnapshot, rootNames, session.GraphRootObjects); err != nil {
 			return fmt.Errorf("validating distributed graph memory identity: %w", err)
@@ -787,6 +788,8 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
 			return fmt.Errorf("recording distributed graph memory identity: %w", err)
 		}
+	}
+	if restoreArgs.GraphSparse {
 		restoreArgs.GraphRemote = true
 		if _, err := rand.Read(restoreArgs.GraphRemoteToken[:]); err != nil {
 			return fmt.Errorf("generating graph restore token: %w", err)
@@ -2162,6 +2165,17 @@ func distributedDrainStepAdvanced(previous, current cluster.TransactionState) bo
 	}
 }
 
+func migrationSourceRuntime(tx cluster.Transaction) (string, string) {
+	container, branch := tx.SourcePhysicalContainer, tx.SourcePhysicalBranch
+	if container == "" {
+		container = tx.Identity.SourceContainer
+	}
+	if branch == "" {
+		branch = tx.Identity.SourceBranch
+	}
+	return container, branch
+}
+
 func drainSourceDependenciesMatching(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, nodeID, containerID, branchID string) error {
 	return drainSourceDependenciesSelected(backend, source, store, nodeID, func(tx cluster.Transaction) bool {
 		if containerID != "" && tx.Identity.SourceContainer != containerID {
@@ -2282,13 +2296,14 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 		// proves the target no longer reads the source, so synchronously release
 		// both the transfer pin and the paused source Kernel. Both operations
 		// are idempotent with a monitor that happened to win the race.
-		unlockSource := source.lockSourceFamily(tx.Identity.SourceContainer)
-		_, _ = backend.command("timetravel", tx.Identity.SourceContainer, "distributed-complete", tx.Identity.TransactionID)
+		sourceContainer, sourceBranch := migrationSourceRuntime(tx)
+		unlockSource := source.lockSourceFamily(sourceContainer)
+		_, _ = backend.command("timetravel", sourceContainer, "distributed-complete", tx.Identity.TransactionID)
 		if err := backend.releaseDistributedGraphReferences(graphTransferReferenceOperation(tx.Identity.TransactionID)); err != nil {
 			unlockSource()
 			return fmt.Errorf("releasing migrated graph roots for %q: %w", tx.Identity.TransactionID, err)
 		}
-		if err := backend.releaseMigratedSourceRuntime(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err != nil {
+		if err := backend.releaseMigratedSourceRuntime(sourceContainer, sourceBranch); err != nil {
 			unlockSource()
 			return fmt.Errorf("releasing migrated source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
 		}

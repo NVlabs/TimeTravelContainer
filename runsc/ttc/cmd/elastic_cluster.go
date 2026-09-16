@@ -640,7 +640,18 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 		for _, branch := range info.Branches {
 			placementFamily, placementBranch := logicalFamily, branch.ID
-			internalPhysical := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+			transactionID := info.DistributedForkTransactionID
+			internalPhysical := info.DistributedFamilyID != "" && transactionID != ""
+			mappedPhysical := false
+			// A migration target may be imported into an existing physical
+			// family. In that case the container itself is ordinary and only the
+			// transaction-named branch carries the private identity marker.
+			// Reconciliation must bind it back to its Raft logical branch, never
+			// enroll the transaction ID as a new user branch.
+			if branch.DistributedMigration && branch.DistributedForkTransactionID != "" {
+				transactionID = branch.DistributedForkTransactionID
+				internalPhysical = true
+			}
 			if internalPhysical {
 				// A sparse fork or migration target exists physically before its
 				// Raft publication/cutover. It must never enroll its transaction
@@ -649,10 +660,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				// the transaction. This is also deliberately independent of branch
 				// names: migration runtimes use transaction IDs while remote-fork
 				// runtimes may use a user-visible destination name.
-				var found bool
-				placementFamily, placementBranch, found = logicalPlacementForPhysicalTransaction(authorityState, info.DistributedForkTransactionID)
-				if !found {
-					continue
+				placementFamily, placementBranch, mappedPhysical = logicalPlacementForPhysicalRuntime(authorityState, info.ID, branch.ID)
+				if !mappedPhysical {
+					placementFamily, placementBranch, mappedPhysical = logicalPlacementForPhysicalTransaction(authorityState, transactionID)
+					if !mappedPhysical {
+						continue
+					}
 				}
 			}
 			key := placementFamily + "\x00" + placementBranch
@@ -1908,6 +1921,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		MaxTransferBytes: dataPlaneMax, FilesystemRoots: filesystemRoots,
 		FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 		ExecSessions: remoteExecSessions(session.ExecSessions), ExecConsoleLogs: execConsoleLogs,
+		GraphSnapshot: persistentBranch.SnapshotID, GraphRootObjects: append([]string(nil), persistentBranch.MemoryRootObjects...),
 	}
 	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)
 	if err != nil {
@@ -2048,6 +2062,12 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 
 func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID string) error {
 	info, err := b.containerStore().LoadContainer(containerID)
+	if errors.Is(err, os.ErrNotExist) {
+		// The synchronous node-retirement barrier and the ordinary background
+		// migration monitor may both observe independence. Whichever removes the
+		// physical source first completes the idempotent cleanup for both.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -2078,6 +2098,13 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 			return err
 		}
 		if info.DistributedFamilyID != "" && info.DistributedForkTransactionID != "" {
+			// Removing the transaction wrapper alone reclaims its directories but
+			// does not release graph/reference authority. Do that while the exact
+			// branch metadata is still available, then let the bundle store drop
+			// the now-empty wrapper and image lease.
+			if err := b.reclaimMigratedSourceBacking(info, branchID); err != nil {
+				return err
+			}
 			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
 		}
 		return b.removeMigratedSourceMetadata(info, branchID)
@@ -2109,6 +2136,19 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 // filesystem pointer, and its console artifacts per migration and would make a
 // later return to this Sentry collide with an obsolete name.
 func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerInfo, branchID string) error {
+	if err := b.reclaimMigratedSourceBacking(info, branchID); err != nil {
+		return err
+	}
+	if info.DistributedFamilyID != "" {
+		return b.containerStore().RemoveBranchRecord(info.ID, branchID)
+	}
+	// The logical catalog record remains, but must not keep pointing at graph
+	// roots owned by the retired physical incarnation. The current placement's
+	// physical branch carries the live roots used by all subsequent commands.
+	return b.containerStore().UpdateBranchSnapshotGraph(info.ID, branchID, 0, nil, nil, "", "", "")
+}
+
+func (b *runtimeBackend) reclaimMigratedSourceBacking(info ttcbundle.ContainerInfo, branchID string) error {
 	var branch ttcbundle.BranchInfo
 	found := false
 	for _, candidate := range info.Branches {
@@ -2120,19 +2160,21 @@ func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerIn
 	if !found {
 		return nil
 	}
-	var result error
-	result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, branch))
-	result = errors.Join(result, b.containerStore().RemoveBranchArtifacts(info.ID, branch))
-	// The original container record is the stable logical family catalog used
-	// for name resolution. Its branch entry remains as lineage/configuration
-	// metadata after its physical runtime and filesystem pointer are retired;
-	// Raft placement resolves every live or durable operation to the current
-	// physical record. Transaction-scoped physical family records have no such
-	// catalog role and can discard their retired branch entry completely.
-	if result == nil && info.DistributedFamilyID != "" {
-		result = b.containerStore().RemoveBranchRecord(info.ID, branchID)
+	// A live page-stream migration makes every byte resident on the target, but
+	// mapped PMAs may continue to name their immutable graph backing. Move any
+	// locally authoritative origins to shared storage before releasing this
+	// source branch so later dehydration can preserve those edges without the
+	// retired node remaining a provider.
+	if err := b.publishMigratedMemoryOrigins(branch); err != nil {
+		return fmt.Errorf("publishing migrated memory backing: %w", err)
 	}
-	return result
+	if err := b.reclaimBranchBacking(info, branch); err != nil {
+		return fmt.Errorf("reclaiming migrated branch backing: %w", err)
+	}
+	if err := b.containerStore().RemoveBranchArtifacts(info.ID, branch); err != nil {
+		return fmt.Errorf("removing migrated branch artifacts: %w", err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {

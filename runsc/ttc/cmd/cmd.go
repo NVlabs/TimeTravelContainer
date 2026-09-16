@@ -5993,14 +5993,27 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 				if placement.OwnerNode != "" && placement.OwnerNode != b.nodeID {
 					return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, placement.OwnerNode)
 				}
-				if placement.PhysicalContainer != "" && placement.PhysicalContainer != info.ID {
-					physical, loadErr := b.containerStore().LoadRuntimeContainer(placement.PhysicalContainer)
-					if loadErr != nil {
-						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime for %s: %w", target, loadErr)
-					}
-					physicalBranch := placement.PhysicalBranch
-					if physicalBranch == "" {
-						physicalBranch = target.branch
+				physicalContainer := placement.PhysicalContainer
+				if physicalContainer == "" {
+					physicalContainer = info.ID
+				}
+				physicalBranch := placement.PhysicalBranch
+				if physicalBranch == "" {
+					physicalBranch = target.branch
+				}
+				// Migration keeps the stable logical selector in Raft, but the
+				// target Sentry uses the transaction ID as its physical branch.
+				// This distinction also exists when the target Sentry already hosts
+				// another branch of the family, so comparing only container IDs
+				// incorrectly routed commands to the nonexistent logical name.
+				if physicalContainer != info.ID || physicalBranch != target.branch {
+					physical := info
+					if physicalContainer != info.ID {
+						var loadErr error
+						physical, loadErr = b.containerStore().LoadRuntimeContainer(physicalContainer)
+						if loadErr != nil {
+							return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime for %s: %w", target, loadErr)
+						}
 					}
 					if _, branchErr := persistentBranchInfo(physical, physicalBranch); branchErr != nil {
 						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime branch for %s: %w", target, branchErr)
@@ -6997,7 +7010,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 	imported := make(chan graphImportOutcome, 1)
 	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
 	go func() {
-		result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+		result, importErr := b.importGraphCapture(reader, origin, prefix)
 		_ = reader.Close()
 		imported <- graphImportOutcome{result: result, err: importErr}
 	}()
@@ -8688,6 +8701,9 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
+	if containerInfo.DistributedFamilyID != "" && containerInfo.DistributedFamilyID != containerInfo.ID {
+		return InspectInfo{}, fmt.Errorf("container %q does not exist: %w", name, os.ErrNotExist)
+	}
 	spec, err := store.LoadSpec(containerInfo.ID)
 	if err != nil {
 		return InspectInfo{}, err
@@ -8700,6 +8716,13 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	// exit. Reload so this inspect response reflects that update immediately.
 	if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
 		containerInfo = refreshed
+	}
+	if b.nodeID != "" {
+		if placements, openErr := b.placementCatalog(); openErr == nil {
+			if records, listErr := placements.List(); listErr == nil {
+				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, records, containerInfo.ID)
+			}
+		}
 	}
 	var runtimeFamily *Family
 	for i := range families {
@@ -8718,7 +8741,11 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	for i := range result.TTC.Branches {
 		branch := &result.TTC.Branches[i]
-		paths, retentionErr := store.BranchConsolePaths(containerInfo.ID, branch.Metadata.ID)
+		physicalContainer, physicalBranch := containerInfo.ID, branch.Metadata.ID
+		if resolved, physical, resolveErr := b.resolveSelector(selector{container: containerInfo.ID, branch: branch.Metadata.ID}); resolveErr == nil {
+			physicalContainer, physicalBranch = physical.ID, resolved.branch
+		}
+		paths, retentionErr := b.containerStore().BranchConsolePaths(physicalContainer, physicalBranch)
 		if retentionErr == nil {
 			stats, statsErr := ttcconsole.ReadRetentionStats(paths.RetentionStats)
 			if statsErr != nil {
@@ -8730,7 +8757,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		if retentionErr != nil {
 			branch.OutputRetentionError = retentionErr.Error()
 		}
-		execStats, execRetentionErr := store.ListExecConsoleRetentionStats(containerInfo.ID, branch.Metadata.ID)
+		execStats, execRetentionErr := b.containerStore().ListExecConsoleRetentionStats(physicalContainer, physicalBranch)
 		if execRetentionErr != nil {
 			branch.ExecOutputRetentionError = execRetentionErr.Error()
 		} else {
@@ -9793,6 +9820,24 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	if storeErr != nil {
 		return nil, storeErr
 	}
+	// Resolve physical migration identities before constructing the persistent
+	// view. A target imported into an existing Sentry is stored under a private
+	// transaction branch name, even though Raft exposes only the stable logical
+	// name. The private name must never enter user-facing inventory.
+	physicalPlacements := make(map[string][]cluster.PlacementRecord)
+	var placementRecords []cluster.PlacementRecord
+	if b.nodeID != "" {
+		if placements, err := b.placementCatalog(); err == nil {
+			if records, err := placements.List(); err == nil {
+				placementRecords = records
+				for _, record := range records {
+					if record.PhysicalContainer != "" {
+						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
+					}
+				}
+			}
+		}
+	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
 		if container.DistributedFamilyID != "" && container.DistributedFamilyID != container.ID {
@@ -9815,68 +9860,60 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			LiveForkWaiver:   container.LiveForkWaiver,
 			State:            state,
 			CreatedAt:        container.CreatedAt,
-			Branches:         persistentBranches(container.Branches),
+			Branches:         persistentBranches(logicalPersistentBranchInfos(container.Branches, physicalPlacements[container.ID], container.ID)),
 		}
 	}
 	// A single catalog snapshot is authoritative for elastically placed branches.
 	// Persistent container metadata describes cold branches, but must not expose
 	// a half-published target during ownership cutover.
-	physicalPlacements := make(map[string][]cluster.PlacementRecord)
 	if b.nodeID != "" {
-		if placements, err := b.placementCatalog(); err == nil {
-			if records, err := placements.List(); err == nil {
-				for _, record := range records {
-					if record.PhysicalContainer != "" {
-						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
-					}
-					family, ok := byID[record.FamilyID]
-					if !ok && record.FamilyName != "" {
-						family = Family{
-							ID: record.FamilyID, Name: record.FamilyName, Image: record.ImageReference,
-							Digest: record.ImageDigest, ImageSize: record.ImageSize,
-							LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
-							CreatedAt: record.FamilyCreatedAt,
-						}
-						ok = true
-					}
-					if !ok {
-						continue
-					}
-					foundBranch := false
-					for i := range family.Branches {
-						if family.Branches[i].ID == record.BranchID {
-							family.Branches[i].NodeID = record.OwnerNode
-							family.Branches[i].State = string(record.State)
-							foundBranch = true
-							break
-						}
-					}
-					if !foundBranch {
-						storageState := "local"
-						if record.State == cluster.PlacementUnplaced {
-							storageState = "shared"
-						}
-						family.Branches = append(family.Branches, Branch{
-							ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
-							State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
-						})
-					}
-					owner := ""
-					for _, branch := range family.Branches {
-						if branch.NodeID == "" {
-							continue
-						}
-						if owner != "" && owner != branch.NodeID {
-							owner = ""
-							break
-						}
-						owner = branch.NodeID
-					}
-					family.NodeID = owner
-					family.State = familyStateFromBranches(family.Branches)
-					byID[record.FamilyID] = family
+		for _, record := range placementRecords {
+			family, ok := byID[record.FamilyID]
+			if !ok && record.FamilyName != "" {
+				family = Family{
+					ID: record.FamilyID, Name: record.FamilyName, Image: record.ImageReference,
+					Digest: record.ImageDigest, ImageSize: record.ImageSize,
+					LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
+					CreatedAt: record.FamilyCreatedAt,
+				}
+				ok = true
+			}
+			if !ok {
+				continue
+			}
+			foundBranch := false
+			for i := range family.Branches {
+				if family.Branches[i].ID == record.BranchID {
+					family.Branches[i].NodeID = record.OwnerNode
+					family.Branches[i].State = string(record.State)
+					foundBranch = true
+					break
 				}
 			}
+			if !foundBranch {
+				storageState := "local"
+				if record.State == cluster.PlacementUnplaced {
+					storageState = "shared"
+				}
+				family.Branches = append(family.Branches, Branch{
+					ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
+					State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
+				})
+			}
+			owner := ""
+			for _, branch := range family.Branches {
+				if branch.NodeID == "" {
+					continue
+				}
+				if owner != "" && owner != branch.NodeID {
+					owner = ""
+					break
+				}
+				owner = branch.NodeID
+			}
+			family.NodeID = owner
+			family.State = familyStateFromBranches(family.Branches)
+			byID[record.FamilyID] = family
 		}
 	}
 	if runtimeErr == nil {
@@ -9999,7 +10036,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 					continue
 				}
 				family.State = normalizeLifecycleState(reconciled.State)
-				family.Branches = persistentBranches(reconciled.Branches)
+				family.Branches = persistentBranches(logicalPersistentBranchInfos(reconciled.Branches, physicalPlacements[reconciled.ID], reconciled.ID))
 				family.SandboxPID = 0
 				byID[displayID] = family
 			}
@@ -10398,6 +10435,54 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 	return branches
 }
 
+// logicalPersistentBranchInfos removes transaction-scoped migration branch
+// names from a user-facing persistent view. A physical migration branch is
+// visible only through the Raft placement that currently maps it to a stable
+// logical identity. Superseded physical branches are provider/cleanup state and
+// remain hidden even while their local metadata genuinely still exists.
+func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, physicalContainer string) []ttcbundle.BranchInfo {
+	byPhysical := make(map[string]cluster.PlacementRecord, len(placements))
+	for _, placement := range placements {
+		if placement.PhysicalContainer == physicalContainer && placement.PhysicalBranch != "" {
+			byPhysical[placement.PhysicalBranch] = placement
+		}
+	}
+	result := make([]ttcbundle.BranchInfo, 0, len(infos))
+	byLogical := make(map[string]int, len(infos))
+	for _, info := range infos {
+		logical := info
+		if info.DistributedMigration {
+			placement, ok := byPhysical[info.ID]
+			if !ok {
+				continue
+			}
+			logical.ID = placement.BranchID
+			logical.NodeID = placement.OwnerNode
+			logical.Unplaced = placement.State == cluster.PlacementUnplaced
+			if placement.ParentBranch != "" || logical.ParentID == "" {
+				logical.ParentID = placement.ParentBranch
+			}
+			if !placement.BranchCreatedAt.IsZero() {
+				logical.CreatedAt = placement.BranchCreatedAt
+			}
+			logical.DistributedForkTransactionID = ""
+			logical.DistributedGraphReferenceOperation = ""
+			logical.DistributedMigration = false
+		}
+		if index, exists := byLogical[logical.ID]; exists {
+			// The currently placed physical incarnation is authoritative over a
+			// stale persistent record carrying the same logical name.
+			if info.DistributedMigration {
+				result[index] = logical
+			}
+			continue
+		}
+		byLogical[logical.ID] = len(result)
+		result = append(result, logical)
+	}
+	return result
+}
+
 func persistentBranchInfo(info ttcbundle.ContainerInfo, branchID string) (ttcbundle.BranchInfo, error) {
 	for _, branch := range info.Branches {
 		if branch.ID == branchID {
@@ -10517,6 +10602,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if len(destinations) == 0 {
 		return nil, errors.New("at least one fork destination is required")
 	}
+	logicalSource := source
 	resolved, containerInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return nil, err
@@ -10542,7 +10628,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		return nil, err
 	}
 	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
-		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
+		return b.forkDehydratedMany(source, logicalSource.branch, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
 	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
 	referenceOperations := make([]string, len(destinations))
@@ -10602,6 +10688,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	branches := make([]Branch, len(infos))
 	for i, info := range infos {
 		branches[i] = branchView(info)
+		branches[i].ParentID = logicalSource.branch
 	}
 	if b.dataRoot != "" {
 		records := make([]ttcbundle.BranchInfo, len(branches))
@@ -10720,7 +10807,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 // state. The source remains process-free and its dehydration image is never
 // consumed. Filesystem metadata and graph roots are immutable, so preparing
 // any number of siblings does not copy file or memory data.
-func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused, quarantined bool) (_ []Branch, retErr error) {
+func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent string, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused, quarantined bool) (_ []Branch, retErr error) {
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
 	}
@@ -10782,7 +10869,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	referenceTransaction := transactionIDForBranch(info, sourceBranch)
 	for _, destination := range destinations {
 		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: logicalParent, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
 		if referenceTransaction != "" && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
 			operation, err := newGraphReferenceOperation()
 			if err != nil {
@@ -10891,7 +10978,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		if capture.Resume && !paused {
 			state = "running"
 		}
-		result = append(result, Branch{ID: child.branch.ID, ParentID: source.branch, Quarantined: child.branch.Quarantined, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
+		result = append(result, Branch{ID: child.branch.ID, ParentID: logicalParent, Quarantined: child.branch.Quarantined, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
 	}
 	return result, nil
 }
@@ -11366,6 +11453,41 @@ func (b *runtimeBackend) releaseBranchGraphRoots(branch ttcbundle.BranchInfo) er
 	return b.releaseGraphMemoryRoots(branchGraphRootNames(branch))
 }
 
+// reclaimBranchBacking releases every immutable graph reference and writable
+// filesystem generation owned by one physical branch. Lifecycle callers keep
+// the branch record until this method succeeds, which makes retries able to
+// recover the exact reference-operation identity after a crash.
+//
+// Physical branches created for a distributed fork or migration use the same
+// backing primitives as ordinary branches. Keeping their cleanup here avoids
+// letting a migration-specific path forget one of the local graph, remote
+// ledger, or filesystem references when the physical runtime is retired.
+func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	operation := graphReferenceOperationForBranch(info, branch)
+	if operation == "" {
+		if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+			return err
+		}
+	}
+	// A remote-origin branch may have both ordinary logical roots and retained
+	// roots installed by its durable reference intent. Drop the retained roots
+	// first so the subsequent local collection sees the true zero-reference
+	// state and can retire the provider origin in the same operation.
+	if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
+		return err
+	}
+	if err := b.releaseBranchGraphRoots(branch); err != nil {
+		return err
+	}
+	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
+		return err
+	}
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // releaseGraphMemoryRoots drops logical branch reachability, cascades exact
 // reference counts, and then removes only bulk objects absent from the graph.
 func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
@@ -11789,6 +11911,19 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, 
 	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
 }
 
+// importGraphCapture keeps stable PageID reuse inside one reference-authority
+// domain. Standalone origins may share other locally sealed objects. Clustered
+// origins may share only working or volatile objects owned by this daemon;
+// SnapshotShared objects are caches whose references are owned by the shared
+// ledger and must not acquire unreported local child edges.
+func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
+	states := []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedVolatile}
+	}
+	return ttcchunk.ImportGraphCaptureWithReusableStates(reader, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+}
+
 // newFilesystemOriginScope returns a bundle allocator and a completion
 // function. A failed bundle preparation abandons every otherwise-unreachable
 // Raft allocation without reusing its ID; success transfers those origins to
@@ -12100,7 +12235,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		imported := make(chan graphImportOutcome, 1)
 		go func() {
-			result, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+			result, importErr := b.importGraphCapture(reader, origin, prefix)
 			_ = reader.Close()
 			imported <- graphImportOutcome{result: result, err: importErr}
 		}()
@@ -13267,25 +13402,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
-		if graphReferenceOperationForBranch(info, *recorded) == "" {
-			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(*recorded), branchGraphRootObjects(*recorded)); err != nil {
-				return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
-			}
-		}
-		if err := b.releaseBranchGraphRoots(*recorded); err != nil {
-			return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
-		}
-		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, *recorded)); err != nil {
-			return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
-		}
-		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {
+		if err := b.reclaimBranchBacking(info, *recorded); err != nil {
 			if portErr != nil {
 				return fmt.Errorf("reclaiming filesystems for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
-			return fmt.Errorf("reclaiming filesystems for %s: %w", target, err)
-		}
-		if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
-			return fmt.Errorf("reconciling filesystem origins after removing %s: %w", target, err)
+			return fmt.Errorf("reclaiming branch backing for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchArtifacts(target.container, *recorded); err != nil {
 			return fmt.Errorf("removing persistent artifacts for %s: %w", target, err)

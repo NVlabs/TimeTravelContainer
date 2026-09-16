@@ -277,6 +277,74 @@ func TestGraphImportReusesStableMemoryPages(t *testing.T) {
 	}
 }
 
+func TestGraphImportDoesNotReuseSharedCachePages(t *testing.T) {
+	chunk := testChunk()
+	object := graphCaptureObjectID(1)
+	stored := make([]StoredBinding, 0, len(chunk.Pages))
+	for _, page := range chunk.Pages {
+		stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
+			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, Object: object})
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	firstOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := importSnapshotGraph(graph, data, firstOrigin, manifest, "shared/first", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPages, err := graph.MemoryPages(first.Roots[0].Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(firstOrigin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.MarkShared(firstOrigin); err != nil {
+		t.Fatal(err)
+	}
+	secondOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := importSnapshotGraphWithReusableStates(graph, data, secondOrigin, manifest, "shared/second", func(ID) (Chunk, error) { return chunk, nil }, []ttcsnapshot.SnapshotState{
+		ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedVolatile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPages, err := graph.MemoryPages(second.Roots[0].Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(secondPages, firstPages) {
+		t.Fatalf("cluster capture reused shared-cache PageIDs %v", secondPages)
+	}
+	for _, page := range secondPages {
+		if page.Snapshot != secondOrigin {
+			t.Fatalf("second capture page %s belongs to shared origin %d", page, firstOrigin)
+		}
+	}
+}
+
 func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	allocator := testAllocator(11)
 	versionAllocator := testAllocator(22)

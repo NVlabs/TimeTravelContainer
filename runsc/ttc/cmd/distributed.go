@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1414,7 +1415,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	imported := make(chan importResult, 1)
 	prefix := fmt.Sprintf("remote/%d/%s", origin, transactionID)
 	go func() {
-		capture, importErr := ttcchunk.ImportGraphCapture(reader, b.snapshotGraph, b.snapshotData, origin, prefix)
+		capture, importErr := b.importGraphCapture(reader, origin, prefix)
 		_ = reader.Close()
 		imported <- importResult{capture: capture, err: importErr}
 	}()
@@ -1507,6 +1508,112 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	}, rootNames, rootObjects, nil
 }
 
+// publishMigratedMemoryOrigins makes immutable backing named by a migrating
+// branch independent of this node. A live stream drain copies all bytes into
+// the target's MemoryFile, but mapped PMAs intentionally retain immutable file
+// identity so a later fork/dehydration can preserve CoW edges. Those objects
+// must therefore move to shared authority before their provider node retires.
+func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInfo) error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	origins := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, encoded := range branchGraphRootObjects(branch) {
+		id, err := ttcsnapshot.ParseObjectID(encoded)
+		if err != nil {
+			return err
+		}
+		provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+		if err != nil {
+			return fmt.Errorf("resolving snapshot origin %d: %w", id.Snapshot, err)
+		}
+		if volatile && provider.NodeID == b.nodeID {
+			origins[id.Snapshot] = struct{}{}
+		}
+	}
+	ordered := make([]ttcsnapshot.SnapshotID, 0, len(origins))
+	for origin := range origins {
+		ordered = append(ordered, origin)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, origin := range ordered {
+		if err := b.publishVolatileGraphOrigin(origin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishVolatileGraphOrigin performs the provider-to-shared authority handoff
+// for an existing immutable origin. Bulk pack creation happens before the
+// short ledger freeze; Raft changes routing only after the shared coordinator
+// has imported the exact provider baseline and catch-up suffix.
+func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) (retErr error) {
+	if origin == 0 || b.snapshotGraph == nil || b.snapshotData == nil || b.snapshotShared == nil ||
+		b.distributedSource == nil || b.distributedSource.authority == nil || b.sharedReferences == nil {
+		return errors.New("distributed graph publication is unavailable")
+	}
+	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			return fmt.Errorf("snapshot origin %d has neither volatile nor shared authority: %w", origin, err)
+		}
+		return nil
+	}
+	if provider.NodeID != b.nodeID {
+		return fmt.Errorf("snapshot origin %d belongs to node %q, not %q", origin, provider.NodeID, b.nodeID)
+	}
+	record, ok := b.snapshotGraph.Snapshot(origin)
+	if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+		return fmt.Errorf("snapshot origin %d is not locally sealed for publication", origin)
+	}
+	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
+		return fmt.Errorf("publishing snapshot origin %d: %w", origin, err)
+	}
+
+	finishHandoff := b.distributedSource.beginBackgroundSnapshotWork()
+	defer finishHandoff()
+	ledgerFrozen := false
+	defer func() {
+		if retErr != nil && ledgerFrozen {
+			_ = b.snapshotGraph.UnfreezeSnapshotLedger(origin)
+		}
+	}()
+	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
+		return err
+	}
+	ledgerFrozen = true
+	changes, _, frozen, err := b.snapshotGraph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		return err
+	}
+	if !frozen {
+		return fmt.Errorf("snapshot origin %d reference handoff did not freeze", origin)
+	}
+	publisher := &branchPublisher{
+		nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	if err := publisher.publishSharedReferenceLedger(origin, changes); err != nil {
+		return fmt.Errorf("transferring snapshot origin %d reference authority: %w", origin, err)
+	}
+	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
+		return fmt.Errorf("publishing snapshot origin %d authority: %w", origin, err)
+	}
+	if err := b.snapshotGraph.MarkShared(origin); err != nil {
+		return err
+	}
+	if err := b.snapshotGraph.UnfreezeSnapshotLedger(origin); err != nil {
+		return err
+	}
+	ledgerFrozen = false
+	return releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin)
+}
+
 func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, repositoryID string) (string, error) {
 	identity := struct {
 		ContainerID  string                    `json:"container_id"`
@@ -1571,6 +1678,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("invalid distributed destination %q: %w", targetDestination, err)
 	}
+	logicalSource := source
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return selector{}, err
@@ -1580,6 +1688,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if logicalSourceContainer == "" {
 		logicalSourceContainer = sourceInfo.ID
 	}
+	logicalSource.container = logicalSourceContainer
 	if !sourceInfo.LiveForkEligible {
 		return selector{}, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
 	}
@@ -1591,7 +1700,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, fmt.Errorf("renewing source execution authority: %w", err)
 	}
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
-		return b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, nil)
+		return b.forkRemoteDehydrated(source, logicalSource, sourceInfo, peer, targetNode, target, paused, nil)
 	}
 	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
 	foregroundCaptureActive := true
@@ -1610,7 +1719,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	}
 	identity := cluster.ForkIdentity{
 		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
-		TargetNodeID: targetNode, SourceContainer: logicalSourceContainer, SourceBranch: source.branch,
+		TargetNodeID: targetNode, SourceContainer: logicalSourceContainer, SourceBranch: logicalSource.branch,
 		TargetContainer: logicalSourceContainer, TargetBranch: transactionID,
 		TargetVisibleBranch: target.branch,
 		ImageDigest:         sourceInfo.Digest, RootfsDigest: rootfsDigest,
@@ -1761,7 +1870,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 // forkRemoteDehydrated restores a process-free branch directly from its
 // durable kernel metadata and sparse memory graph. No source Sentry is
 // created, and the target is independent as soon as publication completes.
-func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {
+func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, sourceInfo ttcbundle.ContainerInfo, peer *cluster.Client, targetNode string, target selector, paused bool, committedTransaction *string) (result selector, retErr error) {
 	sourceBranch, branchErr := persistentBranchInfo(sourceInfo, source.branch)
 	if branchErr != nil {
 		return selector{}, branchErr
@@ -1779,8 +1888,8 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 	}
 	identity := cluster.ForkIdentity{
 		TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
-		TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
-		TargetContainer: target.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
+		TargetNodeID: targetNode, SourceContainer: logicalSource.container, SourceBranch: logicalSource.branch,
+		TargetContainer: logicalSource.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
 		ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 		RepositoryID: b.distributedSource.capabilities.RepositoryID,
 	}
@@ -2181,11 +2290,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		seenTargets[target.String()] = struct{}{}
 		destinations[i] = target
 	}
+	logicalSource := source
 	resolved, sourceInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return nil, err
 	}
 	source = resolved
+	logicalSource.container = logicalFamilyID(sourceInfo)
 	if !sourceInfo.LiveForkEligible {
 		return nil, fmt.Errorf("container family %q is not live fork eligible: %s", sourceInfo.Name, sourceInfo.LiveForkWaiver)
 	}
@@ -2201,7 +2312,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		transactions := make([]string, 0, len(targetContainers))
 		for _, target := range destinations {
 			var transactionID string
-			result, err := b.forkRemoteDehydrated(source, sourceInfo, peer, targetNode, target, paused, &transactionID)
+			result, err := b.forkRemoteDehydrated(source, logicalSource, sourceInfo, peer, targetNode, target, paused, &transactionID)
 			if err == nil {
 				results = append(results, result)
 				transactions = append(transactions, transactionID)
@@ -2298,8 +2409,8 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 		identity := cluster.ForkIdentity{
 			TransactionID: transactionID, SourceNodeID: b.distributedSource.capabilities.NodeID,
-			TargetNodeID: targetNode, SourceContainer: source.container, SourceBranch: source.branch,
-			TargetContainer: target.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
+			TargetNodeID: targetNode, SourceContainer: logicalSource.container, SourceBranch: logicalSource.branch,
+			TargetContainer: logicalSource.container, TargetBranch: transactionID, TargetVisibleBranch: target.branch,
 			ImageDigest: sourceInfo.Digest, RootfsDigest: rootfsDigest,
 			RepositoryID: b.distributedSource.capabilities.RepositoryID,
 		}

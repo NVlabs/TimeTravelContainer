@@ -167,9 +167,11 @@ type RemoteSessionDescriptor struct {
 	// Bulk objects remain in their authoritative provider or shared pack and
 	// are populated into the target cache only when faulted.
 	GraphManifest string `json:"graph_manifest,omitempty"`
-	// GraphSnapshot and GraphRootObjects preserve the immutable memory
-	// identity selected by GraphManifest. Root names are target-local handles
-	// reconstructed from the target filesystem-branch identity.
+	// GraphSnapshot and GraphRootObjects preserve immutable backing identity.
+	// GraphManifest selects a graph-native sparse restore; without a manifest,
+	// the roots protect immutable files still referenced by a live page-stream
+	// restore after all remote bytes have become resident. Root names are
+	// target-local handles reconstructed from the filesystem-branch identity.
 	GraphSnapshot    uint64   `json:"graph_snapshot,omitempty"`
 	GraphRootObjects []string `json:"graph_root_objects,omitempty"`
 	// InternalMounts carries the small TTC-generated files that are bind-mounted

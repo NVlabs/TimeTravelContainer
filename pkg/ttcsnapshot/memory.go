@@ -66,8 +66,27 @@ type MemoryPageDescriptor struct {
 // a page record with a different value may share bytes but cannot share the
 // same PageID. Missing identities are omitted from the result.
 func (s *Store) ExistingMemoryPages(pages []MemoryPageDescriptor) (map[uint8]PageID, error) {
+	return s.ExistingMemoryPagesInStates(pages)
+}
+
+// ExistingMemoryPagesInStates is ExistingMemoryPages restricted to origins in
+// one of reusableStates. An empty reusableStates list accepts every live
+// origin and preserves the standalone behavior of ExistingMemoryPages.
+//
+// Distributed graph builders must not form new local edges to SnapshotShared
+// objects: their reference authority has already moved to the cluster ledger,
+// so a local edge would be invisible to shared GC. They use this method with
+// SnapshotWorking and SnapshotSealedVolatile instead.
+func (s *Store) ExistingMemoryPagesInStates(pages []MemoryPageDescriptor, reusableStates ...SnapshotState) (map[uint8]PageID, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	allowed := make(map[SnapshotState]struct{}, len(reusableStates))
+	for _, state := range reusableStates {
+		if !state.valid() {
+			return nil, fmt.Errorf("invalid reusable memory snapshot state %q", state)
+		}
+		allowed[state] = struct{}{}
+	}
 	result := make(map[uint8]PageID, len(pages))
 	seen := make(map[uint8]struct{}, len(pages))
 	for _, descriptor := range pages {
@@ -81,6 +100,15 @@ func (s *Store) ExistingMemoryPages(pages []MemoryPageDescriptor) (map[uint8]Pag
 		}
 		var selected ObjectID
 		for id := range s.memoryPages[identity] {
+			if len(allowed) != 0 {
+				snapshot, ok := s.state.Snapshots[snapshotKey(id.Snapshot)]
+				if !ok {
+					continue
+				}
+				if _, ok := allowed[snapshot.State]; !ok {
+					continue
+				}
+			}
 			if selected.IsZero() || id.key() < selected.key() {
 				selected = id
 			}

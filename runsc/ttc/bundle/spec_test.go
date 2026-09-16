@@ -2314,6 +2314,9 @@ func TestContainerIdentityResolution(t *testing.T) {
 	if _, err := store.LoadContainer("ab"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous ID prefix error=%v", err)
 	}
+	if _, err := store.LoadContainer("missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing container error=%v, want os.ErrNotExist", err)
+	}
 	paths, err := store.BranchConsolePaths("alpha", "main")
 	if err != nil {
 		t.Fatalf("BranchConsolePaths by name: %v", err)

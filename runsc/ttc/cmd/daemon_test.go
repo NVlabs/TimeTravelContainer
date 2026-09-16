@@ -558,6 +558,22 @@ func TestStopDaemonContainersTreatsLineageAsDisplayOnly(t *testing.T) {
 	}
 }
 
+func TestMigrationSourceRuntimeUsesPhysicalIdentity(t *testing.T) {
+	tx := cluster.Transaction{
+		Identity:                cluster.ForkIdentity{SourceContainer: "family", SourceBranch: "test"},
+		SourcePhysicalContainer: "fork-original", SourcePhysicalBranch: "test",
+	}
+	container, branch := migrationSourceRuntime(tx)
+	if container != "fork-original" || branch != "test" {
+		t.Fatalf("migration source runtime = %s@%s, want fork-original@test", container, branch)
+	}
+	tx.SourcePhysicalContainer, tx.SourcePhysicalBranch = "", ""
+	container, branch = migrationSourceRuntime(tx)
+	if container != "family" || branch != "test" {
+		t.Fatalf("legacy migration source runtime = %s@%s, want family@test", container, branch)
+	}
+}
+
 func TestStopDaemonContainersRemovesRuntimeWithoutFamilyMetadata(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

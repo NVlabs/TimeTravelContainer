@@ -4413,6 +4413,32 @@ func TestVisiblePhysicalRuntimeBranchesHidesSparseProviders(t *testing.T) {
 	}
 }
 
+func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
+	created := time.Unix(123, 456).UTC()
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{
+			ID: "fork-current", ParentID: "main", State: "running", DistributedMigration: true,
+			DistributedForkTransactionID: "fork-current", DistributedGraphReferenceOperation: "graph-current",
+		},
+		{ID: "fork-retired", ParentID: "main", State: "paused", DistributedMigration: true},
+	}
+	placements := []cluster.PlacementRecord{{
+		FamilyID: "family", BranchID: "test", PhysicalContainer: "family", PhysicalBranch: "fork-current",
+		OwnerNode: "node-a", State: cluster.PlacementRunning, ParentBranch: "main", BranchCreatedAt: created,
+	}}
+	visible := logicalPersistentBranchInfos(infos, placements, "family")
+	if len(visible) != 2 || visible[0].ID != "main" || visible[1].ID != "test" {
+		t.Fatalf("logical persistent branches = %+v, want main and test", visible)
+	}
+	if visible[1].DistributedMigration || visible[1].DistributedForkTransactionID != "" || visible[1].DistributedGraphReferenceOperation != "" {
+		t.Fatalf("logical branch leaked private migration metadata: %+v", visible[1])
+	}
+	if visible[1].NodeID != "node-a" || !visible[1].CreatedAt.Equal(created) {
+		t.Fatalf("logical branch lost placement metadata: %+v", visible[1])
+	}
+}
+
 func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		NodeID: "node-a",

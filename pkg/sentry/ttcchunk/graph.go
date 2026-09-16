@@ -71,6 +71,10 @@ func resourceKey(id checkpoint.ResourceID) string {
 // importSnapshotGraph installs manifest and its immutable source chunks into
 // graph. getChunk lets callers stream a capture directly from the Sentry.
 func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, getChunk func(ID) (Chunk, error)) (_ GraphImportResult, retErr error) {
+	return importSnapshotGraphWithReusableStates(graph, data, origin, manifest, rootPrefix, getChunk, nil)
+}
+
+func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, getChunk func(ID) (Chunk, error), reusableStates []ttcsnapshot.SnapshotState) (_ GraphImportResult, retErr error) {
 	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || getChunk == nil {
 		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
 	}
@@ -214,7 +218,7 @@ func importSnapshotGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataSt
 		if len(pages) != len(references) {
 			return GraphImportResult{}, fmt.Errorf("memory chunk %s contains %d pages, manifest references %d slots", use.id, len(pages), len(references))
 		}
-		existing, err := graph.ExistingMemoryPages(pages)
+		existing, err := graph.ExistingMemoryPagesInStates(pages, reusableStates...)
 		if err != nil {
 			return GraphImportResult{}, err
 		}

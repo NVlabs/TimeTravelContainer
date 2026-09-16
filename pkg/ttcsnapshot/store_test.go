@@ -1335,6 +1335,50 @@ func TestExistingMemoryPagesRebuildAndReclaim(t *testing.T) {
 	}
 }
 
+func TestExistingMemoryPagesFiltersSnapshotAuthorityState(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := MemoryPageDescriptor{Slot: 7, Identity: MemoryPageIdentity{
+		LogicalAllocator: [16]byte{1}, LogicalSequence: 9,
+		VersionAllocator: [16]byte{2}, VersionSequence: 11, References: 1,
+	}}
+	reservation, err := store.ReserveMemoryChunkPages(origin, "authority/build", []MemoryPageDescriptor{descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitMemoryChunk(reservation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetMemoryPages(origin, "authority/root", map[uint64]ObjectID{0: ObjectID(reservation.Pages[7])}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(reservation.Pins); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotSealedVolatile); err != nil || got[7] != reservation.Pages[7] {
+		t.Fatalf("volatile lookup=(%v,%v), want slot 7=%s", got, err, ObjectID(reservation.Pages[7]))
+	}
+	if err := store.MarkShared(origin); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotWorking, SnapshotSealedVolatile); err != nil || len(got) != 0 {
+		t.Fatalf("volatile-only lookup of shared page=(%v,%v), want empty", got, err)
+	}
+	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotShared); err != nil || got[7] != reservation.Pages[7] {
+		t.Fatalf("shared lookup=(%v,%v), want slot 7=%s", got, err, ObjectID(reservation.Pages[7]))
+	}
+}
+
 func TestCloneRootsIsAtomicAndReferenceCounted(t *testing.T) {
 	store, err := Open(t.TempDir())
 	if err != nil {

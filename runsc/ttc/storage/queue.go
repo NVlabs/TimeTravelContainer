@@ -7,6 +7,7 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -527,7 +528,16 @@ func (q *Queue) signal() {
 }
 
 func intentID(container, branch, publicationID string) string {
-	return hex.EncodeToString([]byte(container)) + "-" + hex.EncodeToString([]byte(branch)) + "-" + hex.EncodeToString([]byte(publicationID))
+	raw := hex.EncodeToString([]byte(container)) + "-" + hex.EncodeToString([]byte(branch)) + "-" + hex.EncodeToString([]byte(publicationID))
+	// Keep existing compact identities readable and stable, but bound the
+	// filename when a migration transaction name is the physical branch. The
+	// JSON intent retains all three unhashed identity fields; this digest is only
+	// the node-local queue key and is not used as protocol authority.
+	if len(raw)+len(".json") <= 240 {
+		return raw
+	}
+	digest := sha256.Sum256([]byte(raw))
+	return "sha256-" + hex.EncodeToString(digest[:])
 }
 
 func writeJSONAtomic(path string, value any) error {

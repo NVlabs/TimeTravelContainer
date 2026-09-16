@@ -230,6 +230,13 @@ func readGraphCaptureUint64(r io.Reader) (uint64, error) {
 // installs its graph roots and bulk objects. Persistent compatibility chunk
 // repositories are never involved.
 func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string) (GraphImportResult, error) {
+	return ImportGraphCaptureWithReusableStates(r, graph, data, origin, rootPrefix, nil)
+}
+
+// ImportGraphCaptureWithReusableStates imports a capture while limiting
+// stable-page reuse to the specified snapshot authority states. Passing nil
+// retains the standalone behavior of reusing every live immutable page.
+func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string, reusableStates []ttcsnapshot.SnapshotState) (GraphImportResult, error) {
 	if r == nil {
 		return GraphImportResult{}, errors.New("graph memory capture reader is nil")
 	}
@@ -312,5 +319,5 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 			return GraphImportResult{}, fmt.Errorf("finishing empty graph memory capture: %w", err)
 		}
 	}
-	return importSnapshotGraph(graph, data, origin, manifest, rootPrefix, readObject)
+	return importSnapshotGraphWithReusableStates(graph, data, origin, manifest, rootPrefix, readObject, reusableStates)
 }
