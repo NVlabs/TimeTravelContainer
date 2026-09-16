@@ -1148,9 +1148,22 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph snapshot %d: %w", origin, err)
 	}
+	// Serialize only the short final ledger/authority switch against foreground
+	// captures. The potentially slow shared-pack write above remains outside the
+	// gate. Once a foreground writer owns the gate, it may add references to
+	// this origin; the later freeze will include them in its baseline.
+	finishFinalHandoff := b.distributedSource.beginBackgroundSnapshotWork()
+	defer finishFinalHandoff()
+	ledgerFrozen := false
+	defer func() {
+		if retErr != nil && ledgerFrozen {
+			_ = b.snapshotGraph.UnfreezeSnapshotLedger(origin)
+		}
+	}()
 	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
+	ledgerFrozen = true
 	changes, _, frozen, err := b.snapshotGraph.SnapshotLedgerHandoffChanges(origin, 0)
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
@@ -1176,6 +1189,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err := b.snapshotGraph.UnfreezeSnapshotLedger(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
+	ledgerFrozen = false
 	if err := releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}

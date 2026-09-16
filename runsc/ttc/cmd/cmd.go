@@ -11756,6 +11756,20 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err := b.ensureDistributedTargetMemoryIndependent(info, persistentBranch); err != nil {
 		return fmt.Errorf("materializing remote memory before dehydrating %s: %w", target, err)
 	}
+	// A graph capture installs roots and parent edges to immutable origins.
+	// Exclude the short provider-to-shared ledger freeze so every new reference
+	// is included on exactly one side of the authority handoff.
+	finishGraphCapture := func() {}
+	graphCaptureActive := false
+	if b.distributedSource != nil {
+		finishGraphCapture = b.distributedSource.beginForegroundCapture()
+		graphCaptureActive = true
+	}
+	defer func() {
+		if graphCaptureActive {
+			finishGraphCapture()
+		}
+	}()
 	store := b.containerStore()
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
@@ -11928,6 +11942,10 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		graphControlRootObject = controlObject.String()
 		if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
 			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+		}
+		if graphCaptureActive {
+			finishGraphCapture()
+			graphCaptureActive = false
 		}
 		if _, err := os.Stat(finalDir); err == nil {
 			return fmt.Errorf("dehydration image already exists for branch %q", target.branch)

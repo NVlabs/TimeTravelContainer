@@ -883,6 +883,12 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		lifecycle = "dehydrated"
 	}
 	if p.authority != nil {
+		// The final provider-to-shared ledger switch freezes reference changes.
+		// Coordinate it with live/dehydration captures, which may create new DAG
+		// edges to these immutable origins. Slow pack construction happened before
+		// this point and does not hold the gate.
+		finishReferenceHandoff := p.peers.beginBackgroundSnapshotWork()
+		defer finishReferenceHandoff()
 		branch, branchErr := persistentBranchInfo(info, intent.Branch)
 		if branchErr != nil {
 			return branchErr
