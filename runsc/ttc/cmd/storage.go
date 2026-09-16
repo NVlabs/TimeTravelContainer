@@ -1503,8 +1503,34 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")
 	}
-	_, err = b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true)
-	return err
+	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
+		return err
+	}
+	// An ordinary rehydrated Sentry receives shared-pack relay FDs and keeps
+	// this imported repository lazy. The short-lived offline cp helper has no
+	// control RPC before its init process starts, so make its host repository
+	// self-contained first. Whole-file materialization preserves repository
+	// identity and CoW metadata; only this explicit management path pays the
+	// recursive cost.
+	sources, cleanup, err := b.prepareColdDirectFilesystemSources(info, branch, branch.FilesystemBranch)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	seen := make(map[*ttcvolume.Repository]struct{}, len(sources))
+	for _, source := range sources {
+		if source.Repository == nil {
+			continue
+		}
+		if _, ok := seen[source.Repository]; ok {
+			continue
+		}
+		seen[source.Repository] = struct{}{}
+		if err := source.Repository.MaterializeRemoteObjects(); err != nil {
+			return fmt.Errorf("materializing repository for %q: %w", branch.ID, err)
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) filesystemRestoreIDs(container string) (map[string]string, error) {
