@@ -792,6 +792,27 @@ func logicalPlacementForPhysicalRuntime(state *cluster.AuthorityState, physicalC
 	return family, branch, family != ""
 }
 
+func logicalFamilyForPhysicalRuntime(state *cluster.AuthorityState, physicalContainer string, physicalBranches []string) (Family, bool) {
+	logical := Family{}
+	if len(physicalBranches) == 0 {
+		return logical, false
+	}
+	seen := make(map[string]struct{}, len(physicalBranches))
+	for _, physicalBranch := range physicalBranches {
+		family, branch, found := logicalPlacementForPhysicalRuntime(state, physicalContainer, physicalBranch)
+		if !found || (logical.ID != "" && logical.ID != family) {
+			return Family{}, false
+		}
+		logical.ID = family
+		if _, duplicate := seen[branch]; duplicate {
+			continue
+		}
+		seen[branch] = struct{}{}
+		logical.Branches = append(logical.Branches, Branch{ID: branch})
+	}
+	return logical, logical.ID != "" && len(logical.Branches) != 0
+}
+
 // placementHasProcessFreePublication reports whether Raft has authorized the
 // exact placement generation to be temporarily process-free while its sealed
 // state is published. Publication commit atomically changes the placement to
@@ -4052,6 +4073,13 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 	if err := json.Unmarshal(data, &record); err != nil || record.Version != 1 || record.NodeID != nodeID {
 		return fmt.Errorf("invalid local execution fence for node %q", nodeID)
 	}
+	var authorityState *cluster.AuthorityState
+	if backend.distributedSource != nil && backend.distributedSource.authority != nil {
+		authorityState, err = backend.distributedSource.authority.AuthorityState()
+		if err != nil {
+			return fmt.Errorf("loading execution authority for fence recovery: %w", err)
+		}
+	}
 	var result error
 	for _, process := range record.Processes {
 		start, err := processStartTime(process.PID)
@@ -4064,11 +4092,8 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 		}
 		containerID := process.ContainerID
 		if backend.distributedSource != nil && backend.distributedSource.authority != nil {
-			family := Family{ID: containerID}
-			for _, branchID := range process.Branches {
-				family.Branches = append(family.Branches, Branch{ID: branchID})
-			}
-			if len(family.Branches) == 0 && containerID != "" {
+			physicalBranches := append([]string(nil), process.Branches...)
+			if len(physicalBranches) == 0 && containerID != "" {
 				// Guardian-created records lack an in-Sentry branch snapshot. Shared
 				// metadata is safe to inspect without waking the process. Restrict
 				// the fallback to branches whose last physical owner was this node;
@@ -4076,12 +4101,17 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 				if info, loadErr := backend.containerStore().LoadContainer(containerID); loadErr == nil {
 					for _, branch := range info.Branches {
 						if info.BranchNodeID(branch.ID) == nodeID && (normalizeLifecycleState(branch.State) == "running" || normalizeLifecycleState(branch.State) == "paused") {
-							family.Branches = append(family.Branches, Branch{ID: branch.ID})
+							physicalBranches = append(physicalBranches, branch.ID)
 						}
 					}
 				}
 			}
-			authorized := containerID != "" && fencedRuntimeAuthorized(family, nodeID, incarnation, backend.distributedSource.authority.LookupPlacement)
+			// The guardian records host-visible runtime identity. After migration
+			// both the container and branch may be transaction IDs, while Raft owns
+			// the stable family@branch. Re-authorize the exact physical-to-logical
+			// mapping before applying the ordinary placement checks.
+			family, mapped := logicalFamilyForPhysicalRuntime(authorityState, containerID, physicalBranches)
+			authorized := mapped && fencedRuntimeAuthorized(family, nodeID, incarnation, backend.distributedSource.authority.LookupPlacement)
 			if !authorized {
 				if containerID == "" {
 					result = errors.Join(result, fmt.Errorf("fenced Sentry PID %d has no runtime identity and cannot be re-authorized", process.PID))

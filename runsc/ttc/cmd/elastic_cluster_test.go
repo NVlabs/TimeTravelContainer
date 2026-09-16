@@ -623,6 +623,13 @@ func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 			t.Fatalf("physical %q resolved (%q,%q,%t), want (%q,%q,%t)", tc.physical, family, branch, found, tc.family, tc.branch, tc.found)
 		}
 	}
+	logical, found := logicalFamilyForPhysicalRuntime(state, "physical", []string{"migration", "child"})
+	if !found || logical.ID != "family" || len(logical.Branches) != 2 || logical.Branches[0].ID != "main" || logical.Branches[1].ID != "child" {
+		t.Fatalf("physical family resolved %+v, found=%t", logical, found)
+	}
+	if logical, found := logicalFamilyForPhysicalRuntime(state, "physical", []string{"migration", "missing"}); found || logical.ID != "" {
+		t.Fatalf("partially mapped physical family resolved %+v, found=%t", logical, found)
+	}
 }
 
 func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T) {
