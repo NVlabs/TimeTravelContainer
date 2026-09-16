@@ -21,19 +21,19 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
-const daemonCPUProfileVersion = 1
+const daemonCPUProfileVersion = 2
 
-// portableAMD64Features is an x86-64-v2-class guest instruction contract plus
-// the XSAVE ABI required by systrap, expressed using gVisor's Linux-compatible
+// portableAMD64Features is an x86-64-v2-class guest instruction contract,
+// expressed using gVisor's Linux-compatible
 // feature names. It is deliberately independent of the bootstrap host's vendor
 // and model so an AMD-initialized cluster can admit an Intel node (and vice
 // versa). Newer vector instructions are available via immutable host or
 // explicit profiles.
 var portableAMD64Features = []string{
 	"apic", "cmov", "cx16", "cx8", "fpu", "fxsr", "lahf_lm", "lm",
-	"mmx", "nx", "osxsave", "pae", "pat", "pge", "pni", "popcnt", "pse",
+	"mmx", "nx", "pae", "pat", "pge", "pni", "popcnt", "pse",
 	"pse36", "sep", "sse", "sse2", "sse4_1", "sse4_2", "ssse3", "syscall",
-	"tsc", "xsave",
+	"tsc",
 }
 
 // daemonCPUProfile is the exact guest-visible instruction contract. Mode is
@@ -43,6 +43,7 @@ type daemonCPUProfile struct {
 	Version  int      `json:"version"`
 	Mode     string   `json:"mode"`
 	Features []string `json:"features"`
+	XsaveABI string   `json:"xsave_abi,omitempty"`
 }
 
 func hostCPUFeatureNames(runtimePlatform string) []string {
@@ -135,29 +136,32 @@ func resolveDaemonCPUProfile(mode, explicit, runtimePlatform string) (daemonCPUP
 	if len(features) == 0 {
 		return daemonCPUProfile{}, fmt.Errorf("CPU profile %q contains no features on %s", mode, runtime.GOARCH)
 	}
-	if err := validateSystrapCPUProfileContract(features, runtimePlatform); err != nil {
+	if err := validateXsaveCPUProfileContract(features); err != nil {
 		return daemonCPUProfile{}, err
 	}
-	return daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: mode, Features: features}, nil
+	profile := daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: mode, Features: features}
+	if slices.Contains(features, "xsave") {
+		profile.XsaveABI = cpuid.HostXsaveABI()
+	}
+	return profile, nil
 }
 
-func validateSystrapCPUProfileContract(features []string, runtimePlatform string) error {
-	if runtime.GOARCH != "amd64" || runtimePlatform != "systrap" {
+func validateXsaveCPUProfileContract(features []string) error {
+	if runtime.GOARCH != "amd64" {
 		return nil
 	}
-	// Systrap saves host thread state in XSAVE format. Guest signal frames and
-	// migrated FPU state must consequently use the XSAVE ABI as well, even when
-	// the portable instruction contract excludes AVX and later vector
-	// extensions. Failing early is preferable to a workload that crashes only
-	// after its first post-migration signal delivery.
-	required := map[string]bool{"xsave": false, "osxsave": false}
-	for _, feature := range features {
-		if _, ok := required[feature]; ok {
-			required[feature] = true
-		}
+	// The internal systrap save format is independent of the guest instruction
+	// contract. Portable guests use the stable FXSAVE ABI. Exposing XSAVE requires
+	// matching the physical ABI on every node, since native XGETBV/XSAVE cannot
+	// be virtualized by the CPUID feature mask.
+	xsave := slices.Contains(features, "xsave")
+	if xsave != slices.Contains(features, "osxsave") {
+		return errors.New("CPU profiles must enable xsave and osxsave together")
 	}
-	if !required["xsave"] || !required["osxsave"] {
-		return errors.New("systrap CPU profiles on amd64 require xsave and osxsave")
+	for _, feature := range features {
+		if !xsave && (strings.HasPrefix(feature, "avx") || strings.HasPrefix(feature, "xsave") || feature == "fma" || feature == "f16c") {
+			return fmt.Errorf("CPU feature %q requires xsave and osxsave", feature)
+		}
 	}
 	return nil
 }
@@ -179,7 +183,13 @@ func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) 
 	if len(missing) != 0 {
 		return fmt.Errorf("host CPU cannot execute immutable TTC profile %q; missing features: %s", profile.Mode, strings.Join(missing, ","))
 	}
-	return validateSystrapCPUProfileContract(profile.Features, runtimePlatform)
+	if err := validateXsaveCPUProfileContract(profile.Features); err != nil {
+		return err
+	}
+	if slices.Contains(profile.Features, "xsave") && (profile.XsaveABI == "" || profile.XsaveABI != cpuid.HostXsaveABI()) {
+		return errors.New("host XSAVE ABI differs from the immutable CPU profile; use a fresh portable-profile root for heterogeneous CPUs")
+	}
+	return nil
 }
 
 func applyStandaloneCPUProfile(root, mode, features, runtimePlatform string, explicitlySet bool) (daemonCPUProfile, error) {
@@ -205,7 +215,7 @@ func applyStandaloneCPUProfile(root, mode, features, runtimePlatform string, exp
 	if err := validateDaemonCPUProfile(stored, runtimePlatform); err != nil {
 		return daemonCPUProfile{}, err
 	}
-	if explicitlySet && (requested.Mode != stored.Mode || !slices.Equal(requested.Features, stored.Features)) {
+	if explicitlySet && (requested.Mode != stored.Mode || !slices.Equal(requested.Features, stored.Features) || requested.XsaveABI != stored.XsaveABI) {
 		return daemonCPUProfile{}, fmt.Errorf("requested CPU profile differs from immutable profile %q stored in TTC_ROOT", stored.Mode)
 	}
 	return stored, nil

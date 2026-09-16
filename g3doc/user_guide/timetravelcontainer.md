@@ -106,6 +106,18 @@ is absent, they tell you to run `ttc daemon start`.
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but
 removes host-side defense in depth. Do not use it for untrusted images.
 
+The default `--cpu-profile=portable` uses an x86-64-v2-class instruction set on
+amd64, suitable for moving workloads between compatible AMD and Intel nodes.
+It hides AVX, AVX-512, and guest XSAVE. Systrap still uses the host's extended
+register save format internally. For vector-heavy workloads, initialize the
+root or cluster with `--cpu-profile=host`, or select feature names with
+`--cpu-profile=explicit --cpu-features=...`. The profile is fixed at
+initialization. Joining nodes must support every selected feature. Profiles
+exposing XSAVE also require identical native XCR0 and XSAVE layouts: libraries
+may cache their buffer size, and these instructions execute directly on the
+CPU. AVX-512 register state is preserved by fork and hydration on compatible
+hosts; AMX is not exposed.
+
 ## Compile
 
 The repository's Docker-based build wrapper can copy both binaries in one
@@ -408,6 +420,12 @@ per operation. Cluster-wide paging, lease,
 transaction, and automatic-rebalance policy is created once by the bootstrap
 node and adopted by joiners. Node names, addresses, local memory targets, and
 capacity-provider hooks remain node-local settings.
+
+Node names default to their hostnames. Admission checks connectivity in both
+directions between the candidate and every current member before joining
+Raft. Use `--advertise` when the hostname does not resolve to an address that
+the other nodes can reach. Firewalls must also allow the ephemeral page-data
+connections used during remote fork and migration.
 
 The first three admitted members are voting replicas; further elastic compute
 nodes remain non-voting replicas. Thus a large worker fleet does not enlarge
@@ -993,9 +1011,12 @@ curl http://127.0.0.1:8080/
 
 Accepted forms are `HOST_PORT:CONTAINER_PORT` and
 `HOST_IP:HOST_PORT:CONTAINER_PORT[/tcp]`. Host addresses and published ports are
-currently IPv4/TCP only. The binding is persistent configuration: `ttcd`
-reconciles its rootless user-mode listener after restart. It is also shown in
-Docker-compatible `.HostConfig.PortBindings` inspect output.
+currently IPv4/TCP only. A published listener belongs to the daemon receiving
+the command and lasts until it is unpublished or that daemon stops. In a
+cluster, it routes new connections to the branch's current owner, so the same
+host address continues working after migration. Existing connections can be
+interrupted during migration. This does not create an all-node guest network
+or DNS service.
 
 Add or remove a listener on any existing live branch without restarting it:
 
@@ -1008,10 +1029,9 @@ ttc port unpublish web@child 127.0.0.1:8082:80
 ```
 
 `publish`, `unpublish`, and `port ls` all require a full branch selector.
-Dynamically published listeners are persistent and reconciled after
-`ttcd` restarts. Docker-compatible `.HostConfig.PortBindings` continues to
-show only `main`; the complete branch-aware list is available through
-`ttc port ls --json` and `.TTC.container.published_ports` in `ttc inspect`.
+Run `ttc port ls --json` against the publishing daemon to inspect its local
+listeners. Publish them again after a daemon restart. Publishing the same
+branch on another node creates an independent ingress listener there.
 
 Live-fork policy deliberately distinguishes internal from external flows:
 

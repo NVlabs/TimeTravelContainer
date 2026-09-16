@@ -446,6 +446,25 @@ var (
 	amxTileDataSize = native(In{Eax: uint32(xSaveInfo), Ecx: 18}).Eax
 )
 
+// HostXsaveABI identifies the userspace XSAVE ABI of the physical CPU. XSAVE
+// and XGETBV execute natively, so feature-bit masking alone cannot make their
+// buffer sizes or layouts portable. Applications may cache these values at
+// startup; a migration must preserve them for the lifetime of the process.
+func HostXsaveABI() string {
+	if !HostFeatureSet().UseXsave() {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "xcr0=%x", xgetbv(0))
+	for leaf := uint32(0); leaf < 64; leaf++ {
+		out := native(In{Eax: uint32(xSaveInfo), Ecx: leaf})
+		if out != (Out{}) {
+			fmt.Fprintf(&b, ";%x=%x,%x,%x,%x", leaf, out.Eax, out.Ebx, out.Ecx, out.Edx)
+		}
+	}
+	return b.String()
+}
+
 const (
 	// XCR0AmxCfgMask is the bits that enable xsave to operate on
 	// AMX TILECFG.

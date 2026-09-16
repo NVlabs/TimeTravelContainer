@@ -43,6 +43,9 @@ type FeatureSet struct {
 	cpuRevDec  uint64
 }
 
+// HostXsaveABI is empty on architectures without x86 XSAVE.
+func HostXsaveABI() string { return "" }
+
 // CPUImplementer is part of the processor signature.
 func (fs FeatureSet) CPUImplementer() uint8 {
 	return uint8(fs.cpuImplHex)

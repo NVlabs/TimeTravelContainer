@@ -82,6 +82,15 @@ func TestNegotiateRejectsRepositoryAndRequiredFeatureMismatch(t *testing.T) {
 	}
 }
 
+func TestNegotiateRejectsXsaveABIMismatch(t *testing.T) {
+	source, target := testCapabilities("source"), testCapabilities("target")
+	source.XsaveABI = "xcr0=7;layout-a"
+	target.XsaveABI = "xcr0=e7;layout-b"
+	if _, err := Negotiate(source, target); err == nil {
+		t.Fatal("accepted incompatible native XSAVE ABIs")
+	}
+}
+
 func TestNegotiateRejectsCPUProfileMismatch(t *testing.T) {
 	source, target := testCapabilities("source"), testCapabilities("target")
 	target.CPUFeatures = []string{"avx512f", "sse", "sse2"}

@@ -509,8 +509,8 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		// retain a former owner after migration. Reuse only a physical Sentry
 		// that Raft currently places on this node; otherwise create an isolated
 		// transaction-scoped target. This applies equally to forks and migrations:
-		// creating a second Sentry when a sibling already lives on the destination
-		// duplicates the family's virtual NIC identity and breaks both runtimes.
+		// keeping siblings in one Sentry preserves family-local resource sharing
+		// and avoids splitting the runtime's branch bookkeeping.
 		// A stale migration source is not reusable because it has no active local
 		// placement after cutover.
 		targetName = tx.Identity.TransactionID
@@ -3236,6 +3236,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		NodeID: opts.NodeID, ProtocolMin: cluster.ControlProtocolVersion, ProtocolMax: cluster.ControlProtocolVersion,
 		BuildID: version.Version(), Architecture: runtime.GOARCH, BasePageSize: hostarch.PageSize,
 		CPUProfile: opts.ResolvedCPU.Mode, CPUFeatures: append([]string(nil), opts.ResolvedCPU.Features...),
+		XsaveABI:        opts.ResolvedCPU.XsaveABI,
 		MaxTransferSize: 2 << 20, RepositoryID: opts.RepositoryID, PagingPolicy: opts.PagingPolicy,
 		Features: []string{
 			cluster.FeatureRemotePull, cluster.FeatureReversePush, cluster.FeatureAckBatch,
@@ -3442,7 +3443,7 @@ func equalImmutableClusterConfig(a, b daemonImmutableClusterConfig) bool {
 	return a.Version == b.Version && a.PagingPolicy == b.PagingPolicy &&
 		a.LeaseDuration == b.LeaseDuration && a.MaxTransactions == b.MaxTransactions &&
 		a.AutoRebalance == b.AutoRebalance && a.CPUProfile.Version == b.CPUProfile.Version &&
-		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features)
+		a.CPUProfile.Mode == b.CPUProfile.Mode && slices.Equal(a.CPUProfile.Features, b.CPUProfile.Features) && a.CPUProfile.XsaveABI == b.CPUProfile.XsaveABI
 }
 
 // applyImmutableClusterConfig creates the cluster policy once on bootstrap.

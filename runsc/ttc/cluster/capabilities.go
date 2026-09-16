@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 7 adds an immutable, exact guest CPU profile to
-	// cluster admission and migration negotiation.
-	ControlProtocolVersion = 7
+	// ControlProtocolVersion 8 also binds native XSAVE layout and XCR0 when
+	// the guest CPU profile exposes XSAVE.
+	ControlProtocolVersion = 8
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"
@@ -54,6 +54,7 @@ type Capabilities struct {
 	Architecture    string           `json:"architecture"`
 	CPUProfile      string           `json:"cpu_profile"`
 	CPUFeatures     []string         `json:"cpu_features"`
+	XsaveABI        string           `json:"xsave_abi,omitempty"`
 	BasePageSize    uint64           `json:"base_page_size"`
 	MaxTransferSize uint64           `json:"max_transfer_size"`
 	RepositoryID    string           `json:"repository_id"`
@@ -93,6 +94,9 @@ func (c Capabilities) Validate() error {
 	}
 	if len(c.CPUFeatures) == 0 {
 		return errors.New("CPU feature profile is empty")
+	}
+	if slices.Contains(c.CPUFeatures, "xsave") && c.XsaveABI == "" {
+		return errors.New("XSAVE CPU profile omits the physical XSAVE ABI")
 	}
 	seen = make(map[string]struct{}, len(c.CPUFeatures))
 	for _, feature := range c.CPUFeatures {
@@ -142,7 +146,7 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 	if source.Architecture != target.Architecture {
 		return NegotiatedCapabilities{}, fmt.Errorf("architecture mismatch: source=%s target=%s", source.Architecture, target.Architecture)
 	}
-	if source.CPUProfile != target.CPUProfile || !slices.Equal(source.CPUFeatures, target.CPUFeatures) {
+	if source.CPUProfile != target.CPUProfile || !slices.Equal(source.CPUFeatures, target.CPUFeatures) || source.XsaveABI != target.XsaveABI {
 		return NegotiatedCapabilities{}, fmt.Errorf("guest CPU profile mismatch: source=%s target=%s", source.CPUProfile, target.CPUProfile)
 	}
 	if source.BasePageSize != target.BasePageSize {

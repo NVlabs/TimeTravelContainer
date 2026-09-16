@@ -1603,7 +1603,17 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	sourceQuarantined := false
 	targetParent := opts.ParentBranch
+	targetCreated := time.Now().UTC()
+	var migrationSource *BranchInfo
 	for _, branch := range source.Branches {
+		if opts.Migration && branch.ID == opts.VisibleBranch {
+			copy := branch
+			migrationSource = &copy
+			targetParent = branch.ParentID
+			targetCreated = branch.CreatedAt
+			sourceQuarantined = branch.Quarantined
+			break
+		}
 		if branch.ID == opts.ParentBranch {
 			sourceQuarantined = branch.Quarantined
 			if opts.Migration {
@@ -1660,8 +1670,8 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 					return false, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", current.Name, branch.ID, current.BranchNodeID(branch.ID), opts.SourceNode)
 				}
 			}
-			if opts.Migration && !branchExists {
-				return false, fmt.Errorf("migration source branch %s@%s does not exist", current.Name, opts.VisibleBranch)
+			if opts.Migration && !branchExists && (migrationSource == nil || source.BranchNodeID(opts.VisibleBranch) != opts.SourceNode) {
+				return false, fmt.Errorf("migration source branch %s@%s is absent from the source-owned family metadata", current.Name, opts.VisibleBranch)
 			}
 			if current.DistributedForkImports == nil {
 				current.DistributedForkImports = make(map[string]DistributedForkImport)
@@ -1676,8 +1686,8 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 				}
 			}
 			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-				BranchID: opts.VisibleBranch, ParentID: opts.ParentBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
-				State: "created", CreatedAt: time.Now().UTC(), SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
+				BranchID: opts.VisibleBranch, ParentID: targetParent, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
+				State: "created", CreatedAt: targetCreated, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
 			}
 			existing = *current
 			return true, nil
@@ -3232,7 +3242,19 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 					break
 				}
 				if !found {
-					return false, fmt.Errorf("migration branch %q disappeared before publication", pending.BranchID)
+					// Physical family records on different nodes need not contain
+					// the same branch set. Import the migrating branch alongside the
+					// existing local siblings only after placement has cut over.
+					current.Branches = append(current.Branches, BranchInfo{
+						ID: pending.BranchID, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt,
+						FilesystemBranch: pending.FilesystemBranch, Quarantined: pending.Quarantined,
+						NodeID: pending.TargetNode, State: pending.State, StorageState: "local", SourceNode: pending.SourceNode,
+						DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
+						DistributedForkTransactionID: transactionID, DistributedMigration: true,
+						SnapshotID: pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
+						MemoryRootObjects:                  append([]string(nil), pending.MemoryRootObjects...),
+						DistributedGraphReferenceOperation: pending.GraphReferenceOperation,
+					})
 				}
 			} else {
 				for _, branch := range current.Branches {
@@ -3420,6 +3442,7 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 			}
 		}
 		branch.FilesystemBranch = pending.FilesystemBranch
+		branch.Quarantined = pending.Quarantined
 		branch.State = pending.State
 		branch.DistributedForkTransactionID = transactionID
 		branch.DistributedMigration = pending.Migration

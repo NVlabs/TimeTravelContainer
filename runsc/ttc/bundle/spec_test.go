@@ -267,6 +267,56 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	}
 }
 
+func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created := time.Now().UTC().Add(-time.Hour)
+	source := ContainerInfo{ID: "source-runtime", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a",
+		Branches: []BranchInfo{{ID: "moving", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created, Quarantined: true}}}
+	target := ContainerInfo{ID: "target-runtime", Name: "target-runtime", DistributedFamilyID: "family-id", NodeID: "node-b",
+		BundleDir: filepath.Join(root, "containers", "target-runtime", "bundle"),
+		Branches:  []BranchInfo{{ID: "sibling", NodeID: "node-b", State: "running", CreatedAt: created}}}
+	if err := os.MkdirAll(target.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", target.ID, "container.json"), &target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+		SourceContainer: "family-id", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
+		ParentBranch: "moving", TransactionID: "tx-move", NodeID: "node-b", SourceNode: "node-a", Migration: true, Source: &source,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.LoadContainer(target.ID)
+	if err != nil || len(pending.Branches) != 1 {
+		t.Fatalf("reservation exposed migrating branch: %+v, %v", pending.Branches, err)
+	}
+	if _, branch, _, err := store.DistributedForkTargetBranch("tx-move"); err != nil || !branch.Quarantined {
+		t.Fatalf("pending migration lost quarantine: %+v, %v", branch, err)
+	}
+	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		published, err := store.PublishDistributedForkTarget("tx-move")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(published.Branches) != 2 {
+			t.Fatalf("publication lost sibling or duplicated migration: %+v", published.Branches)
+		}
+		branch := published.Branches[1]
+		if branch.ID != "moving" || branch.ParentID != "ancestor" || branch.NodeID != "node-b" ||
+			!branch.CreatedAt.Equal(created) || !branch.Quarantined || !branch.DistributedMigration || branch.State != "paused" {
+			t.Fatalf("migration lost branch metadata: %+v", branch)
+		}
+	}
+}
+
 func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

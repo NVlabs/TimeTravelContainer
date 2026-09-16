@@ -1600,21 +1600,32 @@ func TestPortableCPUProfileIsHostIndependent(t *testing.T) {
 		t.Fatalf("portable features=%v, want fixed baseline %v", profile.Features, portableAMD64Features)
 	}
 	for _, feature := range profile.Features {
-		if strings.HasPrefix(feature, "avx") || strings.HasPrefix(feature, "amx_") {
+		if strings.HasPrefix(feature, "avx") || strings.HasPrefix(feature, "amx_") || strings.Contains(feature, "xsave") {
 			t.Fatalf("portable profile exposed optional extended-state feature %q", feature)
 		}
 	}
 }
 
-func TestExplicitSystrapCPUProfileRequiresXsaveABI(t *testing.T) {
+func TestExplicitCPUProfileXsaveABI(t *testing.T) {
 	if runtime.GOARCH != "amd64" {
 		t.Skip("x86 XSAVE contract")
 	}
-	if _, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2", "systrap"); err == nil || !strings.Contains(err.Error(), "require xsave and osxsave") {
-		t.Fatalf("missing XSAVE contract error=%v", err)
+	if _, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2", "systrap"); err != nil {
+		t.Fatalf("FXSAVE profile rejected: %v", err)
 	}
-	if _, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2,xsave,osxsave", "systrap"); err != nil {
+	profile, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2,xsave,osxsave", "systrap")
+	if err != nil {
 		t.Fatalf("complete XSAVE contract rejected: %v", err)
+	}
+	if profile.XsaveABI == "" {
+		t.Fatal("XSAVE profile has no physical ABI")
+	}
+	if err := validateDaemonCPUProfile(profile, "systrap"); err != nil {
+		t.Fatalf("local XSAVE ABI rejected: %v", err)
+	}
+	profile.XsaveABI += ";different-node"
+	if err := validateDaemonCPUProfile(profile, "systrap"); err == nil || !strings.Contains(err.Error(), "XSAVE ABI differs") {
+		t.Fatalf("incompatible native XSAVE ABI error=%v", err)
 	}
 }
 
