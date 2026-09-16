@@ -165,6 +165,14 @@ type Transaction struct {
 	// immediately true.
 	DesiredPaused bool `json:"desired_paused,omitempty"`
 	Activated     bool `json:"activated,omitempty"`
+	// TargetPhysical* is the target-reported runtime identity. It is recorded
+	// while a migration target is still paused, before the atomic ownership
+	// cutover. A target may reuse a Sentry that already hosts a sibling branch,
+	// so the physical container is not necessarily TargetBranch or the
+	// transaction ID.
+	TargetPhysicalContainer   string `json:"target_physical_container,omitempty"`
+	TargetPhysicalBranch      string `json:"target_physical_branch,omitempty"`
+	TargetPhysicalIncarnation string `json:"target_physical_incarnation,omitempty"`
 	// OwnershipCommitted is set in the same Raft entry that moves a migrated
 	// branch's placement. It separates a physically prepared target from the
 	// sole authoritative target before activation.

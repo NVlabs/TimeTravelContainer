@@ -376,6 +376,7 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 			TargetBranch: "physical-main", TargetVisibleBranch: "main", Migration: true,
 		},
 		State: TransactionPublished, Revision: 6,
+		TargetPhysicalContainer: "physical-main", TargetPhysicalBranch: "main", TargetPhysicalIncarnation: "incarnation-b",
 	}
 	cutover := decodeAuthorityResultForTest[MigrationCutoverResult](t, applyAuthorityForTest(t, state, "cutover", at.Add(2*time.Second), AuthorityMigrationCutover, AuthorityMigrationCutoverPayload{
 		TransactionID: "migration-1", TransactionRevision: 6,

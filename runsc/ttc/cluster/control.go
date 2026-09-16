@@ -1471,6 +1471,18 @@ func (c *ControlPlane) publish(w http.ResponseWriter, r *http.Request, id, peer 
 		} else {
 			tx, err = c.Store.Publish(id, tx.Revision, request.Paused, true, c.Now())
 		}
+	} else if publisher, ok := c.Store.(AtomicMigrationTargetPublisher); ok {
+		identity, ok := c.TargetRuntime.(PublishedTargetIdentity)
+		if !ok {
+			writeControlError(w, http.StatusInternalServerError, "migration target runtime cannot report its physical identity")
+			return
+		}
+		_, _, physicalContainer, physicalBranch, incarnation, identityErr := identity.PublishedTarget(tx)
+		if identityErr != nil {
+			writeControlError(w, http.StatusInternalServerError, identityErr.Error())
+			return
+		}
+		tx, err = publisher.PublishMigrationTarget(id, tx.Revision, request.Paused, physicalContainer, physicalBranch, incarnation)
 	} else {
 		tx, err = c.Store.Publish(id, tx.Revision, request.Paused, false, c.Now())
 	}

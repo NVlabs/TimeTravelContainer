@@ -562,16 +562,18 @@ type AuthorityPlacementPayload struct {
 
 // AuthorityTransactionPayload carries a distributed transaction command.
 type AuthorityTransactionPayload struct {
-	Transaction   Transaction             `json:"transaction,omitempty"`
-	ID            string                  `json:"id,omitempty"`
-	Revision      uint64                  `json:"revision,omitempty"`
-	Next          TransactionState        `json:"next,omitempty"`
-	Failure       string                  `json:"failure,omitempty"`
-	Digest        string                  `json:"digest,omitempty"`
-	Metrics       *TransferMetrics        `json:"metrics,omitempty"`
-	Graph         *GraphHandoffDescriptor `json:"graph,omitempty"`
-	DesiredPaused bool                    `json:"desired_paused,omitempty"`
-	Activated     bool                    `json:"activated,omitempty"`
+	Transaction                       Transaction             `json:"transaction,omitempty"`
+	ID                                string                  `json:"id,omitempty"`
+	Revision                          uint64                  `json:"revision,omitempty"`
+	Next                              TransactionState        `json:"next,omitempty"`
+	Failure                           string                  `json:"failure,omitempty"`
+	Digest                            string                  `json:"digest,omitempty"`
+	Metrics                           *TransferMetrics        `json:"metrics,omitempty"`
+	Graph                             *GraphHandoffDescriptor `json:"graph,omitempty"`
+	DesiredPaused                     bool                    `json:"desired_paused,omitempty"`
+	Activated                         bool                    `json:"activated,omitempty"`
+	PhysicalContainer, PhysicalBranch string
+	TargetIncarnation                 string
 }
 
 // AuthorityPublicationPayload carries a durable publication command.
@@ -888,7 +890,8 @@ func (s *AuthorityState) applyMigrationCutover(command AuthorityCommand) (json.R
 		return nil, errors.New("migration transaction is not published and awaiting cutover")
 	}
 	if tx.Identity.TransactionID != p.Operation || tx.Identity.SourceContainer != p.Family || tx.Identity.SourceBranch != p.Branch ||
-		tx.Identity.TargetNodeID != p.Target || tx.Identity.TargetBranch != p.PhysicalContainer || tx.Identity.VisibleTargetBranch() != p.PhysicalBranch {
+		tx.Identity.TargetNodeID != p.Target || tx.TargetPhysicalContainer != p.PhysicalContainer ||
+		tx.TargetPhysicalBranch != p.PhysicalBranch || tx.TargetPhysicalIncarnation != p.TargetIncarnation {
 		return nil, errors.New("migration transaction does not match placement cutover")
 	}
 	if err := s.requireNodeIncarnation(p.Target, p.TargetIncarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
@@ -1532,7 +1535,9 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		}
 	case AuthorityTransactionPublish:
 		if tx.State == TransactionPublished {
-			if tx.DesiredPaused != p.DesiredPaused || tx.Activated != p.Activated {
+			if tx.DesiredPaused != p.DesiredPaused || tx.Activated != p.Activated ||
+				tx.TargetPhysicalContainer != p.PhysicalContainer || tx.TargetPhysicalBranch != p.PhysicalBranch ||
+				tx.TargetPhysicalIncarnation != p.TargetIncarnation {
 				return nil, errors.New("publication retry changed activation")
 			}
 			return authorityValue(tx)
@@ -1543,7 +1548,16 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		if err := tx.Advance(TransactionPublished, "", command.IssuedAt); err != nil {
 			return nil, err
 		}
+		if tx.Identity.Migration {
+			if !transactionIDPattern.MatchString(p.PhysicalContainer) || !transactionIDPattern.MatchString(p.PhysicalBranch) || p.TargetIncarnation == "" {
+				return nil, errors.New("migration publication has invalid physical identity")
+			}
+		} else if p.PhysicalContainer != "" || p.PhysicalBranch != "" || p.TargetIncarnation != "" {
+			return nil, errors.New("ordinary transaction publication unexpectedly names a physical target")
+		}
 		tx.DesiredPaused, tx.Activated = p.DesiredPaused, p.Activated
+		tx.TargetPhysicalContainer, tx.TargetPhysicalBranch = p.PhysicalContainer, p.PhysicalBranch
+		tx.TargetPhysicalIncarnation = p.TargetIncarnation
 	case AuthorityTransactionActivate:
 		if tx.Activated {
 			return authorityValue(tx)

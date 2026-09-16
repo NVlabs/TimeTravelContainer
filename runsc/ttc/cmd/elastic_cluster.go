@@ -1557,7 +1557,10 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
 		return abort(errors.New("raft migration authority is unavailable"))
 	}
-	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, logicalFamily, target.branch, requestID, targetNode, targetRecord.Incarnation, requestID, target.branch)
+	if tx.TargetPhysicalContainer == "" || tx.TargetPhysicalBranch == "" || tx.TargetPhysicalIncarnation != targetRecord.Incarnation {
+		return abort(errors.New("published migration target omitted or changed its physical runtime identity"))
+	}
+	cutover, err := b.distributedSource.authority.CutoverMigration(requestID, tx.Revision, logicalFamily, target.branch, requestID, targetNode, targetRecord.Incarnation, tx.TargetPhysicalContainer, tx.TargetPhysicalBranch)
 	if err != nil {
 		return abort(fmt.Errorf("publishing migration placement: %w", err))
 	}

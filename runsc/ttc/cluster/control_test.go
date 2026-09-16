@@ -589,6 +589,10 @@ func (r *testTargetRuntime) Publish(_ context.Context, _ *Transaction, paused bo
 	return nil
 }
 
+func (r *testTargetRuntime) PublishedTarget(tx *Transaction) (family, branch, physicalContainer, physicalBranch, incarnation string, err error) {
+	return tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch(), "physical-target", tx.Identity.VisibleTargetBranch(), "target-incarnation", nil
+}
+
 func (r *testTargetRuntime) Activate(context.Context, *Transaction) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -919,7 +923,9 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if migration.Activated || migration.DesiredPaused || migration.State != TransactionPublished {
+	if migration.Activated || migration.DesiredPaused || migration.State != TransactionPublished ||
+		migration.TargetPhysicalContainer != "physical-target" || migration.TargetPhysicalBranch != migration.Identity.VisibleTargetBranch() ||
+		migration.TargetPhysicalIncarnation != "target-incarnation" {
 		t.Fatalf("migration publication=%+v, want paused cutover awaiting activation", migration)
 	}
 	migration, err = client.Activate(context.Background(), migration.Identity.TransactionID, migration.Revision)

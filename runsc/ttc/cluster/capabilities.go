@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 9 requires every systrap cluster member to enforce
-	// its immutable guest CPU contract using CPUID faulting. It also binds the
-	// native XSAVE layout and XCR0 when the profile exposes XSAVE.
-	ControlProtocolVersion = 9
+	// ControlProtocolVersion 10 records the target-reported physical runtime
+	// identity before migration cutover. Version 9 introduced enforceable CPUID
+	// profiles and native XSAVE ABI binding.
+	ControlProtocolVersion = 10
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

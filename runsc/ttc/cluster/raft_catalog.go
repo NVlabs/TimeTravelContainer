@@ -798,6 +798,12 @@ func (r raftTransactionCatalog) AdvanceIndependent(id string, revision uint64, m
 func (r raftTransactionCatalog) Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error) {
 	return applyRaftValue[Transaction](r.RaftCatalog, now, AuthorityTransactionPublish, AuthorityTransactionPayload{ID: id, Revision: revision, DesiredPaused: desiredPaused, Activated: activated})
 }
+func (r raftTransactionCatalog) PublishMigrationTarget(id string, revision uint64, desiredPaused bool, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error) {
+	return applyRaftValue[Transaction](r.RaftCatalog, time.Now().UTC(), AuthorityTransactionPublish, AuthorityTransactionPayload{
+		ID: id, Revision: revision, DesiredPaused: desiredPaused,
+		PhysicalContainer: physicalContainer, PhysicalBranch: physicalBranch, TargetIncarnation: targetIncarnation,
+	})
+}
 func (r raftTransactionCatalog) PublishTarget(id string, revision uint64, desiredPaused bool, family, branch, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error) {
 	result, err := applyRaftValue[ForkPublishResult](r.RaftCatalog, time.Now().UTC(), AuthorityForkPublish, AuthorityForkPublishPayload{
 		TransactionID: id, TransactionRevision: revision, DesiredPaused: desiredPaused,
