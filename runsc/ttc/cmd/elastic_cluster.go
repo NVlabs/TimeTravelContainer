@@ -1540,6 +1540,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax, FilesystemRoots: filesystemRoots,
 		FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
+		ExecSessions: remoteExecSessions(session.ExecSessions),
 	}
 	tx, err = peer.Prepare(ctx, requestID, tx.Revision, descriptor)
 	if err != nil {

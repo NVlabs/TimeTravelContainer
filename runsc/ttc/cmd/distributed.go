@@ -36,6 +36,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	sentryremote "gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
@@ -61,6 +62,44 @@ const distributedBatchControlConcurrency = 8
 // continue faulting through their live relays while this bounded background
 // queue makes them source-independent.
 const distributedHandoffConcurrency = 2
+
+func remoteExecSessions(sessions []boot.ExecSessionInfo) []cluster.RemoteExecSessionDescriptor {
+	out := make([]cluster.RemoteExecSessionDescriptor, 0, len(sessions))
+	for _, session := range sessions {
+		if session.State != boot.ExecSessionRunning {
+			continue
+		}
+		var status *uint32
+		if session.ExitStatus != nil {
+			value := *session.ExitStatus
+			status = &value
+		}
+		out = append(out, cluster.RemoteExecSessionDescriptor{
+			ID: session.ID, PID: int32(session.PID), ConsoleID: session.ConsoleID,
+			Terminal: session.Terminal, State: string(session.State), CreatedAt: session.CreatedAt,
+			ExitStatus: status,
+		})
+	}
+	return out
+}
+
+func bootExecSessions(sessions []cluster.RemoteExecSessionDescriptor, containerID string) []boot.ExecSessionInfo {
+	out := make([]boot.ExecSessionInfo, len(sessions))
+	for i, session := range sessions {
+		var status *uint32
+		if session.ExitStatus != nil {
+			value := *session.ExitStatus
+			status = &value
+		}
+		out[i] = boot.ExecSessionInfo{
+			ID: session.ID, ContainerID: containerID, PID: kernel.ThreadID(session.PID),
+			ConsoleID: session.ConsoleID, Terminal: session.Terminal,
+			State: boot.ExecSessionState(session.State), CreatedAt: session.CreatedAt,
+			ExitStatus: status,
+		}
+	}
+	return out
+}
 
 func (b *runtimeBackend) portableDistributedInternalMounts(container string) ([]cluster.InternalMountDescriptor, error) {
 	mounts, err := b.containerStore().PortableInternalMounts(container)
@@ -1372,6 +1411,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
 		FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
+		ExecSessions: remoteExecSessions(session.ExecSessions),
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -1579,6 +1619,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source selector, sourceInfo ttcbun
 		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
 		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
 		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
+		ExecSessions: remoteExecSessions(capture.ExecSessions),
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -2047,6 +2088,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
 			FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
+			ExecSessions: remoteExecSessions(session.ExecSessions),
 		}
 	}
 	prepareErrors := make([]error, len(children))

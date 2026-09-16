@@ -38,11 +38,39 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 )
+
+func TestRemoteExecSessionRoundTrip(t *testing.T) {
+	exit := uint32(17)
+	created := time.Unix(123, 456).UTC()
+	source := []boot.ExecSessionInfo{{
+		ID: "build", ContainerID: "source-runtime", PID: 42, ConsoleID: "console-build",
+		Terminal: true, State: boot.ExecSessionRunning, CreatedAt: created, ExitStatus: &exit,
+	}, {
+		ID: "finished", PID: 43, State: boot.ExecSessionExited,
+	}}
+	transport := remoteExecSessions(source)
+	if len(transport) != 1 || transport[0].ID != "build" {
+		t.Fatalf("transport sessions=%+v", transport)
+	}
+	restored := bootExecSessions(transport, "target-runtime")
+	if len(restored) != 1 {
+		t.Fatalf("restored sessions=%+v", restored)
+	}
+	got := restored[0]
+	if got.ID != "build" || got.ContainerID != "target-runtime" || got.PID != 42 || got.ConsoleID != "console-build" || !got.Terminal || got.State != boot.ExecSessionRunning || !got.CreatedAt.Equal(created) || got.ExitStatus == nil || *got.ExitStatus != exit {
+		t.Fatalf("restored session=%+v", got)
+	}
+	*source[0].ExitStatus = 99
+	if *transport[0].ExitStatus != 17 || *restored[0].ExitStatus != 17 {
+		t.Fatal("exec-session exit status aliases source storage")
+	}
+}
 
 func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
 	info := input

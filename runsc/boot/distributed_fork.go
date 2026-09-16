@@ -87,6 +87,9 @@ type DistributedForkRestoreArgs struct {
 	// FilesystemRestoreIDs maps each target-local repository identity to the
 	// repository identity serialized in the cold source metadata.
 	FilesystemRestoreIDs map[string]string
+	// ExecSessions preserves branch-local control identities for exec task
+	// groups already present in the captured Kernel.
+	ExecSessions []ExecSessionInfo
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -440,6 +443,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	for _, task := range child.TaskSet().Root.Tasks() {
 		task.RestoreContainerID(l.sandboxID)
 	}
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
 	child.RegisterContainerName(l.sandboxID, l.root.containerName)
 	dogOpts := watchdog.DefaultOpts
 	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
@@ -452,6 +458,10 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		return nil, fmt.Errorf("starting placeholder kernel for release: %w", err)
 	}
 	if err := l.family.ReplaceDefaultKernel(child); err != nil {
+		old.Release()
+		return nil, err
+	}
+	if err := l.family.RestoreLoaderExecSessions(args.ExecSessions); err != nil {
 		old.Release()
 		return nil, err
 	}
@@ -658,7 +668,10 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 	}()
 	var child *kernel.Kernel
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, args.ExecSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		resources, err = aliasLiveForkFilesystemResources(resources, args.FilesystemRestoreIDs)
 		if err != nil {
 			return nil, err
@@ -839,7 +852,10 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			}
 		}
 	}()
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, args.ExecSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
 		if len(args.FilesystemRestoreIDs) != 0 {
 			aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(args.FilesystemRestoreIDs))
 			for id, resource := range resources {

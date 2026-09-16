@@ -221,6 +221,7 @@ type DistributedForkSessionInfo struct {
 	Token            ttcremote.SnapshotToken
 	MetadataBytes    uint64
 	StreamBytes      uint64
+	ExecSessions     []ExecSessionInfo
 }
 
 // DistributedForkSessionArgs identifies an existing source snapshot.
@@ -882,6 +883,15 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	if !sourceWasPaused {
 		source.k.Pause()
 	}
+	f.mu.Lock()
+	execSessions := make([]ExecSessionInfo, 0, len(source.execSessions))
+	for _, session := range source.execSessions {
+		if session.info.State == ExecSessionRunning {
+			execSessions = append(execSessions, cloneExecSessionInfo(session.info))
+		}
+	}
+	f.mu.Unlock()
+	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
 	resume := func() error {
 		if sourceWasPaused {
 			return nil
@@ -1012,6 +1022,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
 			FilesystemBranch: volumeBranches[i],
 			MetadataBytes:    uint64(len(metadata)), StreamBytes: server.StreamBytes(),
+			ExecSessions: cloneExecSessionInfos(execSessions),
 		}
 	}
 	// The legacy TCP and allocator-wide handoff snapshots have transferred to
@@ -1608,6 +1619,14 @@ func cloneExecSessionInfo(info ExecSessionInfo) ExecSessionInfo {
 		cloned.ExitStatus = &status
 	}
 	return cloned
+}
+
+func cloneExecSessionInfos(in []ExecSessionInfo) []ExecSessionInfo {
+	out := make([]ExecSessionInfo, len(in))
+	for i := range in {
+		out[i] = cloneExecSessionInfo(in[i])
+	}
+	return out
 }
 
 // reserveExecSession registers a creating session. The caller must hold b.opMu

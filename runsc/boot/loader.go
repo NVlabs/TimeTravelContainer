@@ -1561,7 +1561,7 @@ func (l *Loader) run() error {
 		}
 	}
 	l.family.MarkDefaultStarted()
-	if l.dehydrationRestore {
+	if l.dehydrationRestore || l.distributedRestore {
 		if err := l.family.WatchRestoredLoaderExecSessions(); err != nil {
 			return err
 		}

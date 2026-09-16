@@ -124,6 +124,34 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
+		ExecSessions: []RemoteExecSessionDescriptor{{ID: "build", PID: 42, State: "running"}},
+	}
+	if err := base.validate(negotiated); err != nil {
+		t.Fatalf("valid exec session: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].ID = "" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].PID = 0 },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].State = "exited" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions = append(d.ExecSessions, d.ExecSessions[0]) },
+	} {
+		invalid := base
+		invalid.ExecSessions = append([]RemoteExecSessionDescriptor(nil), base.ExecSessions...)
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted invalid exec sessions: %+v", invalid.ExecSessions)
+		}
+	}
+}
+
 func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {

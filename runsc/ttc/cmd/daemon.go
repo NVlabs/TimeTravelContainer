@@ -593,6 +593,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		SharedMetadata:        session.SharedMetadata != "",
 		DurableDehydration:    session.DurableDehydration,
 		GraphSparse:           session.GraphManifest != "",
+		ExecSessions:          bootExecSessions(session.ExecSessions, info.ID),
 	}
 	restoreArgs.FilesystemRestoreIDs, err = r.backend.filesystemRestoreIDs(info.ID)
 	if err != nil {

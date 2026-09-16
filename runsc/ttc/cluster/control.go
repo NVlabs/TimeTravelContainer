@@ -175,6 +175,21 @@ type RemoteSessionDescriptor struct {
 	// into the guest (currently hostname, hosts, and resolv.conf). Their source
 	// paths are node-local and therefore cannot be reused by a remote gofer.
 	InternalMounts []InternalMountDescriptor `json:"internal_mounts,omitempty"`
+	// ExecSessions names managed exec task groups contained in the captured
+	// Kernel. The processes themselves remain part of Kernel state.
+	ExecSessions []RemoteExecSessionDescriptor `json:"exec_sessions,omitempty"`
+}
+
+// RemoteExecSessionDescriptor is the transport-neutral identity of a managed
+// exec task group. PID is a guest virtual PID and is stable across a fork.
+type RemoteExecSessionDescriptor struct {
+	ID         string    `json:"id"`
+	PID        int32     `json:"pid"`
+	ConsoleID  string    `json:"console_id"`
+	Terminal   bool      `json:"terminal"`
+	State      string    `json:"state"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExitStatus *uint32   `json:"exit_status,omitempty"`
 }
 
 // InternalMountDescriptor is portable content for one TTC-generated mount.
@@ -204,6 +219,19 @@ type FilesystemRootDescriptor struct {
 }
 
 func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) error {
+	if len(s.ExecSessions) > 4096 {
+		return errors.New("remote session has too many exec sessions")
+	}
+	seenExecSessions := make(map[string]struct{}, len(s.ExecSessions))
+	for _, session := range s.ExecSessions {
+		if session.ID == "" || session.PID <= 0 || session.State != "running" {
+			return fmt.Errorf("remote session has invalid exec session %q", session.ID)
+		}
+		if _, ok := seenExecSessions[session.ID]; ok {
+			return fmt.Errorf("remote session repeats exec session %q", session.ID)
+		}
+		seenExecSessions[session.ID] = struct{}{}
+	}
 	if len(s.InternalMounts) > 64 {
 		return errors.New("remote session has too many internal mounts")
 	}

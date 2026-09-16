@@ -496,11 +496,11 @@ func (f *SandboxFamily) RestoreDurablePeer(args *DurableDehydrationRestoreArgs, 
 // Sentry and application MemoryFile. BranchID is the user-visible identity;
 // filesystemBranch is the globally unique repository branch prepared by the
 // source transaction.
-func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, quarantined bool, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
+func (f *SandboxFamily) RestoreDistributedPeer(branchID, filesystemBranch string, quarantined bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
 	if branchID == "" || filesystemBranch == "" || load == nil {
 		return errors.New("distributed peer restore is missing branch, filesystem, or loader")
 	}
-	return f.restorePeer(branchID, "", filesystemBranch, quarantined, false, nil, load)
+	return f.restorePeer(branchID, "", filesystemBranch, quarantined, false, sessions, load)
 }
 
 func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quarantined, resume bool, sessions []ExecSessionInfo, load func(*kernel.Kernel, vfs.LiveForkFilesystemResources) (*kernel.Kernel, error)) error {
