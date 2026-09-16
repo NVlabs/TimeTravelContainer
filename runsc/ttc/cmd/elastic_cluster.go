@@ -3172,7 +3172,9 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if source.State != cluster.NodeReady && source.State != cluster.NodePressured && source.State != cluster.NodeDraining {
 		return nil, fmt.Errorf("node %q cannot stop from state %s", sourceNode, source.State)
 	}
-	if source.State != cluster.NodeDraining {
+	cordonedForStop := source.State != cluster.NodeDraining
+	previousState := source.State
+	if cordonedForStop {
 		if _, err := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, cluster.NodeDraining, time.Now(), lease); err != nil {
 			return nil, fmt.Errorf("cordoning node %q: %w", sourceNode, err)
 		}
@@ -3181,6 +3183,12 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	switch mode {
 	case "":
 		if err := rejectActiveDaemonContainers(b); err != nil {
+			if cordonedForStop {
+				_, rollbackErr := b.distributedSource.directory.Transition(source.NodeID, source.Incarnation, previousState, time.Now(), lease)
+				if rollbackErr != nil {
+					return nil, errors.Join(err, fmt.Errorf("restoring node %q after rejected stop: %w", sourceNode, rollbackErr))
+				}
+			}
 			return nil, err
 		}
 	case "stop":

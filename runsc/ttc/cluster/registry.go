@@ -49,7 +49,9 @@ var nodeTransitions = map[NodeState]map[NodeState]bool{
 	NodeJoining:   {NodeReady: true, NodeDraining: true, NodeOffline: true},
 	NodeReady:     {NodePressured: true, NodeDraining: true, NodeOffline: true},
 	NodePressured: {NodeReady: true, NodeDraining: true, NodeOffline: true},
-	NodeDraining:  {NodeOffline: true},
+	// A drain may be canceled before it creates a durable evacuation intent,
+	// for example when daemon stop discovers active branches without a policy.
+	NodeDraining: {NodeReady: true, NodePressured: true, NodeOffline: true},
 }
 
 // NodeRecord is the shared discovery record for one ttcd incarnation.
