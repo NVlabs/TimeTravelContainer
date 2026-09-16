@@ -586,6 +586,26 @@ func TestBranchOwnedByBackendRequiresExplicitBranchOwner(t *testing.T) {
 	}
 }
 
+func TestConfigureCommandBackendIncludesDistributedRuntime(t *testing.T) {
+	source := &distributedSourceRuntime{}
+	capabilities := &cluster.Capabilities{NodeID: "node-a"}
+	server := &daemonServer{
+		distributedSource:   source,
+		clusterCapabilities: capabilities,
+	}
+	backend := &runtimeBackend{}
+	server.configureCommandBackend(backend)
+	if backend.distributedSource != source {
+		t.Fatal("command backend omitted distributed source runtime")
+	}
+	if backend.nodeID != capabilities.NodeID {
+		t.Fatalf("command backend node=%q, want %q", backend.nodeID, capabilities.NodeID)
+	}
+	if backend.consoleSidecars != server {
+		t.Fatal("command backend omitted daemon sidecar manager")
+	}
+}
+
 func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	status := Run([]string{"--unsafe-no-host-isolation", "completion", "bash"}, strings.NewReader(""), &stdout, &stderr)

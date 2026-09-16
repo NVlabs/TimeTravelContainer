@@ -1792,6 +1792,20 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.portIngress = s.portIngress
 }
 
+// configureCommandBackend installs every daemon-owned service needed by a
+// backend that executes user-visible lifecycle commands. Keep this separate
+// from configureVolumeBackend: target-runtime construction deliberately wires
+// some cluster services in stages, whereas an ordinary command backend must
+// never observe a partially configured distributed runtime.
+func (s *daemonServer) configureCommandBackend(backend *runtimeBackend) {
+	s.configureVolumeBackend(backend)
+	backend.consoleSidecars = s
+	backend.distributedSource = s.distributedSource
+	if s.clusterCapabilities != nil {
+		backend.nodeID = s.clusterCapabilities.NodeID
+	}
+}
+
 type daemonStopTarget struct {
 	selector selector
 }
@@ -4720,11 +4734,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			opts := s.optionsFromRequest()
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
-			s.configureVolumeBackend(backend)
-			backend.consoleSidecars = s
-			if s.clusterCapabilities != nil {
-				backend.nodeID = s.clusterCapabilities.NodeID
-			}
+			s.configureCommandBackend(backend)
 			unlock := s.lockDataRoot(opts.dataRoot)
 			var err error
 			migrateAll := slices.Contains(request.Args, "--migrate-all")
@@ -4930,11 +4940,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	backend := directBackend(opts, terminalInput,
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout},
 		daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
-	s.configureVolumeBackend(backend)
+	s.configureCommandBackend(backend)
 	backend.clientTERM = request.ClientTERM
 	backend.progressTerminal = request.StderrTerminal
 	backend.progressWidth = request.StderrWidth
-	backend.consoleSidecars = s
 	clientCanceled := make(chan struct{})
 	var cancelClientOnce sync.Once
 	backend.clientCanceled = clientCanceled
@@ -4943,10 +4952,6 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			close(clientCanceled)
 			_ = conn.Close()
 		})
-	}
-	backend.distributedSource = s.distributedSource
-	if s.clusterCapabilities != nil {
-		backend.nodeID = s.clusterCapabilities.NodeID
 	}
 	if request.Args[0] == "events" {
 		status := 0
