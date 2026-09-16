@@ -291,18 +291,19 @@ func writeRemoteFailure(writer io.Writer, request remoteHeader, message string) 
 }
 
 type remoteObjectClient struct {
-	mu         sync.Mutex
-	users      sync.WaitGroup
-	conn       io.ReadWriteCloser
-	token      RemoteToken
-	source     RemoteSourceKey
-	next       uint32
-	complete   map[string]bool
-	objects    map[string]int64
-	sources    map[string]string
-	repository *Repository
-	branchID   string
-	catalog    string
+	mu          sync.Mutex
+	users       sync.WaitGroup
+	conn        io.ReadWriteCloser
+	terminalErr error
+	token       RemoteToken
+	source      RemoteSourceKey
+	next        uint32
+	complete    map[string]bool
+	objects     map[string]int64
+	sources     map[string]string
+	repository  *Repository
+	branchID    string
+	catalog     string
 }
 
 func (r *Repository) prepareDeferredInode(inode *Inode) error {
@@ -857,6 +858,16 @@ func (c *remoteObjectClient) pull(object string, offset uint64, length uint32) (
 }
 
 func (c *remoteObjectClient) request(kind remoteMessageType, object string, offset uint64, length uint32) ([]byte, error) {
+	if c.terminalErr != nil {
+		return nil, c.terminalErr
+	}
+	fail := func(err error) ([]byte, error) {
+		if err == nil {
+			err = errors.New("remote filesystem protocol failed")
+		}
+		c.terminalErr = fmt.Errorf("remote filesystem source became unavailable: %w", err)
+		return nil, c.terminalErr
+	}
 	if len(object) > len(remoteHeader{}.object) {
 		return nil, errors.New("remote filesystem object identity is too long")
 	}
@@ -866,28 +877,28 @@ func (c *remoteObjectClient) request(kind remoteMessageType, object string, offs
 	var encoded [remoteHeaderSize]byte
 	request.marshal(encoded[:])
 	if err := writeAll(c.conn, encoded[:]); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	response, err := readRemoteHeader(c.conn)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	maxResponse := uint32(remoteExtentBytes)
 	if kind == remoteMetadataPull {
 		maxResponse = uint32(remoteMaxMetadataBytes)
 	}
 	if response.token != c.token || response.requestID != request.requestID || response.source != c.source || response.object != request.object || response.offset != offset || response.length > maxResponse {
-		return nil, errors.New("remote filesystem response identity mismatch")
+		return fail(errors.New("remote filesystem response identity mismatch"))
 	}
 	payload := make([]byte, response.length)
 	if _, err := io.ReadFull(c.conn, payload); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if response.type_ == remoteError {
-		return nil, errors.New(string(payload))
+		return fail(errors.New(string(payload)))
 	}
 	if response.type_ != remoteData || (kind == remotePull && response.length != length) {
-		return nil, errors.New("invalid remote filesystem data response")
+		return fail(errors.New("invalid remote filesystem data response"))
 	}
 	return payload, nil
 }

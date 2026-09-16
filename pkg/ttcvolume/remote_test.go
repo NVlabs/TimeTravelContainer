@@ -12,6 +12,7 @@ import (
 	"net"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +61,33 @@ func attachTestRemote(t *testing.T, source, target *Repository, sourceBranch, ta
 		t.Fatal(err)
 	}
 	return serverErr
+}
+
+func TestRemoteClientPreservesFirstTerminalProtocolError(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var token RemoteToken
+	copy(token[:], []byte("terminal-error"))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer server.Close()
+		request, err := readRemoteHeader(server)
+		if err != nil {
+			return
+		}
+		_ = writeRemoteFailure(server, request, "authoritative object is unavailable")
+	}()
+	remote := &remoteObjectClient{conn: client, token: token}
+	_, first := remote.request(remotePull, "object", 0, 1)
+	if first == nil || !strings.Contains(first.Error(), "authoritative object is unavailable") {
+		t.Fatalf("first request error=%v", first)
+	}
+	<-done
+	_, second := remote.request(remotePull, "object", 0, 1)
+	if second == nil || second.Error() != first.Error() {
+		t.Fatalf("second request error=%v, want preserved %q", second, first)
+	}
 }
 
 func finishTestRemote(t *testing.T, target *Repository, serverErr <-chan error) {
