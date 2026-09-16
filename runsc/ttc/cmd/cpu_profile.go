@@ -21,7 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
-const daemonCPUProfileVersion = 2
+const daemonCPUProfileVersion = 3
 
 // portableAMD64Features is an x86-64-v2-class guest instruction contract,
 // expressed using gVisor's Linux-compatible
@@ -188,6 +188,13 @@ func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) 
 	}
 	if slices.Contains(profile.Features, "xsave") && (profile.XsaveABI == "" || profile.XsaveABI != cpuid.HostXsaveABI()) {
 		return errors.New("host XSAVE ABI differs from the immutable CPU profile; use a fresh portable-profile root for heterogeneous CPUs")
+	}
+	return nil
+}
+
+func validateClusterCPUEnforcement(runtimePlatform string, cpuidFaulting bool) error {
+	if runtimePlatform == "systrap" && !cpuidFaulting {
+		return errors.New("systrap cluster mode requires host CPUID faulting (ARCH_SET_CPUID); this host cannot enforce a migration-safe guest CPU profile")
 	}
 	return nil
 }

@@ -1543,6 +1543,18 @@ func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 	}
 }
 
+func TestValidateClusterCPUEnforcement(t *testing.T) {
+	if err := validateClusterCPUEnforcement("systrap", false); err == nil || !strings.Contains(err.Error(), "CPUID faulting") {
+		t.Fatalf("systrap without CPUID faulting: %v", err)
+	}
+	if err := validateClusterCPUEnforcement("systrap", true); err != nil {
+		t.Fatalf("systrap with CPUID faulting: %v", err)
+	}
+	if err := validateClusterCPUEnforcement("kvm", false); err != nil {
+		t.Fatalf("KVM without host CPUID faulting: %v", err)
+	}
+}
+
 func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	root := t.TempDir()
 	bootstrap := defaultDaemonClusterOptions()

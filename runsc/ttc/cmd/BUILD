@@ -12,6 +12,8 @@ go_library(
         "cmd.go",
         "completion.go",
         "cp.go",
+		"cpuid_fault_amd64.go",
+		"cpuid_fault_other.go",
 		"cpu_profile.go",
 		"elastic_capacity.go",
 		"graph_provider.go",

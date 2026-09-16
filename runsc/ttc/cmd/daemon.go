@@ -3162,6 +3162,15 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if !opts.Configured {
 		return nil, nil
 	}
+	// A distributed systrap runtime must be able to make the persisted CPU
+	// profile authoritative. Some x86 CPUs and older kernels reject
+	// ARCH_SET_CPUID; on those hosts applications execute native CPUID even
+	// though /proc/cpuinfo shows the restricted profile. Moving such a process
+	// to a host with a different XCR0/XSAVE layout can corrupt its userspace
+	// XSAVE buffers. Refuse cluster membership before creating any runtime.
+	if err := validateClusterCPUEnforcement(runtimePlatform, hostSupportsCPUIDFaulting()); err != nil {
+		return nil, err
+	}
 	if opts.LeaseDuration == 0 {
 		opts.LeaseDuration = 15 * time.Second
 	}

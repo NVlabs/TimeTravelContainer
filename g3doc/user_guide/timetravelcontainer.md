@@ -116,7 +116,12 @@ initialization. Joining nodes must support every selected feature. Profiles
 exposing XSAVE also require identical native XCR0 and XSAVE layouts: libraries
 may cache their buffer size, and these instructions execute directly on the
 CPU. AVX-512 register state is preserved by fork and hydration on compatible
-hosts; AMX is not exposed.
+hosts; AMX is not exposed. A systrap cluster also requires host CPUID faulting
+(`ARCH_SET_CPUID`) on every member. Without it, an application can observe the
+physical CPU instead of the immutable profile; TTC rejects that node at daemon
+startup rather than allowing a later cross-CPU migration to corrupt userspace
+XSAVE buffers. This restriction applies to distributed systrap execution, not
+standalone TTC.
 
 ## Compile
 
