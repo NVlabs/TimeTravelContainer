@@ -17,7 +17,10 @@
 
 package arch
 
+import "gvisor.dev/gvisor/pkg/sentry/arch/fpu"
+
 // afterLoadFPState is invoked by afterLoad.
 func (s *State) afterLoadFPState() {
-	s.fpState.AfterLoad()
+	s.fpState.AfterLoadFrom(s.fpStateLayout)
+	s.fpStateLayout = fpu.HostXstateLayout()
 }

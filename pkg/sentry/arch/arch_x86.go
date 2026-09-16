@@ -147,8 +147,9 @@ func (s State) Proto() *rpb.Registers {
 // Fork creates and returns an identical copy of the state.
 func (s *State) Fork() State {
 	return State{
-		Regs:    s.Regs,
-		fpState: s.fpState.Fork(),
+		Regs:          s.Regs,
+		fpState:       s.fpState.Fork(),
+		fpStateLayout: s.fpStateLayout,
 	}
 }
 
@@ -377,7 +378,8 @@ func New(arch Arch) *Context64 {
 	case AMD64:
 		return &Context64{
 			State: State{
-				fpState: fpu.NewState(),
+				fpState:       fpu.NewState(),
+				fpStateLayout: fpu.HostXstateLayout(),
 				// Set initial registers for compatibility with Linux
 				// (as done in arch/x86/kernel/process_64.c:start_thread()).
 				Regs: Registers{
