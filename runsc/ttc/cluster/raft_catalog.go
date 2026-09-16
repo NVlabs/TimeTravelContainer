@@ -698,7 +698,15 @@ func (c *RaftCatalog) UpdateStableState(family, branch, owner, incarnation strin
 }
 
 func (c *RaftCatalog) Remove(family, branch string, generation uint64) error {
-	return applyRaftNoValue(c, time.Now().UTC(), AuthorityPlacementRemove, AuthorityPlacementPayload{Family: family, Branch: branch, Generation: generation})
+	err := applyRaftNoValue(c, time.Now().UTC(), AuthorityPlacementRemove, AuthorityPlacementPayload{Family: family, Branch: branch, Generation: generation})
+	// Reconciliation is intentionally performed by every node from independent
+	// linearizable snapshots. Another node may remove the same stale placement
+	// first; absence is the desired final state and matches PlacementStore's
+	// idempotent Remove contract.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (c *RaftCatalog) LookupPlacement(family, branch string) (*PlacementRecord, error) {

@@ -1235,6 +1235,9 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 	key := logicalBranchKey(p.Family, p.Branch)
 	record, ok := s.Placements[key]
 	if !ok {
+		if command.Kind == AuthorityPlacementRemove {
+			return nil, nil
+		}
 		return nil, os.ErrNotExist
 	}
 	switch command.Kind {

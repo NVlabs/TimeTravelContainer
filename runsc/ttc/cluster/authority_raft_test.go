@@ -212,6 +212,16 @@ func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	if placement.OwnerNode != "node-a" || placement.Generation != 1 {
 		t.Fatalf("unexpected replicated placement: %+v", placement)
 	}
+	catalog, err := NewRaftCatalog(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Remove("family", "main", placement.Generation); err != nil {
+		t.Fatalf("first placement removal: %v", err)
+	}
+	if err := catalog.Remove("family", "main", placement.Generation); err != nil {
+		t.Fatalf("idempotent placement removal: %v", err)
+	}
 }
 
 func TestRaftCatalogHeartbeatReturnsLocallyAppliedState(t *testing.T) {
