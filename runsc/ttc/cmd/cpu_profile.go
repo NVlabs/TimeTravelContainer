@@ -23,15 +23,17 @@ import (
 
 const daemonCPUProfileVersion = 1
 
-// portableAMD64Features is an x86-64-v2-class guest contract expressed using
-// gVisor's Linux-compatible feature names. It is deliberately independent of
-// the bootstrap host's vendor and model so an AMD-initialized cluster can
-// admit an Intel node (and vice versa). Newer instructions are available via
-// the immutable host or explicit profiles.
+// portableAMD64Features is an x86-64-v2-class guest instruction contract plus
+// the XSAVE ABI required by systrap, expressed using gVisor's Linux-compatible
+// feature names. It is deliberately independent of the bootstrap host's vendor
+// and model so an AMD-initialized cluster can admit an Intel node (and vice
+// versa). Newer vector instructions are available via immutable host or
+// explicit profiles.
 var portableAMD64Features = []string{
 	"apic", "cmov", "cx16", "cx8", "fpu", "fxsr", "lahf_lm", "lm",
-	"mmx", "nx", "pae", "pat", "pge", "pni", "popcnt", "pse", "pse36",
-	"sep", "sse", "sse2", "sse4_1", "sse4_2", "ssse3", "syscall", "tsc",
+	"mmx", "nx", "osxsave", "pae", "pat", "pge", "pni", "popcnt", "pse",
+	"pse36", "sep", "sse", "sse2", "sse4_1", "sse4_2", "ssse3", "syscall",
+	"tsc", "xsave",
 }
 
 // daemonCPUProfile is the exact guest-visible instruction contract. Mode is
@@ -133,7 +135,31 @@ func resolveDaemonCPUProfile(mode, explicit, runtimePlatform string) (daemonCPUP
 	if len(features) == 0 {
 		return daemonCPUProfile{}, fmt.Errorf("CPU profile %q contains no features on %s", mode, runtime.GOARCH)
 	}
+	if err := validateSystrapCPUProfileContract(features, runtimePlatform); err != nil {
+		return daemonCPUProfile{}, err
+	}
 	return daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: mode, Features: features}, nil
+}
+
+func validateSystrapCPUProfileContract(features []string, runtimePlatform string) error {
+	if runtime.GOARCH != "amd64" || runtimePlatform != "systrap" {
+		return nil
+	}
+	// Systrap saves host thread state in XSAVE format. Guest signal frames and
+	// migrated FPU state must consequently use the XSAVE ABI as well, even when
+	// the portable instruction contract excludes AVX and later vector
+	// extensions. Failing early is preferable to a workload that crashes only
+	// after its first post-migration signal delivery.
+	required := map[string]bool{"xsave": false, "osxsave": false}
+	for _, feature := range features {
+		if _, ok := required[feature]; ok {
+			required[feature] = true
+		}
+	}
+	if !required["xsave"] || !required["osxsave"] {
+		return errors.New("systrap CPU profiles on amd64 require xsave and osxsave")
+	}
+	return nil
 }
 
 func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) error {
@@ -153,7 +179,7 @@ func validateDaemonCPUProfile(profile daemonCPUProfile, runtimePlatform string) 
 	if len(missing) != 0 {
 		return fmt.Errorf("host CPU cannot execute immutable TTC profile %q; missing features: %s", profile.Mode, strings.Join(missing, ","))
 	}
-	return nil
+	return validateSystrapCPUProfileContract(profile.Features, runtimePlatform)
 }
 
 func applyStandaloneCPUProfile(root, mode, features, runtimePlatform string, explicitlySet bool) (daemonCPUProfile, error) {

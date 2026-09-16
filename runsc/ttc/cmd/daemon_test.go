@@ -1587,6 +1587,18 @@ func TestPortableCPUProfileIsHostIndependent(t *testing.T) {
 	}
 }
 
+func TestExplicitSystrapCPUProfileRequiresXsaveABI(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("x86 XSAVE contract")
+	}
+	if _, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2", "systrap"); err == nil || !strings.Contains(err.Error(), "require xsave and osxsave") {
+		t.Fatalf("missing XSAVE contract error=%v", err)
+	}
+	if _, err := resolveDaemonCPUProfile("explicit", "fpu,sse,sse2,xsave,osxsave", "systrap"); err != nil {
+		t.Fatalf("complete XSAVE contract rejected: %v", err)
+	}
+}
+
 func TestImmutableClusterConfigRequiresBootstrap(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
 	if err := applyImmutableClusterConfig(t.TempDir(), false, false, &opts); err == nil || !strings.Contains(err.Error(), "fresh first node") {
