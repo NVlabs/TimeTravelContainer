@@ -561,8 +561,54 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	if err != nil {
 		return err
 	}
-	known := make(map[string]struct{})
+	// Persistent container metadata is not proof that a running placement still
+	// has execution state. In particular, a batch scheduler may SIGKILL every
+	// process in a job while leaving both the local runsc state directory and the
+	// shared Raft placement intact. Adopting that placement into the daemon's new
+	// incarnation would make every node continue routing commands to a dead PID.
+	//
+	// Query only runsc's sandbox inventory here, rather than each Sentry control
+	// server. A lease fence deliberately SIGSTOPs Sentries during recovery, so a
+	// control RPC cannot be required before the new incarnation re-authorizes and
+	// resumes them. The host PID is the physical execution proof at this boundary.
+	liveSandboxes, err := b.liveRuntimeSandboxes()
+	if err != nil {
+		return fmt.Errorf("listing physical sandboxes for placement recovery: %w", err)
+	}
 	var result error
+	if b.distributedSource.authority != nil {
+		for key, record := range placementByBranch {
+			if record.OwnerNode != b.nodeID || (record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) {
+				continue
+			}
+			physicalContainer := record.PhysicalContainer
+			if physicalContainer == "" {
+				physicalContainer = record.FamilyID
+			}
+			if _, alive := liveSandboxes[physicalContainer]; alive {
+				continue
+			}
+			reason := fmt.Sprintf("physical runtime %q on node %q was lost while branch was %s", physicalContainer, b.nodeID, record.State)
+			if _, corruptErr := b.distributedSource.authority.MarkBranchCorrupted(record.FamilyID, record.BranchID, reason); corruptErr != nil {
+				result = errors.Join(result, fmt.Errorf("fencing lost placement %s@%s: %w", record.FamilyID, record.BranchID, corruptErr))
+				continue
+			}
+			physicalBranch := record.PhysicalBranch
+			if physicalBranch == "" {
+				physicalBranch = record.BranchID
+			}
+			// Raft is authoritative, but keep the physical materialization record
+			// consistent so offline cleanup and a later branch removal do not
+			// mistake this dead runtime for reusable execution state.
+			_ = b.containerStore().UpdateBranchState(physicalContainer, physicalBranch, "corrupted")
+			_, _ = b.command("delete", "--force", physicalContainer)
+			record.State = cluster.PlacementCorrupted
+			record.OwnerNode, record.OwnerIncarnation = "", ""
+			record.PhysicalContainer, record.PhysicalBranch = "", ""
+			placementByBranch[key] = record
+		}
+	}
+	known := make(map[string]struct{})
 	now := time.Now()
 	for _, info := range containers {
 		logicalFamily := info.ID
@@ -662,6 +708,44 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 	}
 	return result
+}
+
+// liveRuntimeSandboxes returns physical runsc container IDs whose Sentry host
+// process still exists. It intentionally does not contact the Sentry: a
+// correctly lease-fenced Sentry may be SIGSTOPped until placement recovery is
+// complete, but its PID remains valid execution state.
+func (b *runtimeBackend) liveRuntimeSandboxes() (map[string]struct{}, error) {
+	output, err := b.command("list", "--format=json", "--sandbox")
+	if err != nil {
+		return nil, err
+	}
+	var states []struct {
+		ID  string `json:"id"`
+		PID int    `json:"pid"`
+	}
+	if err := json.Unmarshal(output, &states); err != nil {
+		return nil, fmt.Errorf("decoding runsc sandbox list: %w", err)
+	}
+	processes, err := sentryProcessesForRuntimeRoot(b.root)
+	if err != nil {
+		return nil, fmt.Errorf("discovering Sentry processes: %w", err)
+	}
+	physicalPIDs := make(map[string]int, len(processes))
+	for _, process := range processes {
+		if process.ContainerID != "" {
+			physicalPIDs[process.ContainerID] = process.PID
+		}
+	}
+	result := make(map[string]struct{}, len(states))
+	for _, state := range states {
+		// Match both the state-directory PID and the live ttc-sentry command
+		// line. kill(pid, 0) alone is insufficient because Linux may have
+		// reused a dead Sentry's PID for an unrelated process.
+		if state.ID != "" && state.PID > 0 && physicalPIDs[state.ID] == state.PID {
+			result[state.ID] = struct{}{}
+		}
+	}
+	return result, nil
 }
 
 // retireTransactionsForRemovedPlacement bounds Raft history after the target
