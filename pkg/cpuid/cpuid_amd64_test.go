@@ -88,6 +88,21 @@ func TestUnsetXsaveSubfeatureDoesNotEnableXsave(t *testing.T) {
 	}
 }
 
+func TestIntersectWithoutXsaveClearsEnumerationLeaf(t *testing.T) {
+	allowed := map[Feature]struct{}{
+		X86FeatureFPU: {}, X86FeatureFXSR: {}, X86FeatureSSE: {}, X86FeatureSSE2: {},
+	}
+	got, err := HostFeatureSet().Intersect(allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for subleaf := uint32(0); subleaf < xSaveInfoNumLeaves; subleaf++ {
+		if out := got.Query(In{Eax: uint32(xSaveInfo), Ecx: subleaf}); out != (Out{}) {
+			t.Fatalf("CPUID.0xd.%d=%+v, want zero without XSAVE", subleaf, out)
+		}
+	}
+}
+
 func featureSetWithIdentity(signature uint32, vendor, brand string) FeatureSet {
 	static := make(Static)
 	var vendorBytes [12]byte

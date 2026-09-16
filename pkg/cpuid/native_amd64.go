@@ -187,6 +187,16 @@ func (fs FeatureSet) Intersect(allowedFeatures map[Feature]struct{}) (FeatureSet
 			}
 		}
 	}
+	// CPUID leaf 0xd is architecturally meaningful only when XSAVE is
+	// advertised. Keep the raw leaf consistent as well as HasFeature(): some
+	// dynamic loaders inspect subleaf 1 directly and select an XSAVEC resolver
+	// even if CPUID.1:ECX.XSAVE is clear. That resolver then observes native
+	// XCR0, whose enabled components and save size may differ after migration.
+	if _, ok := allowedFeatures[X86FeatureXSAVE]; !ok {
+		for subleaf := uint32(0); subleaf < xSaveInfoNumLeaves; subleaf++ {
+			hs.Set(In{Eax: uint32(xSaveInfo), Ecx: subleaf}, Out{})
+		}
+	}
 
 	return hs.ToFeatureSet(), nil
 }
