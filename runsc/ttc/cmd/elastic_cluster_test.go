@@ -238,6 +238,44 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 	}
 }
 
+func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "containers", "family-id", "container.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(filepath.Dir(path), "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(path, ttcbundle.ContainerInfo{
+		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "cold", State: "dehydrated", StorageState: "publishing", PublicationID: "publication-test"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !daemonCommandMayAwaitColdUnplacement(root, []string{"rehydrate", "web@cold"}) {
+		t.Fatal("cold rehydrate was not recognized as an asynchronous publication race")
+	}
+	if daemonCommandMayAwaitColdUnplacement(root, []string{"exec", "web@cold", "true"}) {
+		t.Fatal("non-lifecycle command may wait for cold unplacement")
+	}
+	info, err := (ttcbundle.Store{Root: root}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Branches[0].State = "running"
+	if err := writeCurrentBundleFixture(path, info); err != nil {
+		t.Fatal(err)
+	}
+	if daemonCommandMayAwaitColdUnplacement(root, []string{"rehydrate", "web@cold"}) {
+		t.Fatal("running branch may wait for conflicting placement")
+	}
+}
+
 func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()

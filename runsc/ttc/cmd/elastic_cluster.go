@@ -813,6 +813,40 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	}
 }
 
+// daemonCommandMayAwaitColdUnplacement reports whether a placement mismatch
+// can be the normal publication race between a completed local capture and
+// its Raft commit. Running branches must still reject a conflicting --node
+// immediately; only process-free lifecycle operations may wait for ownership
+// to become unplaced.
+func daemonCommandMayAwaitColdUnplacement(dataRoot string, args []string) bool {
+	if dataRoot == "" || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start") {
+		return false
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	found := false
+	for _, operand := range args[1:] {
+		target, err := parseSelector(operand)
+		if err != nil {
+			continue
+		}
+		info, err := store.LoadContainer(target.container)
+		if err != nil {
+			return false
+		}
+		branch, err := persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return false
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "dehydrating", "dehydrated", "exited", "materializing":
+		default:
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 // claimUnplacedLifecycleTargets turns admission of a durable cold branch into
 // a generation-fenced placement before its runtime is reconstructed. Without
 // this claim, two entry daemons may independently start or rehydrate the same

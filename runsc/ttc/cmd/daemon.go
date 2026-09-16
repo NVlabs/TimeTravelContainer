@@ -4849,6 +4849,21 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			writeError(err)
 			return
 		}
+		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode && daemonCommandMayAwaitColdUnplacement(s.dataRoot, request.Args) {
+			// Dehydrate/stop return after the process-free local capture is safe,
+			// while publication to shared storage is intentionally asynchronous.
+			// Wait outside every lifecycle lock for its atomic Raft commit, then
+			// redo routing so an explicit --node can claim the unplaced branch.
+			deadline := time.Now().Add(2 * time.Minute)
+			for owner != "" && owner != request.PlacementNode && time.Now().Before(deadline) {
+				time.Sleep(25 * time.Millisecond)
+				owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, request.Args)
+				if err != nil {
+					writeError(err)
+					return
+				}
+			}
+		}
 		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode {
 			writeError(fmt.Errorf("branch is already placed on node %q, not requested node %q", owner, request.PlacementNode))
 			return
