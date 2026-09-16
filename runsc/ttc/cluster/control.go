@@ -371,7 +371,13 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return errors.New("graph memory restore requires bounded immutable root identities")
 		}
 	} else if s.GraphSnapshot != 0 || len(s.GraphRootObjects) != 0 {
-		return errors.New("graph memory identity requires a graph manifest")
+		// A live page-stream restore may still carry immutable graph identity.
+		// The target retains these roots while pages are fetched from the source,
+		// preserving CoW ancestry across a later migration. Only process-free
+		// sparse restore requires a shared graph manifest.
+		if s.GraphSnapshot == 0 || len(s.GraphRootObjects) == 0 || len(s.GraphRootObjects) > 4096 {
+			return errors.New("live graph memory identity requires bounded immutable root identities")
+		}
 	}
 	if s.SharedMetadata != "" && s.GraphManifest == "" {
 		return errors.New("shared distributed metadata requires graph memory")

@@ -83,6 +83,7 @@ start_node() {
 	port=$2
 	shift 2
 	mkdir -p "$ROOT/local-$node" "$ROOT/run-$node"
+	chmod 700 "$ROOT/run-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
@@ -133,14 +134,26 @@ test "$(client b exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1
 client b quarantine "$NAME@child" >/dev/null
 client b migrate --node node-c "$NAME@child" >/dev/null
 test "$(branch_field c child node_id)" = node-c
-test "$(branch_field c child quarantined)" = true
+quarantined=$(branch_field c child quarantined)
+if test "$quarantined" != true; then
+	echo "migrated quarantine state is $quarantined, want true" >&2
+	client c ls --json >&2 || true
+	find "$ROOT/local-c/containers" -name container.json -type f -exec sh -c 'echo "=== $1"; sed -n "1,240p" "$1"' sh {} \; >&2 || true
+	exit 1
+fi
 test "$(client c exec "$NAME@child" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 test "$(client c exec "$NAME@child" sha256sum /dev/shm/resident | awk '{print $1}')" = "$source_digest"
+test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = ELASTIC-MARK
 
 # Retiring node-a must move its remaining running branch, preserve its state,
 # and stop that daemon only after no authoritative state remains on its local
 # root. The destination is deliberately left to the scheduler.
-client b node stop node-a --migrate-all >/dev/null
+if ! client b node stop node-a --migrate-all >/dev/null; then
+	echo "node-a retirement failed; cluster inventory follows" >&2
+	client b ls --json >&2 || true
+	find "$SHARED/containers" -name container.json -type f -exec sh -c 'echo "=== $1"; sed -n "1,240p" "$1"' sh {} \; >&2 || true
+	exit 1
+fi
 wait "$PID_A"
 PID_A=
 owner=$(branch_field b main node_id)

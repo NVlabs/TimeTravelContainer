@@ -704,6 +704,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 					FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
 					LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
 					FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+					Quarantined: branch.Quarantined,
 				}, now)
 				if createErr != nil && !errors.Is(createErr, os.ErrExist) {
 					result = errors.Join(result, fmt.Errorf("creating placement for %s@%s: %w", info.ID, branch.ID, createErr))
@@ -1274,6 +1275,57 @@ func distributedChildRequestID(parent string, ordinal int, args []string) string
 	return hex.EncodeToString(hash[:16])
 }
 
+// logicalFamilyPlacements returns the user-visible branch inventory for a
+// clustered family. Raft placement records are the authority for logical
+// identities; container metadata may additionally contain transaction-scoped
+// physical branches used to implement migration. Those private branches must
+// never be expanded into child CLI commands.
+func logicalFamilyPlacements(catalog cluster.PlacementCatalog, familyID string) ([]cluster.PlacementRecord, error) {
+	records, err := catalog.List()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]cluster.PlacementRecord, 0)
+	seen := make(map[string]struct{})
+	for _, record := range records {
+		if record.FamilyID != familyID {
+			continue
+		}
+		if _, ok := seen[record.BranchID]; ok {
+			return nil, fmt.Errorf("family %q has duplicate placement for branch %q", familyID, record.BranchID)
+		}
+		seen[record.BranchID] = struct{}{}
+		result = append(result, record)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].BranchID < result[j].BranchID })
+	return result, nil
+}
+
+// orderFamilyRemovalPlacements keeps a branch in the canonical physical
+// container until last. The final child is a family rm, so it must execute
+// where removing the canonical family record can also tear down its runtime.
+// Branches materialized in transaction-named physical containers are removed
+// individually first.
+func orderFamilyRemovalPlacements(records []cluster.PlacementRecord, familyID string) {
+	final := -1
+	for i := range records {
+		if records[i].PhysicalContainer != familyID {
+			continue
+		}
+		if final == -1 || records[i].PhysicalBranch == records[i].BranchID {
+			final = i
+		}
+		if records[i].PhysicalBranch == records[i].BranchID {
+			break
+		}
+	}
+	if final >= 0 && final != len(records)-1 {
+		selected := records[final]
+		copy(records[final:], records[final+1:])
+		records[len(records)-1] = selected
+	}
+}
+
 // executeDistributedStats obtains one accounting snapshot per physical
 // runtime owner and reduces them at the entry daemon. A node-local ttcvolume
 // repository can only describe branches resident on that node; trying to
@@ -1459,7 +1511,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if err != nil {
 				return true, 1, nil, nil, err
 			}
-			node := info.BranchNodeID(selected.branch)
+			placement, placementErr := s.clusterPlacements.Lookup(info.ID, selected.branch)
+			if placementErr != nil {
+				return true, 1, nil, nil, fmt.Errorf("resolving family mutation placement for %s: %w", selected, placementErr)
+			}
+			node := placement.OwnerNode
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
 			}
@@ -1470,25 +1526,30 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
-		branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
-		sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
-		if len(branches) == 0 {
+		placements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
+		if err != nil {
+			return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
+		}
+		if len(placements) == 0 {
 			return true, 1, nil, nil, fmt.Errorf("container %q has no branches", operand)
 		}
-		finalNode := info.BranchNodeID(branches[len(branches)-1].ID)
+		if request.Args[0] == "rm" {
+			orderFamilyRemovalPlacements(placements, info.ID)
+		}
+		finalNode := placements[len(placements)-1].OwnerNode
 		if finalNode == "" {
 			finalNode = s.clusterCapabilities.NodeID
 		}
 		formerOwners := make(map[string]struct{})
-		for i, branch := range branches {
-			node := info.BranchNodeID(branch.ID)
+		for i, placement := range placements {
+			node := placement.OwnerNode
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
 			}
-			target := operand + "@" + branch.ID
+			target := operand + "@" + placement.BranchID
 			// The final rm must run as a family removal so it can reclaim the
 			// family record and anonymous volumes after every peer runtime is gone.
-			if request.Args[0] == "rm" && i == len(branches)-1 {
+			if request.Args[0] == "rm" && i == len(placements)-1 {
 				target = operand
 			} else if request.Args[0] == "rm" && node != finalNode {
 				formerOwners[node] = struct{}{}
@@ -1714,6 +1775,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
 			LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
 			FamilyCreatedAt: info.CreatedAt, ParentBranch: persistentBranch.ParentID, BranchCreatedAt: persistentBranch.CreatedAt,
+			Quarantined: persistentBranch.Quarantined,
 		}, time.Now())
 	}
 	if err != nil {
@@ -2988,6 +3050,9 @@ func (b *runtimeBackend) placementWindow(source cluster.NodeRecord, targets []cl
 }
 
 func (b *runtimeBackend) executePlacementPlan(plan cluster.FixedTerminalPlan, records map[string]cluster.NodeRecord) error {
+	if plan.SourceNode == "" || plan.SourceNode != b.nodeID {
+		return fmt.Errorf("placement plan for source node %q reached executor on %q", plan.SourceNode, b.nodeID)
+	}
 	type reservation struct {
 		node        string
 		incarnation string
@@ -3027,26 +3092,52 @@ func (b *runtimeBackend) executePlacementPlan(plan cluster.FixedTerminalPlan, re
 	for index := range reservations {
 		byNode[reservations[index].node] = &reservations[index]
 	}
-	// A plan contains independent branch cutovers. Execute a bounded set in
-	// parallel so evacuating a high-fanout family does not pay target startup
-	// and network latency serially for every branch. Each migration has its own
-	// Raft transaction and placement CAS; failures leave the node cordoned and
+	// A plan contains independent branch cutovers, but migrations of sibling
+	// branches to the same node are not independent while the destination
+	// physical Sentry is being selected. The first branch establishes that
+	// Sentry's placement; a concurrently reserved sibling would not observe the
+	// placement yet and would create a second Sentry for the same family. Keep
+	// each (logical family, destination node) group ordered while executing
+	// unrelated groups in parallel. Each migration still has its own Raft
+	// transaction and placement CAS; failures leave the node cordoned and
 	// retryable, while successful siblings remain valid completed moves.
 	const migrationConcurrency = 4
 	moveErrors := make([]error, len(plan.Moves))
 	moved := make([]bool, len(plan.Moves))
-	runBoundedBatch(len(plan.Moves), migrationConcurrency, func(i int) {
-		move := plan.Moves[i]
+	type migrationGroup struct {
+		indices []int
+	}
+	groupsByKey := make(map[string]*migrationGroup)
+	var groups []*migrationGroup
+	for i, move := range plan.Moves {
 		target, err := parseSelector(move.Branch)
 		if err != nil {
 			moveErrors[i] = err
-			return
+			continue
 		}
-		if err := b.migrate(target, move.ToNode); err != nil {
-			moveErrors[i] = fmt.Errorf("executing placement move %s to %s: %w", target, move.ToNode, err)
-			return
+		key := move.ToNode + "\x00" + target.container
+		group := groupsByKey[key]
+		if group == nil {
+			group = &migrationGroup{}
+			groupsByKey[key] = group
+			groups = append(groups, group)
 		}
-		moved[i] = true
+		group.indices = append(group.indices, i)
+	}
+	runBoundedBatch(len(groups), migrationConcurrency, func(groupIndex int) {
+		for _, i := range groups[groupIndex].indices {
+			move := plan.Moves[i]
+			target, err := parseSelector(move.Branch)
+			if err != nil {
+				moveErrors[i] = err
+				continue
+			}
+			if err := b.migrate(target, move.ToNode); err != nil {
+				moveErrors[i] = fmt.Errorf("executing placement move %s to %s: %w", target, move.ToNode, err)
+				continue
+			}
+			moved[i] = true
+		}
 	})
 	var executionErr error
 	for i, moveErr := range moveErrors {

@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,6 +75,34 @@ func TestTransactionTargetsRemovedPlacement(t *testing.T) {
 	migration.Identity.Migration = true
 	if !transactionTargetsRemovedPlacement(migration, cluster.PlacementRecord{FamilyID: "family", BranchID: "main"}) {
 		t.Fatal("migration did not match its preserved placement")
+	}
+}
+
+func TestLogicalFamilyPlacementsOrdersCanonicalRuntimeLastForRemoval(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "migrated", PhysicalContainer: "family", PhysicalBranch: "fork-private", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "remote", PhysicalContainer: "target-private", PhysicalBranch: "remote", OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning},
+		{FamilyID: "other", BranchID: "unrelated", PhysicalContainer: "other", PhysicalBranch: "unrelated", OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning},
+	} {
+		if _, err := placements.Create(record, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	records, err := logicalFamilyPlacements(placements, "family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("logical placements=%+v, want three family branches", records)
+	}
+	orderFamilyRemovalPlacements(records, "family")
+	if got := records[len(records)-1]; got.BranchID != "main" || got.PhysicalContainer != "family" || got.PhysicalBranch != "main" {
+		t.Fatalf("final family removal placement=%+v, want canonical main runtime", got)
 	}
 }
 
@@ -280,6 +309,35 @@ func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
 type branchAwarePlacementCatalog struct {
 	cluster.PlacementCatalog
 	branches map[string]cluster.BranchAuthority
+}
+
+func TestRemoveContainerPlacementsResolvesMigratedPhysicalBranch(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "physical", PhysicalBranch: "migration-1",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{
+		placements: placements, transactions: transactions,
+	}}
+	if err := backend.removeContainerPlacements(ttcbundle.ContainerInfo{
+		ID: "physical", DistributedFamilyID: "family",
+		Branches: []ttcbundle.BranchInfo{{ID: "migration-1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Lookup("family", "main"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed migrated placement lookup error=%v, want not exist", err)
+	}
 }
 
 func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.BranchAuthority, error) {
@@ -697,17 +755,27 @@ func TestResolveDistributedPersistentBranchUsesPublicationIdentity(t *testing.T)
 	})
 	writeContainer(ttcbundle.ContainerInfo{
 		ID: "physical-old", Name: "physical-old", State: "exited", DistributedFamilyID: "family",
-		Branches: []ttcbundle.BranchInfo{{ID: "transaction-old", State: "exited", StorageState: "shared", PublicationID: "publication-old"}},
+		Branches: []ttcbundle.BranchInfo{{ID: "transaction-old", State: "exited", StorageState: "shared", PublicationID: "publication-old", StorageManifest: "/shared/old-manifest"}},
 	})
 	writeContainer(ttcbundle.ContainerInfo{
 		ID: "physical-current", Name: "physical-current", State: "dehydrated", DistributedFamilyID: "family",
-		Branches: []ttcbundle.BranchInfo{{ID: "transaction-current", State: "dehydrated", StorageState: "shared", PublicationID: "publication-current"}},
+		Branches: []ttcbundle.BranchInfo{{ID: "transaction-current", State: "dehydrated", StorageState: "shared", PublicationID: "publication-current", StorageManifest: "/shared/current-manifest"}},
 	})
 	store := ttcbundle.Store{Root: root}
 	logical, err := store.LoadContainer("web")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Store.LoadContainer normally synthesizes the user-facing family from
+	// cluster placements. Reproduce that view explicitly: the logical branch
+	// advertises the current publication, but it cannot supply the physical
+	// bundle/repository or cold manifest that consumes it.
+	logical.Branches = []ttcbundle.BranchInfo{{
+		ID:            "main",
+		State:         "dehydrated",
+		StorageState:  "shared",
+		PublicationID: "publication-current",
+	}}
 	backend := &runtimeBackend{dataRoot: root}
 	physical, branch, err := backend.resolveDistributedPersistentBranch(logical, "main", "publication-current")
 	if err != nil {

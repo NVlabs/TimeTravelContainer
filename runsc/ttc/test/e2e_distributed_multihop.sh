@@ -87,6 +87,7 @@ wait_ready() {
 }
 
 mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B" "$RUN_A" "$RUN_B"
+chmod 700 "$RUN_A" "$RUN_B"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
 	"$TTCD" --socket "$SOCKET_A" --cluster-init --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \

@@ -427,6 +427,12 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
 		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
 	}}))
+	quarantined := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "quarantine", at.Add(500*time.Millisecond), AuthorityPlacementQuarantine, AuthorityPlacementPayload{
+		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: created.Generation, Quarantined: true,
+	}))
+	if !quarantined.Quarantined || quarantined.Generation != created.Generation {
+		t.Fatalf("quarantine transition=%+v", quarantined)
+	}
 	begin := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "begin", at.Add(time.Second), AuthorityPlacementBegin, AuthorityPlacementPayload{
 		Family: "family", Branch: "main", Owner: "node-a", Incarnation: "incarnation-a", Generation: created.Generation, Operation: "migration-1", Target: "node-b",
 	}))
@@ -445,7 +451,7 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 		TargetIncarnation: "incarnation-b", PhysicalContainer: "physical-main", PhysicalBranch: "main",
 	}))
 	committed := cutover.Placement
-	if committed.OwnerNode != "node-b" || committed.Generation != begin.Generation+1 || committed.State != PlacementRunning {
+	if committed.OwnerNode != "node-b" || committed.Generation != begin.Generation+1 || committed.State != PlacementRunning || !committed.Quarantined {
 		t.Fatalf("bad atomic migration cutover: %+v", cutover)
 	}
 	stale, _ := NewAuthorityCommand("stale-state", at.Add(3*time.Second), AuthorityPlacementStableState, AuthorityPlacementPayload{
@@ -666,6 +672,7 @@ func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
 	at := time.Unix(3500, 0).UTC()
 	state := NewAuthorityState()
 	registerReadyAuthorityNode(t, state, "node-b", "incarnation-b", at)
+	state.Placements[logicalBranchKey("source", "main")] = PlacementRecord{Quarantined: true}
 	state.Transactions["fork-1"] = Transaction{
 		Identity: ForkIdentity{
 			TransactionID: "fork-1", SourceNodeID: "node-a", TargetNodeID: "node-b",
@@ -679,7 +686,7 @@ func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
 		Family: "physical-family", Branch: "child", PhysicalContainer: "physical-family", PhysicalBranch: "child",
 		TargetIncarnation: "incarnation-b",
 	}))
-	if result.Transaction.State != TransactionPublished || result.Transaction.Activated || result.Placement.OwnerNode != "node-b" || result.Placement.State != PlacementRunning {
+	if result.Transaction.State != TransactionPublished || result.Transaction.Activated || result.Placement.OwnerNode != "node-b" || result.Placement.State != PlacementRunning || !result.Placement.Quarantined {
 		t.Fatalf("bad atomic fork publication: %+v", result)
 	}
 	if state.Revision != 3 { // register, ready, publish

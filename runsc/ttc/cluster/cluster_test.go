@@ -133,6 +133,31 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 	}
 }
 
+func TestRemoteSessionDescriptorLiveGraphIdentity(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
+		GraphSnapshot: 7, GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
+	}
+	if err := live.validate(negotiated); err != nil {
+		t.Fatalf("valid live graph identity: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
+		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
+	} {
+		invalid := live
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted incomplete live graph identity: %+v", invalid)
+		}
+	}
+}
+
 func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {

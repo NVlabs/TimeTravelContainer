@@ -54,15 +54,20 @@ type PlacementRecord struct {
 	// Display metadata is replicated with placement so name resolution and
 	// cluster-wide inventory never depend on shared-filesystem directory-cache
 	// convergence. It is not part of execution authority.
-	FamilyName        string         `json:"family_name,omitempty"`
-	ImageReference    string         `json:"image_reference,omitempty"`
-	ImageDigest       string         `json:"image_digest,omitempty"`
-	ImageSize         int64          `json:"image_size,omitempty"`
-	LiveForkEligible  bool           `json:"live_fork_eligible,omitempty"`
-	LiveForkWaiver    string         `json:"live_fork_waiver,omitempty"`
-	FamilyCreatedAt   time.Time      `json:"family_created_at,omitempty"`
-	ParentBranch      string         `json:"parent_branch,omitempty"`
-	BranchCreatedAt   time.Time      `json:"branch_created_at,omitempty"`
+	FamilyName       string    `json:"family_name,omitempty"`
+	ImageReference   string    `json:"image_reference,omitempty"`
+	ImageDigest      string    `json:"image_digest,omitempty"`
+	ImageSize        int64     `json:"image_size,omitempty"`
+	LiveForkEligible bool      `json:"live_fork_eligible,omitempty"`
+	LiveForkWaiver   string    `json:"live_fork_waiver,omitempty"`
+	FamilyCreatedAt  time.Time `json:"family_created_at,omitempty"`
+	ParentBranch     string    `json:"parent_branch,omitempty"`
+	BranchCreatedAt  time.Time `json:"branch_created_at,omitempty"`
+	// Quarantined is cluster-wide branch policy. It belongs beside placement
+	// authority rather than in one physical runtime's metadata, because that
+	// runtime is replaced during migration and may be invisible to control-only
+	// nodes.
+	Quarantined       bool           `json:"quarantined,omitempty"`
 	PhysicalContainer string         `json:"physical_container,omitempty"`
 	PhysicalBranch    string         `json:"physical_branch,omitempty"`
 	OwnerNode         string         `json:"owner_node,omitempty"`
@@ -134,6 +139,7 @@ type PlacementCatalog interface {
 	Unplace(family, branch, owner, incarnation string, generation uint64, now time.Time) (*PlacementRecord, error)
 	ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
 	UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
+	SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error)
 	Remove(family, branch string, generation uint64) error
 	Lookup(family, branch string) (*PlacementRecord, error)
 	List() ([]PlacementRecord, error)
@@ -528,6 +534,42 @@ func (s *PlacementStore) UpdateStableState(family, branch, owner, incarnation st
 		}
 		record.State = state
 		record.Generation++
+		record.Revision++
+		record.UpdatedAt = now
+		if err := record.validate(); err != nil {
+			return err
+		}
+		if err := s.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// SetQuarantine changes externally visible network policy without replacing
+// execution authority. A concurrent migration wins or loses as one catalog
+// operation, so policy cannot be changed on a stale physical incarnation.
+func (s *PlacementStore) SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error) {
+	var result PlacementRecord
+	err := s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != incarnation ||
+			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			return errors.New("stale or non-stable placement cannot change quarantine policy")
+		}
+		if record.Quarantined == quarantined {
+			result = record
+			return nil
+		}
+		record.Quarantined = quarantined
 		record.Revision++
 		record.UpdatedAt = now
 		if err := record.validate(); err != nil {

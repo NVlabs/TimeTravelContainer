@@ -90,6 +90,7 @@ wait_active() {
 }
 
 mkdir -p "$SHARED" "$LOCAL" "$ROOT/run"
+chmod 700 "$ROOT/run"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL TTC_CLUSTER_TOKEN=$TOKEN \
 	setsid "$TTCD" --socket "$SOCKET" --node node-a --listen "127.0.0.1:$PORT" \
 	--advertise "127.0.0.1:$PORT" --cluster-init --unsafe-no-host-isolation \

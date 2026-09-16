@@ -523,15 +523,22 @@ func (c *RaftCatalog) VolatileDependencyForwarded(family, branch, transactionID,
 // Healthy branches must use the ordinary lifecycle/placement transaction.
 func (c *RaftCatalog) RemoveCorruptedBranch(family, branch string) error {
 	record, err := c.Branch(family, branch)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	if !record.Corrupted {
 		return errors.New("branch is not corrupted")
 	}
-	return applyRaftNoValue(c, time.Now().UTC(), AuthorityBranchRemoveCorrupted, AuthorityPublicationPayload{
+	err = applyRaftNoValue(c, time.Now().UTC(), AuthorityBranchRemoveCorrupted, AuthorityPublicationPayload{
 		Family: family, Branch: branch, BranchGeneration: record.Generation,
 	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // InheritBranchDependencies copies the source's current coarse dependency
@@ -728,6 +735,10 @@ func (c *RaftCatalog) ClaimUnplaced(family, branch, owner, incarnation, physical
 
 func (c *RaftCatalog) UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error) {
 	return applyRaftValue[PlacementRecord](c, now, AuthorityPlacementStableState, AuthorityPlacementPayload{Family: family, Branch: branch, Owner: owner, Incarnation: incarnation, Generation: generation, State: state})
+}
+
+func (c *RaftCatalog) SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error) {
+	return applyRaftValue[PlacementRecord](c, now, AuthorityPlacementQuarantine, AuthorityPlacementPayload{Family: family, Branch: branch, Owner: owner, Incarnation: incarnation, Generation: generation, Quarantined: quarantined})
 }
 
 func (c *RaftCatalog) Remove(family, branch string, generation uint64) error {

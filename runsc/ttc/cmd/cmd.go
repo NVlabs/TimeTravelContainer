@@ -4643,6 +4643,13 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 			if durable {
 				return waitResult{}
 			}
+			// A clustered backend's Raft catalog is the complete lifecycle and
+			// publication authority. Its persistent family view may deliberately
+			// omit a transaction-scoped physical branch while publication is in
+			// progress, so consulting inspect here can turn a normal pending state
+			// into a spurious "branch does not exist" failure.
+			<-ticker.C
+			continue
 		}
 		family, err := backend.inspect(target.container)
 		if err != nil {
@@ -5493,7 +5500,27 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 	}
 	switch publication.State {
 	case cluster.PublicationCommitted:
-		return true, nil
+		// CommitPublication is the cluster durability boundary, but the
+		// provider still has a short local completion tail: it changes local
+		// snapshot origins to shared authority, removes their handoff freeze,
+		// and finally publishes the matching container metadata. A command that
+		// immediately forks the cold branch may execute on that same provider;
+		// returning before the tail completes would expose the internal frozen
+		// ledger as a dynamic fork failure. CompleteBranchPublication is ordered
+		// after all local handoffs, so require the exact derived identity too.
+		physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, branch.PublicationID)
+		if errors.Is(resolveErr, os.ErrNotExist) {
+			return false, nil
+		}
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		persistent, persistentErr := persistentBranchInfo(physical, physicalBranch)
+		if persistentErr != nil {
+			return false, persistentErr
+		}
+		return persistent.PublicationID == branch.PublicationID &&
+			persistent.StorageState == "shared" && persistent.StorageManifest != "", nil
 	case cluster.PublicationFailed:
 		return false, fmt.Errorf("storage publication failed: %s", publication.Failure)
 	default:
@@ -5909,14 +5936,25 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 // The physical records are in TTC_ROOT, so every node can resolve them without
 // assigning execution ownership first.
 func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.ContainerInfo, branchID, publicationID string) (ttcbundle.ContainerInfo, string, error) {
-	if branch, err := persistentBranchInfo(logical, branchID); err == nil && (publicationID == "" || branch.PublicationID == publicationID) {
-		return logical, branchID, nil
+	// The caller may have obtained logical through Store.LoadContainer(name),
+	// whose user-facing family view merges branches from hidden physical
+	// runtimes. Such a synthesized branch is useful for ls/inspect, but its
+	// containing bundle and repository paths still belong to the logical
+	// family's original runtime. Reload the exact immutable family ID so only a
+	// branch genuinely stored in that bundle can satisfy the fast path.
+	logicalID := logicalFamilyID(logical)
+	if exact, err := b.containerStore().LoadRuntimeContainer(logicalID); err == nil {
+		logical = exact
+	}
+	if branch, err := persistentBranchInfo(logical, branchID); err == nil {
+		if publicationID == "" || (branch.PublicationID == publicationID && branch.StorageManifest != "") {
+			return logical, branchID, nil
+		}
 	}
 	containers, err := b.containerStore().ListContainersForPlacement()
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, "", err
 	}
-	logicalID := logicalFamilyID(logical)
 	type candidate struct {
 		info   ttcbundle.ContainerInfo
 		branch string
@@ -5933,7 +5971,7 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 			// locator for its cold record. Match the logical name only when no
 			// authoritative publication identity is available.
 			if publicationID != "" {
-				if branch.PublicationID != publicationID {
+				if branch.PublicationID != publicationID || branch.StorageManifest == "" {
 					continue
 				}
 			} else if branch.ID != branchID {
@@ -8872,24 +8910,11 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err := store.RemoveContainer(runtimeID); err != nil {
 		return err
 	}
+	if err := b.removeContainerPlacements(info); err != nil {
+		return fmt.Errorf("removing cluster placement for %q: %w", name, err)
+	}
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
 		return fmt.Errorf("reconciling filesystem origins after removing %q: %w", name, err)
-	}
-	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		for _, branch := range info.Branches {
-			authority, err := b.distributedSource.authority.Branch(info.ID, branch.ID)
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("loading removed branch authority for %s@%s: %w", info.Name, branch.ID, err)
-			}
-			if authority.Corrupted {
-				if err := b.distributedSource.authority.RemoveCorruptedBranch(info.ID, branch.ID); err != nil {
-					return fmt.Errorf("removing corrupted branch authority for %s@%s: %w", info.Name, branch.ID, err)
-				}
-			}
-		}
 	}
 	if volumes {
 		manager, err := b.volumeManager()
@@ -8906,6 +8931,55 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	}
 	if _, err := store.PruneImageRoots(context.Background()); err != nil {
 		return fmt.Errorf("pruning unreferenced image roots: %w", err)
+	}
+	return nil
+}
+
+// removeContainerPlacements commits logical deletion after physical cleanup.
+// A migrated runtime may store transaction-scoped physical branch names, so
+// candidates are matched by both logical branch and exact physical identity.
+// Removal must never depend on a later reconciliation pass: daemon shutdown
+// can immediately follow rm, and stale authority would then resurrect work in
+// the drain planner.
+func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo) error {
+	if b.nodeID == "" {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return err
+	}
+	logicalFamily := logicalFamilyID(info)
+	physicalBranches := make(map[string]struct{}, len(info.Branches))
+	for _, branch := range info.Branches {
+		physicalBranches[branch.ID] = struct{}{}
+	}
+	for _, record := range records {
+		if record.FamilyID != logicalFamily {
+			continue
+		}
+		_, logicalMatch := physicalBranches[record.BranchID]
+		_, physicalMatch := physicalBranches[record.PhysicalBranch]
+		if !logicalMatch && !(record.PhysicalContainer == info.ID && physicalMatch) {
+			continue
+		}
+		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+			return fmt.Errorf("branch %s@%s is still owned by node %q", record.FamilyID, record.BranchID, record.OwnerNode)
+		}
+		if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
+			if err := b.distributedSource.authority.RemoveCorruptedBranch(record.FamilyID, record.BranchID); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		} else if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
+			return err
+		}
+		if err := b.retireTransactionsForRemovedPlacement(record); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -9887,6 +9961,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				if family.Branches[i].ID == record.BranchID {
 					family.Branches[i].NodeID = record.OwnerNode
 					family.Branches[i].State = string(record.State)
+					family.Branches[i].Quarantined = record.Quarantined
 					foundBranch = true
 					break
 				}
@@ -9898,7 +9973,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				family.Branches = append(family.Branches, Branch{
 					ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
-					State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
+					Quarantined: record.Quarantined, State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
 				})
 			}
 			owner := ""
@@ -10459,6 +10534,7 @@ func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []clu
 			}
 			logical.ID = placement.BranchID
 			logical.NodeID = placement.OwnerNode
+			logical.Quarantined = placement.Quarantined
 			logical.Unplaced = placement.State == cluster.PlacementUnplaced
 			if placement.ParentBranch != "" || logical.ParentID == "" {
 				logical.ParentID = placement.ParentBranch
@@ -11011,6 +11087,7 @@ func (b *runtimeBackend) resume(target selector) error {
 }
 
 func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
+	logicalBranch := target.branch
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -11025,6 +11102,31 @@ func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
 	}
 	if branch.Quarantined == enabled {
 		return nil
+	}
+	logicalFamily := info.DistributedFamilyID
+	if logicalFamily == "" {
+		logicalFamily = info.ID
+	}
+	var placement *cluster.PlacementRecord
+	var placements cluster.PlacementCatalog
+	var ownerIncarnation string
+	if b.nodeID != "" {
+		owner, renewErr := b.renewDistributedExecutionAuthority()
+		if renewErr != nil {
+			return fmt.Errorf("renewing quarantine execution authority: %w", renewErr)
+		}
+		ownerIncarnation = owner.Incarnation
+		placements, err = b.placementCatalog()
+		if err != nil {
+			return fmt.Errorf("opening quarantine placement authority: %w", err)
+		}
+		placement, err = placements.Lookup(logicalFamily, logicalBranch)
+		if err != nil {
+			return fmt.Errorf("resolving quarantine placement: %w", err)
+		}
+		if placement.OwnerNode != b.nodeID || placement.OwnerIncarnation != ownerIncarnation || placement.PhysicalContainer != target.container || placement.PhysicalBranch != target.branch {
+			return errors.New("quarantine placement no longer names the resolved physical branch")
+		}
 	}
 	state := normalizeLifecycleState(branch.State)
 	live := state == "running" || state == "paused"
@@ -11107,6 +11209,22 @@ func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
 			return fmt.Errorf("persisting quarantine: %w; restoring runtime state: %v", err, rollbackErr)
 		}
 		return err
+	}
+	if placement != nil {
+		if _, err := placements.SetQuarantine(logicalFamily, logicalBranch, b.nodeID, ownerIncarnation, placement.Generation, enabled, time.Now().UTC()); err != nil {
+			rollbackErr := b.containerStore().UpdateBranchQuarantine(target.container, target.branch, branch.Quarantined)
+			if !enabled && live {
+				rollbackErr = errors.Join(rollbackErr, b.stopPublishedPortsForBranch(info, target.branch))
+			}
+			rollbackErr = errors.Join(rollbackErr, transitionRuntime(branch.Quarantined))
+			if enabled && live {
+				rollbackErr = errors.Join(rollbackErr, b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch))
+			}
+			if rollbackErr != nil {
+				return fmt.Errorf("persisting cluster quarantine policy: %w; restoring local state: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("persisting cluster quarantine policy: %w", err)
+		}
 	}
 	return nil
 }
@@ -13302,9 +13420,6 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		if err := b.remove(target.container, true, false); err != nil {
 			return err
 		}
-		if corrupted && logicalFamily != info.ID {
-			return b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch)
-		}
 		return nil
 	}
 	releaseClients, err := b.quiesceConsoleClients(target)
@@ -13418,15 +13533,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
 		}
+		removedInfo := info
+		removedInfo.Branches = []ttcbundle.BranchInfo{*recorded}
+		if err := b.removeContainerPlacements(removedInfo); err != nil {
+			return fmt.Errorf("removing cluster placement for %s: %w", requested, err)
+		}
 		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {
 			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
-		}
-		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			if authority, err := b.distributedSource.authority.Branch(logicalFamily, requested.branch); err == nil && authority.Corrupted {
-				if err := b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch); err != nil {
-					return fmt.Errorf("removing corrupted branch authority for %s: %w", target, err)
-				}
-			}
 		}
 		latest, err := store.LoadContainer(target.container)
 		if err != nil {

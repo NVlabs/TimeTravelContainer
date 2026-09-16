@@ -75,6 +75,7 @@ start_node() {
 	port=$2
 	shift 2
 	mkdir -p "$ROOT/local-$node" "$ROOT/run-$node"
+	chmod 700 "$ROOT/run-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \

@@ -222,6 +222,25 @@ func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	if err := catalog.Remove("family", "main", placement.Generation); err != nil {
 		t.Fatalf("idempotent placement removal: %v", err)
 	}
+	created, err := catalog.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "doomed", PhysicalContainer: "physical-doomed", PhysicalBranch: "doomed",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("creating doomed branch: %v", err)
+	}
+	if _, err := catalog.MarkBranchCorrupted("family", "doomed", "provider lost"); err != nil {
+		t.Fatalf("corrupting branch: %v", err)
+	}
+	if err := catalog.RemoveCorruptedBranch("family", "doomed"); err != nil {
+		t.Fatalf("first corrupted branch removal: %v", err)
+	}
+	if err := catalog.RemoveCorruptedBranch("family", "doomed"); err != nil {
+		t.Fatalf("idempotent corrupted branch removal: %v", err)
+	}
+	if created.Generation == 0 {
+		t.Fatal("created doomed branch without a generation")
+	}
 }
 
 func TestRaftCatalogHeartbeatReturnsLocallyAppliedState(t *testing.T) {

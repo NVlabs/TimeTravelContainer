@@ -62,6 +62,7 @@ const (
 	AuthorityPlacementUnplace      AuthorityCommandKind = "placement-unplace"
 	AuthorityPlacementClaim        AuthorityCommandKind = "placement-claim-unplaced"
 	AuthorityPlacementStableState  AuthorityCommandKind = "placement-update-state"
+	AuthorityPlacementQuarantine   AuthorityCommandKind = "placement-set-quarantine"
 	AuthorityPlacementRemove       AuthorityCommandKind = "placement-remove"
 	AuthorityTransactionCreate     AuthorityCommandKind = "transaction-create"
 	AuthorityTransactionAdvance    AuthorityCommandKind = "transaction-advance"
@@ -469,7 +470,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
 		AuthorityPlacementCommit, AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
-		AuthorityPlacementStableState, AuthorityPlacementRemove:
+		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRemove:
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Branches = cloneAuthorityMap(s.Branches)
 	case AuthorityTransactionCreate, AuthorityTransactionPublish,
@@ -610,6 +611,7 @@ type AuthorityPlacementPayload struct {
 	Operation, Target, TargetIncarnation string
 	PhysicalContainer, PhysicalBranch    string
 	State                                PlacementState
+	Quarantined                          bool
 }
 
 // AuthorityTransactionPayload carries a distributed transaction command.
@@ -699,7 +701,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyClusterPolicy(command)
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover, AuthorityPlacementCommit,
 		AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
-		AuthorityPlacementStableState, AuthorityPlacementRemove:
+		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRemove:
 		return s.applyPlacement(command)
 	case AuthorityTransactionCreate, AuthorityTransactionAdvance, AuthorityTransactionPublish,
 		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff,
@@ -931,6 +933,7 @@ func (s *AuthorityState) applyForkPublish(command AuthorityCommand) (json.RawMes
 		placement.FamilyCreatedAt = source.FamilyCreatedAt
 		placement.ParentBranch = tx.Identity.SourceBranch
 		placement.BranchCreatedAt = command.IssuedAt
+		placement.Quarantined = source.Quarantined
 	}
 	if err := placement.validate(); err != nil {
 		return nil, err
@@ -1477,6 +1480,18 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 			return nil, errors.New("invalid stable state")
 		}
 		record.State = p.State
+	case AuthorityPlacementQuarantine:
+		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+			return nil, fmt.Errorf("placement owner: %w", err)
+		}
+		if record.Generation != p.Generation || record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation ||
+			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			return nil, errors.New("stale or non-stable placement cannot change quarantine policy")
+		}
+		if record.Quarantined == p.Quarantined {
+			return authorityValue(record)
+		}
+		record.Quarantined = p.Quarantined
 	case AuthorityPlacementRemove:
 		if record.Generation != p.Generation || record.State == PlacementMigrating {
 			return nil, errors.New("stale or migrating placement cannot be removed")

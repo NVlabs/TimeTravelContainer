@@ -112,6 +112,42 @@ func TestMaterializingPlacementBecomesStable(t *testing.T) {
 	}
 }
 
+func TestPlacementQuarantineIsMigrationStableAndGenerationFenced(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(875, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "fork-a",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined, err := store.SetQuarantine("family", "child", "node-a", "boot-a", created.Generation, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quarantined.Quarantined || quarantined.Generation != created.Generation {
+		t.Fatalf("quarantined placement=%+v", quarantined)
+	}
+	if _, err := store.SetQuarantine("family", "child", "node-b", "boot-b", created.Generation, false, now.Add(2*time.Second)); err == nil {
+		t.Fatal("stale owner changed quarantine policy")
+	}
+	migrating, err := store.BeginMigration("family", "child", "node-a", "boot-a", created.Generation, "move-1", "node-b", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := store.CommitMigration("family", "child", "move-1", "node-b", "boot-b", "runtime-b", "fork-b", now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrating.Quarantined || !moved.Quarantined {
+		t.Fatalf("migration lost quarantine policy: migrating=%+v moved=%+v", migrating, moved)
+	}
+}
+
 func TestPlacementCatalogLocksReadsAgainstSnapshotWriter(t *testing.T) {
 	store, err := OpenPlacementStore(t.TempDir())
 	if err != nil {
