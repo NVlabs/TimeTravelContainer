@@ -6780,7 +6780,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		}
 	}()
 	capture.Resume = true
-	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, false); err != nil {
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, nil); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
 	}
 	graphRecorded = true
@@ -10740,7 +10740,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	}
 	result := make([]Branch, 0, len(children))
 	for _, child := range children {
-		if err := b.rehydrateCold(child.target, info, child.branch, peer); err != nil {
+		if err := b.rehydrateCold(child.target, info, child.branch, peer, sourceBranch); err != nil {
 			return nil, fmt.Errorf("starting dehydrated fork child %s: %w", child.target, err)
 		}
 		peer = true
@@ -12415,7 +12415,7 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 		_ = dir.Close()
 	}
 }
-func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
+func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool, filesystemSource ...ttcbundle.BranchInfo) (retErr error) {
 	refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
 	if err != nil {
 		return fmt.Errorf("materializing immutable image cache: %w", err)
@@ -12437,8 +12437,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	localImageBefore := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	_, localImageErr := os.Stat(localImageBefore)
-	needsColdMaterialization := errors.Is(localImageErr, os.ErrNotExist)
-	if localImageErr != nil && !needsColdMaterialization {
+	if localImageErr != nil && !errors.Is(localImageErr, os.ErrNotExist) {
 		return localImageErr
 	}
 	if err := b.ensureLocalColdBranch(info, branch); err != nil {
@@ -12464,18 +12463,28 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		return fmt.Errorf("opening dehydration metadata: %w", err)
 	}
 	defer metadata.Close()
-	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, needsColdMaterialization)
+	relaySource := branch
+	if len(filesystemSource) != 0 {
+		relaySource = filesystemSource[0]
 	}
 	var relays *coldFilesystemRelays
-	if needsColdMaterialization {
-		relays, err = b.prepareColdFilesystemRelays(info, branch)
+	// A local control image says nothing about whether the imported filesystem
+	// repository still contains lazy whole-file placeholders. This is common
+	// after a cold branch was materialized once, and is guaranteed for a child
+	// forked from that branch. Donate shared-pack relays whenever a durable
+	// backing manifest exists; AttachRemoteObjectSource closes an unused relay
+	// immediately when all files are already local.
+	if relaySource.StorageManifest != "" {
+		relays, err = b.prepareColdFilesystemRelays(info, relaySource)
 		if err != nil {
 			return fmt.Errorf("preparing lazy cold filesystem: %w", err)
 		}
 	}
 	if relays != nil {
 		defer relays.close()
+	}
+	if peer {
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, relays)
 	}
 	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
 	if err != nil {
@@ -12775,18 +12784,8 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	return restore, nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, needsColdMaterialization bool) error {
-	var relays *coldFilesystemRelays
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, relays *coldFilesystemRelays) error {
 	var err error
-	if needsColdMaterialization {
-		relays, err = b.prepareColdFilesystemRelays(info, branch)
-		if err != nil {
-			return fmt.Errorf("preparing lazy cold peer filesystem: %w", err)
-		}
-	}
-	if relays != nil {
-		defer relays.close()
-	}
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
 		for _, file := range targets {
