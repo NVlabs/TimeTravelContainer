@@ -86,11 +86,14 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-7", Kind: "dehydrate", FilesystemBranch: "capture"}
+	intent := Intent{
+		Container: "physical", Branch: "transaction", AuthorityContainer: "family", AuthorityBranch: "main",
+		PublicationID: "publication-7", Kind: "dehydrate", FilesystemBranch: "capture",
+	}
 	if err := queue.Enqueue(intent); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.Activate("family", "main", "publication-7"); err != nil {
+	if err := queue.Activate("physical", "transaction", "publication-7"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -108,6 +111,9 @@ func TestQueuePersistsRetriesAndCompletes(t *testing.T) {
 	pending, err := queue.Pending()
 	if err != nil || len(pending) != 1 || pending[0].Attempts != 1 {
 		t.Fatalf("pending after failure=%+v, err=%v", pending, err)
+	}
+	if pending[0].AuthorityContainer != "family" || pending[0].AuthorityBranch != "main" {
+		t.Fatalf("stable authority identity was not persisted: %+v", pending[0])
 	}
 	pending[0].RetryAt = time.Now().Add(-time.Second)
 	if err := writeJSONAtomic(queue.path("pending", pending[0].ID), pending[0]); err != nil {

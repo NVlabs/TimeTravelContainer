@@ -390,6 +390,13 @@ type branchPublisher struct {
 	event        func(DaemonEvent)
 }
 
+func publicationAuthorityIdentity(info ttcbundle.ContainerInfo, intent ttcstorage.Intent) (string, string) {
+	if intent.AuthorityContainer != "" && intent.AuthorityBranch != "" {
+		return intent.AuthorityContainer, intent.AuthorityBranch
+	}
+	return logicalFamilyID(info), intent.Branch
+}
+
 // FenceCancellation orders cancellation against the publication's one
 // irreversible Raft commit before waiting for data-plane cleanup.
 func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
@@ -401,7 +408,8 @@ func (p *branchPublisher) FenceCancellation(intent ttcstorage.Intent) error {
 	if err != nil {
 		return err
 	}
-	return p.authority.CancelPublication(logicalFamilyID(info), intent.Branch, intent.PublicationID)
+	family, branch := publicationAuthorityIdentity(info, intent)
+	return p.authority.CancelPublication(family, branch, intent.PublicationID)
 }
 
 func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (ttcstorage.Result, error) {
@@ -875,7 +883,8 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			}
 			captureRoots.MemorySnapshot = branch.SnapshotID
 		}
-		if _, err := p.authority.EnsurePublicationReady(logicalFamilyID(info), intent.Branch, intent.PublicationID, lifecycle, captureRoots); err != nil {
+		family, authorityBranch := publicationAuthorityIdentity(info, intent)
+		if _, err := p.authority.EnsurePublicationReady(family, authorityBranch, intent.PublicationID, lifecycle, captureRoots); err != nil {
 			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
 		}
 	}
@@ -888,13 +897,13 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 	if err != nil {
 		return err
 	}
-	family := logicalFamilyID(info)
+	family, authorityBranch := publicationAuthorityIdentity(info, intent)
 	canceled := p.authority != nil
 	if p.authority != nil {
-		if err := p.authority.CancelPublication(family, intent.Branch, intent.PublicationID); err != nil {
+		if err := p.authority.CancelPublication(family, authorityBranch, intent.PublicationID); err != nil {
 			return fmt.Errorf("canceling publication authority: %w", err)
 		}
-		record, ok, err := p.authority.Publication(family, intent.Branch, intent.PublicationID)
+		record, ok, err := p.authority.Publication(family, authorityBranch, intent.PublicationID)
 		if err != nil {
 			return fmt.Errorf("reading publication authority after cleanup fence: %w", err)
 		}
@@ -1201,7 +1210,8 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		// installs branch roots, releases placement, and changes every prepared
 		// origin from provider-owned to shared together. Cancellation before it
 		// reverses every handoff; cancellation after it is a no-op.
-		if _, err := p.authority.CommitPublication(logicalFamilyID(info), intent.Branch, intent.PublicationID, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
+		family, authorityBranch := publicationAuthorityIdentity(info, intent)
+		if _, err := p.authority.CommitPublication(family, authorityBranch, intent.PublicationID, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
 			return fmt.Errorf("committing publication roots in Raft: %w", err)
 		}
 		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && p.graph != nil {

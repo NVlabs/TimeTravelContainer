@@ -21,17 +21,22 @@ import (
 
 // Intent is a durable, immutable-identity-fenced request to publish a branch.
 type Intent struct {
-	ID               string    `json:"id"`
-	Container        string    `json:"container"`
-	Branch           string    `json:"branch"`
-	PublicationID    string    `json:"publication_id"`
-	Kind             string    `json:"kind"`
-	FilesystemBranch string    `json:"filesystem_branch"`
-	CaptureReady     bool      `json:"capture_ready"`
-	CreatedAt        time.Time `json:"created_at"`
-	Attempts         int       `json:"attempts,omitempty"`
-	LastError        string    `json:"last_error,omitempty"`
-	RetryAt          time.Time `json:"retry_at,omitempty"`
+	ID        string `json:"id"`
+	Container string `json:"container"`
+	Branch    string `json:"branch"`
+	// AuthorityContainer and AuthorityBranch are the stable user-visible
+	// identity in clustered mode. Container and Branch remain the immutable
+	// physical capture identity used to find node-local data after migrations.
+	AuthorityContainer string    `json:"authority_container,omitempty"`
+	AuthorityBranch    string    `json:"authority_branch,omitempty"`
+	PublicationID      string    `json:"publication_id"`
+	Kind               string    `json:"kind"`
+	FilesystemBranch   string    `json:"filesystem_branch"`
+	CaptureReady       bool      `json:"capture_ready"`
+	CreatedAt          time.Time `json:"created_at"`
+	Attempts           int       `json:"attempts,omitempty"`
+	LastError          string    `json:"last_error,omitempty"`
+	RetryAt            time.Time `json:"retry_at,omitempty"`
 }
 
 // Result is the authoritative shared manifest produced by Publisher.
@@ -125,6 +130,9 @@ func (q *Queue) Activate(container, branch, publicationID string) error {
 func (q *Queue) Enqueue(intent Intent) error {
 	if intent.Container == "" || intent.Branch == "" || intent.PublicationID == "" || intent.Kind == "" || intent.FilesystemBranch == "" {
 		return errors.New("invalid publication intent")
+	}
+	if (intent.AuthorityContainer == "") != (intent.AuthorityBranch == "") {
+		return errors.New("incomplete publication authority identity")
 	}
 	intent.ID = intentID(intent.Container, intent.Branch, intent.PublicationID)
 	if intent.CreatedAt.IsZero() {

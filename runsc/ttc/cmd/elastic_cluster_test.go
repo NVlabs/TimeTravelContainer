@@ -574,17 +574,23 @@ func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 }
 
 func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
-	state := &cluster.AuthorityState{Transactions: map[string]cluster.Transaction{
-		"migration": {Identity: cluster.ForkIdentity{
-			TransactionID: "migration", Migration: true,
-			SourceContainer: "family", SourceBranch: "main",
-			TargetContainer: "family", TargetBranch: "physical-migration",
-		}},
-		"fork": {Identity: cluster.ForkIdentity{
-			TransactionID: "fork", SourceContainer: "family", SourceBranch: "main",
-			TargetContainer: "family", TargetBranch: "physical-fork", TargetVisibleBranch: "child",
-		}},
-	}}
+	state := &cluster.AuthorityState{
+		Transactions: map[string]cluster.Transaction{
+			"migration": {Identity: cluster.ForkIdentity{
+				TransactionID: "migration", Migration: true,
+				SourceContainer: "family", SourceBranch: "main",
+				TargetContainer: "family", TargetBranch: "physical-migration",
+			}},
+			"fork": {Identity: cluster.ForkIdentity{
+				TransactionID: "fork", SourceContainer: "family", SourceBranch: "main",
+				TargetContainer: "family", TargetBranch: "physical-fork", TargetVisibleBranch: "child",
+			}},
+		},
+		Placements: map[string]cluster.PlacementRecord{
+			"family\x00main":  {FamilyID: "family", BranchID: "main", PhysicalContainer: "physical", PhysicalBranch: "migration"},
+			"family\x00child": {FamilyID: "family", BranchID: "child", PhysicalContainer: "physical", PhysicalBranch: "child"},
+		},
+	}
 	for _, tc := range []struct {
 		name, transaction, family, branch string
 		found                             bool
@@ -603,6 +609,19 @@ func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 	}
 	if family, branch, found := logicalPlacementForPhysicalTransaction(nil, "migration"); family != "" || branch != "" || found {
 		t.Fatalf("nil authority resolved (%q,%q,%t)", family, branch, found)
+	}
+	for _, tc := range []struct {
+		physical, family, branch string
+		found                    bool
+	}{
+		{physical: "migration", family: "family", branch: "main", found: true},
+		{physical: "child", family: "family", branch: "child", found: true},
+		{physical: "missing"},
+	} {
+		family, branch, found := logicalPlacementForPhysicalRuntime(state, "physical", tc.physical)
+		if family != tc.family || branch != tc.branch || found != tc.found {
+			t.Fatalf("physical %q resolved (%q,%q,%t), want (%q,%q,%t)", tc.physical, family, branch, found, tc.family, tc.branch, tc.found)
+		}
 	}
 }
 

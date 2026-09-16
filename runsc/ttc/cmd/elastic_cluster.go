@@ -772,6 +772,26 @@ func logicalPlacementForPhysicalTransaction(state *cluster.AuthorityState, trans
 	return tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch(), true
 }
 
+// logicalPlacementForPhysicalRuntime maps a node-local runtime branch back to
+// its single stable Raft identity. Physical transaction IDs must never be used
+// as branch keys by lifecycle protocols such as durable publication.
+func logicalPlacementForPhysicalRuntime(state *cluster.AuthorityState, physicalContainer, physicalBranch string) (string, string, bool) {
+	if state == nil || physicalContainer == "" || physicalBranch == "" {
+		return "", "", false
+	}
+	family, branch := "", ""
+	for _, placement := range state.Placements {
+		if placement.PhysicalContainer != physicalContainer || placement.PhysicalBranch != physicalBranch {
+			continue
+		}
+		if family != "" && (family != placement.FamilyID || branch != placement.BranchID) {
+			return "", "", false
+		}
+		family, branch = placement.FamilyID, placement.BranchID
+	}
+	return family, branch, family != ""
+}
+
 // placementHasProcessFreePublication reports whether Raft has authorized the
 // exact placement generation to be temporarily process-free while its sealed
 // state is published. Publication commit atomically changes the placement to

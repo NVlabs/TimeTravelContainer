@@ -5692,6 +5692,18 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	if err != nil {
 		return err
 	}
+	authorityContainer, authorityBranch := logicalFamilyID(container), target.branch
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		state, err := b.distributedSource.authority.AuthorityState()
+		if err != nil {
+			return fmt.Errorf("resolving publication authority: %w", err)
+		}
+		var found bool
+		authorityContainer, authorityBranch, found = logicalPlacementForPhysicalRuntime(state, container.ID, target.branch)
+		if !found {
+			return fmt.Errorf("physical branch %s has no unique logical Raft placement", target)
+		}
+	}
 	if previous.PublicationID != "" {
 		if err := b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID); err != nil {
 			return fmt.Errorf("canceling superseded publication for %s: %w", target, err)
@@ -5704,7 +5716,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	captureBranch := "ttc-publish-" + strings.TrimPrefix(publicationID, "publication-")
 	intent := ttcstorage.Intent{
 		Container: target.container, Branch: target.branch, PublicationID: publicationID, Kind: kind,
-		FilesystemBranch: captureBranch,
+		AuthorityContainer: authorityContainer, AuthorityBranch: authorityBranch, FilesystemBranch: captureBranch,
 	}
 	if err := b.publicationQueue.Enqueue(intent); err != nil {
 		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "error", err.Error(), time.Time{})
@@ -5819,7 +5831,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if kind == "dehydrate" {
 			lifecycle = "dehydrated"
 		}
-		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(logicalFamilyID(info), target.branch, publicationID, lifecycle); err != nil {
+		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(authorityContainer, authorityBranch, publicationID, lifecycle); err != nil {
 			return rollback(fmt.Errorf("authorizing asynchronous publication: %w", err))
 		}
 	}
