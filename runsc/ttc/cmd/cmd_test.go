@@ -3073,6 +3073,31 @@ func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
 	}
 }
 
+type authoritativeWaitBackend struct {
+	*fakeBackend
+	durable bool
+}
+
+func (b *authoritativeWaitBackend) authoritativeBranchDurable(selector) (bool, error) {
+	return b.durable, nil
+}
+
+func TestWaitDurableUsesClusterAuthorityInsteadOfStaleLocalMetadata(t *testing.T) {
+	b := &authoritativeWaitBackend{
+		fakeBackend: &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+			Metadata: Branch{ID: "child", State: "dehydrating", StorageState: "local"},
+		}}}}},
+		durable: true,
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("wait durable status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("wait durable output=%q, want %q", got, want)
+	}
+}
+
 func containsSelector(values []selector, target selector) bool {
 	for _, value := range values {
 		if value == target {

@@ -4615,6 +4615,15 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if authority, ok := backend.(authoritativeDurabilityBackend); ok {
+			durable, err := authority.authoritativeBranchDurable(target)
+			if err != nil {
+				return waitResult{err: err}
+			}
+			if durable {
+				return waitResult{}
+			}
+		}
 		family, err := backend.inspect(target.container)
 		if err != nil {
 			return waitResult{err: err}
@@ -5425,8 +5434,51 @@ type localDurabilityBackend interface {
 	localStorageIsDurable() bool
 }
 
+type authoritativeDurabilityBackend interface {
+	authoritativeBranchDurable(selector) (bool, error)
+}
+
 func (b *runtimeBackend) localStorageIsDurable() bool {
 	return b != nil && b.distributedSource == nil
+}
+
+func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false, nil
+	}
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return false, err
+	}
+	family := logicalFamilyID(info)
+	branch, err := b.distributedSource.authority.Branch(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	if branch.Corrupted {
+		return false, fmt.Errorf("branch %s is corrupted: %s", target, branch.CorruptionReason)
+	}
+	if branch.Lifecycle != "exited" && branch.Lifecycle != "dehydrated" {
+		return false, nil
+	}
+	if branch.PublicationID == "" {
+		return false, nil
+	}
+	publication, ok, err := b.distributedSource.authority.Publication(family, target.branch, branch.PublicationID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	switch publication.State {
+	case cluster.PublicationCommitted:
+		return true, nil
+	case cluster.PublicationFailed:
+		return false, fmt.Errorf("storage publication failed: %s", publication.Failure)
+	default:
+		return false, nil
+	}
 }
 
 type consoleSidecarOwner interface {
