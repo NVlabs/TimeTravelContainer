@@ -394,7 +394,16 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	config.LogOutput = io.Discard
 	config.SnapshotThreshold = 8192
 	config.SnapshotInterval = 2 * time.Minute
-	config.ShutdownOnRemove = true
+	// A TTC node whose execution lease expires is removed from the live voter
+	// set, but the physical node is allowed to return later. Keep its Raft
+	// engine alive long enough to apply the removal entry and a subsequent
+	// AddNonvoter entry from the surviving leader. With ShutdownOnRemove set,
+	// replay stops at the removal entry and a node with a stale local WAL can
+	// never be re-admitted without deleting its only copy of the Raft log -- an
+	// unsafe operation during a whole-cluster restart. An excluded engine has
+	// no vote or proposal authority; TTC's replicated execution lease and
+	// host-level guardian remain the data-plane fence.
+	config.ShutdownOnRemove = false
 	fsm := NewAuthorityFSM()
 	engine, err := raft.NewRaft(config, fsm, store, store, snapshots, transport)
 	if err != nil {

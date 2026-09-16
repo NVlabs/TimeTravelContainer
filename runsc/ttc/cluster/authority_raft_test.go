@@ -397,6 +397,65 @@ func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) 
 	}
 }
 
+func TestAuthorityRaftRemovedMemberCanRejoinWithoutProcessRestart(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	open := func(id string, bootstrap bool) *AuthorityRaftNode {
+		t.Helper()
+		node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+			NodeID: id, LocalDir: filepath.Join(t.TempDir(), "raft"),
+			ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+			ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: bootstrap,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return node
+	}
+	a, b := open("node-a", true), open("node-b", false)
+	defer a.Close()
+	defer b.Close()
+	leader := waitAuthorityLeader(t, a)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.Promote(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	registerReadyRaftNode(t, leader, a.id, "incarnation-a")
+	registerReadyRaftNode(t, leader, b.id, "incarnation-b")
+	result, err := leader.Propose(ctx, "fence-node-b", AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: b.id, Incarnation: "incarnation-b", State: NodeOffline,
+	})
+	if err != nil || result.Err() != nil {
+		t.Fatalf("fencing node-b: result=%+v err=%v", result, err)
+	}
+	if err := leader.ReconcileVoters(ctx, 3); err != nil {
+		t.Fatalf("removing fenced node-b: %v", err)
+	}
+	if b.raft.State() == raft.Shutdown {
+		t.Fatal("removed TTC member shut down before it could be re-admitted")
+	}
+	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatalf("re-adding removed node-b: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		configuration, err := leader.Configuration()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, server := range configuration.Servers {
+			if server.ID == raft.ServerID(b.id) && server.Suffrage == raft.Nonvoter {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("removed node-b was not re-admitted as a learner")
+}
+
 func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {
 	serverTLS, clientTLS := newAuthorityRaftTLS(t)
 	open := func(id string, bootstrap bool) *AuthorityRaftNode {
