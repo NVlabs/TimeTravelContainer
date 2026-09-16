@@ -708,15 +708,46 @@ func (s *sharedReferenceService) mutateRoots(snapshot ttcsnapshot.SnapshotID, op
 		action = "retain"
 	}
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		for _, name := range names {
-			id := roots[name]
-			idempotency := fmt.Sprintf("shared-%s/%s", action, name)
-			if err := ledger.ApplyReference(idempotency, name, id, retain); err != nil {
-				return err
+		return applySharedRootMutation(ledger, names, roots, action, retain)
+	})
+}
+
+// applySharedRootMutation preserves release idempotency across coordinator
+// rebuilds. The reference ledger keeps operation receipts while one
+// coordinator is active, but a newly elected coordinator reconstructs the
+// current reference set rather than every historical receipt. A crash after a
+// release commit and before the branch intent advances therefore legitimately
+// retries against an absent exact name. Retains remain strict, and a release
+// that finds the name bound to another immutable object is still rejected.
+func applySharedRootMutation(ledger *ttcsnapshot.ReferenceLedger, names []string, roots map[string]ttcsnapshot.ObjectID, action string, retain bool) error {
+	if ledger == nil {
+		return errors.New("shared reference ledger is unavailable")
+	}
+	for _, name := range names {
+		id := roots[name]
+		if !retain {
+			current, exists := ledger.References()[name]
+			if !exists {
+				continue
+			}
+			if current != id {
+				return fmt.Errorf("reference %q selects %s, not %s", name, current, id)
 			}
 		}
-		return nil
-	})
+		idempotency := fmt.Sprintf("shared-%s/%s", action, name)
+		if err := ledger.ApplyReference(idempotency, name, id, retain); err != nil {
+			// Concurrent batches are serialized inside the ledger, but the
+			// observation above is intentionally lock-free from this layer. If an
+			// identical release won that race, its absent exact name is success.
+			if !retain {
+				if _, exists := ledger.References()[name]; !exists {
+					continue
+				}
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *sharedReferenceService) mutateReference(operation, name string, object ttcsnapshot.ObjectID, retain bool) error {

@@ -228,6 +228,36 @@ func TestSharedReferenceCoordinatorTransitionClassification(t *testing.T) {
 	}
 }
 
+func TestSharedRootReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
+	ledger := ttcsnapshot.NewReferenceLedger()
+	origin := ttcsnapshot.SnapshotID(17)
+	object := ttcsnapshot.Object{ID: ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 1}}
+	if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{object}, map[string]ttcsnapshot.ObjectID{"root/source": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	name := "remote/17/branch-test/00000000"
+	roots := map[string]ttcsnapshot.ObjectID{name: object.ID}
+	if err := applySharedRootMutation(ledger, []string{name}, roots, "retain", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedRootMutation(ledger, []string{name}, roots, "release", false); err != nil {
+		t.Fatal(err)
+	}
+	// A rebuilt coordinator has the resulting reference set, but not the old
+	// release receipt. Replaying the branch intent must still be a no-op.
+	rebuilt := ttcsnapshot.NewReferenceLedger()
+	objects, references, ok := ledger.OriginManifest(origin)
+	if !ok {
+		t.Fatal("released origin disappeared before coordinator rebuild")
+	}
+	if err := rebuilt.ImportOrigin(origin, objects, references); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedRootMutation(rebuilt, []string{name}, roots, "release", false); err != nil {
+		t.Fatalf("release replay after coordinator rebuild: %v", err)
+	}
+}
+
 func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	localRoot := t.TempDir()
 	service := &sharedReferenceService{localRoot: localRoot, nodeID: "node-a", incarnation: "boot-a"}
