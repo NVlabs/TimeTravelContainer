@@ -225,6 +225,20 @@ func TestSnapshotReferenceInventoryReservesEveryUnreleasedGroup(t *testing.T) {
 	}
 }
 
+func TestSnapshotReferenceInventoryOmitsRetiredCrashPrefix(t *testing.T) {
+	intent := graphReferenceIntent{
+		Operation: "release-after-ledger-commit",
+		Groups: []graphReferenceGroup{
+			{Origin: 10, Roots: []cluster.SnapshotRootBinding{{Slot: 0, Object: "000000000000000a-03-0000000000000001"}}, Retained: true},
+			{Origin: 11, Roots: []cluster.SnapshotRootBinding{{Slot: 1, Object: "000000000000000b-03-0000000000000001"}}, Retained: true},
+		},
+	}
+	claims := snapshotReferenceClaims(intent, map[uint64]struct{}{11: {}})
+	if len(claims) != 1 || claims[0].Origin != 10 {
+		t.Fatalf("claims=%+v, want only non-retired origin 10", claims)
+	}
+}
+
 func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 	for failAt := 0; failAt < 2; failAt++ {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {

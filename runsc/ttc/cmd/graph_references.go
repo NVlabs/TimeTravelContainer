@@ -497,6 +497,19 @@ func advanceGraphReferenceRelease(path string, intent *graphReferenceIntent, mut
 func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent graphReferenceIntent, group graphReferenceGroup, retain bool) error {
 	current, volatile, err := b.distributedSource.authority.SnapshotProvider(group.Origin)
 	if err != nil {
+		if !retain && errors.Is(err, os.ErrNotExist) {
+			state, stateErr := b.distributedSource.authority.AuthorityState()
+			if stateErr != nil {
+				return stateErr
+			}
+			if _, retired := state.RetiredOrigins[group.Origin]; retired {
+				// Reference-ledger release precedes marking the local intent
+				// complete. A crash after the release may allow the zero-count
+				// origin to retire first; retirement is an irreversible,
+				// generation-fenced acknowledgement of that release.
+				return nil
+			}
+		}
 		return err
 	}
 	if !volatile {

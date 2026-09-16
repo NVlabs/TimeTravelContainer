@@ -71,6 +71,16 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 	}
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
+	retired := make(map[uint64]struct{})
+	if s.authority != nil {
+		state, err := s.authority.AuthorityState()
+		if err != nil {
+			return nil, fmt.Errorf("reading retired snapshot origins: %w", err)
+		}
+		for origin := range state.RetiredOrigins {
+			retired[origin] = struct{}{}
+		}
+	}
 	dir := filepath.Join(s.localRoot, "graph-references")
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -88,15 +98,7 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 		if err != nil {
 			return nil, fmt.Errorf("reading reference claim %q: %w", entry.Name(), err)
 		}
-		for _, group := range intent.Groups {
-			if group.Released {
-				continue
-			}
-			claims = append(claims, cluster.SnapshotReferenceClaim{
-				Origin: group.Origin, Operation: intent.Operation,
-				Roots: append([]cluster.SnapshotRootBinding(nil), group.Roots...),
-			})
-		}
+		claims = append(claims, snapshotReferenceClaims(intent, retired)...)
 	}
 	sort.Slice(claims, func(i, j int) bool {
 		if claims[i].Origin != claims[j].Origin {
@@ -105,6 +107,30 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 		return claims[i].Operation < claims[j].Operation
 	})
 	return &cluster.SnapshotReferenceInventory{NodeID: s.nodeID, Incarnation: s.incarnation, Claims: claims}, nil
+}
+
+func snapshotReferenceClaims(intent graphReferenceIntent, retired map[uint64]struct{}) []cluster.SnapshotReferenceClaim {
+	claims := make([]cluster.SnapshotReferenceClaim, 0, len(intent.Groups))
+	for _, group := range intent.Groups {
+		if group.Released {
+			continue
+		}
+		// A release reaches the exact reference ledger before the intent is
+		// marked complete. If the daemon dies between those two durable
+		// writes, collection may legitimately retire the now-unreferenced
+		// origin. Reporting the stale local intent as a live claim would then
+		// make every future ledger rebuild reject the retired origin, while
+		// the release cannot finish without an active ledger. Retirement is
+		// irreversible proof that this release was already applied.
+		if _, done := retired[group.Origin]; done {
+			continue
+		}
+		claims = append(claims, cluster.SnapshotReferenceClaim{
+			Origin: group.Origin, Operation: intent.Operation,
+			Roots: append([]cluster.SnapshotRootBinding(nil), group.Roots...),
+		})
+	}
+	return claims
 }
 
 func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (int, error) {
