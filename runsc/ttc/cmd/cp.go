@@ -514,10 +514,15 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	if err != nil {
 		return err
 	}
-	if b.nodeID != "" && branch.StorageState == "shared" && branch.StorageManifest != "" {
+	if b.nodeID != "" && branch.StorageManifest != "" {
 		if len(helperArgs) == 0 || helperArgs[0] != "export" {
 			return fmt.Errorf("cannot copy into durable unplaced branch %q; rehydrate it first", resolved.branch)
 		}
+		// StorageState describes an in-progress local cache/placement action,
+		// not whether the durable immutable backing ceased to exist. A cold fork
+		// can leave its dehydrated source marked materializing while the child
+		// starts from the same lazy repository. Offline helpers have no donated
+		// relay FDs, so always make a manifested cold branch self-contained.
 		if err := b.materializeColdFilesystem(info, branch); err != nil {
 			return fmt.Errorf("materializing filesystem for durable branch %q: %w", resolved.branch, err)
 		}
