@@ -76,6 +76,18 @@ func TestFixedExtendedState(t *testing.T) {
 
 }
 
+func TestUnsetXsaveSubfeatureDoesNotEnableXsave(t *testing.T) {
+	features := make(Static)
+	X86FeatureXSAVEOPT.Unset(features)
+	got := features.ToFeatureSet()
+	if got.HasFeature(X86FeatureXSAVE) {
+		t.Fatal("unsetting XSAVEOPT unexpectedly enabled XSAVE")
+	}
+	if got.HasFeature(X86FeatureXSAVEOPT) {
+		t.Fatal("XSAVEOPT remains enabled")
+	}
+}
+
 func featureSetWithIdentity(signature uint32, vendor, brand string) FeatureSet {
 	static := make(Static)
 	var vendorBytes [12]byte

@@ -93,12 +93,18 @@ func (f Feature) set(s ChangeableSet, on bool) {
 		}
 		s.Set(In{Eax: uint32(extendedFeatureInfo)}, out)
 	case 4:
-		// Need to turn on the bit in block 0.
-		out := s.Query(In{Eax: uint32(featureInfo)})
-		out.Ecx |= (1 << 26)
-		s.Set(In{Eax: uint32(featureInfo)}, out)
+		// Enabling an XSAVE capability also requires the parent XSAVE bit.
+		// Disabling a capability must not do the reverse: Intersect removes
+		// disallowed features in map iteration order, and re-enabling XSAVE
+		// while clearing XSAVEOPT/XSAVEC made restricted CPU profiles expose a
+		// feature that was absent from their declared contract.
+		if on {
+			out := s.Query(In{Eax: uint32(featureInfo)})
+			out.Ecx |= (1 << 26)
+			s.Set(In{Eax: uint32(featureInfo)}, out)
+		}
 
-		out = s.Query(In{Eax: xSaveInfoSub.eax(), Ecx: xSaveInfoSub.ecx()})
+		out := s.Query(In{Eax: xSaveInfoSub.eax(), Ecx: xSaveInfoSub.ecx()})
 		if on {
 			out.Eax |= f.bit()
 		} else {
