@@ -1479,6 +1479,20 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "error", retErr.Error(), time.Time{})
 		}
 	}()
+	return b.materializeColdFilesystem(info, branch)
+}
+
+// materializeColdFilesystem installs one committed filesystem snapshot in the
+// node-local cache without changing branch lifecycle or storage authority. It
+// is used by read-only management operations such as cp-from-dehydrated; the
+// shared manifest remains authoritative and the local files are disposable.
+func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	if branch.StorageManifest == "" {
+		return nil
+	}
+	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
+		return err
+	}
 	manifest, err := readColdBranchManifest(branch.StorageManifest)
 	if err != nil {
 		return err

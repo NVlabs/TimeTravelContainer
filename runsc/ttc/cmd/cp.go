@@ -510,6 +510,18 @@ func writeOfflineCopySpec(bundleDir string, spec *specs.Spec) error {
 }
 
 func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.ContainerInfo, helperArgs []string, input io.Reader, output io.Writer) error {
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if b.nodeID != "" && branch.StorageState == "shared" && branch.StorageManifest != "" {
+		if len(helperArgs) == 0 || helperArgs[0] != "export" {
+			return fmt.Errorf("cannot copy into durable unplaced branch %q; rehydrate it first", resolved.branch)
+		}
+		if err := b.materializeColdFilesystem(info, branch); err != nil {
+			return fmt.Errorf("materializing filesystem for durable branch %q: %w", resolved.branch, err)
+		}
+	}
 	original, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
 		return err
