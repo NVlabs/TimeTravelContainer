@@ -575,6 +575,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	if err != nil {
 		return fmt.Errorf("listing physical sandboxes for placement recovery: %w", err)
 	}
+	persistentPhysicalBranches := make(map[string]struct{})
+	for _, info := range containers {
+		for _, branch := range info.Branches {
+			persistentPhysicalBranches[info.ID+"\x00"+branch.ID] = struct{}{}
+		}
+	}
 	var result error
 	if b.distributedSource.authority != nil {
 		for key, record := range placementByBranch {
@@ -585,6 +591,17 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if physicalContainer == "" {
 				physicalContainer = record.FamilyID
 			}
+			physicalBranch := record.PhysicalBranch
+			if physicalBranch == "" {
+				physicalBranch = record.BranchID
+			}
+			if _, stillRecorded := persistentPhysicalBranches[physicalContainer+"\x00"+physicalBranch]; !stillRecorded {
+				// Branch removal deletes physical persistent metadata before the
+				// post-command reconciliation removes its Raft placement. The
+				// missing runtime is intentional in this narrow, lifecycle-locked
+				// window and must not be reported as state loss.
+				continue
+			}
 			if _, alive := liveSandboxes[physicalContainer]; alive {
 				continue
 			}
@@ -593,19 +610,14 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				result = errors.Join(result, fmt.Errorf("fencing lost placement %s@%s: %w", record.FamilyID, record.BranchID, corruptErr))
 				continue
 			}
-			physicalBranch := record.PhysicalBranch
-			if physicalBranch == "" {
-				physicalBranch = record.BranchID
-			}
 			// Raft is authoritative, but keep the physical materialization record
 			// consistent so offline cleanup and a later branch removal do not
 			// mistake this dead runtime for reusable execution state.
 			_ = b.containerStore().UpdateBranchState(physicalContainer, physicalBranch, "corrupted")
 			_, _ = b.command("delete", "--force", physicalContainer)
-			record.State = cluster.PlacementCorrupted
-			record.OwnerNode, record.OwnerIncarnation = "", ""
-			record.PhysicalContainer, record.PhysicalBranch = "", ""
-			placementByBranch[key] = record
+			if currentPlacement, lookupErr := b.distributedSource.authority.LookupPlacement(record.FamilyID, record.BranchID); lookupErr == nil {
+				placementByBranch[key] = *currentPlacement
+			}
 		}
 	}
 	known := make(map[string]struct{})
