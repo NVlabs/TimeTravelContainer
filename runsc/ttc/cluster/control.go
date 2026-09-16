@@ -478,6 +478,7 @@ const (
 	controlAuthorityProposePath = "/v1/authority/propose"
 	controlAuthorityStatePath   = "/v1/authority/state"
 	controlAuthorityJoinPath    = "/v1/authority/join"
+	controlAuthorityCancelPath  = "/v1/authority/cancel-join"
 	controlAuthorityRetirePath  = "/v1/authority/retire"
 )
 
@@ -493,9 +494,20 @@ type AuthorityProposal struct {
 // Raft group. Node registration follows through the ordinary state machine.
 type AuthorityJoinRequest struct {
 	NodeID       string       `json:"node_id"`
+	Incarnation  string       `json:"incarnation"`
 	RaftAddress  string       `json:"raft_address"`
 	ClusterID    string       `json:"cluster_id"`
 	Capabilities Capabilities `json:"capabilities"`
+}
+
+// AuthorityCancelJoinRequest removes a learner whose daemon failed before it
+// completed topology validation and became ready. It is deliberately scoped
+// to the joining node's exact incarnation and Raft address, so a delayed
+// cancellation cannot remove a successfully admitted or replacement member.
+type AuthorityCancelJoinRequest struct {
+	NodeID      string `json:"node_id"`
+	Incarnation string `json:"incarnation"`
+	RaftAddress string `json:"raft_address"`
 }
 
 type AuthorityRetireRequest struct {
@@ -627,7 +639,7 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if request.NodeID != peer || request.Capabilities.NodeID != request.NodeID {
+		if request.NodeID != peer || request.Capabilities.NodeID != request.NodeID || !transactionIDPattern.MatchString(request.Incarnation) {
 			writeControlError(w, http.StatusForbidden, "joining node ID does not match its client certificate")
 			return
 		}
@@ -651,6 +663,46 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		// the quorum and make the healthy cluster unavailable. The leader's
 		// membership reconciler promotes only admitted ready learners.
 		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID, "raft_address": request.RaftAddress})
+	case controlAuthorityCancelPath:
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority join cancellation requires POST")
+			return
+		}
+		var request AuthorityCancelJoinRequest
+		if err := decodeControlJSON(r.Body, &request); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if request.NodeID != peer || !transactionIDPattern.MatchString(request.Incarnation) {
+			writeControlError(w, http.StatusForbidden, "only the exact joining node may cancel its Raft admission")
+			return
+		}
+		state, err := a.Node.LinearizableState(r.Context())
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if record, ok := state.Nodes[request.NodeID]; ok {
+			if record.Incarnation != request.Incarnation {
+				writeControlError(w, http.StatusConflict, "join cancellation refers to a stale node incarnation")
+				return
+			}
+			if record.State != NodeJoining && record.State != NodeOffline {
+				writeControlError(w, http.StatusConflict, "an admitted node may not cancel its Raft membership")
+				return
+			}
+		}
+		if err := a.Node.CancelNonvoter(r.Context(), request.NodeID, request.RaftAddress); err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]any{"node_id": request.NodeID})
 	case controlAuthorityRetirePath:
 		if r.Method != http.MethodPost {
 			writeControlError(w, http.StatusMethodNotAllowed, "authority retirement requires POST")
@@ -2199,6 +2251,14 @@ func (c *Client) SnapshotReferenceInventory(ctx context.Context) (*SnapshotRefer
 func (c *Client) JoinAuthority(ctx context.Context, request AuthorityJoinRequest) error {
 	var response map[string]any
 	return c.call(ctx, http.MethodPost, controlAuthorityJoinPath, request, &response)
+}
+
+// CancelAuthorityJoin removes this client's own learner after startup failed
+// before admission. Successfully admitted members must use the ordinary
+// offline/drain retirement protocol instead.
+func (c *Client) CancelAuthorityJoin(ctx context.Context, request AuthorityCancelJoinRequest) error {
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlAuthorityCancelPath, request, &response)
 }
 
 // ProbeTopology proves bidirectional control reachability between this

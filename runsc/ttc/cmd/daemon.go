@@ -350,6 +350,7 @@ type daemonClusterRuntime struct {
 	lease             time.Duration
 	clusterID         string
 	recoverMembership func(context.Context) error
+	cancelFreshJoin   func(context.Context) error
 	autoRebalance     bool
 	capacitySink      elasticCapacitySink
 	cpuProfile        daemonCPUProfile
@@ -3380,12 +3381,22 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			clients[peerID] = client
 		}
 	}
+	var cancelFreshJoin func(context.Context) error
 	closeRaft := true
 	defer func() {
 		if closeRaft {
+			if cancelFreshJoin != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = cancelFreshJoin(ctx)
+				cancel()
+			}
 			_ = raftNode.Close()
 		}
 	}()
+	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
+	if err != nil {
+		return nil, err
+	}
 	if raftNode.HadExistingState() {
 		// Keep the Raft listener alive even when this is the first member being
 		// restarted after a whole-cluster outage. Waiting for a leader here and
@@ -3404,7 +3415,19 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	} else {
 		joined := false
 		var joinErr error
-		request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
+		request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
+		cancelRequest := cluster.AuthorityCancelJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address()}
+		cancelFreshJoin = func(ctx context.Context) error {
+			var result error
+			for _, peer := range clients {
+				if err := cancelAuthorityJoinThroughSeed(ctx, peer, cancelRequest, opts.NodeID, opts.AuthToken); err == nil {
+					return nil
+				} else {
+					result = errors.Join(result, err)
+				}
+			}
+			return result
+		}
 		for _, peer := range clients {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			joinErr = joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken)
@@ -3415,9 +3438,14 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			}
 		}
 		if !joined {
-			// No membership change committed. A freshly opened Bolt store still
-			// counts as existing Raft state, so retaining it would make the next
-			// attempt wait forever as a member that was never admitted.
+			// A timeout can lose the successful AddNonvoter response, so cancel
+			// even when no seed acknowledged the join. A freshly opened Bolt
+			// store still counts as existing Raft state; retaining it would make
+			// the next attempt wait forever as a member that was never admitted.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = cancelFreshJoin(ctx)
+			cancel()
+			cancelFreshJoin = nil
 			_ = raftNode.Close()
 			closeRaft = false
 			_ = os.RemoveAll(raftLocalDir)
@@ -3432,10 +3460,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		}
 	}
 	catalog, err := cluster.NewRaftCatalog(raftNode)
-	if err != nil {
-		return nil, err
-	}
-	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -3499,7 +3523,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			if len(clients) == 0 {
 				return errors.New("no cluster seed is configured for Raft membership recovery")
 			}
-			request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
+			request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
 			var result error
 			for _, peer := range clients {
 				if err := joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken); err == nil {
@@ -3510,7 +3534,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			}
 			return result
 		},
-		autoRebalance: opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
+		cancelFreshJoin: cancelFreshJoin,
+		autoRebalance:   opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
 	}, nil
 }
 
@@ -3629,6 +3654,38 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 		}
 	}
 	return errors.New("too many Raft leader redirects while joining cluster")
+}
+
+// cancelAuthorityJoinThroughSeed follows the same leader redirect rules as
+// admission. This path is intentionally available before a node has a catalog
+// record, since that is precisely the failure window it closes.
+func cancelAuthorityJoinThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityCancelJoinRequest, nodeID, authToken string) error {
+	peer := seed
+	seen := make(map[string]bool)
+	for redirects := 0; redirects < 5; redirects++ {
+		err := peer.CancelAuthorityJoin(ctx, request)
+		if err == nil {
+			return nil
+		}
+		var redirect *cluster.AuthorityNotLeaderError
+		if !errors.As(err, &redirect) {
+			return err
+		}
+		if redirect.LeaderControlURL == "" {
+			return fmt.Errorf("cancelling join through a follower that cannot resolve its Raft leader: %w", err)
+		}
+		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
+		if seen[key] {
+			return fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
+		}
+		seen[key] = true
+		var clientErr error
+		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
+		if clientErr != nil {
+			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
+		}
+	}
+	return errors.New("too many Raft leader redirects while cancelling cluster join")
 }
 
 type daemonRaftClusterIdentity struct {
@@ -3873,6 +3930,25 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if clusterRuntime != nil && clusterRuntime.raft != nil {
 		defer clusterRuntime.raft.Close()
 	}
+	// A fresh node first joins Raft as a learner, then commits its execution
+	// identity and proves full-mesh topology before becoming ready. If any
+	// startup step in that window fails, remove the learner after the shutdown
+	// defer has fenced/offlined a possibly committed joining record and before
+	// the local Raft transport closes.
+	cancelFreshJoin := (func(context.Context) error)(nil)
+	if clusterRuntime != nil {
+		cancelFreshJoin = clusterRuntime.cancelFreshJoin
+	}
+	defer func() {
+		if cancelFreshJoin == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := cancelFreshJoin(ctx); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: cancelling incomplete Raft admission: %v\n", err)
+		}
+	}()
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
 		return err
@@ -4155,6 +4231,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 					return fmt.Errorf("marking elastic cluster node pressured: %w", err)
 				}
 			}
+			// The exact incarnation is now admitted. From here ordinary offline,
+			// drain, lease expiry, and Raft reconciliation own its lifecycle.
+			cancelFreshJoin = nil
 			elasticRecord = ready
 			// Origin abandonment is an execution-authority mutation and is not
 			// permitted while the node is joining. Reconcile only after the

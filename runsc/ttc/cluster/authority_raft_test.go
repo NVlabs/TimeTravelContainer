@@ -335,6 +335,59 @@ func TestAuthorityRaftPromotesOnlyReadyLearner(t *testing.T) {
 	t.Fatal("ready learner disappeared from configuration")
 }
 
+func TestAuthorityRaftCancelsOnlyExactNonvoter(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	open := func(id string, bootstrap bool) *AuthorityRaftNode {
+		t.Helper()
+		node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+			NodeID: id, LocalDir: filepath.Join(t.TempDir(), "raft"),
+			ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+			ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: bootstrap,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return node
+	}
+	a, b := open("node-a", true), open("node-b", false)
+	defer a.Close()
+	defer b.Close()
+	leader := waitAuthorityLeader(t, a)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.CancelNonvoter(ctx, b.id, "127.0.0.1:1"); err == nil {
+		t.Fatal("stale learner address cancelled current admission")
+	}
+	if err := leader.CancelNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := leader.Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range configuration.Servers {
+		if server.ID == raft.ServerID(b.id) {
+			t.Fatalf("cancelled learner remains in Raft configuration: %+v", server)
+		}
+	}
+	// Retrying cleanup after a lost response is intentionally idempotent.
+	if err := leader.CancelNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatalf("retrying cancellation: %v", err)
+	}
+	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.Promote(ctx, b.id, b.Address()); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.CancelNonvoter(ctx, b.id, b.Address()); err == nil {
+		t.Fatal("voter was removed through learner cancellation")
+	}
+}
+
 func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) {
 	serverTLS, clientTLS := newAuthorityRaftTLS(t)
 	open := func(id string, bootstrap bool) *AuthorityRaftNode {

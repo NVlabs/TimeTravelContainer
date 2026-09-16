@@ -655,6 +655,38 @@ func (n *AuthorityRaftNode) AddNonvoter(ctx context.Context, id, address string)
 	return n.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
 }
 
+// CancelNonvoter removes an exact learner admission. It never removes a voter
+// and never follows an ID that has since moved to another address, which makes
+// delayed startup cleanup safe after node-name reuse.
+func (n *AuthorityRaftNode) CancelNonvoter(ctx context.Context, id, address string) error {
+	if !n.IsLeader() {
+		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
+	}
+	if !transactionIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid Raft member ID %q", id)
+	}
+	if err := validateRaftServerAddress(address); err != nil {
+		return err
+	}
+	configuration, err := n.Configuration()
+	if err != nil {
+		return err
+	}
+	for _, server := range configuration.Servers {
+		if string(server.ID) != id {
+			continue
+		}
+		if string(server.Address) != address {
+			return fmt.Errorf("Raft member %q now uses address %q, not stale join address %q", id, server.Address, address)
+		}
+		if server.Suffrage != raft.Nonvoter {
+			return fmt.Errorf("Raft member %q is already a voter", id)
+		}
+		return n.raft.RemoveServer(server.ID, 0, n.contextTimeout(ctx)).Error()
+	}
+	return nil
+}
+
 // Promote promotes a caught-up learner to a voter.
 func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) error {
 	if !n.IsLeader() {
