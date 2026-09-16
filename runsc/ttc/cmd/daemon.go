@@ -508,26 +508,22 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		// Shared container metadata describes the whole logical family and may
 		// retain a former owner after migration. Reuse only a physical Sentry
 		// that Raft currently places on this node; otherwise create an isolated
-		// transaction-scoped target. This prevents a remote fork from racing the
-		// teardown of an old migration source on the destination node.
+		// transaction-scoped target. This applies equally to forks and migrations:
+		// creating a second Sentry when a sibling already lives on the destination
+		// duplicates the family's virtual NIC identity and breaks both runtimes.
+		// A stale migration source is not reusable because it has no active local
+		// placement after cutover.
 		targetName = tx.Identity.TransactionID
 		targetID = tx.Identity.TransactionID
-		if !tx.Identity.Migration {
-			records, listErr := r.authority.Placements().List()
-			if listErr != nil {
-				return fmt.Errorf("selecting distributed target runtime: %w", listErr)
-			}
-			for _, record := range records {
-				if record.FamilyID != tx.Identity.TargetContainer || record.OwnerNode != r.nodeID ||
-					(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) || record.PhysicalContainer == "" {
-					continue
-				}
-				if targetID == "" && targetName != record.PhysicalContainer {
-					return fmt.Errorf("family %q has multiple physical runtimes on node %q", record.FamilyID, r.nodeID)
-				}
-				targetName = record.PhysicalContainer
-				targetID = ""
-			}
+		records, listErr := r.authority.Placements().List()
+		if listErr != nil {
+			return fmt.Errorf("selecting distributed target runtime: %w", listErr)
+		}
+		if physical, found, selectErr := reusablePhysicalTarget(records, tx.Identity.TargetContainer, r.nodeID); selectErr != nil {
+			return selectErr
+		} else if found {
+			targetName = physical
+			targetID = ""
 		}
 	}
 	defer r.lockTarget(tx.Identity.TargetContainer)()
@@ -540,6 +536,24 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 		Source: &source, Spec: &spec, TargetID: targetID,
 	})
 	return err
+}
+
+// reusablePhysicalTarget returns the single active physical Sentry for family
+// on node. Placement is the authority here: transaction-scoped remnants from
+// an earlier migration are deliberately invisible and therefore never reused.
+func reusablePhysicalTarget(records []cluster.PlacementRecord, family, node string) (string, bool, error) {
+	var physical string
+	for _, record := range records {
+		if record.FamilyID != family || record.OwnerNode != node ||
+			(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) || record.PhysicalContainer == "" {
+			continue
+		}
+		if physical != "" && physical != record.PhysicalContainer {
+			return "", false, fmt.Errorf("family %q has multiple physical runtimes on node %q", family, node)
+		}
+		physical = record.PhysicalContainer
+	}
+	return physical, physical != "", nil
 }
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {

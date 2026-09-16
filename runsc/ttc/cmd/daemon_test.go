@@ -71,6 +71,25 @@ func TestDependencyMonitorIntervalBoundsAggregatePolling(t *testing.T) {
 	}
 }
 
+func TestReusablePhysicalTarget(t *testing.T) {
+	records := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "source", OwnerNode: "source-node", PhysicalContainer: "source-runtime", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "sibling", OwnerNode: "target-node", PhysicalContainer: "target-runtime", State: cluster.PlacementPaused},
+		{FamilyID: "other", BranchID: "main", OwnerNode: "target-node", PhysicalContainer: "other-runtime", State: cluster.PlacementRunning},
+	}
+	got, found, err := reusablePhysicalTarget(records, "family", "target-node")
+	if err != nil || !found || got != "target-runtime" {
+		t.Fatalf("reusablePhysicalTarget=%q,%t,%v, want target-runtime,true,nil", got, found, err)
+	}
+
+	records = append(records, cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "split", OwnerNode: "target-node", PhysicalContainer: "second-runtime", State: cluster.PlacementRunning,
+	})
+	if _, _, err := reusablePhysicalTarget(records, "family", "target-node"); err == nil {
+		t.Fatal("reusablePhysicalTarget accepted multiple physical runtimes")
+	}
+}
+
 func TestDependencyMonitorPollAdmissionIsNonBlocking(t *testing.T) {
 	runtime := &daemonTargetRuntime{}
 	releases := make([]func(), 0, dependencyMonitorConcurrency)
