@@ -495,6 +495,7 @@ func advanceGraphReferenceRelease(path string, intent *graphReferenceIntent, mut
 }
 
 func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent graphReferenceIntent, group graphReferenceGroup, retain bool) error {
+	transaction := graphReferenceAuthorizationTransaction(intent)
 	current, volatile, err := b.distributedSource.authority.SnapshotProvider(group.Origin)
 	if err != nil {
 		if !retain && errors.Is(err, os.ErrNotExist) {
@@ -528,9 +529,9 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 			return err
 		}
 		if retain {
-			return peer.RetainSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+			return peer.RetainSnapshotRoots(ctx, group.Origin, transaction, intent.Operation, group.Roots)
 		}
-		return peer.ReleaseSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+		return peer.ReleaseSnapshotRoots(ctx, group.Origin, transaction, intent.Operation, group.Roots)
 	}
 	if group.Provider == "" || current.NodeID != group.Provider {
 		return fmt.Errorf("snapshot origin %d provider changed from %q to %q without shared publication", group.Origin, group.Provider, current.NodeID)
@@ -550,9 +551,26 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 		return err
 	}
 	if retain {
-		return peer.RetainSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+		return peer.RetainSnapshotRoots(ctx, group.Origin, transaction, intent.Operation, group.Roots)
 	}
-	return peer.ReleaseSnapshotRoots(ctx, group.Origin, intent.Transaction, intent.Operation, group.Roots)
+	return peer.ReleaseSnapshotRoots(ctx, group.Origin, transaction, intent.Operation, group.Roots)
+}
+
+// graphReferenceAuthorizationTransaction distinguishes the transaction-owned
+// reference installed while importing a remote branch from descendant branch
+// references created later. A local fork inherits immutable roots and may
+// outlive or move away from the original transaction's target node; requiring
+// that old transaction to authorize every descendant makes behavior depend on
+// which node currently holds the disposable shared-reference coordinator.
+// Descendant operations have fresh, unguessable operation identities and can
+// mutate only their exact retained root names, so cluster membership and the
+// immutable object bindings are their authority. Transfer intents remain
+// transaction-fenced even though their operation carries a prefix.
+func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string {
+	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction {
+		return ""
+	}
+	return intent.Transaction
 }
 
 // releaseSharedGraphMemoryRoots releases the canonical roots captured for the

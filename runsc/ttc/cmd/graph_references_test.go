@@ -54,6 +54,41 @@ func TestSnapshotReferenceRequesterAuthorization(t *testing.T) {
 	}
 }
 
+func TestGraphReferenceAuthorizationTransaction(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		intent graphReferenceIntent
+		want   string
+	}{
+		{
+			name: "remote import",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeBranch, Transaction: "fork-1", Operation: "fork-1",
+			},
+			want: "fork-1",
+		},
+		{
+			name: "local descendant",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeBranch, Transaction: "fork-1", Operation: "branch-2",
+			},
+		},
+		{
+			name: "migration transfer",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeTransfer, Transaction: "fork-1", Operation: "transfer-fork-1",
+			},
+			want: "fork-1",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := graphReferenceAuthorizationTransaction(test.intent); got != test.want {
+				t.Fatalf("authorization transaction=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestGraphReferenceOperationIsBranchScoped(t *testing.T) {
 	info := ttcbundle.ContainerInfo{DistributedForkTransactionID: "family-transaction"}
 	initial := ttcbundle.BranchInfo{ID: "remote"}
