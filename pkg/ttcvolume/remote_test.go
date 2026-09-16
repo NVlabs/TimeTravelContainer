@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -214,6 +215,79 @@ func TestMaterializationHookMayEnterRepositoryMutation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("source stream remained open after target materialization")
 	}
+}
+
+func TestRemoteFetchDoesNotHoldBranchViewLock(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("remote data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	imported, err := target.Inode("imported", ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the provider lock so EnsureDataRange reaches the bulk-transfer
+	// boundary but cannot complete. Repository mutation must remain possible in
+	// this state; runtime invalidation hooks may need exactly that ordering.
+	target.remoteMu.Lock()
+	remote := target.remoteByObject[imported.Object]
+	if remote == nil {
+		target.remoteMu.Unlock()
+		t.Fatal("imported object has no remote provider")
+	}
+	remote.mu.Lock()
+	target.remoteMu.Unlock()
+
+	readDone := make(chan error, 1)
+	go func() { readDone <- target.EnsureDataRange("imported", ino, 0, 1) }()
+	// Give the reader several scheduling turns to reach remote.mu. The assertion
+	// below is bounded and cleanup always releases the artificial barrier.
+	for i := 0; i < 20; i++ {
+		runtime.Gosched()
+		time.Sleep(time.Millisecond)
+	}
+	mutationDone := make(chan error, 1)
+	go func() { mutationDone <- target.withLock(func() error { return nil }) }()
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			remote.mu.Unlock()
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		remote.mu.Unlock()
+		<-readDone
+		t.Fatal("remote fetch retained the branch view lock while waiting for its provider")
+	}
+	remote.mu.Unlock()
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+	finishTestRemote(t, target, serverErr)
 }
 
 func TestRemoteDescriptorReadsCatalogAndFilesFromSharedPacks(t *testing.T) {

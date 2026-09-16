@@ -734,17 +734,35 @@ func (r *Repository) EnsureDataRange(branchID string, ino uint64, offset, length
 	if offset < 0 || length < 0 {
 		return os.ErrInvalid
 	}
-	r.viewMu.RLock()
-	defer r.viewMu.RUnlock()
-	branch, err := r.readBranch(branchID)
-	if err != nil {
+	// Resolve the immutable object while the branch view is stable, but never
+	// retain viewMu while fetching it. A fetch serializes on the remote client
+	// and invokes runtime cache-invalidation hooks. Guest writes take those
+	// runtime locks before entering a repository mutation (and therefore before
+	// taking viewMu for writing), so blocking on the remote client under the
+	// read lock creates a three-way inversion with an eager materializer:
+	//
+	//   guest read:       viewMu.RLock -> remote client
+	//   materializer:     remote client -> runtime file lock
+	//   guest write:      runtime file lock -> viewMu.Lock
+	//
+	// Object IDs and their lengths are immutable. remote.users, acquired by
+	// ensureObjectRange, pins the selected provider after this metadata lookup,
+	// so the bulk transfer needs no branch-view lock.
+	var inode Inode
+	err := func() error {
+		r.viewMu.RLock()
+		defer r.viewMu.RUnlock()
+		branch, err := r.readBranch(branchID)
+		if err != nil {
+			return err
+		}
+		state, err := r.metadataForBranch(branch)
+		if err != nil {
+			return err
+		}
+		inode, err = r.metadataInode(state, ino)
 		return err
-	}
-	state, err := r.metadataForBranch(branch)
-	if err != nil {
-		return err
-	}
-	inode, err := r.metadataInode(state, ino)
+	}()
 	if err != nil {
 		return err
 	}
