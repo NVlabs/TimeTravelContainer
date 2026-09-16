@@ -424,6 +424,11 @@ func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	if ready.CandidateRoots.MemorySnapshot != 7 {
 		t.Fatalf("capture-ready publication did not fence snapshot 7: %+v", ready)
 	}
+	branchKey := logicalBranchKey("family", "main")
+	withRoots := state.Branches[branchKey]
+	withRoots.Roots = DurableRoots{MemorySnapshot: 7, FilesystemRoot: "snapshots/7/filesystem.manifest"}
+	withRoots.VolatileDependencies = []VolatileDependency{{TransactionID: "migration-1", SourceNode: "node-a", SourceIncarnation: "incarnation-a"}}
+	state.Branches[branchKey] = withRoots
 	applyAuthorityForTest(t, state, "corrupt", at.Add(3*time.Second), AuthorityBranchCorrupt, AuthorityPublicationPayload{
 		Family: "family", Branch: "main", BranchGeneration: created.Generation, Failure: "authoritative node-local state was lost",
 	})
@@ -434,12 +439,39 @@ func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	if result := state.Apply(late); result.Err() == nil {
 		t.Fatal("late publisher resurrected corrupted branch")
 	}
-	branch := state.Branches[logicalBranchKey("family", "main")]
-	if !branch.Corrupted || branch.Roots.MemoryRoot != "" {
+	branch := state.Branches[branchKey]
+	if !branch.Corrupted || branch.Roots != (DurableRoots{}) || len(branch.VolatileDependencies) != 0 {
 		t.Fatalf("corrupted branch was changed: %+v", branch)
 	}
 	if placement := state.Placements[logicalBranchKey("family", "main")]; placement.State != PlacementCorrupted {
 		t.Fatalf("corrupted branch retained placement state %+v", placement)
+	}
+}
+
+func TestRestoreNormalizesLegacyCorruptedRoots(t *testing.T) {
+	at := time.Unix(3250, 0).UTC()
+	state := NewAuthorityState()
+	state.NextSnapshotID = 8
+	state.NextSharedGCGeneration = 2
+	state.RetiredOrigins[7] = SharedPackRetirement{SnapshotID: 7, GCGeneration: 1, RetiredAt: at}
+	key := logicalBranchKey("family", "main")
+	state.Branches[key] = BranchAuthority{
+		FamilyID: "family", BranchID: "main", Generation: 2, Lifecycle: "corrupted",
+		Corrupted: true, CorruptionReason: "provider lost", UpdatedAt: at,
+		Roots:                DurableRoots{MemorySnapshot: 7, FilesystemRoot: "snapshots/7/filesystem.manifest"},
+		VolatileDependencies: []VolatileDependency{{TransactionID: "old-transaction", SourceNode: "old-node", SourceIncarnation: "old-incarnation"}},
+	}
+	data, err := state.SnapshotBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := RestoreAuthorityState(data)
+	if err != nil {
+		t.Fatalf("RestoreAuthorityState rejected removable corrupted metadata: %v", err)
+	}
+	branch := restored.Branches[key]
+	if branch.Roots != (DurableRoots{}) || len(branch.VolatileDependencies) != 0 {
+		t.Fatalf("legacy corrupted references survived restore: %+v", branch)
 	}
 }
 

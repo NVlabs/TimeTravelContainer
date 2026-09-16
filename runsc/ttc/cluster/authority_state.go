@@ -1912,6 +1912,13 @@ func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) B
 	}
 	branch.Corrupted, branch.CorruptionReason, branch.Lifecycle = true, reason, "corrupted"
 	branch.PublicationID = ""
+	// Corrupted is terminal except for removal. Its former roots must no longer
+	// pin shared objects or participate in provider recovery; those objects may
+	// be retired immediately. Keeping the stale roots makes a later Raft
+	// snapshot invalid as soon as shared GC performs that permitted retirement,
+	// which can take every daemon offline while trying to restore the state.
+	branch.Roots = DurableRoots{}
+	branch.VolatileDependencies = nil
 	branch.Generation++
 	branch.UpdatedAt = at
 	s.Branches[key] = branch
@@ -1981,6 +1988,15 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 		}
 		if branch.Corrupted != (branch.Lifecycle == "corrupted") || (branch.Corrupted && branch.CorruptionReason == "") {
 			return nil, errors.New("authority snapshot has inconsistent branch corruption state")
+		}
+		// Format-5 snapshots created before corrupted roots were cleared may
+		// contain roots whose objects shared GC has already retired. Corrupted
+		// branches support only removal, so normalize those dead references
+		// instead of making the whole cluster unrestorable.
+		if branch.Corrupted {
+			branch.Roots = DurableRoots{}
+			branch.VolatileDependencies = nil
+			state.Branches[key] = branch
 		}
 		if branch.Roots != (DurableRoots{}) {
 			if err := validateDurableRoots(branch.Roots); err != nil {
