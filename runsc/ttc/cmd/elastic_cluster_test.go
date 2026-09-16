@@ -289,7 +289,9 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 	info := ttcbundle.ContainerInfo{
 		ID: "web", Name: "web", NodeID: "node-b", BundleDir: bundleDir,
-		Branches: []ttcbundle.BranchInfo{{ID: "main", Unplaced: true, State: "dehydrated", CreatedAt: time.Unix(1, 0).UTC()}},
+		// Model the short interval after Raft publication unplaced the branch but
+		// before the derived shared container record cleared its old owner.
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-old", State: "dehydrated", CreatedAt: time.Unix(1, 0).UTC()}},
 	}
 	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
 		t.Fatal(err)

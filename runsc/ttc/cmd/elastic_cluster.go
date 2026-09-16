@@ -908,7 +908,17 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		if err != nil {
 			return fmt.Errorf("claiming cold-branch placement for %s: %w", target, err)
 		}
-		if err := store.CompareAndSwapBranchNodeID(info.ID, resolved.branch, "", node.NodeID); err != nil {
+		// Raft publication atomically unplaces the branch before its derived
+		// shared catalog is rewritten. Read and replace that exact stale value;
+		// requiring an already-empty NodeID introduces a window in which the
+		// authoritative claim succeeds but materialization cannot start.
+		persistent, loadErr := store.LoadRuntimeContainer(info.ID)
+		if loadErr != nil {
+			_, _ = placements.Unplace(familyID, target.branch, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
+			return fmt.Errorf("loading cold-branch metadata for %s: %w", target, loadErr)
+		}
+		expectedOwner := persistent.BranchNodeID(resolved.branch)
+		if err := store.CompareAndSwapBranchNodeID(info.ID, resolved.branch, expectedOwner, node.NodeID); err != nil {
 			_, releaseErr := placements.Unplace(familyID, target.branch, node.NodeID, node.Incarnation, claimed.Generation, time.Now())
 			if releaseErr != nil {
 				return fmt.Errorf("recording cold-branch owner for %s: %w; releasing placement also failed: %v", target, err, releaseErr)
