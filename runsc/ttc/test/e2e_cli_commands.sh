@@ -157,6 +157,12 @@ ttc wait "$RESTORED@main" >/dev/null
 ttc rm --force "$RESTORED"
 ttc rm --force "$NAME"
 ttc volume rm "$VOLUME"
+# Exercise the Docker-compatible top-level alias independently of `image rm`.
+# The dedicated test root has no remaining family references at this point.
+ttc rmi "$IMAGE" >/dev/null
+if ttc images --json | grep -q 'busybox'; then
+	fail "rmi left the removed image in inventory"
+fi
 ttc daemon stop >/dev/null
 
 echo "TTC client-local and standalone CLI command matrix passed"

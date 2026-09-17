@@ -140,6 +140,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts two compute daemons plus an outbound-only
+# login-node gateway, and binds a host port to test placement-aware routing.
+sh_binary(
+    name = "e2e_control_only",
+    srcs = ["e2e_control_only.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual multi-daemon pressure/rebalance qualification. It intentionally
 # allocates hundreds of MiB and performs live migrations.
 sh_binary(

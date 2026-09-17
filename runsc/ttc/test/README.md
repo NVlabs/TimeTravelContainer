@@ -171,6 +171,12 @@ remain executable. The test also verifies that removal is still available for
 the corrupted branch and reaps every process in the failed node's private test
 root.
 
+`e2e_control_only.sh` starts two compute nodes and an outbound-only login-node
+gateway. Every pull, run, exec, fork, migration, inventory, and port command is
+issued through the gateway. The test verifies that the gateway never enters
+placement inventory, transaction-private branches remain hidden, and a host
+listener transparently follows its branch between remote compute owners.
+
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTC's runsc arguments, daemon namespace preflight,
