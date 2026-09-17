@@ -6122,8 +6122,26 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 		logical = exact
 	}
 	if branch, err := persistentBranchInfo(logical, branchID); err == nil {
-		if publicationID == "" || (branch.PublicationID == publicationID && branch.StorageManifest != "") {
+		if publicationID == "" || (branch.PublicationID == publicationID && (branch.StorageManifest != "" ||
+			(branch.NodeID == b.nodeID && (branch.StorageState == "local" || branch.StorageState == "publishing")))) {
 			return logical, branchID, nil
+		}
+	}
+	// Once Raft commits publication, its filesystem root is the canonical
+	// ancestry-independent locator. Following the manifest avoids an NFS
+	// directory scan and disambiguates stale physical incarnations left by
+	// repeated migrations. It also closes the cutover race where placement is
+	// already unplaced but the derived container record is still being updated.
+	if publicationID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
+		if authority, err := b.distributedSource.authority.Branch(logicalID, branchID); err == nil &&
+			authority.PublicationID == publicationID && authority.Roots.FilesystemRoot != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			physical, physicalBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), logicalID, branchID, *authority)
+			cancel()
+			if waitErr != nil {
+				return ttcbundle.ContainerInfo{}, "", waitErr
+			}
+			return physical, physicalBranch.ID, nil
 		}
 	}
 	containers, err := b.containerStore().ListContainersForPlacement()
