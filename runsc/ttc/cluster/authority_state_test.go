@@ -623,6 +623,74 @@ func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	}
 }
 
+func TestAuthorityCorruptionSettlesVolatileTransactionClosure(t *testing.T) {
+	at := time.Unix(3200, 0).UTC()
+	newState := func() *AuthorityState {
+		state := NewAuthorityState()
+		state.Transactions["fork-1"] = Transaction{
+			Identity: ForkIdentity{
+				TransactionID: "fork-1", SourceContainer: "source", SourceBranch: "main",
+				TargetContainer: "target", TargetBranch: "hidden", TargetVisibleBranch: "main",
+			},
+			State: TransactionPublished, SourceNeeded: true, Revision: 7,
+			CreatedAt: at, UpdatedAt: at,
+		}
+		for _, identity := range [][2]string{{"source", "main"}, {"target", "main"}, {"target", "child"}} {
+			key := logicalBranchKey(identity[0], identity[1])
+			state.Branches[key] = BranchAuthority{
+				FamilyID: identity[0], BranchID: identity[1], Generation: 1,
+				Lifecycle: "running", UpdatedAt: at,
+			}
+			state.Placements[key] = PlacementRecord{
+				FamilyID: identity[0], BranchID: identity[1], Generation: 1,
+				State: PlacementRunning, Revision: 1, UpdatedAt: at,
+			}
+		}
+		dependency := VolatileDependency{TransactionID: "fork-1", SourceNode: "source-node", SourceIncarnation: "source-incarnation"}
+		main := state.Branches[logicalBranchKey("target", "main")]
+		main.VolatileDependencies = []VolatileDependency{dependency}
+		state.Branches[logicalBranchKey("target", "main")] = main
+		child := state.Branches[logicalBranchKey("target", "child")]
+		child.VolatileDependencies = []VolatileDependency{dependency}
+		state.Branches[logicalBranchKey("target", "child")] = child
+		return state
+	}
+
+	t.Run("target keeps transaction for healthy descendant", func(t *testing.T) {
+		state := newState()
+		applyAuthorityForTest(t, state, "corrupt-target", at.Add(time.Second), AuthorityBranchCorrupt, AuthorityPublicationPayload{
+			Family: "target", Branch: "main", BranchGeneration: 1, Failure: "target runtime exited",
+		})
+		if tx := state.Transactions["fork-1"]; tx.State != TransactionPublished || !tx.SourceNeeded {
+			t.Fatalf("healthy descendant lost source transaction: %+v", tx)
+		}
+		if child := state.Branches[logicalBranchKey("target", "child")]; child.Corrupted {
+			t.Fatalf("healthy descendant was corrupted: %+v", child)
+		}
+		applyAuthorityForTest(t, state, "corrupt-child", at.Add(2*time.Second), AuthorityBranchCorrupt, AuthorityPublicationPayload{
+			Family: "target", Branch: "child", BranchGeneration: 1, Failure: "target family exited",
+		})
+		if tx := state.Transactions["fork-1"]; tx.State != TransactionFailed || tx.SourceNeeded {
+			t.Fatalf("unreferenced target transaction remained live: %+v", tx)
+		}
+	})
+
+	t.Run("source loss corrupts exact dependent closure", func(t *testing.T) {
+		state := newState()
+		applyAuthorityForTest(t, state, "corrupt-source", at.Add(time.Second), AuthorityBranchCorrupt, AuthorityPublicationPayload{
+			Family: "source", Branch: "main", BranchGeneration: 1, Failure: "source runtime exited",
+		})
+		for _, key := range []string{logicalBranchKey("source", "main"), logicalBranchKey("target", "main"), logicalBranchKey("target", "child")} {
+			if branch := state.Branches[key]; !branch.Corrupted {
+				t.Fatalf("dependency closure retained branch %q: %+v", key, branch)
+			}
+		}
+		if tx := state.Transactions["fork-1"]; tx.State != TransactionFailed || tx.SourceNeeded {
+			t.Fatalf("source-loss transaction remained live: %+v", tx)
+		}
+	})
+}
+
 func TestRestoreNormalizesLegacyCorruptedRoots(t *testing.T) {
 	at := time.Unix(3250, 0).UTC()
 	state := NewAuthorityState()

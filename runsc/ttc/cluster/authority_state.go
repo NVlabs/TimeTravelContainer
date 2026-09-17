@@ -2160,7 +2160,10 @@ func (s *AuthorityState) applyBranch(command AuthorityCommand) (json.RawMessage,
 		if p.Failure == "" {
 			return nil, errors.New("corruption requires a reason")
 		}
-		branch = s.markBranchCorrupted(key, p.Failure, command.IssuedAt)
+		branch, err = s.corruptBranchClosure(key, p.Failure, command.IssuedAt)
+		if err != nil {
+			return nil, err
+		}
 		return authorityValue(branch)
 	case AuthorityBranchDiscardMemory:
 		placement, ok := s.Placements[key]
@@ -2214,6 +2217,95 @@ func (s *AuthorityState) applyBranch(command AuthorityCommand) (json.RawMessage,
 		return nil, nil
 	}
 	return nil, errors.New("invalid branch command")
+}
+
+// corruptBranchClosure fences a branch and resolves distributed transactions
+// whose volatile state can no longer be completed. A failed target does not
+// automatically retire a transaction while a healthy descendant still uses
+// the same source session. Losing the source branch is different: every
+// branch backed by that transaction has lost its only volatile authority and
+// is corrupted in the same Raft entry.
+func (s *AuthorityState) corruptBranchClosure(initialKey, reason string, at time.Time) (BranchAuthority, error) {
+	queue := []string{initialKey}
+	seen := make(map[string]struct{})
+	// sourceLost distinguishes a dead provider from a dead consumer. A dead
+	// consumer may share its transaction with surviving locally-forked peers.
+	candidates := make(map[string]bool)
+	for len(queue) != 0 {
+		key := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		branch, ok := s.Branches[key]
+		if !ok {
+			continue
+		}
+		for _, dependency := range branch.VolatileDependencies {
+			if dependency.TransactionID != "" {
+				if _, ok := candidates[dependency.TransactionID]; !ok {
+					candidates[dependency.TransactionID] = false
+				}
+			}
+		}
+		for id, tx := range s.Transactions {
+			if tx.Terminal() {
+				continue
+			}
+			sourceKey := logicalBranchKey(tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+			targetKey := logicalBranchKey(tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch())
+			if sourceKey == key {
+				candidates[id] = true
+				for dependentKey, dependent := range s.Branches {
+					if branchHasVolatileDependency(dependent, id) {
+						queue = append(queue, dependentKey)
+					}
+				}
+			} else if targetKey == key {
+				if _, ok := candidates[id]; !ok {
+					candidates[id] = false
+				}
+			}
+		}
+		s.markBranchCorrupted(key, reason, at)
+	}
+	for id, sourceLost := range candidates {
+		tx, ok := s.Transactions[id]
+		if !ok || tx.Terminal() {
+			continue
+		}
+		if !sourceLost {
+			referenced := false
+			for _, branch := range s.Branches {
+				if !branch.Corrupted && branchHasVolatileDependency(branch, id) {
+					referenced = true
+					break
+				}
+			}
+			if referenced {
+				continue
+			}
+		}
+		if err := tx.Advance(TransactionFailed, reason, at); err != nil {
+			return BranchAuthority{}, fmt.Errorf("failing transaction %q after branch corruption: %w", id, err)
+		}
+		s.Transactions[id] = tx
+	}
+	branch, ok := s.Branches[initialKey]
+	if !ok {
+		return BranchAuthority{}, os.ErrNotExist
+	}
+	return branch, nil
+}
+
+func branchHasVolatileDependency(branch BranchAuthority, transactionID string) bool {
+	for _, dependency := range branch.VolatileDependencies {
+		if dependency.TransactionID == transactionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *AuthorityState) markBranchCorrupted(key, reason string, at time.Time) BranchAuthority {
