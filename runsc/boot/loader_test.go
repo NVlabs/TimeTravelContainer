@@ -835,6 +835,16 @@ func TestRestoredExecSessionsRetainsExitedMetadata(t *testing.T) {
 	if status != uint32(linux.WaitStatusExit(7)) {
 		t.Fatal("restored exit status aliases serialized metadata")
 	}
+
+	// A remote restore installs both running and completed records, then asks
+	// the family to start watchers for the resulting map. Completed records
+	// have no ThreadGroup and must remain passive retained metadata.
+	family := &SandboxFamily{}
+	family.watchExecSession("branch", "finished", session)
+	time.Sleep(10 * time.Millisecond)
+	if session.info.State != ExecSessionExited || session.info.ExitStatus == nil || *session.info.ExitStatus != 99 {
+		t.Fatalf("watching completed session changed metadata: %+v", session.info)
+	}
 }
 
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.

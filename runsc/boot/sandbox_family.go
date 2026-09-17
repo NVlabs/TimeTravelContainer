@@ -1691,9 +1691,17 @@ func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kern
 }
 
 func (f *SandboxFamily) watchExecSession(branchID, id string, session *execSession) {
+	// Completed sessions are deliberately retained so clients can inspect their
+	// status and output after a fork, checkpoint restore, or remote import. They
+	// have no live ThreadGroup to watch. In particular, restorePeer installs
+	// both running and completed session records before starting watchers.
+	if session == nil || session.info.State != ExecSessionRunning || session.tg == nil {
+		return
+	}
+	tg := session.tg
 	go func() {
-		session.tg.WaitExited()
-		status := uint32(session.tg.ExitStatus())
+		tg.WaitExited()
+		status := uint32(tg.ExitStatus())
 		f.mu.Lock()
 		if branch := f.branches[branchID]; branch != nil && branch.execSessions[id] == session {
 			session.info.State = ExecSessionExited
