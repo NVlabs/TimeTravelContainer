@@ -181,6 +181,33 @@ func TestDistributedConsoleLogRelay(t *testing.T) {
 	}
 }
 
+func TestApplyColdFilesystemRestoreIDs(t *testing.T) {
+	roots := []cluster.FilesystemRootDescriptor{
+		{Source: "/run/ttc/rootfs-upper", RepositoryID: "cache-rootfs", RestoreID: "cache-rootfs"},
+		{Source: "/run/ttc/volume-data", RepositoryID: "cache-data", RestoreID: "cache-data"},
+	}
+	cold := []coldFilesystemSnapshot{
+		{Root: cluster.FilesystemRootDescriptor{Source: "/run/ttc/volume-data", RestoreID: "captured-data"}},
+		{Root: cluster.FilesystemRootDescriptor{Source: "/run/ttc/rootfs-upper", RestoreID: "captured-rootfs"}},
+	}
+	if err := applyColdFilesystemRestoreIDs(roots, cold); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "captured-rootfs"; got != want {
+		t.Fatalf("rootfs restore ID=%q, want %q", got, want)
+	}
+	if got, want := roots[1].RestoreID, "captured-data"; got != want {
+		t.Fatalf("data restore ID=%q, want %q", got, want)
+	}
+	if err := applyColdFilesystemRestoreIDs(roots[:1], cold); err == nil || !strings.Contains(err.Error(), "unmatched") {
+		t.Fatalf("unmatched cold filesystem error=%v", err)
+	}
+	duplicate := append(append([]coldFilesystemSnapshot(nil), cold...), cold[0])
+	if err := applyColdFilesystemRestoreIDs(roots, duplicate); err == nil || !strings.Contains(err.Error(), "repeats") {
+		t.Fatalf("duplicate cold filesystem error=%v", err)
+	}
+}
+
 func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
 	info := input
 	info.Branches = append([]ttcbundle.BranchInfo(nil), input.Branches...)

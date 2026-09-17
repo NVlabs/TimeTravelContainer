@@ -2305,9 +2305,29 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	}
 	wasRunning := b.state == BranchRunning
 	b.state = BranchDehydrating
+	// The Loader bookkeeping role must remain attached to a process-backed
+	// Kernel while any hydrated peer survives. Otherwise releasing the current
+	// loader below makes Loader.WaitForExit tear down the Sentry and strands all
+	// sibling branches even though dehydration was requested for only one of
+	// them.
+	var loaderKernel *kernel.Kernel
+	var loaderWatchdog *watchdog.Watchdog
+	loaderChanged := id == f.loaderBranchID
+	if loaderChanged {
+		if replacement := f.liveLoaderReplacementLocked(id); replacement != nil {
+			f.loaderBranchID = replacement.id
+			loaderKernel = replacement.k
+			loaderWatchdog = replacement.watchdog
+		} else {
+			loaderChanged = false
+		}
+	}
 	f.stateChanged.Broadcast()
 	k := b.k
 	f.mu.Unlock()
+	if loaderChanged && f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
+	}
 
 	f.cancelConsoleWaits(b)
 	if wasRunning {

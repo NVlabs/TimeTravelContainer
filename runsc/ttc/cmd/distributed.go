@@ -1090,6 +1090,36 @@ func (b *runtimeBackend) configureRemoteExecConsoleLogs(relay *distributedPageRe
 	return descriptors, nil
 }
 
+// applyColdFilesystemRestoreIDs preserves the repository identities encoded in
+// a process-free kernel snapshot. A cold branch may be materialized into a new
+// node-local repository before it is forked remotely; that cache repository
+// provides the graph objects, but the saved filesystem still names the
+// repository that was active at dehydration time.
+func applyColdFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, filesystems []coldFilesystemSnapshot) error {
+	bySource := make(map[string]string, len(filesystems))
+	for _, filesystem := range filesystems {
+		if filesystem.Root.Source == "" || filesystem.Root.RestoreID == "" {
+			return errors.New("cold filesystem snapshot omits source or restore identity")
+		}
+		if _, ok := bySource[filesystem.Root.Source]; ok {
+			return fmt.Errorf("cold filesystem snapshot repeats source %q", filesystem.Root.Source)
+		}
+		bySource[filesystem.Root.Source] = filesystem.Root.RestoreID
+	}
+	for i := range roots {
+		restoreID, ok := bySource[roots[i].Source]
+		if !ok {
+			return fmt.Errorf("cold filesystem snapshot omits repository %q", roots[i].Source)
+		}
+		roots[i].RestoreID = restoreID
+		delete(bySource, roots[i].Source)
+	}
+	if len(bySource) != 0 {
+		return fmt.Errorf("cold filesystem snapshot has %d unmatched repositories", len(bySource))
+	}
+	return nil
+}
+
 // installRemoteExecSessionStates restores the host-side completion markers for
 // retained exec sessions. The Sentry owns the authoritative session metadata,
 // but attach/log readers use these files to avoid starting a console follower
@@ -2383,6 +2413,13 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
+	}
+	coldManifest, err := readColdBranchManifest(sourceBranch.StorageManifest)
+	if err != nil {
+		return selector{}, fmt.Errorf("reading dehydrated filesystem identities: %w", err)
+	}
+	if err := applyColdFilesystemRestoreIDs(filesystemRoots, coldManifest.Filesystems); err != nil {
+		return selector{}, fmt.Errorf("binding dehydrated filesystem identities: %w", err)
 	}
 	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
 	if err != nil {

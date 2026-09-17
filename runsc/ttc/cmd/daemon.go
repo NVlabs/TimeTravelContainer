@@ -967,6 +967,15 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err != nil {
 		return fmt.Errorf("materializing distributed filesystem metadata: %w", err)
 	}
+	// materializeDistributedFilesystemRoots installs one-shot restore aliases in
+	// the active repository map. A later restore failure must not leave those
+	// foreign identities attached to an otherwise healthy peer runtime.
+	aliasesPending := len(session.FilesystemRoots) != 0
+	defer func() {
+		if aliasesPending {
+			_ = r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID)
+		}
+	}()
 	memoryDependencyBytes := session.StreamBytes
 	if session.GraphManifest != "" {
 		memoryDependencyBytes = 0
@@ -1264,6 +1273,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := r.backend.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
 			return fmt.Errorf("committing distributed filesystem identities: %w", err)
 		}
+		aliasesPending = false
 	} else if runtimeState.Status != "running" {
 		return fmt.Errorf("distributed target runtime is unexpectedly %q", runtimeState.Status)
 	}

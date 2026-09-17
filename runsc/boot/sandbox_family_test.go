@@ -498,6 +498,59 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyDehydrateLoaderTransfersRole(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	var loaderChanges []*kernel.Kernel
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		LiveForkEligible: true,
+		OnLoaderKernelChanged: func(k *kernel.Kernel, _ *watchdog.Watchdog) {
+			loaderChanges = append(loaderChanges, k)
+		},
+	})
+	if _, err := family.Fork(&ForkBranchArgs{ID: "survivor", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	family.mu.Lock()
+	survivor := family.branches["survivor"].k
+	family.mu.Unlock()
+	metadata, err := os.CreateTemp(t.TempDir(), "loader-dehydration-*.state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := family.Dehydrate(DefaultBranchID, metadata); err != nil {
+		t.Fatalf("Dehydrate loader: %v", err)
+	}
+	if got := family.LoaderBranchID(); got != "survivor" {
+		t.Fatalf("loader branch after dehydration=%q, want survivor", got)
+	}
+	if len(loaderChanges) != 1 || loaderChanges[0] != survivor {
+		t.Fatalf("loader callbacks=%p, want [%p]", loaderChanges, survivor)
+	}
+	if got := branchStateForTest(family.List(), DefaultBranchID); got != BranchDehydrated {
+		t.Fatalf("dehydrated loader state=%q, want %q", got, BranchDehydrated)
+	}
+	if got := branchStateForTest(family.List(), "survivor"); got != BranchPaused {
+		t.Fatalf("survivor state=%q, want %q", got, BranchPaused)
+	}
+	if err := family.Destroy(DefaultBranchID); err != nil {
+		t.Fatalf("Destroy dehydrated branch: %v", err)
+	}
+	survivor.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	survivor.Unpause()
+	survivor.WaitExited()
+	survivor.Release()
+}
+
 func branchStateForTest(infos []BranchInfo, id string) BranchState {
 	for _, info := range infos {
 		if info.ID == id {
