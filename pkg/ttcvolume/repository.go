@@ -1105,9 +1105,9 @@ func (r *Repository) releaseActiveLock() error {
 	return err
 }
 
-// Close releases the repository directory descriptor.
+// Close releases every host resource owned by the repository.
 func (r *Repository) Close() error {
-	if r == nil || r.dir == nil {
+	if r == nil {
 		return nil
 	}
 	// Repository close is a lifecycle durability fence. In particular, do not
@@ -1139,15 +1139,23 @@ func (r *Repository) Close() error {
 		graphErr = r.graph.Close()
 		r.graph = nil
 	}
+	var dataErr error
+	if r.data != nil {
+		dataErr = r.data.Close()
+		r.data = nil
+	}
 	var lockErr error
 	if r.lockFile != nil {
 		lockErr = r.lockFile.Close()
 		r.lockFile = nil
 	}
 	activeErr := r.releaseActiveLock()
-	err := r.dir.Close()
-	r.dir = nil
-	return errors.Join(syncErr, lockErr, activeErr, remoteErr, graphErr, err)
+	var dirErr error
+	if r.dir != nil {
+		dirErr = r.dir.Close()
+		r.dir = nil
+	}
+	return errors.Join(syncErr, lockErr, activeErr, remoteErr, graphErr, dataErr, dirErr)
 }
 
 // Directory duplicates the repository directory descriptor for donation to a

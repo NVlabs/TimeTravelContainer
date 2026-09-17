@@ -758,6 +758,14 @@ func TestDaemonRootsRequireExplicitFreshEnvironment(t *testing.T) {
 	}
 }
 
+func TestStandaloneRuntimeRootFollowsDaemonSocket(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	want := filepath.Join(filepath.Dir(socket), "runsc")
+	if got := standaloneRuntimeRoot(socket); got != want {
+		t.Fatalf("standaloneRuntimeRoot(%q)=%q, want %q", socket, got, want)
+	}
+}
+
 func TestDaemonStorageRootRejectsOldLayoutAndLocksLocalRoot(t *testing.T) {
 	old := t.TempDir()
 	if err := os.WriteFile(filepath.Join(old, "containers"), []byte("legacy"), 0600); err != nil {

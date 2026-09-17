@@ -2750,6 +2750,15 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	daemonDataRoot := roots.shared
 	daemonRoot := roots.runtime
+	if !clusterOpts.Configured {
+		// TTC_ROOT is authoritative standalone storage and may itself be on a
+		// shared filesystem. runsc's live control sockets and process-state files
+		// are ephemeral host runtime state, not persistent container data; keep
+		// them beside the explicitly local daemon socket. Clustered daemons use
+		// TTC_LOCAL_ROOT instead because peers need a stable node-local scratch
+		// hierarchy independent of the client socket location.
+		daemonRoot = standaloneRuntimeRoot(socket)
+	}
 	daemonRunsc, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: finding embedded runtime executable: %v\n", err)
@@ -2993,6 +3002,10 @@ func daemonRootsFromEnvironment(clustered bool) (daemonRoots, error) {
 		}
 	}
 	return daemonRoots{shared: shared, local: local, runtime: filepath.Join(local, "runtime", "runsc")}, nil
+}
+
+func standaloneRuntimeRoot(socket string) string {
+	return filepath.Join(filepath.Dir(filepath.Clean(socket)), "runsc")
 }
 
 func pathsReferToSameLocation(first, second string) (bool, error) {
@@ -4466,8 +4479,10 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 }
 
 // prepareDaemonRuntimeStorage ensures that control sockets and runsc's live
-// state remain on node-local storage. In cluster mode TTC_ROOT may be shared,
-// but TTC_LOCAL_ROOT contains all paths checked here.
+// state remain on node-local storage. Cluster mode places runtime state below
+// TTC_LOCAL_ROOT; standalone mode places it beside TTC_SOCKET so TTC_ROOT may
+// hold authoritative data on a shared filesystem without putting live Unix
+// sockets there.
 func prepareDaemonRuntimeStorage(socket, root string) error {
 	paths := []struct {
 		name string

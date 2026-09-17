@@ -34,6 +34,41 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
+func TestRepositoryCloseReleasesDataStore(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("close-data-store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataLock := filepath.Join(repository.path, "data", ".gc.lock")
+	countOpen := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+			if err == nil && target == dataLock {
+				count++
+			}
+		}
+		return count
+	}
+	if got := countOpen(); got != 1 {
+		t.Fatalf("open data-store locks=%d, want 1", got)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOpen(); got != 0 {
+		t.Fatalf("open data-store locks after Repository.Close=%d, want 0", got)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatalf("second Repository.Close: %v", err)
+	}
+}
+
 func openTestManager(t *testing.T) *Manager {
 	t.Helper()
 	manager, err := OpenManager(t.TempDir())
