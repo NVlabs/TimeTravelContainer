@@ -20,12 +20,75 @@ import (
 	"testing"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sync"
 )
+
+func encodeWakeOp(op uint32, opArg int32, cmp uint32, cmpArg int32) uint32 {
+	return op<<28 | (uint32(opArg)&0xfff)<<12 | cmp<<24 | uint32(cmpArg)&0xfff
+}
+
+func TestAtomicOpSignedArgumentsAndComparison(t *testing.T) {
+	tests := []struct {
+		name      string
+		initial   uint32
+		op        uint32
+		wantValue uint32
+		wantCond  bool
+	}{
+		{
+			name:      "old value is negative",
+			initial:   0x80000016,
+			op:        encodeWakeOp(linux.FUTEX_OP_ANDN|linux.FUTEX_OP_OPARG_SHIFT, 31, linux.FUTEX_OP_CMP_LT, 0),
+			wantValue: 22,
+			wantCond:  true,
+		},
+		{
+			name:      "comparison argument is negative",
+			initial:   0,
+			op:        encodeWakeOp(linux.FUTEX_OP_SET, 0, linux.FUTEX_OP_CMP_GT, -1),
+			wantValue: 0,
+			wantCond:  true,
+		},
+		{
+			name:      "operation argument is negative",
+			initial:   5,
+			op:        encodeWakeOp(linux.FUTEX_OP_ADD, -1, linux.FUTEX_OP_CMP_EQ, 5),
+			wantValue: 4,
+			wantCond:  true,
+		},
+		{
+			name:      "invalid negative shift is masked like Linux",
+			initial:   0,
+			op:        encodeWakeOp(linux.FUTEX_OP_OR|linux.FUTEX_OP_OPARG_SHIFT, -1, linux.FUTEX_OP_CMP_EQ, 0),
+			wantValue: 0x80000000,
+			wantCond:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			d := newTestData(sizeofInt32)
+			if _, err := d.SwapUint32(0, test.initial); err != nil {
+				t.Fatalf("SwapUint32: %v", err)
+			}
+			gotCond, err := atomicOp(d, 0, test.op)
+			if err != nil {
+				t.Fatalf("atomicOp: %v", err)
+			}
+			gotValue, err := d.LoadUint32(0)
+			if err != nil {
+				t.Fatalf("LoadUint32: %v", err)
+			}
+			if gotValue != test.wantValue || gotCond != test.wantCond {
+				t.Errorf("atomicOp: got value %#x, condition %t; want value %#x, condition %t", gotValue, gotCond, test.wantValue, test.wantCond)
+			}
+		})
+	}
+}
 
 // testData implements the Target interface, and allows us to
 // treat the address passed for futex operations as an index in
