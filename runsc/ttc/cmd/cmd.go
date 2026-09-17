@@ -5766,6 +5766,23 @@ func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	return nil
 }
 
+// clearConsoleIncarnationStatus removes only the terminal markers owned by a
+// previous init incarnation. Logs and retention metadata intentionally remain:
+// Docker-style restart appends to the same branch log, but a stale wait status
+// must never be mistaken for the freshly imported init's exit.
+func clearConsoleIncarnationStatus(paths ttcbundle.ConsolePaths) error {
+	var result error
+	for _, path := range []string{paths.PID, paths.WaitStatus} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
 func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
 	consoleDir := filepath.Join(b.activeDataRoot(), "containers", containerID, "console")
 	var result error
@@ -7235,6 +7252,13 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", "")
 		}
 	}()
+	consolePaths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return fmt.Errorf("resolving console state for fresh branch %s: %w", target, err)
+	}
+	if err := clearConsoleIncarnationStatus(consolePaths); err != nil {
+		return fmt.Errorf("clearing prior console state for fresh branch %s: %w", target, err)
+	}
 	capture.Resume = true
 	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, nil); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)

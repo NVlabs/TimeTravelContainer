@@ -5562,6 +5562,35 @@ func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	}
 }
 
+func TestClearConsoleIncarnationStatusPreservesLogs(t *testing.T) {
+	dir := t.TempDir()
+	paths := ttcbundle.ConsolePaths{
+		Log: filepath.Join(dir, "main.log"), RetentionStats: filepath.Join(dir, "main.retention.json"),
+		PID: filepath.Join(dir, "main.pid"), WaitStatus: filepath.Join(dir, "main.wait-status"),
+	}
+	for path, contents := range map[string]string{
+		paths.Log: "old output\n", paths.RetentionStats: `{"evicted_bytes":1}`,
+		paths.PID: "123\n", paths.WaitStatus: "15\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := clearConsoleIncarnationStatus(paths); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.PID, paths.WaitStatus} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("terminal marker %q remains: %v", path, err)
+		}
+	}
+	for _, path := range []string{paths.Log, paths.RetentionStats} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("durable log state %q was removed: %v", path, err)
+		}
+	}
+}
+
 func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	control := `{"snapshot_id":8,"memory_roots":[{"name":"memory/8/root","root":"0000000000000008-03-0000000000000001"}]}`
