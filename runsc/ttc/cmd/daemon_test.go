@@ -1966,6 +1966,32 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	}
 }
 
+func TestControlOnlyProxyInputDoesNotWaitForUnusedStdin(t *testing.T) {
+	blocked := make(chan struct{})
+	reader := io.Reader(readerFunc(func([]byte) (int, error) {
+		<-blocked
+		return 0, io.EOF
+	}))
+	done := make(chan string, 1)
+	go func() {
+		data, _ := io.ReadAll(controlOnlyProxyInput("header\n", reader, false))
+		done <- string(data)
+	}()
+	select {
+	case got := <-done:
+		if got != "header\n" {
+			t.Fatalf("proxy input=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("non-streaming proxy input waited for Unix client EOF")
+	}
+	close(blocked)
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
 func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
 	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir(), "systrap")
 	if err == nil || !strings.Contains(err.Error(), "requires") {

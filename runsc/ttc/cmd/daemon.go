@@ -5271,7 +5271,12 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		}
 		return
 	}
-	var input io.Reader = io.MultiReader(strings.NewReader(header), reader)
+	// A non-interactive request contains no bytes after its JSON header. Do not
+	// leave the upstream HTTP transport reading from the still-open local Unix
+	// connection: if the selected compute node has just retired, net/http waits
+	// for that request-body goroutine and failover never observes the dial
+	// error. Interactive stdin keeps the full-duplex reader by construction.
+	input := controlOnlyProxyInput(header, reader, request.Stdin)
 	var copyUploadFlow *daemonStdinFlow
 	var cleanupCopyUpload func()
 	if copyCommand && !copyRoute.sourceContainer && copyRoute.source != "-" {
@@ -5338,6 +5343,13 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	if tracked != nil {
 		ingressCommitted = tracked.statusSeen && tracked.status == 0
 	}
+}
+
+func controlOnlyProxyInput(header string, stdin io.Reader, streaming bool) io.Reader {
+	if !streaming {
+		return strings.NewReader(header)
+	}
+	return io.MultiReader(strings.NewReader(header), stdin)
 }
 
 // prepareDaemonRuntimeStorage ensures that control sockets and runsc's live
