@@ -5541,6 +5541,31 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				clusterListener.Close()
 				return fmt.Errorf("starting execution-lease guardian: %w", err)
 			}
+			// Registration starts the execution lease. Recovery below may replay a
+			// large crash journal or reconcile many placements, so renewal must
+			// begin now rather than after the Ready transition.
+			fence := func() error {
+				_ = listener.Close()
+				_ = clusterServer.Close()
+				return fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation)
+			}
+			var heartbeatFatal <-chan error
+			elasticHeartbeatStopped, heartbeatFatal, err = startElasticNodeHeartbeat(
+				clusterRuntime.directory, clusterRuntime.raftCatalog, *registered, clusterRuntime.lease,
+				stderr, clusterDone, targetBackend, leaseGuardian, fence)
+			if err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("starting elastic cluster heartbeat: %w", err)
+			}
+			go func() {
+				select {
+				case err := <-heartbeatFatal:
+					clusterErr <- err
+					listener.Close()
+					clusterServer.Close()
+				case <-clusterDone:
+				}
+			}()
 			// Start shared-reference election while the node is still joining.
 			// A recovered retain must be durable before any local runtime is
 			// admitted; if this node becomes the coordinator, its ledger must be
@@ -5640,60 +5665,6 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		server.distributedSource = clusterRuntime.source
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
-			authorityState, err := clusterRuntime.raftCatalog.AuthorityState()
-			if err != nil {
-				clusterListener.Close()
-				return fmt.Errorf("reading initial Raft execution grants: %w", err)
-			}
-			lastExecutionGrants := nodeExecutionGrants(authorityState, elasticRecord.NodeID, elasticRecord.Incarnation)
-			heartbeatFatal := make(chan error, 1)
-			heartbeatStopped := make(chan struct{})
-			elasticHeartbeatStopped = heartbeatStopped
-			go func(record cluster.NodeRecord) {
-				defer close(heartbeatStopped)
-				maintainElasticNode(clusterRuntime.directory, record, clusterRuntime.lease, stderr, clusterDone, func(state *cluster.AuthorityState) error {
-					if state == nil {
-						var err error
-						state, err = clusterRuntime.raftCatalog.AuthorityState()
-						if err != nil {
-							return fmt.Errorf("reading Raft execution grants: %w", err)
-						}
-					}
-					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
-					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) &&
-						executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
-						// Project the replicated decision onto the affected local branches
-						// before acknowledging another guardian interval. Corrupting one
-						// source-dependent branch must not stop the daemon or unrelated
-						// branches on this node. If selective eviction cannot be proven,
-						// retain the conservative whole-node fence as the failure path.
-						if err := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation); err != nil {
-							fenceErr := fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
-							return fmt.Errorf("enforcing revoked Raft execution authority: %w", errors.Join(err, fenceErr))
-						}
-					}
-					lastExecutionGrants = currentExecutionGrants
-					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
-						return fmt.Errorf("notifying execution-lease guardian: %w", err)
-					}
-					return nil
-				}, func() error {
-					// Stop all ingress before the host-level execution fence so no
-					// command can create new runnable work after the Sentry snapshot.
-					_ = listener.Close()
-					_ = clusterServer.Close()
-					return fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
-				}, heartbeatFatal)
-			}(*elasticRecord)
-			go func() {
-				select {
-				case err := <-heartbeatFatal:
-					clusterErr <- err
-					listener.Close()
-					clusterServer.Close()
-				case <-clusterDone:
-				}
-			}()
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 		go maintainDistributedGraphReferences(targetBackend, stderr, clusterDone, func() func() {

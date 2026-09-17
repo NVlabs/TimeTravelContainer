@@ -5352,6 +5352,55 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 	}
 }
 
+// startElasticNodeHeartbeat begins lease renewal as soon as a joining
+// incarnation is registered. Startup recovery may replay journals or recover
+// placements for longer than one lease; delaying this worker until the Ready
+// transition lets Raft expire the node while the daemon is still making
+// forward progress, after which every heartbeat is correctly rejected as
+// stale. The same worker continues after admission, avoiding a renewal gap at
+// the Joining -> Ready boundary.
+func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster.RaftCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, backend *runtimeBackend, guardian *os.File, fence func() error) (<-chan struct{}, <-chan error, error) {
+	if directory == nil || authority == nil || backend == nil || guardian == nil {
+		return nil, nil, errors.New("elastic heartbeat dependencies are incomplete")
+	}
+	authorityState, err := authority.AuthorityState()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading initial Raft execution grants: %w", err)
+	}
+	lastExecutionGrants := nodeExecutionGrants(authorityState, initial.NodeID, initial.Incarnation)
+	fatal := make(chan error, 1)
+	stopped := make(chan struct{})
+	go func(record cluster.NodeRecord) {
+		defer close(stopped)
+		maintainElasticNode(directory, record, lease, stderr, done, func(state *cluster.AuthorityState) error {
+			if state == nil {
+				var err error
+				state, err = authority.AuthorityState()
+				if err != nil {
+					return fmt.Errorf("reading Raft execution grants: %w", err)
+				}
+			}
+			currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
+			if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) &&
+				executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
+				// A node may still be recovering physically stopped Sentries while it
+				// is Joining. Project any replicated revocation before extending the
+				// guardian lease, using the same selective-fence rule as Ready nodes.
+				if err := enforceLocalRaftPlacements(backend, record.NodeID, record.Incarnation); err != nil {
+					fenceErr := fenceElasticRuntimeRoot(backend.activeDataRoot(), backend.root, record.NodeID, record.Incarnation)
+					return fmt.Errorf("enforcing revoked Raft execution authority: %w", errors.Join(err, fenceErr))
+				}
+			}
+			lastExecutionGrants = currentExecutionGrants
+			if _, err := guardian.Write([]byte{1}); err != nil {
+				return fmt.Errorf("notifying execution-lease guardian: %w", err)
+			}
+			return nil
+		}, fence, fatal)
+	}(initial)
+	return stopped, fatal, nil
+}
+
 // elasticHeartbeatAttemptBudget returns the maximum duration of one Raft
 // renewal attempt. The caller has already subtracted the lease safety margin,
 // so using two thirds of this duration cannot delay physical fencing beyond the
