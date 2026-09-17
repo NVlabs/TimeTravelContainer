@@ -645,6 +645,17 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if _, alive := liveSandboxes[physicalContainer]; alive {
 				continue
 			}
+			// The init-console follower durably records normal process exit
+			// before the Sentry disappears. During startup the node is still
+			// Joining and therefore cannot authorize the asynchronous filesystem
+			// publication yet. Preserve this placement through the early recovery
+			// pass; reconcileObservedInitExits consumes it immediately after the
+			// incarnation becomes Ready.
+			if paths, pathErr := b.containerStore().BranchConsolePaths(physicalContainer, physicalBranch); pathErr == nil {
+				if _, completed, statusErr := readConsoleWaitStatus(paths.WaitStatus); statusErr == nil && completed {
+					continue
+				}
+			}
 			// Stop and dehydration deliberately release the physical runtime
 			// before their immutable capture has finished publishing. The Raft
 			// placement remains live until publication commit atomically installs

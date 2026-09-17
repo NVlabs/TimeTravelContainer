@@ -5694,7 +5694,7 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 }
 
 type consoleSidecarOwner interface {
-	OwnConsoleSidecar(key string, command *exec.Cmd) error
+	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
 	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
@@ -8438,7 +8438,7 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		return ttcbundle.ConsolePaths{}, fmt.Errorf("waiting for console drain readiness for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
 	}
 	if b.consoleSidecars != nil {
-		if err := b.consoleSidecars.OwnConsoleSidecar(paths.Lock, command); err != nil {
+		if err := b.consoleSidecars.OwnConsoleSidecar(paths.Lock, command, target, execID == ""); err != nil {
 			_ = command.Process.Kill()
 			_ = command.Wait()
 			return ttcbundle.ConsolePaths{}, fmt.Errorf("transferring console drain ownership for %s: %w", target, err)
@@ -14681,6 +14681,83 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	if err := store.RecordBranchExit(target.container, target.branch, exitStatus); err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttc: warning: recording branch exit state for %s: %v\n", target, err)
 	}
+}
+
+// finalizeObservedInitExit converts a detached init's completed wait status
+// into the same process-free, persistable state as a foreground exit. The
+// console follower writes WaitStatus only after runsc has observed init
+// termination and drained its output, so its presence is the durable local
+// proof that this is a normal branch exit rather than unexplained runtime
+// loss.
+func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return false, err
+	}
+	target = resolved
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return false, err
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "running", "paused", "restarting", "rehydrating", "exited":
+	default:
+		return false, nil
+	}
+	if branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared" {
+		return false, nil
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return false, err
+	}
+	status, found, err := readConsoleWaitStatus(paths.WaitStatus)
+	if err != nil || !found {
+		return false, err
+	}
+	// Detached --rm has its own durable daemon request, which waits for this
+	// same status before removing the branch. Do not race it by publishing a
+	// filesystem generation that is intended to be discarded.
+	if info.AutoRemove {
+		return false, nil
+	}
+	b.recordWaitState(target, status)
+	if err := b.discard(target); err != nil {
+		return false, fmt.Errorf("releasing naturally exited branch %s: %w", target, err)
+	}
+	if err := b.queueBranchPublication(target, "stop"); err != nil {
+		return false, fmt.Errorf("queueing naturally exited branch %s for publication: %w", target, err)
+	}
+	return true, nil
+}
+
+// reconcileObservedInitExits retries exit finalization after daemon restart or
+// a failure between the console follower's durable wait-status write and the
+// asynchronous publication intent. It intentionally scans physical records:
+// remote forks and migrations may be materialized under hidden IDs even though
+// their user-facing identity is a logical Raft branch.
+func (b *runtimeBackend) reconcileObservedInitExits() error {
+	if b == nil || b.dataRoot == "" {
+		return nil
+	}
+	containers, err := b.containerStore().ListContainersForPlacement()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, info := range containers {
+		for _, branch := range info.Branches {
+			if _, err := b.finalizeObservedInitExit(selector{container: info.ID, branch: branch.ID}); err != nil {
+				// A physical record for another node can be visible through the
+				// shared catalog. It is not this daemon's exit to finalize.
+				if b.nodeID != "" && info.BranchNodeID(branch.ID) != b.nodeID {
+					continue
+				}
+				result = errors.Join(result, err)
+			}
+		}
+	}
+	return result
 }
 
 func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, error) {

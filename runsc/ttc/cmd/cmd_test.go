@@ -3479,6 +3479,58 @@ func TestReadConsoleWaitStatus(t *testing.T) {
 	}
 }
 
+func TestFinalizeObservedInitExit(t *testing.T) {
+	dataRoot := t.TempDir()
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(dataRoot, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "running",
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", StorageState: "local"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	paths, err := store.BranchConsolePaths("demo", defaultBranchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.WaitStatus), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.WaitStatus, []byte(strconv.FormatUint(uint64(7<<8), 10)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: filepath.Join(dataRoot, "runsc-root"), runsc: runsc, dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	changed, err := b.finalizeObservedInitExit(selector{container: "demo", branch: defaultBranchID})
+	if err != nil {
+		t.Fatalf("finalizeObservedInitExit: %v", err)
+	}
+	if !changed {
+		t.Fatal("completed init exit was not finalized")
+	}
+	info, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := persistentBranchInfo(info, defaultBranchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.State != "exited" || info.ExitStatus == nil || *info.ExitStatus != 7 {
+		t.Fatalf("finalized metadata=%+v branch=%+v", info, branch)
+	}
+}
+
 func TestStopContainerConsoleDrainsRemovesInactiveFollower(t *testing.T) {
 	dataRoot := t.TempDir()
 	base := filepath.Join(dataRoot, "containers", "demo", "console", "exec", "main", "exec-test")

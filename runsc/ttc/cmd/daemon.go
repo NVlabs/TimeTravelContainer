@@ -323,6 +323,7 @@ type daemonServer struct {
 	snapshotShared        *ttcsnapshot.SharedPackStore
 	sharedReferences      *sharedReferenceService
 	portIngress           *portIngressManager
+	stderr                io.Writer
 
 	stopOnce   sync.Once
 	cleanStop  atomic.Bool
@@ -1901,8 +1902,12 @@ func (w *daemonJSONFrameWriter) Write(data []byte) (int, error) {
 // OwnConsoleSidecar tracks and reaps one ready console follower. Followers are
 // intentionally not killed when the daemon shuts down: they retain the advisory
 // lock and continue draining until a restarted daemon reconciles the family.
-func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd) error {
-	return s.ownSidecar("console", key, command)
+func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error {
+	var exited func()
+	if observeInitExit {
+		exited = func() { s.observeInitConsoleExit(target) }
+	}
+	return s.ownSidecar("console", key, command, exited)
 }
 
 // StopConsoleSidecar terminates a console follower owned by this daemon.
@@ -1912,7 +1917,7 @@ func (s *daemonServer) StopConsoleSidecar(key string) (bool, error) {
 
 // OwnPortSidecar tracks and reaps a published-port listener.
 func (s *daemonServer) OwnPortSidecar(key string, command *exec.Cmd) error {
-	return s.ownSidecar("port", key, command)
+	return s.ownSidecar("port", key, command, nil)
 }
 
 // StopPortSidecar terminates a listener owned by this daemon. The boolean is
@@ -2066,7 +2071,7 @@ func (s *daemonServer) stopOwnedSidecar(key string) (bool, error) {
 	return true, fmt.Errorf("sidecar %q did not exit", key)
 }
 
-func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd) error {
+func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd, exited func()) error {
 	s.sidecarMu.Lock()
 	if _, ok := s.sidecars[key]; ok {
 		s.sidecarMu.Unlock()
@@ -2084,8 +2089,28 @@ func (s *daemonServer) ownSidecar(kind, key string, command *exec.Cmd) error {
 			delete(s.sidecars, key)
 		}
 		s.sidecarMu.Unlock()
+		if exited != nil {
+			exited()
+		}
 	}()
 	return nil
+}
+
+func (s *daemonServer) observeInitConsoleExit(target selector) {
+	if s == nil || s.dataRoot == "" {
+		return
+	}
+	unlock := s.lockDataRoot(s.dataRoot)
+	defer unlock()
+	backend := directBackend(s.optionsFromRequest(), strings.NewReader(""), io.Discard, s.stderr)
+	s.configureCommandBackend(backend)
+	changed, err := backend.finalizeObservedInitExit(target)
+	if err == nil && changed {
+		err = backend.reconcilePlacementCatalog()
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) && s.stderr != nil {
+		fmt.Fprintf(s.stderr, "ttcd: warning: finalizing natural exit for %s: %v\n", target, err)
+	}
 }
 
 func (s *daemonServer) ownedConsoleSidecars() int {
@@ -5059,6 +5084,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		volumeCapability:      volumeCapability,
 		snapshotGraph:         snapshotGraph,
 		snapshotData:          snapshotData,
+		stderr:                stderr,
 		reconciled:            make(map[string]bool),
 		mutationLocks:         make(map[string]*sync.Mutex),
 	}
@@ -5380,6 +5406,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// Enroll any legacy/untracked local branch now that ordinary placement
 			// creation is authorized. Repeat the resume idempotently in case a
 			// concurrent guardian fence landed after the first recovery pass.
+			if err := targetBackend.reconcileObservedInitExits(); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("reconciling completed init exits: %w", err)
+			}
 			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("re-authorizing fenced branch placements: %w", err)
@@ -6739,6 +6769,11 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	families, err := backend.listFamilies()
 	if err != nil {
 		return
+	}
+	if err := backend.reconcileObservedInitExits(); err != nil {
+		if backend.stderr != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling completed init exits: %v\n", err)
+		}
 	}
 	quarantineReconciled := lifecycleErr == nil && lifecycleReconciled
 	for _, family := range families {

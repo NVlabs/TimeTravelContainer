@@ -1136,7 +1136,7 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 		t.Fatalf("starting sidecar fixture: %v", err)
 	}
 	server := &daemonServer{}
-	if err := server.OwnConsoleSidecar("console-lock", command); err != nil {
+	if err := server.OwnConsoleSidecar("console-lock", command, selector{}, false); err != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("OwnConsoleSidecar: %v", err)
@@ -1144,7 +1144,7 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	if got := server.ownedConsoleSidecars(); got != 1 {
 		t.Fatalf("owned sidecars=%d, want 1", got)
 	}
-	if err := server.OwnConsoleSidecar("console-lock", exec.Command("true")); err == nil {
+	if err := server.OwnConsoleSidecar("console-lock", exec.Command("true"), selector{}, false); err == nil {
 		t.Fatal("duplicate console sidecar ownership succeeded")
 	}
 	if err := command.Process.Kill(); err != nil {
@@ -1159,6 +1159,31 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	}
 	if command.ProcessState == nil {
 		t.Fatalf("sidecar was not reaped: state=%v", command.ProcessState)
+	}
+}
+
+func TestDaemonSidecarRunsExitCallbackAfterReaping(t *testing.T) {
+	command := exec.Command("true")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{}
+	called := make(chan struct{})
+	if err := server.ownSidecar("console", "console-lock", command, func() {
+		if got := server.ownedConsoleSidecars(); got != 0 {
+			t.Errorf("callback observed %d owned sidecars, want 0", got)
+		}
+		close(called)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sidecar exit callback did not run")
+	}
+	if command.ProcessState == nil {
+		t.Fatal("callback ran before child was reaped")
 	}
 }
 
