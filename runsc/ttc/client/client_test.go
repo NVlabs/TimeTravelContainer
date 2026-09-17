@@ -296,8 +296,6 @@ func TestNormalizeClientRelativePaths(t *testing.T) {
 		args  []string
 		index int
 	}{
-		{[]string{"save", "-o", "image.tar", "busybox"}, 2},
-		{[]string{"load", "--input=archive.tar"}, 1},
 		{[]string{"checkpoint", "demo@main", "state.ttc"}, 2},
 		{[]string{"restore", "state.ttc"}, 1},
 		{[]string{"cp", "local.txt", "demo@main:/tmp/local.txt"}, 1},
@@ -309,5 +307,48 @@ func TestNormalizeClientRelativePaths(t *testing.T) {
 		if !strings.Contains(got[test.index], cwd) {
 			t.Fatalf("normalizeHostPaths(%q)=%q", test.args, got)
 		}
+	}
+}
+
+func TestPrepareImageArchiveIOUsesClientFiles(t *testing.T) {
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "input.tar")
+	if err := os.WriteFile(inputPath, []byte("archive-input"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args, input, output, closeArchive, err := prepareImageArchiveIO(
+		[]string{"image", "load", "--platform", "linux/amd64", "-i", inputPath}, strings.NewReader("wrong"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "image load --platform linux/amd64" || string(data) != "archive-input" || output != io.Discard || !commandUsesStdin(args) {
+		t.Fatalf("load args=%q data=%q stdin=%t", args, data, commandUsesStdin(args))
+	}
+
+	outputPath := filepath.Join(dir, "output.tar")
+	args, input, output, closeArchive, err = prepareImageArchiveIO(
+		[]string{"save", "--output=" + outputPath, "busybox:1.36"}, strings.NewReader("stdin"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(output, "archive-output"); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "save busybox:1.36" || string(data) != "archive-output" || input == nil {
+		t.Fatalf("save args=%q data=%q", args, data)
 	}
 }

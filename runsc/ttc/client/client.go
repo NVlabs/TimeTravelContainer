@@ -117,17 +117,92 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
-	args, err = normalizeHostPaths(args)
+	args, stdin, stdout, closeArchive, err := prepareImageArchiveIO(args, stdin, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
+	args, err = normalizeHostPaths(args)
+	if err != nil {
+		_ = closeArchive()
+		fmt.Fprintf(stderr, "ttc: %v\n", err)
+		return 2
+	}
 	status, err := runCommand(opts.socket, args, stdin, stdout, stderr)
+	closeErr := closeArchive()
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
 		return 1
 	}
+	if closeErr != nil {
+		fmt.Fprintf(stderr, "ttc: closing image archive: %v\n", closeErr)
+		return 1
+	}
 	return status
+}
+
+// prepareImageArchiveIO implements Docker's client-local -i/-o semantics.
+// The daemon always consumes or produces a stream; it must never interpret a
+// CLI path in its own mount namespace, especially through a control-only
+// gateway whose filesystem differs from the user's login node.
+func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, func() error, error) {
+	result := append([]string(nil), args...)
+	command, start := result[0], 1
+	if command == "image" && len(result) > 1 {
+		command, start = result[1], 2
+	}
+	closeArchive := func() error { return nil }
+	var short, long string
+	switch command {
+	case "load":
+		short, long = "-i", "--input"
+	case "save":
+		short, long = "-o", "--output"
+	default:
+		return result, stdin, stdout, closeArchive, nil
+	}
+	option := -1
+	value := ""
+	consume := 1
+	for i := start; i < len(result); i++ {
+		arg := result[i]
+		switch {
+		case arg == short || arg == long:
+			if i+1 >= len(result) {
+				return nil, stdin, stdout, closeArchive, fmt.Errorf("%s requires a path", arg)
+			}
+			option, value, consume = i, result[i+1], 2
+		case strings.HasPrefix(arg, short+"="):
+			option, value = i, strings.TrimPrefix(arg, short+"=")
+		case strings.HasPrefix(arg, long+"="):
+			option, value = i, strings.TrimPrefix(arg, long+"=")
+		}
+		if option >= 0 {
+			break
+		}
+	}
+	if option < 0 {
+		return result, stdin, stdout, closeArchive, nil
+	}
+	result = append(result[:option], result[option+consume:]...)
+	if value == "" {
+		return nil, stdin, stdout, closeArchive, fmt.Errorf("%s requires a path", long)
+	}
+	if value == "-" {
+		return result, stdin, stdout, closeArchive, nil
+	}
+	if command == "load" {
+		file, err := os.Open(value)
+		if err != nil {
+			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening image archive: %w", err)
+		}
+		return result, file, stdout, file.Close, nil
+	}
+	file, err := os.OpenFile(value, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, stdin, stdout, closeArchive, fmt.Errorf("opening image archive output: %w", err)
+	}
+	return result, stdin, file, file.Close, nil
 }
 
 func parseGlobal(args []string, stdout io.Writer) (options, []string, bool, error) {
@@ -1227,15 +1302,7 @@ func hasBoolFlag(args []string, short byte, long string) bool {
 func normalizeHostPaths(args []string) ([]string, error) {
 	result := append([]string(nil), args...)
 	command := result[0]
-	index := 1
-	if command == "image" && len(result) > 1 {
-		command, index = result[1], 2
-	}
 	switch command {
-	case "load":
-		return normalizeOptionPath(result, index, "-i", "--input")
-	case "save":
-		return normalizeOptionPath(result, index, "-o", "--output")
 	case "checkpoint":
 		if len(result) >= 3 {
 			return normalizeIndex(result, len(result)-1)
@@ -1271,26 +1338,6 @@ func normalizeHostPaths(args []string) ([]string, error) {
 		}
 	}
 	return result, nil
-}
-
-func normalizeOptionPath(args []string, start int, names ...string) ([]string, error) {
-	for i := start; i < len(args); i++ {
-		for _, name := range names {
-			if args[i] == name && i+1 < len(args) {
-				return normalizeIndex(args, i+1)
-			}
-			if strings.HasPrefix(args[i], name+"=") {
-				path := strings.TrimPrefix(args[i], name+"=")
-				absolute, err := filepath.Abs(path)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = name + "=" + absolute
-				return args, nil
-			}
-		}
-	}
-	return args, nil
 }
 
 func normalizeIndex(args []string, index int) ([]string, error) {
