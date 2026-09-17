@@ -1295,6 +1295,24 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 		retain = append(retain, name)
 	}
 	for name, object := range current {
+		if _, structural, err := incomingEdgeParent(name); err != nil {
+			return err
+		} else if structural {
+			live, err := manifestReferenceIsLive(state, name)
+			if err != nil {
+				return err
+			}
+			if !live {
+				// An incoming-edge bridge stands in for a parent that was not
+				// present when this child origin was imported. If that parent is
+				// later abandoned or permanently retired, no future import can
+				// replace the bridge with a structural edge. Release it in the
+				// live coordinator as well as filtering it during rebuild; waiting
+				// for coordinator turnover otherwise pins the child pack forever.
+				release = append(release, name)
+			}
+			continue
+		}
 		if isAuthoritativeColdReference(name) {
 			if _, ok := desired[name]; !ok {
 				release = append(release, name)

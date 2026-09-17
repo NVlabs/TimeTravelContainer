@@ -11813,14 +11813,24 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 		}
 		objects, err := b.snapshotGraph.SnapshotObjects(snapshot.ID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return len(abandoned), err
+			return len(abandoned), fmt.Errorf("inspecting memory origin %d: %w", snapshot.ID, err)
 		}
 		if len(objects) != 0 {
 			continue
 		}
 		provider, found, err := b.distributedSource.authority.SnapshotProvider(uint64(snapshot.ID))
+		if errors.Is(err, os.ErrNotExist) {
+			// Empty-origin cleanup is global to the node, while migration
+			// completion is deliberately concurrent across families. Another
+			// cleanup may therefore have installed the permanent abandoned or
+			// retired tombstone after this pass inspected the local graph. The
+			// tombstone proves that no provider authority remains; finish the
+			// idempotent local collection instead of failing branch removal.
+			abandoned[snapshot.ID] = struct{}{}
+			continue
+		}
 		if err != nil {
-			return len(abandoned), err
+			return len(abandoned), fmt.Errorf("resolving empty memory origin %d: %w", snapshot.ID, err)
 		}
 		if !found || provider.NodeID != node {
 			continue
