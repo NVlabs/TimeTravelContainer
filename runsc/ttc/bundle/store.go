@@ -453,9 +453,11 @@ type BranchInfo struct {
 	// idempotent provider-root batch. Multiple local descendants may share the
 	// same authorizing distributed transaction, but must never share this
 	// lifetime identity.
-	DistributedGraphReferenceOperation string `json:"distributed_graph_reference_operation,omitempty"`
-	DistributedMigration               bool   `json:"distributed_migration,omitempty"`
-	State                              string `json:"state"`
+	DistributedGraphReferenceOperation string     `json:"distributed_graph_reference_operation,omitempty"`
+	DistributedMigration               bool       `json:"distributed_migration,omitempty"`
+	State                              string     `json:"state"`
+	ExitStatus                         *int       `json:"exit_status,omitempty"`
+	ExitedAt                           *time.Time `json:"exited_at,omitempty"`
 	// StorageState describes where the authoritative captured snapshot is.
 	// It is independent of the process lifecycle in State.
 	StorageState             string    `json:"storage_state,omitempty"`
@@ -3659,7 +3661,7 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 		found := false
 		for i := range info.Branches {
 			if info.Branches[i].ID == "main" {
-				info.Branches[i].State = state
+				updateBranchLifecycle(&info.Branches[i], state, exitStatus, now)
 				found = true
 				break
 			}
@@ -3854,6 +3856,25 @@ func recomputeContainerState(info *ContainerInfo) {
 	}
 }
 
+// updateBranchLifecycle is the single persistence boundary for branch-local
+// process state. Exit status is branch state, not family state: siblings may
+// terminate independently and a cold branch must remain waitable after its
+// Sentry and console sidecar have been reclaimed.
+func updateBranchLifecycle(branch *BranchInfo, state string, exitStatus *int, now time.Time) {
+	branch.State = state
+	if state == "exited" || state == "stopped" {
+		if exitStatus != nil {
+			status := *exitStatus
+			branch.ExitStatus = &status
+			finished := now
+			branch.ExitedAt = &finished
+		}
+		return
+	}
+	branch.ExitStatus = nil
+	branch.ExitedAt = nil
+}
+
 // UpdateBranchState changes only the last known lifecycle state of a recorded branch.
 func (s Store) UpdateBranchState(name, branchID, state string) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
@@ -3861,7 +3882,7 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 			if info.Branches[i].ID != branchID {
 				continue
 			}
-			info.Branches[i].State = state
+			updateBranchLifecycle(&info.Branches[i], state, nil, time.Now().UTC())
 			recomputeContainerState(info)
 			return true, nil
 		}
@@ -4223,7 +4244,7 @@ func (s Store) RecordBranchStart(name, branchID string) error {
 			if branch.ID != branchID {
 				continue
 			}
-			branch.State = "running"
+			updateBranchLifecycle(branch, "running", nil, now)
 			branch.Unplaced = false
 			branch.StorageState = "local"
 			branch.StorageError = ""
@@ -4242,6 +4263,7 @@ func (s Store) RecordBranchStart(name, branchID string) error {
 // its filesystem, logs, identity, and peer branches.
 func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		now := time.Now().UTC()
 		found := false
 		alreadyExited := false
 		for i := range info.Branches {
@@ -4250,7 +4272,9 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 				continue
 			}
 			alreadyExited = branch.State == "exited" || branch.State == "stopped"
-			branch.State = "exited"
+			if !alreadyExited || branch.ExitStatus == nil {
+				updateBranchLifecycle(branch, "exited", &exitStatus, now)
+			}
 			found = true
 			break
 		}
@@ -4259,7 +4283,6 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 		}
 		recomputeContainerState(info)
 		if info.State == "exited" {
-			now := time.Now().UTC()
 			if !alreadyExited || info.ExitStatus == nil {
 				info.ExitStatus = &exitStatus
 			}
@@ -4285,7 +4308,7 @@ func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
 			if branch.State == "dehydrated" {
 				return false, nil
 			}
-			branch.State = "exited"
+			updateBranchLifecycle(branch, "exited", &exitStatus, now)
 			break
 		}
 		if !found {
@@ -4320,7 +4343,7 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *
 			}
 			switch branch.State {
 			case "creating", "running", "paused", "rehydrating":
-				branch.State = "exited"
+				updateBranchLifecycle(branch, "exited", exitStatus, time.Now().UTC())
 				changed = true
 			case "dehydrating":
 				// A successful dehydration deliberately removes the final

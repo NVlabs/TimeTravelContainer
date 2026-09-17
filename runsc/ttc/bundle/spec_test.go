@@ -2233,6 +2233,9 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "exited" {
 		t.Fatalf("branch stop rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
 	}
+	if loaded.Branches[1].ExitStatus == nil || *loaded.Branches[1].ExitStatus != 137 || loaded.Branches[1].ExitedAt == nil {
+		t.Fatalf("branch stop did not persist branch-local wait status: %+v", loaded.Branches[1])
+	}
 	if err := store.RecordBranchStart("demo", "child"); err != nil {
 		t.Fatalf("RecordBranchStart: %v", err)
 	}
@@ -2242,6 +2245,9 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "running" {
 		t.Fatalf("branch start rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
+	}
+	if loaded.Branches[1].ExitStatus != nil || loaded.Branches[1].ExitedAt != nil {
+		t.Fatalf("branch start retained the previous incarnation's wait status: %+v", loaded.Branches[1])
 	}
 	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
 		t.Fatalf("RemoveBranchRecord: %v", err)

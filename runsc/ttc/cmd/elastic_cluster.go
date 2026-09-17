@@ -481,7 +481,11 @@ func loadDistributedFamily(store ttcbundle.Store, placements cluster.PlacementCa
 	if resolveErr != nil {
 		return ttcbundle.ContainerInfo{}, err
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	// Raft makes the exact immutable identity authoritative before NFS is
+	// required to expose the corresponding directory to every client. Common
+	// NFS attribute/negative-cache intervals are tens of seconds, so use the
+	// same bounded visibility window as shared snapshot artifacts.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		info, exactErr := store.LoadRuntimeContainer(familyID)
 		if exactErr == nil {

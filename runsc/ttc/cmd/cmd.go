@@ -6083,8 +6083,12 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	if b.dataRoot == "" {
 		return ttcbundle.ContainerInfo{ID: identifier, Name: identifier}, nil
 	}
-	info, err := b.containerStore().LoadContainer(identifier)
+	store := b.containerStore()
+	info, err := store.LoadContainer(identifier)
 	if err != nil {
+		if placements, placementErr := b.placementCatalog(); placementErr == nil {
+			return loadDistributedFamily(store, placements, identifier)
+		}
 		return ttcbundle.ContainerInfo{}, err
 	}
 	return info, nil
@@ -14642,11 +14646,25 @@ func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
 }
 
 func (b *runtimeBackend) wait(target selector) (uint32, error) {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return 0, err
 	}
 	target = resolved
+	// A completed branch remains waitable after its runtime and console helper
+	// are discarded. Avoid invoking runsc for a process-free cold branch: doing
+	// so both obscures the real status and produces a misleading FetchSpec error.
+	if branch, branchErr := persistentBranchInfo(info, target.branch); branchErr == nil && normalizeLifecycleState(branch.State) == "exited" {
+		if branch.ExitStatus != nil {
+			return uint32(*branch.ExitStatus) << 8, nil
+		}
+		// Compatibility for records written earlier in the same root format,
+		// before exits became branch-local. This is sound only when the whole
+		// family is terminal.
+		if normalizeLifecycleState(info.State) == "exited" && info.ExitStatus != nil {
+			return uint32(*info.ExitStatus) << 8, nil
+		}
+	}
 	output, commandErr := b.command("timetravel", target.container, "wait", target.branch)
 	if commandErr == nil {
 		var result struct {
