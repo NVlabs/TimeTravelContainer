@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1795,7 +1796,8 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 
 func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	var gotNode string
-	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var seed *httptest.Server
+	seed = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotNode = r.Header.Get("X-TTC-Node")
 		if r.URL.Path != "/v1/daemon" {
 			http.NotFound(w, r)
@@ -1830,12 +1832,65 @@ func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotNode != "login-gateway" || len(control.clients) != 1 || control.repositoryID != "repo-control" {
+	if gotNode != "login-gateway" || len(control.peerSnapshot()) != 1 || control.repositoryID != "repo-control" {
 		t.Fatalf("probe node=%q control=%+v", gotNode, control)
 	}
 	opts.RepositoryID = "another-repository"
 	if _, err := prepareControlOnlyCluster(opts, "/shared/ttc"); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched repository error=%v", err)
+	}
+}
+
+func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
+	var second *httptest.Server
+	second = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority/state" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+			"compute-a": {NodeID: "compute-a", State: cluster.NodeReady, ControlURL: second.URL},
+		}})
+	}))
+	defer second.Close()
+
+	var seed *httptest.Server
+	seed = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/daemon":
+			payload, _ := json.Marshal(map[string]any{
+				"build_id": version.Version(),
+				"cluster": map[string]any{"capabilities": cluster.Capabilities{
+					NodeID: "seed", RepositoryID: "repo-control",
+				}},
+			})
+			var mu sync.Mutex
+			_ = writeDaemonFrame(w, &mu, daemonFrameStdout, append(payload, '\n'))
+			_ = writeDaemonStatus(w, &mu, 0)
+		case "/v1/authority/state":
+			_ = json.NewEncoder(w).Encode(cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+				"seed":      {NodeID: "seed", State: cluster.NodeReady, ControlURL: seed.URL},
+				"compute-a": {NodeID: "compute-a", State: cluster.NodeReady, ControlURL: second.URL},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer seed.Close()
+
+	opts := defaultDaemonClusterOptions()
+	opts.Configured, opts.ControlOnly = true, true
+	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.Peers = []string{"seed=" + strings.TrimPrefix(seed.URL, "http://")}
+	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := control.seedURLs()
+	want := []string{second.URL, seed.URL}
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("discovered peers=%v, want %v", got, want)
 	}
 }
 

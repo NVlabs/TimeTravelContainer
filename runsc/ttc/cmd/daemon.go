@@ -466,9 +466,91 @@ type daemonClusterRuntime struct {
 type controlOnlyCluster struct {
 	nodeID       string
 	repositoryID string
-	seeds        []string
-	clients      []*cluster.Client
-	active       atomic.Uint64
+	authToken    string
+
+	peersMu sync.RWMutex
+	peers   []controlOnlyPeer
+	active  atomic.Uint64
+}
+
+type controlOnlyPeer struct {
+	url    string
+	client *cluster.Client
+}
+
+func (c *controlOnlyCluster) peerSnapshot() []controlOnlyPeer {
+	c.peersMu.RLock()
+	defer c.peersMu.RUnlock()
+	return append([]controlOnlyPeer(nil), c.peers...)
+}
+
+func (c *controlOnlyCluster) seedURLs() []string {
+	peers := c.peerSnapshot()
+	urls := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		urls = append(urls, peer.url)
+	}
+	return urls
+}
+
+// refreshPeers learns the current compute endpoints through a linearizable
+// authority read. The gateway itself remains absent from Raft membership and
+// never advertises a listener. Existing clients are reused so an in-flight
+// stream is unaffected by a concurrent refresh.
+func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
+	current := c.peerSnapshot()
+	var state *cluster.AuthorityState
+	var readErrors error
+	for _, peer := range current {
+		candidate, err := peer.client.AuthorityState(ctx)
+		if err != nil {
+			readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", peer.url, err))
+			continue
+		}
+		state = candidate
+		break
+	}
+	if state == nil {
+		return fmt.Errorf("reading cluster authority through all compute peers: %w", readErrors)
+	}
+
+	existing := make(map[string]*cluster.Client, len(current))
+	for _, peer := range current {
+		existing[peer.url] = peer.client
+	}
+	urls := make([]string, 0, len(state.Nodes))
+	for _, record := range state.Nodes {
+		if record.State == cluster.NodeOffline || record.ControlURL == "" {
+			continue
+		}
+		urls = append(urls, record.ControlURL)
+	}
+	sort.Strings(urls)
+	refreshed := make([]controlOnlyPeer, 0, len(urls))
+	seen := make(map[string]struct{}, len(urls))
+	for _, baseURL := range urls {
+		if _, ok := seen[baseURL]; ok {
+			continue
+		}
+		seen[baseURL] = struct{}{}
+		client := existing[baseURL]
+		if client == nil {
+			var err error
+			client, err = cluster.NewPlainClient(baseURL, c.nodeID, c.authToken, 2*time.Minute)
+			if err != nil {
+				readErrors = errors.Join(readErrors, fmt.Errorf("creating client for discovered compute peer %s: %w", baseURL, err))
+				continue
+			}
+		}
+		refreshed = append(refreshed, controlOnlyPeer{url: baseURL, client: client})
+	}
+	if len(refreshed) == 0 {
+		return fmt.Errorf("cluster authority contains no usable compute endpoint: %w", readErrors)
+	}
+	c.peersMu.Lock()
+	c.peers = refreshed
+	c.peersMu.Unlock()
+	return nil
 }
 
 type controlOnlyPeerStatus struct {
@@ -479,7 +561,7 @@ type controlOnlyPeerStatus struct {
 }
 
 func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*controlOnlyCluster, error) {
-	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID}
+	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: os.Getenv("TTC_CLUSTER_TOKEN")}
 	seen := make(map[string]struct{})
 	var probeErrors error
 	for _, peerSpec := range opts.Peers {
@@ -491,7 +573,7 @@ func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*c
 			continue
 		}
 		seen[baseURL] = struct{}{}
-		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, os.Getenv("TTC_CLUSTER_TOKEN"), 2*time.Minute)
+		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, control.authToken, 2*time.Minute)
 		if err != nil {
 			return nil, err
 		}
@@ -510,12 +592,17 @@ func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*c
 			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: repository %q does not match TTC_ROOT repository %q", baseURL, status.Cluster.Capabilities.RepositoryID, opts.RepositoryID))
 			continue
 		}
-		control.seeds = append(control.seeds, baseURL)
-		control.clients = append(control.clients, client)
+		control.peers = append(control.peers, controlOnlyPeer{url: baseURL, client: client})
 	}
-	if len(control.clients) == 0 {
+	if len(control.peers) == 0 {
 		return nil, fmt.Errorf("no control seed is reachable and compatible with %q: %w", sharedRoot, probeErrors)
 	}
+	// Discovery is best-effort during startup: a compatible seed is sufficient
+	// to start, and the background refresher will retry a temporarily
+	// unavailable authority read.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = control.refreshPeers(ctx)
+	cancel()
 	return control, nil
 }
 
@@ -4795,7 +4882,7 @@ type controlOnlyDaemonServer struct {
 // listener and never registers a cluster node, so compute nodes cannot select
 // it for placement or initiate a connection to it.
 func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyCluster, stdout, stderr io.Writer) error {
-	if control == nil || len(control.clients) == 0 {
+	if control == nil || len(control.peerSnapshot()) == 0 {
 		return errors.New("control-only cluster has no compute seed")
 	}
 	dir := filepath.Dir(socket)
@@ -4830,8 +4917,24 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 		return fmt.Errorf("unlocking daemon startup: %w", err)
 	}
 	server := &controlOnlyDaemonServer{listener: listener, cluster: control, root: sharedRoot, localRoot: dir}
+	discoveryDone := make(chan struct{})
+	defer close(discoveryDone)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-discoveryDone:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = control.refreshPeers(ctx)
+				cancel()
+			}
+		}
+	}()
 	if stdout != nil {
-		fmt.Fprintf(stdout, "ttcd control-only gateway listening on %s (repository=%s, seed=%s)\n", socket, control.repositoryID, control.seeds[0])
+		fmt.Fprintf(stdout, "ttcd control-only gateway listening on %s (repository=%s, seed=%s)\n", socket, control.repositoryID, control.seedURLs()[0])
 	}
 	for {
 		conn, err := listener.Accept()
@@ -4877,11 +4980,12 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	}
 	switch request.Action {
 	case "ping":
+		seeds := s.cluster.seedURLs()
 		payload, _ := json.Marshal(map[string]any{
 			"version": daemonAPIVersion, "build_id": version.Version(), "features": daemonAPIFeatures,
 			"pid": os.Getpid(), "role": "control-only", "control_only": true,
 			"shared_root": s.root,
-			"cluster":     map[string]any{"control_only": true, "repository_id": s.cluster.repositoryID, "seeds": s.cluster.seeds},
+			"cluster":     map[string]any{"control_only": true, "repository_id": s.cluster.repositoryID, "seeds": seeds},
 		})
 		_ = writeDaemonFrame(conn, &writeMu, daemonFrameStdout, append(payload, '\n'))
 		_ = writeDaemonStatus(conn, &writeMu, 0)
@@ -4895,8 +4999,14 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		s.stopOnce.Do(func() { _ = s.listener.Close() })
 		return
 	}
-	index := s.cluster.active.Load() % uint64(len(s.cluster.clients))
-	client := s.cluster.clients[index]
+	peers := s.cluster.peerSnapshot()
+	if len(peers) == 0 {
+		writeError(errors.New("control-only cluster has no known compute peer"))
+		return
+	}
+	index := s.cluster.active.Load() % uint64(len(peers))
+	peer := peers[index]
+	client := peer.client
 	copyRoute, copyCommand, err := parseDistributedCopyRoute(request.Args)
 	if err != nil {
 		writeError(err)
@@ -4904,8 +5014,8 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	}
 	if copyCommand && copyRoute.sourceContainer && copyRoute.destination != "-" {
 		if err := proxyDistributedCopyDownload(context.Background(), client, s.localRoot, request, copyRoute, conn, &writeMu); err != nil {
-			s.cluster.active.CompareAndSwap(index, (index+1)%uint64(len(s.cluster.clients)))
-			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", s.cluster.seeds[index], err))
+			s.cluster.active.Add(1)
+			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", peer.url, err))
 		}
 		return
 	}
@@ -4922,17 +5032,40 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 	}
 	if copyUploadFlow != nil {
 		if err := proxyDistributedCopyUpload(context.Background(), client, input, copyUploadFlow, conn, &writeMu); err != nil {
-			s.cluster.active.CompareAndSwap(index, (index+1)%uint64(len(s.cluster.clients)))
-			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", s.cluster.seeds[index], err))
+			s.cluster.active.Add(1)
+			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", peer.url, err))
 		}
 		return
 	}
 	output := &countingDaemonWriter{writer: conn}
 	if err := client.ProxyDaemon(context.Background(), input, output); err != nil {
-		s.cluster.active.CompareAndSwap(index, (index+1)%uint64(len(s.cluster.clients)))
-		if output.bytes == 0 {
-			writeError(fmt.Errorf("proxying through compute seed %s: %w", s.cluster.seeds[index], err))
+		s.cluster.active.Add(1)
+		if output.bytes != 0 {
+			return
 		}
+		firstErr := fmt.Errorf("%s: %w", peer.url, err)
+		// Requests without a streaming stdin are replayable until a peer emits a
+		// response byte. This makes graceful compute retirement invisible to a
+		// control-only client even when it races the periodic topology refresh.
+		if !request.Stdin {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = s.cluster.refreshPeers(ctx)
+			cancel()
+			refreshed := s.cluster.peerSnapshot()
+			for _, candidate := range refreshed {
+				if candidate.url == peer.url {
+					continue
+				}
+				if retryErr := candidate.client.ProxyDaemon(context.Background(), strings.NewReader(header), output); retryErr == nil {
+					return
+				} else if output.bytes != 0 {
+					return
+				} else {
+					firstErr = errors.Join(firstErr, fmt.Errorf("%s: %w", candidate.url, retryErr))
+				}
+			}
+		}
+		writeError(fmt.Errorf("proxying through compute peers: %w", firstErr))
 	}
 }
 
