@@ -6635,6 +6635,20 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 		t.Fatalf("renamed migration resolves to %q, want moved", got)
 	}
 
+	// Target cleanup happens before the cancellation CAS. Recovery must keep
+	// selecting metadata-only removal after the transaction becomes terminal,
+	// including when the public branch was renamed in the meantime.
+	canceledFork := transaction("canceled-fork", "node-a", "main", "child", cluster.TransactionCanceled, false, false)
+	canceledFork.Identity.TargetNodeID = "node-b"
+	canceledPlacements := []cluster.PlacementRecord{{
+		FamilyID: "family-id", BranchID: "renamed-child", OwnerNode: "node-b",
+		PhysicalContainer: "fork-runtime", LastOperationID: "canceled-fork",
+	}}
+	_, recoveredCancel, _ := distributedRemovalSourceTransactions([]cluster.Transaction{canceledFork}, canceledPlacements, info, "renamed-child")
+	if _, ok := recoveredCancel["node-a"]["canceled-fork"]; !ok {
+		t.Fatalf("terminal canceled target did not retain metadata-only removal: %v", recoveredCancel)
+	}
+
 	corruptedPlacements := []cluster.PlacementRecord{
 		{FamilyID: "family-id", BranchID: "child", State: cluster.PlacementCorrupted},
 		{FamilyID: "family-id", BranchID: "grandchild", State: cluster.PlacementRunning},

@@ -86,6 +86,13 @@ func TestCanceledForkOwnsPlacement(t *testing.T) {
 			}
 		})
 	}
+	renamedTx, renamedPlacement := tx, placement
+	renamedTx.Identity.TransactionID = "fork-rename"
+	renamedPlacement.BranchID = "renamed-child"
+	renamedPlacement.LastOperationID = "fork-rename"
+	if !canceledForkOwnsPlacement(renamedTx, renamedPlacement, "node-b") {
+		t.Fatal("operation-fenced renamed target placement lost cancellation ownership")
+	}
 }
 
 func TestDependencyMonitorIntervalBoundsAggregatePolling(t *testing.T) {

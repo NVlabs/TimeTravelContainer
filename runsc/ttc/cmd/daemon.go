@@ -2848,7 +2848,7 @@ func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactio
 	if err != nil {
 		return err
 	}
-	if tx.Identity.Migration || tx.Identity.TargetContainer != target.container || tx.Identity.VisibleTargetBranch() != target.branch {
+	if tx.Identity.Migration || tx.Identity.TargetContainer != target.container {
 		return fmt.Errorf("transaction %q does not identify canceled fork target %s", transactionID, target)
 	}
 	if tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionFailed {
@@ -2888,9 +2888,12 @@ func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactio
 // placement fence is therefore the exact logical target plus the target node
 // that still owns that placement.
 func canceledForkOwnsPlacement(tx cluster.Transaction, placement cluster.PlacementRecord, localNode string) bool {
+	operationMatches := tx.Identity.TransactionID != "" &&
+		(placement.OperationID == tx.Identity.TransactionID || placement.LastOperationID == tx.Identity.TransactionID)
+	branchMatches := tx.Identity.VisibleTargetBranch() == placement.BranchID || operationMatches
 	return !tx.Identity.Migration &&
 		tx.Identity.TargetContainer == placement.FamilyID &&
-		tx.Identity.VisibleTargetBranch() == placement.BranchID &&
+		branchMatches &&
 		tx.Identity.TargetNodeID == placement.OwnerNode &&
 		placement.OwnerNode == localNode
 }

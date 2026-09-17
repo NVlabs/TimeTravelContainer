@@ -1731,11 +1731,25 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 				continue
 			}
 		}
+		node := tx.Identity.SourceNodeID
+		removesTarget := branchID == "" || logicalBranch == branchID
+		// Cancellation destroys the physical target before committing its Raft
+		// terminal state. A crash or stale-revision retry can therefore leave a
+		// canceled transaction with its target placement still present. Keep
+		// selecting the metadata-only canceled-target path until that placement is
+		// removed; falling through to ordinary rm would try to reopen a runtime
+		// that cancellation has already destroyed. Operation IDs fence this from a
+		// later branch-name reuse.
+		if !tx.Identity.Migration && removesTarget && (tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed) && transactionOwnsCurrentPlacement(tx, placements) {
+			if cancel[node] == nil {
+				cancel[node] = make(map[string]struct{})
+			}
+			cancel[node][tx.Identity.TransactionID] = struct{}{}
+			continue
+		}
 		if !transactionNeedsSourceSettlement(tx) {
 			continue
 		}
-		node := tx.Identity.SourceNodeID
-		removesTarget := branchID == "" || logicalBranch == branchID
 		// Corruption has already fenced the physical runtime and discarded its
 		// volatile dependencies. Removal must therefore be a metadata-only Raft
 		// operation. In particular, do not spend a peer timeout asking the lost
@@ -1775,6 +1789,18 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 		settle[node][tx.Identity.TransactionID] = struct{}{}
 	}
 	return settle, cancel, discard
+}
+
+func transactionOwnsCurrentPlacement(tx cluster.Transaction, placements []cluster.PlacementRecord) bool {
+	for _, placement := range placements {
+		if placement.FamilyID != tx.Identity.TargetContainer {
+			continue
+		}
+		if placement.OperationID == tx.Identity.TransactionID || placement.LastOperationID == tx.Identity.TransactionID {
+			return true
+		}
+	}
+	return false
 }
 
 func placementLifecycle(placements []cluster.PlacementRecord, branch string) cluster.PlacementState {
