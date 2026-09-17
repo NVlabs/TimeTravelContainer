@@ -214,6 +214,7 @@ type testSnapshotReferenceProvider struct {
 	roots     []SnapshotRootBinding
 	retained  int
 	released  int
+	published int
 }
 
 type testSharedReferenceProvider struct {
@@ -287,6 +288,12 @@ func (provider *testSnapshotReferenceProvider) ApplySnapshotReference(_ context.
 	return nil
 }
 
+func (provider *testSnapshotReferenceProvider) PublishSnapshot(_ context.Context, peer string, snapshot uint64) error {
+	provider.peer, provider.snapshot = peer, snapshot
+	provider.published++
+	return nil
+}
+
 func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "transactions")
 	if err := os.Mkdir(storeRoot, 0700); err != nil {
@@ -334,6 +341,12 @@ func TestSnapshotReferenceProviderReceivesBoundedOperation(t *testing.T) {
 	}
 	if provider.retained != 3 || provider.operation != "edge-0000000000000001-0000000000000001" {
 		t.Fatalf("owner reference provider state=%+v", provider)
+	}
+	if err := client.PublishSnapshot(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if provider.published != 1 || provider.peer != "target" || provider.snapshot != 42 {
+		t.Fatalf("publication provider state=%+v", provider)
 	}
 }
 

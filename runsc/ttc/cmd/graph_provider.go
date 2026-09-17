@@ -101,6 +101,7 @@ type graphObjectProvider struct {
 	nodeID       string
 	incarnation  string
 	shared       *sharedReferenceService
+	publish      func(context.Context, ttcsnapshot.SnapshotID) error
 }
 
 const graphSnapshotCatalogVersion = 1
@@ -421,6 +422,27 @@ func (p *graphObjectProvider) ApplySnapshotReference(ctx context.Context, peer s
 		return p.graph.RetainRoots(bridge)
 	}
 	return p.graph.ReleaseRetainedRoots(bridge)
+}
+
+func (p *graphObjectProvider) PublishSnapshot(ctx context.Context, peer string, snapshotID uint64) error {
+	if p == nil || p.publish == nil || snapshotID == 0 {
+		return errors.New("snapshot publication provider is unavailable")
+	}
+	snapshot := ttcsnapshot.SnapshotID(snapshotID)
+	provider, volatile, err := p.authority.SnapshotProvider(snapshotID)
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		return nil
+	}
+	if provider.NodeID != p.nodeID {
+		return fmt.Errorf("snapshot origin %d is not owned by node %q", snapshot, p.nodeID)
+	}
+	if err := p.authorizeSnapshot(peer, snapshot, "", "", true); err != nil {
+		return err
+	}
+	return p.publish(ctx, snapshot)
 }
 
 func (p *graphObjectProvider) authorizeReferenceTransaction(peer, transactionID, operation string, allowTerminal bool) error {

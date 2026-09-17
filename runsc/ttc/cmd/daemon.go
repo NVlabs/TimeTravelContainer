@@ -5112,6 +5112,16 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		targetBackend.consoleSidecars = server
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		targetBackend.distributedSource = clusterRuntime.source
+		graphProvider.publish = func(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
+			publisher := &branchPublisher{
+				sharedRoot: targetBackend.dataRoot,
+				nodeID:     targetBackend.nodeID, incarnation: clusterRuntime.nodeRecord.Incarnation,
+				authority: clusterRuntime.raftCatalog, graph: targetBackend.snapshotGraph,
+				graphData: targetBackend.snapshotData, graphShared: targetBackend.snapshotShared,
+				sharedRefs: targetBackend.sharedReferences, peers: targetBackend.distributedSource,
+			}
+			return publisher.publishVolatileGraphOrigin(ctx, snapshot)
+		}
 		targetRuntime := &daemonTargetRuntime{
 			backend: targetBackend, nodeID: clusterRuntime.controlPlane.Capabilities.NodeID,
 			incarnation: clusterRuntime.nodeRecord.Incarnation, directory: clusterRuntime.directory,

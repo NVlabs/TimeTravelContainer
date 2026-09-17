@@ -54,6 +54,28 @@ func TestReferenceLedgerInternalCascade(t *testing.T) {
 	}
 }
 
+func TestReferenceLedgerNoOpCollectionDoesNotGrowJournal(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	object := ledgerObject(1, 1, ObjectKindMemoryChunk)
+	if err := ledger.ImportOrigin(1, []Object{object}, map[string]ObjectID{"branch/a": object.ID}); err != nil {
+		t.Fatal(err)
+	}
+	before := ledger.JournalBytes()
+	for i := 0; i < 8; i++ {
+		if collected, err := ledger.Collect(64 << 10); err != nil || collected != 0 {
+			t.Fatalf("Collect()=(%d, %v), want (0, nil)", collected, err)
+		}
+	}
+	if after := ledger.JournalBytes(); after != before {
+		t.Fatalf("no-op collection grew journal from %d to %d bytes", before, after)
+	}
+}
+
 func TestReferenceLedgerConvertsIncomingBridgeInEitherImportOrder(t *testing.T) {
 	child := ledgerObject(21, 1, ObjectKindFile)
 	parent := ledgerObject(22, 1, ObjectKindInode, Edge{Slot: 9, Child: child.ID})

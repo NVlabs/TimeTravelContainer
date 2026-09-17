@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
@@ -335,7 +336,7 @@ func TestSharedPackRetireWaitsForReaders(t *testing.T) {
 	}
 }
 
-func TestCanceledSharedPackPublicationRemovesNamespace(t *testing.T) {
+func TestCanceledSharedPackPublicationLeavesRecoverableNamespace(t *testing.T) {
 	directory := t.TempDir()
 	graph, err := Open(filepath.Join(directory, "graph"))
 	if err != nil {
@@ -373,8 +374,106 @@ func TestCanceledSharedPackPublicationRemovesNamespace(t *testing.T) {
 	if err := shared.Publish(ctx, graph, origin, local); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Publish(canceled) error=%v, want context cancellation", err)
 	}
-	if _, err := os.Stat(shared.snapshotDirectory(origin)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("canceled publication namespace stat error=%v, want not-exist", err)
+	if _, err := os.Stat(filepath.Join(shared.snapshotDirectory(origin), sharedManifestName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled publication manifest stat error=%v, want not-exist", err)
+	}
+	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {
+		t.Fatalf("retrying canceled publication: %v", err)
+	}
+	if _, err := shared.Manifest(origin); err != nil {
+		t.Fatalf("opening retried publication: %v", err)
+	}
+}
+
+type blockingObjectSource struct {
+	ObjectSource
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (source *blockingObjectSource) Fetch(ctx context.Context, id ObjectID) (io.ReadCloser, uint64, error) {
+	select {
+	case source.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	case <-source.release:
+	}
+	return source.ObjectSource.Fetch(ctx, id)
+}
+
+func TestConcurrentCanceledSharedPackPublicationCannotRemoveCommit(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := OpenSharedPackStore(filepath.Join(directory, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0x5c}, 1<<20)
+	if err := local.Install(id, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(id, "chunk", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := &blockingObjectSource{ObjectSource: local, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	published := make(chan error, 1)
+	go func() {
+		published <- shared.Publish(context.Background(), graph, origin, blocked)
+	}()
+	<-blocked.entered
+	competing := &blockingObjectSource{ObjectSource: local, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	canceled, cancel := context.WithCancel(context.Background())
+	competed := make(chan error, 1)
+	go func() {
+		competed <- shared.Publish(canceled, graph, origin, competing)
+	}()
+	// Without publication serialization, the competitor reaches Fetch and a
+	// subsequent cancellation removes the directory out from under the first
+	// publisher. With the lease, it remains outside the data path until the
+	// cancellation interrupts its lock wait.
+	select {
+	case <-competing.entered:
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	if err := <-competed; !errors.Is(err, context.Canceled) {
+		t.Fatalf("concurrent canceled Publish() error=%v, want context cancellation", err)
+	}
+	close(blocked.release)
+	if err := <-published; err != nil {
+		t.Fatalf("winning Publish(): %v", err)
+	}
+	reader, length, err := shared.Fetch(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || length != uint64(len(data)) || !bytes.Equal(got, data) {
+		t.Fatalf("published object length=%d bytes=%d err=%v", length, len(got), errors.Join(readErr, closeErr))
 	}
 }
 

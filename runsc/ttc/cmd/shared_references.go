@@ -249,6 +249,11 @@ type sharedReferenceService struct {
 	peers        *distributedSourceRuntime
 	lease        cluster.SharedGCLease
 	ledger       *ttcsnapshot.ReferenceLedger
+	// compactionPending is protected by mu. Shared-pack compaction is
+	// needed only after logical collection removes objects, plus one recovery
+	// reconciliation after a new coordinator activates. Remembering that fact
+	// avoids cloning every potentially huge manifest on every maintenance tick.
+	compactionPending bool
 }
 
 func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
@@ -906,6 +911,7 @@ func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 	}
 	s.mu.Lock()
 	s.ledger, s.lease = ledger, current
+	s.compactionPending = true
 	s.mu.Unlock()
 	if entries, err := os.ReadDir(s.directory); err == nil {
 		keep := fmt.Sprintf("generation-%016x", current.Generation)
@@ -932,6 +938,7 @@ func (s *sharedReferenceService) deactivate() error {
 	}
 	s.ledger = nil
 	s.lease = cluster.SharedGCLease{}
+	s.compactionPending = false
 	return err
 }
 
@@ -1520,64 +1527,90 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if err != nil {
 		return collected, err
 	}
-	// Rewrite at most one partially-live origin per maintenance pass. Logical
-	// collection is already durable in the ledger; compaction only changes its
-	// reader-fenced physical representation and therefore may be retried after
-	// interruption without affecting authority.
-	var origins []ttcsnapshot.SnapshotID
-	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		origins = ledger.Inspect().Origins
-		return nil
-	}); err != nil {
-		return collected, err
+	if collected != 0 {
+		s.mu.Lock()
+		s.compactionPending = true
+		s.mu.Unlock()
 	}
-	for _, origin := range origins {
-		if err := ctx.Err(); err != nil {
-			return collected, err
-		}
-		encoded := uint64(origin)
-		if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
-			continue
-		}
-		if _, volatile := state.VolatileOrigins[encoded]; volatile {
-			continue
-		}
-		if _, retired := state.RetiredOrigins[encoded]; retired {
-			continue
-		}
-		var objects []ttcsnapshot.Object
-		var references map[string]ttcsnapshot.ObjectID
-		var ready bool
+	s.mu.RLock()
+	compactionPending := s.compactionPending
+	s.mu.RUnlock()
+	if compactionPending {
+		// Rewrite at most one partially-live origin per maintenance pass. Logical
+		// collection is already durable in the ledger; compaction only changes its
+		// reader-fenced physical representation and therefore may be retried after
+		// interruption without affecting authority. A new coordinator performs one
+		// recovery scan; steady-state scans happen only after collection actually
+		// changes the physical live set.
+		var origins []ttcsnapshot.SnapshotID
 		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-			var ok bool
-			objects, references, ok, ready = ledger.OriginCompactionManifest(origin)
-			if !ok {
-				return os.ErrNotExist
-			}
+			origins = ledger.Origins()
 			return nil
 		}); err != nil {
 			return collected, err
 		}
-		if !ready || len(objects) == 0 {
-			continue
-		}
-		if _, busy, err := s.packs.Reconcile(origin); err != nil {
-			return collected, err
-		} else if busy {
-			continue
-		}
-		manifest, err := s.packs.Manifest(origin)
-		if err != nil {
-			return collected, err
-		}
-		if !sharedPackNeedsCompaction(manifest, objects) {
-			continue
-		}
-		if _, busy, err := s.packs.Compact(origin, objects, references); err != nil {
-			return collected, err
-		} else if !busy {
+		retryCompaction := false
+		for _, origin := range origins {
+			if err := ctx.Err(); err != nil {
+				return collected, err
+			}
+			encoded := uint64(origin)
+			if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
+				continue
+			}
+			if _, volatile := state.VolatileOrigins[encoded]; volatile {
+				continue
+			}
+			if _, retired := state.RetiredOrigins[encoded]; retired {
+				continue
+			}
+			var objects []ttcsnapshot.Object
+			var references map[string]ttcsnapshot.ObjectID
+			var ready bool
+			if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+				var ok bool
+				objects, references, ok, ready = ledger.OriginCompactionManifest(origin)
+				if !ok {
+					return os.ErrNotExist
+				}
+				return nil
+			}); err != nil {
+				return collected, err
+			}
+			if !ready {
+				retryCompaction = true
+				continue
+			}
+			if len(objects) == 0 {
+				continue
+			}
+			if _, busy, err := s.packs.Reconcile(origin); err != nil {
+				return collected, err
+			} else if busy {
+				retryCompaction = true
+				continue
+			}
+			manifest, err := s.packs.Manifest(origin)
+			if err != nil {
+				return collected, err
+			}
+			if !sharedPackNeedsCompaction(manifest, objects) {
+				continue
+			}
+			if _, busy, err := s.packs.Compact(origin, objects, references); err != nil {
+				return collected, err
+			} else if busy {
+				retryCompaction = true
+				continue
+			}
+			// Only one physical rewrite runs per pass. Revisit the remaining origins
+			// after the next lease tick.
+			retryCompaction = true
 			break
 		}
+		s.mu.Lock()
+		s.compactionPending = retryCompaction
+		s.mu.Unlock()
 	}
 	var candidates []ttcsnapshot.SnapshotID
 	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
@@ -1735,7 +1768,7 @@ func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context, requir
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		collected, err := s.collectAndRetire(ctx, lease, 4096)
+		collected, err := s.collectAndRetire(ctx, lease, 64<<10)
 		if err != nil {
 			return err
 		}

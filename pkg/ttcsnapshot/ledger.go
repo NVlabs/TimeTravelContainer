@@ -1220,6 +1220,21 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
+	// A healthy live graph overwhelmingly has nothing to collect. Avoid cloning
+	// the complete object table and appending a no-op WAL record on every
+	// coordinator maintenance tick. For large memory origins that work is
+	// proportional to resident memory and can otherwise keep a coordinator CPU
+	// saturated even though the graph has not changed.
+	hasReclaiming := false
+	for _, object := range ledger.state.Objects {
+		if object.State == ObjectReclaiming {
+			hasReclaiming = true
+			break
+		}
+	}
+	if !hasReclaiming {
+		return 0, nil
+	}
 	next := cloneReferenceLedgerState(ledger.state)
 	queue := make([]string, 0)
 	for key, object := range next.Objects {
@@ -1379,6 +1394,23 @@ func (ledger *ReferenceLedger) OriginCompactionManifest(origin SnapshotID) (obje
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
 	return ledger.originManifestLocked(origin)
+}
+
+// Origins returns the owned immutable origin IDs without copying the much
+// larger object and reference tables. Callers that only schedule per-origin
+// maintenance must not pay Inspect's object-proportional diagnostic cost.
+func (ledger *ReferenceLedger) Origins() []SnapshotID {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	result := make([]SnapshotID, 0, len(ledger.state.Origins))
+	for origin := range ledger.state.Origins {
+		result = append(result, origin)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result
 }
 
 // References returns the ledger's named roots without copying its potentially

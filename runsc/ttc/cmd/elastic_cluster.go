@@ -5432,7 +5432,7 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 				// renewed coordinator lease fences every irreversible boundary, so a
 				// short wall-clock timeout adds no safety and can starve a large
 				// family forever. Bound it by daemon lifetime instead.
-				_, err := references.collectAndRetire(maintenanceContext, held, 4096)
+				_, err := references.collectAndRetire(maintenanceContext, held, 64<<10)
 				if err != nil {
 					maintenanceErr = fmt.Errorf("collecting shared snapshot graph: %w", err)
 				}

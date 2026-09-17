@@ -283,6 +283,10 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 // with local inventory capture, but waiting occurs outside claimMu: otherwise
 // a node elected as the successor could deadlock rebuilding its own inventory.
 func (b *runtimeBackend) retryGraphReferenceMutation(run func(context.Context) error) error {
+	return retryGraphReferenceMutation(run)
+}
+
+func retryGraphReferenceMutation(run func(context.Context) error) error {
 	if run == nil {
 		return errors.New("invalid graph-reference mutation")
 	}

@@ -833,6 +833,7 @@ type SnapshotReferenceProvider interface {
 	RetainSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
 	ReleaseSnapshotRoots(context.Context, string, uint64, string, string, []SnapshotRootBinding) error
 	ApplySnapshotReference(context.Context, string, uint64, string, string, string, bool) error
+	PublishSnapshot(context.Context, string, uint64) error
 }
 
 // SharedReferenceMutation is one provider handoff record. Object uses TTC's
@@ -1198,7 +1199,7 @@ func (c *ControlPlane) serveObject(w http.ResponseWriter, r *http.Request, peer 
 func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, peer string) {
 	remainder := strings.TrimPrefix(r.URL.Path, controlSnapshotPrefix)
 	text, suffix, ok := strings.Cut(remainder, "/")
-	if !ok || (suffix != "catalog" && suffix != "references" && !strings.HasPrefix(suffix, "objects/")) {
+	if !ok || (suffix != "catalog" && suffix != "references" && suffix != "publish" && !strings.HasPrefix(suffix, "objects/")) {
 		writeControlError(w, http.StatusBadRequest, "invalid immutable snapshot path")
 		return
 	}
@@ -1209,6 +1210,22 @@ func (c *ControlPlane) serveSnapshot(w http.ResponseWriter, r *http.Request, pee
 	}
 	if suffix == "references" {
 		c.serveSnapshotReferences(w, r, peer, snapshot)
+		return
+	}
+	if suffix == "publish" {
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "snapshot publication requires POST")
+			return
+		}
+		if c.SnapshotReferences == nil {
+			writeControlError(w, http.StatusNotImplemented, "snapshot publication provider is unavailable")
+			return
+		}
+		if err := c.SnapshotReferences.PublishSnapshot(r.Context(), peer, snapshot); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]any{"snapshot_id": snapshot, "published": true})
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -2095,6 +2112,18 @@ func (c *Client) ApplySnapshotReference(ctx context.Context, snapshot uint64, op
 	var response map[string]any
 	request := snapshotReferenceRequest{Operation: operation, Action: "reference", Name: name, Object: object, Retain: retain}
 	return c.call(ctx, http.MethodPost, controlSnapshotPrefix+strconv.FormatUint(snapshot, 10)+"/references", request, &response)
+}
+
+// PublishSnapshot asks the exact volatile provider to make an immutable
+// origin and all of its backing origins durable in shared storage. The
+// provider serializes concurrent requests; a retry after a lost response is
+// idempotent because shared authority is immutable.
+func (c *Client) PublishSnapshot(ctx context.Context, snapshot uint64) error {
+	if snapshot == 0 {
+		return errors.New("invalid snapshot publication request")
+	}
+	var response map[string]any
+	return c.call(ctx, http.MethodPost, controlSnapshotPrefix+strconv.FormatUint(snapshot, 10)+"/publish", struct{}{}, &response)
 }
 
 // ImportSharedSnapshot asks the current shared-GC coordinator to import the

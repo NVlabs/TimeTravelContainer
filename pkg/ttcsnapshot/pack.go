@@ -186,6 +186,25 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if graph == nil || source == nil || snapshot == 0 {
 		return errors.New("invalid shared snapshot publication")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	directory := store.snapshotDirectory(snapshot)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	// More than one retry may exist on the authorized provider. Serialize the
+	// whole publication with readers, compaction, and retirement, then check
+	// the manifest under that lease. In particular, a failed retry must never
+	// remove a namespace or pack committed by another retry.
+	lease, err := store.acquireSnapshotWriteLease(ctx, snapshot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
+		_ = lease.Close()
+	}()
 	if _, err := store.Manifest(snapshot); err == nil {
 		// The manifest is the immutable authority point. Provider reference
 		// counts may already have moved to the shared ledger, so a post-handoff
@@ -203,7 +222,6 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	}
 	var objects []Object
 	var references map[string]ObjectID
-	var err error
 	if handoff {
 		objects, references, _, err = graph.BeginSnapshotLedgerHandoff(snapshot)
 	} else {
@@ -230,27 +248,12 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 			bulkSources[resolved.ID.key()] = bulk
 		}
 	}
-	directory := store.snapshotDirectory(snapshot)
-	if err := os.MkdirAll(directory, 0700); err != nil {
-		return err
-	}
 	temporary, err := os.CreateTemp(directory, ".pack-")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	committed := false
-	defer func() {
-		_ = os.Remove(temporaryPath)
-		if !committed {
-			// A provider is uniquely authorized to publish this snapshot. If
-			// it is canceled before manifest-last commit, none of the staging
-			// namespace is authoritative. Remove it now instead of leaving an
-			// empty numeric directory for distributed GC to rediscover.
-			_ = os.RemoveAll(directory)
-			_ = syncDirectory(filepath.Dir(directory))
-		}
-	}()
+	defer os.Remove(temporaryPath)
 	const packNumber = uint32(0)
 	if err := writePackHeader(temporary, snapshot, packNumber); err != nil {
 		temporary.Close()
@@ -352,7 +355,6 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err := writeAtomicJSON(filepath.Join(directory, sharedManifestName), manifest); err != nil {
 		return err
 	}
-	committed = true
 	store.mu.Lock()
 	delete(store.manifests, snapshot)
 	store.mu.Unlock()
@@ -827,6 +829,20 @@ func (store *SharedPackStore) acquireSnapshotLease(snapshot SnapshotID, operatio
 func (store *SharedPackStore) acquireSnapshotReadLease(ctx context.Context, snapshot SnapshotID) (*os.File, error) {
 	for {
 		lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_SH|syscall.LOCK_NB)
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return lease, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func (store *SharedPackStore) acquireSnapshotWriteLease(ctx context.Context, snapshot SnapshotID) (*os.File, error) {
+	for {
+		lease, err := store.acquireSnapshotLease(snapshot, syscall.LOCK_EX|syscall.LOCK_NB)
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
 			return lease, err
 		}

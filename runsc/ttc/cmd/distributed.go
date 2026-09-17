@@ -282,8 +282,18 @@ type distributedSourceRuntime struct {
 	monitorSlots  chan struct{}
 	monitorCount  atomic.Int64
 	sourceLocks   [64]sync.Mutex
+	originLocks   [64]sync.Mutex
 	pageListen    string
 	pageAdvertise string
+}
+
+func (r *distributedSourceRuntime) lockSnapshotOrigin(origin ttcsnapshot.SnapshotID) func() {
+	if r == nil || origin == 0 {
+		return func() {}
+	}
+	lock := &r.originLocks[uint64(origin)%uint64(len(r.originLocks))]
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
@@ -1679,79 +1689,15 @@ func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInf
 // for an existing immutable origin. Bulk pack creation happens before the
 // short ledger freeze; Raft changes routing only after the shared coordinator
 // has imported the exact provider baseline and catch-up suffix.
-func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) (retErr error) {
-	if origin == 0 || b.snapshotGraph == nil || b.snapshotData == nil || b.snapshotShared == nil ||
-		b.distributedSource == nil || b.distributedSource.authority == nil || b.sharedReferences == nil {
-		return errors.New("distributed graph publication is unavailable")
-	}
-	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
-	if err != nil {
-		return err
-	}
-	if !volatile {
-		if _, err := b.snapshotShared.Manifest(origin); err != nil {
-			return fmt.Errorf("snapshot origin %d has neither volatile nor shared authority: %w", origin, err)
-		}
-		return nil
-	}
-	if provider.NodeID != b.nodeID {
-		return fmt.Errorf("snapshot origin %d belongs to node %q, not %q", origin, provider.NodeID, b.nodeID)
-	}
-	record, ok := b.snapshotGraph.Snapshot(origin)
-	if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
-		return fmt.Errorf("snapshot origin %d is not locally sealed for publication", origin)
-	}
-	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
-		return fmt.Errorf("publishing snapshot origin %d: %w", origin, err)
-	}
-
-	finishHandoff := b.distributedSource.beginBackgroundSnapshotWork()
-	defer finishHandoff()
-	ledgerFrozen := false
-	defer func() {
-		if retErr != nil && ledgerFrozen {
-			_ = b.snapshotGraph.UnfreezeSnapshotLedger(origin)
-		}
-	}()
-	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
-		return err
-	}
-	ledgerFrozen = true
-	changes, _, frozen, err := b.snapshotGraph.SnapshotLedgerHandoffChanges(origin, 0)
-	if err != nil {
-		return err
-	}
-	if !frozen {
-		return fmt.Errorf("snapshot origin %d reference handoff did not freeze", origin)
-	}
+func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) error {
 	publisher := &branchPublisher{
 		sharedRoot: b.dataRoot,
 		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		graph: b.snapshotGraph, graphData: b.snapshotData,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
-	bridgeIntent := sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
-	if err := b.retryGraphReferenceMutation(func(context.Context) error {
-		return publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent)
-	}); err != nil {
-		return fmt.Errorf("transferring snapshot origin %d reference authority: %w", origin, err)
-	}
-	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
-		return fmt.Errorf("publishing snapshot origin %d authority: %w", origin, err)
-	}
-	if err := b.snapshotGraph.MarkShared(origin); err != nil {
-		return err
-	}
-	if err := b.snapshotGraph.UnfreezeSnapshotLedger(origin); err != nil {
-		return err
-	}
-	ledgerFrozen = false
-	if err := b.retryGraphReferenceMutation(func(context.Context) error {
-		return publisher.releaseSharedPublicationBridge(origin)
-	}); err != nil {
-		return fmt.Errorf("releasing snapshot origin %d publication bridge: %w", origin, err)
-	}
-	return releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin)
+	return publisher.publishVolatileGraphOrigin(context.Background(), origin)
 }
 
 // publishVolatileFilesystemOrigin transfers one immutable filesystem origin
