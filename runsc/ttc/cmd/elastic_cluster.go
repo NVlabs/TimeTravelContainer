@@ -2790,14 +2790,9 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if err != nil {
 		return abort(fmt.Errorf("capturing portable internal mounts: %w", err))
 	}
-	execConsoleLogs, execConsoleFiles, err := b.captureRemoteExecConsoleLogs(info.ID, target.branch, session.ExecSessions)
+	execConsoleLogs, err := b.configureRemoteExecConsoleLogs(relay, session.Token, info.ID, target.branch, session.ExecSessions)
 	if err != nil {
 		return abort(fmt.Errorf("capturing retained exec output: %w", err))
-	}
-	if len(execConsoleLogs) != 0 {
-		if err := relay.ConfigureConsoleLogs(session.Token, execConsoleFiles); err != nil {
-			return abort(fmt.Errorf("configuring retained exec output relay: %w", err))
-		}
 	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),

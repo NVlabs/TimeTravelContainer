@@ -108,7 +108,32 @@ func TestDistributedConsoleLogRelay(t *testing.T) {
 	defer relay.Close()
 	var token [16]byte
 	copy(token[:], "console-log-test")
-	if err := relay.ConfigureConsoleLogs(token, map[string][]string{"build": {older, newer}}); err != nil {
+	openExtent := func(path string) remoteConsoleLogExtent {
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		return remoteConsoleLogExtent{file: file, size: info.Size()}
+	}
+	if err := relay.ConfigureConsoleLogs(token, map[string][]remoteConsoleLogExtent{"build": {openExtent(older), openExtent(newer)}}); err != nil {
+		t.Fatal(err)
+	}
+	// A running session may append after capture. The relay must expose exactly
+	// the captured prefix, not the file's later length.
+	file, err := os.OpenFile(newer, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("late\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(dir, "target", "build.log")

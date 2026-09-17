@@ -672,7 +672,16 @@ type distributedPageRelay struct {
 	directCleanup        func()
 	directWG             sync.WaitGroup
 	consoleToken         [16]byte
-	consoleLogs          map[string][]string
+	consoleLogs          map[string][]remoteConsoleLogExtent
+}
+
+// remoteConsoleLogExtent pins one console-log generation at the exact length
+// observed during capture. Keeping the file open makes the handoff independent
+// of subsequent log rotation or unlink, while the length fence prevents a live
+// session from extending the supposedly immutable captured prefix.
+type remoteConsoleLogExtent struct {
+	file *os.File
+	size int64
 }
 
 func newDistributedPageRelay(listener net.Listener, backend *runtimeBackend, source, session string) *distributedPageRelay {
@@ -761,20 +770,19 @@ func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
 	r.serveFile(file)
 }
 
-// ConfigureConsoleLogs exposes stable, stopped-follower log generations over
-// the same authenticated point-to-point listener as memory and filesystem
-// paging. The paths never cross the wire and are valid only for this relay's
-// lifetime.
-func (r *distributedPageRelay) ConfigureConsoleLogs(token [16]byte, logs map[string][]string) error {
+// ConfigureConsoleLogs exposes capture-fenced log generations over the same
+// authenticated point-to-point listener as memory and filesystem paging.
+// Ownership of every open extent transfers to the relay on success.
+func (r *distributedPageRelay) ConfigureConsoleLogs(token [16]byte, logs map[string][]remoteConsoleLogExtent) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed || len(r.consoleLogs) != 0 {
 		return errors.New("distributed console relay is closed or already configured")
 	}
 	r.consoleToken = token
-	r.consoleLogs = make(map[string][]string, len(logs))
-	for id, paths := range logs {
-		r.consoleLogs[id] = append([]string(nil), paths...)
+	r.consoleLogs = make(map[string][]remoteConsoleLogExtent, len(logs))
+	for id, extents := range logs {
+		r.consoleLogs[id] = append([]remoteConsoleLogExtent(nil), extents...)
 	}
 	return nil
 }
@@ -799,34 +807,27 @@ func (r *distributedPageRelay) serveConsoleLog(conn *net.TCPConn) {
 		return
 	}
 	r.mu.Lock()
-	paths := append([]string(nil), r.consoleLogs[string(idBytes)]...)
-	authorized := token == r.consoleToken && len(paths) != 0 && !r.closed
+	extents := append([]remoteConsoleLogExtent(nil), r.consoleLogs[string(idBytes)]...)
+	authorized := token == r.consoleToken && len(extents) != 0 && !r.closed
 	r.mu.Unlock()
 	if !authorized {
 		return
 	}
 	var size uint64
-	for _, path := range paths {
-		info, err := os.Stat(path)
-		if err != nil || info.Size() < 0 {
+	for _, extent := range extents {
+		if extent.file == nil || extent.size < 0 {
 			return
 		}
-		if uint64(info.Size()) > math.MaxUint64-size {
+		if uint64(extent.size) > math.MaxUint64-size {
 			return
 		}
-		size += uint64(info.Size())
+		size += uint64(extent.size)
 	}
 	if err := binary.Write(conn, binary.BigEndian, size); err != nil {
 		return
 	}
-	for _, path := range paths {
-		file, err := os.Open(path)
-		if err != nil {
-			return
-		}
-		_, copyErr := io.Copy(conn, file)
-		closeErr := file.Close()
-		if copyErr != nil || closeErr != nil {
+	for _, extent := range extents {
+		if _, err := io.Copy(conn, io.NewSectionReader(extent.file, 0, extent.size)); err != nil {
 			return
 		}
 	}
@@ -1005,42 +1006,88 @@ func fileContentPrefix(prefixPath, completePath string) (bool, error) {
 	return true, nil
 }
 
-func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, sessions []boot.ExecSessionInfo) ([]cluster.RemoteConsoleLogDescriptor, map[string][]string, error) {
+func closeRemoteConsoleLogExtents(logs map[string][]remoteConsoleLogExtent) error {
+	var result error
+	for _, extents := range logs {
+		for _, extent := range extents {
+			if extent.file != nil {
+				result = errors.Join(result, extent.file.Close())
+			}
+		}
+	}
+	return result
+}
+
+func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, sessions []boot.ExecSessionInfo) ([]cluster.RemoteConsoleLogDescriptor, map[string][]remoteConsoleLogExtent, error) {
 	_, maxFiles, err := b.consoleRetention(container)
 	if err != nil {
 		return nil, nil, err
 	}
 	store := b.containerStore()
 	descriptors := make([]cluster.RemoteConsoleLogDescriptor, 0, len(sessions))
-	files := make(map[string][]string)
+	files := make(map[string][]remoteConsoleLogExtent)
+	fail := func(err error) ([]cluster.RemoteConsoleLogDescriptor, map[string][]remoteConsoleLogExtent, error) {
+		return nil, nil, errors.Join(err, closeRemoteConsoleLogExtents(files))
+	}
 	for _, session := range sessions {
 		paths, err := store.ExecConsolePaths(container, branch, session.ID)
 		if err != nil {
-			return nil, nil, err
+			return fail(err)
 		}
 		generations, err := listConsoleLogGenerations(paths.Log, maxFiles)
 		if err != nil {
-			return nil, nil, err
+			return fail(err)
 		}
 		var size uint64
-		generationPaths := make([]string, 0, len(generations))
+		extents := make([]remoteConsoleLogExtent, 0, len(generations))
 		for _, generation := range generations {
-			if generation.info.Size() < 0 {
-				return nil, nil, fmt.Errorf("exec console log %q has a negative size", session.ID)
+			file, err := os.Open(generation.path)
+			if err != nil {
+				return fail(err)
 			}
-			if uint64(generation.info.Size()) > math.MaxUint64-size {
-				return nil, nil, fmt.Errorf("exec console log %q is too large", session.ID)
+			info, err := file.Stat()
+			if err != nil {
+				file.Close()
+				return fail(err)
 			}
-			size += uint64(generation.info.Size())
-			generationPaths = append(generationPaths, generation.path)
+			if info.Size() < 0 {
+				file.Close()
+				return fail(fmt.Errorf("exec console log %q has a negative size", session.ID))
+			}
+			if uint64(info.Size()) > math.MaxUint64-size {
+				file.Close()
+				return fail(fmt.Errorf("exec console log %q is too large", session.ID))
+			}
+			size += uint64(info.Size())
+			extents = append(extents, remoteConsoleLogExtent{file: file, size: info.Size()})
+			files[session.ID] = extents
 		}
 		if size == 0 {
+			_ = closeRemoteConsoleLogExtents(map[string][]remoteConsoleLogExtent{session.ID: extents})
+			delete(files, session.ID)
 			continue
 		}
 		descriptors = append(descriptors, cluster.RemoteConsoleLogDescriptor{ExecID: session.ID, Size: size})
-		files[session.ID] = generationPaths
+		files[session.ID] = extents
 	}
 	return descriptors, files, nil
+}
+
+// configureRemoteExecConsoleLogs captures the host-side portion of managed
+// exec state and attaches it to the same fenced relay as the Sentry snapshot.
+// Every remote fork/migration path must call this before preparing its target.
+func (b *runtimeBackend) configureRemoteExecConsoleLogs(relay *distributedPageRelay, token [16]byte, container, branch string, sessions []boot.ExecSessionInfo) ([]cluster.RemoteConsoleLogDescriptor, error) {
+	descriptors, files, err := b.captureRemoteExecConsoleLogs(container, branch, sessions)
+	if err != nil {
+		return nil, err
+	}
+	if len(descriptors) == 0 {
+		return nil, closeRemoteConsoleLogExtents(files)
+	}
+	if err := relay.ConfigureConsoleLogs(token, files); err != nil {
+		return nil, errors.Join(err, closeRemoteConsoleLogExtents(files))
+	}
+	return descriptors, nil
 }
 
 // installRemoteExecSessionStates restores the host-side completion markers for
@@ -1213,10 +1260,13 @@ func (r *distributedPageRelay) Close() {
 			cleanup := r.directCleanup
 			r.directCleanup = nil
 			r.directFilesystem = nil
+			consoleLogs := r.consoleLogs
+			r.consoleLogs = nil
 			r.mu.Unlock()
 			if cleanup != nil {
 				cleanup()
 			}
+			_ = closeRemoteConsoleLogExtents(consoleLogs)
 		})
 	}
 }
@@ -2142,12 +2192,16 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, fmt.Errorf("capturing portable internal mounts: %w", err)
 	}
+	execConsoleLogs, err := b.configureRemoteExecConsoleLogs(relay, session.Token, sourceInfo.ID, source.branch, session.ExecSessions)
+	if err != nil {
+		return selector{}, fmt.Errorf("capturing retained exec output: %w", err)
+	}
 	descriptor := cluster.RemoteSessionDescriptor{
 		Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 		MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 		MaxTransferBytes: dataPlaneMax,
 		FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
-		ExecSessions: remoteExecSessions(session.ExecSessions),
+		ExecSessions: remoteExecSessions(session.ExecSessions), ExecConsoleLogs: execConsoleLogs,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -2342,6 +2396,10 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 		directCleanup()
 		return selector{}, err
 	}
+	execConsoleLogs, err := b.configureRemoteExecConsoleLogs(relay, filesystemToken, sourceInfo.ID, sourceBranch.ID, capture.ExecSessions)
+	if err != nil {
+		return selector{}, fmt.Errorf("capturing retained exec output: %w", err)
+	}
 	var streamBytes uint64
 	for _, run := range decodedGraphManifest.Runs {
 		streamBytes += uint64(run.Pages) * 4096
@@ -2357,7 +2415,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
 		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
 		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
-		ExecSessions: remoteExecSessions(capture.ExecSessions),
+		ExecSessions: remoteExecSessions(capture.ExecSessions), ExecConsoleLogs: execConsoleLogs,
 	}
 	tx, err = peer.Prepare(ctx, transactionID, tx.Revision, descriptor)
 	if err != nil {
@@ -2826,12 +2884,16 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if err != nil {
 			return nil, fmt.Errorf("sealing filesystem generation for target %s: %w", child.target, err)
 		}
+		execConsoleLogs, err := b.configureRemoteExecConsoleLogs(child.relay, session.Token, sourceInfo.ID, source.branch, session.ExecSessions)
+		if err != nil {
+			return nil, fmt.Errorf("capturing retained exec output for target %s: %w", child.target, err)
+		}
 		descriptors[i] = cluster.RemoteSessionDescriptor{
 			Address: session.Address, SnapshotToken: hex.EncodeToString(session.Token[:]),
 			MetadataBytes: session.MetadataBytes, StreamBytes: session.StreamBytes,
 			MaxTransferBytes: child.dataPlaneMax,
 			FilesystemRoots:  filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
-			ExecSessions: remoteExecSessions(session.ExecSessions),
+			ExecSessions: remoteExecSessions(session.ExecSessions), ExecConsoleLogs: execConsoleLogs,
 		}
 	}
 	prepareChild := func(i int) error {
