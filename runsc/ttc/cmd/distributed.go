@@ -1789,15 +1789,15 @@ type snapshotProviderLookup interface {
 	SnapshotProvider(uint64) (cluster.SnapshotOriginProvider, bool, error)
 }
 
-func retirementOriginIsTerminal(authority snapshotProviderLookup, origin ttcsnapshot.SnapshotID) (bool, error) {
+func snapshotOriginAuthority(authority snapshotProviderLookup, origin ttcsnapshot.SnapshotID) (cluster.SnapshotOriginProvider, bool, bool, error) {
 	if authority == nil || origin == 0 {
-		return false, errors.New("snapshot origin authority is unavailable")
+		return cluster.SnapshotOriginProvider{}, false, false, errors.New("snapshot origin authority is unavailable")
 	}
-	_, _, err := authority.SnapshotProvider(uint64(origin))
+	provider, volatile, err := authority.SnapshotProvider(uint64(origin))
 	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
+		return cluster.SnapshotOriginProvider{}, false, true, nil
 	}
-	return false, err
+	return provider, volatile, false, err
 }
 
 // publishRetirementFilesystemOrigin publishes a filesystem origin discovered
@@ -1815,7 +1815,7 @@ func (b *runtimeBackend) publishRetirementFilesystemOrigin(origin ttcsnapshot.Sn
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return errors.New("distributed filesystem publication is unavailable")
 	}
-	terminal, err := retirementOriginIsTerminal(b.distributedSource.authority, origin)
+	_, _, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, origin)
 	if err != nil {
 		return fmt.Errorf("resolving retiring filesystem origin %d: %w", origin, err)
 	}
@@ -1826,7 +1826,7 @@ func (b *runtimeBackend) publishRetirementFilesystemOrigin(origin ttcsnapshot.Sn
 	if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	terminal, lookupErr := retirementOriginIsTerminal(b.distributedSource.authority, origin)
+	_, _, terminal, lookupErr := snapshotOriginAuthority(b.distributedSource.authority, origin)
 	if lookupErr != nil {
 		return errors.Join(err, fmt.Errorf("rechecking retiring filesystem origin %d authority: %w", origin, lookupErr))
 	}

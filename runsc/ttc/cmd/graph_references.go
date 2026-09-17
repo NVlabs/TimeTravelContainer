@@ -678,7 +678,14 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if protected[uint64(id.Snapshot)] {
 			continue
 		}
-		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+		_, volatile, terminal, err := snapshotOriginAuthority(b.distributedSource.authority, id.Snapshot)
+		if terminal {
+			// Raft tombstones are permanent. Shared GC has either already
+			// consumed this reference, or the unpublished origin never had a
+			// shared-ledger reference. This is the idempotent completion case
+			// when removing a branch marked corrupted after provider loss.
+			continue
+		}
 		if err != nil {
 			return err
 		}

@@ -41,7 +41,7 @@ func (lookup testSnapshotProviderLookup) SnapshotProvider(snapshot uint64) (clus
 	return cluster.SnapshotOriginProvider{SnapshotID: snapshot, NodeID: "node-a"}, lookup.found, lookup.err
 }
 
-func TestRetirementOriginIsTerminalOnlyForAuthorityTombstone(t *testing.T) {
+func TestSnapshotOriginAuthorityDistinguishesTombstones(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		lookup   testSnapshotProviderLookup
@@ -54,9 +54,9 @@ func TestRetirementOriginIsTerminalOnlyForAuthorityTombstone(t *testing.T) {
 		{name: "authority failure", lookup: testSnapshotProviderLookup{err: errors.New("raft unavailable")}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			terminal, err := retirementOriginIsTerminal(test.lookup, 17)
-			if terminal != test.terminal || (err != nil) != test.wantErr {
-				t.Fatalf("retirementOriginIsTerminal() = (%t, %v), want (%t, error=%t)", terminal, err, test.terminal, test.wantErr)
+			_, volatile, terminal, err := snapshotOriginAuthority(test.lookup, 17)
+			if volatile != test.lookup.found || terminal != test.terminal || (err != nil) != test.wantErr {
+				t.Fatalf("snapshotOriginAuthority() = (volatile=%t, terminal=%t, err=%v), want (volatile=%t, terminal=%t, error=%t)", volatile, terminal, err, test.lookup.found, test.terminal, test.wantErr)
 			}
 		})
 	}

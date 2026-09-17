@@ -12150,7 +12150,7 @@ func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, bran
 	operation := graphReferenceOperationForBranch(info, branch)
 	if operation == "" {
 		if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
-			return err
+			return fmt.Errorf("releasing producer shared-memory roots: %w", err)
 		}
 	}
 	// A remote-origin branch may have both ordinary logical roots and retained
@@ -12158,16 +12158,16 @@ func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, bran
 	// first so the subsequent local collection sees the true zero-reference
 	// state and can retire the provider origin in the same operation.
 	if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
-		return err
+		return fmt.Errorf("releasing distributed memory references: %w", err)
 	}
 	if err := b.releaseBranchGraphRoots(branch); err != nil {
-		return err
+		return fmt.Errorf("releasing local memory roots: %w", err)
 	}
 	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
-		return err
+		return fmt.Errorf("removing branch filesystems: %w", err)
 	}
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
-		return err
+		return fmt.Errorf("reconciling snapshot providers: %w", err)
 	}
 	return nil
 }
