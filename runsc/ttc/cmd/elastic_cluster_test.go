@@ -769,6 +769,35 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 }
 
+func TestRegisterCreatedContainerPlacementIsUnplaced(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{distributedSource: &distributedSourceRuntime{
+		placements: placements,
+		// Presence identifies the production Raft-backed cluster path. The
+		// placement store remains a deterministic catalog test double.
+		authority: &cluster.RaftCatalog{},
+	}}
+	created := time.Unix(123, 0).UTC()
+	info := ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", Reference: "busybox:1.36", Digest: "sha256:image", ImageSize: 42,
+		LiveForkEligible: true, CreatedAt: created,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "created", CreatedAt: created}},
+	}
+	if err := backend.registerCreatedContainerPlacement(info); err != nil {
+		t.Fatal(err)
+	}
+	record, err := placements.Lookup("family", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.State != cluster.PlacementUnplaced || record.OwnerNode != "" || record.PhysicalContainer != "" || record.FamilyName != "web" || record.ImageReference != "busybox:1.36" {
+		t.Fatalf("created placement=%+v", record)
+	}
+}
+
 func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()

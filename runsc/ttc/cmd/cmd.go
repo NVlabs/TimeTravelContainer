@@ -6855,6 +6855,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	}
 	store := b.containerStore()
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
+	createdNodeID := b.nodeID
+	if b.distributedSource != nil {
+		createdNodeID = ""
+	}
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6890,24 +6894,26 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:               request.reference,
-		PullPolicy:              request.pullPolicy,
-		LogDriver:               request.logDriver,
-		LogOptions:              request.logOptions,
-		ConsoleLogMaxBytes:      request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles:      request.consoleLogMaxFiles,
-		OpenStdin:               request.interactive,
-		AutoRemove:              request.autoRemove,
-		StopTimeout:             &request.stopTimeout,
-		NetworkNAT:              request.networkNAT,
-		NetworkIP:               request.networkIP,
-		NetworkMAC:              request.networkMAC,
-		PublishedPorts:          request.publishedPorts,
-		WaiveLiveFork:           !request.liveForkEligible,
-		LiveForkWaiver:          request.liveForkWaiver,
-		Progress:                b.imageProgress(),
-		VolumeCopyMode:          b.volumeCopyMode,
-		NodeID:                  b.nodeID,
+		Reference:          request.reference,
+		PullPolicy:         request.pullPolicy,
+		LogDriver:          request.logDriver,
+		LogOptions:         request.logOptions,
+		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
+		OpenStdin:          request.interactive,
+		AutoRemove:         request.autoRemove,
+		StopTimeout:        &request.stopTimeout,
+		NetworkNAT:         request.networkNAT,
+		NetworkIP:          request.networkIP,
+		NetworkMAC:         request.networkMAC,
+		PublishedPorts:     request.publishedPorts,
+		WaiveLiveFork:      !request.liveForkEligible,
+		LiveForkWaiver:     request.liveForkWaiver,
+		Progress:           b.imageProgress(),
+		VolumeCopyMode:     b.volumeCopyMode,
+		// A created branch is cluster-wide durable state with no execution
+		// owner. `start --node` records ownership only after Raft admission.
+		NodeID:                  createdNodeID,
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,
 	})
@@ -6915,7 +6921,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		return "", errors.Join(err, finishFilesystemOrigins(false))
 	}
 	if err := finishFilesystemOrigins(true); err != nil {
-		return "", err
+		return "", errors.Join(err, store.RemoveContainer(prepared.Container.ID))
+	}
+	if err := b.registerCreatedContainerPlacement(prepared.Container); err != nil {
+		return "", errors.Join(err, store.RemoveContainer(prepared.Container.ID))
 	}
 	return prepared.Container.ID, nil
 }

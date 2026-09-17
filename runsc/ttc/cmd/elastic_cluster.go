@@ -855,6 +855,35 @@ type newPlacementReservation struct {
 	record *cluster.PlacementRecord
 }
 
+// registerCreatedContainerPlacement publishes the logical identity of a
+// cluster-created, never-started branch. It deliberately has no owner: create
+// prepares durable shared state, while a later start chooses and fences the
+// compute node that will materialize it.
+func (b *runtimeBackend) registerCreatedContainerPlacement(info ttcbundle.ContainerInfo) error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, defaultBranchID)
+	if err != nil {
+		return err
+	}
+	_, err = placements.Create(cluster.PlacementRecord{
+		FamilyID: info.ID, BranchID: branch.ID, State: cluster.PlacementUnplaced,
+		FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
+		LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
+		FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+		Quarantined: branch.Quarantined,
+	}, time.Now())
+	if err != nil {
+		return fmt.Errorf("registering created placement for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	return nil
+}
+
 // reserveNewContainerPlacement fences a newly prepared main branch before its
 // Sentry exists. PlacementMaterializing grants this node exclusive construction
 // authority but is not executable/routable as a normal branch. Standalone TTC
@@ -1476,14 +1505,20 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 			if authorityErr != nil {
 				return fmt.Errorf("loading cold-branch authority for %s: %w", target, authorityErr)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			persistent, persistentBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, store, info.ID, resolved.branch, *committed)
-			cancel()
-			if waitErr != nil {
-				return fmt.Errorf("waiting to claim cold branch %s: %w", target, waitErr)
+			// A branch created by `ttc create` has durable bundle/filesystem
+			// state but has never produced a cold publication. Claim its existing
+			// shared record directly. Every other unplaced lifecycle must pass the
+			// immutable publication fence before it can execute elsewhere.
+			if normalizeLifecycleState(branch.State) != "created" {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				persistent, persistentBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, store, info.ID, resolved.branch, *committed)
+				cancel()
+				if waitErr != nil {
+					return fmt.Errorf("waiting to claim cold branch %s: %w", target, waitErr)
+				}
+				info, branch = persistent, persistentBranch
+				resolved = selector{container: persistent.ID, branch: persistentBranch.ID}
 			}
-			info, branch = persistent, persistentBranch
-			resolved = selector{container: persistent.ID, branch: persistentBranch.ID}
 		}
 		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {
