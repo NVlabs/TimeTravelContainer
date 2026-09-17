@@ -4187,6 +4187,19 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		return err
 	}
 	for _, family := range families {
+		markCorrupted := func(branchID string) error {
+			placement, err := backend.distributedSource.authority.LookupPlacement(family.ID, branchID)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if placement.State != cluster.PlacementCorrupted {
+				return nil
+			}
+			return backend.containerStore().UpdateBranchState(family.ID, branchID, "corrupted")
+		}
 		var revoked []Branch
 		var info ttcbundle.ContainerInfo
 		var infoErr error
@@ -4226,10 +4239,14 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		if len(revoked) == len(family.Branches) {
 			if _, err := backend.command("delete", "--force", family.ID); err != nil {
 				present, checkErr := runtimeBranchPresent(backend, family.ID, "")
-				if checkErr == nil && !present {
-					continue
+				if checkErr != nil || present {
+					return fmt.Errorf("destroying wholly unauthorized runtime %q: %w", family.ID, err)
 				}
-				return fmt.Errorf("destroying wholly unauthorized runtime %q: %w", family.ID, err)
+			}
+			for _, branch := range revoked {
+				if err := markCorrupted(branch.ID); err != nil {
+					return fmt.Errorf("recording revoked branch %s@%s: %w", family.ID, branch.ID, err)
+				}
 			}
 			continue
 		}
@@ -4250,8 +4267,8 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 				}
 				return fmt.Errorf("destroying revoked branch %s@%s: %w", family.ID, branch.ID, err)
 			}
-			if placement, err := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID); err == nil && placement.State == cluster.PlacementCorrupted {
-				_ = backend.containerStore().UpdateBranchState(family.ID, branch.ID, "corrupted")
+			if err := markCorrupted(branch.ID); err != nil {
+				return fmt.Errorf("recording revoked branch %s@%s: %w", family.ID, branch.ID, err)
 			}
 		}
 	}

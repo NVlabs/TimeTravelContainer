@@ -4902,12 +4902,15 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 					currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
 					if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) &&
 						executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
-						// Never run a Sentry command on the heartbeat path. A busy family
-						// may take longer than the lease merely to enumerate its branches.
-						// Host-stop every local Sentry immediately; restart reconciliation
-						// later kills revoked branches before resuming authorized peers.
-						fenceErr := fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
-						return errors.Join(errors.New("raft revoked live execution authority"), fenceErr)
+						// Project the replicated decision onto the affected local branches
+						// before acknowledging another guardian interval. Corrupting one
+						// source-dependent branch must not stop the daemon or unrelated
+						// branches on this node. If selective eviction cannot be proven,
+						// retain the conservative whole-node fence as the failure path.
+						if err := enforceLocalRaftPlacements(targetBackend, record.NodeID, record.Incarnation); err != nil {
+							fenceErr := fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, record.NodeID, record.Incarnation)
+							return fmt.Errorf("enforcing revoked Raft execution authority: %w", errors.Join(err, fenceErr))
+						}
 					}
 					lastExecutionGrants = currentExecutionGrants
 					if _, err := leaseGuardian.Write([]byte{1}); err != nil {
