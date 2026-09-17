@@ -394,7 +394,7 @@ func TestPrepareRunIngressKeepsListenerAtEntryDaemon(t *testing.T) {
 }
 
 func TestPrepareRunIngressMakesGeneratedNameExplicit(t *testing.T) {
-	clean, prepared, err := prepareRunIngress([]string{"run", "-d", "-p=18080:80", "image"})
+	clean, prepared, err := prepareRunIngress([]string{"run", "-d", "--network=ttc", "-p=18080:80", "image"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,6 +403,12 @@ func TestPrepareRunIngressMakesGeneratedNameExplicit(t *testing.T) {
 	}
 	if len(clean) < 4 || clean[1] != "--name" || clean[2] != prepared.target.container {
 		t.Fatalf("clean=%q does not expose generated name %q", clean, prepared.target.container)
+	}
+}
+
+func TestPrepareRunIngressRejectsNonTTCNetwork(t *testing.T) {
+	if _, _, err := prepareRunIngress([]string{"run", "-d", "-p", "18080:80", "image"}); err == nil || !strings.Contains(err.Error(), "--network=ttc") {
+		t.Fatalf("prepareRunIngress() error=%v, want network rejection", err)
 	}
 }
 

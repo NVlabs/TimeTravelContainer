@@ -473,6 +473,7 @@ func prepareRunIngress(args []string) ([]string, *preparedRunIngress, error) {
 	}
 	clean := append([]string(nil), args[:prefix]...)
 	name := ""
+	networkMode := "none"
 	var ports []string
 	for i := prefix; i < len(args); i++ {
 		arg := args[i]
@@ -491,6 +492,22 @@ func prepareRunIngress(args []string) ([]string, *preparedRunIngress, error) {
 			continue
 		case strings.HasPrefix(arg, "--name="):
 			name = strings.TrimPrefix(arg, "--name=")
+			clean = append(clean, arg)
+			continue
+		case arg == "--network" || arg == "--net":
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("%s requires a network mode", arg)
+			}
+			networkMode = args[i+1]
+			clean = append(clean, arg, networkMode)
+			i++
+			continue
+		case strings.HasPrefix(arg, "--network="):
+			networkMode = strings.TrimPrefix(arg, "--network=")
+			clean = append(clean, arg)
+			continue
+		case strings.HasPrefix(arg, "--net="):
+			networkMode = strings.TrimPrefix(arg, "--net=")
 			clean = append(clean, arg)
 			continue
 		case arg == "-p" || arg == "--publish":
@@ -515,6 +532,13 @@ func prepareRunIngress(args []string) ([]string, *preparedRunIngress, error) {
 	}
 	if len(ports) == 0 {
 		return args, nil, nil
+	}
+	mode, err := parseNetworkMode(networkMode)
+	if err != nil {
+		return nil, nil, err
+	}
+	if mode != "ttc" {
+		return nil, nil, errors.New("--publish requires --network=ttc")
 	}
 	bindings, err := parsePublishedPorts(ports)
 	if err != nil {
