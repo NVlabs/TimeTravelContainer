@@ -1462,10 +1462,22 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
 		}
 		if peer {
+			// An imported peer must join the repository already mounted by its
+			// physical runtime. If this is the first materialization for the source,
+			// use the same container-private deterministic path as a new target.
+			// Never create a private replica at filesystems/volumes/<logical-id>:
+			// that directory is the managed-volume catalog and requires its on-disk
+			// repository identity to equal the directory name.
+			repositoryPath := config.Path
+			if _, statErr := os.Stat(filepath.Join(repositoryPath, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
+				repositoryPath = distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)
+			} else if statErr != nil {
+				return 0, statErr
+			}
 			var repository *ttcvolume.Repository
 			created := false
-			if _, statErr := os.Stat(filepath.Join(config.Path, "volume.json")); statErr == nil {
-				repository, err = ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+			if _, statErr := os.Stat(filepath.Join(repositoryPath, "volume.json")); statErr == nil {
+				repository, err = ttcvolume.OpenRepository(repositoryPath, ttcvolume.CopyMode(config.CopyMode))
 				if err == nil {
 					if len(origins) == 0 {
 						err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
@@ -1476,9 +1488,9 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			} else if errors.Is(statErr, os.ErrNotExist) {
 				created = true
 				if len(origins) == 0 {
-					repository, err = manager.ImportPrivateRemoteDescriptor(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
+					repository, err = manager.ImportPrivateRemoteDescriptor(repositoryPath, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
 				} else {
-					repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(config.Path, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
+					repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(repositoryPath, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
 				}
 			} else {
 				err = statErr
@@ -1490,6 +1502,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 				_ = repository.Close()
 				return 0, fmt.Errorf("verifying imported peer repository %q branch %q: %w", config.Source, filesystemBranch, err)
 			}
+			config.Path = repositoryPath
 			config.Branch = filesystemBranch
 			config.CopyMode = string(manager.Capability().Mode)
 			config.RestoreID = root.RestoreID
@@ -1497,12 +1510,11 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			if err := repository.Close(); err != nil {
 				return 0, err
 			}
-			imported = append(imported, importedFilesystem{path: config.Path, copyMode: ttcvolume.CopyMode(config.CopyMode), created: created})
+			imported = append(imported, importedFilesystem{path: repositoryPath, copyMode: ttcvolume.CopyMode(config.CopyMode), created: created})
 			installed++
 			continue
 		}
-		pathKey := sha256.Sum256([]byte(path))
-		destination := filepath.Join(b.activeDataRoot(), "containers", info.ID, "repositories", "remote", hex.EncodeToString(pathKey[:]))
+		destination := distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)
 		var repository *ttcvolume.Repository
 		created := false
 		if _, statErr := os.Stat(destination); statErr == nil {
@@ -1549,6 +1561,11 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 	}
 	originsCommitted = true
 	return installed, nil
+}
+
+func distributedRepositoryCachePath(activeRoot, containerID, source string) string {
+	key := sha256.Sum256([]byte(source))
+	return filepath.Join(activeRoot, "containers", containerID, "repositories", "remote", hex.EncodeToString(key[:]))
 }
 
 // exportDistributedGraph publishes the fork-time memory retained by session

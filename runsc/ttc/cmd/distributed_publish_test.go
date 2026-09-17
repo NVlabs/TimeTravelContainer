@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sync/atomic"
 	"testing"
@@ -31,6 +32,21 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
+
+func TestDistributedRepositoryCachePathIsPrivateAndStable(t *testing.T) {
+	active := t.TempDir()
+	first := distributedRepositoryCachePath(active, "physical-a", "/run/ttc/volumes/logical-volume")
+	if first != distributedRepositoryCachePath(active, "physical-a", "/run/ttc/volumes/logical-volume") {
+		t.Fatal("repository cache path is not deterministic")
+	}
+	wantParent := filepath.Join(active, "containers", "physical-a", "repositories", "remote")
+	if filepath.Dir(first) != wantParent {
+		t.Fatalf("repository cache parent=%q, want %q", filepath.Dir(first), wantParent)
+	}
+	if first == distributedRepositoryCachePath(active, "physical-a", "/run/ttc/volumes/other") {
+		t.Fatal("different repository sources alias the same cache path")
+	}
+}
 
 type testSnapshotProviderLookup struct {
 	found bool
