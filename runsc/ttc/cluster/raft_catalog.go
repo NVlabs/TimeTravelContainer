@@ -744,6 +744,14 @@ func (c *RaftCatalog) SetQuarantine(family, branch, owner, incarnation string, g
 	return applyRaftValue[PlacementRecord](c, now, AuthorityPlacementQuarantine, AuthorityPlacementPayload{Family: family, Branch: branch, Owner: owner, Incarnation: incarnation, Generation: generation, Quarantined: quarantined})
 }
 
+func (c *RaftCatalog) Rename(family, branch, newBranch, owner, incarnation, physicalBranch string, generation uint64, now time.Time) (*PlacementRecord, error) {
+	return applyRaftValue[PlacementRecord](c, now, AuthorityPlacementRename, AuthorityPlacementPayload{
+		Family: family, Branch: branch, NewBranch: newBranch,
+		Owner: owner, Incarnation: incarnation, PhysicalBranch: physicalBranch,
+		Generation: generation,
+	})
+}
+
 func (c *RaftCatalog) Remove(family, branch string, generation uint64) error {
 	err := applyRaftNoValue(c, time.Now().UTC(), AuthorityPlacementRemove, AuthorityPlacementPayload{Family: family, Branch: branch, Generation: generation})
 	// Reconciliation is intentionally performed by every node from independent

@@ -111,18 +111,34 @@ client_b exec "$NAME@remote1" sh -c "printf REMOTE-1 >/identity"
 test "$(client_b exec "$NAME@remote1" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote1" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 
-client_b migrate --node node-a "$NAME@remote1" >/dev/null
-test "$(client_a exec "$NAME@remote1" cat /identity)" = REMOTE-1
-test "$(client_a exec "$NAME@remote1" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
-test "$(client_a exec "$NAME@remote1" sh -c 'wc -c </dev/shm/resident')" = 33554432
+client_b rename "$NAME@remote1" renamed
+# Renaming releases the old visible name immediately. Reusing it must create a
+# distinct branch, and transaction-private physical branches must never appear
+# in cluster inventory.
+client_a fork --node node-b "$NAME@main" remote1 >/dev/null
+client_b exec "$NAME@remote1" sh -c "printf REUSED-NAME >/identity"
+test "$(client_b exec "$NAME@renamed" cat /identity)" = REMOTE-1
+test "$(client_b exec "$NAME@remote1" cat /identity)" = REUSED-NAME
+visible_branches=$(client_a ls --json | jq -r --arg name "$NAME" '.[] | select(.name == $name) | .branches[].id' | sort)
+test "$visible_branches" = "$(printf '%s\n' main remote1 renamed | sort)"
+if printf '%s\n' "$visible_branches" | grep -q '^fork-'; then
+	echo "private distributed branch leaked through ls: $visible_branches" >&2
+	exit 1
+fi
 
-client_a fork --node node-b "$NAME@remote1" remote2 >/dev/null
+client_b migrate --node node-a "$NAME@renamed" >/dev/null
+test "$(client_a exec "$NAME@renamed" cat /identity)" = REMOTE-1
+test "$(client_a exec "$NAME@renamed" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
+test "$(client_a exec "$NAME@renamed" sh -c 'wc -c </dev/shm/resident')" = 33554432
+
+client_a fork --node node-b "$NAME@renamed" remote2 >/dev/null
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 test "$(client_b exec "$NAME@remote2" sh -c 'wc -c </dev/shm/resident')" = 33554432
 client_b exec "$NAME@remote2" sh -c "printf REMOTE-2 >/identity"
-test "$(client_a exec "$NAME@remote1" cat /identity)" = REMOTE-1
+test "$(client_a exec "$NAME@renamed" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-2
+test "$(client_a ls --json | jq -r --arg name "$NAME" '.[] | select(.name == $name) | .branches[] | select(.id == "remote2") | .parent')" = renamed
 
 # Live handoff descriptors are carried directly over the cluster protocol.
 # Creating a branch or migrating it must not synchronously stage a legacy

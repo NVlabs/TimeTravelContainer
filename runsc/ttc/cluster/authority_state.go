@@ -63,6 +63,7 @@ const (
 	AuthorityPlacementClaim        AuthorityCommandKind = "placement-claim-unplaced"
 	AuthorityPlacementStableState  AuthorityCommandKind = "placement-update-state"
 	AuthorityPlacementQuarantine   AuthorityCommandKind = "placement-set-quarantine"
+	AuthorityPlacementRename       AuthorityCommandKind = "placement-rename"
 	AuthorityPlacementRemove       AuthorityCommandKind = "placement-remove"
 	AuthorityTransactionCreate     AuthorityCommandKind = "transaction-create"
 	AuthorityTransactionAdvance    AuthorityCommandKind = "transaction-advance"
@@ -474,9 +475,12 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		// ClusterPolicy is copied by value with AuthorityState.
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover,
 		AuthorityPlacementCommit, AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
-		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRemove:
+		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRename, AuthorityPlacementRemove:
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Branches = cloneAuthorityMap(s.Branches)
+		if kind == AuthorityPlacementRename {
+			s.Publications = cloneAuthorityMap(s.Publications)
+		}
 	case AuthorityTransactionCreate, AuthorityTransactionPublish,
 		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff,
 		AuthorityTransactionRetire:
@@ -610,7 +614,8 @@ type AuthorityCapacityPayload struct {
 // by command kinds for which they have no meaning.
 type AuthorityPlacementPayload struct {
 	Record                               PlacementRecord `json:"record,omitempty"`
-	Family, Branch, Owner, Incarnation   string
+	Family, Branch, NewBranch            string
+	Owner, Incarnation                   string
 	OldIncarnation, NewIncarnation       string
 	Generation                           uint64
 	Operation, Target, TargetIncarnation string
@@ -706,7 +711,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 		return s.applyClusterPolicy(command)
 	case AuthorityPlacementCreate, AuthorityPlacementBegin, AuthorityPlacementAdopt, AuthorityPlacementRecover, AuthorityPlacementCommit,
 		AuthorityPlacementAbort, AuthorityPlacementUnplace, AuthorityPlacementClaim,
-		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRemove:
+		AuthorityPlacementStableState, AuthorityPlacementQuarantine, AuthorityPlacementRename, AuthorityPlacementRemove:
 		return s.applyPlacement(command)
 	case AuthorityTransactionCreate, AuthorityTransactionAdvance, AuthorityTransactionPublish,
 		AuthorityTransactionActivate, AuthorityTransactionSession, AuthorityTransactionHandoff,
@@ -1398,6 +1403,79 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		return nil, os.ErrNotExist
 	}
 	switch command.Kind {
+	case AuthorityPlacementRename:
+		if !transactionIDPattern.MatchString(p.NewBranch) {
+			return nil, errors.New("invalid replacement branch ID")
+		}
+		if p.NewBranch == p.Branch {
+			return authorityValue(record)
+		}
+		newKey := logicalBranchKey(p.Family, p.NewBranch)
+		if _, exists := s.Placements[newKey]; exists {
+			return nil, os.ErrExist
+		}
+		if record.Generation != p.Generation || record.State == PlacementMigrating || record.State == PlacementMaterializing || record.State == PlacementCorrupted {
+			return nil, errors.New("stale or unstable placement cannot be renamed")
+		}
+		if record.State == PlacementRunning || record.State == PlacementPaused {
+			if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
+				return nil, fmt.Errorf("placement owner: %w", err)
+			}
+			if record.OwnerNode != p.Owner || record.OwnerIncarnation != p.Incarnation || !transactionIDPattern.MatchString(p.PhysicalBranch) {
+				return nil, errors.New("rename does not match the physical placement owner")
+			}
+		} else if record.State != PlacementUnplaced {
+			return nil, fmt.Errorf("branch is %s, not renameable", record.State)
+		}
+		branch, exists := s.Branches[key]
+		if !exists {
+			return nil, errors.New("placement has no branch authority")
+		}
+		if branch.PublicationID != "" {
+			publication, exists := s.Publications[publicationKey(p.Family, p.Branch, branch.PublicationID)]
+			if !exists || (publication.State != PublicationCommitted && publication.State != PublicationCanceled) {
+				return nil, errors.New("branch has an active publication")
+			}
+		}
+
+		delete(s.Placements, key)
+		record.BranchID = p.NewBranch
+		if record.State == PlacementRunning || record.State == PlacementPaused {
+			record.PhysicalBranch = p.PhysicalBranch
+		}
+		record.Generation++
+		record.Revision++
+		record.UpdatedAt = command.IssuedAt
+		if err := record.validate(); err != nil {
+			return nil, err
+		}
+		s.Placements[newKey] = record
+
+		delete(s.Branches, key)
+		branch.BranchID = p.NewBranch
+		branch.Generation = record.Generation
+		branch.UpdatedAt = command.IssuedAt
+		s.Branches[newKey] = branch
+
+		for childKey, child := range s.Placements {
+			if child.FamilyID != p.Family || child.ParentBranch != p.Branch {
+				continue
+			}
+			child.ParentBranch = p.NewBranch
+			child.Revision++
+			child.UpdatedAt = command.IssuedAt
+			s.Placements[childKey] = child
+		}
+		for oldPublicationKey, publication := range s.Publications {
+			if publication.FamilyID != p.Family || publication.BranchID != p.Branch {
+				continue
+			}
+			delete(s.Publications, oldPublicationKey)
+			publication.BranchID = p.NewBranch
+			publication.UpdatedAt = command.IssuedAt
+			s.Publications[publicationKey(p.Family, p.NewBranch, publication.PublicationID)] = publication
+		}
+		return authorityValue(record)
 	case AuthorityPlacementBegin:
 		if err := s.requireNodeIncarnation(p.Owner, p.Incarnation, command.IssuedAt, command.LeaderTerm, false); err != nil {
 			return nil, fmt.Errorf("migration source: %w", err)

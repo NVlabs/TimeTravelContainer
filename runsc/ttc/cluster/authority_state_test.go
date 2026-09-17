@@ -485,6 +485,63 @@ func TestAuthorityMigrationCutoverFencesOldOwner(t *testing.T) {
 	}
 }
 
+func TestAuthorityPlacementRenameMovesLogicalStateAndReleasesOldName(t *testing.T) {
+	at := time.Unix(2250, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "child",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}}))
+	applyAuthorityForTest(t, state, "place-grandchild", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "grandchild", ParentBranch: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "grandchild",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
+	}})
+	oldKey := logicalBranchKey("family", "child")
+	branch := state.Branches[oldKey]
+	branch.PublicationID = "publication-1"
+	state.Branches[oldKey] = branch
+	state.Publications[publicationKey("family", "child", "publication-1")] = PublicationRecord{
+		FamilyID: "family", BranchID: "child", BranchGeneration: created.Generation,
+		PublicationID: "publication-1", Lifecycle: "dehydrated", State: PublicationCommitted,
+		Revision: 3, UpdatedAt: at,
+	}
+
+	renamed := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "rename", at.Add(time.Second), AuthorityPlacementRename, AuthorityPlacementPayload{
+		Family: "family", Branch: "child", NewBranch: "renamed", Owner: "node-a", Incarnation: "incarnation-a",
+		PhysicalBranch: "renamed", Generation: created.Generation,
+	}))
+	if renamed.BranchID != "renamed" || renamed.PhysicalBranch != "renamed" || renamed.Generation != created.Generation+1 {
+		t.Fatalf("renamed placement=%+v", renamed)
+	}
+	if _, ok := state.Placements[oldKey]; ok {
+		t.Fatal("old placement key remains after rename")
+	}
+	newKey := logicalBranchKey("family", "renamed")
+	if authority := state.Branches[newKey]; authority.BranchID != "renamed" || authority.Generation != renamed.Generation {
+		t.Fatalf("renamed branch authority=%+v", authority)
+	}
+	if child := state.Placements[logicalBranchKey("family", "grandchild")]; child.ParentBranch != "renamed" {
+		t.Fatalf("child parent after rename=%q, want renamed", child.ParentBranch)
+	}
+	if _, ok := state.Publications[publicationKey("family", "child", "publication-1")]; ok {
+		t.Fatal("old publication key remains after rename")
+	}
+	if publication := state.Publications[publicationKey("family", "renamed", "publication-1")]; publication.BranchID != "renamed" {
+		t.Fatalf("renamed publication=%+v", publication)
+	}
+	// The visible name is not an immutable lineage identity. It is immediately
+	// reusable by another branch once the atomic rename commits.
+	reused := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "reuse", at.Add(2*time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "child",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}}))
+	if reused.BranchID != "child" {
+		t.Fatalf("reused placement=%+v", reused)
+	}
+	mustAuthoritySnapshotForTest(t, state)
+}
+
 func TestAuthorityMigrationTransactionBindsPhysicalSource(t *testing.T) {
 	at := time.Unix(2500, 0).UTC()
 	state := NewAuthorityState()

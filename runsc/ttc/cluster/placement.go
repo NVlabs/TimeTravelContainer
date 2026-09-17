@@ -140,6 +140,7 @@ type PlacementCatalog interface {
 	ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
 	UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
 	SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error)
+	Rename(family, branch, newBranch, owner, incarnation, physicalBranch string, generation uint64, now time.Time) (*PlacementRecord, error)
 	Remove(family, branch string, generation uint64) error
 	Lookup(family, branch string) (*PlacementRecord, error)
 	List() ([]PlacementRecord, error)
@@ -580,6 +581,58 @@ func (s *PlacementStore) SetQuarantine(family, branch, owner, incarnation string
 		}
 		result = record
 		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Rename moves a logical placement key without changing the runtime it owns.
+// The catalog-wide lock makes absence of the destination and removal of the
+// source one atomic filesystem transaction for this legacy implementation.
+func (s *PlacementStore) Rename(family, branch, newBranch, owner, incarnation, physicalBranch string, generation uint64, now time.Time) (*PlacementRecord, error) {
+	if branch == newBranch {
+		return s.Lookup(family, branch)
+	}
+	var result PlacementRecord
+	err := s.withCatalogLock(true, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if _, err := s.load(family, newBranch); err == nil {
+			return os.ErrExist
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if record.Generation != generation || record.State == PlacementMigrating || record.State == PlacementMaterializing || record.State == PlacementCorrupted {
+			return errors.New("stale or unstable placement cannot be renamed")
+		}
+		if record.State == PlacementRunning || record.State == PlacementPaused {
+			if record.OwnerNode != owner || record.OwnerIncarnation != incarnation {
+				return errors.New("rename does not match the physical placement owner")
+			}
+			record.PhysicalBranch = physicalBranch
+		} else if record.State != PlacementUnplaced {
+			return fmt.Errorf("branch is %s, not renameable", record.State)
+		}
+		oldKey, err := placementKey(family, branch)
+		if err != nil {
+			return err
+		}
+		record.BranchID = newBranch
+		record.Generation++
+		record.Revision++
+		record.UpdatedAt = now
+		if err := s.store(record); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(s.dir, oldKey+".json")); err != nil {
+			return err
+		}
+		result = record
+		return syncDirectory(s.dir)
 	})
 	if err != nil {
 		return nil, err

@@ -148,6 +148,34 @@ func TestPlacementQuarantineIsMigrationStableAndGenerationFenced(t *testing.T) {
 	}
 }
 
+func TestPlacementRenameReleasesOldName(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(890, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "child",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := store.Rename("family", "child", "renamed", "node-a", "boot-a", "renamed", created.Generation, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.BranchID != "renamed" || renamed.PhysicalBranch != "renamed" || renamed.Generation != created.Generation+1 {
+		t.Fatalf("renamed placement=%+v", renamed)
+	}
+	if _, err := store.Lookup("family", "child"); !os.IsNotExist(err) {
+		t.Fatalf("old placement lookup error=%v, want not exist", err)
+	}
+	if _, err := store.Create(PlacementRecord{FamilyID: "family", BranchID: "child", State: PlacementUnplaced}, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("reusing old branch name: %v", err)
+	}
+}
+
 func TestPlacementCatalogLocksReadsAgainstSnapshotWriter(t *testing.T) {
 	store, err := OpenPlacementStore(t.TempDir())
 	if err != nil {

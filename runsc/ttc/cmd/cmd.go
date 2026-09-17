@@ -11468,6 +11468,7 @@ func infoWithBranchQuarantine(info ttcbundle.ContainerInfo, branchID string, qua
 // written the sandbox is told to change back, because a family whose two halves
 // disagree about a branch's name is worse than one that never renamed it.
 func (b *runtimeBackend) renameBranch(target selector, name string) error {
+	logicalBranch := target.branch
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -11540,6 +11541,34 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 			return fmt.Errorf("checking dehydrated branch runtime before rename: %w", branchesErr)
 		}
 	}
+	logicalFamily := info.DistributedFamilyID
+	if logicalFamily == "" {
+		logicalFamily = info.ID
+	}
+	var placement *cluster.PlacementRecord
+	var placements cluster.PlacementCatalog
+	var ownerIncarnation string
+	if b.nodeID != "" {
+		placements, err = b.placementCatalog()
+		if err != nil {
+			return fmt.Errorf("opening rename placement authority: %w", err)
+		}
+		placement, err = placements.Lookup(logicalFamily, logicalBranch)
+		if err != nil {
+			return fmt.Errorf("resolving rename placement: %w", err)
+		}
+		if placement.State != cluster.PlacementUnplaced {
+			owner, renewErr := b.renewDistributedExecutionAuthority()
+			if renewErr != nil {
+				return fmt.Errorf("renewing rename execution authority: %w", renewErr)
+			}
+			ownerIncarnation = owner.Incarnation
+			if placement.OwnerNode != b.nodeID || placement.OwnerIncarnation != ownerIncarnation ||
+				placement.PhysicalContainer != target.container || placement.PhysicalBranch != target.branch {
+				return errors.New("rename placement no longer names the resolved physical branch")
+			}
+		}
+	}
 	if live {
 		if _, err := b.command("timetravel", target.container, "rename", target.branch, name); err != nil {
 			return err
@@ -11553,6 +11582,23 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 			_, _ = b.command("timetravel", target.container, "rename", name, target.branch)
 		}
 		return err
+	}
+	if placement != nil {
+		physicalBranch := ""
+		if placement.State != cluster.PlacementUnplaced {
+			physicalBranch = name
+		}
+		if _, err := placements.Rename(logicalFamily, logicalBranch, name, b.nodeID, ownerIncarnation, physicalBranch, placement.Generation, time.Now().UTC()); err != nil {
+			rollbackErr := b.containerStore().RenameBranch(target.container, name, target.branch)
+			if live {
+				_, runtimeErr := b.command("timetravel", target.container, "rename", name, target.branch)
+				rollbackErr = errors.Join(rollbackErr, runtimeErr)
+			}
+			if rollbackErr != nil {
+				return fmt.Errorf("renaming cluster authority: %w; restoring local branch: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("renaming cluster authority: %w", err)
+		}
 	}
 	return nil
 }
