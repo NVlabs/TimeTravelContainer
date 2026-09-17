@@ -1636,7 +1636,9 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 	s.Placements[key] = record
 	if branch, ok := s.Branches[key]; ok {
 		branch.Generation = record.Generation
-		branch.Lifecycle = string(record.State)
+		if !(command.Kind == AuthorityPlacementAdopt && record.State == PlacementMaterializing && branch.Lifecycle == "created") {
+			branch.Lifecycle = string(record.State)
+		}
 		if command.Kind == AuthorityPlacementClaim {
 			// Claiming a durable snapshot creates a new mutable runtime. The
 			// committed publication remains immutable history, not the identity

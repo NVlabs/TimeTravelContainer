@@ -1294,7 +1294,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	if err != nil {
 		return err
 	}
-	lifecycle := ""
+	lifecycle := "exited"
 	if intent.Kind == "dehydrate" {
 		lifecycle = "dehydrated"
 	}

@@ -743,6 +743,18 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			}
 			owner := info.BranchNodeID(branch.ID)
 			state := cluster.PlacementState(normalizeLifecycleState(branch.State))
+			record, found := placementByBranch[key]
+			// A never-started branch has no sandbox to discover, but its local
+			// writable repository remains authoritative across daemon restarts.
+			// Re-fence that process-free owner to the new daemon incarnation.
+			if state == "created" && found && record.State == cluster.PlacementMaterializing && record.OwnerNode == b.nodeID {
+				if record.OwnerIncarnation != current.Incarnation {
+					if _, err := placements.AdoptOwnerIncarnation(placementFamily, placementBranch, b.nodeID, record.OwnerIncarnation, current.Incarnation, record.Generation, now); err != nil {
+						result = errors.Join(result, fmt.Errorf("adopting prepared placement for %s@%s: %w", info.ID, branch.ID, err))
+					}
+				}
+				continue
+			}
 			if owner != b.nodeID || (state != cluster.PlacementRunning && state != cluster.PlacementPaused) {
 				continue
 			}
@@ -754,7 +766,6 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			if _, alive := liveSandboxes[info.ID]; !alive {
 				continue
 			}
-			record, found := placementByBranch[key]
 			if !found {
 				if internalPhysical {
 					// The transaction is known but publication has not installed its
@@ -4230,6 +4241,10 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 			return nil, fmt.Errorf("cordoning node %q: %w", sourceNode, err)
 		}
 	}
+	createdPublished, err := publishCreatedDaemonContainers(b)
+	if err != nil {
+		return nil, err
+	}
 
 	switch mode {
 	case "":
@@ -4254,7 +4269,7 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	default:
 		return nil, fmt.Errorf("unknown node stop mode %q", mode)
 	}
-	if b.publicationQueue != nil && mode != "migrate" {
+	if b.publicationQueue != nil && (mode != "migrate" || createdPublished) {
 		if err := b.publicationQueue.Drain(context.Background()); err != nil {
 			return nil, fmt.Errorf("waiting for durable branch publication: %w", err)
 		}

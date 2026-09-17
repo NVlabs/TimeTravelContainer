@@ -4676,7 +4676,13 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			}
 		}
 		return queueExit()
-	case "created", "failed", "dead":
+	case "created":
+		// A prepared branch has no runtime to terminate, but its writable
+		// repository is still authoritative on this node. Publishing it makes a
+		// later start independent of this node and lets graceful retirement
+		// discard node-local scratch safely.
+		return queueExit()
+	case "failed", "dead":
 		return nil
 	default:
 		return fmt.Errorf("cannot stop %s in state %q", target.selector, target.state)

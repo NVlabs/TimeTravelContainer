@@ -2377,6 +2377,33 @@ func dehydrateDaemonContainers(backend backend) error {
 	return nil
 }
 
+// publishCreatedDaemonContainers seals prepared branches that have no runtime
+// but still own node-local mutable filesystem state. They are not active
+// execution, so every node-stop policy may make them cold and unplaced.
+func publishCreatedDaemonContainers(backend backend) (bool, error) {
+	families, err := backend.listFamilies()
+	if err != nil {
+		return false, err
+	}
+	published := false
+	for _, family := range families {
+		for _, branch := range family.Branches {
+			if !branchOwnedByBackend(backend, family, branch) || branch.State != "created" {
+				continue
+			}
+			target := branchOperationTarget{
+				selector: selector{container: family.ID, branch: branch.ID},
+				state:    branch.State,
+			}
+			if err := stopBranchLifecycle(target, 0, 0, backend, true); err != nil {
+				return published, fmt.Errorf("publishing prepared branch %s@%s: %w", family.ID, branch.ID, err)
+			}
+			published = true
+		}
+	}
+	return published, nil
+}
+
 func rejectActiveDaemonContainers(backend backend) error {
 	families, err := backend.listFamilies()
 	if err != nil {
