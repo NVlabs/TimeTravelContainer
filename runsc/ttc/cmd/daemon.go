@@ -261,8 +261,11 @@ type daemonServer struct {
 	sharedReferences      *sharedReferenceService
 	portIngress           *portIngressManager
 
-	stopOnce  sync.Once
-	cleanStop atomic.Bool
+	stopOnce   sync.Once
+	cleanStop  atomic.Bool
+	retireMu   sync.Mutex
+	retireNode func() error
+	retired    bool
 
 	reconcileMu sync.Mutex
 	reconciled  map[string]bool
@@ -283,6 +286,26 @@ type daemonServer struct {
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
 	closingConsoleClient map[string]int
+}
+
+// retireBeforeReply completes clustered identity retirement before a
+// successful stop response becomes observable. Closing the Unix listener and
+// leaving retirement to serveDaemon defers used to let `ttc node stop` return
+// while the node was still listed as draining/offline.
+func (s *daemonServer) retireBeforeReply() error {
+	if s == nil || s.retireNode == nil {
+		return nil
+	}
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
+	if s.retired {
+		return nil
+	}
+	if err := s.retireNode(); err != nil {
+		return err
+	}
+	s.retired = true
+	return nil
 }
 
 func (s *daemonServer) mutationRoot() string {
@@ -1262,6 +1285,88 @@ func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph clust
 	return nil
 }
 
+func (r *daemonTargetRuntime) graphHandoffStatus(tx *cluster.Transaction) (boot.DistributedForkHandoffStatus, error) {
+	if r == nil || r.backend == nil || tx == nil || tx.GraphHandoff == nil {
+		return boot.DistributedForkHandoffStatus{}, errors.New("distributed graph handoff is unavailable")
+	}
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	if err != nil {
+		return boot.DistributedForkHandoffStatus{}, r.forwardedDependencyError(tx, err)
+	}
+	output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
+	if err != nil {
+		return boot.DistributedForkHandoffStatus{}, err
+	}
+	var status boot.DistributedForkHandoffStatus
+	if err := json.Unmarshal(output, &status); err != nil {
+		return boot.DistributedForkHandoffStatus{}, fmt.Errorf("decoding graph memory handoff status: %w", err)
+	}
+	if status.Snapshot != tx.GraphHandoff.GraphSnapshot {
+		return boot.DistributedForkHandoffStatus{}, fmt.Errorf("graph memory handoff snapshot is %d, want %d", status.Snapshot, tx.GraphHandoff.GraphSnapshot)
+	}
+	return status, nil
+}
+
+func (r *daemonTargetRuntime) waitGraphHandoff(ctx context.Context, tx *cluster.Transaction) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status, err := r.graphHandoffStatus(tx)
+		if err != nil {
+			return err
+		}
+		if status.Done {
+			if status.Error != "" {
+				return fmt.Errorf("graph memory handoff failed: %s", status.Error)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// refreshDistributedGraphHandoffsAtStartup replaces every retained target's
+// immutable-memory relay before the node is admitted for new work. Snapshot
+// identity is unchanged; only unresolved page faults are redirected to a new
+// detached helper. This repairs roots created by older daemons whose relay was
+// daemon-owned and also makes helper failure recoverable by restarting ttcd.
+func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
+	if r == nil || r.store == nil {
+		return nil
+	}
+	transactions, err := r.store.List()
+	if err != nil {
+		return err
+	}
+	for i := range transactions {
+		tx := &transactions[i]
+		if tx.Identity.TargetNodeID != r.nodeID || tx.GraphHandoff == nil ||
+			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent) {
+			continue
+		}
+		if _, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("locating graph handoff target %q: %w", tx.Identity.TransactionID, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		err := r.Handoff(ctx, tx, *tx.GraphHandoff)
+		if err == nil {
+			err = r.waitGraphHandoff(ctx, tx)
+		}
+		cancel()
+		if err != nil {
+			return fmt.Errorf("refreshing graph handoff %q: %w", tx.Identity.TransactionID, err)
+		}
+	}
+	return nil
+}
+
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	var familyID string
@@ -1320,7 +1425,7 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 		return r.forwardedDependencyError(tx, err)
 	}
 	if tx.GraphHandoff != nil {
-		output, err := r.backend.command("timetravel", info.ID, "distributed-handoff-status", branch.ID)
+		status, err := r.graphHandoffStatus(tx)
 		if err != nil {
 			// Raft may contain a bound handoff intent whose first runtime attempt
 			// failed before the Sentry recorded it. Reinstall the exact immutable
@@ -1330,13 +1435,6 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 				return fmt.Errorf("reading graph memory handoff status: %w; reinstalling handoff: %v", err, retryErr)
 			}
 			return errors.New("graph memory handoff was reinstalled and is still in progress")
-		}
-		var status boot.DistributedForkHandoffStatus
-		if err := json.Unmarshal(output, &status); err != nil {
-			return fmt.Errorf("decoding graph memory handoff status: %w", err)
-		}
-		if status.Snapshot != tx.GraphHandoff.GraphSnapshot {
-			return fmt.Errorf("graph memory handoff snapshot is %d, want %d", status.Snapshot, tx.GraphHandoff.GraphSnapshot)
 		}
 		if !status.Done {
 			return errors.New("graph memory handoff is still in progress")
@@ -4877,38 +4975,54 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	var elasticRecord *cluster.NodeRecord
 	var clusterTargetBackend *runtimeBackend
 	var leaseGuardian *os.File
+	retireClusterNode := func(clean bool) error {
+		if elasticRecord == nil || clusterRuntime == nil || clusterRuntime.directory == nil {
+			return nil
+		}
+		record := *elasticRecord
+		var result error
+		if !clean && clusterTargetBackend != nil {
+			if err := fenceElasticRuntimeRoot(clusterTargetBackend.activeDataRoot(), clusterTargetBackend.root, record.NodeID, record.Incarnation); err != nil {
+				result = errors.Join(result, fmt.Errorf("fencing runtimes during unclean cluster shutdown: %w", err))
+			}
+		}
+		offline, transitionErr := clusterRuntime.directory.Transition(record.NodeID, record.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease)
+		if transitionErr != nil {
+			result = errors.Join(result, fmt.Errorf("publishing cluster node offline state: %w", transitionErr))
+		}
+		if !clean {
+			return result
+		}
+		intent, intentErr := loadElasticDrainIntent(dataRoot, record.NodeID)
+		if intentErr != nil {
+			result = errors.Join(result, fmt.Errorf("loading completed drain intent: %w", intentErr))
+		} else if intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
+			retired, err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation)
+			if err != nil {
+				result = errors.Join(result, fmt.Errorf("retiring drained Raft member: %w", err))
+			} else {
+				removeRetiredRaftState = retired
+				if err := removeLocalNodeIncarnation(localRoot, offline.NodeID, offline.Incarnation); err != nil {
+					result = errors.Join(result, fmt.Errorf("rotating retired node incarnation: %w", err))
+				}
+			}
+		}
+		if err := removeCompletedElasticDrainIntent(dataRoot, record.NodeID); err != nil {
+			result = errors.Join(result, fmt.Errorf("consuming completed drain intent: %w", err))
+		}
+		if result == nil {
+			// The discovery identity and, where applicable, Raft membership are
+			// gone. Suppress duplicate work in the shutdown defer.
+			elasticRecord = nil
+		}
+		return result
+	}
 	defer func() {
 		close(clusterDone)
 		waitDaemonWorker(elasticHeartbeatStopped, "elastic heartbeat", stderr)
 		waitDaemonWorker(sharedGCStopped, "shared GC coordinator", stderr)
-		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
-			if !server.cleanStop.Load() && clusterTargetBackend != nil {
-				if err := fenceElasticRuntimeRoot(clusterTargetBackend.activeDataRoot(), clusterTargetBackend.root, elasticRecord.NodeID, elasticRecord.Incarnation); err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: fencing runtimes during unclean cluster shutdown: %v\n", err)
-				}
-			}
-			offline, transitionErr := clusterRuntime.directory.Transition(elasticRecord.NodeID, elasticRecord.Incarnation, cluster.NodeOffline, time.Now(), clusterRuntime.lease)
-			if transitionErr != nil && stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: warning: publishing cluster node offline state: %v\n", transitionErr)
-			}
-			if server.cleanStop.Load() {
-				if intent, err := loadElasticDrainIntent(dataRoot, elasticRecord.NodeID); err == nil && intent != nil && intent.State == elasticDrainComplete && transitionErr == nil {
-					retired, err := retireDaemonRaftMember(clusterRuntime, offline.NodeID, offline.Incarnation)
-					if err != nil {
-						if stderr != nil {
-							fmt.Fprintf(stderr, "ttcd: warning: retiring drained Raft member: %v\n", err)
-						}
-					} else {
-						removeRetiredRaftState = retired
-						if err := removeLocalNodeIncarnation(localRoot, offline.NodeID, offline.Incarnation); err != nil && stderr != nil {
-							fmt.Fprintf(stderr, "ttcd: warning: rotating retired node incarnation: %v\n", err)
-						}
-					}
-				}
-				if err := removeCompletedElasticDrainIntent(dataRoot, elasticRecord.NodeID); err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: consuming completed drain intent: %v\n", err)
-				}
-			}
+		if err := retireClusterNode(server.cleanStop.Load()); err != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: retiring cluster node: %v\n", err)
 		}
 		if leaseGuardian != nil {
 			_ = leaseGuardian.Close()
@@ -5031,6 +5145,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				defer close(gcStopped)
 				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, clusterDone)
 			}()
+			if err := targetBackend.reconcileInterruptedClusterMemoryGraph(); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("recovering interrupted memory captures: %w", err)
+			}
 			if err := reconcileDistributedGraphReferencesAtStartup(targetBackend, clusterRuntime.lease); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("recovering distributed graph references: %w", err)
@@ -5054,6 +5172,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			if err := targetBackend.reconcilePlacementCatalog(); err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("recovering fenced branch placements: %w", err)
+			}
+			if err := refreshDistributedGraphHandoffsAtStartup(targetRuntime); err != nil {
+				clusterListener.Close()
+				return fmt.Errorf("refreshing distributed memory relays: %w", err)
 			}
 			if err := validateClusterTopology(clusterRuntime, *registered); err != nil {
 				clusterListener.Close()
@@ -5079,6 +5201,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// drain, lease expiry, and Raft reconciliation own its lifecycle.
 			cancelFreshJoin = nil
 			elasticRecord = ready
+			server.retireNode = func() error { return retireClusterNode(true) }
 			// Origin abandonment is an execution-authority mutation and is not
 			// permitted while the node is joining. Reconcile only after the
 			// ready/pressured transition has admitted this incarnation.
@@ -5773,6 +5896,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 					return
 				}
 			}
+			if err := s.retireBeforeReply(); err != nil {
+				writeError(fmt.Errorf("retiring cluster node: %w", err))
+				return
+			}
 		}
 		_ = writeDaemonStatus(conn, &writeMu, 0)
 		s.cleanStop.Store(true)
@@ -6079,6 +6206,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				}
 			}
 		}
+		if status == 0 && mutationBackend.daemonStopRequested {
+			if err := s.retireBeforeReply(); err != nil {
+				fmt.Fprintf(&mutationStderr, "ttcd: retiring cluster node: %v\n", err)
+				status = 1
+			}
+		}
 		completed, err := completeDaemonMutation(mutationRoot, record, status, mutationStdout.Bytes(), mutationStderr.Bytes())
 		if err != nil {
 			fmt.Fprintf(&mutationStderr, "ttcd: %v; command outcome is indeterminate\n", err)
@@ -6110,6 +6243,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if err := backend.reconcilePlacementCatalog(); err != nil {
 				fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
+		}
+	}
+	if status == 0 && backend.daemonStopRequested {
+		if err := s.retireBeforeReply(); err != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: retiring cluster node: %v\n", err)
+			status = 1
 		}
 	}
 	unlock()

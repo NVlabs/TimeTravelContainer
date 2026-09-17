@@ -12330,15 +12330,106 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, 
 
 // importGraphCapture keeps stable PageID reuse inside one reference-authority
 // domain. Standalone origins may share other locally sealed objects. Clustered
-// origins may share only working or volatile objects owned by this daemon;
+// origins may share only sealed volatile objects owned by this daemon;
 // SnapshotShared objects are caches whose references are owned by the shared
 // ledger and must not acquire unreported local child edges.
 func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
 	states := []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedVolatile}
+		// Concurrent and crash-interrupted cluster captures may leave committed
+		// objects in a working origin. Reusing them would let a completed capture
+		// depend on an origin that is still mutable or was never sealed. Reuse only
+		// origins whose immutability is already established. Standalone captures
+		// are serialized by the foreground gate and retain their local behavior.
+		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}
 	}
 	return ttcchunk.ImportGraphCaptureWithReusableStates(reader, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+}
+
+// reconcileInterruptedClusterMemoryGraph converts crash residue into one of
+// two unambiguous states before the node resumes execution: unreachable
+// working origins are reclaimed and abandoned, while objects already reached
+// from a later sealed root are themselves sealed. A graph import commits
+// immutable objects and bounded radix updates transactionally, so removing its
+// construction roots/pins leaves only references created by a completed
+// capture. No new cluster import is admitted while startup reconciliation runs.
+func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
+	if b == nil || b.snapshotGraph == nil || b.snapshotData == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	if err := reconcileInterruptedMemoryGraph(b.snapshotGraph, b.snapshotData, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		return err
+	}
+	// Empty provider origins are abandoned by the ordinary volatile-origin
+	// reconciliation after this node transitions from joining to ready. Raft
+	// intentionally rejects execution-authority mutations while joining.
+	return nil
+}
+
+func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, sealState ttcsnapshot.SnapshotState) error {
+	inspection := graph.Inspect()
+	working := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotWorking {
+			working[snapshot.ID] = struct{}{}
+		}
+	}
+	if len(working) == 0 {
+		return nil
+	}
+	var roots, pins []string
+	for name, object := range inspection.Roots {
+		if _, ok := working[object.Snapshot]; ok {
+			roots = append(roots, name)
+		}
+	}
+	for name, object := range inspection.Pins {
+		if _, ok := working[object.Snapshot]; ok {
+			pins = append(pins, name)
+		}
+	}
+	sort.Strings(roots)
+	sort.Strings(pins)
+	if len(pins) != 0 {
+		if err := graph.DeletePins(pins); err != nil {
+			return fmt.Errorf("releasing interrupted memory construction pins: %w", err)
+		}
+	}
+	if len(roots) != 0 {
+		if err := graph.ReleaseRoots(roots); err != nil {
+			return fmt.Errorf("releasing interrupted memory construction roots: %w", err)
+		}
+	}
+	for {
+		collected, err := graph.Collect(4096)
+		if err != nil {
+			return fmt.Errorf("collecting interrupted memory graph: %w", err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if _, _, err := data.ReclaimUnreferenced(graph); err != nil {
+		return fmt.Errorf("reclaiming interrupted memory data: %w", err)
+	}
+	ordered := make([]ttcsnapshot.SnapshotID, 0, len(working))
+	for origin := range working {
+		ordered = append(ordered, origin)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, origin := range ordered {
+		objects, err := graph.SnapshotObjects(origin)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspecting interrupted memory origin %d: %w", origin, err)
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		if err := graph.Seal(origin, sealState); err != nil {
+			return fmt.Errorf("sealing referenced interrupted memory origin %d: %w", origin, err)
+		}
+	}
+	return nil
 }
 
 // newFilesystemOriginScope returns a bundle allocator and a completion

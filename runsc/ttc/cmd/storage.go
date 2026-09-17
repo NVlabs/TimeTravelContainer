@@ -140,23 +140,34 @@ func RunSharedMemoryRelay(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd shared memory relay: invalid catalog")
 		return 2
 	}
-	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(catalog.Objects))
+	requested := make([]ttcsnapshot.ObjectID, 0, len(catalog.Objects))
+	expected := make(map[ttcsnapshot.ObjectID]uint64, len(catalog.Objects))
 	for _, encoded := range catalog.Objects {
 		id, err := ttcsnapshot.ParseObjectID(encoded.ID)
 		if err != nil || encoded.Length == 0 || encoded.Length > ttcsnapshot.MemoryChunkBytes {
 			fmt.Fprintln(stderr, "ttcd shared memory relay: invalid catalog object")
 			return 2
 		}
-		if _, duplicate := allowed[id]; duplicate {
+		if _, duplicate := expected[id]; duplicate {
 			fmt.Fprintln(stderr, "ttcd shared memory relay: duplicate catalog object")
 			return 2
 		}
-		object, err := store.Object(id)
-		if err != nil || object.BulkLength != encoded.Length {
+		requested = append(requested, id)
+		expected[id] = encoded.Length
+	}
+	objects, err := store.Objects(requested)
+	if err != nil {
+		fmt.Fprintln(stderr, "ttcd shared memory relay: catalog object is unavailable")
+		return 1
+	}
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(objects))
+	for id, object := range objects {
+		length := expected[id]
+		if object.BulkLength != length {
 			fmt.Fprintln(stderr, "ttcd shared memory relay: catalog object is unavailable")
 			return 1
 		}
-		allowed[id] = encoded.Length
+		allowed[id] = length
 	}
 	connection := os.NewFile(3, "ttcd-shared-memory-relay")
 	if connection == nil {
@@ -2181,12 +2192,12 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 		}
 		manifests[path] = struct{}{}
 	}
-	// Graph handoff manifests are transaction-scoped restore descriptors, not
-	// durable branch roots. Keep them through every nonterminal transaction
-	// state (including the interval before Handoff binds its descriptor), then
-	// reclaim them as soon as the transaction is terminal or retired. This is
-	// also the crash-recovery path for a source that died after publishing the
-	// target but before its completion monitor removed the manifest.
+	// Graph handoff manifests are transaction-scoped restore descriptors. A
+	// bound manifest remains authoritative after the transaction becomes
+	// independent: the target may still contain unfaulted pages and needs the
+	// mapping to recreate its detached shared-pack reader after a restart. Keep
+	// it until the transaction itself is retired. A terminal transaction that
+	// never bound this exact handoff may reclaim its abandoned candidate.
 	memoryManifestRoot := filepath.Join(sharedRoot, "cluster", "memory-manifests")
 	memoryManifests, err := os.ReadDir(memoryManifestRoot)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -2202,8 +2213,13 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 			// collection of recognized objects.
 			continue
 		}
-		if tx, exists := transactionsByID[transactionID]; exists && !tx.Terminal() {
-			continue
+		if tx, exists := transactionsByID[transactionID]; exists {
+			if !tx.Terminal() {
+				continue
+			}
+			if tx.GraphHandoff != nil && filepath.Clean(tx.GraphHandoff.GraphManifest) == filepath.Join("cluster", "memory-manifests", entry.Name()) {
+				continue
+			}
 		}
 		if err := os.Remove(filepath.Join(memoryManifestRoot, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err

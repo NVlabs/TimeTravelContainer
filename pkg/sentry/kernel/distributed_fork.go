@@ -635,11 +635,8 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 		closeInputs()
 		return errors.New("distributed graph handoff has no snapshot identity")
 	}
-	if k.remoteHandoffSnapshot != 0 {
+	if k.remoteHandoffSnapshot != 0 && k.remoteHandoffSnapshot != uint64(snapshot) {
 		closeInputs()
-		if k.remoteHandoffSnapshot == uint64(snapshot) {
-			return nil
-		}
 		return fmt.Errorf("distributed memory was already handed to graph snapshot %d", k.remoteHandoffSnapshot)
 	}
 	if k.remotePageLoad == nil {
@@ -679,6 +676,7 @@ func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataSt
 	}
 	packed, err := ttcchunk.NewGraphPackedManifestReader(data, remote, manifest, k.remoteLoadRanges, true)
 	if err != nil {
+		closeInputs()
 		return err
 	}
 	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)

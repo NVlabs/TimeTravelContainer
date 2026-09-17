@@ -123,6 +123,17 @@ func TestSharedPackPublicationAndRandomAccess(t *testing.T) {
 	if err != nil || object.ID != id || object.BulkLength != uint64(len(data)) {
 		t.Fatalf("Object(%s) = %+v, %v", id, object, err)
 	}
+	objects, err := shared.Objects([]ObjectID{id, metadata, id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 2 || objects[id].BulkLength != uint64(len(data)) || objects[metadata].BulkLength != 0 {
+		t.Fatalf("Objects() = %+v, want both published objects", objects)
+	}
+	missing := ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1 << 62}
+	if _, err := shared.Objects([]ObjectID{missing}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Objects(missing) error = %v, want os.ErrNotExist", err)
+	}
 	reader, length, err = shared.Fetch(context.Background(), metadata)
 	if err != nil {
 		t.Fatal(err)

@@ -1253,10 +1253,11 @@ func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandof
 	if current := f.distributedHandoffs[args.BranchID]; current != nil {
 		select {
 		case <-current.done:
-			if current.err == nil && current.snapshot == uint64(args.GraphSnapshot) {
-				f.mu.Unlock()
-				return nil
-			}
+			// A completed handoff records the immutable snapshot, but its relay
+			// connection is deliberately replaceable. The helper serving that
+			// connection may have failed or may predate daemon-independent relays.
+			// Reinstalling the same snapshot switches only the unresolved-page
+			// reader and is therefore both safe and necessary during recovery.
 			delete(f.distributedHandoffs, args.BranchID)
 		default:
 			f.mu.Unlock()

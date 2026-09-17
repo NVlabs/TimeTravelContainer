@@ -24,7 +24,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -33,10 +32,12 @@ import (
 )
 
 // openDistributedGraphRestore turns an immutable graph manifest into the
-// descriptors consumed by the Sentry. The local object directory is always
-// donated. A transaction-fenced resolver stream resolves cache misses without
-// making the Sentry aware of provider placement or shared storage.
-func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, transaction string, token ttcsnapshot.ObjectRelayToken) (*graphMemoryRestore, error) {
+// descriptors consumed by the Sentry. Graph handoff is invoked only after the
+// origin is published to shared storage, so cache misses are served by a tiny
+// detached helper. Keeping that relay outside ttcd is essential: a daemon
+// crash must not turn a later guest page fault into EIO while the Sentry and
+// immutable shared snapshot both remain healthy.
+func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, _ string, token ttcsnapshot.ObjectRelayToken) (*graphMemoryRestore, error) {
 	if b == nil || manifest == nil || b.snapshotData == nil {
 		return nil, errors.New("distributed graph restore is unavailable")
 	}
@@ -60,37 +61,35 @@ func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, transact
 		return nil, err
 	}
 	restore := &graphMemoryRestore{manifest: manifest, objects: objects}
-	available := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
-	for _, id := range chunks {
-		available[id] = ttcsnapshot.Object{ID: id, State: ttcsnapshot.ObjectLive, BulkLength: ttcsnapshot.MemoryChunkBytes}
-	}
-	if b.distributedSource == nil || b.distributedSource.authority == nil || b.snapshotShared == nil || b.snapshotGraph == nil {
+	if b.snapshotShared == nil {
 		restore.close()
-		return nil, errors.New("distributed graph restore has missing objects and no resolver")
+		return nil, errors.New("distributed graph restore has no shared snapshot store")
 	}
-	resolver, err := ttcsnapshot.NewResolver(b.snapshotGraph, b.snapshotData,
-		raftOriginLocator{authority: b.distributedSource.authority},
-		clusterPeerSources{runtime: b.distributedSource, transaction: transaction}, b.snapshotShared)
+	chunkObjects := make([]ttcsnapshot.ObjectID, 0, len(chunks))
+	for _, id := range chunks {
+		chunkObjects = append(chunkObjects, id)
+	}
+	available, err := b.snapshotShared.Objects(chunkObjects)
 	if err != nil {
 		restore.close()
-		return nil, err
+		return nil, fmt.Errorf("opening shared graph objects: %w", err)
+	}
+	for id, object := range available {
+		if object.BulkLength != ttcsnapshot.MemoryChunkBytes {
+			restore.close()
+			return nil, fmt.Errorf("shared graph object %s has length %d, want %d", id, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
+		}
+	}
+	if len(available) == 0 {
+		return restore, nil
+	}
+	client, _, err := startSharedMemoryRelay(b.dataRoot, available, token)
+	if err != nil {
+		restore.close()
+		return nil, fmt.Errorf("starting detached distributed graph relay: %w", err)
 	}
 	restore.token = token
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		restore.close()
-		return nil, err
-	}
-	server := os.NewFile(uintptr(fds[0]), "ttc-distributed-graph-server")
-	restore.remote = os.NewFile(uintptr(fds[1]), "ttc-distributed-graph-client")
-	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(available))
-	for id := range available {
-		allowed[id] = ttcsnapshot.MemoryChunkBytes
-	}
-	go func() {
-		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: resolver, objects: available}, allowed)
-		b.reportColdRelayError("distributed graph memory", err)
-	}()
+	restore.remote = client
 	return restore, nil
 }
 

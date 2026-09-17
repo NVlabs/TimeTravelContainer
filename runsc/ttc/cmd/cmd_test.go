@@ -5773,16 +5773,23 @@ func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
 	}
 	retired := filepath.Join(root, "fork-retired.manifest")
 	live := filepath.Join(root, "fork-live.manifest")
+	independent := filepath.Join(root, "fork-independent.manifest")
+	unbound := filepath.Join(root, "fork-unbound.manifest")
 	unknown := filepath.Join(root, "operator-note.manifest")
-	for _, path := range []string{retired, live, unknown} {
+	for _, path := range []string{retired, live, independent, unbound, unknown} {
 		if err := os.WriteFile(path, []byte("descriptor"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	catalog := transactionListCatalog{records: []cluster.Transaction{{
-		Identity: cluster.ForkIdentity{TransactionID: "fork-live"},
-		State:    cluster.TransactionPublished,
-	}}}
+	catalog := transactionListCatalog{records: []cluster.Transaction{
+		{Identity: cluster.ForkIdentity{TransactionID: "fork-live"}, State: cluster.TransactionPublished},
+		{
+			Identity:     cluster.ForkIdentity{TransactionID: "fork-independent"},
+			State:        cluster.TransactionIndependent,
+			GraphHandoff: &cluster.GraphHandoffDescriptor{GraphManifest: filepath.Join("cluster", "memory-manifests", "fork-independent.manifest")},
+		},
+		{Identity: cluster.ForkIdentity{TransactionID: "fork-unbound"}, State: cluster.TransactionIndependent},
+	}}
 	if err := collectColdStorage(shared, local, nil, catalog); err != nil {
 		t.Fatal(err)
 	}
@@ -5794,6 +5801,12 @@ func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
 	}
 	if _, err := os.Stat(live); err != nil {
 		t.Fatalf("nonterminal graph handoff manifest was reclaimed: %v", err)
+	}
+	if _, err := os.Stat(independent); err != nil {
+		t.Fatalf("bound independent graph handoff manifest was reclaimed: %v", err)
+	}
+	if _, err := os.Stat(unbound); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unbound terminal graph handoff manifest remains: %v", err)
 	}
 }
 
@@ -6293,5 +6306,86 @@ func TestReconcileStandaloneMemoryGraphReclaimsCrashResidue(t *testing.T) {
 	}
 	if got := graph.JournalBytes(); got > 1024 {
 		t.Fatalf("compacted journal has %d bytes, want at most 1024", got)
+	}
+}
+
+func TestReconcileInterruptedMemoryGraphSealsOnlyReferencedResidue(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+
+	interrupted, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := graph.CreateObject(interrupted, "capture/construction-child", ttcsnapshot.ObjectKindMetadata, []byte("child"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("capture/partial-root", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/construction-child"); err != nil {
+		t.Fatal(err)
+	}
+
+	completed, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := graph.CreateObject(completed, "capture/completed-parent", ttcsnapshot.ObjectKindMetadata, []byte("parent"), []ttcsnapshot.Edge{{Slot: 0, Child: child}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/completed-root", parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/completed-parent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(completed, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+
+	empty, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := graph.CreateObject(empty, "capture/dead", ttcsnapshot.ObjectKindMetadata, []byte("dead"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("capture/dead-root", dead); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/dead"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconcileInterruptedMemoryGraph(graph, data, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root("capture/partial-root"); ok {
+		t.Fatal("interrupted construction root survived reconciliation")
+	}
+	if _, ok := graph.Root("capture/dead-root"); ok {
+		t.Fatal("unreferenced construction root survived reconciliation")
+	}
+	if got, ok := graph.Root("branch/completed-root"); !ok || got != parent {
+		t.Fatalf("completed root = %v, %t; want %v", got, ok, parent)
+	}
+	if record, ok := graph.Snapshot(interrupted); !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+		t.Fatalf("referenced interrupted snapshot = %+v, %t; want sealed volatile", record, ok)
+	}
+	if objects, err := graph.SnapshotObjects(empty); err != nil || len(objects) != 0 {
+		t.Fatalf("empty interrupted snapshot objects = %v, %v; want none", objects, err)
 	}
 }

@@ -546,6 +546,32 @@ func (store *SharedPackStore) Object(id ObjectID) (Object, error) {
 	return cloneObject(packed.Object), nil
 }
 
+// Objects returns immutable metadata for ids while opening each snapshot
+// manifest at most once. Callers that validate a complete memory graph may
+// name thousands of objects; repeatedly calling Object would clone the entire
+// manifest for every ID and turn that validation into quadratic work.
+func (store *SharedPackStore) Objects(ids []ObjectID) (map[ObjectID]Object, error) {
+	result := make(map[ObjectID]Object, len(ids))
+	bySnapshot := make(map[SnapshotID][]ObjectID)
+	for _, id := range ids {
+		bySnapshot[id.Snapshot] = append(bySnapshot[id.Snapshot], id)
+	}
+	for snapshot, group := range bySnapshot {
+		manifest, err := store.Manifest(snapshot)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range group {
+			packed, ok := packedObjectByID(manifest, id)
+			if !ok {
+				return nil, fmt.Errorf("shared snapshot object %s: %w", id, os.ErrNotExist)
+			}
+			result[id] = cloneObject(packed.Object)
+		}
+	}
+	return result, nil
+}
+
 // ReadObjectRange reads only the extents intersecting [offset, offset+len).
 // Guest reads remain arbitrary-sized even though shared packs use 1 MiB
 // extents, and no preceding bytes in a large file are scanned.
