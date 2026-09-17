@@ -17,12 +17,37 @@ package bundle
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+func TestRetryStalePathRead(t *testing.T) {
+	attempts := 0
+	value, err := retryStalePathRead(func() (string, error) {
+		attempts++
+		if attempts < 3 {
+			return "", &os.PathError{Op: "read", Path: "container.json", Err: syscall.ESTALE}
+		}
+		return "current", nil
+	})
+	if err != nil || value != "current" || attempts != 3 {
+		t.Fatalf("retryStalePathRead()=(%q, %v) after %d attempts, want current after 3", value, err, attempts)
+	}
+
+	attempts = 0
+	_, err = retryStalePathRead(func() (string, error) {
+		attempts++
+		return "", os.ErrPermission
+	})
+	if !errors.Is(err, os.ErrPermission) || attempts != 1 {
+		t.Fatalf("non-ESTALE retry returned %v after %d attempts, want permission after 1", err, attempts)
+	}
+}
 
 // writeCurrentContainerFixture fills fields that every current-format writer
 // persists. Tests that intentionally exercise malformed metadata use writeJSON

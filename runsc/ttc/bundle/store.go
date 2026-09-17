@@ -67,6 +67,40 @@ const removedContainerDir = "removed-containers"
 
 const containerCreationMarker = ".creating"
 
+const stalePathReadAttempts = 6
+
+// retryStalePathRead reopens pathname-based metadata after NFS reports
+// ESTALE. TTC publishes records with atomic rename; an NFS client may briefly
+// retain the replaced inode's file handle even though a fresh pathname lookup
+// is already valid. Retrying only ESTALE keeps real corruption and permission
+// failures visible while preventing a transient cache entry from aborting a
+// fork or making the cluster inventory disappear.
+func retryStalePathRead[T any](operation func() (T, error)) (T, error) {
+	delay := time.Millisecond
+	for attempt := 0; ; attempt++ {
+		value, err := operation()
+		if err == nil || !errors.Is(err, unix.ESTALE) || attempt+1 == stalePathReadAttempts {
+			return value, err
+		}
+		time.Sleep(delay)
+		if delay < 16*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
+func readFileWithStaleRetry(path string) ([]byte, error) {
+	return retryStalePathRead(func() ([]byte, error) {
+		return os.ReadFile(path)
+	})
+}
+
+func readDirWithStaleRetry(path string) ([]fs.DirEntry, error) {
+	return retryStalePathRead(func() ([]fs.DirEntry, error) {
+		return os.ReadDir(path)
+	})
+}
+
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
 	Root string
@@ -698,7 +732,7 @@ func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount
 	if hostname == "" {
 		hostname = opts.Name
 	}
-	hostResolv, err := os.ReadFile("/etc/resolv.conf")
+	hostResolv, err := readFileWithStaleRetry("/etc/resolv.conf")
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading host resolver configuration: %w", err)
 	}
@@ -805,7 +839,7 @@ func rehomeInternalMounts(spec *specs.Spec, targetContainerDir string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("TTC internal mount %q is not a regular file", mount.Destination)
 		}
-		contents, err := os.ReadFile(mount.Source)
+		contents, err := readFileWithStaleRetry(mount.Source)
 		if err != nil {
 			return fmt.Errorf("copying TTC internal mount %q: %w", mount.Destination, err)
 		}
@@ -856,7 +890,7 @@ func (s Store) PortableInternalMounts(name string) ([]PortableInternalMount, err
 		if _, ok := internal[filepath.Clean(mount.Destination)]; !ok {
 			continue
 		}
-		contents, err := os.ReadFile(mount.Source)
+		contents, err := readFileWithStaleRetry(mount.Source)
 		if err != nil {
 			return nil, fmt.Errorf("reading TTC internal mount %q: %w", mount.Destination, err)
 		}
@@ -885,7 +919,7 @@ func (s Store) InstallPortableInternalMounts(name string, mounts []PortableInter
 		return err
 	}
 	configPath := filepath.Join(info.BundleDir, "config.json")
-	data, err := os.ReadFile(configPath)
+	data, err := readFileWithStaleRetry(configPath)
 	if err != nil {
 		return err
 	}
@@ -914,7 +948,7 @@ func MaterializePortableInternalMounts(bundleDir string, mounts []PortableIntern
 
 func materializePortableInternalMounts(bundleDir, directory string, mounts []PortableInternalMount) error {
 	configPath := filepath.Join(bundleDir, "config.json")
-	data, err := os.ReadFile(configPath)
+	data, err := readFileWithStaleRetry(configPath)
 	if err != nil {
 		return err
 	}
@@ -973,7 +1007,7 @@ func installPortableInternalMounts(spec *specs.Spec, directory string, mounts []
 // entry also avoids exposing a partially rewritten hostname/hosts/resolv.conf
 // to a concurrently starting branch.
 func replacePortableInternalMount(path string, contents []byte, mode os.FileMode) error {
-	if existing, err := os.ReadFile(path); err == nil {
+	if existing, err := readFileWithStaleRetry(path); err == nil {
 		if info, statErr := os.Stat(path); statErr == nil && info.Mode().Perm() == mode && bytes.Equal(existing, contents) {
 			return nil
 		}
@@ -2825,7 +2859,7 @@ func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, e
 }
 
 func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
-	data, err := os.ReadFile(filepath.Join(s.Root, "containers", key, "container.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(s.Root, "containers", key, "container.json"))
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("reading container %q: %w", key, err)
 	}
@@ -2942,7 +2976,7 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(info.BundleDir, "config.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(info.BundleDir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading OCI config for container %q: %w", name, err)
 	}
@@ -3014,7 +3048,7 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 		}
 		changed := false
 		activeMappings := make(map[string]activeRepositoryMapping)
-		if mappingData, err := os.ReadFile(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
+		if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
 			if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
 				return nil, fmt.Errorf("decoding active repository map: %w", err)
 			}
@@ -3064,7 +3098,7 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	// from the canonical OCI spec. Consult the map even in standalone mode so
 	// checkpoint restores can advance from a captured repository identity to
 	// the identity of the newly installed local repository.
-	if mappingData, err := os.ReadFile(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
+	if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
 		activeMappings := make(map[string]activeRepositoryMapping)
 		if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
 			return nil, fmt.Errorf("decoding active repository map: %w", err)
@@ -3241,7 +3275,7 @@ func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 // must not infer that unreadable state is unreferenced.
 func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerateUnreadable bool) ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
-	entries, err := os.ReadDir(containersDir)
+	entries, err := readDirWithStaleRetry(containersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []ContainerInfo{}, nil
@@ -4128,7 +4162,7 @@ type renamePath struct {
 func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldID, newID string) (func() error, error) {
 	var paths []renamePath
 	dir := filepath.Join(s.activeRoot(), "containers", containerID, "console")
-	entries, err := os.ReadDir(dir)
+	entries, err := readDirWithStaleRetry(dir)
 	if err == nil {
 		for _, entry := range entries {
 			name := entry.Name()
@@ -4818,7 +4852,7 @@ func (s Store) stageContainerRemoval(id string) (string, error) {
 }
 
 func loadRemovedContainerInfo(path string) (*ContainerInfo, error) {
-	data, err := os.ReadFile(filepath.Join(path, "container.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(path, "container.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -4904,7 +4938,7 @@ func (s Store) removeContainerInfo(info ContainerInfo) error {
 // data-root mutation lock is held.
 func (s Store) RecoverContainerRemovals() (int, error) {
 	containersRoot := filepath.Join(s.Root, "containers")
-	entries, err := os.ReadDir(containersRoot)
+	entries, err := readDirWithStaleRetry(containersRoot)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return 0, fmt.Errorf("scanning incomplete container removals: %w", err)
 	}
@@ -4948,7 +4982,7 @@ func (s Store) RecoverContainerRemovals() (int, error) {
 // any other removed container.
 func (s Store) SweepRemovedContainers() (int, error) {
 	root := s.removedContainersRoot()
-	entries, err := os.ReadDir(root)
+	entries, err := readDirWithStaleRetry(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
@@ -5038,7 +5072,7 @@ func (s Store) PruneImageCache(targetBytes uint64) (ImageCachePruneResult, error
 	if s.activeRoot() == s.Root {
 		return result, nil
 	}
-	entries, err := os.ReadDir(s.imageRootDir())
+	entries, err := readDirWithStaleRetry(s.imageRootDir())
 	if errors.Is(err, os.ErrNotExist) {
 		return result, nil
 	}
@@ -5152,7 +5186,7 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 
 	removed := 0
 	err := s.withImageRootLock(func() error {
-		entries, err := os.ReadDir(imagesDir)
+		entries, err := readDirWithStaleRetry(imagesDir)
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -5214,7 +5248,7 @@ func (s Store) PruneSharedImagePacks(ctx context.Context) (int, int, error) {
 		}
 	}
 	manifestsDir := filepath.Join(s.sharedImagePackRoot(), "manifests")
-	entries, err := os.ReadDir(manifestsDir)
+	entries, err := readDirWithStaleRetry(manifestsDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, 0, nil
 	}
@@ -5238,7 +5272,7 @@ func (s Store) PruneSharedImagePacks(ctx context.Context) (int, int, error) {
 		}
 		removedManifests++
 	}
-	remaining, err := os.ReadDir(manifestsDir)
+	remaining, err := readDirWithStaleRetry(manifestsDir)
 	if err != nil {
 		return removedManifests, 0, err
 	}
@@ -5271,7 +5305,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 	prefix := safeComponent(imageRootFormatVersion + "-" + digest + "-")
 	removed := 0
 	err := s.withImageRootLock(func() error {
-		entries, err := os.ReadDir(imagesDir)
+		entries, err := readDirWithStaleRetry(imagesDir)
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -5373,7 +5407,7 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 		return nil, err
 	}
 	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console", "exec", branch)
-	entries, err := os.ReadDir(dir)
+	entries, err := readDirWithStaleRetry(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -5664,7 +5698,7 @@ func installSharedImagePackManifest(path string, manifest sharedImagePackManifes
 }
 
 func loadSharedImagePackManifest(path string) (sharedImagePackManifest, error) {
-	data, err := os.ReadFile(path)
+	data, err := readFileWithStaleRetry(path)
 	if err != nil {
 		return sharedImagePackManifest{}, err
 	}
@@ -5724,7 +5758,7 @@ func (s Store) withImageRootLock(fn func() error) error {
 }
 
 func removeStaleImageRootTemps(imagesDir, key string) error {
-	entries, err := os.ReadDir(imagesDir)
+	entries, err := readDirWithStaleRetry(imagesDir)
 	if err != nil {
 		return err
 	}
@@ -5781,7 +5815,7 @@ func imageRootKey(digest, platform string) string {
 }
 
 func loadImageRoot(dir string) (images.RootFSInfo, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "image.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(dir, "image.json"))
 	if err != nil {
 		return images.RootFSInfo{}, err
 	}
