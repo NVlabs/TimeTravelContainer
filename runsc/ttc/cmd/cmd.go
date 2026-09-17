@@ -5596,7 +5596,10 @@ func (b *runtimeBackend) finalizeColdStopAuthority(target selector, previousStat
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return false, nil
 	}
-	info, err := b.containerStore().LoadContainer(target.container)
+	// Resolve through Raft as well as the shared store. A publication may be
+	// authoritative before NFS directory and negative-entry caches on this
+	// control node expose the family by name.
+	info, err := b.resolveContainer(target.container)
 	if err != nil {
 		return false, err
 	}
@@ -5628,7 +5631,10 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return false, nil
 	}
-	info, err := b.containerStore().LoadContainer(target.container)
+	// Resolve through Raft as well as the shared store. A publication may be
+	// authoritative before NFS directory and negative-entry caches on this
+	// control node expose the family by name.
+	info, err := b.resolveContainer(target.container)
 	if err != nil {
 		return false, err
 	}
