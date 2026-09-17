@@ -172,10 +172,17 @@ func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 	if err := base.validate(negotiated); err != nil {
 		t.Fatalf("valid exec session: %v", err)
 	}
+	exitStatus := uint32(7 << 8)
+	exited := base
+	exited.ExecSessions = []RemoteExecSessionDescriptor{{ID: "finished", PID: 43, State: "exited", ExitStatus: &exitStatus}}
+	exited.ExecConsoleLogs = []RemoteConsoleLogDescriptor{{ExecID: "finished", Size: 4096}}
+	if err := exited.validate(negotiated); err != nil {
+		t.Fatalf("valid exited exec session: %v", err)
+	}
 	for _, mutate := range []func(*RemoteSessionDescriptor){
 		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].ID = "" },
 		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].PID = 0 },
-		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].State = "exited" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].State = "unknown" },
 		func(d *RemoteSessionDescriptor) { d.ExecSessions = append(d.ExecSessions, d.ExecSessions[0]) },
 		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].ExecID = "unknown" },
 		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].Size = 0 },
@@ -188,6 +195,12 @@ func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 		if err := invalid.validate(negotiated); err == nil {
 			t.Fatalf("accepted invalid exec sessions: %+v", invalid.ExecSessions)
 		}
+	}
+	exitedWithoutStatus := exited
+	exitedWithoutStatus.ExecSessions = append([]RemoteExecSessionDescriptor(nil), exited.ExecSessions...)
+	exitedWithoutStatus.ExecSessions[0].ExitStatus = nil
+	if err := exitedWithoutStatus.validate(negotiated); err == nil {
+		t.Fatal("accepted exited exec session without status")
 	}
 }
 

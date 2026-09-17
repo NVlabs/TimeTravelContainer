@@ -59,25 +59,31 @@ func TestDistributedFilesystemRestoreID(t *testing.T) {
 }
 
 func TestRemoteExecSessionRoundTrip(t *testing.T) {
-	exit := uint32(17)
+	runningExit := uint32(17)
+	exitedStatus := uint32(7 << 8)
 	created := time.Unix(123, 456).UTC()
 	source := []boot.ExecSessionInfo{{
 		ID: "build", ContainerID: "source-runtime", PID: 42, ConsoleID: "console-build",
-		Terminal: true, State: boot.ExecSessionRunning, CreatedAt: created, ExitStatus: &exit,
+		Terminal: true, State: boot.ExecSessionRunning, CreatedAt: created, ExitStatus: &runningExit,
 	}, {
-		ID: "finished", PID: 43, State: boot.ExecSessionExited,
+		ID: "finished", ContainerID: "source-runtime", PID: 43, ConsoleID: "console-finished",
+		State: boot.ExecSessionExited, CreatedAt: created.Add(time.Second), ExitStatus: &exitedStatus,
 	}}
 	transport := remoteExecSessions(source)
-	if len(transport) != 1 || transport[0].ID != "build" {
+	if len(transport) != 2 || transport[0].ID != "build" || transport[1].ID != "finished" {
 		t.Fatalf("transport sessions=%+v", transport)
 	}
 	restored := bootExecSessions(transport, "target-runtime")
-	if len(restored) != 1 {
+	if len(restored) != 2 {
 		t.Fatalf("restored sessions=%+v", restored)
 	}
 	got := restored[0]
-	if got.ID != "build" || got.ContainerID != "target-runtime" || got.PID != 42 || got.ConsoleID != "console-build" || !got.Terminal || got.State != boot.ExecSessionRunning || !got.CreatedAt.Equal(created) || got.ExitStatus == nil || *got.ExitStatus != exit {
+	if got.ID != "build" || got.ContainerID != "target-runtime" || got.PID != 42 || got.ConsoleID != "console-build" || !got.Terminal || got.State != boot.ExecSessionRunning || !got.CreatedAt.Equal(created) || got.ExitStatus == nil || *got.ExitStatus != runningExit {
 		t.Fatalf("restored session=%+v", got)
+	}
+	finished := restored[1]
+	if finished.ID != "finished" || finished.ContainerID != "target-runtime" || finished.State != boot.ExecSessionExited || finished.ExitStatus == nil || *finished.ExitStatus != exitedStatus {
+		t.Fatalf("restored exited session=%+v", finished)
 	}
 	*source[0].ExitStatus = 99
 	if *transport[0].ExitStatus != 17 || *restored[0].ExitStatus != 17 {

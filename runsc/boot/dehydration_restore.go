@@ -554,14 +554,10 @@ func (f *SandboxFamily) restorePeer(id, parentID, filesystemBranch string, quara
 		child.Release()
 		return err
 	}
-	newSessions := make(map[string]*execSession)
-	for _, info := range sessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
-		if tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID); tg != nil {
-			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
-		}
+	newSessions, err := restoredExecSessions(child, sessions)
+	if err != nil {
+		child.Release()
+		return fmt.Errorf("restoring dehydrated exec sessions: %w", err)
 	}
 	var dog *watchdog.Watchdog
 	if f.watchdogOpts != nil {

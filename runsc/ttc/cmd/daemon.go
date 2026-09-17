@@ -1278,6 +1278,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			return err
 		}
 	}
+	if err := r.backend.installRemoteExecSessionStates(info.ID, targetBranch.ID, session.ExecSessions); err != nil {
+		return err
+	}
 	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "paused")
 }
 

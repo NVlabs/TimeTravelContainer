@@ -70,9 +70,6 @@ const distributedHandoffConcurrency = 2
 func remoteExecSessions(sessions []boot.ExecSessionInfo) []cluster.RemoteExecSessionDescriptor {
 	out := make([]cluster.RemoteExecSessionDescriptor, 0, len(sessions))
 	for _, session := range sessions {
-		if session.State != boot.ExecSessionRunning {
-			continue
-		}
 		var status *uint32
 		if session.ExitStatus != nil {
 			value := *session.ExitStatus
@@ -1017,9 +1014,6 @@ func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, 
 	descriptors := make([]cluster.RemoteConsoleLogDescriptor, 0, len(sessions))
 	files := make(map[string][]string)
 	for _, session := range sessions {
-		if session.State != boot.ExecSessionRunning {
-			continue
-		}
 		paths, err := store.ExecConsolePaths(container, branch, session.ID)
 		if err != nil {
 			return nil, nil, err
@@ -1047,6 +1041,30 @@ func (b *runtimeBackend) captureRemoteExecConsoleLogs(container, branch string, 
 		files[session.ID] = generationPaths
 	}
 	return descriptors, files, nil
+}
+
+// installRemoteExecSessionStates restores the host-side completion markers for
+// retained exec sessions. The Sentry owns the authoritative session metadata,
+// but attach/log readers use these files to avoid starting a console follower
+// for a process that had already exited before migration.
+func (b *runtimeBackend) installRemoteExecSessionStates(container, branch string, sessions []cluster.RemoteExecSessionDescriptor) error {
+	store := b.containerStore()
+	for _, session := range sessions {
+		if session.State != string(boot.ExecSessionExited) {
+			continue
+		}
+		if session.ExitStatus == nil {
+			return fmt.Errorf("exited exec session %q has no wait status", session.ID)
+		}
+		paths, err := store.ExecConsolePaths(container, branch, session.ID)
+		if err != nil {
+			return err
+		}
+		if err := installRetainedExecWaitStatus(paths, *session.ExitStatus); err != nil {
+			return fmt.Errorf("restoring wait status for exec session %q: %w", session.ID, err)
+		}
+	}
+	return nil
 }
 
 func (b *runtimeBackend) installRemoteExecConsoleLogs(ctx context.Context, address string, token [16]byte, container, branch string, logs []cluster.RemoteConsoleLogDescriptor) error {

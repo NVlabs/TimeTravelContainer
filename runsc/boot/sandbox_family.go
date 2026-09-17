@@ -887,9 +887,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	f.mu.Lock()
 	execSessions := make([]ExecSessionInfo, 0, len(source.execSessions))
 	for _, session := range source.execSessions {
-		if session.info.State == ExecSessionRunning {
-			execSessions = append(execSessions, cloneExecSessionInfo(session.info))
-		}
+		execSessions = append(execSessions, cloneExecSessionInfo(session.info))
 	}
 	f.mu.Unlock()
 	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
@@ -1540,14 +1538,21 @@ func (f *SandboxFamily) RestoreLoaderExecSessions(sessions []ExecSessionInfo) er
 func restoredExecSessions(k *kernel.Kernel, sessions []ExecSessionInfo) (map[string]*execSession, error) {
 	restored := make(map[string]*execSession)
 	for _, info := range sessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
 		if info.ID == "" || info.PID <= 0 {
 			return nil, fmt.Errorf("invalid restored exec session %+v", info)
 		}
 		if _, ok := restored[info.ID]; ok {
 			return nil, fmt.Errorf("duplicate restored exec session %q", info.ID)
+		}
+		if info.State == ExecSessionExited {
+			if info.ExitStatus == nil {
+				return nil, fmt.Errorf("restored exited exec session %q has no status", info.ID)
+			}
+			restored[info.ID] = &execSession{info: cloneExecSessionInfo(info), retain: true}
+			continue
+		}
+		if info.State != ExecSessionRunning {
+			return nil, fmt.Errorf("restored exec session %q has invalid state %q", info.ID, info.State)
 		}
 		tg := k.RootPIDNamespace().ThreadGroupWithID(info.PID)
 		if tg == nil || tg.Leader().Origin != kernel.OriginExec {
@@ -3270,6 +3275,13 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 		return 0, err
 	}
 	defer done()
+	f.mu.Lock()
+	if session.info.State == ExecSessionExited && session.info.ExitStatus != nil {
+		status := *session.info.ExitStatus
+		f.mu.Unlock()
+		return status, nil
+	}
+	f.mu.Unlock()
 	if session.tg == nil {
 		return 0, fmt.Errorf("exec session %q is not published", args.ExecID)
 	}
@@ -3308,14 +3320,14 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 		return err
 	}
 	defer done()
-	if session.tg == nil {
-		return fmt.Errorf("exec session %q is not published", args.ExecID)
-	}
 	f.mu.Lock()
 	exited := session.info.State == ExecSessionExited
 	f.mu.Unlock()
 	if exited {
 		return fmt.Errorf("exec session %q has exited", args.ExecID)
+	}
+	if session.tg == nil {
+		return fmt.Errorf("exec session %q is not published", args.ExecID)
 	}
 	return b.k.SendExternalSignalThreadGroup(session.tg, &linux.SignalInfo{Signo: args.Signo})
 }

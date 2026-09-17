@@ -818,6 +818,25 @@ func liveForkTestExecSession(t *testing.T, family *SandboxFamily, branchID, cid,
 	return ExecSessionInfo{}
 }
 
+func TestRestoredExecSessionsRetainsExitedMetadata(t *testing.T) {
+	status := uint32(linux.WaitStatusExit(7))
+	sessions, err := restoredExecSessions(nil, []ExecSessionInfo{{
+		ID: "finished", ContainerID: "container", PID: 42, ConsoleID: "console-finished",
+		State: ExecSessionExited, ExitStatus: &status,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := sessions["finished"]
+	if session == nil || session.tg != nil || !session.retain || session.info.ExitStatus == nil || *session.info.ExitStatus != status {
+		t.Fatalf("restored exited session=%+v", session)
+	}
+	*session.info.ExitStatus = 99
+	if status != uint32(linux.WaitStatusExit(7)) {
+		t.Fatal("restored exit status aliases serialized metadata")
+	}
+}
+
 // TestRunLiveForkNetworkNone forks a live loader with no host-facing network.
 func TestRunLiveForkNetworkNone(t *testing.T) {
 	hostBind := t.TempDir()

@@ -8491,7 +8491,40 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, console
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
+	// A restored completed session has no live ThreadGroup to follow. Its
+	// retained ring and status are already authoritative, so materialize the
+	// ordinary host-side completion marker and let attach/log readers consume
+	// them without spawning a doomed console follower. This also repairs old
+	// node-local caches after rehydration on demand.
+	if !reset {
+		session, sessionErr := b.execSession(target, execID)
+		if sessionErr == nil && session.State == string(boot.ExecSessionExited) && session.ExitStatus != nil {
+			if err := installRetainedExecWaitStatus(paths, *session.ExitStatus); err != nil {
+				return ttcbundle.ConsolePaths{}, err
+			}
+			return paths, nil
+		}
+	}
 	return b.ensureConsoleDrainPaths(target, execID, consoleID, paths, reset)
+}
+
+func installRetainedExecWaitStatus(paths ttcbundle.ConsolePaths, status uint32) error {
+	if current, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil {
+		return err
+	} else if found {
+		if current != status {
+			return fmt.Errorf("retained exec wait status is %d, want %d", current, status)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.WaitStatus), 0700); err != nil {
+		return err
+	}
+	data := []byte(strconv.FormatUint(uint64(status), 10) + "\n")
+	if err := os.WriteFile(paths.WaitStatus, data, 0600); err != nil {
+		return fmt.Errorf("restoring retained exec wait status: %w", err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consoleID string, paths ttcbundle.ConsolePaths, reset bool) (ttcbundle.ConsolePaths, error) {

@@ -241,8 +241,11 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 	}
 	seenExecSessions := make(map[string]struct{}, len(s.ExecSessions))
 	for _, session := range s.ExecSessions {
-		if session.ID == "" || session.PID <= 0 || session.State != "running" {
+		if session.ID == "" || session.PID <= 0 || (session.State != "running" && session.State != "exited") {
 			return fmt.Errorf("remote session has invalid exec session %q", session.ID)
+		}
+		if session.State == "exited" && session.ExitStatus == nil {
+			return fmt.Errorf("remote session has exited exec session %q without status", session.ID)
 		}
 		if _, ok := seenExecSessions[session.ID]; ok {
 			return fmt.Errorf("remote session repeats exec session %q", session.ID)
