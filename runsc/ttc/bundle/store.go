@@ -3446,9 +3446,12 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 // UpdateDistributedForkMemoryGraph records the immutable graph roots selected
 // by a hidden or published distributed target. Target-local logical names are
 // derived from its immutable filesystem-branch identity, not its visible name.
-func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID uint64, objects []string) error {
+func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID uint64, objects []string, referenceOperation string) error {
 	if snapshotID == 0 || len(objects) == 0 || len(objects) > 4096 {
 		return errors.New("distributed graph memory identity is incomplete")
+	}
+	if referenceOperation == "" || filepath.Base(referenceOperation) != referenceOperation || strings.ContainsAny(referenceOperation, `/\\`) {
+		return errors.New("distributed graph reference operation is invalid")
 	}
 	info, err := s.LoadDistributedForkTarget(transactionID)
 	if err != nil {
@@ -3467,14 +3470,14 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
-			branch.DistributedGraphReferenceOperation = transactionID
+			branch.DistributedGraphReferenceOperation = referenceOperation
 			return true, nil
 		}
 		if pending, ok := current.DistributedForkImports[transactionID]; ok {
 			pending.SnapshotID = snapshotID
 			pending.MemoryRoots = makeRoots(pending.FilesystemBranch)
 			pending.MemoryRootObjects = append([]string(nil), objects...)
-			pending.GraphReferenceOperation = transactionID
+			pending.GraphReferenceOperation = referenceOperation
 			current.DistributedForkImports[transactionID] = pending
 			return true, nil
 		}
@@ -3486,7 +3489,7 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 			branch.SnapshotID = snapshotID
 			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
 			branch.MemoryRootObjects = append([]string(nil), objects...)
-			branch.DistributedGraphReferenceOperation = transactionID
+			branch.DistributedGraphReferenceOperation = referenceOperation
 			return true, nil
 		}
 		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)

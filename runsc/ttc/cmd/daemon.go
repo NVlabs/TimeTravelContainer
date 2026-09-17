@@ -845,7 +845,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, tx.Identity.TransactionID, info.ID, targetBranch.ID, session.GraphRootObjects); err != nil {
 			return fmt.Errorf("retaining distributed graph memory origins: %w", err)
 		}
-		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects); err != nil {
+		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects, tx.Identity.TransactionID); err != nil {
 			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
 			return fmt.Errorf("recording distributed graph memory identity: %w", err)
 		}
@@ -1277,21 +1277,28 @@ func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph clust
 	if err := validateGraphRootObjects(graph.GraphSnapshot, graphMemoryRootNames(branch.FilesystemBranch, len(objects)), objects); err != nil {
 		return fmt.Errorf("validating graph handoff roots: %w", err)
 	}
-	if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, tx.Identity.TransactionID, info.ID, branch.ID, objects); err != nil {
+	previousReferenceOperation := graphReferenceOperationForBranch(info, branch)
+	handoffReferenceOperation := graphHandoffReferenceOperation(tx.Identity.TransactionID, graph.GraphSnapshot)
+	if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, handoffReferenceOperation, info.ID, branch.ID, objects); err != nil {
 		return fmt.Errorf("retaining graph handoff roots: %w", err)
 	}
 	retained := true
 	defer func() {
 		if retained {
-			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
+			_ = r.backend.releaseDistributedGraphReferences(handoffReferenceOperation)
 		}
 	}()
-	if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, graph.GraphSnapshot, objects); err != nil {
+	if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, graph.GraphSnapshot, objects, handoffReferenceOperation); err != nil {
 		return fmt.Errorf("recording graph handoff roots: %w", err)
 	}
 	// The persistent branch record now owns this reference intent. A later
 	// handoff retry must retain it even if the current Sentry switch fails.
 	retained = false
+	if previousReferenceOperation != "" && previousReferenceOperation != handoffReferenceOperation {
+		if err := r.backend.releaseDistributedGraphReferencesEventually(previousReferenceOperation); err != nil {
+			return fmt.Errorf("releasing superseded graph roots: %w", err)
+		}
+	}
 	manifest, err := os.Open(filepath.Join(r.backend.dataRoot, graph.GraphManifest))
 	if err != nil {
 		return fmt.Errorf("opening graph handoff manifest: %w", err)

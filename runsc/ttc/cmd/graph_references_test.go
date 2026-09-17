@@ -75,6 +75,13 @@ func TestGraphReferenceAuthorizationTransaction(t *testing.T) {
 			},
 		},
 		{
+			name: "sparse handoff replacement",
+			intent: graphReferenceIntent{
+				Purpose: graphReferencePurposeBranch, Transaction: "fork-1", Operation: graphHandoffReferenceOperation("fork-1", 42),
+			},
+			want: "fork-1",
+		},
+		{
 			name: "migration transfer",
 			intent: graphReferenceIntent{
 				Purpose: graphReferencePurposeTransfer, Transaction: "fork-1", Operation: "transfer-fork-1",

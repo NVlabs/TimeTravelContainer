@@ -190,6 +190,14 @@ func graphTransferReferenceOperation(transaction string) string {
 	return "transfer-" + transaction
 }
 
+// graphHandoffReferenceOperation separates a target's initial inherited graph
+// from a later sparse-handoff graph. Both may legitimately exist during one
+// transaction, and each immutable snapshot must have a distinct idempotency
+// identity until the branch record atomically switches between them.
+func graphHandoffReferenceOperation(transaction string, snapshot uint64) string {
+	return fmt.Sprintf("handoff-%s-%016x", transaction, snapshot)
+}
+
 func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphReferenceIntent) error {
 	if intent == nil || intent.State == "releasing" {
 		return errors.New("graph reference operation is already releasing")
@@ -622,7 +630,10 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 // transaction-fenced even though their operation carries a prefix.
 func graphReferenceAuthorizationTransaction(intent graphReferenceIntent) string {
 	if intent.Purpose == graphReferencePurposeBranch && intent.Operation != intent.Transaction {
-		return ""
+		prefix := "handoff-" + intent.Transaction + "-"
+		if !strings.HasPrefix(intent.Operation, prefix) {
+			return ""
+		}
 	}
 	return intent.Transaction
 }

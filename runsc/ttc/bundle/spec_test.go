@@ -424,7 +424,7 @@ func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testin
 	if err := store.UpdateDistributedForkTargetState("fork-original", "paused"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateDistributedForkMemoryGraph("fork-original", 9, []string{"0000000000000009-03-0000000000000001"}); err != nil {
+	if err := store.UpdateDistributedForkMemoryGraph("fork-original", 9, []string{"0000000000000009-03-0000000000000001"}, "fork-original"); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.LoadContainer(info.ID)
@@ -495,7 +495,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 		t.Fatalf("peer bootstrap filesystem annotation=%q, want %q", got, branch.FilesystemBranch)
 	}
 	graphObjects := []string{"0000000000000007-03-0000000000000001", "0000000000000006-03-0000000000000002"}
-	if err := store.UpdateDistributedForkMemoryGraph("tx-import", 7, graphObjects); err != nil {
+	if err := store.UpdateDistributedForkMemoryGraph("tx-import", 7, graphObjects, "tx-import"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateDistributedForkTargetState("tx-import", "paused"); err != nil {
