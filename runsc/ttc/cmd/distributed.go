@@ -1287,13 +1287,12 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		dependentBytes += snapshot.LogicalBytes
 		roots = append(roots, cluster.FilesystemRootDescriptor{
 			Source: config.Source, RepositoryID: snapshot.RepositoryID,
-			// A running Sentry is canonicalized to its node-local repository
-			// after every successful restore. Offline cold-branch materialization
-			// is different: it copies the immutable filesystem graph without
-			// rewriting the serialized Kernel metadata. Preserve that pending
-			// restore identity until the target has consumed it; the target then
-			// canonicalizes the mapping through CommitActiveRepositoryRestoreIDs.
-			RestoreID: distributedFilesystemRestoreID(config, snapshot.RepositoryID),
+			// A live capture serializes the identity of the repository object that
+			// is currently mounted in the Sentry. Use that exact physical identity
+			// for the target restore. config.RestoreID may describe any earlier
+			// import hop and is therefore neither authoritative nor sufficient
+			// after repeated migration or cold rehydration.
+			RestoreID: snapshot.RepositoryID,
 			BranchID:  snapshot.BranchID, Root: descriptor.Root.String(),
 			NextInode: snapshot.NextInode, LogicalBytes: snapshot.LogicalBytes,
 		})
@@ -1302,13 +1301,6 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 		return nil, 0, err
 	}
 	return roots, dependentBytes, nil
-}
-
-func distributedFilesystemRestoreID(config specutils.TTCVolumeRepository, repositoryID string) string {
-	if config.RestoreID != "" {
-		return config.RestoreID
-	}
-	return repositoryID
 }
 
 // materializeDistributedFilesystemRoots installs the bounded graph-root
