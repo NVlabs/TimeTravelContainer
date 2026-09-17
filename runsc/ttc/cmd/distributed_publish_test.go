@@ -656,6 +656,58 @@ func TestActivateRemoteMigrationRetriesAdvancedIndependentRevision(t *testing.T)
 	}
 }
 
+func TestCancelRemoteForkTargetRetriesAdvancedRevision(t *testing.T) {
+	const transactionID = "fork-cancel-retry"
+	var cancels atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tx := cluster.Transaction{
+			Identity: cluster.ForkIdentity{TransactionID: transactionID},
+			State:    cluster.TransactionPublished, Revision: 8,
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/forks/"+transactionID:
+			_ = json.NewEncoder(w).Encode(tx)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/forks/"+transactionID+"/cancel":
+			var request cluster.CancelRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			attempt := cancels.Add(1)
+			if attempt == 1 {
+				if request.Revision != 7 {
+					t.Errorf("first cancellation revision=%d, want 7", request.Revision)
+				}
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "stale transaction revision"})
+				return
+			}
+			if request.Revision != 8 {
+				t.Errorf("retried cancellation revision=%d, want 8", request.Revision)
+			}
+			tx.State = cluster.TransactionCanceled
+			tx.Revision = 9
+			_ = json.NewEncoder(w).Encode(tx)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	peer, err := cluster.NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	tx, err := cancelRemoteForkTarget(ctx, peer, transactionID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.State != cluster.TransactionCanceled || tx.Revision != 9 || cancels.Load() != 2 {
+		t.Fatalf("cancellation result=(%s, revision=%d, attempts=%d), want (canceled, 9, 2)", tx.State, tx.Revision, cancels.Load())
+	}
+}
+
 func TestReserveRemoteTargetWaitsForNewLeaderLease(t *testing.T) {
 	var attempts atomic.Int32
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

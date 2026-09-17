@@ -2777,19 +2777,7 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 			return fmt.Errorf("finding removable distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, transactionID, err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		canceled, cancelErr := peer.Cancel(ctx, transactionID, tx.Revision)
-		if cancelErr != nil {
-			// A target cleanup may have committed while its response was lost or
-			// another recovery worker may have won the revision race. Only a
-			// terminal authoritative reread proves this cancellation complete.
-			current, statusErr := peer.Status(ctx, transactionID)
-			if statusErr == nil && current.Terminal() {
-				canceled = current
-				cancelErr = nil
-			} else {
-				cancelErr = errors.Join(cancelErr, statusErr)
-			}
-		}
+		canceled, cancelErr := cancelRemoteForkTarget(ctx, peer, transactionID, tx.Revision)
 		cancel()
 		if cancelErr != nil {
 			return fmt.Errorf("canceling removable distributed target %q: %w", transactionID, cancelErr)
@@ -2799,6 +2787,38 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 		}
 	}
 	return nil
+}
+
+// cancelRemoteForkTarget retries optimistic cancellation across transaction
+// progress that races a family removal. TargetRuntime.Cancel intentionally
+// destroys the physical target before the Raft revision CAS; therefore a stale
+// revision response can mean cleanup already happened and must be followed by
+// the same idempotent request at the newly authoritative revision. A terminal
+// status is the only other successful outcome.
+func cancelRemoteForkTarget(ctx context.Context, peer *cluster.Client, transactionID string, revision uint64) (*cluster.Transaction, error) {
+	var lastErr error
+	for range 16 { // More than the complete finite transaction state sequence.
+		canceled, err := peer.Cancel(ctx, transactionID, revision)
+		if err == nil && canceled != nil && canceled.Terminal() {
+			return canceled, nil
+		}
+		if err == nil {
+			err = errors.New("cancellation returned a nonterminal transaction")
+		}
+		lastErr = errors.Join(lastErr, err)
+		current, statusErr := peer.Status(ctx, transactionID)
+		if statusErr != nil {
+			return nil, errors.Join(lastErr, statusErr)
+		}
+		if current.Terminal() {
+			return current, nil
+		}
+		if current.Revision == revision {
+			return nil, lastErr
+		}
+		revision = current.Revision
+	}
+	return nil, fmt.Errorf("canceling transaction %q did not converge: %w", transactionID, lastErr)
 }
 
 // removeCanceledForkPlacement commits the metadata half of a remote-fork
