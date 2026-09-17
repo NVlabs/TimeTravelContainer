@@ -120,6 +120,16 @@ sh_binary(
     ],
 )
 
+# Manual because it pulls an image and composes all of the lower-frequency CLI
+# lifecycle paths, including checkpoint/restore and dehydration.
+sh_binary(
+    name = "e2e_cli_commands",
+    srcs = ["e2e_cli_commands.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it starts a three-node cluster, migrates live branches, and
 # retires a node through scheduler-selected evacuation.
 sh_binary(

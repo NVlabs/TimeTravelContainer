@@ -1009,6 +1009,23 @@ func TestScopedBranchID(t *testing.T) {
 	}
 }
 
+func TestNewScopedBranchIDAllowsVisibleNameReuse(t *testing.T) {
+	first, err := NewScopedBranchID("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewScopedBranchID("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("new branch incarnations reused physical ID %q", first)
+	}
+	if !strings.HasPrefix(first, "b-") || !strings.HasPrefix(second, "b-") {
+		t.Fatalf("new scoped branch IDs = %q, %q, want b- prefixes", first, second)
+	}
+}
+
 func TestSnapshotRoundTripIsBranchScoped(t *testing.T) {
 	manager := openTestManager(t)
 	source, err := manager.Create("source")

@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -197,8 +198,16 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	}
 	defer os.RemoveAll(stage)
 
-	if _, err := b.command("timetravel", "--source", target.branch, "--paused", info.ID, "fork", hiddenBranch); err != nil {
+	forkOutput, err := b.command("timetravel", "--source", target.branch, "--paused", info.ID, "fork", hiddenBranch)
+	if err != nil {
 		return fmt.Errorf("creating checkpoint snapshot branch: %w", err)
+	}
+	var hiddenInfo runscBranchInfo
+	if err := json.Unmarshal(forkOutput, &hiddenInfo); err != nil {
+		return fmt.Errorf("decoding checkpoint snapshot branch: %w", err)
+	}
+	if hiddenInfo.FilesystemBranch == "" {
+		return errors.New("checkpoint snapshot branch has no filesystem identity")
 	}
 	hiddenExists := true
 	defer func() {
@@ -229,7 +238,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	if err != nil {
 		return err
 	}
-	persistentBranch := ttcvolume.ScopedBranchID(info.ID, hiddenBranch)
+	persistentBranch := hiddenInfo.FilesystemBranch
 	manifestRepositories := make([]ttccheckpoint.RepositorySnapshot, 0, len(repositories))
 	var opened []*ttcvolume.Repository
 	defer func() {

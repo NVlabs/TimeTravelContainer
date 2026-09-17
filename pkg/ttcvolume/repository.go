@@ -75,6 +75,20 @@ func ScopedBranchID(scope, visibleBranchID string) string {
 	return fmt.Sprintf("b-%x", sum[:])
 }
 
+// NewScopedBranchID returns a repository branch ID for a newly-created branch
+// incarnation. Unlike ScopedBranchID, its result is intentionally not derived
+// solely from the user-visible name: visible branch names may be renamed,
+// removed, and reused while older branches with those names' former storage
+// identities are still alive.
+func NewScopedBranchID(scope, visibleBranchID string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generating repository branch identity: %w", err)
+	}
+	sum := sha256.Sum256(append([]byte(scope+"\x00"+visibleBranchID+"\x00"), nonce[:]...))
+	return fmt.Sprintf("b-%x", sum[:]), nil
+}
+
 // CopyMode describes how shared regular-file objects are privatized.
 type CopyMode string
 

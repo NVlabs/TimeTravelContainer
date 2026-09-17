@@ -1801,10 +1801,15 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			f.mu.Unlock()
 			return nil, fmt.Errorf("branch %q already exists", id)
 		}
+		filesystemBranch, err := ttcvolume.NewScopedBranchID(f.volumeBranchScope, id)
+		if err != nil {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("allocating filesystem identity for branch %q: %w", id, err)
+		}
 		childBranches[i] = &sandboxBranch{
 			id:               id,
 			parentID:         sourceID,
-			filesystemBranch: f.volumeBranchID(id),
+			filesystemBranch: filesystemBranch,
 			state:            BranchCreating,
 			createdAt:        time.Now().UTC(),
 			quarantined:      source.quarantined || args.Quarantine,
@@ -1883,7 +1888,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	for i, childBranch := range childBranches {
 		kernelOpts[i] = kernel.LiveForkOptions{
 			Clocks:                         sentrytime.NewCalibratedClocks(),
-			ChildBranchID:                  f.volumeBranchID(childBranch.id),
+			ChildBranchID:                  childBranch.filesystemBranch,
 			AllowNetworkStack:              f.allowNetworkStack,
 			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 			Quarantine:                     args.Quarantine,

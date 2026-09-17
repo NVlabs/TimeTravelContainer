@@ -11161,7 +11161,10 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
 	referenceTransaction := transactionIDForBranch(info, sourceBranch)
 	for _, destination := range destinations {
-		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
+		filesystemBranch, err := ttcvolume.NewScopedBranchID(info.ID, destination)
+		if err != nil {
+			return nil, fmt.Errorf("allocating filesystem identity for %s@%s: %w", source.container, destination, err)
+		}
 		branch := ttcbundle.BranchInfo{ID: destination, ParentID: logicalParent, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
 		if referenceTransaction != "" && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
 			operation, err := newGraphReferenceOperation()
