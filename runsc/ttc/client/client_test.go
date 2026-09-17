@@ -132,6 +132,18 @@ func TestHelpAndCompletionAreOffline(t *testing.T) {
 	}
 }
 
+func TestHelpRejectsUnknownCommands(t *testing.T) {
+	for _, args := range [][]string{{"branch", "--help"}, {"banana", "-h"}, {"help", "banana"}} {
+		var stdout, stderr bytes.Buffer
+		if status := Run(args, strings.NewReader(""), &stdout, &stderr); status != 2 {
+			t.Fatalf("Run(%q): status=%d, want 2", args, status)
+		}
+		if stdout.Len() != 0 || !strings.Contains(stderr.String(), "unknown command") {
+			t.Fatalf("Run(%q): stdout=%q stderr=%q", args, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestDetailedHelpIsClientLocal(t *testing.T) {
 	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
 	tests := []struct {

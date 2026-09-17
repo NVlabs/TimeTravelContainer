@@ -91,7 +91,11 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
-	if localHelp(args, stdout) {
+	if handled, err := localHelp(args, stdout); handled {
+		if err != nil {
+			fmt.Fprintf(stderr, "ttc: %v\n", err)
+			return 2
+		}
 		return 0
 	}
 	if args[0] == "completion" {
@@ -621,20 +625,30 @@ Generate a shell completion script on standard output. This command is fully
 client-local and does not require a running daemon.`,
 }
 
-func localHelp(args []string, stdout io.Writer) bool {
+func localHelp(args []string, stdout io.Writer) (bool, error) {
 	if args[0] == "help" {
 		if len(args) == 1 {
 			printUsage(stdout)
-			return true
+			return true, nil
+		}
+		if !knownHelpCommand(args[1]) {
+			return true, fmt.Errorf("unknown command %q", args[1])
 		}
 		printHelpTopic(args[1:], stdout)
-		return true
+		return true, nil
 	}
 	if len(args) >= 2 && (args[len(args)-1] == "--help" || args[len(args)-1] == "-h") {
+		if !knownHelpCommand(args[0]) {
+			return true, fmt.Errorf("unknown command %q", args[0])
+		}
 		printHelpTopic(args[:len(args)-1], stdout)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
+}
+
+func knownHelpCommand(command string) bool {
+	return command == "daemon" || command == "completion" || knownCommand(command)
 }
 
 func printHelpTopic(topic []string, stdout io.Writer) {
