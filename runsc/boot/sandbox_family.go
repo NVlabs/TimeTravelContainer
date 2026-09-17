@@ -2529,15 +2529,18 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 		f.mu.Unlock()
 		return fmt.Errorf("starting rehydrated branch %q: %w", id, err)
 	}
-	newSessions := make(map[string]*execSession)
-	for _, info := range d.execSessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
-		tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID)
-		if tg != nil {
-			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg, retain: true}
-		}
+	newSessions, err := restoredExecSessions(child, d.execSessions)
+	if err != nil {
+		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		child.Unpause()
+		child.WaitExited()
+		child.Release()
+		f.mu.Lock()
+		b.dehydration = nil
+		b.state = BranchFailed
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("restoring dehydrated exec sessions: %w", err)
 	}
 	var dog *watchdog.Watchdog
 	if f.watchdogOpts != nil {

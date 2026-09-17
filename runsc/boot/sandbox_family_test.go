@@ -432,6 +432,11 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 	family.mu.Lock()
 	original := family.branches["sleeping"].k
+	exitStatus := uint32(linux.WaitStatusExit(7))
+	family.branches["sleeping"].execSessions["completed"] = &execSession{info: ExecSessionInfo{
+		ID: "completed", ContainerID: "container", PID: 4242, ConsoleID: "console-completed",
+		State: ExecSessionExited, ExitStatus: &exitStatus,
+	}, retain: true}
 	family.mu.Unlock()
 	metadata, err := os.CreateTemp(t.TempDir(), "dehydration-*.state")
 	if err != nil {
@@ -455,12 +460,16 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 	family.mu.Lock()
 	restored := family.branches["sleeping"].k
+	completed := family.branches["sleeping"].execSessions["completed"]
 	family.mu.Unlock()
 	if restored == nil || restored == original {
 		t.Fatalf("rehydrated Kernel=%p, original=%p", restored, original)
 	}
 	if !restored.IsPaused() {
 		t.Fatal("previously paused branch resumed during rehydration")
+	}
+	if completed == nil || completed.tg != nil || completed.info.State != ExecSessionExited || completed.info.ExitStatus == nil || *completed.info.ExitStatus != exitStatus {
+		t.Fatalf("rehydrated completed exec session=%+v", completed)
 	}
 	if got := branchStateForTest(family.List(), "sleeping"); got != BranchPaused {
 		t.Fatalf("state after rehydration=%q, want %q", got, BranchPaused)
