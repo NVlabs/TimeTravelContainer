@@ -138,10 +138,35 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 	if args[0] == "checkpoint" || args[0] == "restore" {
-		args, err = normalizeCheckpointCommandArgs(args)
+		var finish func(bool) error
+		args, stdin, stdout, finish, err = prepareCheckpointClientIO(args, stdin, stdout)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 2
+		}
+		if finish != nil {
+			cleanup := finish
+			completed := false
+			defer func() {
+				// The actual result is finalized immediately below. This fallback
+				// only closes/removes a temporary file if a future early return is
+				// added between preparation and transport.
+				if !completed {
+					_ = cleanup(false)
+				}
+			}()
+			status, runErr := runViaDaemon(opts, args, stdin, stdout, stderr)
+			finishErr := cleanup(runErr == nil && status == 0)
+			completed = true
+			if runErr != nil {
+				fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", runErr)
+				return 1
+			}
+			if finishErr != nil {
+				fmt.Fprintf(stderr, "ttc: finalizing checkpoint archive: %v\n", finishErr)
+				return 1
+			}
+			return status
 		}
 	}
 	status, err := runViaDaemon(opts, args, stdin, stdout, stderr)

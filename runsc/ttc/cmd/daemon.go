@@ -7378,6 +7378,13 @@ func daemonCommandUsesStdin(args []string) bool {
 		return imageLoadReadsStdin(args[1:])
 	case "image":
 		return len(args) > 1 && args[1] == "load" && imageLoadReadsStdin(args[2:])
+	case "restore":
+		for _, arg := range args[1:] {
+			if arg == "-" {
+				return true
+			}
+		}
+		return false
 	case "attach", "run", "start":
 	case "exec":
 		if len(args) > 1 && (args[1] == "ls" || args[1] == "wait" || args[1] == "kill") {

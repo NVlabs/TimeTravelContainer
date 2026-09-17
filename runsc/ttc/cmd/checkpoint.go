@@ -40,7 +40,7 @@ type checkpointRequest struct {
 }
 
 type checkpointCommandBackend interface {
-	checkpoint(request checkpointRequest) error
+	checkpoint(request checkpointRequest, output io.Writer) error
 	restoreCheckpoint(source, name string) (string, error)
 }
 
@@ -69,10 +69,12 @@ func runCheckpoint(args []string, stdout io.Writer, b backend) error {
 		target:      target,
 		destination: fs.Arg(1),
 		compression: *compression,
-	}); err != nil {
+	}, stdout); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, fs.Arg(1))
+	if fs.Arg(1) != "-" {
+		fmt.Fprintln(stdout, fs.Arg(1))
+	}
 	return nil
 }
 
@@ -101,11 +103,12 @@ func runRestoreCheckpoint(args []string, stdout io.Writer, b backend) error {
 	return nil
 }
 
-// normalizeCheckpointCommandArgs resolves checkpoint files in the client
-// process before forwarding to a daemon with an unrelated working directory.
-func normalizeCheckpointCommandArgs(args []string) ([]string, error) {
+// prepareCheckpointClientIO keeps checkpoint archive paths in the client. The
+// daemon sees only a byte stream, which remains correct when a control-only
+// client routes the operation to a different physical host.
+func prepareCheckpointClientIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, func(bool) error, error) {
 	if len(args) == 0 || (args[0] != "checkpoint" && args[0] != "restore") {
-		return args, nil
+		return args, stdin, stdout, nil, nil
 	}
 	normalized := append([]string(nil), args...)
 	if args[0] == "checkpoint" {
@@ -113,44 +116,78 @@ func normalizeCheckpointCommandArgs(args []string) ([]string, error) {
 		_ = fs.String("compression", "flate-best-speed", "")
 		fs.SetOutput(io.Discard)
 		if err := fs.Parse(args[1:]); err != nil {
-			return nil, err
+			return nil, nil, nil, nil, err
 		}
 		if fs.NArg() != 2 {
-			return args, nil
+			return args, stdin, stdout, nil, nil
 		}
-		index := len(normalized) - 1
-		absolute, err := filepath.Abs(normalized[index])
+		destination := fs.Arg(1)
+		if destination == "-" {
+			return normalized, stdin, stdout, nil, nil
+		}
+		absolute, err := filepath.Abs(destination)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, nil, err
 		}
-		normalized[index] = absolute
-		return normalized, nil
+		output, err := os.CreateTemp(filepath.Dir(absolute), "."+filepath.Base(absolute)+".ttc-tmp-")
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("creating checkpoint output: %w", err)
+		}
+		for index := len(normalized) - 1; index >= 1; index-- {
+			if normalized[index] == destination {
+				normalized[index] = "-"
+				break
+			}
+		}
+		finish := func(success bool) error {
+			var finishErr error
+			if success {
+				finishErr = errors.Join(output.Sync(), output.Close())
+				if finishErr == nil {
+					finishErr = os.Rename(output.Name(), absolute)
+				}
+			} else {
+				finishErr = output.Close()
+			}
+			if finishErr != nil || !success {
+				_ = os.Remove(output.Name())
+			}
+			return finishErr
+		}
+		return normalized, stdin, output, finish, nil
 	}
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	_ = fs.String("name", "", "")
 	_ = fs.String("node", "", "")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args[1:]); err != nil {
-		return nil, err
+		return nil, nil, nil, nil, err
 	}
 	if fs.NArg() != 1 {
-		return args, nil
+		return args, stdin, stdout, nil, nil
 	}
 	operand := fs.Arg(0)
+	if operand == "-" {
+		return normalized, stdin, stdout, nil, nil
+	}
 	absolute, err := filepath.Abs(operand)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, nil, err
+	}
+	input, err := os.Open(absolute)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("opening checkpoint input: %w", err)
 	}
 	for index := len(normalized) - 1; index >= 1; index-- {
 		if normalized[index] == operand {
-			normalized[index] = absolute
+			normalized[index] = "-"
 			break
 		}
 	}
-	return normalized, nil
+	return normalized, input, stdout, func(bool) error { return input.Close() }, nil
 }
 
-func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
+func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer) (retErr error) {
 	target, info, err := b.resolveSelector(request.target)
 	if err != nil {
 		return err
@@ -334,8 +371,22 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	}); err != nil {
 		return err
 	}
-	if err := ttccheckpoint.Pack(stage, request.destination); err != nil {
+	destination := request.destination
+	stream := destination == "-"
+	if stream {
+		destination = stage + ".ttc"
+		defer os.Remove(destination)
+	}
+	if err := ttccheckpoint.Pack(stage, destination); err != nil {
 		return err
+	}
+	if stream {
+		archive, err := os.Open(destination)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(output, archive)
+		return errors.Join(copyErr, archive.Close())
 	}
 	return nil
 }
@@ -445,6 +496,20 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		return "", err
 	}
 	defer os.RemoveAll(stageBase)
+	if source == "-" {
+		if b.stdin == nil {
+			return "", errors.New("checkpoint restore from '-' requires standard input")
+		}
+		source = filepath.Join(stageBase, "input.ttc")
+		archive, err := os.OpenFile(source, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return "", err
+		}
+		_, copyErr := io.Copy(archive, b.stdin)
+		if err := errors.Join(copyErr, archive.Close()); err != nil {
+			return "", fmt.Errorf("receiving checkpoint archive: %w", err)
+		}
+	}
 	stage := filepath.Join(stageBase, "checkpoint")
 	if err := ttccheckpoint.Unpack(source, stage); err != nil {
 		return "", err

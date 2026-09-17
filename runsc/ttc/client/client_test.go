@@ -352,3 +352,46 @@ func TestPrepareImageArchiveIOUsesClientFiles(t *testing.T) {
 		t.Fatalf("save args=%q data=%q", args, data)
 	}
 }
+
+func TestPrepareCheckpointArchiveIOUsesClientFiles(t *testing.T) {
+	dir := t.TempDir()
+	outputPath := filepath.Join(dir, "output.ttc")
+	args, input, output, closeArchive, err := prepareCheckpointArchiveIO(
+		[]string{"checkpoint", "demo@main", outputPath}, strings.NewReader("stdin"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(output, "checkpoint-output"); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "checkpoint demo@main -" || string(data) != "checkpoint-output" || input == nil {
+		t.Fatalf("checkpoint args=%q data=%q", args, data)
+	}
+
+	inputPath := filepath.Join(dir, "input.ttc")
+	if err := os.WriteFile(inputPath, []byte("checkpoint-input"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args, input, output, closeArchive, err = prepareCheckpointArchiveIO(
+		[]string{"restore", "--node", "node-b", "--name", "copy", inputPath}, strings.NewReader("wrong"), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = io.ReadAll(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closeArchive(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(args, " "); got != "restore --node node-b --name copy -" || string(data) != "checkpoint-input" || output != io.Discard || !commandUsesStdin(args) {
+		t.Fatalf("restore args=%q data=%q stdin=%t", args, data, commandUsesStdin(args))
+	}
+}

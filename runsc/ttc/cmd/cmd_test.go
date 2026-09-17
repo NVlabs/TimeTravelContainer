@@ -5584,8 +5584,11 @@ func (b *fakeBackend) importContainerPath(target selector, destination string, p
 	return b.err
 }
 
-func (b *fakeBackend) checkpoint(request checkpointRequest) error {
+func (b *fakeBackend) checkpoint(request checkpointRequest, output io.Writer) error {
 	b.checkpointRequest = request
+	if request.destination == "-" {
+		_, _ = io.WriteString(output, "checkpoint-bytes")
+	}
 	return b.err
 }
 
@@ -5619,29 +5622,49 @@ func TestCheckpointAndRestoreCommands(t *testing.T) {
 	}
 }
 
-func TestNormalizeCheckpointCommandArgs(t *testing.T) {
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		args []string
-		path string
-	}{
-		{args: []string{"checkpoint", "--compression=none", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
-		{args: []string{"restore", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
-		{args: []string{"restore", "--node", "node-b", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
-	}
-	for _, test := range tests {
-		got, err := normalizeCheckpointCommandArgs(test.args)
+func TestPrepareCheckpointClientIO(t *testing.T) {
+	t.Run("checkpoint download", func(t *testing.T) {
+		destination := filepath.Join(t.TempDir(), "snapshot.ttc")
+		args, input, output, finish, err := prepareCheckpointClientIO(
+			[]string{"checkpoint", "--compression=none", "web@main", destination}, strings.NewReader("stdin"), io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := filepath.Join(workingDirectory, test.path)
-		if got[len(got)-1] != want {
-			t.Errorf("normalizeCheckpointCommandArgs(%q)=%q, want final path %q", test.args, got, want)
+		if args[len(args)-1] != "-" || input == nil || finish == nil {
+			t.Fatalf("prepared checkpoint args=%q input=%v finish=%v", args, input, finish)
 		}
-	}
+		if _, err := io.WriteString(output, "checkpoint-bytes"); err != nil {
+			t.Fatal(err)
+		}
+		if err := finish(true); err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(destination); err != nil || string(data) != "checkpoint-bytes" {
+			t.Fatalf("checkpoint output=(%q, %v)", data, err)
+		}
+	})
+
+	t.Run("restore upload", func(t *testing.T) {
+		source := filepath.Join(t.TempDir(), "snapshot.ttc")
+		if err := os.WriteFile(source, []byte("checkpoint-bytes"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args, input, _, finish, err := prepareCheckpointClientIO(
+			[]string{"restore", "--node", "node-b", "--name", "web", source}, strings.NewReader(""), io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if args[len(args)-1] != "-" || finish == nil {
+			t.Fatalf("prepared restore args=%q finish=%v", args, finish)
+		}
+		data, err := io.ReadAll(input)
+		if err != nil || string(data) != "checkpoint-bytes" {
+			t.Fatalf("restore input=(%q, %v)", data, err)
+		}
+		if err := finish(true); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestCopyCheckpointHostDirectory(t *testing.T) {

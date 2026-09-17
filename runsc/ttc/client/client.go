@@ -125,14 +125,21 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
-	args, err = normalizeHostPaths(args)
+	args, stdin, stdout, closeCheckpoint, err := prepareCheckpointArchiveIO(args, stdin, stdout)
 	if err != nil {
 		_ = closeArchive()
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
+	args, err = normalizeHostPaths(args)
+	if err != nil {
+		_ = closeCheckpoint()
+		_ = closeArchive()
+		fmt.Fprintf(stderr, "ttc: %v\n", err)
+		return 2
+	}
 	status, err := runCommand(opts.socket, args, stdin, stdout, stderr)
-	closeErr := closeArchive()
+	closeErr := errors.Join(closeCheckpoint(), closeArchive())
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", err)
 		return 1
@@ -142,6 +149,44 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return status
+}
+
+// prepareCheckpointArchiveIO keeps checkpoint and restore operands on the
+// client host. The daemon always streams the archive as standard output/input,
+// which is essential when a login-node client routes work to a compute node
+// with an unrelated filesystem namespace.
+func prepareCheckpointArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]string, io.Reader, io.Writer, func() error, error) {
+	result := append([]string(nil), args...)
+	closeArchive := func() error { return nil }
+	if len(result) == 0 {
+		return result, stdin, stdout, closeArchive, nil
+	}
+	switch result[0] {
+	case "checkpoint":
+		if len(result) < 3 || result[len(result)-1] == "-" {
+			return result, stdin, stdout, closeArchive, nil
+		}
+		path := result[len(result)-1]
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening checkpoint output: %w", err)
+		}
+		result[len(result)-1] = "-"
+		return result, stdin, file, file.Close, nil
+	case "restore":
+		if len(result) < 2 || result[len(result)-1] == "-" {
+			return result, stdin, stdout, closeArchive, nil
+		}
+		path := result[len(result)-1]
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, stdin, stdout, closeArchive, fmt.Errorf("opening checkpoint input: %w", err)
+		}
+		result[len(result)-1] = "-"
+		return result, file, stdout, file.Close, nil
+	default:
+		return result, stdin, stdout, closeArchive, nil
+	}
 }
 
 // prepareImageArchiveIO implements Docker's client-local -i/-o semantics.
@@ -1237,6 +1282,8 @@ func commandUsesStdin(args []string) bool {
 			}
 		}
 		return false
+	case "restore":
+		return len(args) > 1 && args[len(args)-1] == "-"
 	case "attach", "run", "start", "exec":
 	default:
 		return false
@@ -1307,11 +1354,11 @@ func normalizeHostPaths(args []string) ([]string, error) {
 	command := result[0]
 	switch command {
 	case "checkpoint":
-		if len(result) >= 3 {
+		if len(result) >= 3 && result[len(result)-1] != "-" {
 			return normalizeIndex(result, len(result)-1)
 		}
 	case "restore":
-		if len(result) >= 2 {
+		if len(result) >= 2 && result[len(result)-1] != "-" {
 			return normalizeIndex(result, len(result)-1)
 		}
 	case "cp":

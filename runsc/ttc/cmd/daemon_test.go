@@ -1288,6 +1288,8 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 		{[]string{"load", "-i", "/tmp/images.tar"}, false},
 		{[]string{"image", "load"}, true},
 		{[]string{"image", "load", "--input=/tmp/images.tar"}, false},
+		{[]string{"restore", "--name", "copy", "-"}, true},
+		{[]string{"restore", "--name", "copy", "/tmp/state.ttc"}, false},
 		{[]string{"exec", "ls", "demo"}, false},
 		{[]string{"exec", "demo@main", "true"}, false},
 		{[]string{"logs", "-f", "demo"}, false},
