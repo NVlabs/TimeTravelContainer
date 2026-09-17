@@ -6555,6 +6555,27 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if _, ok := sharedCancel["node-a"]["incoming"]; ok {
 		t.Fatalf("shared physical descendant allowed target-family cancellation: %v", sharedCancel)
 	}
+
+	// Rename leaves immutable transaction identities untouched. Reusing the
+	// old branch name must not associate the new placement with the migration
+	// that now backs the renamed branch.
+	oldMigration := transaction("old-migration", "node-a", "remote", "remote", cluster.TransactionIndependent, false, true)
+	newFork := transaction("new-fork", "node-a", "main", "remote", cluster.TransactionPublished, true, false)
+	newFork.Identity.TargetNodeID = "node-b"
+	renameReusePlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "moved", PhysicalContainer: "old-runtime", OwnerNode: "node-b", LastOperationID: "old-migration"},
+		{FamilyID: "family-id", BranchID: "remote", PhysicalContainer: "new-runtime", OwnerNode: "node-b", OperationID: "new-fork"},
+	}
+	_, reusedCancel, reusedDiscard := distributedRemovalSourceTransactions([]cluster.Transaction{oldMigration, newFork}, renameReusePlacements, info, "remote")
+	if _, ok := reusedCancel["node-a"]["new-fork"]; !ok {
+		t.Fatalf("reused branch removal did not select its current fork: %v", reusedCancel)
+	}
+	if _, ok := reusedDiscard["node-a"]["old-migration"]; ok {
+		t.Fatalf("reused branch removal selected renamed migration history: %v", reusedDiscard)
+	}
+	if got := distributedTransactionLogicalBranch(oldMigration, renameReusePlacements); got != "moved" {
+		t.Fatalf("renamed migration resolves to %q, want moved", got)
+	}
 }
 
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {

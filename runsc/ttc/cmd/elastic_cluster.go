@@ -1676,14 +1676,19 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
 			continue
 		}
-		if branchID != "" && tx.Identity.SourceBranch != branchID && tx.Identity.VisibleTargetBranch() != branchID {
-			continue
+		logicalBranch := distributedTransactionLogicalBranch(tx, placements)
+		if branchID != "" {
+			selectsTarget := logicalBranch == branchID
+			selectsForkSource := !tx.Identity.Migration && tx.Identity.SourceBranch == branchID
+			if !selectsTarget && !selectsForkSource {
+				continue
+			}
 		}
 		if !transactionNeedsSourceSettlement(tx) {
 			continue
 		}
 		node := tx.Identity.SourceNodeID
-		removesTarget := branchID == "" || tx.Identity.VisibleTargetBranch() == branchID
+		removesTarget := branchID == "" || logicalBranch == branchID
 		// A remote target may have been locally forked after import. Those
 		// logical descendants share the transaction-private Sentry and its lazy
 		// MemoryFile. Canceling the original transaction would attempt to delete
@@ -1718,11 +1723,31 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 	return settle, cancel, discard
 }
 
+// distributedTransactionLogicalBranch resolves an immutable transaction to
+// its current public branch name. Branch names are reusable and rename does
+// not rewrite transaction history, so matching SourceBranch or TargetBranch
+// directly creates an ABA bug: removing a newly-created branch can select an
+// older migration that now backs a differently named placement. Operation IDs
+// are the generation fence tying retained transaction history to a placement.
+func distributedTransactionLogicalBranch(tx cluster.Transaction, placements []cluster.PlacementRecord) string {
+	for _, placement := range placements {
+		if placement.OperationID == tx.Identity.TransactionID {
+			return placement.BranchID
+		}
+	}
+	for _, placement := range placements {
+		if placement.LastOperationID == tx.Identity.TransactionID {
+			return placement.BranchID
+		}
+	}
+	return tx.Identity.VisibleTargetBranch()
+}
+
 func remoteForkTargetHasSurvivingPhysicalPeer(tx cluster.Transaction, placements []cluster.PlacementRecord, removedBranch string) bool {
 	if tx.Identity.Migration || removedBranch == "" {
 		return false
 	}
-	visibleTarget := tx.Identity.VisibleTargetBranch()
+	visibleTarget := distributedTransactionLogicalBranch(tx, placements)
 	physicalContainer := ""
 	for i := range placements {
 		record := placements[i]
@@ -2072,8 +2097,10 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		settle := distributedMutationSourceTransactions(transactions, info, branchID)
 		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
+		var placements []cluster.PlacementRecord
 		if request.Args[0] == "rm" {
-			placements, placementErr := logicalFamilyPlacements(s.clusterPlacements, info.ID)
+			var placementErr error
+			placements, placementErr = logicalFamilyPlacements(s.clusterPlacements, info.ID)
 			if placementErr != nil {
 				return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, placementErr)
 			}
@@ -2094,7 +2121,8 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			for transactionID := range ids {
 				cancelByNode[node][transactionID] = struct{}{}
 				if tx := transactionsByID[transactionID]; tx != nil {
-					canceledTargets[tx.Identity.TargetContainer+"\x00"+tx.Identity.VisibleTargetBranch()] = transactionID
+					logicalBranch := distributedTransactionLogicalBranch(*tx, placements)
+					canceledTargets[info.ID+"\x00"+logicalBranch] = transactionID
 				}
 			}
 		}
