@@ -10916,6 +10916,9 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			}
 		}
 	}
+	if err := b.ensureForkPlacementDestinationsAvailable(containerInfo, destinations); err != nil {
+		return nil, err
+	}
 	sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
 	if err != nil {
 		return nil, err
@@ -11063,6 +11066,16 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				}
 				return nil, fmt.Errorf("retaining graph origins for branch %q: %w; batch branches were destroyed", records[i].ID, err)
 			}
+		}
+		if err := b.registerLocalForkPlacements(containerInfo, records); err != nil {
+			var cleanupErr error
+			for _, cleanupDestination := range destinations {
+				cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
+			}
+			if cleanupErr != nil {
+				return nil, fmt.Errorf("registering batch fork placements: %w; cleaning batch branches: %v", err, cleanupErr)
+			}
+			return nil, fmt.Errorf("registering batch fork placements: %w; batch branches were destroyed", err)
 		}
 	}
 	for _, destination := range destinations {

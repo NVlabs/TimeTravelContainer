@@ -23,6 +23,10 @@ KEEP_ROOT=${TTC_CLUSTER_RESTART_KEEP_ROOT:-}
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
 client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout 120s "$TTC" "$@"; }
+read_counter() {
+	client a exec "$NAME@main" sh -c \
+		'while :; do value=$(cat /counter); case "$value" in ""|*[!0-9]*) sleep 0.01 ;; *) printf "%s\n" "$value"; break ;; esac; done'
+}
 
 start_node() {
 	node=$1
@@ -104,10 +108,10 @@ while test "$attempt" -lt 300; do
 done
 test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = RESTART-MARK
 client a fork --node node-b "$NAME@main" remote >/dev/null
-# Deliberately leave the remote tail unfaulted. Its first access happens only
-# after two control-daemon crash/recovery cycles. The first cycle interrupts
-# the live source and makes recovery establish immutable graph backing.
-before=$(client a exec "$NAME@main" cat /counter)
+# Deliberately leave the target tail unfaulted and crash promptly, before its
+# background transfer can make the target independent. Recovery must establish
+# immutable graph backing and a daemon-independent relay.
+before=$(read_counter)
 pid_a=$(client a daemon status | jq -r .pid)
 pid_b=$(client b daemon status | jq -r .pid)
 stop_pid "$pid_a"
@@ -121,6 +125,27 @@ while test "$attempt" -lt 600; do
 done
 pgrep -f "[/]ttcd _shared-memory-relay $ROOT/shared/snapshot-packs" >/dev/null
 
+# A branch name is a cluster-wide family identity even when its physical
+# runtime is on another node. Reject the conflict before creating a throwaway
+# local CoW branch.
+if client a fork --node node-a "$NAME@main" remote >"$ROOT/duplicate.out" 2>"$ROOT/duplicate.err"; then
+	echo "duplicate distributed fork unexpectedly succeeded" >&2
+	exit 1
+fi
+grep -q 'branch "remote" already exists' "$ROOT/duplicate.err"
+
+# Create a second remote import solely to exercise a locally forked descendant
+# whose intermediate parent is removed. Keep "remote" intact so the second
+# restart below still covers the first branch's lazy cross-node relay.
+client a fork --node node-b "$NAME@main" intermediate >/dev/null
+client b fork --node node-b "$NAME@intermediate" child >/dev/null
+if ! client a rm -f "$NAME@intermediate" >/dev/null; then
+	client a ls --json >&2 || true
+	exit 1
+fi
+test "$(client a ls --json | jq --arg family "$NAME" \
+	'[.[] | select(.name == $family) | .branches[]] | length')" -eq 3
+
 # A second daemon crash must not kill the now-authoritative lazy relay.
 pid_a=$(client a daemon status | jq -r .pid)
 pid_b=$(client b daemon status | jq -r .pid)
@@ -131,7 +156,8 @@ restart_cluster
 
 test "$(client a exec "$NAME@main" sh -c 'dd if=/dev/shm/resident bs=12 count=1 2>/dev/null')" = RESTART-MARK
 test "$(client b exec "$NAME@remote" sh -c 'dd if=/dev/shm/resident bs=1M skip=31 count=1 2>/dev/null | dd bs=9 count=1 2>/dev/null')" = TAIL-MARK
-after=$(client a exec "$NAME@main" cat /counter)
+test "$(client b exec "$NAME@child" sh -c 'dd if=/dev/shm/resident bs=1M skip=31 count=1 2>/dev/null | dd bs=9 count=1 2>/dev/null')" = TAIL-MARK
+after=$(read_counter)
 test "$after" -ge "$before"
 
 client a rm -f "$NAME" >/dev/null

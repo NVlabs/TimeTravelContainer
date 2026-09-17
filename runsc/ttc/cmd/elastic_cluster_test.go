@@ -782,15 +782,20 @@ func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 				TransactionID: "migration", Migration: true,
 				SourceContainer: "family", SourceBranch: "main",
 				TargetContainer: "family", TargetBranch: "physical-migration",
-			}},
+			}, TargetPhysicalContainer: "physical", TargetPhysicalBranch: "migration"},
 			"fork": {Identity: cluster.ForkIdentity{
 				TransactionID: "fork", SourceContainer: "family", SourceBranch: "main",
 				TargetContainer: "family", TargetBranch: "physical-fork", TargetVisibleBranch: "child",
+			}, TargetPhysicalContainer: "physical", TargetPhysicalBranch: "child"},
+			"placement-fallback": {Identity: cluster.ForkIdentity{
+				TransactionID: "placement-fallback", SourceContainer: "fallback-family", SourceBranch: "main",
+				TargetContainer: "fallback-family", TargetBranch: "physical-fallback", TargetVisibleBranch: "base",
 			}},
 		},
 		Placements: map[string]cluster.PlacementRecord{
-			"family\x00main":  {FamilyID: "family", BranchID: "main", PhysicalContainer: "physical", PhysicalBranch: "migration"},
-			"family\x00child": {FamilyID: "family", BranchID: "child", PhysicalContainer: "physical", PhysicalBranch: "child"},
+			"family\x00main":          {FamilyID: "family", BranchID: "main", PhysicalContainer: "physical", PhysicalBranch: "migration"},
+			"family\x00child":         {FamilyID: "family", BranchID: "child", PhysicalContainer: "physical", PhysicalBranch: "child"},
+			"fallback-family\x00base": {FamilyID: "fallback-family", BranchID: "base", PhysicalContainer: "fallback-physical", PhysicalBranch: "base"},
 		},
 	}
 	for _, tc := range []struct {
@@ -831,6 +836,45 @@ func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 	}
 	if logical, found := logicalFamilyForPhysicalRuntime(state, "physical", []string{"migration", "missing"}); found || logical.ID != "" {
 		t.Fatalf("partially mapped physical family resolved %+v, found=%t", logical, found)
+	}
+	for _, tc := range []struct {
+		name, transaction, physicalContainer, physicalBranch, family, branch string
+		found                                                                bool
+	}{
+		{name: "fork descendant", transaction: "fork", physicalContainer: "physical", physicalBranch: "grandchild", family: "family", branch: "grandchild", found: true},
+		{name: "migration descendant", transaction: "migration", physicalContainer: "physical", physicalBranch: "debug", family: "family", branch: "debug", found: true},
+		{name: "placement fallback", transaction: "placement-fallback", physicalContainer: "fallback-physical", physicalBranch: "sibling", family: "fallback-family", branch: "sibling", found: true},
+		{name: "original branch", transaction: "fork", physicalContainer: "physical", physicalBranch: "child"},
+		{name: "wrong runtime", transaction: "fork", physicalContainer: "other", physicalBranch: "grandchild"},
+		{name: "unknown transaction", transaction: "missing", physicalContainer: "physical", physicalBranch: "grandchild"},
+	} {
+		t.Run("descendant/"+tc.name, func(t *testing.T) {
+			family, branch, found := logicalPlacementForUnmappedTransactionDescendant(state, tc.transaction, tc.physicalContainer, tc.physicalBranch)
+			if family != tc.family || branch != tc.branch || found != tc.found {
+				t.Fatalf("resolved (%q,%q,%t), want (%q,%q,%t)", family, branch, found, tc.family, tc.branch, tc.found)
+			}
+		})
+	}
+}
+
+func TestForkPlacementDestinationPreflight(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "logical", BranchID: "remote", PhysicalContainer: "physical-remote", PhysicalBranch: "remote",
+		OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{distributedSource: &distributedSourceRuntime{placements: placements}}
+	info := ttcbundle.ContainerInfo{ID: "physical", DistributedFamilyID: "logical"}
+	if err := backend.ensureForkPlacementDestinationsAvailable(info, []string{"new-a", "new-b"}); err != nil {
+		t.Fatalf("available names rejected: %v", err)
+	}
+	if err := backend.ensureForkPlacementDestinationsAvailable(info, []string{"new-a", "remote"}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("remote placement conflict error=%v, want already exists", err)
 	}
 }
 

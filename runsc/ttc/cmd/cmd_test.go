@@ -6222,7 +6222,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, ""); len(got) != 0 {
 		t.Fatalf("unrelated family selected transactions: %v", got)
 	}
-	settle, cancel, discard := distributedRemovalSourceTransactions(transactions, info, "")
+	settle, cancel, discard := distributedRemovalSourceTransactions(transactions, nil, info, "")
 	if len(settle) != 1 || len(cancel) != 2 || len(discard) != 2 {
 		t.Fatalf("removal transaction split settle=%v cancel=%v discard=%v", settle, cancel, discard)
 	}
@@ -6241,12 +6241,25 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if _, ok := settle["node-d"]; ok {
 		t.Fatalf("removal would publish an obsolete independent migration: %v", settle)
 	}
-	branchSettle, branchCancel, _ := distributedRemovalSourceTransactions(transactions, info, "child")
+	branchSettle, branchCancel, _ := distributedRemovalSourceTransactions(transactions, nil, info, "child")
 	if _, ok := branchCancel["node-a"]["incoming"]; !ok {
 		t.Fatalf("target branch removal did not cancel its incoming fork: %v", branchCancel)
 	}
 	if _, ok := branchSettle["node-b"]["outgoing"]; !ok {
 		t.Fatalf("source branch removal did not preserve its surviving child: %v", branchSettle)
+	}
+	sharedRuntime := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "child", PhysicalContainer: "fork-runtime", PhysicalBranch: "child", OwnerNode: "node-a"},
+		{FamilyID: "family-id", BranchID: "sibling", PhysicalContainer: "fork-runtime", PhysicalBranch: "sibling", OwnerNode: "node-a"},
+	}
+	sharedTransactions := append([]cluster.Transaction(nil), transactions...)
+	sharedTransactions[0].Identity.TargetNodeID = "node-a"
+	sharedSettle, sharedCancel, _ := distributedRemovalSourceTransactions(sharedTransactions, sharedRuntime, info, "child")
+	if _, ok := sharedSettle["node-a"]["incoming"]; !ok {
+		t.Fatalf("shared physical descendant did not retain its source handoff: settle=%v cancel=%v", sharedSettle, sharedCancel)
+	}
+	if _, ok := sharedCancel["node-a"]["incoming"]; ok {
+		t.Fatalf("shared physical descendant allowed target-family cancellation: %v", sharedCancel)
 	}
 }
 

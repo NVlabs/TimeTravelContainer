@@ -675,9 +675,15 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 				// runtimes may use a user-visible destination name.
 				placementFamily, placementBranch, mappedPhysical = logicalPlacementForPhysicalRuntime(authorityState, info.ID, branch.ID)
 				if !mappedPhysical {
-					placementFamily, placementBranch, mappedPhysical = logicalPlacementForPhysicalTransaction(authorityState, transactionID)
-					if !mappedPhysical {
-						continue
+					if placementFamily, placementBranch, mappedPhysical = logicalPlacementForUnmappedTransactionDescendant(authorityState, transactionID, info.ID, branch.ID); mappedPhysical {
+						// Unlike the imported transaction branch, this descendant is
+						// already a completed user mutation and may be enrolled below.
+						internalPhysical = false
+					} else {
+						placementFamily, placementBranch, mappedPhysical = logicalPlacementForPhysicalTransaction(authorityState, transactionID)
+						if !mappedPhysical {
+							continue
+						}
 					}
 				}
 			}
@@ -873,6 +879,95 @@ func (b *runtimeBackend) cancelNewContainerPlacement(reservation newPlacementRes
 	return nil
 }
 
+// ensureForkPlacementDestinationsAvailable checks the cluster-wide logical
+// namespace before runsc mutates the source Sentry. A physical runtime only
+// contains its local branches, so checking ContainerInfo alone misses a branch
+// of the same family placed on another node. Detecting that conflict after the
+// fork is both slower and leaves rollback responsible for reclaiming live CoW
+// state.
+func (b *runtimeBackend) ensureForkPlacementDestinationsAvailable(info ttcbundle.ContainerInfo, destinations []string) error {
+	if b == nil || b.distributedSource == nil || len(destinations) == 0 {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	family := logicalFamilyID(info)
+	for _, destination := range destinations {
+		if _, err := placements.Lookup(family, destination); err == nil {
+			return fmt.Errorf("branch %q already exists", destination)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("checking placement for %s@%s: %w", family, destination, err)
+		}
+	}
+	return nil
+}
+
+// registerLocalForkPlacements publishes branches created inside an existing
+// clustered Sentry. Placement reconciliation remains a crash-recovery tool;
+// successful fork must not depend on a later inventory scan to make its new
+// logical branches routable. This is especially important for a locally
+// forked descendant of a remote import, whose physical container is private
+// transaction state and is intentionally hidden from ordinary discovery.
+func (b *runtimeBackend) registerLocalForkPlacements(info ttcbundle.ContainerInfo, branches []ttcbundle.BranchInfo) error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" || len(branches) == 0 {
+		return nil
+	}
+	owner, err := b.renewDistributedExecutionAuthority()
+	if err != nil {
+		return fmt.Errorf("renewing fork placement authority: %w", err)
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	logicalFamily := logicalFamilyID(info)
+	display := info
+	if logicalFamily != info.ID {
+		if canonical, loadErr := b.containerStore().LoadContainer(logicalFamily); loadErr == nil {
+			display = canonical
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			return fmt.Errorf("loading logical fork family %q: %w", logicalFamily, loadErr)
+		}
+	}
+	created := make([]cluster.PlacementRecord, 0, len(branches))
+	rollback := func(cause error) error {
+		var rollbackErr error
+		for i := len(created) - 1; i >= 0; i-- {
+			record := created[i]
+			if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil && !errors.Is(err, os.ErrNotExist) {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("removing fork placement %s@%s: %w", record.FamilyID, record.BranchID, err))
+			}
+		}
+		return errors.Join(cause, rollbackErr)
+	}
+	now := time.Now()
+	for i := range branches {
+		branch := branches[i]
+		state := cluster.PlacementState(normalizeLifecycleState(branch.State))
+		if state != cluster.PlacementRunning && state != cluster.PlacementPaused {
+			return rollback(fmt.Errorf("forked branch %q has non-routable state %q", branch.ID, branch.State))
+		}
+		record, err := placements.Create(cluster.PlacementRecord{
+			FamilyID: logicalFamily, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+			OwnerNode: b.nodeID, OwnerIncarnation: owner.Incarnation, State: state,
+			FamilyName: display.Name, ImageReference: display.Reference, ImageDigest: display.Digest, ImageSize: display.ImageSize,
+			LiveForkEligible: display.LiveForkEligible, LiveForkWaiver: display.LiveForkWaiver,
+			FamilyCreatedAt: display.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+			Quarantined: branch.Quarantined,
+		}, now)
+		if err != nil {
+			return rollback(fmt.Errorf("registering fork placement for %s@%s: %w", logicalFamily, branch.ID, err))
+		}
+		created = append(created, *record)
+		if _, err := b.distributedSource.authority.InheritBranchDependencies(logicalFamily, branch.ID, branch.ParentID); err != nil {
+			return rollback(fmt.Errorf("recording fork dependencies for %s@%s: %w", logicalFamily, branch.ID, err))
+		}
+	}
+	return nil
+}
+
 // logicalPlacementForPhysicalTransaction resolves transaction-scoped runtime
 // identity to the stable logical branch whose authority the transaction moves
 // or creates. Returning false before Raft knows the transaction is intentional:
@@ -889,6 +984,49 @@ func logicalPlacementForPhysicalTransaction(state *cluster.AuthorityState, trans
 		return tx.Identity.SourceContainer, tx.Identity.SourceBranch, true
 	}
 	return tx.Identity.TargetContainer, tx.Identity.VisibleTargetBranch(), true
+}
+
+// logicalPlacementForUnmappedTransactionDescendant recognizes a user-created
+// branch in a transaction-private target runtime during crash recovery. The
+// original imported branch is named by TargetPhysical* and remains private
+// until its transaction publishes it. Any other persistent physical branch in
+// that exact runtime can only have been created by a completed local Sentry
+// fork and keeps its user-visible physical name.
+//
+// This helper deliberately requires Raft to have recorded the original target
+// runtime. Before that fence, an arbitrary prepared branch must remain hidden:
+// only the transaction publication operation may expose it.
+func logicalPlacementForUnmappedTransactionDescendant(state *cluster.AuthorityState, transactionID, physicalContainer, physicalBranch string) (string, string, bool) {
+	if state == nil || transactionID == "" || physicalContainer == "" || physicalBranch == "" {
+		return "", "", false
+	}
+	tx, ok := state.Transactions[transactionID]
+	if !ok {
+		return "", "", false
+	}
+	targetContainer, targetBranch := tx.TargetPhysicalContainer, tx.TargetPhysicalBranch
+	if targetContainer == "" || targetBranch == "" {
+		family, branch, found := logicalPlacementForPhysicalTransaction(state, transactionID)
+		if !found {
+			return "", "", false
+		}
+		placement, found := state.Placements[family+"\x00"+branch]
+		if !found {
+			return "", "", false
+		}
+		targetContainer, targetBranch = placement.PhysicalContainer, placement.PhysicalBranch
+	}
+	if targetContainer != physicalContainer || targetBranch == "" || targetBranch == physicalBranch {
+		return "", "", false
+	}
+	family := tx.Identity.TargetContainer
+	if tx.Identity.Migration {
+		family = tx.Identity.SourceContainer
+	}
+	if family == "" {
+		return "", "", false
+	}
+	return family, physicalBranch, true
 }
 
 // logicalPlacementForPhysicalRuntime maps a node-local runtime branch back to
@@ -1365,7 +1503,7 @@ func distributedMutationSourceTransactions(transactions []cluster.Transaction, i
 // surviving reader: materializing it first makes family rm proportional to the
 // deleted family's resident memory and can wedge on a source that has already
 // handed its backing to another generation.
-func distributedRemovalSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) (settle, cancel, discard map[string]map[string]struct{}) {
+func distributedRemovalSourceTransactions(transactions []cluster.Transaction, placements []cluster.PlacementRecord, info ttcbundle.ContainerInfo, branchID string) (settle, cancel, discard map[string]map[string]struct{}) {
 	settle = make(map[string]map[string]struct{})
 	cancel = make(map[string]map[string]struct{})
 	discard = make(map[string]map[string]struct{})
@@ -1381,7 +1519,14 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, in
 		}
 		node := tx.Identity.SourceNodeID
 		removesTarget := branchID == "" || tx.Identity.VisibleTargetBranch() == branchID
-		if !tx.Identity.Migration && removesTarget {
+		// A remote target may have been locally forked after import. Those
+		// logical descendants share the transaction-private Sentry and its lazy
+		// MemoryFile. Canceling the original transaction would attempt to delete
+		// that whole physical runtime. Materialize the handoff instead whenever
+		// a branch outside this removal still lives in the same physical family;
+		// ordinary branch removal can then destroy only the selected branch.
+		hasSurvivingPhysicalPeer := remoteForkTargetHasSurvivingPhysicalPeer(tx, placements, branchID)
+		if !tx.Identity.Migration && removesTarget && !hasSurvivingPhysicalPeer {
 			if cancel[node] == nil {
 				cancel[node] = make(map[string]struct{})
 			}
@@ -1406,6 +1551,42 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, in
 		settle[node][tx.Identity.TransactionID] = struct{}{}
 	}
 	return settle, cancel, discard
+}
+
+func remoteForkTargetHasSurvivingPhysicalPeer(tx cluster.Transaction, placements []cluster.PlacementRecord, removedBranch string) bool {
+	if tx.Identity.Migration || removedBranch == "" {
+		return false
+	}
+	visibleTarget := tx.Identity.VisibleTargetBranch()
+	physicalContainer := ""
+	for i := range placements {
+		record := placements[i]
+		if record.BranchID != visibleTarget || record.OwnerNode != tx.Identity.TargetNodeID {
+			continue
+		}
+		physicalContainer = record.PhysicalContainer
+		if physicalContainer == "" {
+			physicalContainer = record.FamilyID
+		}
+		break
+	}
+	if physicalContainer == "" {
+		return false
+	}
+	for i := range placements {
+		record := placements[i]
+		if record.BranchID == removedBranch || record.OwnerNode != tx.Identity.TargetNodeID {
+			continue
+		}
+		candidate := record.PhysicalContainer
+		if candidate == "" {
+			candidate = record.FamilyID
+		}
+		if candidate == physicalContainer {
+			return true
+		}
+	}
+	return false
 }
 
 // transactionNeedsSourceSettlement covers both an active remote dependency
@@ -1727,7 +1908,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
 		if request.Args[0] == "rm" {
-			settle, cancel, discard = distributedRemovalSourceTransactions(transactions, info, branchID)
+			placements, placementErr := logicalFamilyPlacements(s.clusterPlacements, info.ID)
+			if placementErr != nil {
+				return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, placementErr)
+			}
+			settle, cancel, discard = distributedRemovalSourceTransactions(transactions, placements, info, branchID)
 		}
 		for node, ids := range settle {
 			if settleByNode[node] == nil {
