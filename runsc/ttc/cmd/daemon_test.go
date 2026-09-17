@@ -118,8 +118,17 @@ func TestReusablePhysicalTarget(t *testing.T) {
 	records = append(records, cluster.PlacementRecord{
 		FamilyID: "family", BranchID: "split", OwnerNode: "target-node", PhysicalContainer: "second-runtime", State: cluster.PlacementRunning,
 	})
-	if _, _, err := reusablePhysicalTarget(records, "family", "target-node"); err == nil {
-		t.Fatal("reusablePhysicalTarget accepted multiple physical runtimes")
+	got, found, err = reusablePhysicalTarget(records, "family", "target-node")
+	if err != nil || !found || got != "second-runtime" {
+		t.Fatalf("reusablePhysicalTarget split tie=%q,%t,%v, want second-runtime,true,nil", got, found, err)
+	}
+	records = append(records,
+		cluster.PlacementRecord{FamilyID: "family", BranchID: "split-2", OwnerNode: "target-node", PhysicalContainer: "second-runtime", State: cluster.PlacementPaused},
+		cluster.PlacementRecord{FamilyID: "family", BranchID: "canonical", OwnerNode: "target-node", PhysicalContainer: "family", State: cluster.PlacementRunning},
+	)
+	got, found, err = reusablePhysicalTarget(records, "family", "target-node")
+	if err != nil || !found || got != "family" {
+		t.Fatalf("reusablePhysicalTarget canonical=%q,%t,%v, want family,true,nil", got, found, err)
 	}
 }
 

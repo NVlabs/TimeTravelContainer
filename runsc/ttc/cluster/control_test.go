@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -81,6 +82,33 @@ func TestProxyDaemonUsesDedicatedNonReusedTransport(t *testing.T) {
 		if got, want := output.String(), "proxied:"+input; got != want {
 			t.Fatalf("ProxyDaemon(%q) output=%q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestRenewExecutionAuthorityRunsOnTarget(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	control := &ControlPlane{
+		Capabilities: testCapabilities("target"), Store: store, MaxTransactions: 1, Now: time.Now,
+		RenewExecution: func(context.Context) error {
+			calls.Add(1)
+			return nil
+		},
+	}
+	server := httptest.NewServer(control)
+	defer server.Close()
+	client, err := NewPlainClient(server.URL, "source", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RenewExecutionAuthority(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("renew calls=%d, want 1", got)
 	}
 }
 

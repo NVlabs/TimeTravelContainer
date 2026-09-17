@@ -6949,7 +6949,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			return 1, err
 		}
 	}
-	preservedPeers, err := freshStartPeers(info, target)
+	preservedPeers, err := freshStartPeers(info, target, b.nodeID)
 	if err != nil {
 		return 1, err
 	}
@@ -7049,10 +7049,19 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 // family's Sentry. Process-free peers need no work. Transient states are
 // rejected because daemon mutation serialization should never expose one here
 // unless an earlier operation was interrupted.
-func freshStartPeers(info ttcbundle.ContainerInfo, target selector) ([]selector, error) {
+func freshStartPeers(info ttcbundle.ContainerInfo, target selector, localNodeID string) ([]selector, error) {
 	peers := make([]selector, 0, len(info.Branches))
 	for _, branch := range info.Branches {
 		if branch.ID == target.branch {
+			continue
+		}
+		// A distributed physical family may have live branches on several
+		// nodes, each in a different Sentry. Only branches owned by this node
+		// can be peers of the runtime that we are about to create here. Treating
+		// a remote branch as a local peer makes start try to import into a
+		// nonexistent local Sentry with the same physical container ID.
+		// Standalone branches have no owner and continue to share one Sentry.
+		if localNodeID != "" && branch.NodeID != localNodeID {
 			continue
 		}
 		switch normalizeLifecycleState(branch.State) {
@@ -9209,6 +9218,43 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 	return nil
 }
 
+// removeLogicalBranchPlacement commits deletion of one user-visible branch.
+//
+// Most placement cleanup can recover the logical identity from the physical
+// container and branch recorded in Raft. A durable publication deliberately
+// clears that physical identity when it makes a branch unplaced, however. At
+// that point the lifecycle command's original selector is the only exact
+// logical identity available. Treating the published physical container as
+// authoritative made removal appear to succeed while leaving its unplaced
+// Raft record behind.
+func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string) error {
+	if b.nodeID == "" {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	record, err := placements.Lookup(familyID, branchID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+		return fmt.Errorf("branch %s@%s is still owned by node %q", familyID, branchID, record.OwnerNode)
+	}
+	if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
+		if err := b.distributedSource.authority.RemoveCorruptedBranch(familyID, branchID); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if err := placements.Remove(familyID, branchID, record.Generation); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return b.retireTransactionsForRemovedPlacement(*record)
+}
+
 // removeDistributedFamilyRecord deletes the canonical, non-executing family
 // record after every Raft placement has been removed through its exact
 // physical branch. A family whose canonical container hosted the final branch
@@ -9275,12 +9321,12 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 // family metadata and branch filesystems are intentionally untouched; elastic
 // migration and family-removal coordinators use this after ownership moved.
 func (b *runtimeBackend) purgeRuntime(containerID string) error {
-	families, err := b.listRuntimeFamilies()
+	sandboxes, err := b.listRuntimeSandboxes()
 	if err != nil {
 		return fmt.Errorf("listing runtimes before purging %q: %w", containerID, err)
 	}
-	for _, family := range families {
-		if family.ID != containerID {
+	for _, sandbox := range sandboxes {
+		if sandbox.ID != containerID {
 			continue
 		}
 		if _, err := b.command("delete", "--force", containerID); err != nil {
@@ -10593,20 +10639,33 @@ func enrichPersistentBranchDiagnostics(family *Family) {
 	}
 }
 
-func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
+type runtimeSandboxState struct {
+	ID     string `json:"id"`
+	PID    int    `json:"pid"`
+	Status string `json:"status"`
+}
+
+// listRuntimeSandboxes reads only runsc's host-side state. It deliberately
+// does not contact a Sentry control server, so teardown can still discover and
+// force-delete a sandbox whose branch RPC endpoint is unavailable.
+func (b *runtimeBackend) listRuntimeSandboxes() ([]runtimeSandboxState, error) {
 	output, err := b.command("list", "--format=json", "--sandbox")
 	if err != nil {
 		return nil, err
 	}
-	var states []struct {
-		ID     string `json:"id"`
-		PID    int    `json:"pid"`
-		Status string `json:"status"`
-	}
+	var states []runtimeSandboxState
 	if err := json.Unmarshal(output, &states); err != nil {
 		return nil, fmt.Errorf("decoding runsc container list: %w", err)
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
+	return states, nil
+}
+
+func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
+	states, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return nil, err
+	}
 	families := make([]Family, 0, len(states))
 	for _, state := range states {
 		if state.ID == "" {
@@ -14009,7 +14068,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		if err := b.remove(target.container, true, false); err != nil {
 			return err
 		}
-		return nil
+		return b.removeLogicalBranchPlacement(logicalFamily, requested.branch)
 	}
 	releaseClients, err := b.quiesceConsoleClients(target)
 	if err != nil {
@@ -14122,9 +14181,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
 		}
-		removedInfo := info
-		removedInfo.Branches = []ttcbundle.BranchInfo{*recorded}
-		if err := b.removeContainerPlacements(removedInfo); err != nil {
+		if err := b.removeLogicalBranchPlacement(logicalFamily, requested.branch); err != nil {
 			return fmt.Errorf("removing cluster placement for %s: %w", requested, err)
 		}
 		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {

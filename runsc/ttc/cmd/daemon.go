@@ -723,22 +723,39 @@ func (r *daemonTargetRuntime) Reserve(ctx context.Context, tx *cluster.Transacti
 	return err
 }
 
-// reusablePhysicalTarget returns the single active physical Sentry for family
-// on node. Placement is the authority here: transaction-scoped remnants from
-// an earlier migration are deliberately invisible and therefore never reused.
+// reusablePhysicalTarget returns one active physical Sentry for family on
+// node. Placement is the authority here: transaction-scoped remnants from an
+// earlier migration are deliberately invisible and therefore never reused.
+//
+// A family may legitimately have more than one physical Sentry on a node.
+// This happens when branches arrive independently and only later converge on
+// the same node. The physical split is an implementation detail, so it must
+// not make a later fork or migration fail. Prefer the canonical family runtime
+// when it exists; otherwise choose the runtime containing the most placed
+// branches, with a stable lexical tie-breaker. New imports consequently
+// converge rather than creating still more physical runtimes.
 func reusablePhysicalTarget(records []cluster.PlacementRecord, family, node string) (string, bool, error) {
-	var physical string
+	counts := make(map[string]int)
 	for _, record := range records {
 		if record.FamilyID != family || record.OwnerNode != node ||
 			(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) || record.PhysicalContainer == "" {
 			continue
 		}
-		if physical != "" && physical != record.PhysicalContainer {
-			return "", false, fmt.Errorf("family %q has multiple physical runtimes on node %q", family, node)
-		}
-		physical = record.PhysicalContainer
+		counts[record.PhysicalContainer]++
 	}
-	return physical, physical != "", nil
+	if len(counts) == 0 {
+		return "", false, nil
+	}
+	if _, ok := counts[family]; ok {
+		return family, true, nil
+	}
+	physical, best := "", -1
+	for candidate, count := range counts {
+		if count > best || count == best && candidate < physical {
+			physical, best = candidate, count
+		}
+	}
+	return physical, true, nil
 }
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
@@ -5069,6 +5086,10 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		clusterRuntime.controlPlane.TargetRuntime = targetRuntime
 		clusterRuntime.controlPlane.CommandProxy = daemonClusterProxy{socket: socket}
 		clusterRuntime.controlPlane.PortProxy = daemonPortProxy{backend: targetBackend}
+		clusterRuntime.controlPlane.RenewExecution = func(context.Context) error {
+			_, err := targetBackend.renewDistributedExecutionAuthority()
+			return err
+		}
 		clusterListener := clusterRuntime.controlListener
 		if clusterListener == nil {
 			return errors.New("cluster protocol multiplexer has no HTTP listener")

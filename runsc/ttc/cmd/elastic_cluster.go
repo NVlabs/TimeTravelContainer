@@ -785,7 +785,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		if _, ok := known[record.FamilyID+"\x00"+record.BranchID]; ok || record.State == cluster.PlacementMigrating {
 			continue
 		}
-		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+		// An unplaced or corrupted branch is authoritative Raft state with no
+		// physical owner. Its derived shared container record may legitimately
+		// lag an atomic publication commit. Reconciliation may clean up only
+		// execution state owned by this node; deleting ownerless state here would
+		// turn an ordinary dehydrate/restart race into permanent branch loss.
+		if record.OwnerNode == "" || record.OwnerNode != b.nodeID {
 			continue
 		}
 		if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
@@ -2751,12 +2756,17 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeDiscard(containerID, branch
 }
 
 func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, branchID string, publishBacking bool) error {
-	info, err := b.containerStore().LoadContainer(containerID)
+	// containerID is an authority-derived physical runtime ID. Distributed
+	// targets are intentionally hidden from the public resolver; using it here
+	// turned completed migrations into false no-ops and left their paused
+	// Sentry/gofer pairs behind after clean node retirement.
+	info, err := b.containerStore().LoadRuntimeContainer(containerID)
 	if errors.Is(err, os.ErrNotExist) {
-		// The synchronous node-retirement barrier and the ordinary background
-		// migration monitor may both observe independence. Whichever removes the
-		// physical source first completes the idempotent cleanup for both.
-		return nil
+		// Metadata absence is not execution absence. A concurrent cold
+		// publication or cleanup retry may have removed the transaction wrapper
+		// while runsc still retains its paused source Kernel. Reconcile the exact
+		// authority-derived physical identity before declaring cleanup complete.
+		return b.removeUnrecordedMigratedSourceRuntime(containerID, branchID, nil)
 	}
 	if err != nil {
 		return err
@@ -2769,13 +2779,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		}
 	}
 	if !branchRecorded {
-		// Source-runtime cleanup is intentionally shared by the synchronous
-		// node-retirement barrier and the ordinary independence monitor. The
-		// family lock serializes them, but the loser observes the durable branch
-		// record already removed by the winner. Metadata removal is the final
-		// cleanup boundary (after runtime destruction and backing reclamation),
-		// so absence proves the operation is complete and must be idempotent.
-		return nil
+		return b.removeUnrecordedMigratedSourceRuntime(containerID, branchID, &info)
 	}
 	runtimes, err := b.listRuntimeFamilies()
 	if err != nil {
@@ -2840,6 +2844,81 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
 	return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
+}
+
+// removeUnrecordedMigratedSourceRuntime closes the crash/race boundary where
+// durable physical metadata has already been reclaimed but runsc still lists
+// the old source branch. The transaction supplies the exact physical identity,
+// so this never searches by a user-visible name. If the Sentry still hosts
+// other branches, remove only this source; otherwise tear down the complete
+// sandbox and its disposable local directory.
+func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, branchID string, info *ttcbundle.ContainerInfo) error {
+	// If no other durable branch requires this physical Sentry, do not ask its
+	// control server to describe itself before deleting it. A transiently
+	// unavailable control server used to make listRuntimeFamilies synthesize a
+	// "main" branch; the requested private branch then appeared absent and a
+	// clean retirement leaked the complete sandbox. The transaction has already
+	// reached independence, so metadata absence (or metadata containing only
+	// process-free/remote branches) makes this exact physical runtime disposable.
+	if info == nil || !persistentFamilyRequiredRuntime(*info, b.nodeID) {
+		sandboxes, err := b.listRuntimeSandboxes()
+		if err != nil {
+			return fmt.Errorf("listing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
+		}
+		for _, sandbox := range sandboxes {
+			if sandbox.ID != containerID {
+				continue
+			}
+			if err := b.removeOrphanRuntime(containerID); err != nil {
+				return fmt.Errorf("removing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
+			}
+			return nil
+		}
+		return os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+	}
+
+	// A physical Sentry may still host a different locally-active branch. In
+	// that case branch-aware destruction is mandatory, and an unavailable
+	// branch inventory is a retirement failure rather than evidence that the
+	// requested source has disappeared.
+	runtimes, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	for _, family := range runtimes {
+		if family.ID != containerID {
+			continue
+		}
+		found := false
+		peers := 0
+		for _, branch := range family.Branches {
+			if branch.ID == branchID {
+				found = true
+			} else {
+				peers++
+			}
+		}
+		if !found {
+			if family.Error != "" {
+				return fmt.Errorf("inspecting unrecorded migrated source %s@%s: %s", containerID, branchID, family.Error)
+			}
+			return nil
+		}
+		if peers != 0 {
+			if _, err := b.command("timetravel", containerID, "destroy", branchID); err != nil {
+				return fmt.Errorf("destroying unrecorded migrated source %s@%s: %w", containerID, branchID, err)
+			}
+			return nil
+		}
+		if err := b.removeOrphanRuntime(containerID); err != nil {
+			return fmt.Errorf("removing unrecorded migrated source %s@%s: %w", containerID, branchID, err)
+		}
+		return nil
+	}
+	// A previous attempt may have removed runsc state but lost its response.
+	// The remaining active-tier directory is non-authoritative and safe to
+	// discard once no physical sandbox bears this exact ID.
+	return os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
 }
 
 // removeMigratedSourceMetadata drops the retired physical incarnation after
@@ -2909,7 +2988,10 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 	}
 	var result error
 	for _, runtimeFamily := range runtimes {
-		info, err := b.containerStore().LoadContainer(runtimeFamily.ID)
+		// listRuntimeFamilies returns exact physical sandbox IDs, including
+		// hidden distributed targets. Resolve that internal identity so cleanup
+		// can distinguish a protected sparse provider from a true orphan.
+		info, err := b.containerStore().LoadRuntimeContainer(runtimeFamily.ID)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				result = errors.Join(result, b.purgeRuntime(runtimeFamily.ID))
@@ -3172,7 +3254,7 @@ func (b *runtimeBackend) activeSparseMigrationSource(containerID, branchID strin
 	// before testing the source lease; otherwise cleanup can mistake a still-
 	// authoritative sparse provider for an unrelated runtime.
 	logicalFamily := containerID
-	if info, err := b.containerStore().LoadContainer(containerID); err == nil && info.DistributedFamilyID != "" {
+	if info, err := b.containerStore().LoadRuntimeContainer(containerID); err == nil && info.DistributedFamilyID != "" {
 		logicalFamily = info.DistributedFamilyID
 	}
 	transactions, err := b.transactionCatalog()
@@ -3797,6 +3879,22 @@ func (b *runtimeBackend) executePlacementPlan(plan cluster.FixedTerminalPlan, re
 		}
 		if after <= baseline {
 			continue
+		}
+		// A Raft election invalidates every previous-term capacity grant. Ask
+		// the target daemon to renew its own authority synchronously rather than
+		// racing its periodic heartbeat or fabricating a heartbeat on its behalf.
+		peer, err := b.distributedSource.peer(node, true)
+		if err != nil {
+			return fmt.Errorf("connecting to placement target %q before capacity reservation: %w", node, err)
+		}
+		renewCtx, cancelRenew := context.WithTimeout(context.Background(), 5*time.Second)
+		err = peer.RenewExecutionAuthority(renewCtx)
+		cancelRenew()
+		if err != nil {
+			for _, held := range reservations {
+				_, _ = b.distributedSource.directory.ReleaseIncoming(held.node, held.incarnation, held.operation, time.Now())
+			}
+			return fmt.Errorf("renewing placement target %q before capacity reservation: %w", node, err)
 		}
 		operation, err := newDaemonRequestID()
 		if err != nil {

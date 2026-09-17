@@ -24,6 +24,8 @@ PORT_B=${TTC_LIFECYCLE_MATRIX_PORT_B:-24793}
 PORT_C=${TTC_LIFECYCLE_MATRIX_PORT_C:-24803}
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
 KEEP_ROOT=${TTC_LIFECYCLE_MATRIX_KEEP_ROOT:-}
+KEEP_LIVE_ON_FAILURE=${TTC_LIFECYCLE_MATRIX_KEEP_LIVE_ON_FAILURE:-}
+SUCCESS=
 PID_A=
 PID_B=
 PID_C=
@@ -52,6 +54,10 @@ stop_session() {
 
 cleanup() {
 	set +e
+	if test -n "$KEEP_LIVE_ON_FAILURE" && test -z "$SUCCESS"; then
+		echo "TTC lifecycle-matrix failure retained live at $ROOT" >&2
+		return
+	fi
 	for node in c b a; do
 		if test -S "$(socket "$node")"; then client "$node" rm -f "$NAME" >/dev/null 2>&1; fi
 	done
@@ -124,6 +130,17 @@ assert_marker() {
 	branch=$2
 	test "$(client "$node" exec "$NAME@$branch" cat /state/marker)" = MATRIX-MARK || \
 		fail "$NAME@$branch lost its writable filesystem marker"
+}
+
+assert_no_processes_for_root() {
+	root=$1
+	for cmdline in /proc/[0-9]*/cmdline; do
+		test -r "$cmdline" || continue
+		command=$(tr '\000' ' ' <"$cmdline" 2>/dev/null || true)
+		case "$command" in
+		*"$root/"*) fail "retired node left host process alive: $command" ;;
+		esac
+	done
 }
 
 mkdir -p "$ROOT/shared"
@@ -221,6 +238,7 @@ assert_marker b main
 client b daemon stop --migrate-all >/dev/null
 wait "$PID_B"
 PID_B=
+assert_no_processes_for_root "$ROOT/local-b"
 test "$(client c node ls --json | jq 'length')" -eq 1
 client c ls --json | jq -e --arg name "$NAME" \
 	'all(.[] | select(.name == $name).branches[]; (.node_id // "") != "node-b")' >/dev/null
@@ -231,4 +249,5 @@ client c daemon stop >/dev/null
 wait "$PID_C"
 PID_C=
 
+SUCCESS=1
 echo "TTC distributed branch-state and daemon-policy matrix passed"

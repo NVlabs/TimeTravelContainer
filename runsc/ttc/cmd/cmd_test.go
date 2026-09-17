@@ -3314,7 +3314,7 @@ func TestFreshStartPeers(t *testing.T) {
 		{ID: "cold", State: "dehydrated"},
 		{ID: "old", State: "stopped"},
 	}}
-	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"})
+	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, "")
 	if err != nil {
 		t.Fatalf("freshStartPeers: %v", err)
 	}
@@ -3327,8 +3327,23 @@ func TestFreshStartPeers(t *testing.T) {
 	}
 
 	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "busy", State: "dehydrating"})
-	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
+	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, ""); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
 		t.Fatalf("freshStartPeers transient error=%v", err)
+	}
+
+	info.Branches = []ttcbundle.BranchInfo{
+		{ID: "target", NodeID: "node-a", State: "exited"},
+		{ID: "local", NodeID: "node-a", State: "running"},
+		{ID: "remote", NodeID: "node-b", State: "running"},
+		{ID: "unplaced", State: "dehydrating"},
+	}
+	got, err = freshStartPeers(info, selector{container: "demo", branch: "target"}, "node-a")
+	if err != nil {
+		t.Fatalf("freshStartPeers distributed: %v", err)
+	}
+	want = []selector{{container: "demo", branch: "local"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("distributed freshStartPeers=%+v, want %+v", got, want)
 	}
 }
 
@@ -4163,6 +4178,47 @@ exit 0
 	})
 	if err != nil || status != 0 {
 		t.Fatalf("terminal exec returned status=%d err=%v stderr=%q", status, err, stderr.String())
+	}
+}
+
+func TestPurgeRuntimeDoesNotRequireBranchControlServer(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	echo '[{"id":"private-source","pid":2468,"status":"running"}]'
+	;;
+timetravel)
+	echo 'branch control server is unavailable' >&2
+	exit 128
+	;;
+delete)
+	if [ "$4" != "--force" ] || [ "$5" != "private-source" ]; then
+		echo "unexpected delete: $*" >&2
+		exit 2
+	fi
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	if err := b.purgeRuntime("private-source"); err != nil {
+		t.Fatalf("purgeRuntime: %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Fatalf("runtime was not force-deleted: %v", err)
 	}
 }
 

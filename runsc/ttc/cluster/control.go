@@ -51,6 +51,7 @@ const (
 	controlReferenceClaimsPath = "/v1/reference-claims"
 	controlTopologyProbePath   = "/v1/topology/probe"
 	controlTopologyEchoPath    = "/v1/topology/echo"
+	controlExecutionRenewPath  = "/v1/execution/renew"
 	controlPortProxyPath       = "/v1/ports/connect"
 	maxControlBody             = 1 << 20
 	controlNodeHeader          = "X-TTC-Node"
@@ -779,6 +780,11 @@ type ControlPlane struct {
 	// PortProxy opens one branch-local guest TCP connection and bridges it to
 	// the authenticated full-duplex request stream.
 	PortProxy http.Handler
+	// RenewExecution synchronously renews this daemon's node lease in the
+	// current Raft term. Placement coordinators call it immediately before
+	// reserving capacity, closing the healthy leader-change window in which a
+	// target's periodic heartbeat has not run yet.
+	RenewExecution func(context.Context) error
 	// ObjectProvider serves immutable graph objects owned by this node. Reads
 	// are fenced by the provider's current Raft authority and transaction.
 	ObjectProvider ImmutableObjectProvider
@@ -927,6 +933,22 @@ func (c *ControlPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == controlTopologyProbePath {
 		c.serveTopologyProbe(w, r, peer)
+		return
+	}
+	if r.URL.Path == controlExecutionRenewPath {
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "execution authority renewal requires POST")
+			return
+		}
+		if c.RenewExecution == nil {
+			writeControlError(w, http.StatusServiceUnavailable, "execution authority renewal is unavailable")
+			return
+		}
+		if err := c.RenewExecution(r.Context()); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]string{"node_id": c.Capabilities.NodeID})
 		return
 	}
 	if r.URL.Path == controlPortProxyPath && r.Method == http.MethodPost {
@@ -2263,6 +2285,14 @@ func (c *Client) ProbeTopology(ctx context.Context, request TopologyProbeRequest
 		return errors.New("topology probe returned the wrong nonce")
 	}
 	return nil
+}
+
+// RenewExecutionAuthority asks the target daemon itself to acquire execution
+// authority in the current Raft term. A different node must never fabricate a
+// target heartbeat merely because its previous-term lease has not expired.
+func (c *Client) RenewExecutionAuthority(ctx context.Context) error {
+	var response map[string]string
+	return c.call(ctx, http.MethodPost, controlExecutionRenewPath, nil, &response)
 }
 
 func (c *Client) RetireAuthority(ctx context.Context, request AuthorityRetireRequest) error {

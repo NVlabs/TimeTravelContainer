@@ -442,6 +442,35 @@ func TestRemoveContainerPlacementsDoesNotMatchStaleLogicalNameInPhysicalRuntime(
 	}
 }
 
+func TestRemoveLogicalBranchPlacementRemovesPublishedUnplacedBranch(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := cluster.OpenStore(filepath.Join(t.TempDir(), "transactions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "cold", State: cluster.PlacementUnplaced,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{
+		placements: placements, transactions: transactions,
+	}}
+	if err := backend.removeLogicalBranchPlacement("family", "cold"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Lookup("family", "cold"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed published placement lookup error=%v, want not exist", err)
+	}
+	// Retries after a lost response must remain harmless.
+	if err := backend.removeLogicalBranchPlacement("family", "cold"); err != nil {
+		t.Fatalf("idempotent removal: %v", err)
+	}
+}
+
 func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.BranchAuthority, error) {
 	record, ok := c.branches[family+"\x00"+branch]
 	if !ok {
