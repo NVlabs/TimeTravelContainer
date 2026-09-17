@@ -112,27 +112,32 @@ func ImportDirectory(ctx context.Context, graph *Store, data *LocalDataStore, or
 		if err != nil {
 			return ObjectID{}, err
 		}
-		reserved := make([]ReservedObject, 0, filesystemImportBatch)
-		for index, item := range regularItems {
-			id := ids[index]
-			identity := hostFileIdentity{device: uint64(item.stat.Dev), inode: item.stat.Ino}
-			fileIDs[identity] = id
-			file, err := os.Open(item.host)
-			if err != nil {
-				return ObjectID{}, err
-			}
-			installErr := data.Install(id, file, item.stat.Size)
-			closeErr := file.Close()
-			if installErr != nil || closeErr != nil {
-				return ObjectID{}, errors.Join(installErr, closeErr)
-			}
-			reserved = append(reserved, ReservedObject{ID: id, Pin: "import/" + id.key(), BulkLength: uint64(item.stat.Size)})
-			if len(reserved) == filesystemImportBatch || index == len(regularItems)-1 {
-				if err := graph.CommitReservedObjects(reserved); err != nil {
-					return ObjectID{}, err
+		if err := data.WithGraphMutation(func() error {
+			reserved := make([]ReservedObject, 0, filesystemImportBatch)
+			for index, item := range regularItems {
+				id := ids[index]
+				identity := hostFileIdentity{device: uint64(item.stat.Dev), inode: item.stat.Ino}
+				fileIDs[identity] = id
+				file, err := os.Open(item.host)
+				if err != nil {
+					return err
 				}
-				reserved = reserved[:0]
+				installErr := data.Install(id, file, item.stat.Size)
+				closeErr := file.Close()
+				if installErr != nil || closeErr != nil {
+					return errors.Join(installErr, closeErr)
+				}
+				reserved = append(reserved, ReservedObject{ID: id, Pin: "import/" + id.key(), BulkLength: uint64(item.stat.Size)})
+				if len(reserved) == filesystemImportBatch || index == len(regularItems)-1 {
+					if err := graph.CommitReservedObjects(reserved); err != nil {
+						return err
+					}
+					reserved = reserved[:0]
+				}
 			}
+			return nil
+		}); err != nil {
+			return ObjectID{}, err
 		}
 	}
 

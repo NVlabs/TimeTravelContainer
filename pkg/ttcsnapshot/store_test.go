@@ -24,8 +24,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -1191,6 +1193,7 @@ func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer data.Close()
 	origin, err := store.AllocateWorking()
 	if err != nil {
 		t.Fatal(err)
@@ -1735,6 +1738,73 @@ func TestLocalDataStoreReserveInstallCloneAndReclaim(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "objects", "files")); !os.IsNotExist(err) {
 		t.Fatalf("empty object-kind directory survived reclaim: %v", err)
+	}
+}
+
+func TestLocalDataStoreReclaimWaitsForGraphCommit(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	collector, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := graph.ReserveObject(origin, ObjectKindMemoryChunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	installed := make(chan struct{})
+	commit := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- data.WithGraphMutation(func() error {
+			if err := data.Install(id, strings.NewReader("data"), 4); err != nil {
+				return err
+			}
+			close(installed)
+			<-commit
+			return graph.CommitReservedObject(id, "build/object", 4, nil, nil)
+		})
+	}()
+	<-installed
+
+	reclaimDone := make(chan error, 1)
+	go func() {
+		_, _, err := collector.ReclaimUnreferenced(graph)
+		reclaimDone <- err
+	}()
+	select {
+	case err := <-reclaimDone:
+		t.Fatalf("reclamation crossed an uncommitted graph mutation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(commit)
+	if err := <-mutationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-reclaimDone; err != nil {
+		t.Fatal(err)
+	}
+	file, err := data.Open(id, 4)
+	if err != nil {
+		t.Fatalf("committed bulk object was reclaimed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

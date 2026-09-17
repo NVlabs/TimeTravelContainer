@@ -120,6 +120,38 @@ func TestProviderBaselineReferencesAreOriginScoped(t *testing.T) {
 	}
 }
 
+func TestManifestReferenceLivenessFollowsParentAuthority(t *testing.T) {
+	state := &cluster.AuthorityState{
+		NextSnapshotID:   64,
+		VolatileOrigins:  map[uint64]cluster.SnapshotProvider{},
+		AbandonedOrigins: map[uint64]bool{},
+		RetiredOrigins:   map[uint64]cluster.SharedPackRetirement{},
+	}
+	parent := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 3}
+	edge := "edge/" + parent.String() + "/0004"
+	for _, name := range []string{edge, "root/bridge/" + edge, "root/branch/main"} {
+		if live, err := manifestReferenceIsLive(state, name); err != nil || !live {
+			t.Fatalf("live reference %q = (%t, %v), want (true, nil)", name, live, err)
+		}
+	}
+	state.AbandonedOrigins[17] = true
+	if live, err := manifestReferenceIsLive(state, edge); err != nil || live {
+		t.Fatalf("abandoned parent edge = (%t, %v), want (false, nil)", live, err)
+	}
+	delete(state.AbandonedOrigins, 17)
+	state.RetiredOrigins[17] = cluster.SharedPackRetirement{SnapshotID: 17, GCGeneration: 1, RetiredAt: time.Unix(1, 0)}
+	if live, err := manifestReferenceIsLive(state, edge); err != nil || live {
+		t.Fatalf("retired parent edge = (%t, %v), want (false, nil)", live, err)
+	}
+	if _, err := manifestReferenceIsLive(state, "edge/not-an-object/0001"); err == nil {
+		t.Fatal("malformed structural edge was accepted")
+	}
+	future := ttcsnapshot.ObjectID{Snapshot: 64, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 1}
+	if _, err := manifestReferenceIsLive(state, "edge/"+future.String()+"/0000"); err == nil {
+		t.Fatal("unallocated parent origin was accepted")
+	}
+}
+
 func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 	provider := ttcsnapshot.NewReferenceLedger()
 	shared := ttcsnapshot.NewReferenceLedger()

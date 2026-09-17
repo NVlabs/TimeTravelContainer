@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -36,11 +37,37 @@ import (
 type LocalDataStore struct {
 	root   string
 	rootFD *os.File
+	gcLock *os.File
 	// gcMu serializes directory reconciliation with other reconciliation
 	// goroutines using this store. Graph mutations are transactional, but the
 	// subsequent physical sweep is deliberately outside the graph lock; two
 	// independent lifecycle completions may therefore reach it concurrently.
-	gcMu sync.Mutex
+	gcMu sync.RWMutex
+}
+
+// WithGraphMutation excludes physical garbage collection while installed bulk
+// bytes are being committed into their authoritative graph. Immutable object
+// construction is intentionally ordered as:
+//
+//	install bytes -> commit graph object
+//
+// because a graph record must never name missing data after a crash. Without
+// this fence, a concurrent collector could observe the final object filename
+// in the short interval before the graph commit and unlink it as unreachable.
+// The caller must include both steps in mutate. A per-store RW lock covers
+// goroutines sharing one handle; .gc.lock extends the fence across independent
+// handles and donated directory descriptors in other TTC processes.
+func (store *LocalDataStore) WithGraphMutation(mutate func() error) error {
+	if store == nil || store.gcLock == nil || mutate == nil {
+		return errors.New("invalid TTC graph-data mutation")
+	}
+	store.gcMu.RLock()
+	defer store.gcMu.RUnlock()
+	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_SH); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
+	return mutate()
 }
 
 // OpenLocalDataStore opens a standalone bulk-object directory.
@@ -51,7 +78,11 @@ func OpenLocalDataStore(root string) (*LocalDataStore, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
 	}
-	return &LocalDataStore{root: root}, nil
+	lock, err := os.OpenFile(filepath.Join(root, ".gc.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalDataStore{root: root, gcLock: lock}, nil
 }
 
 // OpenLocalDataStoreFD opens a donated bulk-object directory. All access stays
@@ -65,7 +96,13 @@ func OpenLocalDataStoreFD(directory *os.File) (*LocalDataStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &LocalDataStore{rootFD: os.NewFile(uintptr(fd), "ttc-graph-objects")}, nil
+	rootFD := os.NewFile(uintptr(fd), "ttc-graph-objects")
+	lockFD, err := unix.Openat(int(rootFD.Fd()), ".gc.lock", unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		rootFD.Close()
+		return nil, err
+	}
+	return &LocalDataStore{rootFD: rootFD, gcLock: os.NewFile(uintptr(lockFD), "ttc-graph-objects-gc-lock")}, nil
 }
 
 var dataTemporarySequence atomic.Uint64
@@ -102,15 +139,21 @@ func copyWholeFile(destination, source *os.File) error {
 	}
 }
 
-// Close releases a donated directory. Path-opened stores own no persistent
-// descriptor and Close is a no-op.
+// Close releases the collector fence and any donated directory descriptor.
 func (store *LocalDataStore) Close() error {
-	if store == nil || store.rootFD == nil {
+	if store == nil {
 		return nil
 	}
-	err := store.rootFD.Close()
-	store.rootFD = nil
-	return err
+	var result error
+	if store.gcLock != nil {
+		result = errors.Join(result, store.gcLock.Close())
+		store.gcLock = nil
+	}
+	if store.rootFD != nil {
+		result = errors.Join(result, store.rootFD.Close())
+		store.rootFD = nil
+	}
+	return result
 }
 
 func objectKindName(kind ObjectKind) (string, error) {
@@ -779,6 +822,13 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (rem
 func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarantined int, err error) {
 	store.gcMu.Lock()
 	defer store.gcMu.Unlock()
+	if store.gcLock == nil {
+		return 0, 0, errors.New("TTC bulk-object store is closed")
+	}
+	if err := syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_EX); err != nil {
+		return 0, 0, err
+	}
+	defer syscall.Flock(int(store.gcLock.Fd()), syscall.LOCK_UN)
 	if store.rootFD != nil {
 		for _, kind := range []string{"pages", "memory-chunks", "files"} {
 			r, q, reclaimErr := store.reclaimRelative(graph, kind)

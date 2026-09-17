@@ -449,6 +449,47 @@ func providerBaselineReferences(origin ttcsnapshot.SnapshotID, references map[st
 	return result
 }
 
+// incomingEdgeParent decodes the canonical owner-crossing edge reference
+// emitted by the snapshot graph. A shared manifest is immutable, so it may
+// retain historical bridge names after the parent origin is permanently
+// abandoned or retired; coordinator rebuild must classify those names rather
+// than treating every manifest entry as currently live.
+func incomingEdgeParent(name string) (ttcsnapshot.ObjectID, bool, error) {
+	effective := strings.TrimPrefix(name, "root/bridge/")
+	if !strings.HasPrefix(effective, "edge/") {
+		return ttcsnapshot.ObjectID{}, false, nil
+	}
+	parts := strings.Split(effective, "/")
+	if len(parts) != 3 {
+		return ttcsnapshot.ObjectID{}, true, fmt.Errorf("malformed incoming edge reference %q", name)
+	}
+	parent, err := ttcsnapshot.ParseObjectID(parts[1])
+	if err != nil {
+		return ttcsnapshot.ObjectID{}, true, fmt.Errorf("parsing incoming edge reference %q: %w", name, err)
+	}
+	if _, err := strconv.ParseUint(parts[2], 16, 16); err != nil {
+		return ttcsnapshot.ObjectID{}, true, fmt.Errorf("parsing incoming edge slot in %q: %w", name, err)
+	}
+	return parent, true, nil
+}
+
+func manifestReferenceIsLive(state *cluster.AuthorityState, name string) (bool, error) {
+	parent, edge, err := incomingEdgeParent(name)
+	if err != nil || !edge {
+		return !edge, err
+	}
+	if state == nil || uint64(parent.Snapshot) >= state.NextSnapshotID {
+		return false, fmt.Errorf("incoming edge reference %q names unallocated parent origin %d", name, parent.Snapshot)
+	}
+	if state.AbandonedOrigins[uint64(parent.Snapshot)] {
+		return false, nil
+	}
+	if _, retired := state.RetiredOrigins[uint64(parent.Snapshot)]; retired {
+		return false, nil
+	}
+	return true, nil
+}
+
 func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*ttcsnapshot.ReferenceLedger, error) {
 	if s == nil || s.authority == nil || s.packs == nil || s.peers == nil {
 		return nil, errors.New("shared reference rebuild is unavailable")
@@ -709,6 +750,13 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 		// canonical so a subsequently imported parent can replace them in place.
 		references := make(map[string]ttcsnapshot.ObjectID, len(manifest.References))
 		for name, object := range manifest.References {
+			live, err := manifestReferenceIsLive(state, name)
+			if err != nil {
+				return fail(fmt.Errorf("validating snapshot %d manifest reference: %w", manifest.Snapshot, err))
+			}
+			if !live {
+				continue
+			}
 			if strings.HasPrefix(name, "root/bridge/edge/") {
 				references[name] = object
 			} else {
@@ -1397,6 +1445,10 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if _, err := s.drainOutbox(ctx, limit*4); err != nil {
 		return collected, err
 	}
+	state, err := s.authority.AuthorityState()
+	if err != nil {
+		return collected, err
+	}
 	// Rewrite at most one partially-live origin per maintenance pass. Logical
 	// collection is already durable in the ledger; compaction only changes its
 	// reader-fenced physical representation and therefore may be retried after
@@ -1411,6 +1463,16 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	for _, origin := range origins {
 		if err := ctx.Err(); err != nil {
 			return collected, err
+		}
+		encoded := uint64(origin)
+		if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
+			continue
+		}
+		if _, volatile := state.VolatileOrigins[encoded]; volatile {
+			continue
+		}
+		if _, retired := state.RetiredOrigins[encoded]; retired {
+			continue
 		}
 		var objects []ttcsnapshot.Object
 		var references map[string]ttcsnapshot.ObjectID
@@ -1457,6 +1519,39 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		if err := ctx.Err(); err != nil {
 			return collected, err
 		}
+		if uint64(snapshot) >= state.NextSnapshotID {
+			// The origin was imported concurrently after the bulk authority
+			// read. Refresh before classifying it; an absent entry only means
+			// shared authority for IDs that had already been allocated.
+			state, err = s.authority.AuthorityState()
+			if err != nil {
+				return collected, err
+			}
+			if uint64(snapshot) >= state.NextSnapshotID {
+				continue
+			}
+		}
+		if state.AbandonedOrigins[uint64(snapshot)] {
+			// A provider-to-shared handoff imports the immutable graph before
+			// changing its routing authority. Cancellation may permanently
+			// abandon the still-volatile origin in that interval. The publisher
+			// removes the speculative pack, but an already-active coordinator
+			// must also forget its now-empty imported ledger origin. A rebuilt
+			// coordinator naturally omits abandoned origins.
+			if err := s.completeAbandonment(snapshot); err != nil {
+				return collected, err
+			}
+			continue
+		}
+		if _, retired := state.RetiredOrigins[uint64(snapshot)]; retired {
+			// Resume a crash after the irreversible Raft fence. In particular,
+			// the ledger and physical pack may independently have completed
+			// their idempotent cleanup steps.
+			if err := s.completeRetirement(snapshot); err != nil {
+				return collected, err
+			}
+			continue
+		}
 		_, volatile, err := s.authority.SnapshotProvider(uint64(snapshot))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return collected, err
@@ -1465,6 +1560,32 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			// Import precedes the provider-to-shared authority switch. An empty
 			// handoff baseline cannot be retired until that switch commits.
 			continue
+		}
+		if _, wasVolatile := state.VolatileOrigins[uint64(snapshot)]; wasVolatile {
+			// SnapshotProvider observed a provider transition after the bulk
+			// state read above. Resolve that one transition again: it committed
+			// either publication (ordinary shared retirement below) or permanent
+			// abandonment. Once shared, an origin cannot become abandoned.
+			latest, err := s.authority.AuthorityState()
+			if err != nil {
+				return collected, err
+			}
+			if latest.AbandonedOrigins[uint64(snapshot)] {
+				if err := s.completeAbandonment(snapshot); err != nil {
+					return collected, err
+				}
+				continue
+			}
+			if _, retired := latest.RetiredOrigins[uint64(snapshot)]; retired {
+				if err := s.completeRetirement(snapshot); err != nil {
+					return collected, err
+				}
+				continue
+			}
+			if _, stillVolatile := latest.VolatileOrigins[uint64(snapshot)]; stillVolatile {
+				// A stale follower read must never authorize shared-pack mutation.
+				continue
+			}
 		}
 		ready, err := s.packs.RetirementReady(snapshot)
 		if err != nil {
@@ -1585,6 +1706,15 @@ func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []tt
 }
 
 func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.SnapshotID) error {
+	// Raft has already made the origin unreachable to new readers. Forget the
+	// logical origin durably before deleting its bytes. If the daemon crashes
+	// between these steps, RetiredOrigins is the permanent recovery work list;
+	// deleting bytes first instead leaves a live ledger origin with no pack.
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		return ledger.RetireOrigin(snapshot)
+	}); err != nil {
+		return err
+	}
 	busy, err := s.packs.CompleteRetirement(snapshot)
 	if err != nil {
 		return err
@@ -1592,9 +1722,32 @@ func (s *sharedReferenceService) completeRetirement(snapshot ttcsnapshot.Snapsho
 	if busy {
 		return fmt.Errorf("shared snapshot %d still has an active reader lease", snapshot)
 	}
+	return nil
+}
+
+// completeAbandonment removes the speculative data-plane state left when a
+// provider-to-shared handoff is canceled after coordinator import but before
+// the Raft authority switch. Raft's abandonment is already permanent, so no
+// shared reader may newly acquire this origin and a missing handoff pack is an
+// expected idempotent prefix rather than evidence of lost shared data.
+func (s *sharedReferenceService) completeAbandonment(snapshot ttcsnapshot.SnapshotID) error {
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-		return ledger.RetireOrigin(snapshot)
+		return discardAbandonedSnapshot(s.packs, ledger, snapshot)
 	})
+}
+
+func discardAbandonedSnapshot(packs *ttcsnapshot.SharedPackStore, ledger *ttcsnapshot.ReferenceLedger, snapshot ttcsnapshot.SnapshotID) error {
+	if packs == nil || ledger == nil {
+		return errors.New("abandoned snapshot cleanup is unavailable")
+	}
+	busy, err := packs.DiscardHandoff(snapshot)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return fmt.Errorf("abandoned snapshot %d still has an active handoff reader lease", snapshot)
+	}
+	return ledger.RetireOrigin(snapshot)
 }
 
 var _ cluster.SharedSnapshotReferenceProvider = (*sharedReferenceService)(nil)

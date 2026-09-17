@@ -11757,13 +11757,6 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	if len(roots) == 0 || b.snapshotGraph == nil || b.snapshotData == nil {
 		return nil
 	}
-	before := b.snapshotGraph.Inspect()
-	volatile := make([]ttcsnapshot.SnapshotID, 0)
-	for _, snapshot := range before.Snapshots {
-		if snapshot.State == ttcsnapshot.SnapshotSealedVolatile {
-			volatile = append(volatile, snapshot.ID)
-		}
-	}
 	if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
 		return err
 	}
@@ -11780,52 +11773,8 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	if err != nil {
 		return err
 	}
-	abandoned := make(map[ttcsnapshot.SnapshotID]struct{})
-	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		node := b.nodeID
-		if node == "" {
-			node = b.distributedSource.capabilities.NodeID
-		}
-		for _, origin := range volatile {
-			objects, objectErr := b.snapshotGraph.SnapshotObjects(origin)
-			if objectErr != nil && !errors.Is(objectErr, os.ErrNotExist) {
-				return objectErr
-			}
-			if len(objects) != 0 {
-				continue
-			}
-			provider, found, providerErr := b.distributedSource.authority.SnapshotProvider(uint64(origin))
-			if providerErr != nil {
-				return providerErr
-			}
-			if !found || provider.NodeID != node {
-				continue
-			}
-			if b.snapshotShared != nil {
-				busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
-				if discardErr != nil {
-					return fmt.Errorf("discarding uncommitted memory origin %d: %w", origin, discardErr)
-				}
-				if busy {
-					return fmt.Errorf("discarding uncommitted memory origin %d: pack is busy", origin)
-				}
-			}
-			if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
-				return fmt.Errorf("abandoning empty memory origin %d: %w", origin, err)
-			}
-			abandoned[origin] = struct{}{}
-		}
-	}
-	if len(abandoned) != 0 {
-		retain := make([]ttcsnapshot.SnapshotID, 0, len(before.Snapshots)-len(abandoned))
-		for _, snapshot := range before.Snapshots {
-			if _, remove := abandoned[snapshot.ID]; !remove {
-				retain = append(retain, snapshot.ID)
-			}
-		}
-		if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
-			return err
-		}
+	if _, err := b.abandonEmptyVolatileMemoryOrigins(); err != nil {
+		return err
 	}
 	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
@@ -11833,6 +11782,76 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 		}
 	}
 	return nil
+}
+
+// abandonEmptyVolatileMemoryOrigins removes cluster provider records for
+// node-local memory origins that own no objects. Both sealed and working
+// origins are eligible: a working origin with no objects is allocation residue
+// from a canceled or fully reclaimed mutation, not mutable guest state. The
+// daemon mutation lock excludes a concurrent graph builder while this runs.
+//
+// Keeping this rule in one place is important. Branch cleanup, crash
+// reconciliation, and node retirement previously used subtly different state
+// filters, which allowed an empty working origin to outlive its final branch
+// and then make clean retirement impossible.
+func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
+	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return 0, nil
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, errors.New("cluster memory-origin cleanup lacks node incarnation")
+	}
+	inspection := b.snapshotGraph.Inspect()
+	abandoned := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.State != ttcsnapshot.SnapshotWorking && snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
+			continue
+		}
+		objects, err := b.snapshotGraph.SnapshotObjects(snapshot.ID)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return len(abandoned), err
+		}
+		if len(objects) != 0 {
+			continue
+		}
+		provider, found, err := b.distributedSource.authority.SnapshotProvider(uint64(snapshot.ID))
+		if err != nil {
+			return len(abandoned), err
+		}
+		if !found || provider.NodeID != node {
+			continue
+		}
+		if b.snapshotShared != nil {
+			busy, err := b.snapshotShared.DiscardHandoff(snapshot.ID)
+			if err != nil {
+				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: %w", snapshot.ID, err)
+			}
+			if busy {
+				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: pack is busy", snapshot.ID)
+			}
+		}
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(snapshot.ID)); err != nil {
+			return len(abandoned), fmt.Errorf("abandoning empty memory origin %d: %w", snapshot.ID, err)
+		}
+		abandoned[snapshot.ID] = struct{}{}
+	}
+	if len(abandoned) == 0 {
+		return 0, nil
+	}
+	retain := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots)-len(abandoned))
+	for _, snapshot := range inspection.Snapshots {
+		if _, remove := abandoned[snapshot.ID]; !remove {
+			retain = append(retain, snapshot.ID)
+		}
+	}
+	if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
+		return len(abandoned), err
+	}
+	return len(abandoned), nil
 }
 
 // reconcileVolatileSnapshotOrigins removes provider-directory entries whose
@@ -11863,6 +11882,10 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	// otherwise successful branch removal cannot fail in this transient window.
 	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
 		return 0, fmt.Errorf("renewing snapshot reconciliation authority: %w", err)
+	}
+	abandoned, err := b.abandonEmptyVolatileMemoryOrigins()
+	if err != nil {
+		return 0, fmt.Errorf("reclaiming empty memory origins: %w", err)
 	}
 	live := make(map[ttcsnapshot.SnapshotID]struct{})
 	if b.snapshotGraph != nil {
@@ -11910,7 +11933,7 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 			}
 		}
 	}
-	return len(stale), nil
+	return abandoned + len(stale), nil
 }
 
 const snapshotGraphJournalCompactBytes = 8 << 20

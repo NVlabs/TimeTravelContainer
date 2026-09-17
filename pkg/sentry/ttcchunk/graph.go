@@ -240,13 +240,18 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 				return GraphImportResult{}, err
 			}
 			chunkID := ttcsnapshot.ObjectID(reservation.Chunk)
-			if err := data.Install(chunkID, bytes.NewReader(raw), int64(len(raw))); err != nil {
-				return GraphImportResult{}, fmt.Errorf("installing graph memory chunk %s: %w", chunkID, err)
+			if err := data.WithGraphMutation(func() error {
+				if err := data.Install(chunkID, bytes.NewReader(raw), int64(len(raw))); err != nil {
+					return fmt.Errorf("installing graph memory chunk %s: %w", chunkID, err)
+				}
+				if err := graph.CommitMemoryChunk(reservation); err != nil {
+					return fmt.Errorf("committing graph memory chunk %s: %w", chunkID, err)
+				}
+				return nil
+			}); err != nil {
+				return GraphImportResult{}, err
 			}
 			activePins = append(activePins, reservation.Pins...)
-			if err := graph.CommitMemoryChunk(reservation); err != nil {
-				return GraphImportResult{}, fmt.Errorf("committing graph memory chunk %s: %w", chunkID, err)
-			}
 			for slot, page := range reservation.Pages {
 				pageIDs[slot] = page
 			}

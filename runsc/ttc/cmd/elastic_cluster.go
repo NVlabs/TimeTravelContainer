@@ -2355,6 +2355,22 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 	if err != nil {
 		return err
 	}
+	branchRecorded := false
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			branchRecorded = true
+			break
+		}
+	}
+	if !branchRecorded {
+		// Source-runtime cleanup is intentionally shared by the synchronous
+		// node-retirement barrier and the ordinary independence monitor. The
+		// family lock serializes them, but the loser observes the durable branch
+		// record already removed by the winner. Metadata removal is the final
+		// cleanup boundary (after runtime destruction and backing reclamation),
+		// so absence proves the operation is complete and must be idempotent.
+		return nil
+	}
 	runtimes, err := b.listRuntimeFamilies()
 	if err != nil {
 		return err

@@ -582,14 +582,16 @@ func (r *Repository) importGraphFiles(metadata *snapshotMetadata, objectsDir str
 		if err != nil {
 			return err
 		}
-		err = r.data.Install(id, file, size)
+		err = r.data.WithGraphMutation(func() error {
+			if err := r.data.Install(id, file, size); err != nil {
+				return err
+			}
+			return r.graph.CommitReservedObject(id, graphConstructionPin(id), uint64(size), nil, nil)
+		})
 		closeErr := file.Close()
 		if err != nil || closeErr != nil {
-			return errors.Join(err, closeErr)
-		}
-		if err := r.graph.CommitReservedObject(id, graphConstructionPin(id), uint64(size), nil, nil); err != nil {
 			_ = r.data.Remove(id)
-			return err
+			return errors.Join(err, closeErr)
 		}
 		translated[source] = id.String()
 	}

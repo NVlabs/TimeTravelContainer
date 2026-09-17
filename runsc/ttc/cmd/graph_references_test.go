@@ -330,6 +330,40 @@ func TestSnapshotReferenceInventoryOmitsRetiredCrashPrefix(t *testing.T) {
 	}
 }
 
+func TestDiscardAbandonedSnapshotForgetsImportedEmptyOrigin(t *testing.T) {
+	root := t.TempDir()
+	packs, err := ttcsnapshot.OpenSharedPackStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := ttcsnapshot.NewReferenceLedger()
+	origin := ttcsnapshot.SnapshotID(41)
+	// This is the publication crash prefix where the coordinator imported the
+	// origin, but cancellation won Raft authority before shared publication.
+	if err := ledger.ImportOrigin(origin, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	namespace := filepath.Join(root, "snapshots", "0000000000000029")
+	if err := os.MkdirAll(namespace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(namespace, "handoff.tmp"), []byte("speculative"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := discardAbandonedSnapshot(packs, ledger, origin); err != nil {
+		t.Fatal(err)
+	}
+	if got := ledger.Inspect(); len(got.Origins) != 0 {
+		t.Fatalf("abandoned origin remains in ledger: %+v", got)
+	}
+	if _, err := os.Stat(namespace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned handoff namespace stat error=%v, want not-exist", err)
+	}
+	if err := discardAbandonedSnapshot(packs, ledger, origin); err != nil {
+		t.Fatalf("idempotent abandoned cleanup: %v", err)
+	}
+}
+
 func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 	for failAt := 0; failAt < 2; failAt++ {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
