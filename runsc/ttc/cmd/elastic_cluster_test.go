@@ -537,6 +537,66 @@ func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {
 	}
 }
 
+func TestAwaitDaemonColdUnplacementWaitsForSameDestinationOwner(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Derived metadata may still name the old owner after stop has captured the
+	// process-free state. Raft lifecycle state is authoritative for deciding
+	// whether start may wait for the asynchronous placement release.
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family-id", Name: "web", State: "exited", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "cold", NodeID: "node-a", State: "exited"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base, err := cluster.OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := base.Create(cluster.PlacementRecord{
+		FamilyID: "family-id", BranchID: "cold", PhysicalContainer: "family-id", PhysicalBranch: "cold",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := branchAwarePlacementCatalog{
+		PlacementCatalog: base,
+		branches: map[string]cluster.BranchAuthority{"family-id\x00cold": {
+			FamilyID: "family-id", BranchID: "cold", Generation: record.Generation,
+			Lifecycle: "exited", Roots: cluster.DurableRoots{FilesystemRoot: "cold/fs.manifest"},
+		}},
+	}
+	if !daemonCommandMayAwaitColdUnplacement(root, catalog, []string{"start", "web@cold"}) {
+		t.Fatal("exited branch was not recognized as awaiting placement release")
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		_, err := base.Unplace("family-id", "cold", "node-a", "inc-a", record.Generation, time.Now())
+		released <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	owner, claims, err := awaitDaemonColdUnplacement(ctx, root, catalog, []string{"start", "web@cold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	if owner != "" || len(claims) != 0 {
+		t.Fatalf("awaitDaemonColdUnplacement owner=%q claims=%+v, want unplaced", owner, claims)
+	}
+}
+
 func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "family-id")

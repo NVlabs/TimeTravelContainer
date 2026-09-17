@@ -6578,19 +6578,21 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			writeError(err)
 			return
 		}
-		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode && daemonCommandMayAwaitColdUnplacement(s.dataRoot, s.clusterPlacements, request.Args) {
+		if owner != "" && daemonCommandMayAwaitColdUnplacement(s.dataRoot, s.clusterPlacements, request.Args) {
 			// Dehydrate/stop return after the process-free local capture is safe,
 			// while publication to shared storage is intentionally asynchronous.
 			// Wait outside every lifecycle lock for its atomic Raft commit, then
-			// redo routing so an explicit --node can claim the unplaced branch.
-			deadline := time.Now().Add(2 * time.Minute)
-			for owner != "" && owner != request.PlacementNode && time.Now().Before(deadline) {
-				time.Sleep(25 * time.Millisecond)
-				owner, request.PlacementClaims, err = daemonCommandPlacementWithCatalog(s.dataRoot, s.clusterPlacements, request.Args)
-				if err != nil {
-					writeError(err)
-					return
-				}
+			// redo routing so the destination can claim the unplaced branch. This
+			// is required even when the requested destination is the former owner:
+			// otherwise start can carry a stale running-placement claim across the
+			// publication commit and fail at the destination as soon as Raft
+			// unplaces the branch.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			owner, request.PlacementClaims, err = awaitDaemonColdUnplacement(ctx, s.dataRoot, s.clusterPlacements, request.Args)
+			cancel()
+			if err != nil {
+				writeError(err)
+				return
 			}
 		}
 		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode {

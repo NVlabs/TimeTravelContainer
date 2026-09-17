@@ -1293,11 +1293,11 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 	}
 }
 
-// daemonCommandMayAwaitColdUnplacement reports whether a placement mismatch
-// can be the normal publication race between a completed local capture and
-// its Raft commit. Running branches must still reject a conflicting --node
-// immediately; only process-free lifecycle operations may wait for ownership
-// to become unplaced.
+// daemonCommandMayAwaitColdUnplacement reports whether an observed placement
+// can be the publication race between a completed local capture and its Raft
+// commit. Running branches must still reject a conflicting --node immediately;
+// only process-free lifecycle operations may wait for ownership to become
+// unplaced.
 func daemonCommandMayAwaitColdUnplacement(dataRoot string, placements cluster.PlacementCatalog, args []string) bool {
 	if dataRoot == "" || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start") {
 		return false
@@ -1359,6 +1359,30 @@ func daemonCommandMayAwaitColdUnplacement(dataRoot string, placements cluster.Pl
 		found = true
 	}
 	return found
+}
+
+// awaitDaemonColdUnplacement waits until asynchronous cold-state publication
+// has atomically released a branch's execution placement. Callers must first
+// establish daemonCommandMayAwaitColdUnplacement: this function deliberately
+// waits for any remaining owner, including the node on which the next runtime
+// will be admitted, so no stale running-placement claim crosses the release.
+func awaitDaemonColdUnplacement(ctx context.Context, dataRoot string, placements cluster.PlacementCatalog, args []string) (string, []daemonPlacementClaim, error) {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		owner, claims, err := daemonCommandPlacementWithCatalog(dataRoot, placements, args)
+		if err != nil {
+			return "", nil, err
+		}
+		if owner == "" {
+			return "", claims, nil
+		}
+		select {
+		case <-ctx.Done():
+			return owner, claims, fmt.Errorf("waiting for process-free branch placement release from node %q: %w", owner, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // waitForCommittedColdBranchMetadata closes the deliberately small gap between
@@ -1927,11 +1951,12 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 	var diagnostic bytes.Buffer
 	fs.SetOutput(&diagnostic)
 	jsonOutput := fs.Bool("json", false, "")
+	fs.Bool("no-stream", false, "")
 	if err := fs.Parse(request.Args[1:]); err != nil {
 		return true, 1, nil, diagnostic.Bytes(), nil
 	}
 	if fs.NArg() != 1 {
-		return true, 1, nil, nil, errors.New("usage: ttc stats [--json] CONTAINER@BRANCH")
+		return true, 1, nil, nil, errors.New("usage: ttc stats [--json] [--no-stream] CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {

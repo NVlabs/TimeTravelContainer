@@ -640,7 +640,7 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 		}},
 	}}
 	var stdout bytes.Buffer
-	if err := runStats([]string{"--json", "demo@main"}, &stdout, io.Discard, backend); err != nil {
+	if err := runStats([]string{"--json", "--no-stream", "demo@main"}, &stdout, io.Discard, backend); err != nil {
 		t.Fatal(err)
 	}
 	if backend.resourceStatsTarget != (selector{container: "demo", branch: "main"}) {

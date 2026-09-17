@@ -300,7 +300,7 @@ TTC_LOCAL_ROOT is not required.`,
 			"rehydrate":    "Usage: ttc rehydrate TARGET [TARGET...]",
 			"unpause":      "Usage: ttc unpause TARGET [TARGET...]",
 			"top":          "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
-			"stats":        "Usage: ttc stats [--json] CONTAINER@BRANCH",
+			"stats":        "Usage: ttc stats [--json] [--no-stream] CONTAINER@BRANCH\n\nTTC stats is one-shot by default; --no-stream is accepted for Docker CLI compatibility.",
 			"tty":          "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
 			"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
 			"checkpoint":   "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
@@ -5465,11 +5465,12 @@ func runStats(args []string, stdout, stderr io.Writer, b backend) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	fs.Bool("no-stream", false, "one-shot output (accepted for Docker CLI compatibility; this is the default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc stats [--json] CONTAINER@BRANCH")
+		return errors.New("usage: ttc stats [--json] [--no-stream] CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
