@@ -9209,7 +9209,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	if containerInfo.DistributedFamilyID != "" && containerInfo.DistributedFamilyID != containerInfo.ID {
+	if containerInfo.IsDistributedPhysicalRuntime() {
 		return InspectInfo{}, fmt.Errorf("container %q does not exist: %w", name, os.ErrNotExist)
 	}
 	spec, err := store.LoadSpec(containerInfo.ID)
@@ -9435,7 +9435,7 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 		_, logicalMatch := physicalBranches[record.BranchID]
 		_, physicalMatch := physicalBranches[record.PhysicalBranch]
 		exactPhysicalMatch := record.PhysicalContainer == info.ID && physicalMatch
-		physicalRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+		physicalRuntime := info.IsDistributedPhysicalRuntime()
 		if physicalRuntime && !exactPhysicalMatch {
 			continue
 		}
@@ -9568,7 +9568,7 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 	if err != nil {
 		return err
 	}
-	if info.DistributedForkTransactionID != "" || (info.DistributedFamilyID != "" && info.DistributedFamilyID != info.ID) {
+	if info.IsDistributedPhysicalRuntime() {
 		return fmt.Errorf("container %q is a physical distributed runtime, not a canonical family record", containerID)
 	}
 	if b.nodeID != "" {
@@ -10613,7 +10613,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
-		if container.DistributedFamilyID != "" && container.DistributedFamilyID != container.ID {
+		if container.IsDistributedPhysicalRuntime() {
 			// Per-node target records are addressed through Raft placement. They
 			// must not appear as additional user-visible families.
 			continue
@@ -10711,7 +10711,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
 			runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
-			physicalRuntime := runtimeInfoErr == nil && runtimeInfo.DistributedFamilyID != "" && runtimeInfo.DistributedForkTransactionID != ""
+			physicalRuntime := runtimeInfoErr == nil && runtimeInfo.IsDistributedPhysicalRuntime()
 			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
 				physicalID := family.ID
 				family.ID = placements[0].FamilyID

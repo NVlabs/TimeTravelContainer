@@ -611,9 +611,21 @@ type ContainerInfo struct {
 	DistributedForkTransactionID string                           `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string                           `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool                             `json:"distributed_fork_hidden,omitempty"`
+	DistributedPhysicalRuntime   bool                             `json:"distributed_physical_runtime,omitempty"`
 	DistributedFamilyID          string                           `json:"distributed_family_id,omitempty"`
 	DistributedForkImports       map[string]DistributedForkImport `json:"distributed_fork_imports,omitempty"`
 	NodeID                       string                           `json:"node_id,omitempty"`
+}
+
+// IsDistributedPhysicalRuntime reports whether info is a node-local physical
+// materialization behind a cluster-wide logical family. Transaction identity
+// exists only while a fork or migration is in flight, so it cannot by itself
+// classify a runtime after publication or a later cold restart.
+func (info ContainerInfo) IsDistributedPhysicalRuntime() bool {
+	return info.DistributedPhysicalRuntime || info.DistributedForkTransactionID != "" || info.DistributedForkHidden ||
+		// Compatibility for physical records created before the explicit role
+		// bit: internal physical runtimes are named by their generated ID.
+		(info.DistributedFamilyID != "" && info.DistributedFamilyID != info.ID && info.Name == info.ID)
 }
 
 func cloneIntPointer(value *int) *int {
@@ -1926,6 +1938,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
+	target.DistributedPhysicalRuntime = true
 	target.DistributedFamilyID = globalFamilyID
 	target.DistributedForkImports = nil
 	target.NodeID = opts.NodeID
@@ -3333,7 +3346,7 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 		// A published physical runtime must remain exactly addressable by daemon
 		// lifecycle helpers, but Raft placement is its only user-visible identity.
 		// Never duplicate it in ordinary family inventory.
-		physicalDistributedRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+		physicalDistributedRuntime := info.IsDistributedPhysicalRuntime()
 		if includeHidden || (!info.DistributedForkHidden && (includePhysical || !physicalDistributedRuntime)) {
 			containers = append(containers, info)
 		}
@@ -4451,7 +4464,7 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		return err
 	}
 	seen := make(map[string]struct{}, len(repositories))
-	physicalDistributedRuntime := info.DistributedFamilyID != "" && info.DistributedForkTransactionID != ""
+	physicalDistributedRuntime := info.IsDistributedPhysicalRuntime()
 	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, duplicate := seen[path]; duplicate {

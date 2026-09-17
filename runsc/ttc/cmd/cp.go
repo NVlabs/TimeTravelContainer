@@ -314,18 +314,18 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 				return b.runLiveCopyHelper(resolved, helperArgs, input, output, false)
 			case "paused":
 				return b.runLiveCopyHelper(resolved, helperArgs, input, output, true)
-			case "dehydrated":
-				// A dehydrated branch has no Kernel or open filesystem handles.
-				// Its persistent TTC volume branches can therefore be mounted by
-				// the short-lived offline helper without rehydrating it or
-				// disturbing live peers in the family.
-				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 			default:
+				if offlineCopyState(branch.State) {
+					// These states have no Kernel or open filesystem handles for this
+					// branch. Its persistent TTC volume branches can therefore be
+					// mounted by the short-lived helper without disturbing live peers.
+					return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+				}
 				return fmt.Errorf("cannot copy to or from branch %q while it is %s", resolved.branch, branch.State)
 			}
 		}
 		for _, branch := range info.Branches {
-			if branch.ID == resolved.branch && branch.State == "dehydrated" {
+			if branch.ID == resolved.branch && offlineCopyState(branch.State) {
 				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 			}
 		}
@@ -338,6 +338,15 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 		return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
 	}
 	return fmt.Errorf("branch %q does not exist", resolved.branch)
+}
+
+func offlineCopyState(state string) bool {
+	switch state {
+	case "dehydrated", "exited", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *runtimeBackend) openCopyHelper() (*os.File, error) {

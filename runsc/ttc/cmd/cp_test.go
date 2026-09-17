@@ -434,3 +434,16 @@ func TestRunCopyStreamsBothDirections(t *testing.T) {
 		}
 	})
 }
+
+func TestOfflineCopyState(t *testing.T) {
+	for _, state := range []string{"dehydrated", "exited", "stopped"} {
+		if !offlineCopyState(state) {
+			t.Errorf("offlineCopyState(%q)=false, want true", state)
+		}
+	}
+	for _, state := range []string{"", "created", "running", "paused", "dehydrating"} {
+		if offlineCopyState(state) {
+			t.Errorf("offlineCopyState(%q)=true, want false", state)
+		}
+	}
+}

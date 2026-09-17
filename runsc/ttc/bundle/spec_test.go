@@ -3008,8 +3008,11 @@ func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *
 	branch := BranchInfo{ID: "migration", FilesystemBranch: physicalBranch, State: "running"}
 	info := ContainerInfo{
 		ID: containerID, Name: containerID, BundleDir: bundleDir,
-		DistributedFamilyID: "logical-family", DistributedForkTransactionID: containerID,
-		Branches: []BranchInfo{branch},
+		// Completed migrations clear their transaction ID while retaining the
+		// physical-to-logical family identity. Final-local-branch cleanup must
+		// continue treating this repository as a disposable materialization.
+		DistributedFamilyID: "logical-family",
+		Branches:            []BranchInfo{branch},
 	}
 	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
 		t.Fatal(err)
