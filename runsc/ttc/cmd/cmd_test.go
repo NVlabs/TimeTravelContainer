@@ -6569,6 +6569,46 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if got := distributedTransactionLogicalBranch(oldMigration, renameReusePlacements); got != "moved" {
 		t.Fatalf("renamed migration resolves to %q, want moved", got)
 	}
+
+	corruptedPlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "child", State: cluster.PlacementCorrupted},
+		{FamilyID: "family-id", BranchID: "grandchild", State: cluster.PlacementRunning},
+	}
+	corruptSettle, corruptCancel, corruptDiscard := distributedRemovalSourceTransactions(transactions, corruptedPlacements, info, "child")
+	if _, ok := corruptCancel["node-a"]; ok {
+		t.Fatalf("corrupted target removal attempted remote cancellation: %v", corruptCancel)
+	}
+	if _, ok := corruptSettle["node-b"]["outgoing"]; !ok {
+		t.Fatalf("corrupted source removal did not preserve a healthy child: %v", corruptSettle)
+	}
+	if _, ok := corruptDiscard["node-e"]["active-migration"]; ok {
+		t.Fatalf("corrupted migration target retained physical cleanup: %v", corruptDiscard)
+	}
+}
+
+func TestOrderFamilyRemovalPlacementsTreatsEmptyPhysicalContainerAsCanonical(t *testing.T) {
+	records := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "", PhysicalBranch: "", State: cluster.PlacementCorrupted},
+		{FamilyID: "family", BranchID: "remote", PhysicalContainer: "fork-runtime", PhysicalBranch: "remote", State: cluster.PlacementRunning},
+	}
+	orderFamilyRemovalPlacements(records, "family")
+	if got := records[len(records)-1].BranchID; got != "main" {
+		t.Fatalf("final removal branch=%q, want canonical main", got)
+	}
+}
+
+func TestFilesystemAccountingDefersZeroByteMetadataDependency(t *testing.T) {
+	branch := ttcbundle.BranchInfo{DistributedForkTransactionID: "fork-1"}
+	if !deferFilesystemAccounting(branch, map[string]bool{"fork-1": true}) {
+		t.Fatal("zero-byte volatile filesystem dependency was treated as independent")
+	}
+	if deferFilesystemAccounting(branch, map[string]bool{"fork-1": false}) {
+		t.Fatal("independent filesystem remained deferred")
+	}
+	branch.DependentFilesystemBytes = 1
+	if !deferFilesystemAccounting(branch, nil) {
+		t.Fatal("nonzero filesystem dependency was not deferred")
+	}
 }
 
 func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {

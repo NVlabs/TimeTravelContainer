@@ -409,6 +409,33 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = remover.removeDistributedFamilyRecord(operands[0], removeVolumes)
+	case "_remove-corrupted-branch":
+		if len(args) != 2 {
+			err = errors.New("internal corrupted-branch removal requires one CONTAINER@BRANCH selector")
+			break
+		}
+		target, parseErr := parseSelector(args[1])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		remover, ok := backend.(interface{ removeCorruptedBranch(selector) error })
+		if !ok {
+			err = errors.New("this backend does not support corrupted-branch removal")
+			break
+		}
+		err = remover.removeCorruptedBranch(target)
+	case "_reclaim-removed-family-local":
+		if len(args) < 3 {
+			err = errors.New("internal removed-family cleanup requires a family ID and at least one physical container ID")
+			break
+		}
+		reclaimer, ok := backend.(interface{ reclaimRemovedFamilyLocal(string, []string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-family local cleanup")
+			break
+		}
+		err = reclaimer.reclaimRemovedFamilyLocal(args[1], args[2:])
 	case "_settle-source-transactions":
 		if len(args) < 2 {
 			err = errors.New("internal source-dependency settlement requires at least one transaction ID")
@@ -9464,6 +9491,65 @@ func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string)
 	return b.retireTransactionsForRemovedPlacement(*record)
 }
 
+// removeCorruptedBranch removes a branch whose execution authority has
+// already been permanently fenced by Raft. Corruption intentionally clears
+// OwnerNode and every physical runtime identity: contacting the former owner
+// would both violate that fence and make rm wait for a process that is known
+// to be gone.
+//
+// The operation is idempotent across crashes. Raft is changed first; a retry
+// can reconstruct the transaction match from the logical selector and finish
+// pruning the shared family catalog even though the placement no longer
+// exists. The family record itself remains until the coordinator has removed
+// the final logical placement.
+func (b *runtimeBackend) removeCorruptedBranch(target selector) error {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return errors.New("corrupted-branch removal requires clustered authority")
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	removed := cluster.PlacementRecord{FamilyID: target.container, BranchID: target.branch}
+	if record, lookupErr := placements.Lookup(target.container, target.branch); lookupErr == nil {
+		if record.State != cluster.PlacementCorrupted {
+			return fmt.Errorf("branch %s is %s, not corrupted", target, record.State)
+		}
+		removed = *record
+	} else if !errors.Is(lookupErr, os.ErrNotExist) {
+		return lookupErr
+	}
+	if err := b.distributedSource.authority.RemoveCorruptedBranch(target.container, target.branch); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := b.retireTransactionsForRemovedPlacement(removed); err != nil {
+		return fmt.Errorf("retiring transactions for %s: %w", target, err)
+	}
+
+	// The shared catalog is display and restart metadata, not execution
+	// authority. Bound it to the live branch set without deleting the family
+	// record that a later child in the same family rm still needs to resolve.
+	shared := ttcbundle.Store{Root: b.dataRoot}
+	if info, loadErr := shared.LoadRuntimeContainer(target.container); loadErr == nil {
+		found := false
+		for _, branch := range info.Branches {
+			if branch.ID == target.branch {
+				found = true
+				break
+			}
+		}
+		if found && len(info.Branches) > 1 {
+			if err := shared.RemoveBranchRecord(info.ID, target.branch); err != nil {
+				return fmt.Errorf("removing shared branch metadata for %s: %w", target, err)
+			}
+		}
+	} else if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+		return loadErr
+	}
+	_, err = b.reconcileVolatileSnapshotOrigins()
+	return err
+}
+
 // removeDistributedFamilyRecord deletes the canonical, non-executing family
 // record after every Raft placement has been removed through its exact
 // physical branch. A family whose canonical container hosted the final branch
@@ -9500,7 +9586,13 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 		}
 		for _, candidate := range containers {
 			if candidate.ID != info.ID && logicalFamilyID(candidate) == info.ID {
-				return fmt.Errorf("cannot remove family record %q while physical runtime %q remains", info.Name, candidate.ID)
+				// With no remaining Raft placement, this is an inert physical
+				// catalog left by a completed migration, canceled fork, or lost
+				// runtime. Per-node cleanup has already fenced and removed any
+				// corresponding local shell; prune the shared identity now.
+				if err := store.RemoveContainer(candidate.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("removing stale physical runtime record %q: %w", candidate.ID, err)
+				}
 			}
 		}
 	}
@@ -9522,6 +9614,60 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 	}
 	if _, err := store.PruneImageRoots(context.Background()); err != nil {
 		return fmt.Errorf("pruning unreferenced image roots: %w", err)
+	}
+	return nil
+}
+
+// reclaimRemovedFamilyLocal drops node-local runtime shells and cache entries
+// only after Raft proves that the logical family has no placements anywhere.
+// physicalIDs are captured before the shared family catalog is removed, so a
+// remote node never has to infer ownership from an already-deleted record.
+func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs []string) error {
+	if b.nodeID == "" || b.localRoot == "" {
+		return errors.New("removed-family local cleanup requires a clustered node-local root")
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.FamilyID == familyID {
+			return fmt.Errorf("family %q still has placement for branch %q", familyID, record.BranchID)
+		}
+	}
+	runtimes, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return fmt.Errorf("listing runtimes before local family cleanup: %w", err)
+	}
+	live := make(map[string]struct{}, len(runtimes))
+	for _, runtime := range runtimes {
+		live[runtime.ID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(physicalIDs))
+	for _, physicalID := range physicalIDs {
+		if physicalID == "" {
+			continue
+		}
+		if _, ok := seen[physicalID]; ok {
+			continue
+		}
+		seen[physicalID] = struct{}{}
+		if _, ok := live[physicalID]; ok {
+			if err := b.removeOrphanRuntime(physicalID); err != nil {
+				return fmt.Errorf("removing unplaced runtime %q: %w", physicalID, err)
+			}
+			continue
+		}
+		if err := b.stopContainerConsoleDrains(physicalID); err != nil {
+			return fmt.Errorf("stopping console followers for unplaced runtime %q: %w", physicalID, err)
+		}
+		if err := os.RemoveAll(filepath.Join(b.localRoot, "containers", physicalID)); err != nil {
+			return fmt.Errorf("removing local cache for unplaced runtime %q: %w", physicalID, err)
+		}
 	}
 	return nil
 }
@@ -14817,6 +14963,16 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	result.Branches = make([]BranchResourceStats, 0, len(branches))
 	byID := make(map[string]*BranchResourceStats, len(branches))
 	filesystemBranches := make(map[string]string, len(branches))
+	volatileTransactions := make(map[string]bool)
+	if b.nodeID != "" {
+		if transactions, txErr := b.transactionCatalog(); txErr == nil {
+			if records, listErr := transactions.List(); listErr == nil {
+				for _, transaction := range records {
+					volatileTransactions[transaction.Identity.TransactionID] = transaction.SourceNeeded
+				}
+			}
+		}
+	}
 	for _, branch := range branches {
 		logicalID := logicalBranchID(branch.ID)
 		account := BranchResourceStats{
@@ -14841,7 +14997,12 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		// already persisted dependent byte count until the Sentry completes the
 		// drain; the next snapshot can then account exact private/shared local
 		// object identity without touching the provider.
-		if branch.DependentFilesystemBytes != 0 {
+		// A dependency can consist entirely of filesystem metadata and
+		// therefore account for zero payload bytes. SourceNeeded is the
+		// authoritative lifetime fence; using the byte counter as a boolean
+		// briefly traversed an incompletely attached deferred catalog directly
+		// after remote fork.
+		if deferFilesystemAccounting(branch, volatileTransactions) {
 			continue
 		}
 		filesystemBranch := branch.FilesystemBranch
@@ -15032,6 +15193,10 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.ImageCacheTotalBytes = usage.TotalBytes
 	}
 	return result, nil
+}
+
+func deferFilesystemAccounting(branch ttcbundle.BranchInfo, volatileTransactions map[string]bool) bool {
+	return branch.DependentFilesystemBytes != 0 || volatileTransactions[branch.DistributedForkTransactionID]
 }
 
 func repositoryGuestMount(spec *specs.Spec, repository specutils.TTCVolumeRepository) (string, error) {
