@@ -57,6 +57,36 @@ type transactionListCatalog struct {
 	records []cluster.Transaction
 }
 
+func TestCanceledForkOwnsPlacement(t *testing.T) {
+	tx := cluster.Transaction{Identity: cluster.ForkIdentity{
+		SourceNodeID: "node-a", TargetNodeID: "node-b",
+		SourceContainer: "family", SourceBranch: "main",
+		TargetContainer: "family", TargetVisibleBranch: "child",
+	}}
+	placement := cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", OwnerNode: "node-b",
+		PhysicalContainer: "fork-runtime", PhysicalBranch: "private-branch",
+	}
+	if !canceledForkOwnsPlacement(tx, placement, "node-b") {
+		t.Fatal("ordinary fork did not own its authoritative target placement")
+	}
+	for name, mutate := range map[string]func(*cluster.Transaction, *cluster.PlacementRecord){
+		"migration":       func(tx *cluster.Transaction, _ *cluster.PlacementRecord) { tx.Identity.Migration = true },
+		"family":          func(_ *cluster.Transaction, p *cluster.PlacementRecord) { p.FamilyID = "other" },
+		"branch":          func(_ *cluster.Transaction, p *cluster.PlacementRecord) { p.BranchID = "other" },
+		"target node":     func(tx *cluster.Transaction, _ *cluster.PlacementRecord) { tx.Identity.TargetNodeID = "node-c" },
+		"placement owner": func(_ *cluster.Transaction, p *cluster.PlacementRecord) { p.OwnerNode = "node-c" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changedTx, changedPlacement := tx, placement
+			mutate(&changedTx, &changedPlacement)
+			if canceledForkOwnsPlacement(changedTx, changedPlacement, "node-b") {
+				t.Fatal("mismatched transaction retained placement authority")
+			}
+		})
+	}
+}
+
 func TestDependencyMonitorIntervalBoundsAggregatePolling(t *testing.T) {
 	for _, test := range []struct {
 		watchers int64

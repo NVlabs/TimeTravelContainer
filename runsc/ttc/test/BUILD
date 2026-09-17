@@ -108,6 +108,18 @@ sh_binary(
     ],
 )
 
+# Manual because it pulls Python and runs a sustained page-checked heap plus a
+# synchronous SQLite WAL workload through remote fork, migration, and cold
+# lifecycle operations.
+sh_binary(
+    name = "e2e_distributed_workload",
+    srcs = ["e2e_distributed_workload.sh"],
+    data = ["workload_fixture.py"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it starts a three-node cluster, migrates live branches, and
 # retires a node through scheduler-selected evacuation.
 sh_binary(

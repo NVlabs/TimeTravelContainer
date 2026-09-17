@@ -1333,22 +1333,43 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 	sort.Strings(retain)
 	sort.Strings(release)
 	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(retain)+len(release))
 		for _, name := range retain {
 			object := desired[name]
 			digest := sha256.Sum256([]byte("retain\x00" + name + "\x00" + object.String()))
-			if err := ledger.ApplyReference(fmt.Sprintf("authority-root-retain/%x", digest), name, object, true); err != nil {
-				return err
-			}
+			mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+				Operation: fmt.Sprintf("authority-root-retain/%x", digest),
+				Name:      name, Object: object, Retain: true,
+			})
 		}
 		for _, name := range release {
 			object := current[name]
 			digest := sha256.Sum256([]byte("release\x00" + name + "\x00" + object.String()))
-			if err := ledger.ApplyReference(fmt.Sprintf("authority-root-release/%x", digest), name, object, false); err != nil {
-				return err
-			}
+			mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+				Operation: fmt.Sprintf("authority-root-release/%x", digest),
+				Name:      name, Object: object,
+			})
 		}
-		return nil
+		return applySharedReferenceBatches(ledger, mutations)
 	})
+}
+
+// applySharedReferenceBatches bounds both WAL record size and the number of
+// full ledger-state clones/fsyncs. Reconciliation can release one structural
+// edge per guest page; committing each edge independently made snapshot
+// retirement quadratic and turned a modest container into minutes of busy
+// shutdown work. 1024 records remain comfortably below the ledger's 8 MiB
+// record limit even with maximum-length names.
+func applySharedReferenceBatches(ledger *ttcsnapshot.ReferenceLedger, mutations []ttcsnapshot.SnapshotReferenceMutation) error {
+	const maxBatch = 1024
+	for len(mutations) != 0 {
+		count := min(len(mutations), maxBatch)
+		if err := ledger.ApplyReferences(mutations[:count]); err != nil {
+			return err
+		}
+		mutations = mutations[count:]
+	}
+	return nil
 }
 
 // reconcilePublicationBridgeIntents rolls forward bridge cleanup after a

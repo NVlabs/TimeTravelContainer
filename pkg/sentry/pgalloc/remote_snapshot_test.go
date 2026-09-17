@@ -586,6 +586,54 @@ func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	}
 }
 
+func TestLogicalChunkDrainSkipsAlreadyResidentLeadingRange(t *testing.T) {
+	const pageCount = 2
+	target, targetFR := newRemoteTestMemoryFile(t, pageCount)
+	want := bytes.Repeat([]byte{0x5a}, pageCount*hostarch.PageSize)
+	reader := stateio.NewIOReader(bytes.NewReader(want), SparseChunkBytes, logicalPagesPerChunk, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := []RemoteLoadRange{
+		{Target: memmap.FileRange{Start: targetFR.Start, End: targetFR.Start + hostarch.PageSize}, StreamOffset: 0},
+		{Target: memmap.FileRange{Start: targetFR.Start + hostarch.PageSize, End: targetFR.End}, StreamOffset: hostarch.PageSize},
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	// Model an import that reused the first page from an already-resident CoW
+	// version while the second page in the same logical chunk still needs the
+	// remote reader. This is the state that previously made Drain await only an
+	// already-resident leading range and leave the loader demand-only forever.
+	amfl := target.asyncPageLoad.Load()
+	if amfl == nil {
+		t.Fatal("target has no asynchronous page load")
+	}
+	pages.mu.Lock()
+	seg := amfl.unloaded.FindSegment(targetFR.Start)
+	if !seg.Ok() {
+		pages.mu.Unlock()
+		t.Fatal("first page is not tracked as unloaded")
+	}
+	seg = amfl.unloaded.SplitAfter(seg, targetFR.Start+hostarch.PageSize)
+	amfl.unloaded.Remove(seg)
+	amfl.minUnloaded.Store(targetFR.Start + hostarch.PageSize)
+	pages.mu.Unlock()
+
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); !stats.Done || stats.BytesOutstanding != 0 {
+		t.Fatalf("logical chunk drain left a trailing unresolved range: %+v", stats)
+	}
+}
+
 func TestLogicalChunkPushInstallsWholeChunkAtomically(t *testing.T) {
 	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
 	target, targetFR := newRemoteTestMemoryFile(t, pageCount)

@@ -4665,6 +4665,39 @@ func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 	}
 }
 
+func TestMergeAuthoritativeBranchSynthesizesColdMigratedBranch(t *testing.T) {
+	created := time.Unix(123, 456).UTC()
+	family := Family{ID: "family", Branches: []Branch{{ID: "main", State: "running"}}}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "worker", Generation: 4,
+		PublicationID: "publication-worker", Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: "snapshot-packs/manifests/worker.json"},
+	}
+	placement := cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "worker", ParentBranch: "main",
+		BranchCreatedAt: created, State: cluster.PlacementUnplaced, Quarantined: true,
+	}
+	got := mergeAuthoritativeBranch(family, authority, placement, true, "/shared")
+	if len(got.Branches) != 2 || got.Branches[0].ID != "main" || got.Branches[1].ID != "worker" {
+		t.Fatalf("merged family branches=%+v", got.Branches)
+	}
+	worker := got.Branches[1]
+	if worker.State != "dehydrated" || worker.NodeID != "" || worker.ParentID != "main" || !worker.Quarantined ||
+		worker.PublicationID != "publication-worker" || worker.StorageState != "shared" ||
+		worker.StorageManifest != "/shared/snapshot-packs/manifests/worker.json" || !worker.CreatedAt.Equal(created) {
+		t.Fatalf("synthesized worker=%+v", worker)
+	}
+
+	// Reapplying an authority snapshot updates the existing logical record and
+	// must not manufacture a duplicate branch.
+	authority.Lifecycle = "running"
+	placement.State, placement.OwnerNode = cluster.PlacementRunning, "node-b"
+	got = mergeAuthoritativeBranch(got, authority, placement, true, "/shared")
+	if len(got.Branches) != 2 || got.Branches[1].NodeID != "node-b" || got.Branches[1].State != "running" {
+		t.Fatalf("updated family branches=%+v", got.Branches)
+	}
+}
+
 func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	info := ttcbundle.ContainerInfo{
 		NodeID: "node-a",
@@ -6176,9 +6209,15 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, ""); len(got) != 0 {
 		t.Fatalf("unrelated family selected transactions: %v", got)
 	}
-	settle, discard := distributedRemovalSourceTransactions(transactions, info, "")
-	if len(settle) != 3 || len(discard) != 2 {
-		t.Fatalf("removal transaction split settle=%v discard=%v", settle, discard)
+	settle, cancel, discard := distributedRemovalSourceTransactions(transactions, info, "")
+	if len(settle) != 1 || len(cancel) != 2 || len(discard) != 2 {
+		t.Fatalf("removal transaction split settle=%v cancel=%v discard=%v", settle, cancel, discard)
+	}
+	if _, ok := cancel["node-a"]["incoming"]; !ok {
+		t.Fatalf("family removal would materialize obsolete incoming fork: %v", cancel)
+	}
+	if _, ok := cancel["node-b"]["outgoing"]; !ok {
+		t.Fatalf("family removal would materialize obsolete outgoing fork: %v", cancel)
 	}
 	if _, ok := discard["node-d"]["independent-migration"]; !ok {
 		t.Fatalf("removal did not defer independent migration to discard postflight: %v", discard)
@@ -6188,6 +6227,13 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	}
 	if _, ok := settle["node-d"]; ok {
 		t.Fatalf("removal would publish an obsolete independent migration: %v", settle)
+	}
+	branchSettle, branchCancel, _ := distributedRemovalSourceTransactions(transactions, info, "child")
+	if _, ok := branchCancel["node-a"]["incoming"]; !ok {
+		t.Fatalf("target branch removal did not cancel its incoming fork: %v", branchCancel)
+	}
+	if _, ok := branchSettle["node-b"]["outgoing"]; !ok {
+		t.Fatalf("source branch removal did not preserve its surviving child: %v", branchSettle)
 	}
 }
 

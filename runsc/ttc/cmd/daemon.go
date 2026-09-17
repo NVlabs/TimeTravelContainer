@@ -2355,11 +2355,221 @@ func (b *runtimeBackend) settleDistributedSourceTransactions(transactionIDs []st
 	})
 }
 
-// discardRemovedMigrationSources completes the second half of distributed rm.
-// The coordinator invokes it only after the logical target placement has been
-// removed, so no branch can still fault from these immutable source objects.
-// The terminal Raft transaction remains present until this method finishes and
-// is therefore also the crash-recovery intent for the retired physical source.
+// cancelDistributedForkTargets removes published remote-fork targets that are
+// themselves part of a destructive rm operation. No state from such a target
+// can survive the mutation, so forcing it through the ordinary independence
+// barrier would copy its entire resident memory and filesystem only to delete
+// those bytes immediately afterward. The target cleanup and Raft cancellation
+// are one idempotent control-plane operation; source monitors observe the
+// terminal transaction and release their capture sessions asynchronously.
+func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
+		return nil
+	}
+	store, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	for _, transactionID := range transactionIDs {
+		tx, err := store.Load(transactionID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("loading removable distributed transaction %q: %w", transactionID, err)
+		}
+		if tx.Identity.SourceNodeID != b.nodeID {
+			return fmt.Errorf("distributed transaction %q is sourced by node %q, not %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+		}
+		if tx.Identity.Migration {
+			return fmt.Errorf("migration transaction %q cannot use remote-fork cancellation", transactionID)
+		}
+		if tx.Terminal() {
+			continue
+		}
+		peer, err := b.distributedSource.peer(tx.Identity.TargetNodeID, false)
+		if err != nil {
+			return fmt.Errorf("finding removable distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, transactionID, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		canceled, cancelErr := peer.Cancel(ctx, transactionID, tx.Revision)
+		if cancelErr != nil {
+			// A target cleanup may have committed while its response was lost or
+			// another recovery worker may have won the revision race. Only a
+			// terminal authoritative reread proves this cancellation complete.
+			current, statusErr := peer.Status(ctx, transactionID)
+			if statusErr == nil && current.Terminal() {
+				canceled = current
+				cancelErr = nil
+			} else {
+				cancelErr = errors.Join(cancelErr, statusErr)
+			}
+		}
+		cancel()
+		if cancelErr != nil {
+			return fmt.Errorf("canceling removable distributed target %q: %w", transactionID, cancelErr)
+		}
+		if canceled == nil || !canceled.Terminal() {
+			return fmt.Errorf("canceling removable distributed target %q returned a nonterminal transaction", transactionID)
+		}
+	}
+	return nil
+}
+
+// removeCanceledForkPlacement commits the metadata half of a remote-fork
+// cancellation. TargetRuntime.Cancel has already destroyed the physical
+// branch, its filesystems, and its graph references, so routing this through
+// ordinary branch destruction would incorrectly require that runtime to still
+// exist. Raft placement removal also performs the user-visible lineage splice.
+func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactionID string) error {
+	if b == nil || b.nodeID == "" || b.distributedSource == nil {
+		return errors.New("canceled-fork placement removal requires a clustered daemon")
+	}
+	transactions, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	tx, err := transactions.Load(transactionID)
+	if errors.Is(err, os.ErrNotExist) {
+		placements, placementErr := b.placementCatalog()
+		if placementErr != nil {
+			return placementErr
+		}
+		if _, lookupErr := placements.Lookup(target.container, target.branch); errors.Is(lookupErr, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("canceled transaction %q disappeared while placement %s remained", transactionID, target)
+	}
+	if err != nil {
+		return err
+	}
+	if tx.Identity.Migration || tx.Identity.TargetContainer != target.container || tx.Identity.VisibleTargetBranch() != target.branch {
+		return fmt.Errorf("transaction %q does not identify canceled fork target %s", transactionID, target)
+	}
+	if tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionFailed {
+		return fmt.Errorf("transaction %q is %s, not canceled", transactionID, tx.State)
+	}
+	if tx.SourceNeeded {
+		return fmt.Errorf("canceled transaction %q still retains its source", transactionID)
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	record, err := placements.Lookup(target.container, target.branch)
+	if errors.Is(err, os.ErrNotExist) {
+		return transactions.Delete(transactionID, tx.Revision)
+	}
+	if err != nil {
+		return err
+	}
+	if !canceledForkOwnsPlacement(*tx, *record, b.nodeID) {
+		return fmt.Errorf("canceled fork target %s placement changed before removal", target)
+	}
+	if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
+		return err
+	}
+	if err := b.retireTransactionsForRemovedPlacement(*record); err != nil {
+		return err
+	}
+	_, err = b.reconcileVolatileSnapshotOrigins()
+	return err
+}
+
+// canceledForkOwnsPlacement verifies the authority that survives target
+// runtime cancellation. Ordinary remote-fork publication deliberately keeps
+// physical identity exclusively in PlacementRecord; unlike migrations, its
+// Transaction has empty TargetPhysical* fields. The stable transaction-to-
+// placement fence is therefore the exact logical target plus the target node
+// that still owns that placement.
+func canceledForkOwnsPlacement(tx cluster.Transaction, placement cluster.PlacementRecord, localNode string) bool {
+	return !tx.Identity.Migration &&
+		tx.Identity.TargetContainer == placement.FamilyID &&
+		tx.Identity.VisibleTargetBranch() == placement.BranchID &&
+		tx.Identity.TargetNodeID == placement.OwnerNode &&
+		placement.OwnerNode == localNode
+}
+
+// prepareRemovedMigrationSources reclaims retired physical migration sources
+// before rm deletes their target placements. Independence proves that the live
+// target no longer faults from the source. Keeping the target placement and
+// terminal transaction authoritative during cleanup prevents the source's
+// canonical family metadata from being mistaken for a newly unowned branch.
+func (b *runtimeBackend) prepareRemovedMigrationSources(transactionIDs []string) error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
+		return nil
+	}
+	store, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	for _, transactionID := range transactionIDs {
+		tx, err := store.Load(transactionID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("loading removed migration transaction %q: %w", transactionID, err)
+		}
+		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent {
+			return fmt.Errorf("transaction %q is not an independent migration", transactionID)
+		}
+		if placement, lookupErr := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); lookupErr == nil {
+			sourceContainer, sourceBranch := migrationSourceRuntime(*tx)
+			if placement.PhysicalContainer == sourceContainer && placement.PhysicalBranch == sourceBranch {
+				return fmt.Errorf("migration source %q is still the authoritative physical placement", transactionID)
+			}
+		} else if !errors.Is(lookupErr, os.ErrNotExist) {
+			return fmt.Errorf("checking migration target placement %q: %w", transactionID, lookupErr)
+		}
+		if err := b.cleanupRemovedMigrationSource(*tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) error {
+	transactionID := tx.Identity.TransactionID
+	if tx.Identity.SourceNodeID == b.nodeID {
+		sourceContainer, sourceBranch := migrationSourceRuntime(tx)
+		unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
+		defer unlockSource()
+		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+		if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+			return fmt.Errorf("releasing removed migration roots %q: %w", transactionID, err)
+		}
+		if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
+			return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
+		}
+		if err := b.removeLocalFamilyStateIfUnowned(tx.Identity.SourceContainer); err != nil {
+			return fmt.Errorf("reclaiming removed migration source family %s: %w", tx.Identity.SourceContainer, err)
+		}
+		return nil
+	}
+	// A clean Raft retirement is a stronger fence than an absent node record:
+	// node stop synchronously releases every physical source before membership
+	// removal. An offline or expired source is not sufficient proof.
+	if b.distributedSource.authority == nil {
+		return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+	}
+	state, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return fmt.Errorf("checking retired migration source %q: %w", transactionID, err)
+	}
+	if retiredIncarnation, ok := state.RetiredNodes[tx.Identity.SourceNodeID]; !ok || retiredIncarnation != tx.SourceIncarnation {
+		return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q, and that source incarnation has not retired cleanly", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+	}
+	return nil
+}
+
+// discardRemovedMigrationSources completes distributed rm after logical
+// placement deletion. Source cleanup is idempotently rechecked, then the
+// terminal transaction can be retired without losing its recovery intent.
 func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string) error {
 	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
 		return nil
@@ -2384,42 +2594,12 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 			return fmt.Errorf("transaction %q is not an independent migration", transactionID)
 		}
 		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
-			return fmt.Errorf("cannot discard migration source %q while placement %s@%s still exists", transactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+			return fmt.Errorf("cannot retire migration source %q while placement %s@%s still exists", transactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("checking removed migration placement %q: %w", transactionID, err)
 		}
-
-		if tx.Identity.SourceNodeID == b.nodeID {
-			sourceContainer, sourceBranch := migrationSourceRuntime(*tx)
-			unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
-			_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
-			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
-				unlockSource()
-				return fmt.Errorf("releasing removed migration roots %q: %w", transactionID, err)
-			}
-			if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
-				unlockSource()
-				return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
-			}
-			unlockSource()
-		} else {
-			// A clean Raft retirement is a stronger fence than an absent node
-			// record: node stop has synchronously released every migration
-			// source, transfer pin, volatile origin, and publication before the
-			// exact incarnation is removed. Only that durable fence permits a
-			// surviving coordinator to retire this historical transaction. An
-			// offline or expired source remains an error because its physical
-			// cleanup has not been proven.
-			if b.distributedSource.authority == nil {
-				return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
-			}
-			state, err := b.distributedSource.authority.AuthorityState()
-			if err != nil {
-				return fmt.Errorf("checking retired migration source %q: %w", transactionID, err)
-			}
-			if retiredIncarnation, ok := state.RetiredNodes[tx.Identity.SourceNodeID]; !ok || retiredIncarnation != tx.SourceIncarnation {
-				return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q, and that source incarnation has not retired cleanly", transactionID, tx.Identity.SourceNodeID, b.nodeID)
-			}
+		if err := b.cleanupRemovedMigrationSource(*tx); err != nil {
+			return err
 		}
 		current, err := store.Load(transactionID)
 		if errors.Is(err, os.ErrNotExist) {

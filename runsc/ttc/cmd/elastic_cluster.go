@@ -553,6 +553,20 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
 		}
 	}
+	var result error
+	// Raft placement is the ownership authority. Keep the canonical bundle's
+	// denormalized owner in sync so cache reclamation and crash diagnostics do
+	// not treat a retired migration source as local work. Transaction-scoped
+	// physical wrappers may not have a canonical branch entry; those are
+	// intentionally ignored.
+	for _, record := range placementByBranch {
+		if record.OwnerNode == "" || record.State == cluster.PlacementMigrating || record.State == cluster.PlacementCorrupted {
+			continue
+		}
+		if err := b.syncLogicalBranchOwner(record.FamilyID, record.BranchID, record.OwnerNode); err != nil {
+			result = errors.Join(result, fmt.Errorf("synchronizing logical owner for %s@%s: %w", record.FamilyID, record.BranchID, err))
+		}
+	}
 	// Placement reconciliation needs the physical runtime behind every remote
 	// logical branch. The user-facing inventory deliberately hides those
 	// containers, so using ListContainers here made a newly committed fork look
@@ -581,7 +595,6 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			persistentPhysicalBranches[info.ID+"\x00"+branch.ID] = struct{}{}
 		}
 	}
-	var result error
 	if b.distributedSource.authority != nil {
 		for key, record := range placementByBranch {
 			if record.OwnerNode != b.nodeID || (record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) {
@@ -683,6 +696,14 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			owner := info.BranchNodeID(branch.ID)
 			state := cluster.PlacementState(normalizeLifecycleState(branch.State))
 			if owner != b.nodeID || (state != cluster.PlacementRunning && state != cluster.PlacementPaused) {
+				continue
+			}
+			// A persistent branch record is not execution authority. Migration
+			// deliberately leaves the canonical family metadata behind after its
+			// source Sentry is reclaimed, and an abnormal host exit leaves the same
+			// shape. Only a live physical sandbox may create or adopt a running or
+			// paused placement. Reservations cover the pre-Sentry creation window.
+			if _, alive := liveSandboxes[info.ID]; !alive {
 				continue
 			}
 			record, found := placementByBranch[key]
@@ -1338,13 +1359,16 @@ func distributedMutationSourceTransactions(transactions []cluster.Transaction, i
 }
 
 // distributedRemovalSourceTransactions separates dependencies that must be
-// materialized before deletion from retired migration providers that should be
-// discarded after their logical target has gone away. Publishing the latter
-// would copy data that has no surviving reader, making rm proportional to the
-// deleted branch's resident memory on shared storage.
-func distributedRemovalSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) (map[string]map[string]struct{}, map[string]map[string]struct{}) {
-	settle := make(map[string]map[string]struct{})
-	discard := make(map[string]map[string]struct{})
+// materialized before deletion, remote-fork targets that can be canceled, and
+// retired migration providers that should be discarded after their logical
+// target has gone away. A fork whose target is also being removed has no
+// surviving reader: materializing it first makes family rm proportional to the
+// deleted family's resident memory and can wedge on a source that has already
+// handed its backing to another generation.
+func distributedRemovalSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) (settle, cancel, discard map[string]map[string]struct{}) {
+	settle = make(map[string]map[string]struct{})
+	cancel = make(map[string]map[string]struct{})
+	discard = make(map[string]map[string]struct{})
 	for _, tx := range transactions {
 		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
 			continue
@@ -1356,6 +1380,14 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, in
 			continue
 		}
 		node := tx.Identity.SourceNodeID
+		removesTarget := branchID == "" || tx.Identity.VisibleTargetBranch() == branchID
+		if !tx.Identity.Migration && removesTarget {
+			if cancel[node] == nil {
+				cancel[node] = make(map[string]struct{})
+			}
+			cancel[node][tx.Identity.TransactionID] = struct{}{}
+			continue
+		}
 		if tx.Identity.Migration {
 			// Every migration needs a post-delete source discard. A still-live
 			// dependency is first made independent, then follows the same path;
@@ -1373,7 +1405,7 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, in
 		}
 		settle[node][tx.Identity.TransactionID] = struct{}{}
 	}
-	return settle, discard
+	return settle, cancel, discard
 }
 
 // transactionNeedsSourceSettlement covers both an active remote dependency
@@ -1518,40 +1550,69 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 	if err != nil {
 		return true, 1, nil, nil, err
 	}
-	if _, err := persistentBranchInfo(info, target.branch); err != nil {
+	placements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
+	if err != nil {
 		return true, 1, nil, nil, err
 	}
+	foundTarget := false
+	for _, placement := range placements {
+		if placement.BranchID == target.branch {
+			foundTarget = true
+			break
+		}
+	}
+	if !foundTarget {
+		return true, 1, nil, nil, fmt.Errorf("branch %q does not exist", target.branch)
+	}
+	authorityByBranch := make(map[string]cluster.BranchAuthority)
+	if s.distributedSource != nil && s.distributedSource.authority != nil {
+		authorities, authorityErr := s.distributedSource.authority.Branches()
+		if authorityErr != nil {
+			return true, 1, nil, nil, fmt.Errorf("reading branch authority for stats: %w", authorityErr)
+		}
+		for _, authority := range authorities {
+			if authority.FamilyID == info.ID {
+				authorityByBranch[authority.BranchID] = authority
+			}
+		}
+	}
 	owners := make(map[string]string)
-	merged := FamilyResourceStats{Container: info.Name}
+	merged := FamilyResourceStats{Container: info.Name, Branches: []BranchResourceStats{}}
 	if merged.Container == "" {
 		merged.Container = target.container
 	}
-	for _, branch := range info.Branches {
-		record, lookupErr := s.clusterPlacements.Lookup(info.ID, branch.ID)
-		if lookupErr == nil && record.OwnerNode != "" && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused) {
-			if _, ok := owners[record.OwnerNode]; !ok {
-				owners[record.OwnerNode] = branch.ID
+	for _, placement := range placements {
+		if placement.OwnerNode != "" && (placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused) {
+			if _, ok := owners[placement.OwnerNode]; !ok {
+				owners[placement.OwnerNode] = placement.BranchID
 			}
 			continue
-		}
-		if lookupErr != nil && !errors.Is(lookupErr, os.ErrNotExist) {
-			return true, 1, nil, nil, fmt.Errorf("resolving stats placement for %s@%s: %w", info.Name, branch.ID, lookupErr)
 		}
 		// Process-free and corrupted branches have no node-local resident graph.
 		// Keep them visible in the cluster snapshot. Immutable cold packs are
 		// cluster storage rather than capacity attributable to a runtime owner.
-		state := normalizeLifecycleState(branch.State)
-		if lookupErr == nil {
-			state = string(record.State)
+		authority, authoritative := authorityByBranch[placement.BranchID]
+		state := string(placement.State)
+		storageState := ""
+		publicationID := ""
+		filesystemRoot := ""
+		sourceNode := ""
+		if authoritative {
+			state = normalizeLifecycleState(authority.Lifecycle)
+			publicationID = authority.PublicationID
+			if authority.Roots.FilesystemRoot != "" {
+				storageState = "shared"
+				filesystemRoot = filepath.Join(s.dataRoot, authority.Roots.FilesystemRoot)
+			}
+			if len(authority.VolatileDependencies) == 1 {
+				sourceNode = authority.VolatileDependencies[0].SourceNode
+			}
 		}
 		merged.Branches = append(merged.Branches, BranchResourceStats{
-			Target: merged.Container + "@" + branch.ID, State: state,
-			StorageState: branch.StorageState, PublicationID: branch.PublicationID,
-			SourceNode: branch.SourceNode, DependentMemoryBytes: branch.DependentMemoryBytes,
-			DependentFilesystemBytes: branch.DependentFilesystemBytes,
+			Target: merged.Container + "@" + placement.BranchID, State: state,
+			StorageState: storageState, PublicationID: publicationID,
+			FilesystemRoot: filesystemRoot, SourceNode: sourceNode,
 		})
-		merged.DependentMemoryBytes += branch.DependentMemoryBytes
-		merged.DependentFilesystemBytes += branch.DependentFilesystemBytes
 	}
 	nodes := make([]string, 0, len(owners))
 	for node := range owners {
@@ -1585,6 +1646,18 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		var local FamilyResourceStats
 		if err := json.Unmarshal([]byte(stdout), &local); err != nil {
 			return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("decoding stats from node %q: %w", node, err)
+		}
+		// Node-local accounting operates on transaction-scoped physical
+		// containers. Physical branch IDs are projected to logical IDs by the
+		// owner, but the physical container name must never escape the internal
+		// response. The coordinator is the single authority for the public family
+		// name and normalizes every branch before aggregation.
+		for i := range local.Branches {
+			_, branchID, ok := strings.Cut(local.Branches[i].Target, "@")
+			if !ok || branchID == "" {
+				return true, 1, nil, diagnostic.Bytes(), fmt.Errorf("node %q returned invalid resource target %q", node, local.Branches[i].Target)
+			}
+			local.Branches[i].Target = merged.Container + "@" + branchID
 		}
 		merged.Branches = append(merged.Branches, local.Branches...)
 		merged.ResidentMemoryUniqueBytes += local.ResidentMemoryUniqueBytes
@@ -1627,8 +1700,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	if err != nil {
 		return true, 1, nil, nil, fmt.Errorf("listing distributed transactions before family mutation: %w", err)
 	}
+	transactionsByID := make(map[string]*cluster.Transaction, len(transactions))
+	for i := range transactions {
+		transactionsByID[transactions[i].Identity.TransactionID] = &transactions[i]
+	}
 	settleByNode := make(map[string]map[string]struct{})
+	cancelByNode := make(map[string]map[string]struct{})
 	discardByNode := make(map[string]map[string]struct{})
+	canceledTargets := make(map[string]string)
 	for _, operand := range mutation.targets {
 		name := operand
 		branchID := ""
@@ -1645,9 +1724,10 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			return true, 1, nil, nil, err
 		}
 		settle := distributedMutationSourceTransactions(transactions, info, branchID)
+		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
 		if request.Args[0] == "rm" {
-			settle, discard = distributedRemovalSourceTransactions(transactions, info, branchID)
+			settle, cancel, discard = distributedRemovalSourceTransactions(transactions, info, branchID)
 		}
 		for node, ids := range settle {
 			if settleByNode[node] == nil {
@@ -1655,6 +1735,17 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			for transactionID := range ids {
 				settleByNode[node][transactionID] = struct{}{}
+			}
+		}
+		for node, ids := range cancel {
+			if cancelByNode[node] == nil {
+				cancelByNode[node] = make(map[string]struct{})
+			}
+			for transactionID := range ids {
+				cancelByNode[node][transactionID] = struct{}{}
+				if tx := transactionsByID[transactionID]; tx != nil {
+					canceledTargets[tx.Identity.TargetContainer+"\x00"+tx.Identity.VisibleTargetBranch()] = transactionID
+				}
 			}
 		}
 		for node, ids := range discard {
@@ -1666,7 +1757,20 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 		}
 	}
-	nodes := make([]string, 0, len(settleByNode))
+	nodes := make([]string, 0, max(len(cancelByNode), len(settleByNode)))
+	for node := range cancelByNode {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		ids := make([]string, 0, len(cancelByNode[node]))
+		for transactionID := range cancelByNode[node] {
+			ids = append(ids, transactionID)
+		}
+		sort.Strings(ids)
+		preflight = append(preflight, child{node: node, args: append([]string{"_cancel-source-transactions"}, ids...)})
+	}
+	nodes = nodes[:0]
 	for node := range settleByNode {
 		nodes = append(nodes, node)
 	}
@@ -1679,8 +1783,32 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		sort.Strings(ids)
 		preflight = append(preflight, child{node: node, args: append([]string{"_settle-source-transactions"}, ids...)})
 	}
+	// Once migration targets are independent, their retired physical sources
+	// are unnecessary to a removal. Reclaim them while the target placement is
+	// still authoritative so the source's persistent family catalog can never
+	// be mistaken for an unowned live branch between placement deletion and
+	// postflight. The transaction remains in Raft until postflight and is the
+	// idempotent crash-recovery intent for this cleanup.
+	nodes = nodes[:0]
+	for node := range discardByNode {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		ids := make([]string, 0, len(discardByNode[node]))
+		for transactionID := range discardByNode[node] {
+			ids = append(ids, transactionID)
+		}
+		sort.Strings(ids)
+		cleanupNode, err := s.distributedCleanupNode(node)
+		if err != nil {
+			return true, 1, nil, nil, err
+		}
+		preflight = append(preflight, child{node: cleanupNode, args: append([]string{"_prepare-removed-migration-sources"}, ids...)})
+	}
 	var children []child
 	var finalizers []child
+	var postflight []child
 	for _, operand := range mutation.targets {
 		if strings.Contains(operand, "@") {
 			selected, err := parseSelector(operand)
@@ -1699,7 +1827,24 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
 			}
-			children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), operand)})
+			if transactionID := canceledTargets[info.ID+"\x00"+selected.branch]; transactionID != "" {
+				children = append(children, child{node: node, args: []string{"_remove-canceled-fork-placement", info.ID + "@" + selected.branch, transactionID}})
+			} else {
+				children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), operand)})
+			}
+			if request.Args[0] == "rm" {
+				familyPlacements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
+				if err != nil {
+					return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, err)
+				}
+				if len(familyPlacements) == 1 && familyPlacements[0].BranchID == selected.branch {
+					// Branch-qualified removal of the final logical branch has the
+					// same empty-family result as standalone TTC. The physical target
+					// may be a migration wrapper, so it cannot remove the canonical
+					// family catalog on its own.
+					finalizers = append(finalizers, child{node: node, args: []string{"_remove-family-record", info.ID}})
+				}
+			}
 			continue
 		}
 		info, err := store.LoadContainer(operand)
@@ -1726,8 +1871,12 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if node == "" {
 				node = s.clusterCapabilities.NodeID
 			}
-			target := operand + "@" + placement.BranchID
-			children = append(children, child{node: node, args: append(append([]string(nil), branchPrefix...), target)})
+			if transactionID := canceledTargets[info.ID+"\x00"+placement.BranchID]; transactionID != "" {
+				children = append(children, child{node: node, args: []string{"_remove-canceled-fork-placement", info.ID + "@" + placement.BranchID, transactionID}})
+			} else {
+				target := operand + "@" + placement.BranchID
+				children = append(children, child{node: node, args: append(append([]string(nil), branchPrefix...), target)})
+			}
 		}
 		if request.Args[0] == "rm" {
 			// Every logical branch above is removed through its exact Raft physical
@@ -1754,22 +1903,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				ids = append(ids, transactionID)
 			}
 			sort.Strings(ids)
-			cleanupNode := node
-			if _, err := s.clusterDirectory.Lookup(node); errors.Is(err, os.ErrNotExist) {
-				// Cleanly retired nodes have already discarded their physical
-				// migration sources before Raft removes their membership. Route
-				// the remaining transaction retirement through this live
-				// coordinator instead of trying to reconnect to a node that is
-				// intentionally gone. discardRemovedMigrationSources verifies
-				// the matching retirement fence before deleting anything.
-				cleanupNode = s.clusterCapabilities.NodeID
-			} else if err != nil {
-				return true, 1, nil, nil, fmt.Errorf("resolving migration cleanup node %q: %w", node, err)
+			cleanupNode, err := s.distributedCleanupNode(node)
+			if err != nil {
+				return true, 1, nil, nil, err
 			}
-			children = append(children, child{node: cleanupNode, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
+			postflight = append(postflight, child{node: cleanupNode, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
 		}
 	}
-	children = append(append(preflight, children...), finalizers...)
+	children = append(append(append(preflight, children...), finalizers...), postflight...)
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
@@ -1819,6 +1960,18 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		fmt.Fprintln(&output, operand)
 	}
 	return true, 0, []byte(output.String()), diagnostic.Bytes(), nil
+}
+
+func (s *daemonServer) distributedCleanupNode(sourceNode string) (string, error) {
+	if _, err := s.clusterDirectory.Lookup(sourceNode); errors.Is(err, os.ErrNotExist) {
+		// Cleanly retired nodes have already discarded their physical migration
+		// sources before membership removal. A live coordinator can retire the
+		// remaining transaction after verifying the durable retirement fence.
+		return s.clusterCapabilities.NodeID, nil
+	} else if err != nil {
+		return "", fmt.Errorf("resolving migration cleanup node %q: %w", sourceNode, err)
+	}
+	return sourceNode, nil
 }
 
 func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (int, string, string, error) {
@@ -2206,6 +2359,12 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	}
 	tx = &cutover.Transaction
 	published = true
+	if err := b.syncLogicalBranchOwner(logicalFamily, logicalTarget.branch, targetNode); err != nil {
+		// Raft cutover is already authoritative and must not be rolled back for a
+		// denormalized bundle write. Reconciliation retries this repair before
+		// using local ownership for reclamation.
+		log.Warningf("TTC: migration %s cut over but canonical owner repair is pending: %v", requestID, err)
+	}
 	tx, err = activateRemoteMigration(ctx, peer, requestID, tx.Revision)
 	if err != nil {
 		status, statusErr := peer.Status(ctx, requestID)
@@ -2597,6 +2756,50 @@ func localFamilyStateNeeded(info ttcbundle.ContainerInfo, nodeID string) bool {
 		}
 	}
 	return false
+}
+
+// syncLogicalBranchOwner updates the bundle's denormalized owner from Raft.
+// It is deliberately idempotent and tolerates families whose public branch is
+// represented only by a transaction-scoped physical runtime.
+func (b *runtimeBackend) syncLogicalBranchOwner(familyID, branchID, owner string) error {
+	if b == nil || familyID == "" || branchID == "" || owner == "" {
+		return nil
+	}
+	store := b.containerStore()
+	info, err := store.LoadContainer(familyID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	branchFound := false
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			branchFound = true
+			break
+		}
+	}
+	if !branchFound {
+		return nil
+	}
+	current := info.BranchNodeID(branchID)
+	if current == owner {
+		return nil
+	}
+	if err := store.CompareAndSwapBranchNodeID(info.ID, branchID, current, owner); err == nil {
+		return nil
+	}
+	// A concurrent cutover/reconciler may have won the CAS. Re-read before
+	// surfacing an error so the common idempotent race stays silent.
+	latest, loadErr := store.LoadContainer(info.ID)
+	if loadErr == nil && latest.BranchNodeID(branchID) == owner {
+		return nil
+	}
+	if loadErr != nil {
+		return loadErr
+	}
+	return fmt.Errorf("branch owner is %q, want %q", latest.BranchNodeID(branchID), owner)
 }
 
 // removeLocalFamilyStateIfUnowned removes a cluster node's disposable active

@@ -419,6 +419,35 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = settler.settleDistributedSourceTransactions(args[1:])
+	case "_cancel-source-transactions":
+		if len(args) < 2 {
+			err = errors.New("internal source-dependency cancellation requires at least one transaction ID")
+			break
+		}
+		canceler, ok := backend.(interface{ cancelDistributedForkTargets([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support distributed source-dependency cancellation")
+			break
+		}
+		err = canceler.cancelDistributedForkTargets(args[1:])
+	case "_remove-canceled-fork-placement":
+		if len(args) != 3 {
+			err = errors.New("internal canceled-fork placement removal requires a branch selector and transaction ID")
+			break
+		}
+		target, parseErr := parseSelector(args[1])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		remover, ok := backend.(interface {
+			removeCanceledForkPlacement(selector, string) error
+		})
+		if !ok {
+			err = errors.New("this backend does not support canceled-fork placement removal")
+			break
+		}
+		err = remover.removeCanceledForkPlacement(target, args[2])
 	case "_discard-removed-migration-sources":
 		if len(args) < 2 {
 			err = errors.New("internal removed-migration cleanup requires at least one transaction ID")
@@ -430,6 +459,17 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = discarder.discardRemovedMigrationSources(args[1:])
+	case "_prepare-removed-migration-sources":
+		if len(args) < 2 {
+			err = errors.New("internal removed-migration preparation requires at least one transaction ID")
+			break
+		}
+		preparer, ok := backend.(interface{ prepareRemovedMigrationSources([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-migration preparation")
+			break
+		}
+		err = preparer.prepareRemovedMigrationSources(args[1:])
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -10291,25 +10331,8 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if !ok {
 				continue
 			}
-			for i := range family.Branches {
-				if family.Branches[i].ID != authority.BranchID {
-					continue
-				}
-				family.Branches[i].State = authority.Lifecycle
-				if authority.Roots.FilesystemRoot != "" {
-					family.Branches[i].StorageManifest = filepath.Join(b.dataRoot, authority.Roots.FilesystemRoot)
-				}
-				placement, placed := placementByBranch[authority.FamilyID+"\x00"+authority.BranchID]
-				if !placed || placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {
-					family.Branches[i].NodeID = ""
-				} else {
-					family.Branches[i].NodeID = placement.OwnerNode
-				}
-				if authority.Corrupted {
-					family.Error = fmt.Sprintf("branch %s is corrupted: %s", authority.BranchID, authority.CorruptionReason)
-				}
-				break
-			}
+			placement, placed := placementByBranch[authority.FamilyID+"\x00"+authority.BranchID]
+			family = mergeAuthoritativeBranch(family, authority, placement, placed, b.dataRoot)
 			family.State = familyStateFromBranches(family.Branches)
 			byID[authority.FamilyID] = family
 		}
@@ -10331,6 +10354,55 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	return families, nil
+}
+
+// mergeAuthoritativeBranch projects one Raft branch record into the public
+// family view. Raft is the existence and lifecycle authority in a cluster, so
+// an unplaced migrated branch must be synthesized even when its durable bytes
+// live in a hidden transaction-scoped container. Requiring a matching entry in
+// the logical family's container.json made cold migrated branches disappear
+// from ls/inspect and consequently made rehydrate impossible.
+func mergeAuthoritativeBranch(family Family, authority cluster.BranchAuthority, placement cluster.PlacementRecord, placed bool, dataRoot string) Family {
+	index := -1
+	for i := range family.Branches {
+		if family.Branches[i].ID == authority.BranchID {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		family.Branches = append(family.Branches, Branch{ID: authority.BranchID})
+		index = len(family.Branches) - 1
+	}
+	branch := &family.Branches[index]
+	branch.State = authority.Lifecycle
+	branch.PublicationID = authority.PublicationID
+	if authority.Roots.FilesystemRoot != "" {
+		branch.StorageManifest = filepath.Join(dataRoot, authority.Roots.FilesystemRoot)
+	}
+	if placed {
+		branch.ParentID = placement.ParentBranch
+		branch.Quarantined = placement.Quarantined
+		if !placement.BranchCreatedAt.IsZero() {
+			branch.CreatedAt = placement.BranchCreatedAt
+		}
+	}
+	if !placed || placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {
+		branch.NodeID = ""
+		if authority.Roots.FilesystemRoot != "" {
+			branch.StorageState = "shared"
+		}
+	} else {
+		branch.NodeID = placement.OwnerNode
+		if branch.StorageState == "" {
+			branch.StorageState = "local"
+		}
+	}
+	if authority.Corrupted {
+		family.Error = fmt.Sprintf("branch %s is corrupted: %s", authority.BranchID, authority.CorruptionReason)
+	}
+	sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
+	return family
 }
 
 func visiblePhysicalRuntimeBranches(branches []Branch, placements []cluster.PlacementRecord, physicalContainer string) []Branch {
@@ -13953,23 +14025,41 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.Container = target.container
 	}
 	branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	physicalToLogical := make(map[string]string)
 	if b.nodeID != "" {
 		placements, placementErr := b.placementCatalog()
+		var records []cluster.PlacementRecord
+		if placementErr == nil {
+			records, placementErr = placements.List()
+		}
 		filtered := branches[:0]
 		for _, branch := range branches {
-			owned := false
-			if placementErr == nil {
-				if record, err := placements.Lookup(info.ID, branch.ID); err == nil {
-					owned = record.OwnerNode == b.nodeID && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused)
+			if placementErr != nil {
+				if info.BranchNodeID(branch.ID) == b.nodeID {
+					physicalToLogical[branch.ID] = branch.ID
+					filtered = append(filtered, branch)
 				}
-			} else {
-				owned = info.BranchNodeID(branch.ID) == b.nodeID
+				continue
 			}
-			if owned {
+			for _, record := range records {
+				if record.PhysicalContainer != info.ID || record.PhysicalBranch != branch.ID || record.OwnerNode != b.nodeID ||
+					(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) {
+					continue
+				}
+				physicalToLogical[branch.ID] = record.BranchID
+				branch.NodeID = record.OwnerNode
+				branch.Quarantined = record.Quarantined
 				filtered = append(filtered, branch)
+				break
 			}
 		}
 		branches = filtered
+	}
+	logicalBranchID := func(physical string) string {
+		if logical := physicalToLogical[physical]; logical != "" {
+			return logical
+		}
+		return physical
 	}
 	if err := b.publishLiveFilesystemMetadata(info.ID, branches...); err != nil {
 		return FamilyResourceStats{}, err
@@ -13979,8 +14069,9 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	byID := make(map[string]*BranchResourceStats, len(branches))
 	filesystemBranches := make(map[string]string, len(branches))
 	for _, branch := range branches {
+		logicalID := logicalBranchID(branch.ID)
 		account := BranchResourceStats{
-			Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State),
+			Target: result.Container + "@" + logicalID, State: normalizeLifecycleState(branch.State),
 			NodeID: info.BranchNodeID(branch.ID), Quarantined: branch.Quarantined,
 			StorageState: branch.StorageState, PublicationID: branch.PublicationID,
 			StorageError: branch.StorageError, StorageRetryAt: branch.StorageRetryAt,
@@ -13993,7 +14084,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.DependentMemoryBytes += branch.DependentMemoryBytes
 		result.DependentFilesystemBytes += branch.DependentFilesystemBytes
 		result.Branches = append(result.Branches, account)
-		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
+		byID[logicalID] = &result.Branches[len(result.Branches)-1]
 		// A remotely backed filesystem deliberately keeps its deferred catalog
 		// and provider connection inside the live Sentry. The manager-side
 		// repository handle has neither, and traversing it would either fail or
@@ -14008,7 +14099,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		if filesystemBranch == "" {
 			filesystemBranch = offlineCopyBranch(info, branch.ID)
 		}
-		filesystemBranches[branch.ID] = filesystemBranch
+		filesystemBranches[logicalID] = filesystemBranch
 	}
 	if b.snapshotGraph != nil {
 		graph := b.snapshotGraph.Stats()
@@ -14080,6 +14171,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 	objectSizes := make(map[ttcsnapshot.ObjectID]uint64)
 	familyReachableObjects := make(map[ttcsnapshot.ObjectID]struct{})
 	for _, branch := range branches {
+		logicalID := logicalBranchID(branch.ID)
 		if len(branch.MemoryRootObjects) == 0 {
 			continue
 		}
@@ -14121,7 +14213,7 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			objectBranches[id]++
 			objectSizes[id] = size
 		}
-		graphMemory[branch.ID] = memoryObjects
+		graphMemory[logicalID] = memoryObjects
 		if result.SnapshotGraph != nil {
 			reachable, err := ttcsnapshot.ReachableObjects(catalog, roots)
 			if err != nil {
@@ -14160,7 +14252,11 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 		result.ResidentMemoryUniqueBytes = resident.UniqueBytes
 		for _, branchMemory := range resident.Branches {
-			if account := byID[branchMemory.ID]; account != nil {
+			branchID := branchMemory.ID
+			if logical := physicalToLogical[branchID]; logical != "" {
+				branchID = logical
+			}
+			if account := byID[branchID]; account != nil {
 				addResourceBytes(&account.ResidentMemory, branchMemory.PrivateBytes, branchMemory.SharedBytes)
 			}
 		}

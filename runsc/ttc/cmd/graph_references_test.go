@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -281,6 +282,34 @@ func TestSharedSingleReleaseSurvivesCoordinatorReceiptLoss(t *testing.T) {
 	wrong := ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 2}
 	if err := applySharedReferenceMutation(ledger, "release-wrong-object", name, wrong, false); err == nil {
 		t.Fatal("release of a conflicting live binding succeeded")
+	}
+}
+
+func TestSharedReferenceBatchesLargeReconciliation(t *testing.T) {
+	ledger, err := ttcsnapshot.OpenReferenceLedger(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	origin := ttcsnapshot.SnapshotID(29)
+	object := ttcsnapshot.Object{ID: ttcsnapshot.ObjectID{Snapshot: origin, Kind: ttcsnapshot.ObjectKindMemoryNode, Ordinal: 1}}
+	references := make(map[string]ttcsnapshot.ObjectID, 2050)
+	mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, 2050)
+	for i := 0; i < 2050; i++ {
+		name := fmt.Sprintf("edge/page/%04x", i)
+		references[name] = object.ID
+		mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+			Operation: fmt.Sprintf("release-page-%04x", i), Name: name, Object: object.ID,
+		})
+	}
+	if err := ledger.ImportOrigin(origin, []ttcsnapshot.Object{object}, references); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedReferenceBatches(ledger, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ledger.References()); got != 0 {
+		t.Fatalf("references after batched release = %d, want 0", got)
 	}
 }
 

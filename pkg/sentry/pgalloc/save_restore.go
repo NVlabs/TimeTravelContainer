@@ -22,7 +22,6 @@ import (
 	"io"
 	"math"
 	"runtime"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -1676,23 +1675,27 @@ func (apfl *AsyncPagesFileLoad) Drain() {
 	if apfl.logicalChunkDemand {
 		apfl.drainOnce.Do(func() {
 			go func() {
-				type demand struct {
-					amfl  *asyncMemoryFileLoad
-					chunk *logicalChunkLoad
-				}
-				var demands []demand
+				var loads []*asyncMemoryFileLoad
 				apfl.amflsMu.Lock()
 				for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
-					for _, chunk := range amfl.logicalChunks {
-						demands = append(demands, demand{amfl: amfl, chunk: chunk})
-					}
+					loads = append(loads, amfl)
 				}
 				apfl.amflsMu.Unlock()
-				sort.Slice(demands, func(i, j int) bool {
-					return demands[i].chunk.ranges[0].StreamOffset < demands[j].chunk.ranges[0].StreamOffset
-				})
-				for _, item := range demands {
-					if err := item.amfl.awaitLoad(item.chunk.ranges[0].Target); err != nil {
+				for _, amfl := range loads {
+					// awaitLoad expands this physical span to exact logical
+					// chunks and queues all discontiguous members of each chunk.
+					// Use the current unresolved span instead of a chunk's first
+					// historical range: imports can reuse that leading range from
+					// an already-resident CoW version.
+					apfl.mu.Lock()
+					first, last := amfl.unloaded.FirstSegment(), amfl.unloaded.LastSegment()
+					if !first.Ok() {
+						apfl.mu.Unlock()
+						continue
+					}
+					unresolved := memmap.FileRange{Start: first.Start(), End: last.End()}
+					apfl.mu.Unlock()
+					if err := amfl.awaitLoad(unresolved); err != nil {
 						break
 					}
 				}
