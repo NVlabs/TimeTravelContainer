@@ -85,6 +85,18 @@ func TestRemoteExecSessionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBranchRemovalRequiresForce(t *testing.T) {
+	if !branchRemovalRequiresForce("running", false) || !branchRemovalRequiresForce("paused", false) {
+		t.Fatal("live healthy branch did not require forced removal")
+	}
+	if branchRemovalRequiresForce("exited", false) {
+		t.Fatal("exited branch required forced removal")
+	}
+	if branchRemovalRequiresForce("running", true) {
+		t.Fatal("fenced corrupted branch retained stale force requirement")
+	}
+}
+
 func TestDistributedConsoleLogRelay(t *testing.T) {
 	dir := t.TempDir()
 	older := filepath.Join(dir, "older.log")
@@ -532,6 +544,24 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || got.ImageCacheBytes != 16384 || got.ImageCacheTotalBytes != 32768 || len(got.Branches) != 1 ||
 		got.SnapshotGraph == nil || got.SnapshotGraph.Sequence != 7 || got.SnapshotGraph.FamilyReachableObjects != 5 || got.Branches[0].SnapshotID != 3 || got.Branches[0].NodeID != "node-a" || !got.Branches[0].Quarantined || got.Branches[0].FilesystemRoot != "filesystem-root" {
 		t.Fatalf("stats=%+v", got)
+	}
+}
+
+func TestStatsHumanOutputUsesPrintablePadding(t *testing.T) {
+	stats := FamilyResourceStats{Container: "demo", Branches: []BranchResourceStats{{
+		Target: "demo@main", State: "running", StorageState: "local",
+	}}}
+	var stdout bytes.Buffer
+	if err := writeResourceStats(&stdout, stats, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range stdout.Bytes() {
+		if b < 0x20 && b != '\n' && b != '\t' {
+			t.Fatalf("human stats contains control byte %#x: %q", b, stdout.String())
+		}
+	}
+	if !strings.Contains(stdout.String(), "demo@main") {
+		t.Fatalf("human stats=%q", stdout.String())
 	}
 }
 

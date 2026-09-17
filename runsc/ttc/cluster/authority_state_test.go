@@ -873,6 +873,29 @@ func TestAuthorityRetiresTerminalTransactionOnlyAfterTargetRemoval(t *testing.T)
 	}
 }
 
+func TestAuthorityRemovingCorruptedBranchReparentsChildren(t *testing.T) {
+	at := time.Unix(3625, 0).UTC()
+	state := NewAuthorityState()
+	parentKey := logicalBranchKey("family", "parent")
+	childKey := logicalBranchKey("family", "child")
+	grandchildKey := logicalBranchKey("family", "grandchild")
+	state.Branches[parentKey] = BranchAuthority{FamilyID: "family", BranchID: "parent", Generation: 1, Lifecycle: "running", UpdatedAt: at}
+	state.Branches[childKey] = BranchAuthority{FamilyID: "family", BranchID: "child", Generation: 2, Lifecycle: "corrupted", Corrupted: true, UpdatedAt: at}
+	state.Branches[grandchildKey] = BranchAuthority{FamilyID: "family", BranchID: "grandchild", Generation: 1, Lifecycle: "running", UpdatedAt: at}
+	state.Placements[parentKey] = PlacementRecord{FamilyID: "family", BranchID: "parent", Generation: 1, Revision: 1, State: PlacementUnplaced, UpdatedAt: at}
+	state.Placements[childKey] = PlacementRecord{FamilyID: "family", BranchID: "child", ParentBranch: "parent", Generation: 2, Revision: 2, State: PlacementCorrupted, UpdatedAt: at}
+	state.Placements[grandchildKey] = PlacementRecord{FamilyID: "family", BranchID: "grandchild", ParentBranch: "child", Generation: 1, Revision: 1, State: PlacementUnplaced, UpdatedAt: at}
+	applyAuthorityForTest(t, state, "remove-corrupted-child", at.Add(time.Second), AuthorityBranchRemoveCorrupted, AuthorityPublicationPayload{
+		Family: "family", Branch: "child", BranchGeneration: 2,
+	})
+	if _, ok := state.Placements[childKey]; ok {
+		t.Fatal("corrupted placement remained after removal")
+	}
+	if got := state.Placements[grandchildKey].ParentBranch; got != "parent" {
+		t.Fatalf("grandchild parent=%q, want parent", got)
+	}
+}
+
 func TestAuthorityRejectsRetirementWithVolatileDependency(t *testing.T) {
 	at := time.Unix(3650, 0).UTC()
 	state := NewAuthorityState()
@@ -942,6 +965,37 @@ func TestAuthorityExpiryCorruptsExactDependencyClosure(t *testing.T) {
 	}
 	if tx := state.Transactions["fork-1"]; tx.State != TransactionFailed || tx.SourceNeeded {
 		t.Fatalf("source-lost transaction remains usable: %+v", tx)
+	}
+}
+
+func TestAuthorityExpiryAbandonsProviderOriginsAndAllowsRemoval(t *testing.T) {
+	at := time.Unix(3750, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	allocation := decodeAuthorityResultForTest[SnapshotAllocation](t, applyAuthorityForTest(t, state, "allocate", at.Add(time.Second), AuthoritySnapshotAllocate, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", Count: 2,
+	}))
+	node := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "expire", node.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+		NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
+	})
+	for id := allocation.First; id < allocation.First+uint64(allocation.Count); id++ {
+		if _, ok := state.VolatileOrigins[id]; ok {
+			t.Fatalf("expired provider retained volatile origin %d", id)
+		}
+		if !state.AbandonedOrigins[id] {
+			t.Fatalf("expired provider origin %d lacks abandonment fence", id)
+		}
+	}
+	offline := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "remove", offline.UpdatedAt.Add(time.Second), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: offline.NodeID, Incarnation: offline.Incarnation, Revision: offline.Revision,
+	})
+	if _, ok := state.Nodes["node-a"]; ok {
+		t.Fatal("expired provider remains in membership after removal")
+	}
+	if _, err := RestoreAuthorityState(mustAuthoritySnapshotForTest(t, state)); err != nil {
+		t.Fatalf("state after provider removal is not restorable: %v", err)
 	}
 }
 

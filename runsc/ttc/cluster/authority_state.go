@@ -1367,6 +1367,19 @@ func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, i
 			s.markBranchCorrupted(key, reason, at)
 		}
 	}
+	// Snapshot providers are fenced by daemon incarnation even though the
+	// compact provider index only stores the stable node ID. Once an
+	// incarnation is lost, its unpublished objects can never become shared
+	// authority. Permanently abandon those IDs in the same Raft transition so
+	// node removal is possible and a replacement incarnation cannot publish
+	// objects allocated by its predecessor.
+	for id, provider := range s.VolatileOrigins {
+		if provider.NodeID != nodeID {
+			continue
+		}
+		delete(s.VolatileOrigins, id)
+		s.AbandonedOrigins[id] = true
+	}
 }
 
 func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessage, error) {
@@ -2172,8 +2185,18 @@ func (s *AuthorityState) applyBranch(command AuthorityCommand) (json.RawMessage,
 		if !branch.Corrupted {
 			return nil, errors.New("branch is not corrupted")
 		}
+		parent := ""
+		if placement, ok := s.Placements[key]; ok {
+			parent = placement.ParentBranch
+		}
 		delete(s.Branches, key)
 		delete(s.Placements, key)
+		for childKey, child := range s.Placements {
+			if child.FamilyID == p.Family && child.ParentBranch == p.Branch {
+				child.ParentBranch = parent
+				s.Placements[childKey] = child
+			}
+		}
 		for key, publication := range s.Publications {
 			if publication.FamilyID == p.Family && publication.BranchID == p.Branch {
 				delete(s.Publications, key)

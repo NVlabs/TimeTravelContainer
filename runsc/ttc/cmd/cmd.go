@@ -5377,7 +5377,7 @@ func writeResourceStats(stdout io.Writer, stats FamilyResourceStats, jsonOutput 
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(stats)
 	}
-	table := tabwriter.NewWriter(stdout, 0, 4, 2, 24, 0)
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(table, "TARGET\tSTATE\tSTORAGE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED\tREMOTE DEPENDENT\tIMAGE CACHE")
 	for _, branch := range stats.Branches {
 		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\n", branch.Target, branch.State, branch.StorageState,
@@ -14041,11 +14041,8 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 		return fmt.Errorf("branch %q does not exist", target.branch)
 	}
-	switch normalizeLifecycleState(recorded.State) {
-	case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
-		if !force {
-			return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
-		}
+	if !force && branchRemovalRequiresForce(recorded.State, corrupted) {
+		return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
 	}
 	if b.publicationQueue != nil {
 		if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
@@ -14202,6 +14199,21 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	return portErr
+}
+
+func branchRemovalRequiresForce(state string, corrupted bool) bool {
+	if corrupted {
+		// Corruption fences execution authority and clears physical placement.
+		// Node-local metadata from the lost incarnation may still say running,
+		// but no live runtime remains for -f to protect against.
+		return false
+	}
+	switch normalizeLifecycleState(state) {
+	case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
