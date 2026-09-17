@@ -855,10 +855,10 @@ type newPlacementReservation struct {
 	record *cluster.PlacementRecord
 }
 
-// registerCreatedContainerPlacement publishes the logical identity of a
-// cluster-created, never-started branch. It deliberately has no owner: create
-// prepares durable shared state, while a later start chooses and fences the
-// compute node that will materialize it.
+// registerCreatedContainerPlacement publishes the logical identity and local
+// storage owner of a cluster-created, never-started branch. The writable
+// repository is node-local authoritative state, so advertising this branch as
+// unplaced would let start run on a node that does not have its filesystem.
 func (b *runtimeBackend) registerCreatedContainerPlacement(info ttcbundle.ContainerInfo) error {
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return nil
@@ -867,12 +867,17 @@ func (b *runtimeBackend) registerCreatedContainerPlacement(info ttcbundle.Contai
 	if err != nil {
 		return err
 	}
+	owner, err := b.renewDistributedExecutionAuthority()
+	if err != nil {
+		return fmt.Errorf("renewing created-container placement authority: %w", err)
+	}
 	branch, err := persistentBranchInfo(info, defaultBranchID)
 	if err != nil {
 		return err
 	}
 	_, err = placements.Create(cluster.PlacementRecord{
-		FamilyID: info.ID, BranchID: branch.ID, State: cluster.PlacementUnplaced,
+		FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+		OwnerNode: b.nodeID, OwnerIncarnation: owner.Incarnation, State: cluster.PlacementMaterializing,
 		FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
 		LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
 		FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,

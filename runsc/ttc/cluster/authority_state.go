@@ -1404,7 +1404,14 @@ func (s *AuthorityState) applyPlacement(command AuthorityCommand) (json.RawMessa
 		}
 		s.Placements[key] = record
 		if _, ok := s.Branches[key]; !ok {
-			s.Branches[key] = BranchAuthority{FamilyID: record.FamilyID, BranchID: record.BranchID, Generation: 1, Lifecycle: string(record.State), UpdatedAt: command.IssuedAt}
+			lifecycle := string(record.State)
+			// A materializing placement created by create/run already has a
+			// prepared filesystem but has not executed guest code. Expose the
+			// stable Docker-compatible lifecycle until launch promotes it.
+			if record.State == PlacementMaterializing {
+				lifecycle = "created"
+			}
+			s.Branches[key] = BranchAuthority{FamilyID: record.FamilyID, BranchID: record.BranchID, Generation: 1, Lifecycle: lifecycle, UpdatedAt: command.IssuedAt}
 		}
 		return authorityValue(record)
 	}

@@ -6875,9 +6875,6 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	store := b.containerStore()
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	createdNodeID := b.nodeID
-	if b.distributedSource != nil {
-		createdNodeID = ""
-	}
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -6930,8 +6927,9 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		LiveForkWaiver:     request.liveForkWaiver,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
-		// A created branch is cluster-wide durable state with no execution
-		// owner. `start --node` records ownership only after Raft admission.
+		// A created branch owns mutable local filesystem state even though it has
+		// no runtime yet. Keep that state assigned to this node until an explicit
+		// publication or migration transfers authority.
 		NodeID:                  createdNodeID,
 		AllocateSnapshotOrigins: filesystemOrigins,
 		SnapshotManagedVolume:   b.snapshotManagedVolume,

@@ -769,12 +769,26 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	}
 }
 
-func TestRegisterCreatedContainerPlacementIsUnplaced(t *testing.T) {
-	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+func TestRegisterCreatedContainerPlacementRetainsLocalOwner(t *testing.T) {
+	root := t.TempDir()
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := &runtimeBackend{distributedSource: &distributedSourceRuntime{
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{
+		directory:  directory,
 		placements: placements,
 		// Presence identifies the production Raft-backed cluster path. The
 		// placement store remains a deterministic catalog test double.
@@ -793,7 +807,7 @@ func TestRegisterCreatedContainerPlacementIsUnplaced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.State != cluster.PlacementUnplaced || record.OwnerNode != "" || record.PhysicalContainer != "" || record.FamilyName != "web" || record.ImageReference != "busybox:1.36" {
+	if record.State != cluster.PlacementMaterializing || record.OwnerNode != "node-a" || record.OwnerIncarnation != node.Incarnation || record.PhysicalContainer != "family" || record.PhysicalBranch != "main" || record.FamilyName != "web" || record.ImageReference != "busybox:1.36" {
 		t.Fatalf("created placement=%+v", record)
 	}
 }
