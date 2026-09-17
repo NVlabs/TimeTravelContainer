@@ -197,6 +197,11 @@ type VolumeInfo struct {
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
 	NextInode uint64    `json:"next_inode"`
+	// Clustered means that every mutable snapshot origin is allocated by the
+	// cluster authority. Opening a sealed clustered repository must remain
+	// read-only: a daemon explicitly installs a fresh authority-allocated
+	// origin before admitting the branch for mutation.
+	Clustered bool `json:"clustered,omitempty"`
 }
 
 // Branch identifies one immutable filesystem root and the exclusive working
@@ -900,7 +905,7 @@ func (m *Manager) createAt(path, name, id string, workingOrigin ttcsnapshot.Snap
 			return nil, fmt.Errorf("creating volume repository: %w", err)
 		}
 	}
-	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1}
+	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1, Clustered: workingOrigin != 0}
 	repo, err := m.openPath(path, info)
 	if err != nil {
 		_ = os.RemoveAll(path)
@@ -1487,7 +1492,7 @@ func (r *Repository) recoverGraphState() error {
 			if !ok {
 				return fmt.Errorf("branch %q references missing working snapshot %d", id, branch.WorkingSnapshot)
 			}
-			if working.State != ttcsnapshot.SnapshotWorking {
+			if working.State != ttcsnapshot.SnapshotWorking && !r.info.Clustered {
 				// The only repository operation that seals a working origin is a
 				// fork. Preserve its diff boundary even if publication stopped
 				// between the graph transaction and the branch pointer rename.
@@ -1559,6 +1564,82 @@ func (r *Repository) recoverGraphState() error {
 		}
 		return nil
 	})
+}
+
+// BranchNeedsWorkingOrigin reports whether branch is immutable and must be
+// assigned a fresh working origin before it can be admitted to a clustered
+// runtime. It never changes repository state.
+func (r *Repository) BranchNeedsWorkingOrigin(id string) (bool, error) {
+	if !r.info.Clustered {
+		return false, nil
+	}
+	branch, err := r.readBranch(id)
+	if err != nil {
+		return false, err
+	}
+	snapshot, ok := r.graph.Snapshot(ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
+	if !ok {
+		return false, fmt.Errorf("branch %q references missing working snapshot %d", id, branch.WorkingSnapshot)
+	}
+	switch snapshot.State {
+	case ttcsnapshot.SnapshotWorking:
+		return false, nil
+	case ttcsnapshot.SnapshotSealedVolatile, ttcsnapshot.SnapshotShared:
+		return true, nil
+	case ttcsnapshot.SnapshotSealedLocal:
+		return false, fmt.Errorf("clustered branch %q references standalone origin %d", id, branch.WorkingSnapshot)
+	default:
+		return false, fmt.Errorf("clustered branch %q working origin %d is %s", id, branch.WorkingSnapshot, snapshot.State)
+	}
+}
+
+// InstallBranchWorkingOrigin makes an immutable clustered branch writable
+// using the exact origin allocated by the cluster authority. The immutable
+// root is unchanged. Replaying the operation is safe after the branch pointer
+// has advanced; callers must abandon origin only when this method returns an
+// error before it becomes referenced.
+func (r *Repository) InstallBranchWorkingOrigin(id string, origin ttcsnapshot.SnapshotID) (bool, error) {
+	if !r.info.Clustered {
+		return false, errors.New("cannot install a cluster working origin in a standalone repository")
+	}
+	if origin == 0 {
+		return false, errors.New("cluster working origin is zero")
+	}
+	adopted := false
+	err := r.withLock(func() error {
+		branch, err := r.readBranch(id)
+		if err != nil {
+			return err
+		}
+		current, ok := r.graph.Snapshot(ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
+		if !ok {
+			return fmt.Errorf("branch %q references missing working snapshot %d", id, branch.WorkingSnapshot)
+		}
+		if current.State == ttcsnapshot.SnapshotWorking {
+			return fmt.Errorf("branch %q already has working origin %d", id, branch.WorkingSnapshot)
+		}
+		if current.State != ttcsnapshot.SnapshotSealedVolatile && current.State != ttcsnapshot.SnapshotShared {
+			return fmt.Errorf("branch %q origin %d is %s, not a clustered immutable origin", id, branch.WorkingSnapshot, current.State)
+		}
+		if branch.BaseRoot == "" {
+			root, ok := r.graph.Root(graphRootName(id))
+			if !ok {
+				return fmt.Errorf("branch %q has no snapshot graph root", id)
+			}
+			if err := r.graph.SetRoot(graphBaseRootName(id), root); err != nil {
+				return fmt.Errorf("retaining diff base for branch %q: %w", id, err)
+			}
+			branch.BaseRoot = root.String()
+		}
+		if err := r.graph.AdoptWorking(origin); err != nil {
+			return err
+		}
+		adopted = true
+		branch.WorkingSnapshot = uint64(origin)
+		branch.Generation++
+		return r.writeBranch(branch)
+	})
+	return adopted, err
 }
 
 // Branch returns a branch root.

@@ -683,6 +683,9 @@ func TestClusteredRepositoryUsesExternallyAllocatedOrigins(t *testing.T) {
 	if main.WorkingSnapshot != 1001 {
 		t.Fatalf("initial working origin=%d, want 1001", main.WorkingSnapshot)
 	}
+	if !repo.Info().Clustered {
+		t.Fatal("externally allocated repository was not marked clustered")
+	}
 	tx, err := repo.BeginForkWithOrigins(MainBranch, "child", 1002, 1003)
 	if err != nil {
 		t.Fatal(err)
@@ -704,6 +707,61 @@ func TestClusteredRepositoryUsesExternallyAllocatedOrigins(t *testing.T) {
 	sealed, ok := repo.graph.Snapshot(1001)
 	if !ok || sealed.State != ttcsnapshot.SnapshotSealedVolatile {
 		t.Fatalf("sealed clustered origin=(%+v,%t)", sealed, ok)
+	}
+}
+
+func TestClusteredRepositoryOpenPreservesSealedBranchUntilActivation(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("cold-clustered", 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		return repository.graph.Seal(1001, ttcsnapshot.SnapshotSealedVolatile)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err = manager.Open("cold-clustered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.WorkingSnapshot != 1001 {
+		t.Fatalf("read-only reopen changed sealed origin to %d", branch.WorkingSnapshot)
+	}
+	if needs, err := repository.BranchNeedsWorkingOrigin(MainBranch); err != nil || !needs {
+		t.Fatalf("BranchNeedsWorkingOrigin()=(%t,%v), want (true,nil)", needs, err)
+	}
+	adopted, err := repository.InstallBranchWorkingOrigin(MainBranch, 1002)
+	if err != nil || !adopted {
+		t.Fatalf("InstallBranchWorkingOrigin()=(%t,%v), want (true,nil)", adopted, err)
+	}
+	branch, err = repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.WorkingSnapshot != 1002 {
+		t.Fatalf("activated working origin=%d, want 1002", branch.WorkingSnapshot)
+	}
+	working, ok := repository.graph.Snapshot(1002)
+	if !ok || working.State != ttcsnapshot.SnapshotWorking {
+		t.Fatalf("activated snapshot=(%+v,%t), want working", working, ok)
+	}
+	if needs, err := repository.BranchNeedsWorkingOrigin(MainBranch); err != nil || needs {
+		t.Fatalf("BranchNeedsWorkingOrigin() after activation=(%t,%v), want (false,nil)", needs, err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

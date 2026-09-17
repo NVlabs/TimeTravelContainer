@@ -371,7 +371,7 @@ func (m *Manager) importPrivateRemoteDescriptor(path, name string, descriptor Re
 	if err != nil {
 		return nil, err
 	}
-	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1}
+	info := VolumeInfo{ID: id, Name: name, CreatedAt: time.Now().UTC(), NextInode: rootInode + 1, Clustered: working != 0}
 	repository, err := m.openPath(stage, info)
 	if err != nil {
 		return nil, err

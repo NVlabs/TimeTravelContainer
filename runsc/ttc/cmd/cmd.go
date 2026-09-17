@@ -6749,7 +6749,24 @@ func (b *runtimeBackend) createVolume(name string) (ttcvolume.VolumeInfo, error)
 	if err != nil {
 		return ttcvolume.VolumeInfo{}, err
 	}
-	repository, err := manager.Create(name)
+	allocate, finish := b.newFilesystemOriginScope()
+	var repository *ttcvolume.Repository
+	if allocate == nil {
+		repository, err = manager.Create(name)
+	} else {
+		origins, allocateErr := allocate(1)
+		if allocateErr != nil {
+			return ttcvolume.VolumeInfo{}, errors.Join(allocateErr, finish(false))
+		}
+		repository, err = manager.CreateWithOrigin(name, origins[0])
+		if err != nil {
+			return ttcvolume.VolumeInfo{}, errors.Join(err, finish(false))
+		}
+		if err := finish(true); err != nil {
+			repository.Close()
+			return ttcvolume.VolumeInfo{}, err
+		}
+	}
 	if err != nil {
 		return ttcvolume.VolumeInfo{}, err
 	}
@@ -7180,6 +7197,9 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 	}
 	if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
+	}
+	if err := b.ensureClusterFilesystemWorkingOrigins(info, branch.FilesystemBranch); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("activating durable filesystem for %s: %w", target, err)
 	}
 	// A fresh start does not restore serialized Sentry state: its VFS is
 	// constructed directly from the newly materialized local repository. Retire
@@ -12952,6 +12972,71 @@ func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot
 	return allocate, finish
 }
 
+// ensureClusterFilesystemWorkingOrigins upgrades immutable cold repository
+// branches to fresh Raft-owned working origins immediately before a runtime is
+// admitted to mutate them. Repository open and offline inspection deliberately
+// do not perform this transition.
+func (b *runtimeBackend) ensureClusterFilesystemWorkingOrigins(info ttcbundle.ContainerInfo, filesystemBranch string) error {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	if filesystemBranch == "" {
+		return errors.New("cluster filesystem branch is empty")
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return fmt.Errorf("opening clustered repository %q: %w", config.Source, err)
+		}
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		if !repository.Info().Clustered {
+			repository.Close()
+			return fmt.Errorf("repository %q was created without cluster snapshot authority", config.Source)
+		}
+		needs, err := repository.BranchNeedsWorkingOrigin(physicalBranch)
+		if err != nil {
+			repository.Close()
+			return fmt.Errorf("checking clustered repository %q branch %q: %w", config.Source, physicalBranch, err)
+		}
+		if !needs {
+			if err := repository.Close(); err != nil {
+				return err
+			}
+			continue
+		}
+		allocate, finish := b.newFilesystemOriginScope()
+		origins, err := allocate(1)
+		if err != nil {
+			repository.Close()
+			return errors.Join(err, finish(false))
+		}
+		adopted, installErr := repository.InstallBranchWorkingOrigin(physicalBranch, origins[0])
+		closeErr := repository.Close()
+		finishErr := finish(adopted)
+		if installErr != nil || closeErr != nil || finishErr != nil {
+			if installErr != nil {
+				installErr = fmt.Errorf("installing clustered repository %q working origin: %w", config.Source, installErr)
+			}
+			return errors.Join(installErr, closeErr, finishErr)
+		}
+	}
+	return nil
+}
+
 // allocateFilesystemForkOrigins reserves the exact working origins consumed
 // by one Sentry filesystem fork. Each repository consumes a source/child pair
 // for every destination; the assignment is keyed by the repository identity
@@ -13780,6 +13865,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	if err := b.ensureLocalColdBranch(info, branch); err != nil {
 		return fmt.Errorf("materializing cold branch: %w", err)
+	}
+	if err := b.ensureClusterFilesystemWorkingOrigins(info, branch.FilesystemBranch); err != nil {
+		return fmt.Errorf("activating cold branch filesystem: %w", err)
 	}
 	imageDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
