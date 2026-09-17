@@ -1099,13 +1099,13 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 // preadDisk reads from the branch's current disk object. updateAtime reports
 // whether the read reached an ordinary completion point. The caller must apply
 // that metadata update only after this method releases diskIOMu.
-func (f *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, offset int64) (done int64, err error, updateAtime bool) {
-	if err := f.ensureDiskData(); err != nil {
+func (rf *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, offset int64) (done int64, err error, updateAtime bool) {
+	if err := rf.ensureDiskData(); err != nil {
 		return 0, err, false
 	}
-	f.diskIOMu.Lock()
-	defer f.diskIOMu.Unlock()
-	file, _, err := f.openDiskIOLocked(false, nil)
+	rf.diskIOMu.Lock()
+	defer rf.diskIOMu.Unlock()
+	file, _, err := rf.openDiskIOLocked(false, nil)
 	if err != nil {
 		return 0, err, false
 	}

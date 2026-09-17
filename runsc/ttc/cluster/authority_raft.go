@@ -677,10 +677,10 @@ func (n *AuthorityRaftNode) CancelNonvoter(ctx context.Context, id, address stri
 			continue
 		}
 		if string(server.Address) != address {
-			return fmt.Errorf("Raft member %q now uses address %q, not stale join address %q", id, server.Address, address)
+			return fmt.Errorf("raft member %q now uses address %q, not stale join address %q", id, server.Address, address)
 		}
 		if server.Suffrage != raft.Nonvoter {
-			return fmt.Errorf("Raft member %q is already a voter", id)
+			return fmt.Errorf("raft member %q is already a voter", id)
 		}
 		return n.raft.RemoveServer(server.ID, 0, n.contextTimeout(ctx)).Error()
 	}

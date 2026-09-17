@@ -6097,7 +6097,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 				return target, info, nil
 			} else if authorityErr == nil {
 				publicationID = authority.PublicationID
-			} else if authorityErr != nil && !errors.Is(authorityErr, os.ErrNotExist) {
+			} else if !errors.Is(authorityErr, os.ErrNotExist) {
 				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
 			}
 		}
