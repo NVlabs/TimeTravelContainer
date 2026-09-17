@@ -318,7 +318,7 @@ TTC_LOCAL_ROOT is not required.`,
 			"container pause":   "Usage: ttc container pause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container unpause": "Usage: ttc container unpause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container top":     "Usage: ttc container top CONTAINER@BRANCH [PS OPTIONS]",
-			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
+			"image inspect":     "Usage: ttc image inspect [--format TEMPLATE] IMAGE [IMAGE...]",
 			"image load":        "Usage: ttc image load [--input FILE] [--platform PLATFORM] [--quiet]",
 			"image save":        "Usage: ttc image save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
@@ -3291,20 +3291,104 @@ func runImages(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runImageInspect(args []string, stdout io.Writer, backend backend) error {
-	if len(args) == 0 {
-		return errors.New("usage: ttc image inspect IMAGE [IMAGE...]")
+	format, identifiers, err := parseImageInspectArgs(args)
+	if err != nil {
+		return err
 	}
-	results := make([]ImageInspectInfo, 0, len(args))
-	for _, identifier := range args {
+	if len(identifiers) == 0 {
+		return errors.New("usage: ttc image inspect [--format TEMPLATE] IMAGE [IMAGE...]")
+	}
+	results := make([]ImageInspectInfo, 0, len(identifiers))
+	for _, identifier := range identifiers {
 		info, err := backend.inspectImage(identifier)
 		if err != nil {
 			return err
 		}
 		results = append(results, info)
 	}
-	encoder := json.NewEncoder(stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(results)
+	if format == "" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(results)
+	}
+	return writeImageInspectFormat(stdout, results, format)
+}
+
+func parseImageInspectArgs(args []string) (string, []string, error) {
+	format := ""
+	identifiers := make([]string, 0, len(args))
+	options := true
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if options && arg == "--" {
+			options = false
+			continue
+		}
+		if options {
+			switch {
+			case arg == "--format" || arg == "-f":
+				if i+1 >= len(args) {
+					return "", nil, fmt.Errorf("%s requires a template", arg)
+				}
+				i++
+				format = args[i]
+				continue
+			case strings.HasPrefix(arg, "--format="):
+				format = strings.TrimPrefix(arg, "--format=")
+				continue
+			case strings.HasPrefix(arg, "-f="):
+				format = strings.TrimPrefix(arg, "-f=")
+				continue
+			case strings.HasPrefix(arg, "-"):
+				return "", nil, fmt.Errorf("unknown image inspect option %q", arg)
+			}
+		}
+		identifiers = append(identifiers, arg)
+	}
+	return format, identifiers, nil
+}
+
+func writeImageInspectFormat(w io.Writer, results []ImageInspectInfo, format string) error {
+	if format == "json" {
+		encoder := json.NewEncoder(w)
+		for _, result := range results {
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	tmpl, err := template.New("image-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			data, err := marshalInspectTemplateJSON(value)
+			return string(data), err
+		},
+		"join": strings.Join, "lower": strings.ToLower, "split": strings.Split, "upper": strings.ToUpper,
+	}).Parse(format)
+	if err != nil {
+		return fmt.Errorf("parsing image inspect format: %w", err)
+	}
+	for _, result := range results {
+		data, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		var values map[string]any
+		if err := json.Unmarshal(data, &values); err != nil {
+			return err
+		}
+		var output bytes.Buffer
+		if err := tmpl.Execute(&output, values); err != nil {
+			return fmt.Errorf("executing image inspect format: %w", err)
+		}
+		if output.Len() == 0 || output.Bytes()[output.Len()-1] != '\n' {
+			output.WriteByte('\n')
+		}
+		if _, err := io.Copy(w, &output); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runImageRemove(args []string, stdout, stderr io.Writer, backend backend) error {

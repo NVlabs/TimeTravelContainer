@@ -1513,6 +1513,13 @@ func TestImageInspectAndRemoveCommandRouting(t *testing.T) {
 		t.Errorf("image inspect id=%q output=%q", b.imageInspectID, stdout.String())
 	}
 	stdout.Reset()
+	if status := runCommand([]string{"image", "inspect", "alpine", "--format", "{{.Id}}"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("formatted image inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); got != digest+"\n" {
+		t.Errorf("formatted image inspect output=%q", got)
+	}
+	stdout.Reset()
 	if status := runCommand([]string{"rmi", "--force", "alpine"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("rmi status=%d, stderr=%q", status, stderr.String())
 	}
