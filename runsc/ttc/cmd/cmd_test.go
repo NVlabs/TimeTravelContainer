@@ -39,11 +39,24 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
 )
+
+func TestDistributedFilesystemRestoreID(t *testing.T) {
+	const current = "11111111111111111111111111111111"
+	const captured = "22222222222222222222222222222222"
+	if got := distributedFilesystemRestoreID(specutils.TTCVolumeRepository{}, current); got != current {
+		t.Fatalf("new capture restore ID=%q, want current repository %q", got, current)
+	}
+	config := specutils.TTCVolumeRepository{RestoreID: captured}
+	if got := distributedFilesystemRestoreID(config, current); got != captured {
+		t.Fatalf("offline cold capture restore ID=%q, want serialized repository %q", got, captured)
+	}
+}
 
 func TestRemoteExecSessionRoundTrip(t *testing.T) {
 	exit := uint32(17)
