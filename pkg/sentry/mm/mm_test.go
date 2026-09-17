@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -144,6 +145,55 @@ func TestCaptureMemoryFileRangesIncludesUnfaultedAliasedMappableOwnerOnce(t *tes
 	}
 }
 
+func TestInvalidateMappingsForReboundSpecialMappable(t *testing.T) {
+	ctx := contexttest.Context(t)
+	memMgr := testMemoryManager(ctx, t)
+	defer memMgr.DecUsers(ctx)
+
+	writePage := func(value byte) memmap.FileRange {
+		fr, err := memMgr.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks, err := memMgr.mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		if _, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte{value}))); err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		return fr
+	}
+	oldRange := writePage(1)
+	newRange := writePage(2)
+	mappable := NewSpecialMappable("[rebind-test]", memMgr.mf, oldRange)
+	defer mappable.DecRef(ctx)
+	addr, err := memMgr.MMap(ctx, memmap.MMapOpts{
+		Length: hostarch.PageSize, MappingIdentity: mappable, Mappable: mappable,
+		Perms: hostarch.Read, MaxPerms: hostarch.Read,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() byte {
+		var got [1]byte
+		if n, err := memMgr.CopyIn(ctx, addr, got[:], usermem.IOOpts{}); err != nil || n != 1 {
+			t.Fatalf("CopyIn: n=%d err=%v", n, err)
+		}
+		return got[0]
+	}
+	if got := read(); got != 1 {
+		t.Fatalf("initial byte=%d, want 1", got)
+	}
+	mappable.RebindMemoryFileRange(memMgr.mf, newRange)
+	memMgr.InvalidateMappingsForMappable(mappable)
+	if got := read(); got != 2 {
+		t.Fatalf("byte after rebind=%d, want 2", got)
+	}
+}
+
 func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)
@@ -181,6 +231,13 @@ func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
 	if err != nil {
 		t.Fatalf("NewRemoteSnapshot: %v", err)
+	}
+	// A distributed source resumes before its target necessarily faults any
+	// pages. Verify that a subsequent source write cannot change the fork-time
+	// bytes served to the demand-paged child.
+	mutated := bytes.Repeat([]byte("source-after-fork---"), 200)
+	if n, err := parent.CopyOut(ctx, addr+hostarch.PageSize-100, mutated, usermem.IOOpts{}); err != nil || n != len(mutated) {
+		t.Fatalf("parent.CopyOut after snapshot: n=%d err=%v", n, err)
 	}
 	reader := pgalloc.NewLoopbackRemoteReader(snapshot, 64<<10, 16, 4)
 	loaderDone := make(chan error, 1)

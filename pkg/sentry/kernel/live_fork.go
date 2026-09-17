@@ -1270,6 +1270,30 @@ func (k *Kernel) privatizeLiveForkVDSOParamPage() error {
 		return fmt.Errorf("allocating live-fork VDSO parameter page: %w", err)
 	}
 	k.vdso.ParamPage.RebindMemoryFileRange(k.mf, fr)
+	// Rebinding the SpecialMappable changes future translations, but restored
+	// address spaces may already have PMAs and host mappings for the fork-time
+	// page. Drop those cached translations before the target starts. Otherwise
+	// vDSO clock reads continue using source-host calibration even though the
+	// child Timekeeper updates the new target-local page.
+	seen := make(map[*mm.MemoryManager]struct{})
+	invalidate := func(memMgr *mm.MemoryManager) {
+		if memMgr == nil {
+			return
+		}
+		if _, ok := seen[memMgr]; ok {
+			return
+		}
+		seen[memMgr] = struct{}{}
+		memMgr.InvalidateMappingsForMappable(k.vdso.ParamPage)
+	}
+	k.tasks.mu.RLock()
+	for task := range k.tasks.Root.tids {
+		invalidate(task.image.MemoryManager)
+		if r, ok := task.runState.(*runExecveAfterSiblingExitStop); ok {
+			invalidate(r.image.MemoryManager)
+		}
+	}
+	k.tasks.mu.RUnlock()
 	k.vdsoParams.mf = k.mf
 	k.vdsoParams.fr = fr
 	k.vdsoParams.seq = 0
