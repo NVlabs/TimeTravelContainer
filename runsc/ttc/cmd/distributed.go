@@ -1778,6 +1778,20 @@ func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" {
 		return nil
 	}
+	// drainNode has fenced and evacuated every runtime. Seal the repositories'
+	// final working generations before consulting the coarse Raft provider
+	// directory; publishing a raw working origin is invalid, while creating a
+	// replacement working generation would leave new authority on the node that
+	// is trying to retire.
+	preparedFilesystem, err := b.containerStore().PrepareFilesystemRetirementOrigins()
+	if err != nil {
+		return fmt.Errorf("preparing retiring filesystem generations: %w", err)
+	}
+	for _, origin := range preparedFilesystem {
+		if err := b.publishVolatileFilesystemOrigin(origin); err != nil {
+			return fmt.Errorf("publishing prepared filesystem origin %d: %w", origin, err)
+		}
+	}
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
 		return err
 	}

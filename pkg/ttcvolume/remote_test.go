@@ -417,6 +417,66 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	}
 }
 
+func TestPrepareRetirementPublicationSealsWorkingRemoteBranch(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("retirement materialization\n"), 10000)
+	if written, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || written != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", written, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	if _, err := target.CreateRegular("imported", RootInode, "target-local", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	origins, err := target.PrepareRetirementPublication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []ttcsnapshot.SnapshotID{101, 100}; !slices.Equal(origins, want) {
+		t.Fatalf("retirement origins=%v, want %v", origins, want)
+	}
+	for _, origin := range origins {
+		record, ok := target.graph.Snapshot(origin)
+		if !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+			t.Fatalf("origin %d=(%+v,%t), want sealed-volatile", origin, record, ok)
+		}
+	}
+	branch, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.RemoteCatalog != "" || branch.RemoteCatalogSnapshot != 0 || branch.RemoteLogicalBytes != 0 {
+		t.Fatalf("retired branch retained remote catalog state: %+v", branch)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("retirement materialization changed file contents")
+	}
+	finishTestRemote(t, target, serverErr)
+}
+
 func TestIndependentRemoteImportsOfSameRootHaveDistinctCatalogs(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")

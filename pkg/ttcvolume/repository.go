@@ -595,6 +595,98 @@ func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.Sn
 	return origins, err
 }
 
+// PrepareRetirementPublication seals every surviving branch generation and
+// returns all provider-owned origins in dependency order. This is the terminal
+// counterpart of PrepareBranchPublication: a retiring node has no runtime that
+// can continue writing these generations, so it must not create replacement
+// working origins merely to make its final immutable state publishable.
+//
+// The caller must have fenced all runtime users of the repository. Ordinary
+// branch publication must continue to use PrepareBranchPublication, whose
+// refusal to seal a writable branch is an important live-I/O invariant.
+func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, error) {
+	if err := r.SyncMetadata(); err != nil {
+		return nil, err
+	}
+
+	// Lazy remote objects must become local before their catalog and writable
+	// generations are made immutable. PrepareBranchPublication repeats this
+	// check below, but doing it before sealing avoids creating an immutable root
+	// that still requires metadata expansion.
+	r.remoteLifecycleMu.Lock()
+	materializeErr := r.materializeRemoteObjects()
+	r.remoteLifecycleMu.Unlock()
+	if materializeErr != nil {
+		return nil, fmt.Errorf("materializing repository before retirement: %w", materializeErr)
+	}
+
+	var branchIDs []string
+	if err := r.withLock(func() error {
+		directory, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		entries, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			branchID := strings.TrimSuffix(entry.Name(), ".json")
+			if err := validateName(branchID, "branch"); err != nil {
+				return err
+			}
+			branch, err := r.readBranch(branchID)
+			if err != nil {
+				return err
+			}
+			origin := ttcsnapshot.SnapshotID(branch.WorkingSnapshot)
+			snapshot, ok := r.graph.Snapshot(origin)
+			if !ok {
+				return fmt.Errorf("branch %q has missing working filesystem origin %d", branchID, origin)
+			}
+			switch snapshot.State {
+			case ttcsnapshot.SnapshotWorking:
+				if err := r.graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+					return fmt.Errorf("sealing branch %q filesystem origin %d for retirement: %w", branchID, origin, err)
+				}
+			case ttcsnapshot.SnapshotSealedVolatile, ttcsnapshot.SnapshotShared:
+				// A sibling branch may share a generation that was already sealed
+				// above, or crash recovery may resume a partially completed drain.
+			case ttcsnapshot.SnapshotSealedLocal:
+				return fmt.Errorf("cluster retirement reached standalone filesystem origin %d", origin)
+			default:
+				return fmt.Errorf("branch %q filesystem origin %d is %s during retirement", branchID, origin, snapshot.State)
+			}
+			branchIDs = append(branchIDs, branchID)
+		}
+		sort.Strings(branchIDs)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	seen := make(map[ttcsnapshot.SnapshotID]struct{})
+	var origins []ttcsnapshot.SnapshotID
+	for _, branchID := range branchIDs {
+		prepared, err := r.PrepareBranchPublication(branchID)
+		if err != nil {
+			return nil, fmt.Errorf("preparing branch %q for retirement: %w", branchID, err)
+		}
+		for _, origin := range prepared {
+			if _, duplicate := seen[origin]; duplicate {
+				continue
+			}
+			seen[origin] = struct{}{}
+			origins = append(origins, origin)
+		}
+	}
+	return origins, nil
+}
+
 // BranchVolatileOrigins reports the already-sealed provider-owned immutable
 // origins reachable from branch. It performs no materialization or sealing;
 // callers preparing a durable publication must use PrepareBranchPublication.

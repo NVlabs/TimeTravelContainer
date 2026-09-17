@@ -4532,6 +4532,51 @@ func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{},
 	return origins, nil
 }
 
+// PrepareFilesystemRetirementOrigins converts all surviving node-local
+// filesystem generations into immutable publication roots. Runtime fencing is
+// a precondition enforced by the node-retirement state machine; keeping the
+// repository traversal here ensures named volumes, rootfs uppers, copied
+// mounts, and transaction-private repositories use one inventory.
+func (s Store) PrepareFilesystemRetirementOrigins() ([]ttcsnapshot.SnapshotID, error) {
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return nil, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return nil, err
+	}
+	orderedPaths := make([]string, 0, len(paths))
+	for path := range paths {
+		orderedPaths = append(orderedPaths, path)
+	}
+	sort.Strings(orderedPaths)
+	seen := make(map[ttcsnapshot.SnapshotID]struct{})
+	var origins []ttcsnapshot.SnapshotID
+	for _, path := range orderedPaths {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening repository %q for retirement: %w", path, err)
+		}
+		prepared, prepareErr := repository.PrepareRetirementPublication()
+		closeErr := repository.Close()
+		if prepareErr != nil || closeErr != nil {
+			return nil, errors.Join(prepareErr, closeErr)
+		}
+		for _, origin := range prepared {
+			if _, duplicate := seen[origin]; duplicate {
+				continue
+			}
+			seen[origin] = struct{}{}
+			origins = append(origins, origin)
+		}
+	}
+	return origins, nil
+}
+
 // WithFilesystemSnapshotOrigin opens the unique node-local filesystem
 // repository that contains origin and invokes visit while that repository is
 // open. Snapshot origins are allocated cluster-wide, so finding the same
