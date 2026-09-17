@@ -19,3 +19,19 @@ package protocol
 // DaemonAPIVersion is the exact native CLI protocol version. Official TTC
 // clients also require an exact build match; SDKs negotiate their own API.
 const DaemonAPIVersion = 10
+
+// DaemonQuorumWait is the bounded pre-admission status published by a daemon
+// that has opened its persistent Raft transport but cannot yet regain quorum.
+type DaemonQuorumWait struct {
+	PID        int    `json:"pid"`
+	APIVersion int    `json:"api_version"`
+	BuildID    string `json:"build_id"`
+}
+
+// DaemonQuorumWaitPath returns the advisory local-startup marker used while a
+// persistent Raft member is alive but cannot yet regain quorum. The marker is
+// deliberately outside the RPC stream: the full daemon request loop remains
+// unavailable until the node has recovered execution authority.
+func DaemonQuorumWaitPath(socket string) string {
+	return socket + ".quorum-wait"
+}

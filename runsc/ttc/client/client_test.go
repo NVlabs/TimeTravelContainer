@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,7 +20,85 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
+	"gvisor.dev/gvisor/runsc/version"
 )
+
+func TestQuorumWaitHelperProcess(t *testing.T) {
+	if os.Getenv("TTC_TEST_QUORUM_WAIT_HELPER") != "1" {
+		return
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func TestQuorumWaitDaemonLifecycle(t *testing.T) {
+	directory := t.TempDir()
+	socket := filepath.Join(directory, "ttcd.sock")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon := filepath.Join(directory, "ttcd")
+	source, err := os.Open(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := os.OpenFile(daemon, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+	if err != nil {
+		source.Close()
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(destination, source)
+	closeErr := errors.Join(source.Close(), destination.Close())
+	if copyErr != nil || closeErr != nil {
+		t.Fatal(errors.Join(copyErr, closeErr))
+	}
+	command := exec.Command(daemon, "-test.run=TestQuorumWaitHelperProcess", "--", "--socket", socket)
+	command.Env = append(os.Environ(), "TTC_TEST_QUORUM_WAIT_HELPER=1")
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_, _ = command.Process.Wait()
+	}()
+
+	waiting := protocol.DaemonQuorumWait{PID: command.Process.Pid, APIVersion: daemonAPIVersion, BuildID: version.Version()}
+	data, err := json.Marshal(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(protocol.DaemonQuorumWaitPath(socket), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := quorumWaitDaemon(socket); !ok || got != waiting {
+		t.Fatalf("quorumWaitDaemon=(%+v,%t), want %+v,true", got, ok, waiting)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if status := Run([]string{"--daemon-socket", socket, "daemon", "status"}, strings.NewReader(""), &stdout, &stderr); status != 0 || !strings.Contains(stdout.String(), `"waiting_for_cluster_quorum":true`) || stderr.Len() != 0 {
+		t.Fatalf("waiting status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	waiting.BuildID = "different-build"
+	data, _ = json.Marshal(waiting)
+	if err := os.WriteFile(protocol.DaemonQuorumWaitPath(socket), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := Run([]string{"--daemon-socket", socket, "daemon", "start"}, strings.NewReader(""), &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "does not match") {
+		t.Fatalf("mismatched start=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := Run([]string{"--daemon-socket", socket, "daemon", "stop"}, strings.NewReader(""), &stdout, &stderr); status != 0 || !strings.Contains(stdout.String(), "ttcd stopped") || stderr.Len() != 0 {
+		t.Fatalf("waiting stop=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+	}
+}
 
 func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
 	command := exec.Command("sh", "-c", "trap '' TERM; sleep 60")

@@ -4083,6 +4083,20 @@ func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot s
 	if pending != nil {
 		desired = clusterRuntimePolicy(*pending)
 	}
+	// An existing member can replay its committed FSM only after the restarted
+	// group elects a leader. Do not require that election before opening the
+	// control server when no policy change was requested: doing so makes a
+	// fully stopped multi-voter cluster impossible to start sequentially. The
+	// shared bootstrap record is the last policy atomically persisted after a
+	// Raft commit, so it is a safe temporary projection while the remaining
+	// voters return. registerClusterNodeWithRetry below keeps this process alive
+	// until quorum is restored and the committed policy is replayed.
+	if effective.Revision == 0 && !changeRequested && node.HadExistingState() {
+		if err := desired.Validate(); err != nil {
+			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisted cluster operational policy: %w", err)
+		}
+		return desired, nil
+	}
 	if effective.Revision == 0 || (changeRequested && !equalClusterRuntimePolicy(effective, desired)) {
 		deadline := time.Now().Add(15 * time.Second)
 		for !node.IsLeader() && time.Now().Before(deadline) {
@@ -4795,7 +4809,24 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 				clusterListener.Close()
 				return fmt.Errorf("loading elastic drain recovery state: %w", err)
 			}
+			waitingForQuorum := clusterRuntime.raft != nil && clusterRuntime.raft.HadExistingState() && clusterRuntime.raft.Leader() == ""
+			if waitingForQuorum {
+				// The Raft/control listener is already serving. Advertise this
+				// intentional intermediate state to the local launcher so an
+				// operator can start the remaining voters sequentially. This is
+				// not readiness: the Unix request loop and every execution grant
+				// remain unavailable until registration below commits.
+				if err := writeDaemonQuorumWait(socket); err != nil {
+					clusterListener.Close()
+					return fmt.Errorf("publishing quorum-wait startup state: %w", err)
+				}
+			}
 			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, clusterRuntime.recoverMembership)
+			if waitingForQuorum {
+				if removeErr := os.Remove(protocol.DaemonQuorumWaitPath(socket)); removeErr != nil && !os.IsNotExist(removeErr) && err == nil {
+					err = fmt.Errorf("clearing quorum-wait startup state: %w", removeErr)
+				}
+			}
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("registering elastic cluster node: %w", err)
@@ -6570,6 +6601,33 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 
 func daemonLogPath(socket string) string {
 	return filepath.Join(filepath.Dir(socket), "ttcd.log")
+}
+
+func writeDaemonQuorumWait(socket string) error {
+	state := protocol.DaemonQuorumWait{PID: os.Getpid(), APIVersion: daemonAPIVersion, BuildID: version.Version()}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	path := protocol.DaemonQuorumWaitPath(socket)
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".ttcd-quorum-wait-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bool, clusterOpts daemonClusterOptions) (string, <-chan error, error) {

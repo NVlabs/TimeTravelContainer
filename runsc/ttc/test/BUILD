@@ -88,6 +88,16 @@ sh_binary(
     ],
 )
 
+# Manual because it deliberately SIGKILLs every daemon in a two-voter cluster,
+# then verifies sequential quorum recovery and live-runtime reauthorization.
+sh_binary(
+    name = "e2e_cluster_restart",
+    srcs = ["e2e_cluster_restart.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it starts a three-node cluster, creates a configurable
 # high-fanout family across nodes, and retires a node through bulk migration.
 sh_binary(

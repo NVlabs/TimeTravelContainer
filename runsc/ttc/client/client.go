@@ -700,7 +700,16 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 	}
 	switch args[0] {
 	case "start":
+		if waiting, ok := quorumWaitDaemon(opts.socket); ok {
+			if waiting.APIVersion != daemonAPIVersion || waiting.BuildID != version.Version() {
+				fmt.Fprintf(stderr, "ttc: client build %q does not match quorum-waiting daemon build %q (API %d); only 'ttc daemon stop' is allowed across versions\n", version.Version(), waiting.BuildID, waiting.APIVersion)
+				return 1
+			}
+			fmt.Fprintln(stdout, "ttcd already started; waiting for cluster quorum")
+			return 0
+		}
 		if conn, err := net.DialTimeout("unix", opts.socket, 150*time.Millisecond); err == nil {
+			_ = conn.SetDeadline(time.Now().Add(time.Second))
 			status, exchangeErr := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, stderr)
 			conn.Close()
 			if exchangeErr != nil {
@@ -722,6 +731,15 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 		if len(args) != 1 {
 			fmt.Fprintln(stderr, "ttc: usage: ttc daemon status")
 			return 2
+		}
+		if waiting, ok := quorumWaitDaemon(opts.socket); ok {
+			if waiting.APIVersion != daemonAPIVersion || waiting.BuildID != version.Version() {
+				fmt.Fprintf(stderr, "ttc: client build %q does not match quorum-waiting daemon build %q (API %d)\n", version.Version(), waiting.BuildID, waiting.APIVersion)
+				return 1
+			}
+			encoded, _ := json.Marshal(map[string]any{"pid": waiting.PID, "state": "starting", "waiting_for_cluster_quorum": true})
+			fmt.Fprintln(stdout, string(encoded))
+			return 0
 		}
 		return exchangeControl(opts.socket, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, stdout, stderr)
 	case "stop":
@@ -745,6 +763,28 @@ func runDaemon(opts options, args []string, stdout, stderr io.Writer) int {
 // same stop action with that version is safe because the rejected request made
 // no state change.
 func stopDaemon(socket string, args []string, stdout, stderr io.Writer) int {
+	if waiting, ok := quorumWaitDaemon(socket); ok {
+		pid := waiting.PID
+		if len(args) != 0 {
+			fmt.Fprintln(stderr, "ttc: a daemon waiting for cluster quorum has no admitted containers; stop policies are not applicable")
+			return 2
+		}
+		if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			fmt.Fprintf(stderr, "ttc: stopping daemon waiting for cluster quorum: %v\n", err)
+			return 1
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if syscall.Kill(pid, 0) == nil {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+		_ = os.Remove(protocol.DaemonQuorumWaitPath(socket))
+		_ = os.Remove(socket)
+		fmt.Fprintln(stdout, "ttcd stopped")
+		return 0
+	}
 	req := request{Version: daemonAPIVersion, Action: "stop", ManageStop: true, Args: append([]string(nil), args...)}
 	status, out, diagnostic, err := exchangeControlCapture(socket, req)
 	if err != nil {
@@ -845,6 +885,11 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	command := exec.Command(daemon, append([]string{"--socket", socket}, args...)...)
 	command.Stdin, command.Stdout, command.Stderr = devNull, log, log
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// A SIGKILLed daemon may leave this advisory marker behind. The child
+	// recreates it only after its Raft/control listener is initialized.
+	if err := os.Remove(protocol.DaemonQuorumWaitPath(socket)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale quorum-wait marker: %w", err)
+	}
 	if err := command.Start(); err != nil {
 		return err
 	}
@@ -856,11 +901,16 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 			return false
 		}
 		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(250 * time.Millisecond))
 		status, err := exchange(conn, request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "ping"}, strings.NewReader(""), io.Discard, io.Discard)
 		return err == nil && status == 0
 	}
 	deadline := time.Now().Add(daemonStartTimeout)
 	for time.Now().Before(deadline) {
+		if waiting, ok := quorumWaitDaemon(socket); ok && waiting.APIVersion == daemonAPIVersion && waiting.BuildID == version.Version() {
+			fmt.Fprintln(stdout, "ttcd started; waiting for cluster quorum")
+			return nil
+		}
 		if ready() {
 			fmt.Fprintln(stdout, "ttcd started")
 			return nil
@@ -884,6 +934,37 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	_ = os.Remove(socket)
 	data, _ := os.ReadFile(logPath)
 	return fmt.Errorf("ttcd did not become ready; startup log: %s\n%s", logPath, strings.TrimSpace(string(data)))
+}
+
+// quorumWaitDaemon validates the advisory marker strongly enough that
+// daemon stop/status cannot act on an unrelated process after PID reuse.
+func quorumWaitDaemon(socket string) (protocol.DaemonQuorumWait, bool) {
+	data, err := os.ReadFile(protocol.DaemonQuorumWaitPath(socket))
+	if err != nil {
+		return protocol.DaemonQuorumWait{}, false
+	}
+	var waiting protocol.DaemonQuorumWait
+	if err := json.Unmarshal(data, &waiting); err != nil || waiting.PID <= 0 || waiting.APIVersion <= 0 || waiting.BuildID == "" || syscall.Kill(waiting.PID, 0) != nil {
+		return protocol.DaemonQuorumWait{}, false
+	}
+	executable, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(waiting.PID), "exe"))
+	if err != nil || filepath.Base(executable) != "ttcd" {
+		return protocol.DaemonQuorumWait{}, false
+	}
+	commandLine, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(waiting.PID), "cmdline"))
+	if err != nil {
+		return protocol.DaemonQuorumWait{}, false
+	}
+	arguments := strings.Split(strings.TrimSuffix(string(commandLine), "\x00"), "\x00")
+	for index, argument := range arguments {
+		if argument == "--socket" && index+1 < len(arguments) && arguments[index+1] == socket {
+			return waiting, true
+		}
+		if strings.TrimPrefix(argument, "--socket=") != argument && strings.TrimPrefix(argument, "--socket=") == socket {
+			return waiting, true
+		}
+	}
+	return protocol.DaemonQuorumWait{}, false
 }
 
 func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
