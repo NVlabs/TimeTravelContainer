@@ -499,6 +499,28 @@ func loadDistributedFamily(store ttcbundle.Store, placements cluster.PlacementCa
 	}
 }
 
+// loadDistributedFamilyIdentity resolves the small, immutable family identity
+// needed by a branch-scoped coordinator. Raft commits this identity together
+// with placement before a branch becomes routable, whereas the corresponding
+// container.json is derived shared-filesystem metadata and can remain hidden
+// behind an NFS negative-entry cache on an arbitrary entry node. The branch
+// owner still loads the complete physical record before executing the child
+// command; this fallback never substitutes for runtime or storage metadata.
+func loadDistributedFamilyIdentity(store ttcbundle.Store, placements cluster.PlacementCatalog, identifier string) (ttcbundle.ContainerInfo, error) {
+	info, err := store.LoadContainer(identifier)
+	if err == nil {
+		return info, nil
+	}
+	familyID, resolveErr := resolvePlacementFamily(placements, identifier)
+	if resolveErr != nil {
+		return ttcbundle.ContainerInfo{}, err
+	}
+	if info, exactErr := store.LoadRuntimeContainer(familyID); exactErr == nil {
+		return info, nil
+	}
+	return ttcbundle.ContainerInfo{ID: familyID, Name: identifier, DistributedFamilyID: familyID}, nil
+}
+
 func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
 	if len(claims) == 0 {
 		return nil
@@ -2136,7 +2158,12 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			name = selected.container
 			branchID = selected.branch
 		}
-		info, err := loadDistributedFamily(store, s.clusterPlacements, name)
+		var info ttcbundle.ContainerInfo
+		if branchID != "" {
+			info, err = loadDistributedFamilyIdentity(store, s.clusterPlacements, name)
+		} else {
+			info, err = loadDistributedFamily(store, s.clusterPlacements, name)
+		}
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
@@ -2264,7 +2291,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if err != nil {
 				return true, 1, nil, nil, fmt.Errorf("invalid target %q: %w", operand, err)
 			}
-			info, err := loadDistributedFamily(store, s.clusterPlacements, selected.container)
+			info, err := loadDistributedFamilyIdentity(store, s.clusterPlacements, selected.container)
 			if err != nil {
 				return true, 1, nil, nil, err
 			}

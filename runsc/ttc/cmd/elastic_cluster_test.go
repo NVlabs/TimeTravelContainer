@@ -360,6 +360,29 @@ func TestDaemonCommandPlacementUsesInjectedRaftCatalog(t *testing.T) {
 	}
 }
 
+func TestLoadDistributedFamilyIdentityUsesRaftDuringNFSVisibilityLag(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family-id", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "family-id", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementPaused,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// The store deliberately contains no container directory, modeling an NFS
+	// client whose negative-entry cache has not observed the owner's metadata.
+	info, err := loadDistributedFamilyIdentity(ttcbundle.Store{Root: t.TempDir()}, placements, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID != "family-id" || info.DistributedFamilyID != "family-id" || info.Name != "web" {
+		t.Fatalf("identity=%+v", info)
+	}
+}
+
 func TestDaemonCommandMayAwaitColdUnplacement(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "containers", "family-id", "container.json")
