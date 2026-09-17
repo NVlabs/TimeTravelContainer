@@ -939,15 +939,24 @@ func (b *runtimeBackend) reserveNewContainerPlacement(info ttcbundle.ContainerIn
 // reservation; stable-state completion consequently requires execution
 // authority, but not continued admission of unrelated new work.
 func (b *runtimeBackend) activateNewContainerPlacement(reservation newPlacementReservation) error {
+	return b.activateNewContainerPlacementState(reservation, cluster.PlacementRunning)
+}
+
+// activateNewContainerPlacementState makes a successfully constructed
+// reservation normally routable in its exact lifecycle state.
+func (b *runtimeBackend) activateNewContainerPlacementState(reservation newPlacementReservation, state cluster.PlacementState) error {
 	if reservation.record == nil {
 		return nil
+	}
+	if state != cluster.PlacementRunning && state != cluster.PlacementPaused {
+		return fmt.Errorf("cannot activate new-container placement in state %q", state)
 	}
 	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
 	}
 	record := reservation.record
-	_, err = placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementRunning, time.Now())
+	_, err = placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, state, time.Now())
 	if err != nil {
 		return fmt.Errorf("activating placement for %s@%s: %w", record.FamilyID, record.BranchID, err)
 	}

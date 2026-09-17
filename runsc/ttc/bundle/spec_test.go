@@ -3203,6 +3203,8 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 		Annotations: map[string]string{
 			specutils.AnnotationTTCVolumeRepositories: string(encoded),
 			ttcpack.LazyAnnotation:                    filepath.Join(shared, "images", "source", ttcpack.LazyDescriptorName),
+			ownership.Annotation:                      filepath.Join(shared, "images", "source", ownership.ManifestName),
+			"dev.gvisor.spec.rootfs.source":           filepath.Join(shared, "images", "source", "rootfs"),
 		},
 	}
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
@@ -3245,6 +3247,12 @@ func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
 	}
 	if loaded.Root == nil || loaded.Root.Path != wantRoot {
 		t.Fatalf("root path = %+v, want %q", loaded.Root, wantRoot)
+	}
+	if got, want := loaded.Annotations["dev.gvisor.spec.rootfs.source"], wantRoot; got != want {
+		t.Fatalf("rootfs source annotation = %q, want %q", got, want)
+	}
+	if got, want := loaded.Annotations[ownership.Annotation], ownership.ManifestPath(wantRoot); got != want {
+		t.Fatalf("ownership annotation = %q, want %q", got, want)
 	}
 	if got, want := loaded.Annotations[ttcpack.LazyAnnotation], ttcpack.LazyDescriptorPath(wantRoot); got != want {
 		t.Fatalf("lazy image annotation = %q, want %q", got, want)

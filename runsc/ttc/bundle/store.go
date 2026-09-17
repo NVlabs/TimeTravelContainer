@@ -1528,16 +1528,14 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
 	}
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
-	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
 	if len(repositories) == 0 {
 		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
 	} else {
 		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
 	}
-	if spec.Root == nil {
-		return Prepared{}, errors.New("checkpoint OCI spec has no root")
+	if err := rewriteImageRoot(&spec, rootfs); err != nil {
+		return Prepared{}, fmt.Errorf("rewriting checkpoint image root: %w", err)
 	}
-	spec.Root.Path = rootfs
 	hostMountByIndex := make(map[int]RestoreHostMount, len(opts.HostMounts))
 	for _, mount := range opts.HostMounts {
 		if mount.MountIndex < 0 || mount.Source == "" || mount.SnapshotPath == "" {
@@ -2989,22 +2987,8 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	if s.activeRoot() != s.Root {
 		if spec.Root != nil && info.Digest != "" && info.Platform != "" {
 			rootfs := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
-			spec.Root.Path = rootfs
-			if spec.Annotations == nil {
-				spec.Annotations = make(map[string]string)
-			}
-			spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
-			// The canonical spec is shared metadata and may describe a fully
-			// extracted root on another node. Lazy image backing is a property of
-			// this node's cache, so derive its annotation from the rewritten root
-			// instead of copying the canonical annotation. Without this, the gofer
-			// sees zero-length skeleton files as complete files during distributed
-			// restore, and executable mappings fail with SIGBUS on first access.
-			delete(spec.Annotations, ttcpack.LazyAnnotation)
-			if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
-				spec.Annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("loading node-local lazy image descriptor: %w", err)
+			if err := rewriteImageRoot(&spec, rootfs); err != nil {
+				return nil, err
 			}
 		}
 		// TTC-generated bind mounts are small node-private files (hostname,
@@ -3134,6 +3118,35 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 		return nil, err
 	}
 	return &spec, nil
+}
+
+// rewriteImageRoot makes every path-bearing immutable-image annotation agree
+// with rootfs. Canonical clustered bundles may have been written by another
+// node, so copying only Spec.Root.Path leaves the gofer looking for ownership
+// metadata or lazy-pack state in the former node's cache. Keep this operation
+// centralized so ordinary starts, checkpoint restore, and future cache
+// materializers cannot acquire subtly different node-local views.
+func rewriteImageRoot(spec *specs.Spec, rootfs string) error {
+	if spec == nil || spec.Root == nil {
+		return errors.New("OCI spec has no root")
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	spec.Root.Path = rootfs
+	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
+	spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
+
+	// Lazy image backing is a property of this node's cache, not of the
+	// canonical image identity. A stale descriptor can make zero-length
+	// skeleton files appear complete and later SIGBUS executable mappings.
+	delete(spec.Annotations, ttcpack.LazyAnnotation)
+	if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
+		spec.Annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("loading node-local lazy image descriptor: %w", err)
+	}
+	return nil
 }
 
 // WriteActiveRepositoryMap records node-local materializations without

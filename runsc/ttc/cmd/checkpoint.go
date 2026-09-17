@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	ttccheckpoint "gvisor.dev/gvisor/runsc/ttc/checkpoint"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
 type checkpointRequest struct {
@@ -454,11 +455,19 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		return "", err
 	}
 	id = prepared.Container.ID
+	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
+	if err != nil {
+		return "", errors.Join(err, b.containerStore().RemoveContainer(id))
+	}
 	cleanup := true
 	defer func() {
 		if cleanup {
-			if err := b.remove(id, true, true); err != nil && retErr == nil {
-				retErr = fmt.Errorf("cleaning failed restore: %w", err)
+			cleanupErr := errors.Join(
+				b.cancelNewContainerPlacement(reservation),
+				b.containerStore().RemoveContainer(id),
+			)
+			if cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("cleaning failed restore: %w", cleanupErr))
 			}
 		}
 	}()
@@ -500,6 +509,13 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		if err := store.UpdateState(id, "paused", nil); err != nil {
 			return "", err
 		}
+	}
+	placementState := cluster.PlacementRunning
+	if manifest.RestorePaused {
+		placementState = cluster.PlacementPaused
+	}
+	if err := b.activateNewContainerPlacementState(reservation, placementState); err != nil {
+		return "", err
 	}
 	cleanup = false
 	return id, nil
