@@ -624,7 +624,6 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if protected[uint64(id.Snapshot)] {
 			continue
 		}
-		releasableOrigins[id.Snapshot] = struct{}{}
 		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
 		if err != nil {
 			return err
@@ -665,6 +664,13 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if err != nil {
 			return err
 		}
+		// The bridge belongs to the shared pack, not merely to the logical
+		// snapshot ID. Remember it only after proving that the pack exists and
+		// releasing one of its canonical roots succeeded. Volatile and already
+		// retired/abandoned origins have no shared bridge to release. Recording
+		// them here used to turn an otherwise idempotent branch removal into a
+		// missing-manifest failure.
+		releasableOrigins[id.Snapshot] = struct{}{}
 	}
 	publisher := &branchPublisher{
 		sharedRoot: b.dataRoot, nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
