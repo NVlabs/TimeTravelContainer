@@ -2380,8 +2380,8 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 		if err != nil {
 			return fmt.Errorf("loading removed migration transaction %q: %w", transactionID, err)
 		}
-		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent || tx.Identity.SourceNodeID != b.nodeID {
-			return fmt.Errorf("transaction %q is not an independent migration sourced by node %q", transactionID, b.nodeID)
+		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent {
+			return fmt.Errorf("transaction %q is not an independent migration", transactionID)
 		}
 		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
 			return fmt.Errorf("cannot discard migration source %q while placement %s@%s still exists", transactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
@@ -2389,18 +2389,38 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 			return fmt.Errorf("checking removed migration placement %q: %w", transactionID, err)
 		}
 
-		sourceContainer, sourceBranch := migrationSourceRuntime(*tx)
-		unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
-		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
-		if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+		if tx.Identity.SourceNodeID == b.nodeID {
+			sourceContainer, sourceBranch := migrationSourceRuntime(*tx)
+			unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
+			_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+				unlockSource()
+				return fmt.Errorf("releasing removed migration roots %q: %w", transactionID, err)
+			}
+			if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
+				unlockSource()
+				return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
+			}
 			unlockSource()
-			return fmt.Errorf("releasing removed migration roots %q: %w", transactionID, err)
+		} else {
+			// A clean Raft retirement is a stronger fence than an absent node
+			// record: node stop has synchronously released every migration
+			// source, transfer pin, volatile origin, and publication before the
+			// exact incarnation is removed. Only that durable fence permits a
+			// surviving coordinator to retire this historical transaction. An
+			// offline or expired source remains an error because its physical
+			// cleanup has not been proven.
+			if b.distributedSource.authority == nil {
+				return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+			}
+			state, err := b.distributedSource.authority.AuthorityState()
+			if err != nil {
+				return fmt.Errorf("checking retired migration source %q: %w", transactionID, err)
+			}
+			if retiredIncarnation, ok := state.RetiredNodes[tx.Identity.SourceNodeID]; !ok || retiredIncarnation != tx.SourceIncarnation {
+				return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q, and that source incarnation has not retired cleanly", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+			}
 		}
-		if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
-			unlockSource()
-			return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
-		}
-		unlockSource()
 		current, err := store.Load(transactionID)
 		if errors.Is(err, os.ErrNotExist) {
 			continue

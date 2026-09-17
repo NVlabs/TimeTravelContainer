@@ -1693,6 +1693,141 @@ func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotI
 	return releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin)
 }
 
+// publishVolatileFilesystemOrigin transfers one immutable filesystem origin
+// from this node's repository graph to shared authority. This is the
+// filesystem counterpart of publishVolatileGraphOrigin and is intentionally
+// origin-scoped: graceful node retirement must cover immutable origins kept
+// alive by remote descendants even when no current local branch names them.
+func (b *runtimeBackend) publishVolatileFilesystemOrigin(origin ttcsnapshot.SnapshotID) error {
+	if origin == 0 || b.snapshotShared == nil || b.distributedSource == nil ||
+		b.distributedSource.authority == nil || b.sharedReferences == nil {
+		return errors.New("distributed filesystem publication is unavailable")
+	}
+	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		if _, err := b.snapshotShared.Manifest(origin); err != nil {
+			return fmt.Errorf("filesystem origin %d has neither volatile nor shared authority: %w", origin, err)
+		}
+		return nil
+	}
+	if provider.NodeID != b.nodeID {
+		return fmt.Errorf("filesystem origin %d belongs to node %q, not %q", origin, provider.NodeID, b.nodeID)
+	}
+
+	publisher := &branchPublisher{
+		sharedRoot: b.dataRoot,
+		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	bridgeIntent := sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	found, err := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
+		empty, err := repository.OriginEmpty(origin)
+		if err != nil {
+			return err
+		}
+		if empty {
+			busy, err := b.snapshotShared.DiscardHandoff(origin)
+			if err != nil {
+				return err
+			}
+			if busy {
+				return fmt.Errorf("filesystem origin %d handoff pack is busy", origin)
+			}
+			return b.distributedSource.authority.AbandonSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin))
+		}
+		if err := repository.PublishOriginHandoff(context.Background(), b.snapshotShared, origin); err != nil {
+			return fmt.Errorf("publishing filesystem origin %d: %w", origin, err)
+		}
+		changes, err := repository.FreezeOriginHandoff(origin)
+		if err != nil {
+			return fmt.Errorf("freezing filesystem origin %d reference handoff: %w", origin, err)
+		}
+		if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
+			return fmt.Errorf("transferring filesystem origin %d reference authority: %w", origin, err)
+		}
+		if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
+			return fmt.Errorf("publishing filesystem origin %d authority: %w", origin, err)
+		}
+		if err := repository.CompleteOriginHandoff(origin); err != nil {
+			return fmt.Errorf("completing filesystem origin %d handoff: %w", origin, err)
+		}
+		if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
+			return fmt.Errorf("releasing filesystem origin %d publication bridge: %w", origin, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("filesystem origin %d is absent from node-local repositories", origin)
+	}
+	return nil
+}
+
+// publishRemainingVolatileOrigins is the graceful-retirement authority
+// barrier. Branch migration and dependency draining remove the common roots,
+// but remote descendants may legitimately keep older immutable origins alive.
+// A node must publish or abandon every such origin before its process and
+// scratch storage become disposable.
+func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" {
+		return nil
+	}
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return err
+	}
+	filesystem, err := b.containerStore().FilesystemSnapshotOrigins()
+	if err != nil {
+		return fmt.Errorf("inventorying filesystem origins before retirement: %w", err)
+	}
+	state, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	var origins []ttcsnapshot.SnapshotID
+	for encoded, provider := range state.VolatileOrigins {
+		if provider.NodeID == b.nodeID {
+			origins = append(origins, ttcsnapshot.SnapshotID(encoded))
+		}
+	}
+	sort.Slice(origins, func(i, j int) bool { return origins[i] < origins[j] })
+	for _, origin := range origins {
+		if b.snapshotGraph != nil {
+			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
+				if err := b.publishVolatileGraphOrigin(origin); err != nil {
+					return fmt.Errorf("publishing remaining memory origin %d: %w", origin, err)
+				}
+				continue
+			}
+		}
+		if _, ok := filesystem[origin]; ok {
+			if err := b.publishVolatileFilesystemOrigin(origin); err != nil {
+				return fmt.Errorf("publishing remaining filesystem origin %d: %w", origin, err)
+			}
+			continue
+		}
+		// Reconciliation inventories the same local stores while the daemon
+		// mutation lock is held. Reaching this point means the origin vanished
+		// after that pass without a corresponding authority transition.
+		return fmt.Errorf("volatile snapshot origin %d has no node-local memory or filesystem graph", origin)
+	}
+	state, err = b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	for encoded, provider := range state.VolatileOrigins {
+		if provider.NodeID == b.nodeID {
+			return fmt.Errorf("snapshot origin %d still names retiring node %q", encoded, b.nodeID)
+		}
+	}
+	return nil
+}
+
 func distributedRootfsDigest(info ttcbundle.ContainerInfo, sourceBranch, repositoryID string) (string, error) {
 	identity := struct {
 		ContainerID  string                    `json:"container_id"`

@@ -2907,6 +2907,55 @@ func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing
 	}
 }
 
+func TestWithFilesystemSnapshotOriginFindsUniqueRepository(t *testing.T) {
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.CreateWithOrigin("first", 71)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.CreateWithOrigin("second", 72)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Root: t.TempDir(), ActiveRoot: localRoot}
+	visited := 0
+	found, err := store.WithFilesystemSnapshotOrigin(72, func(repository *ttcvolume.Repository) error {
+		visited++
+		origins := repository.SnapshotOrigins()
+		if !slices.Contains(origins, ttcsnapshot.SnapshotID(72)) || slices.Contains(origins, ttcsnapshot.SnapshotID(71)) {
+			t.Fatalf("visited wrong repository origins: %v", origins)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || visited != 1 {
+		t.Fatalf("found=%t visited=%d, want true/1", found, visited)
+	}
+	found, err = store.WithFilesystemSnapshotOrigin(73, func(*ttcvolume.Repository) error {
+		t.Fatal("visited repository for absent origin")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("reported absent origin as found")
+	}
+}
+
 func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *testing.T) {
 	shared := t.TempDir()
 	local := t.TempDir()

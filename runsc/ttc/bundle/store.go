@@ -4532,6 +4532,72 @@ func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{},
 	return origins, nil
 }
 
+// WithFilesystemSnapshotOrigin opens the unique node-local filesystem
+// repository that contains origin and invokes visit while that repository is
+// open. Snapshot origins are allocated cluster-wide, so finding the same
+// origin in more than one repository indicates corrupt local authority rather
+// than an ambiguous lookup.
+//
+// The callback form deliberately keeps repository discovery in Store. Callers
+// should not need to duplicate its inventory of named volumes, rootfs uppers,
+// copied mounts, and transaction-private repositories merely to complete an
+// origin-level operation such as provider handoff.
+func (s Store) WithFilesystemSnapshotOrigin(origin ttcsnapshot.SnapshotID, visit func(*ttcvolume.Repository) error) (bool, error) {
+	if origin == 0 {
+		return false, errors.New("filesystem snapshot origin is zero")
+	}
+	if visit == nil {
+		return false, errors.New("filesystem snapshot origin visitor is nil")
+	}
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return false, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return false, err
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	found := false
+	for _, path := range ordered {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return found, fmt.Errorf("opening repository %q for origin lookup: %w", path, err)
+		}
+		contains := false
+		for _, candidate := range repository.SnapshotOrigins() {
+			if candidate == origin {
+				contains = true
+				break
+			}
+		}
+		if !contains {
+			if err := repository.Close(); err != nil {
+				return found, fmt.Errorf("closing repository %q after origin lookup: %w", path, err)
+			}
+			continue
+		}
+		if found {
+			_ = repository.Close()
+			return true, fmt.Errorf("filesystem snapshot origin %d appears in multiple repositories", origin)
+		}
+		found = true
+		visitErr := visit(repository)
+		closeErr := repository.Close()
+		if visitErr != nil || closeErr != nil {
+			return true, errors.Join(visitErr, closeErr)
+		}
+	}
+	return found, nil
+}
+
 func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{}, error) {
 	paths := make(map[string]struct{})
 	volumes, err := manager.List()

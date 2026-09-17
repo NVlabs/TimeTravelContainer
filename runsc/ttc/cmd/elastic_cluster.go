@@ -1754,7 +1754,19 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				ids = append(ids, transactionID)
 			}
 			sort.Strings(ids)
-			children = append(children, child{node: node, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
+			cleanupNode := node
+			if _, err := s.clusterDirectory.Lookup(node); errors.Is(err, os.ErrNotExist) {
+				// Cleanly retired nodes have already discarded their physical
+				// migration sources before Raft removes their membership. Route
+				// the remaining transaction retirement through this live
+				// coordinator instead of trying to reconnect to a node that is
+				// intentionally gone. discardRemovedMigrationSources verifies
+				// the matching retirement fence before deleting anything.
+				cleanupNode = s.clusterCapabilities.NodeID
+			} else if err != nil {
+				return true, 1, nil, nil, fmt.Errorf("resolving migration cleanup node %q: %w", node, err)
+			}
+			children = append(children, child{node: cleanupNode, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
 		}
 	}
 	children = append(append(preflight, children...), finalizers...)
@@ -3609,6 +3621,14 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	defer terminalCancel()
 	if err := b.distributedSource.waitForBackgroundTasks(terminalCtx); err != nil {
 		return moved, fmt.Errorf("waiting for distributed source cleanup: %w", err)
+	}
+	// Branch evacuation is not the complete storage-authority barrier. Remote
+	// descendants may still retain immutable origins created by this node even
+	// after every visible branch and transaction dependency has moved away.
+	// Publish (or abandon, when empty) all of them before allowing the daemon's
+	// scratch root and peer endpoint to disappear.
+	if err := b.publishRemainingVolatileOrigins(); err != nil {
+		return moved, fmt.Errorf("publishing retiring node snapshot origins: %w", err)
 	}
 	last, err := waitForTerminalClusterOwnership(terminalCtx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
 	if err != nil {
