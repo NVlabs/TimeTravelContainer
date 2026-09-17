@@ -175,6 +175,49 @@ func TestDependencyMonitorPollAdmissionIsNonBlocking(t *testing.T) {
 	}
 }
 
+func TestOpenDistributedSharedArtifactRetriesVisibilityErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "artifact")
+	contents := []byte("published")
+	if err := os.WriteFile(path, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := uint64(len(contents))
+	attempts := 0
+	file, err := openDistributedSharedArtifactWith(context.Background(), path, &wantBytes, func(path string) (*os.File, error) {
+		attempts++
+		switch attempts {
+		case 1:
+			return nil, os.ErrNotExist
+		case 2:
+			return nil, unix.ESTALE
+		default:
+			return os.Open(path)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if attempts != 3 {
+		t.Fatalf("open attempts=%d, want 3", attempts)
+	}
+}
+
+func TestOpenDistributedSharedArtifactDoesNotHideProtocolErrors(t *testing.T) {
+	permanent := errors.New("permission denied by protocol")
+	attempts := 0
+	_, err := openDistributedSharedArtifactWith(context.Background(), "unused", nil, func(string) (*os.File, error) {
+		attempts++
+		return nil, permanent
+	})
+	if !errors.Is(err, permanent) {
+		t.Fatalf("open error=%v, want %v", err, permanent)
+	}
+	if attempts != 1 {
+		t.Fatalf("open attempts=%d, want 1", attempts)
+	}
+}
+
 func (c transactionListCatalog) List() ([]cluster.Transaction, error) {
 	return append([]cluster.Transaction(nil), c.records...), nil
 }

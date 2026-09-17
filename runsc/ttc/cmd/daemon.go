@@ -102,6 +102,13 @@ var daemonAPIFeatures = []string{
 
 const repositoryMaintenanceInterval = 5 * time.Minute
 
+// distributedArtifactVisibilityTimeout bounds recovery from cross-client NFS
+// directory-cache lag after a source has atomically published and fsynced an
+// immutable transaction artifact. The source retains these files until the
+// target RPC completes, so ENOENT and ESTALE during this interval describe a
+// visibility race rather than an absent logical object.
+const distributedArtifactVisibilityTimeout = 30 * time.Second
+
 const (
 	daemonRootSchema                  = "snapshot-graph-v2"
 	daemonStandaloneRootFormatVersion = 2
@@ -118,6 +125,56 @@ var (
 	daemonPlatformPreflight   = preflightDaemonPlatform
 	daemonStatfs              = unix.Statfs
 )
+
+func openDistributedSharedArtifact(ctx context.Context, path string, expectedBytes *uint64) (*os.File, error) {
+	return openDistributedSharedArtifactWith(ctx, path, expectedBytes, os.Open)
+}
+
+// openDistributedSharedArtifactWith reopens an immutable transaction artifact
+// after the two transient lookup failures exposed by cache-coherent network
+// filesystems: a negative lookup retained across the publisher's atomic rename
+// and ESTALE while the client refreshes the renamed directory entry. It must
+// not be used for general storage lookup; only a live transaction guarantees
+// that the publisher has committed and continues to retain this exact path.
+func openDistributedSharedArtifactWith(ctx context.Context, path string, expectedBytes *uint64, open func(string) (*os.File, error)) (*os.File, error) {
+	ctx, cancel := context.WithTimeout(ctx, distributedArtifactVisibilityTimeout)
+	defer cancel()
+	delay := time.Millisecond
+	var lastErr error
+	for {
+		file, err := open(path)
+		if err == nil && expectedBytes != nil {
+			stat, statErr := file.Stat()
+			if statErr != nil {
+				_ = file.Close()
+				err = statErr
+			} else if uint64(stat.Size()) != *expectedBytes {
+				_ = file.Close()
+				return nil, fmt.Errorf("shared distributed artifact size is %d, want %d", stat.Size(), *expectedBytes)
+			}
+		}
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ESTALE) {
+			return nil, err
+		}
+		lastErr = err
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+		if delay < 250*time.Millisecond {
+			delay *= 2
+			if delay > 250*time.Millisecond {
+				delay = 250 * time.Millisecond
+			}
+		}
+	}
+}
 
 type daemonRequest struct {
 	Version         int                    `json:"version"`
@@ -991,25 +1048,17 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}()
 		if restoreArgs.SharedMetadata {
 			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
-			sharedMetadata, err = os.Open(metadataPath)
+			sharedMetadata, err = openDistributedSharedArtifact(ctx, metadataPath, &session.MetadataBytes)
 			if err != nil {
 				reader.Close()
 				return fmt.Errorf("opening shared distributed metadata: %w", err)
-			}
-			if stat, err := sharedMetadata.Stat(); err != nil || uint64(stat.Size()) != session.MetadataBytes {
-				sharedMetadata.Close()
-				reader.Close()
-				if err != nil {
-					return fmt.Errorf("stating shared distributed metadata: %w", err)
-				}
-				return fmt.Errorf("shared distributed metadata size is %d, want %d", stat.Size(), session.MetadataBytes)
 			}
 			files = append(files, sharedMetadata)
 			connectionsStartFD++
 		}
 		if restoreArgs.GraphSparse {
 			graphPath := filepath.Join(r.backend.dataRoot, session.GraphManifest)
-			graphManifest, openErr := os.Open(graphPath)
+			graphManifest, openErr := openDistributedSharedArtifact(ctx, graphPath, nil)
 			if openErr != nil {
 				reader.Close()
 				for _, file := range connectionFiles {
@@ -1033,7 +1082,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 		if peer && restoreArgs.DurableDehydration {
 			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
-			metadataFile, err := os.Open(metadataPath)
+			metadataFile, err := openDistributedSharedArtifact(ctx, metadataPath, &session.MetadataBytes)
 			if err != nil {
 				return fmt.Errorf("opening durable peer metadata: %w", err)
 			}
@@ -1263,12 +1312,12 @@ func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) 
 	return err
 }
 
-func (r *daemonTargetRuntime) Handoff(_ context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
+func (r *daemonTargetRuntime) Handoff(ctx context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
-	return r.handoffLocked(tx, graph)
+	return r.handoffLocked(ctx, tx, graph)
 }
 
-func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
+func (r *daemonTargetRuntime) handoffLocked(ctx context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
 	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
 	if err != nil {
 		return r.forwardedDependencyError(tx, err)
@@ -1299,7 +1348,7 @@ func (r *daemonTargetRuntime) handoffLocked(tx *cluster.Transaction, graph clust
 			return fmt.Errorf("releasing superseded graph roots: %w", err)
 		}
 	}
-	manifest, err := os.Open(filepath.Join(r.backend.dataRoot, graph.GraphManifest))
+	manifest, err := openDistributedSharedArtifact(ctx, filepath.Join(r.backend.dataRoot, graph.GraphManifest), nil)
 	if err != nil {
 		return fmt.Errorf("opening graph handoff manifest: %w", err)
 	}
@@ -1450,7 +1499,7 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 	return nil
 }
 
-func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Transaction) error {
+func (r *daemonTargetRuntime) MarkIndependent(ctx context.Context, tx *cluster.Transaction) error {
 	if r == nil || r.backend == nil || tx == nil {
 		return nil
 	}
@@ -1476,7 +1525,7 @@ func (r *daemonTargetRuntime) MarkIndependent(_ context.Context, tx *cluster.Tra
 			// failed before the Sentry recorded it. Reinstall the exact immutable
 			// descriptor and let the ordinary retry observe completion. This also
 			// repairs transactions produced by older daemons with this race.
-			if retryErr := r.handoffLocked(tx, *tx.GraphHandoff); retryErr != nil {
+			if retryErr := r.handoffLocked(ctx, tx, *tx.GraphHandoff); retryErr != nil {
 				return fmt.Errorf("reading graph memory handoff status: %w; reinstalling handoff: %v", err, retryErr)
 			}
 			return errors.New("graph memory handoff was reinstalled and is still in progress")
