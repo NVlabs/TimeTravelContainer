@@ -614,6 +614,62 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	}
 }
 
+func TestWaitForCommittedColdBranchMetadataIgnoresLocalCacheState(t *testing.T) {
+	root := t.TempDir()
+	const publicationID = "publication-cold"
+	containerDir := filepath.Join(root, "containers", "physical")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(root, "physical", "cold", publicationID)
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := coldBranchManifest{
+		Version: 5, Container: "physical", Branch: "cold", PublicationID: publicationID, Kind: "dehydrate",
+		MemorySnapshot: 17,
+		ControlRoot:    ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encoded, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "physical", Name: "physical", DistributedFamilyID: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "cold", State: "dehydrated", Unplaced: true,
+			StorageState: "materializing", PublicationID: publicationID, StorageManifest: manifestPath,
+			SnapshotID: 17,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "cold", PublicationID: publicationID, Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest, MemorySnapshot: 17},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, branch, err := waitForCommittedColdBranchMetadata(ctx, ttcbundle.Store{Root: root}, "family", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.PublicationID != publicationID || branch.StorageManifest != manifestPath {
+		t.Fatalf("resolved branch=%+v", branch)
+	}
+}
+
 func TestWaitForCommittedColdBranchMetadataUsesFilesystemRootAfterMemoryDiscard(t *testing.T) {
 	root := t.TempDir()
 	const (

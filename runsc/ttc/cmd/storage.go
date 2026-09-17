@@ -1958,7 +1958,7 @@ func (b *runtimeBackend) installColdExecConsoleLogs(info ttcbundle.ContainerInfo
 	return nil
 }
 
-func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
+func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	// Portable internal mounts are not part of a TTC volume repository. Restore
 	// them even when a valid local control image is already cached: the branch
 	// may have returned to a node after its prior authoritative local state was
@@ -1996,15 +1996,6 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
 		return err
 	}
-	store := b.containerStore()
-	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{}); err != nil {
-		return err
-	}
-	defer func() {
-		if retErr != nil {
-			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "error", retErr.Error(), time.Time{})
-		}
-	}()
 	manifest, err := readColdBranchManifest(branch.StorageManifest)
 	if err != nil {
 		return err
@@ -2044,7 +2035,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 		if _, err := b.snapshotShared.Manifest(ttcsnapshot.SnapshotID(manifest.MemorySnapshot)); err != nil {
 			return fmt.Errorf("opening shared graph memory snapshot: %w", err)
 		}
-		return store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{})
+		return nil
 	}
 	return errors.New("new-format cold manifest omits graph-native memory snapshot")
 }
@@ -2054,7 +2045,7 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 // branch has deliberately discarded execution state, but its next fresh start
 // must still reconstruct the committed writable repositories on whichever
 // node claims its unplaced Raft record.
-func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (retErr error) {
+func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	if branch.StorageManifest == "" {
 		return nil
 	}
@@ -2064,15 +2055,11 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
 		return err
 	}
-	store := b.containerStore()
-	if err := store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "materializing", "", time.Time{}); err != nil {
-		return err
-	}
-	defer func() {
-		if retErr != nil {
-			_ = store.UpdateBranchStorage(info.ID, branch.ID, branch.PublicationID, "error", retErr.Error(), time.Time{})
-		}
-	}()
+	// Materializing a committed snapshot into this node's disposable cache is
+	// not an authority transition. In particular, cp and cold-fork source
+	// preparation may run on any node while the branch remains unplaced. The
+	// caller records "local" only after it has claimed placement and committed
+	// a live runtime.
 	return b.materializeColdFilesystem(info, branch)
 }
 

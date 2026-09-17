@@ -1407,7 +1407,12 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		// metadata update. An empty or older ID therefore means the publisher
 		// has not completed its shared-catalog write yet, not that the committed
 		// roots are invalid. Poll until the exact authoritative identity appears.
-		if branch.PublicationID == manifest.PublicationID && branch.StorageState == "shared" && branch.StorageManifest != "" {
+		// PublicationID and StorageManifest are the immutable publication fence.
+		// StorageState is deliberately not part of it: after publication, a node
+		// may materialize the branch into its disposable local cache for cp, a
+		// cold fork, or rehydration. That cache activity must not make the
+		// already-committed shared snapshot inadmissible on another node.
+		if branch.PublicationID == manifest.PublicationID && branch.StorageManifest != "" {
 			if filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
 				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", manifest.Branch, branch.StorageManifest, expectedManifest)
 			}
