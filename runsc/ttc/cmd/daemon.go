@@ -4829,14 +4829,22 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		return
 	}
 	var input io.Reader = io.MultiReader(strings.NewReader(header), reader)
+	var copyUploadFlow *daemonStdinFlow
 	var cleanupCopyUpload func()
 	if copyCommand && !copyRoute.sourceContainer && copyRoute.source != "-" {
-		request, input, cleanupCopyUpload, err = prepareDistributedCopyUpload(s.localRoot, request, copyRoute)
+		request, input, copyUploadFlow, cleanupCopyUpload, err = prepareDistributedCopyUpload(s.localRoot, request, copyRoute)
 		if err != nil {
 			writeError(err)
 			return
 		}
 		defer cleanupCopyUpload()
+	}
+	if copyUploadFlow != nil {
+		if err := proxyDistributedCopyUpload(context.Background(), client, input, copyUploadFlow, conn, &writeMu); err != nil {
+			s.cluster.active.CompareAndSwap(index, (index+1)%uint64(len(s.cluster.clients)))
+			writeError(fmt.Errorf("proxying distributed cp through compute seed %s: %w", s.cluster.seeds[index], err))
+		}
+		return
 	}
 	output := &countingDaemonWriter{writer: conn}
 	if err := client.ProxyDaemon(context.Background(), input, output); err != nil {
@@ -6132,9 +6140,10 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				return
 			}
 			var input io.Reader
+			var copyUploadFlow *daemonStdinFlow
 			var cleanupCopyUpload func()
 			if copyCommand && !copyRoute.sourceContainer && copyRoute.source != "-" {
-				proxiedRequest, input, cleanupCopyUpload, err = prepareDistributedCopyUpload(s.localRoot, proxiedRequest, copyRoute)
+				proxiedRequest, input, copyUploadFlow, cleanupCopyUpload, err = prepareDistributedCopyUpload(s.localRoot, proxiedRequest, copyRoute)
 				if err != nil {
 					writeError(err)
 					return
@@ -6151,6 +6160,14 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 			if request.Stdin && cleanupCopyUpload == nil {
 				input = io.MultiReader(input, reader)
+			}
+			if copyUploadFlow != nil {
+				if err := proxyDistributedCopyUpload(context.Background(), peer, input, copyUploadFlow, conn, &writeMu); err == nil {
+					return
+				} else {
+					writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
+					return
+				}
 			}
 			if err := peer.ProxyDaemon(context.Background(), input, conn); err == nil {
 				return

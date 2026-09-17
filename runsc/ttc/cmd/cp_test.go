@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -69,6 +70,50 @@ func TestDaemonStdinFrameReader(t *testing.T) {
 		default:
 			t.Fatalf("unexpected frame %q", typ)
 		}
+	}
+}
+
+func TestDistributedCopyUploadConsumesFlowControl(t *testing.T) {
+	flow := newDaemonStdinFlow()
+	payload := bytes.Repeat([]byte("large-distributed-copy"), daemonStdinWindowBytes/(len("large-distributed-copy"))*3)
+	framed := bufio.NewReader(&daemonStdinFrameReader{raw: bytes.NewReader(payload), flow: flow})
+	var response bytes.Buffer
+	var responseMu sync.Mutex
+	var received bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		for {
+			typ, frame, err := readDaemonFrame(framed)
+			if err != nil {
+				done <- err
+				return
+			}
+			switch typ {
+			case daemonFrameStdin:
+				received.Write(frame)
+				if err := flow.acknowledge(len(frame)); err != nil {
+					done <- err
+					return
+				}
+			case daemonFrameEOF:
+				done <- nil
+				return
+			default:
+				done <- fmt.Errorf("unexpected frame %q", typ)
+				return
+			}
+		}
+	}()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received.Bytes(), payload) {
+		t.Fatalf("received %d bytes, want %d", received.Len(), len(payload))
+	}
+	// Keep imports and the framing writer exercised together; the network
+	// response filter forwards non-acknowledgement frames unchanged.
+	if err := writeDaemonStatus(&response, &responseMu, 0); err != nil {
+		t.Fatal(err)
 	}
 }
 
