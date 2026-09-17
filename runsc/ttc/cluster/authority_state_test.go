@@ -185,6 +185,25 @@ func TestAuthoritySnapshotOriginAllocationAndPublish(t *testing.T) {
 	if _, ok := state.VolatileOrigins[3]; ok {
 		t.Fatal("abandoned snapshot retained a volatile provider")
 	}
+	if !state.AbandonedOrigins[3] {
+		t.Fatal("abandoned snapshot has no permanent authority tombstone")
+	}
+	publishAbandoned, err := NewAuthorityCommand("publish-abandoned-3", at.Add(4*time.Second), AuthoritySnapshotPublish, abandon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(publishAbandoned); result.Err() == nil {
+		t.Fatal("published an abandoned snapshot origin")
+	}
+	abandonPublished, err := NewAuthorityCommand("abandon-published-2", at.Add(5*time.Second), AuthoritySnapshotAbandon, AuthoritySnapshotPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", SnapshotID: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := state.Apply(abandonPublished); result.Err() == nil {
+		t.Fatal("abandoned a published snapshot origin")
+	}
 	if state.NextSnapshotID != 4 {
 		t.Fatalf("abandonment reused or rewound snapshot IDs: next=%d", state.NextSnapshotID)
 	}

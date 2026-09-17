@@ -419,6 +419,17 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = settler.settleDistributedSourceTransactions(args[1:])
+	case "_discard-removed-migration-sources":
+		if len(args) < 2 {
+			err = errors.New("internal removed-migration cleanup requires at least one transaction ID")
+			break
+		}
+		discarder, ok := backend.(interface{ discardRemovedMigrationSources([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-migration cleanup")
+			break
+		}
+		err = discarder.discardRemovedMigrationSources(args[1:])
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -6634,11 +6645,22 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	if err != nil {
 		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
 	}
-	if err := finishFilesystemOrigins(true); err != nil {
-		return containerRunResult{}, err
-	}
 	id := prepared.Container.ID
 	target := selector{container: id, branch: defaultBranchID}
+	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
+	if err != nil {
+		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false), store.RemoveContainer(id))
+	}
+	placementActive := false
+	cleanupPrepared := func(cause error) error {
+		if placementActive {
+			return cause
+		}
+		return errors.Join(cause, b.cancelNewContainerPlacement(reservation), store.RemoveContainer(id))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return containerRunResult{}, cleanupPrepared(err)
+	}
 	var ingressBindings []ttcbundle.PortBinding
 	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
 		for _, binding := range request.publishedPorts {
@@ -6646,22 +6668,46 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 				for _, installed := range ingressBindings {
 					_ = b.portIngress.Unpublish(target, installed)
 				}
-				return containerRunResult{}, fmt.Errorf("publishing ingress port: %w", err)
+				return containerRunResult{}, cleanupPrepared(fmt.Errorf("publishing ingress port: %w", err))
 			}
 			ingressBindings = append(ingressBindings, binding)
 		}
 	}
-	status, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
+	status, running, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
 	if err != nil {
 		for _, binding := range ingressBindings {
 			_ = b.portIngress.Unpublish(target, binding)
 		}
+		return containerRunResult{ID: id, Status: status}, cleanupPrepared(err)
 	}
-	if err == nil {
-		b.recordLaunchState(target, request.detach, status)
+	// Guest execution has started, so the materializing placement is now an
+	// authoritative recovery record. From this point onward cleanup must use the
+	// normal branch lifecycle; deleting the reservation on a later bookkeeping
+	// failure would strand an existing runtime outside the cluster catalog.
+	placementActive = true
+	b.recordLaunchState(target, running, status)
+	if running {
+		if err := b.activateNewContainerPlacement(reservation); err != nil {
+			// A materializing record is authoritative and recovery can still find
+			// this runtime, but the initiating command must not report success
+			// until the branch is normally routable.
+			return containerRunResult{ID: id, Status: 1}, err
+		}
+	} else if !request.autoRemove {
+		// A foreground exit has the same durable-storage obligations as `ttc
+		// stop`: release its process state, seal the filesystem, and let
+		// publication atomically replace the materializing placement with an
+		// unplaced durable branch. This remains correct if publication finishes
+		// after the client disconnects or the daemon restarts.
+		if err := b.discard(target); err != nil {
+			return containerRunResult{ID: id, Status: status}, fmt.Errorf("releasing foreground execution state for %s: %w", target, err)
+		}
+		if err := b.queueBranchPublication(target, "stop"); err != nil {
+			return containerRunResult{ID: id, Status: status}, fmt.Errorf("queueing foreground filesystem publication for %s: %w", target, err)
+		}
 	}
 	if request.autoRemove {
-		status, err = b.applyAutoRemove(target, request.detach, status, err)
+		status, err = b.applyAutoRemove(target, running, status, err)
 	}
 	return containerRunResult{ID: id, Status: status}, err
 }
@@ -6843,12 +6889,12 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return 1, err
 	}
 	defer cleanupBundle()
-	status, err := b.launch(info, target, bundleDir, detach, interactive)
+	status, running, err := b.launch(info, target, bundleDir, detach, interactive)
 	if err == nil {
-		b.recordLaunchState(target, detach, status)
+		b.recordLaunchState(target, running, status)
 	}
 	if info.AutoRemove {
-		return b.applyAutoRemove(target, detach, status, err)
+		return b.applyAutoRemove(target, running, status, err)
 	}
 	return status, err
 }
@@ -6951,7 +6997,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		}
 		_ = b.releaseGraphMemoryRoots(graphRoots)
 		if b.distributedSource != nil {
-			_ = b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(capture.SnapshotID))
+			_ = b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(capture.SnapshotID))
 		}
 	}()
 	if _, err := b.command("delete", "--force", runtimeID); err != nil {
@@ -7062,7 +7108,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 			_ = b.releaseGraphMemoryRoots(roots)
 		}
 		if b.distributedSource != nil {
-			_ = b.retireFailedGraphSnapshot(origin)
+			_ = b.discardFailedGraphSnapshot(origin)
 		}
 	}()
 	reader, writer, err := os.Pipe()
@@ -9404,23 +9450,26 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 	return nil
 }
 
-func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (int, error) {
+// launch starts target and reports whether it remains running when this call
+// returns. The latter is intentionally distinct from the requested detach
+// flag: an attached terminal may detach through its detach key sequence.
+func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (status int, running bool, err error) {
 	name := info.ID
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
-		return 1, err
+		return 1, false, err
 	}
 	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
-	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
+	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
-		return status, err
+		return status, false, err
 	}
 	if err := b.verifyHostResourceLimits(name, bundleDir); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, err
+		return 1, false, err
 	}
 	startDrain := func(phase string) error {
 		if _, err := b.ensureConsoleDrain(target, true); err != nil {
@@ -9431,9 +9480,9 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 	if err := startDrain("before"); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, err
+		return 1, false, err
 	}
 	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "start", name)
 	if err != nil || status != 0 {
@@ -9442,29 +9491,29 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 		}
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return status, false, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return status, err
+		return status, false, err
 	}
 	if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, fmt.Errorf("publishing ports: %w", err)
+		return 1, false, fmt.Errorf("publishing ports: %w", err)
 	}
 	b.signalLifecycleReady()
 	if detach {
-		return 0, nil
+		return 0, true, nil
 	}
 	waitStatus, err := b.attach(attachRequest{target: target, stdin: interactive, stdout: true, stderr: true, detachKeys: defaultDetachKeys})
 	if err != nil {
 		if errors.Is(err, errDetached) {
-			return 0, nil
+			return 0, true, nil
 		}
-		return 1, err
+		return 1, false, err
 	}
-	return waitStatusExitCode(waitStatus), nil
+	return waitStatusExitCode(waitStatus), false, nil
 }
 
 func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding) (lockPath, errorPath string) {
@@ -12251,38 +12300,119 @@ func filesystemOriginAssignmentsPipe(assignments []boot.FilesystemOriginAssignme
 	return newConfigMemFD("ttc-filesystem-origin-assignments", encoded)
 }
 
-// retireFailedGraphSnapshot makes a Raft allocation resolve to a committed
-// empty shared snapshot after a capture fails. This is safe even when some
-// unreachable capture objects were already created: the immutable pack is
-// published first, then Raft removes the volatile-provider entry. Normal graph
-// reclamation may subsequently release the local objects.
-func (b *runtimeBackend) retireFailedGraphSnapshot(origin ttcsnapshot.SnapshotID) error {
+// discardFailedGraphSnapshot rolls back an origin that never became
+// authoritative. Failed captures must not be published as empty snapshots:
+// doing so bypasses the shared reference ledger and leaves a pack that no
+// collector owns. Callers release every construction root before entering
+// this method.
+//
+// If authority already switched to shared, publication passed the reference
+// ledger fence and normal shared GC owns the origin. The only local repair
+// needed in that case is finishing a possibly interrupted MarkShared step.
+func (b *runtimeBackend) discardFailedGraphSnapshot(origin ttcsnapshot.SnapshotID) error {
 	if origin == 0 || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return nil
-	}
-	record, ok := b.snapshotGraph.Snapshot(origin)
-	if !ok {
-		return fmt.Errorf("allocated snapshot origin %d is missing locally", origin)
-	}
-	if record.State == ttcsnapshot.SnapshotWorking {
-		if err := b.snapshotGraph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
-			return err
-		}
-	}
-	if b.snapshotShared == nil || b.snapshotData == nil {
-		return errors.New("shared graph snapshot repository is unavailable")
-	}
-	if err := b.snapshotShared.Publish(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
-		return err
 	}
 	node := b.nodeID
 	if node == "" {
 		node = b.distributedSource.capabilities.NodeID
 	}
-	if err := b.distributedSource.authority.PublishSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
-		return err
+	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("resolving failed snapshot origin %d: %w", origin, err)
 	}
-	return b.snapshotGraph.MarkShared(origin)
+	abandoned := errors.Is(err, os.ErrNotExist)
+	if volatile && provider.NodeID != node {
+		return fmt.Errorf("failed snapshot origin %d is owned by node %q, not %q", origin, provider.NodeID, node)
+	}
+	if !volatile && !abandoned && b.snapshotShared != nil {
+		if _, manifestErr := b.snapshotShared.Manifest(origin); manifestErr == nil {
+			if record, ok := b.snapshotGraph.Snapshot(origin); ok && record.State != ttcsnapshot.SnapshotShared {
+				if err := b.snapshotGraph.MarkShared(origin); err != nil {
+					return fmt.Errorf("finishing shared state for snapshot origin %d: %w", origin, err)
+				}
+			}
+			return nil
+		} else if !errors.Is(manifestErr, os.ErrNotExist) {
+			return fmt.Errorf("checking failed snapshot origin %d publication: %w", origin, manifestErr)
+		}
+	}
+	if b.snapshotGraph == nil || b.snapshotData == nil {
+		return errors.New("local graph snapshot repository is unavailable")
+	}
+	// A failed origin was never made visible to another branch. Reclaim every
+	// construction reference rooted in that origin rather than relying on each
+	// streaming caller to have observed the importer's final result. In
+	// particular, a command may report failure after its stream was committed.
+	inspection := b.snapshotGraph.Inspect()
+	var roots, pins []string
+	for name, object := range inspection.Roots {
+		if object.Snapshot == origin {
+			roots = append(roots, name)
+		}
+	}
+	for name, object := range inspection.Pins {
+		if object.Snapshot == origin {
+			pins = append(pins, name)
+		}
+	}
+	if len(pins) != 0 {
+		if err := b.snapshotGraph.DeletePins(pins); err != nil {
+			return fmt.Errorf("releasing failed snapshot origin %d pins: %w", origin, err)
+		}
+	}
+	if len(roots) != 0 {
+		if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
+			return fmt.Errorf("releasing failed snapshot origin %d roots: %w", origin, err)
+		}
+	}
+	for {
+		collected, collectErr := b.snapshotGraph.Collect(4096)
+		if collectErr != nil {
+			return fmt.Errorf("collecting failed snapshot origin %d: %w", origin, collectErr)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if _, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph); err != nil {
+		return fmt.Errorf("reclaiming failed snapshot origin %d data: %w", origin, err)
+	}
+	objects, err := b.snapshotGraph.SnapshotObjects(origin)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspecting failed snapshot origin %d: %w", origin, err)
+	}
+	if len(objects) != 0 {
+		return fmt.Errorf("failed snapshot origin %d still owns %d reachable objects", origin, len(objects))
+	}
+	if b.snapshotShared != nil {
+		busy, err := b.snapshotShared.DiscardHandoff(origin)
+		if err != nil {
+			return fmt.Errorf("discarding failed snapshot origin %d pack: %w", origin, err)
+		}
+		if busy {
+			return fmt.Errorf("discarding failed snapshot origin %d pack: pack is busy", origin)
+		}
+	}
+	if volatile {
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
+			return fmt.Errorf("abandoning failed snapshot origin %d: %w", origin, err)
+		}
+	}
+	if _, ok := b.snapshotGraph.Snapshot(origin); !ok {
+		return nil
+	}
+	inspection = b.snapshotGraph.Inspect()
+	retain := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots)-1)
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.ID != origin {
+			retain = append(retain, snapshot.ID)
+		}
+	}
+	if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
+		return fmt.Errorf("forgetting failed snapshot origin %d: %w", origin, err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) dehydrate(target selector) error {
@@ -12350,14 +12480,14 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if graphMemoryRecorded {
 			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphControlRoot, previousGraphControlRootObject, previousGraphReferenceOperation)
 		}
-		if graphMemorySnapshot != 0 && b.distributedSource != nil {
-			if graphErr := b.retireFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: retiring failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
-			}
-		}
 		if len(graphMemoryRoots) != 0 || graphControlRoot != "" {
 			if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), graphMemoryRoots...), graphControlRoot)); graphErr != nil && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
+			}
+		}
+		if graphMemorySnapshot != 0 && b.distributedSource != nil {
+			if graphErr := b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: discarding failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
 			}
 		}
 		if finalPublished {

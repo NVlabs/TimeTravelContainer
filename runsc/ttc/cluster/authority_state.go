@@ -35,7 +35,7 @@ import (
 const (
 	// AuthorityFormatVersion is the durable replicated-state format. It is
 	// deliberately independent from the peer data-plane protocol version.
-	AuthorityFormatVersion = 9
+	AuthorityFormatVersion = 10
 	maxRememberedRequests  = 65536
 	maxSharedGCLease       = 30 * time.Second
 )
@@ -256,6 +256,7 @@ type AuthorityState struct {
 	Branches         map[string]BranchAuthority         `json:"branches,omitempty"`
 	Publications     map[string]PublicationRecord       `json:"publications,omitempty"`
 	VolatileOrigins  map[uint64]SnapshotOriginProvider  `json:"volatile_origins,omitempty"`
+	AbandonedOrigins map[uint64]bool                    `json:"abandoned_origins,omitempty"`
 	SharedGC         SharedGCLease                      `json:"shared_gc,omitempty"`
 	RetiredOrigins   map[uint64]SharedPackRetirement    `json:"retired_origins,omitempty"`
 	Requests         map[string]appliedAuthorityRequest `json:"requests,omitempty"`
@@ -290,6 +291,9 @@ func (s *AuthorityState) initMaps() {
 	}
 	if s.VolatileOrigins == nil {
 		s.VolatileOrigins = make(map[uint64]SnapshotOriginProvider)
+	}
+	if s.AbandonedOrigins == nil {
+		s.AbandonedOrigins = make(map[uint64]bool)
 	}
 	if s.RetiredOrigins == nil {
 		s.RetiredOrigins = make(map[uint64]SharedPackRetirement)
@@ -501,6 +505,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		s.Publications = cloneAuthorityMap(s.Publications)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		s.VolatileOrigins = cloneAuthorityMap(s.VolatileOrigins)
+		s.AbandonedOrigins = cloneAuthorityMap(s.AbandonedOrigins)
 	case AuthoritySharedGCAcquire, AuthoritySharedGCRenew, AuthoritySharedGCRelease:
 		// SharedGC is copied by value with AuthorityState.
 	case AuthoritySharedGCRetire:
@@ -802,6 +807,9 @@ func (s *AuthorityState) applySharedGC(command AuthorityCommand) (json.RawMessag
 		if _, volatile := s.VolatileOrigins[p.SnapshotID]; volatile {
 			return nil, errors.New("cannot retire a volatile snapshot origin")
 		}
+		if s.AbandonedOrigins[p.SnapshotID] {
+			return nil, errors.New("cannot retire an abandoned snapshot origin")
+		}
 		if retirement, retired := s.RetiredOrigins[p.SnapshotID]; retired {
 			return authorityValue(retirement)
 		}
@@ -850,14 +858,18 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
 			return nil, errors.New("invalid snapshot abandonment request")
 		}
+		if s.AbandonedOrigins[p.SnapshotID] {
+			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+		}
 		provider, ok := s.VolatileOrigins[p.SnapshotID]
 		if !ok {
-			return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
+			return nil, errors.New("snapshot origin is already published")
 		}
 		if provider.NodeID != p.NodeID {
 			return nil, errors.New("snapshot origin is owned by another provider")
 		}
 		delete(s.VolatileOrigins, p.SnapshotID)
+		s.AbandonedOrigins[p.SnapshotID] = true
 		return authorityValue(SnapshotOriginProvider{SnapshotID: p.SnapshotID})
 	case AuthoritySnapshotPublish:
 		if p.SnapshotID == 0 || p.SnapshotID >= s.NextSnapshotID || p.Count != 0 {
@@ -865,6 +877,9 @@ func (s *AuthorityState) applySnapshot(command AuthorityCommand) (json.RawMessag
 		}
 		if _, retired := s.RetiredOrigins[p.SnapshotID]; retired {
 			return nil, errors.New("snapshot origin is permanently retired")
+		}
+		if s.AbandonedOrigins[p.SnapshotID] {
+			return nil, errors.New("snapshot origin was abandoned")
 		}
 		provider, ok := s.VolatileOrigins[p.SnapshotID]
 		if !ok {
@@ -1839,6 +1854,9 @@ func (s *AuthorityState) validateSnapshotRootAuthority(roots DurableRoots) error
 	if _, retired := s.RetiredOrigins[roots.MemorySnapshot]; retired {
 		return errors.New("durable memory snapshot is permanently retired")
 	}
+	if s.AbandonedOrigins[roots.MemorySnapshot] {
+		return errors.New("durable memory snapshot was abandoned")
+	}
 	return nil
 }
 
@@ -2287,6 +2305,17 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 	for id, provider := range state.VolatileOrigins {
 		if id == 0 || id >= state.NextSnapshotID || provider.SnapshotID != id || provider.NodeID == "" {
 			return nil, errors.New("authority snapshot has invalid volatile origin")
+		}
+	}
+	for id, abandoned := range state.AbandonedOrigins {
+		if !abandoned || id == 0 || id >= state.NextSnapshotID {
+			return nil, errors.New("authority snapshot has invalid abandoned origin")
+		}
+		if _, volatile := state.VolatileOrigins[id]; volatile {
+			return nil, errors.New("authority snapshot marks an origin volatile and abandoned")
+		}
+		if _, retired := state.RetiredOrigins[id]; retired {
+			return nil, errors.New("authority snapshot marks an origin abandoned and retired")
 		}
 	}
 	for id, retirement := range state.RetiredOrigins {

@@ -17,6 +17,7 @@ PORT_C=${TTC_ELASTIC_PRESSURE_PORT_C:-20403}
 PID_A=
 PID_B=
 PID_C=
+CLEANED=
 FAMILIES="pressure-a-$$ pressure-b-$$"
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
@@ -38,14 +39,16 @@ stop_session() {
 
 cleanup() {
 	set +e
-	for family in $FAMILIES; do
-		for node in a b c; do
-			if test -S "$(socket "$node")"; then client "$node" rm -f "$family" >/dev/null 2>&1; fi
+	if test -z "$CLEANED"; then
+		for family in $FAMILIES; do
+			for node in a b c; do
+				if test -S "$(socket "$node")"; then client "$node" rm -f "$family" >/dev/null 2>&1 && break; fi
+			done
 		done
-	done
-	for node in c b a; do
-		if test -S "$(socket "$node")"; then client "$node" node stop "node-$node" --stop-all >/dev/null 2>&1; fi
-	done
+		for node in c b a; do
+			if test -S "$(socket "$node")"; then client "$node" node stop "node-$node" --stop-all >/dev/null 2>&1; fi
+		done
+	fi
 	stop_session "$PID_C"
 	stop_session "$PID_B"
 	stop_session "$PID_A"
@@ -108,11 +111,19 @@ start_node b "$PORT_B" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
 start_node c "$PORT_C" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
 
 client a pull "$IMAGE" >/dev/null
-fill_pids=
 for family in $FAMILIES; do
 	client a run -d --node node-a --name "$family" "$IMAGE" sh -c \
 		'while test ! -e /tmp/fill; do sleep 0.05; done; yes 0123456789abcdef | head -c 50331648 >/dev/shm/private && printf PRESSURE >/tmp/ready; sleep 3600' >/dev/null
 	client a fork --node node-a "$family@main" b1 b2 b3 >/dev/null
+done
+
+# Admit the complete test topology before dirtying memory. Admission and
+# pressure transitions are concurrent in production, but the property under
+# test here is multi-destination rebalance after a known accepted workload.
+# A separate lifecycle regression verifies that a late admission failure never
+# leaves an executable branch outside Raft placement authority.
+fill_pids=
+for family in $FAMILIES; do
 	for branch in main b1 b2 b3; do
 		client a exec "$family@$branch" touch /tmp/fill &
 		fill_pids="$fill_pids $!"
@@ -177,3 +188,28 @@ for family in $FAMILIES; do
 done
 
 echo "TTC high-fanout pressure rebalance passed with $(printf '%s' "$plan" | jq '.moves | length') migrations"
+
+# Cleanup is part of the regression, not merely a best-effort EXIT trap. A
+# high-fanout migration used to leave retired physical branches and hundreds
+# of MiB of authoritative memory chunks after every visible family was gone.
+for family in $FAMILIES; do
+	client a rm -f "$family" >/dev/null
+done
+for node in c b a; do
+	client "$node" node stop "node-$node" --stop-all >/dev/null
+done
+wait "$PID_C"
+wait "$PID_B"
+wait "$PID_A"
+PID_A=
+PID_B=
+PID_C=
+CLEANED=yes
+if find "$ROOT" -path '*/objects/memory-chunks/*' -type f -print -quit | grep -q .; then
+	echo "quiescent cluster retained authoritative local memory chunks" >&2
+	exit 1
+fi
+if find "$SHARED/snapshot-packs/snapshots" -type f -print -quit 2>/dev/null | grep -q .; then
+	echo "quiescent cluster retained unreachable shared snapshot packs" >&2
+	exit 1
+fi

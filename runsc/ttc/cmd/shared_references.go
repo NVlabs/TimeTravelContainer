@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +31,171 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
+
+const sharedPublicationBridgeIntentVersion = 1
+
+const (
+	sharedPublicationBridgeTransaction = "transaction"
+	sharedPublicationBridgePublication = "publication"
+	sharedPublicationBridgeOrigin      = "origin"
+)
+
+// sharedPublicationBridgeIntent is the durable crash fence for the short
+// provider-to-shared interval in which an immutable origin exists in the
+// shared pack store but its eventual consumer has not installed replacement
+// roots yet. It is snapshot-granular: page and file identities remain outside
+// the control plane.
+type sharedPublicationBridgeIntent struct {
+	Version       int       `json:"version"`
+	Snapshot      uint64    `json:"snapshot"`
+	Kind          string    `json:"kind"`
+	Transaction   string    `json:"transaction,omitempty"`
+	Family        string    `json:"family,omitempty"`
+	Branch        string    `json:"branch,omitempty"`
+	PublicationID string    `json:"publication_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+func (i sharedPublicationBridgeIntent) validate() error {
+	if i.Version != sharedPublicationBridgeIntentVersion || i.Snapshot == 0 {
+		return errors.New("invalid shared publication bridge intent")
+	}
+	switch i.Kind {
+	case sharedPublicationBridgeTransaction:
+		if i.Transaction == "" || i.Family != "" || i.Branch != "" || i.PublicationID != "" {
+			return errors.New("invalid transaction publication bridge intent")
+		}
+	case sharedPublicationBridgePublication:
+		if i.Transaction != "" || i.Family == "" || i.Branch == "" || i.PublicationID == "" {
+			return errors.New("invalid branch publication bridge intent")
+		}
+	case sharedPublicationBridgeOrigin:
+		if i.Transaction != "" || i.Family != "" || i.Branch != "" || i.PublicationID != "" {
+			return errors.New("invalid origin publication bridge intent")
+		}
+	default:
+		return fmt.Errorf("unknown shared publication bridge intent kind %q", i.Kind)
+	}
+	return nil
+}
+
+func sharedPublicationBridgeIntentPath(sharedRoot string, snapshot ttcsnapshot.SnapshotID) string {
+	return filepath.Join(sharedRoot, "cluster", "reference-bridges", fmt.Sprintf("%016x.json", uint64(snapshot)))
+}
+
+func persistSharedPublicationBridgeIntent(sharedRoot string, intent sharedPublicationBridgeIntent) error {
+	if sharedRoot == "" {
+		return errors.New("shared root is unavailable for publication bridge")
+	}
+	if err := intent.validate(); err != nil {
+		return err
+	}
+	path := sharedPublicationBridgeIntentPath(sharedRoot, ttcsnapshot.SnapshotID(intent.Snapshot))
+	if data, err := os.ReadFile(path); err == nil {
+		var current sharedPublicationBridgeIntent
+		if err := json.Unmarshal(data, &current); err != nil {
+			return fmt.Errorf("decoding existing publication bridge intent: %w", err)
+		}
+		if err := current.validate(); err != nil {
+			return err
+		}
+		if current.Snapshot != intent.Snapshot || current.Kind != intent.Kind || current.Transaction != intent.Transaction ||
+			current.Family != intent.Family || current.Branch != intent.Branch || current.PublicationID != intent.PublicationID {
+			return fmt.Errorf("snapshot %d publication bridge is owned by a different operation", intent.Snapshot)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeDurableJSON(path, intent)
+}
+
+func removeSharedPublicationBridgeIntent(sharedRoot string, snapshot ttcsnapshot.SnapshotID) error {
+	path := sharedPublicationBridgeIntentPath(sharedRoot, snapshot)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	return errors.Join(syncErr, directory.Close())
+}
+
+func loadSharedPublicationBridgeIntents(sharedRoot string) ([]sharedPublicationBridgeIntent, error) {
+	directory := filepath.Join(sharedRoot, "cluster", "reference-bridges")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	intents := make([]sharedPublicationBridgeIntent, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		encoded := strings.TrimSuffix(entry.Name(), ".json")
+		snapshot, parseErr := strconv.ParseUint(encoded, 16, 64)
+		if parseErr != nil || snapshot == 0 || fmt.Sprintf("%016x", snapshot) != encoded {
+			// Unknown files are never interpreted as TTC state.
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var intent sharedPublicationBridgeIntent
+		if err := json.Unmarshal(data, &intent); err != nil {
+			return nil, fmt.Errorf("decoding publication bridge intent %q: %w", entry.Name(), err)
+		}
+		if err := intent.validate(); err != nil {
+			return nil, fmt.Errorf("validating publication bridge intent %q: %w", entry.Name(), err)
+		}
+		if intent.Snapshot != snapshot {
+			return nil, fmt.Errorf("publication bridge intent %q names snapshot %d", entry.Name(), intent.Snapshot)
+		}
+		intents = append(intents, intent)
+	}
+	sort.Slice(intents, func(i, j int) bool { return intents[i].Snapshot < intents[j].Snapshot })
+	return intents, nil
+}
+
+func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedPublicationBridgeIntent) bool {
+	if state == nil {
+		return true
+	}
+	if _, volatile := state.VolatileOrigins[intent.Snapshot]; volatile {
+		return false
+	}
+	if state.AbandonedOrigins[intent.Snapshot] {
+		return false
+	}
+	switch intent.Kind {
+	case sharedPublicationBridgeTransaction:
+		tx, ok := state.Transactions[intent.Transaction]
+		return ok && !tx.Terminal()
+	case sharedPublicationBridgePublication:
+		for _, publication := range state.Publications {
+			if publication.FamilyID == intent.Family && publication.BranchID == intent.Branch && publication.PublicationID == intent.PublicationID {
+				return publication.State == cluster.PublicationPreparing || publication.State == cluster.PublicationReady
+			}
+		}
+		return false
+	case sharedPublicationBridgeOrigin:
+		// Origin handoff is performed only after a branch/transfer reference has
+		// already been retained. A rebuild obtains that replacement from node
+		// inventories, so the temporary bridge must not be resurrected.
+		return false
+	default:
+		return true
+	}
+}
 
 // sharedReferenceService serializes exact shared-origin reference mutations
 // through the daemon holding Raft's shared-GC lease. The hot ledger lives only
@@ -78,6 +244,9 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 			return nil, fmt.Errorf("reading retired snapshot origins: %w", err)
 		}
 		for origin := range state.RetiredOrigins {
+			retired[origin] = struct{}{}
+		}
+		for origin := range state.AbandonedOrigins {
 			retired[origin] = struct{}{}
 		}
 	}
@@ -159,6 +328,14 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 		}
 		for offset := 0; offset < len(pending); {
 			outbound := pending[offset]
+			if state.AbandonedOrigins[uint64(outbound.Child.Snapshot)] {
+				if outbound.Retain {
+					return delivered, fmt.Errorf("cannot retain abandoned snapshot origin %d", outbound.Child.Snapshot)
+				}
+				delivered++
+				offset++
+				continue
+			}
 			provider, volatile := state.VolatileOrigins[uint64(outbound.Child.Snapshot)]
 			end := offset + 1
 			if !volatile {
@@ -166,6 +343,9 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 					mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(pending)-offset)
 					for end = offset; end < len(pending); end++ {
 						candidate := pending[end]
+						if state.AbandonedOrigins[uint64(candidate.Child.Snapshot)] {
+							break
+						}
 						if _, candidateVolatile := state.VolatileOrigins[uint64(candidate.Child.Snapshot)]; candidateVolatile {
 							break
 						}
@@ -319,6 +499,9 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
 				continue
 			}
+			if state.AbandonedOrigins[uint64(root.Snapshot)] {
+				continue
+			}
 			if coldFilesystemReferences[root.Snapshot] == nil {
 				coldFilesystemReferences[root.Snapshot] = make(map[string]ttcsnapshot.ObjectID)
 			}
@@ -333,7 +516,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	}
 	for _, branch := range state.Branches {
 		_, memoryVolatile := state.VolatileOrigins[branch.Roots.MemorySnapshot]
-		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile {
+		if !branch.Corrupted && branch.Roots.MemorySnapshot != 0 && !memoryVolatile && !state.AbandonedOrigins[branch.Roots.MemorySnapshot] {
 			origin := ttcsnapshot.SnapshotID(branch.Roots.MemorySnapshot)
 			manifest, err := s.packs.Manifest(origin)
 			if err != nil {
@@ -367,7 +550,7 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			continue
 		}
 		_, memoryVolatile := state.VolatileOrigins[publication.CandidateRoots.MemorySnapshot]
-		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile {
+		if publication.CandidateRoots.MemorySnapshot != 0 && !memoryVolatile && !state.AbandonedOrigins[publication.CandidateRoots.MemorySnapshot] {
 			origin := ttcsnapshot.SnapshotID(publication.CandidateRoots.MemorySnapshot)
 			manifest, err := s.packs.Manifest(origin)
 			if err != nil {
@@ -395,6 +578,31 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 				}
 			}
 		}
+	}
+
+	// Reconstruct the temporary roots that cover a provider-to-shared handoff.
+	// The intent is written before the first coordinator mutation, so a new
+	// lease holder can close every crash prefix without relying on the previous
+	// coordinator's local operation receipts.
+	publicationBridgeReferencesByOrigin := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
+	bridgeIntents, err := loadSharedPublicationBridgeIntents(s.sharedRoot)
+	if err != nil {
+		return fail(fmt.Errorf("reading publication bridge intents: %w", err))
+	}
+	for _, intent := range bridgeIntents {
+		if !publicationBridgeIntentNeeded(state, intent) {
+			continue
+		}
+		origin := ttcsnapshot.SnapshotID(intent.Snapshot)
+		manifest, err := s.packs.Manifest(origin)
+		if err != nil {
+			return fail(fmt.Errorf("reading publication bridge origin %d: %w", origin, err))
+		}
+		roots := make(map[string]ttcsnapshot.ObjectID)
+		for _, bridge := range publicationBridgeReferences(origin, manifest.References) {
+			roots[bridge.Name] = bridge.Object
+		}
+		publicationBridgeReferencesByOrigin[origin] = roots
 	}
 
 	// Query every unfenced execution incarnation. If one cannot prove its
@@ -437,6 +645,9 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			return fail(fmt.Errorf("snapshot reference inventory identity is %v/%v, want %s/%s", inventoryNodeID(inventory), inventoryIncarnation(inventory), node.NodeID, node.Incarnation))
 		}
 		for _, claim := range inventory.Claims {
+			if state.AbandonedOrigins[claim.Origin] {
+				continue
+			}
 			if _, volatile := state.VolatileOrigins[claim.Origin]; volatile {
 				continue
 			}
@@ -467,6 +678,16 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	imported := make(map[ttcsnapshot.SnapshotID]struct{}, len(manifests))
 	for _, manifest := range manifests {
 		if _, retired := state.RetiredOrigins[uint64(manifest.Snapshot)]; retired {
+			continue
+		}
+		if state.AbandonedOrigins[uint64(manifest.Snapshot)] {
+			busy, discardErr := s.packs.DiscardHandoff(manifest.Snapshot)
+			if discardErr != nil {
+				return fail(fmt.Errorf("discarding abandoned snapshot origin %d: %w", manifest.Snapshot, discardErr))
+			}
+			if busy {
+				return fail(fmt.Errorf("discarding abandoned snapshot origin %d: pack is busy", manifest.Snapshot))
+			}
 			continue
 		}
 		// Publication writes immutable pack bytes before authority handoff.
@@ -509,6 +730,12 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 			}
 			references[name] = object
 		}
+		for name, object := range publicationBridgeReferencesByOrigin[manifest.Snapshot] {
+			if previous, exists := references[name]; exists && previous != object {
+				return fail(fmt.Errorf("reference %q selects both %s and %s", name, previous, object))
+			}
+			references[name] = object
+		}
 		if err := ledger.ImportOrigin(manifest.Snapshot, objects, references); err != nil {
 			return fail(fmt.Errorf("importing shared origin %d during rebuild: %w", manifest.Snapshot, err))
 		}
@@ -540,6 +767,11 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	for origin := range coldMemoryReferences {
 		if _, ok := imported[origin]; !ok {
 			return fail(fmt.Errorf("cold memory references shared origin %d without a committed manifest", origin))
+		}
+	}
+	for origin := range publicationBridgeReferencesByOrigin {
+		if _, ok := imported[origin]; !ok {
+			return fail(fmt.Errorf("publication bridge references shared origin %d without a committed manifest", origin))
 		}
 	}
 	if err := ledger.Checkpoint(); err != nil {
@@ -675,19 +907,40 @@ func (s *sharedReferenceService) ImportSharedSnapshot(_ context.Context, peer st
 }
 
 // ApplySharedSnapshotReference records an idempotent publication bridge at
-// the shared-GC coordinator. Only the current volatile provider may create or
-// remove such a bridge, and the referenced object must belong to the origin
-// being published.
+// the shared-GC coordinator. Only the current volatile provider may create a
+// bridge. After authority moves to shared storage, any authenticated member
+// may release the exact bridge: the immutable name/object binding prevents it
+// from releasing another consumer's reference.
 func (s *sharedReferenceService) ApplySharedSnapshotReference(_ context.Context, peer string, snapshotID uint64, operation, name, objectText string, retain bool) error {
-	if err := s.authorizeProvider(peer, snapshotID); err != nil {
-		return err
-	}
 	object, err := ttcsnapshot.ParseObjectID(objectText)
 	if err != nil {
 		return err
 	}
 	if uint64(object.Snapshot) != snapshotID {
 		return fmt.Errorf("shared reference object %s does not belong to snapshot %d", object, snapshotID)
+	}
+	wantPrefix := fmt.Sprintf("root/publication-bridge/%016x/", snapshotID)
+	if !strings.HasPrefix(name, wantPrefix) {
+		return fmt.Errorf("invalid publication bridge name %q for snapshot %d", name, snapshotID)
+	}
+	if retain {
+		if err := s.authorizeProvider(peer, snapshotID); err != nil {
+			return err
+		}
+	} else {
+		_, volatile, err := s.authority.SnapshotProvider(snapshotID)
+		if err != nil {
+			return err
+		}
+		if volatile {
+			if err := s.authorizeProvider(peer, snapshotID); err != nil {
+				return err
+			}
+		} else if err := s.reconcileAuthoritativeColdReferences(); err != nil {
+			// Cold branch roots selected by Raft must reach the ledger before
+			// their temporary publication bridge is released.
+			return fmt.Errorf("reconciling replacement roots: %w", err)
+		}
 	}
 	return s.mutateReference(operation, name, object, retain)
 }
@@ -836,7 +1089,7 @@ func isAuthoritativeColdReference(name string) bool {
 }
 
 func isProviderBaselineReference(name string) bool {
-	if isAuthoritativeColdReference(name) || strings.HasPrefix(name, "root/bridge/edge/") {
+	if isAuthoritativeColdReference(name) || strings.HasPrefix(name, "root/bridge/edge/") || strings.HasPrefix(name, "root/publication-bridge/") {
 		return false
 	}
 	return strings.HasPrefix(name, "root/") || strings.HasPrefix(name, "pin/")
@@ -847,7 +1100,7 @@ func providerBaselineCanBeReleased(state *cluster.AuthorityState, name string, o
 		return false
 	}
 	_, volatile := state.VolatileOrigins[uint64(object.Snapshot)]
-	return !volatile
+	return !volatile && !state.AbandonedOrigins[uint64(object.Snapshot)]
 }
 
 // coldBranchReferenceIdentity makes a durable branch root activation unique.
@@ -879,7 +1132,7 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 		if snapshot == 0 {
 			return
 		}
-		if _, volatile := state.VolatileOrigins[snapshot]; !volatile {
+		if _, volatile := state.VolatileOrigins[snapshot]; !volatile && !state.AbandonedOrigins[snapshot] {
 			origin := ttcsnapshot.SnapshotID(snapshot)
 			if memory[origin] == nil {
 				memory[origin] = make(map[string]struct{})
@@ -905,6 +1158,9 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 				return err
 			}
 			if _, volatile := state.VolatileOrigins[uint64(root.Snapshot)]; volatile {
+				continue
+			}
+			if state.AbandonedOrigins[uint64(root.Snapshot)] {
 				continue
 			}
 			nameHash := sha256.Sum256([]byte(identity + "\x00" + filesystem.Root.Source + "\x00" + root.String()))
@@ -1029,6 +1285,64 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 	})
 }
 
+// reconcilePublicationBridgeIntents rolls forward bridge cleanup after a
+// publisher crash or lost response. Nonterminal operations keep their bridge;
+// committed publications, terminal handoffs, and generic origin transfers
+// already have replacement roots in Raft or node inventories.
+func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
+	state, err := s.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	intents, err := loadSharedPublicationBridgeIntents(s.sharedRoot)
+	if err != nil {
+		return err
+	}
+	// Install Raft-selected cold roots before removing any publication bridge.
+	if err := s.reconcileAuthoritativeColdReferences(); err != nil {
+		return err
+	}
+	for _, intent := range intents {
+		if state.AbandonedOrigins[intent.Snapshot] {
+			origin := ttcsnapshot.SnapshotID(intent.Snapshot)
+			busy, discardErr := s.packs.DiscardHandoff(origin)
+			if discardErr != nil {
+				return fmt.Errorf("discarding abandoned publication bridge %d: %w", origin, discardErr)
+			}
+			if busy {
+				return fmt.Errorf("discarding abandoned publication bridge %d: pack is busy", origin)
+			}
+			if err := removeSharedPublicationBridgeIntent(s.sharedRoot, origin); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, volatile := state.VolatileOrigins[intent.Snapshot]; volatile || publicationBridgeIntentNeeded(state, intent) {
+			continue
+		}
+		origin := ttcsnapshot.SnapshotID(intent.Snapshot)
+		manifest, err := s.packs.Manifest(origin)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := removeSharedPublicationBridgeIntent(s.sharedRoot, origin); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, bridge := range publicationBridgeReferences(origin, manifest.References) {
+			if err := s.mutateReference(bridge.ReleaseOperation, bridge.Name, bridge.Object, false); err != nil {
+				return err
+			}
+		}
+		if err := removeSharedPublicationBridgeIntent(s.sharedRoot, origin); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // collectAndRetire performs the shared origin retirement protocol in its only
 // safe order: collect exact zero-count objects, deliver every resulting
 // cross-origin release, prove that no physical reader remains, fence the empty
@@ -1048,6 +1362,9 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	// selected origin cannot disappear underneath a sibling pass.
 	s.collectionMu.Lock()
 	defer s.collectionMu.Unlock()
+	if err := s.reconcilePublicationBridgeIntents(); err != nil {
+		return 0, err
+	}
 	if err := s.reconcileAuthoritativeColdReferences(); err != nil {
 		return 0, err
 	}

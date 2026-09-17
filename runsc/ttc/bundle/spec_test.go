@@ -2967,6 +2967,37 @@ func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *
 	}
 }
 
+func TestRemoveBranchFilesystemsAcceptsAlreadyReclaimedActiveRepository(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	containerID := "retired-physical"
+	bundleDir := filepath.Join(shared, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(local, "containers", containerID, "rootfs-upper")
+	encodedRepositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: missing, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(encodedRepositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "exited"}
+	info := ContainerInfo{ID: containerID, Name: containerID, BundleDir: bundleDir, Branches: []BranchInfo{branch}}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Root: shared, ActiveRoot: local}).RemoveBranchFilesystems(containerID, branch); err != nil {
+		t.Fatalf("already reclaimed active repository: %v", err)
+	}
+}
+
 func TestBuildSpecManagedCoWHostMount(t *testing.T) {
 	host := t.TempDir()
 	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}

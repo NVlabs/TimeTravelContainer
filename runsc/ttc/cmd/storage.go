@@ -865,6 +865,7 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 		}
 	}
 	if p.authority != nil {
+		family, authorityBranch := publicationAuthorityIdentity(info, intent)
 		lifecycle := "exited"
 		manifestPath := coldManifestPath(p.sharedRoot, info.ID, intent.Branch, intent.PublicationID)
 		relativeManifest, err := filepath.Rel(p.sharedRoot, manifestPath)
@@ -883,7 +884,6 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 			}
 			captureRoots.MemorySnapshot = branch.SnapshotID
 		}
-		family, authorityBranch := publicationAuthorityIdentity(info, intent)
 		if _, err := p.authority.EnsurePublicationReady(family, authorityBranch, intent.PublicationID, lifecycle, captureRoots); err != nil {
 			return false, fmt.Errorf("authorizing publication capture in Raft: %w", err)
 		}
@@ -1104,6 +1104,10 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		lifecycle = "dehydrated"
 	}
 	if p.authority != nil {
+		family, authorityBranch := publicationAuthorityIdentity(info, intent)
+		bridgeIntent := sharedPublicationBridgeIntent{
+			Kind: sharedPublicationBridgePublication, Family: family, Branch: authorityBranch, PublicationID: intent.PublicationID,
+		}
 		// The final provider-to-shared ledger switch freezes reference changes.
 		// Coordinate it with live/dehydration captures, which may create new DAG
 		// edges to these immutable origins. Slow pack construction happened before
@@ -1139,7 +1143,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 				if !frozen {
 					return fmt.Errorf("snapshot origin %d reference handoff is not frozen", branch.SnapshotID)
 				}
-				if err := p.publishSharedReferenceLedger(snapshot, changes); err != nil {
+				if err := p.publishSharedReferenceLedger(snapshot, changes, bridgeIntent); err != nil {
 					return fmt.Errorf("transferring snapshot origin %d reference authority: %w", branch.SnapshotID, err)
 				}
 				handoffOrigins = append(handoffOrigins, branch.SnapshotID)
@@ -1183,7 +1187,7 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 						repository.Close()
 						return fmt.Errorf("freezing filesystem snapshot origin %d: %w", origin, err)
 					}
-					if err := p.publishSharedReferenceLedger(origin, changes); err != nil {
+					if err := p.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 						repository.Close()
 						return fmt.Errorf("transferring filesystem snapshot origin %d reference authority: %w", origin, err)
 					}
@@ -1210,9 +1214,13 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		// installs branch roots, releases placement, and changes every prepared
 		// origin from provider-owned to shared together. Cancellation before it
 		// reverses every handoff; cancellation after it is a no-op.
-		family, authorityBranch := publicationAuthorityIdentity(info, intent)
 		if _, err := p.authority.CommitPublication(family, authorityBranch, intent.PublicationID, roots, p.nodeID, p.incarnation, handoffOrigins); err != nil {
 			return fmt.Errorf("committing publication roots in Raft: %w", err)
+		}
+		for _, encodedOrigin := range handoffOrigins {
+			if err := p.releaseSharedPublicationBridge(ttcsnapshot.SnapshotID(encodedOrigin)); err != nil {
+				return fmt.Errorf("releasing publication bridge for snapshot origin %d: %w", encodedOrigin, err)
+			}
 		}
 		if intent.Kind == "dehydrate" && branch.SnapshotID != 0 && p.graph != nil {
 			snapshot := ttcsnapshot.SnapshotID(branch.SnapshotID)
@@ -1296,9 +1304,17 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 	}
 }
 
-func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.SnapshotID, changes []ttcsnapshot.SnapshotReferenceMutation) error {
+func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.SnapshotID, changes []ttcsnapshot.SnapshotReferenceMutation, intent sharedPublicationBridgeIntent) error {
 	if p == nil || p.authority == nil || p.graphShared == nil || snapshot == 0 {
 		return errors.New("shared reference publication is unavailable")
+	}
+	intent.Version = sharedPublicationBridgeIntentVersion
+	intent.Snapshot = uint64(snapshot)
+	if intent.CreatedAt.IsZero() {
+		intent.CreatedAt = time.Now().UTC()
+	}
+	if err := persistSharedPublicationBridgeIntent(p.sharedRoot, intent); err != nil {
+		return fmt.Errorf("persisting publication bridge intent: %w", err)
 	}
 	lease, err := p.authority.SharedGCLease()
 	if err != nil {
@@ -1361,7 +1377,7 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 		return fmt.Errorf("reading publication bridge roots: %w", err)
 	}
 	for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
-		if err := retainBridge(ctx, uint64(snapshot), bridge.Operation, bridge.Name, bridge.Object.String()); err != nil {
+		if err := retainBridge(ctx, uint64(snapshot), bridge.RetainOperation, bridge.Name, bridge.Object.String()); err != nil {
 			return fmt.Errorf("retaining publication bridge %q: %w", bridge.Name, err)
 		}
 	}
@@ -1389,9 +1405,10 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 }
 
 type publicationBridgeReference struct {
-	Operation string
-	Name      string
-	Object    ttcsnapshot.ObjectID
+	RetainOperation  string
+	ReleaseOperation string
+	Name             string
+	Object           ttcsnapshot.ObjectID
 }
 
 func publicationBridgeReferences(snapshot ttcsnapshot.SnapshotID, references map[string]ttcsnapshot.ObjectID) []publicationBridgeReference {
@@ -1406,13 +1423,60 @@ func publicationBridgeReferences(snapshot ttcsnapshot.SnapshotID, references map
 			// Operation crosses the cluster control protocol and therefore uses
 			// its bounded opaque-ID alphabet. Name is ledger-local and may retain
 			// the hierarchical spelling.
-			Operation: fmt.Sprintf("publication-bridge-retain-%016x-%x", uint64(snapshot), digest),
-			Name:      bridgeName,
-			Object:    object,
+			RetainOperation:  fmt.Sprintf("publication-bridge-retain-%016x-%x", uint64(snapshot), digest),
+			ReleaseOperation: fmt.Sprintf("publication-bridge-release-%016x-%x", uint64(snapshot), digest),
+			Name:             bridgeName,
+			Object:           object,
 		})
 	}
 	sort.Slice(bridges, func(i, j int) bool { return bridges[i].Name < bridges[j].Name })
 	return bridges
+}
+
+// releaseSharedPublicationBridge removes the temporary provider-to-shared
+// roots only after their replacement authority is durable. It is idempotent
+// across lost responses and coordinator turnover.
+func (p *branchPublisher) releaseSharedPublicationBridge(snapshot ttcsnapshot.SnapshotID) error {
+	if p == nil || p.authority == nil || p.graphShared == nil || p.sharedRefs == nil || snapshot == 0 {
+		return errors.New("shared publication bridge release is unavailable")
+	}
+	manifest, err := p.graphShared.Manifest(snapshot)
+	if err != nil {
+		return fmt.Errorf("reading publication bridge roots: %w", err)
+	}
+	lease, err := p.authority.SharedGCLease()
+	if err != nil {
+		return err
+	}
+	if lease.Generation == 0 || !time.Now().Before(lease.ExpiresAt) {
+		return errors.New("shared reference coordinator has no active lease")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if lease.NodeID == p.nodeID && lease.Incarnation == p.incarnation {
+		if err := p.sharedRefs.reconcileAuthoritativeColdReferences(); err != nil {
+			return fmt.Errorf("reconciling replacement roots: %w", err)
+		}
+		for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+			if err := p.sharedRefs.mutateReference(bridge.ReleaseOperation, bridge.Name, bridge.Object, false); err != nil {
+				return fmt.Errorf("releasing publication bridge %q: %w", bridge.Name, err)
+			}
+		}
+	} else {
+		if p.peers == nil {
+			return errors.New("cluster peer routing is unavailable")
+		}
+		peer, err := p.peers.peer(lease.NodeID, false)
+		if err != nil {
+			return err
+		}
+		for _, bridge := range publicationBridgeReferences(snapshot, manifest.References) {
+			if err := peer.ApplySharedSnapshotReference(ctx, uint64(snapshot), bridge.ReleaseOperation, bridge.Name, bridge.Object.String(), false); err != nil {
+				return fmt.Errorf("releasing publication bridge %q: %w", bridge.Name, err)
+			}
+		}
+	}
+	return removeSharedPublicationBridgeIntent(p.sharedRoot, snapshot)
 }
 
 func fileSHA256Digest(path string) (string, error) {
@@ -1827,6 +1891,13 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	}
 	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
 		return errors.New("cold manifest identity does not match branch publication")
+	}
+	// Hostname, hosts, and resolv.conf are TTC-owned bind mounts outside the
+	// volume graph. A cold branch may be inspected on any node, so materialize
+	// these small portable objects alongside the repository cache rather than
+	// leaving canonical paths that point into the former owner's scratch root.
+	if err := b.containerStore().InstallPortableInternalMounts(info.ID, portableInternalMountsFromColdManifest(manifest)); err != nil {
+		return fmt.Errorf("materializing portable internal mounts: %w", err)
 	}
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")

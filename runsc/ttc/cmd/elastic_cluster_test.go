@@ -31,6 +31,78 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
+type transientHeartbeatCatalog struct {
+	cluster.NodeCatalog
+	attempts int
+	success  chan struct{}
+}
+
+func (c *transientHeartbeatCatalog) Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*cluster.NodeRecord, error) {
+	c.attempts++
+	if c.attempts == 1 {
+		return nil, errors.New("transient heartbeat failure")
+	}
+	select {
+	case c.success <- struct{}{}:
+	default:
+	}
+	return &cluster.NodeRecord{NodeID: nodeID, Incarnation: incarnation}, nil
+}
+
+func TestMaintainElasticNodeRetriesBeforeFencing(t *testing.T) {
+	catalog := &transientHeartbeatCatalog{success: make(chan struct{}, 1)}
+	done := make(chan struct{})
+	defer close(done)
+	fatal := make(chan error, 1)
+	fenced := make(chan struct{}, 1)
+	go maintainElasticNode(catalog, cluster.NodeRecord{NodeID: "node-a", Incarnation: "inc-a"}, 900*time.Millisecond, nil, done, nil, func() error {
+		fenced <- struct{}{}
+		return nil
+	}, fatal)
+	select {
+	case <-catalog.success:
+	case err := <-fatal:
+		t.Fatalf("node fenced instead of retrying: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for heartbeat retry")
+	}
+	select {
+	case <-fenced:
+		t.Fatal("transient heartbeat failure fenced the node")
+	default:
+	}
+}
+
+func TestDistributedSourceRuntimeWaitsForScheduledCleanup(t *testing.T) {
+	runtime := &distributedSourceRuntime{}
+	release := make(chan struct{})
+	started := make(chan struct{}, 2)
+	runtime.scheduleHandoff(func() {
+		started <- struct{}{}
+		<-release
+	})
+	runtime.scheduleSourceMonitor(func() {
+		started <- struct{}{}
+		<-release
+	})
+	<-started
+	<-started
+
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err := runtime.waitForBackgroundTasks(short)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait returned %v while cleanup was active, want deadline", err)
+	}
+
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runtime.waitForBackgroundTasks(ctx); err != nil {
+		t.Fatalf("wait after cleanup: %v", err)
+	}
+}
+
 func TestClusterAdvertiseResolution(t *testing.T) {
 	base, name, err := parseClusterAdvertise("node-a.example:0")
 	if err != nil {

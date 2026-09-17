@@ -272,6 +272,9 @@ func (c *RaftCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOrig
 	if _, retired := state.RetiredOrigins[snapshotID]; retired {
 		return SnapshotOriginProvider{}, false, os.ErrNotExist
 	}
+	if state.AbandonedOrigins[snapshotID] {
+		return SnapshotOriginProvider{}, false, os.ErrNotExist
+	}
 	provider, found = state.VolatileOrigins[snapshotID]
 	return provider, found, nil
 }

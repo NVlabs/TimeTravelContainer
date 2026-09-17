@@ -692,10 +692,14 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 					// placement yet. Only the Raft publish/cutover operation may do so.
 					continue
 				}
-				// During restart recovery, first adopt all existing placements
-				// while the node is still unschedulable. Previously untracked
-				// local branches are enrolled after the node becomes ready.
-				if current.State == cluster.NodeJoining {
+				// A missing placement may be enrolled only while this node accepts
+				// new ownership. Pressured/draining nodes frequently retain a
+				// physical source briefly after migration or removal has deleted its
+				// logical placement; recreating that placement would resurrect the
+				// branch and is rejected by Raft in any event. During restart
+				// recovery, existing placements are adopted while joining and truly
+				// untracked local branches are enrolled after the node becomes ready.
+				if current.State != cluster.NodeReady {
 					continue
 				}
 				_, createErr := placements.Create(cluster.PlacementRecord{
@@ -766,6 +770,86 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 	}
 	return result
+}
+
+// newPlacementReservation is the Raft ownership record installed before a
+// newly prepared container may execute guest code. Placement reconciliation is
+// deliberately a recovery mechanism, not an admission protocol: creating the
+// record after runsc start leaves a window in which a live runtime is invisible
+// to routing and may fail enrollment if the node becomes pressured meanwhile.
+type newPlacementReservation struct {
+	record *cluster.PlacementRecord
+}
+
+// reserveNewContainerPlacement fences a newly prepared main branch before its
+// Sentry exists. PlacementMaterializing grants this node exclusive construction
+// authority but is not executable/routable as a normal branch. Standalone TTC
+// has no placement authority and returns a no-op reservation.
+func (b *runtimeBackend) reserveNewContainerPlacement(info ttcbundle.ContainerInfo) (newPlacementReservation, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil || b.nodeID == "" {
+		return newPlacementReservation{}, nil
+	}
+	owner, err := b.renewDistributedExecutionAuthority()
+	if err != nil {
+		return newPlacementReservation{}, fmt.Errorf("renewing new-container placement authority: %w", err)
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return newPlacementReservation{}, err
+	}
+	branch, err := persistentBranchInfo(info, defaultBranchID)
+	if err != nil {
+		return newPlacementReservation{}, err
+	}
+	record, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: info.ID, BranchID: branch.ID, PhysicalContainer: info.ID, PhysicalBranch: branch.ID,
+		OwnerNode: b.nodeID, OwnerIncarnation: owner.Incarnation, State: cluster.PlacementMaterializing,
+		FamilyName: info.Name, ImageReference: info.Reference, ImageDigest: info.Digest, ImageSize: info.ImageSize,
+		LiveForkEligible: info.LiveForkEligible, LiveForkWaiver: info.LiveForkWaiver,
+		FamilyCreatedAt: info.CreatedAt, ParentBranch: branch.ParentID, BranchCreatedAt: branch.CreatedAt,
+		Quarantined: branch.Quarantined,
+	}, time.Now())
+	if err != nil {
+		return newPlacementReservation{}, fmt.Errorf("reserving placement for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	return newPlacementReservation{record: record}, nil
+}
+
+// activateNewContainerPlacement makes a successfully started reservation
+// normally routable. A node is allowed to become pressured after accepting the
+// reservation; stable-state completion consequently requires execution
+// authority, but not continued admission of unrelated new work.
+func (b *runtimeBackend) activateNewContainerPlacement(reservation newPlacementReservation) error {
+	if reservation.record == nil {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	record := reservation.record
+	_, err = placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementRunning, time.Now())
+	if err != nil {
+		return fmt.Errorf("activating placement for %s@%s: %w", record.FamilyID, record.BranchID, err)
+	}
+	return nil
+}
+
+// cancelNewContainerPlacement releases an unactivated construction record.
+// The caller separately removes the prepared local container tree.
+func (b *runtimeBackend) cancelNewContainerPlacement(reservation newPlacementReservation) error {
+	if reservation.record == nil {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	record := reservation.record
+	if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("canceling placement for %s@%s: %w", record.FamilyID, record.BranchID, err)
+	}
+	return nil
 }
 
 // logicalPlacementForPhysicalTransaction resolves transaction-scoped runtime
@@ -904,6 +988,14 @@ func (b *runtimeBackend) retireTransactionsForRemovedPlacement(removed cluster.P
 	for i := range records {
 		tx := &records[i]
 		if !tx.Terminal() || !transactionTargetsRemovedPlacement(*tx, removed) {
+			continue
+		}
+		// An independent migration may still have a paused physical source and
+		// transfer roots on the old owner. Keep its terminal Raft record as the
+		// durable cleanup intent until the family-mutation coordinator discards
+		// that source. Deleting this record here made a crash permanently orphan
+		// the old memory graph.
+		if tx.Identity.Migration {
 			continue
 		}
 		if err := transactions.Delete(tx.Identity.TransactionID, tx.Revision); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1228,7 +1320,7 @@ func (m distributedFamilyMutation) branchPrefix() []string {
 func distributedMutationSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) map[string]map[string]struct{} {
 	settleByNode := make(map[string]map[string]struct{})
 	for _, tx := range transactions {
-		if !tx.SourceNeeded || (tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+		if !transactionNeedsSourceSettlement(tx) {
 			continue
 		}
 		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
@@ -1245,9 +1337,63 @@ func distributedMutationSourceTransactions(transactions []cluster.Transaction, i
 	return settleByNode
 }
 
+// distributedRemovalSourceTransactions separates dependencies that must be
+// materialized before deletion from retired migration providers that should be
+// discarded after their logical target has gone away. Publishing the latter
+// would copy data that has no surviving reader, making rm proportional to the
+// deleted branch's resident memory on shared storage.
+func distributedRemovalSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) (map[string]map[string]struct{}, map[string]map[string]struct{}) {
+	settle := make(map[string]map[string]struct{})
+	discard := make(map[string]map[string]struct{})
+	for _, tx := range transactions {
+		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
+			continue
+		}
+		if branchID != "" && tx.Identity.SourceBranch != branchID && tx.Identity.VisibleTargetBranch() != branchID {
+			continue
+		}
+		if !transactionNeedsSourceSettlement(tx) {
+			continue
+		}
+		node := tx.Identity.SourceNodeID
+		if tx.Identity.Migration {
+			// Every migration needs a post-delete source discard. A still-live
+			// dependency is first made independent, then follows the same path;
+			// categorizing only its initial state lost that postflight.
+			if discard[node] == nil {
+				discard[node] = make(map[string]struct{})
+			}
+			discard[node][tx.Identity.TransactionID] = struct{}{}
+			if tx.State == cluster.TransactionIndependent {
+				continue
+			}
+		}
+		if settle[node] == nil {
+			settle[node] = make(map[string]struct{})
+		}
+		settle[node][tx.Identity.TransactionID] = struct{}{}
+	}
+	return settle, discard
+}
+
+// transactionNeedsSourceSettlement covers both an active remote dependency
+// and the short post-independence interval before a migration's old physical
+// source has been reclaimed. The latter is deliberately synchronous before a
+// destructive lifecycle command: deleting target metadata first would leave
+// no durable operation from which to publish/release the source's immutable
+// graph roots after a daemon crash.
+func transactionNeedsSourceSettlement(tx cluster.Transaction) bool {
+	if tx.SourceNeeded && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining) {
+		return true
+	}
+	return tx.Identity.Migration && tx.State == cluster.TransactionIndependent
+}
+
 // parseDistributedFamilyMutation recognizes the deliberately small set of
-// commands whose unqualified operands mean "all branches in this family".
-// It follows flag.FlagSet's ordering rule: options precede positional targets.
+// destructive lifecycle commands that require cross-node dependency
+// settlement. Both family and branch operands pass through the coordinator;
+// family operands are additionally expanded to all logical placements. It
+// follows flag.FlagSet's ordering rule: options precede positional targets.
 func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, bool) {
 	if len(args) < 2 || (args[0] != "rm" && args[0] != "stop" && args[0] != "dehydrate") {
 		return distributedFamilyMutation{}, false
@@ -1281,15 +1427,6 @@ func parseDistributedFamilyMutation(args []string) (distributedFamilyMutation, b
 		i++
 	}
 	if i == len(args) {
-		return distributedFamilyMutation{}, false
-	}
-	hasFamily := false
-	for _, target := range args[i:] {
-		if !strings.Contains(target, "@") {
-			hasFamily = true
-		}
-	}
-	if !hasFamily {
 		return distributedFamilyMutation{}, false
 	}
 	return distributedFamilyMutation{
@@ -1466,9 +1603,10 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 	return true, 0, output.Bytes(), diagnostic.Bytes(), nil
 }
 
-// executeDistributedFamilyMutation coordinates family-wide lifecycle changes
-// before any daemon takes its process-local lifecycle lock. This is necessary
-// once one logical family can have physical runtimes on multiple nodes.
+// executeDistributedFamilyMutation coordinates destructive family- and
+// branch-scoped lifecycle changes before any daemon takes its process-local
+// lifecycle lock. This is necessary once one logical family can have physical
+// runtimes and immutable backing providers on multiple nodes.
 func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (bool, int, []byte, []byte, error) {
 	mutation, ok := parseDistributedFamilyMutation(request.Args)
 	if !ok {
@@ -1490,6 +1628,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		return true, 1, nil, nil, fmt.Errorf("listing distributed transactions before family mutation: %w", err)
 	}
 	settleByNode := make(map[string]map[string]struct{})
+	discardByNode := make(map[string]map[string]struct{})
 	for _, operand := range mutation.targets {
 		name := operand
 		branchID := ""
@@ -1505,12 +1644,25 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
-		for node, ids := range distributedMutationSourceTransactions(transactions, info, branchID) {
+		settle := distributedMutationSourceTransactions(transactions, info, branchID)
+		discard := map[string]map[string]struct{}{}
+		if request.Args[0] == "rm" {
+			settle, discard = distributedRemovalSourceTransactions(transactions, info, branchID)
+		}
+		for node, ids := range settle {
 			if settleByNode[node] == nil {
 				settleByNode[node] = make(map[string]struct{})
 			}
 			for transactionID := range ids {
 				settleByNode[node][transactionID] = struct{}{}
+			}
+		}
+		for node, ids := range discard {
+			if discardByNode[node] == nil {
+				discardByNode[node] = make(map[string]struct{})
+			}
+			for transactionID := range ids {
+				discardByNode[node][transactionID] = struct{}{}
 			}
 		}
 	}
@@ -1528,6 +1680,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		preflight = append(preflight, child{node: node, args: append([]string{"_settle-source-transactions"}, ids...)})
 	}
 	var children []child
+	var finalizers []child
 	for _, operand := range mutation.targets {
 		if strings.Contains(operand, "@") {
 			selected, err := parseSelector(operand)
@@ -1586,10 +1739,25 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				args = append(args, "--volumes")
 			}
 			args = append(args, info.ID)
-			children = append(children, child{node: finalNode, args: args})
+			finalizers = append(finalizers, child{node: finalNode, args: args})
 		}
 	}
-	children = append(preflight, children...)
+	if request.Args[0] == "rm" {
+		nodes := make([]string, 0, len(discardByNode))
+		for node := range discardByNode {
+			nodes = append(nodes, node)
+		}
+		sort.Strings(nodes)
+		for _, node := range nodes {
+			ids := make([]string, 0, len(discardByNode[node]))
+			for transactionID := range discardByNode[node] {
+				ids = append(ids, transactionID)
+			}
+			sort.Strings(ids)
+			children = append(children, child{node: node, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
+		}
+	}
+	children = append(append(preflight, children...), finalizers...)
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
@@ -2047,7 +2215,9 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	// path exclusively for retirement; target execution is already active, and
 	// node shutdown must wait for complete materialization in either case.
 	if sourceRecord.State != cluster.NodeDraining {
-		go monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+		b.distributedSource.scheduleHandoff(func() {
+			monitorBackend.handoffDistributedFork(peer, info.ID, requestID, tx.Revision, relay)
+		})
 	}
 	// monitorSparseMigrationCleanup is deliberately passive until the eager
 	// retirement barrier has made the target independent. It keeps the relay
@@ -2055,7 +2225,9 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	// monitorDistributedFork here as well would create a second active drain
 	// driver; after either caller timed out, its still-running HTTP handler and
 	// retries could form an O(branches^2) target-lock convoy.
-	go monitorBackend.monitorSparseMigrationCleanup(peer, info.ID, target.branch, requestID, relay)
+	b.distributedSource.scheduleSourceMonitor(func() {
+		monitorBackend.monitorSparseMigrationCleanup(peer, info.ID, target.branch, requestID, relay)
+	})
 	return nil
 }
 
@@ -2107,8 +2279,6 @@ func (b *runtimeBackend) restoreMigrationBranchSidecars(target selector, info tt
 }
 
 func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, containerID, branchID, transactionID string, relay *distributedPageRelay) {
-	finishMonitor := b.distributedSource.beginSourceMonitor()
-	defer finishMonitor()
 	for {
 		timer := time.NewTimer(b.distributedSource.sourceMonitorInterval())
 		<-timer.C
@@ -2126,8 +2296,23 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
 				log.Warningf("TTC: retaining completed migration transfer roots for retry %s@%s: %v", containerID, branchID, err)
 			}
-			if err := b.releaseMigratedSourceRuntime(containerID, branchID); err != nil {
-				log.Warningf("TTC: retaining source runtime after sparse migration %s@%s: %v", containerID, branchID, err)
+			// If rm already committed logical placement deletion, there is no
+			// surviving reader for this retired provider. Discard it directly;
+			// publishing here would race the deletion postflight and copy an
+			// entire dead memory graph to shared storage.
+			discard := false
+			if placements, placementErr := b.placementCatalog(); placementErr == nil {
+				_, placementErr = placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+				discard = errors.Is(placementErr, os.ErrNotExist)
+			}
+			var releaseErr error
+			if discard {
+				releaseErr = b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
+			} else {
+				releaseErr = b.releaseMigratedSourceRuntime(containerID, branchID)
+			}
+			if releaseErr != nil {
+				log.Warningf("TTC: retaining source runtime after sparse migration %s@%s: %v", containerID, branchID, releaseErr)
 			}
 			unlockSource()
 			return
@@ -2140,6 +2325,14 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 }
 
 func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID string) error {
+	return b.releaseMigratedSourceRuntimeWithPolicy(containerID, branchID, true)
+}
+
+func (b *runtimeBackend) releaseMigratedSourceRuntimeDiscard(containerID, branchID string) error {
+	return b.releaseMigratedSourceRuntimeWithPolicy(containerID, branchID, false)
+}
+
+func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, branchID string, publishBacking bool) error {
 	info, err := b.containerStore().LoadContainer(containerID)
 	if errors.Is(err, os.ErrNotExist) {
 		// The synchronous node-retirement barrier and the ordinary background
@@ -2170,7 +2363,13 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 		break
 	}
 	if !found {
-		return nil
+		// Runtime deletion and backing reclamation are separate crash
+		// boundaries. A prior attempt may already have removed the Sentry but
+		// failed while publishing or releasing immutable roots. Continue from
+		// the durable branch record instead of treating runtime absence as full
+		// cleanup; otherwise one transient shared-storage failure leaks the
+		// entire source graph permanently.
+		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
 	if physicalPeers == 0 {
 		if err := b.purgeRuntime(info.ID); err != nil {
@@ -2181,12 +2380,12 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 			// does not release graph/reference authority. Do that while the exact
 			// branch metadata is still available, then let the bundle store drop
 			// the now-empty wrapper and image lease.
-			if err := b.reclaimMigratedSourceBacking(info, branchID); err != nil {
+			if err := b.reclaimMigratedSourceBackingWithPolicy(info, branchID, publishBacking); err != nil {
 				return err
 			}
 			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
 		}
-		return b.removeMigratedSourceMetadata(info, branchID)
+		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
 		families, listErr := b.listRuntimeFamilies()
@@ -2204,9 +2403,9 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 			}
 		}
 		// An idempotent retry may observe that the branch is already absent.
-		return b.removeMigratedSourceMetadata(info, branchID)
+		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
-	return b.removeMigratedSourceMetadata(info, branchID)
+	return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 }
 
 // removeMigratedSourceMetadata drops the retired physical incarnation after
@@ -2215,7 +2414,11 @@ func (b *runtimeBackend) releaseMigratedSourceRuntime(containerID, branchID stri
 // filesystem pointer, and its console artifacts per migration and would make a
 // later return to this Sentry collide with an obsolete name.
 func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerInfo, branchID string) error {
-	if err := b.reclaimMigratedSourceBacking(info, branchID); err != nil {
+	return b.removeMigratedSourceMetadataWithPolicy(info, branchID, true)
+}
+
+func (b *runtimeBackend) removeMigratedSourceMetadataWithPolicy(info ttcbundle.ContainerInfo, branchID string, publishBacking bool) error {
+	if err := b.reclaimMigratedSourceBackingWithPolicy(info, branchID, publishBacking); err != nil {
 		return err
 	}
 	if info.DistributedFamilyID != "" {
@@ -2228,6 +2431,10 @@ func (b *runtimeBackend) removeMigratedSourceMetadata(info ttcbundle.ContainerIn
 }
 
 func (b *runtimeBackend) reclaimMigratedSourceBacking(info ttcbundle.ContainerInfo, branchID string) error {
+	return b.reclaimMigratedSourceBackingWithPolicy(info, branchID, true)
+}
+
+func (b *runtimeBackend) reclaimMigratedSourceBackingWithPolicy(info ttcbundle.ContainerInfo, branchID string, publishBacking bool) error {
 	var branch ttcbundle.BranchInfo
 	found := false
 	for _, candidate := range info.Branches {
@@ -2244,8 +2451,10 @@ func (b *runtimeBackend) reclaimMigratedSourceBacking(info ttcbundle.ContainerIn
 	// locally authoritative origins to shared storage before releasing this
 	// source branch so later dehydration can preserve those edges without the
 	// retired node remaining a provider.
-	if err := b.publishMigratedMemoryOrigins(branch); err != nil {
-		return fmt.Errorf("publishing migrated memory backing: %w", err)
+	if publishBacking {
+		if err := b.publishMigratedMemoryOrigins(branch); err != nil {
+			return fmt.Errorf("publishing migrated memory backing: %w", err)
+		}
 	}
 	if err := b.reclaimBranchBacking(info, branch); err != nil {
 		return fmt.Errorf("reclaiming migrated branch backing: %w", err)
@@ -3398,6 +3607,9 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	}
 	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer terminalCancel()
+	if err := b.distributedSource.waitForBackgroundTasks(terminalCtx); err != nil {
+		return moved, fmt.Errorf("waiting for distributed source cleanup: %w", err)
+	}
 	last, err := waitForTerminalClusterOwnership(terminalCtx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
 	if err != nil {
 		return moved, fmt.Errorf("waiting for terminal cluster storage ownership: %w", err)
@@ -3911,51 +4123,6 @@ func fenceElasticRuntimeRoot(localRoot, runtimeRoot, nodeID, incarnation string)
 	return result
 }
 
-// fenceElasticRuntimes uses SIGSTOP as the final physical lease fence. Unlike
-// a logical branch pause, this freezes every branch and every in-flight Sentry
-// operation in one host-kernel action. The durable PID/start-time record lets
-// a later daemon resume only the exact processes it has re-authorized.
-func fenceElasticRuntimes(backend *runtimeBackend, nodeID, incarnation string) error {
-	families, err := backend.listRuntimeFamilies()
-	if err != nil {
-		return err
-	}
-	record := elasticFenceRecord{Version: 1, NodeID: nodeID, Incarnation: incarnation, FencedAt: time.Now().UTC()}
-	for _, family := range families {
-		if family.SandboxPID <= 0 {
-			continue
-		}
-		start, err := processStartTime(family.SandboxPID)
-		if err != nil {
-			continue
-		}
-		process := elasticFencedProcess{PID: family.SandboxPID, StartTime: start, ContainerID: family.ID}
-		for _, branch := range family.Branches {
-			process.Branches = append(process.Branches, branch.ID)
-		}
-		sort.Strings(process.Branches)
-		record.Processes = append(record.Processes, process)
-	}
-	path := elasticFencePath(backend.activeDataRoot())
-	var result error
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		result = errors.Join(result, err)
-	} else if err := writeDurableJSON(path, record); err != nil {
-		// Failure to record resumable identity must not prevent the physical
-		// fence. These Sentries will stay stopped (or be killed) for manual
-		// recovery rather than execute outside their lease.
-		result = errors.Join(result, fmt.Errorf("recording execution fence: %w", err))
-	}
-	for _, process := range record.Processes {
-		if err := syscall.Kill(process.PID, syscall.SIGSTOP); err != nil && !errors.Is(err, syscall.ESRCH) {
-			// Failure to stop before lease expiry must fail closed.
-			killErr := syscall.Kill(process.PID, syscall.SIGKILL)
-			result = errors.Join(result, fmt.Errorf("stopping Sentry PID %d: %w (kill fallback: %v)", process.PID, err, killErr))
-		}
-	}
-	return result
-}
-
 func fencedRuntimeAuthorized(family Family, nodeID, incarnation string, lookup func(string, string) (*cluster.PlacementRecord, error)) bool {
 	if family.ID == "" || len(family.Branches) == 0 {
 		return false
@@ -4340,52 +4507,89 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 	if interval < 250*time.Millisecond {
 		interval = 250 * time.Millisecond
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	margin := lease / 3
+	if margin < 500*time.Millisecond {
+		margin = 500 * time.Millisecond
+	}
+	retryDelay := interval / 10
+	if retryDelay < 50*time.Millisecond {
+		retryDelay = 50 * time.Millisecond
+	}
+	if retryDelay > 250*time.Millisecond {
+		retryDelay = 250 * time.Millisecond
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	record := initial
 	// This is deliberately monotonic-local, not the leader's absolute wall
 	// clock deadline. Starting it before each renewal request makes network RTT
 	// conservative and avoids assuming synchronized clocks for physical fencing.
 	localDeadline := time.Now().Add(lease)
+	var lastErr error
 	for {
 		select {
 		case <-done:
 			return
-		case now := <-ticker.C:
+		case <-timer.C:
 			renewalStarted := time.Now()
+			fenceAt := localDeadline.Add(-margin)
+			if !renewalStarted.Before(fenceAt) {
+				cause := lastErr
+				if cause == nil {
+					cause = errors.New("lease renewal safety margin elapsed before the heartbeat could run")
+				}
+				fenceErr := error(nil)
+				if fence != nil {
+					fenceErr = fence()
+				}
+				select {
+				case fatal <- fmt.Errorf("elastic cluster lease self-fenced before expiry after heartbeat failure: %w", errors.Join(cause, fenceErr)):
+				default:
+				}
+				return
+			}
 			current, err := currentNodeMemoryBytes()
 			var authorityState *cluster.AuthorityState
 			if err == nil {
 				if catalog, ok := directory.(*cluster.RaftCatalog); ok {
-					// Bound the complete renewal and local-apply wait well inside
-					// the guardian deadline. A failed attempt leaves another
-					// interval for recovery before conservative self-fencing.
-					ctx, cancel := context.WithTimeout(context.Background(), interval)
-					var renewedRecord *cluster.NodeRecord
-					renewedRecord, authorityState, err = catalog.HeartbeatState(ctx, record.NodeID, record.Incarnation, current, lease)
-					cancel()
-					if err == nil {
-						record = *renewedRecord
+					// Bound each complete renewal and local-apply wait to half of
+					// the remaining safety window. Failed attempts are retried
+					// promptly below rather than consuming a whole heartbeat
+					// interval and forcing an otherwise healthy node to fence.
+					attemptBudget := interval / 2
+					if remaining := time.Until(fenceAt); attemptBudget > remaining/2 {
+						attemptBudget = remaining / 2
+					}
+					if attemptBudget <= 0 {
+						err = context.DeadlineExceeded
+					} else {
+						ctx, cancel := context.WithTimeout(context.Background(), attemptBudget)
+						var renewedRecord *cluster.NodeRecord
+						renewedRecord, authorityState, err = catalog.HeartbeatState(ctx, record.NodeID, record.Incarnation, current, lease)
+						cancel()
+						if err == nil {
+							record = *renewedRecord
+						}
 					}
 				} else {
-					record, err = heartbeatElasticNode(directory, record, current, now, lease)
+					record, err = heartbeatElasticNode(directory, record, current, renewalStarted, lease)
 				}
 				if err == nil && renewed != nil {
 					err = renewed(authorityState)
 				}
 				if err == nil {
 					localDeadline = renewalStarted.Add(lease)
+					lastErr = nil
+					timer.Reset(interval)
 					continue
 				}
 			}
+			lastErr = err
 			if stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: elastic cluster heartbeat failed: %v\n", err)
 			}
-			margin := lease / 3
-			if margin < 500*time.Millisecond {
-				margin = 500 * time.Millisecond
-			}
-			if !time.Now().Before(localDeadline.Add(-margin)) {
+			remaining := time.Until(fenceAt)
+			if remaining <= 0 {
 				fenceErr := error(nil)
 				if fence != nil {
 					fenceErr = fence()
@@ -4396,6 +4600,17 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 				}
 				return
 			}
+			// Retry quickly while there is still execution-lease headroom.
+			// Limit the sleep to a fraction of the remaining window so a
+			// short control-plane stall cannot turn into a single-shot fence.
+			delay := retryDelay
+			if quarter := remaining / 4; delay > quarter {
+				delay = quarter
+			}
+			if delay <= 0 {
+				delay = time.Millisecond
+			}
+			timer.Reset(delay)
 		}
 	}
 }

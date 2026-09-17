@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"sync/atomic"
 	"testing"
@@ -49,6 +50,31 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 		if providerBaselineCanBeReleased(state, name, object) {
 			t.Fatalf("non-provider reference %q was releasable", name)
 		}
+	}
+}
+
+func TestTerminalSourceAction(t *testing.T) {
+	tests := []struct {
+		name   string
+		tx     *cluster.Transaction
+		err    error
+		action string
+		done   bool
+	}{
+		{name: "independent", tx: &cluster.Transaction{State: cluster.TransactionIndependent}, action: "distributed-complete", done: true},
+		{name: "canceled", tx: &cluster.Transaction{State: cluster.TransactionCanceled}, action: "distributed-cancel", done: true},
+		{name: "failed", tx: &cluster.Transaction{State: cluster.TransactionFailed}, action: "distributed-cancel", done: true},
+		{name: "retired", err: os.ErrNotExist, action: "distributed-cancel", done: true},
+		{name: "published", tx: &cluster.Transaction{State: cluster.TransactionPublished}},
+		{name: "read error", err: errors.New("raft unavailable")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action, done := terminalSourceAction(test.tx, test.err)
+			if action != test.action || done != test.done {
+				t.Fatalf("terminalSourceAction() = (%q, %t), want (%q, %t)", action, done, test.action, test.done)
+			}
+		})
 	}
 }
 
@@ -112,10 +138,13 @@ func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 		t.Fatalf("bridges=%+v, want one", bridges)
 	}
 	bridge := bridges[0]
-	if matched := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(bridge.Operation); !matched {
-		t.Fatalf("publication bridge operation %q is not a valid cluster operation ID", bridge.Operation)
+	if isProviderBaselineReference(bridge.Name) {
+		t.Fatalf("publication bridge %q was classified as a disposable provider baseline", bridge.Name)
 	}
-	if err := shared.ApplyReference(bridge.Operation, bridge.Name, bridge.Object, true); err != nil {
+	if matched := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(bridge.RetainOperation); !matched {
+		t.Fatalf("publication bridge operation %q is not a valid cluster operation ID", bridge.RetainOperation)
+	}
+	if err := shared.ApplyReference(bridge.RetainOperation, bridge.Name, bridge.Object, true); err != nil {
 		t.Fatal(err)
 	}
 	// This is the mutation that raced the bulk pack write: the provider's
@@ -134,6 +163,66 @@ func TestPublicationBridgePinsProviderRootsAcrossHandoff(t *testing.T) {
 	inspection := shared.Inspect()
 	if got := inspection.Objects[root]; got != 1 {
 		t.Fatalf("root refs=%d, want one durable cold root; inspection=%+v", got, inspection)
+	}
+}
+
+func TestPublicationBridgeIntentLifetime(t *testing.T) {
+	state := cluster.NewAuthorityState()
+	state.Transactions["fork-live"] = cluster.Transaction{State: cluster.TransactionPublished}
+	transaction := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: 17,
+		Kind: sharedPublicationBridgeTransaction, Transaction: "fork-live", CreatedAt: time.Now(),
+	}
+	if !publicationBridgeIntentNeeded(state, transaction) {
+		t.Fatal("nonterminal graph handoff did not preserve its publication bridge")
+	}
+	completed := state.Transactions["fork-live"]
+	completed.State = cluster.TransactionIndependent
+	state.Transactions["fork-live"] = completed
+	if publicationBridgeIntentNeeded(state, transaction) {
+		t.Fatal("terminal graph handoff retained its publication bridge")
+	}
+
+	publication := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: 19,
+		Kind: sharedPublicationBridgePublication, Family: "family", Branch: "main", PublicationID: "publish-1", CreatedAt: time.Now(),
+	}
+	state.Publications["arbitrary-map-key"] = cluster.PublicationRecord{
+		FamilyID: "family", BranchID: "main", PublicationID: "publish-1", State: cluster.PublicationReady,
+	}
+	if !publicationBridgeIntentNeeded(state, publication) {
+		t.Fatal("ready branch publication did not preserve its publication bridge")
+	}
+	record := state.Publications["arbitrary-map-key"]
+	record.State = cluster.PublicationCommitted
+	state.Publications["arbitrary-map-key"] = record
+	if publicationBridgeIntentNeeded(state, publication) {
+		t.Fatal("committed branch publication retained its publication bridge")
+	}
+}
+
+func TestPublicationBridgeIntentRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	intent := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: 23,
+		Kind: sharedPublicationBridgeTransaction, Transaction: "fork-roundtrip", CreatedAt: time.Now().UTC(),
+	}
+	if err := persistSharedPublicationBridgeIntent(root, intent); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := loadSharedPublicationBridgeIntents(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 1 || intents[0].Snapshot != intent.Snapshot || intents[0].Transaction != intent.Transaction {
+		t.Fatalf("loaded intents=%+v, want %+v", intents, intent)
+	}
+	if err := removeSharedPublicationBridgeIntent(root, ttcsnapshot.SnapshotID(intent.Snapshot)); err != nil {
+		t.Fatal(err)
+	}
+	intents, err = loadSharedPublicationBridgeIntents(root)
+	if err != nil || len(intents) != 0 {
+		t.Fatalf("intents after removal=%+v, err=%v", intents, err)
 	}
 }
 

@@ -111,7 +111,7 @@ func (b *runtimeBackend) newGraphReferenceIntentWithPurpose(transaction, operati
 		origin := ttcsnapshot.SnapshotID(encodedOrigin)
 		provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
 		if err != nil {
-			return graphReferenceIntent{}, "", err
+			return graphReferenceIntent{}, "", fmt.Errorf("resolving operation %q origin %d before retain: %w", operation, origin, err)
 		}
 		group := graphReferenceGroup{Origin: uint64(origin), Roots: groups[origin]}
 		if volatile {
@@ -204,7 +204,10 @@ func (b *runtimeBackend) resumeGraphReferenceRetain(path string, intent *graphRe
 			defer b.sharedReferences.claimMu.Unlock()
 		}
 		return advanceGraphReferenceRetain(path, intent, func(group graphReferenceGroup) error {
-			return b.mutateGraphReferenceGroup(ctx, *intent, group, true)
+			if err := b.mutateGraphReferenceGroup(ctx, *intent, group, true); err != nil {
+				return fmt.Errorf("retaining operation %q origin %d from provider %q (%d roots): %w", intent.Operation, group.Origin, group.Provider, len(group.Roots), err)
+			}
+			return nil
 		})
 	})
 }
@@ -255,7 +258,10 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 			defer b.sharedReferences.claimMu.Unlock()
 		}
 		return advanceGraphReferenceRelease(path, &intent, func(group graphReferenceGroup) error {
-			return b.mutateGraphReferenceGroup(ctx, intent, group, false)
+			if err := b.mutateGraphReferenceGroup(ctx, intent, group, false); err != nil {
+				return fmt.Errorf("releasing operation %q origin %d from provider %q (%d roots): %w", intent.Operation, group.Origin, group.Provider, len(group.Roots), err)
+			}
+			return nil
 		})
 	}); err != nil {
 		return err
@@ -510,6 +516,11 @@ func (b *runtimeBackend) mutateGraphReferenceGroup(ctx context.Context, intent g
 				// generation-fenced acknowledgement of that release.
 				return nil
 			}
+			if state.AbandonedOrigins[group.Origin] {
+				// An unpublished origin can have no surviving reference. A
+				// release retry after its abandonment is therefore complete.
+				return nil
+			}
 		}
 		return err
 	}
@@ -599,6 +610,7 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 			protected[publication.CandidateRoots.MemorySnapshot] = true
 		}
 	}
+	releasableOrigins := make(map[ttcsnapshot.SnapshotID]struct{})
 	for index, name := range roots {
 		id, err := ttcsnapshot.ParseObjectID(objects[index])
 		if err != nil {
@@ -612,6 +624,7 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		if protected[uint64(id.Snapshot)] {
 			continue
 		}
+		releasableOrigins[id.Snapshot] = struct{}{}
 		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
 		if err != nil {
 			return err
@@ -651,6 +664,16 @@ func (b *runtimeBackend) releaseSharedGraphMemoryRoots(roots, objects []string) 
 		}
 		if err != nil {
 			return err
+		}
+	}
+	publisher := &branchPublisher{
+		sharedRoot: b.dataRoot, nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
+		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
+		sharedRefs: b.sharedReferences, peers: b.distributedSource,
+	}
+	for origin := range releasableOrigins {
+		if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
+			return fmt.Errorf("releasing snapshot origin %d publication bridge: %w", origin, err)
 		}
 	}
 	return nil

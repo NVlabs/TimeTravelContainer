@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -517,6 +518,19 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	if b.nodeID != "" && branch.StorageManifest != "" {
 		if len(helperArgs) == 0 || helperArgs[0] != "export" {
 			return fmt.Errorf("cannot copy into durable unplaced branch %q; rehydrate it first", resolved.branch)
+		}
+		// The canonical OCI spec records image identity, but its rootfs path was
+		// created on the branch's previous owner. Offline cp has no live target
+		// runtime that would normally populate this node's image cache, so do it
+		// explicitly before asking the gofer to open the rewritten local path.
+		refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+		if err != nil {
+			return fmt.Errorf("materializing immutable image for offline copy: %w", err)
+		}
+		info = refreshed
+		branch, err = persistentBranchInfo(info, resolved.branch)
+		if err != nil {
+			return err
 		}
 		// StorageState describes an in-progress local cache/placement action,
 		// not whether the durable immutable backing ceased to exist. A cold fork

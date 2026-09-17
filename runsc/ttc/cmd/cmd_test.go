@@ -6106,7 +6106,7 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 		{args: []string{"rm", "-fv", "demo"}, prefix: []string{"rm", "-fv"}, targets: []string{"demo"}, handle: true},
 		{args: []string{"stop", "--time", "2", "demo", "peer@main"}, prefix: []string{"stop", "--time", "2"}, targets: []string{"demo", "peer@main"}, handle: true},
 		{args: []string{"dehydrate", "demo"}, prefix: []string{"dehydrate"}, targets: []string{"demo"}, handle: true},
-		{args: []string{"stop", "demo@main"}, handle: false},
+		{args: []string{"stop", "demo@main"}, prefix: []string{"stop"}, targets: []string{"demo@main"}, handle: true},
 		{args: []string{"pause", "demo"}, handle: false},
 		{args: []string{"rm", "--unknown", "demo"}, handle: false},
 	} {
@@ -6139,24 +6139,26 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 }
 
 func TestDistributedMutationSourceTransactions(t *testing.T) {
-	transaction := func(id, sourceNode, sourceBranch, targetBranch string, state cluster.TransactionState, needed bool) cluster.Transaction {
+	transaction := func(id, sourceNode, sourceBranch, targetBranch string, state cluster.TransactionState, needed, migration bool) cluster.Transaction {
 		return cluster.Transaction{
 			Identity: cluster.ForkIdentity{
 				TransactionID: id, SourceNodeID: sourceNode, SourceContainer: "family-id", SourceBranch: sourceBranch,
-				TargetContainer: "family-id", TargetBranch: id, TargetVisibleBranch: targetBranch,
+				TargetContainer: "family-id", TargetBranch: id, TargetVisibleBranch: targetBranch, Migration: migration,
 			},
 			State: state, SourceNeeded: needed,
 		}
 	}
 	transactions := []cluster.Transaction{
-		transaction("incoming", "node-a", "main", "child", cluster.TransactionPublished, true),
-		transaction("outgoing", "node-b", "child", "grandchild", cluster.TransactionDraining, true),
-		transaction("independent", "node-c", "main", "old", cluster.TransactionIndependent, false),
+		transaction("incoming", "node-a", "main", "child", cluster.TransactionPublished, true, false),
+		transaction("outgoing", "node-b", "child", "grandchild", cluster.TransactionDraining, true, false),
+		transaction("active-migration", "node-e", "child", "child", cluster.TransactionPublished, true, true),
+		transaction("independent-fork", "node-c", "main", "old", cluster.TransactionIndependent, false, false),
+		transaction("independent-migration", "node-d", "main", "moved", cluster.TransactionIndependent, false, true),
 	}
 	info := ttcbundle.ContainerInfo{ID: "family-id"}
 	all := distributedMutationSourceTransactions(transactions, info, "")
-	if len(all) != 2 {
-		t.Fatalf("family settlement nodes=%v, want node-a and node-b", all)
+	if len(all) != 4 {
+		t.Fatalf("family settlement nodes=%v, want node-a, node-b, node-d, and node-e", all)
 	}
 	if _, ok := all["node-a"]["incoming"]; !ok {
 		t.Fatalf("family settlement omitted incoming transaction: %v", all)
@@ -6164,12 +6166,28 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if _, ok := all["node-b"]["outgoing"]; !ok {
 		t.Fatalf("family settlement omitted outgoing transaction: %v", all)
 	}
+	if _, ok := all["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("family settlement omitted independent migration cleanup: %v", all)
+	}
 	child := distributedMutationSourceTransactions(transactions, info, "child")
-	if len(child) != 2 {
-		t.Fatalf("branch settlement nodes=%v, want incoming and outgoing sources", child)
+	if len(child) != 3 {
+		t.Fatalf("branch settlement nodes=%v, want incoming, outgoing, and active migration sources", child)
 	}
 	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, ""); len(got) != 0 {
 		t.Fatalf("unrelated family selected transactions: %v", got)
+	}
+	settle, discard := distributedRemovalSourceTransactions(transactions, info, "")
+	if len(settle) != 3 || len(discard) != 2 {
+		t.Fatalf("removal transaction split settle=%v discard=%v", settle, discard)
+	}
+	if _, ok := discard["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("removal did not defer independent migration to discard postflight: %v", discard)
+	}
+	if _, ok := discard["node-e"]["active-migration"]; !ok {
+		t.Fatalf("removal omitted active migration from discard postflight: %v", discard)
+	}
+	if _, ok := settle["node-d"]; ok {
+		t.Fatalf("removal would publish an obsolete independent migration: %v", settle)
 	}
 }
 

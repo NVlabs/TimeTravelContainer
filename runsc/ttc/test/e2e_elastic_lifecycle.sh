@@ -13,6 +13,7 @@ TTC=${TTC:-ttc}
 TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_ELASTIC_TEST_IMAGE:-busybox:1.36}
 NAME=${TTC_ELASTIC_TEST_NAME:-ttc-elastic-lifecycle-$$}
+FOREGROUND_NAME=$NAME-foreground
 ROOT=${TTC_ELASTIC_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-elastic-lifecycle.XXXXXX")}
 SHARED=${TTC_ELASTIC_TEST_SHARED_ROOT:-$ROOT/shared}
 TOKEN=ttc-elastic-lifecycle-$NAME
@@ -20,7 +21,9 @@ PORT_A=${TTC_ELASTIC_TEST_PORT_A:-19883}
 PORT_B=${TTC_ELASTIC_TEST_PORT_B:-19893}
 PORT_C=${TTC_ELASTIC_TEST_PORT_C:-19903}
 KEEP_ROOT=${TTC_ELASTIC_TEST_KEEP_ROOT:-}
+KEEP_ON_FAILURE=${TTC_ELASTIC_TEST_KEEP_ON_FAILURE:-0}
 COMMAND_TIMEOUT=${TTC_E2E_COMMAND_TIMEOUT:-120s}
+SUCCESS=0
 PID_A=
 PID_B=
 PID_C=
@@ -43,7 +46,14 @@ stop_session() {
 }
 
 cleanup() {
+	if test "$KEEP_ON_FAILURE" -ne 0 && test "$SUCCESS" -eq 0; then
+		echo "TTC elastic lifecycle failure retained live at $ROOT" >&2
+		return
+	fi
 	set +e
+	for node in c b a; do
+		if test -S "$(socket "$node")"; then client "$node" rm -f "$FOREGROUND_NAME" >/dev/null 2>&1; fi
+	done
 	if test -S "$(socket c)"; then client c rm -f "$NAME" >/dev/null 2>&1; fi
 	if test -S "$(socket b)"; then client b rm -f "$NAME" >/dev/null 2>&1; fi
 	if test -S "$(socket c)"; then client c node stop node-c --stop-all >/dev/null 2>&1; fi
@@ -116,6 +126,22 @@ done
 test "$(client a node ls --json | jq 'length')" -eq 3
 
 client a pull "$IMAGE" >/dev/null
+# Foreground execution must reserve Raft ownership before starting just like a
+# detached container. Once init exits, TTC preserves the real status, publishes
+# the filesystem asynchronously, and makes the branch durable and unplaced.
+foreground_status=0
+client a run --node node-a --name "$FOREGROUND_NAME" "$IMAGE" sh -c \
+	'printf FOREGROUND-MARK >/foreground-marker; exit 7' >/dev/null || foreground_status=$?
+test "$foreground_status" -eq 7
+client a wait --condition durable "$FOREGROUND_NAME@main" >/dev/null
+foreground=$(client b ls --json | jq -c --arg name "$FOREGROUND_NAME" '.[] | select(.name == $name) | .branches[] | select(.id == "main")')
+test "$(printf '%s' "$foreground" | jq -r '.state')" = exited
+test "$(printf '%s' "$foreground" | jq -r '.storage_state')" = shared
+test "$(printf '%s' "$foreground" | jq -r '.node_id // ""')" = ""
+client c cp "$FOREGROUND_NAME@main:/foreground-marker" "$ROOT/copied-foreground-marker"
+test "$(cat "$ROOT/copied-foreground-marker")" = FOREGROUND-MARK
+client b rm -f "$FOREGROUND_NAME" >/dev/null
+
 client a run -d --node node-a --name "$NAME" --shm-size 32m -v /work "$IMAGE" sh -c \
 	'dd if=/dev/zero of=/dev/shm/resident bs=1M count=16 2>/dev/null; printf ELASTIC-MARK | dd of=/dev/shm/resident conv=notrunc 2>/dev/null; printf VOLUME-MARK >/work/marker; exec sleep 3600' >/dev/null
 # Detached run returns once the runtime starts, before the guest entrypoint is
@@ -184,4 +210,5 @@ PID_B=
 test "$(find "$SHARED/containers" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" -eq 0
 test "$(find "$SHARED/removed-containers" -mindepth 1 2>/dev/null | wc -l)" -eq 0
 
+SUCCESS=1
 echo "TTC elastic join, migration, quarantine, and retirement lifecycle passed"

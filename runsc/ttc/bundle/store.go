@@ -4394,6 +4394,17 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		}
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
+			// Runtime eviction and active-tier reclamation may win the race with
+			// branch metadata cleanup. An absent node-local repository is already
+			// in the desired terminal state; treating it as fatal strands the
+			// branch's independent memory graph and transaction record.
+			if errors.Is(err, fs.ErrNotExist) {
+				if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				} else if statErr != nil {
+					return fmt.Errorf("stating repository %q: %w", config.Source, statErr)
+				}
+			}
 			return fmt.Errorf("opening repository %q: %w", config.Source, err)
 		}
 		removeErr := repository.RemoveBranch(repositoryBranch)

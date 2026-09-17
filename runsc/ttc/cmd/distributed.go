@@ -274,6 +274,7 @@ type distributedSourceRuntime struct {
 	dynamicPeers  map[string]dynamicClusterPeer
 	handoffOnce   sync.Once
 	handoffSlots  chan struct{}
+	handoffCount  atomic.Int64
 	handoffGate   sync.RWMutex
 	collectNeeded atomic.Bool
 	collectActive atomic.Bool
@@ -303,12 +304,19 @@ func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
 
 const distributedSourceMonitorConcurrency = 2
 
-func (r *distributedSourceRuntime) beginSourceMonitor() func() {
+func (r *distributedSourceRuntime) scheduleSourceMonitor(fn func()) {
+	if fn == nil {
+		return
+	}
 	if r == nil {
-		return func() {}
+		go fn()
+		return
 	}
 	r.monitorCount.Add(1)
-	return func() { r.monitorCount.Add(-1) }
+	go func() {
+		defer r.monitorCount.Add(-1)
+		fn()
+	}()
 }
 
 func (r *distributedSourceRuntime) sourceMonitorInterval() time.Duration {
@@ -353,11 +361,41 @@ func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
 	r.handoffOnce.Do(func() {
 		r.handoffSlots = make(chan struct{}, distributedHandoffConcurrency)
 	})
+	r.handoffCount.Add(1)
 	go func() {
+		defer r.handoffCount.Add(-1)
 		r.handoffSlots <- struct{}{}
 		defer func() { <-r.handoffSlots }()
 		fn()
 	}()
+}
+
+// waitForBackgroundTasks is the graceful-retirement barrier for work that may
+// still own transaction-scoped graph roots or a source page relay. Scheduling
+// increments the counters before starting a goroutine, so observing a stable
+// zero cannot miss a goroutine that has been created but has not run yet.
+func (r *distributedSourceRuntime) waitForBackgroundTasks(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	stable := 0
+	for {
+		if r.handoffCount.Load() == 0 && r.monitorCount.Load() == 0 && !r.collectActive.Load() {
+			stable++
+			if stable == 2 {
+				return nil
+			}
+		} else {
+			stable = 0
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for distributed source cleanup (handoffs=%d monitors=%d collection=%t): %w", r.handoffCount.Load(), r.monitorCount.Load(), r.collectActive.Load(), ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func (r *distributedSourceRuntime) beginBackgroundSnapshotWork() func() {
@@ -366,6 +404,35 @@ func (r *distributedSourceRuntime) beginBackgroundSnapshotWork() func() {
 	}
 	r.handoffGate.RLock()
 	return r.handoffGate.RUnlock
+}
+
+// sourceTransactionTerminalAction resolves handoff liveness from local Raft
+// authority when the target peer is unavailable. Family removal may retire a
+// transaction before a background handoff next contacts the target; retrying
+// that dead endpoint forever would pin both source memory and daemon shutdown.
+func (r *distributedSourceRuntime) sourceTransactionTerminalAction(transactionID string) (string, bool) {
+	if r == nil || r.transactions == nil || transactionID == "" {
+		return "", false
+	}
+	tx, err := r.transactions.Load(transactionID)
+	return terminalSourceAction(tx, err)
+}
+
+func terminalSourceAction(tx *cluster.Transaction, err error) (string, bool) {
+	if errors.Is(err, os.ErrNotExist) {
+		return "distributed-cancel", true
+	}
+	if err != nil || tx == nil {
+		return "", false
+	}
+	switch tx.State {
+	case cluster.TransactionIndependent:
+		return "distributed-complete", true
+	case cluster.TransactionCanceled, cluster.TransactionFailed:
+		return "distributed-cancel", true
+	default:
+		return "", false
+	}
 }
 
 // beginForegroundCapture prevents queued background graph handoffs from
@@ -1397,10 +1464,11 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		if shared {
 			_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
 		} else {
+			_ = removeSharedPublicationBridgeIntent(b.dataRoot, origin)
 			_ = b.releaseGraphMemoryRoots(rootNames)
 		}
-		if err := b.retireFailedGraphSnapshot(origin); err != nil && b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: retiring failed live handoff snapshot %d: %v\n", origin, err)
+		if err := b.discardFailedGraphSnapshot(origin); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: discarding failed live handoff snapshot %d: %v\n", origin, err)
 		}
 	}()
 
@@ -1427,15 +1495,19 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	_ = writer.Close()
 	finishBackgroundWork()
 	outcome := <-imported
+	// The Sentry command can fail after it has finished writing a valid stream
+	// (for example, if its source branch is retired concurrently). Record the
+	// imported roots before considering the command status so rollback can
+	// release everything the importer committed.
+	for _, root := range outcome.capture.Roots {
+		rootNames = append(rootNames, root.Name)
+		rootObjects = append(rootObjects, root.Root.String())
+	}
 	if exportErr != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("streaming live graph memory: %w", exportErr)
 	}
 	if outcome.err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("importing live graph memory: %w", outcome.err)
-	}
-	for _, root := range outcome.capture.Roots {
-		rootNames = append(rootNames, root.Name)
-		rootObjects = append(rootObjects, root.Root.String())
 	}
 	if len(rootObjects) == 0 {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("live graph capture returned no roots")
@@ -1481,11 +1553,13 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("live graph reference handoff did not freeze")
 	}
 	publisher := &branchPublisher{
-		nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
+		sharedRoot: b.dataRoot,
+		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
-	if err := publisher.publishSharedReferenceLedger(origin, changes); err != nil {
+	bridgeIntent := sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeTransaction, Transaction: transactionID}
+	if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph reference ledger: %w", err)
 	}
 	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
@@ -1594,11 +1668,13 @@ func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotI
 		return fmt.Errorf("snapshot origin %d reference handoff did not freeze", origin)
 	}
 	publisher := &branchPublisher{
-		nodeID: b.nodeID, incarnation: b.distributedSource.incarnation,
+		sharedRoot: b.dataRoot,
+		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
-	if err := publisher.publishSharedReferenceLedger(origin, changes); err != nil {
+	bridgeIntent := sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
+	if err := publisher.publishSharedReferenceLedger(origin, changes, bridgeIntent); err != nil {
 		return fmt.Errorf("transferring snapshot origin %d reference authority: %w", origin, err)
 	}
 	if err := b.distributedSource.authority.PublishSnapshotOrigin(b.nodeID, b.distributedSource.incarnation, uint64(origin)); err != nil {
@@ -1611,6 +1687,9 @@ func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotI
 		return err
 	}
 	ledgerFrozen = false
+	if err := publisher.releaseSharedPublicationBridge(origin); err != nil {
+		return fmt.Errorf("releasing snapshot origin %d publication bridge: %w", origin, err)
+	}
 	return releasePublishedProviderGraphRoots(b.snapshotGraph, b.snapshotData, origin)
 }
 
@@ -1862,7 +1941,9 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 			monitorBackend.handoffDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
 		})
 	} else {
-		go monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+		b.distributedSource.scheduleSourceMonitor(func() {
+			monitorBackend.monitorDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
+		})
 	}
 	return target, nil
 }
@@ -2601,7 +2682,9 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 				monitorBackend.handoffDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
 			})
 		} else {
-			go monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+			b.distributedSource.scheduleSourceMonitor(func() {
+				monitorBackend.monitorDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
+			})
 		}
 		results[i] = child.target
 	}
@@ -2624,8 +2707,22 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		// when graph publication is unavailable. It must not occupy one of the
 		// bounded graph-export workers and prevent independent siblings from
 		// being consolidated.
-		go b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
+		b.distributedSource.scheduleSourceMonitor(func() {
+			b.monitorDistributedFork(peer, sourceContainer, transactionID, revision, relay)
+		})
 		return
+	}
+	var releaseOnce sync.Once
+	releaseExport := func() {
+		releaseOnce.Do(func() {
+			_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
+			_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
+		})
+	}
+	finishTerminal := func(action string) {
+		_, _ = b.command("timetravel", sourceContainer, action, transactionID)
+		relay.Close()
+		releaseExport()
 	}
 	var tx *cluster.Transaction
 	for {
@@ -2648,18 +2745,12 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 					} else if current.State == cluster.TransactionIndependent {
 						// The target faulted every page from TCP before handoff.
 						cancel()
-						_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-						_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
-						_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
-						relay.Close()
+						finishTerminal("distributed-complete")
 						return
 					}
 				case cluster.TransactionCanceled, cluster.TransactionFailed:
 					cancel()
-					_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-					_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
-					_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
-					relay.Close()
+					finishTerminal("distributed-cancel")
 					return
 				}
 			}
@@ -2668,6 +2759,10 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		if err == nil && tx != nil {
 			break
 		}
+		if action, terminal := b.distributedSource.sourceTransactionTerminalAction(transactionID); terminal {
+			finishTerminal(action)
+			return
+		}
 		// Once publication succeeds, never delete its root merely because an
 		// RPC response or reader switch failed. The target may have completed
 		// the switch, and both the durable descriptor and Sentry operation are
@@ -2675,24 +2770,23 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		time.Sleep(500 * time.Millisecond)
 	}
 	if tx.State == cluster.TransactionIndependent {
-		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
-		relay.Close()
+		finishTerminal("distributed-complete")
 		return
 	}
 	if tx.GraphHandoff == nil {
 		// Eager drain won the race, so this source-side sparse publication was
 		// never made authoritative and can be reclaimed immediately.
-		_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-		_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
+		releaseExport()
 	}
 	if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, tx.Revision, relay); err != nil {
 		// Retrying status/independence is safe; the target now has no source
 		// reads, while the source retains its snapshot until completion.
-		go b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay, rootNames, rootObjects, handoff.GraphManifest)
+		b.distributedSource.scheduleSourceMonitor(func() {
+			b.monitorHandoffCompletion(peer, sourceContainer, transactionID, tx.Revision, relay, rootNames, rootObjects, handoff.GraphManifest)
+		})
 		return
 	}
-	_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-	_ = os.Remove(filepath.Join(b.dataRoot, handoff.GraphManifest))
+	releaseExport()
 }
 
 func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay, rootNames, rootObjects []string, manifest string) {
@@ -2725,6 +2819,10 @@ func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceCo
 				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
 				return
 			}
+		}
+		if action, terminal := b.distributedSource.sourceTransactionTerminalAction(transactionID); terminal {
+			_, _ = b.command("timetravel", sourceContainer, action, transactionID)
+			return
 		}
 		if err := b.completeSharedDistributedFork(peer, sourceContainer, transactionID, revision, relay); err == nil {
 			return
@@ -2767,8 +2865,6 @@ func (b *runtimeBackend) completeSharedDistributedFork(peer *cluster.Client, sou
 
 func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
 	defer relay.Close()
-	finishMonitor := b.distributedSource.beginSourceMonitor()
-	defer finishMonitor()
 	for {
 		timer := time.NewTimer(b.distributedSource.sourceMonitorInterval())
 		<-timer.C
@@ -2785,6 +2881,10 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
 				return
 			}
+		}
+		if action, terminal := b.distributedSource.sourceTransactionTerminalAction(transactionID); terminal {
+			_, _ = b.command("timetravel", sourceContainer, action, transactionID)
+			return
 		}
 		releasePoll, admitted := b.distributedSource.trySourcePoll()
 		if !admitted {
@@ -2907,8 +3007,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				if tx.GraphHandoff != nil {
 					manifest = tx.GraphHandoff.GraphManifest
 				}
-				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
+				runtime.source.scheduleSourceMonitor(func() {
+					monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
+						tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
+				})
 			} else {
 				runtime.source.scheduleHandoff(func() {
 					monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
@@ -2921,8 +3023,10 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				if tx.GraphHandoff != nil {
 					manifest = tx.GraphHandoff.GraphManifest
 				}
-				go monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
-					tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
+				runtime.source.scheduleSourceMonitor(func() {
+					monitorBackend.monitorHandoffCompletion(peer, tx.Identity.SourceContainer,
+						tx.Identity.TransactionID, tx.Revision, nil, nil, nil, manifest)
+				})
 			} else {
 				runtime.source.scheduleHandoff(func() {
 					monitorBackend.handoffDistributedFork(peer, tx.Identity.SourceContainer,
@@ -2930,12 +3034,16 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 				})
 			}
 		} else {
-			go monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
-				tx.Identity.TransactionID, tx.Revision, nil)
+			runtime.source.scheduleSourceMonitor(func() {
+				monitorBackend.monitorDistributedFork(peer, tx.Identity.SourceContainer,
+					tx.Identity.TransactionID, tx.Revision, nil)
+			})
 		}
 		if tx.Identity.Migration {
-			go monitorBackend.monitorSparseMigrationCleanup(peer, tx.Identity.SourceContainer,
-				tx.Identity.SourceBranch, tx.Identity.TransactionID, nil)
+			runtime.source.scheduleSourceMonitor(func() {
+				monitorBackend.monitorSparseMigrationCleanup(peer, tx.Identity.SourceContainer,
+					tx.Identity.SourceBranch, tx.Identity.TransactionID, nil)
+			})
 		}
 	}
 }

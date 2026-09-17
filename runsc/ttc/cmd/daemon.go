@@ -2196,8 +2196,7 @@ func drainSourceDependenciesSelected(backend *runtimeBackend, source *distribute
 	pending := make([]cluster.Transaction, 0, len(transactions))
 	for i := range transactions {
 		tx := transactions[i]
-		if tx.Identity.SourceNodeID != nodeID || !tx.SourceNeeded ||
-			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining) {
+		if tx.Identity.SourceNodeID != nodeID || !transactionNeedsSourceSettlement(tx) {
 			continue
 		}
 		if selected != nil && !selected(tx) {
@@ -2219,10 +2218,6 @@ func drainSourceDependenciesSelected(backend *runtimeBackend, source *distribute
 }
 
 func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRuntime, store cluster.TransactionCatalog, tx cluster.Transaction) error {
-	peer, err := source.peer(tx.Identity.TargetNodeID, false)
-	if err != nil {
-		return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
-	}
 	// Drive both halves of the independence barrier. Drain materializes
 	// remote memory and advances Published -> Draining. MarkIndependent
 	// verifies memory completion, materializes every deferred filesystem
@@ -2234,6 +2229,14 @@ func drainSourceDependency(backend *runtimeBackend, source *distributedSourceRun
 	// filesystem may legitimately need longer than any fixed deadline. Both
 	// transitions and their runtime operations are idempotent, so a request
 	// whose response was lost can be retried safely.
+	var peer *cluster.Client
+	if tx.State != cluster.TransactionIndependent {
+		var err error
+		peer, err = source.peer(tx.Identity.TargetNodeID, false)
+		if err != nil {
+			return fmt.Errorf("finding distributed target node %q for transaction %q: %w", tx.Identity.TargetNodeID, tx.Identity.TransactionID, err)
+		}
+	}
 	for tx.State != cluster.TransactionIndependent {
 		var (
 			current *cluster.Transaction
@@ -2350,6 +2353,102 @@ func (b *runtimeBackend) settleDistributedSourceTransactions(transactionIDs []st
 		_, ok := wanted[tx.Identity.TransactionID]
 		return ok
 	})
+}
+
+// discardRemovedMigrationSources completes the second half of distributed rm.
+// The coordinator invokes it only after the logical target placement has been
+// removed, so no branch can still fault from these immutable source objects.
+// The terminal Raft transaction remains present until this method finishes and
+// is therefore also the crash-recovery intent for the retired physical source.
+func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string) error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" || len(transactionIDs) == 0 {
+		return nil
+	}
+	store, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	for _, transactionID := range transactionIDs {
+		tx, err := store.Load(transactionID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("loading removed migration transaction %q: %w", transactionID, err)
+		}
+		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent || tx.Identity.SourceNodeID != b.nodeID {
+			return fmt.Errorf("transaction %q is not an independent migration sourced by node %q", transactionID, b.nodeID)
+		}
+		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
+			return fmt.Errorf("cannot discard migration source %q while placement %s@%s still exists", transactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("checking removed migration placement %q: %w", transactionID, err)
+		}
+
+		sourceContainer, sourceBranch := migrationSourceRuntime(*tx)
+		unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
+		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
+		if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+			unlockSource()
+			return fmt.Errorf("releasing removed migration roots %q: %w", transactionID, err)
+		}
+		if err := b.releaseMigratedSourceRuntimeDiscard(sourceContainer, sourceBranch); err != nil {
+			unlockSource()
+			return fmt.Errorf("discarding removed migration source %s@%s: %w", tx.Identity.SourceContainer, tx.Identity.SourceBranch, err)
+		}
+		unlockSource()
+		current, err := store.Load(transactionID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := store.Delete(transactionID, current.Revision); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("retiring removed migration transaction %q: %w", transactionID, err)
+		}
+	}
+	return nil
+}
+
+// reconcileRemovedMigrationSources resumes the rm postflight after a daemon
+// or coordinator crash. Placement deletion is the irreversible proof that the
+// logical target no longer exists; the retained terminal transaction supplies
+// the exact old physical identity until cleanup succeeds.
+func (b *runtimeBackend) reconcileRemovedMigrationSources() error {
+	if b == nil || b.distributedSource == nil || b.nodeID == "" {
+		return nil
+	}
+	store, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	transactions, err := store.List()
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for _, tx := range transactions {
+		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent || tx.Identity.SourceNodeID != b.nodeID {
+			continue
+		}
+		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		ids = append(ids, tx.Identity.TransactionID)
+	}
+	sort.Strings(ids)
+	return b.discardRemovedMigrationSources(ids)
 }
 
 // ensureDistributedSourceIndependent prevents branch-destructive operations
@@ -4555,7 +4654,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		waitDaemonWorker(sharedGCStopped, "shared GC coordinator", stderr)
 		if elasticRecord != nil && clusterRuntime != nil && clusterRuntime.directory != nil {
 			if !server.cleanStop.Load() && clusterTargetBackend != nil {
-				if err := fenceElasticRuntimes(clusterTargetBackend, elasticRecord.NodeID, elasticRecord.Incarnation); err != nil && stderr != nil {
+				if err := fenceElasticRuntimeRoot(clusterTargetBackend.activeDataRoot(), clusterTargetBackend.root, elasticRecord.NodeID, elasticRecord.Incarnation); err != nil && stderr != nil {
 					fmt.Fprintf(stderr, "ttcd: warning: fencing runtimes during unclean cluster shutdown: %v\n", err)
 				}
 			}
@@ -4672,7 +4771,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			elasticRecord = registered
 			leaseGuardian, err = startLeaseGuardian(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation, clusterRuntime.lease)
 			if err != nil {
-				_ = fenceElasticRuntimes(targetBackend, registered.NodeID, registered.Incarnation)
+				_ = fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation)
 				clusterListener.Close()
 				return fmt.Errorf("starting execution-lease guardian: %w", err)
 			}
@@ -6083,6 +6182,12 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 		}
 	}
 	_ = backend.reconcilePlacementCatalog()
+	if err := backend.reconcileRemovedMigrationSources(); err != nil {
+		quarantineReconciled = false
+		if backend.stderr != nil {
+			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling removed migration sources: %v\n", err)
+		}
+	}
 	if quarantineReconciled {
 		s.reconciled[key] = true
 	}
