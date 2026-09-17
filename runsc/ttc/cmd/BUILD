@@ -23,6 +23,7 @@ go_library(
         "daemon_requests.go",
         "daemon_stdin_lease.go",
         "daemon_terminal.go",
+		"distributed_cp.go",
         "distributed.go",
 		"elastic_cluster.go",
         "events.go",

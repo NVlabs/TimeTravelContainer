@@ -37,13 +37,15 @@ import (
 )
 
 const (
-	copyContentsPAXKey = "TTC.source-contents"
-	copyHelperArg      = "_cp-helper"
+	copyContentsPAXKey   = "TTC.source-contents"
+	copyHelperArg        = "_cp-helper"
+	copyPreparedInputArg = "--ttc-prepared-input"
 )
 
 type copyCommandOptions struct {
-	archive    bool
-	followLink bool
+	archive       bool
+	followLink    bool
+	preparedInput bool
 }
 
 type copyContainerEndpoint struct {
@@ -73,6 +75,11 @@ func parseCopyCommandArgs(args []string) (copyCommandOptions, string, string, er
 		}
 		if arg == "--follow-link" || arg == "-L" {
 			opts.followLink = true
+			index++
+			continue
+		}
+		if arg == copyPreparedInputArg {
+			opts.preparedInput = true
 			index++
 			continue
 		}
@@ -238,8 +245,8 @@ func runCopy(args []string, stdout, _ io.Writer, backend backend) error {
 	}
 
 	input := copyBackend.copyInput()
-	rawArchive := source == "-"
-	if !rawArchive {
+	rawArchive := source == "-" && !opts.preparedInput
+	if source != "-" {
 		reader, writer := io.Pipe()
 		producer := make(chan error, 1)
 		go func() {
@@ -254,7 +261,7 @@ func runCopy(args []string, stdout, _ io.Writer, backend backend) error {
 	if input == nil {
 		return errors.New("cp from '-' requires standard input")
 	}
-	return copyBackend.importContainerPath(destinationEndpoint.target, destinationEndpoint.path, opts.archive, true, input)
+	return copyBackend.importContainerPath(destinationEndpoint.target, destinationEndpoint.path, opts.archive, rawArchive, input)
 }
 
 func (b *runtimeBackend) copyInput() io.Reader {

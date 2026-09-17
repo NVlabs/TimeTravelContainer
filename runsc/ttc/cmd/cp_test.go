@@ -16,12 +16,14 @@ package cmd
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -29,6 +31,71 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
+
+func TestDistributedCopyRoute(t *testing.T) {
+	upload, ok, err := parseDistributedCopyRoute([]string{"cp", "-aL", "/host/source", "demo@main:/guest/destination"})
+	if err != nil || !ok {
+		t.Fatalf("parse upload = (%+v, %t, %v)", upload, ok, err)
+	}
+	if upload.sourceContainer || !upload.destContainer || !upload.opts.archive || !upload.opts.followLink {
+		t.Fatalf("upload route = %+v", upload)
+	}
+	download, ok, err := parseDistributedCopyRoute([]string{"cp", "demo@main:/guest/source", "/host/destination"})
+	if err != nil || !ok || !download.sourceContainer || download.destContainer {
+		t.Fatalf("parse download = (%+v, %t, %v)", download, ok, err)
+	}
+	if got := distributedCopyArgs(upload.opts, "-", upload.destination); strings.Join(got, "\x00") != "cp\x00--archive\x00--follow-link\x00-\x00demo@main:/guest/destination" {
+		t.Fatalf("rewritten upload = %q", got)
+	}
+}
+
+func TestDaemonStdinFrameReader(t *testing.T) {
+	payload := bytes.Repeat([]byte("distributed-copy"), 8192)
+	reader := bufio.NewReader(&daemonStdinFrameReader{raw: bytes.NewReader(payload)})
+	var got bytes.Buffer
+	for {
+		typ, frame, err := readDaemonFrame(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch typ {
+		case daemonFrameStdin:
+			got.Write(frame)
+		case daemonFrameEOF:
+			if got.String() != string(payload) {
+				t.Fatalf("framed payload size=%d, want %d", got.Len(), len(payload))
+			}
+			return
+		default:
+			t.Fatalf("unexpected frame %q", typ)
+		}
+	}
+}
+
+func TestDaemonCopyArchiveReader(t *testing.T) {
+	var frames bytes.Buffer
+	var mu sync.Mutex
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStdout, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStderr, []byte("diagnostic")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStdout, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonStatus(&frames, &mu, 7); err != nil {
+		t.Fatal(err)
+	}
+	reader := newDaemonCopyArchiveReader(&frames)
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "firstsecond" || reader.diagnostic.String() != "diagnostic" || !reader.statusSeen || reader.status != 7 {
+		t.Fatalf("archive=%q diagnostic=%q status=(%t,%d)", got, reader.diagnostic.String(), reader.statusSeen, reader.status)
+	}
+}
 
 func TestParseCopyCommandArgs(t *testing.T) {
 	opts, source, destination, err := parseCopyCommandArgs([]string{"-aL", "demo@child:/src/.", "/tmp/dest"})
@@ -309,6 +376,16 @@ func TestRunCopyStreamsBothDirections(t *testing.T) {
 		if string(backend.copyImportData) != "archive" || backend.copyImportTarget != (selector{container: "demo", branch: "child"}) ||
 			backend.copyImportPath != "/destination" || !backend.copyImportArchive || !backend.copyImportRaw {
 			t.Fatalf("import data=%q target=%+v path=%q archive=%t raw=%t", backend.copyImportData, backend.copyImportTarget, backend.copyImportPath, backend.copyImportArchive, backend.copyImportRaw)
+		}
+	})
+
+	t.Run("prepared archive to container", func(t *testing.T) {
+		backend := &fakeBackend{copyStdin: strings.NewReader("archive")}
+		if err := runCopy([]string{copyPreparedInputArg, "-", "demo@child:/destination"}, io.Discard, io.Discard, backend); err != nil {
+			t.Fatal(err)
+		}
+		if string(backend.copyImportData) != "archive" || backend.copyImportRaw {
+			t.Fatalf("prepared import data=%q raw=%t", backend.copyImportData, backend.copyImportRaw)
 		}
 	})
 }

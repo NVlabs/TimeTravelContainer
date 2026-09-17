@@ -467,6 +467,33 @@ func resolvePlacementFamily(placements cluster.PlacementCatalog, identifier stri
 	panic("unreachable")
 }
 
+// loadDistributedFamily uses Raft display identity to bypass transient NFS
+// directory-cache lag after a remote create. Placement is already committed
+// before a distributed branch is routable, so its exact family ID is the
+// stable lookup key even when Store.LoadContainer cannot yet discover the new
+// directory by listing or by name.
+func loadDistributedFamily(store ttcbundle.Store, placements cluster.PlacementCatalog, identifier string) (ttcbundle.ContainerInfo, error) {
+	info, err := store.LoadContainer(identifier)
+	if err == nil {
+		return info, nil
+	}
+	familyID, resolveErr := resolvePlacementFamily(placements, identifier)
+	if resolveErr != nil {
+		return ttcbundle.ContainerInfo{}, err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, exactErr := store.LoadRuntimeContainer(familyID)
+		if exactErr == nil {
+			return info, nil
+		}
+		if !errors.Is(exactErr, os.ErrNotExist) || time.Now().After(deadline) {
+			return ttcbundle.ContainerInfo{}, fmt.Errorf("loading Raft-visible container %q (%s): %w", identifier, familyID, exactErr)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
 	if len(claims) == 0 {
 		return nil
@@ -1785,7 +1812,7 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		return true, 1, nil, nil, err
 	}
 	store := ttcbundle.Store{Root: s.dataRoot}
-	info, err := store.LoadContainer(target.container)
+	info, err := loadDistributedFamily(store, s.clusterPlacements, target.container)
 	if err != nil {
 		return true, 1, nil, nil, err
 	}
@@ -1958,7 +1985,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			name = selected.container
 			branchID = selected.branch
 		}
-		info, err := store.LoadContainer(name)
+		info, err := loadDistributedFamily(store, s.clusterPlacements, name)
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
@@ -2058,7 +2085,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if err != nil {
 				return true, 1, nil, nil, fmt.Errorf("invalid target %q: %w", operand, err)
 			}
-			info, err := store.LoadContainer(selected.container)
+			info, err := loadDistributedFamily(store, s.clusterPlacements, selected.container)
 			if err != nil {
 				return true, 1, nil, nil, err
 			}
@@ -2090,7 +2117,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			continue
 		}
-		info, err := store.LoadContainer(operand)
+		info, err := loadDistributedFamily(store, s.clusterPlacements, operand)
 		if err != nil {
 			return true, 1, nil, nil, err
 		}

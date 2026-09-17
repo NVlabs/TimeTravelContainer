@@ -2738,18 +2738,21 @@ func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
 	return s.LoadRuntimeContainer(identifier)
 }
 
-// LoadRuntimeContainer resolves ordinary containers and exact internal
-// distributed runtime IDs. Callers must already possess an authority-derived
-// physical ID; this method deliberately does not expose hidden targets through
-// names or ID prefixes.
+// LoadRuntimeContainer resolves ordinary containers and exact persistent
+// container IDs. Callers using an internal distributed identity must already
+// possess that ID from placement authority; this method deliberately does not
+// expose hidden targets through names or ID prefixes. The exact-ID fallback is
+// also important on NFS, where a newly committed Raft placement can become
+// visible before another client's directory cache sees the corresponding
+// shared family record.
 func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
 	info, err := s.LoadContainer(identifier)
 	if err == nil {
 		return info, nil
 	}
-	hidden, hiddenErr := s.loadContainerKey(identifier)
-	if hiddenErr == nil && hidden.DistributedForkHidden {
-		return hidden, nil
+	exact, exactErr := s.loadContainerKey(identifier)
+	if exactErr == nil && exact.ID == identifier {
+		return exact, nil
 	}
 	return ContainerInfo{}, err
 }
