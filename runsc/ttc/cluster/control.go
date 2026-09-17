@@ -771,6 +771,10 @@ type ControlPlane struct {
 	Now             func() time.Time
 	TargetRuntime   TargetRuntime
 	Authority       *AuthorityService
+	// TopologyState returns linearizable cluster membership. Topology probes
+	// must not validate a newly committed joining identity against an
+	// arbitrarily stale follower FSM.
+	TopologyState func(context.Context) (*AuthorityState, error)
 	// AuthToken optionally authenticates peers on a trusted plaintext network.
 	// It provides admission control only; it does not provide confidentiality.
 	AuthToken string
@@ -1073,7 +1077,15 @@ func (c *ControlPlane) serveTopologyProbe(w http.ResponseWriter, r *http.Request
 		writeControlError(w, http.StatusServiceUnavailable, "topology authority is unavailable")
 		return
 	}
-	state, err := c.Authority.Node.AppliedState()
+	var state *AuthorityState
+	var err error
+	if c.TopologyState != nil {
+		state, err = c.TopologyState(r.Context())
+	} else {
+		// Retain a local fallback for small in-process control-plane tests. Real
+		// clustered daemons always configure the linearizable reader.
+		state, err = c.Authority.Node.AppliedState()
+	}
 	if err != nil {
 		writeControlError(w, http.StatusServiceUnavailable, err.Error())
 		return

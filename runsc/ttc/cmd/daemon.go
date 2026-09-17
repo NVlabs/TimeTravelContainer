@@ -4497,7 +4497,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		mux: protocolMux, controlListener: protocolMux.HTTPListener(),
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
-			Authority: &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID}, AuthToken: opts.AuthToken,
+			Authority:     &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID},
+			TopologyState: catalog.LinearizableState, AuthToken: opts.AuthToken,
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
 		raft: raftNode, raftLocalDir: raftLocalDir, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,

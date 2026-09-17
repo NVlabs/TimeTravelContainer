@@ -213,6 +213,14 @@ func (c *RaftCatalog) AuthorityState() (*AuthorityState, error) {
 	return c.state()
 }
 
+// LinearizableState is AuthorityState with caller-controlled cancellation.
+// Admission probes use it on every peer: followers transparently forward to
+// the current leader through the catalog's configured resolver, so a lagging
+// local FSM cannot reject an identity that registration already committed.
+func (c *RaftCatalog) LinearizableState(ctx context.Context) (*AuthorityState, error) {
+	return c.linearizableState(ctx)
+}
+
 // AppliedTransaction is a local, non-linearizable monitor read that avoids
 // copying the complete authority state.
 func (c *RaftCatalog) AppliedTransaction(id string) (Transaction, bool) {
