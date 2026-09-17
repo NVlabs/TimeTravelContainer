@@ -93,6 +93,44 @@ func TestElasticHeartbeatAttemptBudget(t *testing.T) {
 	}
 }
 
+func TestSerializedAuthorityStateRefreshesAfterLock(t *testing.T) {
+	stale := cluster.NewAuthorityState()
+	current := stale
+	fresh := cluster.NewAuthorityState()
+	fresh.Placements["family@main"] = cluster.PlacementRecord{
+		FamilyID:  "family",
+		BranchID:  "main",
+		OwnerNode: "node-a",
+		Revision:  1,
+	}
+	locked := false
+	state, unlock, err := serializedAuthorityState(func() func() {
+		locked = true
+		// Model a command committing placement before releasing the lifecycle
+		// lock while a heartbeat is waiting to perform orphan reclamation.
+		current = fresh
+		return func() { locked = false }
+	}, func() (*cluster.AuthorityState, error) {
+		if !locked {
+			t.Fatal("authority was read without the lifecycle lock")
+		}
+		return current, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Placements["family@main"]; !ok {
+		t.Fatal("serialized authority read returned the pre-lock snapshot")
+	}
+	if !locked {
+		t.Fatal("lifecycle lock was released before local reconciliation")
+	}
+	unlock()
+	if locked {
+		t.Fatal("unlock did not release the lifecycle lock")
+	}
+}
+
 func TestDistributedSourceRuntimeWaitsForScheduledCleanup(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
 	release := make(chan struct{})

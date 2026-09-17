@@ -5788,7 +5788,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			var heartbeatFatal <-chan error
 			elasticHeartbeatStopped, heartbeatFatal, err = startElasticNodeHeartbeat(
 				clusterRuntime.directory, clusterRuntime.raftCatalog, *registered, clusterRuntime.lease,
-				stderr, clusterDone, targetBackend, leaseGuardian, fence)
+				stderr, clusterDone, targetBackend, leaseGuardian, fence, func() func() {
+					return server.lockDataRoot(dataRoot)
+				})
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("starting elastic cluster heartbeat: %w", err)
