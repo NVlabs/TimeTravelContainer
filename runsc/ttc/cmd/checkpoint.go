@@ -199,9 +199,34 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	}
 	defer os.RemoveAll(stage)
 
-	forkOutput, err := b.command("timetravel", "--source", target.branch, "--paused", info.ID, "fork", hiddenBranch)
+	forkArgs := []string{"timetravel", "--source", target.branch, "--paused", info.ID, "fork", hiddenBranch}
+	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
 	if err != nil {
-		return fmt.Errorf("creating checkpoint snapshot branch: %w", err)
+		return fmt.Errorf("allocating checkpoint filesystem origins: %w", err)
+	}
+	var forkOutput []byte
+	if len(filesystemOrigins) == 0 {
+		forkOutput, err = b.command(forkArgs...)
+	} else {
+		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+		if pipeErr != nil {
+			return errors.Join(pipeErr, finishFilesystemOrigins(false))
+		}
+		forkArgs = append([]string{"timetravel", "--filesystem-origins-fd=3"}, forkArgs[1:]...)
+		forkOutput, err = b.commandWithFiles([]*os.File{originsReader}, forkArgs...)
+		closeErr := originsReader.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		return errors.Join(fmt.Errorf("creating checkpoint snapshot branch: %w", err), finishFilesystemOrigins(false))
+	}
+	// The source and hidden child now use the exact Raft-allocated working
+	// origins. They cannot be abandoned even if archive construction fails:
+	// the source may resume and mutate its new working origin.
+	if err := finishFilesystemOrigins(true); err != nil {
+		return fmt.Errorf("committing checkpoint filesystem origins: %w", err)
 	}
 	var hiddenInfo runscBranchInfo
 	if err := json.Unmarshal(forkOutput, &hiddenInfo); err != nil {
@@ -213,8 +238,10 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	hiddenExists := true
 	defer func() {
 		if hiddenExists {
-			if _, err := b.command("timetravel", info.ID, "destroy-reclaim", hiddenBranch); err != nil && retErr == nil {
-				retErr = fmt.Errorf("destroying checkpoint snapshot branch: %w", err)
+			if _, err := b.command("timetravel", info.ID, "destroy-reclaim", hiddenBranch); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("destroying checkpoint snapshot branch: %w", err))
+			} else if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("reclaiming checkpoint snapshot origins: %w", err))
 			}
 		}
 	}()
@@ -244,10 +271,9 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 	var opened []*ttcvolume.Repository
 	defer func() {
 		for _, repository := range opened {
-			if err := repository.RemoveBranch(persistentBranch); err != nil && !errors.Is(err, os.ErrNotExist) && retErr == nil {
-				retErr = fmt.Errorf("removing checkpoint filesystem branch: %w", err)
+			if err := repository.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing checkpoint repository: %w", err))
 			}
-			_ = repository.Close()
 		}
 	}()
 	for index, config := range repositories {
@@ -292,6 +318,12 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest) (retErr error) {
 		return fmt.Errorf("destroying checkpoint snapshot branch: %w", err)
 	}
 	hiddenExists = false
+	// destroy-reclaim drops the hidden branch's filesystem roots. Reconcile its
+	// now-empty origin immediately so short-lived checkpoints do not grow the
+	// cluster provider directory indefinitely.
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return fmt.Errorf("reclaiming checkpoint snapshot origins: %w", err)
+	}
 	if err := ttccheckpoint.WriteManifest(stage, ttccheckpoint.Manifest{
 		SourceBranch:  target.branch,
 		RestorePaused: sourceState == "paused",
