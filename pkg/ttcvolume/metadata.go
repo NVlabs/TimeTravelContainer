@@ -377,11 +377,6 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 			if err := r.syncMetadataLocked(); err != nil {
 				return fmt.Errorf("flushing bounded filesystem garbage: %w", err)
 			}
-			if r.graph.JournalBytes() >= reclaimJournalBytes {
-				if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
-					return fmt.Errorf("compacting bounded filesystem journal: %w", err)
-				}
-			}
 		}
 	}
 	return nil

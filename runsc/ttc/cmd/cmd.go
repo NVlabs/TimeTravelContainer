@@ -12643,7 +12643,20 @@ func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot
 		// are serialized by the foreground gate and retain their local behavior.
 		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}
 	}
-	return ttcchunk.ImportGraphCaptureWithReusableStates(reader, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+	result, err := ttcchunk.ImportGraphCaptureWithReusableStates(reader, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+	if err != nil {
+		return ttcchunk.GraphImportResult{}, err
+	}
+	// A capture can append hundreds of megabytes of bounded page/radix
+	// transactions. It is already a foreground durability operation, so publish
+	// one compact generation before returning instead of making every later
+	// daemon restart replay the complete capture history.
+	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return ttcchunk.GraphImportResult{}, fmt.Errorf("compacting imported memory graph: %w", err)
+		}
+	}
+	return result, nil
 }
 
 // reconcileInterruptedClusterMemoryGraph converts crash residue into one of
@@ -12659,6 +12672,11 @@ func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
 	}
 	if err := reconcileInterruptedMemoryGraph(b.snapshotGraph, b.snapshotData, ttcsnapshot.SnapshotSealedVolatile); err != nil {
 		return err
+	}
+	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting recovered cluster memory graph: %w", err)
+		}
 	}
 	// Empty provider origins are abandoned by the ordinary volatile-origin
 	// reconciliation after this node transitions from joining to ready. Raft

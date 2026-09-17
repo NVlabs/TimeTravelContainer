@@ -1549,6 +1549,14 @@ func (r *Repository) recoverGraphState() error {
 		if err := r.graph.DeletePins(pinNames); err != nil {
 			return fmt.Errorf("releasing interrupted construction pins: %w", err)
 		}
+		// Recovery has already paid the cost of replaying the selected WAL. Seal
+		// that work into a compact generation before making the repository
+		// available, otherwise every daemon/Sentry reopen repeats the same replay.
+		if r.graph.JournalBytes() >= reclaimJournalBytes {
+			if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
+				return fmt.Errorf("compacting recovered repository journal: %w", err)
+			}
+		}
 		return nil
 	})
 }
@@ -2792,6 +2800,15 @@ func (r *Repository) syncMetadataLocked() error {
 		delete(r.dirtyBranches, id)
 	}
 	r.dirtyMu.Unlock()
+	// A durability boundary is also the natural WAL compaction boundary. Hot
+	// databases commonly fsync the same inode thousands of times; distinct-key
+	// metadata batching does not fire for that workload, so relying on namespace
+	// churn alone permits an unbounded journal and multi-minute daemon restart.
+	if r.graph.JournalBytes() >= reclaimJournalBytes {
+		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
+			return fmt.Errorf("compacting repository snapshot journal: %w", err)
+		}
+	}
 	return nil
 }
 

@@ -1536,14 +1536,23 @@ func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
 			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent) {
 			continue
 		}
-		if _, err := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err != nil {
+		_, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return fmt.Errorf("locating graph handoff target %q: %w", tx.Identity.TransactionID, err)
 		}
+		// A graph handoff is a reader switch in a live Sentry, not a durable
+		// branch repair. Dehydrated, exited, and interrupted-dehydration targets
+		// have no reader to refresh; their immutable cold manifests are the
+		// authority. Retrying an obsolete transaction here can instead resurrect
+		// already-retired volatile origins and prevent the daemon from starting.
+		if !distributedGraphHandoffHasLiveRuntime(branch) {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		err := r.Handoff(ctx, tx, *tx.GraphHandoff)
+		err = r.Handoff(ctx, tx, *tx.GraphHandoff)
 		if err == nil {
 			err = r.waitGraphHandoff(ctx, tx)
 		}
@@ -1553,6 +1562,18 @@ func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
 		}
 	}
 	return nil
+}
+
+func distributedGraphHandoffHasLiveRuntime(branch ttcbundle.BranchInfo) bool {
+	if branch.Unplaced {
+		return false
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "running", "paused":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {

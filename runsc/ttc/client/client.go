@@ -40,9 +40,12 @@ import (
 	"gvisor.dev/gvisor/runsc/version"
 )
 
-// daemonStartTimeout includes cluster Raft startup and the bidirectional
-// topology admission check, whose own bounded retry window is 20 seconds.
-const daemonStartTimeout = 45 * time.Second
+// daemonStartTimeout includes cluster admission and crash recovery. New TTC
+// roots keep journals bounded, but a daemon upgraded from a build containing
+// the old unbounded-WAL bug may need several minutes to replay and compact its
+// final large journal once. Killing it at the ordinary topology timeout makes
+// that otherwise recoverable root impossible to open through the CLI.
+const daemonStartTimeout = 10 * time.Minute
 
 const (
 	daemonAPIVersion      = protocol.DaemonAPIVersion

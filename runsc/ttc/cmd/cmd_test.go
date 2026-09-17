@@ -6508,6 +6508,27 @@ func TestReconcileStandaloneMemoryGraphReclaimsCrashResidue(t *testing.T) {
 	}
 }
 
+func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		branch ttcbundle.BranchInfo
+		want   bool
+	}{
+		{name: "running", branch: ttcbundle.BranchInfo{State: "running"}, want: true},
+		{name: "paused", branch: ttcbundle.BranchInfo{State: "paused"}, want: true},
+		{name: "dehydrating", branch: ttcbundle.BranchInfo{State: "dehydrating"}},
+		{name: "dehydrated", branch: ttcbundle.BranchInfo{State: "dehydrated", Unplaced: true}},
+		{name: "exited", branch: ttcbundle.BranchInfo{State: "exited"}},
+		{name: "unplaced-running", branch: ttcbundle.BranchInfo{State: "running", Unplaced: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := distributedGraphHandoffHasLiveRuntime(test.branch); got != test.want {
+				t.Fatalf("distributedGraphHandoffHasLiveRuntime(%+v)=%t, want %t", test.branch, got, test.want)
+			}
+		})
+	}
+}
+
 func TestReconcileInterruptedMemoryGraphSealsOnlyReferencedResidue(t *testing.T) {
 	root := t.TempDir()
 	graph, err := ttcsnapshot.Open(filepath.Join(root, "graph"))

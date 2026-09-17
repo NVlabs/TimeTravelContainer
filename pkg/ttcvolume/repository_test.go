@@ -856,6 +856,53 @@ func TestRepeatedMetadataUpdatesKeepGraphBoundedAndRecoverable(t *testing.T) {
 	}
 }
 
+func TestFsyncMetadataChurnCompactsGraphJournal(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("fsync-metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "database", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use one legal-size xattr value to make the regression inexpensive. The
+	// important shape is a durability boundary after repeatedly updating the
+	// same inode: the metadata batch contains one key and therefore never
+	// reaches its distinct-operation flush threshold.
+	value := strings.Repeat("x", 60<<10)
+	for iteration := 0; iteration < 160; iteration++ {
+		inode, err := repo.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.MtimeNsec = int64(iteration + 1)
+		inode.Xattrs = map[string]string{"user.ttc-journal-test": value}
+		if err := repo.UpdateMetadata(MainBranch, inode); err != nil {
+			t.Fatalf("metadata update %d: %v", iteration, err)
+		}
+		if err := repo.SyncMetadata(); err != nil {
+			t.Fatalf("metadata sync %d: %v", iteration, err)
+		}
+	}
+	if got := repo.graph.JournalBytes(); got >= reclaimJournalBytes {
+		t.Fatalf("graph journal remained unbounded at %d bytes, threshold %d", got, reclaimJournalBytes)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("fsync-metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if got, err := repo.Inode(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	} else if got.MtimeNsec != 160 || got.Xattrs["user.ttc-journal-test"] != value {
+		t.Fatalf("recovered inode metadata = %+v", got)
+	}
+}
+
 func TestMetadataUsesGraphWithoutPerEntryFiles(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("journal-only")

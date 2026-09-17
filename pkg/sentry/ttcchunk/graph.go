@@ -64,6 +64,23 @@ type graphResourcePages struct {
 	pages map[uint64]ttcsnapshot.ObjectID
 }
 
+// graphImportCheckpointBytes bounds crash-recovery replay while importing a
+// large memory image. Checkpointing after every small graph transaction would
+// repeatedly rewrite the growing radix forest; 64 MiB keeps that cost
+// amortized while preventing one interrupted capture from leaving a
+// multi-hundred-megabyte WAL.
+const graphImportCheckpointBytes = 64 << 20
+
+func checkpointGraphImportIfNeeded(graph *ttcsnapshot.Store, threshold int64) error {
+	if graph == nil || threshold <= 0 || graph.JournalBytes() < threshold {
+		return nil
+	}
+	if err := graph.Checkpoint(); err != nil {
+		return fmt.Errorf("checkpointing in-progress memory graph import: %w", err)
+	}
+	return nil
+}
+
 func resourceKey(id checkpoint.ResourceID) string {
 	return id.ContainerName + "\x00" + id.Path
 }
@@ -164,6 +181,9 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 		activePins = nil
 		pendingPages = make(map[string]map[uint64]ttcsnapshot.ObjectID)
 		pendingUses = 0
+		if err := checkpointGraphImportIfNeeded(graph, graphImportCheckpointBytes); err != nil {
+			return err
+		}
 		return nil
 	}
 

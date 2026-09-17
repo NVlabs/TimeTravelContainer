@@ -277,6 +277,33 @@ func TestGraphImportReusesStableMemoryPages(t *testing.T) {
 	}
 }
 
+func TestGraphImportCheckpointBoundsRecoveryJournal(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	if _, err := graph.AllocateWorking(); err != nil {
+		t.Fatal(err)
+	}
+	before := graph.JournalBytes()
+	if before <= int64(len("TTCSGJ2\n")) {
+		t.Fatalf("graph mutation did not grow journal: %d", before)
+	}
+	if err := checkpointGraphImportIfNeeded(graph, before+1); err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.JournalBytes(); got != before {
+		t.Fatalf("journal checkpointed below threshold: got %d, want %d", got, before)
+	}
+	if err := checkpointGraphImportIfNeeded(graph, before); err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.JournalBytes(); got >= before {
+		t.Fatalf("journal remained at %d bytes after checkpoint, was %d", got, before)
+	}
+}
+
 func TestGraphImportDoesNotReuseSharedCachePages(t *testing.T) {
 	chunk := testChunk()
 	object := graphCaptureObjectID(1)
