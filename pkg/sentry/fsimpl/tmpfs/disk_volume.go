@@ -45,14 +45,23 @@ func diskVolumeError(op string, err error) error {
 	}
 	var linuxError *gerrors.Error
 	if errors.As(err, &linuxError) {
+		if linuxError == linuxerr.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
 		return linuxError
 	}
 	var syscallError syscall.Errno
 	if errors.As(err, &syscallError) {
+		if syscallError == syscall.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
 		return syscallError
 	}
 	var unixError unix.Errno
 	if errors.As(err, &unixError) {
+		if unixError == unix.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
 		return unixError
 	}
 	switch {
@@ -65,12 +74,18 @@ func diskVolumeError(op string, err error) error {
 	case errors.Is(err, stdfs.ErrInvalid):
 		return linuxerr.EINVAL
 	}
-	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
-	// Sentries normally discard informational logs, but preserve fd 2 in the
-	// daemon-local panic log. Keep invariant diagnostics beside fatal runtime
-	// failures so a guest-visible EIO remains actionable in production.
-	fmt.Fprintf(os.Stderr, "TTC persistent filesystem %s failed: %v\n", op, err)
+	reportDiskVolumeFailure(op, err)
 	return linuxerr.EIO
+}
+
+// reportDiskVolumeFailure preserves the full failing operation even when the
+// underlying implementation already returned EIO. Sentries normally discard
+// informational logs, but preserve fd 2 in the daemon-local panic log. An EIO
+// without its repository cause is otherwise indistinguishable from a host
+// storage failure at the guest syscall boundary.
+func reportDiskVolumeFailure(op string, err error) {
+	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
+	fmt.Fprintf(os.Stderr, "TTC persistent filesystem %s failed: %v\n", op, err)
 }
 
 // registerDiskMaterializationHook keeps the guest's cached host descriptors
