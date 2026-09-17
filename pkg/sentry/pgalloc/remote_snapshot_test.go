@@ -127,6 +127,46 @@ func fillRemoteTestRange(t *testing.T, mf *MemoryFile, fr memmap.FileRange, data
 	}
 }
 
+type blockingRemoteExportEvictable struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (u *blockingRemoteExportEvictable) Evict(context.Context, EvictableRange) {
+	close(u.started)
+	<-u.release
+}
+
+func TestRemoteAllocatorMetadataWaitsForEvictableCache(t *testing.T) {
+	source, _ := newRemoteTestMemoryFile(t, 1)
+	user := &blockingRemoteExportEvictable{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	source.MarkEvictable(user, EvictableRange{Start: 0, End: hostarch.PageSize})
+	<-user.started
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("remote export returned before eviction completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(user.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("remote export after eviction: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote export did not resume after eviction")
+	}
+}
+
 func TestRemoteSnapshotPageRelease(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 4)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 10, File: mf, Range: fr}})

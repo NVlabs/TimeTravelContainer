@@ -420,15 +420,32 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 	}
 	var metadata bytes.Buffer
 	var used []memmap.FileRange
-	source.mu.Lock()
-	for source.haveWaste {
-		source.mu.Unlock()
-		runtime.Gosched()
+	// File-backed cache pages may still be registered for eviction when a
+	// branch is paused for capture. They are ordinary reclaimable cache state,
+	// not a reason to reject an otherwise eligible live fork. Drain them before
+	// serializing the allocator. The loop is required because another Kernel
+	// sharing this family MemoryFile may register a new evictable range while
+	// an earlier eviction is completing. Observing an empty registry while
+	// holding source.mu closes that race with MarkEvictable.
+	for {
 		source.mu.Lock()
-	}
-	if len(source.evictable) != 0 {
+		if source.haveWaste {
+			source.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, nil, nil, nil, err
+			}
+			runtime.Gosched()
+			continue
+		}
+		if len(source.evictable) == 0 {
+			break
+		}
+		source.startEvictionsLocked()
 		source.mu.Unlock()
-		return nil, nil, nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
+		source.WaitForEvictions()
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, nil, err
+		}
 	}
 	defer source.mu.Unlock()
 	collectUsed := func(set *unfreeSet) {
