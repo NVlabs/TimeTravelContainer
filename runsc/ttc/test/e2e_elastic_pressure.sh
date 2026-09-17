@@ -55,8 +55,9 @@ cleanup() {
 	root_pattern="[/]${ROOT#/}"
 	for root_pid in $(pgrep -f "$root_pattern" 2>/dev/null || true); do
 		executable=$(readlink "/proc/$root_pid/exe" 2>/dev/null || true)
-		test "${executable##*/}" = ttcd || continue
-		kill -KILL "$root_pid" >/dev/null 2>&1 || true
+		case "${executable##*/}" in
+			ttcd|runsc|runsc-gofer) kill -KILL "$root_pid" >/dev/null 2>&1 || true ;;
+		esac
 	done
 	if test -z "${TTC_ELASTIC_PRESSURE_ROOT:-}"; then rm -rf "$ROOT"; else echo "TTC elastic pressure root retained at $ROOT" >&2; fi
 }
