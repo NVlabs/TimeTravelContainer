@@ -1878,6 +1878,41 @@ func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	}
 }
 
+func TestJoinAuthorityWaitsForLeaderElection(t *testing.T) {
+	calls := 0
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority/join" {
+			http.NotFound(w, r)
+			return
+		}
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls < 3 {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":      "TTC authority has no elected Raft leader",
+				"not_leader": true,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"node_id": "joining"})
+	}))
+	defer seed.Close()
+	client, err := cluster.NewPlainClient(seed.URL, "joining", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	request := cluster.AuthorityJoinRequest{NodeID: "joining"}
+	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", ""); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("join calls=%d, want 3", calls)
+	}
+}
+
 func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	var second *httptest.Server
 	second = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

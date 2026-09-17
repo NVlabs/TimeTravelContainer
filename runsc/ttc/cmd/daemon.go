@@ -4734,7 +4734,8 @@ func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot s
 func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request cluster.AuthorityJoinRequest, nodeID, authToken string) error {
 	peer := seed
 	seen := make(map[string]bool)
-	for redirects := 0; redirects < 5; redirects++ {
+	redirects := 0
+	for {
 		err := peer.JoinAuthority(ctx, request)
 		if err == nil {
 			return nil
@@ -4744,7 +4745,25 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			return err
 		}
 		if redirect.LeaderControlURL == "" {
-			return fmt.Errorf("joining through a follower that cannot resolve its Raft leader: %w", err)
+			// A surviving member can expose its control listener before the
+			// restarted Raft group has elected a leader. Keep the fresh joiner
+			// listening and retry the configured seed instead of tearing down its
+			// local state during this ordinary election window.
+			peer = seed
+			seen = make(map[string]bool)
+			redirects = 0
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("waiting for a Raft leader while joining cluster: %w", ctx.Err())
+			case <-timer.C:
+			}
+			continue
+		}
+		redirects++
+		if redirects > 5 {
+			return errors.New("too many Raft leader redirects while joining cluster")
 		}
 		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
 		if seen[key] {
@@ -4757,7 +4776,6 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
 		}
 	}
-	return errors.New("too many Raft leader redirects while joining cluster")
 }
 
 // cancelAuthorityJoinThroughSeed follows the same leader redirect rules as

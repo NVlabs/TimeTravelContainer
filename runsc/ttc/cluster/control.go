@@ -477,6 +477,7 @@ type PublishedTargetIdentity interface {
 
 type controlError struct {
 	Error            string `json:"error"`
+	NotLeader        bool   `json:"not_leader,omitempty"`
 	LeaderID         string `json:"leader_id,omitempty"`
 	LeaderAddress    string `json:"leader_address,omitempty"`
 	LeaderControlURL string `json:"leader_control_url,omitempty"`
@@ -564,7 +565,7 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		response := controlError{Error: err.Error(), LeaderID: a.Node.LeaderID(), LeaderAddress: a.Node.Leader()}
+		response := controlError{Error: err.Error(), NotLeader: true, LeaderID: a.Node.LeaderID(), LeaderAddress: a.Node.Leader()}
 		// A Raft transport address is not an HTTP endpoint. Include the
 		// leader's committed control endpoint so joining through any seed also
 		// works when that seed is a follower.
@@ -2496,7 +2497,7 @@ func (c *Client) callWithLimit(ctx context.Context, method, path string, request
 		if err := json.NewDecoder(limited).Decode(&remote); err != nil || remote.Error == "" {
 			return fmt.Errorf("cluster peer returned HTTP %s", resp.Status)
 		}
-		if remote.LeaderID != "" || remote.LeaderAddress != "" {
+		if remote.NotLeader || remote.LeaderID != "" || remote.LeaderAddress != "" {
 			return &AuthorityNotLeaderError{
 				LeaderID: remote.LeaderID, Leader: remote.LeaderAddress,
 				LeaderControlURL: remote.LeaderControlURL, LeaderServerName: remote.LeaderServerName,
