@@ -4755,6 +4755,9 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 		}
 		return queueExit()
 	case "paused":
+		if err := backend.preparePausedStop(target.selector); err != nil {
+			return fmt.Errorf("persisting paused filesystem state for %s: %w", target.selector, err)
+		}
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
 		}
@@ -5676,6 +5679,7 @@ type backend interface {
 	resume(target selector) error
 	renameBranch(target selector, name string) error
 	prepareStop(target selector) error
+	preparePausedStop(target selector) error
 	discard(target selector) error
 	destroy(target selector, force bool) error
 	signal(target selector, signal int, all bool) error
@@ -12246,6 +12250,139 @@ func (b *runtimeBackend) prepareStop(target selector) error {
 	}
 	_, err = b.command("timetravel", resolved.container, "prepare-stop", resolved.branch)
 	return err
+}
+
+// preparePausedStop commits the Sentry's bounded filesystem metadata batches
+// into each TTC repository before the paused Kernel is discarded. A manager-
+// side repository fork is insufficient here: the mounted VFS may still own
+// creates, writes, and mmap invalidations that are visible to the guest but
+// have not reached the repository branch pointer. Running stop obtains this
+// fence through orderly task/VFS teardown; paused stop deliberately executes
+// no guest instruction and therefore needs an explicit filesystem snapshot.
+//
+// The temporary child is removed immediately. Its purpose is to drive the
+// existing atomic live-filesystem snapshot protocol, which both flushes the
+// mounted branch and installs a fresh working generation for the source.
+func (b *runtimeBackend) preparePausedStop(target selector) (retErr error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if normalizeLifecycleState(branch.State) != "paused" {
+		return fmt.Errorf("branch %s is %s, not paused", resolved, normalizeLifecycleState(branch.State))
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	if len(configs) == 0 {
+		return nil
+	}
+	cont, err := container.Load(b.root, container.FullID{
+		SandboxID: info.ID, ContainerID: info.ID,
+	}, container.LoadOpts{Exact: true, SkipCheck: true})
+	if err != nil {
+		return fmt.Errorf("loading paused runtime: %w", err)
+	}
+	assignments, finishOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
+	if err != nil {
+		return err
+	}
+	originsByRepository := make(map[string][]uint64, len(assignments))
+	for _, assignment := range assignments {
+		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return errors.Join(err, finishOrigins(false))
+	}
+	temporaryBranch := "paused-stop-" + hex.EncodeToString(random[:])
+	type capturedRepository struct {
+		repository *ttcvolume.Repository
+		captured   bool
+	}
+	opened := make([]capturedRepository, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
+	committedAny := false
+	originsAdopted := false
+	finish := func(adopt bool) error {
+		err := finishOrigins(adopt)
+		originsAdopted = adopt && err == nil
+		return err
+	}
+	cleanup := func() error {
+		var cleanupErr error
+		for i := len(opened) - 1; i >= 0; i-- {
+			entry := opened[i]
+			if entry.captured {
+				if err := entry.repository.RemoveBranch(temporaryBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
+					cleanupErr = errors.Join(cleanupErr, err)
+				} else if err == nil {
+					cleanupErr = errors.Join(cleanupErr, entry.repository.GarbageCollect())
+				}
+			}
+			cleanupErr = errors.Join(cleanupErr, entry.repository.Close())
+		}
+		return cleanupErr
+	}
+	defer func() {
+		if len(opened) != 0 {
+			retErr = errors.Join(retErr, cleanup())
+		}
+		if originsAdopted {
+			if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("reconciling paused filesystem snapshot origins: %w", err))
+			}
+		}
+	}()
+	for _, config := range configs {
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			if committedAny {
+				retErr = errors.Join(err, finish(true))
+			} else {
+				retErr = errors.Join(err, finish(false))
+			}
+			return retErr
+		}
+		repositoryID := repository.Info().ID
+		if _, duplicate := seen[repositoryID]; duplicate {
+			retErr = errors.Join(retErr, repository.Close())
+			continue
+		}
+		seen[repositoryID] = struct{}{}
+		opened = append(opened, capturedRepository{repository: repository})
+		args := &boot.FilesystemBranchSnapshotArgs{
+			BranchID:   resolved.branch,
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repositoryID},
+			Child:      temporaryBranch,
+		}
+		if origins := originsByRepository[repositoryID]; len(origins) != 0 {
+			args.SourceWorking, args.ChildWorking = origins[0], origins[1]
+		}
+		if err := cont.Sandbox.SnapshotFilesystemBranch(args); err != nil {
+			if committedAny {
+				retErr = errors.Join(err, finish(true))
+			} else {
+				retErr = errors.Join(err, finish(false))
+			}
+			return retErr
+		}
+		opened[len(opened)-1].captured = true
+		committedAny = true
+	}
+	if err := finish(true); err != nil {
+		return err
+	}
+	return retErr
 }
 
 func graphMemoryRootNames(filesystemBranch string, count int) []string {

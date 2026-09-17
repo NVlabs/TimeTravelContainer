@@ -3350,6 +3350,13 @@ func TestStopPausedAndDehydratedDiscardsWithoutResume(t *testing.T) {
 			if b.discarded != (selector{container: "web", branch: "child"}) {
 				t.Fatalf("discarded=%+v", b.discarded)
 			}
+			wantPrepared := 0
+			if state == "paused" {
+				wantPrepared = 1
+			}
+			if got := len(b.preparedPausedStops); got != wantPrepared {
+				t.Fatalf("paused filesystem preparations=%+v, want %d", b.preparedPausedStops, wantPrepared)
+			}
 		})
 	}
 }
@@ -5186,6 +5193,7 @@ type fakeBackend struct {
 	quarantineEnabled   bool
 	preparedStop        selector
 	preparedStops       []selector
+	preparedPausedStops []selector
 	discarded           selector
 	discards            []selector
 	dehydratedTargets   []selector
@@ -5489,6 +5497,11 @@ func (b *fakeBackend) renameBranch(target selector, name string) error {
 func (b *fakeBackend) prepareStop(target selector) error {
 	b.preparedStop = target
 	b.preparedStops = append(b.preparedStops, target)
+	return b.err
+}
+
+func (b *fakeBackend) preparePausedStop(target selector) error {
+	b.preparedPausedStops = append(b.preparedPausedStops, target)
 	return b.err
 }
 
