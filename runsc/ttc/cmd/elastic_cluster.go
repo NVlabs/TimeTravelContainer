@@ -5375,8 +5375,6 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 		case <-maintenanceContext.Done():
 		}
 	}()
-	ticker := time.NewTicker(duration / 3)
-	defer ticker.Stop()
 	var held cluster.SharedGCLease
 	deactivateReferences := func() {
 		if references != nil {
@@ -5399,11 +5397,17 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 	for {
 		now := time.Now()
 		if held.Generation != 0 {
-			if renewed, err := authority.RenewSharedGCLease(held, duration); err == nil {
-				held = renewed
-			} else {
-				held = cluster.SharedGCLease{}
-				deactivateReferences()
+			// Activation may retry more frequently while an expired execution
+			// incarnation is being fenced. Do not turn those retries into Raft
+			// lease writes; the ordinary one-third-duration renewal cadence is
+			// sufficient to retain ownership throughout the rebuild.
+			if time.Until(held.ExpiresAt) <= 2*duration/3 {
+				if renewed, err := authority.RenewSharedGCLease(held, duration); err == nil {
+					held = renewed
+				} else {
+					held = cluster.SharedGCLease{}
+					deactivateReferences()
+				}
 			}
 		} else if current, err := authority.SharedGCLease(); err == nil {
 			switch {
@@ -5418,12 +5422,14 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 				}
 			}
 		}
+		retryActivation := false
 		if held.Generation != 0 && time.Now().Before(held.ExpiresAt) {
 			stopKeeper := keepSharedGCLeaseAlive(authority, held, duration)
 			var maintenanceErr error
 			if references != nil {
 				if err := references.activate(held); err != nil {
 					maintenanceErr = fmt.Errorf("activating shared reference ledger: %w", err)
+					retryActivation = true
 				}
 			}
 			if references != nil && maintenanceErr == nil {
@@ -5465,10 +5471,20 @@ func maintainSharedGCCoordinator(authority *cluster.RaftCatalog, packs *ttcsnaps
 				fmt.Fprintf(stderr, "ttcd: warning: %v\n", maintenanceErr)
 			}
 		}
+		delay := duration / 3
+		if retryActivation {
+			// An old provider can become fenced just after a failed rebuild.
+			// Waiting for the normal five-second maintenance tick unnecessarily
+			// extends the dynamic-unavailability window for otherwise valid
+			// forks. Retrying reads is cheap; lease renewal above remains bounded.
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-done:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }

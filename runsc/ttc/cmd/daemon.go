@@ -314,6 +314,21 @@ func (s *daemonServer) retireBeforeReply() error {
 	return nil
 }
 
+// stopAfterReply closes the accepted connection before closing the listener.
+// The accept loop owns the daemon's lifetime: closing the listener lets it
+// return and permits the process to exit without waiting for this handler's
+// deferred conn.Close. If the listener were closed first, process teardown
+// could win that race and discard the final status frame, causing the client
+// to retry an already-successful node stop against a removed socket.
+func (s *daemonServer) stopAfterReply(conn net.Conn) {
+	if s == nil {
+		return
+	}
+	s.cleanStop.Store(true)
+	_ = conn.Close()
+	s.stopOnce.Do(func() { _ = s.listener.Close() })
+}
+
 func (s *daemonServer) mutationRoot() string {
 	if s != nil && s.localRoot != "" {
 		return s.localRoot
@@ -5975,8 +5990,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 		}
 		_ = writeDaemonStatus(conn, &writeMu, 0)
-		s.cleanStop.Store(true)
-		s.stopOnce.Do(func() { s.listener.Close() })
+		s.stopAfterReply(conn)
 		return
 	case "mutation-control":
 		status := s.handleMutationControl(s.mutationRoot(), request.Args, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStdout}, daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
@@ -6301,8 +6315,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			writeDaemonBufferedResult(conn, &writeMu, mutationStdout.Bytes(), mutationStderr.Bytes(), status)
 		}
 		if status == 0 && mutationBackend.daemonStopRequested {
-			s.cleanStop.Store(true)
-			s.stopOnce.Do(func() { _ = s.listener.Close() })
+			s.stopAfterReply(conn)
 		}
 		return
 	}
@@ -6328,8 +6341,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	stdinReader.Close()
 	_ = writeDaemonStatus(conn, &writeMu, status)
 	if status == 0 && backend.daemonStopRequested {
-		s.cleanStop.Store(true)
-		s.stopOnce.Do(func() { _ = s.listener.Close() })
+		s.stopAfterReply(conn)
 	}
 }
 
