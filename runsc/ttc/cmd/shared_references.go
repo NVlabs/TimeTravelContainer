@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
@@ -84,6 +85,15 @@ func sharedPublicationBridgeIntentPath(sharedRoot string, snapshot ttcsnapshot.S
 }
 
 func persistSharedPublicationBridgeIntent(sharedRoot string, intent sharedPublicationBridgeIntent) error {
+	return persistSharedPublicationBridgeIntentWithAuthority(sharedRoot, intent, nil)
+}
+
+// persistSharedPublicationBridgeIntentWithAuthority durably transfers bridge
+// ownership from a completed operation to its next operation on the same
+// immutable snapshot. The bridge's ledger roots are snapshot/object-derived,
+// so they remain valid across this ownership handoff. Raft terminality is the
+// fence that prevents a previous publisher from resuming after adoption.
+func persistSharedPublicationBridgeIntentWithAuthority(sharedRoot string, intent sharedPublicationBridgeIntent, state *cluster.AuthorityState) error {
 	if sharedRoot == "" {
 		return errors.New("shared root is unavailable for publication bridge")
 	}
@@ -91,6 +101,21 @@ func persistSharedPublicationBridgeIntent(sharedRoot string, intent sharedPublic
 		return err
 	}
 	path := sharedPublicationBridgeIntentPath(sharedRoot, ttcsnapshot.SnapshotID(intent.Snapshot))
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	// One bounded directory lock avoids leaking a lock inode for every snapshot
+	// ever created. Bridge ownership changes are control-plane operations, so
+	// serializing them does not enter the guest data path.
+	lock, err := os.OpenFile(filepath.Join(filepath.Dir(path), ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	if data, err := os.ReadFile(path); err == nil {
 		var current sharedPublicationBridgeIntent
 		if err := json.Unmarshal(data, &current); err != nil {
@@ -101,7 +126,14 @@ func persistSharedPublicationBridgeIntent(sharedRoot string, intent sharedPublic
 		}
 		if current.Snapshot != intent.Snapshot || current.Kind != intent.Kind || current.Transaction != intent.Transaction ||
 			current.Family != intent.Family || current.Branch != intent.Branch || current.PublicationID != intent.PublicationID {
-			return fmt.Errorf("snapshot %d publication bridge is owned by a different operation", intent.Snapshot)
+			// An origin handoff has no separate Raft transaction whose
+			// terminality can fence a concurrent attempt, so only its exact retry
+			// may reuse the intent. Transaction and branch-publication owners are
+			// safely replaceable only after Raft says they are terminal.
+			if state == nil || current.Kind == sharedPublicationBridgeOrigin || publicationBridgeIntentNeeded(state, current) {
+				return fmt.Errorf("snapshot %d publication bridge is owned by a different operation", intent.Snapshot)
+			}
+			return writeDurableJSON(path, intent)
 		}
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {

@@ -5996,6 +5996,25 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
 		backend.lifecycleReady = unlock
 	}
+	// A retry after a lost response must consult the durable result before
+	// mutable-state validation. The committed command may have removed its own
+	// runtime or Raft placement, in which case revalidating the original claim
+	// would turn a successful idempotent retry into a false stale-route error.
+	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
+		record, replay, err := replayCompletedDaemonMutation(s.mutationRoot(), request)
+		if err != nil {
+			unlock()
+			stdinReader.Close()
+			writeError(err)
+			return
+		}
+		if replay {
+			unlock()
+			stdinReader.Close()
+			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+			return
+		}
+	}
 	// Reconciliation lists runsc state and may reap runtimes that have lost
 	// their Sentry. Keep it in the same lifecycle critical section as the
 	// command: otherwise a read-only `ttc ps` can observe `runsc create` after

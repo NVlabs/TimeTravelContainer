@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,6 +57,36 @@ func TestDaemonMutationRecordReplay(t *testing.T) {
 	request.Args = []string{"resume", "demo"}
 	if _, _, err := beginDaemonMutation(root, request); err == nil || !strings.Contains(err.Error(), "reused for a different command") {
 		t.Fatalf("request ID reuse: %v", err)
+	}
+}
+
+func TestReplayCompletedDaemonMutationDoesNotCreateIntent(t *testing.T) {
+	root := t.TempDir()
+	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: "00112233445566778899aabbccddeeff", Args: []string{"rm", "family@branch"}}
+	if _, replay, err := replayCompletedDaemonMutation(root, request); err != nil || replay {
+		t.Fatalf("replayCompletedDaemonMutation(fresh) replay=%t err=%v", replay, err)
+	}
+	path, err := daemonMutationPath(root, request.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh replay probe created journal state: %v", err)
+	}
+	record, replay, err := beginDaemonMutation(root, request)
+	if err != nil || replay {
+		t.Fatalf("beginDaemonMutation replay=%t err=%v", replay, err)
+	}
+	record, err = completeDaemonMutation(root, record, 0, []byte("family@branch\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, replay, err := replayCompletedDaemonMutation(root, request)
+	if err != nil || !replay {
+		t.Fatalf("replayCompletedDaemonMutation(completed) replay=%t err=%v", replay, err)
+	}
+	if got.Status != record.Status || string(got.Stdout) != string(record.Stdout) {
+		t.Fatalf("replayed record = %+v, want %+v", got, record)
 	}
 }
 

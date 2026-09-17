@@ -258,6 +258,40 @@ func TestPublicationBridgeIntentRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPublicationBridgeIntentAdoptsTerminalTransaction(t *testing.T) {
+	root := t.TempDir()
+	old := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: 29,
+		Kind: sharedPublicationBridgeTransaction, Transaction: "fork-finished", CreatedAt: time.Now().UTC(),
+	}
+	if err := persistSharedPublicationBridgeIntent(root, old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: old.Snapshot,
+		Kind: sharedPublicationBridgeOrigin, CreatedAt: old.CreatedAt.Add(time.Second),
+	}
+	state := cluster.NewAuthorityState()
+	state.VolatileOrigins[old.Snapshot] = cluster.SnapshotProvider{NodeID: "node-a"}
+	state.Transactions[old.Transaction] = cluster.Transaction{State: cluster.TransactionPublished}
+	if err := persistSharedPublicationBridgeIntentWithAuthority(root, replacement, state); err == nil {
+		t.Fatal("live transaction bridge was adopted")
+	}
+	finished := state.Transactions[old.Transaction]
+	finished.State = cluster.TransactionIndependent
+	state.Transactions[old.Transaction] = finished
+	if err := persistSharedPublicationBridgeIntentWithAuthority(root, replacement, state); err != nil {
+		t.Fatalf("adopting terminal transaction bridge: %v", err)
+	}
+	intents, err := loadSharedPublicationBridgeIntents(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(intents) != 1 || intents[0].Kind != sharedPublicationBridgeOrigin || intents[0].Snapshot != old.Snapshot {
+		t.Fatalf("adopted intents=%+v, want origin bridge for snapshot %d", intents, old.Snapshot)
+	}
+}
+
 func TestSharedSnapshotReaderScopesRestartedRelayToManifestOrigins(t *testing.T) {
 	root := ttcsnapshot.ObjectID{Snapshot: 7, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
 	reader := &sharedSnapshotObjectReader{

@@ -1982,9 +1982,18 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	backend.consoleSidecars = s
 	backend.distributedSource = s.distributedSource
 	backend.nodeID = s.clusterCapabilities.NodeID
-	s.reconcile(backend)
 	unlock := s.lockMutation(opts.dataRoot, request.Args)
 	defer unlock()
+	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
+		record, replay, err := replayCompletedDaemonMutation(s.mutationRoot(), request)
+		if err != nil {
+			return 1, stdout.String(), stderr.String(), err
+		}
+		if replay {
+			return record.Status, string(record.Stdout), string(record.Stderr), nil
+		}
+	}
+	s.reconcile(backend)
 	placements, err := backend.placementCatalog()
 	if err != nil && len(request.PlacementClaims) != 0 {
 		return 1, stdout.String(), stderr.String(), err
@@ -3838,49 +3847,67 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	}
 	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer terminalCancel()
-	if err := b.distributedSource.waitForBackgroundTasks(terminalCtx); err != nil {
-		return moved, fmt.Errorf("waiting for distributed source cleanup: %w", err)
-	}
-	// Branch evacuation is not the complete storage-authority barrier. Remote
-	// descendants may still retain immutable origins created by this node even
-	// after every visible branch and transaction dependency has moved away.
-	// Publish (or abandon, when empty) all of them before allowing the daemon's
-	// scratch root and peer endpoint to disappear.
-	if err := b.publishRemainingVolatileOrigins(); err != nil {
-		return moved, fmt.Errorf("publishing retiring node snapshot origins: %w", err)
-	}
-	last, err := waitForTerminalClusterOwnership(terminalCtx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
-	if err != nil {
-		return moved, fmt.Errorf("waiting for terminal cluster storage ownership: %w", err)
-	}
-	// No maintenance iteration is guaranteed between the final successful
-	// node-stop command and listener shutdown. Perform the terminal shared-data
-	// sweep here so retired transaction packs and handoff manifests do not need
-	// a future daemon restart to become reclaimable.
-	transactions, err := b.transactionCatalog()
-	if err != nil {
-		return moved, fmt.Errorf("opening transaction catalog for final storage collection: %w", err)
-	}
-	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions); err != nil {
-		return moved, fmt.Errorf("collecting terminal shared storage: %w", err)
-	}
-	if b.sharedReferences != nil {
-		if err := b.sharedReferences.drainBeforeShutdown(terminalCtx, last); err != nil {
-			return moved, fmt.Errorf("collecting terminal shared snapshot graph: %w", err)
-		}
-	}
-	if last {
-		// All clean peers have drained their publication queues before becoming
-		// offline, and expired peers have been fenced by Raft. With this daemon's
-		// own queue drained above, no publisher can still be between pack creation
-		// and manifest commit. Remove newly unreachable cold data immediately so
-		// a fully stopped cluster leaves no ten-minute grace residue.
-		if err := collectColdStorageOlderThan(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, time.Now().Add(time.Hour)); err != nil {
-			return moved, fmt.Errorf("collecting final cluster cold storage: %w", err)
-		}
+	if err := b.finalizeNodeRetirement(terminalCtx); err != nil {
+		return moved, err
 	}
 	b.daemonStopRequested = true
 	return moved, nil
+}
+
+// finalizeNodeRetirement is the common terminal barrier for foreground node
+// stop and crash-recovered drains. Evacuating visible branches is insufficient:
+// immutable origins, publication work, and shared reference ownership must all
+// cease naming this node before its scratch storage is disposable. The drain
+// intent becomes complete only after every one of these conditions holds.
+func (b *runtimeBackend) finalizeNodeRetirement(ctx context.Context) error {
+	if b.publicationQueue != nil {
+		if err := b.publicationQueue.Drain(ctx); err != nil {
+			return fmt.Errorf("waiting for durable branch publication: %w", err)
+		}
+	}
+	if err := b.distributedSource.waitForBackgroundTasks(ctx); err != nil {
+		return fmt.Errorf("waiting for distributed source cleanup: %w", err)
+	}
+	if err := b.publishRemainingVolatileOrigins(); err != nil {
+		return fmt.Errorf("publishing retiring node snapshot origins: %w", err)
+	}
+	last, err := waitForTerminalClusterOwnership(ctx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
+	if err != nil {
+		return fmt.Errorf("waiting for terminal cluster storage ownership: %w", err)
+	}
+	transactions, err := b.transactionCatalog()
+	if err != nil {
+		return fmt.Errorf("opening transaction catalog for final storage collection: %w", err)
+	}
+	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions); err != nil {
+		return fmt.Errorf("collecting terminal shared storage: %w", err)
+	}
+	if b.sharedReferences != nil {
+		if err := b.sharedReferences.drainBeforeShutdown(ctx, last); err != nil {
+			return fmt.Errorf("collecting terminal shared snapshot graph: %w", err)
+		}
+	}
+	if last {
+		// No maintenance iteration is guaranteed after the final daemon exits.
+		// All publishers are fenced here, so the last node can remove newly
+		// unreachable cold data without the ordinary recovery grace interval.
+		if err := collectColdStorageOlderThan(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, time.Now().Add(time.Hour)); err != nil {
+			return fmt.Errorf("collecting final cluster cold storage: %w", err)
+		}
+	}
+	intent, err := loadElasticDrainIntent(b.dataRoot, b.nodeID)
+	if err != nil {
+		return fmt.Errorf("loading terminal drain intent: %w", err)
+	}
+	if intent == nil {
+		return fmt.Errorf("node %q has no durable drain intent", b.nodeID)
+	}
+	if intent.State != elasticDrainComplete {
+		if err := finishElasticDrainAttempt(b.dataRoot, b.nodeID, intent.OperationID, nil); err != nil {
+			return fmt.Errorf("committing terminal drain outcome: %w", err)
+		}
+	}
+	return nil
 }
 
 // waitForTerminalClusterOwnership distinguishes a live peer, which can inherit
@@ -3966,8 +3993,13 @@ func (b *runtimeBackend) drainNode(sourceNode, targetNode string) (moved []selec
 		return nil, fmt.Errorf("recording durable drain intent: %w", err)
 	}
 	defer func() {
-		if err := finishElasticDrainAttempt(b.dataRoot, b.nodeID, intent.OperationID, retErr); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("recording drain outcome: %w", err))
+		// Success means only that visible branches and live dependencies were
+		// evacuated. finalizeNodeRetirement owns the later durability barrier and
+		// is the sole operation allowed to mark the drain complete.
+		if retErr != nil {
+			if err := finishElasticDrainAttempt(b.dataRoot, b.nodeID, intent.OperationID, retErr); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("recording drain outcome: %w", err))
+			}
 		}
 	}()
 	lease := source.LeaseExpiresAt.Sub(source.UpdatedAt)
@@ -5171,9 +5203,6 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 			timer.Reset(interval)
 			continue
 		}
-		if intent.State == elasticDrainComplete {
-			return
-		}
 		var moved []selector
 		err = serialize(func() error {
 			if _, recoverErr := backend.recoverInterruptedMigrations(); recoverErr != nil {
@@ -5184,14 +5213,9 @@ func maintainElasticDrain(backend *runtimeBackend, nodeID string, lease time.Dur
 			if drainErr != nil {
 				return drainErr
 			}
-			// This recovery path closes the daemon directly rather than returning
-			// through stopNode. Run the same terminal collection barrier before
-			// invoking completed, while the Raft catalog is still available.
-			transactions, catalogErr := backend.transactionCatalog()
-			if catalogErr != nil {
-				return catalogErr
-			}
-			return collectColdStorage(backend.dataRoot, backend.activeDataRoot(), backend.publicationQueue, transactions)
+			terminalCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			return backend.finalizeNodeRetirement(terminalCtx)
 		})
 		if err != nil {
 			consecutiveFailures++

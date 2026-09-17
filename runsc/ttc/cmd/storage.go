@@ -1313,7 +1313,11 @@ func (p *branchPublisher) publishSharedReferenceLedger(snapshot ttcsnapshot.Snap
 	if intent.CreatedAt.IsZero() {
 		intent.CreatedAt = time.Now().UTC()
 	}
-	if err := persistSharedPublicationBridgeIntent(p.sharedRoot, intent); err != nil {
+	state, err := p.authority.AuthorityState()
+	if err != nil {
+		return fmt.Errorf("reading publication bridge authority: %w", err)
+	}
+	if err := persistSharedPublicationBridgeIntentWithAuthority(p.sharedRoot, intent, state); err != nil {
 		return fmt.Errorf("persisting publication bridge intent: %w", err)
 	}
 	lease, err := p.authority.SharedGCLease()
