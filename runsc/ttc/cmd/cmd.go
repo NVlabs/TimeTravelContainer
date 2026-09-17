@@ -214,7 +214,8 @@ Commands:
   save [OPTIONS] IMAGE...        Save images to a tar archive or standard output
   commit [OPTIONS] TARGET IMAGE  Commit a branch rootfs as a new OCI image
   run [--node NODE] [OPTIONS] IMAGE [COMMAND] Pull, create, and run a container
-  create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
+  create [--node NODE] [OPTIONS] IMAGE [CMD]
+                                 Prepare a container without starting it
   start [--node NODE] [OPTIONS] TARGET Start a prepared or exited branch
   attach [OPTIONS] TARGET        Attach to a branch init or managed exec console
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs

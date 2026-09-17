@@ -1613,6 +1613,7 @@ func TestExtractPlacementNode(t *testing.T) {
 		node string
 	}{
 		{name: "run", args: []string{"run", "--node", "node-b", "--name", "demo", "alpine", "echo"}, want: []string{"run", "--name", "demo", "alpine", "echo"}, node: "node-b"},
+		{name: "create", args: []string{"create", "--node", "node-b", "--name", "demo", "alpine", "echo"}, want: []string{"create", "--name", "demo", "alpine", "echo"}, node: "node-b"},
 		{name: "container start", args: []string{"container", "start", "--node=node-c", "demo@main"}, want: []string{"container", "start", "demo@main"}, node: "node-c"},
 		{name: "restore", args: []string{"restore", "--name", "copy", "--node", "node-b", "/tmp/state.ttc"}, want: []string{"restore", "--name", "copy", "/tmp/state.ttc"}, node: "node-b"},
 		{name: "guest argument", args: []string{"run", "alpine", "tool", "--node", "guest-value"}, want: []string{"run", "alpine", "tool", "--node", "guest-value"}},
