@@ -550,6 +550,7 @@ type execSession struct {
 	info           ExecSessionInfo
 	tg             *kernel.ThreadGroup
 	managementDone <-chan struct{}
+	retain         bool
 }
 
 type consoleWaitLease struct {
@@ -1552,7 +1553,9 @@ func restoredExecSessions(k *kernel.Kernel, sessions []ExecSessionInfo) (map[str
 		if tg == nil || tg.Leader().Origin != kernel.OriginExec {
 			return nil, fmt.Errorf("restored exec session %q has no exec thread group with PID %d", info.ID, info.PID)
 		}
-		session := &execSession{info: cloneExecSessionInfo(info), tg: tg}
+		// Restored sessions have no foreground waiter. Keep their identity and
+		// output available after they exit.
+		session := &execSession{info: cloneExecSessionInfo(info), tg: tg, retain: true}
 		restored[info.ID] = session
 	}
 	return restored, nil
@@ -1651,7 +1654,7 @@ func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecA
 		Terminal:    args.StdioIsPty,
 		State:       ExecSessionCreating,
 		CreatedAt:   time.Now().UTC(),
-	}}
+	}, retain: args.RetainExecSession}
 	return nil
 }
 
@@ -1943,7 +1946,9 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			info := cloneExecSessionInfo(sourceSession.info)
 			info.State = ExecSessionRunning
 			info.ExitStatus = nil
-			clonedExecSessions[i][id] = &execSession{info: info, tg: childTG}
+			// A foreground waiter belongs only to the source command. Its cloned
+			// process has no waiter, so expose the child copy as a retained session.
+			clonedExecSessions[i][id] = &execSession{info: info, tg: childTG, retain: true}
 		}
 		f.mu.Unlock()
 	}
@@ -2498,7 +2503,7 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 		}
 		tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID)
 		if tg != nil {
-			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
+			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg, retain: true}
 		}
 	}
 	var dog *watchdog.Watchdog
@@ -3289,7 +3294,7 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 	f.mu.Lock()
 	session.info.State = ExecSessionExited
 	session.info.ExitStatus = &status
-	if session.info.ConsoleID == "" && b.execSessions[args.ExecID] == session {
+	if !session.retain && b.execSessions[args.ExecID] == session {
 		delete(b.execSessions, args.ExecID)
 	}
 	f.mu.Unlock()

@@ -1710,6 +1710,7 @@ type attachRequest struct {
 type execRequest struct {
 	detach         bool
 	execID         string
+	retain         bool
 	target         selector
 	args           []string
 	env            []string
@@ -2632,6 +2633,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 	}
 	execID := *sessionID
+	retain := execID != "" || *detach
 	if execID == "" {
 		execID, err = newExecID()
 		if err != nil {
@@ -2643,6 +2645,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	status, err := backend.exec(execRequest{
 		detach:         *detach,
 		execID:         execID,
+		retain:         retain,
 		target:         target,
 		args:           append([]string(nil), fs.Args()[1:]...),
 		env:            append([]string(nil), env...),
@@ -7451,6 +7454,9 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		}
 	}
 	args = append(args, "--exec-id", execID)
+	if request.retain {
+		args = append(args, "--retain-exec-session")
+	}
 	consoleID = "ttc-" + execID
 	args = append(args, "--internal-console", consoleID)
 	if request.detach {

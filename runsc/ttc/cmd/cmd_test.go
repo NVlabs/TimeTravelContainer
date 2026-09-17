@@ -2581,6 +2581,9 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	if !strings.HasPrefix(request.execID, "exec-") {
 		t.Errorf("attached exec has no stable session ID: %q", request.execID)
 	}
+	if request.retain {
+		t.Error("ordinary foreground exec unexpectedly retained its session")
+	}
 }
 
 func TestExecSessionBeforeCombinedShortOptions(t *testing.T) {
@@ -2589,7 +2592,7 @@ func TestExecSessionBeforeCombinedShortOptions(t *testing.T) {
 	if status := runCommand([]string{"exec", "--session", "build1", "-dit", "demo@main", "sh"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.execRequest.execID != "build1" || !b.execRequest.detach || !b.execRequest.interactive || !b.execRequest.terminal {
+	if b.execRequest.execID != "build1" || !b.execRequest.detach || !b.execRequest.interactive || !b.execRequest.terminal || !b.execRequest.retain {
 		t.Fatalf("exec request=%+v", b.execRequest)
 	}
 }
@@ -2636,7 +2639,7 @@ func TestExecDetachReturnsQualifiedSessionID(t *testing.T) {
 		t.Fatalf("detached exec status=%d, stderr=%q", status, stderr.String())
 	}
 	request := b.execRequest
-	if !request.detach || !request.interactive || !request.terminal || !strings.HasPrefix(request.execID, "exec-") {
+	if !request.detach || !request.interactive || !request.terminal || !request.retain || !strings.HasPrefix(request.execID, "exec-") {
 		t.Fatalf("detached exec request=%+v", request)
 	}
 	want := "demo@child:" + request.execID + "\n"
@@ -2653,6 +2656,9 @@ func TestExecNamedDurableSession(t *testing.T) {
 	}
 	if got := b.execRequest.execID; got != "build1" {
 		t.Fatalf("exec session=%q, want build1", got)
+	}
+	if !b.execRequest.retain {
+		t.Fatal("named exec did not retain its session")
 	}
 	if got, want := stdout.String(), "demo@child:build1\n"; got != want {
 		t.Fatalf("detached exec output=%q, want %q", got, want)

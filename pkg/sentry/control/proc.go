@@ -151,6 +151,11 @@ type ExecArgs struct {
 	// ExecID is a stable branch-local identity for a managed exec session.
 	ExecID string `json:"exec_id,omitempty"`
 
+	// RetainExecSession keeps the session metadata and internal console after a
+	// waiter observes process exit. Detached and explicitly named TTC sessions
+	// set this; ordinary foreground execs are transient.
+	RetainExecSession bool `json:"retain_exec_session,omitempty"`
+
 	// InternalConsoleID requests Sentry-owned pipe or PTY stdio instead of
 	// imported host descriptors. Loader populates FDTable and, for a PTY, TTY.
 	InternalConsoleID string `json:"internal_console_id,omitempty"`

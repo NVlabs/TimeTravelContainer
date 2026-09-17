@@ -462,6 +462,30 @@ func TestRunInternalTTYLiveFork(t *testing.T) {
 		}
 	}
 
+	const (
+		transientExecID    = "transient-exec"
+		transientConsoleID = "transient-console"
+	)
+	if _, err := l.executeAsync(&control.ExecArgs{
+		BranchID: DefaultBranchID, Filename: "/bin/true", Argv: []string{"/bin/true"},
+		Envv: []string{"PATH=/bin:/usr/bin"}, WorkingDirectory: "/",
+		KUID: auth.RootKUID, KGID: auth.RootKGID, ExecID: transientExecID,
+		InternalConsoleID: transientConsoleID, ContainerID: l.sandboxID,
+	}); err != nil {
+		t.Fatalf("executing transient session: %v", err)
+	}
+	if status, err := l.family.WaitExecSession(&ExecSessionArgs{BranchID: DefaultBranchID, ExecID: transientExecID}, nil); err != nil || status != 0 {
+		t.Fatalf("waiting for transient session: status=%#x err=%v", status, err)
+	}
+	if sessions, err := l.family.ExecSessions(&ExecSessionsArgs{BranchID: DefaultBranchID, CID: l.sandboxID}); err != nil {
+		t.Fatalf("listing sessions after transient wait: %v", err)
+	} else if len(sessions) != 0 {
+		t.Fatalf("transient session retained after wait: %+v", sessions)
+	}
+	if err := l.k.RemoveInternalConsole(l.k.SupervisorContext(), transientConsoleID); err != nil {
+		t.Fatalf("removing transient console: %v", err)
+	}
+
 	stdinFile, err := os.Open("/dev/null")
 	if err != nil {
 		t.Fatalf("opening donated stdin: %v", err)

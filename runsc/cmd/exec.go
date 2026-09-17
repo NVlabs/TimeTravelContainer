@@ -86,6 +86,9 @@ type Exec struct {
 	// tasks in the selected paused branch remain stopped.
 	pausedManagement bool
 
+	// retainExecSession preserves the session and console after process exit.
+	retainExecSession bool
+
 	// allowStoppedSandbox permits TTC to address a rehydrated family whose OCI
 	// init process was intentionally released during dehydration.
 	allowStoppedSandbox bool
@@ -130,6 +133,7 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&ex.branch, "branch", boot.DefaultBranchID, "TimeTravel branch in which to execute")
 	f.BoolVar(&ex.detach, "detach", false, "detach from the container's process")
 	f.StringVar(&ex.execID, "exec-id", "", "stable branch-local exec session ID")
+	f.BoolVar(&ex.retainExecSession, "retain-exec-session", false, "retain TTC exec session metadata and console after exit")
 	f.StringVar(&ex.processPath, "process", "", "path to the process.json")
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
@@ -171,6 +175,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}
 	e.BranchID = ex.branch
 	e.ExecID = ex.execID
+	e.RetainExecSession = ex.retainExecSession
 	e.PausedManagement = ex.pausedManagement
 	e.AllowStoppedContainer = ex.allowStoppedSandbox
 	if ex.pausedManagement && ex.execFD < 0 {
