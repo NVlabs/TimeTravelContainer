@@ -1744,6 +1744,42 @@ func TestSimpleClusterOptions(t *testing.T) {
 	}
 }
 
+func TestReadClusterSharedRootMarkerWaitsForInitialization(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "shared")
+	created := make(chan error, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		created <- prepareDaemonStorageRoot(root, daemonRootRoleClusterShared, "repo-visible", "")
+	}()
+	started := time.Now()
+	marker, err := readClusterSharedRootMarker(root, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+	if marker.RepositoryID != "repo-visible" {
+		t.Fatalf("marker=%+v", marker)
+	}
+	if elapsed := time.Since(started); elapsed < 40*time.Millisecond {
+		t.Fatalf("marker read returned before delayed initialization: %v", elapsed)
+	}
+}
+
+func TestReadClusterSharedRootMarkerTimeout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing")
+	started := time.Now()
+	_, err := readClusterSharedRootMarker(root, 25*time.Millisecond)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read error=%v, want ENOENT", err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("missing marker returned before visibility grace: %v", elapsed)
+	}
+}
+
 func TestControlOnlyClusterOptions(t *testing.T) {
 	shared := t.TempDir()
 	if err := prepareDaemonStorageRoot(shared, daemonRootRoleClusterShared, "repo-control", ""); err != nil {

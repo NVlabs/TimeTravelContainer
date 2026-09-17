@@ -62,21 +62,27 @@ import (
 const (
 	daemonAPIVersion       = protocol.DaemonAPIVersion
 	defaultRuntimePlatform = "systrap"
-	daemonStartTimeout     = 45 * time.Second
-	kvmGetAPIVersion       = uintptr(0xae00)
-	kvmCreateVM            = uintptr(0xae01)
-	kvmAPIVersion          = uintptr(12)
-	daemonFrameStdin       = byte('I')
-	daemonFrameStdinAck    = byte('A')
-	daemonFrameEOF         = byte('C')
-	daemonFrameResize      = byte('W')
-	daemonFrameStdout      = byte('O')
-	daemonFrameStderr      = byte('E')
-	daemonFrameStatus      = byte('X')
-	daemonFrameTerminal    = byte('T')
-	daemonFrameTTYState    = byte('S')
-	daemonMaxFrame         = 1 << 20
-	daemonRootlessProbeArg = "_rootless-userns-probe"
+	daemonStartTimeout     = 2 * time.Minute
+	// A clustered TTC_ROOT is commonly hosted on NFS. A node that looked up the
+	// root before the first member initialized it may retain a negative directory
+	// entry for the server's acdirmax interval (commonly 60 seconds). Keep the
+	// joining daemon alive long enough for that cache entry to expire instead of
+	// turning a successful cluster initialization into a spurious join failure.
+	clusterSharedRootVisibilityTimeout = 90 * time.Second
+	kvmGetAPIVersion                   = uintptr(0xae00)
+	kvmCreateVM                        = uintptr(0xae01)
+	kvmAPIVersion                      = uintptr(12)
+	daemonFrameStdin                   = byte('I')
+	daemonFrameStdinAck                = byte('A')
+	daemonFrameEOF                     = byte('C')
+	daemonFrameResize                  = byte('W')
+	daemonFrameStdout                  = byte('O')
+	daemonFrameStderr                  = byte('E')
+	daemonFrameStatus                  = byte('X')
+	daemonFrameTerminal                = byte('T')
+	daemonFrameTTYState                = byte('S')
+	daemonMaxFrame                     = 1 << 20
+	daemonRootlessProbeArg             = "_rootless-userns-probe"
 	// Batch remote fork reserves every sibling before pausing the source. Keep
 	// the default high enough for agent-harness fanout while retaining a bound
 	// against an accidentally unbounded number of unfinished transactions.
@@ -3395,17 +3401,9 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		if !transactionIDPatternForDaemon(opts.NodeID) {
 			return fmt.Errorf("invalid control client name %q; set --node to letters, digits, '.', '_', or '-'", opts.NodeID)
 		}
-		markerData, err := os.ReadFile(filepath.Join(roots.shared, ".ttc-root-format"))
+		marker, err := readClusterSharedRootMarker(roots.shared, clusterSharedRootVisibilityTimeout)
 		if err != nil {
 			return fmt.Errorf("control-only mode requires an initialized cluster TTC_ROOT: %w", err)
-		}
-		var marker daemonRootMarker
-		if err := json.Unmarshal(markerData, &marker); err != nil {
-			return fmt.Errorf("decoding cluster TTC_ROOT marker: %w", err)
-		}
-		want, err := daemonRootMarkerFor(daemonRootRoleClusterShared, marker.RepositoryID, "")
-		if err != nil || marker != want {
-			return fmt.Errorf("TTC_ROOT is not a current-format clustered shared root")
 		}
 		if opts.RepositoryID != "" && opts.RepositoryID != marker.RepositoryID {
 			return fmt.Errorf("configured repository %q does not match TTC_ROOT repository %q", opts.RepositoryID, marker.RepositoryID)
@@ -3441,23 +3439,24 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		}
 	}
 	if opts.RepositoryID == "" {
-		markerPath := filepath.Join(roots.shared, ".ttc-root-format")
-		if data, err := os.ReadFile(markerPath); err == nil {
-			var marker daemonRootMarker
-			if err := json.Unmarshal(data, &marker); err != nil {
-				return err
-			}
+		visibilityWait := clusterSharedRootVisibilityTimeout
+		if opts.RaftBootstrap {
+			// The first node owns initialization; a genuinely fresh root must not
+			// pay the joiner's NFS visibility grace period.
+			visibilityWait = 0
+		}
+		if marker, err := readClusterSharedRootMarker(roots.shared, visibilityWait); err == nil {
 			opts.RepositoryID = marker.RepositoryID
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		} else if opts.RaftBootstrap {
+		} else if opts.RaftBootstrap && errors.Is(err, os.ErrNotExist) {
 			id, err := newDaemonRequestID()
 			if err != nil {
 				return err
 			}
 			opts.RepositoryID = "repo-" + strings.TrimPrefix(id, "req-")
+		} else if opts.RaftBootstrap {
+			return err
 		} else {
-			return errors.New("joining a cluster requires an initialized shared TTC_ROOT")
+			return fmt.Errorf("joining a cluster requires an initialized shared TTC_ROOT: %w", err)
 		}
 	}
 	_, port, err := net.SplitHostPort(opts.Listen)
@@ -3477,6 +3476,39 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		}
 	}
 	return nil
+}
+
+// readClusterSharedRootMarker reads and validates the shared-root marker. The
+// bounded wait is required for NFS clients that cached the root as nonexistent
+// immediately before another node initialized it. Errors other than ENOENT are
+// never retried: malformed, inaccessible, and incompatible roots fail closed.
+func readClusterSharedRootMarker(root string, wait time.Duration) (daemonRootMarker, error) {
+	markerPath := filepath.Join(root, ".ttc-root-format")
+	deadline := time.Now().Add(wait)
+	for {
+		data, err := os.ReadFile(markerPath)
+		if err == nil {
+			var marker daemonRootMarker
+			if err := json.Unmarshal(data, &marker); err != nil {
+				return daemonRootMarker{}, fmt.Errorf("decoding cluster TTC_ROOT marker: %w", err)
+			}
+			want, err := daemonRootMarkerFor(daemonRootRoleClusterShared, marker.RepositoryID, "")
+			if err != nil || marker != want {
+				return daemonRootMarker{}, errors.New("TTC_ROOT is not a current-format clustered shared root")
+			}
+			return marker, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) || wait <= 0 || !time.Now().Before(deadline) {
+			return daemonRootMarker{}, err
+		}
+		delay := 100 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < delay {
+			delay = remaining
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
 }
 
 // daemonRootsFromEnvironment is the only source of daemon storage paths.
