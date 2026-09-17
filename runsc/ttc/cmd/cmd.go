@@ -11141,13 +11141,29 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	}
 	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
 	referenceOperations := make([]string, len(destinations))
-	if referenceTransaction != "" && len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
+	referenceTransactions := make([]string, len(destinations))
+	referenceRequired := referenceTransaction != ""
+	if len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		localRoots, err := b.graphMemoryRootsLocal(sourceRecord.MemoryRoots)
+		if err != nil {
+			return nil, err
+		}
+		referenceRequired = referenceRequired || !localRoots
+	}
+	if referenceRequired && len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
 		for index := range referenceOperations {
 			operation, err := newGraphReferenceOperation()
 			if err != nil {
 				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destinations[index], err)
 			}
 			referenceOperations[index] = operation
+			referenceTransactions[index] = referenceTransaction
+			if referenceTransactions[index] == "" {
+				// Shared-only roots have no fork transaction to authorize. The
+				// unique operation is a durable local ownership fence and also
+				// satisfies the intent format's non-empty transaction identity.
+				referenceTransactions[index] = operation
+			}
 		}
 	}
 	args := []string{"timetravel", "--source", source.branch}
@@ -11214,7 +11230,9 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				ForkMetadataBytes: branch.ForkMetadataBytes, ForkChildRestoreNS: branch.ForkChildRestoreNS,
 			}
 			if referenceOperations[i] != "" {
-				records[i].DistributedForkTransactionID = referenceTransaction
+				if referenceTransaction != "" {
+					records[i].DistributedForkTransactionID = referenceTransaction
+				}
 				records[i].DistributedGraphReferenceOperation = referenceOperations[i]
 			}
 		}
@@ -11269,7 +11287,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			if records[i].DistributedGraphReferenceOperation == "" {
 				continue
 			}
-			if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
+			if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 				var cleanupErr error
 				for _, cleanupDestination := range destinations {
 					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
@@ -11386,19 +11404,34 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	createdAt := time.Now().UTC()
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
 	referenceTransaction := transactionIDForBranch(info, sourceBranch)
-	for _, destination := range destinations {
+	referenceTransactions := make([]string, len(destinations))
+	externalMemoryRoots := false
+	if len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		localRoots, err := b.graphMemoryRootsLocal(sourceBranch.MemoryRoots)
+		if err != nil {
+			return nil, err
+		}
+		externalMemoryRoots = !localRoots
+	}
+	for destinationIndex, destination := range destinations {
 		filesystemBranch, err := ttcvolume.NewScopedBranchID(info.ID, destination)
 		if err != nil {
 			return nil, fmt.Errorf("allocating filesystem identity for %s@%s: %w", source.container, destination, err)
 		}
 		branch := ttcbundle.BranchInfo{ID: destination, ParentID: logicalParent, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
-		if referenceTransaction != "" && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		if (referenceTransaction != "" || externalMemoryRoots) && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
 			operation, err := newGraphReferenceOperation()
 			if err != nil {
 				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destination, err)
 			}
-			branch.DistributedForkTransactionID = referenceTransaction
+			if referenceTransaction != "" {
+				branch.DistributedForkTransactionID = referenceTransaction
+			}
 			branch.DistributedGraphReferenceOperation = operation
+			referenceTransactions[destinationIndex] = referenceTransaction
+			if referenceTransactions[destinationIndex] == "" {
+				referenceTransactions[destinationIndex] = operation
+			}
 		}
 		childDir := memoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
@@ -11476,7 +11509,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 		if records[i].DistributedGraphReferenceOperation == "" {
 			continue
 		}
-		if err := b.retainDistributedGraphReferences(referenceTransaction, records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
+		if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 			return nil, fmt.Errorf("retaining graph origins for dehydrated branch %q: %w", records[i].ID, err)
 		}
 	}
@@ -11957,21 +11990,18 @@ func (b *runtimeBackend) cloneGraphMemoryRoots(sourceRoots, sourceObjects []stri
 	}
 	destinations := graphMemoryRootNames(targetFilesystemBranch, len(sourceRoots))
 	copies := make(map[string]string, len(sourceRoots))
-	existing := 0
 	for index, source := range sourceRoots {
 		copies[destinations[index]] = source
-		if _, ok := b.snapshotGraph.Root(source); ok {
-			existing++
-		}
 	}
-	if existing == len(sourceRoots) {
+	local, err := b.graphMemoryRootsLocal(sourceRoots)
+	if err != nil {
+		return nil, err
+	}
+	if local {
 		if err := b.snapshotGraph.CloneRoots(copies); err != nil {
 			return nil, err
 		}
 		return destinations, nil
-	}
-	if existing != 0 {
-		return nil, errors.New("memory roots are split between local and external authority")
 	}
 	// Cache materialization never imports shared or peer reference authority
 	// into the local graph. The branch-level object IDs are sufficient to add
@@ -11981,6 +12011,29 @@ func (b *runtimeBackend) cloneGraphMemoryRoots(sourceRoots, sourceObjects []stri
 		return nil, err
 	}
 	return destinations, nil
+}
+
+// graphMemoryRootsLocal determines whether one logical root set is wholly
+// represented in the node-local graph. A root set may instead be wholly
+// external (peer- or shared-pack authoritative), but a mixed set is invalid:
+// no single reference operation could then preserve it atomically.
+func (b *runtimeBackend) graphMemoryRootsLocal(roots []string) (bool, error) {
+	if len(roots) == 0 {
+		return true, nil
+	}
+	if b.snapshotGraph == nil {
+		return false, errors.New("snapshot graph is unavailable")
+	}
+	existing := 0
+	for _, root := range roots {
+		if _, ok := b.snapshotGraph.Root(root); ok {
+			existing++
+		}
+	}
+	if existing != 0 && existing != len(roots) {
+		return false, errors.New("memory roots are split between local and external authority")
+	}
+	return existing == len(roots), nil
 }
 
 // cloneGraphMemoryRootsMany commits all roots for a batch fork in one graph
@@ -11997,25 +12050,22 @@ func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots, sourceObjects []
 		return nil, err
 	}
 	copies := make(map[string]string, len(sourceRoots)*len(branches))
-	existing := 0
 	for _, branch := range branches {
 		destinations := graphMemoryRootNames(branch.FilesystemBranch, len(sourceRoots))
 		result[branch.FilesystemBranch] = destinations
 		for index, source := range sourceRoots {
 			copies[destinations[index]] = source
-			if _, ok := b.snapshotGraph.Root(source); ok {
-				existing++
-			}
 		}
 	}
-	if existing == len(copies) {
+	local, err := b.graphMemoryRootsLocal(sourceRoots)
+	if err != nil {
+		return nil, err
+	}
+	if local {
 		if err := b.snapshotGraph.CloneRoots(copies); err != nil {
 			return nil, err
 		}
 		return result, nil
-	}
-	if existing != 0 {
-		return nil, errors.New("batch memory roots are split between local and external authority")
 	}
 	if err := b.validateExternalGraphRoots(snapshotID, sourceRoots, sourceObjects); err != nil {
 		return nil, err
@@ -14355,7 +14405,14 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		if err != nil {
 			return nil, fmt.Errorf("opening repository for %s: %w", mount, err)
 		}
-		diff, diffErr := repository.BranchDiff(repositoryPhysicalBranch(config, filesystemBranch))
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		if b.snapshotShared != nil {
+			if err := repository.AttachImmutableMetadataSource(physicalBranch, b.snapshotShared.Object); err != nil {
+				repository.Close()
+				return nil, fmt.Errorf("attaching shared metadata for %s: %w", mount, err)
+			}
+		}
+		diff, diffErr := repository.BranchDiff(physicalBranch)
 		closeErr := repository.Close()
 		if diffErr != nil {
 			return nil, fmt.Errorf("reading repository diff for %s: %w", mount, diffErr)
@@ -14523,6 +14580,14 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			}
 			seenFilesystemIDs[physicalBranch] = struct{}{}
 			filesystemIDs = append(filesystemIDs, physicalBranch)
+		}
+		if b.snapshotShared != nil {
+			for _, physicalBranch := range filesystemIDs {
+				if err := repository.AttachImmutableMetadataSource(physicalBranch, b.snapshotShared.Object); err != nil {
+					repository.Close()
+					return FamilyResourceStats{}, fmt.Errorf("attaching shared filesystem metadata for %s: %w", physicalBranch, err)
+				}
+			}
 		}
 		usage, usageErr := repository.BranchSetUsage(filesystemIDs)
 		closeErr := repository.Close()

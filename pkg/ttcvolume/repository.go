@@ -2998,6 +2998,9 @@ type BranchSetDataUsage struct {
 func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, error) {
 	ids := append([]string(nil), branchIDs...)
 	sort.Strings(ids)
+	if err := r.graph.Reload(); err != nil {
+		return BranchSetDataUsage{}, err
+	}
 	type snapshot struct {
 		inodes  uint64
 		objects map[string]uint64
@@ -3014,29 +3017,28 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 		if err != nil {
 			return BranchSetDataUsage{}, err
 		}
-		state, err := r.metadataForBranch(branch)
+		root, ok := r.graph.Root(graphRootName(branch.ID))
+		if !ok {
+			return BranchSetDataUsage{}, fmt.Errorf("branch %q has no snapshot graph root", branch.ID)
+		}
+		inodes, _, err := r.graph.FilesystemRecords(root)
 		if err != nil {
 			return BranchSetDataUsage{}, err
 		}
-		if err := r.completeMetadata(state); err != nil {
-			return BranchSetDataUsage{}, err
-		}
-		state.mu.RLock()
-		current := snapshot{inodes: uint64(len(state.inodes)), objects: make(map[string]uint64)}
-		for _, inode := range state.inodes {
+		current := snapshot{inodes: uint64(len(inodes)), objects: make(map[string]uint64)}
+		for _, inode := range inodes {
 			if inode.Type != "regular" || inode.Size <= 0 {
 				continue
 			}
-			if inode.Object == "" {
-				state.mu.RUnlock()
+			if inode.File.IsZero() {
 				return BranchSetDataUsage{}, fmt.Errorf("branch %q inode %d has data without an object", id, inode.Number)
 			}
 			size := (uint64(inode.Size) + pageSize - 1) &^ (pageSize - 1)
-			if size > current.objects[inode.Object] {
-				current.objects[inode.Object] = size
+			object := inode.File.String()
+			if size > current.objects[object] {
+				current.objects[object] = size
 			}
 		}
-		state.mu.RUnlock()
 		snapshots[id] = current
 		for object, size := range current.objects {
 			objectBranches[object]++
@@ -3073,25 +3075,13 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	if err != nil {
 		return nil, err
 	}
-	current, err := r.metadataForBranch(branch)
-	if err != nil {
+	if err := r.graph.Reload(); err != nil {
 		return nil, err
 	}
-	if err := r.completeMetadata(current); err != nil {
-		return nil, err
-	}
-	current.mu.RLock()
-	currentPaths, err := metadataPaths(current)
-	current.mu.RUnlock()
-	if err != nil {
-		return nil, err
-	}
-
-	base := newBranchMetadata(Branch{ID: branchID + "-diff-base"})
-	if branch.BaseRoot != "" {
-		root, err := ttcsnapshot.ParseObjectID(branch.BaseRoot)
-		if err != nil {
-			return nil, err
+	pathsForRoot := func(root ttcsnapshot.ObjectID, name string) (map[string]Inode, error) {
+		state := newBranchMetadata(Branch{ID: name})
+		if root.IsZero() {
+			return metadataPaths(state)
 		}
 		inodes, entries, err := r.graph.FilesystemRecords(root)
 		if err != nil {
@@ -3099,22 +3089,38 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 		}
 		for _, record := range inodes {
 			inode := inodeFromGraph(record)
-			base.inodes[inode.Number] = inode
+			state.inodes[inode.Number] = inode
 		}
 		for _, record := range entries {
 			entry := DirectoryEntry{Name: record.Name, Inode: record.Inode}
-			base.entries[metadataEntryKey{Parent: record.Parent, Name: record.Name}] = entry
-			directory := base.directories[record.Parent]
+			state.entries[metadataEntryKey{Parent: record.Parent, Name: record.Name}] = entry
+			directory := state.directories[record.Parent]
 			if directory == nil {
 				directory = make(map[string]DirectoryEntry)
-				base.directories[record.Parent] = directory
+				state.directories[record.Parent] = directory
 			}
 			directory[record.Name] = entry
 		}
+		return metadataPaths(state)
 	}
-	basePaths, err := metadataPaths(base)
+	currentRoot, ok := r.graph.Root(graphRootName(branchID))
+	if !ok {
+		return nil, fmt.Errorf("branch %q has no snapshot graph root", branchID)
+	}
+	currentPaths, err := pathsForRoot(currentRoot, branchID)
 	if err != nil {
 		return nil, err
+	}
+	basePaths := make(map[string]Inode)
+	if branch.BaseRoot != "" {
+		baseRoot, err := ttcsnapshot.ParseObjectID(branch.BaseRoot)
+		if err != nil {
+			return nil, err
+		}
+		basePaths, err = pathsForRoot(baseRoot, branchID+"-diff-base")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	all := make(map[string]struct{}, len(currentPaths)+len(basePaths))

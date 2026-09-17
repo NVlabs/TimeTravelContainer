@@ -131,6 +131,32 @@ type RemoteObjectCatalog interface {
 	RemoteObject(ttcsnapshot.ObjectID) (ttcsnapshot.Object, error)
 }
 
+// AttachImmutableMetadataSource reattaches the authoritative metadata catalog
+// for a deferred branch without installing a bulk-data transport. Manager-side
+// observations such as diff and resource accounting only traverse immutable
+// inode and directory metadata; they must not materialize regular-file bytes or
+// depend on the Sentry's process-local relay attachment.
+//
+// Resolver attachments are intentionally transient. The durable branch record
+// retains both the catalog identity and its expansion origin, so every process
+// that opens the repository can reconstruct this attachment independently.
+func (r *Repository) AttachImmutableMetadataSource(branchID string, loader ttcsnapshot.ImmutableObjectLoader) error {
+	if r == nil || loader == nil {
+		return errors.New("immutable filesystem metadata source is unavailable")
+	}
+	branch, err := r.Branch(branchID)
+	if err != nil {
+		return err
+	}
+	if branch.RemoteCatalog == "" {
+		return nil
+	}
+	if branch.RemoteCatalogSnapshot == 0 {
+		return errors.New("remote filesystem branch has no catalog expansion origin")
+	}
+	return r.graph.AttachDeferredResolver(branch.RemoteCatalog, ttcsnapshot.SnapshotID(branch.RemoteCatalogSnapshot), loader)
+}
+
 type repositoryObjectCatalog struct{ repository *Repository }
 
 func (c repositoryObjectCatalog) RemoteObject(id ttcsnapshot.ObjectID) (ttcsnapshot.Object, error) {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -540,6 +541,79 @@ func TestIndependentRemoteImportsOfSameRootHaveDistinctCatalogs(t *testing.T) {
 	}
 	finishTestRemote(t, target, firstServer)
 	finishTestRemote(t, target, secondServer)
+}
+
+func TestDeferredMetadataObservationDoesNotRequireBulkTransport(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-observation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("immutable payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-observation"), "target-observation", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.AttachImmutableMetadataSource("imported", source.graph.ResolveObject); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := target.BranchSetUsage([]string{"imported"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage.Branches) != 1 || usage.Branches[0].Inodes != 2 || usage.Branches[0].TotalBytes != uint64(os.Getpagesize()) {
+		t.Fatalf("usage=%+v, want two inodes and one page", usage)
+	}
+	branch, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inodes, _, err := target.graph.FilesystemRecords(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inode := range inodes {
+		if inode.Type != "regular" {
+			continue
+		}
+		if file, err := target.data.Open(inode.File, int64(inode.Size)); err == nil {
+			file.Close()
+			t.Fatalf("metadata observation materialized regular-file object %s", inode.File)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	if _, err := target.CreateRegular("imported", RootInode, "local", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := target.BranchDiff("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Path != "/local" || changes[0].Kind != "add" {
+		t.Fatalf("changes=%+v, want local addition", changes)
+	}
 }
 
 func TestMaterializeRemoteObjectsAfterImportedBranchRemoval(t *testing.T) {
