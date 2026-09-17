@@ -74,7 +74,7 @@ wait_ready() {
 	socket=$1
 	log=$2
 	attempt=0
-	while test "$attempt" -lt 200; do
+	while test "$attempt" -lt 600; do
 		if TTC_SOCKET=$socket timeout 2s "$TTC" node ls >/dev/null 2>&1; then
 			return 0
 		fi

@@ -431,12 +431,7 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 		tx, txErr := b.distributedSource.transactions.Load(intent.Transaction)
 		branchPresent := false
 		if info, loadErr := b.containerStore().LoadContainer(intent.Container); loadErr == nil {
-			for _, branch := range info.Branches {
-				if branch.ID == intent.Branch && transactionIDForBranch(info, branch) == intent.Transaction && graphReferenceOperationForBranch(info, branch) == intent.Operation {
-					branchPresent = true
-					break
-				}
-			}
+			branchPresent = containerHasGraphReferenceIntent(info, intent)
 		}
 		if graphReferenceIntentShouldRelease(intent, tx, txErr, branchPresent) {
 			if err := b.releaseDistributedGraphReferences(intent.Operation); err != nil {
@@ -465,6 +460,21 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 	return retryable
 }
 
+// containerHasGraphReferenceIntent matches the immutable branch ownership
+// identity, not its user-visible name. A rename deliberately changes only the
+// latter, and the old name may immediately be reused by a different branch.
+// Treating intent.Branch as identity made the reconciler release a live
+// branch's roots after rename and allowed GC to retire memory still needed by
+// that branch.
+func containerHasGraphReferenceIntent(info ttcbundle.ContainerInfo, intent graphReferenceIntent) bool {
+	for _, branch := range info.Branches {
+		if transactionIDForBranch(info, branch) == intent.Transaction && graphReferenceOperationForBranch(info, branch) == intent.Operation {
+			return true
+		}
+	}
+	return false
+}
+
 func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.Transaction, txErr error, branchPresent bool) bool {
 	if intent.State == "releasing" {
 		return true
@@ -476,8 +486,37 @@ func graphReferenceIntentShouldRelease(intent graphReferenceIntent, tx *cluster.
 		// post-cutover migration deliberately retains its source for recovery.
 		return txErr == nil && tx != nil && (tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled)
 	}
-	terminal := txErr == nil && tx != nil && (tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed)
-	return terminal || !branchPresent
+	if txErr != nil {
+		// A catalog or quorum failure does not prove that the authorizing
+		// transaction disappeared. Only an authoritative not-found result and a
+		// missing branch make this intent unreachable.
+		return errors.Is(txErr, os.ErrNotExist) && !branchPresent
+	}
+	if tx == nil {
+		return !branchPresent
+	}
+	if tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+		return true
+	}
+	if branchPresent {
+		return false
+	}
+	// Prepare retains roots before it records their ownership in the hidden
+	// target branch. The transaction remains target-restoring throughout that
+	// crash-safe handoff. Releasing a temporarily ownerless intent in this
+	// window lets GC retire live roots before UpdateDistributedForkMemoryGraph
+	// can publish them. Once Prepare returns, TargetPaused (and every later
+	// state) proves that the branch record should already own the intent, so a
+	// missing record is a genuine interrupted removal.
+	switch tx.State {
+	case cluster.TransactionPreparing,
+		cluster.TransactionTargetReserved,
+		cluster.TransactionSourceCaptured,
+		cluster.TransactionTargetRestoring:
+		return false
+	default:
+		return true
+	}
 }
 
 func advanceGraphReferenceRelease(path string, intent *graphReferenceIntent, mutate func(graphReferenceGroup) error) error {

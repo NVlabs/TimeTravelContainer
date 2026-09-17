@@ -57,6 +57,13 @@ type AuthorityRaftOptions struct {
 	AuthToken     string
 	Bootstrap     bool
 	ApplyTimeout  time.Duration
+	// StabilityTimeout is the minimum period without leader traffic before a
+	// follower starts an election, and without quorum contact before a leader
+	// steps down. Zero retains Hashicorp Raft's defaults. TTC derives this from
+	// its longer execution lease so paging congestion cannot cause election
+	// churn while still leaving time to elect a replacement before workloads
+	// must self-fence.
+	StabilityTimeout time.Duration
 }
 
 // AuthorityNotLeaderError tells callers where to retry an authority request.
@@ -394,6 +401,11 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	config.LogOutput = io.Discard
 	config.SnapshotThreshold = 8192
 	config.SnapshotInterval = 2 * time.Minute
+	if options.StabilityTimeout > 0 {
+		config.HeartbeatTimeout = options.StabilityTimeout
+		config.ElectionTimeout = options.StabilityTimeout
+		config.LeaderLeaseTimeout = options.StabilityTimeout
+	}
 	// A TTC node whose execution lease expires is removed from the live voter
 	// set, but the physical node is allowed to return later. Keep its Raft
 	// engine alive long enough to apply the removal entry and a subsequent

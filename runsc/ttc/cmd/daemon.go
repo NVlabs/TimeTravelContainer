@@ -81,6 +81,12 @@ const (
 	// the default high enough for agent-harness fanout while retaining a bound
 	// against an accidentally unbounded number of unfinished transactions.
 	defaultClusterMaxTransactions = 4096
+	// Cluster control traffic may share a constrained link with peer paging and
+	// network-filesystem traffic. Thirty seconds leaves enough renewal headroom
+	// for transient bulk-transfer queues while still detecting failed nodes
+	// promptly; operators that need a different tradeoff can set
+	// --cluster-lease when initializing the cluster.
+	defaultClusterLeaseDuration = 30 * time.Second
 )
 
 var daemonAPIFeatures = []string{
@@ -354,7 +360,7 @@ func defaultDaemonClusterOptions() daemonClusterOptions {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4
 	policy.AckInterval = time.Millisecond
-	return daemonClusterOptions{MaxTransactions: defaultClusterMaxTransactions, PageListen: "0.0.0.0:0", LeaseDuration: 15 * time.Second, PagingPolicy: policy, CPUProfileMode: "portable"}
+	return daemonClusterOptions{MaxTransactions: defaultClusterMaxTransactions, PageListen: "0.0.0.0:0", LeaseDuration: defaultClusterLeaseDuration, PagingPolicy: policy, CPUProfileMode: "portable"}
 }
 
 type daemonClusterRuntime struct {
@@ -3896,7 +3902,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		return nil, err
 	}
 	if opts.LeaseDuration == 0 {
-		opts.LeaseDuration = 15 * time.Second
+		opts.LeaseDuration = defaultClusterLeaseDuration
 	}
 	if opts.Listen == "" || opts.Advertise == "" || opts.NodeID == "" || opts.RepositoryID == "" {
 		return nil, errors.New("cluster mode requires listen/advertise addresses, node ID, and repository ID")
@@ -4026,6 +4032,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		NodeID: opts.NodeID, LocalDir: raftLocalDir,
 		Listener: protocolMux.RaftListener(), AdvertiseHost: parsedAdvertise.Host,
 		AuthToken: opts.AuthToken, Bootstrap: opts.RaftBootstrap,
+		StabilityTimeout: clusterRaftStabilityTimeout(opts.LeaseDuration),
 	})
 	if err != nil {
 		return nil, err
@@ -4249,6 +4256,21 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		cancelFreshJoin: cancelFreshJoin,
 		autoRebalance:   opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
 	}, nil
+}
+
+// clusterRaftStabilityTimeout keeps transient data-plane congestion from
+// looking like leadership failure. It remains a fraction of the execution
+// lease so a genuine leader loss can be resolved before runtime guardians
+// reach their conservative fencing deadline.
+func clusterRaftStabilityTimeout(lease time.Duration) time.Duration {
+	timeout := lease / 10
+	if timeout < time.Second {
+		return time.Second
+	}
+	if timeout > 5*time.Second {
+		return 5 * time.Second
+	}
+	return timeout
 }
 
 const daemonImmutableClusterConfigVersion = 2
@@ -4988,6 +5010,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	})
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
+	var sharedGCDone chan struct{}
 	var sharedGCStopped <-chan struct{}
 	var elasticRecord *cluster.NodeRecord
 	var clusterTargetBackend *runtimeBackend
@@ -5035,9 +5058,20 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		return result
 	}
 	defer func() {
+		// Relinquishing shared-data mutation authority is a Raft operation. Stop
+		// and join that worker while the execution heartbeat is still renewing;
+		// otherwise a slow final collection can outlive the node lease and turn a
+		// clean shutdown into a spurious stale-lease warning.
+		if sharedGCDone != nil {
+			close(sharedGCDone)
+		}
+		sharedGCStopTimeout := 5 * time.Second
+		if clusterRuntime != nil && clusterRuntime.lease > sharedGCStopTimeout {
+			sharedGCStopTimeout = clusterRuntime.lease
+		}
+		waitDaemonWorkerFor(sharedGCStopped, "shared GC coordinator", sharedGCStopTimeout, stderr)
 		close(clusterDone)
 		waitDaemonWorker(elasticHeartbeatStopped, "elastic heartbeat", stderr)
-		waitDaemonWorker(sharedGCStopped, "shared GC coordinator", stderr)
 		if err := retireClusterNode(server.cleanStop.Load()); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: retiring cluster node: %v\n", err)
 		}
@@ -5161,10 +5195,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// admitted; if this node becomes the coordinator, its ledger must be
 			// available to that recovery first.
 			gcStopped := make(chan struct{})
+			sharedGCDone = make(chan struct{})
 			sharedGCStopped = gcStopped
 			go func() {
 				defer close(gcStopped)
-				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, clusterDone)
+				maintainSharedGCCoordinator(clusterRuntime.raftCatalog, sharedObjects, sharedReferences, registered.NodeID, registered.Incarnation, stderr, sharedGCDone)
 			}()
 			if err := targetBackend.reconcileInterruptedClusterMemoryGraph(); err != nil {
 				clusterListener.Close()
@@ -5542,10 +5577,17 @@ func shutdownClusterServer(server *http.Server) {
 // already committed to exit at this point; bounding the join lets subsequent
 // deferred cleanup close the Raft transport and local stores.
 func waitDaemonWorker(done <-chan struct{}, name string, stderr io.Writer) {
+	waitDaemonWorkerFor(done, name, 5*time.Second, stderr)
+}
+
+func waitDaemonWorkerFor(done <-chan struct{}, name string, timeout time.Duration, stderr io.Writer) {
 	if done == nil {
 		return
 	}
-	timer := time.NewTimer(5 * time.Second)
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-done:

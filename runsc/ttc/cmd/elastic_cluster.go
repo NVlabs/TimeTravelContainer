@@ -5127,7 +5127,11 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 }
 
 func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func(*cluster.AuthorityState) error, fence func() error, fatal chan<- error) {
-	interval := lease / 3
+	// Begin renewing well before the fencing window. Cluster control traffic may
+	// share a constrained link with peer paging or a network filesystem, so a
+	// healthy renewal must be allowed to absorb a transient multi-second queue
+	// without turning an otherwise healthy node into a false failure.
+	interval := lease / 4
 	if interval < 250*time.Millisecond {
 		interval = 250 * time.Millisecond
 	}
@@ -5176,14 +5180,12 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 			var authorityState *cluster.AuthorityState
 			if err == nil {
 				if catalog, ok := directory.(*cluster.RaftCatalog); ok {
-					// Bound each complete renewal and local-apply wait to half of
-					// the remaining safety window. Failed attempts are retried
-					// promptly below rather than consuming a whole heartbeat
-					// interval and forcing an otherwise healthy node to fence.
-					attemptBudget := interval / 2
-					if remaining := time.Until(fenceAt); attemptBudget > remaining/2 {
-						attemptBudget = remaining / 2
-					}
+					// A renewal includes leader forwarding, quorum persistence, and
+					// waiting until the committed authority state is locally visible.
+					// Give that complete operation most of the remaining safe window.
+					// Keeping one third in reserve guarantees another attempt can begin
+					// before the local guardian's conservative fencing deadline.
+					attemptBudget := elasticHeartbeatAttemptBudget(time.Until(fenceAt))
 					if attemptBudget <= 0 {
 						err = context.DeadlineExceeded
 					} else {
@@ -5237,6 +5239,17 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 			timer.Reset(delay)
 		}
 	}
+}
+
+// elasticHeartbeatAttemptBudget returns the maximum duration of one Raft
+// renewal attempt. The caller has already subtracted the lease safety margin,
+// so using two thirds of this duration cannot delay physical fencing beyond the
+// authoritative lease expiry and always reserves headroom for a retry.
+func elasticHeartbeatAttemptBudget(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		return 0
+	}
+	return remaining * 2 / 3
 }
 
 // maintainAuthorityExpirations is leader-only failure reconciliation. The

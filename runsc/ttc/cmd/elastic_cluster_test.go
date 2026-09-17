@@ -74,6 +74,25 @@ func TestMaintainElasticNodeRetriesBeforeFencing(t *testing.T) {
 	}
 }
 
+func TestElasticHeartbeatAttemptBudget(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{name: "expired", remaining: 0, want: 0},
+		{name: "negative", remaining: -time.Second, want: 0},
+		{name: "short", remaining: 3 * time.Millisecond, want: 2 * time.Millisecond},
+		{name: "throttled control plane", remaining: 6 * time.Second, want: 4 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := elasticHeartbeatAttemptBudget(test.remaining); got != test.want {
+				t.Fatalf("elasticHeartbeatAttemptBudget(%v)=%v, want %v", test.remaining, got, test.want)
+			}
+		})
+	}
+}
+
 func TestDistributedSourceRuntimeWaitsForScheduledCleanup(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
 	release := make(chan struct{})

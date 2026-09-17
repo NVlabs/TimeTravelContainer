@@ -266,7 +266,7 @@ Options:
                                   (default: disabled)
 
 Advanced cluster policy:
-  --cluster-lease DURATION        Execution lease, 1s..10m (default: 15s)
+  --cluster-lease DURATION        Execution lease, 1s..10m (default: 30s)
   --cluster-max-transactions N    Concurrent transaction bound (default: 4096)
   --cluster-transfer-bytes N      Preferred transfer bytes (default: 1048576)
   --cluster-max-outstanding-bytes N

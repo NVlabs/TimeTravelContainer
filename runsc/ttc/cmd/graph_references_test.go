@@ -105,6 +105,29 @@ func TestGraphReferenceOperationIsBranchScoped(t *testing.T) {
 	}
 }
 
+func TestGraphReferenceIntentSurvivesRenameAndNameReuse(t *testing.T) {
+	intent := graphReferenceIntent{
+		Transaction: "fork-original", Operation: "branch-reference", Branch: "original-name",
+	}
+	info := ttcbundle.ContainerInfo{Branches: []ttcbundle.BranchInfo{
+		{
+			ID: "renamed", DistributedForkTransactionID: "fork-original",
+			DistributedGraphReferenceOperation: "branch-reference",
+		},
+		{
+			ID: "original-name", DistributedForkTransactionID: "fork-reused",
+			DistributedGraphReferenceOperation: "other-reference",
+		},
+	}}
+	if !containerHasGraphReferenceIntent(info, intent) {
+		t.Fatal("renamed branch no longer owns its graph reference intent")
+	}
+	info.Branches = info.Branches[1:]
+	if containerHasGraphReferenceIntent(info, intent) {
+		t.Fatal("reused visible name was mistaken for the original branch")
+	}
+}
+
 func TestPublishedOriginReleasesOnlyItsProviderRoots(t *testing.T) {
 	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
 	if err != nil {
@@ -197,8 +220,36 @@ func TestGraphReferenceTransferLifetimeFollowsTransaction(t *testing.T) {
 		t.Fatal("transfer intent released while transaction authority was unavailable")
 	}
 	branch := graphReferenceIntent{Purpose: graphReferencePurposeBranch, State: "active"}
-	if !graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: cluster.TransactionPublished}, nil, false) {
-		t.Fatal("orphaned branch intent was retained")
+	for _, state := range []cluster.TransactionState{
+		cluster.TransactionPreparing,
+		cluster.TransactionTargetReserved,
+		cluster.TransactionSourceCaptured,
+		cluster.TransactionTargetRestoring,
+	} {
+		if graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: state}, nil, false) {
+			t.Fatalf("branch intent released before ownership handoff in %s", state)
+		}
+	}
+	for _, state := range []cluster.TransactionState{
+		cluster.TransactionTargetPaused,
+		cluster.TransactionPublished,
+		cluster.TransactionDraining,
+		cluster.TransactionIndependent,
+		cluster.TransactionCanceled,
+		cluster.TransactionFailed,
+	} {
+		if !graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: state}, nil, false) {
+			t.Fatalf("orphaned branch intent was retained in %s", state)
+		}
+	}
+	if graphReferenceIntentShouldRelease(branch, nil, errors.New("temporary quorum failure"), false) {
+		t.Fatal("transient transaction lookup failure released a branch intent")
+	}
+	if !graphReferenceIntentShouldRelease(branch, nil, os.ErrNotExist, false) {
+		t.Fatal("missing transaction and branch retained an unreachable intent")
+	}
+	if graphReferenceIntentShouldRelease(branch, &cluster.Transaction{State: cluster.TransactionIndependent}, nil, true) {
+		t.Fatal("live branch intent was released after transaction independence")
 	}
 }
 

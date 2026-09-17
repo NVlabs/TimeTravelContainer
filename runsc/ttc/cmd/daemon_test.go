@@ -1625,6 +1625,21 @@ func TestDefaultClusterTransactionCapacitySupportsHighFanout(t *testing.T) {
 	}
 }
 
+func TestClusterRaftStabilityTimeout(t *testing.T) {
+	for _, test := range []struct {
+		lease time.Duration
+		want  time.Duration
+	}{
+		{lease: 3 * time.Second, want: time.Second},
+		{lease: 30 * time.Second, want: 3 * time.Second},
+		{lease: 2 * time.Minute, want: 5 * time.Second},
+	} {
+		if got := clusterRaftStabilityTimeout(test.lease); got != test.want {
+			t.Errorf("clusterRaftStabilityTimeout(%v)=%v, want %v", test.lease, got, test.want)
+		}
+	}
+}
+
 func TestSimpleClusterOptions(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
 	args := []string{"--cluster-init", "--node", "node-a", "--listen", "127.0.0.1:7443", "--advertise", "node-a.example:7443", "--memory-target", "8GiB"}
