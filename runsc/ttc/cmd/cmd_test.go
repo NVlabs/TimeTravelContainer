@@ -375,6 +375,64 @@ func TestDistributedPortIngressCanPrecedeInitialPlacement(t *testing.T) {
 	}
 }
 
+func TestPrepareRunIngressKeepsListenerAtEntryDaemon(t *testing.T) {
+	args := []string{"run", "-dit", "--node", "node-b", "--name", "web", "--network=ttc", "-p", "127.0.0.1:18080:8080", "--publish=18081:8081", "image", "serve", "-p", "guest-argument"}
+	clean, prepared, err := prepareRunIngress(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared == nil || prepared.target != (selector{container: "web", branch: "main"}) {
+		t.Fatalf("prepared=%+v", prepared)
+	}
+	if len(prepared.bindings) != 2 || prepared.bindings[0].HostPort != 18080 || prepared.bindings[1].HostPort != 18081 {
+		t.Fatalf("bindings=%+v", prepared.bindings)
+	}
+	want := []string{"run", "-dit", "--node", "node-b", "--name", "web", "--network=ttc", "image", "serve", "-p", "guest-argument"}
+	if !slices.Equal(clean, want) {
+		t.Fatalf("clean=%q, want %q", clean, want)
+	}
+}
+
+func TestPrepareRunIngressMakesGeneratedNameExplicit(t *testing.T) {
+	clean, prepared, err := prepareRunIngress([]string{"run", "-d", "-p=18080:80", "image"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared == nil || !strings.HasPrefix(prepared.target.container, "ttc-") {
+		t.Fatalf("prepared=%+v", prepared)
+	}
+	if len(clean) < 4 || clean[1] != "--name" || clean[2] != prepared.target.container {
+		t.Fatalf("clean=%q does not expose generated name %q", clean, prepared.target.container)
+	}
+}
+
+func TestDaemonStatusWriterObservesSplitFrames(t *testing.T) {
+	var framed bytes.Buffer
+	var mu sync.Mutex
+	if err := writeDaemonFrame(&framed, &mu, daemonFrameStdout, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonStatus(&framed, &mu, 7); err != nil {
+		t.Fatal(err)
+	}
+	var forwarded bytes.Buffer
+	observer := &daemonStatusWriter{writer: &forwarded}
+	data := framed.Bytes()
+	for len(data) != 0 {
+		n := min(3, len(data))
+		if _, err := observer.Write(data[:n]); err != nil {
+			t.Fatal(err)
+		}
+		data = data[n:]
+	}
+	if !bytes.Equal(forwarded.Bytes(), framed.Bytes()) {
+		t.Fatal("observer changed the daemon frame stream")
+	}
+	if !observer.statusSeen || observer.status != 7 {
+		t.Fatalf("statusSeen=%t status=%d", observer.statusSeen, observer.status)
+	}
+}
+
 func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

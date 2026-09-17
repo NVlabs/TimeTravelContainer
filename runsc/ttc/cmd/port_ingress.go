@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,11 @@ type portIngressBinding struct {
 	cancel   context.CancelFunc
 }
 
+type preparedRunIngress struct {
+	target   selector
+	bindings []ttcbundle.PortBinding
+}
+
 var errIngressPortNotFound = errors.New("ephemeral ingress port not found")
 
 // portIngressManager owns node-local, intentionally ephemeral published
@@ -40,13 +46,37 @@ var errIngressPortNotFound = errors.New("ephemeral ingress port not found")
 // listening endpoint remains valid after migration without being recreated on
 // the destination node.
 type portIngressManager struct {
-	server *daemonServer
+	router portIngressRouter
 	mu     sync.Mutex
 	ports  map[string]*portIngressBinding
 }
 
+// portIngressRouter separates the lifetime of a node-local listening socket
+// from the runtime that currently owns its target. Compute daemons resolve the
+// route from their local Raft catalog; outbound-only control daemons resolve it
+// through a linearizable authority read. Keeping this boundary here prevents
+// the command proxy from accidentally moving an ingress socket to the branch
+// owner.
+type portIngressRouter interface {
+	Resolve(selector) (selector, error)
+	ResolveFamily(string) (string, error)
+	Forward(context.Context, selector, uint16, net.Conn) error
+	Clustered() bool
+}
+
+type daemonPortIngressRouter struct{ server *daemonServer }
+
+type controlOnlyPortIngressRouter struct {
+	cluster *controlOnlyCluster
+	root    string
+}
+
 func newPortIngressManager(server *daemonServer) *portIngressManager {
-	return &portIngressManager{server: server, ports: make(map[string]*portIngressBinding)}
+	return newRoutedPortIngressManager(daemonPortIngressRouter{server: server})
+}
+
+func newRoutedPortIngressManager(router portIngressRouter) *portIngressManager {
+	return &portIngressManager{router: router, ports: make(map[string]*portIngressBinding)}
 }
 
 func ingressPortKey(binding ttcbundle.PortBinding) string {
@@ -57,52 +87,81 @@ func (m *portIngressManager) Publish(target selector, binding ttcbundle.PortBind
 	if binding.Protocol != "tcp" {
 		return fmt.Errorf("unsupported published-port protocol %q", binding.Protocol)
 	}
-	if m.server.clusterPlacements != nil {
-		family, err := resolvePlacementFamily(m.server.clusterPlacements, target.container)
+	if m == nil || m.router == nil {
+		return errors.New("published-port ingress is unavailable")
+	}
+	resolved, err := m.router.Resolve(target)
+	if err != nil {
+		return err
+	}
+	return m.publishResolved(resolved, binding)
+}
+
+func (r daemonPortIngressRouter) Clustered() bool {
+	return r.server != nil && r.server.clusterPlacements != nil
+}
+
+func (r daemonPortIngressRouter) Resolve(target selector) (selector, error) {
+	if r.server == nil {
+		return selector{}, errors.New("published-port daemon is unavailable")
+	}
+	if r.server.clusterPlacements != nil {
+		family, err := resolvePlacementFamily(r.server.clusterPlacements, target.container)
 		if err != nil {
-			return fmt.Errorf("resolving placement family %q: %w", target.container, err)
+			return selector{}, fmt.Errorf("resolving placement family %q: %w", target.container, err)
 		}
-		placement, err := m.server.clusterPlacements.Lookup(family, target.branch)
+		placement, err := r.server.clusterPlacements.Lookup(family, target.branch)
 		if err != nil {
-			return err
+			return selector{}, err
 		}
 		if placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused {
-			return fmt.Errorf("branch %q is %s", target.branch, placement.State)
+			return selector{}, fmt.Errorf("branch %q is %s", target.branch, placement.State)
 		}
-		target.container = family
-		// Placement is sufficient to create a listener before a local image or
-		// physical runtime exists, but when the shared family record is present it
-		// must still enforce the same network-mode contract as standalone TTC.
-		// Otherwise --network=none accepts a published port that can only reset
-		// every connection later in the asynchronous forwarding path.
-		if info, loadErr := m.serverStore().LoadContainer(family); loadErr == nil {
+		if placement.Quarantined {
+			return selector{}, fmt.Errorf("branch %q is quarantined", target.branch)
+		}
+		if info, loadErr := r.serverStore().LoadContainer(family); loadErr == nil {
 			if info.NetworkMode != "ttc" {
-				return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+				return selector{}, fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
 			}
-		} else if !errors.Is(loadErr, os.ErrNotExist) && m.server.dataRoot != "" {
-			return fmt.Errorf("loading published-port family metadata: %w", loadErr)
+		} else if !errors.Is(loadErr, os.ErrNotExist) && r.server.dataRoot != "" {
+			return selector{}, fmt.Errorf("loading published-port family metadata: %w", loadErr)
 		}
-	} else {
-		info, err := m.serverStore().LoadContainer(target.container)
-		if err != nil {
-			return err
-		}
-		branch, err := persistentBranchInfo(info, target.branch)
-		if err != nil {
-			return err
-		}
-		if branch.State != "running" && branch.State != "paused" {
-			return fmt.Errorf("branch %q is %s", target.branch, branch.State)
-		}
-		if branch.Quarantined {
-			return fmt.Errorf("branch %q is quarantined", target.branch)
-		}
-		if info.NetworkMode != "ttc" {
-			return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
-		}
-		target.container = info.ID
+		return selector{container: family, branch: target.branch}, nil
 	}
-	return m.publishResolved(target, binding)
+	info, err := r.serverStore().LoadContainer(target.container)
+	if err != nil {
+		return selector{}, err
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return selector{}, err
+	}
+	if branch.State != "running" && branch.State != "paused" {
+		return selector{}, fmt.Errorf("branch %q is %s", target.branch, branch.State)
+	}
+	if branch.Quarantined {
+		return selector{}, fmt.Errorf("branch %q is quarantined", target.branch)
+	}
+	if info.NetworkMode != "ttc" {
+		return selector{}, fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+	}
+	return selector{container: info.ID, branch: target.branch}, nil
+}
+
+func (r daemonPortIngressRouter) serverStore() ttcbundle.Store {
+	return ttcbundle.Store{Root: r.server.dataRoot, ActiveRoot: r.server.localRoot, CPUFeatures: r.server.cpuFeatures}
+}
+
+func (r daemonPortIngressRouter) ResolveFamily(container string) (string, error) {
+	if r.server.clusterPlacements != nil {
+		return resolvePlacementFamily(r.server.clusterPlacements, container)
+	}
+	info, err := r.serverStore().LoadContainer(container)
+	if err != nil {
+		return "", err
+	}
+	return info.ID, nil
 }
 
 // PublishPrepared installs a node-local ingress listener for a container that
@@ -145,8 +204,41 @@ func (m *portIngressManager) publishResolved(target selector, binding ttcbundle.
 	return nil
 }
 
-func (m *portIngressManager) serverStore() ttcbundle.Store {
-	return ttcbundle.Store{Root: m.server.dataRoot, ActiveRoot: m.server.localRoot, CPUFeatures: m.server.cpuFeatures}
+// PublishPending reserves a node-local endpoint before a remotely placed run
+// exists in Raft. The logical container name is resolved on every accepted
+// connection, so the listener is useful as soon as the target commits its
+// placement and continues to follow subsequent migrations.
+func (m *portIngressManager) PublishPending(target selector, binding ttcbundle.PortBinding) error {
+	if !m.Clustered() {
+		return errors.New("pending ingress requires clustered TTC")
+	}
+	if binding.Protocol != "tcp" {
+		return fmt.Errorf("unsupported published-port protocol %q", binding.Protocol)
+	}
+	return m.publishResolved(target, binding)
+}
+
+func (m *portIngressManager) removePending(target selector, binding ttcbundle.PortBinding) error {
+	key := ingressPortKey(binding)
+	m.mu.Lock()
+	entry := m.ports[key]
+	if entry == nil || entry.target != target || entry.binding.ContainerPort != binding.ContainerPort {
+		m.mu.Unlock()
+		return errIngressPortNotFound
+	}
+	delete(m.ports, key)
+	m.mu.Unlock()
+	entry.cancel()
+	return entry.listener.Close()
+}
+
+func (m *portIngressManager) rollbackPrepared(prepared *preparedRunIngress) {
+	if prepared == nil {
+		return
+	}
+	for _, binding := range prepared.bindings {
+		_ = m.removePending(prepared.target, binding)
+	}
 }
 
 func (m *portIngressManager) serve(ctx context.Context, entry *portIngressBinding) {
@@ -163,9 +255,18 @@ func (m *portIngressManager) serve(ctx context.Context, entry *portIngressBindin
 }
 
 func (m *portIngressManager) forward(ctx context.Context, target selector, port uint16, conn net.Conn) error {
+	resolved, err := m.router.Resolve(target)
+	if err != nil {
+		return err
+	}
+	return m.router.Forward(ctx, resolved, port, conn)
+}
+
+func (r daemonPortIngressRouter) Forward(ctx context.Context, target selector, port uint16, conn net.Conn) error {
+	server := r.server
 	owner := ""
-	if m.server.clusterPlacements != nil && m.server.clusterCapabilities != nil {
-		placement, err := m.server.clusterPlacements.Lookup(target.container, target.branch)
+	if server.clusterPlacements != nil && server.clusterCapabilities != nil {
+		placement, err := server.clusterPlacements.Lookup(target.container, target.branch)
 		if err != nil {
 			return err
 		}
@@ -174,11 +275,11 @@ func (m *portIngressManager) forward(ctx context.Context, target selector, port 
 		}
 		owner = placement.OwnerNode
 	}
-	if owner == "" || m.server.clusterCapabilities == nil || owner == m.server.clusterCapabilities.NodeID {
-		backend := directBackend(m.server.optionsFromRequest(), nil, io.Discard, io.Discard)
-		m.server.configureVolumeBackend(backend)
+	if owner == "" || server.clusterCapabilities == nil || owner == server.clusterCapabilities.NodeID {
+		backend := directBackend(server.optionsFromRequest(), nil, io.Discard, io.Discard)
+		server.configureVolumeBackend(backend)
 		backend.nodeID = owner
-		backend.distributedSource = m.server.distributedSource
+		backend.distributedSource = server.distributedSource
 		guest, err := backend.openGuestPortStream(ctx, target, port)
 		if err != nil {
 			return err
@@ -186,33 +287,137 @@ func (m *portIngressManager) forward(ctx context.Context, target selector, port 
 		defer guest.Close()
 		return bridgePortStreams(ctx, conn, guest)
 	}
-	peer, err := m.server.distributedSource.peer(owner, false)
+	peer, err := server.distributedSource.peer(owner, false)
 	if err != nil {
 		return err
 	}
 	return peer.ProxyPort(ctx, target.container, target.branch, port, conn, conn)
 }
 
+func (r controlOnlyPortIngressRouter) Clustered() bool { return true }
+
+func (r controlOnlyPortIngressRouter) authorityState(ctx context.Context) (*cluster.AuthorityState, error) {
+	if r.cluster == nil {
+		return nil, errors.New("control-only cluster is unavailable")
+	}
+	var result error
+	for _, peer := range r.cluster.peerSnapshot() {
+		state, err := peer.client.AuthorityState(ctx)
+		if err == nil {
+			return state, nil
+		}
+		result = errors.Join(result, fmt.Errorf("%s: %w", peer.url, err))
+	}
+	return nil, fmt.Errorf("reading cluster authority: %w", result)
+}
+
+func controlOnlyPlacement(state *cluster.AuthorityState, target selector) (cluster.PlacementRecord, error) {
+	if state == nil {
+		return cluster.PlacementRecord{}, errors.New("cluster authority is unavailable")
+	}
+	var found *cluster.PlacementRecord
+	for _, record := range state.Placements {
+		if record.BranchID != target.branch || (record.FamilyID != target.container && record.FamilyName != target.container) {
+			continue
+		}
+		if found != nil && found.FamilyID != record.FamilyID {
+			return cluster.PlacementRecord{}, fmt.Errorf("container name %q is ambiguous", target.container)
+		}
+		copy := record
+		found = &copy
+	}
+	if found == nil {
+		return cluster.PlacementRecord{}, fmt.Errorf("branch %s does not exist", target)
+	}
+	return *found, nil
+}
+
+func (r controlOnlyPortIngressRouter) Resolve(target selector) (selector, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	state, err := r.authorityState(ctx)
+	if err != nil {
+		return selector{}, err
+	}
+	placement, err := controlOnlyPlacement(state, target)
+	if err != nil {
+		return selector{}, err
+	}
+	if placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused {
+		return selector{}, fmt.Errorf("branch %q is %s", target.branch, placement.State)
+	}
+	if placement.Quarantined {
+		return selector{}, fmt.Errorf("branch %q is quarantined", target.branch)
+	}
+	info, err := (ttcbundle.Store{Root: r.root}).LoadContainer(placement.FamilyID)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return selector{}, fmt.Errorf("loading published-port family metadata: %w", err)
+	}
+	if err == nil && info.NetworkMode != "ttc" {
+		return selector{}, fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
+	}
+	return selector{container: placement.FamilyID, branch: placement.BranchID}, nil
+}
+
+func (r controlOnlyPortIngressRouter) ResolveFamily(container string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	state, err := r.authorityState(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, record := range state.Placements {
+		if record.FamilyID == container || record.FamilyName == container {
+			return record.FamilyID, nil
+		}
+	}
+	return "", fmt.Errorf("container %q does not exist", container)
+}
+
+func (r controlOnlyPortIngressRouter) Forward(ctx context.Context, target selector, port uint16, conn net.Conn) error {
+	state, err := r.authorityState(ctx)
+	if err != nil {
+		return err
+	}
+	placement, err := controlOnlyPlacement(state, target)
+	if err != nil {
+		return err
+	}
+	if placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused {
+		return fmt.Errorf("branch %s is not connectable (placement=%s)", target, placement.State)
+	}
+	for _, peer := range r.cluster.peerSnapshot() {
+		if peer.nodeID == placement.OwnerNode {
+			return peer.client.ProxyPort(ctx, placement.FamilyID, placement.BranchID, port, conn, conn)
+		}
+	}
+	// Membership may have changed since the gateway's periodic refresh. Refresh
+	// once before declaring a currently authoritative owner unreachable.
+	refreshCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	_ = r.cluster.refreshPeers(refreshCtx)
+	cancel()
+	for _, peer := range r.cluster.peerSnapshot() {
+		if peer.nodeID == placement.OwnerNode {
+			return peer.client.ProxyPort(ctx, placement.FamilyID, placement.BranchID, port, conn, conn)
+		}
+	}
+	return fmt.Errorf("branch owner %q has no reachable control endpoint", placement.OwnerNode)
+}
+
 func (m *portIngressManager) List(container string) ([]ttcbundle.PortBinding, error) {
-	family := ""
-	if m.server.clusterPlacements != nil {
-		resolved, err := resolvePlacementFamily(m.server.clusterPlacements, container)
-		if err != nil {
-			return nil, err
-		}
-		family = resolved
-	} else {
-		info, err := m.serverStore().LoadContainer(container)
-		if err != nil {
-			return nil, err
-		}
-		family = info.ID
+	family, err := m.router.ResolveFamily(container)
+	if err != nil {
+		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var result []ttcbundle.PortBinding
 	for _, entry := range m.ports {
-		if entry.target.container == family {
+		entryFamily := entry.target.container
+		if entryFamily != family {
+			entryFamily, _ = m.router.ResolveFamily(entryFamily)
+		}
+		if entryFamily == family {
 			result = append(result, entry.binding)
 		}
 	}
@@ -220,25 +425,22 @@ func (m *portIngressManager) List(container string) ([]ttcbundle.PortBinding, er
 }
 
 func (m *portIngressManager) Unpublish(target selector, binding ttcbundle.PortBinding) error {
-	family := ""
-	if m.server.clusterPlacements != nil {
-		resolved, err := resolvePlacementFamily(m.server.clusterPlacements, target.container)
-		if err != nil {
-			return err
-		}
-		family = resolved
-	} else {
-		info, err := m.serverStore().LoadContainer(target.container)
-		if err != nil {
-			return err
-		}
-		family = info.ID
+	family, err := m.router.ResolveFamily(target.container)
+	if err != nil {
+		return err
 	}
 	binding.BranchID = target.branch
 	key := ingressPortKey(binding)
 	m.mu.Lock()
 	entry := m.ports[key]
-	if entry == nil || entry.target.container != family || entry.target.branch != target.branch || entry.binding.ContainerPort != binding.ContainerPort {
+	entryFamily := ""
+	if entry != nil {
+		entryFamily = entry.target.container
+		if entryFamily != family {
+			entryFamily, _ = m.router.ResolveFamily(entryFamily)
+		}
+	}
+	if entry == nil || entryFamily != family || entry.target.branch != target.branch || entry.binding.ContainerPort != binding.ContainerPort {
 		m.mu.Unlock()
 		return errIngressPortNotFound
 	}
@@ -246,6 +448,102 @@ func (m *portIngressManager) Unpublish(target selector, binding ttcbundle.PortBi
 	m.mu.Unlock()
 	entry.cancel()
 	return entry.listener.Close()
+}
+
+func (m *portIngressManager) Clustered() bool {
+	return m != nil && m.router != nil && m.router.Clustered()
+}
+
+// prepareRunIngress removes published-port options from a clustered run and
+// returns the node-local listeners that the entry daemon must reserve. It also
+// makes TTC's generated name explicit so a listener can refer to the logical
+// container before the remote owner creates it.
+func prepareRunIngress(args []string) ([]string, *preparedRunIngress, error) {
+	if len(args) == 0 {
+		return args, nil, nil
+	}
+	prefix := 1
+	if args[0] == "container" {
+		if len(args) < 2 || args[1] != "run" {
+			return args, nil, nil
+		}
+		prefix = 2
+	} else if args[0] != "run" {
+		return args, nil, nil
+	}
+	clean := append([]string(nil), args[:prefix]...)
+	name := ""
+	var ports []string
+	for i := prefix; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || arg == "-" || arg == "" || arg[0] != '-' {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		switch {
+		case arg == "--name":
+			if i+1 >= len(args) {
+				return nil, nil, errors.New("--name requires a container name")
+			}
+			name = args[i+1]
+			clean = append(clean, arg, name)
+			i++
+			continue
+		case strings.HasPrefix(arg, "--name="):
+			name = strings.TrimPrefix(arg, "--name=")
+			clean = append(clean, arg)
+			continue
+		case arg == "-p" || arg == "--publish":
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("%s requires a port binding", arg)
+			}
+			ports = append(ports, args[i+1])
+			i++
+			continue
+		case strings.HasPrefix(arg, "--publish="):
+			ports = append(ports, strings.TrimPrefix(arg, "--publish="))
+			continue
+		case strings.HasPrefix(arg, "-p="):
+			ports = append(ports, strings.TrimPrefix(arg, "-p="))
+			continue
+		}
+		clean = append(clean, arg)
+		if placementOptionConsumesValue("run", arg) && !strings.Contains(arg, "=") && i+1 < len(args) {
+			i++
+			clean = append(clean, args[i])
+		}
+	}
+	if len(ports) == 0 {
+		return args, nil, nil
+	}
+	bindings, err := parsePublishedPorts(ports)
+	if err != nil {
+		return nil, nil, err
+	}
+	if name == "" {
+		name = "ttc-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+		withName := make([]string, 0, len(clean)+2)
+		withName = append(withName, clean[:prefix]...)
+		withName = append(withName, "--name", name)
+		clean = append(withName, clean[prefix:]...)
+	}
+	return clean, &preparedRunIngress{target: selector{container: name, branch: defaultBranchID}, bindings: bindings}, nil
+}
+
+func (m *portIngressManager) prepareRun(args []string) ([]string, *preparedRunIngress, error) {
+	clean, prepared, err := prepareRunIngress(args)
+	if err != nil || prepared == nil {
+		return clean, prepared, err
+	}
+	for i, binding := range prepared.bindings {
+		if err := m.PublishPending(prepared.target, binding); err != nil {
+			for _, installed := range prepared.bindings[:i] {
+				_ = m.removePending(prepared.target, installed)
+			}
+			return nil, nil, fmt.Errorf("publishing ingress port: %w", err)
+		}
+	}
+	return clean, prepared, nil
 }
 
 func (m *portIngressManager) Close() error {

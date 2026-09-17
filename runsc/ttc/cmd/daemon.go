@@ -196,6 +196,9 @@ type daemonRequest struct {
 	Route           []string               `json:"route,omitempty"`
 	PlacementNode   string                 `json:"placement_node,omitempty"`
 	PlacementClaims []daemonPlacementClaim `json:"placement_claims,omitempty"`
+	// IngressPrepared means an entry daemon has already reserved every
+	// node-local listener requested by run -p and removed those flags from Args.
+	IngressPrepared bool `json:"ingress_prepared,omitempty"`
 	// DistributedLeaf marks a coordinator-generated owner-local command. It
 	// prevents a family mutation from being expanded again on the destination.
 	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
@@ -290,6 +293,9 @@ func extractPlacementNode(args []string) ([]string, string, error) {
 
 func placementOptionConsumesValue(command, arg string) bool {
 	name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+	if name == "node" {
+		return true
+	}
 	switch command {
 	case "restore":
 		return name == "name"
@@ -480,6 +486,7 @@ type controlOnlyCluster struct {
 }
 
 type controlOnlyPeer struct {
+	nodeID string
 	url    string
 	client *cluster.Client
 }
@@ -548,7 +555,14 @@ func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 				continue
 			}
 		}
-		refreshed = append(refreshed, controlOnlyPeer{url: baseURL, client: client})
+		nodeID := ""
+		for _, record := range state.Nodes {
+			if record.ControlURL == baseURL {
+				nodeID = record.NodeID
+				break
+			}
+		}
+		refreshed = append(refreshed, controlOnlyPeer{nodeID: nodeID, url: baseURL, client: client})
 	}
 	if len(refreshed) == 0 {
 		return fmt.Errorf("cluster authority contains no usable compute endpoint: %w", readErrors)
@@ -598,7 +612,7 @@ func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*c
 			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: repository %q does not match TTC_ROOT repository %q", baseURL, status.Cluster.Capabilities.RepositoryID, opts.RepositoryID))
 			continue
 		}
-		control.peers = append(control.peers, controlOnlyPeer{url: baseURL, client: client})
+		control.peers = append(control.peers, controlOnlyPeer{nodeID: status.Cluster.Capabilities.NodeID, url: baseURL, client: client})
 	}
 	if len(control.peers) == 0 {
 		return nil, fmt.Errorf("no control seed is reachable and compatible with %q: %w", sharedRoot, probeErrors)
@@ -4945,6 +4959,59 @@ type countingDaemonWriter struct {
 	bytes  int64
 }
 
+// daemonStatusWriter forwards a daemon frame stream unchanged while learning
+// its terminal status. It intentionally does not buffer stdout/stderr, which
+// may be an unbounded attached console stream.
+type daemonStatusWriter struct {
+	writer         io.Writer
+	header         [5]byte
+	headerBytes    int
+	frameType      byte
+	frameRemaining uint32
+	statusPayload  [4]byte
+	statusBytes    int
+	status         int
+	statusSeen     bool
+}
+
+func (w *daemonStatusWriter) Write(data []byte) (int, error) {
+	n, err := w.writer.Write(data)
+	w.observe(data[:n])
+	return n, err
+}
+
+func (w *daemonStatusWriter) observe(data []byte) {
+	for len(data) != 0 {
+		if w.headerBytes < len(w.header) {
+			take := min(len(w.header)-w.headerBytes, len(data))
+			copy(w.header[w.headerBytes:], data[:take])
+			w.headerBytes += take
+			data = data[take:]
+			if w.headerBytes != len(w.header) {
+				continue
+			}
+			w.frameType = w.header[0]
+			w.frameRemaining = binary.BigEndian.Uint32(w.header[1:])
+			w.statusBytes = 0
+		}
+		take := min(int(w.frameRemaining), len(data))
+		if w.frameType == daemonFrameStatus && w.statusBytes < len(w.statusPayload) {
+			copied := min(take, len(w.statusPayload)-w.statusBytes)
+			copy(w.statusPayload[w.statusBytes:], data[:copied])
+			w.statusBytes += copied
+		}
+		data = data[take:]
+		w.frameRemaining -= uint32(take)
+		if w.frameRemaining == 0 {
+			if w.frameType == daemonFrameStatus && w.statusBytes == len(w.statusPayload) {
+				w.status = int(binary.BigEndian.Uint32(w.statusPayload[:]))
+				w.statusSeen = true
+			}
+			w.headerBytes = 0
+		}
+	}
+}
+
 func (w *countingDaemonWriter) Write(data []byte) (int, error) {
 	n, err := w.writer.Write(data)
 	w.bytes += int64(n)
@@ -4952,11 +5019,14 @@ func (w *countingDaemonWriter) Write(data []byte) (int, error) {
 }
 
 type controlOnlyDaemonServer struct {
-	listener  net.Listener
-	cluster   *controlOnlyCluster
-	root      string
-	localRoot string
-	stopOnce  sync.Once
+	listener     net.Listener
+	cluster      *controlOnlyCluster
+	root         string
+	localRoot    string
+	mutationRoot string
+	portIngress  *portIngressManager
+	portMu       sync.Mutex
+	stopOnce     sync.Once
 }
 
 // serveControlOnlyDaemon exposes only the local Unix API. It never opens a TCP
@@ -4998,6 +5068,14 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 		return fmt.Errorf("unlocking daemon startup: %w", err)
 	}
 	server := &controlOnlyDaemonServer{listener: listener, cluster: control, root: sharedRoot, localRoot: dir}
+	mutationRoot, err := os.MkdirTemp(dir, ".ttc-control-mutations-")
+	if err != nil {
+		return fmt.Errorf("creating control-only mutation journal: %w", err)
+	}
+	defer os.RemoveAll(mutationRoot)
+	server.mutationRoot = mutationRoot
+	server.portIngress = newRoutedPortIngressManager(controlOnlyPortIngressRouter{cluster: control, root: sharedRoot})
+	defer server.portIngress.Close()
 	discoveryDone := make(chan struct{})
 	defer close(discoveryDone)
 	go func() {
@@ -5080,6 +5158,78 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		s.stopOnce.Do(func() { _ = s.listener.Close() })
 		return
 	}
+	// Published ports belong to the daemon contacted by the client, not to the
+	// current branch owner. A control-only gateway therefore executes these
+	// commands locally and tunnels accepted streams outbound to the owner. All
+	// other commands retain the ordinary compute-proxy path below.
+	if request.Action == "command" && len(request.Args) != 0 && request.Args[0] == "port" {
+		s.portMu.Lock()
+		defer s.portMu.Unlock()
+		if request.RequestID != "" {
+			if record, replay, err := replayCompletedDaemonMutation(s.mutationRoot, request); err != nil {
+				writeError(err)
+				return
+			} else if replay {
+				writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+				return
+			}
+		}
+		var stdout, stderr bytes.Buffer
+		backend := &runtimeBackend{portIngress: s.portIngress, stdout: &stdout, stderr: &stderr}
+		var record daemonMutationRecord
+		if request.RequestID != "" {
+			var replay bool
+			var err error
+			record, replay, err = beginDaemonMutation(s.mutationRoot, request)
+			if err != nil {
+				writeError(err)
+				return
+			}
+			if replay {
+				writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+				return
+			}
+		}
+		status := runCommand(request.Args, &stdout, &stderr, backend)
+		if request.RequestID != "" {
+			completed, err := completeDaemonMutation(s.mutationRoot, record, status, stdout.Bytes(), stderr.Bytes())
+			if err != nil {
+				fmt.Fprintf(&stderr, "ttcd: %v; command outcome is indeterminate\n", err)
+				status = 1
+			} else {
+				record = completed
+				writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
+				return
+			}
+		}
+		writeDaemonBufferedResult(conn, &writeMu, stdout.Bytes(), stderr.Bytes(), status)
+		return
+	}
+	var preparedIngress *preparedRunIngress
+	ingressCommitted := false
+	defer func() {
+		if preparedIngress != nil && !ingressCommitted {
+			s.portIngress.rollbackPrepared(preparedIngress)
+		}
+	}()
+	if request.Action == "command" && !request.IngressPrepared {
+		cleanArgs, prepared, err := s.portIngress.prepareRun(request.Args)
+		if err != nil {
+			writeError(err)
+			return
+		}
+		request.Args = cleanArgs
+		preparedIngress = prepared
+		request.IngressPrepared = prepared != nil
+		if prepared != nil {
+			encoded, err := json.Marshal(&request)
+			if err != nil {
+				writeError(err)
+				return
+			}
+			header = string(append(encoded, '\n'))
+		}
+	}
 	peers := s.cluster.peerSnapshot()
 	if len(peers) == 0 {
 		writeError(errors.New("control-only cluster has no known compute peer"))
@@ -5119,9 +5269,18 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		return
 	}
 	output := &countingDaemonWriter{writer: conn}
-	if err := client.ProxyDaemon(context.Background(), input, output); err != nil {
+	var tracked *daemonStatusWriter
+	var proxyOutput io.Writer = output
+	if preparedIngress != nil {
+		tracked = &daemonStatusWriter{writer: output}
+		proxyOutput = tracked
+	}
+	if err := client.ProxyDaemon(context.Background(), input, proxyOutput); err != nil {
 		s.cluster.active.Add(1)
 		if output.bytes != 0 {
+			// A response without a terminal status is indeterminate. Keep a
+			// prepared listener because the idempotent run may already exist.
+			ingressCommitted = preparedIngress != nil && (tracked == nil || !tracked.statusSeen || tracked.status == 0)
 			return
 		}
 		firstErr := fmt.Errorf("%s: %w", peer.url, err)
@@ -5137,7 +5296,13 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 				if candidate.url == peer.url {
 					continue
 				}
-				if retryErr := candidate.client.ProxyDaemon(context.Background(), strings.NewReader(header), output); retryErr == nil {
+				retryOutput := io.Writer(output)
+				if preparedIngress != nil {
+					tracked = &daemonStatusWriter{writer: output}
+					retryOutput = tracked
+				}
+				if retryErr := candidate.client.ProxyDaemon(context.Background(), strings.NewReader(header), retryOutput); retryErr == nil {
+					ingressCommitted = preparedIngress != nil && tracked != nil && tracked.statusSeen && tracked.status == 0
 					return
 				} else if output.bytes != 0 {
 					return
@@ -5147,6 +5312,10 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 			}
 		}
 		writeError(fmt.Errorf("proxying through compute peers: %w", firstErr))
+		return
+	}
+	if tracked != nil {
+		ingressCommitted = tracked.statusSeen && tracked.status == 0
 	}
 }
 
@@ -6184,6 +6353,13 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(fmt.Errorf("client build %q does not match daemon build %q; only 'ttc daemon stop' is allowed across versions", request.ClientBuildID, version.Version()))
 		return
 	}
+	var preparedIngress *preparedRunIngress
+	ingressCommitted := false
+	defer func() {
+		if preparedIngress != nil && !ingressCommitted {
+			s.portIngress.rollbackPrepared(preparedIngress)
+		}
+	}()
 	if request.Action == "command" {
 		cleanArgs, placementNode, err := extractPlacementNode(request.Args)
 		if err != nil {
@@ -6197,6 +6373,16 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				return
 			}
 			request.PlacementNode = placementNode
+		}
+		if s.portIngress.Clustered() && !request.IngressPrepared {
+			cleanArgs, prepared, err := s.portIngress.prepareRun(request.Args)
+			if err != nil {
+				writeError(err)
+				return
+			}
+			request.Args = cleanArgs
+			preparedIngress = prepared
+			request.IngressPrepared = prepared != nil
 		}
 	}
 	switch request.Action {
@@ -6440,7 +6626,16 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 					return
 				}
 			}
-			if err := peer.ProxyDaemon(context.Background(), input, conn); err == nil {
+			output := io.Writer(conn)
+			var tracked *daemonStatusWriter
+			if preparedIngress != nil {
+				tracked = &daemonStatusWriter{writer: conn}
+				output = tracked
+			}
+			if err := peer.ProxyDaemon(context.Background(), input, output); err == nil {
+				if tracked != nil {
+					ingressCommitted = tracked.statusSeen && tracked.status == 0
+				}
 				return
 			} else if !automaticPlacement || request.Stdin || !errors.Is(err, syscall.ECONNREFUSED) {
 				writeError(fmt.Errorf("proxying command to node %q: %w", owner, err))
@@ -6559,6 +6754,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if replay {
 			unlock()
 			stdinReader.Close()
+			ingressCommitted = preparedIngress != nil && record.Status == 0
 			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
 			return
 		}
@@ -6600,6 +6796,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if replay {
 			unlock()
 			stdinReader.Close()
+			ingressCommitted = preparedIngress != nil && record.Status == 0
 			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
 			return
 		}
@@ -6644,6 +6841,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		unlock()
 		stdinReader.Close()
 		if err == nil {
+			ingressCommitted = preparedIngress != nil && record.Status == 0
 			writeDaemonBufferedResult(conn, &writeMu, record.Stdout, record.Stderr, record.Status)
 		} else {
 			writeDaemonBufferedResult(conn, &writeMu, mutationStdout.Bytes(), mutationStderr.Bytes(), status)
@@ -6673,6 +6871,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	unlock()
 	stdinReader.Close()
+	ingressCommitted = preparedIngress != nil && status == 0
 	_ = writeDaemonStatus(conn, &writeMu, status)
 	if status == 0 && backend.daemonStopRequested {
 		s.stopAfterReply(conn)

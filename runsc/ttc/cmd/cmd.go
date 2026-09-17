@@ -6759,7 +6759,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	store := b.containerStore()
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	persistedPorts := request.publishedPorts
-	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+	if b.portIngress.Clustered() {
 		// Cluster ingress is deliberately local to the daemon that receives the
 		// run request and does not survive its restart.
 		persistedPorts = nil
@@ -6840,7 +6840,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 		return containerRunResult{}, cleanupPrepared(err)
 	}
 	var ingressBindings []ttcbundle.PortBinding
-	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+	if b.portIngress.Clustered() {
 		for _, binding := range request.publishedPorts {
 			if err := b.portIngress.PublishPrepared(prepared.Container, defaultBranchID, binding); err != nil {
 				for _, installed := range ingressBindings {
@@ -9791,7 +9791,7 @@ func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding)
 }
 
 func (b *runtimeBackend) ensurePublishedPortsForBranch(info ttcbundle.ContainerInfo, branch string) error {
-	if b.portIngress != nil && b.portIngress.server.clusterPlacements != nil {
+	if b.portIngress.Clustered() {
 		// Cluster ingress listeners are explicit node-local ephemeral objects.
 		// They are created by run -p or `ttc port publish`, not reconstructed
 		// from shared container metadata on a target or daemon restart.
@@ -10154,7 +10154,7 @@ func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBi
 // Standalone TTC has no placement catalog and therefore persists bindings in
 // the container record so daemon reconciliation can restore their listeners.
 func (b *runtimeBackend) usesEphemeralPortIngress() bool {
-	return b.portIngress != nil && b.portIngress.server != nil && b.portIngress.server.clusterPlacements != nil
+	return b.portIngress.Clustered()
 }
 
 func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcimages.Info, error) {
