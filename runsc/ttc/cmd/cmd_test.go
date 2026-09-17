@@ -4860,6 +4860,22 @@ func TestVisiblePhysicalRuntimeBranchesHidesSparseProviders(t *testing.T) {
 	}
 }
 
+func TestBranchesInPlacementSnapshotDropsRenamedMetadata(t *testing.T) {
+	branches := []Branch{
+		{ID: "main", State: "running"},
+		{ID: "old-name", State: "running"},
+		{ID: "new-name", State: "running"},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main"},
+		{FamilyID: "family", BranchID: "new-name"},
+	}
+	got := branchesInPlacementSnapshot(branches, placements)
+	if len(got) != 2 || got[0].ID != "main" || got[1].ID != "new-name" {
+		t.Fatalf("filtered branches=%+v, want main and new-name", got)
+	}
+}
+
 func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 	created := time.Unix(123, 456).UTC()
 	infos := []ttcbundle.BranchInfo{
@@ -4870,10 +4886,13 @@ func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 		},
 		{ID: "fork-retired", ParentID: "main", State: "paused", DistributedMigration: true},
 	}
-	placements := []cluster.PlacementRecord{{
-		FamilyID: "family", BranchID: "test", PhysicalContainer: "family", PhysicalBranch: "fork-current",
-		OwnerNode: "node-a", State: cluster.PlacementRunning, ParentBranch: "main", BranchCreatedAt: created, Quarantined: true,
-	}}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", State: cluster.PlacementRunning},
+		{
+			FamilyID: "family", BranchID: "test", PhysicalContainer: "family", PhysicalBranch: "fork-current",
+			OwnerNode: "node-a", State: cluster.PlacementRunning, ParentBranch: "main", BranchCreatedAt: created, Quarantined: true,
+		},
+	}
 	visible := logicalPersistentBranchInfos(infos, placements, "family")
 	if len(visible) != 2 || visible[0].ID != "main" || visible[1].ID != "test" {
 		t.Fatalf("logical persistent branches = %+v, want main and test", visible)
@@ -4883,6 +4902,24 @@ func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 	}
 	if visible[1].NodeID != "node-a" || !visible[1].CreatedAt.Equal(created) || !visible[1].Quarantined {
 		t.Fatalf("logical branch lost placement metadata: %+v", visible[1])
+	}
+}
+
+func TestLogicalPersistentBranchInfosUsesRaftNames(t *testing.T) {
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{ID: "old-name", ParentID: "main", State: "running"},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "new-name", PhysicalContainer: "remote-physical", PhysicalBranch: "private", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementRunning},
+	}
+	got := logicalPersistentBranchInfos(infos, placements, "family")
+	if len(got) != 2 || got[0].ID != "main" || got[1].ID != "new-name" {
+		t.Fatalf("logical infos=%+v, want main and new-name", got)
+	}
+	if got[1].NodeID != "node-b" || got[1].ParentID != "main" || got[1].State != "running" {
+		t.Fatalf("synthesized renamed branch=%+v", got[1])
 	}
 }
 

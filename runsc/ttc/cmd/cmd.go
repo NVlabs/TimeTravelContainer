@@ -10308,12 +10308,14 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	// transaction branch name, even though Raft exposes only the stable logical
 	// name. The private name must never enter user-facing inventory.
 	physicalPlacements := make(map[string][]cluster.PlacementRecord)
+	logicalPlacements := make(map[string][]cluster.PlacementRecord)
 	var placementRecords []cluster.PlacementRecord
 	if b.nodeID != "" {
 		if placements, err := b.placementCatalog(); err == nil {
 			if records, err := placements.List(); err == nil {
 				placementRecords = records
 				for _, record := range records {
+					logicalPlacements[record.FamilyID] = append(logicalPlacements[record.FamilyID], record)
 					if record.PhysicalContainer != "" {
 						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
 					}
@@ -10398,6 +10400,23 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			family.NodeID = owner
 			family.State = familyStateFromBranches(family.Branches)
 			byID[record.FamilyID] = family
+		}
+	}
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		// In clustered TTC, Raft is the existence authority for every logical
+		// branch, including cold/unplaced ones. container.json is a physical
+		// materialization record and can lag a rename or removal on another node;
+		// retaining names absent from the placement snapshot manufactures zombie
+		// branches in ps/ls and can make later commands appear routable.
+		for familyID, family := range byID {
+			records := logicalPlacements[familyID]
+			if len(records) == 0 {
+				delete(byID, familyID)
+				continue
+			}
+			family.Branches = branchesInPlacementSnapshot(family.Branches, records)
+			family.State = familyStateFromBranches(family.Branches)
+			byID[familyID] = family
 		}
 	}
 	if runtimeErr == nil {
@@ -10578,6 +10597,20 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		return families[i].ID < families[j].ID
 	})
 	return families, nil
+}
+
+func branchesInPlacementSnapshot(branches []Branch, placements []cluster.PlacementRecord) []Branch {
+	visible := make(map[string]struct{}, len(placements))
+	for _, placement := range placements {
+		visible[placement.BranchID] = struct{}{}
+	}
+	filtered := make([]Branch, 0, min(len(branches), len(visible)))
+	for _, branch := range branches {
+		if _, ok := visible[branch.ID]; ok {
+			filtered = append(filtered, branch)
+		}
+	}
+	return filtered
 }
 
 // mergeAuthoritativeBranch projects one Raft branch record into the public
@@ -10971,13 +11004,19 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 // remain hidden even while their local metadata genuinely still exists.
 func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, physicalContainer string) []ttcbundle.BranchInfo {
 	byPhysical := make(map[string]cluster.PlacementRecord, len(placements))
+	byLogical := make(map[string]cluster.PlacementRecord, len(placements))
+	authoritativeFamily := false
 	for _, placement := range placements {
 		if placement.PhysicalContainer == physicalContainer && placement.PhysicalBranch != "" {
 			byPhysical[placement.PhysicalBranch] = placement
 		}
+		if placement.FamilyID == physicalContainer {
+			authoritativeFamily = true
+			byLogical[placement.BranchID] = placement
+		}
 	}
 	result := make([]ttcbundle.BranchInfo, 0, len(infos))
-	byLogical := make(map[string]int, len(infos))
+	resultByLogical := make(map[string]int, len(infos))
 	for _, info := range infos {
 		logical := info
 		if info.DistributedMigration {
@@ -10998,8 +11037,24 @@ func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []clu
 			logical.DistributedForkTransactionID = ""
 			logical.DistributedGraphReferenceOperation = ""
 			logical.DistributedMigration = false
+		} else if authoritativeFamily {
+			placement, ok := byLogical[info.ID]
+			if !ok {
+				// A rename/removal committed on another node may leave this
+				// physical materialization record behind until asynchronous
+				// cleanup. It is no longer a logical branch.
+				continue
+			}
+			logical.NodeID = placement.OwnerNode
+			logical.Quarantined = placement.Quarantined
+			logical.Unplaced = placement.State == cluster.PlacementUnplaced
+			logical.State = string(placement.State)
+			logical.ParentID = placement.ParentBranch
+			if !placement.BranchCreatedAt.IsZero() {
+				logical.CreatedAt = placement.BranchCreatedAt
+			}
 		}
-		if index, exists := byLogical[logical.ID]; exists {
+		if index, exists := resultByLogical[logical.ID]; exists {
 			// The currently placed physical incarnation is authoritative over a
 			// stale persistent record carrying the same logical name.
 			if info.DistributedMigration {
@@ -11007,8 +11062,22 @@ func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []clu
 			}
 			continue
 		}
-		byLogical[logical.ID] = len(result)
+		resultByLogical[logical.ID] = len(result)
 		result = append(result, logical)
+	}
+	if authoritativeFamily {
+		for _, placement := range byLogical {
+			if _, ok := resultByLogical[placement.BranchID]; ok {
+				continue
+			}
+			result = append(result, ttcbundle.BranchInfo{
+				ID: placement.BranchID, ParentID: placement.ParentBranch,
+				NodeID: placement.OwnerNode, State: string(placement.State),
+				Quarantined: placement.Quarantined, Unplaced: placement.State == cluster.PlacementUnplaced,
+				CreatedAt: placement.BranchCreatedAt,
+			})
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
 	}
 	return result
 }
