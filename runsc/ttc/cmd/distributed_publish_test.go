@@ -32,6 +32,36 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
+type testSnapshotProviderLookup struct {
+	found bool
+	err   error
+}
+
+func (lookup testSnapshotProviderLookup) SnapshotProvider(snapshot uint64) (cluster.SnapshotOriginProvider, bool, error) {
+	return cluster.SnapshotOriginProvider{SnapshotID: snapshot, NodeID: "node-a"}, lookup.found, lookup.err
+}
+
+func TestRetirementOriginIsTerminalOnlyForAuthorityTombstone(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lookup   testSnapshotProviderLookup
+		terminal bool
+		wantErr  bool
+	}{
+		{name: "volatile", lookup: testSnapshotProviderLookup{found: true}},
+		{name: "shared", lookup: testSnapshotProviderLookup{}},
+		{name: "terminal", lookup: testSnapshotProviderLookup{err: os.ErrNotExist}, terminal: true},
+		{name: "authority failure", lookup: testSnapshotProviderLookup{err: errors.New("raft unavailable")}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			terminal, err := retirementOriginIsTerminal(test.lookup, 17)
+			if terminal != test.terminal || (err != nil) != test.wantErr {
+				t.Fatalf("retirementOriginIsTerminal() = (%t, %v), want (%t, error=%t)", terminal, err, test.terminal, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	object := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
 	state := &cluster.AuthorityState{VolatileOrigins: map[uint64]cluster.SnapshotProvider{17: {NodeID: "node-a"}}}

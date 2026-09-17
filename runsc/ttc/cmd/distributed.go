@@ -1785,6 +1785,57 @@ func (b *runtimeBackend) publishVolatileFilesystemOrigin(origin ttcsnapshot.Snap
 	return nil
 }
 
+type snapshotProviderLookup interface {
+	SnapshotProvider(uint64) (cluster.SnapshotOriginProvider, bool, error)
+}
+
+func retirementOriginIsTerminal(authority snapshotProviderLookup, origin ttcsnapshot.SnapshotID) (bool, error) {
+	if authority == nil || origin == 0 {
+		return false, errors.New("snapshot origin authority is unavailable")
+	}
+	_, _, err := authority.SnapshotProvider(uint64(origin))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, err
+}
+
+// publishRetirementFilesystemOrigin publishes a filesystem origin discovered
+// in node-local repository metadata unless Raft has already permanently
+// retired or abandoned that origin. A corrupted branch can leave an immutable
+// local graph generation behind after provider-loss reconciliation has
+// tombstoned its authority. Such residue must not prevent the node that still
+// holds the disposable scratch copy from retiring.
+//
+// Do not generally translate os.ErrNotExist from publication into success:
+// the same error can report a missing live bulk object or shared manifest. We
+// only accept it after SnapshotProvider itself proves the origin terminal,
+// including a race in which authority becomes terminal during publication.
+func (b *runtimeBackend) publishRetirementFilesystemOrigin(origin ttcsnapshot.SnapshotID) error {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return errors.New("distributed filesystem publication is unavailable")
+	}
+	terminal, err := retirementOriginIsTerminal(b.distributedSource.authority, origin)
+	if err != nil {
+		return fmt.Errorf("resolving retiring filesystem origin %d: %w", origin, err)
+	}
+	if terminal {
+		return nil
+	}
+	err = b.publishVolatileFilesystemOrigin(origin)
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	terminal, lookupErr := retirementOriginIsTerminal(b.distributedSource.authority, origin)
+	if lookupErr != nil {
+		return errors.Join(err, fmt.Errorf("rechecking retiring filesystem origin %d authority: %w", origin, lookupErr))
+	}
+	if terminal {
+		return nil
+	}
+	return err
+}
+
 // publishRemainingVolatileOrigins is the graceful-retirement authority
 // barrier. Branch migration and dependency draining remove the common roots,
 // but remote descendants may legitimately keep older immutable origins alive.
@@ -1804,7 +1855,7 @@ func (b *runtimeBackend) publishRemainingVolatileOrigins() error {
 		return fmt.Errorf("preparing retiring filesystem generations: %w", err)
 	}
 	for _, origin := range preparedFilesystem {
-		if err := b.publishVolatileFilesystemOrigin(origin); err != nil {
+		if err := b.publishRetirementFilesystemOrigin(origin); err != nil {
 			return fmt.Errorf("publishing prepared filesystem origin %d: %w", origin, err)
 		}
 	}
