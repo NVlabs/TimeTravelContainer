@@ -796,6 +796,86 @@ func TestSnapshotLedgerHandoffCatchupIsDurableAndExact(t *testing.T) {
 	}
 }
 
+func TestSnapshotLedgerHandoffTracksPreparedFilesystemTransactions(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "graph")
+	graph, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := graph.CreateObject(origin, "build/first", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := graph.CreateObject(origin, "build/second", ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	filesystemOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootName := "branch/main/filesystem"
+	if _, err := graph.ApplyFilesystem(filesystemOrigin, rootName, []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}},
+		{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, File: first}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "value", Inode: 2}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := graph.BeginSnapshotLedgerHandoff(origin); err != nil {
+		t.Fatal(err)
+	}
+
+	// ApplyFilesystem uses commitLockedPrepared. Replacing the root twice
+	// must advance the handoff cursor in the writer as well as in the WAL.
+	for index := 0; index < 2; index++ {
+		file := second
+		if index == 1 {
+			file = first
+		}
+		if _, err := graph.ApplyFilesystem(filesystemOrigin, rootName, []FilesystemOperation{
+			{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, File: file, MtimeNsec: int64(index + 1)}},
+		}); err != nil {
+			t.Fatalf("filesystem mutation %d: %v", index, err)
+		}
+	}
+	changes, cursor, _, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != uint64(len(changes)) || cursor == 0 {
+		t.Fatalf("handoff cursor=%d changes=%d", cursor, len(changes))
+	}
+	for index, change := range changes {
+		if change.Sequence != uint64(index+1) {
+			t.Fatalf("change %d sequence=%d", index, change.Sequence)
+		}
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(directory)
+	if err != nil {
+		t.Fatalf("reopening graph after prepared handoff mutations: %v", err)
+	}
+	defer reopened.Close()
+	replayed, replayedCursor, _, err := reopened.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayedCursor != cursor || len(replayed) != len(changes) {
+		t.Fatalf("replayed cursor=%d changes=%d, want %d/%d", replayedCursor, len(replayed), cursor, len(changes))
+	}
+}
+
 func TestReferenceLedgerRetiresOnlyEmptyDrainedOrigin(t *testing.T) {
 	origin := SnapshotID(41)
 	object := Object{ID: ObjectID{Snapshot: origin, Kind: ObjectKindFile, Ordinal: 1}}

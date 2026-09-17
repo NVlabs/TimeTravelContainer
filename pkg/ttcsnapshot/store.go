@@ -1618,6 +1618,17 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		}
 		if len(mutations) != 0 {
 			record.Ops = append(record.Ops, mutations...)
+			// A prepared transaction applies only the caller's original
+			// high-level mutation. The handoff mutations above are derived
+			// after that prepared state was built, so using the prepared
+			// installer would leave Handoffs.NextSequence unchanged in this
+			// Store. A subsequent transaction would then emit the same
+			// sequence numbers again, producing a journal that no fresh
+			// reader can replay. Apply the complete bounded journal record
+			// whenever handoff catch-up was appended. This remains O(number
+			// of operations in this transaction); it does not clone or walk
+			// the graph.
+			prepared = nil
 			if err := validateJournalRecord(record); err != nil {
 				return err
 			}
