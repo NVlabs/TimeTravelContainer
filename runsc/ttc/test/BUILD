@@ -190,6 +190,16 @@ sh_binary(
     ],
 )
 
+# Manual because it starts three clustered daemons and composes branch state
+# transitions with graceful node and daemon retirement policies.
+sh_binary(
+    name = "e2e_lifecycle_state_matrix",
+    srcs = ["e2e_lifecycle_state_matrix.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Hermetic registry integration: both the server and OCI guest are repository-built.
 sh_binary(
     name = "e2e_local_registry",

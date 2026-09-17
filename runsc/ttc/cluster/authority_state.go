@@ -81,6 +81,7 @@ const (
 	AuthorityPublicationCancel     AuthorityCommandKind = "publication-cancel"
 	AuthorityBranchCorrupt         AuthorityCommandKind = "branch-mark-corrupted"
 	AuthorityBranchInherit         AuthorityCommandKind = "branch-inherit-dependencies"
+	AuthorityBranchDiscardMemory   AuthorityCommandKind = "branch-discard-memory"
 	AuthorityBranchRemoveCorrupted AuthorityCommandKind = "branch-remove-corrupted"
 	AuthoritySnapshotAllocate      AuthorityCommandKind = "snapshot-allocate"
 	AuthoritySnapshotAbandon       AuthorityCommandKind = "snapshot-abandon"
@@ -503,7 +504,7 @@ func (s *AuthorityState) cloneMutationMaps(kind AuthorityCommandKind) {
 		if kind == AuthorityPublicationCommit {
 			s.Placements = cloneAuthorityMap(s.Placements)
 		}
-	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchRemoveCorrupted:
+	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchDiscardMemory, AuthorityBranchRemoveCorrupted:
 		s.Branches = cloneAuthorityMap(s.Branches)
 		s.Placements = cloneAuthorityMap(s.Placements)
 		s.Publications = cloneAuthorityMap(s.Publications)
@@ -724,7 +725,7 @@ func (s *AuthorityState) apply(command AuthorityCommand) (json.RawMessage, error
 	case AuthorityPublicationBegin, AuthorityPublicationReady, AuthorityPublicationCommit,
 		AuthorityPublicationFail, AuthorityPublicationCancel:
 		return s.applyPublication(command)
-	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchRemoveCorrupted:
+	case AuthorityBranchCorrupt, AuthorityBranchInherit, AuthorityBranchDiscardMemory, AuthorityBranchRemoveCorrupted:
 		return s.applyBranch(command)
 	case AuthoritySnapshotAllocate, AuthoritySnapshotAbandon, AuthoritySnapshotPublish:
 		return s.applySnapshot(command)
@@ -2138,6 +2139,34 @@ func (s *AuthorityState) applyBranch(command AuthorityCommand) (json.RawMessage,
 			return nil, errors.New("corruption requires a reason")
 		}
 		branch = s.markBranchCorrupted(key, p.Failure, command.IssuedAt)
+		return authorityValue(branch)
+	case AuthorityBranchDiscardMemory:
+		placement, ok := s.Placements[key]
+		if !ok || placement.Generation != branch.Generation || placement.State != PlacementUnplaced {
+			return nil, errors.New("dehydrated branch does not have a stable unplaced generation")
+		}
+		if branch.Corrupted || branch.Lifecycle != "dehydrated" || branch.Roots.FilesystemRoot == "" || len(branch.VolatileDependencies) != 0 {
+			return nil, errors.New("branch does not have a durable dehydrated snapshot")
+		}
+		branch.Generation++
+		branch.Lifecycle = "exited"
+		branch.PublicationID = ""
+		branch.Roots.MemoryRoot = ""
+		branch.Roots.MemorySnapshot = 0
+		branch.UpdatedAt = command.IssuedAt
+		placement.Generation = branch.Generation
+		placement.Revision++
+		placement.UpdatedAt = command.IssuedAt
+		if err := placement.validate(); err != nil {
+			return nil, err
+		}
+		s.Branches[key] = branch
+		s.Placements[key] = placement
+		for publicationKey, publication := range s.Publications {
+			if publication.FamilyID == p.Family && publication.BranchID == p.Branch && publication.State == PublicationCommitted {
+				delete(s.Publications, publicationKey)
+			}
+		}
 		return authorityValue(branch)
 	case AuthorityBranchRemoveCorrupted:
 		if !branch.Corrupted {

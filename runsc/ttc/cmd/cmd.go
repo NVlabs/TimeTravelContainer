@@ -4591,7 +4591,7 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 			stopTimeout = timeout
 		}
 		for _, target := range targets {
-			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend, true); err != nil {
 				return err
 			}
 		}
@@ -4600,8 +4600,11 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend, publish bool) error {
 	queueExit := func() error {
+		if !publish {
+			return nil
+		}
 		if publisher, ok := backend.(interface{ queueBranchPublication(selector, string) error }); ok {
 			if err := publisher.queueBranchPublication(target.selector, "stop"); err != nil {
 				return fmt.Errorf("queueing durable filesystem publication for %s: %w", target.selector, err)
@@ -4636,14 +4639,37 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
 		}
 		return queueExit()
-	case "paused", "dehydrated":
+	case "paused":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
+		}
+		return queueExit()
+	case "dehydrated":
+		if err := backend.discard(target.selector); err != nil {
+			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
+		}
+		if authority, ok := backend.(coldStopAuthorityBackend); ok {
+			handled, err := authority.finalizeColdStopAuthority(target.selector, target.state)
+			if err != nil {
+				return err
+			}
+			if handled {
+				return nil
+			}
 		}
 		return queueExit()
 	case "exited":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing exited execution state for %s: %w", target.selector, err)
+		}
+		if authority, ok := backend.(coldStopAuthorityBackend); ok {
+			handled, err := authority.finalizeColdStopAuthority(target.selector, target.state)
+			if err != nil {
+				return err
+			}
+			if handled {
+				return nil
+			}
 		}
 		return queueExit()
 	case "created", "failed", "dead":
@@ -4806,10 +4832,17 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		}
 		switch target.state {
 		case "running", "restarting", "paused", "dehydrated":
-			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
+			// Restart consumes the stopped state immediately on the same node.
+			// Publishing that transient state introduces an unnecessary race in
+			// which the asynchronous publication can unplace the branch between
+			// stop and the fresh start.
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend, false); err != nil {
 				return err
 			}
-		case "created", "exited", "failed", "dead":
+		case "created", "exited", "failed", "dead", "materializing":
+			// Cluster admission claims an unplaced dehydrated branch as
+			// materializing after converting it to an exited filesystem-only
+			// snapshot. The node-local record is ready for the fresh start below.
 		default:
 			return fmt.Errorf("cannot restart %s in state %q", target.selector, target.state)
 		}
@@ -5544,8 +5577,48 @@ type authoritativeDurabilityBackend interface {
 	authoritativeBranchDurable(selector) (bool, error)
 }
 
+type coldStopAuthorityBackend interface {
+	finalizeColdStopAuthority(selector, string) (bool, error)
+}
+
 func (b *runtimeBackend) localStorageIsDurable() bool {
 	return b != nil && b.distributedSource == nil
+}
+
+// finalizeColdStopAuthority avoids recapturing an already durable, unplaced
+// branch. In particular, stopping a dehydrated branch only drops its memory
+// root; its immutable filesystem root is already authoritative in shared
+// storage and needs no physical placement or second publication.
+func (b *runtimeBackend) finalizeColdStopAuthority(target selector, previousState string) (bool, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false, nil
+	}
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return false, err
+	}
+	family := logicalFamilyID(info)
+	branch, err := b.distributedSource.authority.Branch(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	placement, err := b.distributedSource.authority.LookupPlacement(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	if previousState == "dehydrated" {
+		if placement.State != cluster.PlacementUnplaced {
+			return false, errors.New("dehydrated branch is no longer unplaced")
+		}
+		if _, err := b.distributedSource.authority.DiscardDehydratedMemory(family, target.branch); err != nil {
+			return false, fmt.Errorf("discarding durable memory authority for %s: %w", target, err)
+		}
+		return true, nil
+	}
+	if previousState == "exited" && placement.State == cluster.PlacementUnplaced && branch.Lifecycle == "exited" && branch.Roots.FilesystemRoot != "" {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, error) {
@@ -5568,7 +5641,17 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 		return false, nil
 	}
 	if branch.PublicationID == "" {
-		return false, nil
+		// A stopped dehydrated branch deliberately drops its memory root and
+		// terminal publication history in one Raft transition. Its filesystem
+		// root remains authoritative, and an unplaced generation proves that no
+		// mutable runtime can still supersede it. Do not require dead transaction
+		// metadata merely to report this stable state as durable.
+		placement, placementErr := b.distributedSource.authority.LookupPlacement(family, target.branch)
+		if placementErr != nil {
+			return false, placementErr
+		}
+		return branch.Lifecycle == "exited" && branch.Roots.FilesystemRoot != "" &&
+			branch.Roots.MemoryRoot == "" && branch.Roots.MemorySnapshot == 0 && placement.State == cluster.PlacementUnplaced, nil
 	}
 	publication, ok, err := b.distributedSource.authority.Publication(family, target.branch, branch.PublicationID)
 	if err != nil {
@@ -6871,6 +6954,10 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return 1, err
 	}
 	if len(preservedPeers) != 0 {
+		info, branch, err = b.prepareFreshStartStorage(info, target)
+		if err != nil {
+			return 1, err
+		}
 		if err := b.startFreshBranchBesidePeers(info, target, branch); err != nil {
 			return 1, err
 		}
@@ -6890,31 +6977,9 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
 		return 1, fmt.Errorf("preparing a fresh runtime for %s: %w", target, err)
 	}
-	if b.dataRoot != "" {
-		store := b.containerStore()
-		info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
-		if err != nil {
-			return 1, err
-		}
-		if _, err := store.PruneImageRoots(context.Background()); err != nil {
-			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
-		}
-		branch, err = persistentBranchInfo(info, target.branch)
-		if err != nil {
-			return 1, err
-		}
-		if branch.StorageManifest != "" {
-			if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
-				return 1, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
-			}
-			// A fresh start does not restore serialized Sentry state: its VFS
-			// is constructed directly from the newly materialized local
-			// repository. Retire the one-shot source alias before this runtime
-			// can become a later migration source.
-			if err := store.CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
-				return 1, fmt.Errorf("canonicalizing fresh filesystem identities for %s: %w", target, err)
-			}
-		}
+	info, branch, err = b.prepareFreshStartStorage(info, target)
+	if err != nil {
+		return 1, err
 	}
 	filesystemBranch := branch.FilesystemBranch
 	if filesystemBranch == "" {
@@ -6937,6 +7002,47 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return b.applyAutoRemove(target, running, status, err)
 	}
 	return status, err
+}
+
+// prepareFreshStartStorage makes the target branch's immutable image and
+// filesystem roots usable from this node's active repository. It is shared by
+// full-sandbox replacement and bootstrap-beside-peers: a cold branch may be
+// admitted on a node that has neither its image extraction nor its writable
+// repository yet.
+func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if b.dataRoot == "" {
+		return info, branch, nil
+	}
+	store := b.containerStore()
+	info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("pruning superseded image roots: %w", err)
+	}
+	branch, err = persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if branch.StorageManifest == "" {
+		return info, branch, nil
+	}
+	if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
+	}
+	// A fresh start does not restore serialized Sentry state: its VFS is
+	// constructed directly from the newly materialized local repository. Retire
+	// the one-shot source alias before this runtime can become a later migration
+	// source.
+	if err := store.CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("canonicalizing fresh filesystem identities for %s: %w", target, err)
+	}
+	return info, branch, nil
 }
 
 // freshStartPeers returns active branches that must survive replacement of the

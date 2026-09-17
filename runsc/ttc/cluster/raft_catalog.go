@@ -475,6 +475,27 @@ func (c *RaftCatalog) MarkBranchCorrupted(family, branch, reason string) (*Branc
 	})
 }
 
+// DiscardDehydratedMemory converts a durable process snapshot into an exited
+// filesystem snapshot without materializing it. The generation change fences
+// a concurrent rehydrate, and removing the memory root makes its immutable
+// chunks eligible for ordinary shared-GC tracing.
+func (c *RaftCatalog) DiscardDehydratedMemory(family, branch string) (*BranchAuthority, error) {
+	state, err := c.state()
+	if err != nil {
+		return nil, err
+	}
+	record, ok := state.Branches[logicalBranchKey(family, branch)]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if record.Lifecycle == "exited" && record.Roots.MemoryRoot == "" && record.Roots.MemorySnapshot == 0 {
+		return &record, nil
+	}
+	return applyRaftValue[BranchAuthority](c, time.Now().UTC(), AuthorityBranchDiscardMemory, AuthorityPublicationPayload{
+		Family: family, Branch: branch, BranchGeneration: record.Generation,
+	})
+}
+
 // Branches returns a linearizable snapshot of logical branch authority. Bulk
 // memory and filesystem objects are intentionally absent; only lifecycle,
 // fencing generations, durable roots, and coarse volatile dependencies live

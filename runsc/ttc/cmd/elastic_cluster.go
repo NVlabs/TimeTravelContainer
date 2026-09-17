@@ -372,7 +372,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		return "", nil, errors.New("placement authority is unavailable")
 	}
 	owner := ""
-	allowMaterializing := len(args) != 0 && (args[0] == "start" || args[0] == "rehydrate")
+	allowMaterializing := len(args) != 0 && (args[0] == "start" || args[0] == "rehydrate" || args[0] == "restart")
 	var claims []daemonPlacementClaim
 	seen := make(map[string]struct{})
 	for _, arg := range args[1:] {
@@ -1182,7 +1182,7 @@ func daemonCommandNeedsPlacementAdmission(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "run", "create", "start", "rehydrate", "restore":
+	case "run", "create", "start", "rehydrate", "restart", "restore":
 		return true
 	case "container":
 		return len(args) > 1 && (args[1] == "run" || args[1] == "create")
@@ -1222,7 +1222,14 @@ func daemonCommandMayAwaitColdUnplacement(dataRoot string, placements cluster.Pl
 		}
 		if authoritative {
 			branch, err := authority.Branch(familyID, target.branch)
-			if err != nil || branch.Corrupted || branch.PublicationID == "" {
+			if err != nil || branch.Corrupted {
+				return false
+			}
+			// An exited branch produced by stopping a durable dehydrated
+			// snapshot has no active publication transaction and no memory
+			// root. Its immutable filesystem root is sufficient to admit a
+			// fresh start while an older placement release finishes.
+			if branch.PublicationID == "" && (branch.Lifecycle != "exited" || branch.Roots.FilesystemRoot == "" || branch.Roots.MemoryRoot != "" || branch.Roots.MemorySnapshot != 0) {
 				return false
 			}
 			switch normalizeLifecycleState(branch.Lifecycle) {
@@ -1264,22 +1271,33 @@ func daemonCommandMayAwaitColdUnplacement(dataRoot string, placements cluster.Pl
 // also orders the old publisher's queue completion before rehydration clears
 // the publication identity for the new mutable runtime.
 func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Store, containerID, branchID string, authority cluster.BranchAuthority) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
-	if authority.PublicationID == "" || authority.Roots.FilesystemRoot == "" {
+	if authority.Roots.FilesystemRoot == "" {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, errors.New("unplaced branch has no committed publication roots")
 	}
 	expectedManifest := filepath.Join(store.Root, filepath.FromSlash(authority.Roots.FilesystemRoot))
 	if err := validateColdManifestPath(store.Root, expectedManifest); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	}
+	manifest, err := readColdBranchManifest(expectedManifest)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("reading committed cold manifest for %s@%s: %w", containerID, branchID, err)
+	}
+	if authority.PublicationID != "" && manifest.PublicationID != authority.PublicationID {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("committed cold manifest publication is %q, authority has %q", manifest.PublicationID, authority.PublicationID)
+	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	lastPublicationID := ""
 	for {
-		info, err := store.LoadRuntimeContainer(containerID)
+		// The manifest is the authoritative filesystem root and contains the
+		// exact physical record that published it. This remains resolvable after
+		// stop discards the memory root and terminal publication transaction,
+		// and avoids selecting a stale same-named record after migrations.
+		info, err := store.LoadRuntimeContainer(manifest.Container)
 		if err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
-		branch, err := persistentBranchInfo(info, branchID)
+		branch, err := persistentBranchInfo(info, manifest.Branch)
 		if err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
@@ -1288,12 +1306,12 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		// metadata update. An empty or older ID therefore means the publisher
 		// has not completed its shared-catalog write yet, not that the committed
 		// roots are invalid. Poll until the exact authoritative identity appears.
-		if branch.PublicationID == authority.PublicationID && branch.StorageState == "shared" && branch.StorageManifest != "" {
+		if branch.PublicationID == manifest.PublicationID && branch.StorageState == "shared" && branch.StorageManifest != "" {
 			if filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
-				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", branchID, branch.StorageManifest, expectedManifest)
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", manifest.Branch, branch.StorageManifest, expectedManifest)
 			}
 			if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {
-				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", branchID, branch.SnapshotID, authority.Roots.MemorySnapshot)
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", manifest.Branch, branch.SnapshotID, authority.Roots.MemorySnapshot)
 			}
 			if _, err := os.Stat(expectedManifest); err != nil {
 				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("opening committed cold manifest: %w", err)
@@ -1302,7 +1320,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		}
 		select {
 		case <-ctx.Done():
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q, want %q): %w", lastPublicationID, authority.PublicationID, ctx.Err())
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q, want %q): %w", lastPublicationID, manifest.PublicationID, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -1318,12 +1336,15 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 // fails. Retrying is then routed back to the node that may hold local staging
 // state, while node drain can still move or republish the cold branch.
 func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, args []string) error {
-	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start") {
+	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start" && args[0] != "restart") {
 		return nil
 	}
-	node, err := s.clusterDirectory.Lookup(s.clusterCapabilities.NodeID)
+	// Raft leadership changes invalidate execution grants from the preceding
+	// term. Renew synchronously at the admission boundary instead of depending
+	// on the periodic heartbeat winning the race with this user request.
+	node, err := backend.renewDistributedExecutionAuthority()
 	if err != nil {
-		return fmt.Errorf("loading cold-branch placement node: %w", err)
+		return fmt.Errorf("renewing cold-branch placement authority: %w", err)
 	}
 	if !node.AcceptsPlacement(time.Now()) {
 		return fmt.Errorf("cluster node %q is not accepting cold-branch placement (state=%s)", node.NodeID, node.State)
@@ -1353,6 +1374,37 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		}
 		if err != nil {
 			return fmt.Errorf("loading placement for %s: %w", target, err)
+		}
+		// Restarting a dehydrated branch means discarding its serialized process
+		// state and starting a fresh init while retaining its filesystem. Do this
+		// while the branch is still unplaced, then claim the resulting exited
+		// snapshot below. Claiming first would make the memory-discard transition
+		// race a materializing owner and leave unused memory roots reachable.
+		if args[0] == "restart" && record.State == cluster.PlacementUnplaced {
+			if authority, ok := placements.(interface {
+				Branch(family, branch string) (*cluster.BranchAuthority, error)
+			}); ok {
+				committed, authorityErr := authority.Branch(familyID, target.branch)
+				if authorityErr != nil {
+					return fmt.Errorf("loading restart authority for %s: %w", target, authorityErr)
+				}
+				if normalizeLifecycleState(committed.Lifecycle) == "dehydrated" {
+					if err := backend.discard(target); err != nil {
+						return fmt.Errorf("discarding dehydrated process state before restarting %s: %w", target, err)
+					}
+					handled, err := backend.finalizeColdStopAuthority(target, "dehydrated")
+					if err != nil {
+						return err
+					}
+					if !handled {
+						return fmt.Errorf("dehydrated restart for %s did not finalize cold authority", target)
+					}
+					record, err = placements.Lookup(familyID, target.branch)
+					if err != nil {
+						return fmt.Errorf("reloading exited placement for %s: %w", target, err)
+					}
+				}
+			}
 		}
 		if record.State != cluster.PlacementUnplaced {
 			if record.OwnerNode != node.NodeID || record.OwnerIncarnation != node.Incarnation {
@@ -1384,6 +1436,7 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 				return fmt.Errorf("waiting to claim cold branch %s: %w", target, waitErr)
 			}
 			info, branch = persistent, persistentBranch
+			resolved = selector{container: persistent.ID, branch: persistentBranch.ID}
 		}
 		claimed, err := placements.ClaimUnplaced(familyID, target.branch, node.NodeID, node.Incarnation, info.ID, resolved.branch, record.Generation, cluster.PlacementMaterializing, time.Now())
 		if err != nil {

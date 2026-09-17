@@ -717,6 +717,49 @@ func TestAuthorityPublicationUnplacesHealthyBranch(t *testing.T) {
 	}
 }
 
+func TestAuthorityDiscardDehydratedMemoryPreservesFilesystem(t *testing.T) {
+	at := time.Unix(3550, 0).UTC()
+	state := NewAuthorityState()
+	state.NextSnapshotID = 8
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "cold", PhysicalContainer: "physical", PhysicalBranch: "cold",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementPaused,
+	}}))
+	begin := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-begin", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "cold", PublicationID: "publication-cold", Lifecycle: "dehydrated", BranchGeneration: created.Generation,
+	}))
+	ready := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-ready", at.Add(2*time.Second), AuthorityPublicationReady, AuthorityPublicationPayload{
+		Family: "family", Branch: "cold", PublicationID: "publication-cold", BranchGeneration: created.Generation, Revision: begin.Revision,
+		Roots: DurableRoots{MemorySnapshot: 7},
+	}))
+	applyAuthorityForTest(t, state, "publish-commit", at.Add(3*time.Second), AuthorityPublicationCommit, AuthorityPublicationPayload{
+		Family: "family", Branch: "cold", PublicationID: "publication-cold", BranchGeneration: created.Generation, Revision: ready.Revision,
+		Roots: DurableRoots{MemorySnapshot: 7, FilesystemRoot: "cold/manifests/family/cold/publication-cold.json"},
+	})
+	committed := state.Branches[logicalBranchKey("family", "cold")]
+	discarded := decodeAuthorityResultForTest[BranchAuthority](t, applyAuthorityForTest(t, state, "discard-memory", at.Add(4*time.Second), AuthorityBranchDiscardMemory, AuthorityPublicationPayload{
+		Family: "family", Branch: "cold", BranchGeneration: committed.Generation,
+	}))
+	if discarded.Lifecycle != "exited" || discarded.Roots.MemorySnapshot != 0 || discarded.Roots.MemoryRoot != "" ||
+		discarded.Roots.FilesystemRoot != "cold/manifests/family/cold/publication-cold.json" || discarded.PublicationID != "" {
+		t.Fatalf("discarded authority = %+v", discarded)
+	}
+	placement := state.Placements[logicalBranchKey("family", "cold")]
+	if placement.State != PlacementUnplaced || placement.Generation != discarded.Generation {
+		t.Fatalf("discarded placement = %+v, branch = %+v", placement, discarded)
+	}
+	if len(state.Publications) != 0 {
+		t.Fatalf("discard retained committed publication history: %+v", state.Publications)
+	}
+	stale, _ := NewAuthorityCommand("discard-memory-stale", at.Add(5*time.Second), AuthorityBranchDiscardMemory, AuthorityPublicationPayload{
+		Family: "family", Branch: "cold", BranchGeneration: committed.Generation,
+	})
+	if result := state.Apply(stale); result.Err() == nil {
+		t.Fatal("stale memory discard unexpectedly succeeded")
+	}
+}
+
 func TestAuthorityCanceledDehydrationRestoresPriorLifecycle(t *testing.T) {
 	at := time.Unix(3600, 0).UTC()
 	state := NewAuthorityState()

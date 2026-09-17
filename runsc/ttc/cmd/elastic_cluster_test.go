@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
@@ -503,7 +504,15 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	if err := os.MkdirAll(filepath.Dir(manifest), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(manifest, []byte("{}\n"), 0600); err != nil {
+	encodedManifest, err := json.Marshal(coldBranchManifest{
+		Version: 5, Container: "family-id", Branch: "cold", PublicationID: publicationID, Kind: "dehydrate",
+		MemorySnapshot: 17,
+		ControlRoot:    ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, append(encodedManifest, '\n'), 0600); err != nil {
 		t.Fatal(err)
 	}
 	metadataPath := filepath.Join(containerDir, "container.json")
@@ -557,6 +566,64 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	}
 }
 
+func TestWaitForCommittedColdBranchMetadataUsesFilesystemRootAfterMemoryDiscard(t *testing.T) {
+	root := t.TempDir()
+	const (
+		publicationID  = "publication-cold"
+		physicalID     = "physical-cold"
+		physicalBranch = "transaction-cold"
+	)
+	containerDir := filepath.Join(root, "containers", physicalID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(root, physicalID, physicalBranch, publicationID)
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	encodedManifest, err := json.Marshal(coldBranchManifest{
+		Version: 5, Container: physicalID, Branch: physicalBranch, PublicationID: publicationID, Kind: "dehydrate",
+		MemorySnapshot: 17,
+		ControlRoot:    ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encodedManifest, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, DistributedFamilyID: "family-id", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: physicalBranch, State: "exited", Unplaced: true, StorageState: "shared",
+			PublicationID: publicationID, StorageManifest: manifestPath,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family-id", BranchID: "cold", Lifecycle: "exited",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	info, branch, err := waitForCommittedColdBranchMetadata(ctx, ttcbundle.Store{Root: root}, "family-id", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ID != physicalID || branch.ID != physicalBranch || branch.PublicationID != publicationID {
+		t.Fatalf("resolved info=%q branch=%+v", info.ID, branch)
+	}
+}
+
 func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	root := t.TempDir()
 	local := t.TempDir()
@@ -589,7 +656,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<30), now, time.Minute)
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +761,7 @@ func TestClaimUnplacedDistributedPhysicalBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<30), now, time.Minute)
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
