@@ -3576,6 +3576,58 @@ func (b *runtimeBackend) reclaimUnownedLocalFamilyState() error {
 	return result
 }
 
+// reclaimRetiringNodeRuntimes is the final process fence for a graceful node
+// retirement. Branch-by-branch migration cleanup is necessarily incremental:
+// several logical branches may have shared one physical Sentry, a cold branch
+// may have moved without a migration transaction, and an asynchronous source
+// monitor may finish just as drain takes over. None of those implementation
+// histories are authority. Once Raft grants this node neither a placement nor
+// a live source dependency, every remaining local sandbox is an orphan and
+// must be reaped before the node reports a completed drain.
+func (b *runtimeBackend) reclaimRetiringNodeRuntimes() error {
+	if b == nil || b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	state, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return fmt.Errorf("reading terminal execution authority: %w", err)
+	}
+	for _, placement := range state.Placements {
+		if placement.OwnerNode == b.nodeID {
+			return fmt.Errorf("branch %s@%s still grants execution to retiring node %q", placement.FamilyID, placement.BranchID, b.nodeID)
+		}
+	}
+	for _, transaction := range state.Transactions {
+		if transaction.Identity.SourceNodeID == b.nodeID && transaction.SourceNeeded {
+			return fmt.Errorf("transaction %q still requires retiring source node %q", transaction.Identity.TransactionID, b.nodeID)
+		}
+	}
+
+	runtimes, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return fmt.Errorf("listing terminal node runtimes: %w", err)
+	}
+	sort.Slice(runtimes, func(i, j int) bool { return runtimes[i].ID < runtimes[j].ID })
+	for _, runtime := range runtimes {
+		if err := b.removeOrphanRuntime(runtime.ID); err != nil {
+			return fmt.Errorf("reaping terminal runtime %q: %w", runtime.ID, err)
+		}
+	}
+	remaining, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return fmt.Errorf("verifying terminal node runtimes: %w", err)
+	}
+	if len(remaining) != 0 {
+		ids := make([]string, 0, len(remaining))
+		for _, runtime := range remaining {
+			ids = append(ids, runtime.ID)
+		}
+		sort.Strings(ids)
+		return fmt.Errorf("retiring node still has physical runtimes: %s", strings.Join(ids, ", "))
+	}
+	return nil
+}
+
 // reclaimOrphanLocalContainerDirs removes disposable local-tier directories
 // after Raft no longer grants this node placement or transaction authority.
 // Shared catalog records are intentionally insufficient to retain a cache:
@@ -4705,6 +4757,9 @@ func (b *runtimeBackend) finalizeNodeRetirement(ctx context.Context) error {
 	}
 	if err := b.publishRemainingVolatileOrigins(); err != nil {
 		return fmt.Errorf("publishing retiring node snapshot origins: %w", err)
+	}
+	if err := b.reclaimRetiringNodeRuntimes(); err != nil {
+		return fmt.Errorf("reclaiming retiring node runtimes: %w", err)
 	}
 	last, err := waitForTerminalClusterOwnership(ctx, b.distributedSource.authority, b.distributedSource.directory, b.nodeID)
 	if err != nil {
