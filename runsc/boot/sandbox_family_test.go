@@ -95,6 +95,49 @@ func TestResidentMemorySharingEdgesExactAndBounded(t *testing.T) {
 	}
 }
 
+func TestWaitExecSessionConsumesAlreadyExitedTransientSession(t *testing.T) {
+	status := uint32(linux.WaitStatusExit(7))
+	transient := &execSession{info: ExecSessionInfo{
+		ID: "ttc-cp-helper", State: ExecSessionExited, ExitStatus: &status,
+	}}
+	retained := &execSession{info: ExecSessionInfo{
+		ID: "named", State: ExecSessionExited, ExitStatus: &status,
+	}, retain: true}
+	family := &SandboxFamily{
+		loaderBranchID: "main",
+		branches: map[string]*sandboxBranch{"main": {
+			id: "main", state: BranchRunning,
+			execSessions: map[string]*execSession{
+				"ttc-cp-helper": transient,
+				"named":         retained,
+			},
+		}},
+	}
+	got, err := family.WaitExecSession(&ExecSessionArgs{BranchID: "main", ExecID: "ttc-cp-helper"}, nil)
+	if err != nil || got != status {
+		t.Fatalf("WaitExecSession()=(%d, %v), want (%d, nil)", got, err, status)
+	}
+	family.mu.Lock()
+	_, transientExists := family.branches["main"].execSessions["ttc-cp-helper"]
+	_, retainedExists := family.branches["main"].execSessions["named"]
+	family.mu.Unlock()
+	if transientExists {
+		t.Fatal("already-exited transient exec session was retained")
+	}
+	if !retainedExists {
+		t.Fatal("unrelated named exec session was removed")
+	}
+	if got, err := family.WaitExecSession(&ExecSessionArgs{BranchID: "main", ExecID: "named"}, nil); err != nil || got != status {
+		t.Fatalf("retained WaitExecSession()=(%d, %v), want (%d, nil)", got, err, status)
+	}
+	family.mu.Lock()
+	_, retainedExists = family.branches["main"].execSessions["named"]
+	family.mu.Unlock()
+	if !retainedExists {
+		t.Fatal("retained named exec session was consumed")
+	}
+}
+
 func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
 	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
 	file1 := &pgalloc.MemoryFile{}

@@ -3309,6 +3309,13 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 	f.mu.Lock()
 	if session.info.State == ExecSessionExited && session.info.ExitStatus != nil {
 		status := *session.info.ExitStatus
+		// The background watcher can publish exit before a foreground runsc exec
+		// reaches this waiter. Non-retained management sessions must be consumed in
+		// that fast path too; otherwise every paused ttc cp leaves a completed
+		// ttc-cp-* session in the branch forever.
+		if !session.retain && b.execSessions[args.ExecID] == session {
+			delete(b.execSessions, args.ExecID)
+		}
 		f.mu.Unlock()
 		return status, nil
 	}
