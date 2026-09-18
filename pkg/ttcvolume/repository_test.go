@@ -1690,6 +1690,19 @@ func TestOriginDependenciesIncludeNewerCrossOriginChildren(t *testing.T) {
 	if dependencies, err := repository.OriginDependencies(101); err != nil || len(dependencies) != 0 {
 		t.Fatalf("OriginDependencies(101)=%v, err=%v, want empty", dependencies, err)
 	}
+	prepared, err := repository.PrepareRetirementPublication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 2 || prepared[0] != 100 || prepared[1] != 101 {
+		t.Fatalf("PrepareRetirementPublication()=%v, want [100 101]", prepared)
+	}
+	for _, origin := range prepared {
+		snapshot, ok := repository.graph.Snapshot(origin)
+		if !ok || snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
+			t.Fatalf("snapshot %d=(%+v,%t), want sealed-volatile", origin, snapshot, ok)
+		}
+	}
 }
 
 func TestMaterializedRemoteMarkerDoesNotPoisonLaterSync(t *testing.T) {

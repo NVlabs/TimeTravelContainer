@@ -682,6 +682,26 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 			}
 			branchIDs = append(branchIDs, branchID)
 		}
+		// A removed branch may leave its working origin reachable through an
+		// immutable object shared by a surviving branch even though no branch
+		// pointer names that origin as WorkingSnapshot. At ordinary publication
+		// time such an origin must remain writable. Node retirement is different:
+		// all runtime users are fenced, so every surviving working origin must be
+		// sealed before a parent origin can transfer its cross-origin edges to the
+		// shared reference ledger.
+		inspection := r.graph.Inspect()
+		working := make([]ttcsnapshot.SnapshotID, 0)
+		for _, snapshot := range inspection.Snapshots {
+			if snapshot.State == ttcsnapshot.SnapshotWorking {
+				working = append(working, snapshot.ID)
+			}
+		}
+		sort.Slice(working, func(i, j int) bool { return working[i] < working[j] })
+		for _, origin := range working {
+			if err := r.graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+				return fmt.Errorf("sealing unbound filesystem origin %d for retirement: %w", origin, err)
+			}
+		}
 		sort.Strings(branchIDs)
 		return nil
 	}); err != nil {
@@ -702,6 +722,17 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 			seen[origin] = struct{}{}
 			origins = append(origins, origin)
 		}
+	}
+	// Include origins that are no longer named as a branch's working generation
+	// but remain reachable through cross-origin immutable edges. Append them
+	// after the ordinary per-branch preparation order so existing dependency-
+	// friendly publication ordering remains stable.
+	for _, origin := range r.VolatileOrigins() {
+		if _, duplicate := seen[origin]; duplicate {
+			continue
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
 	}
 	return origins, nil
 }
