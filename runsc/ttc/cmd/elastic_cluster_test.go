@@ -1361,6 +1361,56 @@ func TestLogicalPlacementForPhysicalTransaction(t *testing.T) {
 	}
 }
 
+func TestAuthorityProtectsLocalContainer(t *testing.T) {
+	state := &cluster.AuthorityState{
+		Placements: map[string]cluster.PlacementRecord{
+			"placed\x00main": {
+				FamilyID: "placed", PhysicalContainer: "physical-placed", OwnerNode: "node-a",
+			},
+		},
+		Transactions: map[string]cluster.Transaction{
+			"cold-source": {
+				Identity: cluster.ForkIdentity{
+					SourceNodeID: "node-a", SourceContainer: "logical", TargetNodeID: "node-b", TargetContainer: "logical",
+				},
+				SourcePhysicalContainer: "physical-cold", TargetPhysicalContainer: "physical-target", SourceNeeded: true,
+			},
+			"released-source": {
+				Identity:                cluster.ForkIdentity{SourceNodeID: "node-a", SourceContainer: "released"},
+				SourcePhysicalContainer: "physical-released", SourceNeeded: false,
+			},
+			"identity-fallback": {
+				Identity: cluster.ForkIdentity{
+					SourceNodeID: "node-a", SourceContainer: "fallback-source", TargetNodeID: "node-a", TargetContainer: "fallback-target",
+				},
+				SourceNeeded: true,
+			},
+		},
+	}
+	for _, test := range []struct {
+		name, node, container string
+		want                  bool
+	}{
+		{name: "placement", node: "node-a", container: "physical-placed", want: true},
+		{name: "cold source", node: "node-a", container: "physical-cold", want: true},
+		{name: "target", node: "node-b", container: "physical-target", want: true},
+		{name: "released source", node: "node-a", container: "physical-released", want: false},
+		{name: "source fallback", node: "node-a", container: "fallback-source", want: true},
+		{name: "target fallback", node: "node-a", container: "fallback-target", want: true},
+		{name: "wrong node", node: "node-c", container: "physical-cold", want: false},
+		{name: "unknown", node: "node-a", container: "unknown", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := authorityProtectsLocalContainer(state, test.node, test.container); got != test.want {
+				t.Fatalf("authorityProtectsLocalContainer(%q, %q)=%t, want %t", test.node, test.container, got, test.want)
+			}
+		})
+	}
+	if authorityProtectsLocalContainer(nil, "node-a", "physical-cold") {
+		t.Fatal("nil authority protected local state")
+	}
+}
+
 func TestForkPlacementDestinationPreflight(t *testing.T) {
 	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
 	if err != nil {

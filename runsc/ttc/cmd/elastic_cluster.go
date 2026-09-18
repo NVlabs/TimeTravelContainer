@@ -3688,6 +3688,23 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	if b.localRoot == "" || b.nodeID == "" || containerID == "" {
 		return nil
 	}
+	// Cold forks and migrations may use an otherwise unplaced physical
+	// container as their live filesystem provider. The repository is only a
+	// cache in the steady state, but it is authoritative for the duration of
+	// that transaction: its graph still performs lazy path expansion while the
+	// target faults files. Never let the ordinary cache reclaimer remove it
+	// until Raft has fenced the source dependency. This check belongs in the
+	// common removal primitive so explicit cleanup, periodic reconciliation,
+	// and node-drain cleanup cannot disagree about the same directory.
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		state, err := b.distributedSource.authority.AuthorityState()
+		if err != nil {
+			return fmt.Errorf("checking cluster authority before local cleanup: %w", err)
+		}
+		if authorityProtectsLocalContainer(state, b.nodeID, containerID) {
+			return nil
+		}
+	}
 	info, err := b.containerStore().LoadContainer(containerID)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -3712,6 +3729,42 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 		}
 	}
 	return os.RemoveAll(filepath.Join(b.localRoot, "containers", containerID))
+}
+
+// authorityProtectsLocalContainer is the single control-plane predicate for
+// node-local container data. Placements protect active runtimes. Transactions
+// additionally protect provisional targets and live source providers, even
+// when the source is a process-free cold snapshot with no public placement.
+func authorityProtectsLocalContainer(state *cluster.AuthorityState, nodeID, containerID string) bool {
+	if state == nil || nodeID == "" || containerID == "" {
+		return false
+	}
+	for _, placement := range state.Placements {
+		physical := placement.PhysicalContainer
+		if physical == "" {
+			physical = placement.FamilyID
+		}
+		if placement.OwnerNode == nodeID && physical == containerID {
+			return true
+		}
+	}
+	for _, transaction := range state.Transactions {
+		sourcePhysical := transaction.SourcePhysicalContainer
+		if sourcePhysical == "" {
+			sourcePhysical = transaction.Identity.SourceContainer
+		}
+		targetPhysical := transaction.TargetPhysicalContainer
+		if targetPhysical == "" {
+			targetPhysical = transaction.Identity.TargetContainer
+		}
+		if transaction.SourceNeeded && transaction.Identity.SourceNodeID == nodeID && sourcePhysical == containerID {
+			return true
+		}
+		if transaction.Identity.TargetNodeID == nodeID && targetPhysical == containerID {
+			return true
+		}
+	}
+	return false
 }
 
 // reclaimUnownedLocalFamilyState completes an evacuation's local-tier fence.
@@ -3841,17 +3894,7 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 		// worker has consumed and removed its node-local capture. The durable
 		// queue intent is authority for that narrow but potentially long-lived
 		// interval (including retries after shared-storage failure).
-		protected := pendingPublicationProtectsContainer(publicationIntents, id)
-		for _, placement := range state.Placements {
-			physical := placement.PhysicalContainer
-			if physical == "" {
-				physical = placement.FamilyID
-			}
-			if placement.OwnerNode == b.nodeID && physical == id {
-				protected = true
-				break
-			}
-		}
+		protected := pendingPublicationProtectsContainer(publicationIntents, id) || authorityProtectsLocalContainer(state, b.nodeID, id)
 		sharedInfo, loadErr := (ttcbundle.Store{Root: b.dataRoot}).LoadRuntimeContainer(id)
 		if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
 			result = errors.Join(result, fmt.Errorf("loading shared container %q: %w", id, loadErr))
@@ -3868,23 +3911,6 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 					continue
 				}
 				if _, ok := state.Transactions[transactionID]; ok {
-					protected = true
-					break
-				}
-			}
-		}
-		if !protected {
-			for _, transaction := range state.Transactions {
-				sourcePhysical := transaction.SourcePhysicalContainer
-				if sourcePhysical == "" {
-					sourcePhysical = transaction.Identity.SourceContainer
-				}
-				targetPhysical := transaction.TargetPhysicalContainer
-				if targetPhysical == "" {
-					targetPhysical = transaction.Identity.TargetContainer
-				}
-				if (transaction.SourceNeeded && transaction.Identity.SourceNodeID == b.nodeID && sourcePhysical == id) ||
-					(transaction.Identity.TargetNodeID == b.nodeID && targetPhysical == id) {
 					protected = true
 					break
 				}
