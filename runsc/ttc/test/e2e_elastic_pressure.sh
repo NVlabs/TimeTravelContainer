@@ -19,6 +19,8 @@ PID_B=
 PID_C=
 CLEANED=
 FAMILIES="pressure-a-$$ pressure-b-$$"
+SOURCE_TARGET=${TTC_ELASTIC_PRESSURE_SOURCE_TARGET:-768MiB}
+BRANCH_BYTES=${TTC_ELASTIC_PRESSURE_BRANCH_BYTES:-67108864}
 
 socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
 client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
@@ -89,23 +91,15 @@ start_node() {
 	wait_ready "$node"
 }
 
-memory_current() {
-	cgroup=$(awk -F: '$1 == 0 { print $3 }' /proc/self/cgroup)
-	if test -r "/sys/fs/cgroup/${cgroup#/}/memory.current"; then
-		cat "/sys/fs/cgroup/${cgroup#/}/memory.current"
-	else
-		awk -v page="$(getconf PAGESIZE)" '{ print $2 * page }' /proc/self/statm
-	fi
-}
-
-baseline=$(memory_current)
-# Same-host test daemons share the caller's cgroup. Give node-a enough startup
-# headroom, then create 8 independently dirtied branches to cross its target.
-source_target=$((baseline + 256 * 1024 * 1024))
-# Planner estimates deliberately include conservative shared-memory exposure;
-# leave ample accepting capacity so this test exercises placement rather than
-# capacity provisioning.
-peer_target=$((baseline + 64 * 1024 * 1024 * 1024))
+# Node accounting deliberately scans only the daemon and processes belonging to
+# its local root. Do not derive this threshold from the caller's cgroup: build
+# workers and unrelated jobs can disappear after this test starts and make the
+# supposedly pressured node fall below a stale, inflated target. Eight branches
+# independently dirty BRANCH_BYTES below, crossing this fixed node-local target.
+# Planner estimates include conservative shared-memory exposure, so peers keep
+# ample accepting capacity to exercise placement rather than provisioning.
+source_target=$SOURCE_TARGET
+peer_target=64GiB
 mkdir -p "$ROOT" "$SHARED"
 start_node a "$PORT_A" "$source_target" --cluster-init
 start_node b "$PORT_B" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
@@ -114,7 +108,7 @@ start_node c "$PORT_C" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
 client a pull "$IMAGE" >/dev/null
 for family in $FAMILIES; do
 	client a run -d --node node-a --name "$family" "$IMAGE" sh -c \
-		'while test ! -e /tmp/fill; do sleep 0.05; done; yes 0123456789abcdef | head -c 50331648 >/dev/shm/private && printf PRESSURE >/tmp/ready; sleep 3600' >/dev/null
+		"while test ! -e /tmp/fill; do sleep 0.05; done; yes 0123456789abcdef | head -c $BRANCH_BYTES >/dev/shm/private && printf PRESSURE >/tmp/ready; sleep 3600" >/dev/null
 	client a fork --node node-a "$family@main" b1 b2 b3 >/dev/null
 done
 
@@ -166,8 +160,9 @@ if test "$planner_bytes" -gt $((512 * 1024)); then
 	exit 1
 fi
 accounted=$(jq '[.branches[].total_bytes] | add // 0' "$ROOT/planner-node-a.json")
-if test "$accounted" -lt $((384 * 1024 * 1024)); then
-	echo "planner accounted only $accounted bytes for eight 48 MiB tmpfs files" >&2
+expected_accounted=$((8 * BRANCH_BYTES))
+if test "$accounted" -lt "$expected_accounted"; then
+	echo "planner accounted only $accounted bytes for $expected_accounted bytes of private tmpfs data" >&2
 	cat "$ROOT/planner-node-a.json" >&2
 	exit 1
 fi
