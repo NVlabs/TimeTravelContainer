@@ -2233,15 +2233,25 @@ func (f *SandboxFamily) Resume(id string) error {
 }
 
 // PublishFilesystemMetadata flushes process-local TTC filesystem metadata for
-// one live branch. The Kernel lifetime lease allows the branch to remain
-// running or paused while the short graph publication completes.
-func (f *SandboxFamily) PublishFilesystemMetadata(id string) error {
+// one live branch and returns its authoritative repository branch. The Kernel
+// lifetime lease allows the branch to remain running or paused while the short
+// graph publication completes. Callers must not derive the repository branch
+// from the visible ID: restored and migrated branches can intentionally retain
+// a different physical filesystem identity.
+func (f *SandboxFamily) PublishFilesystemMetadata(id string) (string, error) {
 	b, done, err := f.beginControl(id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer done()
-	return b.k.VFS().PublishFilesystemMetadata(b.k.SupervisorContext())
+	if err := b.k.VFS().PublishFilesystemMetadata(b.k.SupervisorContext()); err != nil {
+		return "", err
+	}
+	branch := b.filesystemBranch
+	if branch == "" {
+		branch = f.volumeBranchID(b.id)
+	}
+	return branch, nil
 }
 
 // SetQuarantine changes the external-connectivity quarantine bit. Live

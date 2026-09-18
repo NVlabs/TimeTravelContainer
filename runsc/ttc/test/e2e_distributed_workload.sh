@@ -43,6 +43,10 @@ stop_session() {
 
 cleanup() {
 	set +e
+	if test "${TTC_E2E_KEEP_FAILED_STATE:-0}" = 1 && test "$SUCCESS" = 0; then
+		echo "TTC distributed-workload failure state retained at $ROOT" >&2
+		return
+	fi
 	for node in b a; do
 		if test -S "$(socket "$node")"; then client "$node" rm -f "$NAME" >/dev/null 2>&1; fi
 	done

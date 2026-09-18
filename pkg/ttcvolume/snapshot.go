@@ -30,7 +30,7 @@ import (
 
 const (
 	snapshotFormatVersion       = 2
-	remoteSnapshotFormatVersion = 5
+	remoteSnapshotFormatVersion = 6
 )
 
 // SnapshotInfo describes one self-contained repository branch snapshot.
@@ -62,14 +62,34 @@ type snapshotDirectoryEntry struct {
 type RemoteSnapshotDescriptor struct {
 	Snapshot SnapshotInfo         `json:"snapshot"`
 	Root     ttcsnapshot.ObjectID `json:"root"`
+	// BaseRoot is the immutable branch-parent view used by diff. It is resolved
+	// lazily through the same catalog as Root and may be zero for a branch with
+	// no parent boundary.
+	BaseRoot ttcsnapshot.ObjectID `json:"base_root,omitempty"`
+}
+
+// BaseRootString returns the wire representation of BaseRoot, preserving an
+// absent diff boundary as the empty string rather than encoding the zero ID.
+func (d RemoteSnapshotDescriptor) BaseRootString() string {
+	if d.BaseRoot.IsZero() {
+		return ""
+	}
+	return d.BaseRoot.String()
 }
 
 // NewRemoteSnapshotDescriptor reconstructs a wire descriptor after the
 // cluster layer has validated its path-free scalar fields.
-func NewRemoteSnapshotDescriptor(repositoryID, branchID, root string, nextInode, logicalBytes uint64) (RemoteSnapshotDescriptor, error) {
+func NewRemoteSnapshotDescriptor(repositoryID, branchID, root, baseRoot string, nextInode, logicalBytes uint64) (RemoteSnapshotDescriptor, error) {
 	object, err := ttcsnapshot.ParseObjectID(root)
 	if err != nil || object.Kind != ttcsnapshot.ObjectKindMetadata {
 		return RemoteSnapshotDescriptor{}, fmt.Errorf("invalid remote filesystem root %q", root)
+	}
+	var base ttcsnapshot.ObjectID
+	if baseRoot != "" {
+		base, err = ttcsnapshot.ParseObjectID(baseRoot)
+		if err != nil || base.Kind != ttcsnapshot.ObjectKindMetadata {
+			return RemoteSnapshotDescriptor{}, fmt.Errorf("invalid remote filesystem base root %q", baseRoot)
+		}
 	}
 	return RemoteSnapshotDescriptor{
 		Snapshot: SnapshotInfo{
@@ -77,7 +97,7 @@ func NewRemoteSnapshotDescriptor(repositoryID, branchID, root string, nextInode,
 			BranchID: branchID, Root: root, NextInode: nextInode,
 			LogicalBytes: logicalBytes, CreatedAt: time.Now().UTC(),
 		},
-		Root: object,
+		Root: object, BaseRoot: base,
 	}, nil
 }
 
@@ -107,6 +127,13 @@ func (r *Repository) DescribeRemoteSnapshot(branchID string) (RemoteSnapshotDesc
 			return RemoteSnapshotDescriptor{}, fmt.Errorf("reading filesystem byte aggregate: %w", err)
 		}
 	}
+	var baseRoot ttcsnapshot.ObjectID
+	if branch.BaseRoot != "" {
+		baseRoot, ok = r.graph.Root(graphBaseRootName(branchID))
+		if !ok || baseRoot.Kind != ttcsnapshot.ObjectKindMetadata {
+			return RemoteSnapshotDescriptor{}, fmt.Errorf("branch %q has no valid diff base root", branchID)
+		}
+	}
 	return RemoteSnapshotDescriptor{
 		Snapshot: SnapshotInfo{
 			FormatVersion: remoteSnapshotFormatVersion,
@@ -117,7 +144,7 @@ func (r *Repository) DescribeRemoteSnapshot(branchID string) (RemoteSnapshotDesc
 			LogicalBytes:  logicalBytes,
 			CreatedAt:     time.Now().UTC(),
 		},
-		Root: root,
+		Root: root, BaseRoot: baseRoot,
 	}, nil
 }
 
@@ -142,7 +169,8 @@ func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 	}
 	snapshot := descriptor.Snapshot
 	if snapshot.FormatVersion != remoteSnapshotFormatVersion || !validID(snapshot.RepositoryID) || snapshot.NextInode <= rootInode ||
-		descriptor.Root.String() != snapshot.Root || descriptor.Root.Kind != ttcsnapshot.ObjectKindMetadata {
+		descriptor.Root.String() != snapshot.Root || descriptor.Root.Kind != ttcsnapshot.ObjectKindMetadata ||
+		(!descriptor.BaseRoot.IsZero() && descriptor.BaseRoot.Kind != ttcsnapshot.ObjectKindMetadata) {
 		return errors.New("invalid remote graph snapshot descriptor")
 	}
 	return r.withLock(func() error {
@@ -189,10 +217,17 @@ func (r *Repository) importRemoteBranchDescriptor(descriptor RemoteSnapshotDescr
 		if err != nil {
 			return err
 		}
-		if err := r.graph.SetRoot(graphBaseRootName(targetBranch), root); err != nil {
-			return err
+		var baseRoot ttcsnapshot.ObjectID
+		if !descriptor.BaseRoot.IsZero() {
+			baseRoot, err = r.graph.ImportDeferredFilesystemRoot(catalogWorking, graphBaseRootName(targetBranch), catalog, descriptor.BaseRoot)
+			if err != nil {
+				return err
+			}
 		}
-		branch := Branch{ID: targetBranch, Root: root.String(), BaseRoot: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), RemoteLogicalBytes: snapshot.LogicalBytes, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+		branch := Branch{ID: targetBranch, Root: root.String(), RemoteCatalog: catalog, RemoteCatalogSnapshot: uint64(catalogWorking), RemoteLogicalBytes: snapshot.LogicalBytes, WorkingSnapshot: uint64(working), Generation: 1, CreatedAt: time.Now().UTC()}
+		if !baseRoot.IsZero() {
+			branch.BaseRoot = baseRoot.String()
+		}
 		return r.writeBranch(branch)
 	})
 }

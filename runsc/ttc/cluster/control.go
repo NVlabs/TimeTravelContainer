@@ -231,6 +231,7 @@ type FilesystemRootDescriptor struct {
 	RestoreID    string `json:"restore_id"`
 	BranchID     string `json:"branch_id"`
 	Root         string `json:"root"`
+	BaseRoot     string `json:"base_root,omitempty"`
 	NextInode    uint64 `json:"next_inode"`
 	LogicalBytes uint64 `json:"logical_bytes,omitempty"`
 }
@@ -340,6 +341,12 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 		object, err := ttcsnapshot.ParseObjectID(root.Root)
 		if err != nil || object.Kind != ttcsnapshot.ObjectKindMetadata {
 			return fmt.Errorf("filesystem handoff source %q has invalid root %q", root.Source, root.Root)
+		}
+		if root.BaseRoot != "" {
+			base, err := ttcsnapshot.ParseObjectID(root.BaseRoot)
+			if err != nil || base.Kind != ttcsnapshot.ObjectKindMetadata {
+				return fmt.Errorf("filesystem handoff source %q has invalid base root %q", root.Source, root.BaseRoot)
+			}
 		}
 		if root.LogicalBytes > ^uint64(0)-filesystemBytes {
 			return errors.New("filesystem handoff byte count overflows")

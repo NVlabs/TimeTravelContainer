@@ -1357,7 +1357,7 @@ func newDistributedTransactionID() (string, error) {
 // roots and configures the source relay. The descriptor is bounded by the
 // number of mounted repositories and no shared-storage write is required on
 // the target time-to-execution path.
-func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch string, relay *distributedPageRelay) ([]cluster.FilesystemRootDescriptor, uint64, error) {
+func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerInfo, filesystemBranch, preserveDiffBaseBranch string, relay *distributedPageRelay) ([]cluster.FilesystemRootDescriptor, uint64, error) {
 	if filesystemBranch == "" {
 		return nil, 0, errors.New("distributed capture omitted its filesystem generation")
 	}
@@ -1386,6 +1386,18 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 			return nil, 0, err
 		}
 		descriptor, describeErr := repository.DescribeRemoteSnapshot(filesystemBranch)
+		// A migration uses an internal fork only to freeze the transfer view; it
+		// does not create a new user-visible branch or parent edge. Preserve the
+		// visible source's existing diff base instead of treating the migration
+		// instant as a new parent. Ordinary remote forks leave this empty and use
+		// the captured child's fork-point base.
+		if describeErr == nil && preserveDiffBaseBranch != "" {
+			var sourceDescriptor ttcvolume.RemoteSnapshotDescriptor
+			sourceDescriptor, describeErr = repository.DescribeRemoteSnapshot(preserveDiffBaseBranch)
+			if describeErr == nil {
+				descriptor.BaseRoot = sourceDescriptor.BaseRoot
+			}
+		}
 		closeErr := repository.Close()
 		if describeErr != nil || closeErr != nil {
 			return nil, 0, errors.Join(describeErr, closeErr)
@@ -1403,7 +1415,7 @@ func (b *runtimeBackend) prepareDistributedFilesystem(info ttcbundle.ContainerIn
 			// import hop and is therefore neither authoritative nor sufficient
 			// after repeated migration or cold rehydration.
 			RestoreID: snapshot.RepositoryID,
-			BranchID:  snapshot.BranchID, Root: descriptor.Root.String(),
+			BranchID:  snapshot.BranchID, Root: descriptor.Root.String(), BaseRoot: descriptor.BaseRootString(),
 			NextInode: snapshot.NextInode, LogicalBytes: snapshot.LogicalBytes,
 		})
 	}
@@ -1487,7 +1499,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 				return 0, fmt.Errorf("allocating target filesystem origins for %q: %w", config.Source, err)
 			}
 		}
-		descriptor, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.NextInode, root.LogicalBytes)
+		descriptor, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.BaseRoot, root.NextInode, root.LogicalBytes)
 		if err != nil {
 			return 0, fmt.Errorf("decoding repository %q graph root: %w", config.Source, err)
 		}
@@ -2349,7 +2361,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if session.SessionID != transactionID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return selector{}, fmt.Errorf("source returned an incomplete distributed session")
 	}
-	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, "", relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("sealing distributed filesystem generation: %w", err)
 	}
@@ -2555,7 +2567,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if _, err := rand.Read(filesystemToken[:]); err != nil {
 		return selector{}, err
 	}
-	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, "", relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
 	}
@@ -3070,7 +3082,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		if !ok || session.MetadataBytes == 0 || session.StreamBytes == 0 || session.Address != child.advertise {
 			return nil, fmt.Errorf("source returned an incomplete session for target %s", child.target)
 		}
-		filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, child.relay)
+		filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, session.FilesystemBranch, "", child.relay)
 		if err != nil {
 			return nil, fmt.Errorf("sealing filesystem generation for target %s: %w", child.target, err)
 		}

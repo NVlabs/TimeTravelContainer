@@ -581,7 +581,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 				// to its node-local repository. Persist that exact identity;
 				// config.RestoreID may still describe an earlier import hop.
 				RestoreID: descriptor.Snapshot.RepositoryID,
-				BranchID:  descriptor.Snapshot.BranchID, Root: descriptor.Root.String(),
+				BranchID:  descriptor.Snapshot.BranchID, Root: descriptor.Root.String(), BaseRoot: descriptor.BaseRootString(),
 				NextInode: descriptor.Snapshot.NextInode, LogicalBytes: descriptor.Snapshot.LogicalBytes,
 			},
 			Origins: encodedOrigins,
@@ -1846,7 +1846,7 @@ func readColdBranchManifest(path string) (coldBranchManifest, error) {
 			return coldBranchManifest{}, fmt.Errorf("cold manifest repeats filesystem source %q", root.Source)
 		}
 		seenSources[root.Source] = struct{}{}
-		if _, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.NextInode, root.LogicalBytes); err != nil {
+		if _, err := ttcvolume.NewRemoteSnapshotDescriptor(root.RepositoryID, root.BranchID, root.Root, root.BaseRoot, root.NextInode, root.LogicalBytes); err != nil {
 			return coldBranchManifest{}, fmt.Errorf("validating filesystem source %q: %w", root.Source, err)
 		}
 		for _, origin := range filesystem.Origins {

@@ -610,21 +610,33 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	if _, err := target.Lookup("imported", RootInode, "artifact"); err != nil {
 		t.Fatal(err)
 	}
+	if err := target.Unlink("imported", RootInode, "artifact"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := target.CreateRegular("imported", RootInode, "target-local", 0644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := target.BeginForkWithOrigins("imported", "published", 102, 103)
+	changes, err := target.BranchDiff("imported")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if len(changes) != 2 || changes[0].Path != "/artifact" || changes[0].Kind != "delete" || changes[1].Path != "/target-local" || changes[1].Kind != "add" {
+		t.Fatalf("changes before publication=%+v, want inherited deletion and local addition", changes)
 	}
-	origins, err := target.PrepareBranchPublication("published")
+	imported, err := target.Branch("imported")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, branchID := range []string{"published", "imported"} {
+	if err := target.withLock(func() error {
+		return target.graph.Seal(ttcsnapshot.SnapshotID(imported.WorkingSnapshot), ttcsnapshot.SnapshotSealedVolatile)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	origins, err := target.PrepareBranchPublication("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, branchID := range []string{"imported"} {
 		branch, err := target.Branch(branchID)
 		if err != nil {
 			t.Fatal(err)
@@ -644,6 +656,13 @@ func TestPrepareBranchPublicationSealsLazyCatalog(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) {
 		t.Fatal(err)
+	}
+	changes, err = target.BranchDiff("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 2 || changes[0].Path != "/artifact" || changes[0].Kind != "delete" || changes[1].Path != "/target-local" || changes[1].Kind != "add" {
+		t.Fatalf("changes=%+v, want inherited deletion and local addition after provider detach", changes)
 	}
 }
 
@@ -842,6 +861,92 @@ func TestDeferredMetadataObservationDoesNotRequireBulkTransport(t *testing.T) {
 	}
 	if len(changes) != 1 || changes[0].Path != "/local" || changes[0].Kind != "add" {
 		t.Fatalf("changes=%+v, want local addition", changes)
+	}
+}
+
+func TestRemoteDescriptorPreservesDiffBase(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "migrating"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt("migrating", ino, []byte("changed"), 0); err != nil {
+		t.Fatal(err)
+	}
+	migrating, err := source.Branch("migrating")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.withLock(func() error {
+		return source.graph.Seal(ttcsnapshot.SnapshotID(migrating.WorkingSnapshot), ttcsnapshot.SnapshotSealedVolatile)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("migrating")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.BaseRoot.IsZero() || descriptor.BaseRoot == descriptor.Root {
+		t.Fatalf("descriptor roots current=%s base=%s", descriptor.Root, descriptor.BaseRoot)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-diff"), "target-diff", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverErr := attachTestRemote(t, source, target, "migrating", "imported", nil)
+	if err := target.ResolveBranchMetadata("imported"); err != nil {
+		t.Fatal(err)
+	}
+	branch, err := target.Branch("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model the manager-side observer: it can reopen persistent metadata, but
+	// does not own the Sentry's process-local lazy-catalog resolver.
+	target.graph.DetachDeferredResolver(branch.RemoteCatalog)
+	changes, err := target.BranchDiff("imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Path != "/artifact" || changes[0].Kind != "modify" {
+		t.Fatalf("changes=%+v, want migrated artifact modification", changes)
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inodes, _, err := target.graph.FilesystemRecords(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inode := range inodes {
+		if inode.Type != "regular" {
+			continue
+		}
+		if file, err := target.data.Open(inode.File, int64(inode.Size)); err == nil {
+			file.Close()
+			t.Fatalf("metadata resolution materialized regular-file object %s", inode.File)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
 	}
 }
 

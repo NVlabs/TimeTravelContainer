@@ -1949,9 +1949,8 @@ func (r *Repository) beginFork(source, child string, externalOrigins []ttcsnapsh
 		tx.source = sourceBranch
 		sealedOrigin := sourceBranch.WorkingSnapshot
 		copies := map[string]string{
-			graphRootName(child):      graphRootName(source),
-			graphBaseRootName(source): graphRootName(source),
-			graphBaseRootName(child):  graphRootName(source),
+			graphRootName(child):     graphRootName(source),
+			graphBaseRootName(child): graphRootName(source),
 		}
 		var working []ttcsnapshot.SnapshotID
 		if len(externalOrigins) == 0 {
@@ -1973,7 +1972,6 @@ func (r *Repository) beginFork(source, child string, externalOrigins []ttcsnapsh
 		delete(r.reservedFileIDs, sealedOrigin)
 		r.dirtyMu.Unlock()
 		sourceBranch.WorkingSnapshot = uint64(working[0])
-		sourceBranch.BaseRoot = sourceBranch.Root
 		sourceBranch.Generation++
 		childBranch := Branch{
 			ID: child, Root: sourceBranch.Root, BaseRoot: sourceBranch.Root, WorkingSnapshot: uint64(working[1]),

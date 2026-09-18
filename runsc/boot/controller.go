@@ -1409,7 +1409,26 @@ func (cm *containerManager) PublishBranchFilesystemMetadata(args *BranchArgs, _ 
 	if args == nil || args.ID == "" {
 		return errors.New("missing branch filesystem metadata arguments")
 	}
-	return cm.l.family.PublishFilesystemMetadata(args.ID)
+	branchID, err := cm.l.family.PublishFilesystemMetadata(args.ID)
+	if err != nil {
+		return err
+	}
+	// A remotely restored branch may still have graph metadata that is lazy
+	// behind the Sentry's peer connection. Manager-side observers reopen the
+	// repository and cannot use that process-local connection. Resolve both the
+	// current namespace and its immutable diff base here, but leave bulk file
+	// contents lazy.
+	seen := make(map[*ttcvolume.Repository]struct{}, len(cm.l.ttcVolumeRepositories))
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		if _, duplicate := seen[volume.repository]; duplicate {
+			continue
+		}
+		seen[volume.repository] = struct{}{}
+		if err := volume.repository.ResolveBranchMetadata(branchID); err != nil {
+			return fmt.Errorf("publishing TTC volume %q metadata for branch %q: %w", source, args.ID, err)
+		}
+	}
+	return nil
 }
 
 // SetBranchQuarantine changes one branch's external-connectivity bit.

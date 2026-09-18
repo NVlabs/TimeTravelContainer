@@ -1838,8 +1838,8 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	if err := repository.graph.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if stats := repository.graph.Stats(); stats.Roots != 2 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
-		t.Fatalf("graph after churn=%+v, want current+diff roots, at most two live origins, and no reclaiming objects", stats)
+	if stats := repository.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("graph after churn=%+v, want the parentless main root, at most two live origins, and no reclaiming objects", stats)
 	}
 	if info, err := os.Stat(graphJournalPath(t, repository.path)); err != nil || info.Size() != int64(len("TTCSGJ2\n")) {
 		t.Fatalf("compacted graph journal: info=%v err=%v", info, err)
@@ -1994,8 +1994,8 @@ func TestActiveGarbageCollectBoundsDonatedBranchChurn(t *testing.T) {
 		}
 	}
 
-	if stats := runtime.graph.Stats(); stats.Roots != 2 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
-		t.Fatalf("active graph after churn=%+v, want current+diff roots, at most two live origins, and no reclaiming objects", stats)
+	if stats := runtime.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("active graph after churn=%+v, want the parentless main root, at most two live origins, and no reclaiming objects", stats)
 	}
 	runtime.metadataMu.Lock()
 	metadataEntries := len(runtime.metadata)
@@ -2533,6 +2533,48 @@ func TestDiffBaseIsAnAuthoritativeGraphRoot(t *testing.T) {
 	base, ok := repository.graph.Root(graphBaseRootName("child"))
 	if !ok || branch.BaseRoot != base.String() {
 		t.Fatalf("branch base=%q graph base=%v found=%t", branch.BaseRoot, base, ok)
+	}
+}
+
+func TestForkPreservesSourceDiffParent(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-source-parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "base", 0)
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, "child", ino, "changed", 0)
+	before, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].Path != "/value" || before[0].Kind != "modify" {
+		t.Fatalf("diff before child fork=%+v, want value modification", before)
+	}
+	if err := repository.Fork("child", "grandchild"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("fork changed source diff from %+v to %+v", before, after)
+	}
+	grandchild, err := repository.BranchDiff("grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grandchild) != 0 {
+		t.Fatalf("new child diff=%+v, want empty fork-point delta", grandchild)
 	}
 }
 

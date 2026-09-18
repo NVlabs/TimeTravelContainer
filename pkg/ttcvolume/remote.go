@@ -549,6 +549,36 @@ func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 	return r.branchObjects(branch)
 }
 
+// ResolveBranchMetadata expands the immutable namespace roots needed to
+// observe branch, including its diff base, while a live remote catalog is
+// attached. It deliberately leaves regular-file contents remote: callers such
+// as ttc diff need complete inode and directory metadata, not file bytes.
+//
+// Resolved objects become ordinary persistent graph objects, so a manager
+// process can subsequently reopen the repository and perform the observation
+// without owning the Sentry's process-local peer connection.
+func (r *Repository) ResolveBranchMetadata(branchID string) (resultErr error) {
+	branch, err := r.Branch(branchID)
+	if err != nil {
+		return err
+	}
+	names := []string{graphRootName(branchID)}
+	if branch.BaseRoot != "" {
+		names = append(names, graphBaseRootName(branchID))
+	}
+	roots, pins, err := r.pinGraphRoots(names)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, r.releaseGraphObservation(pins)) }()
+	for _, name := range names {
+		if _, _, err := r.graph.FilesystemRecords(roots[name]); err != nil {
+			return fmt.Errorf("resolving branch %q filesystem metadata root %q: %w", branchID, name, err)
+		}
+	}
+	return nil
+}
+
 func (r *Repository) branchObjects(branch Branch) (map[string]int64, error) {
 	state, err := r.metadataForBranch(branch)
 	if err != nil {
@@ -720,6 +750,30 @@ func (r *Repository) materializeRemoteObjectsPassLocked() ([]remoteMaterializati
 		branchRecord.Root = root.String()
 		if _, err := r.branchObjects(branchRecord); err != nil {
 			return nil, nil, err
+		}
+		// The current namespace does not necessarily retain metadata that exists
+		// only in the branch's diff base (most notably a deleted file). Resolve
+		// that immutable root before the repository-wide provider detach too.
+		// FilesystemRecords expands metadata only; regular-file objects are
+		// registered below so the ordinary bulk materialization pass also makes
+		// the complete graph independent.
+		if branchRecord.BaseRoot != "" {
+			baseRoot, ok := r.graph.Root(graphBaseRootName(branch))
+			if !ok {
+				return nil, nil, fmt.Errorf("branch %q has no filesystem diff-base root", branch)
+			}
+			inodes, _, err := r.graph.FilesystemRecords(baseRoot)
+			if err != nil {
+				return nil, nil, fmt.Errorf("resolving branch %q filesystem diff base: %w", branch, err)
+			}
+			for _, inode := range inodes {
+				if inode.Type != "regular" || inode.File.IsZero() {
+					continue
+				}
+				if err := r.prepareDeferredFileObject(inode.File, int64(inode.Size)); err != nil {
+					return nil, nil, fmt.Errorf("registering branch %q diff-base file %s: %w", branch, inode.File, err)
+				}
+			}
 		}
 	}
 	r.remoteMu.Lock()

@@ -2993,7 +2993,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if session.SessionID != requestID || session.MetadataBytes == 0 || session.StreamBytes == 0 {
 		return abort(errors.New("sparse migration capture returned incomplete session metadata"))
 	}
-	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, relay)
+	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(info, session.FilesystemBranch, persistentBranch.FilesystemBranch, relay)
 	if err != nil {
 		return abort(fmt.Errorf("sealing sparse migration filesystem generation: %w", err))
 	}
