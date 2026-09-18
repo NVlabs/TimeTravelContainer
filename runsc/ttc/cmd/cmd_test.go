@@ -5044,6 +5044,19 @@ func TestBranchesInPlacementSnapshotDropsRenamedMetadata(t *testing.T) {
 	}
 }
 
+func TestProjectContainerAuthorityReplacesStaleSummary(t *testing.T) {
+	container := ttcbundle.ContainerInfo{NodeID: "old-node", State: "paused"}
+	family := Family{NodeID: "new-node", State: "running"}
+	projectContainerAuthority(&container, &family)
+	if container.NodeID != "new-node" || container.State != "running" {
+		t.Fatalf("projected container = %+v, want authoritative node and state", container)
+	}
+	projectContainerAuthority(&container, nil)
+	if container.NodeID != "new-node" || container.State != "running" {
+		t.Fatalf("nil family changed container = %+v", container)
+	}
+}
+
 func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 	created := time.Unix(123, 456).UTC()
 	infos := []ttcbundle.BranchInfo{

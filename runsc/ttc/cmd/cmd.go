@@ -9318,6 +9318,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 			break
 		}
 	}
+	projectContainerAuthority(&containerInfo, runtimeFamily)
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
 	if transactionID := containerInfo.DistributedForkTransactionID; transactionID != "" {
 		if store, err := b.transactionCatalog(); err == nil {
@@ -9361,6 +9362,20 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		branch.Processes = processes
 	}
 	return result, nil
+}
+
+// projectContainerAuthority removes stale ownership and lifecycle fields from
+// the shared physical materialization before it is exposed by inspect. A
+// clustered container.json is deliberately not rewritten on every migration;
+// listFamilies has already merged Raft placement and branch authority into
+// family, so it is the single public source for these duplicated summary
+// fields. Branch details were projected above by logicalPersistentBranchInfos.
+func projectContainerAuthority(container *ttcbundle.ContainerInfo, family *Family) {
+	if container == nil || family == nil {
+		return
+	}
+	container.NodeID = family.NodeID
+	container.State = family.State
 }
 
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
