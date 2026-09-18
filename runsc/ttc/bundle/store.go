@@ -4161,6 +4161,40 @@ func (s Store) CompleteBranchPublication(name, branchID, publicationID, manifest
 	})
 }
 
+// CompleteConsumedBranchPublication rolls derived physical metadata forward
+// after Raft has consumed a publication transaction but retained its immutable
+// filesystem root. The exact manifest is the fence in this state: Raft no
+// longer names a publication ID, and StopBranch has cleared the physical ID so
+// a worker that passed an earlier queue check cannot replay its old lifecycle.
+func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifecycle string, unplace bool) error {
+	if manifest == "" {
+		return errors.New("consumed branch publication has no manifest")
+	}
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			branch.PublicationID = ""
+			branch.StorageState = "shared"
+			branch.StorageError = ""
+			branch.StorageManifest = manifest
+			branch.StorageRetryAt = time.Time{}
+			if lifecycle != "" {
+				branch.State = lifecycle
+			}
+			if unplace {
+				branch.NodeID = ""
+				branch.Unplaced = true
+			}
+			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
 // AbandonBranchPublication fences an asynchronous worker before a local
 // capture is consumed to make the branch active again. The old shared
 // manifest remains a valid immutable ancestor, but the active branch is no
@@ -4333,15 +4367,15 @@ func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldI
 // the mutable incarnation created from it. Keep StorageManifest as the
 // immutable filesystem ancestor for lazy reads and the next incremental
 // publication, but retire the old transaction identity when execution starts.
-func (s Store) RecordBranchStart(name, branchID string) error {
-	return s.RecordBranchActivation(name, branchID, "running")
+func (s Store) RecordBranchStart(name, branchID, nodeID string) error {
+	return s.RecordBranchActivation(name, branchID, "running", nodeID)
 }
 
 // RecordBranchActivation commits a process-bearing incarnation reconstructed
 // from a cold branch. state is explicit because a dehydrated branch may have
 // been captured paused. This is also the common publication-fence retirement
 // boundary for fresh start and rehydration.
-func (s Store) RecordBranchActivation(name, branchID, state string) error {
+func (s Store) RecordBranchActivation(name, branchID, state, nodeID string) error {
 	if state != "running" && state != "paused" {
 		return fmt.Errorf("invalid active branch state %q", state)
 	}
@@ -4353,6 +4387,14 @@ func (s Store) RecordBranchActivation(name, branchID, state string) error {
 				continue
 			}
 			updateBranchLifecycle(branch, state, nil, now)
+			// Activation is the physical lifecycle commit, so it must also repair
+			// the derived owner atomically. A cold publication completion may clear
+			// NodeID after Raft has already claimed the branch for this node; merely
+			// clearing Unplaced here would otherwise leave a running physical branch
+			// with no owner and prevent placement from leaving materializing.
+			if nodeID != "" {
+				branch.NodeID = nodeID
+			}
 			branch.Unplaced = false
 			branch.PublicationID = ""
 			branch.StorageState = "local"
@@ -4384,6 +4426,12 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 			if !alreadyExited || branch.ExitStatus == nil {
 				updateBranchLifecycle(branch, "exited", &exitStatus, now)
 			}
+			// Stop consumes this process snapshot. Retire its publication fence in
+			// the same metadata transaction so a worker that already passed its
+			// queue cancellation check cannot replay the preceding lifecycle after
+			// execution state and memory roots have been discarded. The immutable
+			// StorageManifest remains the branch's filesystem ancestor.
+			branch.PublicationID = ""
 			found = true
 			break
 		}

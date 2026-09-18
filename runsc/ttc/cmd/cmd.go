@@ -7215,7 +7215,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		if err := b.startFreshBranchBesidePeers(info, target, branch); err != nil {
 			return 1, err
 		}
-		if err := b.containerStore().RecordBranchStart(target.container, target.branch); err != nil {
+		if err := b.containerStore().RecordBranchStart(target.container, target.branch, b.nodeID); err != nil {
 			_, _ = b.command("timetravel", target.container, "destroy", target.branch)
 			return 1, fmt.Errorf("recording fresh start for %s: %w", target, err)
 		}
@@ -8928,7 +8928,7 @@ func waitStatusExitCode(status uint32) int {
 func (b *runtimeBackend) recordLaunchState(target selector, detach bool, status int) {
 	store := ttcbundle.Store{Root: b.dataRoot}
 	if detach && status == 0 {
-		if err := store.RecordBranchStart(target.container, target.branch); err != nil && b.stderr != nil {
+		if err := store.RecordBranchStart(target.container, target.branch, b.nodeID); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: recording start state for %s: %v\n", target, err)
 		}
 	} else {
@@ -13157,6 +13157,16 @@ func (b *runtimeBackend) discard(target selector) error {
 	if err != nil {
 		return err
 	}
+	// Retiring PublicationID below is the physical CAS that prevents a stale
+	// worker from replaying this branch's preceding lifecycle. First wait out an
+	// exact in-flight queue worker so its committed Raft roots and data-plane
+	// cleanup reach a terminal boundary. Otherwise daemon drain would retain an
+	// intent whose next retry can only report "publication identity changed".
+	if branch.PublicationID != "" && b.publicationQueue != nil {
+		if err := b.publicationQueue.CancelPending(info.ID, target.branch, branch.PublicationID); err != nil {
+			return fmt.Errorf("fencing branch publication before discarding %s: %w", target, err)
+		}
+	}
 	// Natural init exit can reach discard without prepareStop. The Sentry still
 	// exists until the runtime deletion below, so use that last opportunity to
 	// resolve sparse migration backing before the branch becomes process-free.
@@ -14250,7 +14260,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 		for _, branch := range family.Branches {
 			if branch.ID == target.branch {
-				if err := b.containerStore().RecordBranchActivation(target.container, target.branch, branch.State); err != nil {
+				if err := b.containerStore().RecordBranchActivation(target.container, target.branch, branch.State, b.nodeID); err != nil {
 					return err
 				}
 				b.releaseConsumedStandaloneMemoryBacking(target, *persistentBranch)
@@ -14533,7 +14543,7 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		}
 		state = "running"
 	}
-	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state, b.nodeID); err != nil {
 		return err
 	}
 	// The live runtime and its persistent state are now committed. Failures in
@@ -14826,7 +14836,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if capture.Resume {
 		state = "running"
 	}
-	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state, b.nodeID); err != nil {
 		if _, destroyErr := b.command("timetravel", info.ID, "destroy", target.branch); destroyErr != nil {
 			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
 		}

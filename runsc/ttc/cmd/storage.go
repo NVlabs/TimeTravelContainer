@@ -1972,6 +1972,13 @@ func validateColdManifestIdentity(info ttcbundle.ContainerInfo, branch ttcbundle
 		(state == "running" || state == "paused" || state == "exited" || state == "failed" || state == "dead") {
 		return nil
 	}
+	// Explicit stop of a durable dehydrated branch consumes its process
+	// snapshot and publication transaction without consuming the immutable
+	// filesystem ancestor. Until fresh-start materialization commits, that
+	// exited branch correctly remains shared with an empty PublicationID.
+	if branch.PublicationID == "" && branch.StorageState == "shared" && state == "exited" {
+		return nil
+	}
 	return fmt.Errorf("cold manifest publication is %q, branch publication is %q", manifest.PublicationID, branch.PublicationID)
 }
 

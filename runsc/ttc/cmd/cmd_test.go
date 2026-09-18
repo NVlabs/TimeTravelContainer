@@ -6147,6 +6147,11 @@ func TestColdManifestIdentityRetainsActivatedFilesystemAncestor(t *testing.T) {
 			t.Errorf("activated %s ancestor rejected: %v", state, err)
 		}
 	}
+	if err := validateColdManifestIdentity(info, ttcbundle.BranchInfo{
+		ID: "child", State: "exited", StorageState: "shared", StorageManifest: "/shared/cold.json",
+	}, manifest); err != nil {
+		t.Fatalf("consumed stopped filesystem ancestor rejected: %v", err)
+	}
 	branch := ttcbundle.BranchInfo{
 		ID: "child", State: "dehydrated", StorageState: "shared",
 		PublicationID: "publication-cold",

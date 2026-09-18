@@ -1474,8 +1474,24 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	}
-	if branch.PublicationID != manifest.PublicationID || branch.StorageManifest == "" ||
-		filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
+	// The catalog lifecycle is derived from Raft too. In particular, restart of
+	// a dehydrated branch first discards its memory in Raft and in the physical
+	// record. A publication worker that passed its fence just before that discard
+	// can subsequently replay the older "dehydrated" lifecycle while retaining
+	// the new exit timestamp and cleared memory roots. Treat lifecycle drift like
+	// every other incomplete publication tail and roll the physical catalog
+	// forward to the authoritative value before claiming it.
+	activePublication := authority.PublicationID != ""
+	metadataDrift := branch.StorageManifest == "" ||
+		filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) ||
+		normalizeLifecycleState(branch.State) != normalizeLifecycleState(authority.Lifecycle) ||
+		branch.Unplaced == false
+	if activePublication {
+		metadataDrift = metadataDrift || branch.PublicationID != manifest.PublicationID
+	} else {
+		metadataDrift = metadataDrift || branch.PublicationID != ""
+	}
+	if metadataDrift {
 		lifecycle := authority.Lifecycle
 		if lifecycle == "" {
 			lifecycle = "exited"
@@ -1483,8 +1499,12 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 				lifecycle = "dehydrated"
 			}
 		}
-		if err := store.CompleteBranchPublication(manifest.Container, manifest.Branch, manifest.PublicationID, expectedManifest, lifecycle, true); err != nil {
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing committed cold branch metadata: %w", err)
+		if activePublication {
+			if err := store.CompleteBranchPublication(manifest.Container, manifest.Branch, manifest.PublicationID, expectedManifest, lifecycle, true); err != nil {
+				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing committed cold branch metadata: %w", err)
+			}
+		} else if err := store.CompleteConsumedBranchPublication(manifest.Container, manifest.Branch, expectedManifest, lifecycle, true); err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing consumed cold branch metadata: %w", err)
 		}
 		info, err = store.LoadRuntimeContainer(manifest.Container)
 		if err != nil {
@@ -1499,7 +1519,12 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	// StorageState is deliberately not part of it: after publication, a node
 	// may materialize the branch into its disposable local cache for cp, a cold
 	// fork, or rehydration.
-	if branch.PublicationID != manifest.PublicationID || filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
+	publicationMatches := branch.PublicationID == manifest.PublicationID
+	if !activePublication {
+		publicationMatches = branch.PublicationID == ""
+	}
+	if !publicationMatches || filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) ||
+		normalizeLifecycleState(branch.State) != normalizeLifecycleState(authority.Lifecycle) || !branch.Unplaced {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, errors.New("committed cold branch metadata did not converge")
 	}
 	if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {

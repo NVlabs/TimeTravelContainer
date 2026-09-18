@@ -952,8 +952,69 @@ func TestWaitForCommittedColdBranchMetadataUsesFilesystemRootAfterMemoryDiscard(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.ID != physicalID || branch.ID != physicalBranch || branch.PublicationID != publicationID {
+	if info.ID != physicalID || branch.ID != physicalBranch || branch.PublicationID != "" {
 		t.Fatalf("resolved info=%q branch=%+v", info.ID, branch)
+	}
+}
+
+func TestWaitForCommittedColdBranchMetadataRepairsLifecycleAfterMemoryDiscard(t *testing.T) {
+	root := t.TempDir()
+	const (
+		publicationID  = "publication-cold"
+		physicalID     = "physical-cold"
+		physicalBranch = "transaction-cold"
+	)
+	containerDir := filepath.Join(root, "containers", physicalID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(root, physicalID, physicalBranch, publicationID)
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	encodedManifest, err := json.Marshal(coldBranchManifest{
+		Version: 5, Container: physicalID, Branch: physicalBranch,
+		PublicationID: publicationID, Kind: "dehydrate", MemorySnapshot: 17,
+		ControlRoot: ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encodedManifest, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	status := 137
+	exitedAt := time.Unix(17, 0).UTC()
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, DistributedFamilyID: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: physicalBranch, State: "dehydrated", Unplaced: true,
+			ExitStatus: &status, ExitedAt: &exitedAt, StorageState: "shared",
+			PublicationID: publicationID, StorageManifest: manifestPath,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "cold", Lifecycle: "exited",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, branch, err := waitForCommittedColdBranchMetadata(ctx, ttcbundle.Store{Root: root}, "family", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.State != "exited" || branch.PublicationID != "" || branch.ExitStatus == nil || *branch.ExitStatus != status || branch.ExitedAt == nil {
+		t.Fatalf("repaired branch=%+v, want exited lifecycle with retained status", branch)
 	}
 }
 

@@ -2329,7 +2329,10 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	info := ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, NetworkMode: "ttc", State: "running", CreatedAt: time.Now(),
-		Branches:       []BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
+		Branches: []BranchInfo{{ID: "main", State: "running"}, {
+			ID: "child", ParentID: "main", State: "running", StorageState: "publishing",
+			PublicationID: "publication-inflight", StorageManifest: "/shared/base-manifest",
+		}},
 		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"}},
 	}
 	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
@@ -2358,6 +2361,13 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if err := store.StopBranch("demo", "child", 137); err != nil {
 		t.Fatalf("StopBranch: %v", err)
 	}
+	stopped, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stopped.Branches[1]; got.PublicationID != "" || got.StorageManifest != "/shared/base-manifest" {
+		t.Fatalf("StopBranch did not fence the publisher while retaining the filesystem ancestor: %+v", got)
+	}
 	if err := store.mutateContainer("demo", func(info *ContainerInfo) (bool, error) {
 		info.Branches[1].PublicationID = "publication-prior-incarnation"
 		info.Branches[1].StorageState = "shared"
@@ -2376,7 +2386,7 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if loaded.Branches[1].ExitStatus == nil || *loaded.Branches[1].ExitStatus != 137 || loaded.Branches[1].ExitedAt == nil {
 		t.Fatalf("branch stop did not persist branch-local wait status: %+v", loaded.Branches[1])
 	}
-	if err := store.RecordBranchStart("demo", "child"); err != nil {
+	if err := store.RecordBranchStart("demo", "child", "node-a"); err != nil {
 		t.Fatalf("RecordBranchStart: %v", err)
 	}
 	loaded, err = store.LoadContainer("demo")
@@ -2392,7 +2402,10 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if loaded.Branches[1].PublicationID != "" || loaded.Branches[1].StorageState != "local" || loaded.Branches[1].StorageManifest != "/shared/prior-manifest" {
 		t.Fatalf("branch start retained a stale publication fence or lost its immutable ancestor: %+v", loaded.Branches[1])
 	}
-	if err := store.RecordBranchActivation("demo", "child", "paused"); err != nil {
+	if loaded.Branches[1].NodeID != "node-a" || loaded.Branches[1].Unplaced {
+		t.Fatalf("branch start did not atomically record its execution owner: %+v", loaded.Branches[1])
+	}
+	if err := store.RecordBranchActivation("demo", "child", "paused", "node-a"); err != nil {
 		t.Fatalf("RecordBranchActivation(paused): %v", err)
 	}
 	loaded, err = store.LoadContainer("demo")
@@ -2402,7 +2415,7 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if loaded.Branches[1].State != "paused" {
 		t.Fatalf("branch activation state=%q, want paused", loaded.Branches[1].State)
 	}
-	if err := store.RecordBranchActivation("demo", "child", "exited"); err == nil {
+	if err := store.RecordBranchActivation("demo", "child", "exited", "node-a"); err == nil {
 		t.Fatal("RecordBranchActivation accepted exited state")
 	}
 	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
