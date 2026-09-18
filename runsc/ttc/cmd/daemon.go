@@ -4692,6 +4692,11 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			// An offline or absent incarnation has no remaining execution or
 			// storage authority. Its other local journals are just as stale as its
 			// Raft WAL and must not be replayed under the replacement incarnation.
+			// Reap the guardian-stopped runtime before deleting the fence record
+			// and runsc sockets needed to identify and clean those processes.
+			if err := terminateRetiredElasticRuntimeRoot(filepath.Join(localRoot, "runtime", "runsc")); err != nil {
+				return nil, fmt.Errorf("reaping retired local runtimes: %w", err)
+			}
 			if err := discardRetiredLocalAuthority(localRoot); err != nil {
 				return nil, err
 			}

@@ -1818,6 +1818,54 @@ func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	}
 }
 
+func TestTerminateRetiredElasticRuntimeRoot(t *testing.T) {
+	runtimeRoot := filepath.Join(t.TempDir(), "runtime")
+	otherRoot := filepath.Join(t.TempDir(), "runtime")
+	start := func(name, root string) *exec.Cmd {
+		command := exec.Command("bash", "-c", "exec -a '"+name+"' bash -c 'while :; do read -t 1 || :; done' -- --root="+root)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return command
+	}
+	sentry := start("ttc-sentry[retired-test]", runtimeRoot)
+	gofer := start("runsc-gofer", runtimeRoot)
+	unrelated := start("runsc-gofer", otherRoot)
+	defer func() {
+		for _, command := range []*exec.Cmd{sentry, gofer, unrelated} {
+			_ = command.Process.Signal(syscall.SIGCONT)
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		processes, err := elasticProcessesForRuntimeRoot(runtimeRoot, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(processes) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retired runtime helpers were not discoverable: %+v", processes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := terminateRetiredElasticRuntimeRoot(runtimeRoot); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []*exec.Cmd{sentry, gofer} {
+		state, err := processState(command.Process.Pid)
+		if err == nil && state != 'Z' {
+			t.Fatalf("retired runtime PID %d remains in state %c", command.Process.Pid, state)
+		}
+	}
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unrelated runtime was terminated: %v", err)
+	}
+}
+
 func TestTransactionPlacementOwnedByIgnoresHistoricalTargetNode(t *testing.T) {
 	tx := cluster.Transaction{Identity: cluster.ForkIdentity{
 		TargetNodeID:        "node-a",

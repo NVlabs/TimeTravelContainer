@@ -5459,6 +5459,22 @@ func processStartTime(pid int) (string, error) {
 	return fields[19], nil
 }
 
+func processState(pid int) (byte, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	end := strings.LastIndex(string(data), ") ")
+	if end < 0 {
+		return 0, errors.New("malformed process stat")
+	}
+	fields := strings.Fields(string(data)[end+2:])
+	if len(fields) == 0 || len(fields[0]) != 1 {
+		return 0, errors.New("process stat omits state")
+	}
+	return fields[0][0], nil
+}
+
 // RunLeaseGuardian is the private ttcd child entry point. It intentionally
 // lives outside the daemon process: a SIGKILL, panic, or deadlock in ttcd
 // closes/stalls the heartbeat pipe and the guardian still physically stops
@@ -5550,12 +5566,21 @@ func startLeaseGuardian(localRoot, runtimeRoot, nodeID, incarnation string, leas
 	return writer, nil
 }
 
-func sentryProcessesForRuntimeRoot(runtimeRoot string) ([]elasticFencedProcess, error) {
+func processUsesRuntimeRoot(arguments []string, runtimeRoot string) bool {
+	rootArgument := "--root=" + runtimeRoot
+	for i, argument := range arguments[1:] {
+		if argument == rootArgument || (argument == runtimeRoot && i > 0 && arguments[i] == "--root") {
+			return true
+		}
+	}
+	return false
+}
+
+func elasticProcessesForRuntimeRoot(runtimeRoot string, sentryOnly bool) ([]elasticFencedProcess, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
 	}
-	rootArgument := "--root=" + runtimeRoot
 	var processes []elasticFencedProcess
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
@@ -5567,29 +5592,88 @@ func sentryProcessesForRuntimeRoot(runtimeRoot string) ([]elasticFencedProcess, 
 			continue
 		}
 		arguments := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-		if len(arguments) == 0 || !strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[") {
+		if len(arguments) == 0 || (sentryOnly && !strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[")) {
 			continue
 		}
-		matchesRoot := false
-		for _, argument := range arguments[1:] {
-			if argument == rootArgument {
-				matchesRoot = true
-				break
-			}
-		}
-		if !matchesRoot {
+		if !processUsesRuntimeRoot(arguments, runtimeRoot) {
 			continue
 		}
 		start, err := processStartTime(pid)
 		if err == nil {
-			containerID := arguments[len(arguments)-1]
-			if containerID == "" || strings.ContainsAny(containerID, `/\\`) {
-				containerID = ""
+			containerID := ""
+			if strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[") {
+				containerID = arguments[len(arguments)-1]
+				if containerID == "" || strings.ContainsAny(containerID, `/\\`) {
+					containerID = ""
+				}
 			}
 			processes = append(processes, elasticFencedProcess{PID: pid, StartTime: start, ContainerID: containerID})
 		}
 	}
 	return processes, nil
+}
+
+func sentryProcessesForRuntimeRoot(runtimeRoot string) ([]elasticFencedProcess, error) {
+	return elasticProcessesForRuntimeRoot(runtimeRoot, true)
+}
+
+// terminateRetiredElasticRuntimeRoot reaps every helper belonging to an
+// execution epoch that the replicated cluster has already fenced and removed.
+// This must precede deletion of the local authority tree: the lease guardian's
+// PID/start-time record and runsc sockets are the evidence and cleanup handles
+// for the stopped runtime, respectively.
+func terminateRetiredElasticRuntimeRoot(runtimeRoot string) error {
+	processes, err := elasticProcessesForRuntimeRoot(runtimeRoot, false)
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, process := range processes {
+		start, err := processStartTime(process.PID)
+		if errors.Is(err, os.ErrNotExist) || start != process.StartTime {
+			continue
+		}
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("verifying retired runtime PID %d: %w", process.PID, err))
+			continue
+		}
+		if err := syscall.Kill(process.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			result = errors.Join(result, fmt.Errorf("killing retired runtime PID %d: %w", process.PID, err))
+		}
+	}
+	if result != nil {
+		return result
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var alive []int
+		for _, process := range processes {
+			start, err := processStartTime(process.PID)
+			if errors.Is(err, os.ErrNotExist) || start != process.StartTime {
+				continue
+			}
+			if err != nil {
+				alive = append(alive, process.PID)
+				continue
+			}
+			state, err := processState(process.PID)
+			if errors.Is(err, os.ErrNotExist) || state == 'Z' {
+				continue
+			}
+			if err != nil {
+				alive = append(alive, process.PID)
+				continue
+			}
+			alive = append(alive, process.PID)
+		}
+		if len(alive) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("retired runtime processes did not exit: %v", alive)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func fenceElasticRuntimeRoot(localRoot, runtimeRoot, nodeID, incarnation string) error {
