@@ -523,6 +523,12 @@ func TestAuthorityRaftRemovedMemberCanRejoinWithoutProcessRestart(t *testing.T) 
 	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
 		t.Fatalf("re-adding removed node-b: %v", err)
 	}
+	// The authoritative node record remains offline until the learner has
+	// caught up enough to register its replacement incarnation. Reconciliation
+	// must not immediately remove this non-quorum-bearing admission again.
+	if err := leader.ReconcileVoters(ctx, 3); err != nil {
+		t.Fatalf("reconciling re-admitted offline learner: %v", err)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		configuration, err := leader.Configuration()

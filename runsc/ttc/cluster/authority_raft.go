@@ -741,6 +741,15 @@ func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) 
 			if (!ok && !retired) || (ok && record.State != NodeOffline) || string(server.ID) == n.id {
 				continue
 			}
+			// An offline nonvoter may be the first stage of re-admitting an
+			// expired member. Its local WAL cannot propose NodeRegister until it
+			// has received the leader and current configuration, so removing the
+			// learner here creates an endless AddNonvoter/remove race. Retaining it
+			// cannot enlarge the quorum. A failed startup removes its exact learner
+			// through CancelNonvoter; a later join with the same ID is idempotent.
+			if server.Suffrage == raft.Nonvoter {
+				continue
+			}
 			if err := n.RemoveMember(ctx, string(server.ID)); err != nil {
 				return fmt.Errorf("removing fenced Raft member %q: %w", server.ID, err)
 			}

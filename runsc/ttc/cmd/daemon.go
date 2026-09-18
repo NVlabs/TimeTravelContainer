@@ -4080,12 +4080,11 @@ func syncDaemonRootDirectory(root string) error {
 	return directory.Sync()
 }
 
-// localNodeIncarnationRetired reports whether the cluster has
-// administratively forgotten this exact local execution epoch. A failed daemon
-// merely retaining an expired NodeRecord must keep its identity for fenced
-// runtime recovery; only the replicated retirement tombstone authorizes TTC to
-// discard its stale Raft state and rejoin as a new member.
-func localNodeIncarnationRetired(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (bool, error) {
+// localNodeAuthorityMustReset distinguishes an ordinary live-incarnation
+// restart from an incarnation whose execution authority has already been
+// fenced. Offline or forgotten incarnations must not reopen a stale Raft WAL
+// or replay mutable local journals under replacement authority.
+func localNodeAuthorityMustReset(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (bool, error) {
 	ids := make([]string, 0, len(clients))
 	for id := range clients {
 		ids = append(ids, id)
@@ -4098,12 +4097,12 @@ func localNodeIncarnationRetired(nodeID, incarnation, authToken string, clients 
 		if err != nil {
 			continue
 		}
-		return localIncarnationMustRejoin(state, nodeID, incarnation)
+		return localIncarnationMustReset(state, nodeID, incarnation)
 	}
 	return false, nil
 }
 
-func localIncarnationMustRejoin(state *cluster.AuthorityState, nodeID, incarnation string) (bool, error) {
+func localIncarnationMustReset(state *cluster.AuthorityState, nodeID, incarnation string) (bool, error) {
 	if state == nil {
 		return false, errors.New("cluster authority state is nil")
 	}
@@ -4111,13 +4110,16 @@ func localIncarnationMustRejoin(state *cluster.AuthorityState, nodeID, incarnati
 		if record.Incarnation != incarnation {
 			return false, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
 		}
-		return false, nil
+		// Expiry has already invalidated every placement, volatile dependency,
+		// and unpublished origin owned by this incarnation. Its local runtime
+		// journals cannot be recovered, and its Raft WAL may describe a
+		// configuration from which this server was removed while offline.
+		return record.State == cluster.NodeOffline, nil
 	}
 	// `node rm` deliberately forgets its retirement tombstone after removing
 	// the Raft member. Absence from a linearizable authority snapshot is
 	// therefore itself the durable authorization to discard this excluded local
-	// replica. A still-recoverable failed node remains present as offline and
-	// takes the path above.
+	// replica.
 	return true, nil
 }
 
@@ -4502,23 +4504,21 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil {
 		return nil, err
 	}
-	// A removed member's WAL describes a configuration in which it still
-	// participates. Opening that WAL and waiting for its historical quorum can
-	// never re-admit it to the current configuration. When a configured seed
-	// proves that this exact incarnation was retired, discard only the
-	// node-local Raft replica and rotate the execution epoch. The ordinary fresh
-	// join below then adds this node as a learner. The shared state and all
-	// immutable snapshot authority remain untouched.
+	// A removed or expired member's WAL describes a configuration in which it
+	// still participates. Opening that WAL and waiting for its historical quorum
+	// cannot re-admit it to the current configuration. Once a configured seed
+	// proves that this incarnation is offline or absent, discard its node-local
+	// authority and rotate the execution epoch. Expiry has already fenced its
+	// mutable state; immutable image cache and shared snapshot authority remain.
 	if !opts.RaftBootstrap && len(clients) != 0 {
-		retired, err := localNodeIncarnationRetired(opts.NodeID, incarnation, opts.AuthToken, clients)
+		reset, err := localNodeAuthorityMustReset(opts.NodeID, incarnation, opts.AuthToken, clients)
 		if err != nil {
 			return nil, err
 		}
-		if retired {
-			// Absence from the authoritative node catalog means that the old
-			// incarnation has no remaining execution or storage authority. Its
-			// other local journals are just as stale as its Raft WAL and must not
-			// be replayed under the replacement incarnation.
+		if reset {
+			// An offline or absent incarnation has no remaining execution or
+			// storage authority. Its other local journals are just as stale as its
+			// Raft WAL and must not be replayed under the replacement incarnation.
 			if err := discardRetiredLocalAuthority(localRoot); err != nil {
 				return nil, err
 			}
@@ -4560,6 +4560,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	})
 	if err != nil {
 		return nil, err
+	}
+	authorityJoinRequest := cluster.AuthorityJoinRequest{
+		NodeID: opts.NodeID, Incarnation: incarnation,
+		ControlURL: advertiseURL, ControlServerName: advertiseServerName,
+		RaftAddress: raftNode.Address(), ClusterID: clusterID,
+		Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
 	}
 	// A restarted server may have been removed from the current Raft
 	// configuration after its execution lease expired. Its local WAL still
@@ -4623,7 +4629,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	} else {
 		joined := false
 		var joinErr error
-		request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
 		cancelRequest := cluster.AuthorityCancelJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address()}
 		cancelFreshJoin = func(ctx context.Context) error {
 			var result error
@@ -4638,7 +4643,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		}
 		for _, peer := range clients {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			joinErr = joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken)
+			joinErr = joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken)
 			cancel()
 			if joinErr == nil {
 				joined = true
@@ -4757,10 +4762,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			if len(clients) == 0 {
 				return errors.New("no cluster seed is configured for Raft membership recovery")
 			}
-			request := cluster.AuthorityJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address(), ClusterID: clusterID, Capabilities: capabilities}
 			var result error
 			for _, peer := range clients {
-				if err := joinAuthorityThroughSeed(ctx, peer, request, opts.NodeID, opts.AuthToken); err == nil {
+				if err := joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken); err == nil {
 					return nil
 				} else {
 					result = errors.Join(result, err)

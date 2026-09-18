@@ -2283,7 +2283,7 @@ func TestRaftClusterIdentityPreventsSecondBootstrap(t *testing.T) {
 	}
 }
 
-func TestLocalIncarnationMustRejoin(t *testing.T) {
+func TestLocalIncarnationMustReset(t *testing.T) {
 	const (
 		node        = "node-a"
 		incarnation = "incarnation-a"
@@ -2295,17 +2295,20 @@ func TestLocalIncarnationMustRejoin(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "forgotten member", state: cluster.NewAuthorityState(), want: true},
-		{name: "recoverable offline member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+		{name: "expired offline member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeOffline},
+		}}, want: true},
+		{name: "live matching member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeReady},
 		}}},
 		{name: "same name has new identity", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: "incarnation-new", State: cluster.NodeReady},
 		}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := localIncarnationMustRejoin(test.state, node, incarnation)
+			got, err := localIncarnationMustReset(test.state, node, incarnation)
 			if (err != nil) != test.wantErr || got != test.want {
-				t.Fatalf("localIncarnationMustRejoin()=(%t, %v), want (%t, err=%t)", got, err, test.want, test.wantErr)
+				t.Fatalf("localIncarnationMustReset()=(%t, %v), want (%t, err=%t)", got, err, test.want, test.wantErr)
 			}
 		})
 	}

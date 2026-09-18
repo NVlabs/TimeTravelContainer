@@ -503,14 +503,17 @@ type AuthorityProposal struct {
 	Payload   json.RawMessage      `json:"payload"`
 }
 
-// AuthorityJoinRequest adds an already-listening learner to the one cluster
-// Raft group. Node registration follows through the ordinary state machine.
+// AuthorityJoinRequest registers a replacement execution incarnation and adds
+// its already-listening process to the one cluster Raft group as a learner.
 type AuthorityJoinRequest struct {
-	NodeID       string       `json:"node_id"`
-	Incarnation  string       `json:"incarnation"`
-	RaftAddress  string       `json:"raft_address"`
-	ClusterID    string       `json:"cluster_id"`
-	Capabilities Capabilities `json:"capabilities"`
+	NodeID            string       `json:"node_id"`
+	Incarnation       string       `json:"incarnation"`
+	ControlURL        string       `json:"control_url"`
+	ControlServerName string       `json:"control_server_name,omitempty"`
+	RaftAddress       string       `json:"raft_address"`
+	ClusterID         string       `json:"cluster_id"`
+	Capabilities      Capabilities `json:"capabilities"`
+	MemoryTargetBytes uint64       `json:"memory_target_bytes,omitempty"`
 }
 
 // AuthorityCancelJoinRequest removes a learner whose daemon failed before it
@@ -661,6 +664,43 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			return
 		}
 		if _, err := Negotiate(a.Capabilities, request.Capabilities); err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
+		// Publish the replacement incarnation before admitting its Raft
+		// learner. An expired member still has an offline NodeRecord while its
+		// stale WAL catches up. Without this ordering, voter reconciliation can
+		// remove the newly added learner as an offline member before it receives
+		// enough state to propose NodeRegister itself.
+		state, err := a.Node.LinearizableState(r.Context())
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if state.ClusterPolicy.LeaseDuration <= 0 {
+			writeControlError(w, http.StatusServiceUnavailable, "cluster execution lease policy is unavailable")
+			return
+		}
+		record := NodeRecord{
+			NodeID: request.NodeID, Incarnation: request.Incarnation,
+			ControlURL: request.ControlURL, ControlServerName: request.ControlServerName,
+			RaftAddress: request.RaftAddress, Capabilities: request.Capabilities,
+			MemoryTargetBytes: request.MemoryTargetBytes,
+		}
+		result, err := a.Node.Propose(r.Context(), "join-register-"+request.Incarnation, AuthorityNodeRegister, AuthorityNodeRegisterPayload{
+			Record: record, LeaseDuration: state.ClusterPolicy.LeaseDuration,
+		})
+		if err != nil {
+			if notLeader(err) {
+				return
+			}
+			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if err := result.Err(); err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
