@@ -155,6 +155,19 @@ func (s Store) activeRoot() string {
 	return s.Root
 }
 
+// hasUnifiedActiveRoot reports whether durable metadata and mutable runtime
+// data intentionally share one hierarchy. Standalone TTC uses this layout;
+// clustered TTC keeps active data in TTC_LOCAL_ROOT and metadata in TTC_ROOT.
+//
+// A unified store cannot build a container in container-staging and also put
+// its rootfs repository in containers/<id>: creating the repository would
+// create the destination of the final directory rename. Such stores therefore
+// construct the complete record in place behind containerCreationMarker and
+// publish container.json last.
+func (s Store) hasUnifiedActiveRoot() bool {
+	return s.ActiveRoot != "" && filepath.Clean(s.ActiveRoot) == filepath.Clean(s.Root)
+}
+
 func (s Store) activeContainerDir(id string) string {
 	return filepath.Join(s.activeRoot(), "containers", id)
 }
@@ -2687,7 +2700,12 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		if unavailable[id] {
 			continue
 		}
-		dir, err := s.createContainerStagingDir(id)
+		var dir string
+		if s.hasUnifiedActiveRoot() {
+			dir, err = s.createContainerInPlaceDir(id)
+		} else {
+			dir, err = s.createContainerStagingDir(id)
+		}
 		if err == nil {
 			return id, dir, nil
 		} else if !os.IsExist(err) {
@@ -2695,6 +2713,22 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		}
 	}
 	return "", "", errors.New("could not allocate a unique container ID")
+}
+
+func (s Store) createContainerInPlaceDir(id string) (string, error) {
+	root := filepath.Join(s.Root, "containers")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating container state root: %w", err)
+	}
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("marking in-place container construction: %w", err)
+	}
+	return dir, nil
 }
 
 func (s Store) createContainerStagingDir(id string) (string, error) {
@@ -2718,8 +2752,18 @@ func (s Store) createContainerStagingDir(id string) (string, error) {
 // not require cross-client cache ordering between independent pathnames.
 func (s Store) publishContainerDir(id, stagingDir string) error {
 	finalDir := filepath.Join(s.Root, "containers", id)
-	if err := s.rename(stagingDir, finalDir); err != nil {
-		return err
+	if filepath.Clean(stagingDir) == filepath.Clean(finalDir) {
+		// container.json was written atomically after every other required file,
+		// so it is the visibility boundary for a unified standalone store. The
+		// marker is retained only for startup recovery if TTC crashes between
+		// those two operations.
+		if err := os.Remove(filepath.Join(finalDir, containerCreationMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	} else {
+		if err := s.rename(stagingDir, finalDir); err != nil {
+			return err
+		}
 	}
 	directory, err := os.Open(filepath.Dir(finalDir))
 	if err != nil {

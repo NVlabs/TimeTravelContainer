@@ -1962,6 +1962,50 @@ func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
 	}
 }
 
+func TestContainerPublicationWithUnifiedActiveRoot(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root, ActiveRoot: root}
+	id, building, err := store.createContainerDir(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalDir := filepath.Join(root, "containers", id)
+	if building != finalDir {
+		t.Fatalf("building directory=%q, want in-place %q", building, finalDir)
+	}
+	if _, err := os.Stat(filepath.Join(building, containerCreationMarker)); err != nil {
+		t.Fatalf("in-place construction has no marker: %v", err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 0 {
+		t.Fatalf("marked construction is visible: containers=%+v err=%v", containers, err)
+	}
+	bundle := filepath.Join(building, "bundle")
+	if err := os.Mkdir(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(building, "container.json"), &ContainerInfo{
+		ID: id, Name: "unified", BundleDir: bundle, State: "created", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.publishContainerDir(id, building); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(finalDir, containerCreationMarker)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("publication marker remains: %v", err)
+	}
+	loaded, err := store.LoadContainer(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Name != "unified" {
+		t.Fatalf("published container=%+v, want unified", loaded)
+	}
+}
+
 func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "demo")
