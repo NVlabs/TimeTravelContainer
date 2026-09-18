@@ -49,6 +49,19 @@ type transactionLoadCatalog struct {
 	load func(string) (*cluster.Transaction, error)
 }
 
+type failFirstRoundTripper struct {
+	remaining int
+	next      http.RoundTripper
+}
+
+func (r *failFirstRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if r.remaining > 0 {
+		r.remaining--
+		return nil, errors.New("seed listener is not ready")
+	}
+	return r.next.RoundTrip(request)
+}
+
 func (c transactionLoadCatalog) Load(id string) (*cluster.Transaction, error) {
 	return c.load(id)
 }
@@ -1919,6 +1932,29 @@ func TestJoinAuthorityWaitsForLeaderElection(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("join calls=%d, want 3", calls)
+	}
+}
+
+func TestJoinAuthorityWaitsForSeedListener(t *testing.T) {
+	calls := 0
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]string{"node_id": "joining"})
+	}))
+	defer seed.Close()
+	client, err := cluster.NewPlainClient(seed.URL, "joining", "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTP.Transport = &failFirstRoundTripper{remaining: 2, next: http.DefaultTransport}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	request := cluster.AuthorityJoinRequest{NodeID: "joining"}
+	if err := joinAuthorityThroughSeed(ctx, client, request, "joining", ""); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("successful seed calls=%d, want 1", calls)
 	}
 }
 

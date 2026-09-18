@@ -4803,6 +4803,24 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 		if err == nil {
 			return nil
 		}
+		if isTransientAuthorityJoinTransport(err) {
+			// Whole-cluster restart commonly launches members concurrently. The
+			// first seed process may not have opened its listener when another
+			// member makes its initial connection. Keep this joiner's Raft listener
+			// alive and retry the configured seed within the existing bounded
+			// context, just as we already do during leader election.
+			peer = seed
+			seen = make(map[string]bool)
+			redirects = 0
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("waiting for a reachable Raft seed while joining cluster: %w", ctx.Err())
+			case <-timer.C:
+			}
+			continue
+		}
 		var redirect *cluster.AuthorityNotLeaderError
 		if !errors.As(err, &redirect) {
 			return err
@@ -4839,6 +4857,14 @@ func joinAuthorityThroughSeed(ctx context.Context, seed *cluster.Client, request
 			return fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
 		}
 	}
+}
+
+func isTransientAuthorityJoinTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transport *url.Error
+	return errors.As(err, &transport)
 }
 
 // cancelAuthorityJoinThroughSeed follows the same leader redirect rules as
