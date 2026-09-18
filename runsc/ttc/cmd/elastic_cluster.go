@@ -1688,10 +1688,28 @@ func (m distributedFamilyMutation) branchPrefix() []string {
 	return prefix
 }
 
-func distributedMutationSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string) map[string]map[string]struct{} {
+// transactionNeedsReachableSourceSettlement distinguishes terminal migration
+// intent that still needs an RPC to its source from intent whose source node
+// completed the cluster retirement barrier. Node retirement synchronously
+// drains every dependency and releases every physical migration source before
+// Raft records the exact retired incarnation. Keeping the terminal transaction
+// is still necessary while its target placement exists, but routing a later
+// stop/dehydrate/rm to that deliberately removed node is neither necessary nor
+// possible.
+func transactionNeedsReachableSourceSettlement(tx cluster.Transaction, retiredNodes map[string]string) bool {
+	if !transactionNeedsSourceSettlement(tx) {
+		return false
+	}
+	if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent || tx.SourceIncarnation == "" {
+		return true
+	}
+	return retiredNodes[tx.Identity.SourceNodeID] != tx.SourceIncarnation
+}
+
+func distributedMutationSourceTransactions(transactions []cluster.Transaction, info ttcbundle.ContainerInfo, branchID string, retiredNodes map[string]string) map[string]map[string]struct{} {
 	settleByNode := make(map[string]map[string]struct{})
 	for _, tx := range transactions {
-		if !transactionNeedsSourceSettlement(tx) {
+		if !transactionNeedsReachableSourceSettlement(tx, retiredNodes) {
 			continue
 		}
 		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
@@ -2169,6 +2187,14 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	for i := range transactions {
 		transactionsByID[transactions[i].Identity.TransactionID] = &transactions[i]
 	}
+	var retiredNodes map[string]string
+	if s.distributedSource != nil && s.distributedSource.authority != nil {
+		authority, authorityErr := s.distributedSource.authority.AuthorityState()
+		if authorityErr != nil {
+			return true, 1, nil, nil, fmt.Errorf("reading retired node authority before family mutation: %w", authorityErr)
+		}
+		retiredNodes = authority.RetiredNodes
+	}
 	settleByNode := make(map[string]map[string]struct{})
 	cancelByNode := make(map[string]map[string]struct{})
 	discardByNode := make(map[string]map[string]struct{})
@@ -2193,7 +2219,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		if err != nil {
 			return true, 1, nil, nil, err
 		}
-		settle := distributedMutationSourceTransactions(transactions, info, branchID)
+		settle := distributedMutationSourceTransactions(transactions, info, branchID, retiredNodes)
 		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
 		var placements []cluster.PlacementRecord

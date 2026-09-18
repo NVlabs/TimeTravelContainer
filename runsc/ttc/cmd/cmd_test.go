@@ -6578,7 +6578,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 				TransactionID: id, SourceNodeID: sourceNode, SourceContainer: "family-id", SourceBranch: sourceBranch,
 				TargetContainer: "family-id", TargetBranch: id, TargetVisibleBranch: targetBranch, Migration: migration,
 			},
-			State: state, SourceNeeded: needed,
+			State: state, SourceNeeded: needed, SourceIncarnation: sourceNode + "-incarnation",
 		}
 	}
 	transactions := []cluster.Transaction{
@@ -6589,7 +6589,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 		transaction("independent-migration", "node-d", "main", "moved", cluster.TransactionIndependent, false, true),
 	}
 	info := ttcbundle.ContainerInfo{ID: "family-id"}
-	all := distributedMutationSourceTransactions(transactions, info, "")
+	all := distributedMutationSourceTransactions(transactions, info, "", nil)
 	if len(all) != 4 {
 		t.Fatalf("family settlement nodes=%v, want node-a, node-b, node-d, and node-e", all)
 	}
@@ -6602,11 +6602,27 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if _, ok := all["node-d"]["independent-migration"]; !ok {
 		t.Fatalf("family settlement omitted independent migration cleanup: %v", all)
 	}
-	child := distributedMutationSourceTransactions(transactions, info, "child")
+	retired := distributedMutationSourceTransactions(transactions, info, "", map[string]string{
+		"node-d": "node-d-incarnation",
+		"node-e": "node-e-incarnation",
+	})
+	if _, ok := retired["node-d"]; ok {
+		t.Fatalf("cleanly retired independent migration still requires its removed source: %v", retired)
+	}
+	if _, ok := retired["node-e"]["active-migration"]; !ok {
+		t.Fatalf("retirement record hid an active source dependency: %v", retired)
+	}
+	wrongIncarnation := distributedMutationSourceTransactions(transactions, info, "", map[string]string{
+		"node-d": "replacement-incarnation",
+	})
+	if _, ok := wrongIncarnation["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("replacement node incarnation hid old migration cleanup: %v", wrongIncarnation)
+	}
+	child := distributedMutationSourceTransactions(transactions, info, "child", nil)
 	if len(child) != 3 {
 		t.Fatalf("branch settlement nodes=%v, want incoming, outgoing, and active migration sources", child)
 	}
-	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, ""); len(got) != 0 {
+	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, "", nil); len(got) != 0 {
 		t.Fatalf("unrelated family selected transactions: %v", got)
 	}
 	settle, cancel, discard := distributedRemovalSourceTransactions(transactions, nil, info, "")
