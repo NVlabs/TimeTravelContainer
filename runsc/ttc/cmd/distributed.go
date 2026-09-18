@@ -1838,9 +1838,16 @@ func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotI
 // origin-scoped: graceful node retirement must cover immutable origins kept
 // alive by remote descendants even when no current local branch names them.
 func (b *runtimeBackend) publishVolatileFilesystemOrigin(origin ttcsnapshot.SnapshotID) error {
+	return b.publishVolatileFilesystemOriginContext(context.Background(), origin, make(map[ttcsnapshot.SnapshotID]struct{}))
+}
+
+func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Context, origin ttcsnapshot.SnapshotID, visiting map[ttcsnapshot.SnapshotID]struct{}) error {
 	if origin == 0 || b.snapshotShared == nil || b.distributedSource == nil ||
 		b.distributedSource.authority == nil || b.sharedReferences == nil {
 		return errors.New("distributed filesystem publication is unavailable")
+	}
+	if _, cycle := visiting[origin]; cycle {
+		return fmt.Errorf("filesystem snapshot origin dependency cycle through %d", origin)
 	}
 	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
 	if err != nil {
@@ -1856,6 +1863,63 @@ func (b *runtimeBackend) publishVolatileFilesystemOrigin(origin ttcsnapshot.Snap
 		return fmt.Errorf("filesystem origin %d belongs to node %q, not %q", origin, provider.NodeID, b.nodeID)
 	}
 
+	// Shared-ledger import installs cross-origin child edges immediately. Make
+	// every referenced origin authoritative in shared storage first, regardless
+	// of numeric snapshot ID; filesystem path-copy may legitimately create an
+	// older-origin metadata object that selects data from a newer origin.
+	var dependencies []ttcsnapshot.SnapshotID
+	found, err := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
+		var dependencyErr error
+		dependencies, dependencyErr = repository.OriginDependencies(origin)
+		return dependencyErr
+	})
+	if err != nil {
+		return fmt.Errorf("inventorying filesystem origin %d dependencies: %w", origin, err)
+	}
+	if !found {
+		return fmt.Errorf("filesystem origin %d is absent from node-local repositories", origin)
+	}
+	visiting[origin] = struct{}{}
+	defer delete(visiting, origin)
+	for _, dependency := range dependencies {
+		dependencyProvider, dependencyVolatile, err := b.distributedSource.authority.SnapshotProvider(uint64(dependency))
+		if err != nil {
+			return fmt.Errorf("resolving filesystem origin %d dependency %d: %w", origin, dependency, err)
+		}
+		if !dependencyVolatile {
+			if _, err := b.snapshotShared.Manifest(dependency); err != nil {
+				return fmt.Errorf("filesystem dependency %d has shared authority without a manifest: %w", dependency, err)
+			}
+			continue
+		}
+		if dependencyProvider.NodeID == b.nodeID {
+			if err := b.publishVolatileFilesystemOriginContext(ctx, dependency, visiting); err != nil {
+				return fmt.Errorf("publishing backing filesystem origin %d for origin %d: %w", dependency, origin, err)
+			}
+			continue
+		}
+		peer, err := b.distributedSource.peer(dependencyProvider.NodeID, false)
+		if err != nil {
+			return fmt.Errorf("routing filesystem dependency %d to provider %q: %w", dependency, dependencyProvider.NodeID, err)
+		}
+		if err := peer.PublishSnapshot(ctx, uint64(dependency)); err != nil {
+			return fmt.Errorf("requesting filesystem dependency %d from node %q: %w", dependency, dependencyProvider.NodeID, err)
+		}
+	}
+	// Dependency publication can take long enough for an idempotent concurrent
+	// publisher to finish this origin too.
+	provider, volatile, err = b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		_, err := b.snapshotShared.Manifest(origin)
+		return err
+	}
+	if provider.NodeID != b.nodeID {
+		return fmt.Errorf("filesystem origin %d provider changed to node %q", origin, provider.NodeID)
+	}
+
 	publisher := &branchPublisher{
 		sharedRoot: b.dataRoot,
 		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
@@ -1863,7 +1927,7 @@ func (b *runtimeBackend) publishVolatileFilesystemOrigin(origin ttcsnapshot.Snap
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
 	bridgeIntent := sharedPublicationBridgeIntent{Kind: sharedPublicationBridgeOrigin}
-	found, err := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
+	found, err = b.containerStore().WithFilesystemSnapshotOrigin(origin, func(repository *ttcvolume.Repository) error {
 		empty, err := repository.OriginEmpty(origin)
 		if err != nil {
 			return err

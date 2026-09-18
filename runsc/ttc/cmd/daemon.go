@@ -5719,6 +5719,13 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		targetBackend.nodeID = clusterRuntime.controlPlane.Capabilities.NodeID
 		targetBackend.distributedSource = clusterRuntime.source
 		graphProvider.publish = func(ctx context.Context, snapshot ttcsnapshot.SnapshotID) error {
+			// Snapshot IDs are cluster-global, but memory and filesystem origins
+			// have different node-local stores. The peer publication endpoint is
+			// deliberately generic so recursive cross-origin publication works
+			// even when a filesystem dependency resides on another node.
+			if _, ok := targetBackend.snapshotGraph.Snapshot(snapshot); !ok {
+				return targetBackend.publishVolatileFilesystemOriginContext(ctx, snapshot, make(map[ttcsnapshot.SnapshotID]struct{}))
+			}
 			publisher := &branchPublisher{
 				sharedRoot: targetBackend.dataRoot,
 				nodeID:     targetBackend.nodeID, incarnation: clusterRuntime.nodeRecord.Incarnation,

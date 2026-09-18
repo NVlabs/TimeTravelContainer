@@ -1658,6 +1658,40 @@ func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
 	}
 }
 
+func TestOriginDependenciesIncludeNewerCrossOriginChildren(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("origin-dependencies", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	var child ttcsnapshot.ObjectID
+	if err := repository.withLock(func() error {
+		if err := repository.graph.AdoptWorking(101); err != nil {
+			return err
+		}
+		var err error
+		child, err = repository.graph.CreateObject(101, "construct/dependency-child", ttcsnapshot.ObjectKindFile, nil, nil)
+		if err != nil {
+			return err
+		}
+		_, err = repository.graph.CreateObject(100, "construct/dependency-parent", ttcsnapshot.ObjectKindInode, nil, []ttcsnapshot.Edge{{Slot: 0, Child: child}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dependencies, err := repository.OriginDependencies(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 1 || dependencies[0] != 101 {
+		t.Fatalf("OriginDependencies(100)=%v, want [101]", dependencies)
+	}
+	if dependencies, err := repository.OriginDependencies(101); err != nil || len(dependencies) != 0 {
+		t.Fatalf("OriginDependencies(101)=%v, err=%v, want empty", dependencies, err)
+	}
+}
+
 func TestMaterializedRemoteMarkerDoesNotPoisonLaterSync(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("materialized-marker-sync")

@@ -827,6 +827,44 @@ func (r *Repository) OriginEmpty(origin ttcsnapshot.SnapshotID) (bool, error) {
 	return len(objects) == 0, err
 }
 
+// OriginDependencies returns the foreign immutable origins referenced directly
+// by origin. Publishing an origin to the shared reference ledger must publish
+// these dependencies first: importing a parent creates its cross-origin edge
+// references, which cannot name an object whose owning ledger is still only
+// present on a volatile provider.
+//
+// The result is bounded by the objects in this one origin and is used only at
+// cold-publication/retirement time, never in the live filesystem data path.
+func (r *Repository) OriginDependencies(origin ttcsnapshot.SnapshotID) ([]ttcsnapshot.SnapshotID, error) {
+	if origin == 0 {
+		return nil, errors.New("invalid filesystem snapshot origin")
+	}
+	objects, err := r.graph.SnapshotObjects(origin)
+	if err != nil {
+		return nil, err
+	}
+	dependencies := make(map[ttcsnapshot.SnapshotID]struct{})
+	add := func(id ttcsnapshot.ObjectID) {
+		if !id.IsZero() && id.Snapshot != origin {
+			dependencies[id.Snapshot] = struct{}{}
+		}
+	}
+	for _, object := range objects {
+		if object.Deferred {
+			add(object.SourceObject)
+		}
+		for _, edge := range object.Children {
+			add(edge.Child)
+		}
+	}
+	result := make([]ttcsnapshot.SnapshotID, 0, len(dependencies))
+	for dependency := range dependencies {
+		result = append(result, dependency)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, nil
+}
+
 // Create creates a new volume with an empty main branch.
 func (m *Manager) Create(name string) (*Repository, error) {
 	return m.create(name, 0)
