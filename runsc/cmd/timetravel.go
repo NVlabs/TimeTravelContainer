@@ -957,7 +957,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 				case result.err != nil:
 					err = result.err
 				default:
-					err = writeConsoleWaitStatus(t.consoleWaitStatus, binary.BigEndian.Uint32(encodedStatus[:]))
+					err = ttcconsole.WriteWaitStatus(t.consoleWaitStatus, binary.BigEndian.Uint32(encodedStatus[:]))
 				}
 			}
 			if err != nil && drain.err != nil {
@@ -1007,36 +1007,6 @@ func distributedAdvertiseAddress(configured, bound string) (string, error) {
 		port = boundPort
 	}
 	return net.JoinHostPort(host, port), nil
-}
-
-func writeConsoleWaitStatus(path string, status uint32) error {
-	dir := filepath.Dir(path)
-	tempFile, err := os.CreateTemp(dir, ".wait-status-*")
-	if err != nil {
-		return fmt.Errorf("creating temporary console wait status in %q: %w", dir, err)
-	}
-	tempPath := tempFile.Name()
-	renamed := false
-	defer func() {
-		_ = tempFile.Close()
-		if !renamed {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := tempFile.Chmod(0600); err != nil {
-		return fmt.Errorf("setting console wait status permissions: %w", err)
-	}
-	if _, err := tempFile.WriteString(strconv.FormatUint(uint64(status), 10) + "\n"); err != nil {
-		return fmt.Errorf("writing console wait status: %w", err)
-	}
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("closing console wait status: %w", err)
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("installing console wait status at %q: %w", path, err)
-	}
-	renamed = true
-	return nil
 }
 
 type consoleDrainResult struct {

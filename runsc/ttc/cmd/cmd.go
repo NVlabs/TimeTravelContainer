@@ -8069,19 +8069,7 @@ func acquireConsoleStdin(lockPath string, target selector) (*os.File, error) {
 }
 
 func readConsoleWaitStatus(path string) (uint32, bool, error) {
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("reading console wait status: %w", err)
-	}
-	value := strings.TrimSpace(string(data))
-	status, err := strconv.ParseUint(value, 10, 32)
-	if err != nil {
-		return 0, false, fmt.Errorf("parsing console wait status %q: %w", value, err)
-	}
-	return uint32(status), true, nil
+	return ttcconsole.ReadWaitStatus(path)
 }
 
 func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr error) {
@@ -13228,17 +13216,11 @@ func (b *runtimeBackend) discard(target selector) error {
 		if family.ID != info.ID {
 			continue
 		}
-		present := false
-		for _, branch := range family.Branches {
-			if branch.ID == target.branch {
-				present = true
-				break
-			}
-		}
+		present, onlyBranch := runtimeFamilyBranchDisposition(family, target.branch)
 		if !present {
 			break
 		}
-		if len(family.Branches) == 1 || runtimeFamilyUnavailable(family) {
+		if onlyBranch {
 			if _, err := b.command("delete", "--force", info.ID); err != nil {
 				return fmt.Errorf("releasing final runtime branch %s: %w", target, err)
 			}
@@ -13284,6 +13266,19 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 	return b.deleteRuntimeIfProcessFree(latest)
+}
+
+// runtimeFamilyBranchDisposition decides whether discarding branch may delete
+// its whole host sandbox. A sandbox's aggregate OCI status follows its loader
+// branch and may be "exited" while another TTC branch is still running; that
+// aggregate status must never authorize deletion of the peers.
+func runtimeFamilyBranchDisposition(family Family, branchID string) (present, onlyBranch bool) {
+	for _, branch := range family.Branches {
+		if branch.ID == branchID {
+			return true, len(family.Branches) == 1
+		}
+	}
+	return false, false
 }
 
 func persistentFamilyProcessFree(info ttcbundle.ContainerInfo) bool {
@@ -15622,7 +15617,9 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		if err := json.Unmarshal(output, &result); err != nil {
 			return 0, fmt.Errorf("decoding runsc wait result: %w", err)
 		}
-		b.recordWaitState(target, result.Status)
+		if err := b.completeWaitedInitExit(target, result.Status); err != nil {
+			return result.Status, err
+		}
 		return result.Status, nil
 	}
 
@@ -15631,10 +15628,40 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		return 0, fmt.Errorf("%w; checking persistent wait status: %v", commandErr, err)
 	}
 	if found {
-		b.recordWaitState(target, status)
+		if err := b.completeWaitedInitExit(target, status); err != nil {
+			return status, err
+		}
 		return status, nil
 	}
 	return 0, commandErr
+}
+
+// completeWaitedInitExit closes the ordering gap between wait observing PID 1
+// and the asynchronous console follower finalizing the branch. Once wait
+// returns, a subsequent start must see a process-free lifecycle rather than a
+// stale running placement. The wait status is immutable, so racing atomic
+// installations by the follower and this synchronous path are equivalent.
+func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) error {
+	b.recordWaitState(target, status)
+	// Standalone start already consumes the durable exited state directly and
+	// has no asynchronous placement release to race. Preserve its lightweight
+	// wait path; publicationQueue is present only on clustered compute daemons.
+	if b.publicationQueue == nil {
+		return nil
+	}
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return err
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return err
+	}
+	if err := ttcconsole.WriteWaitStatus(paths.WaitStatus, status); err != nil {
+		return err
+	}
+	_, err = b.finalizeObservedInitExit(target)
+	return err
 }
 
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {

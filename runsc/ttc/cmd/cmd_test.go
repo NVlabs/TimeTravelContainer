@@ -5633,6 +5633,19 @@ func (b *fakeBackend) discard(target selector) error {
 	return b.err
 }
 
+func TestRuntimeFamilyExitedLoaderDoesNotDeleteLivePeers(t *testing.T) {
+	family := Family{
+		ID: "physical", State: "exited",
+		Branches: []Branch{{ID: "loader", State: "exited"}, {ID: "peer", State: "running"}},
+	}
+	if present, only := runtimeFamilyBranchDisposition(family, "loader"); !present || only {
+		t.Fatalf("loader disposition=(%t,%t), want present without whole-sandbox deletion", present, only)
+	}
+	if present, only := runtimeFamilyBranchDisposition(Family{Branches: []Branch{{ID: "last", State: "exited"}}}, "last"); !present || !only {
+		t.Fatalf("final branch disposition=(%t,%t), want final sandbox deletion", present, only)
+	}
+}
+
 func (b *fakeBackend) dehydrate(target selector) error {
 	b.dehydratedTargets = append(b.dehydratedTargets, target)
 	return b.err

@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "frame.go",
         "rotating.go",
+        "status.go",
     ],
     visibility = ["//runsc:__subpackages__"],
 )
@@ -20,6 +21,7 @@ go_test(
     srcs = [
         "frame_test.go",
         "rotating_test.go",
+        "status_test.go",
     ],
     library = ":console",
 )
