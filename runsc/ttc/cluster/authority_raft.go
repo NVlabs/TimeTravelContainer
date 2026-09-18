@@ -813,6 +813,17 @@ func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
 	if !n.IsLeader() {
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
+	// Retirement is a quorum transition, so it must not depend on the periodic
+	// membership reconciler winning a race first. In a three-voter cluster where
+	// one voter is already fenced, removing a second live voter before removing
+	// the fenced one leaves the survivor paired with an unreachable voter and
+	// immediately loses quorum. Reconcile authoritative fences synchronously;
+	// this also promotes an eligible learner before we choose a replacement
+	// leader below. ReconcileVoters uses RemoveMember, not RetireMember, so this
+	// cannot recurse.
+	if err := n.ReconcileVoters(ctx, 3); err != nil {
+		return fmt.Errorf("reconciling Raft membership before retirement: %w", err)
+	}
 	configuration, err := n.Configuration()
 	if err != nil {
 		return err

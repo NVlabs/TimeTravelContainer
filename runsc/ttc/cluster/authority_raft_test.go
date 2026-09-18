@@ -407,7 +407,7 @@ func TestAuthorityRaftCancelsOnlyExactNonvoter(t *testing.T) {
 	}
 }
 
-func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) {
+func TestAuthorityRaftRetirementReconcilesFencedVoter(t *testing.T) {
 	serverTLS, clientTLS := newAuthorityRaftTLS(t)
 	open := func(id string, bootstrap bool) *AuthorityRaftNode {
 		t.Helper()
@@ -456,22 +456,13 @@ func TestAuthorityRaftReconcileRemovesFencedVoterBeforeRetirement(t *testing.T) 
 	if err != nil || result.Err() != nil {
 		t.Fatalf("removing node-c discovery identity: result=%+v err=%v", result, err)
 	}
-	if err := leader.ReconcileVoters(ctx, 3); err != nil {
-		t.Fatalf("reconciling removed voter: %v", err)
+	// Retirement must synchronously remove the already-fenced voter before it
+	// removes another live voter. Depending on the periodic reconciler here can
+	// leave node-a paired with unreachable node-c and permanently lose quorum.
+	if err := leader.RetireMember(ctx, "node-b"); err != nil {
+		t.Fatalf("retiring second node with a fenced peer: %v", err)
 	}
 	configuration, err := leader.Configuration()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, server := range configuration.Servers {
-		if server.ID == "node-c" {
-			t.Fatalf("fenced voter remains in Raft configuration: %+v", configuration)
-		}
-	}
-	if err := leader.RetireMember(ctx, "node-b"); err != nil {
-		t.Fatalf("retiring second node after fenced-voter reconciliation: %v", err)
-	}
-	configuration, err = leader.Configuration()
 	if err != nil {
 		t.Fatal(err)
 	}
