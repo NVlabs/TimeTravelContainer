@@ -3701,6 +3701,35 @@ func TestFinalizeObservedInitExit(t *testing.T) {
 	}
 }
 
+func TestFinalizeObservedInitExitSkipsCommittedColdPhysicalRecord(t *testing.T) {
+	dataRoot := t.TempDir()
+	containerDir := filepath.Join(dataRoot, "containers", "physical")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "physical", Name: "logical", BundleDir: bundleDir, State: "dehydrated",
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "private", State: "dehydrated", StorageState: "shared",
+			PublicationID: "publication-1", StorageManifest: "cold/manifest.json",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	changed, err := b.finalizeObservedInitExit(selector{container: "physical", branch: "private"})
+	if err != nil {
+		t.Fatalf("finalizeObservedInitExit: %v", err)
+	}
+	if changed {
+		t.Fatal("committed cold branch was treated as a newly exited runtime")
+	}
+}
+
 func TestStopContainerConsoleDrainsRemovesInactiveFollower(t *testing.T) {
 	dataRoot := t.TempDir()
 	base := filepath.Join(dataRoot, "containers", "demo", "console", "exec", "main", "exec-test")

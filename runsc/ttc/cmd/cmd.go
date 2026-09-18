@@ -15621,12 +15621,24 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 // proof that this is a normal branch exit rather than unexplained runtime
 // loss.
 func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error) {
-	resolved, info, err := b.resolveSelector(target)
-	if err != nil {
-		return false, err
+	// Console followers are attached to an exact physical runtime. Prefer that
+	// record over logical placement resolution: a daemon recovery scan sees
+	// every shared physical record, including committed cold publications whose
+	// derived metadata may still be settling. Resolving such a record as a
+	// logical selector can wait for the publication fence while holding the
+	// daemon-wide reconciliation lock, blocking every client request.
+	info, err := b.containerStore().LoadRuntimeContainer(target.container)
+	branch, branchErr := persistentBranchInfo(info, target.branch)
+	if err != nil || branchErr != nil {
+		resolved, resolvedInfo, resolveErr := b.resolveSelector(target)
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		target, info = resolved, resolvedInfo
+		branch, err = persistentBranchInfo(info, target.branch)
+	} else {
+		err = nil
 	}
-	target = resolved
-	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
 		return false, err
 	}
@@ -15678,12 +15690,18 @@ func (b *runtimeBackend) reconcileObservedInitExits() error {
 	var result error
 	for _, info := range containers {
 		for _, branch := range info.Branches {
+			// Recovery is node-local. Foreign runtimes and process-free cold
+			// publications are visible in the shared catalog but cannot have a
+			// console follower owned by this daemon. Filtering them before selector
+			// resolution prevents an unrelated incomplete publication from stalling
+			// local command admission.
+			if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+				continue
+			}
+			if branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared" {
+				continue
+			}
 			if _, err := b.finalizeObservedInitExit(selector{container: info.ID, branch: branch.ID}); err != nil {
-				// A physical record for another node can be visible through the
-				// shared catalog. It is not this daemon's exit to finalize.
-				if b.nodeID != "" && info.BranchNodeID(branch.ID) != b.nodeID {
-					continue
-				}
 				result = errors.Join(result, err)
 			}
 		}
