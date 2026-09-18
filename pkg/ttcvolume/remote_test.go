@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -320,6 +322,89 @@ func TestRemoteRestorePinDefersRepositoryMaterialization(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("source stream remained open after materialization")
+	}
+}
+
+func TestMaterializeRemoteObjectsRacesLazyCatalogExpansion(t *testing.T) {
+	const files = 128
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("artifact-%03d", i)
+		ino, err := source.CreateRegular(MainBranch, RootInode, name, 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := source.WriteAt(MainBranch, ino, []byte(name), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+
+	start := make(chan struct{})
+	errs := make(chan error, files+1)
+	var wg sync.WaitGroup
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("artifact-%03d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := target.Lookup("imported", RootInode, name)
+			if err != nil {
+				errs <- fmt.Errorf("lookup %s: %w", name, err)
+			}
+		}()
+	}
+	materialized := make(chan error, 1)
+	go func() {
+		<-start
+		materialized <- target.MaterializeRemoteObjects()
+	}()
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if err := <-materialized; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("artifact-%03d", i)
+		ino, err := target.Lookup("imported", RootInode, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(name))
+		if n, err := target.ReadAt("imported", ino, got, 0); err != nil || n != len(got) || string(got) != name {
+			t.Fatalf("ReadAt(%s)=(%q, %d, %v)", name, got, n, err)
+		}
+	}
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source stream remained open after racing materialization")
 	}
 }
 

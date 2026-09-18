@@ -376,20 +376,28 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	} else if openErr != nil && !errors.Is(openErr, os.ErrNotExist) {
 		return openErr
 	}
+	// Publish the durable pending marker and its live resolver atomically with
+	// respect to repository-wide source detachment. In the old order, an eager
+	// independence drain could observe the new object in remote.objects, fetch
+	// and detach the source, and only then race with markRemoteObjectPending.
+	// That left a fresh pending marker whose sole authoritative connection had
+	// already been closed. Holding remoteMu makes the marker+resolver pair appear
+	// before the materializer's final scan, or makes this operation observe that
+	// the provider has already detached and fail without creating a marker.
 	r.remoteMu.Lock()
 	remote := r.remoteByCatalog[catalog]
-	if remote != nil {
-		remote.objects[id.String()] = size
-		remote.sources[id.String()] = sourceID.String()
-		r.remoteByObject[id.String()] = remote
-	}
-	r.remoteMu.Unlock()
 	if remote == nil {
+		r.remoteMu.Unlock()
 		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
 	}
 	if err := r.markRemoteObjectPending(id.String(), sourceID.String()); err != nil {
+		r.remoteMu.Unlock()
 		return err
 	}
+	remote.objects[id.String()] = size
+	remote.sources[id.String()] = sourceID.String()
+	r.remoteByObject[id.String()] = remote
+	r.remoteMu.Unlock()
 	return nil
 }
 
