@@ -1435,15 +1435,31 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	if err := validateColdManifestPath(store.Root, expectedManifest); err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 	}
-	manifest, err := readColdBranchManifest(expectedManifest)
-	if err != nil {
-		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("reading committed cold manifest for %s@%s: %w", containerID, branchID, err)
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	var manifest coldBranchManifest
+	for {
+		var err error
+		manifest, err = readColdBranchManifest(expectedManifest)
+		if err == nil {
+			break
+		}
+		// A successful Raft publication commit may become visible before a
+		// different NFS client revalidates the newly renamed manifest. Treat only
+		// absence as that bounded visibility window; malformed or unreadable data
+		// remains a hard failure.
+		if !errors.Is(err, os.ErrNotExist) {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("reading committed cold manifest for %s@%s: %w", containerID, branchID, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold manifest for %s@%s at %q: %w", containerID, branchID, expectedManifest, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 	if authority.PublicationID != "" && manifest.PublicationID != authority.PublicationID {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("committed cold manifest publication is %q, authority has %q", manifest.PublicationID, authority.PublicationID)
 	}
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
 	lastPublicationID := ""
 	lastManifest := ""
 	for {
@@ -5053,17 +5069,104 @@ func advertisedPageAddress(baseURL string) (string, error) {
 	return net.JoinHostPort(parsed.Hostname(), "0"), nil
 }
 
+// cgroupMemoryFiles resolves the memory-accounting file for both cgroup v2
+// and cgroup v1. The latter is still common on compute clusters. Mountinfo is
+// authoritative because a cgroup hierarchy may be mounted somewhere other
+// than /sys/fs/cgroup and may expose a subtree rather than hierarchy root.
+func cgroupMemoryFiles(cgroupData, mountInfoData string) []string {
+	var unifiedPath, memoryPath string
+	for _, line := range strings.Split(cgroupData, "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			unifiedPath = parts[2]
+		}
+		for _, controller := range strings.Split(parts[1], ",") {
+			if controller == "memory" {
+				memoryPath = parts[2]
+				break
+			}
+		}
+	}
+	type candidate struct {
+		path string
+		v2   bool
+	}
+	var candidates []candidate
+	for _, line := range strings.Split(mountInfoData, "\n") {
+		sections := strings.SplitN(line, " - ", 2)
+		if len(sections) != 2 {
+			continue
+		}
+		mountFields := strings.Fields(sections[0])
+		fsFields := strings.Fields(sections[1])
+		if len(mountFields) < 5 || len(fsFields) < 3 {
+			continue
+		}
+		fsType := fsFields[0]
+		membership := ""
+		v2 := false
+		switch fsType {
+		case "cgroup2":
+			membership, v2 = unifiedPath, true
+		case "cgroup":
+			if !slices.Contains(strings.Split(fsFields[2], ","), "memory") {
+				continue
+			}
+			membership = memoryPath
+		default:
+			continue
+		}
+		if membership == "" {
+			continue
+		}
+		mountRoot := filepath.Clean(unescapeMountInfoPath(mountFields[3]))
+		member := filepath.Clean("/" + strings.TrimPrefix(membership, "/"))
+		relative := ""
+		if mountRoot == "/" {
+			relative = strings.TrimPrefix(member, "/")
+		} else if member == mountRoot {
+			relative = ""
+		} else if strings.HasPrefix(member, mountRoot+"/") {
+			relative = strings.TrimPrefix(strings.TrimPrefix(member, mountRoot), "/")
+		} else {
+			continue
+		}
+		file := "memory.usage_in_bytes"
+		if v2 {
+			file = "memory.current"
+		}
+		candidates = append(candidates, candidate{
+			path: filepath.Join(unescapeMountInfoPath(mountFields[4]), relative, file),
+			v2:   v2,
+		})
+	}
+	// Prefer the unified hierarchy if a host exposes both layouts.
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].v2 && !candidates[j].v2 })
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if !slices.Contains(result, candidate.path) {
+			result = append(result, candidate.path)
+		}
+	}
+	return result
+}
+
+func unescapeMountInfoPath(path string) string {
+	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	return replacer.Replace(path)
+}
+
 // currentNodeMemoryBytes prefers the containing cgroup because Sentries are
 // daemon siblings rather than children whose RSS can be summed reliably.
 func currentNodeMemoryBytes() (uint64, error) {
-	if cgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		for _, line := range strings.Split(string(cgroup), "\n") {
-			parts := strings.SplitN(line, ":", 3)
-			if len(parts) != 3 || parts[0] != "0" || parts[1] != "" {
-				continue
-			}
-			path := "/sys/fs/cgroup/" + strings.TrimPrefix(parts[2], "/")
-			if value, err := readUintFile(path + "/memory.current"); err == nil {
+	cgroupData, cgroupErr := os.ReadFile("/proc/self/cgroup")
+	mountInfoData, mountInfoErr := os.ReadFile("/proc/self/mountinfo")
+	if cgroupErr == nil && mountInfoErr == nil {
+		for _, path := range cgroupMemoryFiles(string(cgroupData), string(mountInfoData)) {
+			if value, err := readUintFile(path); err == nil {
 				return value, nil
 			}
 		}

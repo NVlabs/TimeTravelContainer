@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -71,6 +72,44 @@ func TestMaintainElasticNodeRetriesBeforeFencing(t *testing.T) {
 	case <-fenced:
 		t.Fatal("transient heartbeat failure fenced the node")
 	default:
+	}
+}
+
+func TestCgroupMemoryFiles(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cgroup    string
+		mountinfo string
+		want      []string
+	}{
+		{
+			name:   "unified",
+			cgroup: "0::/user.slice/user-1000.slice/session-4.scope\n",
+			mountinfo: "29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - " +
+				"cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n",
+			want: []string{"/sys/fs/cgroup/user.slice/user-1000.slice/session-4.scope/memory.current"},
+		},
+		{
+			name: "legacy memory controller",
+			cgroup: "13:memory:/user.slice/user-141950.slice/session-3071.scope\n" +
+				"1:name=systemd:/user.slice/user-141950.slice/session-3071.scope\n",
+			mountinfo: "41 30 0:37 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime - " +
+				"cgroup cgroup rw,memory\n",
+			want: []string{"/sys/fs/cgroup/memory/user.slice/user-141950.slice/session-3071.scope/memory.usage_in_bytes"},
+		},
+		{
+			name:   "namespaced subtree and escaped mount point",
+			cgroup: "0::/jobs/job-7/step-2\n",
+			mountinfo: "29 23 0:26 /jobs/job-7 /run/cgroup\\040view rw - " +
+				"cgroup2 cgroup2 rw\n",
+			want: []string{"/run/cgroup view/step-2/memory.current"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cgroupMemoryFiles(test.cgroup, test.mountinfo); !slices.Equal(got, test.want) {
+				t.Fatalf("cgroupMemoryFiles() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -775,6 +814,66 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	}
 	if info.ID != "family-id" || branch.StorageState != "shared" || branch.StorageManifest != manifest || !branch.Unplaced {
 		t.Fatalf("completed metadata info=%+v branch=%+v", info, branch)
+	}
+}
+
+func TestWaitForCommittedColdBranchMetadataWaitsForManifestVisibility(t *testing.T) {
+	root := t.TempDir()
+	const publicationID = "publication-delayed"
+	containerDir := filepath.Join(root, "containers", "physical")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(root, "physical", "cold", publicationID)
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "physical", Name: "physical", DistributedFamilyID: "family", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "cold", State: "dehydrated", Unplaced: true, StorageState: "shared",
+			PublicationID: publicationID, StorageManifest: manifestPath, SnapshotID: 19,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relativeManifest, err := filepath.Rel(root, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "cold", PublicationID: publicationID, Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest, MemorySnapshot: 19},
+	}
+	written := make(chan error, 1)
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+			written <- err
+			return
+		}
+		encoded, err := json.Marshal(coldBranchManifest{
+			Version: 5, Container: "physical", Branch: "cold", PublicationID: publicationID,
+			Kind: "dehydrate", MemorySnapshot: 19,
+			ControlRoot: ttcsnapshot.ObjectID{Snapshot: 19, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+		})
+		if err == nil {
+			err = os.WriteFile(manifestPath, append(encoded, '\n'), 0600)
+		}
+		written <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, branch, err := waitForCommittedColdBranchMetadata(ctx, ttcbundle.Store{Root: root}, "family", "cold", authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	if branch.PublicationID != publicationID || branch.SnapshotID != 19 {
+		t.Fatalf("resolved branch=%+v", branch)
 	}
 }
 
