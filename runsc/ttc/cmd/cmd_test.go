@@ -3853,6 +3853,43 @@ func TestVerifyCgroupV2Resources(t *testing.T) {
 	}
 }
 
+func TestPreflightCgroupV2Delegation(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "delegated")
+	leaf := filepath.Join(parent, "daemon")
+	if err := os.MkdirAll(leaf, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		filepath.Join(root, "cgroup.controllers"):       "cpu memory pids\n",
+		filepath.Join(parent, "cgroup.controllers"):     "cpu memory\n",
+		filepath.Join(parent, "cgroup.subtree_control"): "+cpu +memory\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	proc := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.WriteFile(proc, []byte("0::/delegated/daemon\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"cpu", "memory"}); err != nil {
+		t.Fatalf("preflightCgroupV2Delegation: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"memory"}); err == nil || !strings.Contains(err.Error(), "Delegate=yes") {
+		t.Fatalf("non-delegated preflight error=%v", err)
+	}
+	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"io"}); err == nil || !strings.Contains(err.Error(), `controller "io"`) {
+		t.Fatalf("missing-controller preflight error=%v", err)
+	}
+}
+
 func TestClientDoesNotAcceptStorageOrDirectOptions(t *testing.T) {
 	for _, option := range []string{"--root=/runtime", "--runsc=/ttcd", "--data-root=/data", "--direct"} {
 		if _, _, _, err := parseGlobalOptions([]string{option, "ps"}, io.Discard); err == nil {

@@ -46,6 +46,7 @@ import (
 
 	mobysignal "github.com/moby/sys/signal"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
@@ -10176,6 +10177,93 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 	return nil
 }
 
+// preflightHostResourceLimits reports missing host cgroup delegation before
+// runsc starts a sandbox. Hard memory and CPU limits are host-enforced; the
+// Sentry cannot safely pretend that they are active when the daemon's cgroup
+// does not permit child creation. runsc also fails closed, but its first
+// failing ancestor otherwise leaks a low-level cgroup.subtree_control error to
+// the user after doing most of container creation.
+func preflightHostResourceLimits(bundleDir string) error {
+	data, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		return fmt.Errorf("reading OCI config for resource preflight: %w", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return fmt.Errorf("decoding OCI config for resource preflight: %w", err)
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.CgroupsPath == "" {
+		return nil
+	}
+	resources := spec.Linux.Resources
+	required := make([]string, 0, 2)
+	if resources.Memory != nil && resources.Memory.Limit != nil && *resources.Memory.Limit > 0 {
+		required = append(required, "memory")
+	}
+	if resources.CPU != nil {
+		required = append(required, "cpu")
+	}
+	if len(required) == 0 {
+		return nil
+	}
+	return preflightCgroupV2Delegation("/proc/self/cgroup", "/sys/fs/cgroup", required)
+}
+
+func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []string) error {
+	if _, err := os.Stat(filepath.Join(mountRoot, "cgroup.controllers")); errors.Is(err, os.ErrNotExist) {
+		// The host may use cgroup v1. Let runsc's native implementation decide
+		// whether the requested controllers are available there.
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("checking unified cgroup v2: %w", err)
+	}
+	data, err := os.ReadFile(procCgroupPath)
+	if err != nil {
+		return fmt.Errorf("reading daemon cgroup membership: %w", err)
+	}
+	membership := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			membership = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+	if membership == "" {
+		return errors.New("hard host resource limits require unified cgroup v2 delegation, but ttcd has no unified cgroup membership")
+	}
+	// Relative runsc cgroups are siblings of the daemon's leaf cgroup. In a
+	// cgroup namespace the host membership may not exist below the visible
+	// mount; in that case the mount root itself is the delegated parent.
+	visibleMembership := filepath.Join(mountRoot, filepath.Clean("/"+membership))
+	parent := mountRoot
+	if _, err := os.Stat(visibleMembership); err == nil {
+		parent = filepath.Dir(visibleMembership)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking daemon cgroup %q: %w", visibleMembership, err)
+	}
+	controllersData, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+	if err != nil {
+		return fmt.Errorf("reading delegated cgroup controllers from %q: %w", parent, err)
+	}
+	available := make(map[string]struct{})
+	for _, controller := range strings.Fields(string(controllersData)) {
+		available[controller] = struct{}{}
+	}
+	for _, controller := range required {
+		if _, ok := available[controller]; !ok {
+			return fmt.Errorf("hard host resource limits require delegated cgroup v2 controller %q, but %q exposes %q", controller, parent, strings.TrimSpace(string(controllersData)))
+		}
+	}
+	control := filepath.Join(parent, "cgroup.subtree_control")
+	if err := unix.Access(control, unix.W_OK); err != nil {
+		return fmt.Errorf("hard host resource limits require a writable delegated cgroup v2 subtree: ttcd cannot write %q: %w; start ttcd in a delegated cgroup (for example, a systemd unit with Delegate=yes) or omit --memory and CPU limit options", control, err)
+	}
+	if err := unix.Access(parent, unix.W_OK); err != nil {
+		return fmt.Errorf("hard host resource limits require a writable delegated cgroup v2 subtree: ttcd cannot create child cgroups in %q: %w; start ttcd in a delegated cgroup (for example, a systemd unit with Delegate=yes) or omit --memory and CPU limit options", parent, err)
+	}
+	return nil
+}
+
 // launch starts target and reports whether it remains running when this call
 // returns. The latter is intentionally distinct from the requested detach
 // flag: an attached terminal may detach through its detach key sequence.
@@ -10183,6 +10271,9 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 	name := info.ID
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
+		return 1, false, err
+	}
+	if err := preflightHostResourceLimits(bundleDir); err != nil {
 		return 1, false, err
 	}
 	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
