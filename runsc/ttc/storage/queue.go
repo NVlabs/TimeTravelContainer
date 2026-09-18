@@ -28,17 +28,27 @@ type Intent struct {
 	// AuthorityContainer and AuthorityBranch are the stable user-visible
 	// identity in clustered mode. Container and Branch remain the immutable
 	// physical capture identity used to find node-local data after migrations.
-	AuthorityContainer string    `json:"authority_container,omitempty"`
-	AuthorityBranch    string    `json:"authority_branch,omitempty"`
-	PublicationID      string    `json:"publication_id"`
-	Kind               string    `json:"kind"`
-	FilesystemBranch   string    `json:"filesystem_branch"`
-	CaptureReady       bool      `json:"capture_ready"`
-	CreatedAt          time.Time `json:"created_at"`
-	Attempts           int       `json:"attempts,omitempty"`
-	LastError          string    `json:"last_error,omitempty"`
-	RetryAt            time.Time `json:"retry_at,omitempty"`
+	AuthorityContainer string `json:"authority_container,omitempty"`
+	AuthorityBranch    string `json:"authority_branch,omitempty"`
+	PublicationID      string `json:"publication_id"`
+	// SupersedesPublicationID is the previous control-plane publication, if
+	// any. It is canceled only after this intent's complete local capture has
+	// become the branch's current identity.
+	SupersedesPublicationID string    `json:"supersedes_publication_id,omitempty"`
+	Kind                    string    `json:"kind"`
+	FilesystemBranch        string    `json:"filesystem_branch"`
+	CaptureReady            bool      `json:"capture_ready"`
+	ActivationRequested     bool      `json:"activation_requested,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+	Attempts                int       `json:"attempts,omitempty"`
+	LastError               string    `json:"last_error,omitempty"`
+	RetryAt                 time.Time `json:"retry_at,omitempty"`
 }
+
+// ErrPublicationSuperseded means an immutable work item is no longer the
+// branch's current publication. It is terminal, not a transient storage
+// failure: the queue cleans its private capture and removes the intent.
+var ErrPublicationSuperseded = errors.New("publication was superseded")
 
 // Result is the authoritative shared manifest produced by Publisher.
 type Result struct {
@@ -111,11 +121,20 @@ func (q *Queue) Activate(container, branch, publicationID string) error {
 	if err != nil {
 		return err
 	}
+	// Persist the request before consulting external authority. A transient
+	// Raft or filesystem error must be retried by this daemon, not postponed
+	// until its next restart.
+	intent.ActivationRequested = true
+	if err := writeJSONAtomic(q.path("pending", id), intent); err != nil {
+		return err
+	}
 	ready, err := q.publisher.CaptureAvailable(intent)
 	if err != nil {
+		q.signal()
 		return err
 	}
 	if !ready {
+		q.signal()
 		return errors.New("publication capture fence is incomplete")
 	}
 	intent.CaptureReady = true
@@ -369,6 +388,32 @@ func (q *Queue) process() time.Duration {
 			continue
 		}
 		if !intent.CaptureReady {
+			if !intent.ActivationRequested {
+				q.mu.Unlock()
+				continue
+			}
+			q.inFlight[intent.ID] = struct{}{}
+			q.mu.Unlock()
+			ready, readyErr := q.publisher.CaptureAvailable(intent)
+			q.mu.Lock()
+			if readyErr == nil && ready {
+				intent.CaptureReady = true
+				intent.LastError = ""
+				intent.RetryAt = time.Time{}
+				_ = writeJSONAtomic(q.path("pending", intent.ID), intent)
+				q.signal()
+			} else if readyErr != nil {
+				intent.Attempts++
+				intent.LastError = readyErr.Error()
+				delay := time.Second << min(intent.Attempts-1, 8)
+				intent.RetryAt = time.Now().Add(delay).UTC()
+				_ = q.publisher.Failed(intent, readyErr, intent.RetryAt)
+				_ = writeJSONAtomic(q.path("pending", intent.ID), intent)
+				if delay < next {
+					next = delay
+				}
+			}
+			delete(q.inFlight, intent.ID)
 			q.mu.Unlock()
 			continue
 		}
@@ -402,6 +447,16 @@ func (q *Queue) process() time.Duration {
 			delete(q.inFlight, intent.ID)
 			q.mu.Unlock()
 			continue
+		}
+		if errors.Is(publishErr, ErrPublicationSuperseded) {
+			publishErr = q.publisher.Cleanup(intent)
+			if publishErr == nil {
+				q.mu.Lock()
+				_ = os.Remove(q.path("pending", intent.ID))
+				delete(q.inFlight, intent.ID)
+				q.mu.Unlock()
+				continue
+			}
 		}
 		if publishErr == nil {
 			publishErr = q.publisher.Cleanup(intent)

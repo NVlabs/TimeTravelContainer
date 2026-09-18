@@ -1971,3 +1971,24 @@ func TestExecutionRevocationSkipsCompactedMigrationHandoff(t *testing.T) {
 		t.Fatal("branch without a placement suppressed an immediate source-node fence")
 	}
 }
+
+func TestLifecycleCommandOperandsSkipsOptions(t *testing.T) {
+	tests := []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"restart", "--time", "3", "web@main", "web@child"}, []string{"web@main", "web@child"}},
+		{[]string{"restart", "-t=0", "web@main"}, []string{"web@main"}},
+		{[]string{"start", "-ai", "web@main"}, []string{"web@main"}},
+		{[]string{"rehydrate", "web@main"}, []string{"web@main"}},
+	}
+	for _, test := range tests {
+		got, err := lifecycleCommandOperands(test.args)
+		if err != nil {
+			t.Fatalf("lifecycleCommandOperands(%v): %v", test.args, err)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Errorf("lifecycleCommandOperands(%v) = %v, want %v", test.args, got, test.want)
+		}
+	}
+}

@@ -6,6 +6,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +66,22 @@ type retryCleanupPublisher struct {
 	testPublisher
 	mu       sync.Mutex
 	attempts int
+}
+
+type supersededPublisher struct {
+	testPublisher
+	cleaned chan Intent
+	failed  chan error
+}
+
+func (p *supersededPublisher) Publish(context.Context, Intent) (Result, error) {
+	return Result{}, fmt.Errorf("%w: replaced by publication-new", ErrPublicationSuperseded)
+}
+
+func (p *supersededPublisher) Cleanup(intent Intent) error { p.cleaned <- intent; return nil }
+func (p *supersededPublisher) Failed(_ Intent, err error, _ time.Time) error {
+	p.failed <- err
+	return nil
 }
 
 func (p *retryCleanupPublisher) Cleanup(Intent) error {
@@ -283,6 +300,49 @@ func TestCanceledCleanupRetriesFromDurableIntent(t *testing.T) {
 			t.Fatalf("canceled cleanup was not retried: pending=%+v err=%v", pending, err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSupersededPublicationIsCleanedWithoutRetry(t *testing.T) {
+	publisher := &supersededPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		cleaned:       make(chan Intent, 1), failed: make(chan error, 1),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-old", Kind: "stop", FilesystemBranch: "capture"}
+	if err := queue.Enqueue(intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-old"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cleaned := <-publisher.cleaned:
+		if cleaned.PublicationID != intent.PublicationID {
+			t.Fatalf("cleaned %+v", cleaned)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("superseded capture was not cleaned")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := queue.Pending()
+		if err == nil && len(pending) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("superseded intent remained pending: %+v, %v", pending, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-publisher.failed:
+		t.Fatalf("superseded publication reported retryable failure: %v", err)
+	default:
 	}
 }
 

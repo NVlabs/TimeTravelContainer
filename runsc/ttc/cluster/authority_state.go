@@ -2112,10 +2112,7 @@ func (s *AuthorityState) applyPublication(command AuthorityCommand) (json.RawMes
 		}
 		record.State = PublicationCanceled
 		current := s.Branches[branchKey]
-		if current.Generation == record.BranchGeneration && !current.Corrupted {
-			if current.PublicationID != record.PublicationID {
-				return nil, errors.New("publication authority was superseded")
-			}
+		if current.Generation == record.BranchGeneration && !current.Corrupted && current.PublicationID == record.PublicationID {
 			if record.Lifecycle == "dehydrated" {
 				current.Lifecycle = record.PreviousLifecycle
 			} else {

@@ -435,3 +435,42 @@ func TestRemoveBranchArtifactsRemovesStableMemory(t *testing.T) {
 		}
 	}
 }
+
+func TestBeginBranchPublicationIfDoesNotSupersedeChangedIdentity(t *testing.T) {
+	root := t.TempDir()
+	containerID := "container-id"
+	containerDir := filepath.Join(root, "containers", containerID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: containerID, Name: "example", BundleDir: bundleDir, State: "exited", Branches: []BranchInfo{{
+		ID: "main", FilesystemBranch: "main", State: "exited", PublicationID: "publication-old",
+		StorageState: "publishing", StorageManifest: "old-manifest",
+	}}}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	previous, err := store.BeginBranchPublicationIf("example", "main", "publication-old", "publication-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if previous.PublicationID != "publication-old" || previous.StorageManifest != "old-manifest" {
+		t.Fatalf("replaced metadata = %+v", previous)
+	}
+	if _, err := store.BeginBranchPublicationIf("example", "main", "publication-old", "publication-stale"); err == nil {
+		t.Fatal("stale publication compare-and-swap succeeded")
+	}
+	loaded, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := loaded.Branches[0]
+	if branch.PublicationID != "publication-new" || branch.StorageState != "publishing" || branch.StorageManifest != "old-manifest" {
+		t.Fatalf("branch after stale begin = %+v", branch)
+	}
+}

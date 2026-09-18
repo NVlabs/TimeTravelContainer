@@ -6114,12 +6114,7 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 			return fmt.Errorf("physical branch %s has no unique logical Raft placement", target)
 		}
 	}
-	if previous.PublicationID != "" {
-		if err := b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID); err != nil {
-			return fmt.Errorf("canceling superseded publication for %s: %w", target, err)
-		}
-	}
-	publicationID, err := store.BeginBranchPublication(target.container, target.branch)
+	publicationID, err := store.NewBranchPublicationID()
 	if err != nil {
 		return err
 	}
@@ -6127,12 +6122,13 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	intent := ttcstorage.Intent{
 		Container: target.container, Branch: target.branch, PublicationID: publicationID, Kind: kind,
 		AuthorityContainer: authorityContainer, AuthorityBranch: authorityBranch, FilesystemBranch: captureBranch,
+		SupersedesPublicationID: previous.PublicationID,
 	}
 	if err := b.publicationQueue.Enqueue(intent); err != nil {
-		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "error", err.Error(), time.Time{})
 		return err
 	}
 	captureComplete := false
+	publicationInstalled := false
 	originsCommitted := false
 	finishFilesystemOrigins := func(bool) error { return nil }
 	var forks []*ttcvolume.ForkTransaction
@@ -6151,8 +6147,9 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 		if !originsCommitted {
 			cause = errors.Join(cause, finishFilesystemOrigins(false))
 		}
-		cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, publicationID))
-		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "local", "", time.Time{})
+		if !publicationInstalled {
+			cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, publicationID))
+		}
 		return cause
 	}
 	info, err := store.LoadContainer(target.container)
@@ -6236,14 +6233,17 @@ func (b *runtimeBackend) queueBranchPublication(target selector, kind string) er
 	}
 	originsCommitted = true
 	captureComplete = true
-	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		lifecycle := "exited"
-		if kind == "dehydrate" {
-			lifecycle = "dehydrated"
-		}
-		if _, err := b.distributedSource.authority.EnsurePublicationPreparing(authorityContainer, authorityBranch, publicationID, lifecycle); err != nil {
-			return rollback(fmt.Errorf("authorizing asynchronous publication: %w", err))
-		}
+	if _, err := store.BeginBranchPublicationIf(target.container, target.branch, previous.PublicationID, publicationID); err != nil {
+		return rollback(fmt.Errorf("installing captured publication: %w", err))
+	}
+	publicationInstalled = true
+	// The replacement is visible only after its complete hidden capture exists.
+	// Promptly cancel a same-node predecessor; a predecessor owned by another
+	// node observes the identity fence and terminates through the ordinary queue
+	// supersession path. CaptureAvailable also fences its Raft authority before
+	// authorizing this publication.
+	if previous.PublicationID != "" {
+		_ = b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID)
 	}
 	if err := b.publicationQueue.Activate(target.container, target.branch, publicationID); err != nil {
 		// The committed hidden roots are immutable and safe for retry. Keep the

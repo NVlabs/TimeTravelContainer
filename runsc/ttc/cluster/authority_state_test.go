@@ -878,6 +878,33 @@ func TestAuthorityCanceledDehydrationRestoresPriorLifecycle(t *testing.T) {
 	})
 }
 
+func TestAuthorityCanCancelSupersededPublicationWithoutMutatingCurrent(t *testing.T) {
+	at := time.Unix(3650, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at.Add(-time.Second))
+	created := decodeAuthorityResultForTest[PlacementRecord](t, applyAuthorityForTest(t, state, "place", at, AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}}))
+	old := decodeAuthorityResultForTest[PublicationRecord](t, applyAuthorityForTest(t, state, "publish-old", at.Add(time.Second), AuthorityPublicationBegin, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", PublicationID: "publication-old", Lifecycle: "exited", BranchGeneration: created.Generation,
+	}))
+	branchKey := logicalBranchKey("family", "main")
+	current := state.Branches[branchKey]
+	current.PublicationID = "publication-new"
+	state.Branches[branchKey] = current
+	applyAuthorityForTest(t, state, "cancel-old", at.Add(2*time.Second), AuthorityPublicationCancel, AuthorityPublicationPayload{
+		Family: "family", Branch: "main", PublicationID: old.PublicationID,
+		BranchGeneration: old.BranchGeneration, Revision: old.Revision,
+	})
+	if got := state.Publications[publicationKey("family", "main", "publication-old")].State; got != PublicationCanceled {
+		t.Fatalf("old publication state = %q, want canceled", got)
+	}
+	if got := state.Branches[branchKey].PublicationID; got != "publication-new" {
+		t.Fatalf("canceling old publication changed current identity to %q", got)
+	}
+}
+
 func TestAuthorityForkPublishCreatesPlacementAtomically(t *testing.T) {
 	at := time.Unix(3500, 0).UTC()
 	state := NewAuthorityState()

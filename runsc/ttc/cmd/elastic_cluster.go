@@ -1564,7 +1564,11 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		return err
 	}
 	store := backend.containerStore()
-	for _, operand := range args[1:] {
+	operands, err := lifecycleCommandOperands(args)
+	if err != nil {
+		return err
+	}
+	for _, operand := range operands {
 		target, err := parseSelector(operand)
 		if err != nil {
 			return err
@@ -1677,6 +1681,38 @@ func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, ar
 		}
 	}
 	return nil
+}
+
+// lifecycleCommandOperands applies the same option grammar as the command
+// implementation before cluster placement admission examines selectors. The
+// admission layer used to treat option values (for example restart --time 3)
+// as branch names, even though the command parser below handled them correctly.
+func lifecycleCommandOperands(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	fs := flag.NewFlagSet(args[0]+"-placement", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	switch args[0] {
+	case "start":
+		args = append([]string{args[0]}, expandCombinedShortBools(args[1:], "ai")...)
+		fs.Bool("attach", false, "")
+		fs.Bool("a", false, "")
+		fs.Bool("interactive", false, "")
+		fs.Bool("i", false, "")
+	case "restart":
+		fs.Int("time", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Int("timeout", ttcbundle.DefaultStopTimeoutSeconds, "")
+		fs.Int("t", ttcbundle.DefaultStopTimeoutSeconds, "")
+	case "rehydrate":
+		// Placement flags such as --node are consumed by the daemon router.
+	default:
+		return nil, nil
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		return nil, err
+	}
+	return fs.Args(), nil
 }
 
 func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, string, error) {

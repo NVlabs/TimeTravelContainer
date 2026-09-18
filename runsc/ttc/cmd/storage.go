@@ -434,7 +434,7 @@ func (p *branchPublisher) Publish(_ context.Context, intent ttcstorage.Intent) (
 		return ttcstorage.Result{}, err
 	}
 	if branch.PublicationID != intent.PublicationID {
-		return ttcstorage.Result{}, fmt.Errorf("publication identity changed to %q", branch.PublicationID)
+		return ttcstorage.Result{}, fmt.Errorf("%w: branch now names %q", ttcstorage.ErrPublicationSuperseded, branch.PublicationID)
 	}
 	path := coldManifestPath(p.sharedRoot, info.ID, branch.ID, intent.PublicationID)
 	if existing, err := readColdBranchManifest(path); err == nil {
@@ -818,6 +818,16 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	if err != nil {
 		return false, err
 	}
+	branch, err := persistentBranchInfo(info, intent.Branch)
+	if err != nil {
+		return false, err
+	}
+	// An enqueued capture is deliberately invisible while its hidden roots are
+	// being built. Do not cancel the predecessor or authorize this transaction
+	// until BeginBranchPublicationIf has installed the complete capture.
+	if branch.PublicationID != intent.PublicationID {
+		return false, nil
+	}
 	spec, err := store.LoadSpec(info.ID)
 	if err != nil {
 		return false, err
@@ -877,6 +887,11 @@ func (p *branchPublisher) CaptureAvailable(intent ttcstorage.Intent) (bool, erro
 	}
 	if p.authority != nil {
 		family, authorityBranch := publicationAuthorityIdentity(info, intent)
+		if intent.SupersedesPublicationID != "" && intent.SupersedesPublicationID != intent.PublicationID {
+			if err := p.authority.CancelPublication(family, authorityBranch, intent.SupersedesPublicationID); err != nil {
+				return false, fmt.Errorf("fencing superseded publication in Raft: %w", err)
+			}
+		}
 		lifecycle := "exited"
 		manifestPath := coldManifestPath(p.sharedRoot, info.ID, intent.Branch, intent.PublicationID)
 		relativeManifest, err := filepath.Rel(p.sharedRoot, manifestPath)

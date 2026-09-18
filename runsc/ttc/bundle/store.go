@@ -4077,22 +4077,39 @@ func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64
 	return cleared, err
 }
 
-// BeginBranchPublication allocates an immutable transaction identity and marks
-// a branch as publishing. Identity is independent of branch names and ordering;
-// a stale worker can never become current again after cancellation or name
-// reuse.
-func (s Store) BeginBranchPublication(name, branchID string) (string, error) {
+// NewBranchPublicationID allocates an immutable publication identity without
+// changing branch metadata. Callers use this while constructing a hidden
+// capture, then install it with BeginBranchPublicationIf only after the capture
+// fence is complete. Keeping preparation invisible prevents a failed capture
+// from superseding a valid publication that is still being uploaded.
+func (s Store) NewBranchPublicationID() (string, error) {
 	nonce, err := randomObjectID("publication", 16)
 	if err != nil {
 		return "", err
 	}
-	publicationID := "publication-" + nonce
-	err = s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+	return "publication-" + nonce, nil
+}
+
+// BeginBranchPublicationIf atomically installs publicationID if the branch
+// still names expectedPublicationID. It returns the exact storage metadata
+// that was replaced. The compare-and-swap fences overlapping exit observers
+// and publication workers running in other daemons against the same shared
+// container catalog.
+func (s Store) BeginBranchPublicationIf(name, branchID, expectedPublicationID, publicationID string) (BranchInfo, error) {
+	if publicationID == "" {
+		return BranchInfo{}, errors.New("publication identity is empty")
+	}
+	var previous BranchInfo
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		for i := range info.Branches {
 			branch := &info.Branches[i]
 			if branch.ID != branchID {
 				continue
 			}
+			if branch.PublicationID != expectedPublicationID {
+				return false, fmt.Errorf("branch %q publication changed from %q to %q", branchID, expectedPublicationID, branch.PublicationID)
+			}
+			previous = *branch
 			branch.PublicationID = publicationID
 			branch.StorageState = "publishing"
 			branch.StorageError = ""
@@ -4101,6 +4118,29 @@ func (s Store) BeginBranchPublication(name, branchID string) (string, error) {
 		}
 		return false, fmt.Errorf("branch %q is not recorded", branchID)
 	})
+	return previous, err
+}
+
+// BeginBranchPublication is retained for callers that do not construct a
+// capture in stages. New lifecycle code should use NewBranchPublicationID and
+// BeginBranchPublicationIf so a failed preparation never becomes visible.
+func (s Store) BeginBranchPublication(name, branchID string) (string, error) {
+	publicationID, err := s.NewBranchPublicationID()
+	if err != nil {
+		return "", err
+	}
+	info, err := s.LoadContainer(name)
+	if err != nil {
+		return "", err
+	}
+	var expected string
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			expected = branch.PublicationID
+			break
+		}
+	}
+	_, err = s.BeginBranchPublicationIf(name, branchID, expected, publicationID)
 	return publicationID, err
 }
 
