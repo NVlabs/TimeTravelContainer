@@ -339,6 +339,15 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	if len(args) != 0 && args[0] == "port" {
 		return "", nil, nil
 	}
+	// Remote-fork cancellation destroys the provisional target and may remove
+	// its Raft placement before the coordinator runs this metadata-only second
+	// half. The coordinator has already bound the child request to the target
+	// node and transaction ID; attempting ordinary selector routing here turns
+	// the intended placement-absent success case into a false missing-placement
+	// failure during family removal.
+	if len(args) != 0 && args[0] == "_remove-canceled-fork-placement" {
+		return "", nil, nil
+	}
 	// Durable wait observes Raft publication state and shared metadata; it does
 	// not operate on a runtime. Routing it with the branch's old running
 	// placement creates a race with the publication commit that deliberately

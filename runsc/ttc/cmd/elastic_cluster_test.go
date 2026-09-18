@@ -283,6 +283,9 @@ func TestDaemonCommandOwner(t *testing.T) {
 	if owner, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"port", "publish", "web@main", "8080:80"}); err != nil || owner != "" || len(claims) != 0 {
 		t.Fatalf("port ingress placement=(%q, %+v, %v), want local daemon", owner, claims, err)
 	}
+	if owner, claims, err := daemonCommandPlacementWithCatalog(root, nil, []string{"_remove-canceled-fork-placement", "web@child", "fork-one"}); err != nil || owner != "" || len(claims) != 0 {
+		t.Fatalf("canceled target cleanup placement=(%q, %+v, %v), want coordinator-selected node", owner, claims, err)
+	}
 }
 
 func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
