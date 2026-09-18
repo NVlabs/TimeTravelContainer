@@ -110,17 +110,18 @@ func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
 		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
-		SharedMetadata: "cluster/memory-metadata/tx.state",
-		GraphManifest:  "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
+		MetadataArtifact: "kernel-metadata",
+		GraphArtifact:    "memory-graph", GraphArtifactBytes: 64, GraphSnapshot: 7,
 		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"}, DurableDehydration: true,
 	}
 	if err := base.validate(negotiated); err != nil {
 		t.Fatalf("valid graph metadata descriptor: %v", err)
 	}
 	for _, mutate := range []func(*RemoteSessionDescriptor){
-		func(d *RemoteSessionDescriptor) { d.GraphManifest = "../manifest" },
-		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
+		func(d *RemoteSessionDescriptor) { d.GraphArtifact = "../manifest" },
+		func(d *RemoteSessionDescriptor) { d.MetadataArtifact = "" },
 		func(d *RemoteSessionDescriptor) { d.DurableDehydration = false },
 		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
 		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
@@ -212,8 +213,8 @@ func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T)
 	descriptor := RemoteSessionDescriptor{
 		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
 		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedMetadata: "cluster/memory-metadata/tx.state", DurableDehydration: true,
-		GraphManifest: "cluster/memory-manifests/tx.manifest", GraphSnapshot: 7,
+		MetadataArtifact: "kernel-metadata", DurableDehydration: true,
+		GraphArtifact: "memory-graph", GraphArtifactBytes: 64, GraphSnapshot: 7,
 		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
 		FilesystemRoots: []FilesystemRootDescriptor{{
 			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",

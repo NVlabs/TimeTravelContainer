@@ -1047,20 +1047,18 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		}
 	}()
 	memoryDependencyBytes := session.StreamBytes
-	if session.GraphManifest != "" {
+	if session.GraphArtifact != "" {
 		memoryDependencyBytes = 0
 	}
 	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, memoryDependencyBytes, session.FilesystemBytes); err != nil {
 		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
-	if session.SharedMetadata == "" || len(session.FilesystemRoots) != 0 {
-		tokenBytes, err := hex.DecodeString(session.SnapshotToken)
-		if err != nil || len(tokenBytes) != 16 {
-			return errors.New("invalid distributed snapshot token")
-		}
-		copy(token[:], tokenBytes)
+	tokenBytes, err := hex.DecodeString(session.SnapshotToken)
+	if err != nil || len(tokenBytes) != 16 {
+		return errors.New("invalid distributed snapshot token")
 	}
+	copy(token[:], tokenBytes)
 	restoreArgs := boot.DistributedForkRestoreArgs{
 		SessionID: tx.Identity.TransactionID, FamilyID: tx.Identity.SourceContainer,
 		TargetBranchID: tx.Identity.TargetBranch, Address: session.Address, SnapshotToken: token,
@@ -1071,9 +1069,9 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		AckBatchPages: tx.Negotiated.PagingPolicy.AckBatchPages, AckInterval: tx.Negotiated.PagingPolicy.AckInterval,
 		FilesystemConnections: filesystemConnections,
 		PushPolicy:            ttcremote.TCPPushPolicy(tx.Negotiated.PagingPolicy.Push),
-		SharedMetadata:        session.SharedMetadata != "",
+		SharedMetadata:        session.MetadataArtifact != "",
 		DurableDehydration:    session.DurableDehydration,
-		GraphSparse:           session.GraphManifest != "",
+		GraphSparse:           session.GraphArtifact != "",
 		ExecSessions:          bootExecSessions(session.ExecSessions, info.ID),
 	}
 	restoreArgs.FilesystemRestoreIDs, err = r.backend.filesystemRestoreIDs(info.ID)
@@ -1234,24 +1232,22 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			}
 		}()
 		if restoreArgs.SharedMetadata {
-			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
-			sharedMetadata, err = openDistributedSharedArtifact(ctx, metadataPath, &session.MetadataBytes)
+			sharedMetadata, err = fetchRemoteArtifact(ctx, session.Address, token, session.MetadataArtifact, session.MetadataBytes)
 			if err != nil {
 				reader.Close()
-				return fmt.Errorf("opening shared distributed metadata: %w", err)
+				return fmt.Errorf("fetching peer distributed metadata: %w", err)
 			}
 			files = append(files, sharedMetadata)
 			connectionsStartFD++
 		}
 		if restoreArgs.GraphSparse {
-			graphPath := filepath.Join(r.backend.dataRoot, session.GraphManifest)
-			graphManifest, openErr := openDistributedSharedArtifact(ctx, graphPath, nil)
+			graphManifest, openErr := fetchRemoteArtifact(ctx, session.Address, token, session.GraphArtifact, session.GraphArtifactBytes)
 			if openErr != nil {
 				reader.Close()
 				for _, file := range connectionFiles {
 					file.Close()
 				}
-				return fmt.Errorf("opening shared graph memory manifest: %w", openErr)
+				return fmt.Errorf("fetching peer graph memory manifest: %w", openErr)
 			}
 			graphRestore, err = r.backend.openDistributedGraphRestore(graphManifest, tx.Identity.TransactionID, restoreArgs.GraphRemoteToken)
 			if err != nil {
@@ -1268,15 +1264,18 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 			connectionsStartFD++
 		}
 		if peer && restoreArgs.DurableDehydration {
-			metadataPath := filepath.Join(r.backend.dataRoot, session.SharedMetadata)
-			metadataFile, err := openDistributedSharedArtifact(ctx, metadataPath, &session.MetadataBytes)
-			if err != nil {
-				return fmt.Errorf("opening durable peer metadata: %w", err)
+			if sharedMetadata == nil {
+				return errors.New("durable peer metadata is unavailable")
 			}
-			durable, readErr := kernel.ReadDurableDehydrationMetadata(metadataFile)
-			metadataFile.Close()
+			if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("rewinding durable peer metadata: %w", err)
+			}
+			durable, readErr := kernel.ReadDurableDehydrationMetadata(sharedMetadata)
 			if readErr != nil {
 				return fmt.Errorf("reading durable peer metadata: %w", readErr)
+			}
+			if _, err := sharedMetadata.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("rewinding durable peer metadata after inspection: %w", err)
 			}
 			durableActiveDir = memoryBranchDir(r.backend.activeDataRoot(), info.ID, "active", targetBranch)
 			if err := os.RemoveAll(durableActiveDir); err != nil {

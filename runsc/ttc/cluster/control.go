@@ -156,20 +156,22 @@ type RemoteSessionDescriptor struct {
 	// execution can begin.
 	FilesystemRoots []FilesystemRootDescriptor `json:"filesystem_roots,omitempty"`
 	FilesystemBytes uint64                     `json:"filesystem_bytes,omitempty"`
-	// SharedMetadata is a clean data-root-relative path containing the
-	// authenticated SessionMetadata envelope. It permits restoring a
-	// process-free dehydrated source without a source page server.
-	SharedMetadata string `json:"shared_metadata,omitempty"`
-	// DurableDehydration declares that SharedMetadata is a TTC dehydration
+	// MetadataArtifact names an immutable, transaction-scoped kernel metadata
+	// object served by Address. Keeping this handoff on the authenticated peer
+	// channel avoids relying on cross-client NFS rename visibility before the
+	// target can execute.
+	MetadataArtifact string `json:"metadata_artifact,omitempty"`
+	// DurableDehydration declares that MetadataArtifact is a TTC dehydration
 	// envelope rather than a live-fork SessionMetadata envelope.
 	DurableDehydration bool `json:"durable_dehydration,omitempty"`
-	// GraphManifest is a clean shared-root-relative path containing the
-	// ephemeral dense restore view derived from immutable snapshot-graph roots.
+	// GraphArtifact names the transaction-scoped dense restore view served by
+	// Address and derived from immutable snapshot-graph roots.
 	// Bulk objects remain in their authoritative provider or shared pack and
 	// are populated into the target cache only when faulted.
-	GraphManifest string `json:"graph_manifest,omitempty"`
+	GraphArtifact      string `json:"graph_artifact,omitempty"`
+	GraphArtifactBytes uint64 `json:"graph_artifact_bytes,omitempty"`
 	// GraphSnapshot and GraphRootObjects preserve immutable backing identity.
-	// GraphManifest selects a graph-native sparse restore; without a manifest,
+	// GraphArtifact selects a graph-native sparse restore; without a manifest,
 	// the roots protect immutable files still referenced by a live page-stream
 	// restore after all remote bytes have become resident. Root names are
 	// target-local handles reconstructed from the filesystem-branch identity.
@@ -291,23 +293,21 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return errors.New("remote session internal mounts exceed 1 MiB")
 		}
 	}
-	if s.SharedMetadata == "" {
-		host, port, err := net.SplitHostPort(s.Address)
-		portNumber, portErr := strconv.ParseUint(port, 10, 16)
-		if err != nil || host == "" || portErr != nil || portNumber == 0 {
-			return fmt.Errorf("invalid remote page address %q", s.Address)
+	host, port, err := net.SplitHostPort(s.Address)
+	portNumber, portErr := strconv.ParseUint(port, 10, 16)
+	if err != nil || host == "" || portErr != nil || portNumber == 0 {
+		return fmt.Errorf("invalid remote page address %q", s.Address)
+	}
+	token, err := hex.DecodeString(s.SnapshotToken)
+	if err != nil || len(token) != 16 {
+		return errors.New("snapshot token must be 16 bytes encoded as hexadecimal")
+	}
+	for label, artifact := range map[string]string{"metadata": s.MetadataArtifact, "graph": s.GraphArtifact} {
+		if artifact == "" {
+			continue
 		}
-		token, err := hex.DecodeString(s.SnapshotToken)
-		if err != nil || len(token) != 16 {
-			return errors.New("snapshot token must be 16 bytes encoded as hexadecimal")
-		}
-	} else {
-		clean := filepath.Clean(s.SharedMetadata)
-		if filepath.IsAbs(s.SharedMetadata) || clean != s.SharedMetadata || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("invalid shared distributed metadata path %q", s.SharedMetadata)
-		}
-		if len(s.FilesystemRoots) == 0 && (s.Address != "" || s.SnapshotToken != "") {
-			return errors.New("shared distributed metadata must not include a page-server address or token")
+		if len(artifact) > 4096 || strings.ContainsAny(artifact, "/\\") || artifact == "." || artifact == ".." {
+			return fmt.Errorf("invalid remote %s artifact name %q", label, artifact)
 		}
 	}
 	if s.MetadataBytes == 0 || s.StreamBytes == 0 {
@@ -370,16 +370,15 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return fmt.Errorf("filesystem handoff reports %d bytes, roots contain %d", s.FilesystemBytes, filesystemBytes)
 		}
 	}
-	if s.GraphManifest != "" {
-		clean := filepath.Clean(s.GraphManifest)
-		if filepath.IsAbs(s.GraphManifest) || clean != s.GraphManifest || clean == "." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("invalid graph memory manifest path %q", s.GraphManifest)
-		}
-		if s.SharedMetadata == "" || !s.DurableDehydration {
-			return errors.New("graph memory restore requires durable shared metadata")
+	if s.GraphArtifact != "" {
+		if s.MetadataArtifact == "" || !s.DurableDehydration {
+			return errors.New("graph memory restore requires durable peer metadata")
 		}
 		if s.GraphSnapshot == 0 || len(s.GraphRootObjects) == 0 || len(s.GraphRootObjects) > 4096 {
 			return errors.New("graph memory restore requires bounded immutable root identities")
+		}
+		if s.GraphArtifactBytes == 0 {
+			return errors.New("graph memory restore requires a non-empty artifact")
 		}
 	} else if s.GraphSnapshot != 0 || len(s.GraphRootObjects) != 0 {
 		// A live page-stream restore may still carry immutable graph identity.
@@ -390,11 +389,14 @@ func (s RemoteSessionDescriptor) validate(negotiated NegotiatedCapabilities) err
 			return errors.New("live graph memory identity requires bounded immutable root identities")
 		}
 	}
-	if s.SharedMetadata != "" && s.GraphManifest == "" {
-		return errors.New("shared distributed metadata requires graph memory")
+	if s.GraphArtifact == "" && s.GraphArtifactBytes != 0 {
+		return errors.New("graph memory artifact size has no artifact")
 	}
-	if s.DurableDehydration && s.SharedMetadata == "" {
-		return errors.New("durable dehydration restore requires shared metadata")
+	if s.MetadataArtifact != "" && s.GraphArtifact == "" {
+		return errors.New("peer distributed metadata requires graph memory")
+	}
+	if s.DurableDehydration && s.MetadataArtifact == "" {
+		return errors.New("durable dehydration restore requires peer metadata")
 	}
 	return nil
 }

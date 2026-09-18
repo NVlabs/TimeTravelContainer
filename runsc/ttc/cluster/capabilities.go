@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	// ControlProtocolVersion 10 records the target-reported physical runtime
-	// identity before migration cutover. Version 9 introduced enforceable CPUID
-	// profiles and native XSAVE ABI binding.
-	ControlProtocolVersion = 10
+	// ControlProtocolVersion 11 moves ephemeral dehydrated-fork metadata from
+	// shared-filesystem paths to the transaction-fenced peer relay. Version 10
+	// records the target-reported physical runtime identity before cutover.
+	ControlProtocolVersion = 11
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"

@@ -687,6 +687,8 @@ type distributedPageRelay struct {
 	directWG             sync.WaitGroup
 	consoleToken         [16]byte
 	consoleLogs          map[string][]remoteConsoleLogExtent
+	artifactToken        [16]byte
+	artifacts            map[string][]byte
 }
 
 // remoteConsoleLogExtent pins one console-log generation at the exact length
@@ -776,12 +778,133 @@ func (r *distributedPageRelay) serveConnection(tcp *net.TCPConn) {
 		r.serveConsoleLog(tcp)
 		return
 	}
+	if magic == [4]byte{'T', 'T', 'C', 'A'} {
+		r.serveArtifact(tcp)
+		return
+	}
 	file, err := tcp.File()
 	tcp.Close()
 	if err != nil {
 		return
 	}
 	r.serveFile(file)
+}
+
+// ConfigureArtifacts exposes immutable transaction metadata over the peer
+// relay. These small control artifacts must travel through the same fenced
+// channel as lazy memory and filesystem data: publishing a temporary NFS file
+// and immediately naming it to another client is not coherently visible on all
+// supported shared filesystems.
+func (r *distributedPageRelay) ConfigureArtifacts(token [16]byte, artifacts map[string][]byte) error {
+	if len(artifacts) == 0 {
+		return errors.New("distributed artifact set is empty")
+	}
+	owned := make(map[string][]byte, len(artifacts))
+	for name, payload := range artifacts {
+		if name == "" || len(name) > 4096 || strings.ContainsAny(name, "/\\") || len(payload) == 0 {
+			return fmt.Errorf("invalid distributed artifact %q", name)
+		}
+		owned[name] = payload
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || len(r.artifacts) != 0 {
+		return errors.New("distributed artifact relay is closed or already configured")
+	}
+	r.artifactToken = token
+	r.artifacts = owned
+	return nil
+}
+
+func (r *distributedPageRelay) serveArtifact(conn *net.TCPConn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(reader, magic); err != nil || string(magic) != "TTCA" {
+		return
+	}
+	var token [16]byte
+	if _, err := io.ReadFull(reader, token[:]); err != nil {
+		return
+	}
+	var nameLength uint16
+	if err := binary.Read(reader, binary.BigEndian, &nameLength); err != nil || nameLength == 0 || nameLength > 4096 {
+		return
+	}
+	name := make([]byte, nameLength)
+	if _, err := io.ReadFull(reader, name); err != nil {
+		return
+	}
+	r.mu.Lock()
+	payload, exists := r.artifacts[string(name)]
+	authorized := token == r.artifactToken && exists && !r.closed
+	r.mu.Unlock()
+	if !authorized {
+		_, _ = conn.Write([]byte{0})
+		return
+	}
+	if _, err := conn.Write([]byte{1}); err != nil {
+		return
+	}
+	if err := binary.Write(conn, binary.BigEndian, uint64(len(payload))); err != nil {
+		return
+	}
+	_, _ = conn.Write(payload)
+}
+
+// fetchRemoteArtifact copies one immutable peer artifact into a seekable
+// anonymous file. expected is part of the transaction descriptor and fences
+// truncation, substitution, and unbounded peer responses without introducing
+// content hashing into the trusted-cluster data path.
+func fetchRemoteArtifact(ctx context.Context, address string, token [16]byte, name string, expected uint64) (*os.File, error) {
+	if name == "" || len(name) > 4096 || strings.ContainsAny(name, "/\\") || expected == 0 || expected > math.MaxInt64 {
+		return nil, errors.New("invalid remote artifact descriptor")
+	}
+	conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	var request bytes.Buffer
+	request.WriteString("TTCA")
+	request.Write(token[:])
+	if err := binary.Write(&request, binary.BigEndian, uint16(len(name))); err != nil {
+		return nil, err
+	}
+	request.WriteString(name)
+	if _, err := conn.Write(request.Bytes()); err != nil {
+		return nil, err
+	}
+	status := []byte{0}
+	if _, err := io.ReadFull(conn, status); err != nil {
+		return nil, err
+	}
+	if status[0] != 1 {
+		return nil, fmt.Errorf("remote artifact %q is unavailable", name)
+	}
+	var size uint64
+	if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
+		return nil, err
+	}
+	if size != expected {
+		return nil, fmt.Errorf("remote artifact %q size is %d, want %d", name, size, expected)
+	}
+	file, err := newConfigMemFD("ttc-distributed-"+name, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.CopyN(file, conn, int64(size)); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
 // ConfigureConsoleLogs exposes capture-fenced log generations over the same
@@ -1320,6 +1443,7 @@ func (r *distributedPageRelay) Close() {
 			cleanup := r.directCleanup
 			r.directCleanup = nil
 			r.directFilesystem = nil
+			r.artifacts = nil
 			consoleLogs := r.consoleLogs
 			r.consoleLogs = nil
 			r.mu.Unlock()
@@ -2484,12 +2608,6 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated source kernel metadata: %w", err)
 	}
-	metadataRelative := filepath.Join("cluster", "memory-metadata", transactionID+".state")
-	metadataPath := filepath.Join(b.dataRoot, metadataRelative)
-	if err := writeDurableDistributedFile(metadataPath, encodedMetadata); err != nil {
-		return selector{}, fmt.Errorf("publishing distributed metadata: %w", err)
-	}
-	defer os.Remove(metadataPath)
 	graphRestore, err := b.openGraphMemoryRestore(capture)
 	if err != nil {
 		return selector{}, fmt.Errorf("opening dehydrated graph memory: %w", err)
@@ -2503,13 +2621,6 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if err != nil {
 		return selector{}, fmt.Errorf("decoding dehydrated graph manifest: %w", err)
 	}
-	graphManifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
-	graphManifestPath := filepath.Join(b.dataRoot, graphManifestRelative)
-	if err := writeDurableDistributedFile(graphManifestPath, graphManifest); err != nil {
-		return selector{}, fmt.Errorf("publishing distributed graph manifest: %w", err)
-	}
-	defer os.Remove(graphManifestPath)
-
 	childFilesystemBranch := ttcvolume.ScopedBranchID(sourceInfo.ID, transactionID)
 
 	filesystemForks, finishFilesystemOrigins, err := b.forkDehydratedDistributedFilesystems(sourceInfo.ID, capture.FilesystemBranch, childFilesystemBranch)
@@ -2567,6 +2678,16 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if _, err := rand.Read(filesystemToken[:]); err != nil {
 		return selector{}, err
 	}
+	const (
+		metadataArtifact = "kernel-metadata"
+		graphArtifact    = "memory-graph"
+	)
+	if err := relay.ConfigureArtifacts([16]byte(filesystemToken), map[string][]byte{
+		metadataArtifact: encodedMetadata,
+		graphArtifact:    graphManifest,
+	}); err != nil {
+		return selector{}, fmt.Errorf("configuring dehydrated artifact relay: %w", err)
+	}
 	filesystemRoots, filesystemBytes, err := b.prepareDistributedFilesystem(sourceInfo, childFilesystemBranch, "", relay)
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
@@ -2608,7 +2729,7 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 		Address: advertise, SnapshotToken: hex.EncodeToString(filesystemToken[:]),
 		MetadataBytes: uint64(len(encodedMetadata)), StreamBytes: streamBytes,
 		MaxTransferBytes: tx.Negotiated.PagingPolicy.TransferBytes,
-		SharedMetadata:   metadataRelative, GraphManifest: graphManifestRelative,
+		MetadataArtifact: metadataArtifact, GraphArtifact: graphArtifact, GraphArtifactBytes: uint64(len(graphManifest)),
 		GraphSnapshot: capture.SnapshotID, GraphRootObjects: rootObjects,
 		DurableDehydration: true, FilesystemRoots: filesystemRoots, FilesystemBytes: filesystemBytes, InternalMounts: internalMounts,
 		ExecSessions: remoteExecSessions(capture.ExecSessions), ExecConsoleLogs: execConsoleLogs,

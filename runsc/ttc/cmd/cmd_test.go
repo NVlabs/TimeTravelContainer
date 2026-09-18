@@ -182,6 +182,38 @@ func TestDistributedConsoleLogRelay(t *testing.T) {
 	}
 }
 
+func TestDistributedArtifactRelay(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "", "")
+	defer relay.Close()
+	var token [16]byte
+	copy(token[:], "artifact-test")
+	payload := bytes.Repeat([]byte("kernel-state\n"), 1<<12)
+	if err := relay.ConfigureArtifacts(token, map[string][]byte{"metadata": payload}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), token, "metadata", uint64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("artifact bytes=%d, want %d, err=%v", len(got), len(payload), err)
+	}
+	if _, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), token, "metadata", uint64(len(payload))+1); err == nil {
+		t.Fatal("accepted mismatched artifact size")
+	}
+	wrong := token
+	wrong[0]++
+	if _, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), wrong, "metadata", uint64(len(payload))); err == nil {
+		t.Fatal("accepted wrong artifact token")
+	}
+}
+
 func TestApplyColdFilesystemRestoreIDs(t *testing.T) {
 	roots := []cluster.FilesystemRootDescriptor{
 		{Source: "/run/ttc/rootfs-upper", RepositoryID: "cache-rootfs", RestoreID: "cache-rootfs"},
