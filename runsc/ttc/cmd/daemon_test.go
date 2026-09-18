@@ -1183,6 +1183,42 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	}
 }
 
+func TestDaemonObservesInheritedConsoleSidecarOnce(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "console.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{}
+	target := selector{container: "demo", branch: "main"}
+	server.ObserveInheritedConsoleSidecar(lockPath, target, false)
+	server.ObserveInheritedConsoleSidecar(lockPath, target, false)
+	server.sidecarMu.Lock()
+	watchers := len(server.inheritedConsole)
+	server.sidecarMu.Unlock()
+	if watchers != 1 {
+		t.Fatalf("inherited watcher count=%d, want 1", watchers)
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		server.sidecarMu.Lock()
+		watchers = len(server.inheritedConsole)
+		server.sidecarMu.Unlock()
+		if watchers == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("inherited watcher did not observe lock release")
+}
+
 func TestDaemonSidecarRunsExitCallbackAfterReaping(t *testing.T) {
 	command := exec.Command("true")
 	if err := command.Start(); err != nil {

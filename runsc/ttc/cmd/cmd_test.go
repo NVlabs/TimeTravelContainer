@@ -6177,7 +6177,7 @@ func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
 		},
 		{Identity: cluster.ForkIdentity{TransactionID: "fork-unbound"}, State: cluster.TransactionIndependent},
 	}}
-	if err := collectColdStorage(shared, local, nil, catalog); err != nil {
+	if err := collectColdStorage(shared, local, nil, catalog, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(retired); !errors.Is(err, os.ErrNotExist) {
@@ -6206,13 +6206,13 @@ func TestFinalColdStorageCollectionHasNoPublicationGraceResidue(t *testing.T) {
 	if err := os.WriteFile(orphan, []byte("uncommitted"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := collectColdStorage(shared, local, nil, nil); err != nil {
+	if err := collectColdStorage(shared, local, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(orphan); err != nil {
 		t.Fatalf("ordinary grace did not retain a recent publication: %v", err)
 	}
-	if err := collectColdStorageOlderThan(shared, local, nil, nil, time.Now().Add(time.Hour)); err != nil {
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, nil, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
@@ -6264,11 +6264,58 @@ func TestColdStorageRetainsDistributedPhysicalBranchManifest(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := collectColdStorageOlderThan(shared, local, nil, nil, time.Now()); err != nil {
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, nil, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(manifestPath); err != nil {
 		t.Fatalf("distributed physical branch manifest was reclaimed: %v", err)
+	}
+}
+
+func TestColdStorageRetainsRaftBranchBackingAfterPhysicalCleanup(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	manifestPath := coldManifestPath(shared, "fork-old-physical", "fork-old-physical", "publication-old")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 29, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	manifest := coldBranchManifest{
+		Version: 5, Container: "fork-old-physical", Branch: "fork-old-physical", PublicationID: "publication-old", Kind: "stop",
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef", BranchID: "fork-old-physical",
+			Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{29}}},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(manifestPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(shared, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &cluster.AuthorityState{Branches: map[string]cluster.BranchAuthority{
+		"logical-family\x00main": {
+			FamilyID: "logical-family", BranchID: "main", Lifecycle: "running",
+			Roots: cluster.DurableRoots{FilesystemRoot: filepath.ToSlash(relative)},
+		},
+	}}
+	// The old physical container record has already been removed. The logical
+	// Raft branch is nevertheless still allowed to fault from this immutable
+	// manifest, so terminal collection must retain it.
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, authority, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("Raft-selected branch backing was reclaimed: %v", err)
 	}
 }
 

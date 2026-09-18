@@ -4665,7 +4665,11 @@ func (b *runtimeBackend) finalizeNodeRetirement(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("opening transaction catalog for final storage collection: %w", err)
 	}
-	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions); err != nil {
+	authority, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return fmt.Errorf("reading authoritative cold roots: %w", err)
+	}
+	if err := collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, authority); err != nil {
 		return fmt.Errorf("collecting terminal shared storage: %w", err)
 	}
 	if b.sharedReferences != nil {
@@ -4677,7 +4681,7 @@ func (b *runtimeBackend) finalizeNodeRetirement(ctx context.Context) error {
 		// No maintenance iteration is guaranteed after the final daemon exits.
 		// All publishers are fenced here, so the last node can remove newly
 		// unreachable cold data without the ordinary recovery grace interval.
-		if err := collectColdStorageOlderThan(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, time.Now().Add(time.Hour)); err != nil {
+		if err := collectColdStorageOlderThan(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, authority, time.Now().Add(time.Hour)); err != nil {
 			return fmt.Errorf("collecting final cluster cold storage: %w", err)
 		}
 	}

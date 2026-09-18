@@ -5849,6 +5849,7 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 
 type consoleSidecarOwner interface {
 	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
+	ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool)
 	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
@@ -8601,6 +8602,9 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			if reset {
 				return ttcbundle.ConsolePaths{}, fmt.Errorf("console drain for %s is still active", target)
+			}
+			if b.consoleSidecars != nil {
+				b.consoleSidecars.ObserveInheritedConsoleSidecar(paths.Lock, target, execID == "")
 			}
 			return paths, nil
 		}

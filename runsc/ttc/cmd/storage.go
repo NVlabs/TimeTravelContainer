@@ -2352,8 +2352,8 @@ func (b *runtimeBackend) prepareLocalDirectFilesystemSources(info ttcbundle.Cont
 // collectColdStorage traces every authoritative and pending manifest before
 // reclaiming immutable packs. A grace period protects a publisher between
 // writing its pack and atomically committing its manifest.
-func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog) error {
-	return collectColdStorageOlderThan(sharedRoot, localRoot, publications, transactions, time.Now().Add(-10*time.Minute))
+func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.AuthorityState) error {
+	return collectColdStorageOlderThan(sharedRoot, localRoot, publications, transactions, authority, time.Now().Add(-10*time.Minute))
 }
 
 // collectColdStorageOlderThan is the common tracer with an explicit physical
@@ -2362,7 +2362,7 @@ func collectColdStorage(sharedRoot, localRoot string, publications *ttcstorage.Q
 // may pass a future boundary after every node's publication queue has drained,
 // because no unfenced publisher remains that could still name an unreferenced
 // object.
-func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, olderThan time.Time) error {
+func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.AuthorityState, olderThan time.Time) error {
 	store := ttcbundle.Store{Root: sharedRoot, ActiveRoot: localRoot}
 	// Destructive tracing must include internal distributed physical records.
 	// User-facing ListContainers intentionally hides them, but their cold
@@ -2377,6 +2377,21 @@ func collectColdStorageOlderThan(sharedRoot, localRoot string, publications *ttc
 			if branch.StorageManifest != "" {
 				queue = append(queue, branch.StorageManifest)
 			}
+		}
+	}
+	// A live clustered branch may continue faulting immutable files from the
+	// publication that materialized it after its old physical source record has
+	// been reclaimed. Raft deliberately retains that filesystem root until a
+	// later publication replaces it or branch removal drops it. Include those
+	// logical roots directly: deriving reachability only from physical
+	// container.json records creates a window in which ordinary cold GC can
+	// delete the backing manifest of a running migrated branch.
+	if authority != nil {
+		for _, branch := range authority.Branches {
+			if branch.Corrupted || branch.Roots.FilesystemRoot == "" {
+				continue
+			}
+			queue = append(queue, filepath.Join(sharedRoot, branch.Roots.FilesystemRoot))
 		}
 	}
 	if publications != nil {
@@ -2548,8 +2563,12 @@ func pruneEmptyColdManifestDirectories(root string) error {
 // because the source daemon shuts down before another timer tick.
 func (b *runtimeBackend) collectTerminalColdStorage() {
 	transactions, err := b.transactionCatalog()
+	var authority *cluster.AuthorityState
+	if err == nil && b.distributedSource != nil && b.distributedSource.authority != nil {
+		authority, err = b.distributedSource.authority.AuthorityState()
+	}
 	if err == nil {
-		err = collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions)
+		err = collectColdStorage(b.dataRoot, b.activeDataRoot(), b.publicationQueue, transactions, authority)
 	}
 	if err != nil && b.stderr != nil {
 		fmt.Fprintf(b.stderr, "ttcd: warning: collecting terminal distributed storage: %v\n", err)

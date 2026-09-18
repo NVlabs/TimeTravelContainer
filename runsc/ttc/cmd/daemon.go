@@ -358,6 +358,10 @@ type daemonServer struct {
 
 	sidecarMu sync.Mutex
 	sidecars  map[string]*exec.Cmd
+	// inheritedConsole records drainers that survived an older ttcd. They
+	// cannot be reaped through exec.Cmd, but their advisory locks provide an
+	// exact completion notification for the new daemon.
+	inheritedConsole map[string]struct{}
 
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
@@ -2076,6 +2080,44 @@ func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd, target s
 		exited = func() { s.observeInitConsoleExit(target) }
 	}
 	return s.ownSidecar("console", key, command, exited)
+}
+
+// ObserveInheritedConsoleSidecar adopts completion observation, rather than
+// process ownership, for a console drainer that survived an older ttcd. This
+// closes the restart window in which the old drainer writes wait-status after
+// startup reconciliation has already run: without a new callback, the branch
+// would remain running/materializing forever despite its completed init.
+func (s *daemonServer) ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool) {
+	if s == nil || key == "" {
+		return
+	}
+	s.sidecarMu.Lock()
+	if _, owned := s.sidecars[key]; owned {
+		s.sidecarMu.Unlock()
+		return
+	}
+	if s.inheritedConsole == nil {
+		s.inheritedConsole = make(map[string]struct{})
+	}
+	if _, watching := s.inheritedConsole[key]; watching {
+		s.sidecarMu.Unlock()
+		return
+	}
+	s.inheritedConsole[key] = struct{}{}
+	s.sidecarMu.Unlock()
+	go func() {
+		lockFile, err := os.OpenFile(key, os.O_CREATE|os.O_RDWR, 0600)
+		if err == nil {
+			err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
+			_ = lockFile.Close()
+		}
+		s.sidecarMu.Lock()
+		delete(s.inheritedConsole, key)
+		s.sidecarMu.Unlock()
+		if err == nil && observeInitExit {
+			s.observeInitConsoleExit(target)
+		}
+	}()
 }
 
 // StopConsoleSidecar terminates a console follower owned by this daemon.
@@ -5635,7 +5677,11 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	if clusterRuntime != nil {
 		maintenanceTransactions = clusterRuntime.transactions
 	}
-	go maintainRepositories(dataRoot, localRoot, server.root, server.runsc, publicationQueue, maintenanceTransactions, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
+	var maintenanceAuthority *cluster.RaftCatalog
+	if clusterRuntime != nil {
+		maintenanceAuthority = clusterRuntime.raftCatalog
+	}
+	go maintainRepositories(dataRoot, localRoot, server.root, server.runsc, publicationQueue, maintenanceTransactions, maintenanceAuthority, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
 	})
 	clusterDone := make(chan struct{})
@@ -6356,7 +6402,7 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	}
 }
 
-func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.RaftCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	consumption := time.NewTicker(30 * time.Second)
@@ -6388,7 +6434,14 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 			if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
 			}
-			if err := collectColdStorage(dataRoot, localRoot, publications, transactions); err != nil && stderr != nil {
+			var authorityState *cluster.AuthorityState
+			var authorityErr error
+			if authority != nil {
+				authorityState, authorityErr = authority.AuthorityState()
+			}
+			if authorityErr != nil && stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: reading authoritative cold roots: %v\n", authorityErr)
+			} else if err := collectColdStorage(dataRoot, localRoot, publications, transactions, authorityState); err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: collecting cold packs: %v\n", err)
 			}
 		}
