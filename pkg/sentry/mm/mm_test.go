@@ -194,7 +194,7 @@ func TestInvalidateMappingsForReboundSpecialMappable(t *testing.T) {
 	}
 }
 
-func TestSpecialMappableSparseRestoreUsesDiscontiguousRanges(t *testing.T) {
+func TestSpecialMappableSparseRestoreLinearizesDiscontiguousRanges(t *testing.T) {
 	ctx := contexttest.Context(t)
 	memMgr := testMemoryManager(ctx, t)
 	defer memMgr.DecUsers(ctx)
@@ -232,15 +232,23 @@ func TestSpecialMappableSparseRestoreUsesDiscontiguousRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	mappable := NewSpecialMappable("[sparse-test]", memMgr.mf, source)
+	references := pgalloc.NewSparseReferenceTransaction()
 	loadCtx := context.WithValues(ctx, map[any]any{
-		pgalloc.CtxMemoryFile:       memMgr.mf,
-		pgalloc.CtxSparseRelocation: relocation,
+		pgalloc.CtxMemoryFile:        memMgr.mf,
+		pgalloc.CtxSparseRelocation:  relocation,
+		pgalloc.CtxSparseRestoreRefs: references,
+		pgalloc.CtxLiveForkClone:     true,
 	})
 	mappable.afterLoad(loadCtx)
+	if err := references.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	// In a real sparse restore the serialized source offsets do not own ranges
 	// in the target MemoryFile. This test allocated them only to obtain valid
 	// logical page identities.
 	memMgr.mf.DecRef(source)
+	memMgr.mf.DecRef(first)
+	memMgr.mf.DecRef(second)
 	defer mappable.DecRef(ctx)
 
 	translations, err := mappable.Translate(ctx,
@@ -249,11 +257,22 @@ func TestSpecialMappableSparseRestoreUsesDiscontiguousRanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(translations) != 2 || translations[0].Offset != first.Start || translations[1].Offset != second.Start {
-		t.Fatalf("translations=%+v, want offsets %#x and %#x", translations, first.Start, second.Start)
+	if len(translations) != 1 || translations[0].Offset == first.Start || translations[0].Offset == second.Start {
+		t.Fatalf("translations=%+v, want one newly allocated contiguous range", translations)
 	}
 	if mappable.Length() != 2*hostarch.PageSize {
 		t.Fatalf("length=%d, want %d", mappable.Length(), 2*hostarch.PageSize)
+	}
+	contents, err := memMgr.mf.MapInternal(mappable.FileRange(), hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [2]byte
+	for i, offset := range []uint64{0, hostarch.PageSize} {
+		got[i] = contents.DropFirst64(offset).Head().ToSlice()[0]
+	}
+	if got != [2]byte{0x11, 0x22} {
+		t.Fatalf("linearized page prefixes=%#x, want 0x11,0x22", got)
 	}
 }
 

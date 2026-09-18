@@ -227,6 +227,36 @@ func TestSparseReferenceTransactionCommitAndAbort(t *testing.T) {
 	if !mf.HasUniqueRef(page) {
 		t.Fatal("released graph reference did not leave the cache reference")
 	}
+
+	abortedRange, err := mf.Allocate(hostarch.PageSize, AllocOpts{Mode: AllocateAndCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	abortedAllocation := NewSparseReferenceTransaction()
+	abortedAllocation.AddAllocation(mf, abortedRange, 0)
+	abortedAllocation.Abort()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("aborted adopted allocation retained a reference")
+			}
+		}()
+		mf.IncRef(abortedRange, 0)
+	}()
+
+	committedRange, err := mf.Allocate(hostarch.PageSize, AllocOpts{Mode: AllocateAndCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committedAllocation := NewSparseReferenceTransaction()
+	committedAllocation.AddAllocation(mf, committedRange, 0)
+	if err := committedAllocation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if !mf.HasUniqueRef(committedRange) {
+		t.Fatal("committed adopted allocation changed its initial owner reference")
+	}
+	mf.DecRef(committedRange)
 }
 
 func TestReclaimUnusedSparseChunks(t *testing.T) {

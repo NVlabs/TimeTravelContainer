@@ -207,7 +207,11 @@ type sparsePendingReference struct {
 // without modifying allocator counts.
 type SparseReferenceTransaction struct {
 	references []sparsePendingReference
-	done       bool
+	// allocations already carry their restored owner's reference. They are
+	// retained on commit and released on abort, unlike references which are
+	// acquired only at commit time.
+	allocations []sparsePendingReference
+	done        bool
 }
 
 // NewSparseReferenceTransaction creates an empty restore transaction.
@@ -225,6 +229,17 @@ func (t *SparseReferenceTransaction) Add(mf *MemoryFile, fr memmap.FileRange, me
 	t.references = append(t.references, sparsePendingReference{mf: mf, range_: fr, memCgID: memCgID})
 }
 
+// AddAllocation adopts an already-allocated range for the restored state
+// graph. The allocation's initial reference becomes the object's reference on
+// Commit and is released on Abort.
+func (t *SparseReferenceTransaction) AddAllocation(mf *MemoryFile, fr memmap.FileRange, memCgID uint32) {
+	if t == nil || t.done || mf == nil || !fr.WellFormed() || fr.Length() == 0 ||
+		!hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
+		panic(fmt.Sprintf("invalid sparse restore allocation: mf=%p range=%v", mf, fr))
+	}
+	t.allocations = append(t.allocations, sparsePendingReference{mf: mf, range_: fr, memCgID: memCgID})
+}
+
 // Commit installs every staged reference.
 func (t *SparseReferenceTransaction) Commit() error {
 	if t == nil || t.done {
@@ -235,6 +250,7 @@ func (t *SparseReferenceTransaction) Commit() error {
 		reference.mf.IncRef(reference.range_, reference.memCgID)
 	}
 	t.references = nil
+	t.allocations = nil
 	return nil
 }
 
@@ -245,6 +261,10 @@ func (t *SparseReferenceTransaction) Abort() {
 	}
 	t.done = true
 	t.references = nil
+	for _, allocation := range t.allocations {
+		allocation.mf.DecRef(allocation.range_)
+	}
+	t.allocations = nil
 }
 
 // NewRanges returns a detached map of chunks that require page loading.
