@@ -1710,8 +1710,12 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		if _, ok := s.Transactions[tx.Identity.TransactionID]; ok {
 			return nil, os.ErrExist
 		}
-		if tx.SourceIncarnation != "" || tx.TargetIncarnation != "" || tx.SourcePhysicalContainer != "" || tx.SourcePhysicalBranch != "" {
-			return nil, errors.New("new transaction supplied physical authority")
+		if tx.SourceIncarnation != "" || tx.TargetIncarnation != "" {
+			return nil, errors.New("new transaction supplied node incarnation authority")
+		}
+		if (tx.SourcePhysicalContainer == "") != (tx.SourcePhysicalBranch == "") ||
+			(tx.SourcePhysicalContainer != "" && (!transactionIDPattern.MatchString(tx.SourcePhysicalContainer) || !transactionIDPattern.MatchString(tx.SourcePhysicalBranch))) {
+			return nil, errors.New("new transaction supplied invalid physical source")
 		}
 		source, ok := s.Nodes[tx.Identity.SourceNodeID]
 		if !ok || source.LeaseTerm != command.LeaderTerm || !source.LeaseActive(command.IssuedAt) || (source.State != NodeReady && source.State != NodePressured && source.State != NodeDraining) {
@@ -1723,6 +1727,9 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		}
 		tx.SourceIncarnation, tx.TargetIncarnation = source.Incarnation, target.Incarnation
 		if tx.Identity.Migration {
+			if tx.SourcePhysicalContainer != "" {
+				return nil, errors.New("migration transaction supplied physical source outside placement")
+			}
 			placement, ok := s.Placements[logicalBranchKey(tx.Identity.SourceContainer, tx.Identity.SourceBranch)]
 			if !ok || placement.State != PlacementMigrating || placement.OperationID != tx.Identity.TransactionID ||
 				placement.OwnerNode != tx.Identity.SourceNodeID || placement.OwnerIncarnation != source.Incarnation ||
@@ -2529,8 +2536,8 @@ func RestoreAuthorityState(data []byte) (*AuthorityState, error) {
 			return nil, errors.New("non-migration transaction has inherited dependencies")
 		}
 		if (tx.SourcePhysicalContainer == "") != (tx.SourcePhysicalBranch == "") ||
-			(tx.SourcePhysicalContainer != "" && (!tx.Identity.Migration ||
-				!transactionIDPattern.MatchString(tx.SourcePhysicalContainer) || !transactionIDPattern.MatchString(tx.SourcePhysicalBranch))) {
+			(tx.SourcePhysicalContainer != "" &&
+				(!transactionIDPattern.MatchString(tx.SourcePhysicalContainer) || !transactionIDPattern.MatchString(tx.SourcePhysicalBranch))) {
 			return nil, errors.New("transaction snapshot has invalid physical source identity")
 		}
 		seenInherited := make(map[string]struct{}, len(tx.InheritedDependencies))

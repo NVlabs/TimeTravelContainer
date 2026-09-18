@@ -112,6 +112,15 @@ type ReserveRequest struct {
 	SourceCapabilities Capabilities           `json:"source_capabilities"`
 	Identity           ForkIdentity           `json:"identity"`
 	Family             RemoteFamilyDescriptor `json:"family"`
+	// SourcePhysical* identifies the exact node-local provider selected by the
+	// source daemon. This is distinct from Identity's stable logical branch:
+	// an unplaced cold branch may be materialized into a transaction-scoped
+	// cache before it serves a remote fork. Raft retains this identity until
+	// SourceNeeded becomes false, fencing local cache reclamation meanwhile.
+	// Migrations omit these fields because their source is derived atomically
+	// from the placement transition by the authority state machine.
+	SourcePhysicalContainer string `json:"source_physical_container,omitempty"`
+	SourcePhysicalBranch    string `json:"source_physical_branch,omitempty"`
 }
 
 // RemoteFamilyDescriptor carries the small immutable configuration needed to
@@ -1408,6 +1417,18 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if request.Identity.Migration && (request.SourcePhysicalContainer != "" || request.SourcePhysicalBranch != "") {
+		writeControlError(w, http.StatusBadRequest, "migration physical source is selected by Raft placement")
+		return
+	}
+	if (request.SourcePhysicalContainer == "") != (request.SourcePhysicalBranch == "") ||
+		(request.SourcePhysicalContainer != "" && (!transactionIDPattern.MatchString(request.SourcePhysicalContainer) || !transactionIDPattern.MatchString(request.SourcePhysicalBranch))) {
+		writeControlError(w, http.StatusBadRequest, "invalid physical source identity")
+		return
+	}
+	requestSourceMatches := func(tx *Transaction) bool {
+		return tx.SourcePhysicalContainer == request.SourcePhysicalContainer && tx.SourcePhysicalBranch == request.SourcePhysicalBranch
+	}
 	advanceReserved := func(tx *Transaction) (*Transaction, error) {
 		advanced, err := c.Store.Advance(tx.Identity.TransactionID, tx.Revision, TransactionTargetReserved, "", c.Now())
 		if err == nil {
@@ -1436,7 +1457,7 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		}
 	}
 	if existing, err := c.Store.Load(request.Identity.TransactionID); err == nil {
-		if reflect.DeepEqual(existing.Identity, request.Identity) && reflect.DeepEqual(existing.Negotiated, negotiated) {
+		if reflect.DeepEqual(existing.Identity, request.Identity) && reflect.DeepEqual(existing.Negotiated, negotiated) && requestSourceMatches(existing) {
 			if existing.State == TransactionPreparing {
 				if c.TargetRuntime == nil {
 					writeControlError(w, http.StatusServiceUnavailable, "target distributed-fork runtime is not configured")
@@ -1478,6 +1499,8 @@ func (c *ControlPlane) reserve(w http.ResponseWriter, r *http.Request, peer stri
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	tx.SourcePhysicalContainer = request.SourcePhysicalContainer
+	tx.SourcePhysicalBranch = request.SourcePhysicalBranch
 	if err := c.Store.Create(tx); err != nil {
 		writeControlError(w, http.StatusConflict, err.Error())
 		return

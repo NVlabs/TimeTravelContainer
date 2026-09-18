@@ -781,7 +781,10 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := ReserveRequest{SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor()}
+	request := ReserveRequest{
+		SourceCapabilities: testCapabilities("source"), Identity: testForkIdentity(), Family: testRemoteFamilyDescriptor(),
+		SourcePhysicalContainer: "cold-cache", SourcePhysicalBranch: "cold-branch",
+	}
 	tx, err := client.Reserve(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -789,11 +792,19 @@ func TestMutualTLSControlPlaneReservationStatusAndCancel(t *testing.T) {
 	if tx.State != TransactionTargetReserved || tx.Revision != 2 {
 		t.Fatalf("reserved transaction=%+v", tx)
 	}
+	if tx.SourcePhysicalContainer != "cold-cache" || tx.SourcePhysicalBranch != "cold-branch" {
+		t.Fatalf("reserved physical source=%s@%s", tx.SourcePhysicalContainer, tx.SourcePhysicalBranch)
+	}
 	// A lost reserve response may be retried without consuming quota or
 	// replacing the existing identity.
 	retried, err := client.Reserve(context.Background(), request)
 	if err != nil || retried.Revision != tx.Revision {
 		t.Fatalf("idempotent reserve=%+v err=%v", retried, err)
+	}
+	mismatched := request
+	mismatched.SourcePhysicalContainer = "other-cache"
+	if _, err := client.Reserve(context.Background(), mismatched); err == nil {
+		t.Fatal("reserve accepted a different physical source for the same transaction")
 	}
 	loaded, err := client.Status(context.Background(), tx.Identity.TransactionID)
 	if err != nil || loaded.Revision != tx.Revision {

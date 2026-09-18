@@ -574,6 +574,29 @@ func TestAuthorityMigrationTransactionBindsPhysicalSource(t *testing.T) {
 	}
 }
 
+func TestAuthorityForkTransactionRetainsReportedPhysicalSource(t *testing.T) {
+	at := time.Unix(2600, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "source", "incarnation-a", at.Add(-time.Second))
+	registerReadyAuthorityNode(t, state, "target", "incarnation-b", at.Add(-time.Second))
+	identity := testForkIdentity()
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := NewTransaction(identity, negotiated, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.SourcePhysicalContainer = "cold-cache"
+	tx.SourcePhysicalBranch = "cold-branch"
+	created := decodeAuthorityResultForTest[Transaction](t, applyAuthorityForTest(t, state, "transaction", at, AuthorityTransactionCreate, AuthorityTransactionPayload{Transaction: *tx}))
+	if created.SourcePhysicalContainer != "cold-cache" || created.SourcePhysicalBranch != "cold-branch" {
+		t.Fatalf("transaction physical source = %s@%s, want cold-cache@cold-branch", created.SourcePhysicalContainer, created.SourcePhysicalBranch)
+	}
+	mustAuthoritySnapshotForTest(t, state)
+}
+
 func TestAuthorityPublicationIdentityPreventsLateResurrection(t *testing.T) {
 	at := time.Unix(3000, 0).UTC()
 	state := NewAuthorityState()

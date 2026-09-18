@@ -2389,9 +2389,11 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	defer cancel()
 	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
 		return peer.Reserve(ctx, cluster.ReserveRequest{
-			SourceCapabilities: b.distributedSource.capabilities,
-			Identity:           identity,
-			Family:             family,
+			SourceCapabilities:      b.distributedSource.capabilities,
+			Identity:                identity,
+			Family:                  family,
+			SourcePhysicalContainer: sourceInfo.ID,
+			SourcePhysicalBranch:    source.branch,
 		})
 	})
 	if err != nil {
@@ -2572,7 +2574,10 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-		return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
+		return peer.Reserve(ctx, cluster.ReserveRequest{
+			SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family,
+			SourcePhysicalContainer: sourceInfo.ID, SourcePhysicalBranch: source.branch,
+		})
 	})
 	if err != nil {
 		return selector{}, fmt.Errorf("reserving target node %s: %w", targetNode, err)
@@ -3099,7 +3104,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		var tx *cluster.Transaction
 		if i == 0 {
 			tx, err = reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-				return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
+				return peer.Reserve(ctx, cluster.ReserveRequest{
+					SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family,
+					SourcePhysicalContainer: sourceInfo.ID, SourcePhysicalBranch: source.branch,
+				})
 			})
 			if err != nil {
 				return nil, fmt.Errorf("reserving target %s on node %s: %w", target, targetNode, err)
@@ -3245,7 +3253,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	for i := 1; i < len(children); i++ {
 		child := &children[i]
 		child.tx, err = reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
-			return peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: child.identity, Family: family})
+			return peer.Reserve(ctx, cluster.ReserveRequest{
+				SourceCapabilities: b.distributedSource.capabilities, Identity: child.identity, Family: family,
+				SourcePhysicalContainer: sourceInfo.ID, SourcePhysicalBranch: source.branch,
+			})
 		})
 		if err != nil {
 			return nil, fmt.Errorf("reserving target %s on node %s: %w", child.target, targetNode, err)

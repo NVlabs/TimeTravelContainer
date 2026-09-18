@@ -150,10 +150,12 @@ type Transaction struct {
 	// target's volatile dependency.
 	SourceIncarnation string `json:"source_incarnation,omitempty"`
 	TargetIncarnation string `json:"target_incarnation,omitempty"`
-	// SourcePhysical* binds a migration's paused sparse provider to the exact
-	// runtime incarnation selected by placement when the transaction began.
-	// SourceBranch remains the stable logical identity and may be reused by
-	// later migrations before this provider becomes independent.
+	// SourcePhysical* binds the transaction's provider to the exact node-local
+	// container selected when the transaction began. For migration this comes
+	// from the Raft placement. For an ordinary fork the authenticated source
+	// reports it, which is essential when an unplaced cold branch is served
+	// from a temporary materialization. SourceBranch remains the stable logical
+	// identity and may be reused while the physical provider is still fenced.
 	SourcePhysicalContainer string           `json:"source_physical_container,omitempty"`
 	SourcePhysicalBranch    string           `json:"source_physical_branch,omitempty"`
 	SourceNeeded            bool             `json:"source_needed"`
