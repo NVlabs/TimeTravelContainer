@@ -9510,6 +9510,15 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			graphRoots = append(graphRoots, root)
 		}
 	}
+	for _, backing := range info.RuntimeMemoryBackings {
+		for _, root := range branchGraphRootNames(runtimeBackingAsBranch(backing)) {
+			if _, exists := seenGraphRoots[root]; exists {
+				continue
+			}
+			seenGraphRoots[root] = struct{}{}
+			graphRoots = append(graphRoots, root)
+		}
+	}
 	for _, branch := range info.Branches {
 		if graphReferenceOperationForBranch(info, branch) == "" {
 			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
@@ -9518,6 +9527,17 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		}
 		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
 			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
+		}
+	}
+	for _, backing := range info.RuntimeMemoryBackings {
+		branch := runtimeBackingAsBranch(backing)
+		if graphReferenceOperationForBranch(info, branch) == "" {
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+				return fmt.Errorf("releasing shared runtime memory backing %s for %s: %w", backing.ID, info.Name, err)
+			}
+		}
+		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
+			return fmt.Errorf("releasing distributed runtime memory backing %s for %s: %w", backing.ID, info.Name, err)
 		}
 	}
 	// Resolve shared-ledger references while Raft still identifies local
@@ -12725,6 +12745,17 @@ func branchGraphRootNames(branch ttcbundle.BranchInfo) []string {
 	return roots
 }
 
+func runtimeBackingAsBranch(backing ttcbundle.RuntimeMemoryBacking) ttcbundle.BranchInfo {
+	return ttcbundle.BranchInfo{
+		SnapshotID:                         backing.SnapshotID,
+		MemoryRoots:                        append([]string(nil), backing.MemoryRoots...),
+		MemoryRootObjects:                  append([]string(nil), backing.MemoryRootObjects...),
+		ControlRoot:                        backing.ControlRoot,
+		ControlRootObject:                  backing.ControlRootObject,
+		DistributedGraphReferenceOperation: backing.DistributedGraphReferenceOperation,
+	}
+}
+
 func appendGraphRoot(roots []string, root string) []string {
 	if root == "" {
 		return roots
@@ -12933,6 +12964,28 @@ func (b *runtimeBackend) cloneGraphControlRoot(sourceRoot, sourceObject string, 
 
 func (b *runtimeBackend) releaseBranchGraphRoots(branch ttcbundle.BranchInfo) error {
 	return b.releaseGraphMemoryRoots(branchGraphRootNames(branch))
+}
+
+// parkBranchMemoryGraph detaches immutable page backing from a branch before
+// the Sentry transfers that branch's unresolved loader to a sibling. The
+// returned branch is reloaded after the atomic metadata mutation and therefore
+// no longer owns the parked roots.
+func (b *runtimeBackend) parkBranchMemoryGraph(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+	if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+		return info, branch, nil
+	}
+	if _, _, err := b.containerStore().ParkBranchMemoryGraph(info.ID, branch.ID); err != nil {
+		return info, branch, fmt.Errorf("parking runtime memory backing for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	refreshed, err := b.containerStore().LoadContainer(info.ID)
+	if err != nil {
+		return info, branch, fmt.Errorf("reloading parked runtime memory backing for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	updated, err := persistentBranchInfo(refreshed, branch.ID)
+	if err != nil {
+		return info, branch, err
+	}
+	return refreshed, updated, nil
 }
 
 // reclaimBranchBacking releases every immutable graph reference and writable
@@ -13245,6 +13298,17 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 				}
 			}
 		}
+		for _, backing := range container.RuntimeMemoryBackings {
+			if backing.SnapshotID != 0 {
+				retainedSnapshots[ttcsnapshot.SnapshotID(backing.SnapshotID)] = struct{}{}
+			}
+			for _, name := range branchGraphRootNames(runtimeBackingAsBranch(backing)) {
+				liveRoots[name] = struct{}{}
+				if _, ok := b.snapshotGraph.Root(name); !ok {
+					return fmt.Errorf("container %s runtime backing %s references missing snapshot root %q", container.Name, backing.ID, name)
+				}
+			}
+		}
 	}
 	inspection := b.snapshotGraph.Inspect()
 	var orphanRoots []string
@@ -13381,8 +13445,16 @@ func (b *runtimeBackend) discard(target selector) error {
 			if _, err := b.command("delete", "--force", info.ID); err != nil {
 				return fmt.Errorf("releasing final runtime branch %s: %w", target, err)
 			}
-		} else if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
-			return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
+		} else {
+			var updated ttcbundle.BranchInfo
+			info, updated, err = b.parkBranchMemoryGraph(info, branch)
+			if err != nil {
+				return err
+			}
+			branch = updated
+			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+				return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
+			}
 		}
 		break
 	}
@@ -14485,25 +14557,76 @@ func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector,
 	}
 }
 
-// reconcileConsumedStandaloneMemoryBacking eventually releases roots whose
+// reconcileConsumedMemoryBacking eventually releases roots whose
 // demand loader completed after rehydrate returned. Polling is daemon-side and
 // infrequent; ordinary guest faults never mutate the graph or storage catalog.
-func (b *runtimeBackend) reconcileConsumedStandaloneMemoryBacking() error {
-	if b.nodeID != "" {
-		return nil
-	}
+func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 	containers, err := b.containerStore().ListContainersForGC()
 	if err != nil {
 		return err
 	}
+	runtimeFamilies, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	runtimeByID := make(map[string]Family, len(runtimeFamilies))
+	for _, family := range runtimeFamilies {
+		runtimeByID[family.ID] = family
+	}
 	for _, container := range containers {
-		for _, branch := range container.Branches {
-			if len(branch.MemoryRoots) == 0 {
-				continue
+		if b.nodeID == "" {
+			for _, branch := range container.Branches {
+				if len(branch.MemoryRoots) == 0 {
+					continue
+				}
+				switch normalizeLifecycleState(branch.State) {
+				case "running", "paused":
+					b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+				}
 			}
-			switch normalizeLifecycleState(branch.State) {
-			case "running", "paused":
-				b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+		}
+		if len(container.RuntimeMemoryBackings) == 0 {
+			continue
+		}
+		allDone := true
+		if family, ok := runtimeByID[container.ID]; ok {
+			for _, branch := range family.Branches {
+				switch normalizeLifecycleState(branch.State) {
+				case "running", "paused", "restarting":
+				default:
+					continue
+				}
+				output, statusErr := b.command("timetravel", container.ID, "page-load-status", branch.ID)
+				if statusErr != nil {
+					allDone = false
+					break
+				}
+				var status pgalloc.AsyncPagesFileLoadStats
+				if json.Unmarshal(output, &status) != nil || !status.Done || status.Error != "" {
+					allDone = false
+					break
+				}
+			}
+		}
+		if !allDone {
+			continue
+		}
+		for _, backing := range container.RuntimeMemoryBackings {
+			branch := runtimeBackingAsBranch(backing)
+			operation := graphReferenceOperationForBranch(container, branch)
+			if operation == "" {
+				if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+					return fmt.Errorf("releasing shared runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+				}
+			}
+			if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
+				return fmt.Errorf("releasing distributed runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+			}
+			if err := b.releaseBranchGraphRoots(branch); err != nil {
+				return fmt.Errorf("releasing local runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+			}
+			if err := b.containerStore().RemoveRuntimeMemoryBacking(container.ID, backing.ID); err != nil {
+				return fmt.Errorf("retiring runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
 			}
 		}
 	}
@@ -15176,6 +15299,24 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	case "running", "restarting":
 		if _, err := b.command("timetravel", target.container, "prepare-stop", target.branch); err != nil {
 			return fmt.Errorf("preparing %s for removal: %w", target, err)
+		}
+	}
+	// Branch destruction transfers unresolved page loaders to an in-process
+	// sibling. Move immutable graph authority to the family before that
+	// transfer; otherwise reclaiming the removed branch can unlink chunks that
+	// the sibling will demand later.
+	if families, listErr := b.listRuntimeFamilies(); listErr == nil {
+		for _, family := range families {
+			if family.ID != target.container || len(family.Branches) < 2 {
+				continue
+			}
+			var updated ttcbundle.BranchInfo
+			info, updated, err = b.parkBranchMemoryGraph(info, *recorded)
+			if err != nil {
+				return err
+			}
+			recorded = &updated
+			break
 		}
 	}
 	destroyRuntime := func() error {

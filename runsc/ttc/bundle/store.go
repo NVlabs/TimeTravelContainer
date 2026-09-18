@@ -515,6 +515,21 @@ type BranchInfo struct {
 	CreatedAt                 time.Time `json:"created_at"`
 }
 
+// RuntimeMemoryBacking retains an immutable process-memory graph while a live
+// family MemoryFile may still demand pages from it. Unlike BranchInfo, this is
+// deliberately family-scoped: destroying a branch can transfer its page
+// loader to any surviving sibling, so the backing no longer belongs to the
+// branch that originally introduced it.
+type RuntimeMemoryBacking struct {
+	ID                                 string   `json:"id"`
+	SnapshotID                         uint64   `json:"snapshot_id"`
+	MemoryRoots                        []string `json:"memory_roots"`
+	MemoryRootObjects                  []string `json:"memory_root_objects"`
+	ControlRoot                        string   `json:"control_root,omitempty"`
+	ControlRootObject                  string   `json:"control_root_object,omitempty"`
+	DistributedGraphReferenceOperation string   `json:"distributed_graph_reference_operation,omitempty"`
+}
+
 // BranchNodeID returns the explicit cluster owner of branchID.
 func (c ContainerInfo) BranchNodeID(branchID string) string {
 	for _, branch := range c.Branches {
@@ -589,6 +604,7 @@ type ContainerInfo struct {
 	BundleDir                    string                           `json:"bundle_dir"`
 	RootFS                       string                           `json:"rootfs"`
 	Branches                     []BranchInfo                     `json:"branches,omitempty"`
+	RuntimeMemoryBackings        []RuntimeMemoryBacking           `json:"runtime_memory_backings,omitempty"`
 	NetworkMode                  string                           `json:"network_mode,omitempty"`
 	LiveForkEligible             bool                             `json:"live_fork_eligible"`
 	LiveForkWaiver               string                           `json:"live_fork_waiver,omitempty"`
@@ -4012,6 +4028,84 @@ func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64,
 // roots selected by one dehydration capture.
 func (s Store) UpdateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string) error {
 	return s.updateBranchSnapshotGraph(name, branchID, snapshotID, roots, objects, controlRoot, controlObject, referenceOperation, true)
+}
+
+// ParkBranchMemoryGraph transfers a branch's immutable graph references to
+// family-level runtime ownership. The operation is atomic and idempotent. It
+// is used before destroying a live branch whose unresolved page loader may be
+// transferred by the Sentry to a surviving sibling.
+func (s Store) ParkBranchMemoryGraph(name, branchID string) (RuntimeMemoryBacking, bool, error) {
+	var parked RuntimeMemoryBacking
+	var changed bool
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+				return false, nil
+			}
+			if len(branch.MemoryRoots) != len(branch.MemoryRootObjects) {
+				return false, fmt.Errorf("branch %q memory graph has %d roots and %d objects", branchID, len(branch.MemoryRoots), len(branch.MemoryRootObjects))
+			}
+			parked = RuntimeMemoryBacking{
+				ID:                                 fmt.Sprintf("%s-%016x", branch.FilesystemBranch, branch.SnapshotID),
+				SnapshotID:                         branch.SnapshotID,
+				MemoryRoots:                        append([]string(nil), branch.MemoryRoots...),
+				MemoryRootObjects:                  append([]string(nil), branch.MemoryRootObjects...),
+				ControlRoot:                        branch.ControlRoot,
+				ControlRootObject:                  branch.ControlRootObject,
+				DistributedGraphReferenceOperation: branch.DistributedGraphReferenceOperation,
+			}
+			for _, existing := range info.RuntimeMemoryBackings {
+				if existing.ID != parked.ID {
+					continue
+				}
+				if existing.SnapshotID != parked.SnapshotID ||
+					!slices.Equal(existing.MemoryRoots, parked.MemoryRoots) ||
+					!slices.Equal(existing.MemoryRootObjects, parked.MemoryRootObjects) ||
+					existing.ControlRoot != parked.ControlRoot || existing.ControlRootObject != parked.ControlRootObject ||
+					existing.DistributedGraphReferenceOperation != parked.DistributedGraphReferenceOperation {
+					return false, fmt.Errorf("runtime memory backing %q already names different graph state", parked.ID)
+				}
+				break
+			}
+			found := false
+			for _, existing := range info.RuntimeMemoryBackings {
+				found = found || existing.ID == parked.ID
+			}
+			if !found {
+				info.RuntimeMemoryBackings = append(info.RuntimeMemoryBackings, parked)
+			}
+			branch.SnapshotID = 0
+			branch.MemoryRoots = nil
+			branch.MemoryRootObjects = nil
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
+			branch.DistributedGraphReferenceOperation = ""
+			changed = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return parked, changed, err
+}
+
+// RemoveRuntimeMemoryBacking removes id after its loader no longer has
+// outstanding pages. Graph and distributed references are released before
+// this metadata commit, making retries idempotent after a crash.
+func (s Store) RemoveRuntimeMemoryBacking(name, id string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.RuntimeMemoryBackings {
+			if info.RuntimeMemoryBackings[i].ID != id {
+				continue
+			}
+			info.RuntimeMemoryBackings = append(info.RuntimeMemoryBackings[:i], info.RuntimeMemoryBackings[i+1:]...)
+			return true, nil
+		}
+		return false, nil
+	})
 }
 
 func (s Store) updateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string, replaceControl bool) error {

@@ -207,6 +207,55 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 	}
 }
 
+func TestParkBranchMemoryGraphTransfersAuthorityToFamily(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "container-id")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{
+		ID: "child", FilesystemBranch: "b-child", SnapshotID: 9,
+		MemoryRoots:       []string{"memory/9/resource-0000"},
+		MemoryRootObjects: []string{"0000000000000009-03-0000000000000001"},
+		ControlRoot:       "control/capture/9", ControlRootObject: "0000000000000009-07-0000000000000002",
+		DistributedGraphReferenceOperation: "retain-9",
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: bundleDir, Branches: []BranchInfo{branch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	backing, changed, err := store.ParkBranchMemoryGraph("example", "child")
+	if err != nil || !changed {
+		t.Fatalf("ParkBranchMemoryGraph=(%+v, %t, %v)", backing, changed, err)
+	}
+	info, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Branches[0]; got.SnapshotID != 0 || len(got.MemoryRoots) != 0 || got.DistributedGraphReferenceOperation != "" {
+		t.Fatalf("parked branch retained graph authority: %+v", got)
+	}
+	if len(info.RuntimeMemoryBackings) != 1 || info.RuntimeMemoryBackings[0].ID != backing.ID || info.RuntimeMemoryBackings[0].DistributedGraphReferenceOperation != "retain-9" {
+		t.Fatalf("runtime backings=%+v, want parked graph", info.RuntimeMemoryBackings)
+	}
+	if _, changed, err := store.ParkBranchMemoryGraph("example", "child"); err != nil || changed {
+		t.Fatalf("idempotent ParkBranchMemoryGraph changed=%t err=%v", changed, err)
+	}
+	if err := store.RemoveRuntimeMemoryBacking("example", backing.ID); err != nil {
+		t.Fatal(err)
+	}
+	info, err = store.LoadContainer("example")
+	if err != nil || len(info.RuntimeMemoryBackings) != 0 {
+		t.Fatalf("runtime backings after remove=(%+v, %v)", info.RuntimeMemoryBackings, err)
+	}
+}
+
 func TestUpdateBranchQuarantinePersistsIndependentlyOfLifecycle(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "container-id")

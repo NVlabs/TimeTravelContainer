@@ -7081,6 +7081,72 @@ func TestReconcileStandaloneMemoryGraphReclaimsCrashResidue(t *testing.T) {
 	}
 }
 
+func TestReconcileStandaloneMemoryGraphRetainsRuntimeBacking(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "catalog", "snapshot-graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := graph.CreateObject(origin, "memory/runtime/pin", ttcsnapshot.ObjectKindMemoryNode, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rootName = "memory/runtime/resource-0000"
+	if err := graph.SetRoot(rootName, object); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("memory/runtime/pin"); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", "container-id")
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: filepath.Join(containerDir, "bundle"), State: "exited", CreatedAt: time.Now(), LiveForkEligible: true,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", FilesystemBranch: "main", State: "exited", StorageState: "local", CreatedAt: time.Now()}},
+		RuntimeMemoryBackings: []ttcbundle.RuntimeMemoryBacking{{
+			ID: "runtime-1", SnapshotID: uint64(origin), MemoryRoots: []string{rootName}, MemoryRootObjects: []string{object.String()},
+		}},
+	}
+	encoded, err := json.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root, localRoot: root, snapshotGraph: graph, snapshotData: data}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root(rootName); !ok {
+		t.Fatal("runtime backing root was reclaimed")
+	}
+	if err := backend.containerStore().RemoveRuntimeMemoryBacking("example", "runtime-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root(rootName); ok {
+		t.Fatal("retired runtime backing root was retained")
+	}
+}
+
 func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
 	for _, test := range []struct {
 		name   string

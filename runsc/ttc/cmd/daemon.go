@@ -6473,9 +6473,13 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 			unlock = lock()
 		}
 		err := backend.reconcileDistributedGraphReferences(false)
+		backingErr := backend.reconcileConsumedMemoryBacking()
 		unlock()
 		if err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: reconciling distributed graph references: %v\n", err)
+		}
+		if backingErr != nil && stderr != nil {
+			fmt.Fprintf(stderr, "ttcd: warning: reconciling consumed runtime memory backing: %v\n", backingErr)
 		}
 	}
 }
@@ -6536,6 +6540,14 @@ func validatePersistedMemoryGraph(store ttcbundle.Store) error {
 			}
 			if normalizeLifecycleState(branch.State) == "dehydrated" && branch.ControlRoot == "" {
 				return fmt.Errorf("%s@%s: dehydrated branch omits graph-native process control state; this root is not migrated", container.Name, branch.ID)
+			}
+		}
+		for _, backing := range container.RuntimeMemoryBackings {
+			if err := validateGraphRootObjects(backing.SnapshotID, backing.MemoryRoots, backing.MemoryRootObjects); err != nil {
+				return fmt.Errorf("%s runtime memory backing %s: %w", container.Name, backing.ID, err)
+			}
+			if err := validateGraphControlRoot(backing.SnapshotID, backing.ControlRoot, backing.ControlRootObject); err != nil {
+				return fmt.Errorf("%s runtime memory backing %s: %w", container.Name, backing.ID, err)
 			}
 		}
 	}
@@ -6763,7 +6775,7 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 					fmt.Fprintf(stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
 				}
 			}
-			if err := backend.reconcileConsumedStandaloneMemoryBacking(); err != nil && stderr != nil {
+			if err := backend.reconcileConsumedMemoryBacking(); err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: reconciling consumed standalone memory backing: %v\n", err)
 			}
 		}
@@ -7748,7 +7760,7 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling standalone memory graph: %v\n", err)
 		}
 	}
-	if err := backend.reconcileConsumedStandaloneMemoryBacking(); err != nil {
+	if err := backend.reconcileConsumedMemoryBacking(); err != nil {
 		quarantineReconciled = false
 		if backend.stderr != nil {
 			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling consumed standalone memory backing: %v\n", err)
