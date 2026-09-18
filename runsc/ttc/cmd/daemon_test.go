@@ -2223,6 +2223,34 @@ func TestRaftClusterIdentityPreventsSecondBootstrap(t *testing.T) {
 	}
 }
 
+func TestLocalIncarnationMustRejoin(t *testing.T) {
+	const (
+		node        = "node-a"
+		incarnation = "incarnation-a"
+	)
+	for _, test := range []struct {
+		name    string
+		state   *cluster.AuthorityState
+		want    bool
+		wantErr bool
+	}{
+		{name: "forgotten member", state: cluster.NewAuthorityState(), want: true},
+		{name: "recoverable offline member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeOffline},
+		}}},
+		{name: "same name has new identity", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+			node: {NodeID: node, Incarnation: "incarnation-new", State: cluster.NodeReady},
+		}}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := localIncarnationMustRejoin(test.state, node, incarnation)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("localIncarnationMustRejoin()=(%t, %v), want (%t, err=%t)", got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4

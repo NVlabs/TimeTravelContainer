@@ -4013,7 +4013,7 @@ func syncDaemonRootDirectory(root string) error {
 // merely retaining an expired NodeRecord must keep its identity for fenced
 // runtime recovery; only the replicated retirement tombstone authorizes TTC to
 // discard its stale Raft state and rejoin as a new member.
-func localNodeIncarnationRetired(nodeID, incarnation string, clients map[string]*cluster.Client) (bool, error) {
+func localNodeIncarnationRetired(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (bool, error) {
 	ids := make([]string, 0, len(clients))
 	for id := range clients {
 		ids = append(ids, id)
@@ -4021,18 +4021,58 @@ func localNodeIncarnationRetired(nodeID, incarnation string, clients map[string]
 	sort.Strings(ids)
 	for _, id := range ids {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		state, err := clients[id].AuthorityState(ctx)
+		state, err := authorityStateThroughSeed(ctx, clients[id], nodeID, authToken)
 		cancel()
 		if err != nil {
 			continue
 		}
-		retired, ok := state.RetiredNodes[nodeID]
-		if !ok || retired != incarnation {
-			return false, nil
-		}
-		return true, nil
+		return localIncarnationMustRejoin(state, nodeID, incarnation)
 	}
 	return false, nil
+}
+
+func localIncarnationMustRejoin(state *cluster.AuthorityState, nodeID, incarnation string) (bool, error) {
+	if state == nil {
+		return false, errors.New("cluster authority state is nil")
+	}
+	if record, ok := state.Nodes[nodeID]; ok {
+		if record.Incarnation != incarnation {
+			return false, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
+		}
+		return false, nil
+	}
+	// `node rm` deliberately forgets its retirement tombstone after removing
+	// the Raft member. Absence from a linearizable authority snapshot is
+	// therefore itself the durable authorization to discard this excluded local
+	// replica. A still-recoverable failed node remains present as offline and
+	// takes the path above.
+	return true, nil
+}
+
+func authorityStateThroughSeed(ctx context.Context, seed *cluster.Client, nodeID, authToken string) (*cluster.AuthorityState, error) {
+	peer := seed
+	seen := make(map[string]bool)
+	for redirects := 0; redirects < 5; redirects++ {
+		state, err := peer.AuthorityState(ctx)
+		if err == nil {
+			return state, nil
+		}
+		var redirect *cluster.AuthorityNotLeaderError
+		if !errors.As(err, &redirect) || redirect.LeaderControlURL == "" {
+			return nil, err
+		}
+		key := redirect.LeaderID + "\x00" + redirect.LeaderControlURL
+		if seen[key] {
+			return nil, fmt.Errorf("raft leader redirect loop through %q", redirect.LeaderID)
+		}
+		seen[key] = true
+		var clientErr error
+		peer, clientErr = cluster.NewPlainClient(redirect.LeaderControlURL, nodeID, authToken, 2*time.Minute)
+		if clientErr != nil {
+			return nil, fmt.Errorf("configuring redirected Raft leader %q: %w", redirect.LeaderID, clientErr)
+		}
+	}
+	return nil, errors.New("too many Raft leader redirects while reading cluster authority")
 }
 
 func lockDaemonLocalRoot(root string) (*os.File, error) {
@@ -4398,7 +4438,7 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// join below then adds this node as a learner. The shared state and all
 	// immutable snapshot authority remain untouched.
 	if !opts.RaftBootstrap && len(clients) != 0 {
-		retired, err := localNodeIncarnationRetired(opts.NodeID, incarnation, clients)
+		retired, err := localNodeIncarnationRetired(opts.NodeID, incarnation, opts.AuthToken, clients)
 		if err != nil {
 			return nil, err
 		}
