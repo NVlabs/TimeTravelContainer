@@ -208,6 +208,18 @@ func TestApplyColdFilesystemRestoreIDs(t *testing.T) {
 	}
 }
 
+func TestApplyDehydratedFilesystemRestoreIDsAllowsPendingPublication(t *testing.T) {
+	roots := []cluster.FilesystemRootDescriptor{{
+		Source: "/run/ttc/rootfs-upper", RepositoryID: "local-rootfs", RestoreID: "local-rootfs",
+	}}
+	if err := applyDehydratedFilesystemRestoreIDs(roots, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "local-rootfs"; got != want {
+		t.Fatalf("pending-publication restore ID=%q, want %q", got, want)
+	}
+}
+
 func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
 	info := input
 	info.Branches = append([]ttcbundle.BranchInfo(nil), input.Branches...)

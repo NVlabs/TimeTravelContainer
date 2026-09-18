@@ -2297,6 +2297,58 @@ func (b *runtimeBackend) prepareColdDirectFilesystemSources(info ttcbundle.Conta
 	return sources, cleanup, nil
 }
 
+// prepareLocalDirectFilesystemSources serves a process-free capture from the
+// provider's authoritative local repositories while its asynchronous shared
+// publication is still pending. The hidden filesystem branch pins every
+// immutable object until the remote transaction becomes independent, so no
+// shared manifest or bulk upload is required on the fork critical path.
+func (b *runtimeBackend) prepareLocalDirectFilesystemSources(info ttcbundle.ContainerInfo, filesystemBranch string) ([]ttcvolume.RemoteObjectSource, func(), error) {
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	sort.Slice(configs, func(i, j int) bool { return configs[i].Source < configs[j].Source })
+	var repositories []*ttcvolume.Repository
+	cleanup := func() {
+		for _, repository := range repositories {
+			_ = repository.Close()
+		}
+	}
+	fail := func(err error) ([]ttcvolume.RemoteObjectSource, func(), error) {
+		cleanup()
+		return nil, nil, err
+	}
+	sources := make([]ttcvolume.RemoteObjectSource, 0, len(configs))
+	seenPaths := make(map[string]struct{})
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, duplicate := seenPaths[path]; duplicate {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return fail(err)
+		}
+		if _, err := repository.DescribeRemoteSnapshot(repositoryPhysicalBranch(config, filesystemBranch)); err != nil {
+			_ = repository.Close()
+			return fail(fmt.Errorf("opening local filesystem generation %q: %w", config.Source, err))
+		}
+		repositories = append(repositories, repository)
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(config.Source)))
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: repository})
+	}
+	if len(sources) == 0 {
+		cleanup()
+		return nil, nil, errors.New("dehydrated branch has no managed filesystem repositories")
+	}
+	return sources, cleanup, nil
+}
+
 // collectColdStorage traces every authoritative and pending manifest before
 // reclaiming immutable packs. A grace period protects a publisher between
 // writing its pack and atomically committing its manifest.

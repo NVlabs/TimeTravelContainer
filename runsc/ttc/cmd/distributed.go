@@ -1120,6 +1120,22 @@ func applyColdFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, fil
 	return nil
 }
 
+// applyDehydratedFilesystemRestoreIDs binds a materialized cold cache back to
+// the repository identities serialized in its kernel snapshot. A freshly
+// dehydrated branch that is still publishing has no shared manifest yet and
+// still uses the exact repositories from which it was captured; in that case
+// prepareDistributedFilesystem has already recorded the correct identities.
+func applyDehydratedFilesystemRestoreIDs(roots []cluster.FilesystemRootDescriptor, manifestPath string) error {
+	if manifestPath == "" {
+		return nil
+	}
+	manifest, err := readColdBranchManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+	return applyColdFilesystemRestoreIDs(roots, manifest.Filesystems)
+}
+
 // installRemoteExecSessionStates restores the host-side completion markers for
 // retained exec sessions. The Sentry owns the authoritative session metadata,
 // but attach/log readers use these files to avoid starting a console follower
@@ -2431,18 +2447,20 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if err != nil {
 		return selector{}, fmt.Errorf("preparing dehydrated filesystem objects: %w", err)
 	}
-	coldManifest, err := readColdBranchManifest(sourceBranch.StorageManifest)
-	if err != nil {
+	if err := applyDehydratedFilesystemRestoreIDs(filesystemRoots, sourceBranch.StorageManifest); err != nil {
 		return selector{}, fmt.Errorf("reading dehydrated filesystem identities: %w", err)
-	}
-	if err := applyColdFilesystemRestoreIDs(filesystemRoots, coldManifest.Filesystems); err != nil {
-		return selector{}, fmt.Errorf("binding dehydrated filesystem identities: %w", err)
 	}
 	internalMounts, err := b.portableDistributedInternalMounts(sourceInfo.ID)
 	if err != nil {
 		return selector{}, fmt.Errorf("capturing portable internal mounts: %w", err)
 	}
-	directSources, directCleanup, err := b.prepareColdDirectFilesystemSources(sourceInfo, sourceBranch, childFilesystemBranch)
+	var directSources []ttcvolume.RemoteObjectSource
+	var directCleanup func()
+	if sourceBranch.StorageManifest == "" {
+		directSources, directCleanup, err = b.prepareLocalDirectFilesystemSources(sourceInfo, childFilesystemBranch)
+	} else {
+		directSources, directCleanup, err = b.prepareColdDirectFilesystemSources(sourceInfo, sourceBranch, childFilesystemBranch)
+	}
 	if err != nil {
 		return selector{}, fmt.Errorf("opening durable filesystem sources: %w", err)
 	}
