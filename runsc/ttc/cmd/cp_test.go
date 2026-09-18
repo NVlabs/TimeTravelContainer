@@ -201,6 +201,7 @@ func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
 		Annotations: map[string]string{
 			specutils.AnnotationTTCVolumeRepositories:  string(encoded),
 			"dev.timetravelcontainer.internal-console": "init",
+			ttcbundle.PidsLimitAnnotation:              "sentry",
 		},
 	}
 	cloned, err := offlineCopySpec(original, ttcbundle.ContainerInfo{ID: "family"}, "child", []string{"export", "/tmp/value"})
@@ -218,6 +219,9 @@ func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
 	}
 	if _, ok := cloned.Annotations["dev.timetravelcontainer.internal-console"]; ok {
 		t.Fatal("offline helper retained TTC console interception")
+	}
+	if _, ok := cloned.Annotations[ttcbundle.PidsLimitAnnotation]; ok {
+		t.Fatal("offline helper retained Sentry PID-limit marker after dropping Linux resources")
 	}
 	gotRepositories, err := specutils.TTCVolumeRepositories(cloned)
 	if err != nil {

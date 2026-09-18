@@ -482,6 +482,12 @@ func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch 
 		cloned.Annotations = make(map[string]string)
 	}
 	delete(cloned.Annotations, "dev.timetravelcontainer.internal-console")
+	// The copy helper deliberately runs outside the container's host cgroup and
+	// therefore drops Linux.Resources above. PidsLimitAnnotation is a contract
+	// with the Sentry that linux.resources.pids is present; retaining only the
+	// marker makes loader construction fail before the helper can inspect a
+	// stopped or dehydrated filesystem.
+	delete(cloned.Annotations, ttcbundle.PidsLimitAnnotation)
 	repositories, err := specutils.TTCVolumeRepositories(&cloned)
 	if err != nil {
 		return nil, err
