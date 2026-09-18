@@ -183,15 +183,19 @@ func openDistributedSharedArtifactWith(ctx context.Context, path string, expecte
 }
 
 type daemonRequest struct {
-	Version         int                    `json:"version"`
-	ClientBuildID   string                 `json:"client_build_id,omitempty"`
-	Action          string                 `json:"action"`
-	RequestID       string                 `json:"request_id,omitempty"`
-	ClientTERM      string                 `json:"client_term,omitempty"`
-	StderrTerminal  bool                   `json:"stderr_terminal,omitempty"`
-	StderrWidth     int                    `json:"stderr_width,omitempty"`
-	Args            []string               `json:"args,omitempty"`
-	Stdin           bool                   `json:"stdin,omitempty"`
+	Version        int      `json:"version"`
+	ClientBuildID  string   `json:"client_build_id,omitempty"`
+	Action         string   `json:"action"`
+	RequestID      string   `json:"request_id,omitempty"`
+	ClientTERM     string   `json:"client_term,omitempty"`
+	StderrTerminal bool     `json:"stderr_terminal,omitempty"`
+	StderrWidth    int      `json:"stderr_width,omitempty"`
+	Args           []string `json:"args,omitempty"`
+	Stdin          bool     `json:"stdin,omitempty"`
+	// TerminalControl keeps the daemon stream full-duplex for terminal-size
+	// requests even when guest stdin is detached. This is distinct from Stdin:
+	// `exec -td` needs resize frames, but must not attach the client's input.
+	TerminalControl bool                   `json:"terminal_control,omitempty"`
 	ManageStop      bool                   `json:"manage_stop,omitempty"`
 	Route           []string               `json:"route,omitempty"`
 	PlacementNode   string                 `json:"placement_node,omitempty"`
@@ -202,6 +206,10 @@ type daemonRequest struct {
 	// DistributedLeaf marks a coordinator-generated owner-local command. It
 	// prevents a family mutation from being expanded again on the destination.
 	DistributedLeaf bool `json:"distributed_leaf,omitempty"`
+}
+
+func (r daemonRequest) streamsClientFrames() bool {
+	return r.Stdin || r.TerminalControl
 }
 
 // daemonPlacementClaim fences one routed branch command to the catalog
@@ -5633,12 +5641,14 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 		}
 		return
 	}
-	// A non-interactive request contains no bytes after its JSON header. Do not
+	// A request without stdin or terminal control contains no bytes after its
+	// JSON header. Do not
 	// leave the upstream HTTP transport reading from the still-open local Unix
 	// connection: if the selected compute node has just retired, net/http waits
 	// for that request-body goroutine and failover never observes the dial
-	// error. Interactive stdin keeps the full-duplex reader by construction.
-	input := controlOnlyProxyInput(header, reader, request.Stdin)
+	// error. Interactive stdin and terminal control keep the full-duplex reader
+	// by construction.
+	input := controlOnlyProxyInput(header, reader, request.streamsClientFrames())
 	var copyUploadFlow *daemonStdinFlow
 	var cleanupCopyUpload func()
 	if copyCommand && !copyRoute.sourceContainer && copyRoute.source != "-" {
@@ -7035,7 +7045,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			if input == nil {
 				input = bytes.NewReader(append(encoded, '\n'))
 			}
-			if request.Stdin && cleanupCopyUpload == nil {
+			if request.streamsClientFrames() && cleanupCopyUpload == nil {
 				input = io.MultiReader(input, reader)
 			}
 			if copyUploadFlow != nil {
@@ -7757,6 +7767,35 @@ func daemonCommandUsesStdin(args []string) bool {
 	return false
 }
 
+// daemonCommandUsesTerminalControl reports commands that may ask the client
+// for its current terminal size. Terminal control frames must be routable even
+// when -i is absent: detached TTY sessions are a normal automation primitive.
+func daemonCommandUsesTerminalControl(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "container" {
+		args = args[1:]
+		if len(args) == 0 {
+			return false
+		}
+	}
+	switch args[0] {
+	case "attach":
+		// Whether the selected console is a TTY is known only by ttcd.
+		return true
+	case "start":
+		return daemonCommandBoolFlag(args[1:], 'a', "--attach")
+	case "run", "exec":
+		if args[0] == "exec" && len(args) > 1 && (args[1] == "ls" || args[1] == "wait" || args[1] == "kill") {
+			return false
+		}
+		return daemonCommandBoolFlag(args[1:], 't', "--tty")
+	default:
+		return false
+	}
+}
+
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	var err error
 	args, err = normalizeDaemonImageArchivePaths(args)
@@ -7767,7 +7806,8 @@ func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr i
 	request := daemonRequest{
 		Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command",
 		Args: append([]string(nil), args...), Stdin: daemonCommandUsesStdin(args), ClientTERM: os.Getenv("TERM"),
-		StderrTerminal: stderrTerminal, StderrWidth: stderrWidth,
+		TerminalControl: daemonCommandUsesTerminalControl(args),
+		StderrTerminal:  stderrTerminal, StderrWidth: stderrWidth,
 	}
 	if daemonCommandNeedsMutationJournal(args) {
 		requestID, err := newDaemonRequestID()

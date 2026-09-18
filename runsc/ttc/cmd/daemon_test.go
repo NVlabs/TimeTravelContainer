@@ -1425,6 +1425,38 @@ func TestDaemonCommandUsesStdin(t *testing.T) {
 	}
 }
 
+func TestDaemonCommandUsesTerminalControl(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"attach", "demo@main"}, true},
+		{[]string{"container", "attach", "demo@main"}, true},
+		{[]string{"exec", "-td", "demo@main", "sh"}, true},
+		{[]string{"exec", "--tty", "demo@main", "sh"}, true},
+		{[]string{"exec", "ls", "demo@main"}, false},
+		{[]string{"run", "-itd", "alpine"}, true},
+		{[]string{"run", "--detach", "alpine"}, false},
+		{[]string{"start", "-a", "demo@main"}, true},
+		{[]string{"start", "demo@main"}, false},
+		{[]string{"logs", "-f", "demo@main"}, false},
+	} {
+		if got := daemonCommandUsesTerminalControl(test.args); got != test.want {
+			t.Errorf("daemonCommandUsesTerminalControl(%q)=%t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
+func TestDaemonTerminalControlStreamsWithoutGuestStdin(t *testing.T) {
+	request := daemonRequest{TerminalControl: true}
+	if !request.streamsClientFrames() {
+		t.Fatal("terminal control did not keep client frames routable")
+	}
+	if request.Stdin {
+		t.Fatal("terminal control unexpectedly enabled guest stdin")
+	}
+}
+
 func TestNormalizeDaemonImageArchivePaths(t *testing.T) {
 	workingDirectory, err := os.Getwd()
 	if err != nil {
