@@ -4008,12 +4008,12 @@ func syncDaemonRootDirectory(root string) error {
 	return directory.Sync()
 }
 
-// rotateRetiredLocalNodeIncarnation gives an administratively forgotten node
-// a new execution epoch when it later rejoins from the same scratch disk. A
-// failed daemon merely retaining an expired NodeRecord must keep its identity
-// for fenced runtime recovery; only the replicated retirement tombstone is
-// sufficient authorization to rotate it.
-func rotateRetiredLocalNodeIncarnation(localRoot, nodeID, incarnation string, clients map[string]*cluster.Client) (string, error) {
+// localNodeIncarnationRetired reports whether the cluster has
+// administratively forgotten this exact local execution epoch. A failed daemon
+// merely retaining an expired NodeRecord must keep its identity for fenced
+// runtime recovery; only the replicated retirement tombstone authorizes TTC to
+// discard its stale Raft state and rejoin as a new member.
+func localNodeIncarnationRetired(nodeID, incarnation string, clients map[string]*cluster.Client) (bool, error) {
 	ids := make([]string, 0, len(clients))
 	for id := range clients {
 		ids = append(ids, id)
@@ -4028,14 +4028,11 @@ func rotateRetiredLocalNodeIncarnation(localRoot, nodeID, incarnation string, cl
 		}
 		retired, ok := state.RetiredNodes[nodeID]
 		if !ok || retired != incarnation {
-			return incarnation, nil
+			return false, nil
 		}
-		if err := removeLocalNodeIncarnation(localRoot, nodeID, incarnation); err != nil {
-			return "", fmt.Errorf("rotating administratively retired node incarnation: %w", err)
-		}
-		return localNodeIncarnation(localRoot, nodeID)
+		return true, nil
 	}
-	return incarnation, nil
+	return false, nil
 }
 
 func lockDaemonLocalRoot(root string) (*os.File, error) {
@@ -4389,6 +4386,36 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		}
 		clients[nodeID] = client
 	}
+	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	// A removed member's WAL describes a configuration in which it still
+	// participates. Opening that WAL and waiting for its historical quorum can
+	// never re-admit it to the current configuration. When a configured seed
+	// proves that this exact incarnation was retired, discard only the
+	// node-local Raft replica and rotate the execution epoch. The ordinary fresh
+	// join below then adds this node as a learner. The shared state and all
+	// immutable snapshot authority remain untouched.
+	if !opts.RaftBootstrap && len(clients) != 0 {
+		retired, err := localNodeIncarnationRetired(opts.NodeID, incarnation, clients)
+		if err != nil {
+			return nil, err
+		}
+		if retired {
+			if err := os.RemoveAll(raftLocalDir); err != nil {
+				return nil, fmt.Errorf("discarding retired local Raft replica: %w", err)
+			}
+			localRaftState = false
+			if err := removeLocalNodeIncarnation(localRoot, opts.NodeID, incarnation); err != nil {
+				return nil, fmt.Errorf("rotating administratively retired node incarnation: %w", err)
+			}
+			incarnation, err = localNodeIncarnation(localRoot, opts.NodeID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	sharedListener, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listening for cluster control and Raft on %s: %w", opts.Listen, err)
@@ -4465,16 +4492,6 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			_ = raftNode.Close()
 		}
 	}()
-	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
-	if err != nil {
-		return nil, err
-	}
-	if !opts.RaftBootstrap && localRaftState {
-		incarnation, err = rotateRetiredLocalNodeIncarnation(localRoot, opts.NodeID, incarnation, clients)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if raftNode.HadExistingState() {
 		// Keep the Raft listener alive even when this is the first member being
 		// restarted after a whole-cluster outage. Waiting for a leader here and
