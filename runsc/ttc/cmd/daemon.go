@@ -1550,7 +1550,7 @@ func (r *daemonTargetRuntime) waitGraphHandoff(ctx context.Context, tx *cluster.
 // detached helper. This repairs roots created by older daemons whose relay was
 // daemon-owned and also makes helper failure recoverable by restarting ttcd.
 func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
-	if r == nil || r.store == nil {
+	if r == nil || r.store == nil || r.authority == nil {
 		return nil
 	}
 	transactions, err := r.store.List()
@@ -1561,6 +1561,19 @@ func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
 		tx := &transactions[i]
 		if tx.Identity.TargetNodeID != r.nodeID || tx.GraphHandoff == nil ||
 			(tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent) {
+			continue
+		}
+		// TargetNodeID records where the transaction was first restored; it is
+		// deliberately immutable and therefore cannot authorize recovery. A
+		// later dehydrate/rehydrate or migration may move the visible branch to
+		// another node while the terminal transaction remains in the catalog.
+		// Refreshing such a historical handoff can retain already-collected
+		// roots and, worse, redirect a Sentry owned by another incarnation.
+		state, err := r.authority.AuthorityState()
+		if err != nil {
+			return fmt.Errorf("reading graph handoff placement authority: %w", err)
+		}
+		if !transactionPlacementOwnedBy(*tx, state, r.nodeID, r.incarnation) {
 			continue
 		}
 		_, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
@@ -1589,6 +1602,20 @@ func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
 		}
 	}
 	return nil
+}
+
+func transactionPlacementOwnedBy(tx cluster.Transaction, state *cluster.AuthorityState, nodeID, incarnation string) bool {
+	if state == nil || nodeID == "" || incarnation == "" {
+		return false
+	}
+	for _, placement := range state.Placements {
+		if cluster.TransactionTargetsPlacement(tx, placement) &&
+			placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation &&
+			(placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused) {
+			return true
+		}
+	}
+	return false
 }
 
 func distributedGraphHandoffHasLiveRuntime(branch ttcbundle.BranchInfo) bool {

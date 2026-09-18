@@ -1922,6 +1922,17 @@ func transactionTargetsPlacement(tx Transaction, placement PlacementRecord) bool
 		placement.PhysicalContainer == tx.Identity.SourceContainer
 }
 
+// TransactionTargetsPlacement reports whether placement is the stable logical
+// branch represented by tx. Distributed recovery uses this to distinguish a
+// transaction that was originally delivered to a node from a branch that has
+// since been dehydrated, rehydrated, or migrated elsewhere.
+//
+// TargetNodeID alone is historical: it never changes after transaction
+// creation. Placement ownership is the execution-authority source of truth.
+func TransactionTargetsPlacement(tx Transaction, placement PlacementRecord) bool {
+	return transactionTargetsPlacement(tx, placement)
+}
+
 func validateDurableRoots(roots DurableRoots) error {
 	for name, value := range map[string]string{"memory": roots.MemoryRoot, "object-set": roots.ObjectSetDigest} {
 		if value != "" {

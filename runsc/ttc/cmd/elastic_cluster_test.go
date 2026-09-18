@@ -1597,6 +1597,33 @@ func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	}
 }
 
+func TestTransactionPlacementOwnedByIgnoresHistoricalTargetNode(t *testing.T) {
+	tx := cluster.Transaction{Identity: cluster.ForkIdentity{
+		TargetNodeID:        "node-a",
+		SourceContainer:     "family",
+		SourceBranch:        "main",
+		TargetContainer:     "family",
+		TargetBranch:        "physical-child",
+		TargetVisibleBranch: "child",
+	}}
+	state := cluster.NewAuthorityState()
+	state.Placements["family@child"] = cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning,
+	}
+	if transactionPlacementOwnedBy(tx, state, "node-a", "inc-a") {
+		t.Fatal("historical transaction target was treated as current placement owner")
+	}
+	if !transactionPlacementOwnedBy(tx, state, "node-b", "inc-b") {
+		t.Fatal("current placement owner was not recognized")
+	}
+	state.Placements["family@child"] = cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "child", State: cluster.PlacementUnplaced,
+	}
+	if transactionPlacementOwnedBy(tx, state, "node-b", "inc-b") {
+		t.Fatal("unplaced branch was treated as a live graph-handoff target")
+	}
+}
+
 func TestNodeExecutionGrantsOnlyRequireEnforcementOnRevocation(t *testing.T) {
 	state := cluster.NewAuthorityState()
 	state.Placements["placed"] = cluster.PlacementRecord{
