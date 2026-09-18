@@ -497,6 +497,49 @@ func (r *Repository) AttachRemoteObjectSource(conn io.ReadWriteCloser, token Rem
 	return nil
 }
 
+// PinRemoteRestore prevents repository-wide remote materialization from
+// detaching a source while a peer restore may still expand its lazy metadata
+// catalog. Source attachment remains available while pinned. The returned
+// release function is idempotent.
+func (r *Repository) PinRemoteRestore() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.remoteLifecycleMu.Lock()
+	if r.remoteLifecycleCV == nil {
+		r.remoteLifecycleCV = sync.NewCond(&r.remoteLifecycleMu)
+	}
+	r.remoteRestorePins++
+	r.remoteLifecycleMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.remoteLifecycleMu.Lock()
+			if r.remoteRestorePins == 0 {
+				panic("ttcvolume: unbalanced remote restore pin")
+			}
+			r.remoteRestorePins--
+			if r.remoteRestorePins == 0 {
+				r.remoteLifecycleCV.Broadcast()
+			}
+			r.remoteLifecycleMu.Unlock()
+		})
+	}
+}
+
+// lockRemoteLifecycleForMaterialization acquires remoteLifecycleMu after all
+// peer restores that can discover new lazy objects have completed.
+func (r *Repository) lockRemoteLifecycleForMaterialization() {
+	r.remoteLifecycleMu.Lock()
+	if r.remoteLifecycleCV == nil {
+		r.remoteLifecycleCV = sync.NewCond(&r.remoteLifecycleMu)
+	}
+	for r.remoteRestorePins != 0 {
+		r.remoteLifecycleCV.Wait()
+	}
+}
+
 // BranchObjects returns the immutable object allowlist referenced by branch.
 func (r *Repository) BranchObjects(branchID string) (map[string]int64, error) {
 	branch, err := r.Branch(branchID)
@@ -558,7 +601,7 @@ func (r *Repository) MaterializeRemoteObjects() error {
 	// repository. Their eager drains may arrive concurrently, but detaching
 	// remote catalogs is a repository-wide barrier and must execute exactly one
 	// at a time.
-	r.remoteLifecycleMu.Lock()
+	r.lockRemoteLifecycleForMaterialization()
 	defer r.remoteLifecycleMu.Unlock()
 	return r.materializeRemoteObjects()
 }

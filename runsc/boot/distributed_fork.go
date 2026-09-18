@@ -92,6 +92,29 @@ type DistributedForkRestoreArgs struct {
 	ExecSessions []ExecSessionInfo
 }
 
+// pinRemoteFilesystemRestore protects freshly attached lazy sources until the
+// complete peer restore has finished. Repositories may appear more than once
+// in the mount table, so pin each physical repository exactly once.
+func pinRemoteFilesystemRestore(volumes map[string]ttcVolumeRepository) func() {
+	seen := make(map[*ttcvolume.Repository]struct{}, len(volumes))
+	releases := make([]func(), 0, len(volumes))
+	for _, volume := range volumes {
+		if volume.repository == nil {
+			continue
+		}
+		if _, ok := seen[volume.repository]; ok {
+			continue
+		}
+		seen[volume.repository] = struct{}{}
+		releases = append(releases, volume.repository.PinRemoteRestore())
+	}
+	return func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+}
+
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
 type DistributedForkRestoreInfo struct {
 	SessionID      string
@@ -559,6 +582,8 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	if args.DurableDehydration {
 		return l.restoreDistributedDurablePeer(args)
 	}
+	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
+	defer releaseFilesystemRestore()
 	files := args.FilePayload.Files
 	var sharedMetadata *os.File
 	if args.SharedMetadata {
@@ -740,6 +765,8 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 // image into an existing family. Durable metadata is not a SessionMetadata
 // envelope, so it must be dispatched before the live transport decoder.
 func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
+	defer releaseFilesystemRestore()
 	files := args.FilePayload.Files
 	if !args.SharedMetadata || len(files) == 0 || !args.GraphSparse {
 		return nil, errors.New("distributed durable peer requires shared metadata and graph memory")

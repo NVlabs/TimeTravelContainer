@@ -319,6 +319,8 @@ func (l *Loader) attachColdFilesystemSources(files []*os.File, token ttcvolume.R
 }
 
 func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreArgs) (*DurableDehydrationRestoreInfo, error) {
+	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
+	defer releaseFilesystemRestore()
 	metadataFD, err := unix.Dup(int(args.FilePayload.Files[0].Fd()))
 	if err != nil {
 		return nil, err

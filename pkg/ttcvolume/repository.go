@@ -336,9 +336,16 @@ type Repository struct {
 	// data. Path-backed manager repositories do not retain this lease.
 	activeLock *os.File
 
-	branchMu          sync.Mutex
-	branchCache       map[string]cachedBranch
+	branchMu    sync.Mutex
+	branchCache map[string]cachedBranch
+	// remoteLifecycleMu serializes source attachment, repository-wide
+	// materialization, and close. A restore pin does not retain this mutex:
+	// AttachRemoteObjectSource must remain able to install the incoming sources.
+	// Instead, materializers wait on remoteLifecycleCV until every restore that
+	// may still discover lazy objects has finished.
 	remoteLifecycleMu sync.Mutex
+	remoteLifecycleCV *sync.Cond
+	remoteRestorePins uint64
 	remoteMu          sync.Mutex
 	remotes           map[*remoteObjectClient]struct{}
 	remoteByObject    map[string]*remoteObjectClient
@@ -432,7 +439,7 @@ func (r *Repository) SnapshotOrigins() []ttcsnapshot.SnapshotID {
 // share the same catalog origin. Once complete, sealing that origin is safe:
 // all of its objects are immutable and no branch needs further expansion.
 func (r *Repository) PrepareBranchPublication(branchID string) ([]ttcsnapshot.SnapshotID, error) {
-	r.remoteLifecycleMu.Lock()
+	r.lockRemoteLifecycleForMaterialization()
 	defer r.remoteLifecycleMu.Unlock()
 	if err := r.materializeRemoteObjects(); err != nil {
 		return nil, fmt.Errorf("materializing lazy filesystem dependencies: %w", err)
@@ -639,7 +646,7 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 	// generations are made immutable. PrepareBranchPublication repeats this
 	// check below, but doing it before sealing avoids creating an immutable root
 	// that still requires metadata expansion.
-	r.remoteLifecycleMu.Lock()
+	r.lockRemoteLifecycleForMaterialization()
 	materializeErr := r.materializeRemoteObjects()
 	r.remoteLifecycleMu.Unlock()
 	if materializeErr != nil {
@@ -1303,7 +1310,7 @@ func (r *Repository) Close() error {
 	if r.graph != nil && r.data != nil {
 		syncErr = r.SyncMetadata()
 	}
-	r.remoteLifecycleMu.Lock()
+	r.lockRemoteLifecycleForMaterialization()
 	defer r.remoteLifecycleMu.Unlock()
 	r.remoteMu.Lock()
 	var remoteErr error

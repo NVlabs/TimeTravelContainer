@@ -263,6 +263,66 @@ func TestMaterializationHookMayEnterRepositoryMutation(t *testing.T) {
 	}
 }
 
+func TestRemoteRestorePinDefersRepositoryMaterialization(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("remote data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	release := target.PinRemoteRestore()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	done := make(chan error, 1)
+	go func() { done <- target.MaterializeRemoteObjects() }()
+	select {
+	case err := <-done:
+		t.Fatalf("materialization passed an active restore pin: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Lazy catalog expansion must remain available for the whole restore, not
+	// merely for the AttachRemoteObjectSource call.
+	if _, err := target.Lookup("imported", RootInode, "artifact"); err != nil {
+		t.Fatalf("lookup while restore is pinned: %v", err)
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("materialization remained blocked after restore pin release")
+	}
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source stream remained open after materialization")
+	}
+}
+
 func TestRemoteMarkerRetirementSerializesWithMetadataSync(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")
