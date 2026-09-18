@@ -11112,24 +11112,44 @@ func persistentFamilyRequiredRuntime(container ttcbundle.ContainerInfo, nodeID s
 }
 
 func enrichPersistentBranchDiagnostics(family *Family) {
+	liveKernelsByNode := make(map[string]int)
+	for i := range family.Branches {
+		branch := &family.Branches[i]
+		switch normalizeLifecycleState(branch.State) {
+		case "running", "paused":
+			liveKernelsByNode[branch.NodeID]++
+		}
+	}
 	for i := range family.Branches {
 		branch := &family.Branches[i]
 		if branch.InitState == "" {
-			switch branch.State {
+			switch normalizeLifecycleState(branch.State) {
 			case "created", "creating":
 				branch.InitState = "not-started"
 			case "exited", "stopped", "failed":
 				branch.InitState = "exited"
+			case "running", "paused":
+				// Raft lifecycle and placement are authoritative after a remote
+				// fork or migration. A control-only node may not have a local
+				// Sentry from which to enrich these fields, but a branch cannot
+				// commit either state without a live PID 1 on its owner.
+				branch.InitState = normalizeLifecycleState(branch.State)
+				branch.InitPID = 1
 			default:
 				branch.InitState = "unknown"
 			}
 		}
 		if branch.MemorySharing == "" {
-			switch branch.State {
+			switch normalizeLifecycleState(branch.State) {
 			case "created", "creating":
 				branch.MemorySharing = "unallocated"
 			case "exited", "stopped", "failed":
 				branch.MemorySharing = "released"
+			case "running", "paused":
+				branch.MemorySharing = "private"
+				if liveKernelsByNode[branch.NodeID] > 1 {
+					branch.MemorySharing = "cow"
+				}
 			default:
 				branch.MemorySharing = "unknown"
 			}

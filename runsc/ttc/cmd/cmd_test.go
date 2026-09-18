@@ -781,6 +781,41 @@ func TestWriteTree(t *testing.T) {
 	}
 }
 
+func TestEnrichPersistentBranchDiagnosticsAcrossNodes(t *testing.T) {
+	family := Family{Branches: []Branch{
+		{ID: "a1", NodeID: "node-a", State: "running"},
+		{ID: "a2", NodeID: "node-a", State: "paused"},
+		{ID: "b1", NodeID: "node-b", State: "running"},
+		{ID: "cold", State: "dehydrated"},
+		{ID: "done", State: "exited"},
+		{ID: "observed", NodeID: "node-b", State: "running", InitPID: 7, InitState: "exited", MemorySharing: "cow"},
+	}}
+	enrichPersistentBranchDiagnostics(&family)
+	byID := make(map[string]Branch)
+	for _, branch := range family.Branches {
+		byID[branch.ID] = branch
+	}
+	for _, id := range []string{"a1", "a2"} {
+		if got := byID[id]; got.InitPID != 1 || got.InitState != got.State || got.MemorySharing != "cow" {
+			t.Errorf("%s diagnostics=%+v", id, got)
+		}
+	}
+	if got := byID["b1"]; got.InitPID != 1 || got.InitState != "running" || got.MemorySharing != "cow" {
+		// observed is another live Kernel on node-b even though its runtime
+		// supplied diagnostics must remain untouched below.
+		t.Errorf("b1 diagnostics=%+v", got)
+	}
+	if got := byID["cold"]; got.InitState != "unknown" || got.MemorySharing != "unknown" {
+		t.Errorf("cold diagnostics=%+v", got)
+	}
+	if got := byID["done"]; got.InitState != "exited" || got.MemorySharing != "released" {
+		t.Errorf("done diagnostics=%+v", got)
+	}
+	if got := byID["observed"]; got.InitPID != 7 || got.InitState != "exited" || got.MemorySharing != "cow" {
+		t.Errorf("runtime diagnostics were overwritten: %+v", got)
+	}
+}
+
 func TestListJSONIncludesBranchParentage(t *testing.T) {
 	b := &fakeBackend{families: []Family{{
 		ID: "web", State: "running",
