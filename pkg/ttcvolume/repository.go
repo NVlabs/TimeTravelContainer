@@ -1622,7 +1622,10 @@ func (r *Repository) recoverGraphState() error {
 
 		pinNames := make([]string, 0, len(inspection.Pins))
 		for name := range inspection.Pins {
-			if strings.HasPrefix(name, "construct/") {
+			// Observation pins are process-scoped read leases. A clean reader
+			// removes its pin before closing the repository; seeing one while a
+			// repository is reopened means its daemon operation was interrupted.
+			if strings.HasPrefix(name, "construct/") || strings.HasPrefix(name, "observe/") {
 				pinNames = append(pinNames, name)
 			}
 		}
@@ -3184,15 +3187,68 @@ type BranchSetDataUsage struct {
 	UniqueBytes uint64            `json:"unique_bytes"`
 }
 
+// pinGraphRoots retains a coherent immutable view while a manager-side
+// observation traverses named roots. A live Sentry in another process may
+// replace a branch root and immediately collect its preceding path-copied
+// nodes. Persistent graph pins participate in normal reference counting, so
+// observations remain consistent without blocking guest writes for the whole
+// (potentially remote) metadata traversal.
+func (r *Repository) pinGraphRoots(names []string) (map[string]ttcsnapshot.ObjectID, []string, error) {
+	roots := make(map[string]ttcsnapshot.ObjectID, len(names))
+	pins := make([]string, 0, len(names))
+	err := r.withLock(func() error {
+		for _, name := range names {
+			root, ok := r.graph.Root(name)
+			if !ok {
+				return fmt.Errorf("snapshot graph root %q does not exist", name)
+			}
+			var nonce [16]byte
+			if _, err := rand.Read(nonce[:]); err != nil {
+				return err
+			}
+			pin := "observe/" + hex.EncodeToString(nonce[:])
+			if err := r.graph.SetPin(pin, root); err != nil {
+				return err
+			}
+			roots[name] = root
+			pins = append(pins, pin)
+		}
+		return nil
+	})
+	if err != nil && len(pins) != 0 {
+		_ = r.withLock(func() error { return r.graph.DeletePins(pins) })
+	}
+	return roots, pins, err
+}
+
+func (r *Repository) releaseGraphObservation(pins []string) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	return r.withLock(func() error { return r.graph.DeletePins(pins) })
+}
+
 // BranchSetUsage returns file-data sharing for branchIDs without walking the
 // guest namespace or materializing files. Sharing is based on immutable TTC
 // object identity, and therefore reflects TTC's file-level CoW boundary.
-func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, error) {
-	ids := append([]string(nil), branchIDs...)
-	sort.Strings(ids)
-	if err := r.graph.Reload(); err != nil {
+func (r *Repository) BranchSetUsage(branchIDs []string) (result BranchSetDataUsage, resultErr error) {
+	if err := r.SyncMetadata(); err != nil {
 		return BranchSetDataUsage{}, err
 	}
+	ids := append([]string(nil), branchIDs...)
+	sort.Strings(ids)
+	rootNames := make([]string, len(ids))
+	for index, id := range ids {
+		if index != 0 && ids[index-1] == id {
+			return BranchSetDataUsage{}, fmt.Errorf("duplicate branch %q in usage set", id)
+		}
+		rootNames[index] = graphRootName(id)
+	}
+	roots, pins, err := r.pinGraphRoots(rootNames)
+	if err != nil {
+		return BranchSetDataUsage{}, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, r.releaseGraphObservation(pins)) }()
 	type snapshot struct {
 		inodes  uint64
 		objects map[string]uint64
@@ -3202,17 +3258,11 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 	objectSizes := make(map[string]uint64)
 	pageSize := uint64(os.Getpagesize())
 	for _, id := range ids {
-		if _, exists := snapshots[id]; exists {
-			return BranchSetDataUsage{}, fmt.Errorf("duplicate branch %q in usage set", id)
-		}
 		branch, err := r.Branch(id)
 		if err != nil {
 			return BranchSetDataUsage{}, err
 		}
-		root, ok := r.graph.Root(graphRootName(branch.ID))
-		if !ok {
-			return BranchSetDataUsage{}, fmt.Errorf("branch %q has no snapshot graph root", branch.ID)
-		}
+		root := roots[graphRootName(branch.ID)]
 		inodes, _, err := r.graph.FilesystemRecords(root)
 		if err != nil {
 			return BranchSetDataUsage{}, err
@@ -3239,7 +3289,7 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 			}
 		}
 	}
-	result := BranchSetDataUsage{Branches: make([]BranchDataUsage, 0, len(ids))}
+	result = BranchSetDataUsage{Branches: make([]BranchDataUsage, 0, len(ids))}
 	for _, id := range ids {
 		snapshot := snapshots[id]
 		usage := BranchDataUsage{ID: id, Inodes: snapshot.inodes}
@@ -3262,14 +3312,23 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (BranchSetDataUsage, err
 // BranchDiff returns paths changed by branchID relative to the immutable graph
 // root captured at its most recent fork. It reads TTC metadata; it does not
 // walk materialized host or guest directory trees.
-func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
+func (r *Repository) BranchDiff(branchID string) (changes []PathChange, resultErr error) {
+	if err := r.SyncMetadata(); err != nil {
+		return nil, err
+	}
 	branch, err := r.Branch(branchID)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.graph.Reload(); err != nil {
+	rootNames := []string{graphRootName(branchID)}
+	if branch.BaseRoot != "" {
+		rootNames = append(rootNames, graphBaseRootName(branchID))
+	}
+	roots, pins, err := r.pinGraphRoots(rootNames)
+	if err != nil {
 		return nil, err
 	}
+	defer func() { resultErr = errors.Join(resultErr, r.releaseGraphObservation(pins)) }()
 	pathsForRoot := func(root ttcsnapshot.ObjectID, name string) (map[string]Inode, error) {
 		state := newBranchMetadata(Branch{ID: name})
 		if root.IsZero() {
@@ -3295,20 +3354,14 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 		}
 		return metadataPaths(state)
 	}
-	currentRoot, ok := r.graph.Root(graphRootName(branchID))
-	if !ok {
-		return nil, fmt.Errorf("branch %q has no snapshot graph root", branchID)
-	}
+	currentRoot := roots[graphRootName(branchID)]
 	currentPaths, err := pathsForRoot(currentRoot, branchID)
 	if err != nil {
 		return nil, err
 	}
 	basePaths := make(map[string]Inode)
 	if branch.BaseRoot != "" {
-		baseRoot, err := ttcsnapshot.ParseObjectID(branch.BaseRoot)
-		if err != nil {
-			return nil, err
-		}
+		baseRoot := roots[graphBaseRootName(branchID)]
 		basePaths, err = pathsForRoot(baseRoot, branchID+"-diff-base")
 		if err != nil {
 			return nil, err
@@ -3322,7 +3375,7 @@ func (r *Repository) BranchDiff(branchID string) ([]PathChange, error) {
 	for path := range basePaths {
 		all[path] = struct{}{}
 	}
-	changes := make([]PathChange, 0)
+	changes = make([]PathChange, 0)
 	for path := range all {
 		currentInode, currentOK := currentPaths[path]
 		baseInode, baseOK := basePaths[path]

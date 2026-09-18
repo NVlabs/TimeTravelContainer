@@ -2201,6 +2201,53 @@ func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
 	}
 }
 
+func TestObservationPinRetainsReplacedRoot(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("observed-root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "before", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	roots, pins, err := repository.pinGraphRoots([]string{graphRootName(MainBranch)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := roots[graphRootName(MainBranch)]
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "after", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.Collect(4096)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.graph.FilesystemRecords(oldRoot); err != nil {
+		t.Fatalf("pinned replaced root is not traversable: %v", err)
+	}
+	if err := repository.releaseGraphObservation(pins); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.Collect(4096)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := repository.graph.Object(oldRoot); ok {
+		t.Fatal("released observation root remained reachable after collection")
+	}
+}
+
 // A whiteout is a deletion, and diff says so.
 //
 // Overlayfs hides a name by putting a 0:0 character device where it was. The
