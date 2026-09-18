@@ -300,15 +300,7 @@ func (r controlOnlyPortIngressRouter) authorityState(ctx context.Context) (*clus
 	if r.cluster == nil {
 		return nil, errors.New("control-only cluster is unavailable")
 	}
-	var result error
-	for _, peer := range r.cluster.peerSnapshot() {
-		state, err := peer.client.AuthorityState(ctx)
-		if err == nil {
-			return state, nil
-		}
-		result = errors.Join(result, fmt.Errorf("%s: %w", peer.url, err))
-	}
-	return nil, fmt.Errorf("reading cluster authority: %w", result)
+	return r.cluster.authorityState(ctx)
 }
 
 func controlOnlyPlacement(state *cluster.AuthorityState, target selector) (cluster.PlacementRecord, error) {

@@ -510,25 +510,58 @@ func (c *controlOnlyCluster) seedURLs() []string {
 	return urls
 }
 
+// authorityState follows the Raft leader hint returned by any compute seed.
+// A control-only daemon has no local Raft replica, so its seed is expected to
+// become a follower during ordinary elections. Treating that as an endpoint
+// failure leaves the gateway permanently pinned to a usable but non-authoritative
+// node and breaks every command that needs a linearizable snapshot.
+func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.AuthorityState, error) {
+	if c == nil {
+		return nil, errors.New("control-only cluster is unavailable")
+	}
+	peers := c.peerSnapshot()
+	clients := make(map[string]*cluster.Client, len(peers))
+	for _, peer := range peers {
+		clients[peer.url] = peer.client
+	}
+	var readErrors error
+	for _, peer := range peers {
+		state, err := peer.client.AuthorityState(ctx)
+		if err == nil {
+			return state, nil
+		}
+		readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", peer.url, err))
+		var redirect *cluster.AuthorityNotLeaderError
+		if !errors.As(err, &redirect) || redirect.LeaderControlURL == "" || redirect.LeaderControlURL == peer.url {
+			continue
+		}
+		leader := clients[redirect.LeaderControlURL]
+		if leader == nil {
+			leader, err = cluster.NewPlainClient(redirect.LeaderControlURL, c.nodeID, c.authToken, 2*time.Minute)
+			if err != nil {
+				readErrors = errors.Join(readErrors, fmt.Errorf("creating redirected leader client %s: %w", redirect.LeaderControlURL, err))
+				continue
+			}
+			clients[redirect.LeaderControlURL] = leader
+		}
+		state, err = leader.AuthorityState(ctx)
+		if err == nil {
+			return state, nil
+		}
+		readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", redirect.LeaderControlURL, err))
+	}
+	return nil, fmt.Errorf("reading cluster authority through all compute peers: %w", readErrors)
+}
+
 // refreshPeers learns the current compute endpoints through a linearizable
 // authority read. The gateway itself remains absent from Raft membership and
 // never advertises a listener. Existing clients are reused so an in-flight
 // stream is unaffected by a concurrent refresh.
 func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 	current := c.peerSnapshot()
-	var state *cluster.AuthorityState
-	var readErrors error
-	for _, peer := range current {
-		candidate, err := peer.client.AuthorityState(ctx)
-		if err != nil {
-			readErrors = errors.Join(readErrors, fmt.Errorf("%s: %w", peer.url, err))
-			continue
-		}
-		state = candidate
-		break
-	}
-	if state == nil {
-		return fmt.Errorf("reading cluster authority through all compute peers: %w", readErrors)
+	state, err := c.authorityState(ctx)
+	if err != nil {
+		return err
 	}
 
 	existing := make(map[string]*cluster.Client, len(current))
@@ -555,8 +588,7 @@ func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 			var err error
 			client, err = cluster.NewPlainClient(baseURL, c.nodeID, c.authToken, 2*time.Minute)
 			if err != nil {
-				readErrors = errors.Join(readErrors, fmt.Errorf("creating client for discovered compute peer %s: %w", baseURL, err))
-				continue
+				return fmt.Errorf("creating client for discovered compute peer %s: %w", baseURL, err)
 			}
 		}
 		nodeID := ""
@@ -569,7 +601,7 @@ func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 		refreshed = append(refreshed, controlOnlyPeer{nodeID: nodeID, url: baseURL, client: client})
 	}
 	if len(refreshed) == 0 {
-		return fmt.Errorf("cluster authority contains no usable compute endpoint: %w", readErrors)
+		return errors.New("cluster authority contains no usable compute endpoint")
 	}
 	c.peersMu.Lock()
 	c.peers = refreshed

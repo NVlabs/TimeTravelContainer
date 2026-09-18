@@ -2047,6 +2047,66 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	}
 }
 
+func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
+	var leader *httptest.Server
+	leader = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/authority/state" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
+			"leader": {NodeID: "leader", State: cluster.NodeReady, ControlURL: leader.URL},
+		}})
+	}))
+	defer leader.Close()
+
+	var follower *httptest.Server
+	follower = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/daemon":
+			payload, _ := json.Marshal(map[string]any{
+				"build_id": version.Version(),
+				"cluster": map[string]any{"capabilities": cluster.Capabilities{
+					NodeID: "follower", RepositoryID: "repo-control",
+				}},
+			})
+			var mu sync.Mutex
+			_ = writeDaemonFrame(w, &mu, daemonFrameStdout, append(payload, '\n'))
+			_ = writeDaemonStatus(w, &mu, 0)
+		case "/v1/authority/state":
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "not leader", "not_leader": true, "leader_id": "leader",
+				"leader_address": "leader:raft", "leader_control_url": leader.URL,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer follower.Close()
+
+	opts := defaultDaemonClusterOptions()
+	opts.Configured, opts.ControlOnly = true, true
+	opts.NodeID, opts.RepositoryID = "login-gateway", "repo-control"
+	opts.Peers = []string{"follower=" + strings.TrimPrefix(follower.URL, "http://")}
+	control, err := prepareControlOnlyCluster(opts, "/shared/ttc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := control.seedURLs(), []string{leader.URL}; !slices.Equal(got, want) {
+		t.Fatalf("peers after leader redirect=%v, want %v", got, want)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state, err := control.authorityState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := state.Nodes["leader"]; !ok {
+		t.Fatalf("redirected authority state=%+v", state.Nodes)
+	}
+}
+
 func TestControlOnlyProxyInputDoesNotWaitForUnusedStdin(t *testing.T) {
 	blocked := make(chan struct{})
 	reader := io.Reader(readerFunc(func([]byte) (int, error) {
