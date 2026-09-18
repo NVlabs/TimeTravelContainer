@@ -2251,6 +2251,47 @@ func TestLocalIncarnationMustRejoin(t *testing.T) {
 	}
 }
 
+func TestDiscardRetiredLocalAuthority(t *testing.T) {
+	root := t.TempDir()
+	removed := []string{
+		"catalog", "cluster", "containers", "daemon", "filesystems",
+		"graph-references", "objects", "publication-queue",
+		"publication-staging", "runtime", "snapshot-graph",
+	}
+	for _, name := range removed {
+		path := filepath.Join(root, name, "stale")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "state"), []byte("old incarnation"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"images", "future-version-data"} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "keep"), []byte("immutable or unknown"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := discardRetiredLocalAuthority(root); err != nil {
+		t.Fatalf("discardRetiredLocalAuthority: %v", err)
+	}
+	for _, name := range removed {
+		if _, err := os.Stat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("retired directory %q remains: %v", name, err)
+		}
+	}
+	for _, name := range []string{"images", "future-version-data"} {
+		if data, err := os.ReadFile(filepath.Join(root, name, "keep")); err != nil || string(data) != "immutable or unknown" {
+			t.Errorf("preserved directory %q = %q, %v", name, data, err)
+		}
+	}
+}
+
 func TestAdaptivePrefetchControllerHysteresis(t *testing.T) {
 	policy := ttcpolicy.DefaultPolicy()
 	policy.MaxConcurrency = 4

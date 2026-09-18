@@ -742,6 +742,40 @@ func removeLocalNodeIncarnation(localRoot, nodeID, incarnation string) error {
 	return errors.Join(syncErr, directory.Close())
 }
 
+// discardRetiredLocalAuthority removes state that was authoritative only for a
+// cluster node incarnation which the replicated catalog has forgotten. A
+// subsequent join is a new execution epoch: replaying the old publication,
+// graph-reference, runtime, or request journals could retain objects for
+// transactions that no longer exist, or resurrect runtimes that the cluster
+// has already declared lost.
+//
+// The image directory is deliberately retained. In clustered mode it is an
+// immutable, digest-keyed extraction cache and contains no branch authority.
+// Unknown top-level entries are also left alone so that a new TTC version does
+// not silently delete data it does not understand. The local root is
+// exclusively locked by the caller while this function runs.
+func discardRetiredLocalAuthority(localRoot string) error {
+	for _, name := range []string{
+		"catalog",
+		"cluster",
+		"containers",
+		"daemon",
+		"filesystems",
+		"graph-references",
+		"objects",
+		"publication-queue",
+		"publication-staging",
+		"runtime",
+		"snapshot-graph",
+	} {
+		path := filepath.Join(localRoot, name)
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("discarding retired local %s state: %w", name, err)
+		}
+	}
+	return syncDaemonRootDirectory(localRoot)
+}
+
 type daemonTargetRuntime struct {
 	backend     *runtimeBackend
 	nodeID      string
@@ -4443,13 +4477,14 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, err
 		}
 		if retired {
-			if err := os.RemoveAll(raftLocalDir); err != nil {
-				return nil, fmt.Errorf("discarding retired local Raft replica: %w", err)
+			// Absence from the authoritative node catalog means that the old
+			// incarnation has no remaining execution or storage authority. Its
+			// other local journals are just as stale as its Raft WAL and must not
+			// be replayed under the replacement incarnation.
+			if err := discardRetiredLocalAuthority(localRoot); err != nil {
+				return nil, err
 			}
 			localRaftState = false
-			if err := removeLocalNodeIncarnation(localRoot, opts.NodeID, incarnation); err != nil {
-				return nil, fmt.Errorf("rotating administratively retired node incarnation: %w", err)
-			}
 			incarnation, err = localNodeIncarnation(localRoot, opts.NodeID)
 			if err != nil {
 				return nil, err
