@@ -339,6 +339,82 @@ func snapshotReferenceClaims(intent graphReferenceIntent, retired map[uint64]str
 	return claims
 }
 
+// activeSharedClaimReferences collects the exact shared-origin roots claimed
+// by every execution incarnation that has not been fenced. A node-local intent
+// is written before its retain RPC and remains present until its release RPC is
+// durably acknowledged, so the union is a conservative, crash-safe inventory.
+//
+// This inventory is deliberately queried from live nodes instead of inferred
+// from Raft branch records. A branch can own roots during target preparation or
+// an asynchronous handoff before its final visible record is committed.
+func (s *sharedReferenceService) activeSharedClaimReferences(state *cluster.AuthorityState, deadline time.Time) (map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID, error) {
+	if s == nil || s.peers == nil || state == nil {
+		return nil, errors.New("shared reference inventory is unavailable")
+	}
+	desired := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
+	nodes := make([]cluster.NodeRecord, 0, len(state.Nodes))
+	for _, node := range state.Nodes {
+		if node.State != cluster.NodeOffline {
+			nodes = append(nodes, node)
+		}
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
+	observed := state.LeaderObservedAt
+	if observed.IsZero() {
+		observed = time.Now()
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	for _, node := range nodes {
+		if !node.LeaseActive(observed) {
+			return nil, fmt.Errorf("node %s/%s has not been fenced and cannot provide a current reference inventory", node.NodeID, node.Incarnation)
+		}
+		var inventory *cluster.SnapshotReferenceInventory
+		var err error
+		if node.NodeID == s.nodeID && node.Incarnation == s.incarnation {
+			inventory, err = s.SnapshotReferenceInventory(ctx, s.nodeID)
+		} else {
+			peer, peerErr := s.peers.peer(node.NodeID, false)
+			if peerErr != nil {
+				return nil, peerErr
+			}
+			inventory, err = peer.SnapshotReferenceInventory(ctx)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading snapshot reference claims from node %s: %w", node.NodeID, err)
+		}
+		if inventory == nil || inventory.NodeID != node.NodeID || inventory.Incarnation != node.Incarnation {
+			return nil, fmt.Errorf("snapshot reference inventory identity is %v/%v, want %s/%s", inventoryNodeID(inventory), inventoryIncarnation(inventory), node.NodeID, node.Incarnation)
+		}
+		for _, claim := range inventory.Claims {
+			if state.AbandonedOrigins[claim.Origin] {
+				continue
+			}
+			if _, volatile := state.VolatileOrigins[claim.Origin]; volatile {
+				continue
+			}
+			origin := ttcsnapshot.SnapshotID(claim.Origin)
+			if _, retired := state.RetiredOrigins[claim.Origin]; retired {
+				return nil, fmt.Errorf("node %s claims retired snapshot origin %d", node.NodeID, claim.Origin)
+			}
+			roots, err := graphReferenceRoots(origin, claim.Operation, claim.Roots)
+			if err != nil {
+				return nil, fmt.Errorf("validating node %s reference claim: %w", node.NodeID, err)
+			}
+			if desired[origin] == nil {
+				desired[origin] = make(map[string]ttcsnapshot.ObjectID)
+			}
+			for name, object := range roots {
+				if previous, exists := desired[origin][name]; exists && previous != object {
+					return nil, fmt.Errorf("reference claim %q selects both %s and %s", name, previous, object)
+				}
+				desired[origin][name] = object
+			}
+		}
+	}
+	return desired, nil
+}
+
 func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -688,65 +764,9 @@ func (s *sharedReferenceService) rebuildLedger(lease cluster.SharedGCLease) (*tt
 	// Claims must be part of ImportOrigin's initial baseline: importing an
 	// unreferenced object first would correctly make it reclaiming, after which
 	// a later retain is forbidden from resurrecting it.
-	claimReferences := make(map[ttcsnapshot.SnapshotID]map[string]ttcsnapshot.ObjectID)
-	nodes := make([]cluster.NodeRecord, 0, len(state.Nodes))
-	for _, node := range state.Nodes {
-		if node.State != cluster.NodeOffline {
-			nodes = append(nodes, node)
-		}
-	}
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
-	observed := state.LeaderObservedAt
-	if observed.IsZero() {
-		observed = time.Now()
-	}
-	ctx, cancel := context.WithDeadline(context.Background(), lease.ExpiresAt)
-	defer cancel()
-	for _, node := range nodes {
-		if !node.LeaseActive(observed) {
-			return fail(fmt.Errorf("node %s/%s has not been fenced and cannot provide a current reference inventory", node.NodeID, node.Incarnation))
-		}
-		var inventory *cluster.SnapshotReferenceInventory
-		if node.NodeID == s.nodeID && node.Incarnation == s.incarnation {
-			inventory, err = s.SnapshotReferenceInventory(ctx, s.nodeID)
-		} else {
-			peer, peerErr := s.peers.peer(node.NodeID, false)
-			if peerErr != nil {
-				return fail(peerErr)
-			}
-			inventory, err = peer.SnapshotReferenceInventory(ctx)
-		}
-		if err != nil {
-			return fail(fmt.Errorf("reading snapshot reference claims from node %s: %w", node.NodeID, err))
-		}
-		if inventory == nil || inventory.NodeID != node.NodeID || inventory.Incarnation != node.Incarnation {
-			return fail(fmt.Errorf("snapshot reference inventory identity is %v/%v, want %s/%s", inventoryNodeID(inventory), inventoryIncarnation(inventory), node.NodeID, node.Incarnation))
-		}
-		for _, claim := range inventory.Claims {
-			if state.AbandonedOrigins[claim.Origin] {
-				continue
-			}
-			if _, volatile := state.VolatileOrigins[claim.Origin]; volatile {
-				continue
-			}
-			origin := ttcsnapshot.SnapshotID(claim.Origin)
-			if _, retired := state.RetiredOrigins[claim.Origin]; retired {
-				return fail(fmt.Errorf("node %s claims retired snapshot origin %d", node.NodeID, claim.Origin))
-			}
-			roots, err := graphReferenceRoots(origin, claim.Operation, claim.Roots)
-			if err != nil {
-				return fail(fmt.Errorf("validating node %s reference claim: %w", node.NodeID, err))
-			}
-			if claimReferences[origin] == nil {
-				claimReferences[origin] = make(map[string]ttcsnapshot.ObjectID)
-			}
-			for name, object := range roots {
-				if previous, exists := claimReferences[origin][name]; exists && previous != object {
-					return fail(fmt.Errorf("reference claim %q selects both %s and %s", name, previous, object))
-				}
-				claimReferences[origin][name] = object
-			}
-		}
+	claimReferences, err := s.activeSharedClaimReferences(state, lease.ExpiresAt)
+	if err != nil {
+		return fail(err)
 	}
 
 	manifests, err := s.packs.Manifests()
@@ -1406,6 +1426,91 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 	})
 }
 
+// reconcileInactiveGraphReferences removes active-consumer roots whose owning
+// daemon incarnation has disappeared. Ordinary branch removal releases these
+// roots directly. A hard node loss cannot do so, and keeping the same shared-GC
+// coordinator used to leave the dead node's remote/... claims pinned until an
+// unrelated coordinator election rebuilt the ledger.
+//
+// Only releases are synthesized here. A newly written intent appears in its
+// node inventory before its retain RPC, so installing missing retains from one
+// sampled inventory could race a concurrent release and resurrect a dead root.
+// The normal retain path remains responsible for additions. Conversely, an
+// absent remote/... name cannot be reused by another lifetime: operation names
+// are branch/transaction-unique, making release-only reconciliation monotonic.
+func (s *sharedReferenceService) reconcileInactiveGraphReferences(lease cluster.SharedGCLease) error {
+	state, err := s.authority.AuthorityState()
+	if err != nil {
+		return err
+	}
+	desiredByOrigin, err := s.activeSharedClaimReferences(state, lease.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	desired := make(map[string]ttcsnapshot.ObjectID)
+	for _, roots := range desiredByOrigin {
+		for name, object := range roots {
+			desired[name] = object
+		}
+	}
+	var current map[string]ttcsnapshot.ObjectID
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		current = ledger.References()
+		return nil
+	}); err != nil {
+		return err
+	}
+	mutations, err := inactiveGraphReferenceMutations(state, current, desired)
+	if err != nil {
+		return err
+	}
+	return s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		return applySharedReferenceBatches(ledger, mutations)
+	})
+}
+
+func inactiveGraphReferenceMutations(state *cluster.AuthorityState, current, desired map[string]ttcsnapshot.ObjectID) ([]ttcsnapshot.SnapshotReferenceMutation, error) {
+	if state == nil {
+		return nil, errors.New("shared authority state is unavailable")
+	}
+	names := make([]string, 0)
+	for name, object := range current {
+		if !strings.HasPrefix(name, "remote/") {
+			continue
+		}
+		if wanted, ok := desired[name]; ok {
+			if wanted != object {
+				return nil, fmt.Errorf("active reference %q changed from %s to %s", name, object, wanted)
+			}
+			continue
+		}
+		// Provider authority only moves node -> shared. Restricting cleanup to
+		// origins already shared in the inventory's linearizable Raft view keeps
+		// it disjoint from an in-progress provider handoff.
+		if _, volatile := state.VolatileOrigins[uint64(object.Snapshot)]; volatile {
+			continue
+		}
+		if state.AbandonedOrigins[uint64(object.Snapshot)] {
+			continue
+		}
+		if _, retired := state.RetiredOrigins[uint64(object.Snapshot)]; retired {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	mutations := make([]ttcsnapshot.SnapshotReferenceMutation, 0, len(names))
+	for _, name := range names {
+		object := current[name]
+		digest := sha256.Sum256([]byte("inactive-release\x00" + name + "\x00" + object.String()))
+		mutations = append(mutations, ttcsnapshot.SnapshotReferenceMutation{
+			Operation: fmt.Sprintf("inactive-claim-release/%x", digest),
+			Name:      name, Object: object,
+		})
+	}
+	return mutations, nil
+}
+
 // applySharedReferenceBatches bounds both WAL record size and the number of
 // full ledger-state clones/fsyncs. Reconciliation can release one structural
 // edge per guest page; committing each edge independently made snapshot
@@ -1505,6 +1610,9 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 		return 0, err
 	}
 	if err := s.reconcileAuthoritativeColdReferences(); err != nil {
+		return 0, err
+	}
+	if err := s.reconcileInactiveGraphReferences(lease); err != nil {
 		return 0, err
 	}
 	// A freshly rebuilt ledger represents cross-origin parent edges as durable

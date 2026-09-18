@@ -99,6 +99,50 @@ func TestProviderBaselineReleaseWaitsForSharedAuthority(t *testing.T) {
 	}
 }
 
+func TestInactiveGraphReferenceReconciliationReleasesOnlyFencedClaims(t *testing.T) {
+	sharedDead := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	sharedLive := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 2}
+	volatileDead := ttcsnapshot.ObjectID{Snapshot: 19, Kind: ttcsnapshot.ObjectKindMetadata, Ordinal: 1}
+	current := map[string]ttcsnapshot.ObjectID{
+		"remote/17/dead/00000000":    sharedDead,
+		"remote/17/live/00000000":    sharedLive,
+		"remote/19/handoff/00000000": volatileDead,
+		"root/cold-memory/17/stable": sharedDead,
+	}
+	desired := map[string]ttcsnapshot.ObjectID{"remote/17/live/00000000": sharedLive}
+	state := cluster.NewAuthorityState()
+	state.VolatileOrigins[19] = cluster.SnapshotProvider{NodeID: "provider"}
+	mutations, err := inactiveGraphReferenceMutations(state, current, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mutations) != 1 || mutations[0].Name != "remote/17/dead/00000000" || mutations[0].Retain {
+		t.Fatalf("inactive mutations=%+v, want one release for the fenced shared claim", mutations)
+	}
+	ledger := ttcsnapshot.NewReferenceLedger()
+	objects := []ttcsnapshot.Object{
+		{ID: sharedDead, Kind: sharedDead.Kind, State: ttcsnapshot.ObjectLive},
+		{ID: sharedLive, Kind: sharedLive.Kind, State: ttcsnapshot.ObjectLive},
+	}
+	if err := ledger.ImportOrigin(sharedDead.Snapshot, objects, map[string]ttcsnapshot.ObjectID{
+		"remote/17/dead/00000000":    sharedDead,
+		"remote/17/live/00000000":    sharedLive,
+		"root/cold-memory/17/stable": sharedDead,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySharedReferenceBatches(ledger, mutations); err != nil {
+		t.Fatal(err)
+	}
+	references := ledger.References()
+	if _, ok := references["remote/17/dead/00000000"]; ok {
+		t.Fatal("fenced node claim remains in the shared ledger")
+	}
+	if references["remote/17/live/00000000"] != sharedLive || references["root/cold-memory/17/stable"] != sharedDead {
+		t.Fatalf("reconciliation changed live references: %+v", references)
+	}
+}
+
 func TestTerminalSourceAction(t *testing.T) {
 	tests := []struct {
 		name   string
