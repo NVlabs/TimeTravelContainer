@@ -950,6 +950,23 @@ func (p *branchPublisher) Cleanup(intent ttcstorage.Intent) error {
 		seen[path] = struct{}{}
 		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
 		if err != nil {
+			// Cancellation is also the recovery path for a capture whose local
+			// active tier was lost before this daemon learned about the pending
+			// intent. In that case there is no branch or local reference ledger
+			// left to mutate. Treat every origin named by the immutable manifest
+			// as locally empty so the authority/pack cleanup below can retire it.
+			// Do not absorb malformed or unreadable repositories: only a path
+			// whose absence is independently confirmed has this meaning.
+			if errors.Is(err, os.ErrNotExist) {
+				if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+					for _, encodedOrigin := range filesystemOrigins[config.Source] {
+						emptyFilesystemOrigins[encodedOrigin] = true
+					}
+					continue
+				} else if statErr != nil {
+					return fmt.Errorf("stating canceled publication repository %q: %w", config.Source, statErr)
+				}
+			}
 			return err
 		}
 		for _, encodedOrigin := range filesystemOrigins[config.Source] {
