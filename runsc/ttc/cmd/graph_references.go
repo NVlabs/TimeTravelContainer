@@ -286,10 +286,11 @@ func (b *runtimeBackend) releaseDistributedGraphReferences(operation string) err
 	return errors.Join(syncErr, closeErr)
 }
 
-// retryGraphReferenceMutation hides the bounded unavailability window of the
-// disposable shared-reference coordinator. Each attempt remains serialized
-// with local inventory capture, but waiting occurs outside claimMu: otherwise
-// a node elected as the successor could deadlock rebuilding its own inventory.
+// retryGraphReferenceMutation hides bounded reference-authority transitions:
+// coordinator turnover and the provider-to-shared handoff freeze. Each
+// attempt remains serialized with local inventory capture, but waiting occurs
+// outside claimMu: otherwise a node elected as the successor could deadlock
+// rebuilding its own inventory.
 func (b *runtimeBackend) retryGraphReferenceMutation(run func(context.Context) error) error {
 	return retryGraphReferenceMutation(run)
 }
@@ -343,6 +344,8 @@ func isSharedReferenceCoordinatorTransition(err error) bool {
 		"does not hold an active shared reference lease",
 		"shared reference lease is stale",
 		"shared reference lease changed",
+		"references are frozen for authority handoff",
+		"objects are frozen for authority handoff",
 		"connection refused",
 		"connection reset by peer",
 		"no route to host",

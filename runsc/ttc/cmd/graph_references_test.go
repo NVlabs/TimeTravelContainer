@@ -277,6 +277,8 @@ func TestSharedReferenceCoordinatorTransitionClassification(t *testing.T) {
 		"cluster peer: this daemon does not hold an active shared reference lease",
 		"shared reference lease is stale",
 		"cluster target node \"node-a\" is ready or its lease has expired",
+		"snapshot 17 references are frozen for authority handoff",
+		"snapshot 17 objects are frozen for authority handoff",
 	} {
 		if !isSharedReferenceCoordinatorTransition(errors.New(message)) {
 			t.Fatalf("%q was not classified as coordinator turnover", message)
