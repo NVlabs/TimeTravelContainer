@@ -15599,8 +15599,15 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 	// are discarded. Avoid invoking runsc for a process-free cold branch: doing
 	// so both obscures the real status and produces a misleading FetchSpec error.
 	if branch, branchErr := persistentBranchInfo(info, target.branch); branchErr == nil && normalizeLifecycleState(branch.State) == "exited" {
+		var status uint32
 		if branch.ExitStatus != nil {
-			return uint32(*branch.ExitStatus) << 8, nil
+			status = uint32(*branch.ExitStatus) << 8
+			if b.publicationQueue != nil && branch.PublicationID == "" && branch.StorageState != "shared" {
+				if err := b.completeWaitedInitExit(target, status); err != nil {
+					return status, err
+				}
+			}
+			return status, nil
 		}
 		// Compatibility for records written earlier in the same root format,
 		// before exits became branch-local. This is sound only when the whole
@@ -15649,6 +15656,13 @@ func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) 
 	if b.publicationQueue == nil {
 		return nil
 	}
+	// Waiting for PID 1 itself must not hold the lifecycle lock, but the small
+	// terminal transition after it exits must serialize with the console
+	// follower and foreground lifecycle commands. In particular, the follower
+	// may record the exited status just before wait enters its fast path; only
+	// one of them should seal and publish the process-free branch.
+	unlock := b.lockBackgroundLifecycle()
+	defer unlock()
 	info, err := b.containerStore().LoadContainer(target.container)
 	if err != nil {
 		return err
