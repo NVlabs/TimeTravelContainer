@@ -71,6 +71,54 @@ type transactionListCatalog struct {
 	records []cluster.Transaction
 }
 
+func TestMigrationSourceIncarnationFenced(t *testing.T) {
+	now := time.Unix(1000, 0)
+	tx := cluster.Transaction{
+		Identity:          cluster.ForkIdentity{SourceNodeID: "source"},
+		SourceIncarnation: "old",
+	}
+	tests := []struct {
+		name  string
+		state *cluster.AuthorityState
+		want  bool
+	}{
+		{name: "missing state", state: nil},
+		{name: "missing node", state: cluster.NewAuthorityState()},
+		{name: "gracefully retired", state: func() *cluster.AuthorityState {
+			state := cluster.NewAuthorityState()
+			state.RetiredNodes["source"] = "old"
+			return state
+		}(), want: true},
+		{name: "replacement incarnation", state: func() *cluster.AuthorityState {
+			state := cluster.NewAuthorityState()
+			state.Nodes["source"] = cluster.NodeRecord{NodeID: "source", Incarnation: "new", State: cluster.NodeReady, LeaseExpiresAt: now.Add(time.Minute)}
+			return state
+		}(), want: true},
+		{name: "exact incarnation live", state: func() *cluster.AuthorityState {
+			state := cluster.NewAuthorityState()
+			state.Nodes["source"] = cluster.NodeRecord{NodeID: "source", Incarnation: "old", State: cluster.NodeReady, LeaseExpiresAt: now.Add(time.Minute)}
+			return state
+		}()},
+		{name: "exact incarnation expired", state: func() *cluster.AuthorityState {
+			state := cluster.NewAuthorityState()
+			state.Nodes["source"] = cluster.NodeRecord{NodeID: "source", Incarnation: "old", State: cluster.NodeReady, LeaseExpiresAt: now.Add(-time.Second)}
+			return state
+		}(), want: true},
+		{name: "exact incarnation offline", state: func() *cluster.AuthorityState {
+			state := cluster.NewAuthorityState()
+			state.Nodes["source"] = cluster.NodeRecord{NodeID: "source", Incarnation: "old", State: cluster.NodeOffline, LeaseExpiresAt: now.Add(time.Minute)}
+			return state
+		}(), want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := migrationSourceIncarnationFenced(test.state, tx, now); got != test.want {
+				t.Fatalf("migrationSourceIncarnationFenced() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCanceledForkOwnsPlacement(t *testing.T) {
 	tx := cluster.Transaction{Identity: cluster.ForkIdentity{
 		SourceNodeID: "node-a", TargetNodeID: "node-b",

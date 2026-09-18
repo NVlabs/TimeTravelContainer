@@ -3116,9 +3116,12 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 		}
 		return nil
 	}
-	// A clean Raft retirement is a stronger fence than an absent node record:
-	// node stop synchronously releases every physical source before membership
-	// removal. An offline or expired source is not sufficient proof.
+	// A live coordinator may retire the metadata for a source incarnation that
+	// Raft has already fenced. Its node-local runtime and graph-reference intent
+	// are disposable residue: the lease guardian stopped execution before the
+	// deadline, and startup cache reconciliation removes them if that physical
+	// node returns. This keeps family deletion available after an abrupt node
+	// loss without weakening the exact-incarnation fence.
 	if b.distributedSource.authority == nil {
 		return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q", transactionID, tx.Identity.SourceNodeID, b.nodeID)
 	}
@@ -3126,10 +3129,32 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 	if err != nil {
 		return fmt.Errorf("checking retired migration source %q: %w", transactionID, err)
 	}
-	if retiredIncarnation, ok := state.RetiredNodes[tx.Identity.SourceNodeID]; !ok || retiredIncarnation != tx.SourceIncarnation {
-		return fmt.Errorf("transaction %q is sourced by node %q, not cleanup node %q, and that source incarnation has not retired cleanly", transactionID, tx.Identity.SourceNodeID, b.nodeID)
+	if !migrationSourceIncarnationFenced(state, tx, time.Now()) {
+		return fmt.Errorf("transaction %q is sourced by live node %q incarnation %q, not cleanup node %q", transactionID, tx.Identity.SourceNodeID, tx.SourceIncarnation, b.nodeID)
 	}
 	return nil
+}
+
+// migrationSourceIncarnationFenced reports whether Raft proves that a
+// migration's former source cannot still execute. A replacement incarnation
+// is itself a fence for the old one; an offline/expired exact incarnation is
+// fenced by the lease protocol; and graceful retirement records an explicit
+// durable fence after local cleanup.
+func migrationSourceIncarnationFenced(state *cluster.AuthorityState, tx cluster.Transaction, now time.Time) bool {
+	if state == nil || tx.Identity.SourceNodeID == "" || tx.SourceIncarnation == "" {
+		return false
+	}
+	if retired, ok := state.RetiredNodes[tx.Identity.SourceNodeID]; ok && retired == tx.SourceIncarnation {
+		return true
+	}
+	record, ok := state.Nodes[tx.Identity.SourceNodeID]
+	if !ok {
+		return false
+	}
+	if record.Incarnation != tx.SourceIncarnation {
+		return true
+	}
+	return !record.LeaseActive(now)
 }
 
 // discardRemovedMigrationSources completes distributed rm after logical

@@ -2612,13 +2612,23 @@ func distributedFamilyPhysicalIDs(store ttcbundle.Store, familyID string) ([]str
 }
 
 func (s *daemonServer) distributedCleanupNode(sourceNode string) (string, error) {
-	if _, err := s.clusterDirectory.Lookup(sourceNode); errors.Is(err, os.ErrNotExist) {
+	record, err := s.clusterDirectory.Lookup(sourceNode)
+	if errors.Is(err, os.ErrNotExist) {
 		// Cleanly retired nodes have already discarded their physical migration
 		// sources before membership removal. A live coordinator can retire the
 		// remaining transaction after verifying the durable retirement fence.
 		return s.clusterCapabilities.NodeID, nil
-	} else if err != nil {
+	}
+	if err != nil {
 		return "", fmt.Errorf("resolving migration cleanup node %q: %w", sourceNode, err)
+	}
+	// NodeOffline and lease expiry are replicated execution fences. The old
+	// incarnation can no longer service cleanup RPCs, and its guardian has
+	// revoked every runtime before the lease deadline. Route metadata cleanup
+	// through the live coordinator; cleanupRemovedMigrationSource rechecks the
+	// exact transaction incarnation before allowing it to retire.
+	if !record.LeaseActive(time.Now()) {
+		return s.clusterCapabilities.NodeID, nil
 	}
 	return sourceNode, nil
 }
