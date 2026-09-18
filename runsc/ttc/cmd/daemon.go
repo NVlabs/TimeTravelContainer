@@ -7814,29 +7814,7 @@ func daemonCommandUsesStdin(args []string) bool {
 // for its current terminal size. Terminal control frames must be routable even
 // when -i is absent: detached TTY sessions are a normal automation primitive.
 func daemonCommandUsesTerminalControl(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	if args[0] == "container" {
-		args = args[1:]
-		if len(args) == 0 {
-			return false
-		}
-	}
-	switch args[0] {
-	case "attach":
-		// Whether the selected console is a TTY is known only by ttcd.
-		return true
-	case "start":
-		return daemonCommandBoolFlag(args[1:], 'a', "--attach")
-	case "run", "exec":
-		if args[0] == "exec" && len(args) > 1 && (args[1] == "ls" || args[1] == "wait" || args[1] == "kill") {
-			return false
-		}
-		return daemonCommandBoolFlag(args[1:], 't', "--tty")
-	default:
-		return false
-	}
+	return protocol.CommandUsesTerminalControl(args)
 }
 
 func runViaDaemon(opts options, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {

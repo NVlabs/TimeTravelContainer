@@ -287,6 +287,50 @@ func TestReportedDaemonAPIVersion(t *testing.T) {
 	}
 }
 
+func TestDetachedTTYRequestKeepsTerminalControlStreamOpen(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "ttcd.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	requests := make(chan request, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		header, err := bufio.NewReader(conn).ReadBytes('\n')
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		var req request
+		if err := json.Unmarshal(header, &req); err != nil {
+			serverErr <- err
+			return
+		}
+		requests <- req
+		var status [4]byte
+		var writeMu sync.Mutex
+		serverErr <- writeFrame(conn, &writeMu, daemonFrameStatus, status[:])
+	}()
+	status, err := runCommand(socket, []string{"exec", "-td", "--session", "build", "demo@main", "sh"}, strings.NewReader(""), io.Discard, io.Discard)
+	if err != nil || status != 0 {
+		t.Fatalf("runCommand status=%d err=%v", status, err)
+	}
+	req := <-requests
+	if req.Stdin || !req.TerminalControl {
+		t.Fatalf("detached TTY request stdin=%t terminal_control=%t", req.Stdin, req.TerminalControl)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNormalizeClientRelativePaths(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {

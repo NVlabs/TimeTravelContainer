@@ -68,16 +68,17 @@ type options struct {
 }
 
 type request struct {
-	Version        int      `json:"version"`
-	ClientBuildID  string   `json:"client_build_id,omitempty"`
-	Action         string   `json:"action"`
-	RequestID      string   `json:"request_id,omitempty"`
-	ClientTERM     string   `json:"client_term,omitempty"`
-	StderrTerminal bool     `json:"stderr_terminal,omitempty"`
-	StderrWidth    int      `json:"stderr_width,omitempty"`
-	Args           []string `json:"args,omitempty"`
-	Stdin          bool     `json:"stdin,omitempty"`
-	ManageStop     bool     `json:"manage_stop,omitempty"`
+	Version         int      `json:"version"`
+	ClientBuildID   string   `json:"client_build_id,omitempty"`
+	Action          string   `json:"action"`
+	RequestID       string   `json:"request_id,omitempty"`
+	ClientTERM      string   `json:"client_term,omitempty"`
+	StderrTerminal  bool     `json:"stderr_terminal,omitempty"`
+	StderrWidth     int      `json:"stderr_width,omitempty"`
+	Args            []string `json:"args,omitempty"`
+	Stdin           bool     `json:"stdin,omitempty"`
+	TerminalControl bool     `json:"terminal_control,omitempty"`
+	ManageStop      bool     `json:"manage_stop,omitempty"`
 }
 
 // Run executes the thin ttc client and returns a process exit status.
@@ -792,7 +793,7 @@ func printHelpTopic(topic []string, stdout io.Writer) {
 func runCommand(socket string, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 	terminal, width := terminalWriterInfo(stderr)
 	req := request{Version: daemonAPIVersion, ClientBuildID: version.Version(), Action: "command", Args: args,
-		Stdin: commandUsesStdin(args), ClientTERM: os.Getenv("TERM"), StderrTerminal: terminal, StderrWidth: width}
+		Stdin: commandUsesStdin(args), TerminalControl: protocol.CommandUsesTerminalControl(args), ClientTERM: os.Getenv("TERM"), StderrTerminal: terminal, StderrWidth: width}
 	if commandCanRetry(args) && !req.Stdin {
 		id, err := newRequestID()
 		if err != nil {
