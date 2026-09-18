@@ -1924,6 +1924,29 @@ func portableInternalMountsFromColdManifest(manifest coldBranchManifest) []ttcbu
 	return mounts
 }
 
+// validateColdManifestIdentity distinguishes a cold publication transaction
+// from the immutable filesystem ancestor that remains after activation.
+// RecordBranchActivation clears PublicationID to fence the consumed one-shot
+// transaction, but deliberately retains StorageManifest: a later stop/start
+// or incremental publication may still use those immutable roots. The
+// container and branch identity must always match; only an activated local
+// incarnation may refer to the retained manifest without retaining its
+// transaction ID.
+func validateColdManifestIdentity(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, manifest coldBranchManifest) error {
+	if manifest.Container != info.ID || manifest.Branch != branch.ID {
+		return fmt.Errorf("cold manifest belongs to %s@%s, branch is %s@%s", manifest.Container, manifest.Branch, info.ID, branch.ID)
+	}
+	if manifest.PublicationID == branch.PublicationID {
+		return nil
+	}
+	state := normalizeLifecycleState(branch.State)
+	if branch.PublicationID == "" && branch.StorageState == "local" &&
+		(state == "running" || state == "paused" || state == "exited" || state == "failed" || state == "dead") {
+		return nil
+	}
+	return fmt.Errorf("cold manifest publication is %q, branch publication is %q", manifest.PublicationID, branch.PublicationID)
+}
+
 func (b *runtimeBackend) installColdInternalMounts(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	if branch.StorageManifest == "" {
 		return nil
@@ -1932,8 +1955,8 @@ func (b *runtimeBackend) installColdInternalMounts(info ttcbundle.ContainerInfo,
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
-		return errors.New("cold manifest identity does not match branch publication")
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		return err
 	}
 	if err := b.containerStore().InstallPortableInternalMounts(info.ID, portableInternalMountsFromColdManifest(manifest)); err != nil {
 		return fmt.Errorf("materializing portable internal mounts: %w", err)
@@ -1949,8 +1972,8 @@ func (b *runtimeBackend) installColdExecConsoleLogs(info ttcbundle.ContainerInfo
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
-		return errors.New("cold manifest identity does not match branch publication")
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		return err
 	}
 	if err := installColdExecConsolePack(b.activeDataRoot(), info, branch.ID, manifest, branch.StorageManifest); err != nil {
 		return fmt.Errorf("materializing retained exec output: %w", err)
@@ -2000,8 +2023,8 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
-		return errors.New("cold manifest identity does not match branch publication")
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		return err
 	}
 	if manifest.MemorySnapshot != branch.SnapshotID || manifest.ControlRoot != branch.ControlRootObject {
 		return errors.New("cold manifest process-state roots do not match branch metadata")
@@ -2078,8 +2101,8 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	if err != nil {
 		return err
 	}
-	if manifest.Container != info.ID || manifest.Branch != branch.ID || manifest.PublicationID != branch.PublicationID {
-		return errors.New("cold manifest identity does not match branch publication")
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		return err
 	}
 	// Hostname, hosts, and resolv.conf are TTC-owned bind mounts outside the
 	// volume graph. A cold branch may be inspected on any node, so materialize

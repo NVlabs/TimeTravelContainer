@@ -6103,6 +6103,42 @@ func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
 	}
 }
 
+func TestColdManifestIdentityRetainsActivatedFilesystemAncestor(t *testing.T) {
+	manifest := coldBranchManifest{
+		Container: "physical", Branch: "child", PublicationID: "publication-cold",
+	}
+	info := ttcbundle.ContainerInfo{ID: "physical"}
+	for _, state := range []string{"running", "paused", "exited"} {
+		branch := ttcbundle.BranchInfo{
+			ID: "child", State: state, StorageState: "local",
+			StorageManifest: "/shared/cold.json",
+		}
+		if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+			t.Errorf("activated %s ancestor rejected: %v", state, err)
+		}
+	}
+	branch := ttcbundle.BranchInfo{
+		ID: "child", State: "dehydrated", StorageState: "shared",
+		PublicationID: "publication-cold",
+	}
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		t.Fatalf("matching cold publication rejected: %v", err)
+	}
+	branch.PublicationID = "publication-other"
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("mismatched live publication was accepted")
+	}
+	branch.PublicationID = ""
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("dehydrated branch without its publication fence was accepted")
+	}
+	branch.State, branch.StorageState = "running", "local"
+	manifest.Container = "other"
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("foreign physical manifest was accepted as an ancestor")
+	}
+}
+
 func TestColdExecConsolePackRoundTrip(t *testing.T) {
 	shared, active := t.TempDir(), t.TempDir()
 	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}
