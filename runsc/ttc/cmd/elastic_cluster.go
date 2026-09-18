@@ -2033,11 +2033,58 @@ func orderFamilyRemovalPlacements(records []cluster.PlacementRecord, familyID st
 	}
 }
 
+type distributedStatsPartition struct {
+	node              string
+	physicalContainer string
+	logicalBranch     string
+}
+
+// distributedStatsPartitions returns one probe target for every physical
+// runtime. Grouping by node alone is insufficient: repeated migrations and
+// remote forks may leave several independent Sentries for one logical family
+// on the same node. Conversely, every branch in one Sentry must be accounted
+// together so that its shared-memory totals are not counted repeatedly.
+func distributedStatsPartitions(placements []cluster.PlacementRecord) []distributedStatsPartition {
+	byRuntime := make(map[string]distributedStatsPartition)
+	for _, placement := range placements {
+		if placement.OwnerNode == "" || (placement.State != cluster.PlacementRunning && placement.State != cluster.PlacementPaused) {
+			continue
+		}
+		physicalContainer := placement.PhysicalContainer
+		if physicalContainer == "" {
+			// Old in-flight placement records may omit the explicit physical
+			// container. Keep them isolated by logical branch rather than
+			// incorrectly merging unrelated runtimes on the same node.
+			physicalContainer = "logical:" + placement.BranchID
+		}
+		key := placement.OwnerNode + "\x00" + physicalContainer
+		partition, ok := byRuntime[key]
+		if !ok || placement.BranchID < partition.logicalBranch {
+			byRuntime[key] = distributedStatsPartition{
+				node:              placement.OwnerNode,
+				physicalContainer: physicalContainer,
+				logicalBranch:     placement.BranchID,
+			}
+		}
+	}
+	partitions := make([]distributedStatsPartition, 0, len(byRuntime))
+	for _, partition := range byRuntime {
+		partitions = append(partitions, partition)
+	}
+	sort.Slice(partitions, func(i, j int) bool {
+		if partitions[i].node != partitions[j].node {
+			return partitions[i].node < partitions[j].node
+		}
+		return partitions[i].physicalContainer < partitions[j].physicalContainer
+	})
+	return partitions
+}
+
 // executeDistributedStats obtains one accounting snapshot per physical
-// runtime owner and reduces them at the entry daemon. A node-local ttcvolume
-// repository can only describe branches resident on that node; trying to
-// account a split family from any single owner either fails or reports false
-// sharing. Raft placements define the authoritative partition.
+// runtime and reduces them at the entry daemon. A node-local ttcvolume
+// repository can only describe branches resident in that runtime; trying to
+// account a split family from one owner either drops sibling Sentries or
+// reports false sharing. Raft placements define the authoritative partition.
 func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int, []byte, []byte, error) {
 	if len(request.Args) < 2 || request.Args[0] != "stats" {
 		return false, 0, nil, nil, nil
@@ -2088,16 +2135,13 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 			}
 		}
 	}
-	owners := make(map[string]string)
+	partitions := distributedStatsPartitions(placements)
 	merged := FamilyResourceStats{Container: info.Name, Branches: []BranchResourceStats{}}
 	if merged.Container == "" {
 		merged.Container = target.container
 	}
 	for _, placement := range placements {
 		if placement.OwnerNode != "" && (placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused) {
-			if _, ok := owners[placement.OwnerNode]; !ok {
-				owners[placement.OwnerNode] = placement.BranchID
-			}
 			continue
 		}
 		// Process-free and corrupted branches have no node-local resident graph.
@@ -2126,13 +2170,10 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 			FilesystemRoot: filesystemRoot, SourceNode: sourceNode,
 		})
 	}
-	nodes := make([]string, 0, len(owners))
-	for node := range owners {
-		nodes = append(nodes, node)
-	}
-	sort.Strings(nodes)
-	for ordinal, node := range nodes {
-		args := []string{"_stats-local", "--json", info.Name + "@" + owners[node]}
+	imageAccounted := make(map[string]struct{})
+	for ordinal, partition := range partitions {
+		node := partition.node
+		args := []string{"_stats-local", "--json", info.Name + "@" + partition.logicalBranch}
 		child := daemonRequest{
 			Version: daemonAPIVersion, Action: "command", RequestID: distributedChildRequestID(request.RequestID, ordinal, args),
 			Args: args, DistributedLeaf: true,
@@ -2177,8 +2218,13 @@ func (s *daemonServer) executeDistributedStats(request daemonRequest) (bool, int
 		merged.FilesystemUniqueBytes += local.FilesystemUniqueBytes
 		merged.DependentMemoryBytes += local.DependentMemoryBytes
 		merged.DependentFilesystemBytes += local.DependentFilesystemBytes
-		merged.ImageCacheBytes += local.ImageCacheBytes
-		merged.ImageCacheTotalBytes += local.ImageCacheTotalBytes
+		// The extracted image cache is shared by every runtime on one node.
+		// Count it once per node, not once per physical Sentry.
+		if _, ok := imageAccounted[node]; !ok {
+			merged.ImageCacheBytes += local.ImageCacheBytes
+			merged.ImageCacheTotalBytes += local.ImageCacheTotalBytes
+			imageAccounted[node] = struct{}{}
+		}
 	}
 	sort.Slice(merged.Branches, func(i, j int) bool { return merged.Branches[i].Target < merged.Branches[j].Target })
 	var output bytes.Buffer

@@ -170,6 +170,26 @@ func TestSerializedAuthorityStateRefreshesAfterLock(t *testing.T) {
 	}
 }
 
+func TestDistributedStatsPartitionsEveryPhysicalRuntime(t *testing.T) {
+	placements := []cluster.PlacementRecord{
+		{OwnerNode: "node-b", PhysicalContainer: "physical-c", BranchID: "z", State: cluster.PlacementPaused},
+		{OwnerNode: "node-a", PhysicalContainer: "physical-a", BranchID: "main", State: cluster.PlacementRunning},
+		{OwnerNode: "node-a", PhysicalContainer: "physical-a", BranchID: "child", State: cluster.PlacementRunning},
+		{OwnerNode: "node-a", PhysicalContainer: "physical-b", BranchID: "other", State: cluster.PlacementRunning},
+		{OwnerNode: "node-a", PhysicalContainer: "physical-stopped", BranchID: "cold", State: cluster.PlacementUnplaced},
+		{OwnerNode: "", PhysicalContainer: "physical-none", BranchID: "none", State: cluster.PlacementRunning},
+	}
+	got := distributedStatsPartitions(placements)
+	want := []distributedStatsPartition{
+		{node: "node-a", physicalContainer: "physical-a", logicalBranch: "child"},
+		{node: "node-a", physicalContainer: "physical-b", logicalBranch: "other"},
+		{node: "node-b", physicalContainer: "physical-c", logicalBranch: "z"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("distributedStatsPartitions() = %#v, want %#v", got, want)
+	}
+}
+
 func TestDistributedSourceRuntimeWaitsForScheduledCleanup(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
 	release := make(chan struct{})
