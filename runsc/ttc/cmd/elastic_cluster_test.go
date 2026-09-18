@@ -688,10 +688,14 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	initial := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{
-			// Model metadata from before BeginBranchPublication reached the
-			// shared catalog. Raft has already committed this publication below.
+			// Model the publication queue's narrow post-Raft window: Begin has
+			// recorded the new publication identity but the physical branch still
+			// names its preceding shared manifest. Complete replaces the manifest
+			// path after the authority commit below.
 			ID: "cold", State: "running", StorageState: "local",
-			SnapshotID: 17, NodeID: "node-old", CreatedAt: time.Unix(1, 0).UTC(),
+			PublicationID:   publicationID,
+			StorageManifest: coldManifestPath(root, "family-id", "cold", "publication-previous"),
+			SnapshotID:      17, NodeID: "node-old", CreatedAt: time.Unix(1, 0).UTC(),
 		}},
 	}
 	if err := writeCurrentBundleFixture(metadataPath, initial); err != nil {

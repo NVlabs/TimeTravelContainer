@@ -1436,6 +1436,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	lastPublicationID := ""
+	lastManifest := ""
 	for {
 		// The manifest is the authoritative filesystem root and contains the
 		// exact physical record that published it. This remains resolvable after
@@ -1450,6 +1451,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
 		lastPublicationID = branch.PublicationID
+		lastManifest = branch.StorageManifest
 		// Raft publication commit is irreversible and precedes this derived
 		// metadata update. An empty or older ID therefore means the publisher
 		// has not completed its shared-catalog write yet, not that the committed
@@ -1459,10 +1461,8 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		// may materialize the branch into its disposable local cache for cp, a
 		// cold fork, or rehydration. That cache activity must not make the
 		// already-committed shared snapshot inadmissible on another node.
-		if branch.PublicationID == manifest.PublicationID && branch.StorageManifest != "" {
-			if filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
-				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s shared manifest is %q, committed authority has %q", manifest.Branch, branch.StorageManifest, expectedManifest)
-			}
+		if branch.PublicationID == manifest.PublicationID && branch.StorageManifest != "" &&
+			filepath.Clean(branch.StorageManifest) == filepath.Clean(expectedManifest) {
 			if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {
 				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", manifest.Branch, branch.SnapshotID, authority.Roots.MemorySnapshot)
 			}
@@ -1473,7 +1473,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 		}
 		select {
 		case <-ctx.Done():
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q, want %q): %w", lastPublicationID, manifest.PublicationID, ctx.Err())
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q manifest %q, want publication %q manifest %q): %w", lastPublicationID, lastManifest, manifest.PublicationID, expectedManifest, ctx.Err())
 		case <-ticker.C:
 		}
 	}
