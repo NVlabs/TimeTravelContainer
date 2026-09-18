@@ -34,8 +34,12 @@ import (
 type SpecialMappable struct {
 	SpecialMappableRefs
 
-	mf   *pgalloc.MemoryFile `state:"nosave"`
+	mf *pgalloc.MemoryFile `state:"nosave"`
+	// fr is the common single-run representation. frs is used only when a
+	// sparse restore places adjacent logical pages in discontiguous MemoryFile
+	// ranges. The ranges in frs are ordered by logical mappable offset.
 	fr   memmap.FileRange
+	frs  []memmap.FileRange
 	name string
 }
 
@@ -53,7 +57,9 @@ func NewSpecialMappable(name string, mf *pgalloc.MemoryFile, fr memmap.FileRange
 // DecRef implements refs.RefCounter.DecRef.
 func (m *SpecialMappable) DecRef(ctx context.Context) {
 	m.SpecialMappableRefs.DecRef(func() {
-		m.mf.DecRef(m.fr)
+		for _, fr := range m.fileRanges() {
+			m.mf.DecRef(fr)
+		}
 	})
 }
 
@@ -95,20 +101,29 @@ func (*SpecialMappable) CopyMapping(context.Context, memmap.MappingSpace, hostar
 // Translate implements memmap.Mappable.Translate.
 func (m *SpecialMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	var err error
-	if required.End > m.fr.Length() {
+	length := m.Length()
+	if required.End > length {
 		err = &memmap.BusError{linuxerr.EFAULT}
 	}
-	if source := optional.Intersect(memmap.MappableRange{0, m.fr.Length()}); source.Length() != 0 {
-		return []memmap.Translation{
-			{
+	optional = optional.Intersect(memmap.MappableRange{0, length})
+	if optional.Length() == 0 {
+		return nil, err
+	}
+	translations := make([]memmap.Translation, 0, len(m.fileRanges()))
+	var logical uint64
+	for _, fr := range m.fileRanges() {
+		logicalRange := memmap.MappableRange{Start: logical, End: logical + fr.Length()}
+		if source := optional.Intersect(logicalRange); source.Length() != 0 {
+			translations = append(translations, memmap.Translation{
 				Source: source,
 				File:   m.mf,
-				Offset: m.fr.Start + source.Start,
+				Offset: fr.Start + source.Start - logical,
 				Perms:  hostarch.AnyAccess,
-			},
-		}, err
+			})
+		}
+		logical = logicalRange.End
 	}
-	return nil, err
+	return translations, err
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
@@ -132,9 +147,11 @@ func (m *SpecialMappable) ValidateLiveForkMapping() error {
 //
 // Preconditions: m is not concurrently accessible.
 func (m *SpecialMappable) RebindMemoryFileRange(mf *pgalloc.MemoryFile, fr memmap.FileRange) {
-	oldMF, oldFR := m.mf, m.fr
-	m.mf, m.fr = mf, fr
-	oldMF.DecRef(oldFR)
+	oldMF, oldRanges := m.mf, m.fileRanges()
+	m.mf, m.fr, m.frs = mf, fr, nil
+	for _, oldFR := range oldRanges {
+		oldMF.DecRef(oldFR)
+	}
 }
 
 // InvalidateMappingsForMappable drops all cached PMAs and host address-space
@@ -159,15 +176,34 @@ func (mm *MemoryManager) InvalidateMappingsForMappable(m memmap.Mappable) {
 // FileRange returns the offsets into m.mf that stores the SpecialMappable's
 // contents.
 func (m *SpecialMappable) FileRange() memmap.FileRange {
+	if len(m.frs) != 0 {
+		panic("SpecialMappable has discontiguous MemoryFile ranges")
+	}
 	return m.fr
 }
 
 // MemoryFileRanges implements memmap.MemoryFileRangeProvider.
 func (m *SpecialMappable) MemoryFileRanges() []memmap.MemoryFileRange {
-	return []memmap.MemoryFileRange{{File: m.mf, Range: m.fr}}
+	ranges := m.fileRanges()
+	result := make([]memmap.MemoryFileRange, 0, len(ranges))
+	for _, fr := range ranges {
+		result = append(result, memmap.MemoryFileRange{File: m.mf, Range: fr})
+	}
+	return result
 }
 
 // Length returns the length of the SpecialMappable.
 func (m *SpecialMappable) Length() uint64 {
-	return m.fr.Length()
+	var length uint64
+	for _, fr := range m.fileRanges() {
+		length += fr.Length()
+	}
+	return length
+}
+
+func (m *SpecialMappable) fileRanges() []memmap.FileRange {
+	if len(m.frs) != 0 {
+		return m.frs
+	}
+	return []memmap.FileRange{m.fr}
 }

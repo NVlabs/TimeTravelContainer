@@ -237,13 +237,25 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment)
 // afterLoad is invoked by stateify.
 func (m *SpecialMappable) afterLoad(ctx goContext.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
-	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, m.mf, m.fr); err != nil {
-		panic(fmt.Sprintf("relocating SpecialMappable %q: %v", m.name, err))
-	} else {
-		m.fr = relocated
+	if relocation := pgalloc.SparseRelocationFromContext(ctx); relocation != nil {
+		var relocated []memmap.FileRange
+		for _, fr := range m.fileRanges() {
+			runs, err := relocation.Runs(m.mf.ResourceID(), fr)
+			if err != nil {
+				panic(fmt.Sprintf("relocating SpecialMappable %q: %v", m.name, err))
+			}
+			relocated = append(relocated, runs...)
+		}
+		if len(relocated) == 1 {
+			m.fr, m.frs = relocated[0], nil
+		} else {
+			m.fr, m.frs = memmap.FileRange{}, relocated
+		}
 	}
 	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
-		pgalloc.AcquireRestoreRef(ctx, m.mf, m.fr, 0)
+		for _, fr := range m.fileRanges() {
+			pgalloc.AcquireRestoreRef(ctx, m.mf, fr, 0)
+		}
 	}
 }
 

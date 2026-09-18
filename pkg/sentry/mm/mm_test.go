@@ -194,6 +194,69 @@ func TestInvalidateMappingsForReboundSpecialMappable(t *testing.T) {
 	}
 }
 
+func TestSpecialMappableSparseRestoreUsesDiscontiguousRanges(t *testing.T) {
+	ctx := contexttest.Context(t)
+	memMgr := testMemoryManager(ctx, t)
+	defer memMgr.DecUsers(ctx)
+
+	allocatePage := func(value byte) memmap.FileRange {
+		fr, err := memMgr.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks, err := memMgr.mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		data := bytes.Repeat([]byte{value}, hostarch.PageSize)
+		if _, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data))); err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		return fr
+	}
+	source, err := memMgr.mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := allocatePage(0x11)
+	gap := allocatePage(0x99)
+	defer memMgr.mf.DecRef(gap)
+	second := allocatePage(0x22)
+	relocation := pgalloc.NewSparseRelocation()
+	if err := relocation.Add(memMgr.mf.ResourceID(), source.Start, first.Start); err != nil {
+		t.Fatal(err)
+	}
+	if err := relocation.Add(memMgr.mf.ResourceID(), source.Start+hostarch.PageSize, second.Start); err != nil {
+		t.Fatal(err)
+	}
+	mappable := NewSpecialMappable("[sparse-test]", memMgr.mf, source)
+	loadCtx := context.WithValues(ctx, map[any]any{
+		pgalloc.CtxMemoryFile:       memMgr.mf,
+		pgalloc.CtxSparseRelocation: relocation,
+	})
+	mappable.afterLoad(loadCtx)
+	// In a real sparse restore the serialized source offsets do not own ranges
+	// in the target MemoryFile. This test allocated them only to obtain valid
+	// logical page identities.
+	memMgr.mf.DecRef(source)
+	defer mappable.DecRef(ctx)
+
+	translations, err := mappable.Translate(ctx,
+		memmap.MappableRange{End: 2 * hostarch.PageSize},
+		memmap.MappableRange{End: 2 * hostarch.PageSize}, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(translations) != 2 || translations[0].Offset != first.Start || translations[1].Offset != second.Start {
+		t.Fatalf("translations=%+v, want offsets %#x and %#x", translations, first.Start, second.Start)
+	}
+	if mappable.Length() != 2*hostarch.PageSize {
+		t.Fatalf("length=%d, want %d", mappable.Length(), 2*hostarch.PageSize)
+	}
+}
+
 func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)
