@@ -30,6 +30,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
@@ -1655,6 +1656,59 @@ func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
 	}
 	if snapshot, ok := repository.graph.Snapshot(100); !ok || snapshot.State != ttcsnapshot.SnapshotShared {
 		t.Fatalf("published snapshot=(%+v,%t), want shared", snapshot, ok)
+	}
+}
+
+func TestBranchDiffDuringOriginHandoff(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("diff-handoff", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt("peer", ino, []byte("peer"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.PrepareBranchPublication("peer"); err != nil {
+		t.Fatal(err)
+	}
+	root, ok := repository.graph.Root(graphRootName("peer"))
+	if !ok {
+		t.Fatal("peer graph root is absent")
+	}
+	if _, err := repository.FreezeOriginHandoff(root.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := repository.BranchDiff("peer")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("BranchDiff did not wait for handoff completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := repository.CompleteOriginHandoff(root.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BranchDiff remained blocked after handoff completion")
 	}
 }
 

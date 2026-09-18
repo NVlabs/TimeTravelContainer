@@ -51,6 +51,9 @@ const (
 	// large batch rather than imposed on every namespace mutation.
 	reclaimBatchObjects = 512
 	reclaimJournalBytes = 8 << 20
+
+	graphObservationRetryInterval  = 10 * time.Millisecond
+	graphObservationHandoffTimeout = 30 * time.Second
 )
 
 // ErrFinalBranch indicates that deleting a branch would leave a repository
@@ -3201,30 +3204,30 @@ type BranchSetDataUsage struct {
 // observations remain consistent without blocking guest writes for the whole
 // (potentially remote) metadata traversal.
 func (r *Repository) pinGraphRoots(names []string) (map[string]ttcsnapshot.ObjectID, []string, error) {
-	roots := make(map[string]ttcsnapshot.ObjectID, len(names))
-	pins := make([]string, 0, len(names))
-	err := r.withLock(func() error {
-		for _, name := range names {
-			root, ok := r.graph.Root(name)
-			if !ok {
-				return fmt.Errorf("snapshot graph root %q does not exist", name)
+	var roots map[string]ttcsnapshot.ObjectID
+	var pins []string
+	err := retryFrozenGraphObservation(func() error {
+		roots = make(map[string]ttcsnapshot.ObjectID, len(names))
+		pins = make([]string, 0, len(names))
+		return r.withLock(func() error {
+			add := make(map[string]ttcsnapshot.ObjectID, len(names))
+			for _, name := range names {
+				root, ok := r.graph.Root(name)
+				if !ok {
+					return fmt.Errorf("snapshot graph root %q does not exist", name)
+				}
+				var nonce [16]byte
+				if _, err := rand.Read(nonce[:]); err != nil {
+					return err
+				}
+				pin := "observe/" + hex.EncodeToString(nonce[:])
+				roots[name] = root
+				pins = append(pins, pin)
+				add[pin] = root
 			}
-			var nonce [16]byte
-			if _, err := rand.Read(nonce[:]); err != nil {
-				return err
-			}
-			pin := "observe/" + hex.EncodeToString(nonce[:])
-			if err := r.graph.SetPin(pin, root); err != nil {
-				return err
-			}
-			roots[name] = root
-			pins = append(pins, pin)
-		}
-		return nil
+			return r.graph.AddPins(add)
+		})
 	})
-	if err != nil && len(pins) != 0 {
-		_ = r.withLock(func() error { return r.graph.DeletePins(pins) })
-	}
 	return roots, pins, err
 }
 
@@ -3232,14 +3235,30 @@ func (r *Repository) releaseGraphObservation(pins []string) error {
 	if len(pins) == 0 {
 		return nil
 	}
-	return r.withLock(func() error { return r.graph.DeletePins(pins) })
+	return retryFrozenGraphObservation(func() error {
+		return r.withLock(func() error { return r.graph.DeletePins(pins) })
+	})
+}
+
+func retryFrozenGraphObservation(operation func() error) error {
+	deadline := time.Now().Add(graphObservationHandoffTimeout)
+	for {
+		err := operation()
+		if err == nil || !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
+			return err
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("waiting for snapshot authority handoff: %w", err)
+		}
+		time.Sleep(graphObservationRetryInterval)
+	}
 }
 
 // BranchSetUsage returns file-data sharing for branchIDs without walking the
 // guest namespace or materializing files. Sharing is based on immutable TTC
 // object identity, and therefore reflects TTC's file-level CoW boundary.
 func (r *Repository) BranchSetUsage(branchIDs []string) (result BranchSetDataUsage, resultErr error) {
-	if err := r.SyncMetadata(); err != nil {
+	if err := retryFrozenGraphObservation(r.SyncMetadata); err != nil {
 		return BranchSetDataUsage{}, err
 	}
 	ids := append([]string(nil), branchIDs...)
@@ -3320,7 +3339,7 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (result BranchSetDataUsa
 // root captured at its most recent fork. It reads TTC metadata; it does not
 // walk materialized host or guest directory trees.
 func (r *Repository) BranchDiff(branchID string) (changes []PathChange, resultErr error) {
-	if err := r.SyncMetadata(); err != nil {
+	if err := retryFrozenGraphObservation(r.SyncMetadata); err != nil {
 		return nil, err
 	}
 	branch, err := r.Branch(branchID)

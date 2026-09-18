@@ -47,6 +47,12 @@ const (
 	headFileName                    = "graph.head"
 )
 
+// ErrSnapshotLedgerFrozen reports a reference or object mutation that raced
+// the final provider-to-owner authority handoff. Callers performing transient
+// observations may wait for the short handoff barrier and retry; ordinary
+// mutations must propagate the error.
+var ErrSnapshotLedgerFrozen = errors.New("snapshot ledger is frozen for authority handoff")
+
 type graphHead struct {
 	Version    int    `json:"version"`
 	Generation uint64 `json:"generation"`
@@ -1501,11 +1507,11 @@ func validateFrozenSnapshotMutation(previous, next graphState, ops []journalOp) 
 		}
 		snapshot := SnapshotID(parsed)
 		if !sameObjectReferences(snapshotReferences(previous, snapshot), snapshotReferences(next, snapshot)) {
-			return fmt.Errorf("snapshot %d references are frozen for authority handoff", snapshot)
+			return fmt.Errorf("snapshot %d references are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 		}
 		for _, op := range ops {
 			if op.PutObject != nil && op.PutObject.ID.Snapshot == snapshot {
-				return fmt.Errorf("snapshot %d objects are frozen for authority handoff", snapshot)
+				return fmt.Errorf("snapshot %d objects are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 			}
 			if op.DeleteObject != "" {
 				id, err := parseObjectKey(op.DeleteObject)
@@ -1513,7 +1519,7 @@ func validateFrozenSnapshotMutation(previous, next graphState, ops []journalOp) 
 					return err
 				}
 				if id.Snapshot == snapshot {
-					return fmt.Errorf("snapshot %d objects are frozen for authority handoff", snapshot)
+					return fmt.Errorf("snapshot %d objects are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 				}
 			}
 		}
@@ -2513,6 +2519,59 @@ func (s *Store) SetPin(name string, id ObjectID) error {
 			return err
 		}
 		ops = append(ops, journalOp{PutObject: &old})
+	}
+	return s.commitLocked(ops)
+}
+
+// AddPins atomically installs a set of new pins. It is used by observations
+// that need a coherent view of several roots: either every root is retained,
+// or none are. Existing pin names are rejected.
+func (s *Store) AddPins(pins map[string]ObjectID) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(pins))
+	for name := range pins {
+		if err := validateRootName(name); err != nil {
+			return err
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	touched := make(map[string]Object, len(pins))
+	for _, name := range names {
+		if _, exists := s.state.Pins[name]; exists {
+			return fmt.Errorf("pin %q already exists", name)
+		}
+		id := pins[name]
+		object, ok := touched[id.key()]
+		if !ok {
+			object, ok = s.state.Objects[id.key()]
+		}
+		if !ok {
+			return fmt.Errorf("object %s does not exist", id.key())
+		}
+		if object.State != ObjectLive || object.Refs == math.MaxUint64 {
+			return fmt.Errorf("object %s cannot be retained", id.key())
+		}
+		object.Refs++
+		touched[id.key()] = object
+	}
+	ops := make([]journalOp, 0, len(touched)+len(names))
+	keys := make([]string, 0, len(touched))
+	for key := range touched {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		object := touched[key]
+		ops = append(ops, journalOp{PutObject: &object})
+	}
+	for _, name := range names {
+		id := pins[name]
+		ops = append(ops, journalOp{PinName: name, PutPin: &id})
 	}
 	return s.commitLocked(ops)
 }
