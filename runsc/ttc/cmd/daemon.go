@@ -5587,6 +5587,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	})
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
+	var localCacheCleanupStopped <-chan struct{}
 	var sharedGCDone chan struct{}
 	var sharedGCStopped <-chan struct{}
 	var elasticRecord *cluster.NodeRecord
@@ -5649,6 +5650,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		waitDaemonWorkerFor(sharedGCStopped, "shared GC coordinator", sharedGCStopTimeout, stderr)
 		close(clusterDone)
 		waitDaemonWorker(elasticHeartbeatStopped, "elastic heartbeat", stderr)
+		waitDaemonWorkerFor(localCacheCleanupStopped, "local cache cleanup", 5*time.Second, stderr)
 		if err := retireClusterNode(server.cleanStop.Load()); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: retiring cluster node: %v\n", err)
 		}
@@ -5788,13 +5790,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			var heartbeatFatal <-chan error
 			elasticHeartbeatStopped, heartbeatFatal, err = startElasticNodeHeartbeat(
 				clusterRuntime.directory, clusterRuntime.raftCatalog, *registered, clusterRuntime.lease,
-				stderr, clusterDone, targetBackend, leaseGuardian, fence, func() func() {
-					return server.lockDataRoot(dataRoot)
-				})
+				stderr, clusterDone, targetBackend, leaseGuardian, fence)
 			if err != nil {
 				clusterListener.Close()
 				return fmt.Errorf("starting elastic cluster heartbeat: %w", err)
 			}
+			localCacheCleanupStopped = maintainOrphanLocalCacheCleanup(
+				clusterRuntime.raftCatalog, targetBackend, clusterRuntime.lease/4, stderr, clusterDone,
+				func() func() { return server.lockDataRoot(dataRoot) })
 			go func() {
 				select {
 				case err := <-heartbeatFatal:

@@ -5691,8 +5691,8 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 // forward progress, after which every heartbeat is correctly rejected as
 // stale. The same worker continues after admission, avoiding a renewal gap at
 // the Joining -> Ready boundary.
-func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster.RaftCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, backend *runtimeBackend, guardian *os.File, fence func() error, lockLocalState func() func()) (<-chan struct{}, <-chan error, error) {
-	if directory == nil || authority == nil || backend == nil || guardian == nil || lockLocalState == nil {
+func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster.RaftCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, backend *runtimeBackend, guardian *os.File, fence func() error) (<-chan struct{}, <-chan error, error) {
+	if directory == nil || authority == nil || backend == nil || guardian == nil {
 		return nil, nil, errors.New("elastic heartbeat dependencies are incomplete")
 	}
 	authorityState, err := authority.AuthorityState()
@@ -5700,8 +5700,6 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 		return nil, nil, fmt.Errorf("reading initial Raft execution grants: %w", err)
 	}
 	lastExecutionGrants := nodeExecutionGrants(authorityState, initial.NodeID, initial.Incarnation)
-	var lastLocalCleanupFingerprint uint64
-	localCleanupInitialized := false
 	fatal := make(chan error, 1)
 	stopped := make(chan struct{})
 	go func(record cluster.NodeRecord) {
@@ -5726,26 +5724,6 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 				}
 			}
 			lastExecutionGrants = currentExecutionGrants
-			cleanupFingerprint := localCleanupAuthorityFingerprint(state)
-			if !localCleanupInitialized || cleanupFingerprint != lastLocalCleanupFingerprint {
-				// A command prepares node-local state and then commits its Raft
-				// placement while holding the lifecycle lock. The heartbeat state
-				// above may predate that commit. Reclaiming from it could therefore
-				// remove a newly prepared root between placement commit and sandbox
-				// launch. Take the same lock first and refresh authority under it so
-				// local deletion and command publication have one ordering.
-				currentState, unlock, err := serializedAuthorityState(lockLocalState, authority.AuthorityState)
-				if err != nil {
-					return fmt.Errorf("refreshing Raft authority for local cache reclamation: %w", err)
-				}
-				cleanupFingerprint = localCleanupAuthorityFingerprint(currentState)
-				if err := backend.reclaimOrphanLocalContainerDirs(currentState); err != nil && stderr != nil {
-					fmt.Fprintf(stderr, "ttcd: warning: reclaiming orphan node-local container caches: %v\n", err)
-				}
-				unlock()
-				lastLocalCleanupFingerprint = cleanupFingerprint
-				localCleanupInitialized = true
-			}
 			if _, err := guardian.Write([]byte{1}); err != nil {
 				return fmt.Errorf("notifying execution-lease guardian: %w", err)
 			}
@@ -5753,6 +5731,65 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 		}, fence, fatal)
 	}(initial)
 	return stopped, fatal, nil
+}
+
+// maintainOrphanLocalCacheCleanup keeps disposable node-local state bounded
+// without making execution-lease renewal wait for the global lifecycle lock.
+//
+// A command may hold that lock for an arbitrarily long but healthy operation,
+// such as a large sibling fork or node evacuation. Cache cleanup used to run
+// synchronously after every successful heartbeat; once it blocked behind such
+// a command, no later heartbeat could renew the lease or pulse the out-of-
+// process guardian, and the healthy node self-fenced. Cleanup has no bearing on
+// execution authority, so it belongs in an independent maintenance worker.
+//
+// The worker still takes the lifecycle lock before refreshing Raft state and
+// deleting anything. This preserves the ordering that prevents it from
+// reclaiming a local root between a foreground command preparing that root and
+// committing its placement.
+func maintainOrphanLocalCacheCleanup(authority *cluster.RaftCatalog, backend *runtimeBackend, interval time.Duration, stderr io.Writer, done <-chan struct{}, lockLocalState func() func()) <-chan struct{} {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		if authority == nil || backend == nil || lockLocalState == nil {
+			return
+		}
+		if interval < time.Second {
+			interval = time.Second
+		}
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		var lastFingerprint uint64
+		initialized := false
+		for {
+			select {
+			case <-done:
+				return
+			case <-timer.C:
+			}
+
+			currentState, unlock, err := serializedAuthorityState(lockLocalState, authority.AuthorityState)
+			if err == nil {
+				fingerprint := localCleanupAuthorityFingerprint(currentState)
+				if !initialized || fingerprint != lastFingerprint {
+					if cleanupErr := backend.reclaimOrphanLocalContainerDirs(currentState); cleanupErr != nil {
+						if stderr != nil {
+							fmt.Fprintf(stderr, "ttcd: warning: reclaiming orphan node-local container caches: %v\n", cleanupErr)
+						}
+					} else {
+						lastFingerprint = fingerprint
+						initialized = true
+					}
+				}
+				unlock()
+			} else if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: warning: refreshing Raft authority for local cache reclamation: %v\n", err)
+			}
+
+			timer.Reset(interval)
+		}
+	}()
+	return stopped
 }
 
 // serializedAuthorityState reads the authority state only after acquiring the
