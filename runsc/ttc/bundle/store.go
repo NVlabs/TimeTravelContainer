@@ -5459,13 +5459,24 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 }
 
 // PruneSharedImagePacks removes manifests no longer referenced by an image tag
-// or container, then collects old packs unreachable from the remaining
-// manifests. Newly completed but not-yet-published packs receive a one-hour
-// recovery grace so a concurrent slow publisher cannot lose its data object.
-func (s Store) PruneSharedImagePacks(ctx context.Context) (int, int, error) {
+// or container, then collects packs unreachable from the remaining manifests.
+// Publication and collection share an NFS-visible lock, so a completed pack
+// cannot be mistaken for garbage in the short interval before its manifest is
+// installed. This makes an explicit image removal reclaim storage immediately
+// instead of retaining every removed image for a one-hour crash grace.
+func (s Store) PruneSharedImagePacks(ctx context.Context) (removedManifests, removedPacks int, retErr error) {
 	if s.activeRoot() == s.Root {
 		return 0, 0, nil
 	}
+	err := s.withSharedImagePackLock(func() error {
+		var err error
+		removedManifests, removedPacks, err = s.pruneSharedImagePacksLocked(ctx)
+		return err
+	})
+	return removedManifests, removedPacks, err
+}
+
+func (s Store) pruneSharedImagePacksLocked(ctx context.Context) (int, int, error) {
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
 		return 0, 0, err
@@ -5526,7 +5537,7 @@ func (s Store) PruneSharedImagePacks(ctx context.Context) (int, int, error) {
 		id, _ := ttcpack.ParseID(manifest.Pack)
 		keepPacks[id] = struct{}{}
 	}
-	removedPacks, err := ttcpack.Collect(s.sharedImagePackRoot(), keepPacks, time.Now().Add(-time.Hour).UnixNano())
+	removedPacks, err := ttcpack.Collect(s.sharedImagePackRoot(), keepPacks, 0)
 	return removedManifests, removedPacks, err
 }
 
@@ -5852,6 +5863,12 @@ func (s Store) sharedImagePackManifestPath(key string) string {
 }
 
 func (s Store) publishSharedImagePack(key, imageDir string, info images.RootFSInfo) error {
+	return s.withSharedImagePackLock(func() error {
+		return s.publishSharedImagePackLocked(key, imageDir, info)
+	})
+}
+
+func (s Store) publishSharedImagePackLocked(key, imageDir string, info images.RootFSInfo) error {
 	root := s.sharedImagePackRoot()
 	manifestPath := s.sharedImagePackManifestPath(key)
 	if existing, err := loadSharedImagePackManifest(manifestPath); err == nil {
@@ -5889,6 +5906,23 @@ func (s Store) publishSharedImagePack(key, imageDir string, info images.RootFSIn
 		return err
 	}
 	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func (s Store) withSharedImagePackLock(fn func() error) error {
+	root := s.sharedImagePackRoot()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return fmt.Errorf("creating shared image-pack directory: %w", err)
+	}
+	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening shared image-pack lock: %w", err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("locking shared image packs: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	return fn()
 }
 
 // installSharedImagePackManifest publishes manifest exactly once. Hard-linking

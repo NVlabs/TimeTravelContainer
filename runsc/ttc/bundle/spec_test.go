@@ -2907,13 +2907,12 @@ func TestPruneUnreferencedSharedImagePack(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, _ := ttcpack.ParseID(manifest.Pack)
-	old := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(ttcpack.Path(store.sharedImagePackRoot(), id), old, old); err != nil {
-		t.Fatal(err)
-	}
 	manifests, packs, err := store.PruneSharedImagePacks(context.Background())
 	if err != nil || manifests != 1 || packs != 1 {
 		t.Fatalf("PruneSharedImagePacks = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
+	}
+	if _, err := os.Stat(ttcpack.Path(store.sharedImagePackRoot(), id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreferenced pack remains after immediate prune: %v", err)
 	}
 }
 
