@@ -974,7 +974,7 @@ func TestFreshDaemonRootAllowsOnlyActiveStartupLog(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("reading startup root: entries=%v err=%v", entries, err)
 	}
-	if !freshDaemonRootEntryAllowed(entries[0], logInfo) {
+	if !freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
 		t.Fatal("active startup log was not admitted")
 	}
 	other, err := os.CreateTemp(t.TempDir(), "other-log-")
@@ -986,8 +986,36 @@ func TestFreshDaemonRootAllowsOnlyActiveStartupLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if freshDaemonRootEntryAllowed(entries[0], otherInfo) {
+	if freshDaemonRootEntryAllowed(root, entries[0], otherInfo) {
 		t.Fatal("stale startup log was admitted")
+	}
+}
+
+func TestFreshDaemonRootAllowsNestedActiveStartupLog(t *testing.T) {
+	root := t.TempDir()
+	run := filepath.Join(root, "run", "daemon")
+	if err := os.MkdirAll(run, 0700); err != nil {
+		t.Fatal(err)
+	}
+	logFile, err := os.OpenFile(filepath.Join(run, "ttcd.log"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	logInfo, err := logFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 1 || !freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
+		t.Fatalf("nested active startup log was not admitted: entries=%v err=%v", entries, err)
+	}
+	if err := os.WriteFile(filepath.Join(run, "stale"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(root)
+	if err != nil || freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
+		t.Fatalf("populated startup subtree was admitted: entries=%v err=%v", entries, err)
 	}
 }
 

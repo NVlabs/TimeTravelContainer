@@ -3885,7 +3885,7 @@ type daemonRootMarker struct {
 
 const daemonRootMarkerTemporaryPrefix = ".ttc-root-format.tmp-"
 
-func freshDaemonRootEntryAllowed(entry os.DirEntry, startupLog os.FileInfo) bool {
+func freshDaemonRootEntryAllowed(root string, entry os.DirEntry, startupLog os.FileInfo) bool {
 	if entry.Name() == "lost+found" || strings.HasPrefix(entry.Name(), daemonRootMarkerTemporaryPrefix) && entry.Type().IsRegular() {
 		return true
 	}
@@ -3894,11 +3894,42 @@ func freshDaemonRootEntryAllowed(entry os.DirEntry, startupLog os.FileInfo) bool
 	// is necessarily visible before the daemon can publish the format marker.
 	// Admit only the exact regular file currently attached to stderr; a stale
 	// or user-created ttcd.log must still make an unmarked root fail closed.
-	if entry.Name() != "ttcd.log" || startupLog == nil || !entry.Type().IsRegular() {
+	if startupLog == nil {
 		return false
 	}
-	info, err := entry.Info()
-	return err == nil && os.SameFile(info, startupLog)
+	if entry.Name() == "ttcd.log" && entry.Type().IsRegular() {
+		info, err := entry.Info()
+		return err == nil && os.SameFile(info, startupLog)
+	}
+	if !entry.IsDir() {
+		return false
+	}
+	// TTC_SOCKET commonly lives in a subdirectory of TTC_LOCAL_ROOT (for
+	// example, $TTC_LOCAL_ROOT/run/ttcd.sock). The thin client necessarily
+	// creates that directory and opens its startup log before ttcd can publish
+	// the root marker. Admit the subtree only when every entry is a directory on
+	// the path to the exact regular file currently attached to stderr. Empty,
+	// stale, symlinked, or otherwise populated trees remain old-format roots.
+	found := false
+	path := filepath.Join(root, entry.Name())
+	err := filepath.WalkDir(path, func(candidate string, child os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if candidate == path || child.IsDir() {
+			return nil
+		}
+		if found || child.Name() != "ttcd.log" || !child.Type().IsRegular() {
+			return errors.New("unexpected startup-root entry")
+		}
+		info, err := child.Info()
+		if err != nil || !os.SameFile(info, startupLog) {
+			return errors.New("startup log does not match daemon stderr")
+		}
+		found = true
+		return nil
+	})
+	return err == nil && found
 }
 
 func daemonStartupLogInfo() os.FileInfo {
@@ -3985,7 +4016,7 @@ func inspectDaemonStorageRoot(root, role string) error {
 	}
 	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {
-		if !freshDaemonRootEntryAllowed(entry, startupLog) {
+		if !freshDaemonRootEntryAllowed(root, entry, startupLog) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
 	}
@@ -4087,7 +4118,7 @@ func prepareDaemonStorageRoot(root, role, repositoryID, nodeID string) error {
 	}
 	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {
-		if !freshDaemonRootEntryAllowed(entry, startupLog) {
+		if !freshDaemonRootEntryAllowed(root, entry, startupLog) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
 	}
