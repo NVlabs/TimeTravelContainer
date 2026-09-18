@@ -3119,6 +3119,7 @@ func marshalInspectTemplateJSON(value any) ([]byte, error) {
 }
 
 func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "fv")
 	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	force := fs.Bool("force", false, "force removal of running branches")
@@ -7756,11 +7757,20 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 }
 
 func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error) {
-	resolved, _, err := b.resolveSelector(request.target)
+	resolved, info, err := b.resolveSelector(request.target)
 	if err != nil {
 		return 1, err
 	}
 	request.target = resolved
+	if b.dataRoot != "" {
+		branch, err := persistentBranchInfo(info, request.target.branch)
+		if err != nil {
+			return 1, err
+		}
+		if state := normalizeLifecycleState(branch.State); state != "running" {
+			return 1, fmt.Errorf("cannot exec in branch %s: branch is %s", request.target, state)
+		}
+	}
 	if request.terminal && request.processPath == "" && !environmentHasKey(request.env, "TERM") {
 		request.env = append(request.env, "TERM="+terminalType(b.clientTERM))
 	}
@@ -15541,6 +15551,9 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 			return nil, closeErr
 		}
 		for _, change := range diff {
+			if syntheticRootfsMountChange(spec, mount, change.Path) {
+				continue
+			}
 			path := mount
 			if change.Path != "/" {
 				path = filepath.Join(mount, strings.TrimPrefix(change.Path, "/"))
@@ -15557,6 +15570,26 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		return changes[i].Path < changes[j].Path
 	})
 	return changes, nil
+}
+
+// syntheticRootfsMountChange hides rootfs entries created solely to host OCI
+// mounts. The mounted repository reports its own guest-visible changes; also
+// returning the covered rootfs directory produces duplicate paths such as
+// /data and leaks runtime scaffolding such as /proc and /sys into ttc diff.
+func syntheticRootfsMountChange(spec *specs.Spec, repositoryMount, repositoryPath string) bool {
+	if repositoryMount != "/" {
+		return false
+	}
+	path := filepath.Clean(repositoryPath)
+	if path == "/" {
+		return true
+	}
+	for _, mount := range spec.Mounts {
+		if filepath.Clean(mount.Destination) == path {
+			return true
+		}
+	}
+	return false
 }
 
 func addResourceBytes(target *ResourceBytes, privateBytes, sharedBytes uint64) {

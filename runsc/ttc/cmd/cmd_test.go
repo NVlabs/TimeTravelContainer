@@ -1405,6 +1405,14 @@ func TestRemoveAcceptsFamiliesAndQualifiedBranches(t *testing.T) {
 	if !b.destroyForce {
 		t.Error("rm -f did not force branch removal")
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"rm", "-fv", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("combined family rm flags status=%d, stderr=%q", status, stderr.String())
+	}
+	if !b.removeForce || !b.removeVolumes {
+		t.Errorf("rm -fv parsed force=%t volumes=%t", b.removeForce, b.removeVolumes)
+	}
 }
 
 func TestPullNormalizesDockerReference(t *testing.T) {
@@ -2960,6 +2968,34 @@ func TestDiffHumanAndJSON(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"path": "/work/new"`) || !strings.Contains(stdout.String(), `"kind": "add"`) {
 		t.Fatalf("diff JSON=%q", stdout.String())
+	}
+}
+
+func TestSyntheticRootfsMountChange(t *testing.T) {
+	spec := &specs.Spec{Mounts: []specs.Mount{
+		{Destination: "/proc"},
+		{Destination: "/data"},
+		{Destination: "/etc/hostname"},
+	}}
+	tests := []struct {
+		name            string
+		repositoryMount string
+		repositoryPath  string
+		want            bool
+	}{
+		{name: "root entry", repositoryMount: "/", repositoryPath: "/", want: true},
+		{name: "runtime proc mount", repositoryMount: "/", repositoryPath: "/proc", want: true},
+		{name: "user data mount", repositoryMount: "/", repositoryPath: "/data/", want: true},
+		{name: "ordinary rootfs path", repositoryMount: "/", repositoryPath: "/root", want: false},
+		{name: "mounted repository root", repositoryMount: "/data", repositoryPath: "/", want: false},
+		{name: "mounted repository child", repositoryMount: "/data", repositoryPath: "/file", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := syntheticRootfsMountChange(spec, test.repositoryMount, test.repositoryPath); got != test.want {
+				t.Fatalf("syntheticRootfsMountChange(%q, %q) = %t, want %t", test.repositoryMount, test.repositoryPath, got, test.want)
+			}
+		})
 	}
 }
 
