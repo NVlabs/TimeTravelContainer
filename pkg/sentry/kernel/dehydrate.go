@@ -604,7 +604,9 @@ func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		if err != nil {
 			return nil, err
 		}
-		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true, RangeLoaded: chunkReader.RangeLoaded})
+		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{
+			DemandOnly: true, DurableBacking: true, RangeLoaded: chunkReader.RangeLoaded,
+		})
 		if err != nil {
 			chunkReader.AbortConsumption()
 			return nil, err

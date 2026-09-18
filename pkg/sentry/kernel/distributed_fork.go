@@ -726,10 +726,17 @@ func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadSta
 	result := pgalloc.AsyncPagesFileLoadStats{Done: true}
 	var diagnostics []string
 	for _, load := range loads {
+		status := load.Stats()
+		// Durable backing removes the source-node dependency, but it does not
+		// make a failed immutable reader healthy. Always surface terminal reader
+		// errors so a later shared-pack/relay failure cannot masquerade as a
+		// successfully independent branch.
+		if status.Error != "" {
+			diagnostics = append(diagnostics, status.Error)
+		}
 		if load.HasDurableBacking() {
 			continue
 		}
-		status := load.Stats()
 		result.Done = result.Done && status.Done
 		result.DemandOnly = result.DemandOnly || status.DemandOnly
 		result.BytesLoaded += status.BytesLoaded
@@ -743,9 +750,6 @@ func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadSta
 		result.TotalWaiters += status.TotalWaiters
 		result.Faults += status.Faults
 		result.SequentialFaults += status.SequentialFaults
-		if status.Error != "" {
-			diagnostics = append(diagnostics, status.Error)
-		}
 	}
 	result.Error = strings.Join(diagnostics, "; ")
 	return result

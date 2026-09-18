@@ -1361,6 +1361,25 @@ func TestRemoteSnapshotRetainsUpstreamPageLoad(t *testing.T) {
 	}
 }
 
+func TestAsyncPagesFileLoadStartsWithDurableBacking(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 1)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, sourceFR.Length(), 16, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, DurableBacking: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pages.HasDurableBacking() {
+		t.Fatal("graph-native page load was not marked durable")
+	}
+	_ = pages.DecOwner()
+}
+
 func TestRemoteSnapshotAcquireReleaseRace(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 1)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})

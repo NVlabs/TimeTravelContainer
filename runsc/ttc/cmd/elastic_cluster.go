@@ -2726,6 +2726,19 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	if b.distributedSource == nil || b.distributedSource.directory == nil || b.nodeID == "" {
 		return errors.New("elastic migration requires dynamic cluster discovery")
 	}
+	// Migration seals graph and filesystem generations just like a remote
+	// fork. Serialize that capture against the brief provider-to-shared
+	// reference-ledger handoff. In particular, rehydrate may return while its
+	// durable snapshot is still finishing this handoff; a migration requested
+	// immediately afterwards must wait rather than fail with a transient
+	// "references are frozen" error.
+	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	foregroundCaptureActive := true
+	defer func() {
+		if foregroundCaptureActive {
+			finishForegroundCapture()
+		}
+	}()
 	logicalTarget := target
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -2954,6 +2967,8 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 			err = closeErr
 		}
 	}
+	finishForegroundCapture()
+	foregroundCaptureActive = false
 	if err != nil {
 		return abort(errors.Join(fmt.Errorf("capturing sparse migration source: %w", err), finishFilesystemOrigins(false)))
 	}
@@ -3267,6 +3282,20 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
 		}
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
+	}
+	// Destroy transfers a branch's page-loader ownership to an arbitrary
+	// surviving Kernel that shares its family MemoryFile. A source involved in
+	// repeated migration can still own a volatile predecessor loader even after
+	// its target has become independently graph-backed. Materialize those
+	// remaining pages before the transfer; otherwise the predecessor runtime
+	// may be reclaimed just after the transfer and a later sibling fault sees
+	// EIO. This is background source cleanup, so it does not extend migration
+	// time-to-execution, and already-durable loaders complete immediately.
+	if _, err := b.command("timetravel", info.ID, "distributed-drain", branchID); err != nil {
+		return fmt.Errorf("draining migrated source memory before branch transfer: %w", err)
+	}
+	if err := b.waitDistributedBranchMemory(info.ID, branchID, 5*time.Minute); err != nil {
+		return fmt.Errorf("settling migrated source memory before branch transfer: %w", err)
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
 		families, listErr := b.listRuntimeFamilies()

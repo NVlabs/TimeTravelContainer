@@ -1438,6 +1438,13 @@ type AsyncPagesFileLoadOpts struct {
 	// by a current waiter are read until Drain is called.
 	DemandOnly bool
 
+	// DurableBacking declares that ar reads immutable durable storage rather
+	// than a live source runtime. Most remote loaders become durable later via
+	// SwitchReader, but graph-native cold restores start in this state. This is
+	// lifecycle authority, not an I/O-success assertion: terminal reader errors
+	// remain observable through Stats.
+	DurableBacking bool
+
 	// PrefetchBytes speculatively loads up to this many page-aligned bytes
 	// immediately following a demanded range. It is effective only while
 	// DemandOnly is true; Drain already loads every remaining page.
@@ -1558,6 +1565,7 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		done:                       make(chan struct{}),
 	}
 	apfl.owners.Store(1)
+	apfl.durableBacking.Store(opts.DurableBacking)
 	apfl.prefetchAheadBytes.Store(opts.PrefetchBytes)
 	apfl.prefetchBehindBytes.Store(opts.PrefetchBehindBytes)
 	apfl.demandOnly.Store(opts.DemandOnly)

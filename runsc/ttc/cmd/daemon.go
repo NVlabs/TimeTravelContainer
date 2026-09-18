@@ -2007,11 +2007,25 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			if !tx.Activated {
 				continue
 			}
+			// The logical branch name is deliberately decoupled from the private
+			// branch ID installed in the target Sentry. In particular, migration
+			// keeps the user-visible name stable while each hop receives a fresh
+			// transaction-scoped runtime branch. Polling VisibleTargetBranch here
+			// therefore observed a nonexistent branch after the first hop and left
+			// source-side heuristics as the only independence driver. Resolve the
+			// transaction's exact physical branch for every poll instead.
+			_, physicalBranch, _, branchErr := r.backend.containerStore().DistributedForkTargetBranch(transactionID)
+			if branchErr != nil {
+				if tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+					return
+				}
+				continue
+			}
+			targetBranch := physicalBranch.ID
 			releasePoll, admitted := r.tryDependencyPoll()
 			if !admitted {
 				continue
 			}
-			targetBranch := tx.Identity.VisibleTargetBranch()
 			if adaptive == nil && tx.Negotiated.PagingPolicy.Prefetch == ttcpolicy.PrefetchAdaptive {
 				adaptive = newAdaptivePrefetchController(tx.Negotiated.PagingPolicy)
 			}

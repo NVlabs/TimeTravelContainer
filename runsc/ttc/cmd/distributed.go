@@ -3383,6 +3383,15 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 		if err := json.Unmarshal(output, &status); err != nil {
 			return
 		}
+		// Close releases every still-retained page and consequently reports zero
+		// outstanding bytes. That is cancellation, not proof that the target
+		// installed the bytes. A source Sentry can close a session while an older
+		// migration is being retired; treating that local cleanup as a successful
+		// ACK fence makes a later migration cascade independence through the whole
+		// chain and strands the newest target on a dead TCP reader.
+		if status.Snapshot.Closed {
+			return
+		}
 		if status.Snapshot.PagesOutstanding != 0 {
 			continue
 		}

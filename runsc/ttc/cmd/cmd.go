@@ -14046,17 +14046,6 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 	if transactionID == "" || (branch.DependentMemoryBytes == 0 && branch.DependentFilesystemBytes == 0) {
 		return nil
 	}
-	readStatus := func() (pgalloc.AsyncPagesFileLoadStats, error) {
-		output, err := b.command("timetravel", info.ID, "distributed-dependency", branch.ID)
-		if err != nil {
-			return pgalloc.AsyncPagesFileLoadStats{}, err
-		}
-		var status pgalloc.AsyncPagesFileLoadStats
-		if err := json.Unmarshal(output, &status); err != nil {
-			return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("decoding remote-memory dependency: %w", err)
-		}
-		return status, nil
-	}
 	action := "distributed-filesystem-drain"
 	if branch.DependentMemoryBytes != 0 {
 		action = "distributed-drain"
@@ -14065,22 +14054,8 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 		return err
 	}
 	if branch.DependentMemoryBytes != 0 {
-		deadline := time.Now().Add(5 * time.Minute)
-		for {
-			status, err := readStatus()
-			if err != nil {
-				return err
-			}
-			if status.Done {
-				if status.Error != "" {
-					return errors.New(status.Error)
-				}
-				break
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
-			}
-			time.Sleep(10 * time.Millisecond)
+		if err := b.waitDistributedBranchMemory(info.ID, branch.ID, 5*time.Minute); err != nil {
+			return err
 		}
 	}
 	if err := b.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0); err != nil {
@@ -14104,6 +14079,33 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 		return fmt.Errorf("distributed fork transaction %q is %s: %s", transactionID, tx.State, tx.Failure)
 	default:
 		return fmt.Errorf("distributed fork transaction %q is unexpectedly %s", transactionID, tx.State)
+	}
+}
+
+// waitDistributedBranchMemory waits until all volatile readers owned by one
+// live branch have either materialized their pages or failed. Durable graph
+// readers intentionally report no source dependency and do not get drained.
+func (b *runtimeBackend) waitDistributedBranchMemory(containerID, branchID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		output, err := b.command("timetravel", containerID, "distributed-dependency", branchID)
+		if err != nil {
+			return err
+		}
+		var status pgalloc.AsyncPagesFileLoadStats
+		if err := json.Unmarshal(output, &status); err != nil {
+			return fmt.Errorf("decoding remote-memory dependency: %w", err)
+		}
+		if status.Done {
+			if status.Error != "" {
+				return errors.New(status.Error)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
