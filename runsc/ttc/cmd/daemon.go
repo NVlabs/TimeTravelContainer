@@ -5979,7 +5979,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		}()
 		defer shutdownClusterServer(clusterServer)
 		if clusterRuntime.directory != nil {
-			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes()
+			clusterRuntime.nodeRecord.MemoryCurrentBytes, _ = currentNodeMemoryBytes(localRoot)
 			drainIntent, err := loadElasticDrainIntent(dataRoot, clusterRuntime.nodeRecord.NodeID)
 			if err != nil {
 				clusterListener.Close()

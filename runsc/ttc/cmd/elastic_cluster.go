@@ -4793,7 +4793,7 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 		lease = source.LeaseExpiresAt.Sub(source.UpdatedAt)
 	}
 	current := source.MemoryCurrentBytes
-	if measured, measureErr := currentNodeMemoryBytes(); measureErr == nil {
+	if measured, measureErr := currentNodeMemoryBytes(b.activeDataRoot()); measureErr == nil {
 		current = measured
 	}
 	source, err = b.distributedSource.directory.Heartbeat(source.NodeID, source.Incarnation, current, time.Now(), lease)
@@ -5171,109 +5171,11 @@ func advertisedPageAddress(baseURL string) (string, error) {
 	return net.JoinHostPort(parsed.Hostname(), "0"), nil
 }
 
-// cgroupMemoryFiles resolves the memory-accounting file for both cgroup v2
-// and cgroup v1. The latter is still common on compute clusters. Mountinfo is
-// authoritative because a cgroup hierarchy may be mounted somewhere other
-// than /sys/fs/cgroup and may expose a subtree rather than hierarchy root.
-func cgroupMemoryFiles(cgroupData, mountInfoData string) []string {
-	var unifiedPath, memoryPath string
-	for _, line := range strings.Split(cgroupData, "\n") {
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		if parts[0] == "0" && parts[1] == "" {
-			unifiedPath = parts[2]
-		}
-		for _, controller := range strings.Split(parts[1], ",") {
-			if controller == "memory" {
-				memoryPath = parts[2]
-				break
-			}
-		}
-	}
-	type candidate struct {
-		path string
-		v2   bool
-	}
-	var candidates []candidate
-	for _, line := range strings.Split(mountInfoData, "\n") {
-		sections := strings.SplitN(line, " - ", 2)
-		if len(sections) != 2 {
-			continue
-		}
-		mountFields := strings.Fields(sections[0])
-		fsFields := strings.Fields(sections[1])
-		if len(mountFields) < 5 || len(fsFields) < 3 {
-			continue
-		}
-		fsType := fsFields[0]
-		membership := ""
-		v2 := false
-		switch fsType {
-		case "cgroup2":
-			membership, v2 = unifiedPath, true
-		case "cgroup":
-			if !slices.Contains(strings.Split(fsFields[2], ","), "memory") {
-				continue
-			}
-			membership = memoryPath
-		default:
-			continue
-		}
-		if membership == "" {
-			continue
-		}
-		mountRoot := filepath.Clean(unescapeMountInfoPath(mountFields[3]))
-		member := filepath.Clean("/" + strings.TrimPrefix(membership, "/"))
-		relative := ""
-		if mountRoot == "/" {
-			relative = strings.TrimPrefix(member, "/")
-		} else if member == mountRoot {
-			relative = ""
-		} else if strings.HasPrefix(member, mountRoot+"/") {
-			relative = strings.TrimPrefix(strings.TrimPrefix(member, mountRoot), "/")
-		} else {
-			continue
-		}
-		file := "memory.usage_in_bytes"
-		if v2 {
-			file = "memory.current"
-		}
-		candidates = append(candidates, candidate{
-			path: filepath.Join(unescapeMountInfoPath(mountFields[4]), relative, file),
-			v2:   v2,
-		})
-	}
-	// Prefer the unified hierarchy if a host exposes both layouts.
-	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].v2 && !candidates[j].v2 })
-	result := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		if !slices.Contains(result, candidate.path) {
-			result = append(result, candidate.path)
-		}
-	}
-	return result
-}
-
-func unescapeMountInfoPath(path string) string {
-	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
-	return replacer.Replace(path)
-}
-
-// currentNodeMemoryBytes prefers the containing cgroup because Sentries are
-// daemon siblings rather than children whose RSS can be summed reliably.
-func currentNodeMemoryBytes() (uint64, error) {
-	cgroupData, cgroupErr := os.ReadFile("/proc/self/cgroup")
-	mountInfoData, mountInfoErr := os.ReadFile("/proc/self/mountinfo")
-	if cgroupErr == nil && mountInfoErr == nil {
-		for _, path := range cgroupMemoryFiles(string(cgroupData), string(mountInfoData)) {
-			if value, err := readUintFile(path); err == nil {
-				return value, nil
-			}
-		}
-	}
-	statm, err := os.ReadFile("/proc/self/statm")
+// processResidentMemoryBytes returns the resident bytes charged to one host
+// process. /proc contains process leaders, rather than every thread, so this
+// does not multiply the Sentry's shared address space by its systrap threads.
+func processResidentMemoryBytes(pid int) (uint64, error) {
+	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
 	if err != nil {
 		return 0, err
 	}
@@ -5288,12 +5190,47 @@ func currentNodeMemoryBytes() (uint64, error) {
 	return residentPages * uint64(os.Getpagesize()), nil
 }
 
-func readUintFile(path string) (uint64, error) {
-	data, err := os.ReadFile(path)
+// currentNodeMemoryBytes accounts only memory controlled by this TTC node.
+//
+// A daemon is often launched directly from a login shell, systemd --user, or a
+// batch allocation. Its containing cgroup can therefore include unrelated
+// jobs, caches, and even other TTC roots. Using memory.current from that cgroup
+// made an idle daemon appear pressured and caused placement churn that TTC
+// could not relieve. Sentries are daemon siblings, but every runtime and
+// helper created for this node carries its node-local root in argv. Scan those
+// process leaders and add the daemon itself explicitly.
+func currentNodeMemoryBytes(localRoot string) (uint64, error) {
+	self := os.Getpid()
+	total, err := processResidentMemoryBytes(self)
 	if err != nil {
 		return 0, err
 	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if localRoot == "" {
+		return total, nil
+	}
+	localRoot = filepath.Clean(localRoot)
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || !bytes.Contains(cmdline, []byte(localRoot)) {
+			continue
+		}
+		resident, err := processResidentMemoryBytes(pid)
+		if err != nil {
+			// Processes naturally race the scan by exiting. An unreadable entry
+			// no longer contributes to current resident usage.
+			continue
+		}
+		total += resident
+	}
+	return total, nil
 }
 
 type elasticFencedProcess struct {
@@ -5889,7 +5826,7 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 	return os.Remove(path)
 }
 
-func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func(*cluster.AuthorityState) error, fence func() error, fatal chan<- error) {
+func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, localRoot string, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func(*cluster.AuthorityState) error, fence func() error, fatal chan<- error) {
 	// Begin renewing well before the fencing window. Cluster control traffic may
 	// share a constrained link with peer paging or a network filesystem, so a
 	// healthy renewal must be allowed to absorb a transient multi-second queue
@@ -5939,7 +5876,7 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 				}
 				return
 			}
-			current, err := currentNodeMemoryBytes()
+			current, err := currentNodeMemoryBytes(localRoot)
 			var authorityState *cluster.AuthorityState
 			if err == nil {
 				if catalog, ok := directory.(*cluster.RaftCatalog); ok {
@@ -6024,7 +5961,7 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 	stopped := make(chan struct{})
 	go func(record cluster.NodeRecord) {
 		defer close(stopped)
-		maintainElasticNode(directory, record, lease, stderr, done, func(state *cluster.AuthorityState) error {
+		maintainElasticNode(directory, record, backend.activeDataRoot(), lease, stderr, done, func(state *cluster.AuthorityState) error {
 			if state == nil {
 				var err error
 				state, err = authority.AuthorityState()

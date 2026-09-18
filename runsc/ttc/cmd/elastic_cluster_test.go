@@ -57,7 +57,7 @@ func TestMaintainElasticNodeRetriesBeforeFencing(t *testing.T) {
 	defer close(done)
 	fatal := make(chan error, 1)
 	fenced := make(chan struct{}, 1)
-	go maintainElasticNode(catalog, cluster.NodeRecord{NodeID: "node-a", Incarnation: "inc-a"}, 900*time.Millisecond, nil, done, nil, func() error {
+	go maintainElasticNode(catalog, cluster.NodeRecord{NodeID: "node-a", Incarnation: "inc-a"}, "", 900*time.Millisecond, nil, done, nil, func() error {
 		fenced <- struct{}{}
 		return nil
 	}, fatal)
@@ -72,44 +72,6 @@ func TestMaintainElasticNodeRetriesBeforeFencing(t *testing.T) {
 	case <-fenced:
 		t.Fatal("transient heartbeat failure fenced the node")
 	default:
-	}
-}
-
-func TestCgroupMemoryFiles(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		cgroup    string
-		mountinfo string
-		want      []string
-	}{
-		{
-			name:   "unified",
-			cgroup: "0::/user.slice/user-1000.slice/session-4.scope\n",
-			mountinfo: "29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - " +
-				"cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n",
-			want: []string{"/sys/fs/cgroup/user.slice/user-1000.slice/session-4.scope/memory.current"},
-		},
-		{
-			name: "legacy memory controller",
-			cgroup: "13:memory:/user.slice/user-141950.slice/session-3071.scope\n" +
-				"1:name=systemd:/user.slice/user-141950.slice/session-3071.scope\n",
-			mountinfo: "41 30 0:37 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime - " +
-				"cgroup cgroup rw,memory\n",
-			want: []string{"/sys/fs/cgroup/memory/user.slice/user-141950.slice/session-3071.scope/memory.usage_in_bytes"},
-		},
-		{
-			name:   "namespaced subtree and escaped mount point",
-			cgroup: "0::/jobs/job-7/step-2\n",
-			mountinfo: "29 23 0:26 /jobs/job-7 /run/cgroup\\040view rw - " +
-				"cgroup2 cgroup2 rw\n",
-			want: []string{"/run/cgroup view/step-2/memory.current"},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := cgroupMemoryFiles(test.cgroup, test.mountinfo); !slices.Equal(got, test.want) {
-				t.Fatalf("cgroupMemoryFiles() = %q, want %q", got, test.want)
-			}
-		})
 	}
 }
 
@@ -859,7 +821,11 @@ func TestWaitForCommittedColdBranchMetadataWaitsForManifestVisibility(t *testing
 			ControlRoot: ttcsnapshot.ObjectID{Snapshot: 19, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
 		})
 		if err == nil {
-			err = os.WriteFile(manifestPath, append(encoded, '\n'), 0600)
+			// Production publication installs manifests with a durable rename.
+			// Preserve that atomic-visibility contract in this timing test; a
+			// direct WriteFile can expose a transient empty JSON file and tests a
+			// corruption path rather than delayed NFS visibility.
+			err = writeDurableJSON(manifestPath, json.RawMessage(encoded))
 		}
 		written <- err
 	}()
