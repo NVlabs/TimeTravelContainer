@@ -2401,6 +2401,16 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	if branchErr != nil {
 		return selector{}, branchErr
 	}
+	// A cold fork adds references to immutable memory and filesystem origins.
+	// Serialize those additions with the short provider-to-shared authority
+	// switch, just like a live capture. Slow pack construction happens outside
+	// the background side of this gate, so this does not make a fork wait for
+	// the complete publication; it waits only if the final handoff is already
+	// in progress. Without the gate, FreezeSnapshotLedger can reject a perfectly
+	// valid fork in the narrow interval after publication freezes the provider
+	// ledger and before shared authority becomes visible.
+	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	defer finishForegroundCapture()
 	if err := b.ensureLocalColdBranch(sourceInfo, sourceBranch); err != nil {
 		return selector{}, fmt.Errorf("materializing dehydrated remote-fork source: %w", err)
 	}
