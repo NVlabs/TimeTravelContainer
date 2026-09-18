@@ -1259,6 +1259,43 @@ func TestDaemonOwnsAndReapsConsoleSidecars(t *testing.T) {
 	}
 }
 
+func TestDaemonSuppressesExplicitConsoleExitOnce(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatalf("starting sidecar fixture: %v", err)
+	}
+	server := &daemonServer{}
+	const key = "console-lock"
+	if err := server.OwnConsoleSidecar(key, command, selector{}, false); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("OwnConsoleSidecar: %v", err)
+	}
+
+	finish := server.SuppressConsoleExitOnce(key)
+	finish(true)
+	if !server.consumeSuppressedConsoleExit(key) {
+		t.Fatal("committed explicit stop fence was not consumed")
+	}
+	if server.consumeSuppressedConsoleExit(key) {
+		t.Fatal("one-shot explicit stop fence was consumed twice")
+	}
+
+	finish = server.SuppressConsoleExitOnce(key)
+	finish(false)
+	if server.consumeSuppressedConsoleExit(key) {
+		t.Fatal("cancelled explicit stop fence remained active")
+	}
+
+	if err := command.Process.Kill(); err != nil {
+		t.Fatalf("stopping sidecar fixture: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for server.ownedConsoleSidecars() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestDaemonObservesInheritedConsoleSidecarOnce(t *testing.T) {
 	lockPath := filepath.Join(t.TempDir(), "console.lock")
 	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)

@@ -4754,11 +4754,24 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 	}
 	switch target.state {
 	case "running", "restarting":
+		finishExplicitStop := func(bool) {}
+		if coordinator, ok := backend.(interface {
+			beginExplicitInitStop(selector) (func(bool), error)
+		}); ok {
+			var err error
+			finishExplicitStop, err = coordinator.beginExplicitInitStop(target.selector)
+			if err != nil {
+				return fmt.Errorf("coordinating explicit stop of %s: %w", target.selector, err)
+			}
+		}
+		initTerminated := false
+		defer func() { finishExplicitStop(initTerminated) }()
 		if err := backend.prepareStop(target.selector); err != nil {
 			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
 			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				initTerminated = true
 				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return nil
+					return queueExit()
 				}
 			}
 			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
@@ -4769,12 +4782,14 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			// terminal state, treat the lost wait reply as a committed stop.
 			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
 			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				initTerminated = true
 				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return nil
+					return queueExit()
 				}
 			}
 			return err
 		}
+		initTerminated = true
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
 		}
@@ -4787,6 +4802,18 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
 		}
 		return queueExit()
+	case "dehydrating":
+		// The in-flight dehydration publication owns the newest sealed filesystem
+		// generation. Canceling it would remove that hidden branch and make stop
+		// publish an older working generation. Let the immutable capture reach its
+		// durability boundary first, then discard only its memory roots through the
+		// ordinary dehydrated-stop path.
+		result := waitForDurableBranch(target.selector, backend)
+		if result.err != nil {
+			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, result.err)
+		}
+		target.state = "dehydrated"
+		return stopBranchLifecycle(target, stopSignal, timeoutSeconds, backend, publish)
 	case "dehydrated":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
@@ -5864,11 +5891,40 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 type consoleSidecarOwner interface {
 	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
 	ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool)
+	SuppressConsoleExitOnce(key string) func(bool)
 	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
 	RegisterConsoleClient(target selector, cancel func()) (func(), error)
 	QuiesceConsoleClients(target selector) (func(), error)
+}
+
+// beginExplicitInitStop transfers exit-finalization ownership from the console
+// follower to stopBranchLifecycle. The returned function must be called with
+// true once the old init is known to have terminated, or false when the stop
+// was abandoned while it could still exit naturally later.
+func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), error) {
+	if b.explicitInitStop {
+		return nil, errors.New("explicit init stop is already active")
+	}
+	if b.consoleSidecars == nil {
+		b.explicitInitStop = true
+		return func(bool) { b.explicitInitStop = false }, nil
+	}
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, resolved.branch)
+	if err != nil {
+		return nil, err
+	}
+	finishConsole := b.consoleSidecars.SuppressConsoleExitOnce(paths.Lock)
+	b.explicitInitStop = true
+	return func(commit bool) {
+		b.explicitInitStop = false
+		finishConsole(commit)
+	}, nil
 }
 
 func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
@@ -5993,6 +6049,16 @@ type runtimeBackend struct {
 	// peer polling stay outside this lock; only the terminal mutation that
 	// releases runtimes, graph roots, and private repositories enters it.
 	lockLifecycle func() func()
+	// lifecycleLockHeld is true for the synchronous portion of a daemon
+	// request that already owns lockLifecycle. Helpers shared with background
+	// completion paths use it to avoid recursively acquiring the non-reentrant
+	// family lifecycle lock.
+	lifecycleLockHeld bool
+	// explicitInitStop distinguishes the internal wait performed by stop and
+	// restart from a user-facing `ttc wait`. The foreground lifecycle operation
+	// owns discard/publication ordering and must not recursively invoke the
+	// spontaneous-exit finalizer from its wait path.
+	explicitInitStop bool
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
@@ -15650,6 +15716,9 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 // installations by the follower and this synchronous path are equivalent.
 func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) error {
 	b.recordWaitState(target, status)
+	if b.explicitInitStop {
+		return nil
+	}
 	// Standalone start already consumes the durable exited state directly and
 	// has no asynchronous placement release to race. Preserve its lightweight
 	// wait path; publicationQueue is present only on clustered compute daemons.
@@ -15661,7 +15730,10 @@ func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) 
 	// follower and foreground lifecycle commands. In particular, the follower
 	// may record the exited status just before wait enters its fast path; only
 	// one of them should seal and publish the process-free branch.
-	unlock := b.lockBackgroundLifecycle()
+	unlock := func() {}
+	if !b.lifecycleLockHeld {
+		unlock = b.lockBackgroundLifecycle()
+	}
 	defer unlock()
 	info, err := b.containerStore().LoadContainer(target.container)
 	if err != nil {

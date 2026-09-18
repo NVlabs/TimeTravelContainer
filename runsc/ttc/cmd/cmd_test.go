@@ -3441,6 +3441,23 @@ func TestStopPausedAndDehydratedDiscardsWithoutResume(t *testing.T) {
 	}
 }
 
+func TestStopDehydratingWaitsForSealedFilesystemPublication(t *testing.T) {
+	fake := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "child", State: "dehydrating", StorageState: "publishing"}},
+	}}}}
+	b := &authoritativeWaitBackend{
+		fakeBackend: fake,
+		durable:     true,
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop status=%d stderr=%q", status, stderr.String())
+	}
+	if b.discarded != (selector{container: "web", branch: "child"}) {
+		t.Fatalf("discarded=%+v", b.discarded)
+	}
+}
+
 func TestStopFamilyAppliesBranchStateSemantics(t *testing.T) {
 	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
 		{Metadata: Branch{ID: "main", State: "running"}},

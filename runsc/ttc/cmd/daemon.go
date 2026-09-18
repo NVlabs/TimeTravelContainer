@@ -366,6 +366,11 @@ type daemonServer struct {
 
 	sidecarMu sync.Mutex
 	sidecars  map[string]*exec.Cmd
+	// suppressedConsoleExits contains one-shot fences installed by explicit
+	// stop/restart operations. The console follower still drains and records the
+	// wait status, but it must not also run the spontaneous-exit finalizer: the
+	// foreground operation owns discard and publication ordering for that exit.
+	suppressedConsoleExits map[string]int
 	// inheritedConsole records drainers that survived an older ttcd. They
 	// cannot be reaped through exec.Cmd, but their advisory locks provide an
 	// exact completion notification for the new daemon.
@@ -2170,7 +2175,11 @@ func (w *daemonJSONFrameWriter) Write(data []byte) (int, error) {
 func (s *daemonServer) OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error {
 	var exited func()
 	if observeInitExit {
-		exited = func() { s.observeInitConsoleExit(target) }
+		exited = func() {
+			if !s.consumeSuppressedConsoleExit(key) {
+				s.observeInitConsoleExit(target)
+			}
+		}
 	}
 	return s.ownSidecar("console", key, command, exited)
 }
@@ -2207,10 +2216,68 @@ func (s *daemonServer) ObserveInheritedConsoleSidecar(key string, target selecto
 		s.sidecarMu.Lock()
 		delete(s.inheritedConsole, key)
 		s.sidecarMu.Unlock()
-		if err == nil && observeInitExit {
+		if err == nil && observeInitExit && !s.consumeSuppressedConsoleExit(key) {
 			s.observeInitConsoleExit(target)
 		}
 	}()
+}
+
+// SuppressConsoleExitOnce reserves the next completion notification for an
+// explicit lifecycle operation. commit(true) leaves the one-shot fence for the
+// follower to consume after it records the wait status. commit(false) cancels
+// an unused fence when the operation failed before terminating the init.
+//
+// The fence is keyed by the console lock. A new init incarnation cannot acquire
+// that lock until the old follower has exited, so the notification cannot be
+// stolen by a later restart that reuses the branch name.
+func (s *daemonServer) SuppressConsoleExitOnce(key string) func(bool) {
+	if s == nil || key == "" {
+		return func(bool) {}
+	}
+	s.sidecarMu.Lock()
+	observed := s.sidecars[key] != nil
+	if !observed {
+		_, observed = s.inheritedConsole[key]
+	}
+	if observed {
+		if s.suppressedConsoleExits == nil {
+			s.suppressedConsoleExits = make(map[string]int)
+		}
+		s.suppressedConsoleExits[key]++
+	}
+	s.sidecarMu.Unlock()
+	var once sync.Once
+	return func(commit bool) {
+		once.Do(func() {
+			if commit || !observed {
+				return
+			}
+			s.sidecarMu.Lock()
+			s.decrementSuppressedConsoleExitLocked(key)
+			s.sidecarMu.Unlock()
+		})
+	}
+}
+
+func (s *daemonServer) consumeSuppressedConsoleExit(key string) bool {
+	if s == nil || key == "" {
+		return false
+	}
+	s.sidecarMu.Lock()
+	defer s.sidecarMu.Unlock()
+	if s.suppressedConsoleExits[key] == 0 {
+		return false
+	}
+	s.decrementSuppressedConsoleExitLocked(key)
+	return true
+}
+
+func (s *daemonServer) decrementSuppressedConsoleExitLocked(key string) {
+	if count := s.suppressedConsoleExits[key]; count <= 1 {
+		delete(s.suppressedConsoleExits, key)
+	} else {
+		s.suppressedConsoleExits[key] = count - 1
+	}
 }
 
 // StopConsoleSidecar terminates a console follower owned by this daemon.
@@ -7206,7 +7273,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		_ = writeDaemonStatus(conn, &writeMu, status)
 		return
 	}
+	holdsLifecycleLock := daemonCommandNeedsMutationLock(request.Args) || daemonCommandReadsLifecycle(request.Args)
 	rawUnlock := s.lockMutation(opts.dataRoot, request.Args)
+	backend.lifecycleLockHeld = holdsLifecycleLock
 	var unlockOnce sync.Once
 	unlock := func() { unlockOnce.Do(rawUnlock) }
 	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
@@ -7276,6 +7345,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		var mutationStdout, mutationStderr bytes.Buffer
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
 		s.configureVolumeBackend(mutationBackend)
+		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
 		mutationBackend.consoleSidecars = s
 		mutationBackend.distributedSource = s.distributedSource
 		if s.clusterCapabilities != nil {

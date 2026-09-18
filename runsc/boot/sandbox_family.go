@@ -2357,6 +2357,25 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	if wasRunning {
 		k.Pause()
 	}
+	restoreLiveBranch := func() {
+		if wasRunning {
+			k.Unpause()
+			_ = control.PostResume(k, nil)
+		}
+		f.mu.Lock()
+		b.state = kernelBranchState(k)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+	}
+	// Dehydration's memory image and persistent filesystem must describe the
+	// same paused instant. Disk-backed TTC filesystems deliberately batch inode
+	// and write metadata inside the Sentry; sealing the manager-side repository
+	// without publishing that tail can resurrect the previous contents when a
+	// dehydrated branch is stopped and later started fresh.
+	if err := k.VFS().PublishFilesystemMetadata(k.SupervisorContext()); err != nil {
+		restoreLiveBranch()
+		return fmt.Errorf("publishing filesystem metadata before dehydration: %w", err)
+	}
 	execSessions := make([]ExecSessionInfo, 0, len(b.execSessions))
 	f.mu.Lock()
 	for _, session := range b.execSessions {
@@ -2372,14 +2391,7 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		BranchID: filesystemBranch, MetadataFile: metadataFile,
 	})
 	if err != nil {
-		if wasRunning {
-			k.Unpause()
-			_ = control.PostResume(k, nil)
-		}
-		f.mu.Lock()
-		b.state = kernelBranchState(k)
-		f.stateChanged.Broadcast()
-		f.mu.Unlock()
+		restoreLiveBranch()
 		return err
 	}
 	metadataOwned = true
@@ -2389,14 +2401,7 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	// loader and could leave the later sparse export unable to read a page.
 	if err := image.SparseSnapshot.EnsureResident(); err != nil {
 		_ = image.Close()
-		if wasRunning {
-			k.Unpause()
-			_ = control.PostResume(k, nil)
-		}
-		f.mu.Lock()
-		b.state = kernelBranchState(k)
-		f.stateChanged.Broadcast()
-		f.mu.Unlock()
+		restoreLiveBranch()
 		return fmt.Errorf("materializing branch memory before dehydration: %w", err)
 	}
 	if b.watchdog != nil {
