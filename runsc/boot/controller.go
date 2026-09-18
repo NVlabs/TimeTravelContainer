@@ -1236,7 +1236,13 @@ func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkE
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.
 func (cm *containerManager) DistributedForkDependencyStatus(args *DistributedForkDependencyArgs, out *pgalloc.AsyncPagesFileLoadStats) error {
-	status, err := cm.l.family.DistributedForkDependencyStatus(args.BranchID)
+	var status pgalloc.AsyncPagesFileLoadStats
+	var err error
+	if args.IncludeDurable {
+		status, err = cm.l.family.PageLoadStatus(args.BranchID)
+	} else {
+		status, err = cm.l.family.DistributedForkDependencyStatus(args.BranchID)
+	}
 	if err != nil {
 		return err
 	}

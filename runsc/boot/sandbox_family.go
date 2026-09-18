@@ -261,6 +261,9 @@ type DistributedForkDependencyArgs struct {
 	BranchID            string
 	PrefetchBytes       uint64
 	PrefetchBehindBytes uint64
+	// IncludeDurable requests consumption progress for immutable graph-backed
+	// readers as well as volatile source-node readers.
+	IncludeDurable bool
 }
 
 // DistributedForkHandoffArgs replaces a target's live network page source
@@ -1212,6 +1215,17 @@ func (f *SandboxFamily) DistributedForkDependencyStatus(branchID string) (pgallo
 	}
 	defer release()
 	return b.k.DistributedForkDependencyStatus(), nil
+}
+
+// PageLoadStatus reports all asynchronous page readers, including immutable
+// durable readers whose roots must remain pinned until consumption completes.
+func (f *SandboxFamily) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, err
+	}
+	defer release()
+	return b.k.PageLoadStatus(), nil
 }
 
 // SetDistributedForkPrefetchWindow changes future remote-memory fault reads.

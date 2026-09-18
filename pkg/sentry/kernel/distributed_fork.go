@@ -719,6 +719,18 @@ func (k *Kernel) TryInstallRemotePagesState(offset uint64, data []byte) (pgalloc
 // DistributedForkDependencyStatus reports whether this Kernel still depends
 // on a remote memory source.
 func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {
+	return k.pageLoadStatus(false)
+}
+
+// PageLoadStatus reports progress for every asynchronous page loader,
+// including loaders backed by immutable durable graph objects. Lifecycle code
+// uses this stronger status before releasing those objects; durable backing
+// removes a node dependency, but it does not mean the pages were consumed.
+func (k *Kernel) PageLoadStatus() pgalloc.AsyncPagesFileLoadStats {
+	return k.pageLoadStatus(true)
+}
+
+func (k *Kernel) pageLoadStatus(includeDurable bool) pgalloc.AsyncPagesFileLoadStats {
 	loads := k.distributedForkMemorySources()
 	if len(loads) == 0 {
 		return pgalloc.AsyncPagesFileLoadStats{Done: true}
@@ -734,7 +746,7 @@ func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadSta
 		if status.Error != "" {
 			diagnostics = append(diagnostics, status.Error)
 		}
-		if load.HasDurableBacking() {
+		if load.HasDurableBacking() && !includeDurable {
 			continue
 		}
 		result.Done = result.Done && status.Done

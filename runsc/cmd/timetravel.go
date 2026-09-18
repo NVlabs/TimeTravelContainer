@@ -124,6 +124,7 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> distributed-filesystem-serve <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-export <session-id>\n" +
 		"timetravel [flags] <container-id> distributed-dependency <branch-id>\n" +
+		"timetravel [flags] <container-id> page-load-status <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-prefetch <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-drain <branch-id>\n" +
 		"timetravel [flags] <container-id> distributed-filesystem-drain <branch-id>\n" +
@@ -431,6 +432,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.DistributedForkSessionStatus(f.Arg(2))
 	case "distributed-dependency":
 		output, err = cont.Sandbox.DistributedForkDependencyStatus(f.Arg(2))
+	case "page-load-status":
+		output, err = cont.Sandbox.PageLoadStatus(f.Arg(2))
 	case "distributed-prefetch":
 		err = cont.Sandbox.SetDistributedForkPrefetchWindow(f.Arg(2), t.distributedPrefetchBehind, t.distributedPrefetchBytes)
 	case "distributed-drain":

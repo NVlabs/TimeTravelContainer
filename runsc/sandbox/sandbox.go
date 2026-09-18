@@ -2222,6 +2222,17 @@ func (s *Sandbox) DistributedForkDependencyStatus(branchID string) (pgalloc.Asyn
 	return status, nil
 }
 
+// PageLoadStatus reports all target-side asynchronous page readers, including
+// readers whose backing is durable and has no source-node dependency.
+func (s *Sandbox) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	var status pgalloc.AsyncPagesFileLoadStats
+	err := s.call(boot.ContMgrDistributedForkDependencyStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID, IncludeDurable: true}, &status)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("reading page-load status for branch %q: %w", branchID, err)
+	}
+	return status, nil
+}
+
 // SetDistributedForkPrefetchWindow changes future target remote-memory reads.
 func (s *Sandbox) SetDistributedForkPrefetchWindow(branchID string, behind, ahead uint64) error {
 	args := &boot.DistributedForkDependencyArgs{BranchID: branchID, PrefetchBehindBytes: behind, PrefetchBytes: ahead}

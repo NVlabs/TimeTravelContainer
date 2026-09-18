@@ -14289,7 +14289,7 @@ func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector,
 	if b.nodeID != "" || branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
 		return
 	}
-	output, err := b.command("timetravel", target.container, "distributed-dependency", target.branch)
+	output, err := b.command("timetravel", target.container, "page-load-status", target.branch)
 	if err != nil {
 		return
 	}
