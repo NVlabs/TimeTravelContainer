@@ -46,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 )
 
 type daemonClusterProxy struct {
@@ -3533,6 +3534,37 @@ func localFamilyStateNeeded(info ttcbundle.ContainerInfo, nodeID string) bool {
 	return false
 }
 
+// pendingPublicationProtectsContainer reports whether node-local state for
+// containerID is the capture source of a durable publication intent. Once a
+// stop/dehydrate publication reaches its Raft commit, placement is deliberately
+// released before the worker consumes its local capture. Cleanup driven by the
+// placement view must therefore treat the intent as an independent local-tier
+// pin until Publisher.Cleanup succeeds and Queue removes the intent.
+//
+// Keep this predicate based on the immutable physical container identity. A
+// migrated branch's logical family may differ from the runtime bundle that
+// owns its repositories, while Intent.Container always names that exact
+// bundle.
+func pendingPublicationProtectsContainer(intents []ttcstorage.Intent, containerID string) bool {
+	for _, intent := range intents {
+		if intent.Container == containerID {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *runtimeBackend) pendingPublicationProtectsContainer(containerID string) (bool, error) {
+	if b == nil || b.publicationQueue == nil || containerID == "" {
+		return false, nil
+	}
+	intents, err := b.publicationQueue.Pending()
+	if err != nil {
+		return false, fmt.Errorf("reading durable publication intents: %w", err)
+	}
+	return pendingPublicationProtectsContainer(intents, containerID), nil
+}
+
 // syncLogicalBranchOwner updates the bundle's denormalized owner from Raft.
 // It is deliberately idempotent and tolerates families whose public branch is
 // represented only by a transaction-scoped physical runtime.
@@ -3591,6 +3623,13 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 		return err
 	}
 	if err == nil && localFamilyStateNeeded(info, b.nodeID) {
+		return nil
+	}
+	protected, err := b.pendingPublicationProtectsContainer(containerID)
+	if err != nil {
+		return err
+	}
+	if protected {
 		return nil
 	}
 	runtimes, err := b.listRuntimeFamilies()
@@ -3715,13 +3754,24 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 	for _, runtime := range live {
 		liveIDs[runtime.ID] = struct{}{}
 	}
+	var publicationIntents []ttcstorage.Intent
+	if b.publicationQueue != nil {
+		publicationIntents, err = b.publicationQueue.Pending()
+		if err != nil {
+			return fmt.Errorf("reading publication pins before local cleanup: %w", err)
+		}
+	}
 	var result error
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		id := entry.Name()
-		protected := false
+		// Placement is released by the atomic publication commit before the
+		// worker has consumed and removed its node-local capture. The durable
+		// queue intent is authority for that narrow but potentially long-lived
+		// interval (including retries after shared-storage failure).
+		protected := pendingPublicationProtectsContainer(publicationIntents, id)
 		for _, placement := range state.Placements {
 			physical := placement.PhysicalContainer
 			if physical == "" {

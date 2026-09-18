@@ -43,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 )
 
 func TestRemoteExecSessionRoundTrip(t *testing.T) {
@@ -6607,6 +6608,21 @@ func TestLocalFamilyStateNeeded(t *testing.T) {
 	}
 	if !localFamilyStateNeeded(info, "node-b") {
 		t.Fatal("provisional import did not retain node-local state")
+	}
+}
+
+func TestPendingPublicationProtectsPhysicalContainer(t *testing.T) {
+	intents := []ttcstorage.Intent{
+		{Container: "physical-a", AuthorityContainer: "family", Branch: "transaction-a"},
+		{Container: "physical-b", AuthorityContainer: "family", Branch: "transaction-b"},
+	}
+	for _, test := range []struct {
+		container string
+		want      bool
+	}{{"physical-a", true}, {"physical-b", true}, {"family", false}, {"", false}} {
+		if got := pendingPublicationProtectsContainer(intents, test.container); got != test.want {
+			t.Errorf("pendingPublicationProtectsContainer(%q)=%t, want %t", test.container, got, test.want)
+		}
 	}
 }
 
