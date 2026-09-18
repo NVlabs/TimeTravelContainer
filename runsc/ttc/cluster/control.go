@@ -1904,27 +1904,33 @@ func (c *ControlPlane) cancel(w http.ResponseWriter, r *http.Request, id, peer s
 		writeControlError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if tx.State == TransactionCanceled {
+	// Cancellation is destructive: TargetRuntime.Cancel removes the physical
+	// target. Fence a cancelable transaction in Raft before touching that
+	// runtime; otherwise a concurrent Published -> Draining transition can win
+	// after physical deletion and leave an authoritative independent placement
+	// without a Sentry. Once draining has begun, return the observed state so
+	// the removal coordinator can finish the independence barrier and use
+	// ordinary branch deletion instead.
+	if tx.State == TransactionDraining || tx.State == TransactionIndependent {
 		writeControlJSON(w, http.StatusOK, tx)
 		return
+	}
+	// Failed preparation is already terminal, but cancellation still has to
+	// reclaim any partially created runtime and filesystem import. Canceled is
+	// likewise retried through cleanup: the daemon may have crashed after the
+	// durable fence and before TargetRuntime.Cancel completed.
+	if tx.State != TransactionCanceled && tx.State != TransactionFailed {
+		tx, err = c.Store.Advance(id, request.Revision, TransactionCanceled, "", c.Now())
+		if err != nil {
+			writeControlError(w, http.StatusConflict, err.Error())
+			return
+		}
 	}
 	if c.TargetRuntime != nil {
 		if err := c.TargetRuntime.Cancel(r.Context(), tx); err != nil {
 			writeControlError(w, http.StatusConflict, err.Error())
 			return
 		}
-	}
-	// Failed preparation is already terminal, but cancellation still has to
-	// reclaim any partially created runtime and filesystem import. Successful
-	// cleanup is idempotent and does not rewrite the diagnostic terminal state.
-	if tx.State == TransactionFailed {
-		writeControlJSON(w, http.StatusOK, tx)
-		return
-	}
-	tx, err = c.Store.Advance(id, request.Revision, TransactionCanceled, "", c.Now())
-	if err != nil {
-		writeControlError(w, http.StatusConflict, err.Error())
-		return
 	}
 	writeControlJSON(w, http.StatusOK, tx)
 }

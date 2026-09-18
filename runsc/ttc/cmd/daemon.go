@@ -2926,7 +2926,13 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 		if tx.Identity.Migration {
 			return fmt.Errorf("migration transaction %q cannot use remote-fork cancellation", transactionID)
 		}
-		if tx.Terminal() {
+		switch tx.State {
+		case cluster.TransactionCanceled, cluster.TransactionFailed, cluster.TransactionIndependent:
+			continue
+		case cluster.TransactionDraining:
+			if err := drainSourceDependency(b, b.distributedSource, store, *tx); err != nil {
+				return fmt.Errorf("finishing removable distributed target %q: %w", transactionID, err)
+			}
 			continue
 		}
 		peer, err := b.distributedSource.peer(tx.Identity.TargetNodeID, false)
@@ -2939,25 +2945,39 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 		if cancelErr != nil {
 			return fmt.Errorf("canceling removable distributed target %q: %w", transactionID, cancelErr)
 		}
-		if canceled == nil || !canceled.Terminal() {
-			return fmt.Errorf("canceling removable distributed target %q returned a nonterminal transaction", transactionID)
+		if canceled == nil {
+			return fmt.Errorf("canceling removable distributed target %q returned no transaction", transactionID)
+		}
+		switch canceled.State {
+		case cluster.TransactionCanceled, cluster.TransactionFailed, cluster.TransactionIndependent:
+			// Independent means draining won the race with removal. The physical
+			// target was not canceled and the metadata child below will delete it
+			// through the ordinary branch path.
+		case cluster.TransactionDraining:
+			if err := drainSourceDependency(b, b.distributedSource, store, *canceled); err != nil {
+				return fmt.Errorf("finishing raced distributed target %q: %w", transactionID, err)
+			}
+		default:
+			return fmt.Errorf("canceling removable distributed target %q returned %s", transactionID, canceled.State)
 		}
 	}
 	return nil
 }
 
 // cancelRemoteForkTarget retries optimistic cancellation across transaction
-// progress that races a family removal. TargetRuntime.Cancel intentionally
-// destroys the physical target before the Raft revision CAS; therefore a stale
-// revision response can mean cleanup already happened and must be followed by
-// the same idempotent request at the newly authoritative revision. A terminal
-// status is the only other successful outcome.
+// progress that races a family removal. Cancellation is fenced in Raft before
+// target cleanup, and a canceled retry repeats that idempotent cleanup. If
+// draining wins the revision race, the target remains intact and the caller
+// rolls it forward to independence instead.
 func cancelRemoteForkTarget(ctx context.Context, peer *cluster.Client, transactionID string, revision uint64) (*cluster.Transaction, error) {
 	var lastErr error
 	for range 16 { // More than the complete finite transaction state sequence.
 		canceled, err := peer.Cancel(ctx, transactionID, revision)
-		if err == nil && canceled != nil && canceled.Terminal() {
-			return canceled, nil
+		if err == nil && canceled != nil {
+			switch canceled.State {
+			case cluster.TransactionCanceled, cluster.TransactionFailed, cluster.TransactionDraining, cluster.TransactionIndependent:
+				return canceled, nil
+			}
 		}
 		if err == nil {
 			err = errors.New("cancellation returned a nonterminal transaction")
@@ -2967,7 +2987,8 @@ func cancelRemoteForkTarget(ctx context.Context, peer *cluster.Client, transacti
 		if statusErr != nil {
 			return nil, errors.Join(lastErr, statusErr)
 		}
-		if current.Terminal() {
+		switch current.State {
+		case cluster.TransactionCanceled, cluster.TransactionFailed, cluster.TransactionDraining, cluster.TransactionIndependent:
 			return current, nil
 		}
 		if current.Revision == revision {
@@ -3008,12 +3029,6 @@ func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactio
 	if tx.Identity.Migration || tx.Identity.TargetContainer != target.container {
 		return fmt.Errorf("transaction %q does not identify canceled fork target %s", transactionID, target)
 	}
-	if tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionFailed {
-		return fmt.Errorf("transaction %q is %s, not canceled", transactionID, tx.State)
-	}
-	if tx.SourceNeeded {
-		return fmt.Errorf("canceled transaction %q still retains its source", transactionID)
-	}
 	placements, err := b.placementCatalog()
 	if err != nil {
 		return err
@@ -3027,6 +3042,20 @@ func (b *runtimeBackend) removeCanceledForkPlacement(target selector, transactio
 	}
 	if !canceledForkOwnsPlacement(*tx, *record, b.nodeID) {
 		return fmt.Errorf("canceled fork target %s placement changed before removal", target)
+	}
+	if tx.State == cluster.TransactionIndependent {
+		// The target crossed the draining barrier after the coordinator planned
+		// cancellation but before its preflight ran. Cancellation intentionally
+		// leaves an independent runtime intact; remove it through the same path as
+		// any other running branch so Sentry, filesystems, and placement metadata
+		// are reclaimed together.
+		return b.destroy(target, true)
+	}
+	if tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionFailed {
+		return fmt.Errorf("transaction %q is %s, neither canceled nor independent", transactionID, tx.State)
+	}
+	if tx.SourceNeeded {
+		return fmt.Errorf("canceled transaction %q still retains its source", transactionID)
 	}
 	if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
 		return err

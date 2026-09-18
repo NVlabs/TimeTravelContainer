@@ -950,6 +950,10 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	if err != nil || draining.State != TransactionDraining || !draining.SourceNeeded {
 		t.Fatalf("draining=%+v err=%v", draining, err)
 	}
+	notCanceled, err := client.Cancel(context.Background(), tx.Identity.TransactionID, draining.Revision)
+	if err != nil || notCanceled.State != TransactionDraining || notCanceled.Revision != draining.Revision {
+		t.Fatalf("cancel during drain=%+v err=%v, want unchanged draining transaction", notCanceled, err)
+	}
 	metrics := TransferMetrics{PullRequests: 7, PullBytes: 4096, MetadataBytes: 512, PagesTotal: 1, PagesReleased: 1}
 	independent, err := client.MarkIndependentWithMetrics(context.Background(), tx.Identity.TransactionID, draining.Revision, metrics)
 	if err != nil || independent.State != TransactionIndependent || independent.SourceNeeded {
@@ -957,6 +961,10 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	}
 	if independent.Metrics == nil || independent.Metrics.PullRequests != 7 || independent.Metrics.TimeToIndependent <= 0 {
 		t.Fatalf("independent metrics=%+v", independent.Metrics)
+	}
+	notCanceled, err = client.Cancel(context.Background(), tx.Identity.TransactionID, independent.Revision)
+	if err != nil || notCanceled.State != TransactionIndependent || notCanceled.Revision != independent.Revision {
+		t.Fatalf("cancel after independence=%+v err=%v, want unchanged independent transaction", notCanceled, err)
 	}
 	migrationIdentity := testForkIdentity()
 	migrationIdentity.TransactionID = "tx-migration"
@@ -990,7 +998,7 @@ func TestMutualTLSControlPlanePreparePublishAndDrain(t *testing.T) {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
-	if runtime.prepared != 2 || runtime.published != 2 || runtime.activated != 1 || runtime.drained != 1 || runtime.independent != 1 || len(runtime.publishPaused) != 2 || !runtime.publishPaused[0] || !runtime.publishPaused[1] {
+	if runtime.prepared != 2 || runtime.published != 2 || runtime.activated != 1 || runtime.drained != 1 || runtime.independent != 1 || runtime.canceled != 0 || len(runtime.publishPaused) != 2 || !runtime.publishPaused[0] || !runtime.publishPaused[1] {
 		t.Fatalf("runtime calls: %+v", runtime)
 	}
 }
