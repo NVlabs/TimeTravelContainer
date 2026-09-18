@@ -162,6 +162,51 @@ func TestRemoteDescriptorFetchesWholeFileAndPrivatizesWrites(t *testing.T) {
 	finishTestRemote(t, target, serverErr)
 }
 
+func TestSyncDataMaterializesRemoteWholeFile(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "database-wal", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("sqlite-wal"), 8192)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+
+	// No read, write, or mmap fault precedes this synchronization. This models
+	// SQLite recovery immediately fsyncing an inherited WAL after migration.
+	if err := target.SyncData("imported", ino, false); err != nil {
+		t.Fatalf("SyncData on untouched remote file: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if n, err := target.ReadAt("imported", ino, got, 0); err != nil || n != len(got) {
+		t.Fatalf("ReadAt after SyncData: %d, %v", n, err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("SyncData installed incorrect remote contents")
+	}
+	finishTestRemote(t, target, serverErr)
+}
+
 func TestMaterializationHookMayEnterRepositoryMutation(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source")
@@ -216,6 +261,130 @@ func TestMaterializationHookMayEnterRepositoryMutation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("source stream remained open after target materialization")
 	}
+}
+
+func TestRemoteMarkerRetirementSerializesWithMetadataSync(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "database-wal", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("wal contents"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+
+	meta, err := target.Inode("imported", ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.remoteMu.Lock()
+	remote := target.remoteByObject[meta.Object]
+	target.remoteMu.Unlock()
+	if remote == nil {
+		t.Fatal("imported object has no remote provider")
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	lockDone := make(chan struct{})
+	go func() {
+		target.remoteMarkerSyncMu.Lock()
+		close(locked)
+		<-release
+		target.remoteMarkerSyncMu.Unlock()
+		close(lockDone)
+	}()
+	<-locked
+
+	materialized := make(chan error, 1)
+	go func() { materialized <- remote.ensure(meta.Object, meta.Size, 0, meta.Size) }()
+	select {
+	case err := <-materialized:
+		t.Fatalf("materialization retired its dirty marker outside the repository mutation fence: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-lockDone
+	select {
+	case err := <-materialized:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("materialization did not resume after the metadata fence")
+	}
+	if err := target.SyncMetadata(); err != nil {
+		t.Fatalf("SyncMetadata after marker retirement: %v", err)
+	}
+	finishTestRemote(t, target, serverErr)
+}
+
+func TestRemoteMarkerRetirementDoesNotWaitForRepositoryMutation(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.WriteAt(MainBranch, ino, []byte("contents"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptor(filepath.Join(targetManager.root, "target"), "target", descriptor, "imported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+
+	// Runtime filesystem operations may retain file or mapping locks while a
+	// different goroutine owns operationMu. Completing a remote read must not
+	// join that lock cycle merely to retire its pending marker.
+	target.operationMu.Lock()
+	readDone := make(chan error, 1)
+	go func() { readDone <- target.EnsureDataRange("imported", ino, 0, 1) }()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			target.operationMu.Unlock()
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		target.operationMu.Unlock()
+		t.Fatal("remote marker retirement waited for the repository mutation lock")
+	}
+	target.operationMu.Unlock()
+	finishTestRemote(t, target, serverErr)
 }
 
 func TestRemoteFetchDoesNotHoldBranchViewLock(t *testing.T) {

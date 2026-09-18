@@ -1915,6 +1915,53 @@ func TestListContainersSkipsUnreadableDirectory(t *testing.T) {
 	}
 }
 
+func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	staging, err := store.createContainerStagingDir("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(staging, "bundle")
+	if err := os.Mkdir(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	finalBundle := filepath.Join(root, "containers", "target", "bundle")
+	info := ContainerInfo{ID: "target", Name: "target", BundleDir: finalBundle, State: "created", CreatedAt: time.Now()}
+	if err := writeCurrentContainerFixture(filepath.Join(staging, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	// A maintenance pass from another daemon must neither expose nor reclaim a
+	// container before the single directory-rename publication boundary.
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("recovery reclaimed unpublished staging directory: %v", err)
+	}
+	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
+		t.Fatalf("unpublished containers=%+v, err=%v", containers, err)
+	}
+
+	if err := store.publishContainerDir(info.ID, staging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BundleDir != finalBundle {
+		t.Fatalf("published bundle=%q, want %q", loaded.BundleDir, finalBundle)
+	}
+}
+
 func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "demo")
@@ -2267,6 +2314,14 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if err := store.StopBranch("demo", "child", 137); err != nil {
 		t.Fatalf("StopBranch: %v", err)
 	}
+	if err := store.mutateContainer("demo", func(info *ContainerInfo) (bool, error) {
+		info.Branches[1].PublicationID = "publication-prior-incarnation"
+		info.Branches[1].StorageState = "shared"
+		info.Branches[1].StorageManifest = "/shared/prior-manifest"
+		return true, nil
+	}); err != nil {
+		t.Fatalf("recording prior publication: %v", err)
+	}
 	loaded, err = store.LoadContainer("demo")
 	if err != nil {
 		t.Fatal(err)
@@ -2289,6 +2344,22 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	if loaded.Branches[1].ExitStatus != nil || loaded.Branches[1].ExitedAt != nil {
 		t.Fatalf("branch start retained the previous incarnation's wait status: %+v", loaded.Branches[1])
+	}
+	if loaded.Branches[1].PublicationID != "" || loaded.Branches[1].StorageState != "local" || loaded.Branches[1].StorageManifest != "/shared/prior-manifest" {
+		t.Fatalf("branch start retained a stale publication fence or lost its immutable ancestor: %+v", loaded.Branches[1])
+	}
+	if err := store.RecordBranchActivation("demo", "child", "paused"); err != nil {
+		t.Fatalf("RecordBranchActivation(paused): %v", err)
+	}
+	loaded, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Branches[1].State != "paused" {
+		t.Fatalf("branch activation state=%q, want paused", loaded.Branches[1].State)
+	}
+	if err := store.RecordBranchActivation("demo", "child", "exited"); err == nil {
+		t.Fatal("RecordBranchActivation accepted exited state")
 	}
 	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
 		t.Fatalf("RemoveBranchRecord: %v", err)

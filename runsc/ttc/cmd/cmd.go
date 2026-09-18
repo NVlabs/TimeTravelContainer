@@ -5190,6 +5190,20 @@ type selector struct {
 	branch    string
 }
 
+// remoteBranchOwnershipError is the expected result of observing a stale
+// local physical runtime after clustered placement has moved elsewhere. User
+// commands still receive the ordinary diagnostic text, while asynchronous
+// console-exit reconciliation can distinguish this benign cutover from a real
+// finalization failure without parsing strings.
+type remoteBranchOwnershipError struct {
+	target selector
+	owner  string
+}
+
+func (e *remoteBranchOwnershipError) Error() string {
+	return fmt.Sprintf("branch %s belongs to cluster node %q", e.target, e.owner)
+}
+
 func parseSelector(value string) (selector, error) {
 	if value == "" {
 		return selector{}, errors.New("selector must not be empty")
@@ -5974,6 +5988,11 @@ type runtimeBackend struct {
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
+	// lockLifecycle serializes background lifecycle completion with foreground
+	// commands and periodic repository maintenance. Long-running transfer and
+	// peer polling stay outside this lock; only the terminal mutation that
+	// releases runtimes, graph roots, and private repositories enters it.
+	lockLifecycle func() func()
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
@@ -5987,6 +6006,13 @@ type runtimeBackend struct {
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool
+}
+
+func (b *runtimeBackend) lockBackgroundLifecycle() func() {
+	if b == nil || b.lockLifecycle == nil {
+		return func() {}
+	}
+	return b.lockLifecycle()
 }
 
 func (b *runtimeBackend) signalLifecycleReady() {
@@ -6395,7 +6421,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 			}
 			if placement, lookupErr := placements.Lookup(logicalFamily, target.branch); lookupErr == nil {
 				if placement.OwnerNode != "" && placement.OwnerNode != b.nodeID {
-					return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, placement.OwnerNode)
+					return selector{}, ttcbundle.ContainerInfo{}, &remoteBranchOwnershipError{target: target, owner: placement.OwnerNode}
 				}
 				physicalContainer := placement.PhysicalContainer
 				if physicalContainer == "" {
@@ -6458,7 +6484,7 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 		}
 		owner := info.BranchNodeID(target.branch)
 		if owner != "" && owner != b.nodeID {
-			return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, owner)
+			return selector{}, ttcbundle.ContainerInfo{}, &remoteBranchOwnershipError{target: target, owner: owner}
 		}
 	}
 	target.container = info.ID
@@ -8547,6 +8573,23 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbun
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
+	// A short-lived detached init may exit between runsc start and console
+	// follower registration. Its retained log is already authoritative and its
+	// durable exit status is sufficient to complete log/attach readers; trying
+	// to start another follower can only fail because runsc has removed the
+	// exited container state. This mirrors completed named-exec handling below.
+	if !reset {
+		info, infoErr := store.LoadContainer(target.container)
+		if infoErr == nil {
+			branch, branchErr := persistentBranchInfo(info, target.branch)
+			if branchErr == nil && branch.State == "exited" && branch.ExitStatus != nil {
+				if err := installRetainedConsoleWaitStatus(paths, uint32(*branch.ExitStatus)); err != nil {
+					return ttcbundle.ConsolePaths{}, err
+				}
+				return paths, nil
+			}
+		}
+	}
 	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset)
 }
 
@@ -8564,7 +8607,7 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, console
 	if !reset {
 		session, sessionErr := b.execSession(target, execID)
 		if sessionErr == nil && session.State == string(boot.ExecSessionExited) && session.ExitStatus != nil {
-			if err := installRetainedExecWaitStatus(paths, *session.ExitStatus); err != nil {
+			if err := installRetainedConsoleWaitStatus(paths, *session.ExitStatus); err != nil {
 				return ttcbundle.ConsolePaths{}, err
 			}
 			return paths, nil
@@ -8573,7 +8616,7 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, console
 	return b.ensureConsoleDrainPaths(target, execID, consoleID, paths, reset)
 }
 
-func installRetainedExecWaitStatus(paths ttcbundle.ConsolePaths, status uint32) error {
+func installRetainedConsoleWaitStatus(paths ttcbundle.ConsolePaths, status uint32) error {
 	if current, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil {
 		return err
 	} else if found {
@@ -12306,9 +12349,20 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 }
 
 func (b *runtimeBackend) prepareStop(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	// A migrated branch may still read unchanged files from its source node.
+	// Stop destroys the only live resolver before asynchronous cold publication,
+	// so establish filesystem and memory independence while the Sentry can
+	// still service the drain. Dehydration already uses the same fence.
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before stopping %s: %w", resolved, err)
 	}
 	_, err = b.command("timetravel", resolved.container, "prepare-stop", resolved.branch)
 	return err
@@ -12336,6 +12390,9 @@ func (b *runtimeBackend) preparePausedStop(target selector) (retErr error) {
 	}
 	if normalizeLifecycleState(branch.State) != "paused" {
 		return fmt.Errorf("branch %s is %s, not paused", resolved, normalizeLifecycleState(branch.State))
+	}
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before stopping %s: %w", resolved, err)
 	}
 	spec, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
@@ -12784,11 +12841,14 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 		if snapshot.State != ttcsnapshot.SnapshotWorking && snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
 			continue
 		}
+		unlockOrigin := b.distributedSource.lockSnapshotOrigin(snapshot.ID)
 		objects, err := b.snapshotGraph.SnapshotObjects(snapshot.ID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			unlockOrigin()
 			return len(abandoned), fmt.Errorf("inspecting memory origin %d: %w", snapshot.ID, err)
 		}
 		if len(objects) != 0 {
+			unlockOrigin()
 			continue
 		}
 		provider, found, err := b.distributedSource.authority.SnapshotProvider(uint64(snapshot.ID))
@@ -12800,27 +12860,40 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 			// tombstone proves that no provider authority remains; finish the
 			// idempotent local collection instead of failing branch removal.
 			abandoned[snapshot.ID] = struct{}{}
+			unlockOrigin()
 			continue
 		}
 		if err != nil {
+			unlockOrigin()
 			return len(abandoned), fmt.Errorf("resolving empty memory origin %d: %w", snapshot.ID, err)
 		}
-		if !found || provider.NodeID != node {
+		if !found {
+			// Shared authority makes an empty provider-side graph disposable.
+			abandoned[snapshot.ID] = struct{}{}
+			unlockOrigin()
+			continue
+		}
+		if provider.NodeID != node {
+			unlockOrigin()
 			continue
 		}
 		if b.snapshotShared != nil {
 			busy, err := b.snapshotShared.DiscardHandoff(snapshot.ID)
 			if err != nil {
+				unlockOrigin()
 				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: %w", snapshot.ID, err)
 			}
 			if busy {
+				unlockOrigin()
 				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: pack is busy", snapshot.ID)
 			}
 		}
 		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(snapshot.ID)); err != nil {
+			unlockOrigin()
 			return len(abandoned), fmt.Errorf("abandoning empty memory origin %d: %w", snapshot.ID, err)
 		}
 		abandoned[snapshot.ID] = struct{}{}
+		unlockOrigin()
 	}
 	if len(abandoned) == 0 {
 		return 0, nil
@@ -12899,12 +12972,46 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
 	for _, encoded := range stale {
 		origin := ttcsnapshot.SnapshotID(encoded)
+		unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+		// The inventory above is only a candidate list. A concurrent publisher or
+		// branch mutation may have made the origin live before this origin fence
+		// was acquired, so repeat both data-plane and authority observations.
+		if b.snapshotGraph != nil {
+			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
+				unlockOrigin()
+				continue
+			}
+		}
+		filesystemLive, liveErr := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
+		if liveErr != nil {
+			unlockOrigin()
+			return 0, fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, liveErr)
+		}
+		if filesystemLive {
+			unlockOrigin()
+			continue
+		}
+		provider, volatile, providerErr := b.distributedSource.authority.SnapshotProvider(encoded)
+		if errors.Is(providerErr, os.ErrNotExist) || (!volatile && providerErr == nil) {
+			unlockOrigin()
+			continue
+		}
+		if providerErr != nil {
+			unlockOrigin()
+			return 0, fmt.Errorf("rechecking orphan snapshot origin %d authority: %w", origin, providerErr)
+		}
+		if provider.NodeID != node {
+			unlockOrigin()
+			continue
+		}
 		if b.snapshotShared != nil {
 			busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
 			if discardErr != nil {
+				unlockOrigin()
 				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: %w", origin, discardErr)
 			}
 			if busy {
+				unlockOrigin()
 				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: pack is busy", origin)
 			}
 		}
@@ -12912,9 +13019,11 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 			// Another serialized cleanup may have completed between the state
 			// read and this proposal. Treat an already-retired origin as success.
 			if _, found, lookupErr := b.distributedSource.authority.SnapshotProvider(encoded); lookupErr != nil || found {
+				unlockOrigin()
 				return 0, fmt.Errorf("abandoning orphan snapshot origin %d: %w", origin, errors.Join(err, lookupErr))
 			}
 		}
+		unlockOrigin()
 	}
 	return abandoned + len(stale), nil
 }
@@ -13018,6 +13127,12 @@ func (b *runtimeBackend) discard(target selector) error {
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
 		return err
+	}
+	// Natural init exit can reach discard without prepareStop. The Sentry still
+	// exists until the runtime deletion below, so use that last opportunity to
+	// resolve sparse migration backing before the branch becomes process-free.
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before discarding %s: %w", target, err)
 	}
 	store := b.containerStore()
 	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
@@ -14104,7 +14219,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 		for _, branch := range family.Branches {
 			if branch.ID == target.branch {
-				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
+				if err := b.containerStore().RecordBranchActivation(target.container, target.branch, branch.State); err != nil {
 					return err
 				}
 				b.releaseConsumedStandaloneMemoryBacking(target, *persistentBranch)
@@ -14387,15 +14502,8 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		}
 		state = "running"
 	}
-	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state); err != nil {
 		return err
-	}
-	if relays == nil {
-		if branch.PublicationID != "" {
-			if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.PublicationID, "local", "", time.Time{}); err != nil {
-				return err
-			}
-		}
 	}
 	// The live runtime and its persistent state are now committed. Failures in
 	// sidecar attachment or page-source bookkeeping must not delete it.
@@ -14687,18 +14795,11 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	if capture.Resume {
 		state = "running"
 	}
-	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state); err != nil {
 		if _, destroyErr := b.command("timetravel", info.ID, "destroy", target.branch); destroyErr != nil {
 			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
 		}
 		return err
-	}
-	if relays == nil {
-		if branch.PublicationID != "" {
-			if err := b.containerStore().UpdateBranchStorage(info.ID, target.branch, branch.PublicationID, "local", "", time.Time{}); err != nil {
-				return err
-			}
-		}
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
 	// readers reachable and do not roll the peer back for artifact bookkeeping.

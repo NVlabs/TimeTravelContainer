@@ -3034,47 +3034,89 @@ func (b *runtimeBackend) restoreMigrationBranchSidecars(target selector, info tt
 }
 
 func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, containerID, branchID, transactionID string, relay *distributedPageRelay) {
+	independent := false
+	sourceReleased := false
+	logicalFamily := ""
+	logicalBranch := ""
+	lastWarning := time.Time{}
 	for {
 		timer := time.NewTimer(b.distributedSource.sourceMonitorInterval())
 		<-timer.C
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		tx, err := peer.Status(ctx, transactionID)
-		cancel()
-		if err != nil {
-			continue
+		var tx *cluster.Transaction
+		if !independent {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var err error
+			tx, err = peer.Status(ctx, transactionID)
+			cancel()
+			if err != nil {
+				continue
+			}
+			switch tx.State {
+			case cluster.TransactionIndependent:
+				independent = true
+				logicalFamily = tx.Identity.SourceContainer
+				logicalBranch = tx.Identity.SourceBranch
+			case cluster.TransactionCanceled, cluster.TransactionFailed:
+				// A published migration never rolls ownership backward. Retain the
+				// source snapshot for diagnostics or an explicit recovery attempt.
+				return
+			default:
+				continue
+			}
 		}
-		switch tx.State {
-		case cluster.TransactionIndependent:
-			unlockSource := b.distributedSource.lockSourceFamily(containerID)
+		// Node retirement owns a synchronous dependency-drain barrier while the
+		// daemon lifecycle lock is held. Its bounded workers release the transfer
+		// roots and source runtimes before retirement may commit. An ordinary
+		// monitor must not wait for that same lifecycle lock: node stop waits for
+		// monitorCount to reach zero, which would form a lock/barrier deadlock.
+		// Once the local node is draining, close this monitor's relay and let the
+		// retirement barrier be the sole terminal cleanup driver.
+		if record, err := b.distributedSource.directory.Lookup(b.nodeID); err == nil && record.State == cluster.NodeDraining {
+			relay.Close()
+			return
+		}
+		// Foreground lifecycle commands, repository maintenance, and every other
+		// terminal migration cleanup must see one coherent local namespace. The
+		// peer wait above deliberately remains outside this critical section.
+		unlockLifecycle := b.lockBackgroundLifecycle()
+		unlockSource := b.distributedSource.lockSourceFamily(containerID)
+		if !sourceReleased {
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
 			relay.Close()
 			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
-				log.Warningf("TTC: retaining completed migration transfer roots for retry %s@%s: %v", containerID, branchID, err)
+				unlockSource()
+				unlockLifecycle()
+				if lastWarning.IsZero() || time.Since(lastWarning) >= 30*time.Second {
+					log.Warningf("TTC: retaining completed migration transfer roots for retry %s@%s: %v", containerID, branchID, err)
+					lastWarning = time.Now()
+				}
+				continue
 			}
-			// If rm already committed logical placement deletion, there is no
-			// surviving reader for this retired provider. Discard it directly;
-			// publishing here would race the deletion postflight and copy an
-			// entire dead memory graph to shared storage.
-			discard := false
-			if placements, placementErr := b.placementCatalog(); placementErr == nil {
-				_, placementErr = placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch)
-				discard = errors.Is(placementErr, os.ErrNotExist)
-			}
-			var releaseErr error
-			if discard {
-				releaseErr = b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
-			} else {
-				releaseErr = b.releaseMigratedSourceRuntime(containerID, branchID)
-			}
-			if releaseErr != nil {
-				log.Warningf("TTC: retaining source runtime after sparse migration %s@%s: %v", containerID, branchID, releaseErr)
-			}
-			unlockSource()
+			sourceReleased = true
+		}
+		// If rm already committed logical placement deletion, there is no
+		// surviving reader for this retired provider. Discard it directly;
+		// publishing here would race the deletion postflight and copy an
+		// entire dead memory graph to shared storage.
+		discard := false
+		if placements, placementErr := b.placementCatalog(); placementErr == nil {
+			_, placementErr = placements.Lookup(logicalFamily, logicalBranch)
+			discard = errors.Is(placementErr, os.ErrNotExist)
+		}
+		var releaseErr error
+		if discard {
+			releaseErr = b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
+		} else {
+			releaseErr = b.releaseMigratedSourceRuntime(containerID, branchID)
+		}
+		unlockSource()
+		unlockLifecycle()
+		if releaseErr == nil {
 			return
-		case cluster.TransactionCanceled, cluster.TransactionFailed:
-			// A published migration never rolls ownership backward. Retain the
-			// source snapshot for diagnostics or an explicit recovery attempt.
-			return
+		}
+		if lastWarning.IsZero() || time.Since(lastWarning) >= 30*time.Second {
+			log.Warningf("TTC: retaining source runtime after sparse migration %s@%s for retry: %v", containerID, branchID, releaseErr)
+			lastWarning = time.Now()
 		}
 	}
 }
@@ -3283,6 +3325,13 @@ func (b *runtimeBackend) reclaimMigratedSourceBacking(info ttcbundle.ContainerIn
 }
 
 func (b *runtimeBackend) reclaimMigratedSourceBackingWithPolicy(info ttcbundle.ContainerInfo, branchID string, publishBacking bool) error {
+	// Reclamation ends with a repository-wide origin/provider reconciliation.
+	// Serialize the complete idempotent unit so another family cannot open and
+	// recreate graph lock/checkpoint files while this one removes its final
+	// private repository. Foreground lifecycle exclusion does not cover the
+	// bounded parallel workers used by node drain.
+	unlockReclamation := b.distributedSource.lockReclamation()
+	defer unlockReclamation()
 	var branch ttcbundle.BranchInfo
 	found := false
 	for _, candidate := range info.Branches {
@@ -4622,8 +4671,10 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	default:
 		return nil, fmt.Errorf("unknown node stop mode %q", mode)
 	}
+	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer terminalCancel()
 	if b.publicationQueue != nil && (mode != "migrate" || createdPublished) {
-		if err := b.publicationQueue.Drain(context.Background()); err != nil {
+		if err := b.publicationQueue.Drain(terminalCtx); err != nil {
 			return nil, fmt.Errorf("waiting for durable branch publication: %w", err)
 		}
 	}
@@ -4631,8 +4682,6 @@ func (b *runtimeBackend) stopNode(sourceNode, mode string, local bool) ([]select
 	if err != nil {
 		return moved, err
 	}
-	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer terminalCancel()
 	if err := b.finalizeNodeRetirement(terminalCtx); err != nil {
 		return moved, err
 	}

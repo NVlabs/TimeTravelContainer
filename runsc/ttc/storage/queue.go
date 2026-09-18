@@ -265,7 +265,20 @@ func (q *Queue) Drain(ctx context.Context) error {
 		q.signal()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			var details []string
+			for _, intent := range pending {
+				if intent.LastError == "" {
+					continue
+				}
+				details = append(details, fmt.Sprintf("%s@%s (%s): %s", intent.Container, intent.Branch, intent.ID, intent.LastError))
+				if len(details) == 3 {
+					break
+				}
+			}
+			if len(details) == 0 {
+				return fmt.Errorf("%d publications remain pending: %w", len(pending), ctx.Err())
+			}
+			return fmt.Errorf("%d publications remain pending: %s: %w", len(pending), strings.Join(details, "; "), ctx.Err())
 		case <-ticker.C:
 		}
 	}

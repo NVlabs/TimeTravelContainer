@@ -2318,7 +2318,8 @@ func (s *daemonServer) observeInitConsoleExit(target selector) {
 	if err == nil && changed {
 		err = backend.reconcilePlacementCatalog()
 	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) && s.stderr != nil {
+	var remoteOwner *remoteBranchOwnershipError
+	if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.As(err, &remoteOwner) && s.stderr != nil {
 		fmt.Fprintf(s.stderr, "ttcd: warning: finalizing natural exit for %s: %v\n", target, err)
 	}
 }
@@ -2393,6 +2394,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.snapshotShared = s.snapshotShared
 	backend.sharedReferences = s.sharedReferences
 	backend.portIngress = s.portIngress
+	backend.lockLifecycle = func() func() { return s.lockDataRoot(backend.dataRoot) }
 }
 
 // configureCommandBackend installs every daemon-owned service needed by a

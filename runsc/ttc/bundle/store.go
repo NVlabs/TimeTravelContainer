@@ -67,6 +67,14 @@ const removedContainerDir = "removed-containers"
 
 const containerCreationMarker = ".creating"
 
+// containerStagingDir holds unpublished container directories. Container
+// metadata is assembled here and atomically renamed into containers/ only
+// after the bundle and container record are complete. In particular, this
+// prevents a second NFS client from observing a creation-marker unlink before
+// it observes the preceding container.json rename and reclaiming a live
+// distributed target as an incomplete directory.
+const containerStagingDir = "container-staging"
+
 const stalePathReadAttempts = 6
 
 // retryStalePathRead reopens pathname-based metadata after NFS reports
@@ -1330,7 +1338,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		ImageSize:           pulled.Size,
 		LeaseID:             leaseID,
 		Platform:            imageInfo.Platform,
-		BundleDir:           bundleDir,
+		BundleDir:           filepath.Join(s.Root, "containers", id, "bundle"),
 		RootFS:              rootfs,
 		NetworkMode:         networkMode,
 		LiveForkEligible:    liveForkEligible,
@@ -1379,9 +1387,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)
 	}
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing container metadata: %w", err)
+	}
 	keep = true
 	keepManagedVolumeSnapshots = true
-	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
 // PrepareRestore imports a standalone checkpoint's writable filesystems and
@@ -1614,7 +1625,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.ImageSize = pulled.Size
 	metadata.LeaseID = leaseID
 	metadata.Platform = imageInfo.Platform
-	metadata.BundleDir = bundleDir
+	metadata.BundleDir = filepath.Join(s.Root, "containers", id, "bundle")
 	metadata.RootFS = rootfs
 	metadata.PublishedPorts = nil
 	metadata.RootfsUpperID = rootfsUpperID
@@ -1637,8 +1648,11 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, err
 	}
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing restored container metadata: %w", err)
+	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
 // PrepareDistributedFork creates target container metadata without copying
@@ -1847,21 +1861,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 			return Prepared{}, err
 		}
 		id = opts.TargetID
-		containerDir = filepath.Join(s.Root, "containers", id)
-		// Do not rely on immediate directory-cache visibility from the node that
-		// initialized the shared root. MkdirAll is idempotent when the parent is
-		// visible and establishes it locally when an NFS client still has a stale
-		// negative lookup cached.
-		if err := os.MkdirAll(filepath.Dir(containerDir), 0700); err != nil {
-			return Prepared{}, fmt.Errorf("preparing distributed container directory: %w", err)
-		}
-		if err := os.Mkdir(containerDir, 0700); err != nil {
-			return Prepared{}, fmt.Errorf("creating distributed target container %q: %w", id, err)
-		}
-		if err := os.WriteFile(filepath.Join(containerDir, containerCreationMarker), []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0600); err != nil {
-			_ = os.Remove(containerDir)
-			return Prepared{}, err
-		}
+		containerDir, err = s.createContainerStagingDir(id)
 	} else {
 		id, containerDir, err = s.createContainerDir(containers)
 	}
@@ -1923,7 +1923,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	// after migration. Raft placement maps it back to the logical family.
 	target.Name = id
 	target.LeaseID = leaseID
-	target.BundleDir = bundleDir
+	target.BundleDir = filepath.Join(s.Root, "containers", id, "bundle")
 	target.PublishedPorts = nil
 	target.AutoRemove = false
 	target.State = "created"
@@ -1953,15 +1953,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &target); err != nil {
 		return Prepared{}, err
 	}
-	// Reservation immediately resolves this hidden record by transaction ID on
-	// the same node. Finalize the creation marker synchronously; waiting for a
-	// periodic recovery sweep makes the just-created target invisible to the
-	// following Prepare request.
-	if err := os.Remove(filepath.Join(containerDir, containerCreationMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return Prepared{}, fmt.Errorf("finalizing distributed target metadata: %w", err)
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing distributed target metadata: %w", err)
 	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: target.RootFS, Container: target}, nil
+	return Prepared{BundleDir: target.BundleDir, RootFS: target.RootFS, Container: target}, nil
 }
 
 func copyRestoreHostPath(source, destination string) error {
@@ -2683,10 +2679,6 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 	for _, info := range existing {
 		unavailable[info.Name] = true
 	}
-	containersDir := filepath.Join(s.Root, "containers")
-	if err := os.MkdirAll(containersDir, 0700); err != nil {
-		return "", "", fmt.Errorf("creating container state root: %w", err)
-	}
 	for attempt := 0; attempt < 100; attempt++ {
 		id, err := randomObjectID("container", containerIDBytes)
 		if err != nil {
@@ -2695,23 +2687,45 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		if unavailable[id] {
 			continue
 		}
-		dir := filepath.Join(containersDir, id)
-		if err := os.Mkdir(dir, 0700); err == nil {
-			// Retain the marker through metadata publication. On NFS, another
-			// client may observe its unlink before preceding config.json and
-			// container.json renames. Startup/maintenance removes it only after
-			// loading the complete record through the normal path.
-			marker := filepath.Join(dir, containerCreationMarker)
-			if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0600); err != nil {
-				_ = os.Remove(dir)
-				return "", "", fmt.Errorf("marking container %s creation: %w", id, err)
-			}
+		dir, err := s.createContainerStagingDir(id)
+		if err == nil {
 			return id, dir, nil
 		} else if !os.IsExist(err) {
 			return "", "", fmt.Errorf("creating state for container %s: %w", id, err)
 		}
 	}
 	return "", "", errors.New("could not allocate a unique container ID")
+}
+
+func (s Store) createContainerStagingDir(id string) (string, error) {
+	if err := os.MkdirAll(filepath.Join(s.Root, "containers"), 0700); err != nil {
+		return "", fmt.Errorf("creating container state root: %w", err)
+	}
+	root := filepath.Join(s.Root, containerStagingDir)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating container staging root: %w", err)
+	}
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// publishContainerDir is the only boundary at which a newly constructed
+// container becomes visible. Renaming the complete directory is atomic to all
+// clients of a conforming shared filesystem; unlike a marker unlink, it does
+// not require cross-client cache ordering between independent pathnames.
+func (s Store) publishContainerDir(id, stagingDir string) error {
+	finalDir := filepath.Join(s.Root, "containers", id)
+	if err := s.rename(stagingDir, finalDir); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(finalDir))
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 func normalizePortBinding(binding PortBinding) (PortBinding, error) {
 	address, err := netip.ParseAddr(binding.HostIP)
@@ -4271,8 +4285,22 @@ func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldI
 
 // RecordBranchStart records a fresh process incarnation for one branch. Family
 // state is derived from all branches; starting one branch never deletes or
-// rewrites its peers.
+// rewrites its peers. A publication ID fences one process-free capture, not
+// the mutable incarnation created from it. Keep StorageManifest as the
+// immutable filesystem ancestor for lazy reads and the next incremental
+// publication, but retire the old transaction identity when execution starts.
 func (s Store) RecordBranchStart(name, branchID string) error {
+	return s.RecordBranchActivation(name, branchID, "running")
+}
+
+// RecordBranchActivation commits a process-bearing incarnation reconstructed
+// from a cold branch. state is explicit because a dehydrated branch may have
+// been captured paused. This is also the common publication-fence retirement
+// boundary for fresh start and rehydration.
+func (s Store) RecordBranchActivation(name, branchID, state string) error {
+	if state != "running" && state != "paused" {
+		return fmt.Errorf("invalid active branch state %q", state)
+	}
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		now := time.Now().UTC()
 		for i := range info.Branches {
@@ -4280,8 +4308,9 @@ func (s Store) RecordBranchStart(name, branchID string) error {
 			if branch.ID != branchID {
 				continue
 			}
-			updateBranchLifecycle(branch, "running", nil, now)
+			updateBranchLifecycle(branch, state, nil, now)
 			branch.Unplaced = false
+			branch.PublicationID = ""
 			branch.StorageState = "local"
 			branch.StorageError = ""
 			branch.StorageRetryAt = time.Time{}
@@ -4862,6 +4891,16 @@ func (s Store) removedContainersRoot() string {
 
 func (s Store) discardIncompleteContainer(id string) {
 	defer s.removeActiveContainer(id)
+	staging := filepath.Join(s.Root, containerStagingDir, id)
+	if err := s.removeAll(staging); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Warningf("Deferring cleanup of unpublished container %q: %v", id, err)
+	}
+	// A failed construction normally has no entry in containers/. Preserve the
+	// legacy recovery path for roots created by an interrupted older daemon and
+	// for a failure after the atomic publication rename.
+	if _, err := os.Lstat(filepath.Join(s.Root, "containers", id)); errors.Is(err, fs.ErrNotExist) {
+		return
+	}
 	tombstone, err := s.stageContainerRemoval(id)
 	if err != nil {
 		log.Warningf("Deferring cleanup of incomplete container %q in the active namespace: %v", id, err)

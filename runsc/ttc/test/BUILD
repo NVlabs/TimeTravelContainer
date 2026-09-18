@@ -120,6 +120,16 @@ sh_binary(
     ],
 )
 
+# Manual because it pulls Python, drives a high-frequency SQLite WAL writer,
+# and migrates while lazy whole-file materialization is still active.
+sh_binary(
+    name = "e2e_distributed_active_fs",
+    srcs = ["e2e_distributed_active_fs.sh"],
+    tags = [
+        "manual",
+    ],
+)
+
 # Manual because it pulls an image and composes all of the lower-frequency CLI
 # lifecycle paths, including checkpoint/restore and dehydration.
 sh_binary(

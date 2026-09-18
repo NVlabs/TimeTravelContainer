@@ -280,8 +280,22 @@ type distributedSourceRuntime struct {
 	monitorCount  atomic.Int64
 	sourceLocks   [64]sync.Mutex
 	originLocks   [64]sync.Mutex
+	// reclamationMu serializes terminal physical-source reclamation across
+	// families. Each reclamation performs repository-wide origin inventory and
+	// provider reconciliation, so per-family locks alone are insufficient: one
+	// family deleting its private repository can otherwise race another
+	// family's global inventory opening that same repository.
+	reclamationMu sync.Mutex
 	pageListen    string
 	pageAdvertise string
+}
+
+func (r *distributedSourceRuntime) lockReclamation() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.reclamationMu.Lock()
+	return r.reclamationMu.Unlock
 }
 
 func (r *distributedSourceRuntime) lockSnapshotOrigin(origin ttcsnapshot.SnapshotID) func() {
@@ -1153,7 +1167,7 @@ func (b *runtimeBackend) installRemoteExecSessionStates(container, branch string
 		if err != nil {
 			return err
 		}
-		if err := installRetainedExecWaitStatus(paths, *session.ExitStatus); err != nil {
+		if err := installRetainedConsoleWaitStatus(paths, *session.ExitStatus); err != nil {
 			return fmt.Errorf("restoring wait status for exec session %q: %w", session.ID, err)
 		}
 	}
@@ -1790,11 +1804,17 @@ func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInf
 	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return nil
 	}
+	// Use the graph's current bindings rather than the branch record's captured
+	// object list. Source cleanup is intentionally restartable: a prior attempt
+	// may have committed root release and then failed while removing filesystem
+	// artifacts. In that state the durable branch record still carries its old
+	// diagnostic object IDs, but there is no longer a provider root to publish.
+	// Treating those IDs as live made every retry fail on the origin tombstone.
 	origins := make(map[ttcsnapshot.SnapshotID]struct{})
-	for _, encoded := range branchGraphRootObjects(branch) {
-		id, err := ttcsnapshot.ParseObjectID(encoded)
-		if err != nil {
-			return err
+	for _, root := range branchGraphRootNames(branch) {
+		id, ok := b.snapshotGraph.Root(root)
+		if !ok {
+			continue
 		}
 		provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
 		if err != nil {
@@ -1908,6 +1928,24 @@ func (b *runtimeBackend) publishVolatileFilesystemOriginContext(ctx context.Cont
 	}
 	// Dependency publication can take long enough for an idempotent concurrent
 	// publisher to finish this origin too.
+	provider, volatile, err = b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil {
+		return err
+	}
+	if !volatile {
+		_, err := b.snapshotShared.Manifest(origin)
+		return err
+	}
+	if provider.NodeID != b.nodeID {
+		return fmt.Errorf("filesystem origin %d provider changed to node %q", origin, provider.NodeID)
+	}
+	// Pack construction for dependencies is intentionally outside the origin
+	// critical section. Serialize the final provider ledger/authority handoff
+	// with cancellation and orphan reconciliation, then revalidate authority:
+	// another idempotent publisher may have completed while dependencies were
+	// being made durable.
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
 	provider, volatile, err = b.distributedSource.authority.SnapshotProvider(uint64(origin))
 	if err != nil {
 		return err

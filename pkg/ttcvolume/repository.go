@@ -321,7 +321,14 @@ type Repository struct {
 	// each other, and bulk data I/O continues after this short metadata section.
 	viewMu      sync.RWMutex
 	operationMu sync.Mutex
-	lockFile    *os.File
+	// remoteMarkerSyncMu only serializes removal of a materialized remote
+	// object's pending marker with the metadata durability pass that snapshots
+	// and opens dirty marker files. It must remain independent of operationMu:
+	// remote materialization invokes Sentry cache-invalidation hooks, while
+	// ordinary filesystem operations can hold those runtime locks before taking
+	// operationMu.
+	remoteMarkerSyncMu sync.Mutex
+	lockFile           *os.File
 	// activeLock holds a shared lifecycle lease for descriptor-backed
 	// repositories donated to a live Sentry. Manager-side garbage collection
 	// takes the same file exclusively and non-blockingly, so it cannot mistake
@@ -2732,6 +2739,16 @@ func (r *Repository) OpenDataFileWithCoW(branchID string, ino uint64, writable b
 
 // SyncData makes the selected data object durable.
 func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error {
+	// A remotely restored application may synchronize an inherited file before
+	// issuing its first read, write, or mmap fault. Those ordinary data paths
+	// materialize lazy whole-file objects, but fsync(2) must not assume that one
+	// of them has already run. Besides returning a spurious ENOENT, doing so
+	// would acknowledge durability without making the volatile provider bytes
+	// local. EnsureDataRange clamps this deliberately oversized request to the
+	// immutable inode length and installs the complete object atomically.
+	if err := r.EnsureDataRange(branchID, ino, 0, int64(^uint64(0)>>1)); err != nil {
+		return fmt.Errorf("materializing branch %q inode %d for data sync: %w", branchID, ino, err)
+	}
 	file, _, _, err := r.OpenDataFile(branchID, ino, false)
 	if err != nil {
 		return fmt.Errorf("resolving branch %q inode %d for data sync: %w", branchID, ino, err)
@@ -2820,6 +2837,12 @@ func (r *Repository) syncMetadataLocked() error {
 		return fmt.Errorf("syncing repository data objects: %w", err)
 	}
 	sort.Strings(dirtyBranches)
+	// A completed remote fetch removes its pending marker. Keep the dirty-file
+	// snapshot and the corresponding opens in one small critical section so the
+	// marker cannot disappear between them. This lock deliberately excludes the
+	// rest of SyncMetadata: holding it across graph and branch publication would
+	// unnecessarily stall remote reads behind slow filesystem durability work.
+	r.remoteMarkerSyncMu.Lock()
 	r.dirtyMu.Lock()
 	var rootDirty []string
 	for name := range r.dirtyFiles {
@@ -2856,8 +2879,10 @@ func (r *Repository) syncMetadataLocked() error {
 		return nil
 	}
 	if err := syncFiles(rootDirty); err != nil {
+		r.remoteMarkerSyncMu.Unlock()
 		return err
 	}
+	r.remoteMarkerSyncMu.Unlock()
 	// Persist directory entries only after the files they name. The graph WAL
 	// is the final reachability barrier, so every immutable object must already
 	// be openable if that WAL survives a crash.
@@ -3898,6 +3923,17 @@ func (r *Repository) clearRemoteObjectPending(id string) error {
 		r.markDirtyDirectory(filepath.Dir(marker))
 	}
 	return err
+}
+
+// retireRemoteObjectPending removes a materialized object's remote marker
+// without racing the short dirty-marker portion of a durability boundary. It
+// must not take operationMu: materialization callbacks acquire Sentry file and
+// mapping locks, while guest filesystem operations can hold those locks before
+// entering a repository mutation.
+func (r *Repository) retireRemoteObjectPending(id string) error {
+	r.remoteMarkerSyncMu.Lock()
+	defer r.remoteMarkerSyncMu.Unlock()
+	return r.clearRemoteObjectPending(id)
 }
 
 func (r *Repository) readFile(name string) ([]byte, error) {

@@ -924,12 +924,21 @@ func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
 	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, opts.DataOnly); err != nil {
+		// Sync failures are never an expected pathname-control-flow result. Keep
+		// the repository cause even when it maps to a familiar errno such as
+		// ENOENT or EINVAL; applications such as SQLite collapse all of these to
+		// SQLITE_IOERR_FSYNC, which otherwise conceals lifecycle races.
+		reportDiskVolumeFailure("sync regular-file data", err)
 		return diskVolumeError("sync regular-file data", err)
 	}
 	if err := f.flushDiskMetadataLocked(); err != nil {
 		return err
 	}
-	return diskVolumeError("sync filesystem metadata", f.inode.fs.diskVolume.Repository.SyncMetadata())
+	if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
+		reportDiskVolumeFailure("sync filesystem metadata", err)
+		return diskVolumeError("sync filesystem metadata", err)
+	}
+	return nil
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.

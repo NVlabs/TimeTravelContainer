@@ -958,8 +958,21 @@ func (s *sharedReferenceService) withLedger(fn func(*ttcsnapshot.ReferenceLedger
 	if current.NodeID != s.lease.NodeID || current.Incarnation != s.lease.Incarnation || current.Generation != s.lease.Generation || !time.Now().Before(current.ExpiresAt) {
 		return errors.New("shared reference lease is stale")
 	}
-	return fn(s.ledger)
+	if err := fn(s.ledger); err != nil {
+		return err
+	}
+	// The semantic WAL records crash-safe transitions, not retained history.
+	// Long migration chains can perform millions of short-lived edge updates
+	// while converging back to a tiny live graph. Bound restart time and local
+	// scratch growth by checkpointing the resulting state once the WAL reaches
+	// the same scale as other snapshot-graph journals.
+	if s.ledger.JournalBytes() >= sharedReferenceLedgerCheckpointBytes {
+		return s.ledger.Checkpoint()
+	}
+	return nil
 }
+
+const sharedReferenceLedgerCheckpointBytes = 16 << 20
 
 func (s *sharedReferenceService) authorizeProvider(peer string, snapshot uint64) error {
 	provider, volatile, err := s.authority.SnapshotProvider(snapshot)

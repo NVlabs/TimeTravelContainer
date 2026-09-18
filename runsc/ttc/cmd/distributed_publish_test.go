@@ -499,6 +499,30 @@ func TestDistributedSourceCleanupIsSerializedPerFamily(t *testing.T) {
 	<-released
 }
 
+func TestDistributedSourceReclamationIsSerializedAcrossFamilies(t *testing.T) {
+	runtime := &distributedSourceRuntime{}
+	unlock := runtime.lockReclamation()
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer runtime.lockReclamation()()
+		close(entered)
+	}()
+	select {
+	case <-entered:
+		t.Fatal("repository-wide reclamation entered concurrently")
+	case <-time.After(20 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("repository-wide reclamation did not resume")
+	}
+	<-done
+}
+
 func TestDistributedForegroundCapturePreemptsQueuedHandoffs(t *testing.T) {
 	runtime := &distributedSourceRuntime{}
 	active := make(chan struct{}, distributedHandoffConcurrency)

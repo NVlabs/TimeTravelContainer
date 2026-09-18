@@ -848,7 +848,17 @@ func (c *remoteObjectClient) ensure(object string, size, offset, length int64) e
 	if err := c.repository.replaceRemoteObject(id, object, reader, size); err != nil {
 		return err
 	}
-	if err := c.repository.clearRemoteObjectPending(object); err != nil {
+	// The pending marker participates in the repository durability set. Keep
+	// its unlink in the same operation domain as SyncMetadata: otherwise a
+	// concurrent fsync can snapshot the marker from dirtyFiles, materialization
+	// can unlink it, and fsync then reports a spurious ENOENT to the guest. This
+	// is particularly visible as SQLITE_IOERR_FSYNC during live migration.
+	//
+	// Do not take the full repository mutation fence here. ReadAt may retain
+	// viewMu for reading across this fetch, while withLock needs it for writing.
+	// operationMu is the narrower common lock with SyncMetadata and preserves
+	// the repository's viewMu -> operationMu order.
+	if err := c.repository.retireRemoteObjectPending(object); err != nil {
 		return err
 	}
 	c.complete[object] = true
