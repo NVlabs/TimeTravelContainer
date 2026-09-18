@@ -2949,7 +2949,13 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 	}
 	captureArgs := boot.DistributedForkCaptureManyArgs{
-		Source: source.branch, FamilyID: source.container,
+		// Distributed metadata is a cluster-visible snapshot identity, not the
+		// identity of the Sentry process that happens to capture it. In
+		// particular, source.container changes after migration while
+		// logicalSource.container remains stable. Singular fork and migration
+		// use the logical identity too; keeping the batch path consistent lets a
+		// migrated branch fan out without weakening restore's identity check.
+		Source: source.branch, FamilyID: logicalSource.container,
 		MaxTransferBytes: commonDataPlaneMax, PushPolicy: sentryremote.TCPPushPolicy(commonPolicy.Push),
 		PushHighWater: commonPolicy.MaxOutstandingBytes,
 		Children:      make([]boot.DistributedForkCaptureChildArgs, len(children)),

@@ -131,13 +131,16 @@ test "$(client_a exec "$NAME@renamed" cat /identity)" = REMOTE-1
 test "$(client_a exec "$NAME@renamed" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 test "$(client_a exec "$NAME@renamed" sh -c 'wc -c </dev/shm/resident')" = 33554432
 
-client_a fork --node node-b "$NAME@renamed" remote2 >/dev/null
+client_a fork --node node-b "$NAME@renamed" remote2 remote3 >/dev/null
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 test "$(client_b exec "$NAME@remote2" sh -c 'wc -c </dev/shm/resident')" = 33554432
+test "$(client_b exec "$NAME@remote3" cat /identity)" = REMOTE-1
+test "$(client_b exec "$NAME@remote3" sh -c 'dd if=/dev/shm/resident bs=11 count=1 2>/dev/null')" = MEMORY-MARK
 client_b exec "$NAME@remote2" sh -c "printf REMOTE-2 >/identity"
 test "$(client_a exec "$NAME@renamed" cat /identity)" = REMOTE-1
 test "$(client_b exec "$NAME@remote2" cat /identity)" = REMOTE-2
+test "$(client_b exec "$NAME@remote3" cat /identity)" = REMOTE-1
 test "$(client_a ls --json | jq -r --arg name "$NAME" '.[] | select(.name == $name) | .branches[] | select(.id == "remote2") | .parent')" = renamed
 
 # Live handoff descriptors are carried directly over the cluster protocol.
