@@ -6981,8 +6981,37 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			}
 		}
 		if owner != "" && request.PlacementNode != "" && owner != request.PlacementNode {
-			writeError(fmt.Errorf("branch is already placed on node %q, not requested node %q", owner, request.PlacementNode))
-			return
+			operands, processFree, relocationErr := processFreeStartRelocationOperands(s.dataRoot, s.clusterPlacements, request.Args)
+			if relocationErr != nil {
+				writeError(fmt.Errorf("checking process-free placement relocation: %w", relocationErr))
+				return
+			}
+			if !processFree {
+				writeError(fmt.Errorf("branch is already placed on node %q, not requested node %q", owner, request.PlacementNode))
+				return
+			}
+			peer, err := s.distributedSource.peer(owner, false)
+			if err != nil {
+				writeError(fmt.Errorf("connecting to process-free branch owner %q: %w", owner, err))
+				return
+			}
+			publicationRequestID, err := newDaemonRequestID()
+			if err != nil {
+				writeError(err)
+				return
+			}
+			status, _, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, publicationRequestID, append([]string{"stop"}, operands...))
+			if err != nil || status != 0 {
+				writeError(errors.Join(err, fmt.Errorf("publishing process-free branch on node %q failed with status %d: %s", owner, status, strings.TrimSpace(diagnostic))))
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			owner, request.PlacementClaims, err = awaitDaemonColdUnplacement(ctx, s.dataRoot, s.clusterPlacements, request.Args)
+			cancel()
+			if err != nil {
+				writeError(fmt.Errorf("waiting to relocate process-free branch: %w", err))
+				return
+			}
 		}
 		if owner == "" && daemonCommandNeedsPlacementAdmission(request.Args) {
 			if request.PlacementNode != "" {

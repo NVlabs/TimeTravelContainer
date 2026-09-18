@@ -619,6 +619,47 @@ func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.Bra
 	return &record, nil
 }
 
+func TestProcessFreeStartRelocationEligibility(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir, State: "created",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", FilesystemBranch: "main", State: "created"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a",
+		PhysicalContainer: "family", PhysicalBranch: "main", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	catalog := branchAwarePlacementCatalog{PlacementCatalog: base, branches: map[string]cluster.BranchAuthority{
+		"family\x00main": {FamilyID: "family", BranchID: "main", Lifecycle: "created"},
+	}}
+	operands, ok, err := processFreeStartRelocationOperands(root, catalog, []string{"start", "-a", "web@main"})
+	if err != nil || !ok || !slices.Equal(operands, []string{"web@main"}) {
+		t.Fatalf("created relocation = (%v, %t, %v)", operands, ok, err)
+	}
+	branch := catalog.branches["family\x00main"]
+	branch.Lifecycle = "running"
+	catalog.branches["family\x00main"] = branch
+	if _, ok, err := processFreeStartRelocationOperands(root, catalog, []string{"start", "web@main"}); err != nil || ok {
+		t.Fatalf("running relocation eligibility = (%t, %v), want false", ok, err)
+	}
+}
+
 func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "containers", "family-id", "container.json")

@@ -1715,6 +1715,49 @@ func lifecycleCommandOperands(args []string) ([]string, error) {
 	return fs.Args(), nil
 }
 
+// processFreeStartRelocationOperands returns the exact branches that may be
+// durably published and re-admitted on a requested node. Running/paused state
+// is never moved implicitly by start --node; users must use migrate for that.
+func processFreeStartRelocationOperands(dataRoot string, placements cluster.PlacementCatalog, args []string) ([]string, bool, error) {
+	if dataRoot == "" || placements == nil || len(args) == 0 || args[0] != "start" {
+		return nil, false, nil
+	}
+	authority, ok := placements.(interface {
+		Branch(family, branch string) (*cluster.BranchAuthority, error)
+	})
+	if !ok {
+		return nil, false, nil
+	}
+	operands, err := lifecycleCommandOperands(args)
+	if err != nil || len(operands) == 0 {
+		return nil, false, err
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	for _, operand := range operands {
+		target, err := parseSelector(operand)
+		if err != nil {
+			return nil, false, err
+		}
+		info, loadErr := store.LoadContainer(target.container)
+		family := ""
+		if loadErr == nil {
+			family = logicalFamilyID(info)
+		} else if family, err = resolvePlacementFamily(placements, target.container); err != nil {
+			return nil, false, loadErr
+		}
+		branch, err := authority.Branch(family, target.branch)
+		if err != nil {
+			return nil, false, err
+		}
+		switch normalizeLifecycleState(branch.Lifecycle) {
+		case "created", "exited":
+		default:
+			return nil, false, nil
+		}
+	}
+	return operands, true, nil
+}
+
 func executeRemoteDaemonCommand(ctx context.Context, peer *cluster.Client, requestID string, args []string) (int, string, string, error) {
 	request := daemonRequest{Version: daemonAPIVersion, Action: "command", RequestID: requestID, Args: append([]string(nil), args...)}
 	return executeRemoteDaemonRequest(ctx, peer, request)
