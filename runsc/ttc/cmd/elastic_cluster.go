@@ -1503,7 +1503,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	metadataDrift := branch.StorageManifest == "" ||
 		filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) ||
 		normalizeLifecycleState(branch.State) != normalizeLifecycleState(authority.Lifecycle) ||
-		branch.Unplaced == false
+		!branch.Unplaced
 	if activePublication {
 		metadataDrift = metadataDrift || branch.PublicationID != manifest.PublicationID
 	} else {

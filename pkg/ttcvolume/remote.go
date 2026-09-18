@@ -538,6 +538,8 @@ func (r *Repository) PinRemoteRestore() func() {
 
 // lockRemoteLifecycleForMaterialization acquires remoteLifecycleMu after all
 // peer restores that can discover new lazy objects have completed.
+//
+// +checklocksacquire:r.remoteLifecycleMu
 func (r *Repository) lockRemoteLifecycleForMaterialization() {
 	r.remoteLifecycleMu.Lock()
 	if r.remoteLifecycleCV == nil {
@@ -648,6 +650,8 @@ func (r *Repository) MaterializeRemoteObjects() error {
 // caller retains remoteLifecycleMu across a larger lifecycle transaction.
 //
 // Preconditions: remoteLifecycleMu is held.
+//
+// +checklocks:r.remoteLifecycleMu
 func (r *Repository) materializeRemoteObjects() error {
 	for {
 		var work []remoteMaterialization

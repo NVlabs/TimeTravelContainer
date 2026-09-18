@@ -5856,7 +5856,7 @@ func TestPrepareCheckpointClientIO(t *testing.T) {
 			t.Fatal(err)
 		}
 		if args[len(args)-1] != "-" || input == nil || finish == nil {
-			t.Fatalf("prepared checkpoint args=%q input=%v finish=%v", args, input, finish)
+			t.Fatalf("prepared checkpoint args=%q input=%v finish-nil=%t", args, input, finish == nil)
 		}
 		if _, err := io.WriteString(output, "checkpoint-bytes"); err != nil {
 			t.Fatal(err)
@@ -5880,7 +5880,7 @@ func TestPrepareCheckpointClientIO(t *testing.T) {
 			t.Fatal(err)
 		}
 		if args[len(args)-1] != "-" || finish == nil {
-			t.Fatalf("prepared restore args=%q finish=%v", args, finish)
+			t.Fatalf("prepared restore args=%q finish-nil=%t", args, finish == nil)
 		}
 		data, err := io.ReadAll(input)
 		if err != nil || string(data) != "checkpoint-bytes" {

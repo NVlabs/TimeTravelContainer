@@ -531,8 +531,8 @@ type RuntimeMemoryBacking struct {
 }
 
 // BranchNodeID returns the explicit cluster owner of branchID.
-func (c ContainerInfo) BranchNodeID(branchID string) string {
-	for _, branch := range c.Branches {
+func (info ContainerInfo) BranchNodeID(branchID string) string {
+	for _, branch := range info.Branches {
 		if branch.ID == branchID {
 			if branch.Unplaced {
 				return ""

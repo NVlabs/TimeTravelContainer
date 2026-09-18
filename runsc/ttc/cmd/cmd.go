@@ -9753,7 +9753,7 @@ func (b *runtimeBackend) removeCorruptedBranch(target selector) error {
 				return fmt.Errorf("removing shared branch metadata for %s: %w", target, err)
 			}
 		}
-	} else if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
 		return loadErr
 	}
 	_, err = b.reconcileVolatileSnapshotOrigins()

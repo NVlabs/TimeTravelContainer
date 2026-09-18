@@ -2036,8 +2036,7 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 
 func TestPrepareControlOnlyClusterProbesComputeSeed(t *testing.T) {
 	var gotNode string
-	var seed *httptest.Server
-	seed = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	seed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotNode = r.Header.Get("X-TTC-Node")
 		if r.URL.Path != "/v1/daemon" {
 			http.NotFound(w, r)
@@ -2205,8 +2204,7 @@ func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
 	}))
 	defer leader.Close()
 
-	var follower *httptest.Server
-	follower = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	follower := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/daemon":
 			payload, _ := json.Marshal(map[string]any{
