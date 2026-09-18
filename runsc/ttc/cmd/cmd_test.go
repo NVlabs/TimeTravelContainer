@@ -6925,8 +6925,9 @@ func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
 		branch ttcbundle.BranchInfo
 		want   bool
 	}{
-		{name: "running", branch: ttcbundle.BranchInfo{State: "running"}, want: true},
-		{name: "paused", branch: ttcbundle.BranchInfo{State: "paused"}, want: true},
+		{name: "running-dependent", branch: ttcbundle.BranchInfo{State: "running", DependentMemoryBytes: 4096}, want: true},
+		{name: "paused-roots", branch: ttcbundle.BranchInfo{State: "paused", SnapshotID: 17, MemoryRootObjects: []string{"0000000000000011-03-0000000000000001"}}, want: true},
+		{name: "running-independent", branch: ttcbundle.BranchInfo{State: "running"}},
 		{name: "dehydrating", branch: ttcbundle.BranchInfo{State: "dehydrating"}},
 		{name: "dehydrated", branch: ttcbundle.BranchInfo{State: "dehydrated", Unplaced: true}},
 		{name: "exited", branch: ttcbundle.BranchInfo{State: "exited"}},

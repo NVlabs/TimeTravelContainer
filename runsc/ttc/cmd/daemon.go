@@ -1662,7 +1662,13 @@ func distributedGraphHandoffHasLiveRuntime(branch ttcbundle.BranchInfo) bool {
 	}
 	switch normalizeLifecycleState(branch.State) {
 	case "running", "paused":
-		return true
+		// GraphHandoff remains in the immutable transaction record after the
+		// target has faulted every page and retired its backing roots. At that
+		// point the live Sentry is self-contained: there is no relay reader to
+		// refresh, and the former origin may correctly have been reclaimed from
+		// Raft. Treating the historical handoff as live would make daemon restart
+		// depend on an object that the data plane has already proved unnecessary.
+		return branch.DependentMemoryBytes != 0 || branch.SnapshotID != 0 || len(branch.MemoryRootObjects) != 0
 	default:
 		return false
 	}
