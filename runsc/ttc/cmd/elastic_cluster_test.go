@@ -756,7 +756,7 @@ func TestAwaitDaemonColdUnplacementWaitsForSameDestinationOwner(t *testing.T) {
 	}
 }
 
-func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.T) {
+func TestWaitForCommittedColdBranchMetadataRepairsPublisherCrash(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "family-id")
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -786,10 +786,8 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 	initial := ttcbundle.ContainerInfo{
 		ID: "family-id", Name: "web", State: "dehydrated", BundleDir: bundleDir,
 		Branches: []ttcbundle.BranchInfo{{
-			// Model the publication queue's narrow post-Raft window: Begin has
-			// recorded the new publication identity but the physical branch still
-			// names its preceding shared manifest. Complete replaces the manifest
-			// path after the authority commit below.
+			// Model a publisher crash after Raft committed the new roots but before
+			// it replaced the physical branch's preceding shared manifest.
 			ID: "cold", State: "running", StorageState: "local",
 			PublicationID:   publicationID,
 			StorageManifest: coldManifestPath(root, "family-id", "cold", "publication-previous"),
@@ -808,28 +806,10 @@ func TestWaitForCommittedColdBranchMetadataOrdersPublisherCompletion(t *testing.
 		Roots: cluster.DurableRoots{FilesystemRoot: relativeManifest, MemorySnapshot: 17},
 	}
 	store := ttcbundle.Store{Root: root}
-	completed := make(chan error, 1)
-	go func() {
-		time.Sleep(75 * time.Millisecond)
-		complete := initial
-		complete.State = "dehydrated"
-		complete.Branches = append([]ttcbundle.BranchInfo(nil), initial.Branches...)
-		branch := &complete.Branches[0]
-		branch.State = "dehydrated"
-		branch.StorageState = "shared"
-		branch.PublicationID = publicationID
-		branch.StorageManifest = manifest
-		branch.NodeID = ""
-		branch.Unplaced = true
-		completed <- writeCurrentBundleFixture(metadataPath, complete)
-	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	info, branch, err := waitForCommittedColdBranchMetadata(ctx, store, "family-id", "cold", authority)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := <-completed; err != nil {
 		t.Fatal(err)
 	}
 	if info.ID != "family-id" || branch.StorageState != "shared" || branch.StorageManifest != manifest || !branch.Unplaced {

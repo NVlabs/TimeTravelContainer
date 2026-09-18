@@ -1453,6 +1453,17 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 			config := configBySource[filesystem.Root.Source]
 			repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
 			if err != nil {
+				// CommitPublication already moved these origins to shared
+				// authority. If the provider's disposable active tier was lost
+				// after that irreversible boundary, its local handoff ledger is
+				// gone as well and completion is already satisfied locally.
+				if errors.Is(err, os.ErrNotExist) {
+					if _, statErr := os.Stat(config.Path); errors.Is(statErr, os.ErrNotExist) {
+						continue
+					} else if statErr != nil {
+						return fmt.Errorf("stating published filesystem source %q: %w", filesystem.Root.Source, statErr)
+					}
+				}
 				return err
 			}
 			for _, encodedOrigin := range filesystem.Origins {

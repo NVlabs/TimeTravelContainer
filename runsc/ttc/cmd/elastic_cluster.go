@@ -1425,9 +1425,10 @@ func awaitDaemonColdUnplacement(ctx context.Context, dataRoot string, placements
 // branch in between those steps, because materialization reads the derived
 // manifest path.
 //
-// Waiting is preferable to reconstructing container.json on the claimant: it
-// also orders the old publisher's queue completion before rehydration clears
-// the publication identity for the new mutable runtime.
+// container.json is derived state after the Raft commit. Any node may roll it
+// forward from the immutable manifest if the original publisher crashed in
+// this gap; waiting for that dead publisher would permanently strand the
+// branch and hold the daemon mutation lock for the caller's timeout.
 func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Store, containerID, branchID string, authority cluster.BranchAuthority) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
 	if authority.Roots.FilesystemRoot == "" {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, errors.New("unplaced branch has no committed publication roots")
@@ -1461,48 +1462,53 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	if authority.PublicationID != "" && manifest.PublicationID != authority.PublicationID {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("committed cold manifest publication is %q, authority has %q", manifest.PublicationID, authority.PublicationID)
 	}
-	lastPublicationID := ""
-	lastManifest := ""
-	for {
-		// The manifest is the authoritative filesystem root and contains the
-		// exact physical record that published it. This remains resolvable after
-		// stop discards the memory root and terminal publication transaction,
-		// and avoids selecting a stale same-named record after migrations.
-		info, err := store.LoadRuntimeContainer(manifest.Container)
+	// The manifest is the authoritative filesystem root and contains the exact
+	// physical record that published it. This remains resolvable after stop
+	// discards the memory root and terminal publication transaction, and avoids
+	// selecting a stale same-named record after migrations.
+	info, err := store.LoadRuntimeContainer(manifest.Container)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	branch, err := persistentBranchInfo(info, manifest.Branch)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if branch.PublicationID != manifest.PublicationID || branch.StorageManifest == "" ||
+		filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
+		lifecycle := authority.Lifecycle
+		if lifecycle == "" {
+			lifecycle = "exited"
+			if manifest.Kind == "dehydrate" {
+				lifecycle = "dehydrated"
+			}
+		}
+		if err := store.CompleteBranchPublication(manifest.Container, manifest.Branch, manifest.PublicationID, expectedManifest, lifecycle, true); err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("repairing committed cold branch metadata: %w", err)
+		}
+		info, err = store.LoadRuntimeContainer(manifest.Container)
 		if err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
 		}
-		branch, err := persistentBranchInfo(info, manifest.Branch)
+		branch, err = persistentBranchInfo(info, manifest.Branch)
 		if err != nil {
 			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
-		}
-		lastPublicationID = branch.PublicationID
-		lastManifest = branch.StorageManifest
-		// Raft publication commit is irreversible and precedes this derived
-		// metadata update. An empty or older ID therefore means the publisher
-		// has not completed its shared-catalog write yet, not that the committed
-		// roots are invalid. Poll until the exact authoritative identity appears.
-		// PublicationID and StorageManifest are the immutable publication fence.
-		// StorageState is deliberately not part of it: after publication, a node
-		// may materialize the branch into its disposable local cache for cp, a
-		// cold fork, or rehydration. That cache activity must not make the
-		// already-committed shared snapshot inadmissible on another node.
-		if branch.PublicationID == manifest.PublicationID && branch.StorageManifest != "" &&
-			filepath.Clean(branch.StorageManifest) == filepath.Clean(expectedManifest) {
-			if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {
-				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", manifest.Branch, branch.SnapshotID, authority.Roots.MemorySnapshot)
-			}
-			if _, err := os.Stat(expectedManifest); err != nil {
-				return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("opening committed cold manifest: %w", err)
-			}
-			return info, branch, nil
-		}
-		select {
-		case <-ctx.Done():
-			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("waiting for committed cold branch metadata (last publication %q manifest %q, want publication %q manifest %q): %w", lastPublicationID, lastManifest, manifest.PublicationID, expectedManifest, ctx.Err())
-		case <-ticker.C:
 		}
 	}
+	// PublicationID and StorageManifest are the immutable publication fence.
+	// StorageState is deliberately not part of it: after publication, a node
+	// may materialize the branch into its disposable local cache for cp, a cold
+	// fork, or rehydration.
+	if branch.PublicationID != manifest.PublicationID || filepath.Clean(branch.StorageManifest) != filepath.Clean(expectedManifest) {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, errors.New("committed cold branch metadata did not converge")
+	}
+	if authority.Roots.MemorySnapshot != 0 && branch.SnapshotID != authority.Roots.MemorySnapshot {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("branch %s memory snapshot is %d, committed authority has %d", manifest.Branch, branch.SnapshotID, authority.Roots.MemorySnapshot)
+	}
+	if _, err := os.Stat(expectedManifest); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("opening committed cold manifest: %w", err)
+	}
+	return info, branch, nil
 }
 
 // claimUnplacedLifecycleTargets turns admission of a durable cold branch into
