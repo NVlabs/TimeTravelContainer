@@ -6990,17 +6990,31 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				writeError(fmt.Errorf("branch is already placed on node %q, not requested node %q", owner, request.PlacementNode))
 				return
 			}
-			peer, err := s.distributedSource.peer(owner, false)
-			if err != nil {
-				writeError(fmt.Errorf("connecting to process-free branch owner %q: %w", owner, err))
-				return
+			stopArgs := append([]string{"stop"}, operands...)
+			var status int
+			var diagnostic string
+			if owner == s.clusterCapabilities.NodeID {
+				// Routing reaches the current owner before it can honor a
+				// conflicting placement request. Re-enter through the local Unix
+				// protocol so the ordinary mutation journal and lifecycle lock own
+				// publication; the cluster peer service intentionally rejects a
+				// node dialing itself.
+				var stdout, stderr bytes.Buffer
+				status, err = runViaDaemon(options{daemonSocket: s.socket}, stopArgs, strings.NewReader(""), &stdout, &stderr)
+				diagnostic = stderr.String()
+			} else {
+				peer, peerErr := s.distributedSource.peer(owner, false)
+				if peerErr != nil {
+					writeError(fmt.Errorf("connecting to process-free branch owner %q: %w", owner, peerErr))
+					return
+				}
+				publicationRequestID, idErr := newDaemonRequestID()
+				if idErr != nil {
+					writeError(idErr)
+					return
+				}
+				status, _, diagnostic, err = executeRemoteDaemonCommand(context.Background(), peer, publicationRequestID, stopArgs)
 			}
-			publicationRequestID, err := newDaemonRequestID()
-			if err != nil {
-				writeError(err)
-				return
-			}
-			status, _, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, publicationRequestID, append([]string{"stop"}, operands...))
 			if err != nil || status != 0 {
 				writeError(errors.Join(err, fmt.Errorf("publishing process-free branch on node %q failed with status %d: %s", owner, status, strings.TrimSpace(diagnostic))))
 				return

@@ -384,6 +384,13 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	}
 	owner := ""
 	allowMaterializing := len(args) != 0 && (args[0] == "start" || args[0] == "rehydrate" || args[0] == "restart")
+	allowCreatedProcessFree := false
+	if len(args) != 0 {
+		switch args[0] {
+		case "cp", "stop", "rm", "diff", "commit", "stats", "wait", "logs", "dehydrate":
+			allowCreatedProcessFree = true
+		}
+	}
 	var claims []daemonPlacementClaim
 	seen := make(map[string]struct{})
 	for _, arg := range args[1:] {
@@ -408,6 +415,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 			info.ID = familyID
 		}
 		branchOwner := ""
+		claimMaterializing := allowMaterializing
 		placement, err := placements.Lookup(info.ID, selected.branch)
 		switch {
 		case err == nil:
@@ -420,8 +428,18 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 			if placement.State == cluster.PlacementMigrating {
 				return "", nil, fmt.Errorf("branch %s is migrating from %q to %q; retry after cutover", selected, placement.OwnerNode, placement.TargetNode)
 			}
-			if placement.State == cluster.PlacementMaterializing && !allowMaterializing {
-				return "", nil, fmt.Errorf("branch %s is materializing on %q; only start or rehydrate may retry it", selected, placement.OwnerNode)
+			if placement.State == cluster.PlacementMaterializing && !claimMaterializing {
+				if allowCreatedProcessFree {
+					if authority, ok := placements.(interface {
+						Branch(family, branch string) (*cluster.BranchAuthority, error)
+					}); ok {
+						branch, branchErr := authority.Branch(placement.FamilyID, placement.BranchID)
+						claimMaterializing = branchErr == nil && normalizeLifecycleState(branch.Lifecycle) == "created"
+					}
+				}
+				if !claimMaterializing {
+					return "", nil, fmt.Errorf("branch %s is materializing on %q; only lifecycle recovery may retry it", selected, placement.OwnerNode)
+				}
 			}
 			if placement.State != cluster.PlacementUnplaced {
 				branchOwner = placement.OwnerNode
@@ -430,7 +448,7 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 					claims = append(claims, daemonPlacementClaim{
 						FamilyID: placement.FamilyID, BranchID: placement.BranchID,
 						OwnerNode: placement.OwnerNode, OwnerIncarnation: placement.OwnerIncarnation,
-						Generation: placement.Generation, AllowMaterializing: placement.State == cluster.PlacementMaterializing && allowMaterializing,
+						Generation: placement.Generation, AllowMaterializing: placement.State == cluster.PlacementMaterializing && claimMaterializing,
 					})
 					seen[key] = struct{}{}
 				}

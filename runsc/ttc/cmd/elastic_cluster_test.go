@@ -641,7 +641,7 @@ func TestProcessFreeStartRelocationEligibility(t *testing.T) {
 	}
 	if _, err := base.Create(cluster.PlacementRecord{
 		FamilyID: "family", FamilyName: "web", BranchID: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a",
-		PhysicalContainer: "family", PhysicalBranch: "main", State: cluster.PlacementRunning,
+		PhysicalContainer: "family", PhysicalBranch: "main", State: cluster.PlacementMaterializing,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -651,6 +651,10 @@ func TestProcessFreeStartRelocationEligibility(t *testing.T) {
 	operands, ok, err := processFreeStartRelocationOperands(root, catalog, []string{"start", "-a", "web@main"})
 	if err != nil || !ok || !slices.Equal(operands, []string{"web@main"}) {
 		t.Fatalf("created relocation = (%v, %t, %v)", operands, ok, err)
+	}
+	owner, claims, err := daemonCommandPlacementWithCatalog(root, catalog, []string{"cp", "/etc/hostname", "web@main:/prepared"})
+	if err != nil || owner != "node-a" || len(claims) != 1 || !claims[0].AllowMaterializing {
+		t.Fatalf("created cp route = (%q, %+v, %v)", owner, claims, err)
 	}
 	branch := catalog.branches["family\x00main"]
 	branch.Lifecycle = "running"
