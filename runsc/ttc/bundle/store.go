@@ -615,6 +615,11 @@ type ContainerInfo struct {
 	DistributedFamilyID          string                           `json:"distributed_family_id,omitempty"`
 	DistributedForkImports       map[string]DistributedForkImport `json:"distributed_fork_imports,omitempty"`
 	NodeID                       string                           `json:"node_id,omitempty"`
+	// DistributedCatalogOnly marks the canonical identity record after its
+	// final physical branch has been removed while logical sibling placements
+	// still exist in Raft. Such a record intentionally has no local branches;
+	// user-visible branch inventory is synthesized from placement authority.
+	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
 }
 
 // IsDistributedPhysicalRuntime reports whether info is a node-local physical
@@ -2889,8 +2894,11 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if info.State == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q has no lifecycle state", key)
 	}
-	if len(info.Branches) == 0 {
+	if len(info.Branches) == 0 && !info.DistributedCatalogOnly {
 		return ContainerInfo{}, fmt.Errorf("container %q has no branch metadata", key)
+	}
+	if info.DistributedCatalogOnly && info.IsDistributedPhysicalRuntime() {
+		return ContainerInfo{}, fmt.Errorf("physical container %q cannot be a catalog-only family", key)
 	}
 	seenBranches := make(map[string]struct{}, len(info.Branches))
 	for i := range info.Branches {
@@ -3441,6 +3449,7 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 				})
 			}
 			delete(current.DistributedForkImports, transactionID)
+			current.DistributedCatalogOnly = false
 			recomputeContainerState(current)
 		} else {
 			for _, branch := range current.Branches {
@@ -3845,6 +3854,7 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 			index[branch.ID] = len(info.Branches)
 			info.Branches = append(info.Branches, branch)
 		}
+		info.DistributedCatalogOnly = false
 		recomputeContainerState(info)
 		return true, nil
 	})
@@ -4419,6 +4429,12 @@ func (s Store) RemoveBranchRecord(name, branchID string) error {
 			}
 		}
 		info.Branches = append(info.Branches[:index], info.Branches[index+1:]...)
+		if len(info.Branches) == 0 {
+			if info.IsDistributedPhysicalRuntime() {
+				return false, errors.New("cannot retain an empty physical container record")
+			}
+			info.DistributedCatalogOnly = true
+		}
 		recomputeContainerState(info)
 		bindings := info.PublishedPorts[:0]
 		for _, binding := range info.PublishedPorts {

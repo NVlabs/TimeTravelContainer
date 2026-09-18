@@ -2123,6 +2123,47 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}
 }
 
+func TestRemoveFinalCanonicalBranchLeavesReloadableCatalogIdentity(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	info := ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir, State: "dehydrated", CreatedAt: now,
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: "root-main", State: "dehydrated", StorageState: "shared", CreatedAt: now}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveBranchRecord("family", "main"); err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatalf("loading catalog-only family: %v", err)
+	}
+	if !anchor.DistributedCatalogOnly || len(anchor.Branches) != 0 || anchor.State != "exited" {
+		t.Fatalf("catalog-only family = %+v", anchor)
+	}
+	if err := store.RecordBranch("family", BranchInfo{ID: "next", FilesystemBranch: "root-next", State: "running", StorageState: "local", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	revived, err := store.LoadContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revived.DistributedCatalogOnly || len(revived.Branches) != 1 || revived.Branches[0].ID != "next" {
+		t.Fatalf("revived family = %+v", revived)
+	}
+}
+
 func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}

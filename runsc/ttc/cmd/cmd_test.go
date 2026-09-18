@@ -6718,6 +6718,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 
 func TestOrderFamilyRemovalPlacementsTreatsEmptyPhysicalContainerAsCanonical(t *testing.T) {
 	records := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "migrated", PhysicalContainer: "family", PhysicalBranch: "migration-private", State: cluster.PlacementRunning},
 		{FamilyID: "family", BranchID: "main", PhysicalContainer: "", PhysicalBranch: "", State: cluster.PlacementCorrupted},
 		{FamilyID: "family", BranchID: "remote", PhysicalContainer: "fork-runtime", PhysicalBranch: "remote", State: cluster.PlacementRunning},
 	}

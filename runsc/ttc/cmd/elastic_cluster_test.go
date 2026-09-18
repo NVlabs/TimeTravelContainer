@@ -554,6 +554,42 @@ func TestRemoveLogicalBranchPlacementRemovesPublishedUnplacedBranch(t *testing.T
 	}
 }
 
+func TestDistributedFamilyHasPeerPlacementUsesLogicalFamily(t *testing.T) {
+	standalone := &runtimeBackend{}
+	if peers, err := standalone.distributedFamilyHasPeerPlacement("family", "main"); err != nil || peers {
+		t.Fatalf("standalone peer lookup = (%t, %v), want (false, nil)", peers, err)
+	}
+
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, record := range []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "child", PhysicalContainer: "physical-child", PhysicalBranch: "child", OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning},
+		{FamilyID: "other", BranchID: "main", PhysicalContainer: "other", PhysicalBranch: "main", OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning},
+	} {
+		if _, err := placements.Create(record, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &runtimeBackend{nodeID: "node-a", distributedSource: &distributedSourceRuntime{placements: placements}}
+	if peers, err := backend.distributedFamilyHasPeerPlacement("family", "main"); err != nil || !peers {
+		t.Fatalf("cluster peer lookup = (%t, %v), want (true, nil)", peers, err)
+	}
+	child, err := placements.Lookup("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := placements.Remove("family", "child", child.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if peers, err := backend.distributedFamilyHasPeerPlacement("family", "main"); err != nil || peers {
+		t.Fatalf("final logical branch lookup = (%t, %v), want (false, nil)", peers, err)
+	}
+}
+
 func (c branchAwarePlacementCatalog) Branch(family, branch string) (*cluster.BranchAuthority, error) {
 	record, ok := c.branches[family+"\x00"+branch]
 	if !ok {

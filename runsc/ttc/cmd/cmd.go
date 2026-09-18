@@ -6258,7 +6258,14 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	info, err := store.LoadContainer(identifier)
 	if err != nil {
 		if placements, placementErr := b.placementCatalog(); placementErr == nil {
-			return loadDistributedFamily(store, placements, identifier)
+			// Branch-scoped operations need the Raft family identity before they
+			// resolve the exact physical runtime below; they do not need the
+			// canonical shared catalog record. A multi-node family removal may
+			// legitimately delete that record with its final canonical physical
+			// branch while transaction-scoped siblings are still being removed.
+			// Keep those siblings operable from placement authority instead of
+			// waiting for metadata that is intentionally gone.
+			return loadDistributedFamilyIdentity(store, placements, identifier)
 		}
 		return ttcbundle.ContainerInfo{}, err
 	}
@@ -9519,6 +9526,32 @@ func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string)
 		return err
 	}
 	return b.retireTransactionsForRemovedPlacement(*record)
+}
+
+// distributedFamilyHasPeerPlacement reports whether a physical runtime's
+// final branch is only locally final, while another logical branch in the same
+// family still exists elsewhere in the cluster. Physical containers are an
+// implementation detail of migration and remote fork: deleting a one-branch
+// physical container must not delete the canonical family record while a
+// sibling placement survives on another node.
+func (b *runtimeBackend) distributedFamilyHasPeerPlacement(familyID, branchID string) (bool, error) {
+	if b.nodeID == "" {
+		return false, nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return false, err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		if record.FamilyID == familyID && record.BranchID != branchID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // removeCorruptedBranch removes a branch whose execution authority has
@@ -14781,7 +14814,15 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	remaining := len(info.Branches)
-	if remaining == 1 {
+	logicalPeers, err := b.distributedFamilyHasPeerPlacement(logicalFamily, requested.branch)
+	if err != nil {
+		return fmt.Errorf("checking logical peers before removing %s: %w", requested, err)
+	}
+	// A transaction-scoped physical container may always disappear with its
+	// final local branch: the canonical family record is a different object.
+	// The canonical physical container, however, also carries the logical
+	// family identity and must survive while a peer placement exists remotely.
+	if remaining == 1 && (!logicalPeers || info.ID != logicalFamily) {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
 		// without --volumes.

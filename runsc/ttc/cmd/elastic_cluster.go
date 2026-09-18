@@ -1999,10 +1999,14 @@ func orderFamilyRemovalPlacements(records []cluster.PlacementRecord, familyID st
 		if physicalContainer != familyID {
 			continue
 		}
-		if final == -1 || records[i].PhysicalBranch == records[i].BranchID {
+		physicalBranch := records[i].PhysicalBranch
+		if physicalBranch == "" {
+			physicalBranch = records[i].BranchID
+		}
+		if final == -1 || physicalBranch == records[i].BranchID {
 			final = i
 		}
-		if records[i].PhysicalBranch == records[i].BranchID {
+		if physicalBranch == records[i].BranchID {
 			break
 		}
 	}
@@ -3263,6 +3267,9 @@ func (b *runtimeBackend) removeMigratedSourceMetadataWithPolicy(info ttcbundle.C
 		return err
 	}
 	if info.DistributedFamilyID != "" {
+		if len(info.Branches) == 1 && info.Branches[0].ID == branchID {
+			return b.containerStore().RemoveContainer(info.ID)
+		}
 		return b.containerStore().RemoveBranchRecord(info.ID, branchID)
 	}
 	// The logical catalog record remains, but must not keep pointing at graph
