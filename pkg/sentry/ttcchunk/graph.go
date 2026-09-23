@@ -66,13 +66,13 @@ type graphResourcePages struct {
 
 // graphImportCheckpointBytes bounds crash-recovery replay while importing a
 // large memory image. Checkpointing after every small graph transaction would
-// repeatedly rewrite the growing radix forest; 64 MiB keeps that cost
-// amortized while preventing one interrupted capture from leaving a
-// multi-hundred-megabyte WAL.
+// repeatedly rewrite the growing radix forest; 64 MiB, or the checkpoint's own
+// size once it is larger, keeps that cost amortized while preventing one
+// interrupted capture from leaving a WAL much longer than its checkpoint.
 const graphImportCheckpointBytes = 64 << 20
 
 func checkpointGraphImportIfNeeded(graph *ttcsnapshot.Store, threshold int64) error {
-	if graph == nil || threshold <= 0 || graph.JournalBytes() < threshold {
+	if graph == nil || threshold <= 0 || !graph.CheckpointDue(threshold) {
 		return nil
 	}
 	if err := graph.Checkpoint(); err != nil {
@@ -95,11 +95,8 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || getChunk == nil {
 		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
 	}
-	inspection := graph.Inspect()
-	for name := range inspection.Roots {
-		if name == rootPrefix || len(name) > len(rootPrefix) && name[:len(rootPrefix)+1] == rootPrefix+"/" {
-			return GraphImportResult{}, fmt.Errorf("memory graph root prefix %q is already in use", rootPrefix)
-		}
+	if graph.HasRootUnder(rootPrefix) {
+		return GraphImportResult{}, fmt.Errorf("memory graph root prefix %q is already in use", rootPrefix)
 	}
 
 	resources := make(map[string]*graphResourcePages)
@@ -208,7 +205,6 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 			}
 		}
 		pages := make([]ttcsnapshot.MemoryPageDescriptor, 0, len(chunk.Pages))
-		raw := make([]byte, ttcsnapshot.MemoryChunkBytes)
 		for _, page := range chunk.Pages {
 			pageReferences, ok := references[page.Slot]
 			if !ok {
@@ -231,9 +227,6 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 					References:       pageReferences,
 				},
 			})
-			if !page.Zero {
-				copy(raw[int(page.Slot)*hostarch.PageSize:], page.Data)
-			}
 		}
 		if len(pages) != len(references) {
 			return GraphImportResult{}, fmt.Errorf("memory chunk %s contains %d pages, manifest references %d slots", use.id, len(pages), len(references))
@@ -254,6 +247,19 @@ func importSnapshotGraphWithReusableStates(graph *ttcsnapshot.Store, data *ttcsn
 		}
 		var reservation ttcsnapshot.MemoryChunkReservation
 		if len(missing) != 0 {
+			// The new chunk object holds only the pages the graph does not
+			// have yet; the rest of it, like its zero pages, is a hole. A
+			// branch that rewrote a few pages of each chunk otherwise stored
+			// its whole image again.
+			raw := make([]byte, ttcsnapshot.MemoryChunkBytes)
+			for _, page := range chunk.Pages {
+				if _, ok := existing[page.Slot]; ok || page.Zero {
+					continue
+				}
+				if _, ok := references[page.Slot]; ok {
+					copy(raw[int(page.Slot)*hostarch.PageSize:], page.Data)
+				}
+			}
 			pinPrefix := fmt.Sprintf("%s/construction/%08x", rootPrefix, objectIndex)
 			reservation, err = graph.ReserveMemoryChunkPages(origin, pinPrefix, missing)
 			if err != nil {

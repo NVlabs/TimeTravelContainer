@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -274,6 +275,86 @@ func TestGraphImportReusesStableMemoryPages(t *testing.T) {
 	}
 	if chunksAfter != chunksBefore {
 		t.Fatalf("second capture stored %d chunks, want unchanged %d", chunksAfter, chunksBefore)
+	}
+}
+
+// A capture's new chunk object holds only the pages the graph did not have.
+func TestGraphImportStoresOnlyNewPages(t *testing.T) {
+	first := testChunk()
+	second := testChunk()
+	second.Pages[2] = Page{Slot: 255, Version: pgalloc.PageVersionID{Allocator: testAllocator(3), Sequence: 1000}, Data: bytes.Repeat([]byte{0x77}, hostarch.PageSize)}
+	manifestFor := func(chunk Chunk) Manifest {
+		object := graphCaptureObjectID(1)
+		stored := make([]StoredBinding, 0, len(chunk.Pages))
+		for _, page := range chunk.Pages {
+			logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
+			stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+				OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 1,
+				Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+			}, Object: object})
+		}
+		manifest, err := CompactBindings(stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return manifest
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	chunks := func() map[ttcsnapshot.ObjectID]struct{} {
+		ids := make(map[ttcsnapshot.ObjectID]struct{})
+		for _, object := range graph.Inspect().Objects {
+			if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+				ids[object.ID] = struct{}{}
+			}
+		}
+		return ids
+	}
+	for i, chunk := range []Chunk{first, second} {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := chunks()
+		if _, err := importSnapshotGraph(graph, data, origin, manifestFor(chunk), fmt.Sprintf("new/%d", i), func(ID) (Chunk, error) { return chunk, nil }); err != nil {
+			t.Fatal(err)
+		}
+		var added []ttcsnapshot.ObjectID
+		for id := range chunks() {
+			if _, ok := before[id]; !ok {
+				added = append(added, id)
+			}
+		}
+		if len(added) != 1 {
+			t.Fatalf("capture %d added chunk objects %v, want one", i, added)
+		}
+		file, err := data.Open(added[0], ttcsnapshot.MemoryChunkBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := make([]byte, ttcsnapshot.MemoryChunkBytes)
+		for _, page := range chunk.Pages {
+			if i == 0 || page.Slot == 255 {
+				copy(want[int(page.Slot)*hostarch.PageSize:], page.Data)
+			}
+		}
+		if !bytes.Equal(raw, want) {
+			t.Fatalf("capture %d stored a chunk object with other pages than its new ones", i)
+		}
 	}
 }
 

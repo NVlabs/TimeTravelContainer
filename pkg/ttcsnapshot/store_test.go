@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1935,6 +1936,57 @@ func TestDeletingARootCollectsWhatItHeldWithinABound(t *testing.T) {
 	}
 }
 
+// A checkpoint is due once the journal has grown past both the minimum and
+// the checkpoint it would replace, as reopening the graph also knows.
+func TestCheckpointDueWaitsForTheJournalToOutgrowTheCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := 0
+	create := func() {
+		if _, err := store.CreateObject(origin, fmt.Sprintf("due/%d", next), ObjectKindMetadata, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		next++
+	}
+	for i := 0; i < 64; i++ {
+		create()
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := store.checkpointBytes
+	for store.JournalBytes() < checkpoint {
+		if store.CheckpointDue(1) {
+			t.Fatalf("checkpoint due with a %d-byte journal and a %d-byte checkpoint", store.JournalBytes(), checkpoint)
+		}
+		create()
+	}
+	if !store.CheckpointDue(1) {
+		t.Fatalf("checkpoint not due with a %d-byte journal and a %d-byte checkpoint", store.JournalBytes(), checkpoint)
+	}
+	if store.CheckpointDue(store.JournalBytes() + 1) {
+		t.Fatal("checkpoint due below its minimum")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.checkpointBytes != checkpoint || !reopened.CheckpointDue(1) {
+		t.Fatalf("reopened graph has a %d-byte checkpoint, due %t; want %d, due", reopened.checkpointBytes, reopened.CheckpointDue(1), checkpoint)
+	}
+}
+
 // Collect collects up to its limit in one call, in transactions bounded by
 // the objects they delete and the reference counts they update.
 func TestCollectCommitsBoundedTransactions(t *testing.T) {
@@ -2084,6 +2136,59 @@ func TestCollectTakesMoreThanOneTransactionPerCall(t *testing.T) {
 	}
 	if stats := store.Stats(); stats.Objects != 0 || stats.Sequence != sequence+3 {
 		t.Fatalf("stats after collection=%+v, want no objects after 3 transactions from %d", stats, sequence)
+	}
+}
+
+// Install leaves a hole for each zero page of an object, which still reads
+// back whole.
+func TestLocalDataStoreInstallLeavesZeroPagesAsHoles(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(filepath.Join(dir, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := OpenLocalDataStore(filepath.Join(dir, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := graph.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk, ObjectKindMemoryChunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two pages with data among 64 zero ones, and a partial zero page at the
+	// end.
+	contents := make([]byte, 64*sparsePageSize+100)
+	copy(contents[5*sparsePageSize:], bytes.Repeat([]byte("x"), sparsePageSize))
+	copy(contents[40*sparsePageSize+17:], "middle")
+	if err := data.Install(ids[0], bytes.NewReader(contents), int64(len(contents))); err != nil {
+		t.Fatal(err)
+	}
+	file, err := data.Open(ids[0], int64(len(contents)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := io.ReadAll(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, contents) {
+		t.Fatal("installed object does not read back as written")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocated := info.Sys().(*syscall.Stat_t).Blocks * 512; allocated >= int64(len(contents))/2 {
+		t.Fatalf("object of %d bytes has %d allocated, want its zero pages left as holes", len(contents), allocated)
+	}
+	if err := data.Install(ids[1], bytes.NewReader(contents[:10]), int64(len(contents))); err == nil {
+		t.Fatal("Install of a short source succeeded")
 	}
 }
 

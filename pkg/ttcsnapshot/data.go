@@ -15,6 +15,7 @@
 package ttcsnapshot
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -435,7 +436,7 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 			return err
 		}
 		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
-		written, err := io.CopyN(temporary, source, length)
+		written, err := copySparse(temporary, source, length)
 		if err != nil {
 			temporary.Close()
 			return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
@@ -481,12 +482,55 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	written, err := io.CopyN(temporary, source, length)
+	written, err := copySparse(temporary, source, length)
 	if err != nil {
 		temporary.Close()
 		return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
 	}
 	return installTemporary(temporary, temporaryPath, destination, length, durable)
+}
+
+// sparsePageSize is the granularity at which copySparse leaves holes.
+const sparsePageSize = 4096
+
+var zeroSparsePage [sparsePageSize]byte
+
+// copySparse copies exactly length bytes of source into the empty file, and
+// leaves a hole wherever a page of them is all zeros, as much of a memory
+// chunk is: a chunk holds only the pages its graph did not have yet. It
+// returns how many bytes it consumed from source.
+func copySparse(file *os.File, source io.Reader, length int64) (int64, error) {
+	buffer := make([]byte, min(length, 1<<20))
+	var offset int64
+	for offset < length {
+		n, err := io.ReadFull(source, buffer[:min(int64(len(buffer)), length-offset)])
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				err = io.EOF
+			}
+			return offset + int64(n), err
+		}
+		for start := 0; start < n; {
+			end := min(start+sparsePageSize, n)
+			if bytes.Equal(buffer[start:end], zeroSparsePage[:end-start]) {
+				start = end
+				continue
+			}
+			for end < n {
+				next := min(end+sparsePageSize, n)
+				if bytes.Equal(buffer[end:next], zeroSparsePage[:next-end]) {
+					break
+				}
+				end = next
+			}
+			if _, err := file.WriteAt(buffer[start:end], offset+int64(start)); err != nil {
+				return offset + int64(start), err
+			}
+			start = end
+		}
+		offset += int64(n)
+	}
+	return offset, file.Truncate(length)
 }
 
 // Clone installs destination from a complete source object. If tryReflink is

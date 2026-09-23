@@ -158,10 +158,12 @@ type Store struct {
 	state      graphState
 	poisoned   error
 	journalEnd int64
-	headDev    uint64
-	headIno    uint64
-	headSize   int64
-	headMtime  int64
+	// checkpointBytes is the size of the generation's checkpoint.
+	checkpointBytes int64
+	headDev         uint64
+	headIno         uint64
+	headSize        int64
+	headMtime       int64
 	// externallyCoordinated is used by graph stores embedded in a TTC
 	// filesystem repository. In that mode the repository's cross-process
 	// flock serializes writers, so this Store must not retain graph.lock for
@@ -794,6 +796,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	if previous != nil {
 		_ = previous.Close()
 	}
+	s.checkpointBytes = int64(len(data))
 	s.rebuildDeferredObjectsLocked()
 	s.rebuildMemoryPagesLocked()
 	return nil
@@ -2500,6 +2503,18 @@ func (s *Store) Root(name string) (ObjectID, bool) {
 	return id, ok
 }
 
+// HasRootUnder reports whether a root is named prefix or lies under it.
+func (s *Store) HasRootUnder(prefix string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for name := range s.state.Roots {
+		if name == prefix || strings.HasPrefix(name, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // HasPin reports whether name currently retains an object.
 func (s *Store) HasPin(name string) bool {
 	s.mu.RLock()
@@ -3279,6 +3294,7 @@ func (s *Store) compactGenerationLocked() error {
 	s.journal = journal
 	s.generation = nextGeneration
 	s.journalEnd = int64(len(journalHeader))
+	s.checkpointBytes = int64(len(data) + 1)
 	if previous != nil {
 		_ = previous.Close()
 	}
@@ -3454,4 +3470,17 @@ func (s *Store) JournalBytes() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.journalEnd
+}
+
+// CheckpointDue reports whether the journal has grown enough to fold into a
+// new checkpoint: past minimum, and past the size of the checkpoint it would
+// replace. A checkpoint rewrites the whole graph, so the second bound spreads
+// that cost over as many journal bytes as it writes; without it, importing a
+// large memory image rewrote a checkpoint of hundreds of megabytes for every
+// minimum's worth of journal. Replaying such a journal costs about what
+// loading its checkpoint does.
+func (s *Store) CheckpointDue(minimum int64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.journalEnd >= max(minimum, s.checkpointBytes)
 }

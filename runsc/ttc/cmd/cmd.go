@@ -13122,7 +13122,7 @@ func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
 	if _, err := b.abandonEmptyVolatileMemoryOrigins(); err != nil {
 		return err
 	}
-	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
 			return fmt.Errorf("compacting reclaimed snapshot graph: %w", err)
 		}
@@ -13432,7 +13432,7 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 		return err
 	}
 	changed := len(orphanRoots) != 0 || len(orphanPins) != 0 || collectedTotal != 0 || emptySnapshots != 0 || reclaimedObjects != 0
-	if changed || b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+	if changed || b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
 			return fmt.Errorf("compacting standalone memory graph: %w", err)
 		}
@@ -13673,9 +13673,10 @@ func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot
 	}
 	// A capture can append hundreds of megabytes of bounded page/radix
 	// transactions. It is already a foreground durability operation, so publish
-	// one compact generation before returning instead of making every later
-	// daemon restart replay the complete capture history.
-	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+	// one compact generation before returning once the journal has outgrown
+	// the checkpoint, rather than leave every later daemon restart to replay
+	// more capture history than it loads.
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
 			return ttcchunk.GraphImportResult{}, fmt.Errorf("compacting imported memory graph: %w", err)
 		}
@@ -13697,7 +13698,7 @@ func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
 	if err := reconcileInterruptedMemoryGraph(b.snapshotGraph, b.snapshotData, ttcsnapshot.SnapshotSealedVolatile); err != nil {
 		return err
 	}
-	if b.snapshotGraph.JournalBytes() >= snapshotGraphJournalCompactBytes {
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
 		if err := b.snapshotGraph.Checkpoint(); err != nil {
 			return fmt.Errorf("compacting recovered cluster memory graph: %w", err)
 		}
