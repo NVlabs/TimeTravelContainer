@@ -1988,15 +1988,67 @@ func TestCollectCommitsBoundedTransactions(t *testing.T) {
 	if stats := store.Stats(); stats.Sequence != sequence+2 {
 		t.Fatalf("collect(2) committed %d transactions, want 2", stats.Sequence-sequence)
 	}
-	// The first transaction takes the eight children released so far, which
-	// update no counts, and the last node, whose four fill it; the second
-	// takes that node's children.
+	// The call carries on from where the last one stopped: the last node,
+	// whose four counts fill a transaction, then all twelve children, which
+	// update none.
 	sequence = store.Stats().Sequence
 	if got, err := store.collect(4096, 4096, 4); err != nil || got != 13 {
 		t.Fatalf("collect(4096)=(%d,%v), want (13,nil)", got, err)
 	}
 	if stats := store.Stats(); stats.Objects != 0 || stats.Sequence != sequence+2 {
 		t.Fatalf("stats after collection=%+v, want no objects after 2 transactions from %d", stats, sequence)
+	}
+}
+
+// Collect carries on from where its last call stopped, and still finds what
+// was released since before it reports that nothing is left.
+func TestCollectFindsWhatWasReleasedSinceItsLastCall(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retain := func(first, count int) map[string]ObjectID {
+		retained := make(map[string]ObjectID, count)
+		for i := first; i < first+count; i++ {
+			pin := fmt.Sprintf("later/%d", i)
+			id, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetRoot(pin, id); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.DeletePin(pin); err != nil {
+				t.Fatal(err)
+			}
+			retained[pin] = id
+		}
+		return retained
+	}
+	early, late := retain(0, 5), retain(5, 1)
+	if err := store.ReleaseRetainedRoots(early); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Collect(2); err != nil || got != 2 {
+		t.Fatalf("Collect(2)=(%d,%v), want (2,nil)", got, err)
+	}
+	if err := store.ReleaseRetainedRoots(late); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for {
+		got, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == 0 {
+			break
+		}
+		total += got
+	}
+	if stats := store.Stats(); total != 4 || stats.Objects != 0 {
+		t.Fatalf("Collect until zero collected %d, left %+v; want 4, nothing left", total, stats)
 	}
 }
 

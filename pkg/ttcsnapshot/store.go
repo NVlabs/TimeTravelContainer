@@ -191,6 +191,14 @@ type Store struct {
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
 	deferredLoads map[string]*deferredLoad
+	// collectQueue holds the zero-count objects Collect has found but not
+	// reached yet, in the order it will reach them, and collectQueued every
+	// object it has queued since it last scanned the graph. Callers repeat
+	// Collect until it returns zero, and the queue lets them scan the graph
+	// once rather than on every call. An entry may be stale: Collect skips an
+	// object that is gone, and scans again before it reports nothing left.
+	collectQueue  []string
+	collectQueued map[string]struct{}
 }
 
 type deferredResolver struct {
@@ -3008,42 +3016,69 @@ func (s *Store) collect(limit, batchObjects, batchReferences int) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	queue := make([]string, 0)
-	for key, object := range s.state.Objects {
-		if object.State == ObjectReclaiming {
-			if _, transferring := s.state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
-				continue
-			}
-			queue = append(queue, key)
-		}
+	if len(s.state.Handoffs) != 0 {
+		// A handoff may have begun since the queue was filled. Scanning
+		// again leaves the snapshot it transfers alone.
+		s.collectQueue = nil
 	}
-	sort.Strings(queue)
-	queued := make(map[string]struct{}, len(queue))
-	for _, key := range queue {
-		queued[key] = struct{}{}
-	}
+	scanned := false
 	collected := 0
-	for len(queue) != 0 && collected < limit {
-		n, rest, err := s.collectBatchLocked(queue, queued, min(limit-collected, batchObjects), batchReferences)
+	for collected < limit {
+		if len(s.collectQueue) == 0 {
+			// Only a scan can say that nothing is left, but a call that
+			// collected something can leave it to the next.
+			if scanned || collected != 0 {
+				break
+			}
+			s.scanReclaimingLocked()
+			scanned = true
+			if len(s.collectQueue) == 0 {
+				break
+			}
+		}
+		n, err := s.collectBatchLocked(min(limit-collected, batchObjects), batchReferences)
 		collected += n
 		if err != nil {
+			s.collectQueue = nil
 			return collected, err
 		}
-		queue = rest
-		if n == 0 {
-			break
-		}
+	}
+	if len(s.collectQueue) == 0 {
+		s.collectQueue, s.collectQueued = nil, nil
 	}
 	return collected, nil
 }
 
-// collectBatchLocked collects zero-count objects from the front of queue,
-// breadth first, and commits them in one transaction: at most limit objects,
-// and none more once the transaction updates referenceLimit counts, which an
-// object's children can overrun by maxObjectEdges. It returns how many it
-// collected and what is left of queue, including the objects this batch left
-// without references.
-func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, limit, referenceLimit int) (int, []string, error) {
+// scanReclaimingLocked queues every zero-count object, in key order, except
+// those of a snapshot being handed off.
+func (s *Store) scanReclaimingLocked() {
+	queue := make([]string, 0)
+	for key, object := range s.state.Objects {
+		if object.State != ObjectReclaiming {
+			continue
+		}
+		if len(s.state.Handoffs) != 0 {
+			if _, transferring := s.state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
+				continue
+			}
+		}
+		queue = append(queue, key)
+	}
+	sort.Strings(queue)
+	s.collectQueued = make(map[string]struct{}, len(queue))
+	for _, key := range queue {
+		s.collectQueued[key] = struct{}{}
+	}
+	s.collectQueue = queue
+}
+
+// collectBatchLocked collects zero-count objects from the front of the
+// collection queue, breadth first, and commits them in one transaction: at
+// most limit objects, and none more once the transaction updates
+// referenceLimit counts, which an object's children can overrun by
+// maxObjectEdges. The objects it leaves without references join the queue.
+// It returns how many it collected.
+func (s *Store) collectBatchLocked(limit, referenceLimit int) (int, error) {
 	touched := make(map[string]Object)
 	deleted := make(map[string]struct{})
 	objectFor := func(key string) (Object, bool) {
@@ -3054,9 +3089,9 @@ func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, l
 		return object, ok
 	}
 	collected := 0
-	for len(queue) != 0 && collected < limit && len(touched) < referenceLimit {
-		key := queue[0]
-		queue = queue[1:]
+	for len(s.collectQueue) != 0 && collected < limit && len(touched) < referenceLimit {
+		key := s.collectQueue[0]
+		s.collectQueue = s.collectQueue[1:]
 		object, ok := objectFor(key)
 		if !ok || object.State != ObjectReclaiming {
 			continue
@@ -3064,18 +3099,18 @@ func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, l
 		for _, edge := range object.Children {
 			child, ok := objectFor(edge.Child.key())
 			if !ok {
-				return 0, queue, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
+				return 0, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
 			}
 			var err error
 			child, err = releaseObject(child)
 			if err != nil {
-				return 0, queue, err
+				return 0, err
 			}
 			touched[child.ID.key()] = child
 			if child.State == ObjectReclaiming {
-				if _, exists := queued[child.ID.key()]; !exists {
-					queue = append(queue, child.ID.key())
-					queued[child.ID.key()] = struct{}{}
+				if _, exists := s.collectQueued[child.ID.key()]; !exists {
+					s.collectQueue = append(s.collectQueue, child.ID.key())
+					s.collectQueued[child.ID.key()] = struct{}{}
 				}
 			}
 		}
@@ -3084,7 +3119,7 @@ func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, l
 		collected++
 	}
 	if collected == 0 {
-		return 0, queue, nil
+		return 0, nil
 	}
 	keys := make([]string, 0, len(touched))
 	for key := range touched {
@@ -3107,9 +3142,9 @@ func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, l
 		ops = append(ops, journalOp{DeleteObject: key})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
-		return 0, queue, err
+		return 0, err
 	}
-	return collected, queue, nil
+	return collected, nil
 }
 
 // CollectEmptySnapshots removes origins that own no graph objects and are not
