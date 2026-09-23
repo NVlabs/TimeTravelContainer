@@ -16,6 +16,8 @@ package ttcsnapshot
 
 import (
 	"bytes"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -113,6 +115,99 @@ func TestRemovedObjectsAreForgottenBeforeTheFence(t *testing.T) {
 		}
 		if got := unsyncedNameCount(data); got != 0 {
 			t.Fatalf("collect=%v: %d names survived their object", collect, got)
+		}
+		data.Close()
+		graph.Close()
+	}
+}
+
+// A linked object is a second name for the source's bytes: a write through it
+// is a write through the source, it outlives the source's removal, and its
+// name waits for the next fence like any deferred install. In both store
+// modes, and into an origin whose directory does not exist yet.
+func TestLinkedObjectSharesBytesAndOutlivesItsSource(t *testing.T) {
+	for _, donated := range []bool{false, true} {
+		dir := t.TempDir()
+		graph, err := Open(filepath.Join(dir, "graph"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := filepath.Join(dir, "objects")
+		data, err := OpenLocalDataStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if donated {
+			data.Close()
+			directory, err := os.Open(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if data, err = OpenLocalDataStoreFD(directory); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sealed, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		working, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		source, err := graph.ReserveObject(sealed, ObjectKindFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination, err := graph.ReserveObject(working, ObjectKindFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := []byte("payload")
+		if err := data.Install(source, bytes.NewReader(payload), int64(len(payload))); err != nil {
+			t.Fatal(err)
+		}
+		if err := data.LinkDeferred(source, destination); err != nil {
+			t.Fatalf("donated=%v: %v", donated, err)
+		}
+		if got := unsyncedNameCount(data); got != 1 {
+			t.Fatalf("donated=%v: a link left %d names for the fence, want 1", donated, got)
+		}
+		read := func(id ObjectID) string {
+			t.Helper()
+			file, err := data.Open(id, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			got, err := io.ReadAll(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(got)
+		}
+		file, err := data.OpenFile(destination, os.O_RDWR, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteAt([]byte("P"), 0); err != nil {
+			t.Fatal(err)
+		}
+		file.Close()
+		if got := read(source); got != "Payload" {
+			t.Fatalf("donated=%v: the source reads %q after a write through the link", donated, got)
+		}
+		if err := data.Remove(source); err != nil {
+			t.Fatal(err)
+		}
+		if got := read(destination); got != "Payload" {
+			t.Fatalf("donated=%v: the link reads %q after the source's removal", donated, got)
+		}
+		if err := data.SyncNewNames(); err != nil {
+			t.Fatal(err)
+		}
+		if got := unsyncedNameCount(data); got != 0 {
+			t.Fatalf("donated=%v: a sync left %d names", donated, got)
 		}
 		data.Close()
 		graph.Close()

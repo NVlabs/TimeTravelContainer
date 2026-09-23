@@ -1618,9 +1618,9 @@ func TestOpenReleasesInterruptedConstructionPins(t *testing.T) {
 	if _, ok := repository.graph.Inspect().Pins["construct/interrupted"]; ok {
 		t.Fatal("interrupted construction pin survived recovery")
 	}
-	object, ok := repository.graph.Object(id)
-	if !ok || object.State != ttcsnapshot.ObjectReclaiming || object.Refs != 0 {
-		t.Fatalf("interrupted object=%+v, found=%t", object, ok)
+	// Releasing the pin collects the object it alone held.
+	if object, ok := repository.graph.Object(id); ok {
+		t.Fatalf("interrupted object survived its pin's release: %+v", object)
 	}
 }
 

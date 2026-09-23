@@ -2630,16 +2630,87 @@ func (s *Store) DeletePins(names []string) error {
 		touched[id.key()] = object
 		ops = append(ops, journalOp{PinName: name, DeletePin: true})
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
+	return s.commitReleaseLocked(ops, touched)
+}
+
+// commitReleaseLocked commits ops, which drop the references recorded in
+// touched, together with the collection of what only those references held.
+//
+// A filesystem mutation collapses the path it replaced at once. A released
+// root or pin used to leave everything below it to the next Collect, and until
+// then every object it had shared still counted the reference: a branch whose
+// fork was removed saw its files as shared until a garbage collection ran.
+// The cascade starts from the objects released here and never scans the
+// graph. It is bounded like Collect, which finishes whatever it leaves, and
+// while an authority handoff is in progress it leaves everything to Collect.
+func (s *Store) commitReleaseLocked(ops []journalOp, touched map[string]Object) error {
+	var queue []string
+	for key, object := range touched {
+		if object.State == ObjectReclaiming {
+			queue = append(queue, key)
+		}
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		object := touched[key]
-		ops = append(ops, journalOp{PutObject: &object})
+	sort.Strings(queue)
+	collected, err := s.collectReleasedLocked(touched, queue, maxCollectObjectsPerTransaction)
+	if err != nil {
+		return err
 	}
-	return s.commitLocked(ops)
+	for _, key := range collected {
+		ops = append(ops, journalOp{DeleteObject: key})
+	}
+	return s.commitLockedWithMaterializedReferences(ops, touched)
+}
+
+// collectReleasedLocked collects the objects in queue that a release left
+// without references, and the objects their collection leaves without
+// references in turn, breadth first and at most limit in all. It records the
+// resulting reference changes in touched, removes the collected objects from
+// it, and returns their keys in the order collected. While an authority
+// handoff is in progress it collects nothing.
+func (s *Store) collectReleasedLocked(touched map[string]Object, queue []string, limit int) ([]string, error) {
+	if len(s.state.Handoffs) != 0 || len(s.state.Frozen) != 0 {
+		return nil, nil
+	}
+	objectFor := func(key string) (Object, bool) {
+		if object, ok := touched[key]; ok {
+			return object, true
+		}
+		object, ok := s.state.Objects[key]
+		return object, ok
+	}
+	queued := make(map[string]struct{}, len(queue))
+	for _, key := range queue {
+		queued[key] = struct{}{}
+	}
+	var collected []string
+	for len(queue) != 0 && len(collected) < limit {
+		key := queue[0]
+		queue = queue[1:]
+		object, ok := objectFor(key)
+		if !ok || object.State != ObjectReclaiming || object.Refs != 0 {
+			continue
+		}
+		for _, edge := range object.Children {
+			child, ok := objectFor(edge.Child.key())
+			if !ok {
+				return nil, fmt.Errorf("reclaiming object %s references missing child %s", key, edge.Child.key())
+			}
+			child, err := releaseObject(child)
+			if err != nil {
+				return nil, err
+			}
+			touched[child.ID.key()] = child
+			if child.State == ObjectReclaiming {
+				if _, ok := queued[child.ID.key()]; !ok {
+					queue = append(queue, child.ID.key())
+					queued[child.ID.key()] = struct{}{}
+				}
+			}
+		}
+		collected = append(collected, key)
+		delete(touched, key)
+	}
+	return collected, nil
 }
 
 // SetRoot atomically replaces a named root and its reference.
@@ -2909,16 +2980,7 @@ func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 	if len(ops) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(touched))
-	for key := range touched {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		object := touched[key]
-		ops = append(ops, journalOp{PutObject: &object})
-	}
-	return s.commitLocked(ops)
+	return s.commitReleaseLocked(ops, touched)
 }
 
 // Collect reclaims at most limit zero-count objects and cascades their child

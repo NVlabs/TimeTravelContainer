@@ -2572,16 +2572,93 @@ func (r *Repository) ensurePrivate(branch *Branch, state *branchMetadata, inode 
 	if err := r.ensureObjectRange(inode.Object, inode.Size, 0, inode.Size); err != nil {
 		return false, err
 	}
-	object, err := r.createObject(branch.WorkingSnapshot, inode.Object)
+	object, err := r.adoptObject(branch, inode)
 	if err != nil {
 		return false, err
+	}
+	adopted := object != ""
+	if !adopted {
+		object, err = r.createObject(branch.WorkingSnapshot, inode.Object)
+		if err != nil {
+			return false, err
+		}
 	}
 	inode.Object = object
 	inode.DataGeneration = branch.WorkingSnapshot
 	if err := r.commitMetadata(branch, state, []metadataOp{{Kind: metadataSetInode, Inode: inode}}); err != nil {
 		return false, err
 	}
+	if adopted {
+		// Stop naming the sealed object before anything writes through the
+		// new name, so that no root or observation pin can reach bytes that
+		// are about to change.
+		if err := r.flushMetadataBatchLocked(branch.ID); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
+}
+
+// adoptFileMinimumBytes is the smallest file taken over, rather than copied,
+// when a fork has left it to one branch. A takeover costs a sync of the graph
+// journal, which is more than copying a smaller file costs.
+const adoptFileMinimumBytes = 1 << 20
+
+// adoptObject gives the branch's working generation the bytes of the file that
+// inode selects without copying them, when nothing else can ever read them
+// again. It returns the new object ID, or "" if the file must be copied.
+//
+// A fork shares every file, and the first write to one in either branch
+// copies the whole file into that branch's generation. Once the other branch
+// is gone the file is the writer's alone, but its object still belongs to the
+// sealed generation, so it was copied anyway: a gigabyte for an appended
+// line. Taking it over gives the same host file a second name in the working
+// generation, and the sealed name is reclaimed once the metadata that stops
+// using it is durable.
+func (r *Repository) adoptObject(branch *Branch, inode *Inode) (string, error) {
+	if r.info.Clustered || inode.Size < adoptFileMinimumBytes {
+		// Other nodes read a clustered repository's sealed origins through
+		// references this graph does not count.
+		return "", nil
+	}
+	// The graph must show this branch's tree as the branch sees it.
+	if err := r.flushMetadataBatchLocked(branch.ID); err != nil {
+		return "", err
+	}
+	source, exclusive, err := r.graph.ExclusiveFile(graphRootName(branch.ID), inode.Number)
+	if err != nil || !exclusive {
+		return "", err
+	}
+	if source.String() != inode.Object {
+		return "", fmt.Errorf("branch %q inode %d selects %s in the snapshot graph but %s in its metadata", branch.ID, inode.Number, source, inode.Object)
+	}
+	// The bytes are about to change in place, so the graph in which nothing
+	// else reaches them must be the one a crash recovers. Every release that
+	// can currently leave a file to one branch is already safe from a crash
+	// — a removed branch's pointer is gone for good before its roots are
+	// released, and recovery drops observation pins — but a reference that
+	// came back would read this branch's writes, and one sync is cheap next to
+	// the copy it replaces.
+	if err := r.graph.Sync(); err != nil {
+		return "", fmt.Errorf("syncing snapshot graph before taking over %s: %w", source, err)
+	}
+	id, err := r.reserveFileObjectID(branch.WorkingSnapshot)
+	if err != nil {
+		return "", err
+	}
+	if err := r.data.LinkDeferred(source, id); err != nil {
+		return "", fmt.Errorf("taking over volume object %s: %w", source, err)
+	}
+	r.dirtyMu.Lock()
+	if r.pendingBulk == nil {
+		r.pendingBulk = make(map[string]ttcsnapshot.ReservedObject)
+	}
+	r.pendingBulk[id.String()] = ttcsnapshot.ReservedObject{ID: id, Pin: graphConstructionPin(id), BulkLength: uint64(inode.Size)}
+	r.dirtyMu.Unlock()
+	if err := r.MarkDataDirty(id.String()); err != nil {
+		return "", err
+	}
+	return id.String(), nil
 }
 
 // WriteAt writes directly to a branch-private host object, reflinking the

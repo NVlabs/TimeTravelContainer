@@ -25,6 +25,7 @@ go_test(
     name = "ttcvolume_test",
     size = "small",
     srcs = [
+        "adopt_test.go",
         "remote_test.go",
         "repository_test.go",
         "sync_test.go",

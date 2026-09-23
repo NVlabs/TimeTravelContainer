@@ -470,15 +470,19 @@ func TestRootSharingAndZeroCountCascade(t *testing.T) {
 	if err := store.DeleteRoot("family@child/memory"); err != nil {
 		t.Fatal(err)
 	}
-	gotNode, _ = store.Object(node)
-	if gotNode.State != ObjectReclaiming || gotNode.Refs != 0 {
-		t.Fatalf("node after final delete=%+v", gotNode)
+	// The last reference's release collects what it held at once, down
+	// through the page, rather than leaving both for Collect.
+	if _, ok := store.Object(node); ok {
+		t.Fatal("the node outlived its last reference")
+	}
+	if _, ok := store.Object(page); ok {
+		t.Fatal("the page outlived the node that held it")
 	}
 	if err := store.SetPin("resurrect", node); err == nil {
-		t.Fatal("retained a zero-count reclaiming object")
+		t.Fatal("retained a released object")
 	}
-	if count, err := store.Collect(8); err != nil || count != 2 {
-		t.Fatalf("Collect()=(%d,%v), want (2,nil)", count, err)
+	if count, err := store.Collect(8); err != nil || count != 0 {
+		t.Fatalf("Collect()=(%d,%v), want nothing left", count, err)
 	}
 	if stats := store.Stats(); stats.Objects != 0 || stats.Roots != 0 {
 		t.Fatalf("stats after collection=%+v", stats)
@@ -1177,8 +1181,13 @@ func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
 	if err := store.DeletePins([]string{"build/chunk", "build/page"}); err != nil {
 		t.Fatal(err)
 	}
-	if collected, err := store.Collect(16); err != nil || collected != 2 {
-		t.Fatalf("Collect()=(%d,%v), want (2,nil)", collected, err)
+	for _, id := range ids {
+		if _, ok := store.Object(id); ok {
+			t.Fatalf("object %s outlived its pins", id)
+		}
+	}
+	if collected, err := store.Collect(16); err != nil || collected != 0 {
+		t.Fatalf("Collect()=(%d,%v), want nothing left", collected, err)
 	}
 }
 
@@ -1875,6 +1884,57 @@ func TestLocalDataStoreConcurrentReclaimIsIdempotent(t *testing.T) {
 	}
 }
 
+// Deleting a root collects what it alone held in the same transaction, as far
+// as a collection transaction goes, and leaves the rest to Collect.
+func TestDeletingARootCollectsWhatItHeldWithinABound(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const children = maxCollectObjectsPerTransaction + 10
+	edges := make([]Edge, 0, children)
+	for i := 0; i < children; i++ {
+		id, err := store.CreateObject(origin, fmt.Sprintf("build/child-%d", i), ObjectKindMetadata, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		edges = append(edges, Edge{Slot: uint16(i), Child: id})
+	}
+	node, err := store.CreateObject(origin, "build/node", ObjectKindMetadata, nil, edges)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < children; i++ {
+		if err := store.DeletePin(fmt.Sprintf("build/child-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetRoot("root", node); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePin("build/node"); err != nil {
+		t.Fatal(err)
+	}
+	if stats := store.Stats(); stats.Objects != children+1 || stats.Reclaiming != 0 {
+		t.Fatalf("stats while rooted=%+v", stats)
+	}
+	if err := store.DeleteRoot("root"); err != nil {
+		t.Fatal(err)
+	}
+	// The node first, then its children breadth first, to the bound.
+	left := children + 1 - maxCollectObjectsPerTransaction
+	if stats := store.Stats(); stats.Objects != left || stats.Reclaiming != left {
+		t.Fatalf("stats after the delete=%+v, want %d objects left reclaiming", stats, left)
+	}
+	if got, err := store.Collect(4096); err != nil || got != left {
+		t.Fatalf("Collect(4096)=(%d,%v), want (%d,nil)", got, err, left)
+	}
+	if stats := store.Stats(); stats.Objects != 0 {
+		t.Fatalf("stats after collection=%+v", stats)
+	}
+}
+
 func TestCollectInternallyBatchesLargeRequests(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
@@ -1882,14 +1942,25 @@ func TestCollectInternallyBatchesLargeRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	const objects = maxCollectObjectsPerTransaction + 1
+	// Deleting a root or pin collects what it held at once; releasing
+	// retained roots leaves the objects for Collect.
+	retained := make(map[string]ObjectID, objects)
 	for i := 0; i < objects; i++ {
 		pin := fmt.Sprintf("batch/%d", i)
-		if _, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, nil); err != nil {
+		id, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetRoot(pin, id); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.DeletePin(pin); err != nil {
 			t.Fatal(err)
 		}
+		retained[pin] = id
+	}
+	if err := store.ReleaseRetainedRoots(retained); err != nil {
+		t.Fatal(err)
 	}
 	if got, err := store.Collect(4096); err != nil || got != maxCollectObjectsPerTransaction {
 		t.Fatalf("Collect(4096)=(%d,%v), want internally bounded batch %d", got, err, maxCollectObjectsPerTransaction)

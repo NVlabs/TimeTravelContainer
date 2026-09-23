@@ -508,6 +508,43 @@ func (store *LocalDataStore) CloneDeferred(sourceID, destinationID ObjectID, try
 	return nil
 }
 
+// LinkDeferred installs destination as a second name for source's bytes,
+// without synchronizing it. From then on a write through either name is a
+// write to both, so the caller must be about to release source and must know
+// that nothing else can read it. The enclosing repository must make
+// destination's name durable, as SyncNewNames does, before synchronizing the
+// graph transaction that names it.
+func (store *LocalDataStore) LinkDeferred(sourceID, destinationID ObjectID) error {
+	source, err := objectRelativePath(sourceID)
+	if err != nil {
+		return err
+	}
+	destination, err := objectRelativePath(destinationID)
+	if err != nil {
+		return err
+	}
+	if store.rootFD != nil {
+		if err := store.mkdirAllRelative(filepath.Dir(destination)); err != nil {
+			return err
+		}
+		if err := unix.Linkat(int(store.rootFD.Fd()), source, int(store.rootFD.Fd()), destination, 0); err != nil {
+			return err
+		}
+	} else {
+		if store.root == "" {
+			return errors.New("donated TTC bulk-object store has no host path")
+		}
+		if err := os.MkdirAll(filepath.Join(store.root, filepath.Dir(destination)), 0700); err != nil {
+			return err
+		}
+		if err := os.Link(filepath.Join(store.root, source), filepath.Join(store.root, destination)); err != nil {
+			return err
+		}
+	}
+	store.noteUnsyncedName(destinationID)
+	return nil
+}
+
 func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink, durable bool) error {
 	if store.rootFD != nil {
 		source, err := store.Open(sourceID, -1)

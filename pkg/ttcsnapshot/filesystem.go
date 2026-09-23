@@ -966,6 +966,89 @@ func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor fu
 	return ObjectID{}, false, errors.New("TTC B-tree exceeds maximum structural depth")
 }
 
+// ExclusiveFile returns the whole-file object that inode number selects in the
+// filesystem rootName names, and whether that name is the only way to reach
+// it: the root, every inode-tree node on the way, the inode record and the
+// file object have one reference apiece, and the file was sealed by a local
+// fork and carries no foreign identity. Nothing but the owner of rootName can
+// read such an object again, so the owner may take its bytes over rather than
+// copy them.
+//
+// References are what the graph holds now. A caller that writes the bytes in
+// place must first make the graph durable: a reference released since the
+// last sync would come back after a crash.
+func (s *Store) ExclusiveFile(rootName string, number uint64) (ObjectID, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rootID, ok := s.state.Roots[rootName]
+	if !ok {
+		return ObjectID{}, false, fmt.Errorf("filesystem root %q does not exist", rootName)
+	}
+	sole := func(id ObjectID) (Object, bool) {
+		object, ok := s.state.Objects[id.key()]
+		return object, ok && object.State == ObjectLive && object.Refs == 1 && !object.Deferred
+	}
+	rootObject, ok := sole(rootID)
+	if !ok {
+		return ObjectID{}, false, nil
+	}
+	root, err := decodeFilesystemRoot(rootObject)
+	if err != nil {
+		return ObjectID{}, false, err
+	}
+	key := InodeKey(number)
+	current := root.inodes
+	var inodeID ObjectID
+	for depth := 0; inodeID.IsZero(); depth++ {
+		if current.IsZero() {
+			return ObjectID{}, false, nil
+		}
+		if depth == 64 {
+			return ObjectID{}, false, errors.New("TTC B-tree exceeds maximum structural depth")
+		}
+		object, ok := sole(current)
+		if !ok {
+			return ObjectID{}, false, nil
+		}
+		node, err := decodeBTreeNode(object, ObjectKindInodeNode)
+		if err != nil {
+			return ObjectID{}, false, err
+		}
+		index := bTreePosition(node.keys, key)
+		if !node.leaf {
+			current = node.children[index]
+			continue
+		}
+		if !bytes.Equal(node.keys[index], key) {
+			return ObjectID{}, false, nil
+		}
+		inodeID = node.children[index]
+	}
+	inodeObject, ok := sole(inodeID)
+	if !ok || inodeID.Kind != ObjectKindInode {
+		return ObjectID{}, false, nil
+	}
+	var inode InodeRecord
+	if err := json.Unmarshal(inodeObject.Data, &inode); err != nil {
+		return ObjectID{}, false, err
+	}
+	if inode.File.IsZero() {
+		return ObjectID{}, false, nil
+	}
+	file, ok := sole(inode.File)
+	if !ok || file.SourceCatalog != "" {
+		return inode.File, false, nil
+	}
+	origin := snapshotKey(inode.File.Snapshot)
+	if snapshot, ok := s.state.Snapshots[origin]; !ok || snapshot.State != SnapshotSealedLocal {
+		return inode.File, false, nil
+	}
+	if _, transferring := s.state.Handoffs[origin]; transferring {
+		return inode.File, false, nil
+	}
+	return inode.File, true, nil
+}
+
 // FilesystemInode resolves immutable inode metadata.
 func (s *Store) FilesystemInode(rootID ObjectID, number uint64) (InodeRecord, bool, error) {
 	s.mu.Lock()
