@@ -2800,6 +2800,25 @@ func (r *Repository) SyncMetadata() error {
 	return r.withLock(r.syncMetadataLocked)
 }
 
+// SyncBranchMetadata is the durability boundary of one guest fsync: every
+// published namespace and inode record of branchID, and no other file's data.
+//
+// The caller has already synced the data of the file being fsynced. What this
+// adds is the metadata that makes those bytes reachable after a crash — the
+// file's size, its name, its inode — which lives in the repository's WAL.
+//
+// SyncMetadata is the whole repository's boundary, and a guest fsync used to
+// take it: every dirty object in every branch was synced before the WAL could
+// be, so one process fsyncing a small file waited for another's gigabytes,
+// at three times the cost of the same fsync on the host. The WAL records other
+// files' published metadata too, and those files' objects must stay openable
+// if it survives a crash, so their names are made durable here. Their bytes
+// are not; a file nobody fsynced may come back short, which is what a crash
+// promises it.
+func (r *Repository) SyncBranchMetadata(branchID string) error {
+	return r.withLock(func() error { return r.syncBranchMetadataLocked(branchID) })
+}
+
 // PublishMetadata makes this repository handle's bounded metadata batches
 // visible through the immutable snapshot graph without creating a data or
 // metadata durability boundary. Manager-side observations such as TTC diff
@@ -2808,6 +2827,111 @@ func (r *Repository) SyncMetadata() error {
 // SyncMetadata when persistence is required.
 func (r *Repository) PublishMetadata() error {
 	return r.withLock(r.flushAllMetadataBatchesLocked)
+}
+
+// syncBranchMetadataLocked publishes branchID's metadata tail and makes the
+// WAL durable, having first made durable the names of everything the WAL can
+// reach. Branch pointer summaries, reclaimed-object deletion and every other
+// object's data are left to the next full fence.
+func (r *Repository) syncBranchMetadataLocked(branchID string) error {
+	if err := r.flushMetadataBatchLocked(branchID); err != nil {
+		return fmt.Errorf("publishing branch %q metadata batch: %w", branchID, err)
+	}
+	// Only the names of objects installed since the last fence: the names of
+	// objects that already existed are durable, and resyncing their directory
+	// chains would be most of what an fsync of an existing file costs.
+	if err := r.data.SyncNewNames(); err != nil {
+		return fmt.Errorf("syncing repository data object names: %w", err)
+	}
+	synced, err := r.syncNamesLocked()
+	if err != nil {
+		return err
+	}
+	if err := r.graph.Sync(); err != nil {
+		return fmt.Errorf("syncing repository snapshot graph: %w", err)
+	}
+	r.dirtyMu.Lock()
+	for _, name := range synced.files {
+		delete(r.dirtyFiles, name)
+	}
+	for _, name := range synced.directories {
+		delete(r.dirtyDirs, name)
+	}
+	r.dirtyMu.Unlock()
+	// The same compaction boundary as a full fence. A database that fsyncs
+	// one inode thousands of times appends a record each time, and now does
+	// so through here.
+	if r.graph.JournalBytes() >= reclaimJournalBytes {
+		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
+			return fmt.Errorf("compacting repository snapshot journal: %w", err)
+		}
+	}
+	return nil
+}
+
+// syncedNames are the repository files and directories one sync made durable.
+type syncedNames struct {
+	files       []string
+	directories []string
+}
+
+// syncNamesLocked makes durable the repository's own dirty files — markers
+// and sidecars, not branch pointer summaries — and then every dirty directory,
+// children before parents, so each name is durable before anything that makes
+// it reachable.
+func (r *Repository) syncNamesLocked() (syncedNames, error) {
+	// A completed remote fetch removes its pending marker. Keep the dirty-file
+	// snapshot and the corresponding opens in one small critical section so the
+	// marker cannot disappear between them.
+	r.remoteMarkerSyncMu.Lock()
+	r.dirtyMu.Lock()
+	var synced syncedNames
+	for name := range r.dirtyFiles {
+		if !strings.HasPrefix(name, "branches/") {
+			synced.files = append(synced.files, name)
+		}
+	}
+	for name := range r.dirtyDirs {
+		synced.directories = append(synced.directories, name)
+	}
+	r.dirtyMu.Unlock()
+	sort.Strings(synced.files)
+	sort.Slice(synced.directories, func(i, j int) bool {
+		return strings.Count(synced.directories[i], string(filepath.Separator)) > strings.Count(synced.directories[j], string(filepath.Separator))
+	})
+	err := r.syncRepositoryFiles(synced.files)
+	r.remoteMarkerSyncMu.Unlock()
+	if err != nil {
+		return syncedNames{}, err
+	}
+	for _, name := range synced.directories {
+		if name == "." {
+			continue
+		}
+		if err := r.syncDirectory(name); err != nil {
+			return syncedNames{}, fmt.Errorf("syncing dirty repository directory %q: %w", name, err)
+		}
+	}
+	return synced, nil
+}
+
+// syncRepositoryFiles fsyncs repository-owned files by name.
+func (r *Repository) syncRepositoryFiles(names []string) error {
+	for _, name := range names {
+		file, err := r.openFile(name, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("opening dirty repository file %q: %w", name, err)
+		}
+		err = file.Sync()
+		closeErr := file.Close()
+		if err != nil {
+			return fmt.Errorf("syncing dirty repository file %q: %w", name, err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("closing dirty repository file %q: %w", name, closeErr)
+		}
+	}
+	return nil
 }
 
 // syncMetadataLocked persists files before the directories that make their
@@ -2847,63 +2971,15 @@ func (r *Repository) syncMetadataLocked() error {
 	if err := r.data.SyncObjects(dataIDs); err != nil {
 		return fmt.Errorf("syncing repository data objects: %w", err)
 	}
+	if err := r.data.SyncNewNames(); err != nil {
+		return fmt.Errorf("syncing repository data object names: %w", err)
+	}
 	sort.Strings(dirtyBranches)
-	// A completed remote fetch removes its pending marker. Keep the dirty-file
-	// snapshot and the corresponding opens in one small critical section so the
-	// marker cannot disappear between them. This lock deliberately excludes the
-	// rest of SyncMetadata: holding it across graph and branch publication would
-	// unnecessarily stall remote reads behind slow filesystem durability work.
-	r.remoteMarkerSyncMu.Lock()
-	r.dirtyMu.Lock()
-	var rootDirty []string
-	for name := range r.dirtyFiles {
-		if !strings.HasPrefix(name, "branches/") {
-			rootDirty = append(rootDirty, name)
-		}
-	}
-	dirtyDirs := make([]string, 0, len(r.dirtyDirs))
-	for name := range r.dirtyDirs {
-		dirtyDirs = append(dirtyDirs, name)
-	}
-	r.dirtyMu.Unlock()
-	sort.Strings(rootDirty)
-	// Children must precede parents so every object name is durable before a
-	// journal transaction that makes it reachable.
-	sort.Slice(dirtyDirs, func(i, j int) bool {
-		return strings.Count(dirtyDirs[i], string(filepath.Separator)) > strings.Count(dirtyDirs[j], string(filepath.Separator))
-	})
-	syncFiles := func(names []string) error {
-		for _, name := range names {
-			file, err := r.openFile(name, os.O_RDONLY, 0)
-			if err != nil {
-				return fmt.Errorf("opening dirty repository file %q: %w", name, err)
-			}
-			err = file.Sync()
-			closeErr := file.Close()
-			if err != nil {
-				return fmt.Errorf("syncing dirty repository file %q: %w", name, err)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("closing dirty repository file %q: %w", name, closeErr)
-			}
-		}
-		return nil
-	}
-	if err := syncFiles(rootDirty); err != nil {
-		r.remoteMarkerSyncMu.Unlock()
-		return err
-	}
-	r.remoteMarkerSyncMu.Unlock()
 	// Persist directory entries only after the files they name. The graph WAL
 	// is the final reachability barrier, so every immutable object must already
 	// be openable if that WAL survives a crash.
-	for _, name := range dirtyDirs {
-		if name == "." {
-			continue
-		}
-		if err := r.syncDirectory(name); err != nil {
-			return fmt.Errorf("syncing dirty repository directory %q: %w", name, err)
-		}
+	if _, err := r.syncNamesLocked(); err != nil {
+		return err
 	}
 	// The graph journal names the immutable metadata and data objects made
 	// durable above. Persist it before publishing branch pointer files.
@@ -2966,7 +3042,7 @@ func (r *Repository) syncMetadataLocked() error {
 	}
 	r.dirtyMu.Unlock()
 	sort.Strings(branchDirty)
-	if err := syncFiles(branchDirty); err != nil {
+	if err := r.syncRepositoryFiles(branchDirty); err != nil {
 		return err
 	}
 	if err := r.syncDirectory("branches"); err != nil {

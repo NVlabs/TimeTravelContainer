@@ -34,6 +34,7 @@ go_test(
 		"deferred_test.go",
 		"hosttree_test.go",
 		"ledger_test.go",
+		"names_test.go",
 		"pack_test.go",
 		"relay_test.go",
         "resolver_test.go",

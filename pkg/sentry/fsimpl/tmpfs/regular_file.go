@@ -934,7 +934,10 @@ func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	if err := f.flushDiskMetadataLocked(); err != nil {
 		return err
 	}
-	if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
+	// This file's metadata and names, not the repository's every dirty
+	// object: fsync(2) promises this file, and sync(2) is the call that
+	// promises everything.
+	if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
 		reportDiskVolumeFailure("sync filesystem metadata", err)
 		return diskVolumeError("sync filesystem metadata", err)
 	}
@@ -1288,7 +1291,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			if err := f.flushDiskMetadataLocked(); err != nil {
 				return done, offset + done, err
 			}
-			if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
+			if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
 				return done, offset + done, diskVolumeError("sync filesystem metadata", err)
 			}
 		}

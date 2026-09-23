@@ -1629,7 +1629,9 @@ func (fd *fileDescription) Sync(_ context.Context, opts vfs.SyncOptions) error {
 		if _, ok := fd.inode().impl.(*regularFile); ok {
 			return diskVolumeError("sync inode data", fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, fd.inode().ino, opts.DataOnly))
 		}
-		return diskVolumeError("sync inode metadata", fs.diskVolume.Repository.SyncMetadata())
+		// A directory's fsync promises its entries, which are this branch's
+		// published namespace; no file's data rides along.
+		return diskVolumeError("sync inode metadata", fs.diskVolume.Repository.SyncBranchMetadata(fs.diskVolume.Branch))
 	}
 	return nil
 }

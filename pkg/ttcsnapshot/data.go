@@ -43,6 +43,60 @@ type LocalDataStore struct {
 	// subsequent physical sweep is deliberately outside the graph lock; two
 	// independent lifecycle completions may therefore reach it concurrently.
 	gcMu sync.RWMutex
+	// unsyncedNames are objects installed without a durability barrier whose
+	// directory entries a later fence must make durable, keyed by object with
+	// a generation so a concurrent reinstall is not forgotten by a sync that
+	// began before it. Removal forgets them: a removed object has no name to
+	// make durable.
+	namesMu       sync.Mutex
+	unsyncedNames map[string]unsyncedName
+}
+
+type unsyncedName struct {
+	id         ObjectID
+	generation uint64
+}
+
+func (store *LocalDataStore) noteUnsyncedName(id ObjectID) {
+	store.namesMu.Lock()
+	defer store.namesMu.Unlock()
+	if store.unsyncedNames == nil {
+		store.unsyncedNames = make(map[string]unsyncedName)
+	}
+	current := store.unsyncedNames[id.key()]
+	store.unsyncedNames[id.key()] = unsyncedName{id: id, generation: current.generation + 1}
+}
+
+func (store *LocalDataStore) forgetUnsyncedName(id ObjectID) {
+	store.namesMu.Lock()
+	delete(store.unsyncedNames, id.key())
+	store.namesMu.Unlock()
+}
+
+// SyncNewNames makes durable the directory entries of every object installed
+// without a durability barrier since the last call, and nothing else. It is
+// the part of a durability fence that a WAL naming those objects depends on;
+// their payloads are the fence's separate concern.
+func (store *LocalDataStore) SyncNewNames() error {
+	store.namesMu.Lock()
+	snapshot := make(map[string]unsyncedName, len(store.unsyncedNames))
+	ids := make([]ObjectID, 0, len(store.unsyncedNames))
+	for key, name := range store.unsyncedNames {
+		snapshot[key] = name
+		ids = append(ids, name.id)
+	}
+	store.namesMu.Unlock()
+	if err := store.SyncObjectDirectories(ids); err != nil {
+		return err
+	}
+	store.namesMu.Lock()
+	for key, synced := range snapshot {
+		if current, ok := store.unsyncedNames[key]; ok && current.generation == synced.generation {
+			delete(store.unsyncedNames, key)
+		}
+	}
+	store.namesMu.Unlock()
+	return nil
 }
 
 // WithGraphMutation excludes physical garbage collection while installed bulk
@@ -297,7 +351,11 @@ func (store *LocalDataStore) Install(id ObjectID, source io.Reader, length int64
 // fsync/sync or a lifecycle fence. Other LocalDataStore users retain Install's
 // immediate-durability contract.
 func (store *LocalDataStore) InstallDeferred(id ObjectID, source io.Reader, length int64) error {
-	return store.install(id, source, length, false)
+	if err := store.install(id, source, length, false); err != nil {
+		return err
+	}
+	store.noteUnsyncedName(id)
+	return nil
 }
 
 // ReplaceDeferred writes a complete cache object and atomically replaces any
@@ -306,6 +364,14 @@ func (store *LocalDataStore) InstallDeferred(id ObjectID, source io.Reader, leng
 // Authoritative callers must continue using Install or InstallDeferred, whose
 // create-if-absent semantics protect immutable objects from replacement.
 func (store *LocalDataStore) ReplaceDeferred(id ObjectID, source io.Reader, length int64) error {
+	if err := store.replaceDeferred(id, source, length); err != nil {
+		return err
+	}
+	store.noteUnsyncedName(id)
+	return nil
+}
+
+func (store *LocalDataStore) replaceDeferred(id ObjectID, source io.Reader, length int64) error {
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
@@ -435,7 +501,11 @@ func (store *LocalDataStore) Clone(sourceID, destinationID ObjectID, tryReflink 
 // enclosing filesystem repository must pass destinationID to SyncObjects
 // before synchronizing the graph transaction that names it.
 func (store *LocalDataStore) CloneDeferred(sourceID, destinationID ObjectID, tryReflink bool) error {
-	return store.clone(sourceID, destinationID, tryReflink, false)
+	if err := store.clone(sourceID, destinationID, tryReflink, false); err != nil {
+		return err
+	}
+	store.noteUnsyncedName(destinationID)
+	return nil
 }
 
 func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink, durable bool) error {
@@ -587,6 +657,36 @@ func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
 		}
 		directories["."] = struct{}{}
 	}
+	return store.syncDirectoriesDeepestFirst(directories)
+}
+
+// SyncObjectDirectories makes the names of objects durable without syncing
+// their payloads.
+//
+// A guest fsync of one file must make the metadata WAL durable, and the WAL
+// names every object any branch has published since the last full fence.
+// Those objects must still be openable if the WAL survives a crash, so their
+// directory entries have to be durable first. Their bytes need not be: a file
+// nobody fsynced may come back short, which is what a crash promises it.
+func (store *LocalDataStore) SyncObjectDirectories(ids []ObjectID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	directories := make(map[string]struct{})
+	for _, id := range ids {
+		relative, err := objectRelativePath(id)
+		if err != nil {
+			return err
+		}
+		for directory := filepath.Dir(relative); directory != "."; directory = filepath.Dir(directory) {
+			directories[directory] = struct{}{}
+		}
+		directories["."] = struct{}{}
+	}
+	return store.syncDirectoriesDeepestFirst(directories)
+}
+
+func (store *LocalDataStore) syncDirectoriesDeepestFirst(directories map[string]struct{}) error {
 	ordered := make([]string, 0, len(directories))
 	for directory := range directories {
 		ordered = append(ordered, directory)
@@ -667,6 +767,7 @@ func (store *LocalDataStore) Fetch(_ context.Context, id ObjectID) (io.ReadClose
 
 // Remove deletes an object whose authoritative graph record was reclaimed.
 func (store *LocalDataStore) Remove(id ObjectID) error {
+	store.forgetUnsyncedName(id)
 	if store.rootFD != nil {
 		relative, err := objectRelativePath(id)
 		if err != nil {
@@ -809,6 +910,7 @@ func (store *LocalDataStore) reclaimRelative(graph *Store, relative string) (rem
 		if _, ok := graph.Object(id); ok {
 			continue
 		}
+		store.forgetUnsyncedName(id)
 		if err := unix.Unlinkat(int(store.rootFD.Fd()), child, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return removed, quarantined, err
 		}
@@ -886,6 +988,7 @@ func (store *LocalDataStore) ReclaimUnreferenced(graph *Store) (removed, quarant
 			if _, ok := graph.Object(id); ok {
 				return nil
 			}
+			store.forgetUnsyncedName(id)
 			if err := os.Remove(path); err != nil {
 				// A second LocalDataStore handle may have completed the same
 				// idempotent sweep after WalkDir observed the entry. The graph

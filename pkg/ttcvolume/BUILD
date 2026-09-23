@@ -27,6 +27,7 @@ go_test(
     srcs = [
         "remote_test.go",
         "repository_test.go",
+        "sync_test.go",
     ],
     library = ":ttcvolume",
 )
