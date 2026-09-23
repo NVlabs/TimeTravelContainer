@@ -3418,6 +3418,32 @@ func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
 	}
 }
 
+// A live branch has no durable state, so waiting for it fails at once rather
+// than never returning.
+func TestWaitDurableRefusesALiveBranch(t *testing.T) {
+	for _, state := range []string{"running", "paused"} {
+		b := &fakeBackend{
+			localDurable: true,
+			inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+				Metadata: Branch{ID: "child", State: state, StorageState: "local"},
+			}}}},
+		}
+		var stdout, stderr bytes.Buffer
+		done := make(chan int, 1)
+		go func() {
+			done <- runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b)
+		}()
+		select {
+		case status := <-done:
+			if status == 0 || !strings.Contains(stderr.String(), "only a stopped or dehydrated branch") {
+				t.Fatalf("%s: wait durable status=%d stderr=%q, want a refusal", state, status, stderr.String())
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: wait durable on a live branch did not return", state)
+		}
+	}
+}
+
 type authoritativeWaitBackend struct {
 	*fakeBackend
 	durable bool

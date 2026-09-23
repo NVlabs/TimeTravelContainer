@@ -4949,6 +4949,12 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 				continue
 			}
 			found = true
+			// A live branch has no captured state for durability to describe,
+			// so waiting for it would wait for ever.
+			switch state := normalizeLifecycleState(branch.State); state {
+			case "running", "paused":
+				return waitResult{err: fmt.Errorf("%s is %s: only a stopped or dehydrated branch has durable state to wait for", target, state)}
+			}
 			switch branch.StorageState {
 			case ttcbundle.StorageResident:
 				// Nothing makes a resident capture durable until its family's
@@ -5848,6 +5854,9 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 	}
 	if branch.Corrupted {
 		return false, fmt.Errorf("branch %s is corrupted: %s", target, branch.CorruptionReason)
+	}
+	if branch.Lifecycle == "running" || branch.Lifecycle == "paused" {
+		return false, fmt.Errorf("%s is %s: only a stopped or dehydrated branch has durable state to wait for", target, branch.Lifecycle)
 	}
 	if branch.Lifecycle != "exited" && branch.Lifecycle != "dehydrated" {
 		return false, nil
