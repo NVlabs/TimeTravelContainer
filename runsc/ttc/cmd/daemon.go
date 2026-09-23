@@ -4408,7 +4408,13 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		if err != nil {
 			return consumed, err
 		}
-		opts.Peers = append(opts.Peers, "seed="+clusterJoin)
+		// A seed has no node name of its own, and peers are keyed by name, so
+		// the second and later seeds are numbered.
+		name := "seed"
+		for i := 2; slices.ContainsFunc(opts.Peers, func(peer string) bool { return strings.HasPrefix(peer, name+"=") }); i++ {
+			name = fmt.Sprintf("seed-%d", i)
+		}
+		opts.Peers = append(opts.Peers, name+"="+clusterJoin)
 		opts.Configured = true
 		return consumed, nil
 	}

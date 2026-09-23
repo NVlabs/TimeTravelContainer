@@ -1945,6 +1945,24 @@ func TestSimpleClusterOptions(t *testing.T) {
 	if !reflect.DeepEqual(join.Peers, []string{"seed=node-a.example:7443"}) {
 		t.Fatalf("equals-form join peers=%q", join.Peers)
 	}
+	// --cluster-join is repeatable, and each seed becomes its own peer.
+	for _, args := range [][]string{{"--cluster-join", "node-b.example:7443"}, {"--cluster-join=node-c.example:7443"}} {
+		if consumed, err := consumeDaemonClusterOption(args, &join); err != nil || consumed != len(args) {
+			t.Fatalf("consuming %q: consumed=%d err=%v", args, consumed, err)
+		}
+	}
+	want := []string{"seed=node-a.example:7443", "seed-2=node-b.example:7443", "seed-3=node-c.example:7443"}
+	if !reflect.DeepEqual(join.Peers, want) {
+		t.Fatalf("repeated join peers=%q, want %q", join.Peers, want)
+	}
+	seen := make(map[string]bool)
+	for _, peer := range join.Peers {
+		nodeID, _, _, err := parseClusterPeer(peer)
+		if err != nil || seen[nodeID] {
+			t.Fatalf("seed peer %q: name %q, err %v, already seen %t", peer, nodeID, err, seen[nodeID])
+		}
+		seen[nodeID] = true
+	}
 }
 
 func TestReadClusterSharedRootMarkerWaitsForInitialization(t *testing.T) {
