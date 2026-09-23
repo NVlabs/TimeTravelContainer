@@ -80,6 +80,52 @@ func TestInstallSparseChunksReusesResidentObject(t *testing.T) {
 	}
 }
 
+// Branches restored from one immutable chunk may each use a different subset
+// of its pages. A later branch reuses the resident chunk and records the
+// identities of the slots only it uses; a slot both use must agree.
+func TestInstallSparseChunksReusesResidentObjectForAnotherSubset(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	first := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	resident := installation.NewRanges()[first.Object]
+	allocator := first.Logical.Allocator
+	second := first
+	second.Pages = []SparseChunkPage{
+		first.Pages[1],
+		{Slot: 9, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 9}, Version: PageVersionID{Allocator: allocator, Sequence: 40}, References: 1},
+	}
+	reused, err := mf.InstallSparseChunks([]SparseChunkInstall{second})
+	if err != nil {
+		t.Fatalf("a different subset of a resident chunk was refused: %v", err)
+	}
+	if err := reused.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if len(reused.NewRanges()) != 0 {
+		t.Fatalf("reusing a resident chunk allocated ranges: %v", reused.NewRanges())
+	}
+	for _, page := range append(append([]SparseChunkPage(nil), first.Pages...), second.Pages[1]) {
+		gotPage, gotVersion, ok := mf.LogicalPageVersionAt(resident.Start + uint64(page.Slot)*hostarch.PageSize)
+		if !ok || gotPage != page.Page || gotVersion != page.Version {
+			t.Fatalf("slot %d identity=(%+v,%+v,%t), want (%+v,%+v,true)", page.Slot, gotPage, gotVersion, ok, page.Page, page.Version)
+		}
+	}
+	conflicting := first
+	conflicting.Pages = []SparseChunkPage{first.Pages[0]}
+	conflicting.Pages[0].Version.Sequence++
+	if refused, err := mf.InstallSparseChunks([]SparseChunkInstall{conflicting}); err == nil {
+		_ = refused.Abort()
+		t.Fatal("a resident chunk accepted a different version of a page it holds")
+	}
+}
+
 func TestInstallRemoteBindingsReusesPageVersionChunk(t *testing.T) {
 	mf := newEmptyRemoteTestMemoryFile(t)
 	defer mf.Destroy()

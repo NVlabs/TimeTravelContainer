@@ -416,20 +416,39 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 
 		f.mu.Lock()
 		resident, exists := f.sparseChunks[install.Object]
-		f.mu.Unlock()
 		if exists {
-			if resident.Logical != install.Logical || len(resident.Pages) != len(pages) {
+			// One immutable chunk can back branches that each use a different
+			// subset of its pages. Its whole 1 MiB is read into the resident
+			// range whichever branch installed it first, so a slot only a
+			// later branch uses needs just its identity recorded. Slots both
+			// use must name the same page version.
+			if resident.Logical != install.Logical {
+				f.mu.Unlock()
 				rollback()
-				return nil, fmt.Errorf("resident sparse chunk %x metadata mismatch", install.Object)
+				return nil, fmt.Errorf("resident sparse chunk %x is logical chunk %+v, not %+v", install.Object, resident.Logical, install.Logical)
 			}
 			for slot, page := range pages {
-				old, ok := resident.Pages[slot]
-				if !ok || old.Page != page.Page || old.Version != page.Version {
+				if old, ok := resident.Pages[slot]; ok && (old.Page != page.Page || old.Version != page.Version) {
+					f.mu.Unlock()
 					rollback()
 					return nil, fmt.Errorf("resident sparse chunk %x slot %d identity mismatch", install.Object, slot)
 				}
 			}
+			for slot, page := range pages {
+				if _, ok := resident.Pages[slot]; ok {
+					continue
+				}
+				pageFR := memmap.FileRange{Start: resident.Range.Start + uint64(slot)*hostarch.PageSize, End: resident.Range.Start + (uint64(slot)+1)*hostarch.PageSize}
+				f.logicalPages.RemoveFullRange(pageFR)
+				f.logicalPages.InsertRange(pageFR, logicalPageInfo{
+					Allocator: page.Page.Allocator, FirstSequence: page.Page.Sequence,
+					VersionAllocator: page.Version.Allocator, FirstVersionSequence: page.Version.Sequence,
+				})
+				resident.Pages[slot] = page
+			}
+			f.mu.Unlock()
 		} else {
+			f.mu.Unlock()
 			fr, err := f.Allocate(SparseChunkBytes, AllocOpts{Kind: install.Kind, MemCgID: install.MemCgID})
 			if err != nil {
 				rollback()
