@@ -44,7 +44,13 @@ const (
 	// record ceiling even though every individual object is valid. Callers
 	// already repeat Collect until it returns zero.
 	maxCollectObjectsPerTransaction = 128
-	headFileName                    = "graph.head"
+	// maxCollectBatchObjects and maxCollectReferencesPerTransaction bound one
+	// Collect transaction: its object deletions and the reference updates of
+	// the objects they release, maxObjectEdges more at most, keep the record
+	// within about 6 MiB even with the widest IDs, below maxJournalRecordSize.
+	maxCollectBatchObjects             = 4096
+	maxCollectReferencesPerTransaction = 32768
+	headFileName                       = "graph.head"
 )
 
 // ErrSnapshotLedgerFrozen reports a reference or object mutation that raced
@@ -2985,12 +2991,20 @@ func (s *Store) deleteRoots(names []string, allowMissing bool) error {
 
 // Collect reclaims at most limit zero-count objects and cascades their child
 // edge releases. It returns the number of physical object records removed.
+//
+// Finding the zero-count objects scans the whole graph, so Collect scans once
+// and commits what it finds in bounded transactions, rather than scanning, and
+// syncing the journal, for every 128 objects: releasing a dehydrated 1.5 GiB
+// branch, some 400,000 objects, took 75 seconds that way.
 func (s *Store) Collect(limit int) (int, error) {
+	return s.collect(limit, maxCollectBatchObjects, maxCollectReferencesPerTransaction)
+}
+
+// collect is Collect with each transaction bounded to delete at most
+// batchObjects objects and to update about batchReferences reference counts.
+func (s *Store) collect(limit, batchObjects, batchReferences int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
-	}
-	if limit > maxCollectObjectsPerTransaction {
-		limit = maxCollectObjectsPerTransaction
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3004,15 +3018,34 @@ func (s *Store) Collect(limit int) (int, error) {
 		}
 	}
 	sort.Strings(queue)
-	if len(queue) == 0 {
-		return 0, nil
-	}
-	touched := make(map[string]Object)
-	deleted := make(map[string]struct{})
 	queued := make(map[string]struct{}, len(queue))
 	for _, key := range queue {
 		queued[key] = struct{}{}
 	}
+	collected := 0
+	for len(queue) != 0 && collected < limit {
+		n, rest, err := s.collectBatchLocked(queue, queued, min(limit-collected, batchObjects), batchReferences)
+		collected += n
+		if err != nil {
+			return collected, err
+		}
+		queue = rest
+		if n == 0 {
+			break
+		}
+	}
+	return collected, nil
+}
+
+// collectBatchLocked collects zero-count objects from the front of queue,
+// breadth first, and commits them in one transaction: at most limit objects,
+// and none more once the transaction updates referenceLimit counts, which an
+// object's children can overrun by maxObjectEdges. It returns how many it
+// collected and what is left of queue, including the objects this batch left
+// without references.
+func (s *Store) collectBatchLocked(queue []string, queued map[string]struct{}, limit, referenceLimit int) (int, []string, error) {
+	touched := make(map[string]Object)
+	deleted := make(map[string]struct{})
 	objectFor := func(key string) (Object, bool) {
 		if object, ok := touched[key]; ok {
 			return object, true
@@ -3021,7 +3054,7 @@ func (s *Store) Collect(limit int) (int, error) {
 		return object, ok
 	}
 	collected := 0
-	for len(queue) != 0 && collected < limit {
+	for len(queue) != 0 && collected < limit && len(touched) < referenceLimit {
 		key := queue[0]
 		queue = queue[1:]
 		object, ok := objectFor(key)
@@ -3031,12 +3064,12 @@ func (s *Store) Collect(limit int) (int, error) {
 		for _, edge := range object.Children {
 			child, ok := objectFor(edge.Child.key())
 			if !ok {
-				return collected, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
+				return 0, queue, fmt.Errorf("reclaiming object %s references missing child %s", object.ID.key(), edge.Child.key())
 			}
 			var err error
 			child, err = releaseObject(child)
 			if err != nil {
-				return collected, err
+				return 0, queue, err
 			}
 			touched[child.ID.key()] = child
 			if child.State == ObjectReclaiming {
@@ -3049,6 +3082,9 @@ func (s *Store) Collect(limit int) (int, error) {
 		delete(touched, key)
 		deleted[key] = struct{}{}
 		collected++
+	}
+	if collected == 0 {
+		return 0, queue, nil
 	}
 	keys := make([]string, 0, len(touched))
 	for key := range touched {
@@ -3071,9 +3107,9 @@ func (s *Store) Collect(limit int) (int, error) {
 		ops = append(ops, journalOp{DeleteObject: key})
 	}
 	if err := s.commitLockedWithMaterializedReferences(ops, references); err != nil {
-		return 0, err
+		return 0, queue, err
 	}
-	return collected, nil
+	return collected, queue, nil
 }
 
 // CollectEmptySnapshots removes origins that own no graph objects and are not

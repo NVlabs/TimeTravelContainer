@@ -1935,15 +1935,79 @@ func TestDeletingARootCollectsWhatItHeldWithinABound(t *testing.T) {
 	}
 }
 
-func TestCollectInternallyBatchesLargeRequests(t *testing.T) {
+// Collect collects up to its limit in one call, in transactions bounded by
+// the objects they delete and the reference counts they update.
+func TestCollectCommitsBoundedTransactions(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
 	if err != nil {
 		t.Fatal(err)
 	}
-	const objects = maxCollectObjectsPerTransaction + 1
-	// Deleting a root or pin collects what it held at once; releasing
-	// retained roots leaves the objects for Collect.
+	// Three nodes of four children each. Releasing retained roots leaves the
+	// nodes for Collect, where deleting a root or pin would collect them.
+	retained := make(map[string]ObjectID)
+	for i := 0; i < 3; i++ {
+		edges := make([]Edge, 0, 4)
+		for j := 0; j < 4; j++ {
+			pin := fmt.Sprintf("batch/%d/%d", i, j)
+			id, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			edges = append(edges, Edge{Slot: uint16(j), Child: id})
+		}
+		pin := fmt.Sprintf("batch/%d", i)
+		id, err := store.CreateObject(origin, pin, ObjectKindMetadata, nil, edges)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < 4; j++ {
+			if err := store.DeletePin(fmt.Sprintf("batch/%d/%d", i, j)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetRoot(pin, id); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DeletePin(pin); err != nil {
+			t.Fatal(err)
+		}
+		retained[pin] = id
+	}
+	if err := store.ReleaseRetainedRoots(retained); err != nil {
+		t.Fatal(err)
+	}
+	if stats := store.Stats(); stats.Objects != 15 || stats.Reclaiming != 3 {
+		t.Fatalf("stats after the release=%+v, want 15 objects, 3 reclaiming", stats)
+	}
+	// A limit is honoured across transactions.
+	sequence := store.Stats().Sequence
+	if got, err := store.collect(2, 4096, 4); err != nil || got != 2 {
+		t.Fatalf("collect(2)=(%d,%v), want (2,nil)", got, err)
+	}
+	if stats := store.Stats(); stats.Sequence != sequence+2 {
+		t.Fatalf("collect(2) committed %d transactions, want 2", stats.Sequence-sequence)
+	}
+	// The first transaction takes the eight children released so far, which
+	// update no counts, and the last node, whose four fill it; the second
+	// takes that node's children.
+	sequence = store.Stats().Sequence
+	if got, err := store.collect(4096, 4096, 4); err != nil || got != 13 {
+		t.Fatalf("collect(4096)=(%d,%v), want (13,nil)", got, err)
+	}
+	if stats := store.Stats(); stats.Objects != 0 || stats.Sequence != sequence+2 {
+		t.Fatalf("stats after collection=%+v, want no objects after 2 transactions from %d", stats, sequence)
+	}
+}
+
+// Collect is not capped at one transaction's worth per call.
+func TestCollectTakesMoreThanOneTransactionPerCall(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const objects = 10
 	retained := make(map[string]ObjectID, objects)
 	for i := 0; i < objects; i++ {
 		pin := fmt.Sprintf("batch/%d", i)
@@ -1962,11 +2026,12 @@ func TestCollectInternallyBatchesLargeRequests(t *testing.T) {
 	if err := store.ReleaseRetainedRoots(retained); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := store.Collect(4096); err != nil || got != maxCollectObjectsPerTransaction {
-		t.Fatalf("Collect(4096)=(%d,%v), want internally bounded batch %d", got, err, maxCollectObjectsPerTransaction)
+	sequence := store.Stats().Sequence
+	if got, err := store.collect(4096, 4, 4096); err != nil || got != objects {
+		t.Fatalf("collect(4096)=(%d,%v), want (%d,nil)", got, err, objects)
 	}
-	if got, err := store.Collect(4096); err != nil || got != 1 {
-		t.Fatalf("second Collect(4096)=(%d,%v), want (1,nil)", got, err)
+	if stats := store.Stats(); stats.Objects != 0 || stats.Sequence != sequence+3 {
+		t.Fatalf("stats after collection=%+v, want no objects after 3 transactions from %d", stats, sequence)
 	}
 }
 
