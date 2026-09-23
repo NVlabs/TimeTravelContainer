@@ -305,6 +305,15 @@ type vma struct {
 	// This field can be read atomically, and written with mm.activeMu locked for
 	// writing and mm.mapping locked.
 	lastFault uintptr
+
+	// writeRunEnd and writeRunPages describe the last write fault in this
+	// vma: the end of the range it made usable, and how many pages it asked
+	// for. A write fault that begins at writeRunEnd asks for twice as many.
+	// See writeFaultRangeLocked.
+	//
+	// Heuristic state with the same locking as lastFault, and not saved.
+	writeRunEnd   uintptr `state:"nosave"`
+	writeRunPages uintptr `state:"nosave"`
 }
 
 func (v *vma) copy() vma {
@@ -325,6 +334,8 @@ func (v *vma) copy() vma {
 		name:           v.name,
 		nameMut:        v.nameMut,
 		lastFault:      atomic.LoadUintptr(&v.lastFault),
+		writeRunEnd:    atomic.LoadUintptr(&v.writeRunEnd),
+		writeRunPages:  atomic.LoadUintptr(&v.writeRunPages),
 	}
 }
 

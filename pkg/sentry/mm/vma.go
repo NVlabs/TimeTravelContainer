@@ -458,6 +458,8 @@ func (vmaSetFunctions) ClearValue(vma *vma) {
 	vma.id = nil
 	vma.name = ""
 	atomic.StoreUintptr(&vma.lastFault, 0)
+	atomic.StoreUintptr(&vma.writeRunEnd, 0)
+	atomic.StoreUintptr(&vma.writeRunPages, 0)
 }
 
 func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.AddrRange, vma2 vma) (vma, bool) {

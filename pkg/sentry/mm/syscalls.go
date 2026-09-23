@@ -55,11 +55,26 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 
 	// Ensure that we have a usable pma.
 	mm.activeMu.Lock()
-	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */)
+	faulted := ar
+	if at.Write {
+		ar = mm.writeFaultRangeLocked(vseg, ar)
+	}
+	remap := faultRemap{ar: ar}
+	defer remap.release()
+	pseg, pend, err := mm.getPMAsRemappingLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, &remap)
 	mm.mappingMu.RUnlock()
 	if err != nil {
-		mm.activeMu.Unlock()
-		return err
+		if pend.Start() < faulted.End {
+			// Nothing will map ar now, and what was replaced in it before
+			// the failure is still mapped to what it replaced.
+			mm.unmapASLocked(ar)
+			mm.activeMu.Unlock()
+			return err
+		}
+		// The page that faulted is usable. What failed was making pages
+		// ahead of it usable, and the application meets that failure if it
+		// touches them.
+		ar.End = pend.Start()
 	}
 
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
@@ -67,9 +82,13 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	mm.activeMu.DowngradeLock()
 
 	// Map the faulted page into the active AddressSpace.
-	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+	if err := mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault); err != nil {
+		mm.unmapASLocked(remap.ar)
+		mm.activeMu.RUnlock()
+		return err
+	}
 	mm.activeMu.RUnlock()
-	return err
+	return nil
 }
 
 // MMap establishes a memory mapping.
