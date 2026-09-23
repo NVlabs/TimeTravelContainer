@@ -153,6 +153,12 @@ type Container struct {
 	// This field isn't saved to json, because only a creator of a gofer
 	// process will have it as a child process.
 	goferIsChild bool `nojson:"true"`
+
+	// unownedCgroup is the root container's host cgroup between its
+	// installation and the creation of the sandbox, whose stop uninstalls it.
+	// A creation that fails in between leaves it for stop, which removes it
+	// once the gofer running inside it is gone.
+	unownedCgroup cgroup.Cgroup `nojson:"true"`
 }
 
 // Args is used to configure a new container.
@@ -350,6 +356,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		if err != nil {
 			return fmt.Errorf("cannot set up cgroup for root: %w", err)
 		}
+		c.unownedCgroup = parentCgroup
 		// Join the child cgroup when using cgroupfs. Joining non leaf-node
 		// cgroups is illegal in cgroupsv2 and will return EBUSY.
 		if subCgroup != nil && !conf.SystemdCgroup && cgroup.IsOnlyV2() {
@@ -398,6 +405,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			return fmt.Errorf("cannot create sandbox: %w", err)
 		}
 		c.Sandbox = sand
+		c.unownedCgroup = nil
 		return nil
 
 	}); err != nil {
@@ -1301,6 +1309,12 @@ func (c *Container) stop() error {
 		if err := c.CompatCgroup.Cgroup.Uninstall(); err != nil {
 			return err
 		}
+	}
+	// A root container whose sandbox was never created still owns the cgroup
+	// installed for it.
+	if parentCgroup == nil && c.unownedCgroup != nil {
+		parentCgroup = c.unownedCgroup
+		c.unownedCgroup = nil
 	}
 	// Gofer is running inside parentCgroup, so Cgroup.Uninstall has to be called
 	// after the gofer has stopped.

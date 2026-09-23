@@ -416,6 +416,85 @@ func TestConvertMemorySwapToCgroupV2Value(t *testing.T) {
 	}
 }
 
+// A runtime in a delegated subtree cannot write the ancestors above its
+// delegation. It must not try when they already pass down what it needs, and
+// where they withhold a controller it must go on without it rather than fail.
+func TestCreateCgroupPathsInDelegatedSubtree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not constrain root")
+	}
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "cgroup")
+	if err != nil {
+		t.Fatalf("error creating temporary directory: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	level := func(path, available, enabled string, mode os.FileMode) {
+		t.Helper()
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for name, value := range map[string]string{controllersFile: available, subtreeControl: enabled} {
+			file := filepath.Join(path, name)
+			if err := os.WriteFile(file, []byte(value), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(file, mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The host root and user slice belong to someone else; the app slice is
+	// delegated but passes down only memory and pids so far.
+	level(filepath.Join(dir, "user.slice"), "cpu io memory pids", "cpu memory pids", 0o444)
+	level(filepath.Join(dir, "user.slice", "app.slice"), "cpu memory pids", "memory pids", 0o644)
+	// cgroupfs gives a new cgroup its control files; this directory does not,
+	// so the runtime's own intermediate level exists already.
+	level(filepath.Join(dir, "user.slice", "app.slice", "ttc"), "cpu memory pids", "", 0o644)
+	cg := &cgroupV2{
+		Mountpoint:  dir,
+		Path:        "user.slice/app.slice/ttc/container",
+		Controllers: []string{"cpu", "io", "memory", "pids"},
+	}
+	created, err := cg.createCgroupPaths()
+	if err != nil {
+		t.Fatalf("createCgroupPaths in a delegated subtree: %v", err)
+	}
+	if !created {
+		t.Fatal("createCgroupPaths created nothing")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "user.slice", "app.slice", subtreeControl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "+cpu" {
+		t.Errorf("the delegated slice was asked for %q, want only the missing +cpu", got)
+	}
+	got, err = os.ReadFile(filepath.Join(dir, "user.slice", "app.slice", "ttc", subtreeControl))
+	if err == nil && strings.Contains(string(got), "io") {
+		t.Errorf("a controller withheld above the delegation was requested below it: %q", got)
+	}
+}
+
+// A cgroup without the cpuset controller runs on its nearest ancestor's CPUs.
+func TestNumCPUFromAncestorWithoutCpuset(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "cgroup")
+	if err != nil {
+		t.Fatalf("error creating temporary directory: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	leaf := filepath.Join(dir, "user.slice", "app.slice", "ttc", "container")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "user.slice", "cpuset.cpus.effective"), []byte("0-2,5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cg := &cgroupV2{Mountpoint: dir, Path: "user.slice/app.slice/ttc/container"}
+	if n, err := cg.NumCPU(); err != nil || n != 4 {
+		t.Fatalf("NumCPU()=(%d,%v), want the ancestor's 4", n, err)
+	}
+}
+
 func TestInstallPrecreatedCgroupV2SetsMemorySwap(t *testing.T) {
 	dir, err := os.MkdirTemp(testutil.TmpDir(), "cgroup")
 	if err != nil {
