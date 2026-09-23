@@ -4561,6 +4561,29 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 		return errors.New("usage: ttc resume TARGET [TARGET...]")
 	}
 	for _, arg := range args {
+		if !strings.Contains(arg, "@") {
+			// A family pauses its running branches and resumes its paused
+			// ones, and leaves the rest as they are.
+			targets, err := branchOperationTargets(arg, backend, true)
+			if err != nil {
+				return fmt.Errorf("invalid target %q: %w", arg, err)
+			}
+			for _, target := range targets {
+				switch {
+				case pause && target.state == "running":
+					err = backend.pause(target.selector)
+				case !pause && target.state == "paused":
+					err = backend.resume(target.selector)
+				default:
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("updating %s: %w", target.selector, err)
+				}
+			}
+			fmt.Fprintln(stdout, arg)
+			continue
+		}
 		target, err := parseSelector(arg)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)

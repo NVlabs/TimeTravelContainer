@@ -3444,6 +3444,30 @@ func TestWaitDurableRefusesALiveBranch(t *testing.T) {
 	}
 }
 
+// A family target pauses its running branches and resumes its paused ones,
+// as the help for pause and resume says.
+func TestPauseAndResumeAFamily(t *testing.T) {
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "main", State: "running"}},
+		{Metadata: Branch{ID: "held", State: "paused"}},
+		{Metadata: Branch{ID: "done", State: "exited"}},
+		{Metadata: Branch{ID: "work", State: "running"}},
+	}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"pause", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("pause web status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []selector{{container: "web", branch: "main"}, {container: "web", branch: "work"}}; !reflect.DeepEqual(b.pausedAll, want) {
+		t.Fatalf("paused %+v, want the running branches %+v", b.pausedAll, want)
+	}
+	if status := runCommand([]string{"resume", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("resume web status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []selector{{container: "web", branch: "held"}}; !reflect.DeepEqual(b.resumedAll, want) {
+		t.Fatalf("resumed %+v, want the paused branch %+v", b.resumedAll, want)
+	}
+}
+
 type authoritativeWaitBackend struct {
 	*fakeBackend
 	durable bool
@@ -5529,6 +5553,8 @@ type fakeBackend struct {
 	logsTarget          selector
 	logsOptions         logsOptions
 	inspectInfo         InspectInfo
+	pausedAll           []selector
+	resumedAll          []selector
 	removed             string
 	removeForce         bool
 	removeVolumes       bool
@@ -5773,11 +5799,13 @@ func (b *fakeBackend) unpublishPort(target selector, binding ttcbundle.PortBindi
 
 func (b *fakeBackend) pause(target selector) error {
 	b.paused = target
+	b.pausedAll = append(b.pausedAll, target)
 	return b.err
 }
 
 func (b *fakeBackend) resume(target selector) error {
 	b.resumed = target
+	b.resumedAll = append(b.resumedAll, target)
 	return b.err
 }
 
