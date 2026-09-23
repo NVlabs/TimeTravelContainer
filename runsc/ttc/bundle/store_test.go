@@ -370,6 +370,76 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 	}
 }
 
+// A resident dehydration's capture lives only in its family's runtime: made
+// durable it is an ordinary dehydrated branch, stopped it gives the capture up,
+// and a runtime that disappears takes it the way it takes a running branch.
+func TestResidentDehydrationLifecycle(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "example")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "example", Name: "example", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{
+			{ID: "main", State: "running", StorageState: "local"},
+			{ID: "resident", State: "running", StorageState: "local"},
+			{ID: "stopped", State: "running", StorageState: "local"},
+			{ID: "durable", State: "running", StorageState: "local"},
+			{ID: "cold", State: "dehydrated", StorageState: "local"},
+		},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	for _, id := range []string{"resident", "stopped", "durable"} {
+		if err := store.MarkBranchDehydratedResident("example", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkBranchDehydrationDurable("example", "durable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StopBranch("example", "stopped", 137); err != nil {
+		t.Fatal(err)
+	}
+	branches := func() map[string]BranchInfo {
+		got, err := store.LoadContainer("example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		byID := make(map[string]BranchInfo)
+		for _, branch := range got.Branches {
+			byID[branch.ID] = branch
+		}
+		return byID
+	}
+	before := branches()
+	if b := before["resident"]; !ResidentDehydration(b) {
+		t.Fatalf("marked branch = %s/%s, want dehydrated/resident", b.State, b.StorageState)
+	}
+	if b := before["durable"]; ResidentDehydration(b) || b.State != "dehydrated" || b.StorageState != "local" {
+		t.Fatalf("durable branch = %s/%s, want dehydrated/local", b.State, b.StorageState)
+	}
+	if b := before["stopped"]; b.State != "exited" || b.StorageState != "local" {
+		t.Fatalf("stopped resident branch = %s/%s, want exited/local", b.State, b.StorageState)
+	}
+	if err := store.ReconcileNodeRuntimeUnavailable("example", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	after := branches()
+	for id, want := range map[string]string{"main": "exited", "resident": "exited", "durable": "dehydrated", "cold": "dehydrated"} {
+		if b := after[id]; b.State != want || b.StorageState == StorageResident {
+			t.Errorf("%s after runtime loss = %s/%s, want %s", id, b.State, b.StorageState, want)
+		}
+	}
+}
+
 func TestRenameBranchKeepsStableMemoryAndRenamesConsoleState(t *testing.T) {
 	root := t.TempDir()
 	containerID := "container-id"

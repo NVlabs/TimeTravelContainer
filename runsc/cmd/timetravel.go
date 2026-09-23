@@ -606,8 +606,19 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			util.Fatalf("invalid dehydration graph stream FD")
 		}
 		defer stream.Close()
+		files := []*os.File{stream}
+		// A capture taken without a metadata file gets one when it is made
+		// durable.
+		if t.dehydrationFD >= 0 {
+			metadataFile := os.NewFile(uintptr(t.dehydrationFD), "dehydration-metadata")
+			if metadataFile == nil {
+				util.Fatalf("invalid dehydration metadata FD")
+			}
+			defer metadataFile.Close()
+			files = append(files, metadataFile)
+		}
 		output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
-			FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, ID: f.Arg(2),
+			FilePayload: urpc.FilePayload{Files: files}, ID: f.Arg(2),
 		})
 	case "dehydrate-restore":
 		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) || t.dehydrationFilesystemsCount < 0 || (t.dehydrationFilesystemsCount != 0 && t.dehydrationFilesystemsStartFD < 0) {

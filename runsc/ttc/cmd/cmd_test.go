@@ -5245,6 +5245,66 @@ func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	}
 }
 
+// A standalone dehydration stays resident only while a sibling on the node is
+// live; a clustered one never does, because other nodes find dehydrated
+// branches only through what was published.
+func TestDehydrationStaysResidentOnlyBesideALiveSibling(t *testing.T) {
+	family := func(states ...string) ttcbundle.ContainerInfo {
+		info := ttcbundle.ContainerInfo{ID: "family"}
+		for i, state := range states {
+			info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "b" + strconv.Itoa(i), State: state})
+		}
+		return info
+	}
+	standalone := &runtimeBackend{dataRoot: t.TempDir()}
+	for _, tc := range []struct {
+		states []string
+		want   bool
+	}{
+		{[]string{"dehydrating", "running"}, true},
+		{[]string{"dehydrating", "paused", "dehydrated"}, true},
+		{[]string{"dehydrating", "restarting"}, true},
+		{[]string{"dehydrating", "exited", "dehydrated", "created"}, false},
+		{[]string{"dehydrating", "dehydrating"}, false},
+		{[]string{"dehydrating"}, false},
+	} {
+		if got := standalone.dehydrationMayStayResident(family(tc.states...), "b0"); got != tc.want {
+			t.Errorf("siblings %v: resident=%t, want %t", tc.states[1:], got, tc.want)
+		}
+	}
+	clustered := &runtimeBackend{dataRoot: t.TempDir(), publicationQueue: &ttcstorage.Queue{}}
+	if clustered.dehydrationMayStayResident(family("dehydrating", "running"), "b0") {
+		t.Error("a clustered dehydration stayed resident")
+	}
+	noDataRoot := &runtimeBackend{}
+	if noDataRoot.dehydrationMayStayResident(family("dehydrating", "running"), "b0") {
+		t.Error("a dehydration without a data root stayed resident")
+	}
+	elsewhere := ttcbundle.ContainerInfo{ID: "family", Branches: []ttcbundle.BranchInfo{
+		{ID: "b0", NodeID: "node-a", State: "dehydrating"},
+		{ID: "b1", NodeID: "node-b", State: "running"},
+	}}
+	onNode := &runtimeBackend{dataRoot: t.TempDir(), nodeID: "node-a"}
+	if onNode.dehydrationMayStayResident(elsewhere, "b0") {
+		t.Error("a live sibling on another node kept a dehydration resident")
+	}
+}
+
+// A resident capture is in the runtime, so a family holding one needs it.
+func TestResidentDehydrationRequiresItsRuntime(t *testing.T) {
+	info := ttcbundle.ContainerInfo{Branches: []ttcbundle.BranchInfo{
+		{ID: "main", State: "exited"},
+		{ID: "fork", State: "dehydrated", StorageState: ttcbundle.StorageResident},
+	}}
+	if !persistentFamilyRequiredRuntime(info, "") {
+		t.Error("a family with a resident dehydration did not require its runtime")
+	}
+	info.Branches[1].StorageState = "local"
+	if persistentFamilyRequiredRuntime(info, "") {
+		t.Error("a family with only durable and exited branches required its runtime")
+	}
+}
+
 func TestListFamiliesReconcilesDeadListedSandbox(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")

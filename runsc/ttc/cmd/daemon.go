@@ -2659,6 +2659,20 @@ func dehydrateDaemonContainers(backend backend) error {
 			}
 		}
 	}
+	// A family whose last live branch went some other way may still have a
+	// runtime holding resident captures, which only a standalone daemon
+	// keeps. Dehydrating everything includes them.
+	if runtime, ok := backend.(*runtimeBackend); ok && runtime.dataRoot != "" && runtime.distributedSource == nil && runtime.publicationQueue == nil {
+		containers, err := runtime.containerStore().ListContainersForGC()
+		if err != nil {
+			return err
+		}
+		for _, info := range containers {
+			if err := runtime.deleteRuntimeIfProcessFree(info); err != nil {
+				return fmt.Errorf("releasing the runtime of %s: %w", info.Name, err)
+			}
+		}
+	}
 	return nil
 }
 

@@ -604,6 +604,136 @@ func TestSandboxFamilyDehydrateLoaderTransfersRole(t *testing.T) {
 	survivor.Release()
 }
 
+// A capture taken without a metadata file can be exported later, more than
+// once, and still rehydrated: ttcd exports a resident dehydration only when the
+// family's last live branch goes, and repeats an export whose recording failed.
+func TestSandboxFamilyExportsAResidentCaptureRepeatedly(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		family.DestroyNonLoaderBranches()
+		parent.Pause()
+		parent.Release()
+	}()
+	if _, err := family.Fork(&ForkBranchArgs{ID: "resident", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := family.Dehydrate("resident", nil); err != nil {
+		t.Fatalf("Dehydrate: %v", err)
+	}
+	export := func(withMetadata bool) ([]byte, *BranchDehydrationExportInfo, *os.File) {
+		t.Helper()
+		stream, err := os.CreateTemp(t.TempDir(), "stream-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		files := []*os.File{stream}
+		var metadata *os.File
+		if withMetadata {
+			if metadata, err = os.CreateTemp(t.TempDir(), "metadata-*"); err != nil {
+				t.Fatal(err)
+			}
+			files = append(files, metadata)
+		}
+		info, err := family.ExportDehydration(&BranchDehydrationExportArgs{
+			FilePayload: urpc.FilePayload{Files: files}, ID: "resident",
+		})
+		if err != nil {
+			t.Fatalf("ExportDehydration: %v", err)
+		}
+		data, err := os.ReadFile(stream.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data, info, metadata
+	}
+	first, info, _ := export(false)
+	if len(first) == 0 || len(info.Capture.Memories) == 0 || info.Capture.FilesystemBranch == "" {
+		t.Fatalf("first export: %d stream bytes, capture %+v", len(first), info.Capture)
+	}
+	second, _, metadata := export(true)
+	defer metadata.Close()
+	if string(first) != string(second) {
+		t.Fatalf("a repeated export wrote %d bytes that differ from the first export's %d", len(second), len(first))
+	}
+	if stat, err := metadata.Stat(); err != nil || stat.Size() <= 48 {
+		t.Fatalf("metadata written with the export: stat=%v err=%v", stat, err)
+	}
+	if err := family.Rehydrate("resident"); err != nil {
+		t.Fatalf("Rehydrate after exports: %v", err)
+	}
+	if got := branchStateForTest(family.List(), "resident"); got != BranchPaused {
+		t.Fatalf("state after rehydration=%q, want %q", got, BranchPaused)
+	}
+}
+
+// WaitDefaultExit keeps the Sentry up after its last live branch exits for as
+// long as a branch is dehydrated, because the capture may exist nowhere else.
+// (Its final status comes from a loader init that this test kernel lacks; the
+// daemon-level tests exercise that exit.)
+func TestSandboxFamilyHoldsWhileABranchIsDehydrated(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		family.DestroyNonLoaderBranches()
+		parent.Pause()
+		parent.Release()
+	}()
+	holds := func() bool {
+		family.mu.Lock()
+		defer family.mu.Unlock()
+		return family.holdsDehydrationLocked()
+	}
+	if _, err := family.Fork(&ForkBranchArgs{ID: "held", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if holds() {
+		t.Fatal("a family with only live branches held its exit")
+	}
+	if err := family.Dehydrate("held", nil); err != nil {
+		t.Fatalf("Dehydrate: %v", err)
+	}
+	if !holds() {
+		t.Fatal("a family holding a dehydrated branch would exit")
+	}
+	if err := family.Rehydrate("held"); err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if holds() {
+		t.Fatal("a rehydrated branch still held the family's exit")
+	}
+	if err := family.Dehydrate("held", nil); err != nil {
+		t.Fatalf("Dehydrate again: %v", err)
+	}
+	if err := family.Destroy("held"); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if holds() {
+		t.Fatal("a destroyed dehydrated branch still held the family's exit")
+	}
+}
+
 func branchStateForTest(infos []BranchInfo, id string) BranchState {
 	for _, info := range infos {
 		if info.ID == id {

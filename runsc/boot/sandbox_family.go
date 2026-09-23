@@ -325,8 +325,12 @@ type BranchDehydrationExportArgs struct {
 	ID string
 }
 
-// BranchDehydrationExportInfo is reserved for graph export metadata.
-type BranchDehydrationExportInfo struct{}
+// BranchDehydrationExportInfo describes the capture an export published, so
+// that a daemon exporting a capture long after taking it need not have kept
+// the description it got then.
+type BranchDehydrationExportInfo struct {
+	Capture BranchDehydrateInfo `json:"capture"`
+}
 
 // BranchProcessesArgs selects a container inside one live branch.
 type BranchProcessesArgs struct {
@@ -2404,6 +2408,11 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		restoreLiveBranch()
 		return fmt.Errorf("materializing branch memory before dehydration: %w", err)
 	}
+	if err := image.ParkSparseSnapshot(); err != nil {
+		_ = image.Close()
+		restoreLiveBranch()
+		return fmt.Errorf("parking dehydrated branch memory: %w", err)
+	}
 	if b.watchdog != nil {
 		b.watchdog.Stop()
 	}
@@ -2466,8 +2475,13 @@ func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error)
 	defer b.opMu.Unlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.dehydrationInfoLocked(b)
+}
+
+// Preconditions: b.opMu and f.mu are locked.
+func (f *SandboxFamily) dehydrationInfoLocked(b *sandboxBranch) (*BranchDehydrateInfo, error) {
 	if b.state != BranchDehydrated || b.dehydration == nil || b.dehydration.image == nil {
-		return nil, fmt.Errorf("branch %q is not available for dehydration export", id)
+		return nil, fmt.Errorf("branch %q is not available for dehydration export", b.id)
 	}
 	info := &BranchDehydrateInfo{
 		Memories:         make([]BranchDehydrationMemoryInfo, len(b.dehydration.image.MemoryImages)),
@@ -2503,13 +2517,29 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 	}
 	image := b.dehydration.image
 	f.mu.Unlock()
-	if len(args.FilePayload.Files) != 1 {
-		return nil, fmt.Errorf("graph dehydration export has %d stream descriptors, want 1", len(args.FilePayload.Files))
+	files := args.FilePayload.Files
+	if len(files) != 1 && len(files) != 2 {
+		return nil, fmt.Errorf("graph dehydration export has %d descriptors, want a stream and optionally a metadata file", len(files))
 	}
-	if err := image.PublishGraphStream(args.FilePayload.Files[0]); err != nil {
+	if len(files) == 2 {
+		dup, err := unix.Dup(int(files[1].Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("duplicating dehydration metadata file: %w", err)
+		}
+		if err := image.AttachMetadataFile(os.NewFile(uintptr(dup), "dehydration-metadata")); err != nil {
+			return nil, err
+		}
+	}
+	if err := image.PublishGraphStream(files[0]); err != nil {
 		return nil, err
 	}
-	return &BranchDehydrationExportInfo{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	info, err := f.dehydrationInfoLocked(b)
+	if err != nil {
+		return nil, err
+	}
+	return &BranchDehydrationExportInfo{Capture: *info}, nil
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its
@@ -2633,6 +2663,19 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 		// naturally, not only through a TTC stop command, so transfer here as a
 		// final invariant rather than relying solely on PrepareStop.
 		replacement := f.liveLoaderReplacementLocked(b.id)
+		// So must it while any branch is dehydrated: its capture may exist
+		// nowhere but this Sentry's memory, because ttcd makes captures durable
+		// only when the last live branch on the node goes. ttcd does that when
+		// it sees this exit and then deletes the runtime. A branch it
+		// rehydrates instead becomes the loader.
+		for replacement == nil && f.loaderBranchID == b.id && f.holdsDehydrationLocked() {
+			f.stateChanged.Wait()
+			replacement = f.liveLoaderReplacementLocked(b.id)
+		}
+		if f.loaderBranchID != b.id {
+			f.mu.Unlock()
+			continue
+		}
 		if replacement == nil {
 			status := k.GlobalInit().ExitStatus()
 			f.mu.Unlock()
@@ -2647,6 +2690,20 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 			f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
 		}
 	}
+}
+
+// holdsDehydrationLocked reports whether any branch is dehydrated, or on its
+// way into or out of that state.
+//
+// Preconditions: f.mu is locked.
+func (f *SandboxFamily) holdsDehydrationLocked() bool {
+	for _, b := range f.branches {
+		switch b.state {
+		case BranchDehydrating, BranchDehydrated, BranchRehydrating:
+			return true
+		}
+	}
+	return false
 }
 
 // liveLoaderReplacementLocked returns an established hydrated branch whose
@@ -2866,6 +2923,7 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 	f.mu.Lock()
 	delete(f.branches, id)
 	delete(f.distributedHandoffs, id)
+	f.stateChanged.Broadcast()
 	f.mu.Unlock()
 	return releaseErr
 }

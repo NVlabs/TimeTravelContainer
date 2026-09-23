@@ -4905,6 +4905,10 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
+type residentDehydrationBackend interface {
+	persistResidentDehydration(selector) error
+}
+
 func waitForDurableBranch(target selector, backend backend) waitResult {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -4946,6 +4950,14 @@ func waitForDurableBranch(target selector, backend backend) waitResult {
 			}
 			found = true
 			switch branch.StorageState {
+			case ttcbundle.StorageResident:
+				// Nothing makes a resident capture durable until its family's
+				// last live branch goes, so asking for durability does.
+				if persister, ok := backend.(residentDehydrationBackend); ok {
+					if err := persister.persistResidentDehydration(target); err != nil {
+						return waitResult{err: err}
+					}
+				}
 			case "shared":
 				return waitResult{}
 			case "local":
@@ -7288,6 +7300,10 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 			return 1, fmt.Errorf("recording fresh start for %s: %w", target, err)
 		}
 		return b.finishPreservedPeerStart(info, target, detach, interactive)
+	}
+	// Replacing the runtime would take every capture only its Sentry holds.
+	if err := b.persistResidentDehydrations(info); err != nil {
+		return 1, err
 	}
 	// Waiting for the branch init process and tearing down its sandbox are
 	// separate events. In particular, a multi-process container may report its
@@ -11297,6 +11313,9 @@ func persistentFamilyRequiredRuntime(container ttcbundle.ContainerInfo, nodeID s
 		case "creating", "running", "paused", "dehydrating", "rehydrating", "restarting":
 			return true
 		}
+		if ttcbundle.ResidentDehydration(branch) {
+			return true
+		}
 	}
 	return false
 }
@@ -11833,6 +11852,19 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		return nil, err
 	}
 	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
+		// A dehydrated branch is forked from its durable image, which a
+		// resident dehydration does not have yet.
+		if ttcbundle.ResidentDehydration(sourceRecord) {
+			if err := b.persistDehydration(source, containerInfo, sourceRecord); err != nil {
+				return nil, fmt.Errorf("making the dehydration of %s durable to fork it: %w", source, err)
+			}
+			if containerInfo, err = b.containerStore().LoadContainer(containerInfo.ID); err != nil {
+				return nil, err
+			}
+			if sourceRecord, err = persistentBranchInfo(containerInfo, source.branch); err != nil {
+				return nil, err
+			}
+		}
 		return b.forkDehydratedMany(source, logicalSource.branch, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
 	}
 	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
@@ -13543,6 +13575,11 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 		if family.ID != info.ID {
 			continue
 		}
+		// The last live branch is gone, and with the runtime would go every
+		// capture only its Sentry holds.
+		if err := b.persistResidentDehydrations(info); err != nil {
+			return err
+		}
 		if _, err := b.command("delete", "--force", info.ID); err != nil {
 			return fmt.Errorf("deleting process-free runtime %q: %w", info.Name, err)
 		}
@@ -14017,20 +14054,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err := b.ensureDistributedTargetMemoryIndependent(info, persistentBranch); err != nil {
 		return fmt.Errorf("materializing remote memory before dehydrating %s: %w", target, err)
 	}
-	// A graph capture installs roots and parent edges to immutable origins.
-	// Exclude the short provider-to-shared ledger freeze so every new reference
-	// is included on exactly one side of the authority handoff.
-	finishGraphCapture := func() {}
-	graphCaptureActive := false
-	if b.distributedSource != nil {
-		finishGraphCapture = b.distributedSource.beginForegroundCapture()
-		graphCaptureActive = true
-	}
-	defer func() {
-		if graphCaptureActive {
-			finishGraphCapture()
-		}
-	}()
 	store := b.containerStore()
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
 	execSessions, _ := b.execSessions(target)
@@ -14038,21 +14061,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	originalState := normalizeLifecycleState(persistentBranch.State)
 	transitionPublished := false
 	captured := false
-	var stagingDir, finalDir string
-	finalPublished := false
-	var graphMemoryRoots []string
-	var graphMemoryRootObjects []string
-	var graphControlRoot string
-	var graphControlRootObject string
-	var graphMemorySnapshot uint64
-	var graphMemorySealState ttcsnapshot.SnapshotState
-	graphMemoryRecorded := false
-	previousGraphMemorySnapshot := persistentBranch.SnapshotID
-	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
-	previousGraphMemoryRootObjects := append([]string(nil), persistentBranch.MemoryRootObjects...)
-	previousGraphControlRoot := persistentBranch.ControlRoot
-	previousGraphControlRootObject := persistentBranch.ControlRootObject
-	previousGraphReferenceOperation := persistentBranch.DistributedGraphReferenceOperation
 	defer func() {
 		if dehydrated {
 			return
@@ -14060,26 +14068,11 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if transitionPublished {
 			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
 		}
-		if graphMemoryRecorded {
-			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphControlRoot, previousGraphControlRootObject, previousGraphReferenceOperation)
-		}
-		if len(graphMemoryRoots) != 0 || graphControlRoot != "" {
-			if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), graphMemoryRoots...), graphControlRoot)); graphErr != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
-			}
-		}
-		if graphMemorySnapshot != 0 && b.distributedSource != nil {
-			if graphErr := b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: discarding failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
-			}
-		}
-		if finalPublished {
-			_ = os.RemoveAll(finalDir)
-		}
 		if captured {
-			// Dehydration has already replaced the live Kernel. If durable export
-			// fails, reconstruct it while the Sentry still owns the capture so the
-			// operation remains atomic from the user's point of view.
+			// Dehydration has already replaced the live Kernel. If making it
+			// durable fails, reconstruct it while the Sentry still owns the
+			// capture so the operation remains atomic from the user's point of
+			// view.
 			_, _ = b.command("timetravel", target.container, "rehydrate", target.branch)
 		}
 		// Capture failure leaves the branch in its original running or paused
@@ -14105,133 +14098,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
 		return fmt.Errorf("stopping published ports before dehydration: %w", err)
 	}
-	var metadataFile *os.File
-	if b.dataRoot != "" {
-		metadataDir := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "dehydrated")
-		if err := os.MkdirAll(metadataDir, 0700); err != nil {
-			return fmt.Errorf("creating dehydration metadata directory: %w", err)
-		}
-		encodedBranch := ttcbundle.MemoryBranchKey(persistentBranch)
-		finalDir = filepath.Join(metadataDir, encodedBranch)
-		stagingDir, err = os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
-		if err != nil {
-			return fmt.Errorf("creating dehydration staging directory: %w", err)
-		}
-		defer os.RemoveAll(stagingDir)
-		metadataFile, err = os.OpenFile(filepath.Join(stagingDir, "metadata.state"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		if err != nil {
-			return fmt.Errorf("creating dehydration metadata: %w", err)
-		}
-		defer metadataFile.Close()
-	}
-	var output []byte
 	if b.dataRoot != "" {
 		if err := b.containerStore().UpdateBranchState(info.ID, target.branch, "dehydrating"); err != nil {
 			return fmt.Errorf("publishing dehydration transition for %s: %w", target, err)
 		}
 		transitionPublished = true
 	}
-	if metadataFile != nil {
-		output, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
-	} else {
-		output, err = b.command("timetravel", target.container, "dehydrate", target.branch)
-	}
-	if err != nil {
+	if _, err := b.command("timetravel", target.container, "dehydrate", target.branch); err != nil {
 		return err
 	}
 	captured = true
-	if metadataFile != nil {
-		var capture boot.BranchDehydrateInfo
-		if err := json.Unmarshal(output, &capture); err != nil {
-			return fmt.Errorf("decoding dehydration capture description: %w", err)
-		}
-		origin, sealState, err := b.allocateGraphSnapshotOrigin()
-		if err != nil {
-			return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
-		}
-		graphMemorySnapshot = uint64(origin)
-		graphMemorySealState = sealState
-		prefix := fmt.Sprintf("memory/%016x", uint64(origin))
-		reader, writer, err := os.Pipe()
-		if err != nil {
-			return fmt.Errorf("creating graph dehydration stream: %w", err)
-		}
-		type graphImportOutcome struct {
-			result ttcchunk.GraphImportResult
-			err    error
-		}
-		imported := make(chan graphImportOutcome, 1)
-		go func() {
-			result, importErr := b.importGraphCapture(reader, origin, prefix)
-			_ = reader.Close()
-			imported <- graphImportOutcome{result: result, err: importErr}
-		}()
-		_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", target.container, "dehydrate-export", target.branch)
-		_ = writer.Close()
-		outcome := <-imported
-		if exportErr != nil {
-			return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
-		}
-		if outcome.err != nil {
-			return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
-		}
-		for _, root := range outcome.result.Roots {
-			capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
-				ResourceID: root.ResourceID,
-				Name:       root.Name,
-				Root:       root.Root.String(),
-			})
-			graphMemoryRoots = append(graphMemoryRoots, root.Name)
-			graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
-		}
-		capture.SnapshotID = uint64(origin)
-		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
-			return fmt.Errorf("persisting dehydration control state: %w", err)
-		}
-		if err := metadataFile.Sync(); err != nil {
-			return fmt.Errorf("syncing dehydration metadata: %w", err)
-		}
-		if err := metadataFile.Close(); err != nil {
-			return fmt.Errorf("closing dehydration metadata: %w", err)
-		}
-		metadataFile = nil
-		graphControlRoot = graphCaptureControlRootName(uint64(origin))
-		controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
-		if err != nil {
-			return fmt.Errorf("importing graph-native dehydration control state: %w", err)
-		}
-		graphControlRootObject = controlObject.String()
-		if err := b.snapshotGraph.Seal(origin, graphMemorySealState); err != nil {
-			return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
-		}
-		if graphCaptureActive {
-			finishGraphCapture()
-			graphCaptureActive = false
-		}
-		if _, err := os.Stat(finalDir); err == nil {
-			return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.Rename(stagingDir, finalDir); err != nil {
-			return fmt.Errorf("publishing dehydration image: %w", err)
-		}
-		stagingDir = ""
-		finalPublished = true
-		if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
-			_ = dir.Sync()
-			_ = dir.Close()
-		}
-		if graphMemorySnapshot != 0 {
-			if err := b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, graphControlRoot, graphControlRootObject, ""); err != nil {
-				return fmt.Errorf("recording graph-native dehydration roots: %w", err)
-			}
-			graphMemoryRecorded = true
-		}
-		// Remote dependencies remain live until the asynchronous shared
-		// publication commits. The publisher advances the transaction only after
-		// its manifest is authoritative.
-	}
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
 	// transient statuses so rehydration can attach fresh followers.
@@ -14246,12 +14122,298 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			_ = os.Remove(paths.PID)
 		}
 	}
+	if b.dataRoot != "" {
+		latest, err := store.LoadContainer(info.ID)
+		if err != nil {
+			return err
+		}
+		if b.dehydrationMayStayResident(latest, target.branch) {
+			if err := store.MarkBranchDehydratedResident(info.ID, target.branch); err != nil {
+				return fmt.Errorf("recording resident dehydration of %s: %w", target, err)
+			}
+			dehydrated = true
+			return nil
+		}
+	}
+	if err := b.persistDehydration(target, info, persistentBranch); err != nil {
+		return err
+	}
+	dehydrated = true
+	if b.dataRoot != "" {
+		latest, loadErr := b.containerStore().LoadContainer(target.container)
+		if loadErr != nil {
+			return loadErr
+		}
+		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
+		if allCold && localBranches != 0 {
+			if err := b.persistResidentDehydrations(latest); err != nil {
+				return err
+			}
+			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
+				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
+			}
+		}
+	}
+	return nil
+}
+
+// dehydrationMayStayResident reports whether branchID's dehydration may leave
+// its capture in the family's Sentry rather than making it durable: in a
+// standalone daemon, while another branch of the family on this node is live.
+//
+// The Sentry must stay up for that branch anyway, and a capture shares every
+// page that neither branch has written since, so a durable copy bought little
+// and cost a write of the branch's whole memory: a fork dehydrated at once was
+// the most expensive case, when it should have been the cheapest. A clustered
+// daemon still publishes at once, because other nodes rehydrate and fork
+// dehydrated branches only from what was published.
+func (b *runtimeBackend) dehydrationMayStayResident(info ttcbundle.ContainerInfo, branchID string) bool {
+	if b.dataRoot == "" || b.distributedSource != nil || b.publicationQueue != nil {
+		return false
+	}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			continue
+		}
+		if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "created", "dehydrating", "dehydrated", "exited", "failed", "dead":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// persistResidentDehydrations makes durable every resident dehydration of
+// info's family on this node. It must run while the family's Sentry is still
+// up, before anything deletes the runtime that holds those captures.
+func (b *runtimeBackend) persistResidentDehydrations(info ttcbundle.ContainerInfo) error {
+	for _, branch := range info.Branches {
+		if !ttcbundle.ResidentDehydration(branch) {
+			continue
+		}
+		if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+			continue
+		}
+		if err := b.persistDehydration(selector{container: info.ID, branch: branch.ID}, info, branch); err != nil {
+			return fmt.Errorf("making the dehydration of %s@%s durable: %w", info.Name, branch.ID, err)
+		}
+	}
+	return nil
+}
+
+// persistResidentDehydration makes one resident dehydration durable on
+// request, as waiting for a dehydrated branch to be durable asks.
+func (b *runtimeBackend) persistResidentDehydration(target selector) error {
+	// Exporting a capture must not race a lifecycle command consuming it.
+	unlock := func() {}
+	if !b.lifecycleLockHeld {
+		unlock = b.lockBackgroundLifecycle()
+	}
+	defer unlock()
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if !ttcbundle.ResidentDehydration(branch) {
+		return nil
+	}
+	return b.persistDehydration(resolved, info, branch)
+}
+
+// persistDehydration makes a captured dehydration durable: it exports the
+// capture held by the family's Sentry into the snapshot graph with its control
+// state, records the roots, and publishes the branch as durably dehydrated.
+// The Sentry keeps the capture, so the branch can still be rehydrated from
+// memory, and a failed attempt can be repeated.
+func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.ContainerInfo, persistentBranch ttcbundle.BranchInfo) error {
+	if b.dataRoot == "" {
+		return b.queueBranchPublication(target, "dehydrate")
+	}
+	// A graph capture installs roots and parent edges to immutable origins.
+	// Exclude the short provider-to-shared ledger freeze so every new reference
+	// is included on exactly one side of the authority handoff.
+	finishGraphCapture := func() {}
+	graphCaptureActive := false
+	if b.distributedSource != nil {
+		finishGraphCapture = b.distributedSource.beginForegroundCapture()
+		graphCaptureActive = true
+	}
+	defer func() {
+		if graphCaptureActive {
+			finishGraphCapture()
+		}
+	}()
+	persisted := false
+	finalPublished := false
+	var graphMemoryRoots []string
+	var graphMemoryRootObjects []string
+	var graphControlRoot string
+	var graphControlRootObject string
+	var graphMemorySnapshot uint64
+	graphMemoryRecorded := false
+	previousGraphMemorySnapshot := persistentBranch.SnapshotID
+	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
+	previousGraphMemoryRootObjects := append([]string(nil), persistentBranch.MemoryRootObjects...)
+	previousGraphControlRoot := persistentBranch.ControlRoot
+	previousGraphControlRootObject := persistentBranch.ControlRootObject
+	previousGraphReferenceOperation := persistentBranch.DistributedGraphReferenceOperation
+	metadataDir := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "dehydrated")
+	encodedBranch := ttcbundle.MemoryBranchKey(persistentBranch)
+	finalDir := filepath.Join(metadataDir, encodedBranch)
+	defer func() {
+		if persisted {
+			return
+		}
+		if graphMemoryRecorded {
+			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphControlRoot, previousGraphControlRootObject, previousGraphReferenceOperation)
+		}
+		if len(graphMemoryRoots) != 0 || graphControlRoot != "" {
+			if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), graphMemoryRoots...), graphControlRoot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
+			}
+		}
+		if graphMemorySnapshot != 0 && b.distributedSource != nil {
+			if graphErr := b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: discarding failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
+			}
+		}
+		if finalPublished {
+			_ = os.RemoveAll(finalDir)
+		}
+	}()
+	if ttcbundle.ResidentDehydration(persistentBranch) {
+		// The record names no image, so any here is what an interrupted
+		// attempt left, and nothing refers to it.
+		if err := b.removeInterruptedDehydrationImages(info.ID, persistentBranch); err != nil {
+			return fmt.Errorf("removing an interrupted dehydration image: %w", err)
+		}
+	}
+	if err := os.MkdirAll(metadataDir, 0700); err != nil {
+		return fmt.Errorf("creating dehydration metadata directory: %w", err)
+	}
+	stagingDir, err := os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
+	if err != nil {
+		return fmt.Errorf("creating dehydration staging directory: %w", err)
+	}
+	defer func() {
+		if stagingDir != "" {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+	metadataFile, err := os.OpenFile(filepath.Join(stagingDir, "metadata.state"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("creating dehydration metadata: %w", err)
+	}
+	defer func() {
+		if metadataFile != nil {
+			_ = metadataFile.Close()
+		}
+	}()
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
+	}
+	graphMemorySnapshot = uint64(origin)
+	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("creating graph dehydration stream: %w", err)
+	}
+	type graphImportOutcome struct {
+		result ttcchunk.GraphImportResult
+		err    error
+	}
+	imported := make(chan graphImportOutcome, 1)
+	go func() {
+		result, importErr := b.importGraphCapture(reader, origin, prefix)
+		_ = reader.Close()
+		imported <- graphImportOutcome{result: result, err: importErr}
+	}()
+	output, exportErr := b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
+	_ = writer.Close()
+	outcome := <-imported
+	if exportErr != nil {
+		return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
+	}
+	if outcome.err != nil {
+		return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
+	}
+	var exported boot.BranchDehydrationExportInfo
+	if err := json.Unmarshal(output, &exported); err != nil {
+		return fmt.Errorf("decoding dehydration capture description: %w", err)
+	}
+	capture := exported.Capture
+	for _, root := range outcome.result.Roots {
+		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+			ResourceID: root.ResourceID,
+			Name:       root.Name,
+			Root:       root.Root.String(),
+		})
+		graphMemoryRoots = append(graphMemoryRoots, root.Name)
+		graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
+	}
+	capture.SnapshotID = uint64(origin)
+	if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
+		return fmt.Errorf("persisting dehydration control state: %w", err)
+	}
+	if err := metadataFile.Sync(); err != nil {
+		return fmt.Errorf("syncing dehydration metadata: %w", err)
+	}
+	if err := metadataFile.Close(); err != nil {
+		metadataFile = nil
+		return fmt.Errorf("closing dehydration metadata: %w", err)
+	}
+	metadataFile = nil
+	graphControlRoot = graphCaptureControlRootName(uint64(origin))
+	controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
+	if err != nil {
+		return fmt.Errorf("importing graph-native dehydration control state: %w", err)
+	}
+	graphControlRootObject = controlObject.String()
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+	}
+	if graphCaptureActive {
+		finishGraphCapture()
+		graphCaptureActive = false
+	}
+	if _, err := os.Stat(finalDir); err == nil {
+		return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return fmt.Errorf("publishing dehydration image: %w", err)
+	}
+	stagingDir = ""
+	finalPublished = true
+	if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	if err := b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, graphControlRoot, graphControlRootObject, ""); err != nil {
+		return fmt.Errorf("recording graph-native dehydration roots: %w", err)
+	}
+	graphMemoryRecorded = true
+	// Remote dependencies remain live until the asynchronous shared
+	// publication commits. The publisher advances the transaction only after
+	// its manifest is authoritative.
 	if err := b.queueBranchPublication(target, "dehydrate"); err != nil {
 		return fmt.Errorf("queueing durable dehydration publication: %w", err)
 	}
-	dehydrated = true
-	graphMemoryRoots = nil
-	if graphMemorySnapshot != 0 && len(previousGraphMemoryRoots) != 0 {
+	if err := b.containerStore().MarkBranchDehydrationDurable(info.ID, target.branch); err != nil {
+		return fmt.Errorf("recording durable dehydration of %s: %w", target, err)
+	}
+	persisted = true
+	if len(previousGraphMemoryRoots) != 0 {
 		if graphReferenceOperationForBranch(info, persistentBranch) == "" {
 			previousBranch := persistentBranch
 			previousBranch.MemoryRoots = previousGraphMemoryRoots
@@ -14273,23 +14435,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded distributed memory origins for %s: %v\n", target, err)
 		}
 	}
-	if b.dataRoot != "" {
-		activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
-		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
-			return fmt.Errorf("removing superseded active memory: %w", removeErr)
-		}
-	}
-	if b.dataRoot != "" {
-		latest, loadErr := b.containerStore().LoadContainer(target.container)
-		if loadErr != nil {
-			return loadErr
-		}
-		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
-		if allCold && localBranches != 0 {
-			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
-				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
-			}
-		}
+	activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
+	if removeErr := os.RemoveAll(activeDir); removeErr != nil {
+		return fmt.Errorf("removing superseded active memory: %w", removeErr)
 	}
 	return nil
 }
@@ -14403,6 +14551,16 @@ func transactionIDForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.Branc
 	return info.DistributedForkTransactionID
 }
 
+// lostResidentDehydration records that target's resident capture went with
+// its runtime, as a running branch's memory does, and says so.
+func (b *runtimeBackend) lostResidentDehydration(target selector, info ttcbundle.ContainerInfo) error {
+	exitStatus := 128 + int(linux.SIGKILL)
+	if err := b.containerStore().StopBranch(info.ID, target.branch, exitStatus); err != nil {
+		return fmt.Errorf("recording the loss of %s: %w", target, err)
+	}
+	return fmt.Errorf("branch %s was dehydrated in the runtime it shared with a live branch, and that runtime is gone; start it to boot it from its filesystem", target)
+}
+
 func (b *runtimeBackend) rehydrate(target selector) error {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -14450,10 +14608,16 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	}
 	if persistentBranch.State == "dehydrated" {
 		if _, stateErr := b.command("state", info.ID); stateErr != nil {
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
 			return b.rehydrateCold(target, info, *persistentBranch, false)
 		}
 		output, branchesErr := b.command("timetravel", info.ID, "branches")
 		if branchesErr != nil {
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
 			// A fully dehydrated family has no live Sentry. runsc may briefly
 			// retain a stopped OCI record after the last branch releases it;
 			// state then succeeds even though its control server is gone. Remove
@@ -14483,6 +14647,9 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			}
 		}
 		if !present {
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
 			return b.rehydrateCold(target, info, *persistentBranch, true)
 		}
 		// The durable record is authoritative across daemon crashes. Reconcile

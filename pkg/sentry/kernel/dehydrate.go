@@ -55,10 +55,13 @@ type DehydrationCapture struct {
 	SparseBindings      []pgalloc.CapturedPageBinding
 	SparseSnapshot      *pgalloc.RemoteSnapshot
 
-	reservations []*pgalloc.RemoteSnapshot
-	emptyOwners  []*pgalloc.MemoryFile
-	consumed     bool
-	metadataFile *os.File
+	// sparseRegions are what SparseSnapshot was made from, so that a parked
+	// snapshot can be made again for another export. See ParkSparseSnapshot.
+	sparseRegions []pgalloc.RemoteSnapshotRegion
+	reservations  []*pgalloc.RemoteSnapshot
+	emptyOwners   []*pgalloc.MemoryFile
+	consumed      bool
+	metadataFile  *os.File
 }
 
 // DurableDehydrationMemory describes one MemoryFile in a process-independent
@@ -300,20 +303,70 @@ func (d *DehydrationCapture) DurableMetadata() DurableDehydrationMetadata {
 	}
 }
 
+// ParkSparseSnapshot closes the capture's view of its branch-reachable memory
+// until an export needs it again.
+//
+// A capture may wait a long time for its export: ttcd makes a dehydration
+// durable only when the last live branch of its family on the node goes. An
+// open view is told of every copy-on-write break in the MemoryFiles it reads,
+// and each notice scans its regions, so while it waited it taxed every write
+// the family's live branches made. The capture's reservations keep the pages
+// themselves, so the view can be made again from the same regions.
+func (d *DehydrationCapture) ParkSparseSnapshot() error {
+	if d == nil || d.consumed {
+		return errors.New("dehydration capture is unavailable")
+	}
+	if d.SparseSnapshot == nil {
+		return nil
+	}
+	err := d.SparseSnapshot.Close()
+	d.SparseSnapshot = nil
+	return err
+}
+
+// AttachMetadataFile makes file the capture's durable metadata record and
+// writes the capture's process-independent description there at once, so the
+// record is complete even if a later export fails. The capture owns file from
+// then on, and PublishGraphStream rewrites it.
+func (d *DehydrationCapture) AttachMetadataFile(file *os.File) error {
+	if d == nil || d.consumed || file == nil {
+		if file != nil {
+			_ = file.Close()
+		}
+		return errors.New("dehydration capture is unavailable")
+	}
+	if err := writeDehydrationMetadata(file, d.DurableMetadata()); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("writing dehydration metadata: %w", err)
+	}
+	if d.metadataFile != nil {
+		_ = d.metadataFile.Close()
+	}
+	d.metadataFile = file
+	return nil
+}
+
 // PublishGraphStream sends the exact branch-reachable memory graph to the
 // daemon without creating a persistent compatibility repository. The daemon
-// is the sole writer of the authoritative snapshot graph.
+// is the sole writer of the authoritative snapshot graph. It may be called
+// again, for example when the daemon failed to record an earlier export.
 func (d *DehydrationCapture) PublishGraphStream(writer io.Writer) error {
-	if d == nil || d.consumed || d.SparseSnapshot == nil || writer == nil {
+	if d == nil || d.consumed || writer == nil || (d.SparseSnapshot == nil && len(d.sparseRegions) == 0) {
 		return errors.New("graph dehydration publication is unavailable")
+	}
+	if d.SparseSnapshot == nil {
+		snapshot, err := pgalloc.NewRemoteSnapshot(d.sparseRegions)
+		if err != nil {
+			return fmt.Errorf("reopening dehydrated memory: %w", err)
+		}
+		d.SparseSnapshot = snapshot
 	}
 	if err := ttcchunk.WriteGraphCapture(writer, d.SparseSnapshot, d.SparseBindings); err != nil {
 		return err
 	}
-	if err := d.SparseSnapshot.Close(); err != nil {
+	if err := d.ParkSparseSnapshot(); err != nil {
 		return err
 	}
-	d.SparseSnapshot = nil
 	if d.metadataFile != nil {
 		if err := writeDehydrationMetadata(d.metadataFile, d.DurableMetadata()); err != nil {
 			return fmt.Errorf("updating graph dehydration metadata: %w", err)
@@ -415,6 +468,7 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		}
 		image.SparseBindings = layout.Bindings
 		image.SparseSnapshot = sparseSnapshot
+		image.sparseRegions = layout.Regions
 		image.KernelMetadata = metadata.Bytes()
 		if image.metadataFile != nil {
 			if err := writeDehydrationMetadata(image.metadataFile, image.DurableMetadata()); err != nil {

@@ -480,7 +480,8 @@ type BranchInfo struct {
 	ExitStatus                         *int       `json:"exit_status,omitempty"`
 	ExitedAt                           *time.Time `json:"exited_at,omitempty"`
 	// StorageState describes where the authoritative captured snapshot is.
-	// It is independent of the process lifecycle in State.
+	// It is independent of the process lifecycle in State. StorageResident
+	// marks a dehydrated branch whose capture only its family's Sentry holds.
 	StorageState             string    `json:"storage_state,omitempty"`
 	PublicationID            string    `json:"publication_id,omitempty"`
 	StorageError             string    `json:"storage_error,omitempty"`
@@ -528,6 +529,25 @@ type RuntimeMemoryBacking struct {
 	ControlRoot                        string   `json:"control_root,omitempty"`
 	ControlRootObject                  string   `json:"control_root_object,omitempty"`
 	DistributedGraphReferenceOperation string   `json:"distributed_graph_reference_operation,omitempty"`
+}
+
+// StorageResident is the StorageState of a dehydrated branch whose capture
+// exists only in its family's Sentry on its node.
+//
+// Dehydration used to make every capture durable at once: its memory went
+// into the snapshot graph and its control state into the data root. While
+// another branch of the family runs on the same node the Sentry stays up
+// anyway, and the capture shares nearly all of its pages with that branch, so
+// the copy bought little and cost as much as the branch's whole memory. The
+// capture is made durable when the family's last live branch on the node goes
+// instead, and until then a lost runtime loses it the way it loses a running
+// branch.
+const StorageResident = "resident"
+
+// ResidentDehydration reports whether branch is dehydrated and its capture
+// only its family's Sentry holds.
+func ResidentDehydration(branch BranchInfo) bool {
+	return branch.State == "dehydrated" && branch.StorageState == StorageResident
 }
 
 // BranchNodeID returns the explicit cluster owner of branchID.
@@ -4000,6 +4020,43 @@ func (s Store) UpdateBranchState(name, branchID, state string) error {
 	})
 }
 
+// MarkBranchDehydratedResident records that branchID is dehydrated and that
+// its capture exists only in its family's Sentry. See StorageResident.
+func (s Store) MarkBranchDehydratedResident(name, branchID string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			updateBranchLifecycle(branch, "dehydrated", nil, time.Now().UTC())
+			branch.StorageState = StorageResident
+			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// MarkBranchDehydrationDurable records that a resident dehydration of
+// branchID has been made durable in the data root.
+func (s Store) MarkBranchDehydrationDurable(name, branchID string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.StorageState != StorageResident {
+				return false, nil
+			}
+			branch.StorageState = "local"
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
 // UpdateBranchQuarantine changes the durable external-connectivity flag.
 func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
@@ -4560,6 +4617,11 @@ func (s Store) StopBranch(name, branchID string, exitStatus int) error {
 			if !alreadyExited || branch.ExitStatus == nil {
 				updateBranchLifecycle(branch, "exited", &exitStatus, now)
 			}
+			// Stopping a resident dehydration discards its capture, which
+			// was all the branch had that its filesystem did not.
+			if branch.StorageState == StorageResident {
+				branch.StorageState = "local"
+			}
 			// Stop consumes this process snapshot. Retire its publication fence in
 			// the same metadata transaction so a worker that already passed its
 			// queue cancellation check cannot replay the preceding lifecycle after
@@ -4636,6 +4698,14 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *
 			case "creating", "running", "paused", "rehydrating":
 				updateBranchLifecycle(branch, "exited", exitStatus, time.Now().UTC())
 				changed = true
+			case "dehydrated":
+				// A resident capture was in the runtime that is gone. Like a
+				// running branch, it restarts from its filesystem.
+				if branch.StorageState == StorageResident {
+					updateBranchLifecycle(branch, "exited", exitStatus, time.Now().UTC())
+					branch.StorageState = "local"
+					changed = true
+				}
 			case "dehydrating":
 				// A successful dehydration deliberately removes the final
 				// Sentry before its asynchronous publication commits. The
