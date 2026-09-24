@@ -311,6 +311,25 @@ func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
 	if r == nil {
 		return func() {}
 	}
+	lock := r.sourceFamilyLock(family)
+	lock.Lock()
+	return lock.Unlock
+}
+
+// tryLockSourceFamily is lockSourceFamily for a caller that must not wait for
+// the lock while it holds another.
+func (r *distributedSourceRuntime) tryLockSourceFamily(family string) (func(), bool) {
+	if r == nil {
+		return func() {}, true
+	}
+	lock := r.sourceFamilyLock(family)
+	if !lock.TryLock() {
+		return nil, false
+	}
+	return lock.Unlock, true
+}
+
+func (r *distributedSourceRuntime) sourceFamilyLock(family string) *sync.Mutex {
 	// Fixed stripes keep cleanup bookkeeping bounded even when a long-lived
 	// cluster creates and removes arbitrarily many family names.
 	hash := uint64(14695981039346656037)
@@ -318,9 +337,7 @@ func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
 		hash ^= uint64(family[i])
 		hash *= 1099511628211
 	}
-	lock := &r.sourceLocks[hash%uint64(len(r.sourceLocks))]
-	lock.Lock()
-	return lock.Unlock
+	return &r.sourceLocks[hash%uint64(len(r.sourceLocks))]
 }
 
 const distributedSourceMonitorConcurrency = 2
@@ -2515,10 +2532,7 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 		return selector{}, fmt.Errorf("publishing target node %s: %w", targetNode, err)
 	}
 	committed = true
-	monitorBackend := *b
-	monitorBackend.stdin = strings.NewReader("")
-	monitorBackend.stdout = io.Discard
-	monitorBackend.stderr = io.Discard
+	monitorBackend := b.forBackground()
 	if tx.Negotiated.PagingPolicy.Push == ttcpolicy.PushDemandOnly {
 		b.distributedSource.scheduleHandoff(func() {
 			monitorBackend.handoffDistributedFork(peer, source.container, transactionID, tx.Revision, relay)
@@ -3295,10 +3309,7 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 	results := make([]selector, len(children))
 	for i := range children {
 		child := &children[i]
-		monitorBackend := *b
-		monitorBackend.stdin = strings.NewReader("")
-		monitorBackend.stdout = io.Discard
-		monitorBackend.stderr = io.Discard
+		monitorBackend := b.forBackground()
 		if commonPolicy.Push == ttcpolicy.PushDemandOnly {
 			b.distributedSource.scheduleHandoff(func() {
 				monitorBackend.handoffDistributedFork(peer, source.container, child.transaction, child.tx.Revision, child.relay)
@@ -3634,10 +3645,7 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 			}
 			tx = *activated
 		}
-		monitorBackend := *backend
-		monitorBackend.stdin = strings.NewReader("")
-		monitorBackend.stdout = io.Discard
-		monitorBackend.stderr = io.Discard
+		monitorBackend := backend.forBackground()
 		if tx.Identity.Migration {
 			if tx.State == cluster.TransactionDraining {
 				runtime.source.scheduleSourceMonitor(func() {

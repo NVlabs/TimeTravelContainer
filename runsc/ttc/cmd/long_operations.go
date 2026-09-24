@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -340,6 +341,22 @@ func (b *runtimeBackend) refuseBusy(id string) error {
 // kill during `docker stop` does.
 func (op familyOperation) admits(command string) bool {
 	return command == "kill" && op.state == "stopping"
+}
+
+// forBackground returns a copy of b for background work that outlives b's
+// request: its output goes nowhere, and it holds no lifecycle lock, nor can
+// give one up, until it takes one of its own.
+func (b *runtimeBackend) forBackground() *runtimeBackend {
+	background := *b
+	background.stdin = strings.NewReader("")
+	background.stdout = io.Discard
+	background.stderr = io.Discard
+	background.lifecycleLockHeld = false
+	background.lifecycleReady = nil
+	background.suspendLifecycle = nil
+	background.mutating = false
+	background.commandName = ""
+	return &background
 }
 
 // holdFamilyLifecycle takes the lifecycle lock for background work on the

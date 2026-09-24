@@ -3197,10 +3197,7 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		}
 		tx = status
 	}
-	monitorBackend := *b
-	monitorBackend.stdin = strings.NewReader("")
-	monitorBackend.stdout = io.Discard
-	monitorBackend.stderr = io.Discard
+	monitorBackend := b.forBackground()
 	// A cordoned source is being evacuated. drainNode immediately establishes
 	// an eager independence barrier after this call returns, so racing that
 	// barrier with the ordinary asynchronous graph handoff creates two terminal
@@ -3318,8 +3315,20 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 		// Foreground lifecycle commands, repository maintenance, and every other
 		// terminal migration cleanup must see one coherent local namespace. The
 		// peer wait above deliberately remains outside this critical section.
-		unlockLifecycle := b.lockFamilyLifecycle(containerID)
-		unlockSource := b.distributedSource.lockSourceFamily(containerID)
+		// Take the family's source lock without waiting for it under the
+		// lifecycle lock: a settlement that releases this same source holds
+		// it for as long as that takes, and every command on the node would
+		// wait with this monitor.
+		var unlockLifecycle, unlockSource func()
+		for {
+			unlockLifecycle = b.holdFamilyLifecycle(containerID)
+			var locked bool
+			if unlockSource, locked = b.distributedSource.tryLockSourceFamily(containerID); locked {
+				break
+			}
+			unlockLifecycle()
+			b.distributedSource.lockSourceFamily(containerID)()
+		}
 		if !sourceReleased {
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
 			relay.Close()
@@ -3343,12 +3352,19 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			_, placementErr = placements.Lookup(logicalFamily, logicalBranch)
 			discard = errors.Is(placementErr, os.ErrNotExist)
 		}
-		var releaseErr error
-		if discard {
-			releaseErr = b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
-		} else {
-			releaseErr = b.releaseMigratedSourceRuntime(containerID, branchID)
+		// Releasing the source materializes what it has yet to fetch and
+		// publishes its memory, which takes time in proportion to it; other
+		// commands on this node go on meanwhile, except on its family.
+		family := ttcbundle.ContainerInfo{ID: containerID}
+		if info, err := b.containerStore().LoadRuntimeContainer(containerID); err == nil {
+			family = info
 		}
+		releaseErr := b.withoutLifecycleLock(family, longOperation{branch: branchID, state: "migrating"}, func() error {
+			if discard {
+				return b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
+			}
+			return b.releaseMigratedSourceRuntime(containerID, branchID)
+		})
 		unlockSource()
 		unlockLifecycle()
 		if releaseErr == nil {

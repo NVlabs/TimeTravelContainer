@@ -233,6 +233,50 @@ func TestBackgroundWorkCanGiveUpTheLifecycleLock(t *testing.T) {
 	}
 }
 
+// Background work that outlives a request starts with no lifecycle lock of its
+// own, and cannot give up the request's.
+func TestBackgroundCopiesHoldNoLifecycleLock(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRoot(root) }, release: server.lockDataRoot(root)}
+	request := &runtimeBackend{lifecycleLockHeld: true, mutating: true, commandName: "migrate"}
+	server.configureLongOperations(request, hold)
+	background := request.forBackground()
+	if background.lifecycleLockHeld || background.suspendLifecycle != nil || background.mutating || background.commandName != "" {
+		t.Errorf("background copy: lock held %t, can suspend %t, mutating %t, command %q",
+			background.lifecycleLockHeld, background.suspendLifecycle != nil, background.mutating, background.commandName)
+	}
+	if background.operations != request.operations {
+		t.Error("the background copy does not see the long operations")
+	}
+	if err := background.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "fam", Name: "fam"}, longOperation{state: "migrating"}, func() error {
+		if unlock, locked := server.tryLockDataRoot(root); locked {
+			unlock()
+			t.Error("the background copy gave up the request's lifecycle lock")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hold.unlock()
+}
+
+// A migration's source lock can be tried, so that a monitor holding the
+// lifecycle lock need not wait for a settlement that holds the source lock.
+func TestSourceFamilyLockCanBeTried(t *testing.T) {
+	var source distributedSourceRuntime
+	unlock := source.lockSourceFamily("fam")
+	if _, locked := source.tryLockSourceFamily("fam"); locked {
+		t.Fatal("a held source lock was taken again")
+	}
+	unlock()
+	unlock, locked := source.tryLockSourceFamily("fam")
+	if !locked {
+		t.Fatal("a free source lock was not taken")
+	}
+	unlock()
+}
+
 // Background work across families waits, without the lifecycle lock, until no
 // long operation is in progress.
 func TestBackgroundWorkAcrossFamiliesWaitsForEveryLongOperation(t *testing.T) {
