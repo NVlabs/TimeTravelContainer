@@ -573,6 +573,75 @@ func TestRemoteSnapshotEnsureResidentBeforeLoaderCancellation(t *testing.T) {
 	}
 }
 
+// A capture of pages still loading from an immutable graph keeps their loader
+// instead of loading them, and reads them after the Kernel that owned the
+// loader has let it go. A capture of pages loading from a live source keeps
+// nothing, and must be made resident instead.
+func TestRemoteSnapshotRetainsGraphPageLoads(t *testing.T) {
+	for _, durable := range []bool{true, false} {
+		source, sourceFR := newRemoteTestMemoryFile(t, 8)
+		target, targetFR := newRemoteTestMemoryFile(t, 8)
+		want := make([]byte, sourceFR.Length())
+		for i := range want {
+			want[i] = byte(i*13 + 7)
+		}
+		fillRemoteTestRange(t, source, sourceFR, want)
+		sourceSnapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := NewLoopbackRemoteReader(sourceSnapshot, hostarch.PageSize, 1, 2)
+		pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true, DurableBacking: durable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		pages.MemoryFilesDone()
+		capture, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: targetFR}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		retained, err := capture.RetainGraphPageLoads()
+		if err != nil {
+			t.Fatalf("durable=%t: RetainGraphPageLoads: %v", durable, err)
+		}
+		if retained != durable || len(capture.PageLoads()) != map[bool]int{true: 1, false: 0}[durable] {
+			t.Fatalf("durable=%t: retained=%t, keeping %d loads", durable, retained, len(capture.PageLoads()))
+		}
+		if stats := pages.Stats(); stats.BytesLoaded != 0 {
+			t.Fatalf("durable=%t: retaining the load loaded %d bytes", durable, stats.BytesLoaded)
+		}
+		if !durable {
+			capture.Close()
+			pages.Cancel()
+			_ = pages.Wait()
+			sourceSnapshot.Close()
+			continue
+		}
+		// The Kernel that loaded the pages goes.
+		if err := pages.DecOwner(); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(want))
+		if n, err := capture.CopyStreamAt(got, 0); err != nil || n != len(got) {
+			t.Fatalf("CopyStreamAt after the loader's first owner went: n=%d err=%v", n, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatal("pages read through the retained loader differ")
+		}
+		if err := capture.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if stats := pages.Stats(); !stats.Done {
+			t.Fatalf("the retained loader did not end with the capture: %+v", stats)
+		}
+		sourceSnapshot.Close()
+	}
+}
+
 func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
 	target, targetFR := newRemoteTestMemoryFile(t, pageCount)

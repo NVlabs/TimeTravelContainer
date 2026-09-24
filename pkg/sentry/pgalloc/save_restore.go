@@ -22,6 +22,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -1589,13 +1590,21 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 // reference, which prevents resurrection after the final owner has canceled
 // the load.
 func (apfl *AsyncPagesFileLoad) IncOwner() {
+	if !apfl.tryIncOwner() {
+		panic("retaining released asynchronous page load")
+	}
+}
+
+// tryIncOwner retains apfl's asynchronous reader, unless its last owner has
+// already released it.
+func (apfl *AsyncPagesFileLoad) tryIncOwner() bool {
 	for {
 		owners := apfl.owners.Load()
 		if owners <= 0 {
-			panic("retaining released asynchronous page load")
+			return false
 		}
 		if apfl.owners.CompareAndSwap(owners, owners+1) {
-			return
+			return true
 		}
 	}
 }
@@ -1977,6 +1986,30 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 // calls have no effect.
 func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 	apfl.lfStatus.Notify(aplLFDone)
+}
+
+// pendingPageLoads returns the loaders of the pages in fr that are still to be
+// loaded.
+func (f *MemoryFile) pendingPageLoads(fr memmap.FileRange) []*AsyncPagesFileLoad {
+	var loads []*AsyncPagesFileLoad
+	add := func(amfl *asyncMemoryFileLoad) {
+		if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
+			return
+		}
+		amfl.pf.mu.Lock()
+		pending := !amfl.unloaded.IsEmptyRange(fr)
+		amfl.pf.mu.Unlock()
+		if pending && !slices.Contains(loads, amfl.pf) {
+			loads = append(loads, amfl.pf)
+		}
+	}
+	add(f.asyncPageLoad.Load())
+	if sparse := f.sparseAsyncLoads.Load(); sparse != nil {
+		for _, amfl := range *sparse {
+			add(amfl)
+		}
+	}
+	return loads
 }
 
 // IsAsyncLoading returns true if async page loading is in progress or has

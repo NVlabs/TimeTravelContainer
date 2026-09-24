@@ -2413,10 +2413,18 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	}
 	metadataOwned = true
 	// A branch imported into an existing family can reuse ranges whose lazy
-	// loader belongs to a peer Kernel. Materialize the exact captured graph
-	// while every such loader is still alive; releasing k first would cancel its
-	// loader and could leave the later sparse export unable to read a page.
-	if err := image.SparseSnapshot.EnsureResident(); err != nil {
+	// loader belongs to a peer Kernel, and releasing k would cancel its own:
+	// either could leave a later export unable to read a page. Pages still
+	// loading from the snapshot graph stay readable while the capture keeps
+	// their loaders, and an export to the graph, which sends only what the
+	// graph lacks, does not read them at all. If a page is still loading from
+	// anything else, such as a live source, materialize the exact captured
+	// graph now, while every loader is alive.
+	retained, err := image.RetainGraphPageLoads()
+	if err == nil && !retained {
+		err = image.SparseSnapshot.EnsureResident()
+	}
+	if err != nil {
 		_ = image.Close()
 		restoreLiveBranch()
 		return fmt.Errorf("materializing branch memory before dehydration: %w", err)

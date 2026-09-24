@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -288,6 +289,32 @@ func (d *DehydrationCapture) reserveMemoryFile(ctx context.Context, resourceID c
 	d.reservations = append(d.reservations, reservation)
 	d.MemoryImages = append(d.MemoryImages, image)
 	return nil
+}
+
+// RetainGraphPageLoads keeps d's pages that are still loading from the
+// snapshot graph readable after d's Kernel is released, and reports whether
+// those are all of d's pages still loading; see
+// pgalloc.RemoteSnapshot.RetainGraphPageLoads.
+func (d *DehydrationCapture) RetainGraphPageLoads() (bool, error) {
+	if d == nil || d.consumed {
+		return false, errors.New("dehydration capture is unavailable")
+	}
+	for _, reservation := range d.reservations {
+		if retained, err := reservation.RetainGraphPageLoads(); err != nil || !retained {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// ownPageLoad makes k an owner of load, which loads pages k may read, unless it
+// is one already.
+func (k *Kernel) ownPageLoad(load *pgalloc.AsyncPagesFileLoad) {
+	if k.remotePageLoad == load || slices.Contains(k.auxiliaryRemotePageLoads, load) {
+		return
+	}
+	load.IncOwner()
+	k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
 }
 
 // DurableMetadata returns the process-independent description represented by
@@ -575,6 +602,13 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 		return nil, vfs.PrependErrMsg("VFS dehydration restore failed", err)
 	}
 	child.Pause()
+	// Pages the capture kept loading from the snapshot graph are the child's
+	// to read now; see RetainGraphPageLoads.
+	for _, reservation := range image.reservations {
+		for _, load := range reservation.PageLoads() {
+			child.ownPageLoad(load)
+		}
+	}
 	if err := image.Close(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("releasing dehydration reservations: %w", err)

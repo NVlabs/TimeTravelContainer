@@ -21,6 +21,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 
@@ -387,6 +388,71 @@ func (s *RemoteSnapshot) RetainPageLoads(loads []*AsyncPagesFileLoad) error {
 		s.shared.pageLoads = append(s.shared.pageLoads, load)
 	}
 	return nil
+}
+
+// RetainGraphPageLoads keeps s's pages that are still loading readable after
+// the Kernels that loaded them are released, by owning their loaders, if each
+// of those reads an immutable snapshot graph, and reports whether it did. A
+// page still loading from anything else, such as a live source that may
+// leave, is not kept readable this way; s must be made resident instead.
+func (s *RemoteSnapshot) RetainGraphPageLoads() (bool, error) {
+	if s == nil {
+		return false, errors.New("remote snapshot is nil")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false, errors.New("remote snapshot is closed")
+	}
+	// A snapshot's regions do not change once it is made.
+	regions := s.regions
+	s.mu.Unlock()
+	var loads []*AsyncPagesFileLoad
+	for i := range regions {
+		for _, load := range regions[i].File.pendingPageLoads(regions[i].Range) {
+			if !load.HasDurableBacking() {
+				return false, nil
+			}
+			if err := load.err(); err != nil {
+				return false, err
+			}
+			if !slices.Contains(loads, load) {
+				loads = append(loads, load)
+			}
+		}
+	}
+	s.mu.Lock()
+	retained := make([]*AsyncPagesFileLoad, 0, len(loads))
+	complete := !s.closed
+	for _, load := range loads {
+		if !complete || slices.Contains(s.shared.pageLoads, load) {
+			continue
+		}
+		if !load.tryIncOwner() {
+			complete = false
+			continue
+		}
+		retained = append(retained, load)
+	}
+	if complete {
+		s.shared.pageLoads = append(s.shared.pageLoads, retained...)
+	}
+	s.mu.Unlock()
+	if !complete {
+		for _, load := range retained {
+			_ = load.DecOwner()
+		}
+		return false, errors.New("remote snapshot closed, or a loader of its pages released, while retaining page loads")
+	}
+	return true, nil
+}
+
+// PageLoads returns the loaders s keeps alive for pages still loading; see
+// RetainGraphPageLoads.
+func (s *RemoteSnapshot) PageLoads() []*AsyncPagesFileLoad {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*AsyncPagesFileLoad(nil), s.shared.pageLoads...)
 }
 
 // ExportMemoryFileMetadataForRemote captures allocator metadata and the packed
