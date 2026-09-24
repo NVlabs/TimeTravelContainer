@@ -392,6 +392,15 @@ func (r *Repository) flushMetadataBatchLocked(branchID string) error {
 	if batch == nil || batch.len() == 0 {
 		return nil
 	}
+	// A filesystem transaction path-copies the branch's tree, and so changes
+	// the references of the snapshots it shares with other branches; while
+	// one of them is frozen for an authority handoff, the graph refuses it.
+	// Refuse it before publishing any bulk object below. Refused after, the
+	// objects were left held only by construction pins, and the next process
+	// to open the repository released them as a crashed transaction's.
+	if snapshot, frozen := r.graph.FrozenSnapshotLedger(); frozen {
+		return fmt.Errorf("snapshot %d references are frozen for authority handoff: %w", snapshot, ttcsnapshot.ErrSnapshotLedgerFrozen)
+	}
 	pins := make([]string, 0, len(batch.releasePins))
 	for pin := range batch.releasePins {
 		pins = append(pins, pin)
@@ -425,17 +434,18 @@ func (r *Repository) flushMetadataBatchLocked(branchID string) error {
 			return fmt.Errorf("publishing filesystem bulk objects: %w", err)
 		}
 	}
+	root, reclaimed, err := r.graph.ApplyFilesystemAndReleasePinsReclaimed(
+		ttcsnapshot.SnapshotID(batch.branch.WorkingSnapshot), graphRootName(branchID), batch.operations(), pins)
+	if err != nil {
+		return err
+	}
+	// Until the inodes name them, a retry must still find the objects above.
 	if len(pending) != 0 {
 		r.dirtyMu.Lock()
 		for _, object := range pending {
 			delete(r.pendingBulk, object.ID.String())
 		}
 		r.dirtyMu.Unlock()
-	}
-	root, reclaimed, err := r.graph.ApplyFilesystemAndReleasePinsReclaimed(
-		ttcsnapshot.SnapshotID(batch.branch.WorkingSnapshot), graphRootName(branchID), batch.operations(), pins)
-	if err != nil {
-		return err
 	}
 	batch.branch.Root = root.String()
 	batch.state.mu.Lock()

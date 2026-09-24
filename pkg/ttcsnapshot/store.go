@@ -2495,6 +2495,24 @@ func (s *Store) SnapshotLedgerFrozen(snapshot SnapshotID) bool {
 	return s.state.Frozen[snapshotKey(snapshot)]
 }
 
+// FrozenSnapshotLedger returns a snapshot whose reference ledger is frozen for
+// an authority handoff, if the graph has one.
+func (s *Store) FrozenSnapshotLedger() (SnapshotID, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for key, frozen := range s.state.Frozen {
+		if !frozen {
+			continue
+		}
+		parsed, err := strconv.ParseUint(key, 16, 64)
+		if err != nil {
+			continue
+		}
+		return SnapshotID(parsed), true
+	}
+	return 0, false
+}
+
 // Root returns a named root.
 func (s *Store) Root(name string) (ObjectID, bool) {
 	s.mu.RLock()

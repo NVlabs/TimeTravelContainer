@@ -1659,6 +1659,78 @@ func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
 	}
 }
 
+// A fork that a frozen handoff refuses must leave the source as it was. It
+// used to publish the source's new file object, keep only a construction pin
+// on it and fail; the next process to open the repository took the pin for a
+// crashed transaction's and released it, and the source could never fork
+// again: "inode references unavailable working file".
+func TestForkRefusedByAFrozenHandoffLeavesTheSourceForkable(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("frozen-fork", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "base", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "ck", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repository.CreateRegular(MainBranch, RootInode, "newfile", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, created, []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "a1", 103, 104); !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
+		t.Fatalf("fork during a frozen handoff: %v, want ErrSnapshotLedgerFrozen", err)
+	}
+	// ttcd opens the repository to clean up after the refused fork.
+	other, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := other.Open("frozen-fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "a2", 105, 106); err != nil {
+		t.Fatalf("fork after the handoff completed: %v", err)
+	}
+	for _, branch := range []string{MainBranch, "a2"} {
+		data := make([]byte, 5)
+		if n, err := repository.ReadAt(branch, created, data, 0); err != nil || string(data[:n]) != "hello" {
+			t.Fatalf("%s reads %q, %v; want hello", branch, data[:n], err)
+		}
+	}
+}
+
 func TestBranchDiffDuringOriginHandoff(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.CreateWithOrigin("diff-handoff", 100)
