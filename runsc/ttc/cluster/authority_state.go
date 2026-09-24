@@ -1202,8 +1202,8 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		record.Revision++
 		record.UpdatedAt, record.LeaseExpiresAt = command.IssuedAt, command.IssuedAt
 		s.Nodes[p.NodeID] = record
-		s.invalidateNodeIncarnation(p.NodeID, p.Incarnation, true,
-			"authoritative node state was lost after its execution lease expired", command.IssuedAt)
+		s.suspendNodeIncarnation(p.NodeID, p.Incarnation,
+			"node stopped renewing its execution lease while this was in flight", command.IssuedAt)
 		return authorityValue(record)
 	case AuthorityNodeRemove:
 		p, err := decodeAuthorityPayload[AuthorityNodeRemovePayload](command)
@@ -1220,6 +1220,10 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 		if record.State != NodeOffline {
 			return nil, errors.New("node must be offline before removing its membership record")
 		}
+		// An expired node is only unavailable until it returns; removing it
+		// is what gives up what it held.
+		s.invalidateNodeIncarnation(p.NodeID, p.Incarnation, true,
+			"its node was removed while offline", command.IssuedAt)
 		if s.SharedGC.NodeID == p.NodeID && s.SharedGC.Incarnation == p.Incarnation {
 			return nil, errors.New("node still owns the shared GC lease")
 		}
@@ -1322,6 +1326,57 @@ func (s *AuthorityState) applyNode(command AuthorityCommand) (json.RawMessage, e
 	}
 }
 
+// suspendNodeIncarnation settles what an incarnation whose lease expired was
+// in the middle of. A node that stopped renewing is unavailable, not lost: it
+// may be cut off, or its daemon restarting, with its branches stopped in
+// memory and on disk. Operations in flight through it fail, and branches it
+// had not finished constructing go back to be built elsewhere. Its branches,
+// the snapshots it provides, and forks still paging from it wait for it to
+// return as the same incarnation, or for its removal to give them up.
+func (s *AuthorityState) suspendNodeIncarnation(nodeID, incarnation, reason string, at time.Time) {
+	for id, tx := range s.Transactions {
+		// A published fork or migration exists, and only pages what it has not
+		// yet copied from its source; it waits too.
+		if tx.Terminal() || tx.State == TransactionPublished || tx.State == TransactionDraining {
+			continue
+		}
+		source := tx.Identity.SourceNodeID == nodeID && tx.SourceIncarnation == incarnation
+		target := tx.Identity.TargetNodeID == nodeID && tx.TargetIncarnation == incarnation
+		if !source && !target {
+			continue
+		}
+		tx.State, tx.Failure, tx.SourceNeeded = TransactionFailed, reason, false
+		tx.Revision++
+		tx.UpdatedAt = at
+		s.Transactions[id] = tx
+	}
+	for key, placement := range s.Placements {
+		if placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation || placement.State != PlacementMaterializing {
+			continue
+		}
+		s.releaseMaterializingPlacement(key, placement, at)
+	}
+}
+
+// releaseMaterializingPlacement revokes the claim of a node that never
+// finished constructing a branch, so that another may build it again: the
+// construction had not consumed the branch's durable roots.
+func (s *AuthorityState) releaseMaterializingPlacement(key string, placement PlacementRecord, at time.Time) {
+	placement.OwnerNode, placement.OwnerIncarnation = "", ""
+	placement.PhysicalContainer, placement.PhysicalBranch = "", ""
+	placement.State = PlacementUnplaced
+	placement.Generation++
+	placement.Revision++
+	placement.UpdatedAt = at
+	s.Placements[key] = placement
+	if branch, ok := s.Branches[key]; ok {
+		branch.Generation = placement.Generation
+		branch.Lifecycle = string(PlacementUnplaced)
+		branch.UpdatedAt = at
+		s.Branches[key] = branch
+	}
+}
+
 func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, includePlacements bool, reason string, at time.Time) {
 	for id, tx := range s.Transactions {
 		lostSource := tx.SourceNeeded && tx.Identity.SourceNodeID == nodeID && tx.SourceIncarnation == incarnation
@@ -1339,19 +1394,7 @@ func (s *AuthorityState) invalidateNodeIncarnation(nodeID, incarnation string, i
 		if includePlacements {
 			if placement, ok := s.Placements[key]; ok && placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation {
 				if placement.State == PlacementMaterializing {
-					// Construction never consumed the already durable roots. Revoke
-					// its exclusive claim and let another node retry it.
-					placement.OwnerNode, placement.OwnerIncarnation = "", ""
-					placement.PhysicalContainer, placement.PhysicalBranch = "", ""
-					placement.State = PlacementUnplaced
-					placement.Generation++
-					placement.Revision++
-					placement.UpdatedAt = at
-					s.Placements[key] = placement
-					branch.Generation = placement.Generation
-					branch.Lifecycle = string(PlacementUnplaced)
-					branch.UpdatedAt = at
-					s.Branches[key] = branch
+					s.releaseMaterializingPlacement(key, placement, at)
 				} else {
 					lost = true
 				}

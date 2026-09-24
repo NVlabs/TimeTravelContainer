@@ -1457,3 +1457,67 @@ func TestPlainControlPlaneOptionalToken(t *testing.T) {
 		t.Fatalf("wrong token error=%v", err)
 	}
 }
+
+// An incarnation whose lease expired joins again when it returns. Its
+// registration must take effect, not be answered from the join it first made:
+// its record would stay offline, and voter reconciliation would take it out of
+// Raft for good. A retry of a join, once registered, registers nothing.
+func TestAuthorityJoinRegistersAReturningIncarnation(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+		NodeID: "node-a", LocalDir: filepath.Join(t.TempDir(), "raft"),
+		ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+		ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	waitAuthorityLeader(t, node)
+	lease := 50 * time.Millisecond
+	propose := func(id string, kind AuthorityCommandKind, payload any) {
+		t.Helper()
+		result, err := node.Propose(context.Background(), id, kind, payload)
+		if err != nil || result.Err() != nil {
+			t.Fatalf("applying %s: result=%+v err=%v", kind, result, err)
+		}
+	}
+	propose("policy", AuthorityClusterPolicySet, AuthorityClusterPolicyPayload{Policy: ClusterRuntimePolicy{
+		Version: 1, PagingPolicy: testCapabilities("node-a").PagingPolicy, LeaseDuration: lease, MaxTransactions: 32,
+	}})
+	service := &AuthorityService{Node: node, Capabilities: testCapabilities("node-a"), MaxVoters: 3, ClusterID: "cluster"}
+	join := func() NodeRecord {
+		t.Helper()
+		body, err := json.Marshal(AuthorityJoinRequest{
+			NodeID: "node-b", Incarnation: "incarnation-b", ControlURL: "http://127.0.0.1:2",
+			RaftAddress: "127.0.0.1:1", ClusterID: "cluster", Capabilities: testCapabilities("node-b"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		service.serveHTTP(response, httptest.NewRequest(http.MethodPost, controlAuthorityJoinPath, bytes.NewReader(body)), "node-b")
+		if response.Code != http.StatusOK {
+			t.Fatalf("joining: %d %s", response.Code, response.Body)
+		}
+		state, err := node.LinearizableState(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state.Nodes["node-b"]
+	}
+
+	joined := join()
+	if joined.State != NodeJoining {
+		t.Fatalf("joined as %q, want %q", joined.State, NodeJoining)
+	}
+	time.Sleep(2 * lease)
+	propose("expire", AuthorityNodeExpire, AuthorityNodeExpirePayload{NodeID: "node-b", Incarnation: "incarnation-b", Revision: joined.Revision})
+	returned := join()
+	if returned.State != NodeJoining || returned.Revision <= joined.Revision {
+		t.Fatalf("returned as %q at revision %d, want %q after revision %d", returned.State, returned.Revision, NodeJoining, joined.Revision)
+	}
+	if retried := join(); retried.Revision != returned.Revision {
+		t.Fatalf("a retried join registered again: revision %d, was %d", retried.Revision, returned.Revision)
+	}
+}

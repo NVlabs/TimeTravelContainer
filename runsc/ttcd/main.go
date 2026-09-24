@@ -16,9 +16,13 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"gvisor.dev/gvisor/runsc/cli/maincli"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
@@ -63,7 +67,68 @@ func main() {
 		os.Stdout.WriteString("ttcd version " + version.Version() + "\n")
 		return
 	}
-	os.Exit(cmd.RunDaemon(os.Args[1:], os.Stdout, os.Stderr))
+	reapInheritedChildren()
+	code := cmd.RunDaemon(os.Args[1:], os.Stdout, os.Stderr)
+	if code == cmd.DaemonRestartExitCode {
+		// Keep the process, and so a batch job running it, alive: a new image
+		// starts with nothing held over from this one.
+		executable, err := os.Executable()
+		if err == nil {
+			err = syscall.Exec(executable, os.Args, os.Environ())
+		}
+		os.Stderr.WriteString("ttcd: restarting: " + err.Error() + "\n")
+	}
+	os.Exit(code)
+}
+
+// reapInheritedChildren waits, in the background, for the children this
+// process has as it starts. Only an earlier image of it, restarting by
+// execution, can have left them: console drains, port forwarders, its lease
+// guardian. Nothing in this image knows them, and each would otherwise stay a
+// zombie once it exits.
+func reapInheritedChildren() {
+	children := inheritedChildren()
+	if len(children) == 0 {
+		return
+	}
+	go func() {
+		for len(children) != 0 {
+			time.Sleep(5 * time.Second)
+			waiting := children[:0]
+			for _, pid := range children {
+				if reaped, err := syscall.Wait4(pid, nil, syscall.WNOHANG, nil); reaped == 0 && err == nil {
+					waiting = append(waiting, pid)
+				}
+			}
+			children = waiting
+		}
+	}()
+}
+
+func inheritedChildren() []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	self := strconv.Itoa(os.Getpid())
+	var children []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// The parent follows the state, after the command name, which is in
+		// parentheses and may hold spaces and parentheses itself.
+		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+		if len(fields) > 1 && fields[1] == self {
+			children = append(children, pid)
+		}
+	}
+	return children
 }
 
 func embeddedRuntimeArgv0(argv0 string) bool {

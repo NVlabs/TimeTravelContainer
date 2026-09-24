@@ -1035,7 +1035,9 @@ func TestAuthorityRejectsRetirementWithVolatileDependency(t *testing.T) {
 	}
 }
 
-func TestAuthorityExpiryCorruptsExactDependencyClosure(t *testing.T) {
+// A source whose lease expired only makes forks still paging from it wait;
+// removing it corrupts exactly those.
+func TestAuthorityRemovalCorruptsExactDependencyClosure(t *testing.T) {
 	at := time.Unix(3700, 0).UTC()
 	state := NewAuthorityState()
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
@@ -1073,9 +1075,21 @@ func TestAuthorityExpiryCorruptsExactDependencyClosure(t *testing.T) {
 	applyAuthorityForTest(t, state, "expire-source", source.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
 		NodeID: source.NodeID, Incarnation: source.Incarnation, Revision: source.Revision,
 	})
+	for _, key := range []string{logicalBranchKey("target", "main"), logicalBranchKey("target", "child"), logicalBranchKey("other", "main")} {
+		if branch := state.Branches[key]; branch.Corrupted {
+			t.Fatalf("branch %q was corrupted by its source's expiry: %+v", key, branch)
+		}
+	}
+	if tx := state.Transactions["fork-1"]; tx.State == TransactionFailed || !tx.SourceNeeded {
+		t.Fatalf("expiry gave up a published fork's source: %+v", tx)
+	}
+	offline := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "remove-source", offline.UpdatedAt.Add(time.Second), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: offline.NodeID, Incarnation: offline.Incarnation, Revision: offline.Revision,
+	})
 	for _, key := range []string{logicalBranchKey("target", "main"), logicalBranchKey("target", "child")} {
 		if branch := state.Branches[key]; !branch.Corrupted {
-			t.Fatalf("dependent branch %q survived source expiry: %+v", key, branch)
+			t.Fatalf("dependent branch %q survived its source's removal: %+v", key, branch)
 		}
 	}
 	if branch := state.Branches[logicalBranchKey("other", "main")]; branch.Corrupted {
@@ -1086,7 +1100,9 @@ func TestAuthorityExpiryCorruptsExactDependencyClosure(t *testing.T) {
 	}
 }
 
-func TestAuthorityExpiryAbandonsProviderOriginsAndAllowsRemoval(t *testing.T) {
+// An expired provider keeps its unpublished origins for when it returns;
+// removing it abandons them.
+func TestAuthorityRemovalAbandonsProviderOrigins(t *testing.T) {
 	at := time.Unix(3750, 0).UTC()
 	state := NewAuthorityState()
 	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
@@ -1098,11 +1114,8 @@ func TestAuthorityExpiryAbandonsProviderOriginsAndAllowsRemoval(t *testing.T) {
 		NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
 	})
 	for id := allocation.First; id < allocation.First+uint64(allocation.Count); id++ {
-		if _, ok := state.VolatileOrigins[id]; ok {
-			t.Fatalf("expired provider retained volatile origin %d", id)
-		}
-		if !state.AbandonedOrigins[id] {
-			t.Fatalf("expired provider origin %d lacks abandonment fence", id)
+		if _, ok := state.VolatileOrigins[id]; !ok || state.AbandonedOrigins[id] {
+			t.Fatalf("expiry gave up volatile origin %d", id)
 		}
 	}
 	offline := state.Nodes["node-a"]
@@ -1111,6 +1124,11 @@ func TestAuthorityExpiryAbandonsProviderOriginsAndAllowsRemoval(t *testing.T) {
 	})
 	if _, ok := state.Nodes["node-a"]; ok {
 		t.Fatal("expired provider remains in membership after removal")
+	}
+	for id := allocation.First; id < allocation.First+uint64(allocation.Count); id++ {
+		if _, ok := state.VolatileOrigins[id]; ok || !state.AbandonedOrigins[id] {
+			t.Fatalf("removed provider's origin %d lacks abandonment fence", id)
+		}
 	}
 	if _, err := RestoreAuthorityState(mustAuthoritySnapshotForTest(t, state)); err != nil {
 		t.Fatalf("state after provider removal is not restorable: %v", err)
@@ -1256,6 +1274,62 @@ func TestAuthorityMigrationIndependenceRetainsSharedPredecessor(t *testing.T) {
 	}
 	if dependencies := state.Branches[logicalBranchKey("family", "sibling")].VolatileDependencies; len(dependencies) != 1 || dependencies[0].TransactionID != predecessor.Identity.TransactionID {
 		t.Fatalf("sibling dependency changed: %+v", dependencies)
+	}
+}
+
+// A node whose lease expired has its branches back, unharmed, when it
+// returns as the same incarnation; only its removal loses them.
+func TestAuthorityExpiryKeepsBranchesForTheIncarnationToReturn(t *testing.T) {
+	at := time.Unix(3950, 0).UTC()
+	state := NewAuthorityState()
+	registerReadyAuthorityNode(t, state, "node-a", "incarnation-a", at)
+	applyAuthorityForTest(t, state, "place", at.Add(time.Second), AuthorityPlacementCreate, AuthorityPlacementPayload{Record: PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}})
+	key := logicalBranchKey("family", "main")
+	expire := func(id string) {
+		t.Helper()
+		node := state.Nodes["node-a"]
+		applyAuthorityForTest(t, state, id, node.LeaseExpiresAt, AuthorityNodeExpire, AuthorityNodeExpirePayload{
+			NodeID: node.NodeID, Incarnation: node.Incarnation, Revision: node.Revision,
+		})
+	}
+	expire("expire")
+	if node := state.Nodes["node-a"]; node.State != NodeOffline {
+		t.Fatalf("expired node is %s", node.State)
+	}
+	if placement := state.Placements[key]; placement.State != PlacementRunning || placement.OwnerIncarnation != "incarnation-a" || state.Branches[key].Corrupted {
+		t.Fatalf("expiry took the branch from its node: placement=%+v branch=%+v", placement, state.Branches[key])
+	}
+
+	// The same incarnation returns, recovers as it joins, and is admitted
+	// with its branch.
+	back := state.Nodes["node-a"].LeaseExpiresAt.Add(time.Minute)
+	record := testAuthorityNode(back)
+	record.NodeID, record.Incarnation, record.Capabilities.NodeID = "node-a", "incarnation-a", "node-a"
+	rejoined := decodeAuthorityResultForTest[NodeRecord](t, applyAuthorityForTest(t, state, "register-again", back, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: record, LeaseDuration: time.Hour}))
+	if rejoined.State != NodeJoining {
+		t.Fatalf("returning incarnation is %s, want %s", rejoined.State, NodeJoining)
+	}
+	applyAuthorityForTest(t, state, "ready-again", back.Add(time.Second), AuthorityNodeTransition, AuthorityNodeTransitionPayload{
+		NodeID: "node-a", Incarnation: "incarnation-a", State: NodeReady, LeaseDuration: time.Hour,
+	})
+	if placement := state.Placements[key]; placement.State != PlacementRunning || placement.OwnerIncarnation != "incarnation-a" || state.Branches[key].Corrupted {
+		t.Fatalf("the returned node lost its branch: placement=%+v branch=%+v", placement, state.Branches[key])
+	}
+
+	// Removal is what gives the branch up.
+	expire("expire-again")
+	offline := state.Nodes["node-a"]
+	applyAuthorityForTest(t, state, "remove", offline.UpdatedAt.Add(time.Second), AuthorityNodeRemove, AuthorityNodeRemovePayload{
+		NodeID: offline.NodeID, Incarnation: offline.Incarnation, Revision: offline.Revision,
+	})
+	if _, ok := state.Nodes["node-a"]; ok {
+		t.Fatal("removed node is still a member")
+	}
+	if placement := state.Placements[key]; placement.State != PlacementCorrupted || placement.OwnerNode != "" || !state.Branches[key].Corrupted {
+		t.Fatalf("removing the node kept its branch: placement=%+v branch=%+v", placement, state.Branches[key])
 	}
 }
 

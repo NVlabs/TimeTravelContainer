@@ -9496,8 +9496,8 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	if b.nodeID != "" {
 		if placements, openErr := b.placementCatalog(); openErr == nil {
-			if records, listErr := placements.List(); listErr == nil {
-				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, records, containerInfo.ID)
+			if records, offlineOwners, listErr := placementsWithOfflineOwners(placements); listErr == nil {
+				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, records, offlineOwners, containerInfo.ID)
 			}
 		}
 	}
@@ -11029,6 +11029,32 @@ func allBranchesColdOnNode(info ttcbundle.ContainerInfo, nodeID string) (allCold
 	return allCold, count
 }
 
+// placementOwnersLister is a placement catalog that also reports, from the
+// same snapshot, which nodes are offline.
+type placementOwnersLister interface {
+	ListWithOfflineOwners() ([]cluster.PlacementRecord, map[string]bool, error)
+}
+
+// placementsWithOfflineOwners lists placements and, where the catalog can say
+// so from the same snapshot, which nodes are offline.
+func placementsWithOfflineOwners(placements cluster.PlacementCatalog) ([]cluster.PlacementRecord, map[string]bool, error) {
+	if withOwners, ok := placements.(placementOwnersLister); ok {
+		return withOwners.ListWithOfflineOwners()
+	}
+	records, err := placements.List()
+	return records, nil, err
+}
+
+// placementDisplayState is the state a listing shows for record: a running or
+// paused branch of an offline node is unavailable until the node returns, or
+// its removal gives the branch up.
+func placementDisplayState(record cluster.PlacementRecord, offlineOwners map[string]bool) string {
+	if offlineOwners[record.OwnerNode] && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused) {
+		return "unavailable"
+	}
+	return string(record.State)
+}
+
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
 	if b.dataRoot == "" {
@@ -11046,9 +11072,11 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	physicalPlacements := make(map[string][]cluster.PlacementRecord)
 	logicalPlacements := make(map[string][]cluster.PlacementRecord)
 	var placementRecords []cluster.PlacementRecord
+	var offlineOwners map[string]bool
 	if b.nodeID != "" {
 		if placements, err := b.placementCatalog(); err == nil {
-			if records, err := placements.List(); err == nil {
+			var records []cluster.PlacementRecord
+			if records, offlineOwners, err = placementsWithOfflineOwners(placements); err == nil {
 				placementRecords = records
 				for _, record := range records {
 					logicalPlacements[record.FamilyID] = append(logicalPlacements[record.FamilyID], record)
@@ -11081,7 +11109,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			LiveForkWaiver:   container.LiveForkWaiver,
 			State:            state,
 			CreatedAt:        container.CreatedAt,
-			Branches:         persistentBranches(logicalPersistentBranchInfos(container.Branches, physicalPlacements[container.ID], container.ID)),
+			Branches:         persistentBranches(logicalPersistentBranchInfos(container.Branches, physicalPlacements[container.ID], offlineOwners, container.ID)),
 		}
 	}
 	// A single catalog snapshot is authoritative for elastically placed branches.
@@ -11106,7 +11134,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			for i := range family.Branches {
 				if family.Branches[i].ID == record.BranchID {
 					family.Branches[i].NodeID = record.OwnerNode
-					family.Branches[i].State = string(record.State)
+					family.Branches[i].State = placementDisplayState(record, offlineOwners)
 					family.Branches[i].Quarantined = record.Quarantined
 					foundBranch = true
 					break
@@ -11119,7 +11147,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				family.Branches = append(family.Branches, Branch{
 					ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
-					Quarantined: record.Quarantined, State: string(record.State), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
+					Quarantined: record.Quarantined, State: placementDisplayState(record, offlineOwners), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
 				})
 			}
 			owner := ""
@@ -11278,7 +11306,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 					continue
 				}
 				family.State = normalizeLifecycleState(reconciled.State)
-				family.Branches = persistentBranches(logicalPersistentBranchInfos(reconciled.Branches, physicalPlacements[reconciled.ID], reconciled.ID))
+				family.Branches = persistentBranches(logicalPersistentBranchInfos(reconciled.Branches, physicalPlacements[reconciled.ID], offlineOwners, reconciled.ID))
 				family.SandboxPID = 0
 				byID[displayID] = family
 			}
@@ -11765,7 +11793,7 @@ func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 // visible only through the Raft placement that currently maps it to a stable
 // logical identity. Superseded physical branches are provider/cleanup state and
 // remain hidden even while their local metadata genuinely still exists.
-func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, physicalContainer string) []ttcbundle.BranchInfo {
+func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, offlineOwners map[string]bool, physicalContainer string) []ttcbundle.BranchInfo {
 	byPhysical := make(map[string]cluster.PlacementRecord, len(placements))
 	byLogical := make(map[string]cluster.PlacementRecord, len(placements))
 	authoritativeFamily := false
@@ -11811,7 +11839,7 @@ func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []clu
 			logical.NodeID = placement.OwnerNode
 			logical.Quarantined = placement.Quarantined
 			logical.Unplaced = placement.State == cluster.PlacementUnplaced
-			logical.State = string(placement.State)
+			logical.State = placementDisplayState(placement, offlineOwners)
 			logical.ParentID = placement.ParentBranch
 			if !placement.BranchCreatedAt.IsZero() {
 				logical.CreatedAt = placement.BranchCreatedAt

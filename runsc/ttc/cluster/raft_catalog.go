@@ -827,6 +827,27 @@ func (r raftPlacementCatalog) List() ([]PlacementRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	return placementRecords(state), nil
+}
+
+// ListWithOfflineOwners is List, together with the nodes that are offline,
+// read from the same authority state. A running or paused branch of an
+// offline node is unavailable until the node returns or is removed.
+func (r raftPlacementCatalog) ListWithOfflineOwners() ([]PlacementRecord, map[string]bool, error) {
+	state, err := r.state()
+	if err != nil {
+		return nil, nil, err
+	}
+	offline := make(map[string]bool)
+	for id, node := range state.Nodes {
+		if node.State == NodeOffline {
+			offline[id] = true
+		}
+	}
+	return placementRecords(state), offline, nil
+}
+
+func placementRecords(state *AuthorityState) []PlacementRecord {
 	records := make([]PlacementRecord, 0, len(state.Placements))
 	for key, record := range state.Placements {
 		if authority, ok := state.Branches[key]; ok && authority.Corrupted {
@@ -843,7 +864,7 @@ func (r raftPlacementCatalog) List() ([]PlacementRecord, error) {
 		}
 		return records[i].BranchID < records[j].BranchID
 	})
-	return records, nil
+	return records
 }
 
 // Placements returns the placement-specific view. NodeCatalog and

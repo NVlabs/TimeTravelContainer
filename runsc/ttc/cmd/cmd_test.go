@@ -5353,7 +5353,7 @@ func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
 			OwnerNode: "node-a", State: cluster.PlacementRunning, ParentBranch: "main", BranchCreatedAt: created, Quarantined: true,
 		},
 	}
-	visible := logicalPersistentBranchInfos(infos, placements, "family")
+	visible := logicalPersistentBranchInfos(infos, placements, nil, "family")
 	if len(visible) != 2 || visible[0].ID != "main" || visible[1].ID != "test" {
 		t.Fatalf("logical persistent branches = %+v, want main and test", visible)
 	}
@@ -5374,12 +5374,39 @@ func TestLogicalPersistentBranchInfosUsesRaftNames(t *testing.T) {
 		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", State: cluster.PlacementRunning},
 		{FamilyID: "family", BranchID: "new-name", PhysicalContainer: "remote-physical", PhysicalBranch: "private", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementRunning},
 	}
-	got := logicalPersistentBranchInfos(infos, placements, "family")
+	got := logicalPersistentBranchInfos(infos, placements, nil, "family")
 	if len(got) != 2 || got[0].ID != "main" || got[1].ID != "new-name" {
 		t.Fatalf("logical infos=%+v, want main and new-name", got)
 	}
 	if got[1].NodeID != "node-b" || got[1].ParentID != "main" || got[1].State != "running" {
 		t.Fatalf("synthesized renamed branch=%+v", got[1])
+	}
+}
+
+// A running or paused branch whose node is offline is neither: it is
+// unavailable until the node returns, or its removal gives the branch up.
+func TestLogicalPersistentBranchInfosShowsOfflineOwnersUnavailable(t *testing.T) {
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{ID: "held", ParentID: "main", State: "paused"},
+		{ID: "gone", ParentID: "main", State: "exited"},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-b", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "held", PhysicalContainer: "family", PhysicalBranch: "held", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementPaused},
+		{FamilyID: "family", BranchID: "gone", PhysicalContainer: "family", PhysicalBranch: "gone", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementCorrupted},
+	}
+	got := logicalPersistentBranchInfos(infos, placements, map[string]bool{"node-b": true}, "family")
+	want := map[string]string{"main": "unavailable", "held": "unavailable", "gone": string(cluster.PlacementCorrupted)}
+	for _, info := range got {
+		if info.State != want[info.ID] {
+			t.Errorf("branch %s is %q, want %q", info.ID, info.State, want[info.ID])
+		}
+	}
+	for _, info := range logicalPersistentBranchInfos(infos, placements, nil, "family") {
+		if info.ID == "main" && info.State != string(cluster.PlacementRunning) {
+			t.Errorf("with its node online, main is %q, want running", info.State)
+		}
 	}
 }
 

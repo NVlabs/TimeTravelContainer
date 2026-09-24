@@ -6141,6 +6141,11 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 	return os.Remove(path)
 }
 
+// errLeaseSelfFenced is why a node that could not renew its execution lease
+// stopped its Sentries and its daemon. The daemon starts again at once, and
+// waits for the cluster to answer; see DaemonRestartExitCode.
+var errLeaseSelfFenced = errors.New("elastic cluster lease self-fenced before expiry after heartbeat failure")
+
 func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeRecord, localRoot string, lease time.Duration, stderr io.Writer, done <-chan struct{}, renewed func(*cluster.AuthorityState) error, fence func() error, fatal chan<- error) {
 	// Begin renewing well before the fencing window. Cluster control traffic may
 	// share a constrained link with peer paging or a network filesystem, so a
@@ -6186,7 +6191,7 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 					fenceErr = fence()
 				}
 				select {
-				case fatal <- fmt.Errorf("elastic cluster lease self-fenced before expiry after heartbeat failure: %w", errors.Join(cause, fenceErr)):
+				case fatal <- fmt.Errorf("%w: %w", errLeaseSelfFenced, errors.Join(cause, fenceErr)):
 				default:
 				}
 				return
@@ -6236,7 +6241,7 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 					fenceErr = fence()
 				}
 				select {
-				case fatal <- fmt.Errorf("elastic cluster lease self-fenced before expiry after heartbeat failure: %w", errors.Join(err, fenceErr)):
+				case fatal <- fmt.Errorf("%w: %w", errLeaseSelfFenced, errors.Join(err, fenceErr)):
 				default:
 				}
 				return

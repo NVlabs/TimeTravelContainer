@@ -3733,7 +3733,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: pruning shared image packs: %v\n", err)
 	}
-	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local, runtimePlatform)
+	clusterRuntime, err := prepareDaemonCluster(clusterOpts, daemonDataRoot, roots.local, runtimePlatform, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: configuring cluster peer service: %v\n", err)
 		return 1
@@ -3743,10 +3743,21 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := serveDaemonWithCluster(socket, runtimePlatform, cpuProfile, unsafeNoHostIsolation, kernelCompatibility, daemonDataRoot, roots.local, daemonRoot, daemonRunsc, manager.Capability(), clusterRuntime, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
+		if errors.Is(err, errLeaseSelfFenced) {
+			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
+			return DaemonRestartExitCode
+		}
 		return 1
 	}
 	return 0
 }
+
+// DaemonRestartExitCode is what RunDaemon returns when the daemon must start
+// again in the same process, as ttcd does by executing itself anew: its node
+// lost its execution lease, stopped its Sentries, and must now wait for the
+// cluster rather than end, which on a batch system would end its job and lose
+// everything the node was running.
+const DaemonRestartExitCode = 75
 
 type daemonRoots struct {
 	shared  string
@@ -4274,11 +4285,29 @@ func syncDaemonRootDirectory(root string) error {
 	return directory.Sync()
 }
 
-// localNodeAuthorityMustReset distinguishes an ordinary live-incarnation
-// restart from an incarnation whose execution authority has already been
-// fenced. Offline or forgotten incarnations must not reopen a stale Raft WAL
-// or replay mutable local journals under replacement authority.
-func localNodeAuthorityMustReset(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (bool, error) {
+// localAuthorityRecovery is what a member starting on an existing local root
+// must discard of it before it rejoins its cluster. An ordinary restart keeps
+// everything; an offline incarnation must not reopen a stale Raft WAL; and a
+// removed node must not replay mutable local journals under replacement
+// authority.
+type localAuthorityRecovery int
+
+const (
+	// keepLocalAuthority: the authority still counts this incarnation live,
+	// or no seed could say otherwise; its Raft replica rejoins as it is.
+	keepLocalAuthority localAuthorityRecovery = iota
+	// rejoinLocalAuthority: this incarnation's lease expired while it was
+	// away. What it runs and stores is still its own, but its Raft replica
+	// may describe a configuration it was removed from; only that goes, and
+	// it rejoins as a new member of the current one.
+	rejoinLocalAuthority
+	// resetLocalAuthority: the node was removed, and what it held with it.
+	resetLocalAuthority
+)
+
+// localNodeAuthorityRecovery asks the first seed that answers what this
+// incarnation must discard; see localIncarnationRecovery.
+func localNodeAuthorityRecovery(nodeID, incarnation, authToken string, clients map[string]*cluster.Client) (localAuthorityRecovery, error) {
 	ids := make([]string, 0, len(clients))
 	for id := range clients {
 		ids = append(ids, id)
@@ -4291,30 +4320,33 @@ func localNodeAuthorityMustReset(nodeID, incarnation, authToken string, clients 
 		if err != nil {
 			continue
 		}
-		return localIncarnationMustReset(state, nodeID, incarnation)
+		return localIncarnationRecovery(state, nodeID, incarnation)
 	}
-	return false, nil
+	return keepLocalAuthority, nil
 }
 
-func localIncarnationMustReset(state *cluster.AuthorityState, nodeID, incarnation string) (bool, error) {
+func localIncarnationRecovery(state *cluster.AuthorityState, nodeID, incarnation string) (localAuthorityRecovery, error) {
 	if state == nil {
-		return false, errors.New("cluster authority state is nil")
+		return keepLocalAuthority, errors.New("cluster authority state is nil")
 	}
 	if record, ok := state.Nodes[nodeID]; ok {
 		if record.Incarnation != incarnation {
-			return false, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
+			return keepLocalAuthority, fmt.Errorf("cluster node %q already belongs to incarnation %q; local scratch belongs to %q", nodeID, record.Incarnation, incarnation)
 		}
-		// Expiry has already invalidated every placement, volatile dependency,
-		// and unpublished origin owned by this incarnation. Its local runtime
-		// journals cannot be recovered, and its Raft WAL may describe a
-		// configuration from which this server was removed while offline.
-		return record.State == cluster.NodeOffline, nil
+		// Expiry leaves an incarnation's placements, volatile dependencies and
+		// unpublished origins its own, for when it returns. Its Raft WAL may
+		// still describe a configuration from which this server was removed
+		// while offline.
+		if record.State == cluster.NodeOffline {
+			return rejoinLocalAuthority, nil
+		}
+		return keepLocalAuthority, nil
 	}
-	// `node rm` deliberately forgets its retirement tombstone after removing
-	// the Raft member. Absence from a linearizable authority snapshot is
-	// therefore itself the durable authorization to discard this excluded local
-	// replica.
-	return true, nil
+	// `node rm` gives up what the node held, and deliberately forgets its
+	// retirement tombstone after removing the Raft member. Absence from a
+	// linearizable authority snapshot is therefore itself the durable
+	// authorization to discard this excluded local replica.
+	return resetLocalAuthority, nil
 }
 
 func authorityStateThroughSeed(ctx context.Context, seed *cluster.Client, nodeID, authToken string) (*cluster.AuthorityState, error) {
@@ -4583,7 +4615,7 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 	return 0, nil
 }
 
-func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtimePlatform string) (*daemonClusterRuntime, error) {
+func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtimePlatform string, stderr io.Writer) (*daemonClusterRuntime, error) {
 	if !opts.Configured {
 		return nil, nil
 	}
@@ -4707,15 +4739,22 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// A removed or expired member's WAL describes a configuration in which it
 	// still participates. Opening that WAL and waiting for its historical quorum
 	// cannot re-admit it to the current configuration. Once a configured seed
-	// proves that this incarnation is offline or absent, discard its node-local
-	// authority and rotate the execution epoch. Expiry has already fenced its
-	// mutable state; immutable image cache and shared snapshot authority remain.
+	// proves that this incarnation is offline, discard its Raft replica and
+	// rejoin; once it proves the node absent, discard its node-local authority
+	// and rotate the execution epoch. Immutable image cache and shared snapshot
+	// authority remain either way.
 	if !opts.RaftBootstrap && len(clients) != 0 {
-		reset, err := localNodeAuthorityMustReset(opts.NodeID, incarnation, opts.AuthToken, clients)
+		recovery, err := localNodeAuthorityRecovery(opts.NodeID, incarnation, opts.AuthToken, clients)
 		if err != nil {
 			return nil, err
 		}
-		if reset {
+		if recovery == rejoinLocalAuthority {
+			if err := os.RemoveAll(raftLocalDir); err != nil {
+				return nil, fmt.Errorf("discarding the Raft replica of an expired incarnation: %w", err)
+			}
+			localRaftState = false
+		}
+		if recovery == resetLocalAuthority {
 			// An offline or absent incarnation has no remaining execution or
 			// storage authority. Its other local journals are just as stale as its
 			// Raft WAL and must not be replayed under the replacement incarnation.
@@ -4846,14 +4885,27 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			}
 			return result
 		}
-		for _, peer := range clients {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			joinErr = joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken)
-			cancel()
-			if joinErr == nil {
-				joined = true
+		// A node whose Sentries a fence stopped keeps trying, however long the
+		// cluster is away; see registerClusterNodeWithRetry.
+		wait := holdsFencedRuntimes(localRoot)
+		for report := time.Now().Add(clusterWaitReport); ; {
+			for _, peer := range clients {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				joinErr = joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken)
+				cancel()
+				if joinErr == nil {
+					joined = true
+					break
+				}
+			}
+			if joined || !wait {
 				break
 			}
+			if !time.Now().Before(report) {
+				fmt.Fprintf(stderr, "ttcd: waiting for the cluster, with this node's sandboxes stopped: %v\n", joinErr)
+				report = time.Now().Add(clusterWaitReport)
+			}
+			time.Sleep(time.Second)
 		}
 		if !joined {
 			// A timeout can lose the successful AddNonvoter response, so cancel
@@ -5865,7 +5917,7 @@ func serveDaemon(socket, runtimePlatform string, unsafeNoHostIsolation bool, ker
 	return serveDaemonWithCluster(socket, runtimePlatform, profile, unsafeNoHostIsolation, kernelCompatibility, dataRoot, dataRoot, root, runsc, volumeCapability, nil, stdout, stderr)
 }
 
-func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) error {
+func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPUProfile, unsafeNoHostIsolation bool, kernelCompatibility hostKernelCompatibility, dataRoot, localRoot, root, runsc string, volumeCapability ttcvolume.Capability, clusterRuntime *daemonClusterRuntime, stdout, stderr io.Writer) (err error) {
 	snapshotGraph, err := ttcsnapshot.Open(filepath.Join(localRoot, "catalog", "snapshot-graph"))
 	if err != nil {
 		return fmt.Errorf("opening TTC snapshot graph: %w", err)
@@ -6102,6 +6154,17 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}()
 	var clusterServer *http.Server
 	clusterErr := make(chan error, 1)
+	// A lease that runs out fences this node's Sentries and closes its
+	// listeners, and only then reports why. Whatever ends serving after a
+	// fence, the fence is the reason, and it must be returned for the daemon to
+	// restart and wait for its cluster; see DaemonRestartExitCode.
+	var selfFenced atomic.Bool
+	heartbeatErr := make(chan error, 1)
+	defer func() {
+		if selfFenced.Load() {
+			err = errors.Join(<-heartbeatErr, err)
+		}
+	}()
 	if clusterRuntime != nil {
 		graphProvider := &graphObjectProvider{
 			graph: snapshotGraph, data: snapshotData, authority: clusterRuntime.raftCatalog,
@@ -6208,7 +6271,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 					return fmt.Errorf("publishing quorum-wait startup state: %w", err)
 				}
 			}
-			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, clusterRuntime.recoverMembership)
+			registered, err := registerClusterNodeWithRetry(clusterRuntime.directory, clusterRuntime.nodeRecord, clusterRuntime.lease, clusterRuntime.recoverMembership, holdsFencedRuntimes(localRoot), stderr)
 			if waitingForQuorum {
 				if removeErr := os.Remove(protocol.DaemonQuorumWaitPath(socket)); removeErr != nil && !os.IsNotExist(removeErr) && err == nil {
 					err = fmt.Errorf("clearing quorum-wait startup state: %w", removeErr)
@@ -6232,6 +6295,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// large crash journal or reconcile many placements, so renewal must
 			// begin now rather than after the Ready transition.
 			fence := func() error {
+				selfFenced.Store(true)
 				_ = listener.Close()
 				_ = clusterServer.Close()
 				return fenceElasticRuntimeRoot(targetBackend.activeDataRoot(), targetBackend.root, registered.NodeID, registered.Incarnation)
@@ -6250,7 +6314,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			go func() {
 				select {
 				case err := <-heartbeatFatal:
-					clusterErr <- err
+					heartbeatErr <- err
 					listener.Close()
 					clusterServer.Close()
 				case <-clusterDone:
@@ -6630,7 +6694,21 @@ func waitDaemonWorkerFor(done <-chan struct{}, name string, timeout time.Duratio
 // restarted quorum elects a leader and waits out execution leases granted in
 // the prior term. Exiting during this interval can collapse the quorum before
 // any member is able to re-register and expose its control endpoint.
-func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration, recoverMembership func(context.Context) error) (*cluster.NodeRecord, error) {
+// holdsFencedRuntimes reports whether Sentries of this node's local root are
+// stopped by an execution fence, waiting for the cluster to authorize them
+// again.
+func holdsFencedRuntimes(localRoot string) bool {
+	_, err := os.Stat(elasticFencePath(localRoot))
+	return err == nil
+}
+
+// clusterWaitReport is how often a daemon waiting for its cluster says so.
+const clusterWaitReport = 30 * time.Second
+
+// registerClusterNodeWithRetry registers record, retrying for a bounded time,
+// or for as long as it takes if wait is set: a daemon whose Sentries a fence
+// stopped must not end while they wait, however long the cluster is away.
+func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.NodeRecord, lease time.Duration, recoverMembership func(context.Context) error, wait bool, stderr io.Writer) (*cluster.NodeRecord, error) {
 	if directory == nil {
 		return nil, errors.New("cluster node directory is unavailable")
 	}
@@ -6639,6 +6717,7 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 		timeout = time.Minute
 	}
 	deadline := time.Now().Add(timeout)
+	report := time.Now().Add(clusterWaitReport)
 	var lastErr error
 	for {
 		registered, err := directory.Register(record, time.Now(), lease)
@@ -6646,8 +6725,12 @@ func registerClusterNodeWithRetry(directory cluster.NodeCatalog, record cluster.
 			return registered, nil
 		}
 		lastErr = err
-		if !time.Now().Before(deadline) {
+		if !wait && !time.Now().Before(deadline) {
 			return nil, lastErr
+		}
+		if wait && !time.Now().Before(report) {
+			fmt.Fprintf(stderr, "ttcd: waiting for the cluster, with this node's sandboxes stopped: %v\n", lastErr)
+			report = time.Now().Add(clusterWaitReport)
 		}
 		// An offline server may have been removed from the live Raft
 		// configuration while this daemon was absent. Re-adding the same ID and

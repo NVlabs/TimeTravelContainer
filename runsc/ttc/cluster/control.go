@@ -702,25 +702,38 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusServiceUnavailable, "cluster execution lease policy is unavailable")
 			return
 		}
-		record := NodeRecord{
-			NodeID: request.NodeID, Incarnation: request.Incarnation,
-			ControlURL: request.ControlURL, ControlServerName: request.ControlServerName,
-			RaftAddress: request.RaftAddress, Capabilities: request.Capabilities,
-			MemoryTargetBytes: request.MemoryTargetBytes,
-		}
-		result, err := a.Node.Propose(r.Context(), "join-register-"+request.Incarnation, AuthorityNodeRegister, AuthorityNodeRegisterPayload{
-			Record: record, LeaseDuration: state.ClusterPolicy.LeaseDuration,
-		})
-		if err != nil {
-			if notLeader(err) {
+		// A join registers the incarnation unless it is registered and live
+		// already, as for a retry of the same join, or a member restarting on
+		// its own Raft state that asks to be admitted again: a registration
+		// makes the node Joining, and a late one could demote it once Ready. An
+		// incarnation that expired and returns registers again, told apart
+		// from its earlier joins by the revision it expired at.
+		current, known := state.Nodes[request.NodeID]
+		if !known || current.Incarnation != request.Incarnation || current.State == NodeOffline {
+			requestID := "join-register-" + request.Incarnation
+			if known && current.Incarnation == request.Incarnation {
+				requestID = fmt.Sprintf("%s-%d", requestID, current.Revision)
+			}
+			record := NodeRecord{
+				NodeID: request.NodeID, Incarnation: request.Incarnation,
+				ControlURL: request.ControlURL, ControlServerName: request.ControlServerName,
+				RaftAddress: request.RaftAddress, Capabilities: request.Capabilities,
+				MemoryTargetBytes: request.MemoryTargetBytes,
+			}
+			result, err := a.Node.Propose(r.Context(), requestID, AuthorityNodeRegister, AuthorityNodeRegisterPayload{
+				Record: record, LeaseDuration: state.ClusterPolicy.LeaseDuration,
+			})
+			if err != nil {
+				if notLeader(err) {
+					return
+				}
+				writeControlError(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
-			writeControlError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		if err := result.Err(); err != nil {
-			writeControlError(w, http.StatusConflict, err.Error())
-			return
+			if err := result.Err(); err != nil {
+				writeControlError(w, http.StatusConflict, err.Error())
+				return
+			}
 		}
 		if err := a.Node.AddNonvoter(r.Context(), request.NodeID, request.RaftAddress); err != nil {
 			if notLeader(err) {

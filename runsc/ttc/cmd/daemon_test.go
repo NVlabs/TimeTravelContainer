@@ -2322,7 +2322,7 @@ type readerFunc func([]byte) (int, error)
 func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 func TestPrepareDaemonClusterRejectsPartialConfiguration(t *testing.T) {
-	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir(), "systrap")
+	_, err := prepareDaemonCluster(daemonClusterOptions{Configured: true, Listen: "127.0.0.1:0", MaxTransactions: 1}, t.TempDir(), t.TempDir(), "systrap", io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Fatalf("partial cluster configuration error=%v", err)
 	}
@@ -2471,7 +2471,7 @@ func TestRaftClusterIdentityPreventsSecondBootstrap(t *testing.T) {
 	}
 }
 
-func TestLocalIncarnationMustReset(t *testing.T) {
+func TestLocalIncarnationRecovery(t *testing.T) {
 	const (
 		node        = "node-a"
 		incarnation = "incarnation-a"
@@ -2479,24 +2479,24 @@ func TestLocalIncarnationMustReset(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		state   *cluster.AuthorityState
-		want    bool
+		want    localAuthorityRecovery
 		wantErr bool
 	}{
-		{name: "forgotten member", state: cluster.NewAuthorityState(), want: true},
+		{name: "forgotten member", state: cluster.NewAuthorityState(), want: resetLocalAuthority},
 		{name: "expired offline member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeOffline},
-		}}, want: true},
+		}}, want: rejoinLocalAuthority},
 		{name: "live matching member", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: incarnation, State: cluster.NodeReady},
-		}}},
+		}}, want: keepLocalAuthority},
 		{name: "same name has new identity", state: &cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 			node: {NodeID: node, Incarnation: "incarnation-new", State: cluster.NodeReady},
 		}}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := localIncarnationMustReset(test.state, node, incarnation)
+			got, err := localIncarnationRecovery(test.state, node, incarnation)
 			if (err != nil) != test.wantErr || got != test.want {
-				t.Fatalf("localIncarnationMustReset()=(%t, %v), want (%t, err=%t)", got, err, test.want, test.wantErr)
+				t.Fatalf("localIncarnationRecovery()=(%d, %v), want (%d, err=%t)", got, err, test.want, test.wantErr)
 			}
 		})
 	}
