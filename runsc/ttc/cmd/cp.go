@@ -294,6 +294,12 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 	if err != nil {
 		return err
 	}
+	// A copy takes time in proportion to what it copies. Other commands go
+	// on meanwhile, and none may change the family: the copy's helper runs
+	// in the branch's Kernel, or mounts the branch's filesystem itself.
+	copying := func(copy func() error) error {
+		return b.withoutLifecycleLock(info, longOperation{branch: resolved.branch, state: "copying"}, copy)
+	}
 	families, err := b.listRuntimeFamilies()
 	if err != nil {
 		return err
@@ -310,23 +316,27 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 				continue
 			}
 			switch branch.State {
-			case "running":
-				return b.runLiveCopyHelper(resolved, helperArgs, input, output, false)
-			case "paused":
-				return b.runLiveCopyHelper(resolved, helperArgs, input, output, true)
+			case "running", "paused":
+				return copying(func() error {
+					return b.runLiveCopyHelper(resolved, helperArgs, input, output, branch.State == "paused")
+				})
 			default:
 				if offlineCopyState(branch.State) {
 					// These states have no Kernel or open filesystem handles for this
 					// branch. Its persistent TTC volume branches can therefore be
 					// mounted by the short-lived helper without disturbing live peers.
-					return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+					return copying(func() error {
+						return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+					})
 				}
 				return fmt.Errorf("cannot copy to or from branch %q while it is %s", resolved.branch, branch.State)
 			}
 		}
 		for _, branch := range info.Branches {
 			if branch.ID == resolved.branch && offlineCopyState(branch.State) {
-				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+				return copying(func() error {
+					return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+				})
 			}
 		}
 		return fmt.Errorf("cannot copy the offline branch %q while another branch in its family is live", resolved.branch)
@@ -335,7 +345,9 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 		if branch.ID != resolved.branch {
 			continue
 		}
-		return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+		return copying(func() error {
+			return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+		})
 	}
 	return fmt.Errorf("branch %q does not exist", resolved.branch)
 }

@@ -3315,6 +3315,38 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 // immutable-image root format without changing its writable TTC volume. This
 // keeps containers created by older TTC builds startable after image backing
 // metadata gains new virtualization requirements.
+// ContainerImageRootReady reports whether the image root that the container
+// named name runs from is unpacked on this node.
+func (s Store) ContainerImageRootReady(name string) (bool, error) {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return false, err
+	}
+	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform)))
+	return err == nil, nil
+}
+
+// PrepareContainerImageRoot unpacks on this node the image root that the
+// container named name runs from, if it is not unpacked yet, without changing
+// the container's records; RefreshContainerImageRoot then finds it ready.
+func (s Store) PrepareContainerImageRoot(ctx context.Context, name string) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	if _, err := loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform))); err == nil {
+		return nil
+	}
+	pulled, err := s.resolveImage(ctx, info.Digest, info.Platform, "never", nil)
+	if err != nil {
+		return fmt.Errorf("resolving image for container %q rootfs: %w", info.Name, err)
+	}
+	if _, _, err := s.prepareImageRoot(ctx, pulled, info.Platform, nil); err != nil {
+		return fmt.Errorf("preparing image root for container %q: %w", info.Name, err)
+	}
+	return nil
+}
+
 func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (ContainerInfo, error) {
 	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
@@ -5866,6 +5898,47 @@ func normalizePullPolicy(policy string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", policy)
 	}
+}
+
+// ImageReady reports whether preparing a container from reference under the
+// pull policy would find the image, and its root on this node, ready: neither
+// pull it nor unpack it.
+func (s Store) ImageReady(ctx context.Context, reference, platform, policy string) (bool, error) {
+	policy, err := normalizePullPolicy(policy)
+	if err != nil || policy == "always" {
+		return false, err
+	}
+	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
+	if err != nil {
+		return false, err
+	}
+	return s.imageReadyAmong(stored, reference, platform)
+}
+
+// imageReadyAmong reports whether reference is one of the stored images and
+// its root is unpacked on this node.
+func (s Store) imageReadyAmong(stored []images.Info, reference, platform string) (bool, error) {
+	match, found, err := selectStoredImage(stored, reference, platform)
+	if err != nil || !found {
+		return false, err
+	}
+	selectedPlatform := platform
+	if selectedPlatform == "" {
+		selectedPlatform = match.Platform
+	}
+	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(match.Digest, selectedPlatform)))
+	return err == nil, nil
+}
+
+// PrepareImage pulls reference if the pull policy asks for it and prepares its
+// root on this node, as preparing a container from it would.
+func (s Store) PrepareImage(ctx context.Context, reference, platform, policy string, progress images.ProgressFunc) error {
+	pulled, err := s.resolveImage(ctx, reference, platform, policy, progress)
+	if err != nil {
+		return err
+	}
+	_, _, err = s.prepareImageRoot(ctx, pulled, platform, progress)
+	return err
 }
 
 func (s Store) resolveImage(ctx context.Context, reference, platform, policy string, progress images.ProgressFunc) (images.Info, error) {

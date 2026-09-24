@@ -185,6 +185,56 @@ func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
 	}
 }
 
+// A container's image root is ready on a node once it is unpacked there, and
+// preparing it leaves the container's records as they were.
+func TestContainerImageRootReadyOnceUnpacked(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "web-id", Name: "web", Digest: "sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64",
+		BundleDir: filepath.Join(root, "containers", "web-id", "bundle"),
+	}
+	imageRoot := filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform))
+	info.RootFS = filepath.Join(imageRoot, "rootfs")
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(root, "containers", info.ID, "container.json")
+	if err := writeCurrentContainerFixture(record, &info); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || ready {
+		t.Fatalf("ContainerImageRootReady before the root is unpacked=(%t, %v)", ready, err)
+	}
+	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imageRoot, "image.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(info.RootFS), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || !ready {
+		t.Fatalf("ContainerImageRootReady once unpacked=(%t, %v)", ready, err)
+	}
+	before, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareContainerImageRoot(context.Background(), info.ID); err != nil {
+		t.Fatalf("PrepareContainerImageRoot with the root unpacked: %v", err)
+	}
+	if after, err := os.ReadFile(record); err != nil || string(after) != string(before) {
+		t.Fatalf("PrepareContainerImageRoot changed the container's record: %v", err)
+	}
+}
+
 func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
@@ -1651,6 +1701,50 @@ func TestPullPolicyAndStoredImageSelection(t *testing.T) {
 	}
 	if _, _, err := selectStoredImage(stored, "aaaa", ""); !errors.Is(err, ttcimages.ErrAmbiguous) {
 		t.Errorf("ambiguous prefix error=%v", err)
+	}
+}
+
+// An image is ready to prepare a container from when it is stored and its root
+// is unpacked on this node; only then does preparing neither pull nor unpack.
+func TestImageReadyNeedsTheImageAndItsRoot(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	stored := []ttcimages.Info{{Reference: "docker.io/library/alpine:3.20", Digest: digest, Platform: "linux/amd64"}}
+	ready := func(reference, platform string) bool {
+		t.Helper()
+		got, err := store.imageReadyAmong(stored, reference, platform)
+		if err != nil {
+			t.Fatalf("imageReadyAmong(%q, %q): %v", reference, platform, err)
+		}
+		return got
+	}
+	if ready("alpine:3.20", "") {
+		t.Error("an image whose root is not unpacked is ready")
+	}
+	dir := filepath.Join(root, "images", imageRootKey(digest, "linux/amd64"))
+	if err := os.MkdirAll(filepath.Join(dir, "rootfs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "image.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(filepath.Join(dir, "rootfs")), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !ready("alpine:3.20", "") || !ready("alpine:3.20", "linux/amd64") {
+		t.Error("a stored image with its root unpacked is not ready")
+	}
+	if ready("alpine:3.20", "linux/arm64") {
+		t.Error("an image is ready for a platform it was not stored for")
+	}
+	if ready("busybox:latest", "") {
+		t.Error("an image that is not stored is ready")
+	}
+	if got, err := store.ImageReady(context.Background(), "alpine:3.20", "", "always"); err != nil || got {
+		t.Errorf("ImageReady under the pull policy always=(%t, %v), want a pull", got, err)
 	}
 }
 

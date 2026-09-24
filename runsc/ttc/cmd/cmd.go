@@ -6958,11 +6958,18 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 	}
 	result.Deleted = digest
 	if len(users) == 0 {
-		if _, err := store.RemoveImageRoots(digest); err != nil {
+		// Removing the image's roots and packs takes time in proportion to
+		// its files; the image roots have a lock of their own.
+		if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "removing"}, func() error {
+			if _, err := store.RemoveImageRoots(digest); err != nil {
+				return err
+			}
+			if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: pruning shared image packs: %v\n", err)
+			}
+			return nil
+		}); err != nil {
 			return result, err
-		}
-		if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: pruning shared image packs: %v\n", err)
 		}
 	}
 	return result, nil
@@ -7087,12 +7094,35 @@ func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volu
 	return err
 }
 
+// prepareImageForFamily pulls the image a new family is created from, if its
+// pull policy asks for that, and unpacks its root on this node, without the
+// lifecycle lock: both take time in proportion to the image, and other
+// commands go on meanwhile. It returns the pull policy that preparing the
+// family should then apply.
+func (b *runtimeBackend) prepareImageForFamily(reference, pullPolicy string) (string, error) {
+	store := b.containerStore()
+	if ready, err := store.ImageReady(context.Background(), reference, "", pullPolicy); err != nil || ready {
+		return pullPolicy, err
+	}
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "pulling"}, func() error {
+		return store.PrepareImage(context.Background(), reference, "", pullPolicy, b.imageProgress())
+	}); err != nil {
+		return "", err
+	}
+	// The image is here now, and preparing the family must not pull it again.
+	return "missing", nil
+}
+
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	consoleSize, err := b.initialConsoleSize(request.terminal)
 	if err != nil {
 		return containerRunResult{}, err
 	}
 	store := b.containerStore()
+	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	if err != nil {
+		return containerRunResult{}, err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	persistedPorts := request.publishedPorts
 	if b.portIngress.Clustered() {
@@ -7136,7 +7166,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:               request.reference,
-		PullPolicy:              request.pullPolicy,
+		PullPolicy:              pullPolicy,
 		LogDriver:               request.logDriver,
 		LogOptions:              request.logOptions,
 		ConsoleLogMaxBytes:      request.consoleLogMaxBytes,
@@ -7232,6 +7262,10 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		return "", err
 	}
 	store := b.containerStore()
+	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	if err != nil {
+		return "", err
+	}
 	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	createdNodeID := b.nodeID
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
@@ -7270,7 +7304,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
-		PullPolicy:         request.pullPolicy,
+		PullPolicy:         pullPolicy,
 		LogDriver:          request.logDriver,
 		LogOptions:         request.logOptions,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
@@ -7420,6 +7454,17 @@ func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, 
 		return info, branch, nil
 	}
 	store := b.containerStore()
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	} else if !ready {
+		// Unpacking the image on a node that has not run it yet takes time
+		// in proportion to the image; other commands go on meanwhile.
+		if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "starting"}, func() error {
+			return store.PrepareContainerImageRoot(context.Background(), info.ID)
+		}); err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+		}
+	}
 	info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
@@ -12358,7 +12403,11 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	}
 	result := make([]Branch, 0, len(children))
 	for _, child := range children {
-		if err := b.rehydrateCold(child.target, info, child.branch, peer, sourceBranch); err != nil {
+		// Building the child from the durable image takes time in proportion
+		// to its memory; other commands go on meanwhile.
+		if err := b.withoutLifecycleLock(info, longOperation{branch: child.branch.ID, state: "rehydrating", shown: true}, func() error {
+			return b.rehydrateCold(child.target, info, child.branch, peer, sourceBranch)
+		}); err != nil {
 			return nil, fmt.Errorf("starting dehydrated fork child %s: %w", child.target, err)
 		}
 		peer = true
@@ -14715,12 +14764,19 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 		persistentBranch.State = "dehydrated"
 	}
+	// Rebuilding a branch from its durable image takes time in proportion to
+	// its memory; other commands go on meanwhile.
+	rehydrateCold := func(peer bool) error {
+		return b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "rehydrating", shown: true}, func() error {
+			return b.rehydrateCold(target, info, *persistentBranch, peer)
+		})
+	}
 	if persistentBranch.State == "dehydrated" {
 		if _, stateErr := b.command("state", info.ID); stateErr != nil {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
 			}
-			return b.rehydrateCold(target, info, *persistentBranch, false)
+			return rehydrateCold(false)
 		}
 		output, branchesErr := b.command("timetravel", info.ID, "branches")
 		if branchesErr != nil {
@@ -14742,7 +14798,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				return branchesErr
 			}
 			_, _ = b.command("delete", "--force", info.ID)
-			return b.rehydrateCold(target, info, *persistentBranch, false)
+			return rehydrateCold(false)
 		}
 		var runtimeBranches []runscBranchInfo
 		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
@@ -14759,7 +14815,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
 			}
-			return b.rehydrateCold(target, info, *persistentBranch, true)
+			return rehydrateCold(true)
 		}
 		// The durable record is authoritative across daemon crashes. Reconcile
 		// the process-free runtime record before it recreates the Kernel.
