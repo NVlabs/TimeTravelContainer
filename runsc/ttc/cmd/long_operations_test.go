@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -371,5 +372,38 @@ func TestNothingReadsAFamilyBeingRemoved(t *testing.T) {
 	}
 	if err := reader.refuseBusy("d"); err != nil {
 		t.Errorf("a reader of a family being dehydrated was refused: %v", err)
+	}
+}
+
+// A fork refused by a frozen authority handoff is run again once the handoff
+// is over, without the lifecycle lock meanwhile; any other failure is final.
+func TestForkWaitsOutAHandoff(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRoot(root) }, release: server.lockDataRoot(root)}
+	b := &runtimeBackend{lifecycleLockHeld: true, mutating: true}
+	server.configureLongOperations(b, hold)
+	defer hold.unlock()
+	info := ttcbundle.ContainerInfo{ID: "id", Name: "s"}
+	attempts := 0
+	output, _, err := b.forkThroughHandoffs(info, "main", func() ([]byte, func(bool) error, error) {
+		attempts++
+		if attempts < 3 {
+			if _, locked := server.tryLockDataRoot(root); locked {
+				t.Error("a fork attempt ran without the lifecycle lock")
+			}
+			return nil, nil, errors.New("publishing source metadata before fork: snapshot 79 references are frozen for authority handoff: snapshot ledger is frozen for authority handoff")
+		}
+		return []byte("forked"), func(bool) error { return nil }, nil
+	})
+	if err != nil || string(output) != "forked" || attempts != 3 {
+		t.Fatalf("forkThroughHandoffs=(%q,%v) after %d attempts, want forked after 3", output, err, attempts)
+	}
+	attempts = 0
+	if _, _, err := b.forkThroughHandoffs(info, "main", func() ([]byte, func(bool) error, error) {
+		attempts++
+		return nil, nil, errors.New("branch \"a1\" already exists")
+	}); err == nil || attempts != 1 {
+		t.Fatalf("an ordinary failure was retried: %d attempts, %v", attempts, err)
 	}
 }

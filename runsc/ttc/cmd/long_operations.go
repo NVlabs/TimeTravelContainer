@@ -391,6 +391,33 @@ func (b *runtimeBackend) lockFamilyLifecycle(id string) func() {
 	}
 }
 
+// forkHandoffWait bounds how long a fork waits out authority handoffs. A
+// handoff that must retry its publication stays frozen through the
+// publication queue's backoff, which grows to 256 seconds.
+const forkHandoffWait = 5 * time.Minute
+
+// forkThroughHandoffs runs fork, and while it is refused because a snapshot
+// the source shares is frozen for an authority handoff, waits without the
+// lifecycle lock and runs it again. A refused fork changes nothing, and the
+// publication that ends a handoff runs in its own worker.
+func (b *runtimeBackend) forkThroughHandoffs(info ttcbundle.ContainerInfo, branch string, fork func() ([]byte, func(bool) error, error)) ([]byte, func(bool) error, error) {
+	deadline := time.Now().Add(forkHandoffWait)
+	delay := 100 * time.Millisecond
+	for {
+		output, finish, err := fork()
+		if err == nil || !strings.Contains(err.Error(), "frozen for authority handoff") || time.Now().After(deadline) {
+			return output, finish, err
+		}
+		if err := b.withoutLifecycleLock(info, longOperation{branch: branch, state: "forking"}, func() error {
+			time.Sleep(delay)
+			return nil
+		}); err != nil {
+			return nil, nil, err
+		}
+		delay = min(2*delay, 2*time.Second)
+	}
+}
+
 // imageOperation is the stand-in family of a long image operation: no
 // command names it, but while it works maintenance waits.
 func (b *runtimeBackend) imageOperation() ttcbundle.ContainerInfo {

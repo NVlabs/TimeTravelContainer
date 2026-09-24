@@ -12044,27 +12044,34 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	}
 	args = append(args, source.container, "fork")
 	args = append(args, destinations...)
-	filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(containerInfo.ID, len(destinations))
+	fork := func() ([]byte, func(bool) error, error) {
+		filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(containerInfo.ID, len(destinations))
+		if err != nil {
+			return nil, nil, err
+		}
+		var output []byte
+		if len(filesystemOrigins) == 0 {
+			output, err = b.command(args...)
+		} else {
+			originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+			if pipeErr != nil {
+				return nil, nil, errors.Join(pipeErr, finishFilesystemOrigins(false))
+			}
+			withOrigins := append([]string{"timetravel", "--filesystem-origins-fd=3"}, args[1:]...)
+			output, err = b.commandWithFiles([]*os.File{originsReader}, withOrigins...)
+			closeErr := originsReader.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			return nil, nil, errors.Join(err, finishFilesystemOrigins(false))
+		}
+		return output, finishFilesystemOrigins, nil
+	}
+	output, finishFilesystemOrigins, err := b.forkThroughHandoffs(containerInfo, source.branch, fork)
 	if err != nil {
 		return nil, err
-	}
-	var output []byte
-	if len(filesystemOrigins) == 0 {
-		output, err = b.command(args...)
-	} else {
-		originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
-		if pipeErr != nil {
-			return nil, errors.Join(pipeErr, finishFilesystemOrigins(false))
-		}
-		args = append([]string{"timetravel", "--filesystem-origins-fd=3"}, args[1:]...)
-		output, err = b.commandWithFiles([]*os.File{originsReader}, args...)
-		closeErr := originsReader.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}
-	if err != nil {
-		return nil, errors.Join(err, finishFilesystemOrigins(false))
 	}
 	if err := finishFilesystemOrigins(true); err != nil {
 		return nil, err
