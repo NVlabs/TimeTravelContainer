@@ -7400,7 +7400,7 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return b.finishPreservedPeerStart(info, target, detach, interactive)
 	}
 	// Replacing the runtime would take every capture only its Sentry holds.
-	if err := b.persistResidentDehydrations(info); err != nil {
+	if err := b.persistResidentDehydrations(info, nil); err != nil {
 		return 1, err
 	}
 	// Waiting for the branch init process and tearing down its sandbox are
@@ -12024,7 +12024,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 		// A dehydrated branch is forked from its durable image, which a
 		// resident dehydration does not have yet.
 		if ttcbundle.ResidentDehydration(sourceRecord) {
-			if err := b.persistDehydration(source, containerInfo, sourceRecord); err != nil {
+			if err := b.persistDehydration(source, containerInfo, sourceRecord, nil); err != nil {
 				return nil, fmt.Errorf("making the dehydration of %s durable to fork it: %w", source, err)
 			}
 			if containerInfo, err = b.containerStore().LoadContainer(containerInfo.ID); err != nil {
@@ -13757,7 +13757,7 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 		}
 		// The last live branch is gone, and with the runtime would go every
 		// capture only its Sentry holds.
-		if err := b.persistResidentDehydrations(info); err != nil {
+		if err := b.persistResidentDehydrations(info, nil); err != nil {
 			return err
 		}
 		if _, err := b.command("delete", "--force", info.ID); err != nil {
@@ -14339,7 +14339,15 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 			return nil
 		}
 	}
-	if err := b.persistDehydration(target, info, persistentBranch); err != nil {
+	// The family's resident dehydrations below share pages with the image
+	// this one supersedes; see persistResidentDehydrations.
+	var superseded []func()
+	defer func() {
+		for _, release := range superseded {
+			release()
+		}
+	}()
+	if err := b.persistDehydration(target, info, persistentBranch, &superseded); err != nil {
 		return err
 	}
 	dehydrated = true
@@ -14350,7 +14358,7 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
 		if allCold && localBranches != 0 {
-			if err := b.persistResidentDehydrations(latest); err != nil {
+			if err := b.persistResidentDehydrations(latest, &superseded); err != nil {
 				return err
 			}
 			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
@@ -14394,7 +14402,24 @@ func (b *runtimeBackend) dehydrationMayStayResident(info ttcbundle.ContainerInfo
 // persistResidentDehydrations makes durable every resident dehydration of
 // info's family on this node. It must run while the family's Sentry is still
 // up, before anything deletes the runtime that holds those captures.
-func (b *runtimeBackend) persistResidentDehydrations(info ttcbundle.ContainerInfo) error {
+//
+// The images a branch's dehydration supersedes are released only once every
+// branch is durable, or, if superseded is not nil, appended to it for the
+// caller to release: a sibling forked from or rehydrated beside the branch
+// holds pages of those images, and the graph recognizes a page it holds only
+// while an image names it. Released as each branch was done, a family whose
+// first branch had rewritten much of its memory made its siblings send all of
+// those pages again.
+func (b *runtimeBackend) persistResidentDehydrations(info ttcbundle.ContainerInfo, superseded *[]func()) error {
+	if superseded == nil {
+		var releases []func()
+		defer func() {
+			for _, release := range releases {
+				release()
+			}
+		}()
+		superseded = &releases
+	}
 	for _, branch := range info.Branches {
 		if !ttcbundle.ResidentDehydration(branch) {
 			continue
@@ -14402,7 +14427,7 @@ func (b *runtimeBackend) persistResidentDehydrations(info ttcbundle.ContainerInf
 		if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
 			continue
 		}
-		if err := b.persistDehydration(selector{container: info.ID, branch: branch.ID}, info, branch); err != nil {
+		if err := b.persistDehydration(selector{container: info.ID, branch: branch.ID}, info, branch, superseded); err != nil {
 			return fmt.Errorf("making the dehydration of %s@%s durable: %w", info.Name, branch.ID, err)
 		}
 	}
@@ -14429,7 +14454,7 @@ func (b *runtimeBackend) persistResidentDehydration(target selector) error {
 	if !ttcbundle.ResidentDehydration(branch) {
 		return nil
 	}
-	return b.persistDehydration(resolved, info, branch)
+	return b.persistDehydration(resolved, info, branch, nil)
 }
 
 // persistDehydration makes a captured dehydration durable: it exports the
@@ -14437,7 +14462,10 @@ func (b *runtimeBackend) persistResidentDehydration(target selector) error {
 // state, records the roots, and publishes the branch as durably dehydrated.
 // The Sentry keeps the capture, so the branch can still be rehydrated from
 // memory, and a failed attempt can be repeated.
-func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.ContainerInfo, persistentBranch ttcbundle.BranchInfo) error {
+//
+// The roots the branch's new image supersedes are released at once, or, if
+// superseded is not nil, appended to it to be released later.
+func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.ContainerInfo, persistentBranch ttcbundle.BranchInfo, superseded *[]func()) error {
 	if b.dataRoot == "" {
 		return b.queueBranchPublication(target, "dehydrate")
 	}
@@ -14629,7 +14657,10 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 		return fmt.Errorf("recording durable dehydration of %s: %w", target, err)
 	}
 	persisted = true
-	if len(previousGraphMemoryRoots) != 0 {
+	release := func() {
+		if len(previousGraphMemoryRoots) == 0 {
+			return
+		}
 		if graphReferenceOperationForBranch(info, persistentBranch) == "" {
 			previousBranch := persistentBranch
 			previousBranch.MemoryRoots = previousGraphMemoryRoots
@@ -14650,6 +14681,11 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, persistentBranch)); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded distributed memory origins for %s: %v\n", target, err)
 		}
+	}
+	if superseded != nil {
+		*superseded = append(*superseded, release)
+	} else {
+		release()
 	}
 	activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
 	if removeErr := os.RemoveAll(activeDir); removeErr != nil {
