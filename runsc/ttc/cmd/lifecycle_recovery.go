@@ -61,6 +61,11 @@ func (b *runtimeBackend) reconcileInterruptedStandaloneLifecycles() (bool, error
 	}
 	complete := true
 	for _, container := range containers {
+		// A long operation's dehydration is in progress, not interrupted.
+		if _, busy := b.operations.lookup(container.ID); busy {
+			complete = false
+			continue
+		}
 		runtime, runtimePresent := runtimeByID[container.ID]
 		for _, branch := range container.Branches {
 			if normalizeLifecycleState(branch.State) != "dehydrating" {
@@ -137,6 +142,10 @@ func (b *runtimeBackend) reconcileInterruptedStandaloneLifecycles() (bool, error
 		return false, err
 	}
 	for _, container := range containers {
+		if _, busy := b.operations.lookup(container.ID); busy {
+			complete = false
+			continue
+		}
 		if err := b.deleteRuntimeIfProcessFree(container); err != nil {
 			return false, err
 		}

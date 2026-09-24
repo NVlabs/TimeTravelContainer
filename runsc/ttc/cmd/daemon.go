@@ -354,6 +354,10 @@ type daemonServer struct {
 	reconcileMu sync.Mutex
 	reconciled  map[string]bool
 
+	// operations records the families long operations are working on
+	// without the lifecycle lock.
+	operations familyOperations
+
 	mutationMu    sync.Mutex
 	mutationLocks map[string]*sync.Mutex
 	mutationCount atomic.Uint64
@@ -2470,10 +2474,12 @@ func (s *daemonServer) observeInitConsoleExit(target selector) {
 	if s == nil || s.dataRoot == "" {
 		return
 	}
-	unlock := s.lockDataRoot(s.dataRoot)
-	defer unlock()
 	backend := directBackend(s.optionsFromRequest(), strings.NewReader(""), io.Discard, s.stderr)
 	s.configureCommandBackend(backend)
+	// Releasing the family's last live branch makes its resident
+	// dehydrations durable, which gives the lifecycle lock up meanwhile.
+	unlock := backend.holdFamilyLifecycle(backend.familyID(target.container))
+	defer unlock()
 	changed, err := backend.finalizeObservedInitExit(target)
 	if err == nil && changed {
 		err = backend.reconcilePlacementCatalog()
@@ -2555,6 +2561,7 @@ func (s *daemonServer) configureVolumeBackend(backend *runtimeBackend) {
 	backend.sharedReferences = s.sharedReferences
 	backend.portIngress = s.portIngress
 	backend.lockLifecycle = func() func() { return s.lockDataRoot(backend.dataRoot) }
+	backend.operations = &s.operations
 }
 
 // configureCommandBackend installs every daemon-owned service needed by a
@@ -6019,7 +6026,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	}
 	go maintainRepositories(dataRoot, localRoot, server.root, server.runsc, publicationQueue, maintenanceTransactions, maintenanceAuthority, snapshotGraph, snapshotData, clusterRuntime == nil, stderr, maintenanceDone, func() func() {
 		return server.lockDataRoot(dataRoot)
-	})
+	}, server.operations.any)
 	clusterDone := make(chan struct{})
 	var elasticHeartbeatStopped <-chan struct{}
 	var localCacheCleanupStopped <-chan struct{}
@@ -6239,7 +6246,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			}
 			localCacheCleanupStopped = maintainOrphanLocalCacheCleanup(
 				clusterRuntime.raftCatalog, targetBackend, clusterRuntime.lease/4, stderr, clusterDone,
-				func() func() { return server.lockDataRoot(dataRoot) })
+				func() func() { return server.lockDataRootIdle(dataRoot) })
 			go func() {
 				select {
 				case err := <-heartbeatFatal:
@@ -6351,17 +6358,17 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
 		go maintainDistributedGraphReferences(targetBackend, stderr, clusterDone, func() func() {
-			return server.lockDataRoot(server.dataRoot)
+			return server.lockDataRootIdle(server.dataRoot)
 		})
 		if elasticRecord != nil {
 			go maintainElasticMigrationRecovery(targetBackend, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
-				unlock := server.lockDataRoot(server.dataRoot)
+				unlock := server.lockDataRootIdle(server.dataRoot)
 				defer unlock()
 				server.reconcile(targetBackend)
 				return run()
 			})
 			go maintainElasticDrain(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
-				unlock := server.lockDataRoot(server.dataRoot)
+				unlock := server.lockDataRootIdle(server.dataRoot)
 				defer unlock()
 				server.reconcile(targetBackend)
 				return run()
@@ -6375,7 +6382,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		}
 		if clusterRuntime.autoRebalance && elasticRecord != nil {
 			go maintainElasticRebalancer(targetBackend, elasticRecord.NodeID, clusterRuntime.lease, stderr, clusterDone, func(run func() error) error {
-				unlock := server.lockDataRoot(server.dataRoot)
+				unlock := server.lockDataRootIdle(server.dataRoot)
 				defer unlock()
 				return run()
 			})
@@ -6750,7 +6757,7 @@ func retireDaemonRaftMember(runtime *daemonClusterRuntime, nodeID, incarnation s
 	}
 }
 
-func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.RaftCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func()) {
+func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, publications *ttcstorage.Queue, transactions cluster.TransactionCatalog, authority *cluster.RaftCatalog, snapshotGraph *ttcsnapshot.Store, snapshotData *ttcsnapshot.LocalDataStore, standalone bool, stderr io.Writer, done <-chan struct{}, lock func() func(), busy func() bool) {
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	consumption := time.NewTicker(30 * time.Second)
@@ -6767,6 +6774,16 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 		unlock := func() {}
 		if lock != nil {
 			unlock = lock()
+		}
+		if busy != nil && busy() {
+			// A long operation is working without the lifecycle lock, and
+			// what this pass repairs - interrupted removals, unreachable
+			// data, construction pins - may be its work in progress.
+			unlock()
+			if full {
+				timer.Reset(time.Minute)
+			}
+			continue
 		}
 		if full {
 			store := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
@@ -7311,12 +7328,30 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		return
 	}
 	holdsLifecycleLock := daemonCommandNeedsMutationLock(request.Args) || daemonCommandReadsLifecycle(request.Args)
-	rawUnlock := s.lockMutation(opts.dataRoot, request.Args)
+	var rawUnlock func()
+	if daemonCommandListsInventory(request.Args) {
+		// A listing must not wait for a mutation that takes minutes, such
+		// as a durable dehydration. If one holds the lock, list without it:
+		// read the records and ask the runtimes, but leave reconciliation,
+		// and any repair it would make, to a command that holds the lock.
+		var locked bool
+		if rawUnlock, locked = s.tryLockDataRoot(opts.dataRoot); !locked {
+			holdsLifecycleLock = false
+			backend.inventoryReadOnly = true
+		}
+	} else {
+		rawUnlock = s.lockMutation(opts.dataRoot, request.Args)
+	}
 	backend.lifecycleLockHeld = holdsLifecycleLock
-	var unlockOnce sync.Once
-	unlock := func() { unlockOnce.Do(rawUnlock) }
+	backend.mutating = daemonCommandNeedsMutationLock(request.Args)
+	backend.commandName = daemonCommandName(request.Args)
+	hold := &lifecycleHold{acquire: func() func() { return s.lockDataRoot(opts.dataRoot) }, release: rawUnlock}
+	unlock := hold.unlock
 	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
 		backend.lifecycleReady = unlock
+	}
+	if !daemonCommandKeepsLifecycleLock(request.Args) {
+		s.configureLongOperations(backend, hold)
 	}
 	// A retry after a lost response must consult the durable result before
 	// mutable-state validation. The committed command may have removed its own
@@ -7343,7 +7378,15 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	// command: otherwise a read-only `ttc ps` can observe `runsc create` after
 	// its state file is published but before its control server is ready and
 	// mistake the in-progress runtime for stale state.
-	s.reconcile(backend)
+	if !backend.inventoryReadOnly {
+		s.reconcile(backend)
+	}
+	if operation, busy := s.operations.target(request.Args); busy {
+		unlock()
+		stdinReader.Close()
+		writeError(operation.refusal())
+		return
+	}
 	placements, placementErr := backend.placementCatalog()
 	if placementErr != nil && len(request.PlacementClaims) != 0 {
 		unlock()
@@ -7383,6 +7426,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
 		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
+		mutationBackend.mutating = backend.mutating
+		mutationBackend.commandName = backend.commandName
+		if !daemonCommandKeepsLifecycleLock(request.Args) {
+			s.configureLongOperations(mutationBackend, hold)
+		}
 		mutationBackend.consoleSidecars = s
 		mutationBackend.distributedSource = s.distributedSource
 		if s.clusterCapabilities != nil {
@@ -7499,6 +7547,26 @@ func daemonCommandNeedsMutationLock(args []string) bool {
 		return len(args) > 1 && (args[1] == "pull" || args[1] == "load" || args[1] == "save" || args[1] == "rm" || args[1] == "remove")
 	case "port":
 		return len(args) > 1 && (args[1] == "publish" || args[1] == "unpublish")
+	default:
+		return false
+	}
+}
+
+// daemonCommandListsInventory identifies the lifecycle readers that only list
+// and describe: they may run without the lifecycle lock, as long as they make
+// no repairs. `ps --size` is not one of them: sizing opens repositories.
+func daemonCommandListsInventory(args []string) bool {
+	if len(args) != 0 && args[0] == "container" {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "ls", "inspect", "top":
+		return true
+	case "ps":
+		return !daemonCommandBoolFlag(args[1:], 's', "--size")
 	default:
 		return false
 	}
@@ -7633,11 +7701,28 @@ func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
 }
 
 func (s *daemonServer) lockDataRoot(dataRoot string) func() {
+	lock := s.dataRootLock(dataRoot)
+	lock.Lock()
+	return lock.Unlock
+}
+
+// tryLockDataRoot is lockDataRoot for a caller that would rather go on
+// without the lock than wait for it.
+func (s *daemonServer) tryLockDataRoot(dataRoot string) (func(), bool) {
+	lock := s.dataRootLock(dataRoot)
+	if !lock.TryLock() {
+		return func() {}, false
+	}
+	return lock.Unlock, true
+}
+
+func (s *daemonServer) dataRootLock(dataRoot string) *sync.Mutex {
 	key := filepath.Clean(dataRoot)
 	if absolute, err := filepath.Abs(key); err == nil {
 		key = absolute
 	}
 	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
 	if s.mutationLocks == nil {
 		s.mutationLocks = make(map[string]*sync.Mutex)
 	}
@@ -7646,9 +7731,7 @@ func (s *daemonServer) lockDataRoot(dataRoot string) func() {
 		lock = &sync.Mutex{}
 		s.mutationLocks[key] = lock
 	}
-	s.mutationMu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	return lock
 }
 
 func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin bool, terminal *daemonTerminalInput) {
@@ -7721,10 +7804,18 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 	if s.reconciled[key] {
 		return
 	}
+	// A family a long operation is working on is left to it, and so are the
+	// node-wide repairs, which could take a runtime it is building, or an
+	// offline copy's helper, for a stale one; and the graph-wide repairs below,
+	// which take any construction pin they find for a crashed operation's.
+	// Reconcile again once it finishes.
+	busy := s.operations.any()
 	// A daemon may have died after branch ownership moved but before deleting
 	// its old physical shell. Reclaim only runtimes and branches this node no
 	// longer owns; shared metadata remains authoritative.
-	_ = backend.cleanupNonOwnedRuntimeBranches()
+	if !busy {
+		_ = backend.cleanupNonOwnedRuntimeBranches()
+	}
 	lifecycleReconciled, lifecycleErr := backend.reconcileInterruptedStandaloneLifecycles()
 	if lifecycleErr != nil && backend.stderr != nil {
 		fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling interrupted standalone lifecycle: %v\n", lifecycleErr)
@@ -7739,8 +7830,11 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 			fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling completed init exits: %v\n", err)
 		}
 	}
-	quarantineReconciled := lifecycleErr == nil && lifecycleReconciled
+	quarantineReconciled := lifecycleErr == nil && lifecycleReconciled && !busy
 	for _, family := range families {
+		if _, working := s.operations.lookup(family.ID); working {
+			continue
+		}
 		container, containerErr := backend.containerStore().LoadContainer(family.ID)
 		if containerErr != nil {
 			quarantineReconciled = false
@@ -7778,6 +7872,9 @@ func (s *daemonServer) reconcile(backend *runtimeBackend) {
 				}
 			}
 		}
+	}
+	if busy {
+		return
 	}
 	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
 		quarantineReconciled = false

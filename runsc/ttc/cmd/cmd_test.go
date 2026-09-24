@@ -3785,7 +3785,11 @@ func TestReadConsoleWaitStatus(t *testing.T) {
 	}
 }
 
-func TestFinalizeObservedInitExit(t *testing.T) {
+// observedInitExitFixture is a standalone family, demo, whose running branch's
+// init exited with status 7, as its console follower recorded, while nothing
+// has yet finalized the exit.
+func observedInitExitFixture(t *testing.T) (*runtimeBackend, ttcbundle.Store) {
+	t.Helper()
 	dataRoot := t.TempDir()
 	runsc := filepath.Join(t.TempDir(), "runsc")
 	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
@@ -3816,7 +3820,11 @@ func TestFinalizeObservedInitExit(t *testing.T) {
 	if err := os.WriteFile(paths.WaitStatus, []byte(strconv.FormatUint(uint64(7<<8), 10)+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	b := &runtimeBackend{root: filepath.Join(dataRoot, "runsc-root"), runsc: runsc, dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	return &runtimeBackend{root: filepath.Join(dataRoot, "runsc-root"), runsc: runsc, dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}, store
+}
+
+func TestFinalizeObservedInitExit(t *testing.T) {
+	b, store := observedInitExitFixture(t)
 	changed, err := b.finalizeObservedInitExit(selector{container: "demo", branch: defaultBranchID})
 	if err != nil {
 		t.Fatalf("finalizeObservedInitExit: %v", err)
@@ -3834,6 +3842,43 @@ func TestFinalizeObservedInitExit(t *testing.T) {
 	}
 	if branch.State != "exited" || info.ExitStatus == nil || *info.ExitStatus != 7 {
 		t.Fatalf("finalized metadata=%+v branch=%+v", info, branch)
+	}
+}
+
+// An exit in a family a long operation works on is left to the operation;
+// reconciliation finalizes it once the operation is over.
+func TestReconcileLeavesTheExitsOfABusyFamily(t *testing.T) {
+	b, store := observedInitExitFixture(t)
+	var operations familyOperations
+	op := &familyOperation{id: "demo", name: "demo", longOperation: longOperation{branch: defaultBranchID, state: "stopping"}}
+	if err := operations.begin(op); err != nil {
+		t.Fatal(err)
+	}
+	b.operations = &operations
+	state := func() string {
+		t.Helper()
+		info, err := store.LoadContainer("demo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		branch, err := persistentBranchInfo(info, defaultBranchID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return branch.State
+	}
+	if err := b.reconcileObservedInitExits(); err != nil {
+		t.Fatalf("reconcileObservedInitExits: %v", err)
+	}
+	if got := state(); got != "running" {
+		t.Fatalf("reconciliation finalized an exit in a busy family: branch state=%q", got)
+	}
+	operations.end(op)
+	if err := b.reconcileObservedInitExits(); err != nil {
+		t.Fatalf("reconcileObservedInitExits: %v", err)
+	}
+	if got := state(); got != "exited" {
+		t.Fatalf("branch state=%q once the family was idle, want exited", got)
 	}
 }
 
@@ -4779,9 +4824,16 @@ exit 2
 	}
 }
 
-func TestReconcileInterruptedStandaloneDehydrationRollsBackLiveCapture(t *testing.T) {
+// interruptedDehydrationFixture is a standalone family, web, whose branch main
+// is recorded as dehydrating while its Sentry holds a capture that was never
+// made durable: what ttcd leaves if it dies in the middle of a dehydration.
+// The fake runsc records a rehydration by creating runsc+".rehydrated" and a
+// runtime deletion by creating runsc+".deleted". images are the capture's
+// incomplete image directories.
+func interruptedDehydrationFixture(t *testing.T) (runsc, dataRoot string, images []string) {
+	t.Helper()
 	dir := t.TempDir()
-	runsc := filepath.Join(dir, "runsc")
+	runsc = filepath.Join(dir, "runsc")
 	script := `#!/bin/sh
 if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
 	echo "unexpected globals: $*" >&2
@@ -4824,7 +4876,7 @@ esac
 	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
-	dataRoot := filepath.Join(dir, "data")
+	dataRoot = filepath.Join(dir, "data")
 	containerDir := filepath.Join(dataRoot, "containers", "web")
 	bundleDir := filepath.Join(containerDir, "bundle")
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
@@ -4842,11 +4894,17 @@ esac
 	memoryRoot := filepath.Join(containerDir, "memory", "dehydrated")
 	key := ttcbundle.MemoryBranchKey(branch)
 	for _, name := range []string{key, "." + key + "-interrupted"} {
-		if err := os.MkdirAll(filepath.Join(memoryRoot, name), 0700); err != nil {
+		path := filepath.Join(memoryRoot, name)
+		if err := os.MkdirAll(path, 0700); err != nil {
 			t.Fatal(err)
 		}
+		images = append(images, path)
 	}
+	return runsc, dataRoot, images
+}
 
+func TestReconcileInterruptedStandaloneDehydrationRollsBackLiveCapture(t *testing.T) {
+	runsc, dataRoot, images := interruptedDehydrationFixture(t)
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
 	complete, err := b.reconcileInterruptedStandaloneLifecycles()
 	if err != nil {
@@ -4868,9 +4926,45 @@ esac
 	if got := stored.Branches[0].State; got != "running" {
 		t.Fatalf("persistent branch state=%q, want running", got)
 	}
-	for _, name := range []string{key, "." + key + "-interrupted"} {
-		if _, err := os.Stat(filepath.Join(memoryRoot, name)); !os.IsNotExist(err) {
-			t.Fatalf("interrupted dehydration path %q remains: %v", name, err)
+	for _, path := range images {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("interrupted dehydration path %q remains: %v", path, err)
+		}
+	}
+}
+
+// A dehydration a long operation is making durable looks, to reconciliation,
+// like one a crash interrupted. It is the operation's to finish, not
+// reconciliation's to roll back.
+func TestReconcileLeavesALongOperationsDehydrationAlone(t *testing.T) {
+	runsc, dataRoot, images := interruptedDehydrationFixture(t)
+	var operations familyOperations
+	if err := operations.begin(&familyOperation{id: "web", name: "web", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, operations: &operations}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if complete {
+		t.Error("reconciliation was reported complete while a long operation works on the family")
+	}
+	for _, mark := range []string{".rehydrated", ".deleted"} {
+		if _, err := os.Stat(runsc + mark); !os.IsNotExist(err) {
+			t.Errorf("reconciliation changed the runtime a long operation works on (%s): %v", mark, err)
+		}
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "dehydrating" {
+		t.Errorf("persistent branch state=%q, want dehydrating", got)
+	}
+	for _, path := range images {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("the capture's image %q was removed: %v", path, err)
 		}
 	}
 }
@@ -5067,6 +5161,51 @@ exit 2
 	}
 	if inspected.State.Status != "exited" || inspected.State.ExitCode != 139 {
 		t.Errorf("inspect after reconciliation = %+v, want exited with status 139", inspected.State)
+	}
+}
+
+// A listing that runs without the lifecycle lock repairs nothing: the runtime
+// it cannot find may be one that a long mutation is rebuilding.
+func TestListFamiliesWithoutTheLockRepairsNothing(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte(`#!/bin/sh
+if [ "$3" = "list" ]; then
+	echo '[]'
+	exit 0
+fi
+exit 2
+`), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", "demo", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "demo", "container.json"), ttcbundle.ContainerInfo{
+		Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abcd", BundleDir: bundleDir,
+		State: "running", CreatedAt: time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, inventoryReadOnly: true}
+	if _, err := b.listFamilies(); err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if info, err := store.LoadContainer("demo"); err != nil || info.State != "running" {
+		t.Fatalf("a listing without the lock changed the record: state %q, err %v", info.State, err)
+	}
+	b.inventoryReadOnly = false
+	if _, err := b.listFamilies(); err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if info, err := store.LoadContainer("demo"); err != nil || info.State != "exited" {
+		t.Fatalf("a listing with the lock did not reconcile the lost runtime: state %q, err %v", info.State, err)
 	}
 }
 

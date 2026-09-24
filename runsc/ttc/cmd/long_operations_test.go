@@ -1,0 +1,331 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+)
+
+// A long operation gives the lifecycle lock up while it works, so other
+// requests go on, and takes it back to finish. Meanwhile a request that would
+// change its family is refused, and it alone may change it.
+func TestLongOperationWorksWithoutTheLifecycleLock(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRoot(root) }, release: server.lockDataRoot(root)}
+	owner := &runtimeBackend{lifecycleLockHeld: true, mutating: true}
+	server.configureLongOperations(owner, hold)
+	other := &runtimeBackend{mutating: true, operations: &server.operations}
+	reader := &runtimeBackend{operations: &server.operations}
+	info := ttcbundle.ContainerInfo{ID: "0123abcd", Name: "big"}
+	worked := false
+	if err := owner.withoutLifecycleLock(info, longOperation{branch: "main", state: "dehydrating", shown: true}, func() error {
+		worked = true
+		unlock, locked := server.tryLockDataRoot(root)
+		if !locked {
+			t.Error("the lifecycle lock is held while the long operation works")
+		}
+		unlock()
+		if owner.lifecycleLockHeld {
+			t.Error("the owner believes it still holds the lifecycle lock")
+		}
+		if op, ok := server.operations.lookup("big"); !ok || op.state != "dehydrating" || op.branch != "main" {
+			t.Errorf("operation on big=(%+v,%t), want dehydrating big@main", op, ok)
+		}
+		if err := other.refuseBusy(info.ID); err == nil || !strings.Contains(err.Error(), "big@main is dehydrating") {
+			t.Errorf("another mutating request was not refused: %v", err)
+		}
+		if err := reader.refuseBusy(info.ID); err != nil {
+			t.Errorf("a reading request was refused: %v", err)
+		}
+		if err := owner.refuseBusy(info.ID); err != nil {
+			t.Errorf("the owner was refused its own family: %v", err)
+		}
+		if op, busy := server.operations.target([]string{"rm", "-f", "big"}); !busy || op.name != "big" {
+			t.Errorf("rm -f big was not recognized as a command on the busy family")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !worked {
+		t.Fatal("the long operation did not run")
+	}
+	if !owner.lifecycleLockHeld {
+		t.Error("the owner does not know it holds the lifecycle lock again")
+	}
+	if _, locked := server.tryLockDataRoot(root); locked {
+		t.Fatal("the long operation did not take the lifecycle lock back")
+	}
+	if server.operations.any() {
+		t.Error("the long operation is still recorded after it finished")
+	}
+	hold.unlock()
+	unlock, locked := server.tryLockDataRoot(root)
+	if !locked {
+		t.Fatal("the request's hold did not release the lifecycle lock")
+	}
+	unlock()
+}
+
+// Outside a request that holds the lifecycle lock, a long operation simply
+// runs.
+func TestLongOperationWithoutAHoldJustRuns(t *testing.T) {
+	b := &runtimeBackend{}
+	worked := false
+	if err := b.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "id", Name: "name"}, longOperation{state: "removing", shown: true}, func() error {
+		worked = true
+		return nil
+	}); err != nil || !worked {
+		t.Fatalf("withoutLifecycleLock=(%v), ran %t", err, worked)
+	}
+}
+
+func TestFamilyTargetsNameWhatAMutationWouldChange(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"rm", "-f", "big"}, []string{"big"}},
+		{[]string{"dehydrate", "big@main", "small"}, []string{"big", "small"}},
+		{[]string{"container", "stop", "-t", "3", "big@f1"}, []string{"3", "big"}},
+		{[]string{"cp", "/host/file", "big@main:/tmp/file"}, []string{"/host/file", "big"}},
+		{[]string{"fork", "big@main", "child"}, []string{"big", "child"}},
+		{[]string{"ps", "-a"}, nil},
+		{[]string{"run", "-d", "--name", "big", "alpine"}, nil},
+		{[]string{"exec", "big@main", "true"}, nil},
+	} {
+		if got := daemonCommandFamilyTargets(test.args); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("daemonCommandFamilyTargets(%q)=%q, want %q", test.args, got, test.want)
+		}
+	}
+}
+
+// A node's retirement or rebalance keeps the lifecycle lock through all its
+// branches' long operations, so that nothing slips in between them.
+func TestNodeCommandsKeepTheLifecycleLock(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		keep bool
+	}{
+		{[]string{"node", "stop", "--dehydrate-all", "n1"}, true},
+		{[]string{"node", "rebalance"}, true},
+		{[]string{"dehydrate", "big"}, false},
+		{[]string{"container", "rm", "-f", "big"}, false},
+	} {
+		if got := daemonCommandKeepsLifecycleLock(test.args); got != test.keep {
+			t.Errorf("daemonCommandKeepsLifecycleLock(%q)=%t, want %t", test.args, got, test.keep)
+		}
+	}
+}
+
+// Listings show a long operation's transient state for the branch it works
+// on, or for the whole family.
+func TestListingsShowLongOperations(t *testing.T) {
+	var operations familyOperations
+	if err := operations.begin(&familyOperation{id: "a", name: "alpha", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := operations.begin(&familyOperation{id: "b", name: "beta", longOperation: longOperation{state: "removing", shown: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := operations.begin(&familyOperation{id: "c", name: "gamma", longOperation: longOperation{branch: "main", state: "checkpointing", hidden: "checkpoint-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{operations: &operations}
+	families := []Family{
+		{ID: "a", State: "running", Branches: []Branch{{ID: "main", State: "dehydrated"}, {ID: "f1", State: "running"}}},
+		{ID: "b", State: "exited", Branches: []Branch{{ID: "main", State: "dehydrated"}, {ID: "f1", State: "exited"}}},
+		{ID: "c", State: "running", Branches: []Branch{{ID: "checkpoint-1", State: "paused"}, {ID: "main", State: "running"}}},
+	}
+	b.showLongOperations(families)
+	got := []string{families[0].Branches[0].State, families[0].Branches[1].State, families[0].State,
+		families[1].Branches[0].State, families[1].Branches[1].State, families[1].State, families[2].State}
+	want := []string{"dehydrating", "running", "running", "removing", "removing", "removing", "running"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("states %q, want %q", got, want)
+	}
+	if len(families[2].Branches) != 1 || families[2].Branches[0].ID != "main" {
+		t.Fatalf("a checkpoint's hidden branch is listed: %+v", families[2].Branches)
+	}
+}
+
+// Background lifecycle work on a family waits, without the lifecycle lock,
+// for a long operation working on it to finish.
+func TestBackgroundWorkWaitsForALongOperation(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	op := &familyOperation{id: "fam", name: "fam", longOperation: longOperation{state: "removing", shown: true}}
+	if err := server.operations.begin(op); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{operations: &server.operations, lockLifecycle: func() func() { return server.lockDataRoot(root) }}
+	locked := make(chan func(), 1)
+	go func() { locked <- b.lockFamilyLifecycle("fam") }()
+	select {
+	case <-locked:
+		t.Fatal("background work on a busy family took the lifecycle lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if unlock, free := server.tryLockDataRoot(root); !free {
+		t.Fatal("background work waiting for a busy family holds the lifecycle lock")
+	} else {
+		unlock()
+	}
+	server.operations.end(op)
+	select {
+	case unlock := <-locked:
+		unlock()
+	case <-time.After(5 * time.Second):
+		t.Fatal("background work did not go on once the long operation finished")
+	}
+}
+
+// Background work on a family holds the lifecycle lock so that its long
+// operations can give it up, as a request's can.
+func TestBackgroundWorkCanGiveUpTheLifecycleLock(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	b := &runtimeBackend{operations: &server.operations, lockLifecycle: func() func() { return server.lockDataRoot(root) }}
+	end := b.holdFamilyLifecycle("fam")
+	if _, locked := server.tryLockDataRoot(root); locked {
+		t.Fatal("holdFamilyLifecycle did not take the lifecycle lock")
+	}
+	if err := b.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "fam", Name: "fam"}, longOperation{state: "dehydrating", shown: true}, func() error {
+		unlock, locked := server.tryLockDataRoot(root)
+		if !locked {
+			t.Error("the lifecycle lock is held while background work's long operation works")
+		} else {
+			unlock()
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, locked := server.tryLockDataRoot(root); locked {
+		t.Fatal("the long operation did not take the lifecycle lock back")
+	}
+	end()
+	unlock, locked := server.tryLockDataRoot(root)
+	if !locked {
+		t.Fatal("ending the hold did not release the lifecycle lock")
+	}
+	unlock()
+	if b.lifecycleLockHeld || b.suspendLifecycle != nil {
+		t.Error("ending the hold did not restore the backend")
+	}
+}
+
+// Background work across families waits, without the lifecycle lock, until no
+// long operation is in progress.
+func TestBackgroundWorkAcrossFamiliesWaitsForEveryLongOperation(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	ops := []*familyOperation{
+		{id: "a", name: "a", longOperation: longOperation{state: "removing", shown: true}},
+		{id: "b", name: "b", longOperation: longOperation{branch: "main", state: "stopping"}},
+	}
+	for _, op := range ops {
+		if err := server.operations.begin(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked := make(chan func(), 1)
+	go func() { locked <- server.lockDataRootIdle(root) }()
+	for _, op := range ops {
+		select {
+		case <-locked:
+			t.Fatal("background work took the lifecycle lock while a long operation works")
+		case <-time.After(100 * time.Millisecond):
+		}
+		if unlock, free := server.tryLockDataRoot(root); !free {
+			t.Fatal("background work waiting for long operations holds the lifecycle lock")
+		} else {
+			unlock()
+		}
+		server.operations.end(op)
+	}
+	select {
+	case unlock := <-locked:
+		unlock()
+	case <-time.After(5 * time.Second):
+		t.Fatal("background work did not go on once every long operation finished")
+	}
+}
+
+// A branch being stopped may be killed, as a kill during `docker stop` ends
+// the grace period; nothing else goes through, and nothing goes through any
+// other long operation.
+func TestOnlyAKillGoesThroughAStop(t *testing.T) {
+	var operations familyOperations
+	stopping := &familyOperation{id: "s", name: "stopping", longOperation: longOperation{branch: "main", state: "stopping"}}
+	dehydrating := &familyOperation{id: "d", name: "dehydrating", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}
+	for _, op := range []*familyOperation{stopping, dehydrating} {
+		if err := operations.begin(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		args []string
+		busy bool
+	}{
+		{[]string{"kill", "stopping@main"}, false},
+		{[]string{"container", "kill", "--signal", "KILL", "stopping@main"}, false},
+		{[]string{"rm", "-f", "stopping"}, true},
+		{[]string{"stop", "stopping@main"}, true},
+		{[]string{"kill", "dehydrating@main"}, true},
+	} {
+		if _, busy := operations.target(test.args); busy != test.busy {
+			t.Errorf("target(%q) busy=%t, want %t", test.args, busy, test.busy)
+		}
+	}
+	killer := &runtimeBackend{mutating: true, commandName: "kill", operations: &operations}
+	if err := killer.refuseBusy("s"); err != nil {
+		t.Errorf("a kill of a stopping branch was refused: %v", err)
+	}
+	if err := killer.refuseBusy("d"); err == nil {
+		t.Error("a kill of a dehydrating branch was not refused")
+	}
+	remover := &runtimeBackend{mutating: true, commandName: "rm", operations: &operations}
+	if err := remover.refuseBusy("s"); err == nil || !strings.Contains(err.Error(), "stopping@main is stopping") {
+		t.Errorf("rm of a stopping family was not refused: %v", err)
+	}
+}
+
+// A family being removed is refused to every other request, reading ones too:
+// its storage is going.
+func TestNothingReadsAFamilyBeingRemoved(t *testing.T) {
+	var operations familyOperations
+	for _, op := range []*familyOperation{
+		{id: "r", name: "removing", longOperation: longOperation{state: "removing", shown: true}},
+		{id: "d", name: "dehydrating", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}},
+	} {
+		if err := operations.begin(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := &runtimeBackend{commandName: "diff", operations: &operations}
+	if err := reader.refuseBusy("r"); err == nil || !strings.Contains(err.Error(), "removing is removing") {
+		t.Errorf("a reader of a family being removed was not refused: %v", err)
+	}
+	if err := reader.refuseBusy("d"); err != nil {
+		t.Errorf("a reader of a family being dehydrated was refused: %v", err)
+	}
+}

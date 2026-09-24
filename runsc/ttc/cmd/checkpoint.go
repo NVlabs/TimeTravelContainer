@@ -31,6 +31,8 @@ import (
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	ttccheckpoint "gvisor.dev/gvisor/runsc/ttc/checkpoint"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 type checkpointRequest struct {
@@ -286,70 +288,17 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	if err := os.Mkdir(stateDir, 0700); err != nil {
 		return err
 	}
-	if _, err := b.command(
-		"timetravel",
-		"--image-path", stateDir,
-		"--compression", request.compression,
-		info.ID, "checkpoint", hiddenBranch,
-	); err != nil {
-		return fmt.Errorf("saving checkpoint state: %w", err)
-	}
-
-	repositories, err := specutils.TTCVolumeRepositories(spec)
-	if err != nil {
-		return err
-	}
-	manager, err := b.volumeManager()
-	if err != nil {
-		return err
-	}
-	persistentBranch := hiddenInfo.FilesystemBranch
-	manifestRepositories := make([]ttccheckpoint.RepositorySnapshot, 0, len(repositories))
-	var opened []*ttcvolume.Repository
-	defer func() {
-		for _, repository := range opened {
-			if err := repository.Close(); err != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("closing checkpoint repository: %w", err))
-			}
-		}
-	}()
-	for index, config := range repositories {
-		repository, err := manager.OpenPrivate(config.Path)
-		if err != nil {
-			return fmt.Errorf("opening checkpoint repository %q: %w", config.Source, err)
-		}
-		opened = append(opened, repository)
-		relative := filepath.Join("repositories", strconv.Itoa(index))
-		if _, err := repository.ExportSnapshot(persistentBranch, filepath.Join(stage, relative)); err != nil {
-			return fmt.Errorf("exporting checkpoint repository %q: %w", config.Source, err)
-		}
-		manifestRepositories = append(manifestRepositories, ttccheckpoint.RepositorySnapshot{
-			Source: config.Source,
-			Path:   relative,
-		})
-	}
-
+	var manifestRepositories []ttccheckpoint.RepositorySnapshot
 	var hostMounts []ttccheckpoint.HostMountSnapshot
-	for index, mount := range spec.Mounts {
-		if mount.Type != "bind" {
-			continue
-		}
-		sourceInfo, err := os.Stat(mount.Source)
-		if err != nil {
-			return fmt.Errorf("stating checkpoint host mount %q: %w", mount.Source, err)
-		}
-		if !sourceInfo.Mode().IsRegular() && !sourceInfo.IsDir() {
-			return fmt.Errorf("checkpoint requires bind mount %q at %q to resolve to a regular file or directory", mount.Source, mount.Destination)
-		}
-		relative := filepath.Join("host-mounts", strconv.Itoa(index))
-		if err := copyCheckpointHostPath(mount.Source, filepath.Join(stage, relative)); err != nil {
-			return fmt.Errorf("capturing host mount %q: %w", mount.Source, err)
-		}
-		hostMounts = append(hostMounts, ttccheckpoint.HostMountSnapshot{
-			MountIndex: index,
-			Source:     mount.Source,
-			Path:       relative,
-		})
+	// Saving the branch's memory and exporting its files take time in
+	// proportion to them; other commands go on meanwhile, while the source,
+	// which keeps its state, is left as it is.
+	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "checkpointing", hidden: hiddenBranch}, func() error {
+		var err error
+		manifestRepositories, hostMounts, err = b.saveCheckpointState(info, spec, request.compression, hiddenBranch, hiddenInfo.FilesystemBranch, stage, stateDir)
+		return err
+	}); err != nil {
+		return err
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy-reclaim", hiddenBranch); err != nil {
 		return fmt.Errorf("destroying checkpoint snapshot branch: %w", err)
@@ -371,24 +320,95 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	}); err != nil {
 		return err
 	}
-	destination := request.destination
-	stream := destination == "-"
-	if stream {
-		destination = stage + ".ttc"
-		defer os.Remove(destination)
-	}
-	if err := ttccheckpoint.Pack(stage, destination); err != nil {
-		return err
-	}
-	if stream {
-		archive, err := os.Open(destination)
-		if err != nil {
+	// Packing, like saving, takes time in proportion to the checkpoint.
+	return b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "checkpointing"}, func() error {
+		destination := request.destination
+		stream := destination == "-"
+		if stream {
+			destination = stage + ".ttc"
+			defer os.Remove(destination)
+		}
+		if err := ttccheckpoint.Pack(stage, destination); err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(output, archive)
-		return errors.Join(copyErr, archive.Close())
+		if stream {
+			archive, err := os.Open(destination)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(output, archive)
+			return errors.Join(copyErr, archive.Close())
+		}
+		return nil
+	})
+}
+
+// saveCheckpointState saves the hidden checkpoint branch's kernel state and
+// memory in stateDir, and its repositories and host mounts in stage.
+func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec *specs.Spec, compression, hiddenBranch, persistentBranch, stage, stateDir string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
+	if _, err := b.command(
+		"timetravel",
+		"--image-path", stateDir,
+		"--compression", compression,
+		info.ID, "checkpoint", hiddenBranch,
+	); err != nil {
+		return nil, nil, fmt.Errorf("saving checkpoint state: %w", err)
 	}
-	return nil
+
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	manager, err := b.volumeManager()
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestRepositories = make([]ttccheckpoint.RepositorySnapshot, 0, len(repositories))
+	var opened []*ttcvolume.Repository
+	defer func() {
+		for _, repository := range opened {
+			if err := repository.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing checkpoint repository: %w", err))
+			}
+		}
+	}()
+	for index, config := range repositories {
+		repository, err := manager.OpenPrivate(config.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("opening checkpoint repository %q: %w", config.Source, err)
+		}
+		opened = append(opened, repository)
+		relative := filepath.Join("repositories", strconv.Itoa(index))
+		if _, err := repository.ExportSnapshot(persistentBranch, filepath.Join(stage, relative)); err != nil {
+			return nil, nil, fmt.Errorf("exporting checkpoint repository %q: %w", config.Source, err)
+		}
+		manifestRepositories = append(manifestRepositories, ttccheckpoint.RepositorySnapshot{
+			Source: config.Source,
+			Path:   relative,
+		})
+	}
+	for index, mount := range spec.Mounts {
+		if mount.Type != "bind" {
+			continue
+		}
+		sourceInfo, err := os.Stat(mount.Source)
+		if err != nil {
+			return nil, nil, fmt.Errorf("stating checkpoint host mount %q: %w", mount.Source, err)
+		}
+		if !sourceInfo.Mode().IsRegular() && !sourceInfo.IsDir() {
+			return nil, nil, fmt.Errorf("checkpoint requires bind mount %q at %q to resolve to a regular file or directory", mount.Source, mount.Destination)
+		}
+		relative := filepath.Join("host-mounts", strconv.Itoa(index))
+		if err := copyCheckpointHostPath(mount.Source, filepath.Join(stage, relative)); err != nil {
+			return nil, nil, fmt.Errorf("capturing host mount %q: %w", mount.Source, err)
+		}
+		hostMounts = append(hostMounts, ttccheckpoint.HostMountSnapshot{
+			MountIndex: index,
+			Source:     mount.Source,
+			Path:       relative,
+		})
+	}
+	return manifestRepositories, hostMounts, nil
 }
 
 func copyCheckpointHostPath(source, destination string) error {
@@ -496,22 +516,27 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		return "", err
 	}
 	defer os.RemoveAll(stageBase)
-	if source == "-" {
-		if b.stdin == nil {
-			return "", errors.New("checkpoint restore from '-' requires standard input")
-		}
-		source = filepath.Join(stageBase, "input.ttc")
-		archive, err := os.OpenFile(source, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			return "", err
-		}
-		_, copyErr := io.Copy(archive, b.stdin)
-		if err := errors.Join(copyErr, archive.Close()); err != nil {
-			return "", fmt.Errorf("receiving checkpoint archive: %w", err)
-		}
-	}
 	stage := filepath.Join(stageBase, "checkpoint")
-	if err := ttccheckpoint.Unpack(source, stage); err != nil {
+	// Receiving and unpacking the archive take time in proportion to it,
+	// before there is a family to protect: other commands go on meanwhile,
+	// and one that names the family to be is refused.
+	if err := b.withoutLifecycleLock(ttcbundle.ContainerInfo{ID: "restore:" + stageBase, Name: name}, longOperation{state: "restoring", shown: true}, func() error {
+		if source == "-" {
+			if b.stdin == nil {
+				return errors.New("checkpoint restore from '-' requires standard input")
+			}
+			source = filepath.Join(stageBase, "input.ttc")
+			archive, err := os.OpenFile(source, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(archive, b.stdin)
+			if err := errors.Join(copyErr, archive.Close()); err != nil {
+				return fmt.Errorf("receiving checkpoint archive: %w", err)
+			}
+		}
+		return ttccheckpoint.Unpack(source, stage)
+	}); err != nil {
 		return "", err
 	}
 	manifest, err := ttccheckpoint.ReadManifest(stage)
@@ -574,14 +599,21 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 		prepared.Container.NetworkIP,
 		prepared.Container.NetworkMAC,
 	)
-	status, err := b.runConfiguredCommandWithArgs(
-		configured,
-		"restore",
-		"--bundle", prepared.BundleDir,
-		"--image-path", filepath.Join(stage, "state"),
-		"--detach",
-		id,
-	)
+	var status int
+	// Loading the memory takes time in proportion to it.
+	if suspendErr := b.withoutLifecycleLock(prepared.Container, longOperation{state: "restoring", shown: true}, func() error {
+		status, err = b.runConfiguredCommandWithArgs(
+			configured,
+			"restore",
+			"--bundle", prepared.BundleDir,
+			"--image-path", filepath.Join(stage, "state"),
+			"--detach",
+			id,
+		)
+		return nil
+	}); suspendErr != nil {
+		return "", suspendErr
+	}
 	if err != nil || status != 0 {
 		if err == nil {
 			err = fmt.Errorf("runsc restore exited with status %d", status)

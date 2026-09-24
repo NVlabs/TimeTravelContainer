@@ -1650,6 +1650,33 @@ func TestDaemonLifecycleReadsDoNotEnterMutationJournal(t *testing.T) {
 	}
 }
 
+// Listings may run without the lifecycle lock, rather than wait for a long
+// mutation to release it; sizing, and anything that mutates, may not.
+func TestDaemonInventoryListingsMayRunWithoutTheLock(t *testing.T) {
+	for _, args := range [][]string{{"ps", "-a"}, {"ls", "--json"}, {"inspect", "demo"}, {"top", "demo@main"}, {"container", "ls"}} {
+		if !daemonCommandListsInventory(args) {
+			t.Errorf("%v must be able to list without the lifecycle lock", args)
+		}
+	}
+	for _, args := range [][]string{{"ps", "--size"}, {"ps", "-as"}, {"stats", "demo@main"}, {"diff", "demo@main"}, {"rm", "demo"}, {"dehydrate", "demo"}} {
+		if daemonCommandListsInventory(args) {
+			t.Errorf("%v must not run without the lifecycle lock", args)
+		}
+	}
+	server := &daemonServer{}
+	root := t.TempDir()
+	unlock := server.lockDataRoot(root)
+	if _, locked := server.tryLockDataRoot(root); locked {
+		t.Fatal("tryLockDataRoot took a held lock")
+	}
+	unlock()
+	unlock, locked := server.tryLockDataRoot(root)
+	if !locked {
+		t.Fatal("tryLockDataRoot did not take a free lock")
+	}
+	unlock()
+}
+
 func TestDaemonStdinLeaseRejectsAndTakesOver(t *testing.T) {
 	server := &daemonServer{}
 	cancelOld := make(chan struct{})

@@ -3435,6 +3435,13 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 				// time. The marker makes this an unpublished record, not corruption.
 				continue
 			}
+			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+				// Removed since the directory was read: removal renames the
+				// record away before anything else, so nothing it held is
+				// reachable from it. A family is removed while other commands
+				// run, and a strict listing must not fail for it.
+				continue
+			}
 			if tolerateUnreadable {
 				key := filepath.Join(containersDir, entry.Name())
 				if _, loaded := warnedUnreadableContainers.LoadOrStore(key, struct{}{}); !loaded {

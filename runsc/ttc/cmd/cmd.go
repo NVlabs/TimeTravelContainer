@@ -4801,7 +4801,11 @@ func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSecond
 			}
 			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
 		}
-		if err := stopBranch(target.selector, stopSignal, timeoutSeconds, backend); err != nil {
+		// The grace period lasts as long as the stop policy allows, and
+		// other commands go on meanwhile; a kill of this branch too.
+		if err := withoutLifecycleLock(backend, target.selector, longOperation{branch: target.selector.branch, state: "stopping"}, func() error {
+			return stopBranch(target.selector, stopSignal, timeoutSeconds, backend)
+		}); err != nil {
 			// The final physical branch on an elastic node tears down its control
 			// socket as the init exits. If reconciliation confirms the requested
 			// terminal state, treat the lost wait reply as a committed stop.
@@ -6108,7 +6112,22 @@ type runtimeBackend struct {
 	// lifecycleReady releases the daemon lifecycle lock after an attached
 	// run/start has finished creating its runtime but before it waits for the
 	// guest. Detached commands release the lock when the command returns.
-	lifecycleReady   func()
+	lifecycleReady func()
+	// inventoryReadOnly is set for a listing that runs without the lifecycle
+	// lock because a long mutation holds it. It lists what it finds and
+	// repairs nothing: a runtime missing now may be one that mutation is
+	// rebuilding.
+	inventoryReadOnly bool
+	// mutating is set for a daemon request that changes lifecycle state; it
+	// is refused a family another request's long operation works on.
+	// commandName is the request's command.
+	mutating    bool
+	commandName string
+	// operations records the long operations in progress, and
+	// suspendLifecycle lets this request's long operation give up the
+	// lifecycle lock; see withoutLifecycleLock.
+	operations       *familyOperations
+	suspendLifecycle func(*familyOperation) (func(), error)
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
@@ -6499,6 +6518,9 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	}
+	if err := b.refuseBusy(info.ID); err != nil {
+		return selector{}, ttcbundle.ContainerInfo{}, err
+	}
 	if b.nodeID != "" {
 		var publicationID string
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
@@ -6779,12 +6801,22 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			exportDone <- err
 		}()
 	}
-	result, commitErr := ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
-		Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader,
-		Author: options.Author, Message: options.Message, Changes: options.Changes,
-	})
-	_ = reader.Close()
-	exportErr := <-exportDone
+	var commitErr, exportErr error
+	// Writing the layer takes time in proportion to the files; other
+	// commands go on meanwhile, and the image store has its own lock.
+	if err := b.withoutLifecycleLock(info, longOperation{branch: resolved.branch, state: "committing"}, func() error {
+		result, commitErr = ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
+			Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader,
+			Author: options.Author, Message: options.Message, Changes: options.Changes,
+		})
+		_ = reader.Close()
+		exportErr = <-exportDone
+		return nil
+	}); err != nil {
+		_ = reader.Close()
+		<-exportDone
+		return ttcimages.Info{}, err
+	}
 	if commitErr != nil || exportErr != nil {
 		return ttcimages.Info{}, errors.Join(commitErr, exportErr)
 	}
@@ -9502,6 +9534,9 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err != nil {
 		return err
 	}
+	if err := b.refuseBusy(info.ID); err != nil {
+		return err
+	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, ""); err != nil {
 		return fmt.Errorf("settling remote branches before removing %q: %w", name, err)
 	}
@@ -9601,10 +9636,15 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	// Resolve shared-ledger references while Raft still identifies local
 	// provider origins. Local collection may abandon an empty volatile origin;
 	// after that absence deliberately means "read from shared" to consumers.
-	if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
-		return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
-	}
-	if err := store.RemoveContainer(runtimeID); err != nil {
+	// Both steps take time in proportion to the family's memory and storage,
+	// and the family has no runtime left to change, so other commands go on
+	// meanwhile.
+	if err := b.withoutLifecycleLock(info, longOperation{state: "removing", shown: true}, func() error {
+		if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
+			return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
+		}
+		return store.RemoveContainer(runtimeID)
+	}); err != nil {
 		return err
 	}
 	if err := b.removeContainerPlacements(info); err != nil {
@@ -10794,17 +10834,26 @@ func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcima
 		progressFunc = b.imageProgress()
 	}
 	ctx := context.Background()
-	info, err := ttcimages.Pull(ctx, ttcimages.PullOptions{
-		Root:      b.dataRoot,
-		Reference: reference,
-		Platform:  platform,
-		Progress:  progressFunc,
-	})
-	if err != nil {
+	var info ttcimages.Info
+	// Downloading and unpacking take time in proportion to the image; the
+	// image store and its roots have locks of their own.
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "pulling"}, func() error {
+		var err error
+		info, err = ttcimages.Pull(ctx, ttcimages.PullOptions{
+			Root:      b.dataRoot,
+			Reference: reference,
+			Platform:  platform,
+			Progress:  progressFunc,
+		})
+		if err != nil {
+			return err
+		}
+		if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
+			return fmt.Errorf("preparing pulled image root: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return ttcimages.Info{}, err
-	}
-	if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
-		return ttcimages.Info{}, fmt.Errorf("preparing pulled image root: %w", err)
 	}
 	if _, err := b.containerStore().PruneImageRoots(ctx); err != nil {
 		return ttcimages.Info{}, fmt.Errorf("pruning superseded image roots: %w", err)
@@ -10820,12 +10869,7 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 		return nil, errors.New("no image archive on standard input")
 	}
 	ctx := context.Background()
-	imported, err := ttcimages.Load(ctx, ttcimages.LoadOptions{
-		Root: b.dataRoot, Archive: archive, Platform: platform,
-	})
-	if err != nil {
-		return nil, err
-	}
+	var imported []ttcimages.ImportedImage
 	published := false
 	defer func() {
 		if !published {
@@ -10833,12 +10877,25 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 			_, _ = b.containerStore().PruneImageRoots(context.Background())
 		}
 	}()
-	infos := make([]ttcimages.Info, 0, len(imported))
-	for _, image := range imported {
-		if _, _, err := b.containerStore().EnsureImportedImageRoot(ctx, image, image.Info.Platform, nil); err != nil {
-			return nil, fmt.Errorf("preparing loaded image %q root: %w", image.Info.Reference, err)
+	infos := make([]ttcimages.Info, 0)
+	// Importing and unpacking take time in proportion to the archive.
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "loading"}, func() error {
+		var err error
+		imported, err = ttcimages.Load(ctx, ttcimages.LoadOptions{
+			Root: b.dataRoot, Archive: archive, Platform: platform,
+		})
+		if err != nil {
+			return err
 		}
-		infos = append(infos, image.Info)
+		for _, image := range imported {
+			if _, _, err := b.containerStore().EnsureImportedImageRoot(ctx, image, image.Info.Platform, nil); err != nil {
+				return fmt.Errorf("preparing loaded image %q root: %w", image.Info.Reference, err)
+			}
+			infos = append(infos, image.Info)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if err := ttcimages.PublishLoaded(ctx, b.dataRoot, imported); err != nil {
 		return nil, fmt.Errorf("publishing loaded images: %w", err)
@@ -10854,8 +10911,11 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 }
 
 func (b *runtimeBackend) saveImages(archive io.Writer, identifiers []string, platform string) error {
-	return ttcimages.Save(context.Background(), ttcimages.SaveOptions{
-		Root: b.dataRoot, Archive: archive, Images: identifiers, Platform: platform,
+	// Exporting takes time in proportion to the images.
+	return b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "saving"}, func() error {
+		return ttcimages.Save(context.Background(), ttcimages.SaveOptions{
+			Root: b.dataRoot, Archive: archive, Images: identifiers, Platform: platform,
+		})
 	})
 }
 
@@ -11137,7 +11197,10 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			// interval after a foreground init exits but before its waiter records
 			// the result: persistent state is still "created" in both cases.
 			// Inventory must not force-delete runtime metadata in either window.
-			if !persistentFamilyRequiredRuntime(container, b.nodeID) {
+			if !persistentFamilyRequiredRuntime(container, b.nodeID) || b.inventoryReadOnly {
+				continue
+			}
+			if _, busy := b.operations.lookup(container.ID); busy {
 				continue
 			}
 			var exitStatus *int
@@ -11227,6 +11290,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		}
 		return families[i].ID < families[j].ID
 	})
+	b.showLongOperations(families)
 	return families, nil
 }
 
@@ -11801,7 +11865,7 @@ func familyStateFromBranches(branches []Branch) string {
 	priority := map[string]int{
 		"exited": 1, "failed": 2, "dead": 2, "dehydrated": 3, "created": 4,
 		"paused": 5, "dehydrating": 6, "rehydrating": 7, "creating": 8,
-		"restarting": 9, "running": 10,
+		"restarting": 9, "running": 10, "removing": 11,
 	}
 	state, best := "exited", 0
 	for _, branch := range branches {
@@ -14244,7 +14308,7 @@ func (b *runtimeBackend) persistResidentDehydration(target selector) error {
 	// Exporting a capture must not race a lifecycle command consuming it.
 	unlock := func() {}
 	if !b.lifecycleLockHeld {
-		unlock = b.lockBackgroundLifecycle()
+		unlock = b.holdFamilyLifecycle(b.familyID(target.container))
 	}
 	defer unlock()
 	resolved, info, err := b.resolveSelector(target)
@@ -14365,14 +14429,26 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 		err    error
 	}
 	imported := make(chan graphImportOutcome, 1)
-	go func() {
-		result, importErr := b.importGraphCapture(reader, origin, prefix)
+	var output []byte
+	var exportErr error
+	var outcome graphImportOutcome
+	// Streaming the branch's memory into the graph takes time in
+	// proportion to it; other commands go on meanwhile.
+	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
+		go func() {
+			result, importErr := b.importGraphCapture(reader, origin, prefix)
+			_ = reader.Close()
+			imported <- graphImportOutcome{result: result, err: importErr}
+		}()
+		output, exportErr = b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
+		_ = writer.Close()
+		outcome = <-imported
+		return nil
+	}); err != nil {
+		_ = writer.Close()
 		_ = reader.Close()
-		imported <- graphImportOutcome{result: result, err: importErr}
-	}()
-	output, exportErr := b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
-	_ = writer.Close()
-	outcome := <-imported
+		return err
+	}
 	if exportErr != nil {
 		return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
 	}
@@ -16197,7 +16273,7 @@ func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) 
 	// one of them should seal and publish the process-free branch.
 	unlock := func() {}
 	if !b.lifecycleLockHeld {
-		unlock = b.lockBackgroundLifecycle()
+		unlock = b.holdFamilyLifecycle(b.familyID(target.container))
 	}
 	defer unlock()
 	info, err := b.containerStore().LoadContainer(target.container)
@@ -16303,6 +16379,10 @@ func (b *runtimeBackend) reconcileObservedInitExits() error {
 	}
 	var result error
 	for _, info := range containers {
+		// A long operation working on the family finishes what it changes.
+		if _, busy := b.operations.lookup(info.ID); busy {
+			continue
+		}
 		for _, branch := range info.Branches {
 			// Recovery is node-local. Foreign runtimes and process-free cold
 			// publications are visible in the shared catalog but cannot have a

@@ -636,6 +636,18 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 	}
 	var result error
+	// A long operation changes its family's runtime and records without the
+	// lifecycle lock: a dehydration's runtime, for one, leaves runsc's live
+	// inventory while its placement is still running. Leave such a family's
+	// placements to the operation and to a later pass.
+	busy := func(ids ...string) bool {
+		for _, id := range ids {
+			if _, working := b.operations.lookup(id); working {
+				return true
+			}
+		}
+		return false
+	}
 	// Raft placement is the ownership authority. Keep the canonical bundle's
 	// denormalized owner in sync so cache reclamation and crash diagnostics do
 	// not treat a retired migration source as local work. Transaction-scoped
@@ -643,6 +655,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	// intentionally ignored.
 	for _, record := range placementByBranch {
 		if record.OwnerNode == "" || record.State == cluster.PlacementMigrating || record.State == cluster.PlacementCorrupted {
+			continue
+		}
+		if busy(record.PhysicalContainer, record.FamilyID) {
 			continue
 		}
 		if err := b.syncLogicalBranchOwner(record.FamilyID, record.BranchID, record.OwnerNode); err != nil {
@@ -689,6 +704,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 			physicalBranch := record.PhysicalBranch
 			if physicalBranch == "" {
 				physicalBranch = record.BranchID
+			}
+			if busy(physicalContainer, record.FamilyID) {
+				continue
 			}
 			if _, stillRecorded := persistentPhysicalBranches[physicalContainer+"\x00"+physicalBranch]; !stillRecorded {
 				// Branch removal deletes physical persistent metadata before the
@@ -743,6 +761,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		logicalFamily := info.ID
 		if info.DistributedFamilyID != "" {
 			logicalFamily = info.DistributedFamilyID
+		}
+		if busy(info.ID, logicalFamily) {
+			continue
 		}
 		for _, branch := range info.Branches {
 			placementFamily, placementBranch := logicalFamily, branch.ID
@@ -887,6 +908,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	}
 	for _, record := range placementByBranch {
 		if _, ok := known[record.FamilyID+"\x00"+record.BranchID]; ok || record.State == cluster.PlacementMigrating {
+			continue
+		}
+		if busy(record.PhysicalContainer, record.FamilyID) {
 			continue
 		}
 		// An unplaced or corrupted branch is authoritative Raft state with no
@@ -3294,7 +3318,7 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 		// Foreground lifecycle commands, repository maintenance, and every other
 		// terminal migration cleanup must see one coherent local namespace. The
 		// peer wait above deliberately remains outside this critical section.
-		unlockLifecycle := b.lockBackgroundLifecycle()
+		unlockLifecycle := b.lockFamilyLifecycle(containerID)
 		unlockSource := b.distributedSource.lockSourceFamily(containerID)
 		if !sourceReleased {
 			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
@@ -3602,6 +3626,10 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 	}
 	var result error
 	for _, runtimeFamily := range runtimes {
+		// A runtime a long operation is building or taking down is its own.
+		if _, busy := b.operations.lookup(runtimeFamily.ID); busy {
+			continue
+		}
 		// listRuntimeFamilies returns exact physical sandbox IDs, including
 		// hidden distributed targets. Resolve that internal identity so cleanup
 		// can distinguish a protected sparse provider from a true orphan.
