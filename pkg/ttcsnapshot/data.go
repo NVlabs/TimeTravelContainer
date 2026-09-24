@@ -30,8 +30,15 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
+
+// syncParallelism bounds the fsyncs one durability fence runs at once.
+// Filesystems write concurrently synced files out together and fold their
+// fsyncs into shared journal commits, where one at a time waits for a
+// commit each.
+const syncParallelism = 16
 
 // LocalDataStore stores authoritative standalone whole-file objects. Reflink
 // is opportunistic; correctness always falls back to a complete copy.
@@ -90,13 +97,7 @@ func (store *LocalDataStore) SyncNewNames() error {
 	if err := store.SyncObjectDirectories(ids); err != nil {
 		return err
 	}
-	store.namesMu.Lock()
-	for key, synced := range snapshot {
-		if current, ok := store.unsyncedNames[key]; ok && current.generation == synced.generation {
-			delete(store.unsyncedNames, key)
-		}
-	}
-	store.namesMu.Unlock()
+	store.forgetSyncedNames(snapshot)
 	return nil
 }
 
@@ -418,7 +419,89 @@ func (store *LocalDataStore) replaceDeferred(id ObjectID, source io.Reader, leng
 	return os.Rename(temporaryPath, destination)
 }
 
+// Extent is Data at Offset of an object that is zero everywhere else.
+type Extent struct {
+	Offset int64
+	Data   []byte
+}
+
+// InstallExtentsDeferred is InstallDeferred for an object of length bytes
+// holding extents, in ascending order, and zeros elsewhere. The zeros are
+// left as holes, and nothing is copied or scanned for them. Writeback of the
+// object starts at once, so a sync of many such objects finds most of them
+// written already.
+func (store *LocalDataStore) InstallExtentsDeferred(id ObjectID, length int64, extents []Extent) error {
+	end := int64(0)
+	for _, extent := range extents {
+		if extent.Offset < end || extent.Offset+int64(len(extent.Data)) > length {
+			return fmt.Errorf("TTC bulk object extent at %d of %d bytes is out of order or past %d", extent.Offset, len(extent.Data), length)
+		}
+		end = extent.Offset + int64(len(extent.Data))
+	}
+	if err := store.installWith(id, length, false, func(file *os.File) error {
+		return writeExtents(file, length, extents)
+	}); err != nil {
+		return err
+	}
+	store.noteUnsyncedName(id)
+	return nil
+}
+
+// writeExtents writes extents to the empty file, a run of contiguous ones per
+// system call, and sizes it to length.
+func writeExtents(file *os.File, length int64, extents []Extent) error {
+	for begin := 0; begin < len(extents); {
+		end := begin + 1
+		for end < len(extents) && extents[end].Offset == extents[end-1].Offset+int64(len(extents[end-1].Data)) {
+			end++
+		}
+		buffers := make([][]byte, 0, end-begin)
+		for _, extent := range extents[begin:end] {
+			buffers = append(buffers, extent.Data)
+		}
+		offset := extents[begin].Offset
+		for len(buffers) != 0 {
+			n, err := unix.Pwritev(int(file.Fd()), buffers, offset)
+			if err != nil {
+				return fmt.Errorf("writing TTC bulk object at %d: %w", offset, err)
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+			offset += int64(n)
+			for n != 0 {
+				if n >= len(buffers[0]) {
+					n -= len(buffers[0])
+					buffers = buffers[1:]
+					continue
+				}
+				buffers[0] = buffers[0][n:]
+				n = 0
+			}
+		}
+		begin = end
+	}
+	if err := file.Truncate(length); err != nil {
+		return err
+	}
+	// Only a hint: a later sync is what makes the object durable, so a
+	// filesystem that does not take it loses nothing.
+	_ = unix.SyncFileRange(int(file.Fd()), 0, 0, unix.SYNC_FILE_RANGE_WRITE)
+	return nil
+}
+
 func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64, durable bool) error {
+	return store.installWith(id, length, durable, func(file *os.File) error {
+		if written, err := copySparse(file, source, length); err != nil {
+			return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
+		}
+		return nil
+	})
+}
+
+// installWith atomically publishes id, which fill writes into an empty
+// temporary file, as an object of length bytes.
+func (store *LocalDataStore) installWith(id ObjectID, length int64, durable bool, fill func(*os.File) error) error {
 	if length < 0 {
 		return errors.New("negative TTC bulk-object length")
 	}
@@ -436,10 +519,9 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 			return err
 		}
 		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
-		written, err := copySparse(temporary, source, length)
-		if err != nil {
+		if err := fill(temporary); err != nil {
 			temporary.Close()
-			return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
+			return err
 		}
 		if durable {
 			if err := temporary.Sync(); err != nil {
@@ -482,10 +564,9 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	written, err := copySparse(temporary, source, length)
-	if err != nil {
+	if err := fill(temporary); err != nil {
 		temporary.Close()
-		return fmt.Errorf("writing TTC bulk object after %d bytes: %w", written, err)
+		return err
 	}
 	return installTemporary(temporary, temporaryPath, destination, length, durable)
 }
@@ -718,27 +799,65 @@ func (store *LocalDataStore) SyncObjects(ids []ObjectID) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	names := store.unsyncedNamesOf(ids)
 	directories := make(map[string]struct{})
 	for _, id := range ids {
 		relative, err := objectRelativePath(id)
 		if err != nil {
 			return err
 		}
-		file, err := store.Open(id, -1)
-		if err != nil {
-			return err
-		}
-		syncErr := file.Sync()
-		closeErr := file.Close()
-		if syncErr != nil || closeErr != nil {
-			return errors.Join(syncErr, closeErr)
-		}
 		for directory := filepath.Dir(relative); directory != "."; directory = filepath.Dir(directory) {
 			directories[directory] = struct{}{}
 		}
 		directories["."] = struct{}{}
 	}
-	return store.syncDirectoriesDeepestFirst(directories)
+	var group errgroup.Group
+	group.SetLimit(syncParallelism)
+	for _, id := range ids {
+		group.Go(func() error {
+			file, err := store.Open(id, -1)
+			if err != nil {
+				return err
+			}
+			return errors.Join(file.Sync(), file.Close())
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	if err := store.syncDirectoriesDeepestFirst(directories); err != nil {
+		return err
+	}
+	// Their names are durable now too, so a later SyncNewNames need not
+	// sync them again.
+	store.forgetSyncedNames(names)
+	return nil
+}
+
+// unsyncedNamesOf returns the entries of unsyncedNames for ids, as they are
+// before a sync that covers them begins.
+func (store *LocalDataStore) unsyncedNamesOf(ids []ObjectID) map[string]unsyncedName {
+	store.namesMu.Lock()
+	defer store.namesMu.Unlock()
+	names := make(map[string]unsyncedName)
+	for _, id := range ids {
+		if name, ok := store.unsyncedNames[id.key()]; ok {
+			names[id.key()] = name
+		}
+	}
+	return names
+}
+
+// forgetSyncedNames drops the entries of synced from unsyncedNames, unless the
+// object was installed again after the sync began.
+func (store *LocalDataStore) forgetSyncedNames(synced map[string]unsyncedName) {
+	store.namesMu.Lock()
+	defer store.namesMu.Unlock()
+	for key, name := range synced {
+		if current, ok := store.unsyncedNames[key]; ok && current.generation == name.generation {
+			delete(store.unsyncedNames, key)
+		}
+	}
 }
 
 // SyncObjectDirectories makes the names of objects durable without syncing
@@ -767,22 +886,35 @@ func (store *LocalDataStore) SyncObjectDirectories(ids []ObjectID) error {
 	return store.syncDirectoriesDeepestFirst(directories)
 }
 
+// syncDirectoriesDeepestFirst syncs directories a level at a time, deepest
+// first, so that no directory's entry is made durable before the entries it
+// holds; those of one level are synced concurrently.
 func (store *LocalDataStore) syncDirectoriesDeepestFirst(directories map[string]struct{}) error {
-	ordered := make([]string, 0, len(directories))
+	levels := make(map[int][]string)
 	for directory := range directories {
-		ordered = append(ordered, directory)
-	}
-	sort.Slice(ordered, func(i, j int) bool {
-		return strings.Count(ordered[i], string(filepath.Separator)) > strings.Count(ordered[j], string(filepath.Separator))
-	})
-	for _, directory := range ordered {
-		if store.rootFD != nil {
-			if err := store.syncRelativeDirectory(directory); err != nil {
-				return err
-			}
-			continue
+		depth := 0
+		if directory != "." {
+			depth = strings.Count(directory, string(filepath.Separator)) + 1
 		}
-		if err := syncDirectory(filepath.Join(store.root, directory)); err != nil {
+		levels[depth] = append(levels[depth], directory)
+	}
+	depths := make([]int, 0, len(levels))
+	for depth := range levels {
+		depths = append(depths, depth)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(depths)))
+	for _, depth := range depths {
+		var group errgroup.Group
+		group.SetLimit(syncParallelism)
+		for _, directory := range levels[depth] {
+			group.Go(func() error {
+				if store.rootFD != nil {
+					return store.syncRelativeDirectory(directory)
+				}
+				return syncDirectory(filepath.Join(store.root, directory))
+			})
+		}
+		if err := group.Wait(); err != nil {
 			return err
 		}
 	}

@@ -23,7 +23,10 @@ go_library(
         "types.go",
     ],
     visibility = ["//:sandbox"],
-    deps = ["@org_golang_x_sys//unix:go_default_library"],
+    deps = [
+        "@org_golang_x_sync//errgroup:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )
 
 go_test(
