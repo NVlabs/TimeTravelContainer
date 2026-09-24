@@ -283,10 +283,18 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 		pagesTotal += region.Range.Length() / hostarch.PageSize
 		ownerSet[region.File] = struct{}{}
 	}
+	// Regions of one MemoryFile overlap if, in order of their starts, one
+	// ends after the next starts. Comparing every pair took seconds for the
+	// many small regions of a fork's scattered writes.
+	byFile := make(map[*MemoryFile][]int)
 	for i := range regions {
-		for j := 0; j < i; j++ {
-			left, right := &regions[i], &regions[j]
-			if left.File == right.File && left.Range.Start < right.Range.End && right.Range.Start < left.Range.End {
+		byFile[regions[i].File] = append(byFile[regions[i].File], i)
+	}
+	for _, indexes := range byFile {
+		sort.Slice(indexes, func(a, b int) bool { return regions[indexes[a]].Range.Start < regions[indexes[b]].Range.Start })
+		for k := 1; k < len(indexes); k++ {
+			left, right := &regions[indexes[k-1]], &regions[indexes[k]]
+			if right.Range.Start < left.Range.End {
 				return nil, fmt.Errorf("remote regions %d and %d overlap in one MemoryFile: %v and %v", left.ID, right.ID, left.Range, right.Range)
 			}
 		}
@@ -1108,12 +1116,9 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 			!hostarch.IsPageAligned(loadRange.StreamOffset) {
 			return fmt.Errorf("remote load range %d is invalid: target=%v stream offset=%#x", i, loadRange.Target, loadRange.StreamOffset)
 		}
-		for j := 0; j < i; j++ {
-			other := ranges[j].Target
-			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
-				return fmt.Errorf("remote target ranges %v and %v overlap", loadRange.Target, other)
-			}
-		}
+	}
+	if left, right, overlap := overlappingLoadTargets(ranges); overlap {
+		return fmt.Errorf("remote target ranges %v and %v overlap", left, right)
 	}
 	type attachedRange struct {
 		load  RemoteLoadRange
@@ -1263,6 +1268,25 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 	return nil
 }
 
+// overlappingLoadTargets returns two of the non-empty targets of ranges that
+// overlap, if any do: in order of their starts, one that ends after the next
+// starts. Comparing every pair took seconds for the many small ranges of a
+// branch whose writes were scattered.
+func overlappingLoadTargets(ranges []RemoteLoadRange) (memmap.FileRange, memmap.FileRange, bool) {
+	order := make([]int, len(ranges))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return ranges[order[a]].Target.Start < ranges[order[b]].Target.Start })
+	for k := 1; k < len(order); k++ {
+		left, right := ranges[order[k-1]].Target, ranges[order[k]].Target
+		if right.Start < left.End {
+			return left, right, true
+		}
+	}
+	return memmap.FileRange{}, memmap.FileRange{}, false
+}
+
 // AttachSparseChunkPageLoad attaches another independent demand loader to an
 // existing family MemoryFile. Ranges may describe full durable chunks or
 // page-aligned pieces of a live packed stream; logicalChunkDemand groups all
@@ -1278,12 +1302,9 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 			!hostarch.IsPageAligned(loadRange.StreamOffset) {
 			return fmt.Errorf("invalid sparse chunk load range %d: %+v", i, loadRange)
 		}
-		for j := 0; j < i; j++ {
-			other := ranges[j].Target
-			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
-				return fmt.Errorf("sparse chunk target ranges %v and %v overlap", loadRange.Target, other)
-			}
-		}
+	}
+	if left, right, overlap := overlappingLoadTargets(ranges); overlap {
+		return fmt.Errorf("sparse chunk target ranges %v and %v overlap", left, right)
 	}
 	type attachedRange struct {
 		load  RemoteLoadRange

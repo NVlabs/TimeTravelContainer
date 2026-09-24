@@ -1423,6 +1423,43 @@ func TestNewRemoteSnapshotRejectsOverlap(t *testing.T) {
 	}
 }
 
+// Overlap among regions listed out of order, and not next to each other in
+// the list, is still found; regions that only touch do not overlap.
+func TestNewRemoteSnapshotRejectsOverlapOutOfOrder(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 4)
+	page := uint64(hostarch.PageSize)
+	region := func(id RemoteRegionID, first, last uint64) RemoteSnapshotRegion {
+		return RemoteSnapshotRegion{ID: id, File: mf, Range: memmap.FileRange{Start: fr.Start + first*page, End: fr.Start + last*page}}
+	}
+	if _, err := NewRemoteSnapshot([]RemoteSnapshotRegion{region(1, 2, 4), region(2, 1, 2), region(3, 0, 1)}); err != nil {
+		t.Fatalf("regions that only touch: %v", err)
+	}
+	if _, err := NewRemoteSnapshot([]RemoteSnapshotRegion{region(1, 3, 4), region(2, 0, 1), region(3, 1, 3), region(4, 2, 4)}); err == nil {
+		t.Fatal("NewRemoteSnapshot accepted overlapping regions listed out of order")
+	}
+}
+
+func TestOverlappingLoadTargets(t *testing.T) {
+	page := uint64(hostarch.PageSize)
+	load := func(first, last uint64) RemoteLoadRange {
+		return RemoteLoadRange{Target: memmap.FileRange{Start: first * page, End: last * page}}
+	}
+	for _, test := range []struct {
+		ranges  []RemoteLoadRange
+		overlap bool
+	}{
+		{nil, false},
+		{[]RemoteLoadRange{load(0, 1)}, false},
+		{[]RemoteLoadRange{load(4, 8), load(0, 2), load(2, 4)}, false},
+		{[]RemoteLoadRange{load(6, 9), load(0, 2), load(3, 4), load(8, 10)}, true},
+		{[]RemoteLoadRange{load(0, 10), load(4, 5), load(20, 30)}, true},
+	} {
+		if _, _, got := overlappingLoadTargets(test.ranges); got != test.overlap {
+			t.Errorf("overlappingLoadTargets(%v) = %t, want %t", test.ranges, got, test.overlap)
+		}
+	}
+}
+
 func TestRemoteExportPinsLayoutUntilSnapshotAcquiresReferences(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 2)
 	_, regions, _, temporaryPins, err := exportMemoryFileMetadataForRemote(context.Background(), mf, true)

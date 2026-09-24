@@ -294,18 +294,16 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 					return nil, fmt.Errorf("captured MemoryFile range %v has no logical page at offset %#x", capturedRange, cursor)
 				}
 				for off := run.Range.Start; off < run.Range.End; off += hostarch.PageSize {
-					var streamOffset uint64
-					foundStreamRange := false
-					for _, streamRange := range streamRanges[mf] {
-						if streamRange.range_.Start <= off && off < streamRange.range_.End {
-							streamOffset = streamRange.start + off - streamRange.range_.Start
-							foundStreamRange = true
-							break
-						}
-					}
-					if !foundStreamRange {
+					// The stream ranges of mf are sorted and disjoint. A
+					// memory with many small captured ranges, as copy-on-write
+					// makes of a fork's scattered writes, made scanning them
+					// for every page take seconds.
+					ranges := streamRanges[mf]
+					index := sort.Search(len(ranges), func(i int) bool { return ranges[i].range_.End > off })
+					if index == len(ranges) || ranges[index].range_.Start > off {
 						return nil, fmt.Errorf("captured MemoryFile offset %#x has no packed stream range", off)
 					}
+					streamOffset := ranges[index].start + off - ranges[index].range_.Start
 					pageDelta := (off - run.Range.Start) / hostarch.PageSize
 					pageID := LogicalPageID{Allocator: run.First.Allocator, Sequence: run.First.Sequence + pageDelta}
 					versionID := PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + pageDelta}
