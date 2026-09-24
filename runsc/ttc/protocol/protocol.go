@@ -19,6 +19,7 @@ package protocol
 import (
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DaemonAPIVersion is the exact native CLI protocol version. Official TTC
@@ -40,6 +41,12 @@ type DaemonQuorumWait struct {
 func DaemonQuorumWaitPath(socket string) string {
 	return socket + ".quorum-wait"
 }
+
+// DaemonQuorumWaitPatience is how long a request waits for a daemon waiting
+// for quorum to begin serving: long enough for a starting cluster to elect
+// its leader, where a cluster that is away may keep the daemon waiting for as
+// long as it lasts.
+const DaemonQuorumWaitPatience = 30 * time.Second
 
 // CommandUsesTerminalControl reports whether a CLI command can ask the client
 // for terminal mode or size updates. This is part of the wire contract rather

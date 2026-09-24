@@ -46,6 +46,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
+	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 )
 
@@ -291,6 +292,17 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
 		http.Error(w, "cluster transport cannot clear daemon-stream write deadline: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// The daemon's socket is bound before the daemon serves: one waiting for
+	// its cluster's quorum would hold the stream until the cluster answers.
+	for patience := time.Now().Add(protocol.DaemonQuorumWaitPatience); ; time.Sleep(100 * time.Millisecond) {
+		if _, err := os.Stat(protocol.DaemonQuorumWaitPath(p.socket)); err != nil {
+			break
+		}
+		if !time.Now().Before(patience) {
+			http.Error(w, "ttcd is waiting for its cluster to regain quorum, and serves no commands until it does", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	conn, err := net.Dial("unix", p.socket)
 	if err != nil {

@@ -1127,6 +1127,16 @@ func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {
 }
 
 func connect(socket string) (net.Conn, error) {
+	// A daemon waiting for its cluster's quorum has bound its socket, but
+	// serves nothing until the cluster answers, however long that takes.
+	for patience := time.Now().Add(protocol.DaemonQuorumWaitPatience); ; time.Sleep(100 * time.Millisecond) {
+		if _, ok := quorumWaitDaemon(socket); !ok {
+			break
+		}
+		if !time.Now().Before(patience) {
+			return nil, errors.New("ttcd is waiting for its cluster to regain quorum, and serves no commands until it does; 'ttc daemon status' shows it waiting")
+		}
+	}
 	conn, err := net.DialTimeout("unix", socket, 250*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("ttcd is not running; start it explicitly with 'ttc daemon start': %w", err)
