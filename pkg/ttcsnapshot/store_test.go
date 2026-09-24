@@ -1987,6 +1987,85 @@ func TestCheckpointDueWaitsForTheJournalToOutgrowTheCheckpoint(t *testing.T) {
 	}
 }
 
+// A checkpoint is also due, before the journal outgrows it, once the graph
+// has shrunk to under half of what the checkpoint holds, as after a large
+// removal; reopening the graph knows what its checkpoint holds.
+func TestCheckpointDueOnceTheGraphHasShrunk(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pins []string
+	for i := 0; i < 64; i++ {
+		pin := fmt.Sprintf("shrink/%d", i)
+		if _, err := store.CreateObject(origin, pin, ObjectKindMetadata, bytes.Repeat([]byte{1}, 256), nil); err != nil {
+			t.Fatal(err)
+		}
+		pins = append(pins, pin)
+	}
+	if err := store.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(pins[:31]); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if store.CheckpointDue(1) {
+		t.Fatal("checkpoint due with more than half the graph left")
+	}
+	if err := store.DeletePins(pins[31:33]); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if store.JournalBytes() >= store.checkpointBytes {
+		t.Fatalf("the journal of %d bytes outgrew the %d-byte checkpoint", store.JournalBytes(), store.checkpointBytes)
+	}
+	if !store.CheckpointDue(1) {
+		t.Fatal("checkpoint not due with half the graph removed")
+	}
+	if store.CheckpointDue(store.JournalBytes() + 1) {
+		t.Fatal("checkpoint due below its minimum")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if !reopened.CheckpointDue(1) {
+		t.Fatal("the reopened graph does not know it has shrunk")
+	}
+	if err := reopened.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened.CheckpointDue(1) {
+		t.Fatal("checkpoint still due after one was taken")
+	}
+}
+
 // Collect collects up to its limit in one call, in transactions bounded by
 // the objects they delete and the reference counts they update.
 func TestCollectCommitsBoundedTransactions(t *testing.T) {

@@ -158,12 +158,14 @@ type Store struct {
 	state      graphState
 	poisoned   error
 	journalEnd int64
-	// checkpointBytes is the size of the generation's checkpoint.
-	checkpointBytes int64
-	headDev         uint64
-	headIno         uint64
-	headSize        int64
-	headMtime       int64
+	// checkpointBytes is the size of the generation's checkpoint, and
+	// checkpointObjects the number of objects it holds.
+	checkpointBytes   int64
+	checkpointObjects int
+	headDev           uint64
+	headIno           uint64
+	headSize          int64
+	headMtime         int64
 	// externallyCoordinated is used by graph stores embedded in a TTC
 	// filesystem repository. In that mode the repository's cross-process
 	// flock serializes writers, so this Store must not retain graph.lock for
@@ -769,6 +771,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	previousEnd := s.journalEnd
 	previousHeadDev, previousHeadIno := s.headDev, s.headIno
 	previousHeadSize, previousHeadMtime := s.headSize, s.headMtime
+	checkpointObjects := len(state.Objects)
 	s.state = state
 	s.journal = journal
 	s.generation = head.Generation
@@ -797,6 +800,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 		_ = previous.Close()
 	}
 	s.checkpointBytes = int64(len(data))
+	s.checkpointObjects = checkpointObjects
 	s.rebuildDeferredObjectsLocked()
 	s.rebuildMemoryPagesLocked()
 	return nil
@@ -3313,6 +3317,7 @@ func (s *Store) compactGenerationLocked() error {
 	s.generation = nextGeneration
 	s.journalEnd = int64(len(journalHeader))
 	s.checkpointBytes = int64(len(data) + 1)
+	s.checkpointObjects = len(s.state.Objects)
 	if previous != nil {
 		_ = previous.Close()
 	}
@@ -3500,5 +3505,12 @@ func (s *Store) JournalBytes() int64 {
 func (s *Store) CheckpointDue(minimum int64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.journalEnd >= max(minimum, s.checkpointBytes)
+	if s.journalEnd >= max(minimum, s.checkpointBytes) {
+		return true
+	}
+	// A checkpoint costs in proportion to what it holds. Once the graph has
+	// shrunk to under half of what the current one holds, as when a large
+	// family is removed, a new one costs less and gives back the space of
+	// everything removed.
+	return s.journalEnd >= minimum && len(s.state.Objects)*2 < s.checkpointObjects
 }
