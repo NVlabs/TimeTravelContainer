@@ -27,8 +27,7 @@ import (
 // local state; ImmutableCatalog implements it for shared or peer metadata
 // without creating a second reference-count authority.
 type MemoryCatalog interface {
-	MemoryPages(ObjectID) (map[uint64]ObjectID, error)
-	MemoryPageRecord(ObjectID) (MemoryChunkID, uint32, MemoryPageIdentity, error)
+	MemoryPageEntries(ObjectID) ([]MemoryPageEntry, error)
 }
 
 // FilesystemCatalog is the immutable read surface needed by a graph-backed
@@ -163,11 +162,9 @@ func (catalog *LazyImmutableCatalog) FilesystemRecords(root ObjectID) ([]InodeRe
 	return inodes, entries, catalog.operationError(err)
 }
 
-// MemoryPages resolves a fixed-height radix tree on demand.
-func (catalog *LazyImmutableCatalog) MemoryPages(root ObjectID) (map[uint64]ObjectID, error) {
-	// Reuse the validated immutable implementation after loading the reachable
-	// memory metadata. Memory restore necessarily enumerates its page map; this
-	// path is not used by filesystem lookup.
+// MemoryPageEntries resolves a memory tree on demand. Memory restore
+// necessarily enumerates every page; filesystem lookup does not use it.
+func (catalog *LazyImmutableCatalog) MemoryPageEntries(root ObjectID) ([]MemoryPageEntry, error) {
 	objects, err := ReachableObjects(catalog, []ObjectID{root})
 	if err != nil {
 		return nil, catalog.operationError(err)
@@ -176,28 +173,7 @@ func (catalog *LazyImmutableCatalog) MemoryPages(root ObjectID) (map[uint64]Obje
 	if err != nil {
 		return nil, err
 	}
-	return immutable.MemoryPages(root)
-}
-
-// MemoryPageRecord resolves a page and its chunk descriptor on demand.
-func (catalog *LazyImmutableCatalog) MemoryPageRecord(page ObjectID) (MemoryChunkID, uint32, MemoryPageIdentity, error) {
-	pageObject, ok := catalog.Object(page)
-	if !ok {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, catalog.operationError(osErrNotExist(page))
-	}
-	objects := []Object{pageObject}
-	for _, edge := range pageObject.Children {
-		object, ok := catalog.Object(edge.Child)
-		if !ok {
-			return MemoryChunkID{}, 0, MemoryPageIdentity{}, catalog.operationError(osErrNotExist(edge.Child))
-		}
-		objects = append(objects, object)
-	}
-	immutable, err := NewImmutableCatalog(objects)
-	if err != nil {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, err
-	}
-	return immutable.MemoryPageRecord(page)
+	return immutable.MemoryPageEntries(root)
 }
 
 func osErrNotExist(id ObjectID) error {
@@ -315,69 +291,15 @@ func (catalog *ImmutableCatalog) FilesystemRecords(root ObjectID) ([]InodeRecord
 	return filesystemRecordsObjects(root, catalog.Object)
 }
 
-// MemoryPages enumerates one fixed-height memory radix tree.
-func (catalog *ImmutableCatalog) MemoryPages(root ObjectID) (map[uint64]ObjectID, error) {
+// MemoryPageEntries enumerates the pages a memory tree maps.
+func (catalog *ImmutableCatalog) MemoryPageEntries(root ObjectID) ([]MemoryPageEntry, error) {
 	if catalog == nil {
 		return nil, fmt.Errorf("nil immutable TTC catalog")
 	}
-	result := make(map[uint64]ObjectID)
-	var visit func(ObjectID, int, uint64) error
-	visit = func(id ObjectID, level int, prefix uint64) error {
+	return memoryPageEntries(root, func(id ObjectID) (Object, bool) {
 		object, ok := catalog.objects[id.key()]
-		if !ok {
-			return fmt.Errorf("memory node %s does not exist in immutable catalog", id.key())
-		}
-		if err := validateMemoryNode(object, level); err != nil {
-			return err
-		}
-		for _, edge := range object.Children {
-			if edge.Slot > 255 {
-				return fmt.Errorf("memory node %s has invalid slot %d", id.key(), edge.Slot)
-			}
-			index := prefix | uint64(edge.Slot)<<(8*level)
-			if level == 0 {
-				if edge.Child.Kind != ObjectKindPage {
-					return fmt.Errorf("memory leaf references non-page object %s", edge.Child.key())
-				}
-				if _, exists := result[index]; exists {
-					return fmt.Errorf("memory radix repeats page index %#x", index)
-				}
-				result[index] = edge.Child
-				continue
-			}
-			if err := visit(edge.Child, level-1, index); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	if err := visit(root, memoryTreeLevels-1, 0); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-// MemoryPageRecord resolves one page descriptor to its immutable chunk.
-func (catalog *ImmutableCatalog) MemoryPageRecord(page ObjectID) (MemoryChunkID, uint32, MemoryPageIdentity, error) {
-	if catalog == nil {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("nil immutable TTC catalog")
-	}
-	object, ok := catalog.objects[page.key()]
-	if !ok || object.ID.Kind != ObjectKindPage || len(object.Children) != 1 || object.Children[0].Slot != 0 || object.Children[0].Child.Kind != ObjectKindMemoryChunk {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("object %s is not a chunk-backed memory page", page.key())
-	}
-	offset, identity, err := decodeMemoryPageRecord(object.Data)
-	if err != nil {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("page %s: %w", page.key(), err)
-	}
-	chunk, ok := catalog.objects[object.Children[0].Child.key()]
-	if !ok || chunk.ID.Kind != ObjectKindMemoryChunk {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("page %s references missing memory chunk %s", page.key(), object.Children[0].Child.key())
-	}
-	if uint64(offset)+memoryPageBytes > chunk.BulkLength || offset%memoryPageBytes != 0 {
-		return MemoryChunkID{}, 0, MemoryPageIdentity{}, fmt.Errorf("page %s has invalid chunk offset %d", page.key(), offset)
-	}
-	return MemoryChunkID(object.Children[0].Child), offset, identity, nil
+		return object, ok
+	})
 }
 
 var _ MemoryCatalog = (*Store)(nil)

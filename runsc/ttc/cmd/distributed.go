@@ -1781,7 +1781,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		}
 	}()
 
-	reader, writer, err := os.Pipe()
+	reader, writer, err := graphCaptureStream()
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
@@ -1800,7 +1800,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	// publication and reference-ledger work may take arbitrarily long on a slow
 	// shared filesystem and must never hold the foreground-priority gate.
 	finishBackgroundWork := b.distributedSource.beginBackgroundSnapshotWork()
-	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", containerID, "distributed-export", transactionID)
+	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", containerID, "distributed-export", transactionID)
 	_ = writer.Close()
 	finishBackgroundWork()
 	outcome := <-imported

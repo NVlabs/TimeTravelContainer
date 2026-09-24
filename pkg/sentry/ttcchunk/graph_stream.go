@@ -27,7 +27,13 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-var graphCaptureMagic = [16]byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H', 'C', 'A', 'P', 'T', 'U', 'R', 'E', 2}
+var (
+	graphCaptureMagic = [16]byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H', 'C', 'A', 'P', 'T', 'U', 'R', 'E', 2}
+	// graphCaptureFilteredMagic begins a capture whose reader answers the
+	// manifest, on the same stream, with the slots of each object its graph
+	// lacks. Only those pages follow.
+	graphCaptureFilteredMagic = [16]byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H', 'C', 'A', 'P', 'T', 'U', 'R', 'E', 3}
+)
 
 const (
 	maxGraphCaptureManifestBytes = 256 << 20
@@ -45,41 +51,105 @@ func WriteGraphCapture(w io.Writer, snapshot *pgalloc.RemoteSnapshot, bindings [
 	if err != nil {
 		return err
 	}
-	if err := writeGraphCaptureHeader(w, stored, len(groups)); err != nil {
+	if err := writeGraphCaptureHeader(w, graphCaptureMagic, stored, len(groups)); err != nil {
 		return err
 	}
-	zeroPage := make([]byte, hostarch.PageSize)
-	for _, group := range groups {
-		chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(group.bindings))}
-		for _, binding := range group.bindings {
-			data := make([]byte, hostarch.PageSize)
-			n, err := snapshot.CopyStreamAt(data, int64(binding.StreamOffset))
-			if err != nil || n != len(data) {
-				if err == nil {
-					err = io.ErrUnexpectedEOF
-				}
-				return fmt.Errorf("reading captured page at stream offset %#x: %w", binding.StreamOffset, err)
-			}
-			page := Page{Slot: binding.Slot, Version: binding.Version}
-			if bytes.Equal(data, zeroPage) {
-				page.Zero = true
-			} else {
-				page.Data = data
-			}
-			chunk.Pages = append(chunk.Pages, page)
-		}
-		encoded, err := Encode(chunk)
-		if err != nil {
-			return err
-		}
-		if err := writeGraphCaptureObject(w, group.id, encoded); err != nil {
+	for index := range groups {
+		if err := writeGraphCaptureGroup(w, snapshot, &groups[index], nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeGraphCaptureHeader(w io.Writer, stored []StoredBinding, objectCount int) error {
+// WriteFilteredGraphCapture writes a capture as WriteGraphCapture does, except
+// that after the manifest the daemon answers, on the same stream, with the
+// slots of each object its graph lacks, and only those pages are read and
+// sent. The pages a fork still shares with its dehydrated source cost nothing.
+func WriteFilteredGraphCapture(stream io.ReadWriter, snapshot *pgalloc.RemoteSnapshot, bindings []pgalloc.CapturedPageBinding) error {
+	if stream == nil || snapshot == nil {
+		return errors.New("graph memory capture requires a stream and snapshot")
+	}
+	groups, stored, err := planGraphCapture(bindings)
+	if err != nil {
+		return err
+	}
+	if err := writeGraphCaptureHeader(stream, graphCaptureFilteredMagic, stored, len(groups)); err != nil {
+		return err
+	}
+	answer := make([]byte, len(groups)*slotBitmapBytes)
+	if _, err := io.ReadFull(stream, answer); err != nil {
+		return fmt.Errorf("reading which memory pages the daemon lacks: %w", err)
+	}
+	for index := range groups {
+		group := &groups[index]
+		var need [slotBitmapBytes]byte
+		copy(need[:], answer[index*slotBitmapBytes:])
+		if need == ([slotBitmapBytes]byte{}) {
+			continue
+		}
+		for slot := 0; slot < PagesPerChunk; slot++ {
+			if hasBit(&need, uint8(slot)) && !hasBit(&group.used, uint8(slot)) {
+				return fmt.Errorf("the daemon asked for slot %d of memory object %s, which the capture does not hold", slot, group.id)
+			}
+		}
+		if err := writeGraphCaptureGroup(stream, snapshot, group, &need); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var zeroGraphCapturePage [hostarch.PageSize]byte
+
+// writeGraphCaptureGroup reads the pages of group, or only those in need if
+// it is set, and writes them as one object.
+func writeGraphCaptureGroup(w io.Writer, snapshot *pgalloc.RemoteSnapshot, group *graphCaptureGroup, need *[slotBitmapBytes]byte) error {
+	bindings := group.bindings
+	if need != nil {
+		bindings = make([]pgalloc.CapturedPageBinding, 0, countBits(need))
+		for _, binding := range group.bindings {
+			if hasBit(need, binding.Slot) {
+				bindings = append(bindings, binding)
+			}
+		}
+	}
+	buffer := make([]byte, len(bindings)*hostarch.PageSize)
+	// Pages the capture stream holds one after another are read with one copy.
+	for begin := 0; begin < len(bindings); {
+		end := begin + 1
+		for end < len(bindings) && bindings[end].StreamOffset == bindings[end-1].StreamOffset+hostarch.PageSize {
+			end++
+		}
+		data := buffer[begin*hostarch.PageSize : end*hostarch.PageSize]
+		n, err := snapshot.CopyStreamAt(data, int64(bindings[begin].StreamOffset))
+		if err != nil || n != len(data) {
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			return fmt.Errorf("reading captured pages at stream offset %#x: %w", bindings[begin].StreamOffset, err)
+		}
+		begin = end
+	}
+	chunk := Chunk{Logical: group.logical, Pages: make([]Page, 0, len(bindings))}
+	for index, binding := range bindings {
+		data := buffer[index*hostarch.PageSize : (index+1)*hostarch.PageSize : (index+1)*hostarch.PageSize]
+		page := Page{Slot: binding.Slot, Version: binding.Version}
+		if bytes.Equal(data, zeroGraphCapturePage[:]) {
+			page.Zero = true
+		} else {
+			page.Data = data
+		}
+		chunk.Pages = append(chunk.Pages, page)
+	}
+	encoded, err := Encode(chunk)
+	if err != nil {
+		return err
+	}
+	return writeGraphCaptureObject(w, group.id, encoded)
+}
+
+func writeGraphCaptureHeader(w io.Writer, magic [16]byte, stored []StoredBinding, objectCount int) error {
 	manifest, err := CompactBindings(stored)
 	if err != nil {
 		return err
@@ -91,7 +161,7 @@ func writeGraphCaptureHeader(w io.Writer, stored []StoredBinding, objectCount in
 	if len(manifestData) > maxGraphCaptureManifestBytes {
 		return fmt.Errorf("graph memory manifest has %d bytes, limit is %d", len(manifestData), maxGraphCaptureManifestBytes)
 	}
-	if err := writeGraphCaptureBytes(w, graphCaptureMagic[:]); err != nil {
+	if err := writeGraphCaptureBytes(w, magic[:]); err != nil {
 		return err
 	}
 	if err := writeGraphCaptureUint64(w, uint64(len(manifestData))); err != nil {
@@ -236,6 +306,9 @@ func ImportGraphCapture(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot
 // ImportGraphCaptureWithReusableStates imports a capture while limiting
 // stable-page reuse to the specified snapshot authority states. Passing nil
 // retains the standalone behavior of reusing every live immutable page.
+//
+// A filtered capture, from WriteFilteredGraphCapture, needs r to be a two-way
+// stream: the import writes to it which pages the graph lacks.
 func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, rootPrefix string, reusableStates []ttcsnapshot.SnapshotState) (GraphImportResult, error) {
 	if r == nil {
 		return GraphImportResult{}, errors.New("graph memory capture reader is nil")
@@ -244,7 +317,16 @@ func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store,
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return GraphImportResult{}, fmt.Errorf("reading graph memory capture header: %w", err)
 	}
-	if magic != graphCaptureMagic {
+	var answer io.Writer
+	switch magic {
+	case graphCaptureMagic:
+	case graphCaptureFilteredMagic:
+		writer, ok := r.(io.Writer)
+		if !ok {
+			return GraphImportResult{}, errors.New("a filtered graph memory capture needs a two-way stream")
+		}
+		answer = writer
+	default:
 		return GraphImportResult{}, errors.New("invalid graph memory capture magic")
 	}
 	manifestLength, err := readGraphCaptureUint64(r)
@@ -273,51 +355,99 @@ func ImportGraphCaptureWithReusableStates(r io.Reader, graph *ttcsnapshot.Store,
 	if objectCount != uint64(len(wanted)) {
 		return GraphImportResult{}, fmt.Errorf("graph memory capture has %d objects, manifest references %d", objectCount, len(wanted))
 	}
-	objectIndex := uint64(0)
-	readObject := func(expected ID) (Chunk, error) {
-		if objectIndex >= objectCount {
-			return Chunk{}, fmt.Errorf("graph memory object %s is missing", expected)
+	// carried is every object the stream holds, in the order it holds them:
+	// all of them, unless the Sentry is told which it need not send.
+	carried := make([]ID, 0, len(wanted))
+	for id := range wanted {
+		carried = append(carried, id)
+	}
+	sort.Slice(carried, func(i, j int) bool { return bytes.Compare(carried[i][:], carried[j][:]) < 0 })
+	var source captureSource
+	if answer != nil {
+		source.need = func(objects []ID, slots [][slotBitmapBytes]byte) error {
+			data := make([]byte, 0, len(objects)*slotBitmapBytes)
+			carried = carried[:0]
+			for index, id := range objects {
+				data = append(data, slots[index][:]...)
+				if slots[index] != ([slotBitmapBytes]byte{}) {
+					carried = append(carried, id)
+				}
+			}
+			if err := writeGraphCaptureBytes(answer, data); err != nil {
+				return fmt.Errorf("telling the Sentry which memory pages the graph lacks: %w", err)
+			}
+			return nil
 		}
-		var id ID
-		if _, err := io.ReadFull(r, id[:]); err != nil {
-			return Chunk{}, fmt.Errorf("reading graph memory object %d identity: %w", objectIndex, err)
-		}
-		if id != expected {
-			return Chunk{}, fmt.Errorf("graph memory object %d is %s, want %s", objectIndex, id, expected)
-		}
-		length, err := readGraphCaptureUint64(r)
-		if err != nil {
-			return Chunk{}, fmt.Errorf("reading graph memory object %d length: %w", objectIndex, err)
-		}
-		if length == 0 || length > maxGraphCaptureObjectBytes {
-			return Chunk{}, fmt.Errorf("graph memory object %s length %d is invalid", id, length)
-		}
-		encoded := make([]byte, int(length))
-		if _, err := io.ReadFull(r, encoded); err != nil {
-			return Chunk{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
-		}
-		chunk, err := Decode(encoded)
-		if err != nil {
-			return Chunk{}, fmt.Errorf("decoding graph memory object %s: %w", id, err)
-		}
-		objectIndex++
-		if objectIndex == objectCount {
-			var trailing [1]byte
-			if n, err := r.Read(trailing[:]); n != 0 || err == nil {
-				return Chunk{}, errors.New("graph memory capture has trailing data")
-			} else if !errors.Is(err, io.EOF) {
-				return Chunk{}, fmt.Errorf("finishing graph memory capture: %w", err)
+	}
+	next := 0
+	// Each object is read into buffer, and its chunk refers to it until the
+	// next is read.
+	var buffer []byte
+	source.chunk = func(expected ID) (Chunk, error) {
+		for next < len(carried) {
+			id := carried[next]
+			next++
+			chunk, err := readGraphCaptureObject(r, id, id == expected, &buffer)
+			if err != nil {
+				return Chunk{}, err
+			}
+			if id == expected {
+				return chunk, nil
 			}
 		}
-		return chunk, nil
+		return Chunk{}, fmt.Errorf("graph memory object %s is missing", expected)
 	}
-	if objectCount == 0 {
+	source.finish = func() error {
+		for ; next < len(carried); next++ {
+			if _, err := readGraphCaptureObject(r, carried[next], false, nil); err != nil {
+				return err
+			}
+		}
 		var trailing [1]byte
 		if n, err := r.Read(trailing[:]); n != 0 || err == nil {
-			return GraphImportResult{}, errors.New("empty graph memory capture has trailing data")
+			return errors.New("graph memory capture has trailing data")
 		} else if !errors.Is(err, io.EOF) {
-			return GraphImportResult{}, fmt.Errorf("finishing empty graph memory capture: %w", err)
+			return fmt.Errorf("finishing graph memory capture: %w", err)
 		}
+		return nil
 	}
-	return importSnapshotGraphWithReusableStates(graph, data, origin, manifest, rootPrefix, readObject, reusableStates)
+	return importCapture(graph, data, origin, manifest, rootPrefix, source, reusableStates)
+}
+
+// readGraphCaptureObject reads the next object of a capture stream, which
+// must be expected, and decodes it if decode is set. The object is read into
+// *buffer, grown as needed, and the chunk's pages refer to it.
+func readGraphCaptureObject(r io.Reader, expected ID, decode bool, buffer *[]byte) (Chunk, error) {
+	var id ID
+	if _, err := io.ReadFull(r, id[:]); err != nil {
+		return Chunk{}, fmt.Errorf("reading graph memory object %s identity: %w", expected, err)
+	}
+	if id != expected {
+		return Chunk{}, fmt.Errorf("graph memory object is %s, want %s", id, expected)
+	}
+	length, err := readGraphCaptureUint64(r)
+	if err != nil {
+		return Chunk{}, fmt.Errorf("reading graph memory object %s length: %w", id, err)
+	}
+	if length == 0 || length > maxGraphCaptureObjectBytes {
+		return Chunk{}, fmt.Errorf("graph memory object %s length %d is invalid", id, length)
+	}
+	if !decode {
+		if _, err := io.CopyN(io.Discard, r, int64(length)); err != nil {
+			return Chunk{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
+		}
+		return Chunk{}, nil
+	}
+	if uint64(cap(*buffer)) < length {
+		*buffer = make([]byte, maxGraphCaptureObjectBytes)
+	}
+	encoded := (*buffer)[:length]
+	if _, err := io.ReadFull(r, encoded); err != nil {
+		return Chunk{}, fmt.Errorf("reading graph memory object %s: %w", id, err)
+	}
+	chunk, err := decodeInPlace(encoded)
+	if err != nil {
+		return Chunk{}, fmt.Errorf("decoding graph memory object %s: %w", id, err)
+	}
+	return chunk, nil
 }

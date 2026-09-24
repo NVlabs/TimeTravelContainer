@@ -350,8 +350,11 @@ func (d *DehydrationCapture) AttachMetadataFile(file *os.File) error {
 // daemon without creating a persistent compatibility repository. The daemon
 // is the sole writer of the authoritative snapshot graph. It may be called
 // again, for example when the daemon failed to record an earlier export.
-func (d *DehydrationCapture) PublishGraphStream(writer io.Writer) error {
-	if d == nil || d.consumed || writer == nil || (d.SparseSnapshot == nil && len(d.sparseRegions) == 0) {
+//
+// If filtered is set, the daemon answers the manifest on stream with the
+// pages its graph lacks, and only those are sent.
+func (d *DehydrationCapture) PublishGraphStream(stream io.ReadWriter, filtered bool) error {
+	if d == nil || d.consumed || stream == nil || (d.SparseSnapshot == nil && len(d.sparseRegions) == 0) {
 		return errors.New("graph dehydration publication is unavailable")
 	}
 	if d.SparseSnapshot == nil {
@@ -361,7 +364,13 @@ func (d *DehydrationCapture) PublishGraphStream(writer io.Writer) error {
 		}
 		d.SparseSnapshot = snapshot
 	}
-	if err := ttcchunk.WriteGraphCapture(writer, d.SparseSnapshot, d.SparseBindings); err != nil {
+	var err error
+	if filtered {
+		err = ttcchunk.WriteFilteredGraphCapture(stream, d.SparseSnapshot, d.SparseBindings)
+	} else {
+		err = ttcchunk.WriteGraphCapture(stream, d.SparseSnapshot, d.SparseBindings)
+	}
+	if err != nil {
 		return err
 	}
 	if err := d.ParkSparseSnapshot(); err != nil {

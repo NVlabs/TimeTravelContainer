@@ -192,11 +192,47 @@ func (mutation *graphMutation) create(kind ObjectKind, data []byte, children []E
 	return id, nil
 }
 
-func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
-	if err := mutation.retain(id); err != nil {
+// putReserved adds object under an ID reserved in the mutation's snapshot with
+// ReserveObjects, and retains its children.
+func (mutation *graphMutation) putReserved(object Object) error {
+	id := object.ID
+	if id.Snapshot != mutation.snapshot.ID || id.Ordinal >= mutation.snapshot.NextOrdinal {
+		return fmt.Errorf("object ID %s is not reserved in snapshot %d", id.key(), mutation.snapshot.ID)
+	}
+	if _, exists := mutation.rawObject(id); exists {
+		return fmt.Errorf("object %s already exists", id.key())
+	}
+	if err := validateObject(object); err != nil {
 		return err
 	}
-	if oldID, ok := mutation.store.state.Roots[name]; ok {
+	for _, edge := range object.Children {
+		if err := mutation.retain(edge.Child); err != nil {
+			return err
+		}
+	}
+	mutation.put(object)
+	return nil
+}
+
+func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
+	return mutation.setRoots(map[string]ObjectID{name: id})
+}
+
+// setRoots points each named root at its new tree. Every new tree is retained
+// before any old one is released, so trees that share nodes can be replaced
+// in one transaction.
+func (mutation *graphMutation) setRoots(roots map[string]ObjectID) error {
+	names := sortedRootNames(roots)
+	for _, name := range names {
+		if err := mutation.retain(roots[name]); err != nil {
+			return err
+		}
+	}
+	for _, name := range names {
+		oldID, ok := mutation.store.state.Roots[name]
+		if !ok {
+			continue
+		}
 		oldObject, exists := mutation.rawObject(oldID)
 		if !exists {
 			return fmt.Errorf("root %q references missing object %s", name, oldID.key())
@@ -220,6 +256,12 @@ func (mutation *graphMutation) setRoot(name string, id ObjectID) error {
 }
 
 func (mutation *graphMutation) commit(rootName string, root ObjectID) error {
+	return mutation.commitRoots(map[string]ObjectID{rootName: root})
+}
+
+// commitRoots writes the mutation and the new trees of roots, already set with
+// setRoots, as one transaction.
+func (mutation *graphMutation) commitRoots(roots map[string]ObjectID) error {
 	keys := make([]string, 0, len(mutation.objects))
 	for key := range mutation.objects {
 		keys = append(keys, key)
@@ -237,8 +279,21 @@ func (mutation *graphMutation) commit(rootName string, root ObjectID) error {
 		}
 		ops = append(ops, journalOp{PutObject: &object})
 	}
-	ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot}, journalOp{RootName: rootName, PutRoot: &root})
+	ops = append(ops, journalOp{PutSnapshot: &mutation.snapshot})
+	for _, name := range sortedRootNames(roots) {
+		root := roots[name]
+		ops = append(ops, journalOp{RootName: name, PutRoot: &root})
+	}
 	return mutation.store.commitLockedWithMaterializedReferences(ops, references)
+}
+
+func sortedRootNames(roots map[string]ObjectID) []string {
+	names := make([]string, 0, len(roots))
+	for name := range roots {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 type bTreeBuilder struct {

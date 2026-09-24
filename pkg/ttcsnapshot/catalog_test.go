@@ -25,22 +25,9 @@ func TestImmutableCatalogReadsMemoryWithoutOwningReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := MemoryPageIdentity{LogicalSequence: 7, VersionSequence: 9, References: 2}
-	identity.LogicalAllocator[0] = 1
-	identity.VersionAllocator[0] = 2
-	reservation, err := store.ReserveMemoryChunkPages(origin, "capture", []MemoryPageDescriptor{{Slot: 3, Identity: identity}})
+	root := commitTestMemory(t, store, origin, "memory/root", 123)
+	want, err := store.MemoryPageEntries(root)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitMemoryChunk(reservation); err != nil {
-		t.Fatal(err)
-	}
-	page := ObjectID(reservation.Pages[3])
-	root, err := store.SetMemoryPage(origin, "memory/root", 123, page)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePins(reservation.Pins); err != nil {
 		t.Fatal(err)
 	}
 	objects, err := store.SnapshotObjects(origin)
@@ -51,19 +38,12 @@ func TestImmutableCatalogReadsMemoryWithoutOwningReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pages, err := catalog.MemoryPages(root)
+	entries, err := catalog.MemoryPageEntries(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := pages[123]; got != page || len(pages) != 1 {
-		t.Fatalf("catalog pages=%v, want page 123=%s", pages, page)
-	}
-	chunk, offset, gotIdentity, err := catalog.MemoryPageRecord(page)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ObjectID(chunk) != ObjectID(reservation.Chunk) || offset != 3*memoryPageBytes || gotIdentity != identity {
-		t.Fatalf("catalog page=(%s,%d,%+v), want (%s,%d,%+v)", ObjectID(chunk), offset, gotIdentity, ObjectID(reservation.Chunk), 3*memoryPageBytes, identity)
+	if len(entries) != 1 || entries[0] != want[0] || entries[0].Index != 123 || entries[0].Identity != testPageIdentity(123) {
+		t.Fatalf("catalog entries = %+v, want %+v", entries, want)
 	}
 	if object, ok := catalog.Object(root); !ok || object.Refs == 0 {
 		t.Fatalf("catalog did not preserve immutable metadata: (%+v,%t)", object, ok)

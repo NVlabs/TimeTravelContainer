@@ -48,10 +48,13 @@ const (
 	ObjectKindDirectoryNode
 	ObjectKindMetadata
 	ObjectKindMemoryChunk
+	// ObjectKindMemoryTable describes the pages of 1 MiB of a memory tree; see
+	// memory.go.
+	ObjectKindMemoryTable
 )
 
 func (k ObjectKind) valid() bool {
-	return k >= ObjectKindPage && k <= ObjectKindMemoryChunk
+	return k >= ObjectKindPage && k <= ObjectKindMemoryTable
 }
 
 // ObjectID is stable across physical relocation and compaction. Ordinals are
@@ -72,9 +75,6 @@ func ParseObjectID(value string) (ObjectID, error) {
 	return parseObjectKey(value)
 }
 
-// PageID identifies one immutable 4 KiB memory page.
-type PageID ObjectID
-
 // MemoryChunkID identifies one immutable cold-memory chunk.
 type MemoryChunkID ObjectID
 
@@ -86,14 +86,6 @@ type InodeID ObjectID
 
 // MetadataID identifies one immutable graph metadata object.
 type MetadataID ObjectID
-
-// AsPageID checks and converts id to a page ID.
-func AsPageID(id ObjectID) (PageID, error) {
-	if id.Kind != ObjectKindPage {
-		return PageID{}, fmt.Errorf("object %s is not a page", id.key())
-	}
-	return PageID(id), nil
-}
 
 // AsMemoryChunkID checks and converts id to a cold memory chunk ID.
 func AsMemoryChunkID(id ObjectID) (MemoryChunkID, error) {

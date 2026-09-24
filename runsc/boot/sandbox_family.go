@@ -239,6 +239,11 @@ type DistributedForkServeArgs struct {
 type DistributedForkExportArgs struct {
 	urpc.FilePayload
 	SessionID string
+	// FilteredGraphStream says the stream is two-way and the daemon answers
+	// the manifest with the pages its graph lacks; see
+	// ttcchunk.WriteFilteredGraphCapture. A Sentry predating it ignores it and
+	// sends every page, which such a daemon still accepts.
+	FilteredGraphStream bool
 }
 
 // DistributedForkExportInfo identifies the filesystem branch captured at the
@@ -323,6 +328,8 @@ type BranchMemoryRoot struct {
 type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
 	ID string
+	// FilteredGraphStream is as for DistributedForkExportArgs.
+	FilteredGraphStream bool
 }
 
 // BranchDehydrationExportInfo describes the capture an export published, so
@@ -1123,7 +1130,13 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if session.sparseSnapshot == nil {
 		return nil, fmt.Errorf("distributed fork session %q sparse snapshot is unavailable", args.SessionID)
 	}
-	if err := ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings); err != nil {
+	var err error
+	if args.FilteredGraphStream {
+		err = ttcchunk.WriteFilteredGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings)
+	} else {
+		err = ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("writing distributed graph capture: %w", err)
 	}
 	return &DistributedForkExportInfo{FilesystemBranch: session.filesystemBranch}, nil
@@ -2530,7 +2543,7 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 			return nil, err
 		}
 	}
-	if err := image.PublishGraphStream(files[0]); err != nil {
+	if err := image.PublishGraphStream(files[0], args.FilteredGraphStream); err != nil {
 		return nil, err
 	}
 	f.mu.Lock()

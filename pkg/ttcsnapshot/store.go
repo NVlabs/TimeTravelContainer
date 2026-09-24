@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"math"
 	"os"
@@ -185,12 +186,18 @@ type Store struct {
 	implicitExternalTransaction bool
 	deferredResolvers           map[string]deferredResolver
 	deferredObjects             map[string]ObjectID
-	// memoryPages is a derived index over live graph-native page records. It
-	// makes repeated captures reuse the immutable PageID selected by the
-	// guest's stable logical/version identity instead of scanning the graph or
-	// storing the same 4-KiB page again. It is rebuilt from authoritative graph
-	// metadata on open and is never persisted separately.
-	memoryPages map[MemoryPageIdentity]map[ObjectID]struct{}
+	// memoryPages is a derived index of where the graph holds each page, by
+	// the stable logical/version identity the guest's memory manager gave it,
+	// so that a capture maps pages the graph holds rather than storing them
+	// again. It counts, for each place, the live tables and pages that map the
+	// page there. Most pages are held in one place; memoryPagesElsewhere has
+	// the others. memoryTables finds live tables by their content, so that a
+	// capture mapping the same pages as one shares it. They are rebuilt from
+	// authoritative graph metadata on open and are never persisted.
+	memoryPages          map[MemoryPageIdentity]memoryPageHolding
+	memoryPagesElsewhere map[MemoryPageIdentity][]memoryPageHolding
+	memoryTables         map[uint64][]ObjectID
+	memoryTableSeed      maphash.Seed
 	// deferredLoads serializes provider I/O for one foreign immutable object.
 	// Provider reads must never run while mu is held: a multi-hop filesystem
 	// graph may legitimately re-enter this Store while resolving an ancestor.
@@ -347,7 +354,7 @@ func open(dir string, externallyCoordinated bool) (*Store, error) {
 	store := &Store{
 		dir: dir, dirFD: dirFD, lock: lock, state: newGraphState(), externallyCoordinated: externallyCoordinated,
 		deferredResolvers: make(map[string]deferredResolver), deferredObjects: make(map[string]ObjectID),
-		deferredLoads: make(map[string]*deferredLoad), memoryPages: make(map[MemoryPageIdentity]map[ObjectID]struct{}),
+		deferredLoads: make(map[string]*deferredLoad), memoryTableSeed: maphash.MakeSeed(),
 	}
 	if externallyCoordinated {
 		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
@@ -802,7 +809,7 @@ func (s *Store) loadGeneration(head graphHead, repairTail bool) error {
 	s.checkpointBytes = int64(len(data))
 	s.checkpointObjects = checkpointObjects
 	s.rebuildDeferredObjectsLocked()
-	s.rebuildMemoryPagesLocked()
+	s.rebuildMemoryIndexesLocked()
 	return nil
 }
 
@@ -812,49 +819,6 @@ func (s *Store) rebuildDeferredObjectsLocked() {
 		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
-	}
-}
-
-func (s *Store) rebuildMemoryPagesLocked() {
-	s.memoryPages = make(map[MemoryPageIdentity]map[ObjectID]struct{})
-	for _, object := range s.state.Objects {
-		s.indexMemoryPageLocked(object)
-	}
-}
-
-func memoryPageIdentity(object Object) (MemoryPageIdentity, bool) {
-	if object.ID.Kind != ObjectKindPage || object.State != ObjectLive || object.Refs == 0 || object.Deferred || len(object.Children) != 1 || object.Children[0].Slot != 0 || object.Children[0].Child.Kind != ObjectKindMemoryChunk {
-		return MemoryPageIdentity{}, false
-	}
-	_, identity, err := decodeMemoryPageRecord(object.Data)
-	if err != nil || identity.LogicalAllocator == ([16]byte{}) || identity.VersionAllocator == ([16]byte{}) || identity.References == 0 {
-		return MemoryPageIdentity{}, false
-	}
-	return identity, true
-}
-
-func (s *Store) indexMemoryPageLocked(object Object) {
-	identity, ok := memoryPageIdentity(object)
-	if !ok {
-		return
-	}
-	pages := s.memoryPages[identity]
-	if pages == nil {
-		pages = make(map[ObjectID]struct{})
-		s.memoryPages[identity] = pages
-	}
-	pages[object.ID] = struct{}{}
-}
-
-func (s *Store) unindexMemoryPageLocked(object Object) {
-	identity, ok := memoryPageIdentity(object)
-	if !ok {
-		return
-	}
-	pages := s.memoryPages[identity]
-	delete(pages, object.ID)
-	if len(pages) == 0 {
-		delete(s.memoryPages, identity)
 	}
 }
 
@@ -1153,7 +1117,7 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 		if object.SourceCatalog != "" && !object.SourceObject.IsZero() {
 			delete(s.deferredObjects, deferredObjectKey(object.SourceCatalog, object.SourceObject))
 		}
-		s.unindexMemoryPageLocked(object)
+		s.unindexMemoryObjectLocked(object)
 	}
 	for key := range oldObjects {
 		object, ok := s.state.Objects[key]
@@ -1161,7 +1125,7 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
 		if ok {
-			s.indexMemoryPageLocked(object)
+			s.indexMemoryObjectLocked(object)
 		}
 	}
 	for _, op := range record.Ops {
@@ -1177,7 +1141,7 @@ func (s *Store) applyIncrementalJournalRecord(record journalRecord) error {
 			s.deferredObjects[deferredObjectKey(object.SourceCatalog, object.SourceObject)] = object.ID
 		}
 		if ok {
-			s.indexMemoryPageLocked(object)
+			s.indexMemoryObjectLocked(object)
 		}
 	}
 	return nil
@@ -1740,12 +1704,18 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		}
 		s.state.Objects[key] = cloneObject(object)
 	}
-	for _, object := range affectedObjects {
-		s.unindexMemoryPageLocked(object)
+	for key, before := range affectedObjects {
+		// Most objects a transaction touches only gain or lose a reference,
+		// which leaves a page indexed under the same identity.
+		if after, ok := s.state.Objects[key]; ok && memoryObjectIndexedAlike(before, after) {
+			delete(affectedKeys, key)
+			continue
+		}
+		s.unindexMemoryObjectLocked(before)
 	}
 	for key := range affectedKeys {
 		if object, ok := s.state.Objects[key]; ok {
-			s.indexMemoryPageLocked(object)
+			s.indexMemoryObjectLocked(object)
 		}
 	}
 	return nil
@@ -2578,6 +2548,12 @@ func (s *Store) SetPin(name string, id ObjectID) error {
 // that need a coherent view of several roots: either every root is retained,
 // or none are. Existing pin names are rejected.
 func (s *Store) AddPins(pins map[string]ObjectID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addPinsLocked(pins)
+}
+
+func (s *Store) addPinsLocked(pins map[string]ObjectID) error {
 	if len(pins) == 0 {
 		return nil
 	}
@@ -2589,8 +2565,6 @@ func (s *Store) AddPins(pins map[string]ObjectID) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	touched := make(map[string]Object, len(pins))
 	for _, name := range names {
 		if _, exists := s.state.Pins[name]; exists {

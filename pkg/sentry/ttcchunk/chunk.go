@@ -61,8 +61,11 @@ type Chunk struct {
 	Pages   []Page
 }
 
-func setBit(bitmap *[32]byte, slot uint8) { bitmap[slot/8] |= byte(1 << (slot % 8)) }
-func hasBit(bitmap *[32]byte, slot uint8) bool {
+// slotBitmapBytes is the size of a bitmap with a bit for each slot of a chunk.
+const slotBitmapBytes = PagesPerChunk / 8
+
+func setBit(bitmap *[slotBitmapBytes]byte, slot uint8) { bitmap[slot/8] |= byte(1 << (slot % 8)) }
+func hasBit(bitmap *[slotBitmapBytes]byte, slot uint8) bool {
 	return bitmap[slot/8]&(byte(1)<<(slot%8)) != 0
 }
 
@@ -132,6 +135,20 @@ func Encode(chunk Chunk) ([]byte, error) {
 
 // Decode validates capture-stream chunk data.
 func Decode(data []byte) (Chunk, error) {
+	chunk, err := decodeInPlace(data)
+	if err != nil {
+		return Chunk{}, err
+	}
+	for i := range chunk.Pages {
+		if chunk.Pages[i].Data != nil {
+			chunk.Pages[i].Data = append([]byte(nil), chunk.Pages[i].Data...)
+		}
+	}
+	return chunk, nil
+}
+
+// decodeInPlace is Decode, except that the pages' data are slices of data.
+func decodeInPlace(data []byte) (Chunk, error) {
 	if len(data) < headerBytes || !bytes.Equal(data[:16], formatMagic[:]) {
 		return Chunk{}, errors.New("invalid TTC memory chunk header")
 	}
@@ -191,7 +208,7 @@ func Decode(data []byte) (Chunk, error) {
 		}
 		offset += entryBytes
 		if !page.Zero {
-			page.Data = append([]byte(nil), data[payloadOffset:payloadOffset+hostarch.PageSize]...)
+			page.Data = data[payloadOffset : payloadOffset+hostarch.PageSize : payloadOffset+hostarch.PageSize]
 			payloadOffset += hostarch.PageSize
 		}
 		result.Pages = append(result.Pages, page)

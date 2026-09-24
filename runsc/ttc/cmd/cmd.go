@@ -7723,7 +7723,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 			_ = b.discardFailedGraphSnapshot(origin)
 		}
 	}()
-	reader, writer, err := os.Pipe()
+	reader, writer, err := graphCaptureStream()
 	if err != nil {
 		return boot.BranchDehydrateInfo{}, nil, err
 	}
@@ -7738,7 +7738,7 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 		_ = reader.Close()
 		imported <- graphImportOutcome{result: result, err: importErr}
 	}()
-	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", runtimeID, "dehydrate-export", branchID)
+	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", runtimeID, "dehydrate-export", branchID)
 	_ = writer.Close()
 	outcome := <-imported
 	if exportErr != nil {
@@ -13772,12 +13772,35 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, 
 	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
 }
 
-// importGraphCapture keeps stable PageID reuse inside one reference-authority
-// domain. Standalone origins may share other locally sealed objects. Clustered
-// origins may share only sealed volatile objects owned by this daemon;
-// SnapshotShared objects are caches whose references are owned by the shared
-// ledger and must not acquire unreported local child edges.
-func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
+// graphCaptureStream returns the two ends of a stream a Sentry writes a
+// memory capture to: the daemon's, which is read and answered by
+// importGraphCapture, and the one handed to the Sentry. It is two-way so that
+// the daemon can answer the capture's manifest with the pages its graph
+// lacks, and a fork still sharing most of its memory sends little.
+func graphCaptureStream() (daemon, sentry *os.File, err error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating memory capture stream: %w", err)
+	}
+	// The daemon's end, alone, is nonblocking, so that Go polls it.
+	if err := unix.SetNonblock(fds[0], true); err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		return nil, nil, fmt.Errorf("creating memory capture stream: %w", err)
+	}
+	return os.NewFile(uintptr(fds[0]), "memory-capture"), os.NewFile(uintptr(fds[1]), "memory-capture-sentry"), nil
+}
+
+// importGraphCapture keeps the sharing of pages the graph already holds inside
+// one reference-authority domain. Standalone origins may share other locally
+// sealed objects. Clustered origins may share only sealed volatile objects
+// owned by this daemon; SnapshotShared objects are caches whose references are
+// owned by the shared ledger and must not acquire unreported local child
+// edges.
+//
+// stream is read, and for a filtered capture also answered; see
+// graphCaptureStream.
+func (b *runtimeBackend) importGraphCapture(stream io.ReadWriter, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
 	states := []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
 		// Concurrent and crash-interrupted cluster captures may leave committed
@@ -13787,7 +13810,7 @@ func (b *runtimeBackend) importGraphCapture(reader io.Reader, origin ttcsnapshot
 		// are serialized by the foreground gate and retain their local behavior.
 		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}
 	}
-	result, err := ttcchunk.ImportGraphCaptureWithReusableStates(reader, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+	result, err := ttcchunk.ImportGraphCaptureWithReusableStates(stream, b.snapshotGraph, b.snapshotData, origin, prefix, states)
 	if err != nil {
 		return ttcchunk.GraphImportResult{}, err
 	}
@@ -14476,7 +14499,7 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 	}
 	graphMemorySnapshot = uint64(origin)
 	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
-	reader, writer, err := os.Pipe()
+	reader, writer, err := graphCaptureStream()
 	if err != nil {
 		return fmt.Errorf("creating graph dehydration stream: %w", err)
 	}
@@ -14496,7 +14519,7 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 			_ = reader.Close()
 			imported <- graphImportOutcome{result: result, err: importErr}
 		}()
-		output, exportErr = b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
+		output, exportErr = b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
 		_ = writer.Close()
 		outcome = <-imported
 		return nil

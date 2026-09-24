@@ -81,6 +81,7 @@ type TimeTravel struct {
 	dehydrationConfigFD           int
 	dehydrationGraphObjectsFD     int
 	dehydrationGraphStreamFD      int
+	filteredGraphStream           bool
 	dehydrationGraphManifestFD    int
 	dehydrationMemoryRemoteFD     int
 	dehydrationTargetsStartFD     int
@@ -178,6 +179,7 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.dehydrationConfigFD, "dehydration-config-fd", -1, "inherited FD containing durable dehydration restore arguments")
 	f.IntVar(&t.dehydrationGraphObjectsFD, "dehydration-graph-objects-fd", -1, "inherited graph-native dehydration object directory")
 	f.IntVar(&t.dehydrationGraphStreamFD, "dehydration-graph-stream-fd", -1, "inherited graph-native dehydration capture stream")
+	f.BoolVar(&t.filteredGraphStream, "dehydration-graph-stream-filtered", false, "the capture stream is two-way, and the daemon answers its manifest with the pages its graph lacks")
 	f.IntVar(&t.dehydrationGraphManifestFD, "dehydration-graph-manifest-fd", -1, "inherited graph-native dehydration memory manifest")
 	f.IntVar(&t.dehydrationMemoryRemoteFD, "dehydration-memory-remote-fd", -1, "inherited cold memory chunk stream")
 	f.IntVar(&t.dehydrationTargetsStartFD, "dehydration-targets-start-fd", -1, "first inherited empty dehydration target memory file")
@@ -426,6 +428,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.ExportDistributedForkSnapshot(&boot.DistributedForkExportArgs{
 			FilePayload: urpc.FilePayload{Files: []*os.File{snapshot}}, SessionID: f.Arg(2),
+			FilteredGraphStream: t.filteredGraphStream,
 		})
 		snapshot.Close()
 	case "distributed-status":
@@ -619,6 +622,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		}
 		output, err = cont.Sandbox.ExportDehydratedBranch(&boot.BranchDehydrationExportArgs{
 			FilePayload: urpc.FilePayload{Files: files}, ID: f.Arg(2),
+			FilteredGraphStream: t.filteredGraphStream,
 		})
 	case "dehydrate-restore":
 		if t.dehydrationConfigFD < 0 || t.dehydrationFD < 0 || t.dehydrationGraphManifestFD < 0 || t.dehydrationGraphObjectsFD < 0 || t.dehydrationTargetsCount < 0 || (t.dehydrationTargetsCount != 0 && t.dehydrationTargetsStartFD < 0) || t.dehydrationFilesystemsCount < 0 || (t.dehydrationFilesystemsCount != 0 && t.dehydrationFilesystemsStartFD < 0) {

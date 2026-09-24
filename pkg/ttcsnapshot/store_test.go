@@ -733,17 +733,7 @@ func TestSealAndBatchForkIsOneTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := store.CreateObject(origin, "build/page", ObjectKindPage, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := store.SetMemoryPage(origin, "family/main/memory", 7, page)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePin("build/page"); err != nil {
-		t.Fatal(err)
-	}
+	root := commitTestMemory(t, store, origin, "family/main/memory", 7)
 	copies := make(map[string]string)
 	for i := 0; i < 20; i++ {
 		copies[fmt.Sprintf("family/child-%d/memory", i)] = "family/main/memory"
@@ -771,17 +761,7 @@ func TestSealAndForkWithExternallyAllocatedOrigins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := store.CreateObject(origin, "build/page", ObjectKindPage, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := store.SetMemoryPage(origin, "family/main/memory", 7, page)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePin("build/page"); err != nil {
-		t.Fatal(err)
-	}
+	root := commitTestMemory(t, store, origin, "family/main/memory", 7)
 	before := store.Stats().Sequence
 	working := []SnapshotID{1001, 1002}
 	if err := store.SealAndForkWithOrigins(origin, SnapshotSealedVolatile, map[string]string{
@@ -1013,64 +993,6 @@ func writeGraphTestFiles(t *testing.T, dir string, files map[string][]byte) {
 	}
 }
 
-func TestMemoryRadixPathCopyAndSharing(t *testing.T) {
-	store := openTestStore(t)
-	origin, err := store.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := store.CreateObject(origin, "build/first", ObjectKindPage, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root1, err := store.SetMemoryPage(origin, "branch/main/memory", 0x123456789ab, first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePin("build/first"); err != nil {
-		t.Fatal(err)
-	}
-	if got, ok, err := store.MemoryPage(root1, 0x123456789ab); err != nil || !ok || got != first {
-		t.Fatalf("first lookup=(%+v,%t,%v), want %+v", got, ok, err, first)
-	}
-	if _, ok, err := store.MemoryPage(root1, 0x123456789ac); err != nil || ok {
-		t.Fatalf("absent lookup=(%t,%v), want (false,nil)", ok, err)
-	}
-
-	second, err := store.CreateObject(origin, "build/second", ObjectKindPage, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before := store.Stats()
-	root2, err := store.SetMemoryPage(origin, "branch/main/memory", 0x123456789ac, second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePin("build/second"); err != nil {
-		t.Fatal(err)
-	}
-	if root2 == root1 {
-		t.Fatal("path-copy retained old root identity")
-	}
-	after := store.Stats()
-	if got := after.Objects - before.Objects; got != memoryTreeLevels {
-		t.Fatalf("path-copy created %d nodes, want %d", got, memoryTreeLevels)
-	}
-	for index, want := range map[uint64]ObjectID{0x123456789ab: first, 0x123456789ac: second} {
-		if got, ok, err := store.MemoryPage(root2, index); err != nil || !ok || got != want {
-			t.Fatalf("lookup %#x=(%+v,%t,%v), want %+v", index, got, ok, err, want)
-		}
-	}
-	// A fork shares one root reference and does not traverse descendants.
-	beforeSequence := store.Stats().Sequence
-	if err := store.SetRoot("branch/child/memory", root2); err != nil {
-		t.Fatal(err)
-	}
-	if got := store.Stats().Sequence - beforeSequence; got != 1 {
-		t.Fatalf("fork root mutation used %d journal records, want 1", got)
-	}
-}
-
 func TestReachableBulkObjectsUsesImmutableIdentity(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
@@ -1107,55 +1029,365 @@ func TestReachableBulkObjectsUsesImmutableIdentity(t *testing.T) {
 	}
 }
 
-func TestMemoryChunkCreatesOneSharedRadixPath(t *testing.T) {
+func testPageIdentity(sequence uint64) MemoryPageIdentity {
+	return MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: sequence, VersionAllocator: [16]byte{2}, VersionSequence: sequence, References: 1}
+}
+
+// commitTestMemory maps one page, of a new chunk, at index of the memory tree
+// named root, and returns the tree.
+func commitTestMemory(t *testing.T, store *Store, origin SnapshotID, root string, index uint64) ObjectID {
+	t.Helper()
+	chunks, err := store.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitMemoryTables(origin, []NewMemoryTable{{Root: root, Index: index &^ 0xff, Entries: []MemoryTableEntry{
+		{Slot: uint8(index), Location: MemoryPageLocation{Chunk: chunks[0], Page: uint8(index)}, Identity: testPageIdentity(index)},
+	}}}, chunks); err != nil {
+		t.Fatal(err)
+	}
+	id, ok := store.Root(root)
+	if !ok {
+		t.Fatalf("root %q was not created", root)
+	}
+	return id
+}
+
+// legacyMemoryPageRecord encodes a Page object's record, from before tables.
+func legacyMemoryPageRecord(offset uint32, identity MemoryPageIdentity) []byte {
+	data := binary.BigEndian.AppendUint32(nil, offset)
+	data = append(data, identity.LogicalAllocator[:]...)
+	data = binary.BigEndian.AppendUint64(data, identity.LogicalSequence)
+	data = append(data, identity.VersionAllocator[:]...)
+	data = binary.BigEndian.AppendUint64(data, identity.VersionSequence)
+	return binary.BigEndian.AppendUint64(data, identity.References)
+}
+
+func memoryEntriesByIndex(t *testing.T, store *Store, root string) map[uint64]MemoryPageEntry {
+	t.Helper()
+	id, ok := store.Root(root)
+	if !ok {
+		t.Fatalf("root %q is missing", root)
+	}
+	entries, err := store.MemoryPageEntries(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byIndex := make(map[uint64]MemoryPageEntry, len(entries))
+	for index, entry := range entries {
+		if index != 0 && entry.Index <= entries[index-1].Index {
+			t.Fatalf("entries of %q are out of order at %d", root, entry.Index)
+		}
+		byIndex[entry.Index] = entry
+	}
+	return byIndex
+}
+
+// Tables map pages into several trees in one transaction, which replays after
+// a reopen; a table the same as a live one is shared; and nothing remains
+// once the trees are gone.
+func TestMemoryTablesMapPagesAndShareIdenticalOnes(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := store.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk, ObjectKindMemoryChunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dense := make([]MemoryTableEntry, PagesPerMemoryTable)
+	for slot := range dense {
+		dense[slot] = MemoryTableEntry{Slot: uint8(slot), Location: MemoryPageLocation{Chunk: chunks[0], Page: uint8(slot)}, Identity: testPageIdentity(uint64(slot))}
+	}
+	mixed := []MemoryTableEntry{
+		{Slot: 3, Location: MemoryPageLocation{Chunk: chunks[1], Page: 9}, Identity: testPageIdentity(1000)},
+		{Slot: 4, Location: MemoryPageLocation{Chunk: chunks[0], Page: 4}, Identity: testPageIdentity(4)},
+	}
+	before := store.Stats().Objects
+	if err := store.CommitMemoryTables(origin, []NewMemoryTable{
+		{Root: "memory/a", Index: 0x1234500, Entries: dense},
+		{Root: "memory/b", Index: 0, Entries: mixed},
+	}, chunks); err != nil {
+		t.Fatal(err)
+	}
+	// Two chunks, two tables, and five nodes above each.
+	if got := store.Stats().Objects - before; got != 2+2+2*(memoryTreeLevels-1) {
+		t.Fatalf("mapping two tables created %d objects", got)
+	}
+	check := func(store *Store) {
+		t.Helper()
+		a := memoryEntriesByIndex(t, store, "memory/a")
+		if len(a) != PagesPerMemoryTable {
+			t.Fatalf("memory/a maps %d pages", len(a))
+		}
+		for _, entry := range dense {
+			if got := a[0x1234500+uint64(entry.Slot)]; got.Location != entry.Location || got.Identity != entry.Identity {
+				t.Fatalf("memory/a slot %d is %+v, want %+v", entry.Slot, got, entry)
+			}
+		}
+		b := memoryEntriesByIndex(t, store, "memory/b")
+		if len(b) != 2 || b[3].Location != mixed[0].Location || b[4].Identity != mixed[1].Identity {
+			t.Fatalf("memory/b maps %+v", b)
+		}
+	}
+	check(store)
+
+	// The same pages elsewhere share the table; only the nodes above it are
+	// new.
+	before = store.Stats().Objects
+	if err := store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/c", Index: 0x1234500, Entries: dense}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Stats().Objects - before; got != memoryTreeLevels-1 {
+		t.Fatalf("mapping an existing table created %d objects, want only %d nodes", got, memoryTreeLevels-1)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	check(store)
+	if pins := store.Inspect().Pins; len(pins) != 0 {
+		t.Fatalf("pins %v remain", pins)
+	}
+	for _, name := range []string{"memory/a", "memory/b", "memory/c"} {
+		if err := store.DeleteRoot(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for store.Stats().Objects != 0 {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			t.Fatalf("GC stalled with stats %+v", store.Stats())
+		}
+	}
+}
+
+func TestCommitMemoryTablesRefusesBadTables(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunk, err := store.ReserveObject(origin, ObjectKindMemoryChunk)
+	chunks, err := store.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CommitReservedObject(chunk, "build/chunk", MemoryChunkBytes, nil, nil); err != nil {
-		t.Fatal(err)
+	unreserved := chunks[0]
+	unreserved.Ordinal += 100
+	page := func(slot uint8, chunk ObjectID, identity MemoryPageIdentity) MemoryTableEntry {
+		return MemoryTableEntry{Slot: slot, Location: MemoryPageLocation{Chunk: chunk, Page: slot}, Identity: identity}
 	}
-	slots := make([]uint8, pagesPerChunk)
-	for index := range slots {
-		slots[index] = uint8(index)
+	good := page(1, chunks[0], testPageIdentity(1))
+	for name, commit := range map[string]func() error{
+		"an unreserved chunk": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Entries: []MemoryTableEntry{page(1, unreserved, testPageIdentity(1))}}}, []ObjectID{unreserved})
+		},
+		"a chunk nothing holds": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Entries: []MemoryTableEntry{good}}}, nil)
+		},
+		"an incomplete identity": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Entries: []MemoryTableEntry{page(1, chunks[0], MemoryPageIdentity{})}}}, chunks)
+		},
+		"slots out of order": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Entries: []MemoryTableEntry{page(2, chunks[0], testPageIdentity(2)), good}}}, chunks)
+		},
+		"an unaligned table": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Index: 7, Entries: []MemoryTableEntry{good}}}, chunks)
+		},
+		"one table twice": func() error {
+			return store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "memory/a", Entries: []MemoryTableEntry{good}}, {Root: "memory/a", Entries: []MemoryTableEntry{good}}}, chunks)
+		},
+	} {
+		if err := commit(); err == nil {
+			t.Errorf("committed %s", name)
+		}
 	}
-	before := store.Stats()
-	root, pages, err := store.SetMemoryChunk(origin, "branch/main/memory", 0x1234500, chunk, slots)
+	if _, ok := store.Root("memory/a"); ok {
+		t.Fatal("a refused commit created its root")
+	}
+}
+
+// Holding pages finds those the graph has, in origins in the given states,
+// and pins their chunks, which outlive every tree that held them until the
+// pins go.
+func TestHoldMemoryPagesFindsAndPinsWhatTheGraphHas(t *testing.T) {
+	directory := t.TempDir()
+	store, err := Open(directory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pages) != pagesPerChunk {
-		t.Fatalf("page IDs=%d, want %d", len(pages), pagesPerChunk)
-	}
-	after := store.Stats()
-	if got := after.Objects - before.Objects; got != pagesPerChunk+memoryTreeLevels {
-		t.Fatalf("chunk install created %d objects, want %d pages plus %d shared radix nodes", got, pagesPerChunk, memoryTreeLevels)
-	}
-	for _, slot := range []uint8{0, 1, 127, 255} {
-		page, ok, err := store.MemoryPage(root, 0x1234500+uint64(slot))
-		if err != nil || !ok {
-			t.Fatalf("resolving slot %d: page=%s ok=%t err=%v", slot, page, ok, err)
-		}
-		gotChunk, offset, err := store.MemoryPageOffset(page)
-		if err != nil || ObjectID(gotChunk) != chunk || offset != uint32(slot)*memoryPageBytes {
-			t.Fatalf("slot %d backing=(%s,%d,%v), want (%s,%d,nil)", slot, ObjectID(gotChunk), offset, err, chunk, uint32(slot)*memoryPageBytes)
-		}
-	}
-	chunkObject, _ := store.Object(chunk)
-	if chunkObject.Refs != pagesPerChunk+1 {
-		t.Fatalf("chunk refs=%d, want %d page edges plus construction pin", chunkObject.Refs, pagesPerChunk)
-	}
-	if err := store.DeletePin("build/chunk"); err != nil {
+	first, err := store.AllocateWorking()
+	if err != nil {
 		t.Fatal(err)
 	}
-	chunkObject, _ = store.Object(chunk)
-	if chunkObject.Refs != pagesPerChunk {
-		t.Fatalf("chunk refs after unpin=%d, want %d", chunkObject.Refs, pagesPerChunk)
+	commitTestMemory(t, store, first, "first/memory", 4)
+	held := testPageIdentity(4)
+	chunk := memoryEntriesByIndex(t, store, "first/memory")[4].Location.Chunk
+	if err := store.Seal(first, SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The index is rebuilt from the tables.
+	store, err = Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	unknown := testPageIdentity(5)
+	locations, pins, err := store.HoldMemoryPages("hold/volatile", []MemoryPageIdentity{held, unknown}, SnapshotSealedVolatile)
+	if err != nil || len(pins) != 0 || !locations[0].Chunk.IsZero() || !locations[1].Chunk.IsZero() {
+		t.Fatalf("looking only in volatile origins found %v, pinned %v (%v)", locations, pins, err)
+	}
+	locations, pins, err = store.HoldMemoryPages("hold/any", []MemoryPageIdentity{held, unknown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (MemoryPageLocation{Chunk: chunk, Page: 4}); locations[0] != want || !locations[1].Chunk.IsZero() || len(pins) != 1 {
+		t.Fatalf("found %v and pinned %v, want only %v", locations, pins, want)
+	}
+	if err := store.DeleteRoot("first/memory"); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if _, ok := store.Object(chunk); !ok {
+		t.Fatal("a held chunk was collected")
+	}
+	// A new tree may still refer to it, until the pins go.
+	second, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitMemoryTables(second, []NewMemoryTable{{Root: "second/memory", Entries: []MemoryTableEntry{{Slot: 4, Location: locations[0], Identity: held}}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(pins); err != nil {
+		t.Fatal(err)
+	}
+	if got := memoryEntriesByIndex(t, store, "second/memory")[4]; got.Location != locations[0] {
+		t.Fatalf("the second tree maps %+v", got)
+	}
+	// The page is no longer where no live table holds it.
+	if err := store.DeleteRoot("second/memory"); err != nil {
+		t.Fatal(err)
+	}
+	for store.Stats().Objects != 0 {
+		collected, err := store.Collect(4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if collected == 0 {
+			t.Fatalf("GC stalled with stats %+v", store.Stats())
+		}
+	}
+	if locations, _, err := store.HoldMemoryPages("hold/gone", []MemoryPageIdentity{held}); err != nil || !locations[0].Chunk.IsZero() {
+		t.Fatalf("after collection the page is at %v (%v)", locations, err)
+	}
+}
+
+// A clustered capture may not share pages whose reference authority moved to
+// the shared ledger.
+func TestHoldMemoryPagesFiltersSnapshotAuthorityState(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitTestMemory(t, store, origin, "authority/memory", 7)
+	identity := testPageIdentity(7)
+	if err := store.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if locations, pins, err := store.HoldMemoryPages("hold/volatile", []MemoryPageIdentity{identity}, SnapshotSealedVolatile); err != nil || locations[0].Chunk.IsZero() {
+		t.Fatalf("volatile lookup = (%v, %v)", locations, err)
+	} else if err := store.DeletePins(pins); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkShared(origin); err != nil {
+		t.Fatal(err)
+	}
+	if locations, _, err := store.HoldMemoryPages("hold/volatile-only", []MemoryPageIdentity{identity}, SnapshotWorking, SnapshotSealedVolatile); err != nil || !locations[0].Chunk.IsZero() {
+		t.Fatalf("volatile-only lookup of a shared page = (%v, %v)", locations, err)
+	}
+	if locations, _, err := store.HoldMemoryPages("hold/shared", []MemoryPageIdentity{identity}, SnapshotShared); err != nil || locations[0].Chunk.IsZero() {
+		t.Fatalf("shared lookup = (%v, %v)", locations, err)
+	}
+}
+
+// Trees written before tables, a Page object per page, are read, and their
+// pages shared with tables.
+func TestLegacyMemoryPagesAreReadAndShared(t *testing.T) {
+	store := openTestStore(t)
+	origin, err := store.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.ReserveObjects(origin, []ObjectKind{ObjectKindMemoryChunk, ObjectKindPage, ObjectKindPage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitReservedObjects([]ReservedObject{
+		{ID: ids[0], Pin: "legacy/chunk", BulkLength: MemoryChunkBytes},
+		{ID: ids[1], Pin: "legacy/page-1", Data: legacyMemoryPageRecord(1*memoryPageBytes, testPageIdentity(1)), Children: []Edge{{Slot: 0, Child: ids[0]}}},
+		{ID: ids[2], Pin: "legacy/page-2", Data: legacyMemoryPageRecord(2*memoryPageBytes, testPageIdentity(2)), Children: []Edge{{Slot: 0, Child: ids[0]}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.CreateObject(origin, "legacy/node-0", ObjectKindMemoryNode, []byte{0}, []Edge{{Slot: 1, Child: ids[1]}, {Slot: 2, Child: ids[2]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := []string{"legacy/chunk", "legacy/page-1", "legacy/page-2", "legacy/node-0"}
+	for level := 1; level < memoryTreeLevels; level++ {
+		pin := fmt.Sprintf("legacy/node-%d", level)
+		if node, err = store.CreateObject(origin, pin, ObjectKindMemoryNode, []byte{byte(level)}, []Edge{{Slot: 0, Child: node}}); err != nil {
+			t.Fatal(err)
+		}
+		pins = append(pins, pin)
+	}
+	if err := store.SetRoot("legacy/memory", node); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(pins); err != nil {
+		t.Fatal(err)
+	}
+	entries := memoryEntriesByIndex(t, store, "legacy/memory")
+	if len(entries) != 2 || entries[2].Location != (MemoryPageLocation{Chunk: ids[0], Page: 2}) || entries[1].Identity != testPageIdentity(1) {
+		t.Fatalf("the legacy tree maps %+v", entries)
+	}
+	locations, holds, err := store.HoldMemoryPages("hold/legacy", []MemoryPageIdentity{testPageIdentity(2)})
+	if err != nil || locations[0] != entries[2].Location {
+		t.Fatalf("holding a legacy page found %v (%v)", locations, err)
+	}
+	if err := store.CommitMemoryTables(origin, []NewMemoryTable{{Root: "table/memory", Entries: []MemoryTableEntry{{Slot: 9, Location: locations[0], Identity: testPageIdentity(2)}}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePins(holds); err != nil {
+		t.Fatal(err)
+	}
+	if got := memoryEntriesByIndex(t, store, "table/memory")[9]; got.Location != locations[0] {
+		t.Fatalf("the table maps %+v", got)
 	}
 }
 
@@ -1171,7 +1403,7 @@ func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
 	}
 	if err := store.CommitReservedObjects([]ReservedObject{
 		{ID: ids[0], Pin: "build/chunk", BulkLength: MemoryChunkBytes},
-		{ID: ids[1], Pin: "build/page", Data: encodeMemoryPageRecord(0, MemoryPageIdentity{}), Children: []Edge{{Slot: 0, Child: ids[0]}}},
+		{ID: ids[1], Pin: "build/page", Data: legacyMemoryPageRecord(0, testPageIdentity(0)), Children: []Edge{{Slot: 0, Child: ids[0]}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1189,206 +1421,6 @@ func TestReservedBatchReferencesAndPinRelease(t *testing.T) {
 	}
 	if collected, err := store.Collect(16); err != nil || collected != 0 {
 		t.Fatalf("Collect()=(%d,%v), want nothing left", collected, err)
-	}
-}
-
-func TestMemoryChunkReservationPublishesBulkBeforeGraph(t *testing.T) {
-	directory := t.TempDir()
-	store, err := Open(filepath.Join(directory, "graph"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	data, err := OpenLocalDataStore(filepath.Join(directory, "objects"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer data.Close()
-	origin, err := store.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 99, VersionAllocator: [16]byte{2}, VersionSequence: 103, References: 2}
-	reservation, err := store.ReserveMemoryChunkPages(origin, "build/memory-0", []MemoryPageDescriptor{{Slot: 0, Identity: identity}, {Slot: 7}, {Slot: 255}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := bytes.Repeat([]byte{0x5a}, MemoryChunkBytes)
-	if err := data.Install(ObjectID(reservation.Chunk), bytes.NewReader(payload), MemoryChunkBytes); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := store.Object(ObjectID(reservation.Chunk)); ok {
-		t.Fatal("bulk object became visible before graph commit")
-	}
-	if err := store.CommitMemoryChunk(reservation); err != nil {
-		t.Fatal(err)
-	}
-	pages := make(map[uint64]ObjectID, len(reservation.Pages))
-	for slot, page := range reservation.Pages {
-		pages[0x1000+uint64(slot)] = ObjectID(page)
-	}
-	root, err := store.SetMemoryPages(origin, "branch/main/memory", pages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePins(reservation.Pins); err != nil {
-		t.Fatal(err)
-	}
-	for slot, want := range reservation.Pages {
-		got, ok, err := store.MemoryPage(root, 0x1000+uint64(slot))
-		if err != nil || !ok || got != ObjectID(want) {
-			t.Fatalf("slot %d lookup=(%s,%t,%v), want %s", slot, got, ok, err, ObjectID(want))
-		}
-	}
-	all, err := store.MemoryPages(root)
-	if err != nil || len(all) != len(reservation.Pages) {
-		t.Fatalf("MemoryPages=(%d,%v), want %d entries", len(all), err, len(reservation.Pages))
-	}
-	for slot, want := range reservation.Pages {
-		if got := all[0x1000+uint64(slot)]; got != ObjectID(want) {
-			t.Fatalf("MemoryPages slot %d=%s, want %s", slot, got, ObjectID(want))
-		}
-	}
-	_, _, gotIdentity, err := store.MemoryPageRecord(ObjectID(reservation.Pages[0]))
-	if err != nil || gotIdentity != identity {
-		t.Fatalf("MemoryPageRecord identity=(%+v,%v), want %+v", gotIdentity, err, identity)
-	}
-	file, err := data.Open(ObjectID(reservation.Chunk), MemoryChunkBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := io.ReadAll(file)
-	file.Close()
-	if err != nil || !bytes.Equal(loaded, payload) {
-		t.Fatalf("cold chunk load bytes=%d err=%v", len(loaded), err)
-	}
-	objectsDir, err := os.Open(filepath.Join(directory, "objects"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	donated, err := OpenLocalDataStoreFD(objectsDir)
-	objectsDir.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err = donated.Open(ObjectID(reservation.Chunk), MemoryChunkBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info, err := file.Stat(); err != nil || info.Size() != MemoryChunkBytes {
-		t.Fatalf("donated object info=(%v,%v)", info, err)
-	}
-	file.Close()
-	if err := donated.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestExistingMemoryPagesRebuildAndReclaim(t *testing.T) {
-	directory := t.TempDir()
-	graphDirectory := filepath.Join(directory, "graph")
-	store, err := Open(graphDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	origin, err := store.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := MemoryPageIdentity{LogicalAllocator: [16]byte{1}, LogicalSequence: 7, VersionAllocator: [16]byte{2}, VersionSequence: 11, References: 3}
-	descriptor := MemoryPageDescriptor{Slot: 5, Identity: identity}
-	reservation, err := store.ReserveMemoryChunkPages(origin, "reuse/build", []MemoryPageDescriptor{descriptor})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitMemoryChunk(reservation); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.SetMemoryPages(origin, "reuse/root", map[uint64]ObjectID{99: ObjectID(reservation.Pages[5])}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePins(reservation.Pins); err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor})
-	if err != nil || got[5] != reservation.Pages[5] {
-		t.Fatalf("ExistingMemoryPages()=(%v,%v), want slot 5=%s", got, err, ObjectID(reservation.Pages[5]))
-	}
-	differentReferences := descriptor
-	differentReferences.Identity.References++
-	if got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{differentReferences}); err != nil || len(got) != 0 {
-		t.Fatalf("ExistingMemoryPages(different references)=(%v,%v), want empty", got, err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	store, err = Open(graphDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	got, err = store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor})
-	if err != nil || got[5] != reservation.Pages[5] {
-		t.Fatalf("ExistingMemoryPages() after reopen=(%v,%v), want slot 5=%s", got, err, ObjectID(reservation.Pages[5]))
-	}
-	if err := store.DeleteRoot("reuse/root"); err != nil {
-		t.Fatal(err)
-	}
-	for store.Stats().Objects != 0 {
-		collected, err := store.Collect(4096)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if collected == 0 {
-			t.Fatalf("GC stalled with stats %+v", store.Stats())
-		}
-	}
-	if got, err := store.ExistingMemoryPages([]MemoryPageDescriptor{descriptor}); err != nil || len(got) != 0 {
-		t.Fatalf("ExistingMemoryPages() after reclaim=(%v,%v), want empty", got, err)
-	}
-}
-
-func TestExistingMemoryPagesFiltersSnapshotAuthorityState(t *testing.T) {
-	store, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	origin, err := store.AllocateWorking()
-	if err != nil {
-		t.Fatal(err)
-	}
-	descriptor := MemoryPageDescriptor{Slot: 7, Identity: MemoryPageIdentity{
-		LogicalAllocator: [16]byte{1}, LogicalSequence: 9,
-		VersionAllocator: [16]byte{2}, VersionSequence: 11, References: 1,
-	}}
-	reservation, err := store.ReserveMemoryChunkPages(origin, "authority/build", []MemoryPageDescriptor{descriptor})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CommitMemoryChunk(reservation); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.SetMemoryPages(origin, "authority/root", map[uint64]ObjectID{0: ObjectID(reservation.Pages[7])}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeletePins(reservation.Pins); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Seal(origin, SnapshotSealedVolatile); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotSealedVolatile); err != nil || got[7] != reservation.Pages[7] {
-		t.Fatalf("volatile lookup=(%v,%v), want slot 7=%s", got, err, ObjectID(reservation.Pages[7]))
-	}
-	if err := store.MarkShared(origin); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotWorking, SnapshotSealedVolatile); err != nil || len(got) != 0 {
-		t.Fatalf("volatile-only lookup of shared page=(%v,%v), want empty", got, err)
-	}
-	if got, err := store.ExistingMemoryPagesInStates([]MemoryPageDescriptor{descriptor}, SnapshotShared); err != nil || got[7] != reservation.Pages[7] {
-		t.Fatalf("shared lookup=(%v,%v), want slot 7=%s", got, err, ObjectID(reservation.Pages[7]))
 	}
 }
 
