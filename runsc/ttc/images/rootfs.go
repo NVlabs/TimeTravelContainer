@@ -351,8 +351,16 @@ type ownershipRecord struct {
 }
 
 type ownershipState struct {
-	entries   map[string]ownershipRecord
-	groups    map[string]uint64
+	entries map[string]ownershipRecord
+	groups  map[string]uint64
+	// members holds the paths of each hardlink group, and children the
+	// recorded paths directly beneath each path, recorded or implied. With
+	// them, relinking a group or deleting a subtree costs what the group or
+	// subtree holds, not a scan of every path recorded so far: each file of
+	// a layer deletes the subtree it may replace, and a layer of 200,000
+	// files took seven minutes.
+	members   map[uint64]map[string]struct{}
+	children  map[string]map[string]struct{}
 	sequence  uint64
 	nextGroup uint64
 }
@@ -362,8 +370,61 @@ func newOwnershipState() *ownershipState {
 		entries: map[string]ownershipRecord{
 			".": {owner: ownership.Owner{}},
 		},
-		groups: make(map[string]uint64),
+		groups:   make(map[string]uint64),
+		members:  make(map[uint64]map[string]struct{}),
+		children: make(map[string]map[string]struct{}),
 	}
+}
+
+// index records rel beneath each of its ancestors. Every path beneath an
+// indexed path is indexed up to the root, so indexing stops at the first
+// ancestor that already is.
+func (s *ownershipState) index(rel string) {
+	for rel != "." {
+		parent := path.Dir(rel)
+		siblings := s.children[parent]
+		if siblings == nil {
+			siblings = make(map[string]struct{})
+			s.children[parent] = siblings
+		}
+		if _, ok := siblings[rel]; ok {
+			return
+		}
+		siblings[rel] = struct{}{}
+		rel = parent
+	}
+}
+
+// join puts rel in hardlink group, and out of any other.
+func (s *ownershipState) join(rel string, group uint64) {
+	s.leave(rel)
+	s.groups[rel] = group
+	members := s.members[group]
+	if members == nil {
+		members = make(map[string]struct{})
+		s.members[group] = members
+	}
+	members[rel] = struct{}{}
+	s.index(rel)
+}
+
+// leave takes rel out of its hardlink group, if it is in one.
+func (s *ownershipState) leave(rel string) {
+	group, ok := s.groups[rel]
+	if !ok {
+		return
+	}
+	delete(s.groups, rel)
+	delete(s.members[group], rel)
+	if len(s.members[group]) == 0 {
+		delete(s.members, group)
+	}
+}
+
+// forget deletes what is recorded for rel itself.
+func (s *ownershipState) forget(rel string) {
+	delete(s.entries, rel)
+	s.leave(rel)
 }
 
 func (s *ownershipState) record(header *tar.Header) (bool, error) {
@@ -406,8 +467,9 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 		if previous, ok := s.entries[rel]; ok && !replacesNonDirectory {
 			record.virtualXattrs = mergeVirtualXattrs(previous.virtualXattrs, virtualXattrs)
 		}
-		delete(s.groups, rel)
+		s.leave(rel)
 		s.entries[rel] = record
+		s.index(rel)
 	case tar.TypeLink:
 		s.deleteSubtree(rel)
 		target, err := ownership.CleanPath(header.Linkname)
@@ -421,21 +483,19 @@ func (s *ownershipState) record(header *tar.Header) (bool, error) {
 		if !ok {
 			s.nextGroup++
 			group = s.nextGroup
-			s.groups[target] = group
+			s.join(target, group)
 		}
 		// The archive extractor applies the link header owner with lchown(2), which changes
 		// the shared inode and therefore every existing alias.
-		for name, candidate := range s.groups {
-			if candidate == group {
-				s.entries[name] = record
-			}
+		for name := range s.members[group] {
+			s.entries[name] = record
 		}
-		s.groups[rel] = group
+		s.join(rel, group)
 		s.entries[rel] = record
 	default:
 		s.deleteSubtree(rel)
 		s.nextGroup++
-		s.groups[rel] = s.nextGroup
+		s.join(rel, s.nextGroup)
 		s.entries[rel] = record
 	}
 	return true, nil
@@ -476,27 +536,21 @@ func mergeVirtualXattrs(base, updates map[string][]byte) map[string][]byte {
 	return merged
 }
 
+// deleteSubtree deletes what is recorded for rel and every path beneath it.
 func (s *ownershipState) deleteSubtree(rel string) {
-	prefix := rel + "/"
-	for name := range s.entries {
-		if name == rel || strings.HasPrefix(name, prefix) {
-			delete(s.entries, name)
-			delete(s.groups, name)
-		}
+	if rel != "." {
+		s.deleteChildren(rel)
 	}
+	s.forget(rel)
 }
 
+// deleteChildren deletes what is recorded for every path beneath rel.
 func (s *ownershipState) deleteChildren(rel string) {
-	prefix := ""
-	if rel != "." {
-		prefix = rel + "/"
+	for child := range s.children[rel] {
+		s.deleteChildren(child)
+		s.forget(child)
 	}
-	for name := range s.entries {
-		if name != rel && strings.HasPrefix(name, prefix) {
-			delete(s.entries, name)
-			delete(s.groups, name)
-		}
-	}
+	delete(s.children, rel)
 }
 
 type inodeKey struct {
