@@ -16,6 +16,7 @@ package boot
 
 import (
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -74,5 +75,26 @@ func TestAliasRestoreFilesystemResourcesRejectsMissingCurrent(t *testing.T) {
 	_, err := aliasRestoreFilesystemResources(vfs.RestoreFilesystemResources{}, map[string]string{"missing": "incoming"})
 	if err == nil {
 		t.Fatal("aliasRestoreFilesystemResources succeeded without the active resource")
+	}
+}
+
+// While a durable dehydration restore holds the loader's lock, a runtime that
+// asks whether the container still runs is told at once that it is being
+// created, instead of waiting for the restore to finish.
+func TestContainerRuntimeStateDuringDehydrationRestore(t *testing.T) {
+	l := &Loader{}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.restoringDehydration.Store(true)
+	defer l.restoringDehydration.Store(false)
+	answered := make(chan ContainerRuntimeState, 1)
+	go func() { answered <- l.containerRuntimeState("restoring") }()
+	select {
+	case state := <-answered:
+		if state != RuntimeStateCreating {
+			t.Errorf("containerRuntimeState during a restore=%v, want %v", state, RuntimeStateCreating)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("containerRuntimeState waited for the restore")
 	}
 }

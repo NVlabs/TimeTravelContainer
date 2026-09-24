@@ -97,6 +97,8 @@ func (l *Loader) restoreDurableDehydration(args *DurableDehydrationRestoreArgs) 
 		}
 		return l.restoreDurableDehydrationPeer(args)
 	}
+	l.restoringDehydration.Store(true)
+	defer l.restoringDehydration.Store(false)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.state != created || l.distributedRestore || l.dehydrationRestore {
