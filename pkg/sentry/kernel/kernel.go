@@ -1935,11 +1935,14 @@ func (k *Kernel) SendExternalSignal(info *linux.SignalInfo, context string) {
 
 // SendExternalSignalThreadGroup injects a signal into an specific ThreadGroup.
 //
-// This function doesn't skip signals like SendExternalSignal does.
+// This function doesn't skip signals like SendExternalSignal does. Like every
+// signal from outside the sandbox, one to a PID namespace's init reaches it
+// only as it would from a container runtime on Linux; see
+// ThreadGroup.externalSignalIgnoredLocked.
 func (k *Kernel) SendExternalSignalThreadGroup(tg *ThreadGroup, info *linux.SignalInfo) error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return tg.SendSignal(info)
+	return tg.sendExternalSignal(info)
 }
 
 // SendExternalSignalProcessGroup sends a signal to all ThreadGroups in the
@@ -1956,7 +1959,7 @@ func (k *Kernel) SendExternalSignalProcessGroup(pg *ProcessGroup, info *linux.Si
 		if tg.ProcessGroup() != pg {
 			continue
 		}
-		if err := tg.SendSignal(info); err != nil && firstErr == nil {
+		if err := tg.sendExternalSignal(info); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1975,9 +1978,13 @@ func (k *Kernel) SendContainerSignal(cid string, info *linux.SignalInfo) error {
 	for tg := range k.tasks.Root.tgids {
 		if tg.leader.ContainerID() == cid {
 			tg.signalHandlers.mu.Lock()
-			infoCopy := *info
-			if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
-				lastErr = err
+			if sig := linux.Signal(info.Signo); tg.externalSignalIgnoredLocked(sig) {
+				tg.applySignalSideEffectsLocked(sig)
+			} else {
+				infoCopy := *info
+				if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+					lastErr = err
+				}
 			}
 			tg.signalHandlers.mu.Unlock()
 		}

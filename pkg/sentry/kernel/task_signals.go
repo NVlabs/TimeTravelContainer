@@ -395,6 +395,38 @@ func (tg *ThreadGroup) SendSignal(info *linux.SignalInfo) error {
 	return tg.leader.sendSignalLocked(info, true /* group */)
 }
 
+// sendExternalSignal is SendSignal for a signal from outside the sandbox,
+// which tg discards if externalSignalIgnoredLocked says so.
+func (tg *ThreadGroup) sendExternalSignal(info *linux.SignalInfo) error {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	tg.signalHandlers.mu.Lock()
+	defer tg.signalHandlers.mu.Unlock()
+	if sig := linux.Signal(info.Signo); tg.externalSignalIgnoredLocked(sig) {
+		// As in sendSignalTimerLocked, side effects such as a SIGCONT
+		// resuming a stopped init apply even to a discarded signal.
+		tg.applySignalSideEffectsLocked(sig)
+		return nil
+	}
+	return tg.leader.sendSignalLocked(info, true /* group */)
+}
+
+// externalSignalIgnoredLocked reports whether tg discards sig when it comes
+// from outside the sandbox, as Linux discards a signal sent to a PID
+// namespace's init from an ancestor namespace: it forces only SIGKILL and
+// SIGSTOP on that init, and any other signal reaches it only through a
+// handler the init installed (pid_namespaces(7)). Container runtimes rely on
+// this: a TERM from `docker stop` does not end an init that has no handler
+// for it, and the stop escalates to SIGKILL once its timeout expires.
+//
+// Preconditions: The TaskSet mutex and the signal mutex must be locked.
+func (tg *ThreadGroup) externalSignalIgnoredLocked(sig linux.Signal) bool {
+	if !sig.IsValid() || sig == linux.SIGKILL || sig == linux.SIGSTOP || !tg.isInitInLocked(tg.pidns) {
+		return false
+	}
+	return tg.signalHandlers.actions[sig].Handler == linux.SIG_DFL
+}
+
 // Preconditions: The signal mutex must be locked.
 func (t *Task) sendSignalLocked(info *linux.SignalInfo, group bool) error {
 	return t.sendSignalTimerLocked(info, group, nil)

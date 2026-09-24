@@ -482,6 +482,22 @@ go_test(
 )
 
 go_test(
+    name = "external_signal_test",
+    size = "small",
+    srcs = ["external_signal_test.go"],
+    library = ":kernel",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/limits",
+        "//pkg/sentry/syscalls/linux",
+        "//pkg/sentry/vfs",
+    ],
+)
+
+go_test(
     name = "live_fork_test",
     size = "small",
     srcs = ["live_fork_test.go"],

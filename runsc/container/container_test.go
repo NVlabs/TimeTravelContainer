@@ -634,7 +634,7 @@ func TestLifecycle(t *testing.T) {
 					ch <- err
 					return
 				}
-				if got, want := ws.Signal(), unix.SIGTERM; got != want {
+				if got, want := ws.Signal(), unix.SIGKILL; got != want {
 					ch <- fmt.Errorf("got signal %v, want %v", got, want)
 					return
 				}
@@ -645,9 +645,21 @@ func TestLifecycle(t *testing.T) {
 			// the container before we signal.
 			time.Sleep(time.Second)
 
-			// Send the container a SIGTERM which will cause it to stop.
+			// "sleep 100" is the container's init and has no handler for
+			// SIGTERM, so, as on Linux, a SIGTERM from outside the
+			// container never reaches it.
 			if err := c.SignalContainer(unix.SIGTERM, false); err != nil {
 				t.Fatalf("error sending signal %v to container: %v", unix.SIGTERM, err)
+			}
+			select {
+			case err := <-ch:
+				t.Fatalf("container init without a SIGTERM handler exited on SIGTERM: %v", err)
+			case <-time.After(time.Second):
+			}
+
+			// SIGKILL reaches it regardless.
+			if err := c.SignalContainer(unix.SIGKILL, false); err != nil {
+				t.Fatalf("error sending signal %v to container: %v", unix.SIGKILL, err)
 			}
 
 			// Wait for it to die.
