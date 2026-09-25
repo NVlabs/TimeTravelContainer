@@ -688,10 +688,13 @@ forwardings to the restored container with `ttc port publish`. Connections to
 external hosts are disconnected in the snapshot, as they are for the child of
 a live fork; internal sockets and pipes are retained when supported.
 
-Checkpoint files are intended to be restored by a compatible TTC build. They
-wrap gVisor's versioned state data and are not a stable interchange format
-between arbitrary TTC or upstream gVisor versions. Compression defaults to
-fast DEFLATE and may be disabled:
+A checkpoint holds the branch's own memory, only the pages it uses however
+much its family holds, as a dehydration of the branch; restore imports it and
+rehydrates it as `main`. Checkpoint files are intended to be restored by a
+compatible TTC build. They hold TTC's dehydration state, which is not a stable
+interchange format between arbitrary TTC or upstream gVisor versions, and a
+checkpoint made before TTC saved branches this way can be restored only by the
+build that made it. Compression defaults to fast DEFLATE and may be disabled:
 
 ```shell
 ttc checkpoint --compression none web@main raw-checkpoint.ttc

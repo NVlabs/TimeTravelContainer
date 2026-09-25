@@ -33,8 +33,15 @@ import (
 )
 
 const (
-	// FormatVersion is the current TTC checkpoint container format.
-	FormatVersion = 1
+	// FormatVersion is the current TTC checkpoint container format. Its state
+	// directory holds a dehydration of the branch: its capture, its kernel
+	// state, and a stream of the pages it uses.
+	FormatVersion = 2
+	// kernelCheckpointFormat is the format before: its state directory held a
+	// gVisor checkpoint of the branch's kernel, with the whole memory file the
+	// branch shared with its family, which only the build that wrote it could
+	// restore.
+	kernelCheckpointFormat = 1
 	// ManifestName is the checkpoint manifest path inside the archive.
 	ManifestName = "manifest.json"
 )
@@ -65,6 +72,9 @@ type Manifest struct {
 	Spec          specs.Spec           `json:"spec"`
 	Repositories  []RepositorySnapshot `json:"repositories,omitempty"`
 	HostMounts    []HostMountSnapshot  `json:"host_mounts,omitempty"`
+	// MemoryCompression is how the dehydration's page stream is compressed:
+	// "flate-best-speed", or empty for none.
+	MemoryCompression string `json:"memory_compression,omitempty"`
 }
 
 // WriteManifest writes manifest into an unpacked checkpoint staging tree.
@@ -98,6 +108,9 @@ func ReadManifest(root string) (Manifest, error) {
 	var manifest Manifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return Manifest{}, fmt.Errorf("decoding TTC checkpoint manifest: %w", err)
+	}
+	if manifest.FormatVersion == kernelCheckpointFormat {
+		return Manifest{}, errors.New("this checkpoint was made by an earlier TTC build, and only that build can restore it")
 	}
 	if manifest.FormatVersion != FormatVersion {
 		return Manifest{}, fmt.Errorf("unsupported TTC checkpoint format %d", manifest.FormatVersion)

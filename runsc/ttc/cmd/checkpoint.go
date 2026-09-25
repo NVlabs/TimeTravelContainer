@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,7 +26,9 @@ import (
 	"strconv"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -310,13 +313,18 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
 		return fmt.Errorf("reclaiming checkpoint snapshot origins: %w", err)
 	}
+	memoryCompression := request.compression
+	if memoryCompression == "none" {
+		memoryCompression = ""
+	}
 	if err := ttccheckpoint.WriteManifest(stage, ttccheckpoint.Manifest{
-		SourceBranch:  target.branch,
-		RestorePaused: sourceState == "paused",
-		Container:     info,
-		Spec:          *spec,
-		Repositories:  manifestRepositories,
-		HostMounts:    hostMounts,
+		SourceBranch:      target.branch,
+		RestorePaused:     sourceState == "paused",
+		Container:         info,
+		Spec:              *spec,
+		Repositories:      manifestRepositories,
+		HostMounts:        hostMounts,
+		MemoryCompression: memoryCompression,
 	}); err != nil {
 		return err
 	}
@@ -343,15 +351,10 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	})
 }
 
-// saveCheckpointState saves the hidden checkpoint branch's kernel state and
-// memory in stateDir, and its repositories and host mounts in stage.
+// saveCheckpointState saves a dehydration of the hidden checkpoint branch in
+// stateDir, and its repositories and host mounts in stage.
 func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec *specs.Spec, compression, hiddenBranch, persistentBranch, stage, stateDir string) (manifestRepositories []ttccheckpoint.RepositorySnapshot, hostMounts []ttccheckpoint.HostMountSnapshot, retErr error) {
-	if _, err := b.command(
-		"timetravel",
-		"--image-path", stateDir,
-		"--compression", compression,
-		info.ID, "checkpoint", hiddenBranch,
-	); err != nil {
+	if err := b.saveCheckpointDehydration(info, hiddenBranch, compression, stateDir); err != nil {
 		return nil, nil, fmt.Errorf("saving checkpoint state: %w", err)
 	}
 
@@ -409,6 +412,199 @@ func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec 
 		})
 	}
 	return manifestRepositories, hostMounts, nil
+}
+
+// The files of a checkpoint's dehydration, in its state directory.
+const (
+	checkpointControlName  = "control.json"
+	checkpointMetadataName = "metadata.state"
+	checkpointMemoryName   = "memory.stream"
+)
+
+// saveCheckpointDehydration dehydrates the hidden checkpoint branch and saves
+// the dehydration in stateDir: its capture, its kernel state, and a stream of
+// the pages it uses. The stream holds the branch's own memory; saving its
+// kernel as gVisor does wrote the whole memory file it shares with its family.
+func (b *runtimeBackend) saveCheckpointDehydration(info ttcbundle.ContainerInfo, hiddenBranch, compression, stateDir string) error {
+	if _, err := b.command("timetravel", info.ID, "dehydrate", hiddenBranch); err != nil {
+		return fmt.Errorf("capturing the branch: %w", err)
+	}
+	metadata, err := os.OpenFile(filepath.Join(stateDir, checkpointMetadataName), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer metadata.Close()
+	memory, err := os.OpenFile(filepath.Join(stateDir, checkpointMemoryName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer memory.Close()
+	// Unfiltered, the capture's stream is one-way, so a file can record it.
+	stream, finish := memory, func() error { return nil }
+	if compression != "none" {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		compressed := make(chan error, 1)
+		go func() {
+			compressor, err := flate.NewWriter(memory, flate.BestSpeed)
+			if err == nil {
+				_, err = io.Copy(compressor, reader)
+				err = errors.Join(err, compressor.Close())
+			}
+			// Drain what is left if compressing failed, so the Sentry's
+			// writes do not block.
+			_, _ = io.Copy(io.Discard, reader)
+			compressed <- errors.Join(err, reader.Close())
+		}()
+		stream = writer
+		finish = func() error {
+			_ = writer.Close()
+			return <-compressed
+		}
+	}
+	output, exportErr := b.commandWithFiles([]*os.File{stream, metadata}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-fd=4", info.ID, "dehydrate-export", hiddenBranch)
+	if err := errors.Join(exportErr, finish()); err != nil {
+		return fmt.Errorf("exporting the branch's memory: %w", err)
+	}
+	var exported boot.BranchDehydrationExportInfo
+	if err := json.Unmarshal(output, &exported); err != nil {
+		return fmt.Errorf("decoding the branch's capture: %w", err)
+	}
+	// The state directory is packed into the archive, which is what is kept.
+	data, err := json.Marshal(&exported.Capture)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(stateDir, checkpointControlName), data, 0600)
+}
+
+// recordedCapture replays a memory capture stream recorded to a file. The
+// capture was not filtered, so importing it never answers it.
+type recordedCapture struct {
+	io.Reader
+}
+
+func (recordedCapture) Write([]byte) (int, error) {
+	return 0, errors.New("a recorded memory capture cannot be answered")
+}
+
+// installCheckpointDehydration makes a checkpoint's dehydration the durable
+// dehydration of the restored family's main branch, as dehydrating main would
+// have left it: its pages in the snapshot graph, and its capture and kernel
+// state in main's dehydration image. resume says whether main runs once
+// rehydrated, or stays paused as the checkpointed branch was.
+func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerInfo, stateDir, compression string, resume bool) (retErr error) {
+	main, err := persistentBranchInfo(info, defaultBranchID)
+	if err != nil {
+		return err
+	}
+	controlData, err := os.ReadFile(filepath.Join(stateDir, checkpointControlName))
+	if err != nil {
+		return fmt.Errorf("reading the checkpoint's capture: %w", err)
+	}
+	var capture boot.BranchDehydrateInfo
+	if err := json.Unmarshal(controlData, &capture); err != nil {
+		return fmt.Errorf("decoding the checkpoint's capture: %w", err)
+	}
+	// The restored branch is main, in main's filesystem.
+	capture.FilesystemBranch = main.FilesystemBranch
+	capture.MemoryRoots = nil
+	capture.Resume = resume
+
+	finishGraphCapture := func() {}
+	if b.distributedSource != nil {
+		finishGraphCapture = b.distributedSource.beginForegroundCapture()
+	}
+	defer finishGraphCapture()
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return fmt.Errorf("allocating a snapshot origin: %w", err)
+	}
+	var roots, rootObjects []string
+	controlRoot := ""
+	installed := false
+	defer func() {
+		if installed {
+			return
+		}
+		if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), roots...), controlRoot)); graphErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("releasing the checkpoint's memory roots: %w", graphErr))
+		}
+		if graphErr := b.discardFailedGraphSnapshot(origin); graphErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("discarding the checkpoint's snapshot origin: %w", graphErr))
+		}
+	}()
+	memory, err := os.Open(filepath.Join(stateDir, checkpointMemoryName))
+	if err != nil {
+		return fmt.Errorf("opening the checkpoint's memory: %w", err)
+	}
+	defer memory.Close()
+	var reader io.Reader = memory
+	switch compression {
+	case "":
+	case "flate-best-speed":
+		decompressor := flate.NewReader(memory)
+		defer decompressor.Close()
+		reader = decompressor
+	default:
+		return fmt.Errorf("unsupported checkpoint memory compression %q", compression)
+	}
+	imported, err := b.importGraphCapture(recordedCapture{reader}, origin, fmt.Sprintf("memory/%016x", uint64(origin)))
+	if err != nil {
+		return fmt.Errorf("importing the checkpoint's memory: %w", err)
+	}
+	for _, root := range imported.Roots {
+		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{ResourceID: root.ResourceID, Name: root.Name, Root: root.Root.String()})
+		roots = append(roots, root.Name)
+		rootObjects = append(rootObjects, root.Root.String())
+	}
+	capture.SnapshotID = uint64(origin)
+
+	metadataDir := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "dehydrated")
+	encodedBranch := ttcbundle.MemoryBranchKey(main)
+	if err := os.MkdirAll(metadataDir, 0700); err != nil {
+		return err
+	}
+	stagingDir, err := os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if stagingDir != "" {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+	if err := writeDurableJSON(filepath.Join(stagingDir, checkpointControlName), &capture); err != nil {
+		return err
+	}
+	if err := copyCheckpointHostFile(filepath.Join(stateDir, checkpointMetadataName), filepath.Join(stagingDir, checkpointMetadataName), 0600); err != nil {
+		return fmt.Errorf("installing the checkpoint's kernel state: %w", err)
+	}
+	controlRoot = graphCaptureControlRootName(uint64(origin))
+	controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, controlRoot, stagingDir)
+	if err != nil {
+		return fmt.Errorf("importing the checkpoint's control state: %w", err)
+	}
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return fmt.Errorf("sealing the checkpoint's snapshot origin %d: %w", origin, err)
+	}
+	finalDir := filepath.Join(metadataDir, encodedBranch)
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return fmt.Errorf("publishing the checkpoint's dehydration image: %w", err)
+	}
+	stagingDir = ""
+	store := b.containerStore()
+	if err := store.UpdateBranchSnapshotGraph(info.ID, defaultBranchID, uint64(origin), roots, rootObjects, controlRoot, controlObject.String(), ""); err != nil {
+		_ = os.RemoveAll(finalDir)
+		return fmt.Errorf("recording the checkpoint's memory roots: %w", err)
+	}
+	if err := store.UpdateBranchState(info.ID, defaultBranchID, "dehydrated"); err != nil {
+		return err
+	}
+	installed = true
+	return nil
 }
 
 func copyCheckpointHostPath(source, destination string) error {
@@ -593,51 +789,18 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 			}
 		}
 	}()
-	configured := b.configuredRunscArgsForNetworkConfig(
-		prepared.Container.NetworkMode,
-		prepared.Container.NetworkNAT,
-		prepared.Container.NetworkIP,
-		prepared.Container.NetworkMAC,
-	)
-	var status int
-	// Loading the memory takes time in proportion to it.
-	if suspendErr := b.withoutLifecycleLock(prepared.Container, longOperation{state: "restoring", shown: true}, func() error {
-		status, err = b.runConfiguredCommandWithArgs(
-			configured,
-			"restore",
-			"--bundle", prepared.BundleDir,
-			"--image-path", filepath.Join(stage, "state"),
-			"--detach",
-			id,
-		)
-		return nil
-	}); suspendErr != nil {
-		return "", suspendErr
-	}
-	if err != nil || status != 0 {
-		if err == nil {
-			err = fmt.Errorf("runsc restore exited with status %d", status)
-		}
-		return "", err
-	}
-	target := selector{container: id, branch: defaultBranchID}
-	if _, err := b.ensureConsoleDrain(target, true); err != nil {
-		return "", fmt.Errorf("starting restored console drain: %w", err)
-	}
-	store := b.containerStore()
-	if err := store.UpdateBranchQuarantine(id, defaultBranchID, sourceBranch.Quarantined); err != nil {
+	// Rehydration applies the recorded quarantine.
+	if err := b.containerStore().UpdateBranchQuarantine(id, defaultBranchID, sourceBranch.Quarantined); err != nil {
 		return "", fmt.Errorf("restoring quarantine state: %w", err)
 	}
-	if err := store.UpdateState(id, "running", nil); err != nil {
+	// Importing the memory takes time in proportion to it.
+	if err := b.withoutLifecycleLock(prepared.Container, longOperation{state: "restoring", shown: true}, func() error {
+		return b.installCheckpointDehydration(prepared.Container, filepath.Join(stage, "state"), manifest.MemoryCompression, !manifest.RestorePaused)
+	}); err != nil {
 		return "", err
 	}
-	if manifest.RestorePaused {
-		if _, err := b.command("timetravel", id, "pause", defaultBranchID); err != nil {
-			return "", fmt.Errorf("pausing restored container: %w", err)
-		}
-		if err := store.UpdateState(id, "paused", nil); err != nil {
-			return "", err
-		}
+	if err := b.rehydrate(selector{container: id, branch: defaultBranchID}); err != nil {
+		return "", fmt.Errorf("rehydrating the restored branch: %w", err)
 	}
 	placementState := cluster.PlacementRunning
 	if manifest.RestorePaused {
