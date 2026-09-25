@@ -5685,6 +5685,28 @@ type volumeCommandBackend interface {
 	volumeDriver() (string, error)
 }
 
+// volumeInspectTTC is TTC's own part of a volume's inspect output. A cluster
+// node names itself: its volume is not another node's of the same name.
+func volumeInspectTTC(info ttcvolume.VolumeInfo, b volumeCommandBackend) map[string]any {
+	result := map[string]any{"ID": info.ID, "NextInode": info.NextInode}
+	if runtime, ok := b.(*runtimeBackend); ok && runtime.nodeID != "" {
+		result["Node"] = runtime.nodeID
+	}
+	return result
+}
+
+// clusterVolumeBackend lists the named volumes of every node of a cluster.
+type clusterVolumeBackend interface {
+	clusterVolumes() ([]clusterVolume, bool, error)
+}
+
+// clusterVolume is a named volume and the node whose local root holds it.
+type clusterVolume struct {
+	Name   string `json:"name"`
+	Driver string `json:"driver"`
+	Node   string `json:"node,omitempty"`
+}
+
 func runVolume(args []string, stdout io.Writer, b backend) error {
 	volumes, ok := b.(volumeCommandBackend)
 	if !ok {
@@ -5705,8 +5727,28 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 		fmt.Fprintln(stdout, info.Name)
 		return nil
 	case "ls", "list":
-		if len(args) != 1 {
+		local := len(args) == 2 && args[1] == "--_local"
+		if len(args) != 1 && !local {
 			return errors.New("usage: ttc volume ls")
+		}
+		if !local {
+			if clustered, ok := volumes.(clusterVolumeBackend); ok {
+				list, inCluster, err := clustered.clusterVolumes()
+				if err != nil {
+					return err
+				}
+				if inCluster {
+					sort.Slice(list, func(i, j int) bool {
+						return list[i].Name < list[j].Name || list[i].Name == list[j].Name && list[i].Node < list[j].Node
+					})
+					tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+					fmt.Fprintln(tw, "DRIVER\tVOLUME NAME\tNODE")
+					for _, volume := range list {
+						fmt.Fprintf(tw, "%s\t%s\t%s\n", volume.Driver, volume.Name, volume.Node)
+					}
+					return tw.Flush()
+				}
+			}
 		}
 		list, err := volumes.listVolumes()
 		if err != nil {
@@ -5717,6 +5759,13 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 			return err
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		if local {
+			listing := make([]clusterVolume, 0, len(list))
+			for _, info := range list {
+				listing = append(listing, clusterVolume{Name: info.Name, Driver: driver})
+			}
+			return json.NewEncoder(stdout).Encode(listing)
+		}
 		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "DRIVER\tVOLUME NAME")
 		for _, info := range list {
@@ -5750,7 +5799,7 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 				"Name": info.Name, "Driver": driver,
 				"CreatedAt": info.CreatedAt, "Scope": "local",
 				"Labels": map[string]string{}, "Options": map[string]string{},
-				"TTC": map[string]any{"ID": info.ID, "NextInode": info.NextInode},
+				"TTC": volumeInspectTTC(info, volumes),
 			})
 		}
 		encoder := json.NewEncoder(stdout)
@@ -7046,6 +7095,85 @@ func (b *runtimeBackend) listVolumes() ([]ttcvolume.VolumeInfo, error) {
 		return nil, err
 	}
 	return manager.List()
+}
+
+// clusterVolumes lists the named volumes of every node of the cluster this
+// daemon belongs to, with the node each is on, and reports false for a
+// standalone daemon. As a Docker Swarm node's local volumes do, a volume
+// belongs to one node: its branches there use it, and the same name on
+// another node is another volume. A node that does not answer is passed over
+// with a warning.
+func (b *runtimeBackend) clusterVolumes() ([]clusterVolume, bool, error) {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
+		return nil, false, nil
+	}
+	nodes, err := b.clusterNodes()
+	if err != nil {
+		return nil, true, err
+	}
+	var result []clusterVolume
+	now := time.Now()
+	for _, node := range nodes {
+		if !node.LeaseActive(now) {
+			continue
+		}
+		var listing []clusterVolume
+		if node.NodeID == b.nodeID {
+			listing, err = b.localVolumes()
+		} else {
+			listing, err = b.remoteVolumes(node.NodeID)
+		}
+		if err != nil {
+			if b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: listing the volumes of node %s: %v\n", node.NodeID, err)
+			}
+			continue
+		}
+		for _, volume := range listing {
+			volume.Node = node.NodeID
+			result = append(result, volume)
+		}
+	}
+	return result, true, nil
+}
+
+func (b *runtimeBackend) localVolumes() ([]clusterVolume, error) {
+	list, err := b.listVolumes()
+	if err != nil {
+		return nil, err
+	}
+	driver, err := b.volumeDriver()
+	if err != nil {
+		return nil, err
+	}
+	listing := make([]clusterVolume, 0, len(list))
+	for _, info := range list {
+		listing = append(listing, clusterVolume{Name: info.Name, Driver: driver})
+	}
+	return listing, nil
+}
+
+func (b *runtimeBackend) remoteVolumes(node string) ([]clusterVolume, error) {
+	peer, err := b.distributedSource.peer(node, false)
+	if err != nil {
+		return nil, err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return nil, err
+	}
+	status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"volume", "ls", "--_local"})
+	if err != nil {
+		return nil, err
+	}
+	if status != 0 {
+		return nil, errors.New(strings.TrimSpace(diagnostic))
+	}
+	var listing []clusterVolume
+	if err := json.Unmarshal([]byte(output), &listing); err != nil {
+		return nil, fmt.Errorf("decoding its volumes: %w", err)
+	}
+	return listing, nil
 }
 
 func (b *runtimeBackend) volumeDriver() (string, error) {

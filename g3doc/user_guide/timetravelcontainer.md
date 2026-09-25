@@ -940,6 +940,16 @@ One named volume may have one writable container family at a time. TTC rejects
 a second writable attachment because separate Sentry namespace caches are not
 yet coherent; additional read-only attachments are allowed.
 
+In a cluster, a named volume belongs to one node, as a Docker Swarm node's
+local volumes do: it lives in that node's `TTC_LOCAL_ROOT`, and a branch uses
+the volume of its name on the node it runs on, created on first use. The same
+name on another node is another, separate volume, so branches placed on
+different nodes do not see each other's writes to it. `ttc volume create`,
+`inspect` and `rm` act on the node that runs the command, and `inspect` names
+it; `ttc volume ls` lists the volumes of every node, with a `NODE` column.
+Keep data that branches on several nodes must share on shared storage, and
+bind it read-only.
+
 Use `:ro` for a live read-only view of a host path:
 
 ```shell
