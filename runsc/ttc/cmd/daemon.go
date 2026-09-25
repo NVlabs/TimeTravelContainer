@@ -7477,7 +7477,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		writeError(placementErr)
 		return
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.PlacementClaims, placements); err != nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.Args, request.PlacementClaims, placements); err != nil {
 		unlock()
 		stdinReader.Close()
 		writeError(err)

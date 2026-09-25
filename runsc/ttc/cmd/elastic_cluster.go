@@ -561,7 +561,13 @@ func loadDistributedFamilyIdentity(store ttcbundle.Store, placements cluster.Pla
 	return ttcbundle.ContainerInfo{ID: familyID, Name: identifier, DistributedFamilyID: familyID}, nil
 }
 
-func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
+// daemonCommandClaimsUnplaced reports whether a command claims the unplaced
+// branches it names for the node that runs it.
+func daemonCommandClaimsUnplaced(args []string) bool {
+	return len(args) >= 2 && (args[0] == "rehydrate" || args[0] == "start" || args[0] == "restart")
+}
+
+func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args []string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
 	if len(claims) == 0 {
 		return nil
 	}
@@ -580,6 +586,14 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, claims
 		record, ok := byBranch[claim.FamilyID+"\x00"+claim.BranchID]
 		if !ok {
 			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, os.ErrNotExist)
+		}
+		if record.State == cluster.PlacementUnplaced && daemonCommandClaimsUnplaced(args) {
+			// The branch's cold publication committed after the command was
+			// routed here, as it may whenever a dehydration's publication
+			// outlasts the command that asks for the branch back. The
+			// branch has no owner now, and the command claims it for this
+			// node as it claims any unplaced branch.
+			continue
 		}
 		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused && !(claim.AllowMaterializing && record.State == cluster.PlacementMaterializing) {
 			return fmt.Errorf("stale routed command: branch %s@%s is %s", claim.FamilyID, claim.BranchID, record.State)
@@ -1600,7 +1614,7 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 // fails. Retrying is then routed back to the node that may hold local staging
 // state, while node drain can still move or republish the cold branch.
 func (s *daemonServer) claimUnplacedLifecycleTargets(backend *runtimeBackend, args []string) error {
-	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || len(args) < 2 || (args[0] != "rehydrate" && args[0] != "start" && args[0] != "restart") {
+	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || !daemonCommandClaimsUnplaced(args) {
 		return nil
 	}
 	// Raft leadership changes invalidate execution grants from the preceding
@@ -2815,7 +2829,7 @@ func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (in
 	if err != nil && len(request.PlacementClaims) != 0 {
 		return 1, stdout.String(), stderr.String(), err
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.PlacementClaims, placements); err != nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.Args, request.PlacementClaims, placements); err != nil {
 		return 1, stdout.String(), stderr.String(), err
 	}
 	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {

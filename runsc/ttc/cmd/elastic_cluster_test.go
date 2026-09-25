@@ -345,17 +345,50 @@ func TestDaemonCommandPlacementFencesCatalogGeneration(t *testing.T) {
 	if owner != "node-b" || len(claims) != 1 || claims[0].Generation != created.Generation || claims[0].OwnerIncarnation != "boot-b" {
 		t.Fatalf("placement owner=%q claims=%+v", owner, claims)
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", claims, placements); err != nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", []string{"exec", "web@main", "true"}, claims, placements); err != nil {
 		t.Fatalf("valid claim rejected: %v", err)
 	}
 	if _, err := placements.BeginMigration("web", "main", "node-b", "boot-b", created.Generation, "move-one", "node-c", time.Unix(3, 0).UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", claims, placements); err == nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", []string{"exec", "web@main", "true"}, claims, placements); err == nil {
 		t.Fatal("stale pre-migration claim remained valid")
 	}
 	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
 		t.Fatal("new command was routed into an in-progress migration")
+	}
+}
+
+// A dehydration's publication may commit after a command that asks for the
+// branch back was routed to its owner. The unplaced branch is then the
+// command's to claim; any other command's claim is stale.
+func TestPlacementClaimOfABranchUnplacedSinceRoutingAdmitsAClaimingCommand(t *testing.T) {
+	root := t.TempDir()
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "web", BranchID: "main", PhysicalContainer: "web", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementPaused,
+	}, time.Unix(2, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, claims, err := daemonCommandPlacementWithCatalog(root, placements, []string{"rehydrate", "web@main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Unplace("web", "main", "node-b", "boot-b", created.Generation, time.Unix(3, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"rehydrate", "web@main"}, {"start", "web@main"}, {"restart", "web@main"}} {
+		if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", args, claims, placements); err != nil {
+			t.Errorf("%v of a branch unplaced since routing: %v", args, err)
+		}
+	}
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-b", []string{"exec", "web@main", "true"}, claims, placements); err == nil {
+		t.Error("exec's claim of a branch unplaced since routing was accepted")
 	}
 }
 
@@ -1153,7 +1186,7 @@ func TestClaimUnplacedLifecycleTargetRecordsSelectedNode(t *testing.T) {
 	if owner != "node-a" || len(claims) != 1 || !claims[0].AllowMaterializing {
 		t.Fatalf("materializing rehydrate route=(%q, %+v)", owner, claims)
 	}
-	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-a", claims, placements); err != nil {
+	if err := validateDaemonPlacementClaimsWithCatalog(root, "node-a", []string{"rehydrate", "web@main"}, claims, placements); err != nil {
 		t.Fatalf("materializing rehydrate claim rejected: %v", err)
 	}
 	if _, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@main", "true"}); err == nil {
