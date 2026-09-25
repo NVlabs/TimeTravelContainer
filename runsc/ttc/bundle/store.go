@@ -178,6 +178,36 @@ func (s Store) imageRootDir() string {
 
 var warnedUnreadableContainers sync.Map
 
+// containerNameHints maps a data root and a container name to the ID the name
+// last resolved to, so that LoadContainer need not read every container's
+// record to find one by name. A hint is used only if the record it names
+// still has that name and is listed; otherwise the name is looked up as
+// before. Names are unique, which creation checks, so a hint resolves a name
+// as the full lookup would. The hints are forgotten whenever there are
+// maxContainerNameHints of them.
+var containerNameHints struct {
+	mu  sync.Mutex
+	ids map[string]string
+}
+
+const maxContainerNameHints = 1 << 16
+
+func containerNameHint(key string) (string, bool) {
+	containerNameHints.mu.Lock()
+	defer containerNameHints.mu.Unlock()
+	id, ok := containerNameHints.ids[key]
+	return id, ok
+}
+
+func setContainerNameHint(key, id string) {
+	containerNameHints.mu.Lock()
+	defer containerNameHints.mu.Unlock()
+	if containerNameHints.ids == nil || len(containerNameHints.ids) >= maxContainerNameHints {
+		containerNameHints.ids = make(map[string]string)
+	}
+	containerNameHints.ids[key] = id
+}
+
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
 // branch from its persistent filesystem pointer without changing its visible
 // branch identity. The canonical container bundle is never modified.
@@ -2847,6 +2877,11 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ContainerInfo{}, err
 	}
+	if id, ok := containerNameHint(s.Root + "\x00" + identifier); ok {
+		if info, err := s.loadContainerKey(id); err == nil && info.Name == identifier && !info.DistributedForkHidden && !info.IsDistributedPhysicalRuntime() {
+			return info, nil
+		}
+	}
 	containers, err := s.ListContainers()
 	if err != nil {
 		return ContainerInfo{}, err
@@ -2854,6 +2889,7 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	var names []ContainerInfo
 	var ids []ContainerInfo
 	for _, info := range containers {
+		setContainerNameHint(s.Root+"\x00"+info.Name, info.ID)
 		if info.Name == identifier {
 			names = append(names, info)
 		}

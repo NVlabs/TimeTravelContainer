@@ -593,3 +593,50 @@ func TestBeginBranchPublicationIfDoesNotSupersedeChangedIdentity(t *testing.T) {
 		t.Fatalf("branch after stale begin = %+v", branch)
 	}
 }
+
+// A name that resolved once resolves again without a full listing, and still
+// follows the records when a family is renamed, removed, or its name reused.
+func TestLoadContainerByNameFollowsRenameRemovalAndReuse(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	write := func(id, name string) {
+		t.Helper()
+		containerDir := filepath.Join(root, "containers", id)
+		bundleDir := filepath.Join(containerDir, "bundle")
+		if err := os.MkdirAll(bundleDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{ID: id, Name: name, BundleDir: bundleDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := func(name, id string) {
+		t.Helper()
+		info, err := store.LoadContainer(name)
+		if id == "" {
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("LoadContainer(%q) = (%q, %v), want it not to exist", name, info.ID, err)
+			}
+			return
+		}
+		if err != nil || info.ID != id {
+			t.Fatalf("LoadContainer(%q) = (%q, %v), want %q", name, info.ID, err, id)
+		}
+	}
+	write("id-one", "web")
+	write("id-two", "db")
+	want("web", "id-one")
+	want("db", "id-two")
+	write("id-one", "api")
+	want("web", "")
+	want("api", "id-one")
+	if err := os.RemoveAll(filepath.Join(root, "containers", "id-two")); err != nil {
+		t.Fatal(err)
+	}
+	want("db", "")
+	write("id-three", "db")
+	want("db", "id-three")
+}
