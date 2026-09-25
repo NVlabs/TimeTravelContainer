@@ -17,14 +17,12 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -43,7 +41,6 @@ import (
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/sandbox"
-	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 // TimeTravel controls experimental in-memory sandbox branches.
@@ -68,13 +65,8 @@ type TimeTravel struct {
 	consoleCols                   int
 	consoleXPixels                int
 	consoleYPixels                int
-	consoleLog                    string
 	consoleReadyFD                int
-	consoleWaitStatus             string
-	consoleRetentionStats         string
-	consolePIDFile                string
-	consoleLogMax                 int64
-	consoleLogFiles               int
+	consoleSocket                 string
 	checkpointImagePath           string
 	checkpointCompression         CheckpointCompression
 	dehydrationFD                 int
@@ -142,7 +134,8 @@ func (*TimeTravel) Usage() string {
 		"timetravel [flags] <container-id> dehydrate-restore <branch-id>\n" +
 		"timetravel [flags] <container-id> ps|size|signal|wait|prepare-stop <branch-id>\n" +
 		"timetravel [flags] <container-id> exec-list|exec-wait|exec-signal <branch-id>\n" +
-		"timetravel [flags] <container-id> console-read|console-stat|console-watch|console-wait|console-write|console-close-stdin|console-resize|console-follow <branch-id>\n"
+		"timetravel [flags] <container-id> console-read|console-stat|console-watch|console-wait|console-write|console-close-stdin|console-resize <branch-id>\n" +
+		"timetravel [flags] <container-id> console-follow-family\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -166,13 +159,8 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&t.consoleCols, "cols", 0, "terminal window columns for console-resize")
 	f.IntVar(&t.consoleXPixels, "x-pixels", 0, "terminal window width in pixels for console-resize")
 	f.IntVar(&t.consoleYPixels, "y-pixels", 0, "terminal window height in pixels for console-resize")
-	f.StringVar(&t.consoleLog, "console-log", "", "host path for multiplexed console-follow output")
-	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled after console-follow connects")
-	f.StringVar(&t.consoleWaitStatus, "console-wait-status", "", "host path where console-follow atomically records init wait status")
-	f.StringVar(&t.consoleRetentionStats, "console-retention-stats", "", "host path for cumulative console retention accounting")
-	f.StringVar(&t.consolePIDFile, "console-pid-file", "", "host path for the console-follow process identity")
-	f.Int64Var(&t.consoleLogMax, "console-log-max-bytes", 0, "rotate console-follow output after this many bytes; 0 disables rotation")
-	f.IntVar(&t.consoleLogFiles, "console-log-max-files", 2, "number of console-follow log generations to retain")
+	f.IntVar(&t.consoleReadyFD, "console-ready-fd", -1, "internal FD signaled once console-follow-family listens")
+	f.StringVar(&t.consoleSocket, "console-socket", "", "host path of the socket console-follow-family serves ttcd on")
 	f.StringVar(&t.checkpointImagePath, "image-path", "", "directory path for branch checkpoint state")
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &t.checkpointCompression), "compression", "checkpoint compression: none or flate-best-speed")
 	f.IntVar(&t.dehydrationFD, "dehydration-fd", -1, "inherited file for durable dehydration metadata")
@@ -205,41 +193,6 @@ func (t *TimeTravel) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&t.distributedLeaveSourcePaused, "distributed-leave-source-paused", false, "leave a singular distributed capture paused for migration")
 }
 
-func publishConsoleFollowerPID(path string) (func(), error) {
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, ".console-pid-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating console follower PID file: %w", err)
-	}
-	tempName := temp.Name()
-	cleanupTemp := true
-	defer func() {
-		if cleanupTemp {
-			_ = os.Remove(tempName)
-		}
-	}()
-	if err := temp.Chmod(0600); err != nil {
-		temp.Close()
-		return nil, fmt.Errorf("setting console follower PID permissions: %w", err)
-	}
-	if _, err := fmt.Fprintf(temp, "%d\n", os.Getpid()); err != nil {
-		temp.Close()
-		return nil, fmt.Errorf("writing console follower PID: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return nil, fmt.Errorf("syncing console follower PID: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return nil, fmt.Errorf("closing console follower PID: %w", err)
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		return nil, fmt.Errorf("publishing console follower PID: %w", err)
-	}
-	cleanupTemp = false
-	return func() { _ = os.Remove(path) }, nil
-}
-
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (t *TimeTravel) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
 	c, err := t.loadContainer(conf, f, container.LoadOpts{SkipCheck: true})
@@ -258,7 +211,7 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	action := f.Arg(1)
 	wantArgs := 3
 	switch action {
-	case "branches":
+	case "branches", "console-follow-family":
 		wantArgs = 2
 	case "rename":
 		// The old name and the new one.
@@ -839,153 +792,15 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 			XPixels:   uint16(t.consoleXPixels),
 			YPixels:   uint16(t.consoleYPixels),
 		})
-	case "console-follow":
-		if t.consolePIDFile != "" {
-			cleanupPID, pidErr := publishConsoleFollowerPID(t.consolePIDFile)
-			if pidErr != nil {
-				err = pidErr
-				break
-			}
-			defer cleanupPID()
+	case "console-follow-family":
+		if t.consoleSocket == "" {
+			util.Fatalf("--console-socket is required for console-follow-family")
 		}
-		type branchWaitResult struct {
-			err error
-		}
-		var writer io.Writer = &util.Writer{}
-		var logWriter *ttcconsole.RotatingWriter
-		if t.consoleLog != "" {
-			logWriter, err = ttcconsole.NewRotatingWriterWithStats(t.consoleLog, t.consoleLogMax, t.consoleLogFiles, t.consoleRetentionStats)
-			if err != nil {
-				break
-			}
-			writer = logWriter
-		}
-		var ready func() error
-		var readyFile *os.File
+		var ready *os.File
 		if t.consoleReadyFD >= 0 {
-			readyFile = os.NewFile(uintptr(t.consoleReadyFD), "console-ready")
-			if readyFile == nil {
-				err = fmt.Errorf("invalid console readiness FD %d", t.consoleReadyFD)
-				break
-			}
-			defer readyFile.Close()
-			ready = func() error {
-				_, err := readyFile.Write([]byte{1})
-				return err
-			}
+			ready = os.NewFile(uintptr(t.consoleReadyFD), "console-ready")
 		}
-		if t.consoleWaitStatus != "" {
-			finalReader, finalWriter, pipeErr := os.Pipe()
-			if pipeErr != nil {
-				err = fmt.Errorf("creating final console-output pipe: %w", pipeErr)
-				break
-			}
-			statusReader, statusWriter, pipeErr := os.Pipe()
-			if pipeErr != nil {
-				_ = finalReader.Close()
-				_ = finalWriter.Close()
-				err = fmt.Errorf("creating console wait-status pipe: %w", pipeErr)
-				break
-			}
-			releaseReader, releaseWriter, pipeErr := os.Pipe()
-			if pipeErr != nil {
-				_ = finalReader.Close()
-				_ = finalWriter.Close()
-				_ = statusReader.Close()
-				_ = statusWriter.Close()
-				err = fmt.Errorf("creating console drain-release pipe: %w", pipeErr)
-				break
-			}
-			registrationWriter := readyFile
-			if registrationWriter == nil {
-				registrationWriter, pipeErr = os.OpenFile("/dev/null", os.O_WRONLY, 0)
-				if pipeErr != nil {
-					_ = finalReader.Close()
-					_ = finalWriter.Close()
-					_ = statusReader.Close()
-					_ = statusWriter.Close()
-					_ = releaseReader.Close()
-					_ = releaseWriter.Close()
-					err = fmt.Errorf("opening registration readiness sink: %w", pipeErr)
-					break
-				}
-				defer registrationWriter.Close()
-			}
-			attachedReader, attachedWriter, pipeErr := os.Pipe()
-			if pipeErr != nil {
-				_ = finalReader.Close()
-				_ = finalWriter.Close()
-				_ = statusReader.Close()
-				_ = statusWriter.Close()
-				_ = releaseReader.Close()
-				_ = releaseWriter.Close()
-				err = fmt.Errorf("creating console attachment pipe: %w", pipeErr)
-				break
-			}
-			files := []*os.File{finalWriter, statusWriter, releaseReader, registrationWriter, attachedWriter}
-			waitCh := make(chan branchWaitResult, 1)
-			go func() {
-				_, waitErr := cont.Sandbox.FollowConsole(&boot.ConsoleFollowArgs{
-					FilePayload: urpc.FilePayload{Files: files},
-					BranchID:    f.Arg(2),
-					CID:         cont.ID,
-					ExecID:      t.execID,
-					ConsoleID:   t.consoleID,
-				})
-				_ = finalWriter.Close()
-				_ = statusWriter.Close()
-				_ = releaseReader.Close()
-				_ = attachedWriter.Close()
-				waitCh <- branchWaitResult{err: waitErr}
-			}()
-			var attached [1]byte
-			if _, attachErr := io.ReadFull(attachedReader, attached[:]); attachErr != nil {
-				err = fmt.Errorf("waiting for console attachment readiness: %w", attachErr)
-			}
-			_ = attachedReader.Close()
-			drain := consoleDrainResult{}
-			if err == nil {
-				drain = drainConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, nil)
-			}
-			// A per-read uRPC connection may lose the shutdown race after init
-			// exits. The coordinator still owns the Kernel lease and performs the
-			// authoritative final drain below. Report the client error only when
-			// that handoff also fails.
-			if _, releaseErr := releaseWriter.Write([]byte{1}); err == nil && releaseErr != nil {
-				err = fmt.Errorf("handing console reads to coordinator: %w", releaseErr)
-			}
-			_ = releaseWriter.Close()
-			copyErr := ttcconsole.CopyFinalFrames(writer, finalReader, drain.stdoutEOF, drain.stderrEOF)
-			_ = finalReader.Close()
-			var encodedStatus [4]byte
-			_, statusErr := io.ReadFull(statusReader, encodedStatus[:])
-			_ = statusReader.Close()
-			result := <-waitCh
-			if err == nil {
-				switch {
-				case copyErr != nil:
-					err = copyErr
-				case statusErr != nil && result.err != nil:
-					err = fmt.Errorf("console coordinator failed: %v; reading wait status: %w", result.err, statusErr)
-				case statusErr != nil:
-					err = fmt.Errorf("reading console wait status: %w", statusErr)
-				case result.err != nil:
-					err = result.err
-				default:
-					err = ttcconsole.WriteWaitStatus(t.consoleWaitStatus, binary.BigEndian.Uint32(encodedStatus[:]))
-				}
-			}
-			if err != nil && drain.err != nil {
-				err = fmt.Errorf("%w (client console drain also failed: %v)", err, drain.err)
-			}
-		} else {
-			err = followConsole(cont.Sandbox, f.Arg(2), t.consoleID, writer, ready)
-		}
-		if logWriter != nil {
-			if closeErr := logWriter.Close(); err == nil {
-				err = closeErr
-			}
-		}
+		err = runFamilyConsoleFollower(cont.Sandbox, cont.ID, t.consoleSocket, ready)
 	default:
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -1022,95 +837,4 @@ func distributedAdvertiseAddress(configured, bound string) (string, error) {
 		port = boundPort
 	}
 	return net.JoinHostPort(host, port), nil
-}
-
-type consoleDrainResult struct {
-	stdoutEOF bool
-	stderrEOF bool
-	err       error
-}
-
-// followConsole drains both output streams into versioned TTC multiplexed
-// frames. DecodeFrame also accepts the legacy Docker-compatible representation.
-// It remains connected until both guest writers close.
-func followConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) error {
-	return drainConsole(s, branchID, consoleID, writer, ready).err
-}
-
-func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writer, ready func() error) consoleDrainResult {
-	type streamState struct {
-		kernelStream kernel.InternalConsoleStream
-		frameStream  byte
-		eof          bool
-	}
-	streams := []streamState{
-		{kernelStream: kernel.InternalConsoleStdout, frameStream: ttcconsole.StreamStdout},
-		{kernelStream: kernel.InternalConsoleStderr, frameStream: ttcconsole.StreamStderr},
-	}
-	finish := func(err error) consoleDrainResult {
-		return consoleDrainResult{
-			stdoutEOF: streams[0].eof,
-			stderrEOF: streams[1].eof,
-			err:       err,
-		}
-	}
-	for {
-		progress := false
-		allEOF := true
-		for i := range streams {
-			stream := &streams[i]
-			if stream.eof {
-				continue
-			}
-			allEOF = false
-			readResult, err := s.ReadConsole(&boot.ConsoleReadArgs{
-				BranchID:  branchID,
-				ConsoleID: consoleID,
-				Stream:    stream.kernelStream,
-				MaxBytes:  65536,
-			})
-			if err != nil {
-				return finish(err)
-			}
-			if len(readResult.Data) != 0 {
-				if err := ttcconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), readResult.Data); err != nil {
-					return finish(fmt.Errorf("writing internal console stream %d: %w", stream.frameStream, err))
-				}
-				progress = true
-			}
-			if readResult.EOF {
-				if err := ttcconsole.WriteTimestampedFrame(writer, stream.frameStream, time.Now().UTC(), nil); err != nil {
-					return finish(fmt.Errorf("writing internal console EOF %d: %w", stream.frameStream, err))
-				}
-				stream.eof = true
-				progress = true
-			}
-		}
-		if ready != nil {
-			if err := ready(); err != nil {
-				return finish(fmt.Errorf("signaling console readiness: %w", err))
-			}
-			ready = nil
-		}
-		if allEOF {
-			return finish(nil)
-		}
-		if !progress {
-			// Output, its end, and any change to the branch that ends this
-			// drain wake the wait, so it may be as long as the Sentry allows:
-			// a branch that prints nothing costs a wait every 30 s.
-			_, err := s.WaitConsole(&boot.ConsoleWaitArgs{
-				BranchID:  branchID,
-				ConsoleID: consoleID,
-				Want: kernel.InternalConsoleReadiness{
-					Stdout: !streams[0].eof,
-					Stderr: !streams[1].eof,
-				},
-				Timeout: boot.MaxConsoleWait,
-			})
-			if err != nil {
-				return finish(err)
-			}
-		}
-	}
 }

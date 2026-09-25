@@ -6009,6 +6009,9 @@ func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, erro
 }
 
 type consoleSidecarOwner interface {
+	FollowFamilyConsole(dir string, start func() error, follow ttcconsole.Follow, lock *os.File, target selector, observeInitExit bool) error
+	ObserveFamilyConsole(dir, key string, target selector, observeInitExit bool) bool
+	StopFamilyConsole(dir, key string) (bool, error)
 	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
 	ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool)
 	SuppressConsoleExitOnce(key string) func(bool)
@@ -6050,6 +6053,28 @@ func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), err
 func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	if paths.Lock == "" {
 		return nil
+	}
+	// A console no one follows any more keeps its wait status: its process
+	// has ended.
+	if active, err := consoleDrainActive(paths.Lock); err != nil {
+		return err
+	} else if active && paths.FamilyDir != "" {
+		var err error
+		if b.consoleSidecars != nil {
+			_, err = b.consoleSidecars.StopFamilyConsole(paths.FamilyDir, paths.Lock)
+		} else {
+			err = stopFamilyConsoleOnce(paths.FamilyDir, paths.Lock)
+		}
+		if err != nil {
+			return err
+		}
+		// Unless a follower of its own that an older ttcd started follows
+		// it, it is stopped.
+		if active, err := consoleDrainActive(paths.Lock); err == nil && !active {
+			_ = os.Remove(paths.PID)
+			_ = os.Remove(paths.WaitStatus)
+			return nil
+		}
 	}
 	if b.consoleSidecars != nil {
 		stopped, err := b.consoleSidecars.StopConsoleSidecar(paths.Lock)
@@ -6118,6 +6143,11 @@ func clearConsoleIncarnationStatus(paths ttcbundle.ConsolePaths) error {
 func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
 	consoleDir := filepath.Join(b.activeDataRoot(), "containers", containerID, "console")
 	var result error
+	if b.consoleSidecars != nil {
+		_, result = b.consoleSidecars.StopFamilyConsole(consoleDir, "")
+	} else {
+		result = stopFamilyConsoleOnce(consoleDir, "")
+	}
 	err := filepath.WalkDir(consoleDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -9028,7 +9058,9 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 			if reset {
 				return ttcbundle.ConsolePaths{}, fmt.Errorf("console drain for %s is still active", target)
 			}
-			if b.consoleSidecars != nil {
+			// The console is followed: by its family's follower, or by a
+			// follower of its own an older ttcd started.
+			if b.consoleSidecars != nil && !b.consoleSidecars.ObserveFamilyConsole(paths.FamilyDir, paths.Lock, target, execID == "") {
 				b.consoleSidecars.ObserveInheritedConsoleSidecar(paths.Lock, target, execID == "")
 			}
 			return paths, nil
@@ -9085,67 +9117,110 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, fmt.Errorf("opening console error log: %w", err)
 	}
-	defer errorFile.Close()
+	if err := errorFile.Close(); err != nil {
+		return ttcbundle.ConsolePaths{}, fmt.Errorf("closing prepared console error log: %w", err)
+	}
+	follow := ttcconsole.Follow{
+		Branch: target.branch, ExecID: execID, ConsoleID: consoleID, Lock: paths.Lock,
+		Log: paths.Log, LogMaxBytes: maxBytes, LogMaxFiles: maxFiles, RetentionStats: paths.RetentionStats,
+		WaitStatus: paths.WaitStatus, Error: paths.Error,
+	}
+	start := func() error { return b.startFamilyConsoleFollower(target.container, paths.FamilyDir) }
+	if b.consoleSidecars != nil {
+		err = b.consoleSidecars.FollowFamilyConsole(paths.FamilyDir, start, follow, lockFile, target, execID == "")
+	} else {
+		err = followFamilyConsoleOnce(paths.FamilyDir, start, follow, lockFile)
+	}
+	if err != nil {
+		return ttcbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
+	}
+	return paths, nil
+}
 
+// startFamilyConsoleFollower starts the console follower of container, whose
+// console directory is dir, and waits until it listens: after the follower an
+// older one was, if it is exiting.
+func (b *runtimeBackend) startFamilyConsoleFollower(container, dir string) error {
+	errorPath := filepath.Join(dir, ".follower.error.log")
+	errorFile, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening console follower error log: %w", err)
+	}
+	defer errorFile.Close()
 	readyReader, readyWriter, err := os.Pipe()
 	if err != nil {
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("creating console readiness pipe: %w", err)
+		return fmt.Errorf("creating console follower readiness pipe: %w", err)
 	}
 	defer readyReader.Close()
-	commandArgs := []string{
-		"--root", b.root,
-		"timetravel", "--console", consoleID,
-		"--console-log", paths.Log,
-		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
-		"--console-log-max-files", strconv.Itoa(maxFiles),
-		"--console-wait-status", paths.WaitStatus,
-		"--console-retention-stats", paths.RetentionStats,
-		"--console-pid-file", paths.PID,
-		"--console-ready-fd", "4",
-	}
-	if execID != "" {
-		commandArgs = append(commandArgs, "--exec-id", execID)
-	}
-	commandArgs = append(commandArgs, target.container, "console-follow", target.branch)
-	command := runscCommand(b.runsc, commandArgs...)
+	command := runscCommand(b.runsc, "--root", b.root, "timetravel",
+		"--console-socket", filepath.Join(dir, ttcconsole.FollowerSocketName), "--console-ready-fd", "3",
+		container, "console-follow-family")
 	command.Stderr = errorFile
-	// A follower mostly waits. On one processor its Go runtime keeps an idle
-	// thread fewer: four threads in all, not five.
+	// A follower mostly waits, polling pipes: one processor serves it.
 	command.Env = append(os.Environ(), "GOMAXPROCS=1")
-	// The inherited duplicate keeps the advisory lock held for exactly the
-	// lifetime of the drainer, preventing multiple consumers of one pipe.
-	command.ExtraFiles = []*os.File{lockFile, readyWriter}
+	command.ExtraFiles = []*os.File{readyWriter}
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		readyWriter.Close()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w", target, err)
+		return fmt.Errorf("starting the console follower of %s: %w", container, err)
 	}
-	if err := readyWriter.Close(); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("closing console readiness writer for %s: %w", target, err)
+	readyWriter.Close()
+	fail := func(err error) error {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return fmt.Errorf("starting the console follower of %s: %w: %v", container, err, consoleDrainStoppedError(errorPath))
 	}
-	if err := readyReader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("setting console readiness deadline for %s: %w", target, err)
+	if err := readyReader.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return fail(err)
 	}
 	var ready [1]byte
 	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("waiting for console drain readiness for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
+		return fail(err)
 	}
 	if b.consoleSidecars != nil {
-		if err := b.consoleSidecars.OwnConsoleSidecar(paths.Lock, command, target, execID == ""); err != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-			return ttcbundle.ConsolePaths{}, fmt.Errorf("transferring console drain ownership for %s: %w", target, err)
-		}
-	} else if err := command.Process.Release(); err != nil {
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("releasing console drain process for %s: %w", target, err)
+		// The daemon reaps it; it outlives the daemon otherwise.
+		go func() { _ = command.Wait() }()
+		return nil
 	}
-	return paths, nil
+	return command.Process.Release()
+}
+
+// followFamilyConsoleOnce is FollowFamilyConsole for a backend outside a
+// daemon, which observes no console's end.
+func followFamilyConsoleOnce(dir string, start func() error, follow ttcconsole.Follow, lock *os.File) error {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var client *familyFollowerClient
+		client, err = dialFamilyFollower(dir, nil, nil)
+		if err != nil {
+			if err = start(); err != nil {
+				return err
+			}
+			if client, err = dialFamilyFollower(dir, nil, nil); err != nil {
+				return err
+			}
+		}
+		err = client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerFollow, Follow: &follow}, lock)
+		_ = client.conn.Close()
+		if err == nil || (!errors.Is(err, errFollowerGone) && err.Error() != errFollowerExiting) {
+			return err
+		}
+		<-client.gone
+	}
+	return err
+}
+
+// stopFamilyConsoleOnce is StopFamilyConsole for a backend outside a daemon.
+func stopFamilyConsoleOnce(dir, key string) error {
+	client, err := dialFamilyFollower(dir, nil, nil)
+	if err != nil {
+		return nil
+	}
+	defer client.conn.Close()
+	if err := client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerStop, Lock: key}); err != nil && !errors.Is(err, errFollowerGone) {
+		return err
+	}
+	return nil
 }
 
 func consoleDrainActive(lockPath string) (bool, error) {

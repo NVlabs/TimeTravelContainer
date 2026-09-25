@@ -70,6 +70,7 @@ import (
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 	"gvisor.dev/gvisor/runsc/specutils"
+	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 func init() {
@@ -311,11 +312,11 @@ func TestInitialInternalPTYWinsize(t *testing.T) {
 	}
 }
 
-// TestPreStartInternalTTYFollowerCapturesQuickExit verifies the two-phase
-// follower handshake used by OCI create/start. Registration must complete before
-// start, attachment must wait until the internal PTY exists, and a quick init
-// exit must not lose its buffered terminal output.
-func TestPreStartInternalTTYFollowerCapturesQuickExit(t *testing.T) {
+// TestPreStartInternalTTYPushCapturesQuickExit verifies the console push that
+// OCI create/start relies on: it registers before start, reads once the
+// internal PTY exists, and a quick init exit loses none of its terminal output
+// and ends the push with the init's status.
+func TestPreStartInternalTTYPushCapturesQuickExit(t *testing.T) {
 	spec := testSpec()
 	spec.Process.Args = []string{"/bin/sh", "-c", "printf quick-terminal-output"}
 	spec.Process.Terminal = true
@@ -337,32 +338,19 @@ func TestPreStartInternalTTYFollowerCapturesQuickExit(t *testing.T) {
 	defer cleanup()
 	defer l.Destroy()
 
-	registered := make(chan struct{})
-	attached := make(chan struct{})
-	var final bytes.Buffer
-	type followResult struct {
-		status uint32
-		err    error
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating console push pipe: %v", err)
 	}
-	followDone := make(chan followResult, 1)
+	defer reader.Close()
+	if err := l.family.PushConsole(DefaultBranchID, l.root.cid, "", consoleID, writer); err != nil {
+		t.Fatalf("registering the console push before start: %v", err)
+	}
+	pushed := make(chan []byte, 1)
 	go func() {
-		status, err := l.family.FollowConsole(DefaultBranchID, l.root.cid, "", consoleID, &final,
-			func() error { close(registered); return nil },
-			func() error { close(attached); return nil },
-			func(uint32) error { return nil },
-			func() error { return nil })
-		followDone <- followResult{status: status, err: err}
+		data, _ := io.ReadAll(reader)
+		pushed <- data
 	}()
-	select {
-	case <-registered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("console follower did not register before start")
-	}
-	select {
-	case <-attached:
-		t.Fatal("console follower attached before the internal PTY existed")
-	case <-time.After(10 * time.Millisecond):
-	}
 
 	startResult := make(chan error, 1)
 	go func() { startResult <- <-l.ctrl.manager.startResultChan }()
@@ -372,21 +360,44 @@ func TestPreStartInternalTTYFollowerCapturesQuickExit(t *testing.T) {
 	if err := <-startResult; err != nil {
 		t.Fatalf("start result: %v", err)
 	}
+	var data []byte
 	select {
-	case <-attached:
+	case data = <-pushed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("console follower did not attach after start")
+		t.Fatal("console push did not end after the quick exit")
 	}
-	select {
-	case result := <-followDone:
-		if result.err != nil || result.status != 0 {
-			t.Fatalf("console follower: status=%#x err=%v", result.status, result.err)
+	var output []byte
+	exited := false
+	for len(data) != 0 {
+		if len(data) < ttcconsole.HeaderSize {
+			t.Fatalf("pushed stream ends in a partial header: %x", data)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("console follower did not finish after quick exit")
+		size := ttcconsole.HeaderSize + int(binary.BigEndian.Uint32(data[4:ttcconsole.HeaderSize]))
+		if len(data) < size || exited {
+			t.Fatalf("pushed stream has a partial frame or a frame after the exit: %x", data)
+		}
+		switch data[0] {
+		case ConsolePushExit:
+			if status := binary.BigEndian.Uint32(data[ttcconsole.HeaderSize:size]); status != 0 {
+				t.Fatalf("pushed wait status %#x, want 0", status)
+			}
+			exited = true
+		case ConsolePushError:
+			t.Fatalf("console push failed: %s", data[ttcconsole.HeaderSize:size])
+		default:
+			frame, _, complete, err := ttcconsole.DecodeFrame(data[:size])
+			if err != nil || !complete {
+				t.Fatalf("decoding pushed frame: complete %t, %v", complete, err)
+			}
+			output = append(output, frame.Data...)
+		}
+		data = data[size:]
 	}
-	if !bytes.Contains(final.Bytes(), []byte("quick-terminal-output")) {
-		t.Fatalf("final console frames %q do not contain quick-exit output", final.Bytes())
+	if !exited {
+		t.Fatal("console push ended without the init's status")
+	}
+	if !bytes.Contains(output, []byte("quick-terminal-output")) {
+		t.Fatalf("pushed output %q does not contain the quick exit's output", output)
 	}
 }
 

@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "checkpoint.go",
         "cmd.go",
+        "console_follower.go",
         "cpu_features.go",
         "create.go",
         "debug.go",

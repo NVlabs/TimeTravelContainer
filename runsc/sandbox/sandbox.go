@@ -2526,13 +2526,13 @@ func (s *Sandbox) SignalExecSession(args *boot.ExecSessionArgs) error {
 	return nil
 }
 
-// FollowConsole streams framed init output and waits for init to exit.
-func (s *Sandbox) FollowConsole(args *boot.ConsoleFollowArgs) (uint32, error) {
-	var waitStatus uint32
-	if err := s.call(boot.ContMgrConsoleFollow, args, &waitStatus); err != nil {
-		return 0, fmt.Errorf("following internal console %q in live branch %q: %w", args.ConsoleID, args.BranchID, err)
+// PushConsole has the Sentry push a process's console to the file args
+// carries, in the background, once it holds the Kernel's lifetime.
+func (s *Sandbox) PushConsole(args *boot.ConsolePushArgs) error {
+	if err := s.call(boot.ContMgrConsolePush, args, nil); err != nil {
+		return fmt.Errorf("pushing internal console %q of live branch %q: %w", args.ConsoleID, args.BranchID, err)
 	}
-	return waitStatus, nil
+	return nil
 }
 
 // ReadConsole performs one nonblocking branch-local internal-console read.

@@ -11,6 +11,7 @@ go_library(
         "checkpoint.go",
         "cmd.go",
         "completion.go",
+        "console_followers.go",
         "cp.go",
 		"cpuid_fault_amd64.go",
 		"cpuid_fault_other.go",
@@ -79,6 +80,7 @@ go_test(
     size = "small",
     srcs = [
         "cmd_test.go",
+        "console_followers_test.go",
         "cp_test.go",
         "daemon_terminal_test.go",
         "daemon_test.go",

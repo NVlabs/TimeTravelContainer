@@ -16,7 +16,6 @@ package boot
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,8 +227,8 @@ const (
 	// ContMgrExecSignal signals a managed exec session.
 	ContMgrExecSignal = "containerManager.ExecSignal"
 
-	// ContMgrConsoleFollow streams init output and waits for init to exit.
-	ContMgrConsoleFollow = "containerManager.ConsoleFollow"
+	// ContMgrConsolePush has the Sentry push a process's console to a file.
+	ContMgrConsolePush = "containerManager.ConsolePush"
 
 	// ContMgrConsoleRead reads branch-local internal console output.
 	ContMgrConsoleRead = "containerManager.ConsoleRead"
@@ -1569,51 +1568,22 @@ func (cm *containerManager) ExecSignal(args *ExecSessionArgs, _ *struct{}) error
 	return cm.l.family.SignalExecSession(args)
 }
 
-// ConsoleFollow coordinates client-side console draining with init lifetime.
-func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *uint32) error {
-	if len(args.FilePayload.Files) < 3 || len(args.FilePayload.Files) > 5 {
-		return fmt.Errorf("console follow received %d files, want final output, wait status, release, and optional registration and attachment readiness", len(args.FilePayload.Files))
+// ConsolePush pushes a process's console, in the background, to the one file
+// given.
+func (cm *containerManager) ConsolePush(args *ConsolePushArgs, _ *struct{}) error {
+	if len(args.FilePayload.Files) != 1 {
+		return fmt.Errorf("console push received %d files, want its output", len(args.FilePayload.Files))
 	}
-	var ready func() error
-	var attached func() error
-	if len(args.FilePayload.Files) >= 4 {
-		ready = func() error {
-			if _, err := args.FilePayload.Files[3].Write([]byte{1}); err != nil {
-				return fmt.Errorf("writing console follow readiness: %w", err)
-			}
-			return nil
-		}
-	}
-	if len(args.FilePayload.Files) == 5 {
-		attached = func() error {
-			if _, err := args.FilePayload.Files[4].Write([]byte{1}); err != nil {
-				return fmt.Errorf("writing console attachment readiness: %w", err)
-			}
-			return nil
-		}
-	}
-	exited := func(status uint32) error {
-		var encoded [4]byte
-		binary.BigEndian.PutUint32(encoded[:], status)
-		if n, err := args.FilePayload.Files[1].Write(encoded[:]); err != nil {
-			return fmt.Errorf("writing console follow wait status: %w", err)
-		} else if n != len(encoded) {
-			return fmt.Errorf("writing console follow wait status: %w", io.ErrShortWrite)
-		}
-		return nil
-	}
-	released := func() error {
-		var release [1]byte
-		if _, err := io.ReadFull(args.FilePayload.Files[2], release[:]); err != nil {
-			return err
-		}
-		return nil
-	}
-	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, args.FilePayload.Files[0], ready, attached, exited, released)
+	// urpc closes the files it received when this returns: the push writes
+	// a copy, which the follower made blocking.
+	output, err := args.FilePayload.ReleaseFD(0)
 	if err != nil {
+		return fmt.Errorf("taking console push output: %w", err)
+	}
+	if err := cm.l.family.PushConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, output); err != nil {
+		_ = output.Close()
 		return err
 	}
-	*waitStatus = status
 	return nil
 }
 

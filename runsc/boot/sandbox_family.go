@@ -49,6 +49,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
+	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 // DefaultBranchID is the branch used by existing, branch-unaware runsc RPCs.
@@ -414,16 +415,24 @@ type BranchWaitArgs struct {
 	PID      int32
 }
 
-// ConsoleFollowArgs streams one branch's init output and waits for init to
-// exit. FilePayload contains the final-output writer, wait-status writer,
-// release reader, and optional registration and attachment readiness writers.
-type ConsoleFollowArgs struct {
+// ConsolePushArgs selects a process whose console the Sentry pushes to the one
+// file given: see PushConsole.
+type ConsolePushArgs struct {
 	urpc.FilePayload
 	BranchID  string
 	CID       string
 	ConsoleID string
 	ExecID    string
 }
+
+// A console push ends with one record in the console frame format, of a
+// stream past stdout's and stderr's.
+const (
+	// ConsolePushExit carries the process's wait status, big-endian.
+	ConsolePushExit byte = 3
+	// ConsolePushError carries why the push ended without it.
+	ConsolePushError byte = 4
+)
 
 // BranchSignalArgs selects signal recipients inside one live branch.
 type BranchSignalArgs struct {
@@ -3481,125 +3490,180 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 	return b.k.SendExternalSignalThreadGroup(session.tg, &linux.SignalInfo{Signo: args.Signo})
 }
 
-// FollowConsole coordinates a client-side console drainer with process lifetime.
-// ready acknowledges that the lifetime lease exists, before OCI start may run
-// guest code. attached acknowledges that the process and its console exist, so
-// the client may begin ConsoleRead calls. The lease remains held until output is
-// drained, preventing Sentry shutdown from racing the client's final reads.
-func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, attached func() error, exited func(uint32) error, released func() error) (uint32, error) {
+// PushConsole pushes a process's console to output, in the background: the
+// output of its streams as timestamped console frames, as it comes, and once
+// both have ended, a ConsolePushExit record, or a ConsolePushError record if
+// the push fails; then it closes output. The push holds the Kernel's lifetime
+// from before PushConsole returns, which is before OCI start may run the init
+// of a new container, until it ends. Unlike a console follower's reads, it
+// holds no thread while the console is quiet.
+func (f *SandboxFamily) PushConsole(id, cid, execID, consoleID string, output io.WriteCloser) error {
 	b, done, err := f.beginControl(id)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	defer done()
-	if ready != nil {
-		if err := ready(); err != nil {
-			return 0, fmt.Errorf("acknowledging console follower registration: %w", err)
+	go func() {
+		defer done()
+		defer output.Close()
+		status, err := f.pushConsole(b, id, cid, execID, consoleID, output)
+		if err != nil {
+			_ = writeConsoleFrame(output, ConsolePushError, []byte(err.Error()))
+			return
 		}
-	}
+		var encoded [4]byte
+		binary.BigEndian.PutUint32(encoded[:], status)
+		_ = writeConsoleFrame(output, ConsolePushExit, encoded[:])
+	}()
+	return nil
+}
+
+func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID string, output io.Writer) (uint32, error) {
 	var tg *kernel.ThreadGroup
 	if execID == "" {
 		if id == "" || id == f.LoaderBranchID() {
 			<-f.defaultStarted
 		}
-		tg, err = branchThreadGroup(b.k, cid, 0)
-		if err != nil {
+		var err error
+		if tg, err = branchThreadGroup(b.k, cid, 0); err != nil {
 			return 0, err
 		}
 	} else {
 		f.mu.Lock()
 		session := b.execSessions[execID]
-		if session != nil && session.info.ContainerID != cid {
-			session = nil
-		}
-		if session != nil && session.info.ConsoleID != consoleID {
-			f.mu.Unlock()
-			return 0, fmt.Errorf("exec session %q uses console %q, not %q", execID, session.info.ConsoleID, consoleID)
-		}
-		if session != nil {
+		if session != nil && session.info.ContainerID == cid && session.info.ConsoleID == consoleID {
 			tg = session.tg
 		}
 		f.mu.Unlock()
 		if tg == nil {
-			return 0, fmt.Errorf("exec session %q does not exist in branch %q", execID, id)
+			return 0, fmt.Errorf("exec session %q with console %q does not exist in branch %q", execID, consoleID, id)
 		}
 	}
-	if attached != nil {
-		if err := attached(); err != nil {
-			return 0, fmt.Errorf("acknowledging console attachment: %w", err)
+	exited := make(chan struct{})
+	go func() {
+		tg.WaitExited()
+		close(exited)
+	}()
+	streams := [...]struct {
+		kernel kernel.InternalConsoleStream
+		frame  byte
+		eof    bool
+	}{
+		{kernel: kernel.InternalConsoleStdout, frame: ttcconsole.StreamStdout},
+		{kernel: kernel.InternalConsoleStderr, frame: ttcconsole.StreamStderr},
+	}
+	// drain pushes what the console holds. Once the process has ended,
+	// nothing may be left to wait for.
+	drain := func(final bool) (bool, error) {
+		progress := false
+		for i := range streams {
+			stream := &streams[i]
+			for !stream.eof {
+				b.opMu.Lock()
+				data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), consoleID, stream.kernel, 65536)
+				b.opMu.Unlock()
+				if err != nil {
+					return false, fmt.Errorf("reading internal console stream %d: %w", stream.kernel, err)
+				}
+				if len(data) != 0 {
+					if err := ttcconsole.WriteTimestampedFrame(output, stream.frame, time.Now().UTC(), data); err != nil {
+						return false, fmt.Errorf("pushing internal console stream %d: %w", stream.kernel, err)
+					}
+					progress = true
+				}
+				if eof {
+					if err := ttcconsole.WriteTimestampedFrame(output, stream.frame, time.Now().UTC(), nil); err != nil {
+						return false, fmt.Errorf("pushing internal console EOF %d: %w", stream.kernel, err)
+					}
+					stream.eof = true
+					progress = true
+				}
+				if wouldBlock {
+					if final {
+						return false, fmt.Errorf("internal console stream %d would block after process exit", stream.kernel)
+					}
+					break
+				}
+				if len(data) == 0 && !eof {
+					break
+				}
+			}
+		}
+		return progress, nil
+	}
+	for !streams[0].eof || !streams[1].eof {
+		progress, err := drain(false)
+		if err != nil {
+			return 0, err
+		}
+		if progress {
+			continue
+		}
+		if closed(exited) {
+			break
+		}
+		if err := f.waitConsolePush(b, id, consoleID, kernel.InternalConsoleReadiness{Stdout: !streams[0].eof, Stderr: !streams[1].eof}, exited); err != nil {
+			return 0, err
 		}
 	}
-	tg.WaitExited()
+	<-exited
 	status := uint32(tg.ExitStatus())
+	f.mu.Lock()
 	if execID == "" {
-		f.mu.Lock()
 		if current := f.branches[b.id]; current == b && (b.state == BranchRunning || b.state == BranchPaused) {
 			b.state = BranchExited
 			f.stateChanged.Broadcast()
 		}
-		f.mu.Unlock()
-	} else {
-		f.mu.Lock()
-		if session := b.execSessions[execID]; session != nil && session.tg == tg {
-			session.info.State = ExecSessionExited
-			session.info.ExitStatus = &status
-		}
-		f.mu.Unlock()
+	} else if session := b.execSessions[execID]; session != nil && session.tg == tg {
+		session.info.State = ExecSessionExited
+		session.info.ExitStatus = &status
 	}
-	if exited != nil {
-		if err := exited(status); err != nil {
-			return 0, fmt.Errorf("reporting console process exit: %w", err)
-		}
-	}
+	f.mu.Unlock()
 	if execID == "" {
 		b.k.WaitExited()
 	}
-	if released != nil {
-		if err := released(); err != nil {
-			return 0, fmt.Errorf("waiting for client console-read handoff: %w", err)
-		}
-	}
-	streams := []struct {
-		stream kernel.InternalConsoleStream
-		eof    bool
-	}{
-		{stream: kernel.InternalConsoleStdout},
-		{stream: kernel.InternalConsoleStderr},
-	}
-	for {
-		allEOF := true
-		for i := range streams {
-			stream := &streams[i]
-			if stream.eof {
-				continue
-			}
-			allEOF = false
-			b.opMu.Lock()
-			data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), consoleID, stream.stream, 65536)
-			b.opMu.Unlock()
-			if err != nil {
-				return 0, fmt.Errorf("draining final internal console stream %d: %w", stream.stream, err)
-			}
-			if len(data) != 0 {
-				if err := writeConsoleFrame(finalWriter, byte(stream.stream), data); err != nil {
-					return 0, fmt.Errorf("writing final internal console stream %d: %w", stream.stream, err)
-				}
-			}
-			if eof {
-				if err := writeConsoleFrame(finalWriter, byte(stream.stream), nil); err != nil {
-					return 0, fmt.Errorf("writing final internal console EOF %d: %w", stream.stream, err)
-				}
-				stream.eof = true
-			}
-			if wouldBlock {
-				return 0, fmt.Errorf("internal console stream %d would block after process exit and client handoff", stream.stream)
-			}
-		}
-		if allEOF {
-			break
+	for !streams[0].eof || !streams[1].eof {
+		if _, err := drain(true); err != nil {
+			return 0, err
 		}
 	}
 	return status, nil
+}
+
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitConsolePush waits until the console of a push is ready, its process
+// has exited, or a lifecycle operation needs the branch, which cancels the
+// wait for the push to take again once it is done.
+func (f *SandboxFamily) waitConsolePush(b *sandboxBranch, id, consoleID string, want kernel.InternalConsoleReadiness, exited <-chan struct{}) error {
+	_, lease, finish, err := f.beginConsoleWait(id)
+	if err != nil {
+		// The branch is being dehydrated or removed, which kills its
+		// Kernel and so ends the process.
+		<-exited
+		return nil
+	}
+	defer finish()
+	cancel := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-lease.cancel:
+		case <-exited:
+		case <-stop:
+			return
+		}
+		close(cancel)
+	}()
+	_, _, err = b.k.WaitInternalConsole(b.k.SupervisorContext(), consoleID, want, MaxConsoleWait, cancel)
+	return err
 }
 
 func writeConsoleFrame(writer io.Writer, stream byte, data []byte) error {

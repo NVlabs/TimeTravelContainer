@@ -4290,10 +4290,8 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-retention-stats" ] && [ "${16}" = "--console-pid-file" ] && [ "${18}" = "--console-ready-fd" ] && [ "${19}" = "4" ] && [ "${20}" = "web" ] && [ "${21}" = "console-follow" ] && [ "${22}" = "child" ]; then
-	touch "$0.retention"
-	printf 1 >&4
-	exit 0
+if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-ready-fd" ] && [ "$7" = "3" ] && [ "$8" = "web" ] && [ "$9" = "console-follow-family" ]; then
+	exec env ` + fakeFollowerSocketEnv + `="$5" ` + fakeFollowerMarkerEnv + `="$0.retention" "` + testBinary(t) + `"
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "main" ]; then
 	echo '[{"uid":0,"pid":1,"ppid":0,"pgid":1,"threads":[1],"c":0,"tty":"?","stime":"12:00","time":"1ms","cmd":"init"}]'

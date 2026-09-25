@@ -381,6 +381,14 @@ type daemonServer struct {
 	// exact completion notification for the new daemon.
 	inheritedConsole map[string]struct{}
 
+	// followers are connections to the families' console followers, by
+	// console directory, and familyConsoles the consoles they follow whose
+	// ends this daemon observes, by lock.
+	followerMu     sync.Mutex
+	followers      map[string]*familyFollowerClient
+	followerStarts map[string]*sync.Mutex
+	familyConsoles map[string]daemonFollowedConsole
+
 	consoleClientMu      sync.Mutex
 	consoleClients       map[string]map[*daemonConsoleClient]struct{}
 	closingConsoleClient map[string]int
@@ -2239,8 +2247,9 @@ func (s *daemonServer) SuppressConsoleExitOnce(key string) func(bool) {
 	if s == nil || key == "" {
 		return func(bool) {}
 	}
+	familyObserved := s.familyConsoleObserved(key)
 	s.sidecarMu.Lock()
-	observed := s.sidecars[key] != nil
+	observed := s.sidecars[key] != nil || familyObserved
 	if !observed {
 		_, observed = s.inheritedConsole[key]
 	}

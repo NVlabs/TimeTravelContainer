@@ -1153,6 +1153,9 @@ func replacePortableInternalMount(path string, contents []byte, mode os.FileMode
 // ConsolePaths are persistent host-side files for one branch-local console.
 // None of these files are donated into the sandbox.
 type ConsolePaths struct {
+	// FamilyDir is the console directory of the branch's family, where its
+	// console follower's socket is.
+	FamilyDir      string
 	Log            string
 	Lock           string
 	StdinLock      string
@@ -5968,6 +5971,7 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	}
 	base := filepath.Join(dir, branch)
 	return ConsolePaths{
+		FamilyDir:      dir,
 		Log:            base + ".log",
 		Lock:           base + ".lock",
 		StdinLock:      base + ".stdin.lock",
@@ -6000,6 +6004,7 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	}
 	base := filepath.Join(dir, execID)
 	return ConsolePaths{
+		FamilyDir:      filepath.Dir(filepath.Dir(dir)),
 		Log:            base + ".log",
 		Lock:           base + ".lock",
 		StdinLock:      base + ".stdin.lock",
