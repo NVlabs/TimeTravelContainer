@@ -6114,10 +6114,13 @@ type runtimeBackend struct {
 	// guest. Detached commands release the lock when the command returns.
 	lifecycleReady func()
 	// inventoryReadOnly is set for a listing that runs without the lifecycle
-	// lock because a long mutation holds it. It lists what it finds and
-	// repairs nothing: a runtime missing now may be one that mutation is
-	// rebuilding.
+	// lock. It lists what it finds and repairs nothing: a runtime missing now
+	// may be one that a mutation holding the lock is rebuilding.
 	inventoryReadOnly bool
+	// inventoryRepairWanted is set by such a listing when it passes over a
+	// family whose runtime is gone, which a listing holding the lock would
+	// record.
+	inventoryRepairWanted bool
 	// mutating is set for a daemon request that changes lifecycle state; it
 	// is refused a family another request's long operation works on.
 	// commandName is the request's command.
@@ -11275,10 +11278,14 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			// interval after a foreground init exits but before its waiter records
 			// the result: persistent state is still "created" in both cases.
 			// Inventory must not force-delete runtime metadata in either window.
-			if !persistentFamilyRequiredRuntime(container, b.nodeID) || b.inventoryReadOnly {
+			if !persistentFamilyRequiredRuntime(container, b.nodeID) {
 				continue
 			}
 			if _, busy := b.operations.lookup(container.ID); busy {
+				continue
+			}
+			if b.inventoryReadOnly {
+				b.inventoryRepairWanted = true
 				continue
 			}
 			var exitStatus *int

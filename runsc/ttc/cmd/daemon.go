@@ -7412,16 +7412,17 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	}
 	holdsLifecycleLock := daemonCommandNeedsMutationLock(request.Args) || daemonCommandReadsLifecycle(request.Args)
 	var rawUnlock func()
-	if daemonCommandListsInventory(request.Args) {
-		// A listing must not wait for a mutation that takes minutes, such
-		// as a durable dehydration. If one holds the lock, list without it:
-		// read the records and ask the runtimes, but leave reconciliation,
-		// and any repair it would make, to a command that holds the lock.
-		var locked bool
-		if rawUnlock, locked = s.tryLockDataRoot(opts.dataRoot); !locked {
-			holdsLifecycleLock = false
-			backend.inventoryReadOnly = true
-		}
+	listing := daemonCommandListsInventory(request.Args)
+	if listing {
+		// A listing neither waits for the lifecycle lock, which a mutation
+		// such as a durable dehydration may hold for minutes, nor holds it
+		// while it lists, which would make every mutation wait for it. It
+		// reads the records and asks the runtimes without the lock, and
+		// repairs nothing; below, it lists again holding the lock only if
+		// there is a repair to make and the lock is free.
+		holdsLifecycleLock = false
+		backend.inventoryReadOnly = true
+		rawUnlock = func() {}
 	} else {
 		rawUnlock = s.lockMutation(opts.dataRoot, request.Args)
 	}
@@ -7562,7 +7563,12 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		}
 		return
 	}
-	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
+	var status int
+	if listing {
+		status = s.runListing(opts.dataRoot, request.Args, backend)
+	} else {
+		status = runCommand(request.Args, backend.stdout, backend.stderr, backend)
+	}
 	s.recordCommandEvents(opts.dataRoot, request.Args, status)
 	if status == 0 {
 		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
@@ -7587,6 +7593,40 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if status == 0 && backend.daemonStopRequested {
 		s.stopAfterReply(conn)
 	}
+}
+
+// runListing runs a listing command without the lifecycle lock. If that
+// finds a family whose runtime is gone, or the daemon has yet to reconcile,
+// and the lock is free, it lists again holding the lock, which reconciles
+// and records what it finds; otherwise it gives the first listing.
+func (s *daemonServer) runListing(dataRoot string, args []string, backend *runtimeBackend) int {
+	var stdout, stderr bytes.Buffer
+	status := runCommand(args, &stdout, &stderr, backend)
+	if backend.inventoryRepairWanted || !s.reconciledRoots(backend) {
+		if unlock, locked := s.tryLockDataRoot(dataRoot); locked {
+			backend.inventoryReadOnly, backend.inventoryRepairWanted, backend.lifecycleLockHeld = false, false, true
+			s.reconcile(backend)
+			stdout.Reset()
+			stderr.Reset()
+			status = runCommand(args, &stdout, &stderr, backend)
+			backend.lifecycleLockHeld = false
+			unlock()
+		}
+	}
+	_, _ = backend.stdout.Write(stdout.Bytes())
+	_, _ = backend.stderr.Write(stderr.Bytes())
+	return status
+}
+
+// reconciledRoots reports whether reconcile has completed for backend's
+// roots.
+func (s *daemonServer) reconciledRoots(backend *runtimeBackend) bool {
+	if backend.dataRoot == "" {
+		return true
+	}
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	return s.reconciled[backend.dataRoot+"\x00"+backend.root]
 }
 
 func (s *daemonServer) maybeCompactDaemonMutations(dataRoot string) {
