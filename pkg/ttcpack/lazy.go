@@ -589,7 +589,7 @@ func (d *LazyDirectory) Ensure(virtualPath string) error {
 		if entry.Length < 0 || entry.Length > int64(len(buffer)) {
 			return fmt.Errorf("lazy image extent for %q has invalid length %d", canonical, entry.Length)
 		}
-		n, err := d.pack.ReadAt(buffer[:entry.Length], entry.RecordOffset+Alignment)
+		n, err := d.pack.ReadAt(buffer[:entry.Length], entry.dataOffset)
 		if err != nil && !(err == io.EOF && int64(n) == entry.Length) {
 			return err
 		}

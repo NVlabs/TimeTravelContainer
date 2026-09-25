@@ -41,10 +41,19 @@ import (
 const (
 	Alignment     = int64(4096)
 	MaxDataExtent = int64(1 << 20)
-	formatVersion = 2
-	headerMagic   = "TTCPACK2"
-	recordMagic   = "TTCREC02"
-	trailerMagic  = "TTCIDX02"
+	// A pack of formatVersion keeps each entry's data only where the index
+	// says it is: small data back to back, and data of a page or more from a
+	// page boundary, where reads of it start.
+	formatVersion = 3
+	headerMagic   = "TTCPACK3"
+	trailerMagic  = "TTCIDX03"
+	// A pack of paddedFormatVersion, still read, gave every entry a 4 KiB
+	// header and rounded its data up to 4 KiB, so an image of many small files
+	// took up to twice its size.
+	paddedFormatVersion = 2
+	paddedHeaderMagic   = "TTCPACK2"
+	paddedRecordMagic   = "TTCREC02"
+	paddedTrailerMagic  = "TTCIDX02"
 )
 
 // ID is the stable logical identity of a committed pack. It is derived from
@@ -102,6 +111,10 @@ type Entry struct {
 	Length       int64             `json:"length,omitempty"`
 	RecordOffset int64             `json:"record_offset"`
 	StoredLength int64             `json:"stored_length"`
+
+	// dataOffset is where the entry's data begins in its pack, as the pack's
+	// format places it.
+	dataOffset int64
 }
 
 type packHeader struct {
@@ -131,6 +144,10 @@ type Index struct {
 // An existing structurally valid pack with the same transaction-fenced ID is
 // reused, making publication retries idempotent.
 func WriteDirectory(source, repository string, id ID) (ID, error) {
+	return writeDirectory(source, repository, id, formatVersion)
+}
+
+func writeDirectory(source, repository string, id ID, version int) (ID, error) {
 	if !filepath.IsAbs(source) || !filepath.IsAbs(repository) {
 		return ID{}, errors.New("pack source and repository must be absolute")
 	}
@@ -152,14 +169,18 @@ func WriteDirectory(source, repository string, id ID) (ID, error) {
 			_ = os.Remove(temporaryName)
 		}
 	}()
-	writer := &writer{file: temporary, hardlinks: make(map[fileIdentity]string)}
-	if err := writer.writeBlock(packHeader{Magic: headerMagic, Version: formatVersion}); err != nil {
+	writer := &writer{file: temporary, version: version, hardlinks: make(map[fileIdentity]string)}
+	magic, tailMagic := headerMagic, trailerMagic
+	if version == paddedFormatVersion {
+		magic, tailMagic = paddedHeaderMagic, paddedTrailerMagic
+	}
+	if err := writer.writeBlock(packHeader{Magic: magic, Version: version}); err != nil {
 		return ID{}, err
 	}
 	if err := writer.walk(source); err != nil {
 		return ID{}, err
 	}
-	indexOffset, _ := temporary.Seek(0, io.SeekCurrent)
+	indexOffset := writer.offset
 	indexData, err := json.Marshal(Index{Entries: writer.entries})
 	if err != nil {
 		return ID{}, err
@@ -170,7 +191,7 @@ func WriteDirectory(source, repository string, id ID) (ID, error) {
 	if err := writer.pad(); err != nil {
 		return ID{}, err
 	}
-	if err := writer.writeBlock(trailer{Magic: trailerMagic, Version: formatVersion, IndexOffset: indexOffset, IndexLength: int64(len(indexData)), RecordCount: len(writer.entries)}); err != nil {
+	if err := writer.writeBlock(trailer{Magic: tailMagic, Version: version, IndexOffset: indexOffset, IndexLength: int64(len(indexData)), RecordCount: len(writer.entries)}); err != nil {
 		return ID{}, err
 	}
 	if err := temporary.Sync(); err != nil {
@@ -214,6 +235,8 @@ type fileIdentity struct{ dev, ino uint64 }
 
 type writer struct {
 	file      *os.File
+	version   int
+	offset    int64
 	entries   []Entry
 	hardlinks map[fileIdentity]string
 }
@@ -339,16 +362,27 @@ func (w *writer) record(entry Entry, data []byte) error {
 	if int64(len(data)) > MaxDataExtent {
 		return errors.New("pack data extent exceeds 1 MiB")
 	}
-	offset, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
+	if w.version != paddedFormatVersion {
+		if len(data) != 0 {
+			if int64(len(data)) >= Alignment {
+				if err := w.pad(); err != nil {
+					return err
+				}
+			}
+			entry.RecordOffset, entry.StoredLength = w.offset, int64(len(data))
+			if err := w.writeBytes(data); err != nil {
+				return err
+			}
+		}
+		w.entries = append(w.entries, entry)
+		return nil
 	}
-	if offset%Alignment != 0 {
+	if w.offset%Alignment != 0 {
 		return errors.New("unaligned pack record")
 	}
-	entry.RecordOffset = offset
+	entry.RecordOffset = w.offset
 	entry.StoredLength = Alignment + align(int64(len(data)))
-	if err := w.writeBlock(recordHeader{Magic: recordMagic, Entry: entry}); err != nil {
+	if err := w.writeBlock(recordHeader{Magic: paddedRecordMagic, Entry: entry}); err != nil {
 		return err
 	}
 	if err := w.writeBytes(data); err != nil {
@@ -376,7 +410,9 @@ func (w *writer) writeBlock(value any) error {
 }
 
 func (w *writer) writeBytes(data []byte) error {
-	if n, err := w.file.Write(data); err != nil {
+	n, err := w.file.Write(data)
+	w.offset += int64(n)
+	if err != nil {
 		return err
 	} else if n != len(data) {
 		return io.ErrShortWrite
@@ -385,11 +421,7 @@ func (w *writer) writeBytes(data []byte) error {
 }
 
 func (w *writer) pad() error {
-	offset, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	padding := align(offset) - offset
+	padding := align(w.offset) - w.offset
 	if padding == 0 {
 		return nil
 	}
@@ -520,15 +552,23 @@ func open(repository string, id ID) (*os.File, Index, error) {
 // caller owns file and is responsible for retaining any reader lease or lock.
 func ReadIndex(file *os.File) (Index, error) {
 	var header packHeader
-	if err := readJSONBlock(file, 0, &header); err != nil || header.Magic != headerMagic || header.Version != formatVersion {
+	if err := readJSONBlock(file, 0, &header); err != nil {
 		return Index{}, fmt.Errorf("invalid pack header: %w", err)
+	}
+	tailMagic := trailerMagic
+	switch {
+	case header.Magic == headerMagic && header.Version == formatVersion:
+	case header.Magic == paddedHeaderMagic && header.Version == paddedFormatVersion:
+		tailMagic = paddedTrailerMagic
+	default:
+		return Index{}, fmt.Errorf("invalid pack header %q version %d", header.Magic, header.Version)
 	}
 	stat, err := file.Stat()
 	if err != nil || stat.Size() < 2*Alignment || stat.Size()%Alignment != 0 {
 		return Index{}, fmt.Errorf("invalid pack size: %w", err)
 	}
 	var tail trailer
-	if err := readJSONBlock(file, stat.Size()-Alignment, &tail); err != nil || tail.Magic != trailerMagic || tail.Version != formatVersion {
+	if err := readJSONBlock(file, stat.Size()-Alignment, &tail); err != nil || tail.Magic != tailMagic || tail.Version != header.Version {
 		return Index{}, fmt.Errorf("invalid pack trailer: %w", err)
 	}
 	if tail.IndexOffset < Alignment || tail.IndexLength < 0 || tail.IndexOffset+tail.IndexLength > stat.Size()-Alignment {
@@ -545,16 +585,31 @@ func ReadIndex(file *os.File) (Index, error) {
 	if len(index.Entries) != tail.RecordCount {
 		return Index{}, errors.New("pack record count mismatch")
 	}
-	for _, entry := range index.Entries {
-		if entry.RecordOffset < Alignment || entry.RecordOffset%Alignment != 0 ||
-			entry.StoredLength < Alignment || entry.StoredLength%Alignment != 0 ||
-			entry.RecordOffset > tail.IndexOffset-entry.StoredLength {
-			return Index{}, fmt.Errorf("pack record %q has an invalid extent", entry.Path)
-		}
-		if entry.Length < 0 || entry.Length > MaxDataExtent ||
-			entry.Length > entry.StoredLength-Alignment {
+	for i := range index.Entries {
+		entry := &index.Entries[i]
+		if entry.Length < 0 || entry.Length > MaxDataExtent {
 			return Index{}, fmt.Errorf("pack record %q has an invalid payload length", entry.Path)
 		}
+		if header.Version == paddedFormatVersion {
+			if entry.RecordOffset < Alignment || entry.RecordOffset%Alignment != 0 ||
+				entry.StoredLength < Alignment || entry.StoredLength%Alignment != 0 ||
+				entry.RecordOffset > tail.IndexOffset-entry.StoredLength {
+				return Index{}, fmt.Errorf("pack record %q has an invalid extent", entry.Path)
+			}
+			if entry.Length > entry.StoredLength-Alignment {
+				return Index{}, fmt.Errorf("pack record %q has an invalid payload length", entry.Path)
+			}
+			entry.dataOffset = entry.RecordOffset + Alignment
+			continue
+		}
+		if entry.StoredLength != entry.Length {
+			return Index{}, fmt.Errorf("pack record %q has an invalid payload length", entry.Path)
+		}
+		if entry.Length == 0 && entry.RecordOffset != 0 ||
+			entry.Length != 0 && (entry.RecordOffset < Alignment || entry.RecordOffset > tail.IndexOffset-entry.Length) {
+			return Index{}, fmt.Errorf("pack record %q has an invalid extent", entry.Path)
+		}
+		entry.dataOffset = entry.RecordOffset
 	}
 	return index, nil
 }
@@ -641,7 +696,7 @@ func ReadEntry(file *os.File, entry Entry, destination []byte) (int, error) {
 	if entry.Length == 0 {
 		return 0, nil
 	}
-	return file.ReadAt(destination[:entry.Length], entry.RecordOffset+Alignment)
+	return file.ReadAt(destination[:entry.Length], entry.dataOffset)
 }
 
 // Materialize reconstructs a complete pack below an existing empty

@@ -6,6 +6,7 @@ package ttcpack
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -350,4 +351,84 @@ func TestLazyDirectoryCapacityEvictionFencesActiveGofer(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(rootfs, "alias")); err != nil || !bytes.Equal(got, contents) {
 		t.Fatalf("refetched alias: len=%d err=%v", len(got), err)
 	}
+}
+
+// A pack keeps small files back to back, with no header for each entry, so a
+// directory of many small files packs into little more than its size; a pack
+// of the padded format before is still read, eagerly and on demand.
+func TestPackFormats(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(filepath.Join(source, "d"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte)
+	var total int64
+	for i := 0; i < 200; i++ {
+		files[filepath.Join("d", fmt.Sprintf("f%03d", i))] = bytes.Repeat([]byte{byte(i)}, 100+7*i)
+	}
+	files["large"] = bytes.Repeat([]byte("large-"), 400000)
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(source, name), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		total += int64(len(data))
+	}
+	if err := os.Symlink("large", filepath.Join(source, "link")); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repository")
+	sizes := make(map[int]int64)
+	for _, version := range []int{formatVersion, paddedFormatVersion} {
+		id, err := writeDirectory(source, repository, IDForKey("test", t.Name(), fmt.Sprint(version)), version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(Path(repository, id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes[version] = info.Size()
+		destination := filepath.Join(root, fmt.Sprintf("eager-%d", version))
+		if err := Materialize(repository, id, destination); err != nil {
+			t.Fatalf("materializing a format %d pack: %v", version, err)
+		}
+		lazyRoot := filepath.Join(root, fmt.Sprintf("lazy-%d", version), "rootfs")
+		if err := MaterializeSkeleton(repository, id, lazyRoot, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteLazyDescriptor(lazyRoot, repository, id, ""); err != nil {
+			t.Fatal(err)
+		}
+		descriptor, err := ReadLazyDescriptor(lazyRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lazy, err := OpenLazyDirectory(lazyRoot, descriptor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, want := range files {
+			if err := lazy.Ensure(filepath.ToSlash(name)); err != nil {
+				t.Fatalf("reading %s on demand from a format %d pack: %v", name, version, err)
+			}
+			for _, dir := range []string{destination, lazyRoot} {
+				if got, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("%s from a format %d pack in %s: %d bytes, %v; want %d bytes", name, version, dir, len(got), err, len(want))
+				}
+			}
+		}
+		if err := lazy.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if link, err := os.Readlink(filepath.Join(destination, "link")); err != nil || link != "large" {
+			t.Fatalf("link from a format %d pack: %q, %v", version, link, err)
+		}
+	}
+	// The data, its index, and the pages of the header, the trailer and the
+	// large file's alignment.
+	if limit := total + 64<<10; sizes[formatVersion] > limit {
+		t.Errorf("pack of %d bytes of data is %d bytes, over %d", total, sizes[formatVersion], limit)
+	}
+	t.Logf("%d bytes of data pack into %d bytes, and took %d padded", total, sizes[formatVersion], sizes[paddedFormatVersion])
 }
