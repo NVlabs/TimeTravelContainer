@@ -300,7 +300,7 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 	copying := func(copy func() error) error {
 		return b.withoutLifecycleLock(info, longOperation{branch: resolved.branch, state: "copying"}, copy)
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(resolved.container)
 	if err != nil {
 		return err
 	}

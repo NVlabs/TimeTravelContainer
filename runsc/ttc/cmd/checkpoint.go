@@ -194,7 +194,7 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 	if err != nil {
 		return err
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(info.ID)
 	if err != nil {
 		return err
 	}

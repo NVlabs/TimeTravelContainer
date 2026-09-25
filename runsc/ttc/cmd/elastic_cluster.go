@@ -3445,7 +3445,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 	if !branchRecorded {
 		return b.removeUnrecordedMigratedSourceRuntime(containerID, branchID, &info)
 	}
-	runtimes, err := b.listRuntimeFamilies()
+	runtimes, err := b.listRuntimeFamiliesOf(info.ID)
 	if err != nil {
 		return err
 	}
@@ -3504,7 +3504,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 		return fmt.Errorf("settling migrated source memory before branch transfer: %w", err)
 	}
 	if _, err := b.command("timetravel", info.ID, "destroy", branchID); err != nil {
-		families, listErr := b.listRuntimeFamilies()
+		families, listErr := b.listRuntimeFamiliesOf(info.ID)
 		if listErr != nil {
 			return err
 		}
@@ -3559,7 +3559,7 @@ func (b *runtimeBackend) removeUnrecordedMigratedSourceRuntime(containerID, bran
 	// that case branch-aware destruction is mandatory, and an unavailable
 	// branch inventory is a retirement failure rather than evidence that the
 	// requested source has disappeared.
-	runtimes, err := b.listRuntimeFamilies()
+	runtimes, err := b.listRuntimeFamiliesOf(containerID)
 	if err != nil {
 		return err
 	}
@@ -3903,7 +3903,7 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	if protected {
 		return nil
 	}
-	runtimes, err := b.listRuntimeFamilies()
+	runtimes, err := b.listRuntimeFamiliesOf(containerID)
 	if err != nil {
 		return fmt.Errorf("checking runtime ownership: %w", err)
 	}
@@ -6051,7 +6051,7 @@ func executionRevocationsRequireImmediateFence(previous, current map[string]stru
 // if that cleanup wins, the desired physical state has already been reached
 // and lease renewal must not fail closed merely because destroy saw ENOENT.
 func runtimeBranchPresent(backend *runtimeBackend, familyID, branchID string) (bool, error) {
-	families, err := backend.listRuntimeFamilies()
+	families, err := backend.listRuntimeFamiliesOf(familyID)
 	if err != nil {
 		return false, err
 	}

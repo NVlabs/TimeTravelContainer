@@ -35,6 +35,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -7856,7 +7857,7 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 	)
 	deadline := time.Now().Add(teardownTimeout)
 	for {
-		families, err := b.listRuntimeFamilies()
+		families, err := b.listRuntimeFamiliesOf(name)
 		if err != nil {
 			return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
 		}
@@ -9488,7 +9489,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	families, err := b.listFamilies()
+	families, err := b.listFamiliesOf(containerInfo.ID)
 	if err != nil {
 		return buildInspectInfo(containerInfo, spec, nil, err.Error()), nil
 	}
@@ -9622,7 +9623,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		return fmt.Errorf("stopping published ports for %q: %w", name, err)
 	}
 	runtimeID := info.ID
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(runtimeID)
 	if err != nil {
 		return fmt.Errorf("checking runtime state before removing %q: %w", name, err)
 	}
@@ -10608,7 +10609,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 }
 
 func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(target.container)
 	if err != nil {
 		return "", err
 	}
@@ -11064,14 +11065,41 @@ func placementDisplayState(record cluster.PlacementRecord, offlineOwners map[str
 }
 
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
-	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
+	return b.listFamiliesOf("")
+}
+
+// listFamiliesOf is listFamilies, but on a standalone daemon it lists only
+// the family with the given ID, if it is not empty: it reads no other
+// family's record and asks no other family's Sentry for its branches. A
+// cluster node lists every family, whose physical runtimes it can know only
+// from placements read after its runtimes.
+func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
+	if b.nodeID != "" {
+		familyID = ""
+	}
+	var runtimeFamilies []Family
+	var runtimeErr error
+	if familyID != "" {
+		runtimeFamilies, runtimeErr = b.listRuntimeFamiliesOf(familyID)
+	} else {
+		runtimeFamilies, runtimeErr = b.listRuntimeFamilies()
+	}
 	if b.dataRoot == "" {
 		return runtimeFamilies, runtimeErr
 	}
 	store := ttcbundle.Store{Root: b.dataRoot}
-	containers, storeErr := store.ListContainers()
-	if storeErr != nil {
-		return nil, storeErr
+	var containers []ttcbundle.ContainerInfo
+	if familyID == "" {
+		var storeErr error
+		if containers, storeErr = store.ListContainers(); storeErr != nil {
+			return nil, storeErr
+		}
+	} else if info, err := store.LoadContainer(familyID); err == nil {
+		if !info.IsDistributedPhysicalRuntime() {
+			containers = []ttcbundle.ContainerInfo{info}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 	// Resolve physical migration identities before constructing the persistent
 	// view. A target imported into an existing Sentry is stored under a private
@@ -11569,8 +11597,52 @@ func (b *runtimeBackend) listRuntimeSandboxes() ([]runtimeSandboxState, error) {
 	return states, nil
 }
 
+// listRuntimeSandboxesOf is listRuntimeSandboxes of only the sandboxes with the
+// given IDs. With the runtime embedded in ttcd, it reads only their state.
+func (b *runtimeBackend) listRuntimeSandboxesOf(ids []string) ([]runtimeSandboxState, error) {
+	if !embeddedRuntime(b.runsc) {
+		states, err := b.listRuntimeSandboxes()
+		if err != nil {
+			return nil, err
+		}
+		kept := states[:0]
+		for _, state := range states {
+			if slices.Contains(ids, state.ID) {
+				kept = append(kept, state)
+			}
+		}
+		return kept, nil
+	}
+	var states []runtimeSandboxState
+	for _, id := range ids {
+		// Like runsc list, pass over a sandbox that cannot be loaded, as one
+		// being deleted.
+		c, err := container.Load(b.root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{Exact: true})
+		if err != nil {
+			continue
+		}
+		state := c.State()
+		states = append(states, runtimeSandboxState{ID: state.ID, PID: state.Pid, Status: string(state.Status)})
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
+	return states, nil
+}
+
 func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
-	states, err := b.listRuntimeSandboxes()
+	return b.listRuntimeFamiliesOf()
+}
+
+// listRuntimeFamiliesOf is listRuntimeFamilies of only the sandboxes with the
+// given IDs, or of every sandbox if none is given. It asks no other sandbox
+// about itself.
+func (b *runtimeBackend) listRuntimeFamiliesOf(ids ...string) ([]Family, error) {
+	var states []runtimeSandboxState
+	var err error
+	if len(ids) != 0 {
+		states, err = b.listRuntimeSandboxesOf(ids)
+	} else {
+		states, err = b.listRuntimeSandboxes()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -13663,7 +13735,7 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 
-	runtimeFamilies, listErr := b.listRuntimeFamilies()
+	runtimeFamilies, listErr := b.listRuntimeFamiliesOf(info.ID)
 	if listErr != nil {
 		return fmt.Errorf("checking runtime state while discarding %s: %w", target, listErr)
 	}
@@ -13759,7 +13831,7 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 	if !persistentFamilyProcessFree(info) {
 		return nil
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(info.ID)
 	if err != nil {
 		return fmt.Errorf("checking process-free runtime %q: %w", info.Name, err)
 	}
@@ -14937,7 +15009,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	if err != nil || b.dataRoot == "" {
 		return err
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(target.container)
 	if err != nil {
 		return err
 	}
@@ -15753,7 +15825,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	// sibling. Move immutable graph authority to the family before that
 	// transfer; otherwise reclaiming the removed branch can unlink chunks that
 	// the sibling will demand later.
-	if families, listErr := b.listRuntimeFamilies(); listErr == nil {
+	if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
 		for _, family := range families {
 			if family.ID != target.container || len(family.Branches) < 2 {
 				continue
@@ -15773,7 +15845,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		// correctly refuses to remove a runtime's final branch, so delete this
 		// node-local runtime shell instead; shared family metadata is removed
 		// separately below only for the selected branch.
-		if families, listErr := b.listRuntimeFamilies(); listErr == nil {
+		if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
 			for _, family := range families {
 				if family.ID != target.container || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
 					continue
@@ -15788,7 +15860,7 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return nil
 		} else {
 			destroyErr := err
-			families, listErr := b.listRuntimeFamilies()
+			families, listErr := b.listRuntimeFamiliesOf(target.container)
 			if listErr != nil {
 				return destroyErr
 			}
