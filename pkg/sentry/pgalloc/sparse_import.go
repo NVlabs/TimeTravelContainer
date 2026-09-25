@@ -76,7 +76,7 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 		var encoded [8]byte
 		binary.BigEndian.PutUint64(encoded[:], chunk.Sequence)
 		hash.Write(encoded[:])
-		install := SparseChunkInstall{Logical: chunk, Kind: kind, MemCgID: memCgID}
+		install := SparseChunkInstall{Kind: kind, MemCgID: memCgID}
 		for i, binding := range pages {
 			if i != 0 && pages[i-1].Slot == binding.Slot {
 				return nil, nil, nil, fmt.Errorf("live sparse chunk repeats slot %d", binding.Slot)
@@ -88,7 +88,7 @@ func (f *MemoryFile) InstallRemoteBindings(bindings []CapturedPageBinding, kind 
 			hash.Write(binding.Version.Allocator[:])
 			binary.BigEndian.PutUint64(encoded[:], binding.Version.Sequence)
 			hash.Write(encoded[:])
-			install.Pages = append(install.Pages, SparseChunkPage{Slot: binding.Slot, Page: binding.Page, Version: binding.Version, References: binding.References})
+			install.Pages = append(install.Pages, SparseChunkPage{Position: binding.Slot, Slot: binding.Slot, Page: binding.Page, Version: binding.Version, References: binding.References})
 		}
 		copy(install.Object[:], hash.Sum(nil))
 		installs = append(installs, install)
@@ -163,8 +163,12 @@ func PagesPerSparseChunk() int { return logicalPagesPerChunk }
 type SparseChunkObjectID [32]byte
 
 // SparseChunkPage describes one valid page in a sparse chunk and the number
-// of references the restored branch object graph will own.
+// of references the restored branch object graph will own. Position is the
+// page's index in the chunk object, where its bytes are, and Slot its index
+// in its logical chunk. A chunk may hold pages of several logical chunks,
+// packed together.
 type SparseChunkPage struct {
+	Position   uint8
 	Slot       uint8
 	Page       LogicalPageID
 	Version    PageVersionID
@@ -174,16 +178,15 @@ type SparseChunkPage struct {
 // SparseChunkInstall describes one immutable 1 MiB residency unit.
 type SparseChunkInstall struct {
 	Object  SparseChunkObjectID
-	Logical LogicalChunkID
 	Pages   []SparseChunkPage
 	Kind    usage.MemoryKind
 	MemCgID uint32
 }
 
 type sparseResidentChunk struct {
-	Range   memmap.FileRange
-	Logical LogicalChunkID
-	Pages   map[uint8]SparseChunkPage
+	Range memmap.FileRange
+	// Pages are keyed by position.
+	Pages map[uint8]SparseChunkPage
 }
 
 // SparseChunkInstallation is a transactional set of new residency units.
@@ -387,9 +390,9 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 	}
 	seen := make(map[SparseChunkObjectID]struct{}, len(ordered))
 	for _, install := range ordered {
-		if install.Object == (SparseChunkObjectID{}) || install.Logical.Allocator == (LogicalAllocatorID{}) {
+		if install.Object == (SparseChunkObjectID{}) {
 			rollback()
-			return nil, fmt.Errorf("invalid sparse chunk object or logical coordinate")
+			return nil, fmt.Errorf("invalid sparse chunk object")
 		}
 		if _, ok := seen[install.Object]; ok {
 			rollback()
@@ -398,16 +401,15 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 		seen[install.Object] = struct{}{}
 		pages := make(map[uint8]SparseChunkPage, len(install.Pages))
 		for _, page := range install.Pages {
-			chunk, slot := page.Page.Chunk()
-			if chunk != install.Logical || slot != page.Slot || page.References == 0 || page.Version.Allocator == (LogicalAllocatorID{}) {
+			if _, slot := page.Page.Chunk(); slot != page.Slot || page.Page.Allocator == (LogicalAllocatorID{}) || page.References == 0 || page.Version.Allocator == (LogicalAllocatorID{}) {
 				rollback()
-				return nil, fmt.Errorf("invalid sparse chunk page %+v for %+v", page, install.Logical)
+				return nil, fmt.Errorf("invalid sparse chunk page %+v", page)
 			}
-			if _, ok := pages[page.Slot]; ok {
+			if _, ok := pages[page.Position]; ok {
 				rollback()
-				return nil, fmt.Errorf("sparse chunk repeats slot %d", page.Slot)
+				return nil, fmt.Errorf("sparse chunk repeats page %d", page.Position)
 			}
-			pages[page.Slot] = page
+			pages[page.Position] = page
 		}
 		if len(pages) == 0 {
 			rollback()
@@ -419,32 +421,27 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 		if exists {
 			// One immutable chunk can back branches that each use a different
 			// subset of its pages. Its whole 1 MiB is read into the resident
-			// range whichever branch installed it first, so a slot only a
-			// later branch uses needs just its identity recorded. Slots both
+			// range whichever branch installed it first, so a page only a
+			// later branch uses needs just its identity recorded. Pages both
 			// use must name the same page version.
-			if resident.Logical != install.Logical {
-				f.mu.Unlock()
-				rollback()
-				return nil, fmt.Errorf("resident sparse chunk %x is logical chunk %+v, not %+v", install.Object, resident.Logical, install.Logical)
-			}
-			for slot, page := range pages {
-				if old, ok := resident.Pages[slot]; ok && (old.Page != page.Page || old.Version != page.Version) {
+			for position, page := range pages {
+				if old, ok := resident.Pages[position]; ok && (old.Page != page.Page || old.Version != page.Version) {
 					f.mu.Unlock()
 					rollback()
-					return nil, fmt.Errorf("resident sparse chunk %x slot %d identity mismatch", install.Object, slot)
+					return nil, fmt.Errorf("resident sparse chunk %x page %d identity mismatch", install.Object, position)
 				}
 			}
-			for slot, page := range pages {
-				if _, ok := resident.Pages[slot]; ok {
+			for position, page := range pages {
+				if _, ok := resident.Pages[position]; ok {
 					continue
 				}
-				pageFR := memmap.FileRange{Start: resident.Range.Start + uint64(slot)*hostarch.PageSize, End: resident.Range.Start + (uint64(slot)+1)*hostarch.PageSize}
+				pageFR := memmap.FileRange{Start: resident.Range.Start + uint64(position)*hostarch.PageSize, End: resident.Range.Start + (uint64(position)+1)*hostarch.PageSize}
 				f.logicalPages.RemoveFullRange(pageFR)
 				f.logicalPages.InsertRange(pageFR, logicalPageInfo{
 					Allocator: page.Page.Allocator, FirstSequence: page.Page.Sequence,
 					VersionAllocator: page.Version.Allocator, FirstVersionSequence: page.Version.Sequence,
 				})
-				resident.Pages[slot] = page
+				resident.Pages[position] = page
 			}
 			f.mu.Unlock()
 		} else {
@@ -454,7 +451,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("allocating sparse resident chunk: %w", err)
 			}
-			resident = sparseResidentChunk{Range: fr, Logical: install.Logical, Pages: pages}
+			resident = sparseResidentChunk{Range: fr, Pages: pages}
 			f.mu.Lock()
 			if f.sparseChunks == nil {
 				f.sparseChunks = make(map[SparseChunkObjectID]sparseResidentChunk)
@@ -465,8 +462,8 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				rollback()
 				return nil, fmt.Errorf("concurrent sparse chunk installation is unsupported")
 			}
-			for slot, page := range pages {
-				pageFR := memmap.FileRange{Start: fr.Start + uint64(slot)*hostarch.PageSize, End: fr.Start + (uint64(slot)+1)*hostarch.PageSize}
+			for position, page := range pages {
+				pageFR := memmap.FileRange{Start: fr.Start + uint64(position)*hostarch.PageSize, End: fr.Start + (uint64(position)+1)*hostarch.PageSize}
 				f.logicalPages.RemoveFullRange(pageFR)
 				f.logicalPages.InsertRange(pageFR, logicalPageInfo{
 					Allocator: page.Page.Allocator, FirstSequence: page.Page.Sequence,

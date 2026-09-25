@@ -263,7 +263,7 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 		group := &groups[groupIndex]
 		setBit(&group.used, binding.Slot)
 		group.bindings = append(group.bindings, binding)
-		stored = append(stored, StoredBinding{Binding: binding, Object: group.id})
+		stored = append(stored, capturedBinding(binding, group.id))
 	}
 	return groups, stored, nil
 }

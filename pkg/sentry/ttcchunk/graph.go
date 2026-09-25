@@ -125,10 +125,8 @@ type importedObject struct {
 	id      ID
 	logical pgalloc.LogicalChunkID
 	slots   map[uint8]*importedSlot
-	// missing has the slots whose pages the graph does not hold yet, and
-	// chunk is the new chunk that holds them.
+	// missing has the slots whose pages the graph does not hold yet.
 	missing [slotBitmapBytes]byte
-	chunk   ttcsnapshot.ObjectID
 }
 
 // importedSlot is the page in one slot of a capture object: its identity,
@@ -153,8 +151,8 @@ const graphTablesPerTransaction = 128
 // memory tree per resource. Pages the graph already holds, by the identity the
 // guest's memory manager gave them, are shared rather than stored again, and
 // so is any table they fill exactly; only the others are read from source.
-// New pages are written a chunk per capture object, and mapped once all are
-// durable, in bounded transactions.
+// New pages are packed into as few new chunks as hold them, and mapped once
+// all are durable, in bounded transactions.
 func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, origin ttcsnapshot.SnapshotID, manifest Manifest, rootPrefix string, source captureSource, reusableStates []ttcsnapshot.SnapshotState) (_ GraphImportResult, retErr error) {
 	if graph == nil || data == nil || origin == 0 || rootPrefix == "" || source.chunk == nil {
 		return GraphImportResult{}, errors.New("invalid TTC memory graph import")
@@ -230,55 +228,100 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		}
 	}
 
-	// Each object with pages the graph lacks gets a new chunk, which holds
-	// them at their slots.
+	// The pages the graph lacks are packed into new chunks, in object and
+	// slot order, the order the source sends them in, so that each chunk is
+	// written whole, at once. A chunk per object, its pages at their slots,
+	// held a fork's scattered writes a few pages to a file, between holes,
+	// which a disk writes a tenth as fast. An object's pages share one chunk,
+	// as rehydration loads memory a logical chunk at a time: an object that
+	// does not fit where the chunk has room left starts the next, and the
+	// room is left a hole.
 	var incomplete []*importedObject
+	var starts []int
+	position := 0
 	for _, object := range objects {
-		if object.missing != ([slotBitmapBytes]byte{}) {
-			incomplete = append(incomplete, object)
+		count := countBits(&object.missing)
+		if count == 0 {
+			continue
 		}
+		if used := position % PagesPerChunk; used != 0 && used+count > PagesPerChunk {
+			position += PagesPerChunk - used
+		}
+		incomplete = append(incomplete, object)
+		starts = append(starts, position)
+		position += count
 	}
-	if len(incomplete) != 0 {
-		kinds := make([]ttcsnapshot.ObjectKind, len(incomplete))
+	var chunks []ttcsnapshot.ObjectID
+	if position != 0 {
+		kinds := make([]ttcsnapshot.ObjectKind, (position+PagesPerChunk-1)/PagesPerChunk)
 		for index := range kinds {
 			kinds[index] = ttcsnapshot.ObjectKindMemoryChunk
 		}
-		chunks, err := graph.ReserveObjects(origin, kinds)
-		if err != nil {
+		var err error
+		if chunks, err = graph.ReserveObjects(origin, kinds); err != nil {
 			return GraphImportResult{}, err
 		}
 		for index, object := range incomplete {
-			object.chunk = chunks[index]
-			for slot, page := range object.slots {
-				if hasBit(&object.missing, slot) {
-					page.location = ttcsnapshot.MemoryPageLocation{Chunk: object.chunk, Page: slot}
+			position := starts[index]
+			for slot := 0; slot < PagesPerChunk; slot++ {
+				if hasBit(&object.missing, uint8(slot)) {
+					object.slots[uint8(slot)].location = ttcsnapshot.MemoryPageLocation{Chunk: chunks[position/PagesPerChunk], Page: uint8(position % PagesPerChunk)}
+					position++
 				}
 			}
 		}
 	}
-	tables, newChunks := planCaptureTables(resources, objects, incomplete)
+	tables, newChunks := planCaptureTables(resources, objects, chunks)
 
 	// Collection must not see an installed chunk before a transaction naming
 	// it commits, or it would remove it as unreferenced.
 	if err := data.WithGraphMutation(func() error {
-		installed := make([]ttcsnapshot.ObjectID, 0, len(incomplete))
+		// Each new chunk is filled as the objects with its pages are read,
+		// and installed once full. Its zero pages are holes.
+		installed := make([]ttcsnapshot.ObjectID, 0, len(chunks))
+		packed := make([]byte, ttcsnapshot.MemoryChunkBytes)
+		var extents []ttcsnapshot.Extent
+		install := func() error {
+			chunk := chunks[len(installed)]
+			if err := data.InstallExtentsDeferred(chunk, ttcsnapshot.MemoryChunkBytes, extents); err != nil {
+				return fmt.Errorf("installing graph memory chunk %s: %w", chunk, err)
+			}
+			installed = append(installed, chunk)
+			extents = extents[:0]
+			return nil
+		}
 		for _, object := range incomplete {
+			// The chunk's pages are read into the source's buffer, and so are
+			// copied before the next object is read.
 			chunk, err := source.chunk(object.id)
 			if err != nil {
 				return fmt.Errorf("reading memory chunk %s: %w", object.id, err)
 			}
-			extents, err := object.extents(chunk)
+			pages, err := object.missingPages(chunk)
 			if err != nil {
 				return err
 			}
-			// A new chunk holds only the pages the graph does not have yet;
-			// the rest of it, like its zero pages, is a hole. A branch that
-			// rewrote a few pages of each chunk otherwise stored its whole
-			// image again.
-			if err := data.InstallExtentsDeferred(object.chunk, ttcsnapshot.MemoryChunkBytes, extents); err != nil {
-				return fmt.Errorf("installing graph memory chunk %s: %w", object.chunk, err)
+			for _, page := range pages {
+				location := object.slots[page.Slot].location
+				for len(installed) < len(chunks) && location.Chunk != chunks[len(installed)] {
+					if err := install(); err != nil {
+						return err
+					}
+				}
+				if len(installed) == len(chunks) {
+					return fmt.Errorf("memory chunk %s slot %d is packed out of order", object.id, page.Slot)
+				}
+				if !page.Zero {
+					offset := int(location.Page) * hostarch.PageSize
+					copy(packed[offset:offset+hostarch.PageSize], page.Data)
+					extents = append(extents, ttcsnapshot.Extent{Offset: int64(offset), Data: packed[offset : offset+hostarch.PageSize]})
+				}
 			}
-			installed = append(installed, object.chunk)
+		}
+		for len(installed) < len(chunks) {
+			if err := install(); err != nil {
+				return err
+			}
 		}
 		// The chunks must be durable before a transaction naming them is.
 		// Their writeback began as each was written, while the rest streamed.
@@ -362,6 +405,9 @@ func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject,
 		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk {
 			return nil, nil, fmt.Errorf("memory chunk %s has a run of %d pages from slot %d", run.Object, run.Pages, run.FirstSlot)
 		}
+		if run.ObjectPage != run.FirstSlot {
+			return nil, nil, fmt.Errorf("capture object %s holds slot %d at page %d", run.Object, run.FirstSlot, run.ObjectPage)
+		}
 		if run.FirstPage.Allocator != run.Logical.Allocator || run.FirstPage.Sequence != run.Logical.Sequence*PagesPerChunk+uint64(run.FirstSlot) {
 			return nil, nil, fmt.Errorf("memory chunk %s maps page %+v at slot %d of logical chunk %+v", run.Object, run.FirstPage, run.FirstSlot, run.Logical)
 		}
@@ -411,8 +457,8 @@ func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject,
 
 // planCaptureTables returns the tables that map the capture's pages, once
 // every page's location is known, in root and index order, and for each the
-// new chunks, of incomplete objects, that no earlier table refers to.
-func planCaptureTables(resources []*importedResource, objects, incomplete []*importedObject) ([]ttcsnapshot.NewMemoryTable, [][]ttcsnapshot.ObjectID) {
+// chunks, of the new chunks, that no earlier table refers to.
+func planCaptureTables(resources []*importedResource, objects []*importedObject, chunks []ttcsnapshot.ObjectID) ([]ttcsnapshot.NewMemoryTable, [][]ttcsnapshot.ObjectID) {
 	type tableKey struct {
 		resource int
 		index    uint64
@@ -442,9 +488,9 @@ func planCaptureTables(resources []*importedResource, objects, incomplete []*imp
 		}
 		return keys[i].index < keys[j].index
 	})
-	fresh := make(map[ttcsnapshot.ObjectID]bool, len(incomplete))
-	for _, object := range incomplete {
-		fresh[object.chunk] = true
+	fresh := make(map[ttcsnapshot.ObjectID]bool, len(chunks))
+	for _, chunk := range chunks {
+		fresh[chunk] = true
 	}
 	tables := make([]ttcsnapshot.NewMemoryTable, len(keys))
 	newChunks := make([][]ttcsnapshot.ObjectID, len(keys))
@@ -462,14 +508,13 @@ func planCaptureTables(resources []*importedResource, objects, incomplete []*imp
 	return tables, newChunks
 }
 
-// extents checks chunk against the manifest and returns the extents of the
-// object's new chunk: the pages the graph lacks that are not zero, at their
-// slots.
-func (object *importedObject) extents(chunk Chunk) ([]ttcsnapshot.Extent, error) {
+// missingPages checks chunk against the manifest and returns the pages of it
+// the graph lacks, in slot order.
+func (object *importedObject) missingPages(chunk Chunk) ([]Page, error) {
 	if chunk.Logical != object.logical {
 		return nil, fmt.Errorf("memory chunk %s has logical coordinate %+v, manifest references %+v", object.id, chunk.Logical, object.logical)
 	}
-	var extents []ttcsnapshot.Extent
+	var pages []Page
 	var found [slotBitmapBytes]byte
 	for _, page := range chunk.Pages {
 		// The graph holds the others already, or the manifest does not map
@@ -485,18 +530,16 @@ func (object *importedObject) extents(chunk Chunk) ([]ttcsnapshot.Extent, error)
 		if [16]byte(page.Version.Allocator) != planned.identity.VersionAllocator || page.Version.Sequence != planned.identity.VersionSequence {
 			return nil, fmt.Errorf("memory chunk %s slot %d holds version %+v, manifest references another", object.id, page.Slot, page.Version)
 		}
-		if !page.Zero {
-			if len(page.Data) != hostarch.PageSize {
-				return nil, fmt.Errorf("memory chunk %s slot %d has %d bytes", object.id, page.Slot, len(page.Data))
-			}
-			extents = append(extents, ttcsnapshot.Extent{Offset: int64(page.Slot) * hostarch.PageSize, Data: page.Data})
+		if !page.Zero && len(page.Data) != hostarch.PageSize {
+			return nil, fmt.Errorf("memory chunk %s slot %d has %d bytes", object.id, page.Slot, len(page.Data))
 		}
+		pages = append(pages, page)
 	}
 	if found != object.missing {
 		return nil, fmt.Errorf("memory chunk %s contains %d of the %d pages the graph lacks", object.id, countBits(&found), countBits(&object.missing))
 	}
-	sort.Slice(extents, func(i, j int) bool { return extents[i].Offset < extents[j].Offset })
-	return extents, nil
+	sort.Slice(pages, func(i, j int) bool { return pages[i].Slot < pages[j].Slot })
+	return pages, nil
 }
 
 func countBits(bitmap *[slotBitmapBytes]byte) int {
@@ -577,9 +620,6 @@ func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot
 			result.Chunks[residency] = chunkObject
 			logicalPage := pgalloc.LogicalPageID{Allocator: pgalloc.LogicalAllocatorID(identity.LogicalAllocator), Sequence: identity.LogicalSequence}
 			logicalChunk, slot := logicalPage.Chunk()
-			if slot != entry.Location.Page {
-				return GraphManifestResult{}, fmt.Errorf("page %d of memory root %q has logical slot %d but is page %d of its chunk", entry.Index, root.Name, slot, entry.Location.Page)
-			}
 			bindings = append(bindings, StoredBinding{
 				Binding: pgalloc.CapturedPageBinding{
 					ResourceID: root.ResourceID,
@@ -590,7 +630,8 @@ func BuildGraphManifest(graph ttcsnapshot.MemoryCatalog, roots []GraphMemoryRoot
 					Chunk:      logicalChunk,
 					Slot:       slot,
 				},
-				Object: residency,
+				Object:     residency,
+				ObjectPage: entry.Location.Page,
 			})
 		}
 	}

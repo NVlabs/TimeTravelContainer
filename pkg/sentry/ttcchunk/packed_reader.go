@@ -42,7 +42,8 @@ type GraphPackedManifestReader struct {
 
 type graphPackedPage struct {
 	object ttcsnapshot.ObjectID
-	slot   uint8
+	// page is the page of object that holds it.
+	page uint8
 }
 
 // NewGraphPackedManifestReader constructs a graph-backed reader in the packed
@@ -102,7 +103,7 @@ func NewGraphPackedManifestReader(data *ttcsnapshot.LocalDataStore, remote *ttcs
 			if _, exists := pages[stream]; exists {
 				return fail(fmt.Errorf("graph packed stream repeats page at %#x", stream))
 			}
-			pages[stream] = graphPackedPage{object: object, slot: run.FirstSlot + uint8(i)}
+			pages[stream] = graphPackedPage{object: object, page: run.ObjectPage + uint8(i)}
 		}
 	}
 	if uint64(len(pages)) != totalPages {
@@ -143,7 +144,7 @@ func (r *GraphPackedManifestReader) ReadAt(dst []byte, offset int64) (int, error
 		if err != nil {
 			return written, err
 		}
-		readOffset := int64(page.slot)*hostarch.PageSize + int64(within)
+		readOffset := int64(page.page)*hostarch.PageSize + int64(within)
 		read, readErr := file.ReadAt(dst[written:written+n], readOffset)
 		closeErr := file.Close()
 		written += read

@@ -17,6 +17,7 @@ package ttcchunk
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -141,8 +142,8 @@ func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
 	chunkID := graphCaptureObjectID(1)
 	page := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)}
 	stored := []StoredBinding{
-		{Binding: pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
-		{Binding: pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, Object: chunkID},
+		capturedBinding(pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, chunkID),
+		capturedBinding(pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, chunkID),
 	}
 	var stream bytes.Buffer
 	if err := writeGraphCaptureHeader(&stream, graphCaptureMagic, stored, 1); err != nil {
@@ -222,11 +223,11 @@ func memoryLocations(t *testing.T, graph *ttcsnapshot.Store, root ttcsnapshot.Ob
 func storedChunk(chunk Chunk, object ID) []StoredBinding {
 	stored := make([]StoredBinding, 0, len(chunk.Pages))
 	for _, page := range chunk.Pages {
-		stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
 			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 1,
 			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
 			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-		}, Object: object})
+		}, object))
 	}
 	return stored
 }
@@ -401,10 +402,10 @@ func TestGraphImportReusesStableMemoryPages(t *testing.T) {
 	stored := make([]StoredBinding, 0, len(chunk.Pages))
 	for _, page := range chunk.Pages {
 		logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
-		stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
 			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
 			Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-		}, Object: object})
+		}, object))
 	}
 	manifest, err := CompactBindings(stored)
 	if err != nil {
@@ -462,7 +463,8 @@ func TestGraphImportReusesStableMemoryPages(t *testing.T) {
 	}
 }
 
-// A capture's new chunk object holds only the pages the graph did not have.
+// A capture's new chunk object holds only the pages the graph did not have,
+// packed from its start in slot order.
 func TestGraphImportStoresOnlyNewPages(t *testing.T) {
 	first := testChunk()
 	second := testChunk()
@@ -472,10 +474,10 @@ func TestGraphImportStoresOnlyNewPages(t *testing.T) {
 		stored := make([]StoredBinding, 0, len(chunk.Pages))
 		for _, page := range chunk.Pages {
 			logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
-			stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
 				OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 1,
 				Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-			}, Object: object})
+			}, object))
 		}
 		manifest, err := CompactBindings(stored)
 		if err != nil {
@@ -531,14 +533,173 @@ func TestGraphImportStoresOnlyNewPages(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := make([]byte, ttcsnapshot.MemoryChunkBytes)
+		position := 0
 		for _, page := range chunk.Pages {
 			if i == 0 || page.Slot == 255 {
-				copy(want[int(page.Slot)*hostarch.PageSize:], page.Data)
+				copy(want[position*hostarch.PageSize:], page.Data)
+				position++
 			}
 		}
 		if !bytes.Equal(raw, want) {
 			t.Fatalf("capture %d stored a chunk object with other pages than its new ones", i)
 		}
+	}
+}
+
+// The pages the graph lacks from several capture objects share new chunks,
+// packed in object and slot order. The manifest a rehydration builds says
+// where in its chunk each page is, which a version 2 manifest encodes.
+func TestGraphImportPacksNewPagesOfSeveralObjects(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	type captured struct {
+		id    ID
+		chunk Chunk
+	}
+	objects := []captured{
+		{graphCaptureObjectID(1), Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 5}, Pages: []Page{
+			{Slot: 9, Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: 1}, Data: bytes.Repeat([]byte{0x11}, hostarch.PageSize)},
+		}}},
+		{graphCaptureObjectID(2), Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 6}, Pages: []Page{
+			{Slot: 200, Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: 2}, Data: bytes.Repeat([]byte{0x22}, hostarch.PageSize)},
+		}}},
+	}
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
+	for _, object := range objects {
+		byID[object.id] = object.chunk
+		for _, page := range object.chunk.Pages {
+			index := object.chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				OldOffset: index * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: object.chunk.Logical.Allocator, Sequence: index},
+				Version: page.Version, Chunk: object.chunk.Logical, Slot: page.Slot,
+			}, object.id))
+		}
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "packed", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := memoryLocations(t, graph, result.Roots[0].Root)
+	first, second := locations[5*PagesPerChunk+9], locations[6*PagesPerChunk+200]
+	if first.Chunk != second.Chunk || first.Page != 0 || second.Page != 1 {
+		t.Fatalf("new pages at %+v and %+v, want pages 0 and 1 of one chunk", first, second)
+	}
+	file, err := data.Open(first.Chunk, ttcsnapshot.MemoryChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, ttcsnapshot.MemoryChunkBytes)
+	copy(want, objects[0].chunk.Pages[0].Data)
+	copy(want[hostarch.PageSize:], objects[1].chunk.Pages[0].Data)
+	if !bytes.Equal(raw, want) {
+		t.Fatal("the packed chunk does not hold the two pages at its first two pages")
+	}
+
+	built, err := BuildGraphManifest(graph, result.Roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range built.Manifest.Runs {
+		if want := map[uint8]uint8{9: 0, 200: 1}[run.FirstSlot]; run.Pages != 1 || run.ObjectPage != want {
+			t.Fatalf("rehydration manifest run %+v, want slot 9 at page 0 and slot 200 at page 1", run)
+		}
+	}
+	encoded, err := EncodeManifest(built.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version := binary.LittleEndian.Uint32(encoded[len(manifestMagic):]); version != manifestVersion {
+		t.Fatalf("a packed manifest encodes as version %d, want %d", version, manifestVersion)
+	}
+	decoded, err := DecodeManifest(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, built.Manifest) {
+		t.Fatalf("decoded %+v, encoded %+v", decoded, built.Manifest)
+	}
+}
+
+// An object's new pages share one chunk, as rehydration loads memory a logical
+// chunk at a time: an object that does not fit where the chunk has room
+// starts the next one.
+func TestGraphImportKeepsAnObjectsNewPagesInOneChunk(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
+	for object := uint64(0); object < 3; object++ {
+		id := graphCaptureObjectID(object + 1)
+		chunk := Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 10 + object}}
+		for slot := 0; slot < 100; slot++ {
+			chunk.Pages = append(chunk.Pages, Page{Slot: uint8(slot), Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: object*1000 + uint64(slot)}, Data: bytes.Repeat([]byte{byte(object + 1)}, hostarch.PageSize)})
+			index := chunk.Logical.Sequence*PagesPerChunk + uint64(slot)
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				OldOffset: index * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: index},
+				Version: chunk.Pages[slot].Version, Chunk: chunk.Logical, Slot: uint8(slot),
+			}, id))
+		}
+		byID[id] = chunk
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "aligned", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := memoryLocations(t, graph, result.Roots[0].Root)
+	first := func(object uint64) ttcsnapshot.MemoryPageLocation { return locations[(10+object)*PagesPerChunk] }
+	last := func(object uint64) ttcsnapshot.MemoryPageLocation { return locations[(10+object)*PagesPerChunk+99] }
+	for object := uint64(0); object < 3; object++ {
+		if first(object).Chunk != last(object).Chunk {
+			t.Fatalf("object %d's pages span chunks: %+v to %+v", object, first(object), last(object))
+		}
+	}
+	if first(1).Chunk != first(0).Chunk || first(0).Page != 0 || first(1).Page != 100 {
+		t.Fatalf("the first two objects at %+v and %+v, want pages 0 and 100 of one chunk", first(0), first(1))
+	}
+	if first(2).Chunk == first(0).Chunk || first(2).Page != 0 {
+		t.Fatalf("the third object at %+v, want page 0 of a chunk of its own", first(2))
 	}
 }
 
@@ -574,11 +735,11 @@ func TestGraphImportDoesNotReuseSharedCachePages(t *testing.T) {
 	object := graphCaptureObjectID(1)
 	stored := make([]StoredBinding, 0, len(chunk.Pages))
 	for _, page := range chunk.Pages {
-		stored = append(stored, StoredBinding{Binding: pgalloc.CapturedPageBinding{
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
 			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
 			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
 			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-		}, Object: object})
+		}, object))
 	}
 	manifest, err := CompactBindings(stored)
 	if err != nil {
@@ -638,17 +799,14 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	object := graphCaptureObjectID(9)
 	stored := make([]StoredBinding, PagesPerChunk)
 	for i := range stored {
-		stored[i] = StoredBinding{
-			Binding: pgalloc.CapturedPageBinding{
-				OldOffset:  uint64(i) * hostarch.PageSize,
-				References: 2,
-				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(i)},
-				Version:    pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1000 + uint64(i)},
-				Chunk:      logical,
-				Slot:       uint8(i),
-			},
-			Object: object,
-		}
+		stored[i] = capturedBinding(pgalloc.CapturedPageBinding{
+			OldOffset:  uint64(i) * hostarch.PageSize,
+			References: 2,
+			Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(i)},
+			Version:    pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1000 + uint64(i)},
+			Chunk:      logical,
+			Slot:       uint8(i),
+		}, object)
 	}
 	manifest, err := CompactBindings(stored)
 	if err != nil {

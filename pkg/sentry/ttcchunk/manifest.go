@@ -28,7 +28,10 @@ import (
 )
 
 const (
-	manifestVersion        = 1
+	// A manifest of version 1 has every page at its slot in its object; one
+	// of version 2 says where each run's pages are.
+	manifestVersionSlotted = 1
+	manifestVersion        = 2
 	maxManifestStringBytes = 1 << 20
 	maxManifestRuns        = 1 << 32
 )
@@ -47,6 +50,10 @@ type ManifestRun struct {
 	FirstSlot    uint8
 	Pages        uint16
 	Object       ID
+	// ObjectPage is the page of Object that holds the run's first page; the
+	// others follow it. A capture object holds each page at its slot, and a
+	// graph chunk may hold the pages of several logical chunks packed.
+	ObjectPage uint8
 }
 
 // Manifest is an immutable branch memory root.
@@ -59,6 +66,14 @@ type Manifest struct {
 type StoredBinding struct {
 	Binding pgalloc.CapturedPageBinding
 	Object  ID
+	// ObjectPage is the page of Object that holds the binding's page.
+	ObjectPage uint8
+}
+
+// capturedBinding is binding, carried by object of a capture, which holds each
+// page at its slot.
+func capturedBinding(binding pgalloc.CapturedPageBinding, object ID) StoredBinding {
+	return StoredBinding{Binding: binding, Object: object, ObjectPage: binding.Slot}
 }
 
 func compareAllocator(a, b pgalloc.LogicalAllocatorID) int { return bytes.Compare(a[:], b[:]) }
@@ -105,7 +120,8 @@ func runCanAppend(run *ManifestRun, stored *StoredBinding) bool {
 	return stored.Binding.OldOffset == run.OldOffset+delta*hostarch.PageSize &&
 		stored.Binding.Page.Allocator == run.FirstPage.Allocator && stored.Binding.Page.Sequence == run.FirstPage.Sequence+delta &&
 		stored.Binding.Version.Allocator == run.FirstVersion.Allocator && stored.Binding.Version.Sequence == run.FirstVersion.Sequence+delta &&
-		uint16(stored.Binding.Slot) == uint16(run.FirstSlot)+run.Pages
+		uint16(stored.Binding.Slot) == uint16(run.FirstSlot)+run.Pages &&
+		uint16(stored.ObjectPage) == uint16(run.ObjectPage)+run.Pages
 }
 
 // CompactBindings builds a deterministic run-compressed manifest.
@@ -134,6 +150,7 @@ func CompactBindings(bindings []StoredBinding) (Manifest, error) {
 			FirstSlot:    stored.Binding.Slot,
 			Pages:        1,
 			Object:       stored.Object,
+			ObjectPage:   stored.ObjectPage,
 		})
 	}
 	return manifest, nil
@@ -164,12 +181,21 @@ func EncodeManifest(manifest Manifest) ([]byte, error) {
 	if uint64(len(manifest.Runs)) > maxManifestRuns {
 		return nil, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
 	}
+	// A manifest whose pages are all at their slots is written as version 1,
+	// which daemons predating packed chunks read too.
+	version := uint32(manifestVersionSlotted)
+	for _, run := range manifest.Runs {
+		if run.ObjectPage != run.FirstSlot {
+			version = manifestVersion
+			break
+		}
+	}
 	data := append([]byte(nil), manifestMagic[:]...)
-	data = appendUint32(data, manifestVersion)
+	data = appendUint32(data, version)
 	data = appendUint32(data, uint32(hostarch.PageSize))
 	data = appendUint64(data, uint64(len(manifest.Runs)))
 	for i, run := range manifest.Runs {
-		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk || run.References == 0 || run.Object == (ID{}) || !hostarch.IsPageAligned(run.OldOffset) {
+		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk || uint16(run.ObjectPage)+run.Pages > PagesPerChunk || run.References == 0 || run.Object == (ID{}) || !hostarch.IsPageAligned(run.OldOffset) {
 			return nil, fmt.Errorf("invalid memory manifest run %d: %+v", i, run)
 		}
 		chunk, slot := run.FirstPage.Chunk()
@@ -196,6 +222,9 @@ func EncodeManifest(manifest Manifest) ([]byte, error) {
 		data = append(data, run.FirstSlot)
 		data = appendUint32(data, uint32(run.Pages))
 		data = append(data, run.Object[:]...)
+		if version == manifestVersion {
+			data = append(data, run.ObjectPage)
+		}
 	}
 	return data, nil
 }
@@ -250,7 +279,7 @@ func DecodeManifest(data []byte) (Manifest, error) {
 		return Manifest{}, errors.New("invalid TTC memory manifest header")
 	}
 	version, err := r.uint32()
-	if err != nil || version != manifestVersion {
+	if err != nil || (version != manifestVersion && version != manifestVersionSlotted) {
 		return Manifest{}, fmt.Errorf("unsupported TTC memory manifest version %d", version)
 	}
 	pageSize, err := r.uint32()
@@ -315,6 +344,14 @@ func DecodeManifest(data []byte) (Manifest, error) {
 			return Manifest{}, err
 		}
 		copy(run.Object[:], value)
+		run.ObjectPage = run.FirstSlot
+		if version == manifestVersion {
+			value, err = r.take(1)
+			if err != nil {
+				return Manifest{}, err
+			}
+			run.ObjectPage = value[0]
+		}
 	}
 	if r.off != len(data) {
 		return Manifest{}, errors.New("memory manifest has trailing bytes")
@@ -349,7 +386,8 @@ func (m Manifest) Expand() []StoredBinding {
 					Chunk: run.Logical,
 					Slot:  slot,
 				},
-				Object: run.Object,
+				Object:     run.Object,
+				ObjectPage: run.ObjectPage + uint8(page),
 			})
 		}
 	}

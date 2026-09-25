@@ -30,12 +30,11 @@ func sparseTestInstall(objectByte byte) SparseChunkInstall {
 	object[0] = objectByte
 	var allocator LogicalAllocatorID
 	allocator[0] = 1
-	logical := LogicalChunkID{Allocator: allocator, Sequence: 7}
 	return SparseChunkInstall{
-		Object: object, Logical: logical, Kind: usage.Anonymous,
+		Object: object, Kind: usage.Anonymous,
 		Pages: []SparseChunkPage{
-			{Slot: 3, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 3}, Version: PageVersionID{Allocator: allocator, Sequence: 30}, References: 2},
-			{Slot: 4, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 4}, Version: PageVersionID{Allocator: allocator, Sequence: 31}, References: 1},
+			{Position: 3, Slot: 3, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 3}, Version: PageVersionID{Allocator: allocator, Sequence: 30}, References: 2},
+			{Position: 4, Slot: 4, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 4}, Version: PageVersionID{Allocator: allocator, Sequence: 31}, References: 1},
 		},
 	}
 }
@@ -59,7 +58,7 @@ func TestInstallSparseChunksReusesResidentObject(t *testing.T) {
 		t.Fatalf("SparseChunkRange=(%v,%t), want %v", got, ok, first)
 	}
 	for _, page := range install.Pages {
-		offset := first.Start + uint64(page.Slot)*hostarch.PageSize
+		offset := first.Start + uint64(page.Position)*hostarch.PageSize
 		gotPage, gotVersion, ok := mf.LogicalPageVersionAt(offset)
 		if !ok || gotPage != page.Page || gotVersion != page.Version {
 			t.Fatalf("slot %d identity=(%+v,%+v,%t), want (%+v,%+v,true)", page.Slot, gotPage, gotVersion, ok, page.Page, page.Version)
@@ -95,11 +94,11 @@ func TestInstallSparseChunksReusesResidentObjectForAnotherSubset(t *testing.T) {
 		t.Fatal(err)
 	}
 	resident := installation.NewRanges()[first.Object]
-	allocator := first.Logical.Allocator
+	allocator := first.Pages[0].Page.Allocator
 	second := first
 	second.Pages = []SparseChunkPage{
 		first.Pages[1],
-		{Slot: 9, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 9}, Version: PageVersionID{Allocator: allocator, Sequence: 40}, References: 1},
+		{Position: 9, Slot: 9, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 9}, Version: PageVersionID{Allocator: allocator, Sequence: 40}, References: 1},
 	}
 	reused, err := mf.InstallSparseChunks([]SparseChunkInstall{second})
 	if err != nil {
@@ -112,7 +111,7 @@ func TestInstallSparseChunksReusesResidentObjectForAnotherSubset(t *testing.T) {
 		t.Fatalf("reusing a resident chunk allocated ranges: %v", reused.NewRanges())
 	}
 	for _, page := range append(append([]SparseChunkPage(nil), first.Pages...), second.Pages[1]) {
-		gotPage, gotVersion, ok := mf.LogicalPageVersionAt(resident.Start + uint64(page.Slot)*hostarch.PageSize)
+		gotPage, gotVersion, ok := mf.LogicalPageVersionAt(resident.Start + uint64(page.Position)*hostarch.PageSize)
 		if !ok || gotPage != page.Page || gotVersion != page.Version {
 			t.Fatalf("slot %d identity=(%+v,%+v,%t), want (%+v,%+v,true)", page.Slot, gotPage, gotVersion, ok, page.Page, page.Version)
 		}
@@ -123,6 +122,38 @@ func TestInstallSparseChunksReusesResidentObjectForAnotherSubset(t *testing.T) {
 	if refused, err := mf.InstallSparseChunks([]SparseChunkInstall{conflicting}); err == nil {
 		_ = refused.Abort()
 		t.Fatal("a resident chunk accepted a different version of a page it holds")
+	}
+}
+
+// A chunk may pack pages of several logical chunks, each at a position of
+// its own: a page's identity is recorded where its bytes are.
+func TestInstallSparseChunksPlacesPackedPagesByPosition(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	var object SparseChunkObjectID
+	object[0] = 5
+	var allocator LogicalAllocatorID
+	allocator[0] = 1
+	install := SparseChunkInstall{
+		Object: object, Kind: usage.Anonymous,
+		Pages: []SparseChunkPage{
+			{Position: 0, Slot: 200, Page: LogicalPageID{Allocator: allocator, Sequence: 7*logicalPagesPerChunk + 200}, Version: PageVersionID{Allocator: allocator, Sequence: 50}, References: 1},
+			{Position: 1, Slot: 3, Page: LogicalPageID{Allocator: allocator, Sequence: 9*logicalPagesPerChunk + 3}, Version: PageVersionID{Allocator: allocator, Sequence: 51}, References: 1},
+		},
+	}
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	resident := installation.NewRanges()[object]
+	for _, page := range install.Pages {
+		gotPage, gotVersion, ok := mf.LogicalPageVersionAt(resident.Start + uint64(page.Position)*hostarch.PageSize)
+		if !ok || gotPage != page.Page || gotVersion != page.Version {
+			t.Fatalf("page %d identity=(%+v,%+v,%t), want (%+v,%+v,true)", page.Position, gotPage, gotVersion, ok, page.Page, page.Version)
+		}
 	}
 }
 
@@ -321,7 +352,7 @@ func TestReclaimUnusedSparseChunks(t *testing.T) {
 		t.Fatal("installed chunk is not resident")
 	}
 	page := install.Pages[0]
-	pageRange := memmap.FileRange{Start: resident.Start + uint64(page.Slot)*hostarch.PageSize, End: resident.Start + uint64(page.Slot+1)*hostarch.PageSize}
+	pageRange := memmap.FileRange{Start: resident.Start + uint64(page.Position)*hostarch.PageSize, End: resident.Start + uint64(page.Position+1)*hostarch.PageSize}
 	mf.IncRef(pageRange, 0)
 	if got := mf.ReclaimUnusedSparseChunks(); got != 0 {
 		t.Fatalf("reclaimed %d chunks while a branch reference remained", got)

@@ -135,25 +135,18 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 	// cold remote restore that would eagerly fetch every 1 MiB chunk before the
 	// first guest instruction. Page contents are loaded by ChunkReader when the
 	// corresponding resident range first faults in.
-	objects := make(map[ID]pgalloc.LogicalChunkID)
-	for _, run := range manifest.Runs {
-		if logical, ok := objects[run.Object]; ok {
-			if logical != run.Logical {
-				return InstallResult{}, fmt.Errorf("manifest object %s has conflicting logical coordinates %+v and %+v", run.Object, logical, run.Logical)
-			}
-		} else {
-			objects[run.Object] = run.Logical
-		}
+	// An object may hold pages of several logical chunks, packed.
+	objects := make(map[ID][]int)
+	for index, run := range manifest.Runs {
+		objects[run.Object] = append(objects[run.Object], index)
 	}
 	objectIDs := make([]ID, 0, len(objects))
 	firstOldOffset := make(map[ID]uint64, len(objects))
-	for object := range objects {
+	for object, runs := range objects {
 		objectIDs = append(objectIDs, object)
 		firstOldOffset[object] = ^uint64(0)
-	}
-	for _, run := range manifest.Runs {
-		if run.OldOffset < firstOldOffset[run.Object] {
-			firstOldOffset[run.Object] = run.OldOffset
+		for _, index := range runs {
+			firstOldOffset[object] = min(firstOldOffset[object], manifest.Runs[index].OldOffset)
 		}
 	}
 	sort.Slice(objectIDs, func(i, j int) bool {
@@ -165,29 +158,28 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 	installs := make([]pgalloc.SparseChunkInstall, 0, len(objects))
 	for _, object := range objectIDs {
 		install := pgalloc.SparseChunkInstall{
-			Object: pgalloc.SparseChunkObjectID(object), Logical: objects[object],
-			Kind: kind, MemCgID: memCgID,
+			Object: pgalloc.SparseChunkObjectID(object),
+			Kind:   kind, MemCgID: memCgID,
 		}
 		installedPages := make(map[uint8]pgalloc.SparseChunkPage)
-		for _, run := range manifest.Runs {
-			if run.Object != object {
-				continue
-			}
+		for _, index := range objects[object] {
+			run := &manifest.Runs[index]
 			for i := uint16(0); i < run.Pages; i++ {
-				slot := run.FirstSlot + uint8(i)
+				position := run.ObjectPage + uint8(i)
 				version := pgalloc.PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + uint64(i)}
 				page := pgalloc.SparseChunkPage{
-					Slot:    slot,
-					Page:    pgalloc.LogicalPageID{Allocator: run.FirstPage.Allocator, Sequence: run.FirstPage.Sequence + uint64(i)},
-					Version: version, References: run.References,
+					Position: position,
+					Slot:     run.FirstSlot + uint8(i),
+					Page:     pgalloc.LogicalPageID{Allocator: run.FirstPage.Allocator, Sequence: run.FirstPage.Sequence + uint64(i)},
+					Version:  version, References: run.References,
 				}
-				if previous, ok := installedPages[slot]; ok {
+				if previous, ok := installedPages[position]; ok {
 					if previous != page {
-						return InstallResult{}, fmt.Errorf("manifest object %s slot %d has conflicting page identities", object, slot)
+						return InstallResult{}, fmt.Errorf("manifest object %s page %d has conflicting page identities", object, position)
 					}
 					continue
 				}
-				installedPages[slot] = page
+				installedPages[position] = page
 				install.Pages = append(install.Pages, page)
 			}
 		}
@@ -211,7 +203,7 @@ func InstallManifest(mf *pgalloc.MemoryFile, manifest Manifest, kind usage.Memor
 			return InstallResult{}, fmt.Errorf("installed memory object %s has no resident range", run.Object)
 		}
 		for i := uint16(0); i < run.Pages; i++ {
-			if err := relocation.Add(run.ResourceID, run.OldOffset+uint64(i)*hostarch.PageSize, resident.Start+uint64(run.FirstSlot+uint8(i))*hostarch.PageSize); err != nil {
+			if err := relocation.Add(run.ResourceID, run.OldOffset+uint64(i)*hostarch.PageSize, resident.Start+uint64(run.ObjectPage+uint8(i))*hostarch.PageSize); err != nil {
 				return InstallResult{}, err
 			}
 		}
