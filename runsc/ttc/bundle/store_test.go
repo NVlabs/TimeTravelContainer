@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 
@@ -204,6 +205,46 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 	branch := info.Branches[0]
 	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.ControlRoot != "" || branch.ControlRootObject != "" || branch.DistributedGraphReferenceOperation != "" {
 		t.Fatalf("cleared branch retained memory graph: %+v", branch)
+	}
+}
+
+// A rehydrated branch gives up the control state it was restored from, and
+// keeps its memory roots for its next dehydration.
+func TestClearBranchControlGraphIfKeepsMemory(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "example")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	roots, objects := []string{"memory/7/0"}, []string{"7:1:memory-tree"}
+	info := ContainerInfo{
+		ID: "example", Name: "example", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{{ID: "main", State: "running", SnapshotID: 7, MemoryRoots: roots, MemoryRootObjects: objects, ControlRoot: "control/7", ControlRootObject: "7:2:control"}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	if cleared, err := store.ClearBranchControlGraphIf("example", "main", 6, "control/7", "7:2:control"); err != nil || cleared {
+		t.Fatalf("clearing the control root of another capture = %v, %v", cleared, err)
+	}
+	if cleared, err := store.ClearBranchControlGraphIf("example", "main", 7, "control/7", "7:2:control"); err != nil || !cleared {
+		t.Fatalf("clearing the control root = %v, %v", cleared, err)
+	}
+	got, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := got.Branches[0]
+	if branch.ControlRoot != "" || branch.ControlRootObject != "" {
+		t.Errorf("control root = %q/%q, want none", branch.ControlRoot, branch.ControlRootObject)
+	}
+	if branch.SnapshotID != 7 || !slices.Equal(branch.MemoryRoots, roots) || !slices.Equal(branch.MemoryRootObjects, objects) {
+		t.Errorf("memory = %d %v %v, want 7 %v %v", branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects, roots, objects)
 	}
 }
 

@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,7 +47,38 @@ func (b *runtimeBackend) recordLostRuntime(container ttcbundle.ContainerInfo) er
 	// NFS, where unlinking an open file creates .nfs files.
 	_ = b.stopContainerConsoleDrains(container.ID)
 	_, _ = b.command("delete", "--force", container.ID)
-	return b.containerStore().ReconcileNodeRuntimeUnavailable(container.ID, b.nodeID, loss)
+	if err := b.containerStore().ReconcileNodeRuntimeUnavailable(container.ID, b.nodeID, loss); err != nil {
+		return err
+	}
+	b.releaseLostBranchImages(container)
+	return nil
+}
+
+// releaseLostBranchImages releases the images the family's live branches were
+// rehydrated from, which each kept for its next dehydration: that dehydration
+// will not come, as the branch lost its memory with its runtime.
+func (b *runtimeBackend) releaseLostBranchImages(container ttcbundle.ContainerInfo) {
+	if b.nodeID != "" {
+		return
+	}
+	store := b.containerStore()
+	for _, branch := range container.Branches {
+		switch branch.State {
+		case "running", "paused":
+		default:
+			continue
+		}
+		if len(branch.MemoryRoots) == 0 {
+			continue
+		}
+		cleared, err := store.ClearBranchMemoryGraphIf(container.ID, branch.ID, branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects, branch.DistributedGraphReferenceOperation)
+		if err == nil && cleared {
+			err = b.releaseBranchGraphRoots(branch)
+		}
+		if err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: releasing the image of lost branch %s@%s: %v\n", container.Name, branch.ID, err)
+		}
+	}
 }
 
 // lostRuntimeWaitStatus is the wait status of a branch whose runtime died

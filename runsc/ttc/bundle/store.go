@@ -4279,6 +4279,30 @@ func (s Store) updateBranchSnapshotGraph(name, branchID string, snapshotID uint6
 	})
 }
 
+// ClearBranchControlGraphIf clears a rehydrated branch's consumed control
+// root only if the branch still names the exact capture observed by the
+// caller, and keeps its memory roots.
+func (s Store) ClearBranchControlGraphIf(name, branchID string, snapshotID uint64, controlRoot, controlObject string) (bool, error) {
+	cleared := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID || branch.ControlRoot != controlRoot || branch.ControlRootObject != controlObject {
+				return false, nil
+			}
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
+			cleared = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return cleared, err
+}
+
 // ClearBranchMemoryGraphIf clears a consumed immutable-memory backing only if
 // the branch still names the exact capture observed by the caller. Rehydrate,
 // dehydrate, fork, migration, and name reuse may all replace branch metadata

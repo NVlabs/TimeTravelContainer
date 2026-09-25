@@ -15251,14 +15251,17 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
 }
 
-// releaseConsumedStandaloneMemoryBacking drops a cold graph root once the
-// restored Kernel has no outstanding reads from it. The durable branch CAS is
-// the commit point: if graph collection then fails or the daemon crashes,
-// standalone startup reconciliation finds and releases the orphan root. A
-// clustered branch instead uses its origin ledger and publication protocol;
-// it must never take this local-only shortcut.
+// releaseConsumedStandaloneMemoryBacking drops a rehydrated branch's control
+// root once the restored Kernel has no outstanding reads from its image. The
+// branch keeps its memory roots: its next dehydration finds in them the pages
+// it has not changed since, and writes only the others, and that dehydration,
+// or the branch's end, releases them. The durable branch CAS is the commit
+// point: if graph collection then fails or the daemon crashes, standalone
+// startup reconciliation finds and releases the orphan root. A clustered
+// branch instead uses its origin ledger and publication protocol; it must
+// never take this local-only shortcut.
 func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector, branch ttcbundle.BranchInfo) {
-	if b.nodeID != "" || branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+	if b.nodeID != "" || branch.SnapshotID == 0 || branch.ControlRoot == "" {
 		return
 	}
 	output, err := b.command("timetravel", target.container, "page-load-status", target.branch)
@@ -15269,14 +15272,13 @@ func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector,
 	if err := json.Unmarshal(output, &status); err != nil || !status.Done || status.Error != "" {
 		return
 	}
-	cleared, err := b.containerStore().ClearBranchMemoryGraphIf(
-		target.container, target.branch, branch.SnapshotID, branch.MemoryRoots,
-		branch.MemoryRootObjects, branch.DistributedGraphReferenceOperation)
+	cleared, err := b.containerStore().ClearBranchControlGraphIf(
+		target.container, target.branch, branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject)
 	if err == nil && cleared {
-		err = b.releaseBranchGraphRoots(branch)
+		err = b.releaseGraphMemoryRoots([]string{branch.ControlRoot})
 	}
 	if err != nil && b.stderr != nil {
-		fmt.Fprintf(b.stderr, "ttc: warning: releasing consumed memory backing for %s: %v\n", target, err)
+		fmt.Fprintf(b.stderr, "ttc: warning: releasing consumed control state for %s: %v\n", target, err)
 	}
 }
 
@@ -15304,7 +15306,9 @@ func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 				}
 				switch normalizeLifecycleState(branch.State) {
 				case "running", "paused":
-					b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+					if branch.ControlRoot != "" {
+						b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+					}
 				}
 			}
 		}
