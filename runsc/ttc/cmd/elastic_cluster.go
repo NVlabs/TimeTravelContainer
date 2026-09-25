@@ -674,6 +674,18 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 		return false
 	}
+	// Placement reconciliation needs the physical runtime behind every remote
+	// logical branch. The user-facing inventory deliberately hides those
+	// containers, so using ListContainers here made a newly committed fork look
+	// absent and allowed the target node to delete its own Raft placement.
+	containers, err := b.containerStore().ListContainersForPlacement()
+	if err != nil {
+		return err
+	}
+	containersByID := make(map[string]ttcbundle.ContainerInfo, len(containers))
+	for _, info := range containers {
+		containersByID[info.ID] = info
+	}
 	// Raft placement is the ownership authority. Keep the canonical bundle's
 	// denormalized owner in sync so cache reclamation and crash diagnostics do
 	// not treat a retired migration source as local work. Transaction-scoped
@@ -686,17 +698,13 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		if busy(record.PhysicalContainer, record.FamilyID) {
 			continue
 		}
-		if err := b.syncLogicalBranchOwner(record.FamilyID, record.BranchID, record.OwnerNode); err != nil {
+		info, ok := containersByID[record.FamilyID]
+		if !ok {
+			continue
+		}
+		if err := b.syncLogicalBranchOwnerOf(info, record.BranchID, record.OwnerNode); err != nil {
 			result = errors.Join(result, fmt.Errorf("synchronizing logical owner for %s@%s: %w", record.FamilyID, record.BranchID, err))
 		}
-	}
-	// Placement reconciliation needs the physical runtime behind every remote
-	// logical branch. The user-facing inventory deliberately hides those
-	// containers, so using ListContainers here made a newly committed fork look
-	// absent and allowed the target node to delete its own Raft placement.
-	containers, err := b.containerStore().ListContainersForPlacement()
-	if err != nil {
-		return err
 	}
 	// Persistent container metadata is not proof that a running placement still
 	// has execution state. In particular, a batch scheduler may SIGKILL every
@@ -3809,14 +3817,23 @@ func (b *runtimeBackend) syncLogicalBranchOwner(familyID, branchID, owner string
 	if b == nil || familyID == "" || branchID == "" || owner == "" {
 		return nil
 	}
-	store := b.containerStore()
-	info, err := store.LoadContainer(familyID)
+	info, err := b.containerStore().LoadContainer(familyID)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	return b.syncLogicalBranchOwnerOf(info, branchID, owner)
+}
+
+// syncLogicalBranchOwnerOf is syncLogicalBranchOwner of a family record
+// already read.
+func (b *runtimeBackend) syncLogicalBranchOwnerOf(info ttcbundle.ContainerInfo, branchID, owner string) error {
+	if b == nil || branchID == "" || owner == "" {
+		return nil
+	}
+	store := b.containerStore()
 	branchFound := false
 	for _, branch := range info.Branches {
 		if branch.ID == branchID {
