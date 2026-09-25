@@ -7565,3 +7565,33 @@ func TestReconcileInterruptedMemoryGraphSealsOnlyReferencedResidue(t *testing.T)
 		t.Fatalf("empty interrupted snapshot objects = %v, %v; want none", objects, err)
 	}
 }
+
+// A kernel that accounts swap to cgroups gives a memory cgroup memory.swap.max
+// beside memory.max; one that does not gives only memory.max. With neither, as
+// on cgroup v1, runsc decides.
+func TestCgroupSwapAccounted(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "delegated")
+	if err := os.MkdirAll(filepath.Join(parent, "daemon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	proc := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.WriteFile(proc, []byte("0::/delegated/daemon\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !cgroupSwapAccounted(proc, root) {
+		t.Error("a cgroup with no memory interface was judged unaccounted")
+	}
+	if err := os.WriteFile(filepath.Join(parent, "memory.max"), []byte("max\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if cgroupSwapAccounted(proc, root) {
+		t.Error("a memory cgroup without memory.swap.max was judged accounted")
+	}
+	if err := os.WriteFile(filepath.Join(parent, "memory.swap.max"), []byte("max\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !cgroupSwapAccounted(proc, root) {
+		t.Error("a memory cgroup with memory.swap.max was judged unaccounted")
+	}
+}

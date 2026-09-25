@@ -605,6 +605,8 @@ choose a compute node. Important options:
   --stop-timeout SECONDS      Grace period; -1 waits forever (default: 10)
   --pids-limit N              Maximum tasks; -1 or 0 is unlimited (default: 0)
   -m, --memory SIZE           Memory limit; 0 is unlimited (default: 0)
+  --memory-swap SIZE          Memory plus swap limit; -1 is unlimited swap
+                              (default: twice --memory)
   --cpus DECIMAL              CPU quota, e.g. 0.5 or 2 (default: 0, unlimited)
   --shm-size SIZE             Size of memory-backed /dev/shm (default: 64m)
   --network none|host|ttc     Network mode (default: none)

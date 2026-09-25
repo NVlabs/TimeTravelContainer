@@ -60,7 +60,8 @@ covers:
 - Docker `--pids-limit` OCI and inspect persistence, Sentry-side process and
   thread enforcement without delegated host cgroups, and branch-local limit and
   task-charge inheritance across live fork;
-- Docker `--memory`/`-m`, `--cpus`, `--cpu-shares`, `--cpu-period`, and
+- Docker `--memory`/`-m`, `--memory-swap` (twice the memory unless given; `-1`
+  for unlimited swap), `--cpus`, `--cpu-shares`, `--cpu-period`, and
   `--cpu-quota` parsing, OCI projection, persistence, inspect projection, and
   synthetic cgroup-v2 verification are covered by the focused Go suites. A live
   enforcement matrix requires a delegated cgroup-v2 subtree and is intentionally

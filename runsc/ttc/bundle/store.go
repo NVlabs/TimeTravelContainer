@@ -674,6 +674,7 @@ type ContainerInfo struct {
 	StopTimeout                  *int                             `json:"stop_timeout,omitempty"`
 	PidsLimit                    *int64                           `json:"pids_limit,omitempty"`
 	MemoryLimit                  *int64                           `json:"memory_limit,omitempty"`
+	MemorySwap                   *int64                           `json:"memory_swap,omitempty"`
 	NanoCPUs                     *int64                           `json:"nano_cpus,omitempty"`
 	CPUShares                    *uint64                          `json:"cpu_shares,omitempty"`
 	CPUPeriod                    *uint64                          `json:"cpu_period,omitempty"`
@@ -1440,6 +1441,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopTimeout:         cloneIntPointer(opts.StopTimeout),
 		PidsLimit:           cloneInt64Pointer(opts.PidsLimit),
 		MemoryLimit:         cloneInt64Pointer(opts.MemoryLimit),
+		MemorySwap:          cloneInt64Pointer(opts.MemorySwap),
 		NanoCPUs:            cloneInt64Pointer(opts.NanoCPUs),
 		CPUShares:           cloneUint64Pointer(opts.CPUShares),
 		CPUPeriod:           cloneUint64Pointer(opts.CPUPeriod),
@@ -3118,7 +3120,7 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if *info.ShmSize < 0 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid shared memory size %d", key, *info.ShmSize)
 	}
-	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
+	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, MemorySwap: info.MemorySwap, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid resource limits: %w", key, err)
 	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {

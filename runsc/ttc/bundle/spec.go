@@ -110,6 +110,7 @@ type SpecOptions struct {
 	StopSignal       string
 	PidsLimit        *int64
 	MemoryLimit      *int64
+	MemorySwap       *int64
 	NanoCPUs         *int64
 	CPUShares        *uint64
 	CPUPeriod        *uint64
@@ -409,6 +410,32 @@ func ParseMemoryLimit(value string) (int64, error) {
 	return bytes, nil
 }
 
+// ParseMemorySwap parses Docker's --memory-swap: a byte count for memory and
+// swap together, or -1 for unlimited swap.
+func ParseMemorySwap(value string) (int64, error) {
+	if value == "-1" {
+		return -1, nil
+	}
+	bytes, err := units.RAMInBytes(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory-swap limit %q: %w", value, err)
+	}
+	if bytes < 0 {
+		return 0, fmt.Errorf("memory-swap limit must be -1 or greater: %d", bytes)
+	}
+	return bytes, nil
+}
+
+// EffectiveMemorySwap is the memory-swap limit Docker gives a container with
+// a memory limit: the one asked for, or when none was, twice the memory
+// limit, which lets it swap out as much as it may hold.
+func EffectiveMemorySwap(memory, swap int64) int64 {
+	if memory > 0 && swap == 0 {
+		return 2 * memory
+	}
+	return swap
+}
+
 func hasHardResourceLimits(opts SpecOptions) bool {
 	return opts.MemoryLimit != nil && *opts.MemoryLimit > 0 ||
 		opts.NanoCPUs != nil && *opts.NanoCPUs > 0 ||
@@ -427,6 +454,16 @@ func validateResourceLimits(opts SpecOptions) error {
 		}
 		if *opts.MemoryLimit != 0 && *opts.MemoryLimit < MinimumMemoryLimitBytes {
 			return fmt.Errorf("minimum memory limit allowed is 6 MiB")
+		}
+	}
+	if opts.MemorySwap != nil && *opts.MemorySwap != 0 {
+		switch {
+		case *opts.MemorySwap < -1:
+			return fmt.Errorf("memory-swap limit must be -1 or greater")
+		case opts.MemoryLimit == nil || *opts.MemoryLimit == 0:
+			return fmt.Errorf("a memory-swap limit needs a memory limit")
+		case *opts.MemorySwap > 0 && *opts.MemorySwap < *opts.MemoryLimit:
+			return fmt.Errorf("the memory-swap limit must be at least the memory limit")
 		}
 	}
 	if opts.NanoCPUs != nil {
@@ -663,6 +700,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			resources = &specs.LinuxResources{}
 		}
 		resources.Memory = &specs.LinuxMemory{Limit: cloneInt64Pointer(opts.MemoryLimit)}
+		// Unlimited swap is a new cgroup's own default, and needs no
+		// memory.swap.max, which a kernel that does not account swap lacks.
+		if opts.MemorySwap != nil && *opts.MemorySwap > 0 {
+			resources.Memory.Swap = cloneInt64Pointer(opts.MemorySwap)
+		}
 	}
 	cpu := &specs.LinuxCPU{}
 	hasCPU := false

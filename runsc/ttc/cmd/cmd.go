@@ -1739,6 +1739,7 @@ type runRequest struct {
 	stopTimeout        int
 	pidsLimit          *int64
 	memoryLimit        *int64
+	memorySwap         *int64
 	nanoCPUs           *int64
 	cpuShares          *uint64
 	cpuPeriod          *uint64
@@ -1798,7 +1799,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1816,6 +1817,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	memoryValue := fs.String("memory", "0", "memory limit")
 	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	memorySwapValue := fs.String("memory-swap", "0", "memory plus swap limit; -1 is unlimited")
 	cpusValue := fs.String("cpus", "0", "number of CPUs")
 	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
 	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
@@ -1945,6 +1947,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedMemorySwap, err := ttcbundle.ParseMemorySwap(*memorySwapValue)
+	if err != nil {
+		return err
+	}
 	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
 	if err != nil {
 		return err
@@ -1987,6 +1993,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
 		effectiveMemoryLimit = &parsedMemoryLimit
 	}
+	memorySwap := effectiveMemorySwap(effectiveMemoryLimit, parsedMemorySwap, flagWasSet(fs, "memory-swap"), stderr)
 	if flagWasSet(fs, "cpus") {
 		effectiveNanoCPUs = &parsedNanoCPUs
 	}
@@ -2030,6 +2037,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
 		memoryLimit:        effectiveMemoryLimit,
+		memorySwap:         memorySwap,
 		nanoCPUs:           effectiveNanoCPUs,
 		cpuShares:          effectiveCPUShares,
 		cpuPeriod:          effectiveCPUPeriod,
@@ -2068,7 +2076,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -2084,6 +2092,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	memoryValue := fs.String("memory", "0", "memory limit")
 	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	memorySwapValue := fs.String("memory-swap", "0", "memory plus swap limit; -1 is unlimited")
 	cpusValue := fs.String("cpus", "0", "number of CPUs")
 	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
 	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
@@ -2213,6 +2222,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedMemorySwap, err := ttcbundle.ParseMemorySwap(*memorySwapValue)
+	if err != nil {
+		return err
+	}
 	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
 	if err != nil {
 		return err
@@ -2255,6 +2268,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
 		effectiveMemoryLimit = &parsedMemoryLimit
 	}
+	memorySwap := effectiveMemorySwap(effectiveMemoryLimit, parsedMemorySwap, flagWasSet(fs, "memory-swap"), stderr)
 	if flagWasSet(fs, "cpus") {
 		effectiveNanoCPUs = &parsedNanoCPUs
 	}
@@ -2298,6 +2312,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
 		memoryLimit:        effectiveMemoryLimit,
+		memorySwap:         memorySwap,
 		nanoCPUs:           effectiveNanoCPUs,
 		cpuShares:          effectiveCPUShares,
 		cpuPeriod:          effectiveCPUPeriod,
@@ -2896,6 +2911,7 @@ type InspectHostConfig struct {
 	StopTimeout    *int                            `json:"StopTimeout"`
 	PidsLimit      *int64                          `json:"PidsLimit"`
 	Memory         int64                           `json:"Memory"`
+	MemorySwap     int64                           `json:"MemorySwap"`
 	NanoCPUs       int64                           `json:"NanoCpus"`
 	CPUShares      uint64                          `json:"CpuShares"`
 	CPUPeriod      uint64                          `json:"CpuPeriod"`
@@ -7159,6 +7175,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			MemoryLimit:      request.memoryLimit,
+			MemorySwap:       request.memorySwap,
 			NanoCPUs:         request.nanoCPUs,
 			CPUShares:        request.cpuShares,
 			CPUPeriod:        request.cpuPeriod,
@@ -7297,6 +7314,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			MemoryLimit:      request.memoryLimit,
+			MemorySwap:       request.memorySwap,
 			NanoCPUs:         request.nanoCPUs,
 			CPUShares:        request.cpuShares,
 			CPUPeriod:        request.cpuPeriod,
@@ -9405,6 +9423,10 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 	if container.MemoryLimit != nil {
 		memory = *container.MemoryLimit
 	}
+	memorySwap := int64(0)
+	if container.MemorySwap != nil {
+		memorySwap = *container.MemorySwap
+	}
 	if container.NanoCPUs != nil {
 		nanoCPUs = *container.NanoCPUs
 	}
@@ -9474,7 +9496,7 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, PortBindings: portBindings, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, PortBindings: portBindings, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, MemorySwap: memorySwap, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTC: TTCInspectInfo{
@@ -10410,6 +10432,41 @@ func delegatedCgroupParent(procCgroupPath, mountRoot string) (string, error) {
 		return "", fmt.Errorf("checking daemon cgroup %q: %w", visibleMembership, err)
 	}
 	return mountRoot, nil
+}
+
+// effectiveMemorySwap is the memory-swap limit a new family gets, as Docker
+// gives it: the one asked for, or twice its memory limit. A kernel that does
+// not account swap to cgroups cannot hold a family to one, and, as Docker
+// does, TTC then says so and limits only memory.
+func effectiveMemorySwap(memoryLimit *int64, swap int64, swapSet bool, stderr io.Writer) *int64 {
+	memory := int64(0)
+	if memoryLimit != nil {
+		memory = *memoryLimit
+	}
+	if memory == 0 && !swapSet {
+		return nil
+	}
+	effective := ttcbundle.EffectiveMemorySwap(memory, swap)
+	if memory > 0 && effective > 0 && !cgroupSwapAccounted("/proc/self/cgroup", "/sys/fs/cgroup") {
+		fmt.Fprintln(stderr, "ttc: warning: this kernel does not account swap to cgroups, so memory is limited without limiting swap")
+		effective = -1
+	}
+	return &effective
+}
+
+// cgroupSwapAccounted reports whether the kernel accounts swap to the cgroups
+// runsc creates for sandboxes, as their parent's memory.swap.max shows. With
+// no memory interface to judge by, as on cgroup v1, it lets runsc decide.
+func cgroupSwapAccounted(procCgroupPath, mountRoot string) bool {
+	parent, err := delegatedCgroupParent(procCgroupPath, mountRoot)
+	if err != nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(parent, "memory.max")); err != nil {
+		return true
+	}
+	_, err = os.Stat(filepath.Join(parent, "memory.swap.max"))
+	return err == nil
 }
 
 func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []string) error {

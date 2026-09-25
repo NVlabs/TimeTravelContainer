@@ -3594,3 +3594,61 @@ func TestCommitActiveRepositoryRestoreIDsAdvancesOneShotAlias(t *testing.T) {
 		t.Fatalf("repositories=%+v, want path %q and restore ID %q", got, repositoryPath, localID)
 	}
 }
+
+// A memory limit brings Docker's swap limit with it: twice the memory unless
+// --memory-swap says otherwise, -1 for unlimited swap, never less than the
+// memory, and never without a memory limit.
+func TestMemorySwapFollowsDocker(t *testing.T) {
+	const mib = int64(1) << 20
+	for value, want := range map[string]int64{"-1": -1, "0": 0, "256m": 256 * mib} {
+		if got, err := ParseMemorySwap(value); err != nil || got != want {
+			t.Errorf("ParseMemorySwap(%q) = %d, %v; want %d", value, got, err, want)
+		}
+	}
+	for _, value := range []string{"-2", "lots"} {
+		if _, err := ParseMemorySwap(value); err == nil {
+			t.Errorf("ParseMemorySwap(%q) succeeded", value)
+		}
+	}
+	for _, test := range []struct{ memory, swap, want int64 }{
+		{64 * mib, 0, 128 * mib}, {64 * mib, -1, -1}, {64 * mib, 100 * mib, 100 * mib}, {0, 0, 0},
+	} {
+		if got := EffectiveMemorySwap(test.memory, test.swap); got != test.want {
+			t.Errorf("EffectiveMemorySwap(%d, %d) = %d, want %d", test.memory, test.swap, got, test.want)
+		}
+	}
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	memory := 64 * mib
+	for _, swap := range []int64{128 * mib, 64 * mib} {
+		spec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), MemoryLimit: &memory, MemorySwap: &swap})
+		if err != nil {
+			t.Fatalf("BuildSpec with swap %d: %v", swap, err)
+		}
+		if got := spec.Linux.Resources.Memory.Swap; got == nil || *got != swap {
+			t.Errorf("spec swap = %v, want %d", got, swap)
+		}
+	}
+	// Unlimited swap, asked for or recorded before swap limits, sets none.
+	unlimited := int64(-1)
+	for _, swap := range []*int64{&unlimited, nil} {
+		spec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), MemoryLimit: &memory, MemorySwap: swap})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := spec.Linux.Resources.Memory.Swap; got != nil {
+			t.Errorf("unlimited swap set a limit: %d", *got)
+		}
+	}
+	short, zero := 32*mib, int64(0)
+	for name, opts := range map[string]SpecOptions{
+		"less than memory": {MemoryLimit: &memory, MemorySwap: &short},
+		"without memory":   {MemorySwap: &short},
+		"zero memory":      {MemoryLimit: &zero, MemorySwap: &short},
+		"below unlimited":  {MemoryLimit: &memory, MemorySwap: func() *int64 { v := int64(-2); return &v }()},
+	} {
+		opts.RootFS = t.TempDir()
+		if _, err := BuildSpec(image, opts); err == nil {
+			t.Errorf("BuildSpec accepted a memory-swap limit %s", name)
+		}
+	}
+}
