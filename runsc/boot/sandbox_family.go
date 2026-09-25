@@ -464,6 +464,9 @@ type ConsoleWatchArgs struct {
 	ConsoleObservationArgs
 }
 
+// MaxConsoleWait is the longest timeout ConsoleWait accepts.
+const MaxConsoleWait = 30 * time.Second
+
 // ConsoleWaitArgs waits for branch-local console I/O readiness. A zero timeout
 // performs a nonblocking readiness check.
 type ConsoleWaitArgs struct {
@@ -3702,8 +3705,8 @@ func (f *SandboxFamily) ConsoleWait(args *ConsoleWaitArgs, out *ConsoleWaitResul
 	if args == nil || out == nil {
 		return fmt.Errorf("missing internal console wait arguments or result")
 	}
-	if args.Timeout < 0 || args.Timeout > 30*time.Second {
-		return fmt.Errorf("internal console wait timeout %s is outside 0..30s", args.Timeout)
+	if args.Timeout < 0 || args.Timeout > MaxConsoleWait {
+		return fmt.Errorf("internal console wait timeout %s is outside 0..%s", args.Timeout, MaxConsoleWait)
 	}
 	b, lease, done, err := f.beginConsoleWait(args.BranchID)
 	if err != nil {

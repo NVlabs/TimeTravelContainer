@@ -1096,6 +1096,9 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 			return finish(nil)
 		}
 		if !progress {
+			// Output, its end, and any change to the branch that ends this
+			// drain wake the wait, so it may be as long as the Sentry allows:
+			// a branch that prints nothing costs a wait every 30 s.
 			_, err := s.WaitConsole(&boot.ConsoleWaitArgs{
 				BranchID:  branchID,
 				ConsoleID: consoleID,
@@ -1103,7 +1106,7 @@ func drainConsole(s *sandbox.Sandbox, branchID, consoleID string, writer io.Writ
 					Stdout: !streams[0].eof,
 					Stderr: !streams[1].eof,
 				},
-				Timeout: time.Second,
+				Timeout: boot.MaxConsoleWait,
 			})
 			if err != nil {
 				return finish(err)
