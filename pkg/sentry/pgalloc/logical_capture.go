@@ -16,8 +16,10 @@ package pgalloc
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -61,29 +63,37 @@ type CapturedMemoryLayout struct {
 // layout cannot provide this property. Live remote readers require it to load
 // and publish a chunk atomically.
 func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
-	bindings := append([]CapturedPageBinding(nil), l.Bindings...)
-	sort.Slice(bindings, func(i, j int) bool {
-		left, right := bindings[i], bindings[j]
-		if cmp := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); cmp != 0 {
-			return cmp < 0
+	// Sort indexes, and move each 100-byte binding once.
+	order := make([]int32, len(l.Bindings))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	slices.SortFunc(order, func(a, b int32) int {
+		left, right := &l.Bindings[a], &l.Bindings[b]
+		if c := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); c != 0 {
+			return c
 		}
-		if left.Chunk.Sequence != right.Chunk.Sequence {
-			return left.Chunk.Sequence < right.Chunk.Sequence
+		if c := cmp.Compare(left.Chunk.Sequence, right.Chunk.Sequence); c != 0 {
+			return c
 		}
-		if left.Slot != right.Slot {
-			return left.Slot < right.Slot
+		if c := cmp.Compare(left.Slot, right.Slot); c != 0 {
+			return c
 		}
-		if cmp := bytes.Compare(left.Version.Allocator[:], right.Version.Allocator[:]); cmp != 0 {
-			return cmp < 0
+		if c := bytes.Compare(left.Version.Allocator[:], right.Version.Allocator[:]); c != 0 {
+			return c
 		}
-		if left.Version.Sequence != right.Version.Sequence {
-			return left.Version.Sequence < right.Version.Sequence
+		if c := cmp.Compare(left.Version.Sequence, right.Version.Sequence); c != 0 {
+			return c
 		}
 		if left.ResourceID != right.ResourceID {
-			return left.ResourceID.String() < right.ResourceID.String()
+			return cmp.Compare(left.ResourceID.String(), right.ResourceID.String())
 		}
-		return left.OldOffset < right.OldOffset
+		return cmp.Compare(left.OldOffset, right.OldOffset)
 	})
+	bindings := make([]CapturedPageBinding, len(order))
+	for i, index := range order {
+		bindings[i] = l.Bindings[index]
+	}
 	files := make(map[checkpoint.ResourceID]*MemoryFile)
 	for _, region := range l.Regions {
 		resource := region.File.ResourceID()
@@ -285,7 +295,19 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 		}{captured.Range, nextStreamOffset})
 		nextStreamOffset += captured.Range.Length()
 	}
+	pages := uint64(0)
 	for _, mf := range c.files {
+		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
+			pages += referenced.range_.Length() / hostarch.PageSize
+		}
+	}
+	result = make([]CapturedPageBinding, 0, pages)
+	for _, mf := range c.files {
+		// The stream ranges of mf are sorted and disjoint, and its referenced
+		// ranges are visited in ascending order, so the stream range of each
+		// page is at or after the previous page's.
+		ranges := streamRanges[mf]
+		index := 0
 		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
 			capturedRange := referenced.range_
 			cursor := capturedRange.Start
@@ -294,12 +316,9 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 					return nil, fmt.Errorf("captured MemoryFile range %v has no logical page at offset %#x", capturedRange, cursor)
 				}
 				for off := run.Range.Start; off < run.Range.End; off += hostarch.PageSize {
-					// The stream ranges of mf are sorted and disjoint. A
-					// memory with many small captured ranges, as copy-on-write
-					// makes of a fork's scattered writes, made scanning them
-					// for every page take seconds.
-					ranges := streamRanges[mf]
-					index := sort.Search(len(ranges), func(i int) bool { return ranges[i].range_.End > off })
+					for index < len(ranges) && ranges[index].range_.End <= off {
+						index++
+					}
 					if index == len(ranges) || ranges[index].range_.Start > off {
 						return nil, fmt.Errorf("captured MemoryFile offset %#x has no packed stream range", off)
 					}

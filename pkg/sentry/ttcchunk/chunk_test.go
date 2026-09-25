@@ -837,3 +837,53 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 		t.Fatal("invalid manifest header passed structural validation")
 	}
 }
+
+// A manifest whose runs are out of order still plans an object's pages in slot
+// order and a resource's mappings in index order, maps a page index mapped
+// twice alike once, and refuses one mapped to two pages.
+func TestCaptureImportPlanOrdersPagesAndMappings(t *testing.T) {
+	logical := pgalloc.LogicalChunkID{Allocator: testAllocator(11), Sequence: 9}
+	object := graphCaptureObjectID(9)
+	run := func(index uint64, slot uint8, pages uint16) ManifestRun {
+		return ManifestRun{
+			OldOffset:    index * hostarch.PageSize,
+			References:   1,
+			FirstPage:    pgalloc.LogicalPageID{Allocator: logical.Allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(slot)},
+			FirstVersion: pgalloc.PageVersionID{Allocator: testAllocator(22), Sequence: 1000 + uint64(slot)},
+			Logical:      logical,
+			FirstSlot:    slot,
+			Pages:        pages,
+			Object:       object,
+			ObjectPage:   slot,
+		}
+	}
+	manifest := Manifest{Runs: []ManifestRun{run(8, 200, 2), run(0, 3, 2), run(8, 200, 1)}}
+	objects, resources, mappings, err := planCaptureImport(manifest, "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || len(resources) != 1 {
+		t.Fatalf("planned %d objects and %d resources, want one of each", len(objects), len(resources))
+	}
+	var slots []uint8
+	for index := range objects[0].slots {
+		slots = append(slots, objects[0].slots[index].number())
+	}
+	if want := []uint8{3, 4, 200, 201}; !reflect.DeepEqual(slots, want) {
+		t.Fatalf("planned slots %v, want %v", slots, want)
+	}
+	var indexes []uint64
+	for _, mapping := range mappings {
+		indexes = append(indexes, mapping.index)
+		if page := objects[0].slot(mapping.slot); page.number() != mapping.slot || page.identity.VersionSequence != 1000+uint64(mapping.slot) {
+			t.Fatalf("page index %d maps slot %d to %+v", mapping.index, mapping.slot, page.identity)
+		}
+	}
+	if want := []uint64{0, 1, 8, 9}; !reflect.DeepEqual(indexes, want) {
+		t.Fatalf("planned page indexes %v, want %v", indexes, want)
+	}
+	manifest.Runs = append(manifest.Runs, run(8, 7, 1))
+	if _, _, _, err := planCaptureImport(manifest, "plan"); err == nil {
+		t.Fatal("a page index mapped to two pages was planned")
+	}
+}

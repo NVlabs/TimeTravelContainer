@@ -16,10 +16,12 @@ package ttcchunk
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -205,50 +207,56 @@ func graphCaptureObjectID(sequence uint64) ID {
 
 // planGraphCapture assigns transport-local object IDs using metadata only.
 // It performs no page reads, which lets the manifest precede a bounded stream
-// of one-chunk payloads.
+// of one-chunk payloads. It returns the stored bindings in the order of
+// bindings.
 func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGroup, []StoredBinding, error) {
-	ordered := append([]pgalloc.CapturedPageBinding(nil), bindings...)
-	sort.Slice(ordered, func(i, j int) bool {
-		left, right := &ordered[i], &ordered[j]
-		if cmp := compareAllocator(left.Chunk.Allocator, right.Chunk.Allocator); cmp != 0 {
-			return cmp < 0
+	// Visit the bindings in logical chunk and slot order through their
+	// indexes: sorting the bindings themselves moved every 100-byte record
+	// many times.
+	order := make([]int32, len(bindings))
+	for i := range order {
+		order[i] = int32(i)
+	}
+	slices.SortFunc(order, func(a, b int32) int {
+		left, right := &bindings[a], &bindings[b]
+		if c := compareAllocator(left.Chunk.Allocator, right.Chunk.Allocator); c != 0 {
+			return c
 		}
-		if left.Chunk.Sequence != right.Chunk.Sequence {
-			return left.Chunk.Sequence < right.Chunk.Sequence
+		if c := cmp.Compare(left.Chunk.Sequence, right.Chunk.Sequence); c != 0 {
+			return c
 		}
-		if left.Slot != right.Slot {
-			return left.Slot < right.Slot
+		if c := cmp.Compare(left.Slot, right.Slot); c != 0 {
+			return c
 		}
-		if cmp := compareAllocator(left.Version.Allocator, right.Version.Allocator); cmp != 0 {
-			return cmp < 0
+		if c := compareAllocator(left.Version.Allocator, right.Version.Allocator); c != 0 {
+			return c
 		}
-		if left.Version.Sequence != right.Version.Sequence {
-			return left.Version.Sequence < right.Version.Sequence
+		if c := cmp.Compare(left.Version.Sequence, right.Version.Sequence); c != 0 {
+			return c
 		}
-		return left.OldOffset < right.OldOffset
+		return cmp.Compare(left.OldOffset, right.OldOffset)
 	})
-	groupsByLogical := make(map[pgalloc.LogicalChunkID][]int)
 	groups := make([]graphCaptureGroup, 0)
-	stored := make([]StoredBinding, 0, len(ordered))
-	seenVersions := make(map[struct {
-		page    pgalloc.LogicalPageID
-		version pgalloc.PageVersionID
-	}]struct{}, len(ordered))
-	for _, binding := range ordered {
+	stored := make([]StoredBinding, len(bindings))
+	// The order keeps a logical chunk's bindings together, and a page's of
+	// one version next to each other: chunkGroups are the groups of the
+	// chunk being visited, and previous the binding before.
+	var chunkGroups []int
+	var previous *pgalloc.CapturedPageBinding
+	for _, index := range order {
+		binding := &bindings[index]
 		chunk, slot := binding.Page.Chunk()
 		if binding.Chunk != chunk || binding.Slot != slot || binding.References == 0 || binding.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, nil, fmt.Errorf("invalid captured page binding: %+v", binding)
+			return nil, nil, fmt.Errorf("invalid captured page binding: %+v", *binding)
 		}
-		versionKey := struct {
-			page    pgalloc.LogicalPageID
-			version pgalloc.PageVersionID
-		}{binding.Page, binding.Version}
-		if _, exists := seenVersions[versionKey]; exists {
+		if previous == nil || previous.Chunk != binding.Chunk {
+			chunkGroups = chunkGroups[:0]
+		} else if previous.Page == binding.Page && previous.Version == binding.Version {
 			return nil, nil, fmt.Errorf("captured page %+v repeats version %+v", binding.Page, binding.Version)
 		}
-		seenVersions[versionKey] = struct{}{}
+		previous = binding
 		groupIndex := -1
-		for _, candidate := range groupsByLogical[binding.Chunk] {
+		for _, candidate := range chunkGroups {
 			if !hasBit(&groups[candidate].used, binding.Slot) {
 				groupIndex = candidate
 				break
@@ -258,12 +266,12 @@ func planGraphCapture(bindings []pgalloc.CapturedPageBinding) ([]graphCaptureGro
 			groupIndex = len(groups)
 			id := graphCaptureObjectID(uint64(groupIndex + 1))
 			groups = append(groups, graphCaptureGroup{id: id, logical: binding.Chunk})
-			groupsByLogical[binding.Chunk] = append(groupsByLogical[binding.Chunk], groupIndex)
+			chunkGroups = append(chunkGroups, groupIndex)
 		}
 		group := &groups[groupIndex]
 		setBit(&group.used, binding.Slot)
-		group.bindings = append(group.bindings, binding)
-		stored = append(stored, capturedBinding(binding, group.id))
+		group.bindings = append(group.bindings, *binding)
+		stored[index] = capturedBinding(*binding, group.id)
 	}
 	return groups, stored, nil
 }

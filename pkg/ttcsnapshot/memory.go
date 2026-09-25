@@ -476,7 +476,7 @@ func (s *Store) releaseMemoryPageLocked(identity MemoryPageIdentity, location Me
 // memoryPageLocationLocked returns where the graph holds the page with
 // identity in an origin whose state is in allowed, choosing the least chunk
 // when there are several.
-func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed map[SnapshotState]struct{}) (MemoryPageLocation, bool) {
+func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed map[SnapshotState]struct{}, origins map[SnapshotID]bool) (MemoryPageLocation, bool) {
 	holding, ok := s.memoryPages[identity]
 	if !ok {
 		return MemoryPageLocation{}, false
@@ -484,7 +484,15 @@ func (s *Store) memoryPageLocationLocked(identity MemoryPageIdentity, allowed ma
 	var selected MemoryPageLocation
 	found := false
 	consider := func(candidate memoryPageHolding) {
-		if !s.originAllowedLocked(candidate.location.Chunk.Snapshot, allowed) {
+		// An origin's state is found by a formatted key: remember it for
+		// the many pages a capture looks up in the same few origins.
+		origin := candidate.location.Chunk.Snapshot
+		permitted, known := origins[origin]
+		if !known {
+			permitted = s.originAllowedLocked(origin, allowed)
+			origins[origin] = permitted
+		}
+		if !permitted {
 			return
 		}
 		if order := compareObjectIDs(candidate.location.Chunk, selected.Chunk); !found || order < 0 || (order == 0 && candidate.location.Page < selected.Page) {
@@ -570,11 +578,12 @@ func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentit
 	defer s.mu.Unlock()
 	locations := make([]MemoryPageLocation, len(identities))
 	chunks := make(map[ObjectID]struct{})
+	origins := make(map[SnapshotID]bool)
 	for index, identity := range identities {
 		if !identity.complete() {
 			return nil, nil, fmt.Errorf("memory page %d has an incomplete identity", index)
 		}
-		location, ok := s.memoryPageLocationLocked(identity, allowed)
+		location, ok := s.memoryPageLocationLocked(identity, allowed, origins)
 		if !ok {
 			continue
 		}

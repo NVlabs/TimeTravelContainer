@@ -16,6 +16,7 @@ package ttcchunk
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -23,7 +24,8 @@ import (
 	"io/fs"
 	"math/bits"
 	"os"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -111,36 +113,44 @@ type captureSource struct {
 type importedResource struct {
 	id   checkpoint.ResourceID
 	root string
-	// pages maps each page index to the object slot mapped there.
-	pages map[uint64]importedSlotKey
-}
-
-type importedSlotKey struct {
-	object ID
-	slot   uint8
 }
 
 // importedObject is one capture object: a version of a logical chunk.
 type importedObject struct {
 	id      ID
 	logical pgalloc.LogicalChunkID
-	slots   map[uint8]*importedSlot
+	// mapped has the slots the capture maps, and slots the pages in them, in
+	// slot order.
+	mapped [slotBitmapBytes]byte
+	slots  []importedSlot
 	// missing has the slots whose pages the graph does not hold yet.
 	missing [slotBitmapBytes]byte
 }
 
-// importedSlot is the page in one slot of a capture object: its identity,
-// where its bytes are to be, and the places it is mapped.
+// slot returns the page in a slot the capture maps.
+func (object *importedObject) slot(slot uint8) *importedSlot {
+	return &object.slots[countBitsBelow(&object.mapped, slot)]
+}
+
+// importedSlot is the page in one slot of a capture object: its identity and
+// where its bytes are to be.
 type importedSlot struct {
 	identity ttcsnapshot.MemoryPageIdentity
 	location ttcsnapshot.MemoryPageLocation
-	links    []importedLink
 }
 
-// importedLink is one place a page is mapped: page index of a resource's tree.
-type importedLink struct {
-	resource *importedResource
+// number returns the slot's number in its object.
+func (slot *importedSlot) number() uint8 {
+	return uint8(slot.identity.LogicalSequence % PagesPerChunk)
+}
+
+// importedMapping is one place a page is mapped: page index of a resource's
+// tree.
+type importedMapping struct {
+	resource int
 	index    uint64
+	object   *importedObject
+	slot     uint8
 }
 
 // graphTablesPerTransaction bounds the tables one transaction maps: 128 MiB
@@ -160,7 +170,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 	if graph.HasRootUnder(rootPrefix) {
 		return GraphImportResult{}, fmt.Errorf("memory graph root prefix %q is already in use", rootPrefix)
 	}
-	objects, resources, err := planCaptureImport(manifest, rootPrefix)
+	objects, resources, mappings, err := planCaptureImport(manifest, rootPrefix)
 	if err != nil {
 		return GraphImportResult{}, err
 	}
@@ -190,18 +200,14 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 
 	// Find the pages the graph holds already, and hold them until the new
 	// trees refer to them.
-	var identities []ttcsnapshot.MemoryPageIdentity
-	var planned []*importedSlot
-	var plannedObjects []*importedObject
-	var plannedSlots []uint8
+	pages := 0
 	for _, object := range objects {
-		for slot := 0; slot < PagesPerChunk; slot++ {
-			if page, ok := object.slots[uint8(slot)]; ok {
-				identities = append(identities, page.identity)
-				planned = append(planned, page)
-				plannedObjects = append(plannedObjects, object)
-				plannedSlots = append(plannedSlots, uint8(slot))
-			}
+		pages += len(object.slots)
+	}
+	identities := make([]ttcsnapshot.MemoryPageIdentity, 0, pages)
+	for _, object := range objects {
+		for index := range object.slots {
+			identities = append(identities, object.slots[index].identity)
 		}
 	}
 	locations, held, err := graph.HoldMemoryPages(rootPrefix+"/held", identities, reusableStates...)
@@ -209,12 +215,16 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		return GraphImportResult{}, err
 	}
 	pins = held
-	for index, location := range locations {
-		if location.Chunk.IsZero() {
-			setBit(&plannedObjects[index].missing, plannedSlots[index])
-			continue
+	for _, object := range objects {
+		for index := range object.slots {
+			slot := &object.slots[index]
+			if location := locations[0]; location.Chunk.IsZero() {
+				setBit(&object.missing, slot.number())
+			} else {
+				slot.location = location
+			}
+			locations = locations[1:]
 		}
-		planned[index].location = location
 	}
 	if source.need != nil {
 		ids := make([]ID, len(objects))
@@ -263,15 +273,15 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		}
 		for index, object := range incomplete {
 			position := starts[index]
-			for slot := 0; slot < PagesPerChunk; slot++ {
-				if hasBit(&object.missing, uint8(slot)) {
-					object.slots[uint8(slot)].location = ttcsnapshot.MemoryPageLocation{Chunk: chunks[position/PagesPerChunk], Page: uint8(position % PagesPerChunk)}
+			for index := range object.slots {
+				if slot := &object.slots[index]; hasBit(&object.missing, slot.number()) {
+					slot.location = ttcsnapshot.MemoryPageLocation{Chunk: chunks[position/PagesPerChunk], Page: uint8(position % PagesPerChunk)}
 					position++
 				}
 			}
 		}
 	}
-	tables, newChunks := planCaptureTables(resources, objects, chunks)
+	tables, newChunks := planCaptureTables(resources, mappings, chunks)
 
 	// Collection must not see an installed chunk before a transaction naming
 	// it commits, or it would remove it as unreferenced.
@@ -302,7 +312,7 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 				return err
 			}
 			for _, page := range pages {
-				location := object.slots[page.Slot].location
+				location := object.slot(page.Slot).location
 				for len(installed) < len(chunks) && location.Chunk != chunks[len(installed)] {
 					if err := install(); err != nil {
 						return err
@@ -351,14 +361,13 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 		}
 	}
 
-	result := GraphImportResult{Snapshot: origin, Chunks: uint64(len(objects))}
+	result := GraphImportResult{Snapshot: origin, Chunks: uint64(len(objects)), Pages: uint64(len(mappings))}
 	for _, resource := range resources {
 		root, ok := graph.Root(resource.root)
 		if !ok {
 			return GraphImportResult{}, fmt.Errorf("memory resource root %q was not created", resource.root)
 		}
 		result.Roots = append(result.Roots, GraphMemoryRoot{ResourceID: resource.id, Name: resource.root, Root: root})
-		result.Pages += uint64(len(resource.pages))
 	}
 	for {
 		collected, err := graph.Collect(4096)
@@ -376,49 +385,76 @@ func importCapture(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, o
 }
 
 // planCaptureImport derives from manifest every page of the capture, with its
-// identity and the places it is mapped, by object in ascending ID order, and
-// the capture's resources, each with its root under rootPrefix.
-func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject, []*importedResource, error) {
-	resourcesByKey := make(map[string]*importedResource)
+// identity, by object in ascending ID order; the capture's resources, each with
+// its root under rootPrefix; and the places the pages are mapped, by resource
+// and page index.
+func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject, []*importedResource, []importedMapping, error) {
+	resourceIndexes := make(map[checkpoint.ResourceID]int)
+	var resources []*importedResource
 	for _, run := range manifest.Runs {
-		key := resourceKey(run.ResourceID)
-		if resourcesByKey[key] == nil {
-			resourcesByKey[key] = &importedResource{id: run.ResourceID, pages: make(map[uint64]importedSlotKey)}
+		if _, ok := resourceIndexes[run.ResourceID]; !ok {
+			resourceIndexes[run.ResourceID] = len(resources)
+			resources = append(resources, &importedResource{id: run.ResourceID})
 		}
 	}
-	keys := make([]string, 0, len(resourcesByKey))
-	for key := range resourcesByKey {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	resources := make([]*importedResource, len(keys))
-	for index, key := range keys {
-		resources[index] = resourcesByKey[key]
-		resources[index].root = fmt.Sprintf("%s/resource-%04x", rootPrefix, index)
+	slices.SortFunc(resources, func(left, right *importedResource) int {
+		return strings.Compare(resourceKey(left.id), resourceKey(right.id))
+	})
+	for index, resource := range resources {
+		resourceIndexes[resource.id] = index
+		resource.root = fmt.Sprintf("%s/resource-%04x", rootPrefix, index)
 	}
 
-	objectsByID := make(map[ID]*importedObject)
-	for _, run := range manifest.Runs {
+	// Each object's slots are counted first, so that all are allocated at
+	// once.
+	objectIndexes := make(map[ID]int)
+	var objects []*importedObject
+	var capacities []int
+	runObjects := make([]int, len(manifest.Runs))
+	pages := 0
+	for position, run := range manifest.Runs {
 		if run.References == 0 {
-			return nil, nil, fmt.Errorf("memory chunk %s is mapped with zero references", run.Object)
+			return nil, nil, nil, fmt.Errorf("memory chunk %s is mapped with zero references", run.Object)
 		}
 		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk {
-			return nil, nil, fmt.Errorf("memory chunk %s has a run of %d pages from slot %d", run.Object, run.Pages, run.FirstSlot)
+			return nil, nil, nil, fmt.Errorf("memory chunk %s has a run of %d pages from slot %d", run.Object, run.Pages, run.FirstSlot)
 		}
 		if run.ObjectPage != run.FirstSlot {
-			return nil, nil, fmt.Errorf("capture object %s holds slot %d at page %d", run.Object, run.FirstSlot, run.ObjectPage)
+			return nil, nil, nil, fmt.Errorf("capture object %s holds slot %d at page %d", run.Object, run.FirstSlot, run.ObjectPage)
 		}
 		if run.FirstPage.Allocator != run.Logical.Allocator || run.FirstPage.Sequence != run.Logical.Sequence*PagesPerChunk+uint64(run.FirstSlot) {
-			return nil, nil, fmt.Errorf("memory chunk %s maps page %+v at slot %d of logical chunk %+v", run.Object, run.FirstPage, run.FirstSlot, run.Logical)
+			return nil, nil, nil, fmt.Errorf("memory chunk %s maps page %+v at slot %d of logical chunk %+v", run.Object, run.FirstPage, run.FirstSlot, run.Logical)
 		}
-		object := objectsByID[run.Object]
-		if object == nil {
-			object = &importedObject{id: run.Object, logical: run.Logical, slots: make(map[uint8]*importedSlot)}
-			objectsByID[run.Object] = object
-		} else if object.logical != run.Logical {
-			return nil, nil, fmt.Errorf("memory chunk %s has logical coordinates %+v and %+v", run.Object, object.logical, run.Logical)
+		index, ok := objectIndexes[run.Object]
+		if !ok {
+			index = len(objects)
+			objectIndexes[run.Object] = index
+			objects = append(objects, &importedObject{id: run.Object, logical: run.Logical})
+			capacities = append(capacities, 0)
+		} else if objects[index].logical != run.Logical {
+			return nil, nil, nil, fmt.Errorf("memory chunk %s has logical coordinates %+v and %+v", run.Object, objects[index].logical, run.Logical)
 		}
-		resource := resourcesByKey[resourceKey(run.ResourceID)]
+		runObjects[position] = index
+		capacities[index] = min(capacities[index]+int(run.Pages), PagesPerChunk)
+		pages += int(run.Pages)
+	}
+	slots := 0
+	for _, capacity := range capacities {
+		slots += capacity
+	}
+	slab := make([]importedSlot, slots)
+	for index, object := range objects {
+		object.slots = slab[:0:capacities[index]]
+		slab = slab[capacities[index]:]
+	}
+
+	mappings := make([]importedMapping, 0, pages)
+	resource, resourceID := -1, checkpoint.ResourceID{}
+	for position, run := range manifest.Runs {
+		if resource < 0 || run.ResourceID != resourceID {
+			resource, resourceID = resourceIndexes[run.ResourceID], run.ResourceID
+		}
+		object := objects[runObjects[position]]
 		for delta := uint16(0); delta < run.Pages; delta++ {
 			slotNumber := uint8(uint16(run.FirstSlot) + delta)
 			identity := ttcsnapshot.MemoryPageIdentity{
@@ -428,82 +464,75 @@ func planCaptureImport(manifest Manifest, rootPrefix string) ([]*importedObject,
 				VersionSequence:  run.FirstVersion.Sequence + uint64(delta),
 				References:       run.References,
 			}
-			slot := object.slots[slotNumber]
-			if slot == nil {
-				slot = &importedSlot{identity: identity}
-				object.slots[slotNumber] = slot
-			} else if slot.identity != identity {
-				return nil, nil, fmt.Errorf("chunk %s slot %d is mapped with conflicting identities %+v and %+v", run.Object, slotNumber, slot.identity, identity)
+			rank := countBitsBelow(&object.mapped, slotNumber)
+			if !hasBit(&object.mapped, slotNumber) {
+				setBit(&object.mapped, slotNumber)
+				object.slots = slices.Insert(object.slots, rank, importedSlot{identity: identity})
+			} else if object.slots[rank].identity != identity {
+				return nil, nil, nil, fmt.Errorf("chunk %s slot %d is mapped with conflicting identities %+v and %+v", run.Object, slotNumber, object.slots[rank].identity, identity)
 			}
-			index := run.OldOffset/hostarch.PageSize + uint64(delta)
-			key := importedSlotKey{object: run.Object, slot: slotNumber}
-			if previous, mapped := resource.pages[index]; mapped {
-				if previous != key {
-					return nil, nil, fmt.Errorf("memory resource maps page index %d twice", index)
+			mappings = append(mappings, importedMapping{resource: resource, index: run.OldOffset/hostarch.PageSize + uint64(delta), object: object, slot: slotNumber})
+		}
+	}
+	slices.SortFunc(objects, func(left, right *importedObject) int { return bytes.Compare(left.id[:], right.id[:]) })
+
+	// A manifest's runs are in resource and offset order, as compaction
+	// leaves them; so are the places they map, and a page index mapped twice
+	// is mapped by adjacent ones.
+	compare := func(left, right importedMapping) int {
+		if c := cmp.Compare(left.resource, right.resource); c != 0 {
+			return c
+		}
+		return cmp.Compare(left.index, right.index)
+	}
+	if !slices.IsSortedFunc(mappings, compare) {
+		slices.SortFunc(mappings, compare)
+	}
+	distinct := mappings[:0]
+	for _, mapping := range mappings {
+		if len(distinct) != 0 {
+			if previous := distinct[len(distinct)-1]; previous.resource == mapping.resource && previous.index == mapping.index {
+				if previous.object != mapping.object || previous.slot != mapping.slot {
+					return nil, nil, nil, fmt.Errorf("memory resource maps page index %d twice", mapping.index)
 				}
 				continue
 			}
-			resource.pages[index] = key
-			slot.links = append(slot.links, importedLink{resource: resource, index: index})
 		}
+		distinct = append(distinct, mapping)
 	}
-	objects := make([]*importedObject, 0, len(objectsByID))
-	for _, object := range objectsByID {
-		objects = append(objects, object)
-	}
-	sort.Slice(objects, func(i, j int) bool { return bytes.Compare(objects[i].id[:], objects[j].id[:]) < 0 })
-	return objects, resources, nil
+	return objects, resources, distinct, nil
 }
 
 // planCaptureTables returns the tables that map the capture's pages, once
 // every page's location is known, in root and index order, and for each the
-// chunks, of the new chunks, that no earlier table refers to.
-func planCaptureTables(resources []*importedResource, objects []*importedObject, chunks []ttcsnapshot.ObjectID) ([]ttcsnapshot.NewMemoryTable, [][]ttcsnapshot.ObjectID) {
-	type tableKey struct {
-		resource int
-		index    uint64
-	}
-	resourceIndex := make(map[*importedResource]int, len(resources))
-	for index, resource := range resources {
-		resourceIndex[resource] = index
-	}
-	entries := make(map[tableKey][]ttcsnapshot.MemoryTableEntry)
-	for _, object := range objects {
-		for _, slot := range object.slots {
-			for _, link := range slot.links {
-				key := tableKey{resource: resourceIndex[link.resource], index: link.index / ttcsnapshot.PagesPerMemoryTable * ttcsnapshot.PagesPerMemoryTable}
-				entries[key] = append(entries[key], ttcsnapshot.MemoryTableEntry{
-					Slot: uint8(link.index % ttcsnapshot.PagesPerMemoryTable), Location: slot.location, Identity: slot.identity,
-				})
-			}
-		}
-	}
-	keys := make([]tableKey, 0, len(entries))
-	for key := range entries {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].resource != keys[j].resource {
-			return keys[i].resource < keys[j].resource
-		}
-		return keys[i].index < keys[j].index
-	})
+// chunks, of the new chunks, that no earlier table refers to. mappings are in
+// resource and page index order.
+func planCaptureTables(resources []*importedResource, mappings []importedMapping, chunks []ttcsnapshot.ObjectID) ([]ttcsnapshot.NewMemoryTable, [][]ttcsnapshot.ObjectID) {
 	fresh := make(map[ttcsnapshot.ObjectID]bool, len(chunks))
 	for _, chunk := range chunks {
 		fresh[chunk] = true
 	}
-	tables := make([]ttcsnapshot.NewMemoryTable, len(keys))
-	newChunks := make([][]ttcsnapshot.ObjectID, len(keys))
-	for index, key := range keys {
-		table := entries[key]
-		sort.Slice(table, func(i, j int) bool { return table[i].Slot < table[j].Slot })
-		tables[index] = ttcsnapshot.NewMemoryTable{Root: resources[key.resource].root, Index: key.index, Entries: table}
-		for _, entry := range table {
-			if fresh[entry.Location.Chunk] {
-				newChunks[index] = append(newChunks[index], entry.Location.Chunk)
-				delete(fresh, entry.Location.Chunk)
+	var tables []ttcsnapshot.NewMemoryTable
+	var newChunks [][]ttcsnapshot.ObjectID
+	entries := make([]ttcsnapshot.MemoryTableEntry, len(mappings))
+	begin, resource, index := 0, -1, uint64(0)
+	for position, mapping := range mappings {
+		if tableIndex := mapping.index / ttcsnapshot.PagesPerMemoryTable * ttcsnapshot.PagesPerMemoryTable; mapping.resource != resource || tableIndex != index {
+			if resource >= 0 {
+				tables = append(tables, ttcsnapshot.NewMemoryTable{Root: resources[resource].root, Index: index, Entries: entries[begin:position:position]})
 			}
+			begin, resource, index = position, mapping.resource, tableIndex
+			newChunks = append(newChunks, nil)
 		}
+		slot := mapping.object.slot(mapping.slot)
+		entries[position] = ttcsnapshot.MemoryTableEntry{Slot: uint8(mapping.index % ttcsnapshot.PagesPerMemoryTable), Location: slot.location, Identity: slot.identity}
+		if hasBit(&mapping.object.missing, mapping.slot) && fresh[slot.location.Chunk] {
+			newChunks[len(newChunks)-1] = append(newChunks[len(newChunks)-1], slot.location.Chunk)
+			delete(fresh, slot.location.Chunk)
+		}
+	}
+	if resource >= 0 {
+		tables = append(tables, ttcsnapshot.NewMemoryTable{Root: resources[resource].root, Index: index, Entries: entries[begin:len(mappings):len(mappings)]})
 	}
 	return tables, newChunks
 }
@@ -526,7 +555,7 @@ func (object *importedObject) missingPages(chunk Chunk) ([]Page, error) {
 			return nil, fmt.Errorf("memory chunk %s repeats slot %d", object.id, page.Slot)
 		}
 		setBit(&found, page.Slot)
-		planned := object.slots[page.Slot]
+		planned := object.slot(page.Slot)
 		if [16]byte(page.Version.Allocator) != planned.identity.VersionAllocator || page.Version.Sequence != planned.identity.VersionSequence {
 			return nil, fmt.Errorf("memory chunk %s slot %d holds version %+v, manifest references another", object.id, page.Slot, page.Version)
 		}
@@ -538,7 +567,7 @@ func (object *importedObject) missingPages(chunk Chunk) ([]Page, error) {
 	if found != object.missing {
 		return nil, fmt.Errorf("memory chunk %s contains %d of the %d pages the graph lacks", object.id, countBits(&found), countBits(&object.missing))
 	}
-	sort.Slice(pages, func(i, j int) bool { return pages[i].Slot < pages[j].Slot })
+	slices.SortFunc(pages, func(left, right Page) int { return cmp.Compare(left.Slot, right.Slot) })
 	return pages, nil
 }
 
@@ -548,6 +577,16 @@ func countBits(bitmap *[slotBitmapBytes]byte) int {
 		count += bits.OnesCount8(b)
 	}
 	return count
+}
+
+// countBitsBelow returns the number of bits set in bitmap before bit.
+func countBitsBelow(bitmap *[slotBitmapBytes]byte, bit uint8) int {
+	count := 0
+	word := int(bit) / 64
+	for index := 0; index < word; index++ {
+		count += bits.OnesCount64(binary.LittleEndian.Uint64(bitmap[index*8:]))
+	}
+	return count + bits.OnesCount64(binary.LittleEndian.Uint64(bitmap[word*8:])&(1<<(bit%64)-1))
 }
 
 func graphChunkResidencyID(chunk ttcsnapshot.ObjectID) ID {

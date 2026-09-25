@@ -16,11 +16,12 @@ package ttcchunk
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -78,26 +79,26 @@ func capturedBinding(binding pgalloc.CapturedPageBinding, object ID) StoredBindi
 
 func compareAllocator(a, b pgalloc.LogicalAllocatorID) int { return bytes.Compare(a[:], b[:]) }
 
-func bindingLess(left, right *StoredBinding) bool {
-	if left.Binding.ResourceID.ContainerName != right.Binding.ResourceID.ContainerName {
-		return left.Binding.ResourceID.ContainerName < right.Binding.ResourceID.ContainerName
+func compareBindings(left, right *StoredBinding) int {
+	if c := cmp.Compare(left.Binding.ResourceID.ContainerName, right.Binding.ResourceID.ContainerName); c != 0 {
+		return c
 	}
-	if left.Binding.ResourceID.Path != right.Binding.ResourceID.Path {
-		return left.Binding.ResourceID.Path < right.Binding.ResourceID.Path
+	if c := cmp.Compare(left.Binding.ResourceID.Path, right.Binding.ResourceID.Path); c != 0 {
+		return c
 	}
-	if left.Binding.OldOffset != right.Binding.OldOffset {
-		return left.Binding.OldOffset < right.Binding.OldOffset
+	if c := cmp.Compare(left.Binding.OldOffset, right.Binding.OldOffset); c != 0 {
+		return c
 	}
-	if cmp := compareAllocator(left.Binding.Page.Allocator, right.Binding.Page.Allocator); cmp != 0 {
-		return cmp < 0
+	if c := compareAllocator(left.Binding.Page.Allocator, right.Binding.Page.Allocator); c != 0 {
+		return c
 	}
-	if left.Binding.Page.Sequence != right.Binding.Page.Sequence {
-		return left.Binding.Page.Sequence < right.Binding.Page.Sequence
+	if c := cmp.Compare(left.Binding.Page.Sequence, right.Binding.Page.Sequence); c != 0 {
+		return c
 	}
-	if cmp := compareAllocator(left.Binding.Version.Allocator, right.Binding.Version.Allocator); cmp != 0 {
-		return cmp < 0
+	if c := compareAllocator(left.Binding.Version.Allocator, right.Binding.Version.Allocator); c != 0 {
+		return c
 	}
-	return left.Binding.Version.Sequence < right.Binding.Version.Sequence
+	return cmp.Compare(left.Binding.Version.Sequence, right.Binding.Version.Sequence)
 }
 
 func validateStoredBinding(stored StoredBinding) error {
@@ -126,13 +127,19 @@ func runCanAppend(run *ManifestRun, stored *StoredBinding) bool {
 
 // CompactBindings builds a deterministic run-compressed manifest.
 func CompactBindings(bindings []StoredBinding) (Manifest, error) {
-	ordered := append([]StoredBinding(nil), bindings...)
-	for _, binding := range ordered {
-		if err := validateStoredBinding(binding); err != nil {
+	sorted := true
+	for i := range bindings {
+		if err := validateStoredBinding(bindings[i]); err != nil {
 			return Manifest{}, err
 		}
+		sorted = sorted && (i == 0 || compareBindings(&bindings[i-1], &bindings[i]) <= 0)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return bindingLess(&ordered[i], &ordered[j]) })
+	// A capture lists its bindings in this order already.
+	ordered := bindings
+	if !sorted {
+		ordered = slices.Clone(bindings)
+		slices.SortFunc(ordered, func(left, right StoredBinding) int { return compareBindings(&left, &right) })
+	}
 	manifest := Manifest{Runs: make([]ManifestRun, 0, len(ordered))}
 	for i := range ordered {
 		stored := &ordered[i]
