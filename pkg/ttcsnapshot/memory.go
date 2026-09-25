@@ -569,7 +569,7 @@ func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentit
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	locations := make([]MemoryPageLocation, len(identities))
-	pins := make(map[string]ObjectID)
+	chunks := make(map[ObjectID]struct{})
 	for index, identity := range identities {
 		if !identity.complete() {
 			return nil, nil, fmt.Errorf("memory page %d has an incomplete identity", index)
@@ -579,7 +579,13 @@ func (s *Store) HoldMemoryPages(pinPrefix string, identities []MemoryPageIdentit
 			continue
 		}
 		locations[index] = location
-		pins[pinPrefix+"/"+location.Chunk.key()] = location.Chunk
+		chunks[location.Chunk] = struct{}{}
+	}
+	// A pin is named once per chunk, not per page: a chunk holds up to 256
+	// of them.
+	pins := make(map[string]ObjectID, len(chunks))
+	for chunk := range chunks {
+		pins[pinPrefix+"/"+chunk.key()] = chunk
 	}
 	if err := s.addPinsLocked(pins); err != nil {
 		return nil, nil, err
