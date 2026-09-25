@@ -26,6 +26,7 @@ go_library(
 		"distributed_cp.go",
         "distributed.go",
 		"elastic_cluster.go",
+        "family_locks.go",
         "events.go",
         "idempotency.go",
         "lifecycle_recovery.go",

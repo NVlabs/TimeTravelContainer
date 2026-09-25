@@ -17,6 +17,7 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -250,9 +251,11 @@ func daemonCommandKeepsLifecycleLock(args []string) bool {
 	return daemonCommandName(args) == "node"
 }
 
-// daemonCommandFamilyTargets returns the families a mutating command names:
-// the container part of each operand of the commands that take containers.
-// It errs toward naming too much: a flag's value may be taken for an operand.
+// daemonCommandFamilyTargets returns the families a mutating command names.
+// Each of these commands names a branch as FAMILY@BRANCH, and cp as
+// FAMILY@BRANCH:PATH; rm, whose flags take no values, also names families
+// alone. Other operands name new branches, images or host paths. It errs
+// toward naming too much: a flag's value may look like a branch.
 func daemonCommandFamilyTargets(args []string) []string {
 	if !daemonCommandNeedsMutationLock(args) {
 		return nil
@@ -272,12 +275,11 @@ func daemonCommandFamilyTargets(args []string) []string {
 		if arg == "" || strings.HasPrefix(arg, "-") {
 			continue
 		}
-		if i := strings.IndexAny(arg, "@:"); i == 0 {
-			continue
-		} else if i > 0 {
-			arg = arg[:i]
+		if i := strings.Index(arg, "@"); i > 0 {
+			names = append(names, arg[:i])
+		} else if i < 0 && args[0] == "rm" {
+			names = append(names, arg)
 		}
-		names = append(names, arg)
 	}
 	return names
 }
@@ -417,6 +419,8 @@ func (b *runtimeBackend) forBackground() *runtimeBackend {
 	background.lifecycleLockHeld = false
 	background.lifecycleReady = nil
 	background.suspendLifecycle = nil
+	background.lifecycleHold = nil
+	background.heldFamilies = nil
 	background.mutating = false
 	background.commandName = ""
 	return &background
@@ -427,6 +431,9 @@ func (b *runtimeBackend) forBackground() *runtimeBackend {
 // operations of that work give the lock up as a request's can. It returns
 // what ends the hold.
 func (b *runtimeBackend) holdFamilyLifecycle(id string) func() {
+	if b.lockFamily != nil {
+		return b.holdFamilyLock(id)
+	}
 	release := b.lockFamilyLifecycle(id)
 	if b.operations == nil {
 		return release
@@ -437,6 +444,29 @@ func (b *runtimeBackend) holdFamilyLifecycle(id string) func() {
 	return func() {
 		b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold = held, suspend, previous
 		hold.unlock()
+	}
+}
+
+// holdFamilyLock is holdFamilyLifecycle on a standalone daemon: the family's
+// lock, which a long operation of the work keeps, unless b holds it already,
+// and the lifecycle lock shared, which such an operation gives up.
+func (b *runtimeBackend) holdFamilyLock(id string) func() {
+	releaseFamily := func() {}
+	previousFamilies := b.heldFamilies
+	if !slices.Contains(b.heldFamilies, id) {
+		releaseFamily = b.lockFamily(id)
+		b.heldFamilies = append(append([]string(nil), b.heldFamilies...), id)
+	}
+	hold := &lifecycleHold{acquire: b.lockSharedLifecycle, release: b.lockSharedLifecycle()}
+	held, suspend, previousHold := b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold
+	b.lifecycleLockHeld, b.lifecycleHold = true, hold
+	if b.operations != nil {
+		b.suspendLifecycle = suspendWith(b.operations, hold)
+	}
+	return func() {
+		b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold, b.heldFamilies = held, suspend, previousHold, previousFamilies
+		hold.unlock()
+		releaseFamily()
 	}
 }
 

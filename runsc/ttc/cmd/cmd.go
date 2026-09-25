@@ -6205,13 +6205,20 @@ type runtimeBackend struct {
 	suspendLifecycle func(*familyOperation) (func(), error)
 	// lifecycleHold is the request's hold on the lifecycle lock, which it
 	// gives up while it waits for another request's long operation.
-	lifecycleHold    *lifecycleHold
-	publicationQueue *ttcstorage.Queue
-	snapshotGraph    *ttcsnapshot.Store
-	snapshotData     *ttcsnapshot.LocalDataStore
-	snapshotResolver *ttcsnapshot.Resolver
-	snapshotShared   *ttcsnapshot.SharedPackStore
-	sharedReferences *sharedReferenceService
+	lifecycleHold *lifecycleHold
+	// heldFamilies are the IDs of the families whose locks the request
+	// holds. On a standalone daemon, lockFamily takes a family's lock, and
+	// lockSharedLifecycle the lifecycle lock shared, for background work on
+	// one family; see family_locks.go.
+	heldFamilies        []string
+	lockFamily          func(id string) func()
+	lockSharedLifecycle func() func()
+	publicationQueue    *ttcstorage.Queue
+	snapshotGraph       *ttcsnapshot.Store
+	snapshotData        *ttcsnapshot.LocalDataStore
+	snapshotResolver    *ttcsnapshot.Resolver
+	snapshotShared      *ttcsnapshot.SharedPackStore
+	sharedReferences    *sharedReferenceService
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool

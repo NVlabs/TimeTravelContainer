@@ -359,7 +359,8 @@ type daemonServer struct {
 	operations familyOperations
 
 	mutationMu    sync.Mutex
-	mutationLocks map[string]*sync.Mutex
+	mutationLocks map[string]*sync.RWMutex
+	familyLocks   map[string]chan struct{}
 	mutationCount atomic.Uint64
 
 	eventMu  sync.Mutex
@@ -2576,6 +2577,7 @@ func (s *daemonServer) configureCommandBackend(backend *runtimeBackend) {
 	if s.clusterCapabilities != nil {
 		backend.nodeID = s.clusterCapabilities.NodeID
 	}
+	s.configureFamilyLocks(backend)
 }
 
 type daemonStopTarget struct {
@@ -6025,7 +6027,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		snapshotData:          snapshotData,
 		stderr:                stderr,
 		reconciled:            make(map[string]bool),
-		mutationLocks:         make(map[string]*sync.Mutex),
+		mutationLocks:         make(map[string]*sync.RWMutex),
 	}
 	server.portIngress = newPortIngressManager(server)
 	defer server.portIngress.Close()
@@ -7414,6 +7416,32 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	holdsLifecycleLock := daemonCommandNeedsMutationLock(request.Args) || daemonCommandReadsLifecycle(request.Args)
 	var rawUnlock func()
 	listing := daemonCommandListsInventory(request.Args)
+	// The locks of the families the command names come first, and the
+	// lifecycle lock, shared by a command that changes only its family,
+	// after them.
+	var families []string
+	shared := false
+	if !listing {
+		families, shared = s.requestFamilies(backend, request.Args)
+	}
+	lockLifecycle := func() func() { return s.lockDataRoot(opts.dataRoot) }
+	if shared {
+		lockLifecycle = func() func() { return s.lockDataRootShared(opts.dataRoot) }
+	}
+	releaseFamilies := func() {}
+	lockFamilies := func() bool {
+		if len(families) == 0 {
+			return true
+		}
+		release, ok := s.lockFamilies(opts.dataRoot, families, terminalInput.clientGone())
+		releaseFamilies = release
+		return ok
+	}
+	if !lockFamilies() {
+		stdinReader.Close()
+		return
+	}
+	backend.heldFamilies = families
 	if listing {
 		// A listing neither waits for the lifecycle lock, which a mutation
 		// such as a durable dehydration may hold for minutes, nor holds it
@@ -7424,14 +7452,19 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		holdsLifecycleLock = false
 		backend.inventoryReadOnly = true
 		rawUnlock = func() {}
+	} else if holdsLifecycleLock {
+		rawUnlock = lockLifecycle()
 	} else {
-		rawUnlock = s.lockMutation(opts.dataRoot, request.Args)
+		rawUnlock = func() {}
 	}
 	backend.lifecycleLockHeld = holdsLifecycleLock
 	backend.mutating = daemonCommandNeedsMutationLock(request.Args)
 	backend.commandName = daemonCommandName(request.Args)
-	hold := &lifecycleHold{acquire: func() func() { return s.lockDataRoot(opts.dataRoot) }, release: rawUnlock}
-	unlock := hold.unlock
+	hold := &lifecycleHold{acquire: lockLifecycle, release: rawUnlock}
+	unlock := func() {
+		hold.unlock()
+		releaseFamilies()
+	}
 	if daemonCommandReleasesLifecycleAfterStart(request.Args) {
 		backend.lifecycleReady = unlock
 	}
@@ -7482,7 +7515,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		} else {
 			s.operations.waitAllIdle()
 		}
-		if !idle {
+		if !idle || !lockFamilies() {
 			stdinReader.Close()
 			return
 		}
@@ -7531,6 +7564,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
 		mutationBackend.clientGone = backend.clientGone
+		mutationBackend.heldFamilies = families
 		mutationBackend.mutating = backend.mutating
 		mutationBackend.commandName = backend.commandName
 		if !daemonCommandKeepsLifecycleLock(request.Args) {
@@ -7541,6 +7575,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		if s.clusterCapabilities != nil {
 			mutationBackend.nodeID = s.clusterCapabilities.NodeID
 		}
+		s.configureFamilyLocks(mutationBackend)
 		status := runCommand(request.Args, mutationBackend.stdout, mutationBackend.stderr, mutationBackend)
 		s.recordCommandEvents(opts.dataRoot, request.Args, status)
 		if status == 0 {
@@ -7860,19 +7895,16 @@ func (s *daemonServer) tryLockDataRoot(dataRoot string) (func(), bool) {
 	return lock.Unlock, true
 }
 
-func (s *daemonServer) dataRootLock(dataRoot string) *sync.Mutex {
-	key := filepath.Clean(dataRoot)
-	if absolute, err := filepath.Abs(key); err == nil {
-		key = absolute
-	}
+func (s *daemonServer) dataRootLock(dataRoot string) *sync.RWMutex {
+	key := dataRootKey(dataRoot)
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 	if s.mutationLocks == nil {
-		s.mutationLocks = make(map[string]*sync.Mutex)
+		s.mutationLocks = make(map[string]*sync.RWMutex)
 	}
 	lock := s.mutationLocks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &sync.RWMutex{}
 		s.mutationLocks[key] = lock
 	}
 	return lock

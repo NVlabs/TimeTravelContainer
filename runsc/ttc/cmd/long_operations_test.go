@@ -123,10 +123,12 @@ func TestFamilyTargetsNameWhatAMutationWouldChange(t *testing.T) {
 		want []string
 	}{
 		{[]string{"rm", "-f", "big"}, []string{"big"}},
-		{[]string{"dehydrate", "big@main", "small"}, []string{"big", "small"}},
-		{[]string{"container", "stop", "-t", "3", "big@f1"}, []string{"3", "big"}},
-		{[]string{"cp", "/host/file", "big@main:/tmp/file"}, []string{"/host/file", "big"}},
-		{[]string{"fork", "big@main", "child"}, []string{"big", "child"}},
+		{[]string{"rm", "-f", "big@b2", "small"}, []string{"big", "small"}},
+		{[]string{"dehydrate", "big@main", "small@main"}, []string{"big", "small"}},
+		{[]string{"container", "stop", "-t", "3", "big@f1"}, []string{"big"}},
+		{[]string{"cp", "/host/file", "big@main:/tmp/file"}, []string{"big"}},
+		{[]string{"fork", "big@main", "child"}, []string{"big"}},
+		{[]string{"commit", "big@main", "small:1"}, []string{"big"}},
 		{[]string{"ps", "-a"}, nil},
 		{[]string{"run", "-d", "--name", "big", "alpine"}, nil},
 		{[]string{"exec", "big@main", "true"}, nil},
