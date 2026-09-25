@@ -2019,9 +2019,10 @@ func TestCheckpointDueWaitsForTheJournalToOutgrowTheCheckpoint(t *testing.T) {
 	}
 }
 
-// A checkpoint is also due, before the journal outgrows it, once the graph
-// has shrunk to under half of what the checkpoint holds, as after a large
-// removal; reopening the graph knows what its checkpoint holds.
+// A checkpoint is also due, before the journal outgrows it and whatever the
+// minimum, once the graph has shrunk to under half of what the checkpoint
+// holds, as after a large removal; reopening the graph knows what its
+// checkpoint holds.
 func TestCheckpointDueOnceTheGraphHasShrunk(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)
@@ -2076,8 +2077,8 @@ func TestCheckpointDueOnceTheGraphHasShrunk(t *testing.T) {
 	if !store.CheckpointDue(1) {
 		t.Fatal("checkpoint not due with half the graph removed")
 	}
-	if store.CheckpointDue(store.JournalBytes() + 1) {
-		t.Fatal("checkpoint due below its minimum")
+	if !store.CheckpointDue(store.JournalBytes() + 1) {
+		t.Fatal("a shrunk graph's checkpoint waits for its journal to reach a minimum")
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

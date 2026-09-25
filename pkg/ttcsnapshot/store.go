@@ -3485,6 +3485,9 @@ func (s *Store) CheckpointDue(minimum int64) bool {
 	// A checkpoint costs in proportion to what it holds. Once the graph has
 	// shrunk to under half of what the current one holds, as when a large
 	// family is removed, a new one costs less and gives back the space of
-	// everything removed.
-	return s.journalEnd >= minimum && len(s.state.Objects)*2 < s.checkpointObjects
+	// everything removed, however short the journal of the removal: that of
+	// a family of memory tables can stay under any minimum, and so kept its
+	// checkpoint whole. Each such checkpoint halves the graph at least, so
+	// they cannot come often.
+	return len(s.state.Objects)*2 < s.checkpointObjects
 }
