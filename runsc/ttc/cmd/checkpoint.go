@@ -414,6 +414,22 @@ func (b *runtimeBackend) saveCheckpointState(info ttcbundle.ContainerInfo, spec 
 	return manifestRepositories, hostMounts, nil
 }
 
+// releaseRestoredMemory releases the graph roots a failed restore installed
+// for the family's branches.
+func (b *runtimeBackend) releaseRestoredMemory(id string) error {
+	info, err := b.containerStore().LoadContainer(id)
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, branch := range info.Branches {
+		if len(branch.MemoryRoots) != 0 || branch.ControlRoot != "" {
+			result = errors.Join(result, b.releaseBranchGraphRoots(branch))
+		}
+	}
+	return result
+}
+
 // The files of a checkpoint's dehydration, in its state directory.
 const (
 	checkpointControlName  = "control.json"
@@ -777,17 +793,20 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 	if err := finishFilesystemOrigins(true); err != nil {
 		return "", errors.Join(err, b.containerStore().RemoveContainer(prepared.Container.ID))
 	}
-	id = prepared.Container.ID
+	// The cleanup below must not use id: a failed return has set it to "".
+	restored := prepared.Container.ID
+	id = restored
 	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
 	if err != nil {
-		return "", errors.Join(err, b.containerStore().RemoveContainer(id))
+		return "", errors.Join(err, b.containerStore().RemoveContainer(restored))
 	}
 	cleanup := true
 	defer func() {
 		if cleanup {
 			cleanupErr := errors.Join(
 				b.cancelNewContainerPlacement(reservation),
-				b.containerStore().RemoveContainer(id),
+				b.releaseRestoredMemory(restored),
+				b.containerStore().RemoveContainer(restored),
 			)
 			if cleanupErr != nil {
 				retErr = errors.Join(retErr, fmt.Errorf("cleaning failed restore: %w", cleanupErr))
