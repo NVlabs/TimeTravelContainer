@@ -34,3 +34,28 @@ func TestRunscCommandKeepsExplicitDevelopmentRuntime(t *testing.T) {
 		t.Fatalf("runscCommand(fake-runsc).Args = %q, want %q", command.Args, want)
 	}
 }
+
+func TestEmbeddedRuntimeQueryAnswersOnlyReadOnlyQueries(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"list"},
+		{"list", "--format=json"},
+		{"state", "family"},
+		{"delete", "--force", "family"},
+		{"timetravel", "family", "pause", "main"},
+		{"timetravel", "--signal", "15", "family", "signal", "main"},
+		{"timetravel", "family", "ps"},
+		{"timetravel", "family", "branches", "main"},
+	} {
+		if output, answered, err := embeddedRuntimeQuery(root, args); answered {
+			t.Errorf("embeddedRuntimeQuery(%q) = %q, %v, answered; want it left to the runtime", args, output, err)
+		}
+	}
+	output, answered, err := embeddedRuntimeQuery(root, []string{"list", "--format=json", "--sandbox"})
+	if !answered || err != nil || string(output) != "null" {
+		t.Fatalf("listing an empty root = %q, %t, %v; want null, answered", output, answered, err)
+	}
+	if _, answered, err := embeddedRuntimeQuery(root, []string{"timetravel", "missing", "branches"}); !answered || err == nil {
+		t.Fatalf("branches of a missing sandbox: answered %t, err %v; want an error", answered, err)
+	}
+}

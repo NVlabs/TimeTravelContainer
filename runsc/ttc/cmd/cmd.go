@@ -10969,6 +10969,11 @@ func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 }
 
 func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]byte, error) {
+	if len(files) == 0 && embeddedRuntime(b.runsc) {
+		if output, answered, err := embeddedRuntimeQuery(b.root, args); answered {
+			return output, err
+		}
+	}
 	global := []string{"--root", b.root}
 	command := runscCommand(b.runsc, append(global, args...)...)
 	command.ExtraFiles = files
