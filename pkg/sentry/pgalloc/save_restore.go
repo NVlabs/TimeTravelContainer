@@ -310,7 +310,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		ma := maseg.ValuePtr()
 		if ma.wasteOrReleasing {
 			// This shouldn't be possible since we waited for memory release
-			// above, and f shouldn't be mutated during saving.
+			// above, and f isn't mutated during saving.
 			panic(fmt.Sprintf("found waste or releasing pages %v during pgalloc.MemoryFile.SaveTo()", maseg.Range()))
 		}
 		fr := maseg.Range()
@@ -354,11 +354,15 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}
 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
 			// occasionally unlock f.mu to ensure that the former can promptly
-			// observe f.isSaving and return. Assume that maseg is not
-			// invalidated while f.mu is unlocked, since it should still be the
-			// case that nothing is concurrently trying to mutate f.
-			f.mu.Unlock()
-			f.mu.Lock()
+			// observe f.isSaving and return. maseg stays valid only while
+			// nothing else mutates f. A TimeTravel branch's Kernel shares f
+			// with the rest of its family, which goes on running while the
+			// branch is saved and would allocate and free pages here, so keep
+			// f.mu while f has another owner.
+			if f.owners == 1 {
+				f.mu.Unlock()
+				f.mu.Lock()
+			}
 			return true
 		})
 		// We need to flush batched updates to f.memAcct whenever potentially
