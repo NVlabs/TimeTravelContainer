@@ -26,7 +26,7 @@ import (
 
 // A long operation gives the lifecycle lock up while it works, so other
 // requests go on, and takes it back to finish. Meanwhile a request that would
-// change its family is refused, and it alone may change it.
+// change its family waits for it to finish, and it alone may change it.
 func TestLongOperationWorksWithoutTheLifecycleLock(t *testing.T) {
 	server := &daemonServer{}
 	root := t.TempDir()
@@ -37,6 +37,7 @@ func TestLongOperationWorksWithoutTheLifecycleLock(t *testing.T) {
 	reader := &runtimeBackend{operations: &server.operations}
 	info := ttcbundle.ContainerInfo{ID: "0123abcd", Name: "big"}
 	worked := false
+	otherDone := make(chan error, 1)
 	if err := owner.withoutLifecycleLock(info, longOperation{branch: "main", state: "dehydrating", shown: true}, func() error {
 		worked = true
 		unlock, locked := server.tryLockDataRoot(root)
@@ -50,14 +51,23 @@ func TestLongOperationWorksWithoutTheLifecycleLock(t *testing.T) {
 		if op, ok := server.operations.lookup("big"); !ok || op.state != "dehydrating" || op.branch != "main" {
 			t.Errorf("operation on big=(%+v,%t), want dehydrating big@main", op, ok)
 		}
-		if err := other.refuseBusy(info.ID); err == nil || !strings.Contains(err.Error(), "big@main is dehydrating") {
-			t.Errorf("another mutating request was not refused: %v", err)
+		go func() {
+			waited, err := other.waitBusy(info.ID)
+			if err == nil && !waited {
+				err = errors.New("it did not wait")
+			}
+			otherDone <- err
+		}()
+		select {
+		case err := <-otherDone:
+			t.Errorf("another mutating request did not wait for the operation: %v", err)
+		case <-time.After(50 * time.Millisecond):
 		}
-		if err := reader.refuseBusy(info.ID); err != nil {
-			t.Errorf("a reading request was refused: %v", err)
+		if waited, err := reader.waitBusy(info.ID); waited || err != nil {
+			t.Errorf("a reading request waited: %v", err)
 		}
-		if err := owner.refuseBusy(info.ID); err != nil {
-			t.Errorf("the owner was refused its own family: %v", err)
+		if waited, err := owner.waitBusy(info.ID); waited || err != nil {
+			t.Errorf("the owner waited for its own family: %v", err)
 		}
 		if op, busy := server.operations.target([]string{"rm", "-f", "big"}); !busy || op.name != "big" {
 			t.Errorf("rm -f big was not recognized as a command on the busy family")
@@ -68,6 +78,14 @@ func TestLongOperationWorksWithoutTheLifecycleLock(t *testing.T) {
 	}
 	if !worked {
 		t.Fatal("the long operation did not run")
+	}
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the waiting request still waits after the operation finished")
 	}
 	if !owner.lifecycleLockHeld {
 		t.Error("the owner does not know it holds the lifecycle lock again")
@@ -342,36 +360,83 @@ func TestOnlyAKillGoesThroughAStop(t *testing.T) {
 		}
 	}
 	killer := &runtimeBackend{mutating: true, commandName: "kill", operations: &operations}
-	if err := killer.refuseBusy("s"); err != nil {
-		t.Errorf("a kill of a stopping branch was refused: %v", err)
+	if waited, err := killer.waitBusy("s"); waited || err != nil {
+		t.Errorf("a kill of a stopping branch waited: %v", err)
 	}
-	if err := killer.refuseBusy("d"); err == nil {
-		t.Error("a kill of a dehydrating branch was not refused")
-	}
+	waitsUntil(t, killer, "d", func() { operations.end(dehydrating) })
 	remover := &runtimeBackend{mutating: true, commandName: "rm", operations: &operations}
-	if err := remover.refuseBusy("s"); err == nil || !strings.Contains(err.Error(), "stopping@main is stopping") {
-		t.Errorf("rm of a stopping family was not refused: %v", err)
+	waitsUntil(t, remover, "s", func() { operations.end(stopping) })
+}
+
+// waitsUntil checks that b waits for the long operation on the family id, and
+// goes on once end ends it.
+func waitsUntil(t *testing.T, b *runtimeBackend, id string, end func()) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		waited, err := b.waitBusy(id)
+		if err == nil && !waited {
+			err = errors.New("it did not wait")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("%q did not wait for the operation on %s: %v", b.commandName, id, err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	end()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%q still waits after the operation on %s ended", b.commandName, id)
 	}
 }
 
-// A family being removed is refused to every other request, reading ones too:
-// its storage is going.
+// Every other request waits for a family being removed, reading ones too: its
+// storage is going.
 func TestNothingReadsAFamilyBeingRemoved(t *testing.T) {
 	var operations familyOperations
-	for _, op := range []*familyOperation{
-		{id: "r", name: "removing", longOperation: longOperation{state: "removing", shown: true}},
-		{id: "d", name: "dehydrating", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}},
-	} {
+	removing := &familyOperation{id: "r", name: "removing", longOperation: longOperation{state: "removing", shown: true}}
+	dehydrating := &familyOperation{id: "d", name: "dehydrating", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}
+	for _, op := range []*familyOperation{removing, dehydrating} {
 		if err := operations.begin(op); err != nil {
 			t.Fatal(err)
 		}
 	}
 	reader := &runtimeBackend{commandName: "diff", operations: &operations}
-	if err := reader.refuseBusy("r"); err == nil || !strings.Contains(err.Error(), "removing is removing") {
-		t.Errorf("a reader of a family being removed was not refused: %v", err)
+	if waited, err := reader.waitBusy("d"); waited || err != nil {
+		t.Errorf("a reader of a family being dehydrated waited: %v", err)
 	}
-	if err := reader.refuseBusy("d"); err != nil {
-		t.Errorf("a reader of a family being dehydrated was refused: %v", err)
+	waitsUntil(t, reader, "r", func() { operations.end(removing) })
+}
+
+// A request waiting for another's long operation stops waiting when its client
+// leaves.
+func TestAWaitEndsWithItsClient(t *testing.T) {
+	var operations familyOperations
+	op := &familyOperation{id: "d", name: "dehydrating", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}
+	if err := operations.begin(op); err != nil {
+		t.Fatal(err)
+	}
+	canceled := make(chan struct{})
+	waiter := &runtimeBackend{mutating: true, commandName: "pause", operations: &operations, clientGone: canceled}
+	done := make(chan error, 1)
+	go func() {
+		_, err := waiter.waitBusy("d")
+		done <- err
+	}()
+	close(canceled)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "dehydrating@main was dehydrating") {
+			t.Errorf("a wait whose client left ended with %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a wait whose client left still waits")
 	}
 }
 

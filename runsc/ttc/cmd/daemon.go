@@ -7387,6 +7387,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	clientCanceled := make(chan struct{})
 	var cancelClientOnce sync.Once
 	backend.clientCanceled = clientCanceled
+	backend.clientGone = terminalInput.clientGone()
 	backend.cancelClient = func() {
 		cancelClientOnce.Do(func() {
 			close(clientCanceled)
@@ -7465,11 +7466,30 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 	if !backend.inventoryReadOnly {
 		s.reconcile(backend)
 	}
-	if operation, busy := s.operations.target(request.Args); busy {
+	// A command on a family another request's long operation is working on
+	// waits, without the lock, for it to finish, as it waited for the lock,
+	// unless its client leaves; a node command waits for every one.
+	for {
+		operation, busy := s.operations.target(request.Args)
+		allIdle := !daemonCommandKeepsLifecycleLock(request.Args) || !s.operations.any()
+		if !busy && allIdle {
+			break
+		}
 		unlock()
-		stdinReader.Close()
-		writeError(operation.refusal())
-		return
+		idle := true
+		if busy {
+			idle = s.operations.waitIdleUnless(operation.id, terminalInput.clientGone())
+		} else {
+			s.operations.waitAllIdle()
+		}
+		if !idle {
+			stdinReader.Close()
+			return
+		}
+		hold.relock()
+		if !backend.inventoryReadOnly {
+			s.reconcile(backend)
+		}
 	}
 	placements, placementErr := backend.placementCatalog()
 	if placementErr != nil && len(request.PlacementClaims) != 0 {
@@ -7510,6 +7530,7 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 		mutationBackend := directBackend(opts, stdinReader, &mutationStdout, &mutationStderr)
 		s.configureVolumeBackend(mutationBackend)
 		mutationBackend.lifecycleLockHeld = holdsLifecycleLock
+		mutationBackend.clientGone = backend.clientGone
 		mutationBackend.mutating = backend.mutating
 		mutationBackend.commandName = backend.commandName
 		if !daemonCommandKeepsLifecycleLock(request.Args) {
@@ -7886,6 +7907,9 @@ func receiveDaemonInput(reader *bufio.Reader, writer *io.PipeWriter, allowStdin 
 			// is silent for minutes at a time, and one lost connection made
 			// its session unreachable for good.
 			fail(errDetached)
+			if terminal != nil {
+				terminal.markGone()
+			}
 			return
 		}
 		switch typ {

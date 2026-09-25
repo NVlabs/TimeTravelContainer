@@ -196,13 +196,27 @@ type daemonTerminalInput struct {
 	sizeReady      chan struct{}
 	resizeEvents   chan struct{}
 	resizeWatching bool
+
+	// gone is closed once the client's connection breaks.
+	gone     chan struct{}
+	goneOnce sync.Once
 }
 
 func newDaemonTerminalInput(reader io.Reader, conn net.Conn, writeMu *sync.Mutex) *daemonTerminalInput {
 	return &daemonTerminalInput{
 		reader: reader, conn: conn, writeMu: writeMu,
 		sizeReady: make(chan struct{}, 1), resizeEvents: make(chan struct{}, 1),
+		gone: make(chan struct{}),
 	}
+}
+
+// clientGone is closed once the client's connection breaks.
+func (input *daemonTerminalInput) clientGone() <-chan struct{} {
+	return input.gone
+}
+
+func (input *daemonTerminalInput) markGone() {
+	input.goneOnce.Do(func() { close(input.gone) })
 }
 
 func (input *daemonTerminalInput) Read(data []byte) (int, error) {

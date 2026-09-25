@@ -6164,6 +6164,8 @@ type runtimeBackend struct {
 	nodeID                string
 	cancelClient          func()
 	clientCanceled        <-chan struct{}
+	// clientGone is closed once the client's connection breaks.
+	clientGone <-chan struct{}
 	// lockLifecycle serializes background lifecycle completion with foreground
 	// commands and periodic repository maintenance. Long-running transfer and
 	// peer polling stay outside this lock; only the terminal mutation that
@@ -6192,7 +6194,7 @@ type runtimeBackend struct {
 	// record.
 	inventoryRepairWanted bool
 	// mutating is set for a daemon request that changes lifecycle state; it
-	// is refused a family another request's long operation works on.
+	// waits for a long operation of another request on its family to finish.
 	// commandName is the request's command.
 	mutating    bool
 	commandName string
@@ -6201,6 +6203,9 @@ type runtimeBackend struct {
 	// lifecycle lock; see withoutLifecycleLock.
 	operations       *familyOperations
 	suspendLifecycle func(*familyOperation) (func(), error)
+	// lifecycleHold is the request's hold on the lifecycle lock, which it
+	// gives up while it waits for another request's long operation.
+	lifecycleHold    *lifecycleHold
 	publicationQueue *ttcstorage.Queue
 	snapshotGraph    *ttcsnapshot.Store
 	snapshotData     *ttcsnapshot.LocalDataStore
@@ -6591,8 +6596,12 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	}
-	if err := b.refuseBusy(info.ID); err != nil {
+	if waited, err := b.waitBusy(info.ID); err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
+	} else if waited {
+		if info, err = b.resolveContainer(target.container); err != nil {
+			return selector{}, ttcbundle.ContainerInfo{}, err
+		}
 	}
 	if b.nodeID != "" {
 		var publicationID string
@@ -9740,8 +9749,12 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	if err != nil {
 		return err
 	}
-	if err := b.refuseBusy(info.ID); err != nil {
+	if waited, err := b.waitBusy(info.ID); err != nil {
 		return err
+	} else if waited {
+		if info, err = store.LoadContainer(name); err != nil {
+			return err
+		}
 	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, ""); err != nil {
 		return fmt.Errorf("settling remote branches before removing %q: %w", name, err)

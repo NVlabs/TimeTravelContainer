@@ -30,8 +30,9 @@ import (
 // waits for it for minutes. Instead it marks its family busy, gives the lock
 // up, does its work, and takes the lock back to finish. Meanwhile listings
 // show the family in the operation's transient state, commands that would
-// change the family are refused, background lifecycle work on it waits, and
-// reconciliation and maintenance leave it alone.
+// change the family wait for it to finish, as they wait for the lock, and so
+// does background lifecycle work on it; reconciliation and maintenance leave
+// it alone.
 
 // lifecycleHold is one daemon request's hold on the lifecycle lock, which a
 // long operation may give up and take back.
@@ -92,7 +93,7 @@ type familyOperation struct {
 	owner   *runtimeBackend
 }
 
-// refusal is the error for a command that would change the family.
+// refusal is the error for a second long operation on the family.
 func (op familyOperation) refusal() error {
 	subject := op.name
 	if op.branch != "" {
@@ -167,6 +168,40 @@ func (o *familyOperations) waitIdle(id string) {
 	for o.byID[id] != nil {
 		o.ended.Wait()
 	}
+}
+
+// waitIdleUnless is waitIdle, except that it also returns when canceled is
+// closed. It reports whether the family became idle.
+func (o *familyOperations) waitIdleUnless(id string, canceled <-chan struct{}) bool {
+	if canceled != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-canceled:
+				o.mu.Lock()
+				if o.ended != nil {
+					o.ended.Broadcast()
+				}
+				o.mu.Unlock()
+			case <-stop:
+			}
+		}()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.ended == nil {
+		o.ended = sync.NewCond(&o.mu)
+	}
+	for o.byID[id] != nil {
+		select {
+		case <-canceled:
+			return false
+		default:
+		}
+		o.ended.Wait()
+	}
+	return true
 }
 
 // waitAllIdle blocks until no long operation is in progress.
@@ -248,10 +283,12 @@ func daemonCommandFamilyTargets(args []string) []string {
 }
 
 // configureLongOperations lets b's long operations give up the lifecycle
-// lock that hold holds for b's request.
+// lock that hold holds for b's request, and b wait without it for another
+// request's.
 func (s *daemonServer) configureLongOperations(b *runtimeBackend, hold *lifecycleHold) {
 	b.operations = &s.operations
 	b.suspendLifecycle = suspendWith(&s.operations, hold)
+	b.lifecycleHold = hold
 }
 
 // lockDataRootIdle is lockDataRoot for background work across families, which
@@ -322,18 +359,44 @@ func withoutLifecycleLock(b backend, target selector, op longOperation, work fun
 	return runtime.withoutLifecycleLock(info, op, work)
 }
 
-// refuseBusy fails a mutating request that would change a family another
+// waitBusy makes a mutating request that would change a family another
 // request's long operation is working on, and any request for a family being
-// removed, whose storage is going.
-func (b *runtimeBackend) refuseBusy(id string) error {
-	op, ok := b.operations.lookup(id)
-	if !ok || op.owner == b {
-		return nil
+// removed, whose storage is going, wait for the operation to finish, as it
+// would wait for the lifecycle lock, and without it. It reports whether it
+// waited, in which case the family may have changed or gone meanwhile.
+func (b *runtimeBackend) waitBusy(id string) (bool, error) {
+	waited := false
+	for {
+		op, ok := b.operations.lookup(id)
+		if !ok || op.owner == b || !(b.mutating && !op.admits(b.commandName) || op.state == "removing") {
+			return waited, nil
+		}
+		// Waiting with the lock would deadlock: the operation takes the lock
+		// back to finish.
+		if b.lifecycleLockHeld && b.lifecycleHold == nil {
+			return waited, op.refusal()
+		}
+		if b.lifecycleLockHeld {
+			b.lifecycleHold.unlock()
+		}
+		idle := b.operations.waitIdleUnless(id, b.clientGone)
+		if b.lifecycleLockHeld {
+			b.lifecycleHold.relock()
+		}
+		if !idle {
+			return waited, fmt.Errorf("the client left while %s", op.waiting())
+		}
+		waited = true
 	}
-	if (b.mutating && !op.admits(b.commandName)) || op.state == "removing" {
-		return op.refusal()
+}
+
+// waiting says what a request waits for.
+func (op familyOperation) waiting() string {
+	subject := op.name
+	if op.branch != "" {
+		subject += "@" + op.branch
 	}
-	return nil
+	return fmt.Sprintf("%s was %s", subject, op.state)
 }
 
 // admits reports whether command may run while the operation works: only a
@@ -369,10 +432,10 @@ func (b *runtimeBackend) holdFamilyLifecycle(id string) func() {
 		return release
 	}
 	hold := &lifecycleHold{acquire: b.lockBackgroundLifecycle, release: release}
-	held, suspend := b.lifecycleLockHeld, b.suspendLifecycle
-	b.lifecycleLockHeld, b.suspendLifecycle = true, suspendWith(b.operations, hold)
+	held, suspend, previous := b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold
+	b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold = true, suspendWith(b.operations, hold), hold
 	return func() {
-		b.lifecycleLockHeld, b.suspendLifecycle = held, suspend
+		b.lifecycleLockHeld, b.suspendLifecycle, b.lifecycleHold = held, suspend, previous
 		hold.unlock()
 	}
 }
