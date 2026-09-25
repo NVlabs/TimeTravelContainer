@@ -8943,7 +8943,7 @@ func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbun
 		if infoErr == nil {
 			branch, branchErr := persistentBranchInfo(info, target.branch)
 			if branchErr == nil && branch.State == "exited" && branch.ExitStatus != nil {
-				if err := installRetainedConsoleWaitStatus(paths, uint32(*branch.ExitStatus)); err != nil {
+				if err := installRetainedConsoleExitCode(paths, *branch.ExitStatus); err != nil {
 					return ttcbundle.ConsolePaths{}, err
 				}
 				return paths, nil
@@ -8974,6 +8974,28 @@ func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, console
 		}
 	}
 	return b.ensureConsoleDrainPaths(target, execID, consoleID, paths, reset)
+}
+
+// installRetainedConsoleExitCode is installRetainedConsoleWaitStatus for a
+// process known by its exit code, as a branch's record keeps it: the wait
+// status recorded must give that code.
+func installRetainedConsoleExitCode(paths ttcbundle.ConsolePaths, code int) error {
+	current, found, err := readConsoleWaitStatus(paths.WaitStatus)
+	if err != nil {
+		return err
+	}
+	if found {
+		if waitStatusExitCode(current) != code {
+			return fmt.Errorf("retained wait status %d is not of exit code %d", current, code)
+		}
+		return nil
+	}
+	status := uint32(code&0xff) << 8
+	if code > 128 && code < 128+65 {
+		// Killed by the signal.
+		status = uint32(code - 128)
+	}
+	return installRetainedConsoleWaitStatus(paths, status)
 }
 
 func installRetainedConsoleWaitStatus(paths ttcbundle.ConsolePaths, status uint32) error {

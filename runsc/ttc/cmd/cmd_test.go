@@ -7615,3 +7615,30 @@ func TestCgroupSwapAccounted(t *testing.T) {
 		t.Error("a memory cgroup with memory.swap.max was judged unaccounted")
 	}
 }
+
+// A branch's record keeps its exit code, and its console the raw wait status:
+// the two agree however the process ended.
+func TestRetainedConsoleExitCodeMatchesItsWaitStatus(t *testing.T) {
+	dir := t.TempDir()
+	paths := ttcbundle.ConsolePaths{WaitStatus: filepath.Join(dir, "main.wait-status")}
+	if err := ttcconsole.WriteWaitStatus(paths.WaitStatus, 7<<8); err != nil {
+		t.Fatal(err)
+	}
+	if err := installRetainedConsoleExitCode(paths, 7); err != nil {
+		t.Fatalf("exit code 7 against a status of exit 7: %v", err)
+	}
+	if err := installRetainedConsoleExitCode(paths, 3); err == nil {
+		t.Fatal("exit code 3 was taken for a status of exit 7")
+	}
+	for code, want := range map[int]uint32{3: 3 << 8, 137: 9, 0: 0} {
+		if err := os.Remove(paths.WaitStatus); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := installRetainedConsoleExitCode(paths, code); err != nil {
+			t.Fatalf("installing exit code %d: %v", code, err)
+		}
+		if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil || !found || status != want || waitStatusExitCode(status) != code {
+			t.Fatalf("exit code %d installed status %d (found %t, %v), want %d", code, status, found, err, want)
+		}
+	}
+}
