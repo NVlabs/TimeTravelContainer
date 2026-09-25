@@ -2384,8 +2384,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if got.State != "dehydrated" || len(got.Branches) != 1 || got.Branches[0].ID != "child" || got.Branches[0].ParentID != "" || got.Branches[0].State != "dehydrated" {
 		t.Fatalf("after deleting main and dehydrating child: %+v", got)
 	}
-	status := 137
-	if err := store.ReconcileRuntimeUnavailable("demo", &status); err != nil {
+	if err := store.ReconcileRuntimeUnavailable("demo", RuntimeLoss{}); err != nil {
 		t.Fatalf("ReconcileRuntimeUnavailable: %v", err)
 	}
 	got, err = store.LoadContainer("demo")

@@ -692,6 +692,8 @@ type ContainerInfo struct {
 	RootfsUpperCopyMode          string                           `json:"rootfs_upper_copy_mode,omitempty"`
 	State                        string                           `json:"state"`
 	ExitStatus                   *int                             `json:"exit_status,omitempty"`
+	OOMKilled                    bool                             `json:"oom_killed,omitempty"`
+	ExitError                    string                           `json:"exit_error,omitempty"`
 	CreatedAt                    time.Time                        `json:"created_at"`
 	StartedAt                    *time.Time                       `json:"started_at,omitempty"`
 	ExitedAt                     *time.Time                       `json:"exited_at,omitempty"`
@@ -1711,6 +1713,8 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.RootfsUpperCopyMode = string(copyMode)
 	metadata.State = "created"
 	metadata.ExitStatus = nil
+	metadata.OOMKilled = false
+	metadata.ExitError = ""
 	metadata.CreatedAt = now
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
@@ -2007,6 +2011,8 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	target.AutoRemove = false
 	target.State = "created"
 	target.ExitStatus = nil
+	target.OOMKilled = false
+	target.ExitError = ""
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
@@ -3883,6 +3889,8 @@ func (s Store) UpdateState(name, state string, exitStatus *int) error {
 		} else {
 			info.ExitStatus = nil
 			info.ExitedAt = nil
+			info.OOMKilled = false
+			info.ExitError = ""
 		}
 		return true, nil
 	})
@@ -4058,6 +4066,8 @@ func recomputeContainerState(info *ContainerInfo) {
 	if state != "exited" && state != "stopped" {
 		info.ExitStatus = nil
 		info.ExitedAt = nil
+		info.OOMKilled = false
+		info.ExitError = ""
 	}
 }
 
@@ -4751,19 +4761,53 @@ func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
 	})
 }
 
+// KilledExitStatus is the exit status of a branch killed with its runtime:
+// SIGKILL's, which Docker reports for a container killed outright or by the
+// out-of-memory killer.
+const KilledExitStatus = 128 + 9
+
+// RuntimeExitedUnexpectedly is the error recorded for a family whose runtime
+// died under main, unless the out-of-memory killer took it, which OOMKilled
+// reports instead, as Docker does.
+const RuntimeExitedUnexpectedly = "the family's runtime exited unexpectedly"
+
+// RuntimeLoss is what became of the branches of a runtime found gone.
+type RuntimeLoss struct {
+	// ExitStatuses has the exit status of each branch whose init exited
+	// before the runtime did, as its console follower recorded it. Every
+	// other branch that needed the runtime was killed with it.
+	ExitStatuses map[string]int
+	// OOMKilled reports that the out-of-memory killer of the family's cgroup
+	// killed the runtime.
+	OOMKilled bool
+}
+
 // ReconcileRuntimeUnavailable marks only branches that required the missing
 // Sentry as exited. Durable dehydrated branches remain recoverable.
-func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
-	return s.ReconcileNodeRuntimeUnavailable(name, "", exitStatus)
+func (s Store) ReconcileRuntimeUnavailable(name string, loss RuntimeLoss) error {
+	return s.ReconcileNodeRuntimeUnavailable(name, "", loss)
 }
 
 // ReconcileNodeRuntimeUnavailable marks branches whose runtime was lost on
-// nodeID as exited. An empty nodeID selects all branches for standalone TTC.
-// Elastic families may have live siblings on other nodes, which this operation
-// must never rewrite merely because they are absent from the local runsc root.
-func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *int) error {
+// nodeID as exited: with the status their init exited with, if it had, and
+// otherwise as killed with the runtime. A family whose main was killed records
+// why, in OOMKilled or ExitError. An empty nodeID selects all branches
+// for standalone TTC. Elastic families may have live siblings on other nodes,
+// which this operation must never rewrite merely because they are absent from
+// the local runsc root.
+func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, loss RuntimeLoss) error {
 	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
-		changed := false
+		changed, mainKilled := false, false
+		now := time.Now().UTC()
+		exit := func(branch *BranchInfo) {
+			status, exited := loss.ExitStatuses[branch.ID]
+			if !exited {
+				status = KilledExitStatus
+				mainKilled = mainKilled || branch.ID == "main"
+			}
+			updateBranchLifecycle(branch, "exited", &status, now)
+			changed = true
+		}
 		for i := range info.Branches {
 			branch := &info.Branches[i]
 			if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
@@ -4771,15 +4815,13 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *
 			}
 			switch branch.State {
 			case "creating", "running", "paused", "rehydrating":
-				updateBranchLifecycle(branch, "exited", exitStatus, time.Now().UTC())
-				changed = true
+				exit(branch)
 			case "dehydrated":
 				// A resident capture was in the runtime that is gone. Like a
 				// running branch, it restarts from its filesystem.
 				if branch.StorageState == StorageResident {
-					updateBranchLifecycle(branch, "exited", exitStatus, time.Now().UTC())
+					exit(branch)
 					branch.StorageState = "local"
-					changed = true
 				}
 			case "dehydrating":
 				// A successful dehydration deliberately removes the final
@@ -4793,11 +4835,19 @@ func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *
 		if oldState != info.State {
 			changed = true
 		}
-		if info.State == "exited" && exitStatus != nil {
-			now := time.Now().UTC()
-			info.ExitStatus = exitStatus
+		// The family's exit is main's, as a container's is its init's.
+		if info.State == "exited" && changed {
+			for _, branch := range info.Branches {
+				if branch.ID == "main" && branch.ExitStatus != nil {
+					status := *branch.ExitStatus
+					info.ExitStatus = &status
+				}
+			}
 			info.ExitedAt = &now
-			changed = true
+			info.OOMKilled = mainKilled && loss.OOMKilled
+			if mainKilled && !loss.OOMKilled {
+				info.ExitError = RuntimeExitedUnexpectedly
+			}
 		}
 		return changed, nil
 	})

@@ -4022,6 +4022,9 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 				status = "Created"
 			case "exited", "stopped":
 				status = "Exited"
+				if branch.ExitStatus != nil {
+					status = fmt.Sprintf("Exited (%d)", *branch.ExitStatus)
+				}
 			}
 			createdAt := ""
 			if !created.IsZero() {
@@ -5349,6 +5352,7 @@ type Branch struct {
 	NodeID                    string    `json:"node_id,omitempty"`
 	ParentID                  string    `json:"parent,omitempty"`
 	State                     string    `json:"state"`
+	ExitStatus                *int      `json:"exit_status,omitempty"`
 	StorageState              string    `json:"storage_state"`
 	PublicationID             string    `json:"publication_id,omitempty"`
 	StorageError              string    `json:"storage_error,omitempty"`
@@ -9302,6 +9306,9 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			stateError = family.Error
 		}
 	}
+	if stateError == "" && state == "exited" {
+		stateError = container.ExitError
+	}
 	process := &specs.Process{}
 	if spec != nil && spec.Process != nil {
 		process = spec.Process
@@ -9452,7 +9459,7 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
 			Status: state, Running: state == "running" || state == "paused", Paused: state == "paused",
-			Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
+			OOMKilled: state == "exited" && container.OOMKilled, Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
 			Error: stateError, StartedAt: inspectTimestamp(container.StartedAt), FinishedAt: inspectTimestamp(container.ExitedAt),
 		},
 		Image: container.Digest, Name: "/" + container.Name, Driver: driver,
@@ -10376,17 +10383,12 @@ func preflightHostResourceLimits(bundleDir string) error {
 	return preflightCgroupV2Delegation("/proc/self/cgroup", "/sys/fs/cgroup", required)
 }
 
-func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []string) error {
-	if _, err := os.Stat(filepath.Join(mountRoot, "cgroup.controllers")); errors.Is(err, os.ErrNotExist) {
-		// The host may use cgroup v1. Let runsc's native implementation decide
-		// whether the requested controllers are available there.
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("checking unified cgroup v2: %w", err)
-	}
+// delegatedCgroupParent returns the cgroup v2 directory in which runsc creates
+// a sandbox's relative cgroup: the parent of the daemon's own leaf cgroup.
+func delegatedCgroupParent(procCgroupPath, mountRoot string) (string, error) {
 	data, err := os.ReadFile(procCgroupPath)
 	if err != nil {
-		return fmt.Errorf("reading daemon cgroup membership: %w", err)
+		return "", fmt.Errorf("reading daemon cgroup membership: %w", err)
 	}
 	membership := ""
 	for _, line := range strings.Split(string(data), "\n") {
@@ -10396,17 +10398,31 @@ func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []st
 		}
 	}
 	if membership == "" {
-		return errors.New("hard host resource limits require unified cgroup v2 delegation, but ttcd has no unified cgroup membership")
+		return "", errors.New("hard host resource limits require unified cgroup v2 delegation, but ttcd has no unified cgroup membership")
 	}
 	// Relative runsc cgroups are siblings of the daemon's leaf cgroup. In a
 	// cgroup namespace the host membership may not exist below the visible
 	// mount; in that case the mount root itself is the delegated parent.
 	visibleMembership := filepath.Join(mountRoot, filepath.Clean("/"+membership))
-	parent := mountRoot
 	if _, err := os.Stat(visibleMembership); err == nil {
-		parent = filepath.Dir(visibleMembership)
+		return filepath.Dir(visibleMembership), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("checking daemon cgroup %q: %w", visibleMembership, err)
+		return "", fmt.Errorf("checking daemon cgroup %q: %w", visibleMembership, err)
+	}
+	return mountRoot, nil
+}
+
+func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []string) error {
+	if _, err := os.Stat(filepath.Join(mountRoot, "cgroup.controllers")); errors.Is(err, os.ErrNotExist) {
+		// The host may use cgroup v1. Let runsc's native implementation decide
+		// whether the requested controllers are available there.
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("checking unified cgroup v2: %w", err)
+	}
+	parent, err := delegatedCgroupParent(procCgroupPath, mountRoot)
+	if err != nil {
+		return err
 	}
 	controllersData, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
 	if err != nil {
@@ -11316,25 +11332,7 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 				b.inventoryRepairWanted = true
 				continue
 			}
-			var exitStatus *int
-			// A wait-status file belongs to one incarnation of main. Do not
-			// attribute an old main exit to a different live branch that was
-			// killed with the sandbox.
-			if persistentBranchRequiredRuntime(container, defaultBranchID) {
-				if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
-					if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
-						code := waitStatusExitCode(status)
-						exitStatus = &code
-					}
-				}
-			}
-			// Once the Sentry is known to be gone, no console follower or gofer
-			// may retain files from the persistent container directory. Reap the
-			// sidecars before recording process-free state so later removal is
-			// also safe on NFS, where unlinking an open file creates .nfs files.
-			_ = b.stopContainerConsoleDrains(container.ID)
-			_, _ = b.command("delete", "--force", container.ID)
-			if err := store.ReconcileNodeRuntimeUnavailable(container.ID, b.nodeID, exitStatus); err != nil {
+			if err := b.recordLostRuntime(container); err != nil {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
@@ -11850,7 +11848,7 @@ func normalizeLifecycleState(state string) string {
 func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
 		ID: info.ID, NodeID: info.NodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
-		StorageState: info.StorageState, PublicationID: info.PublicationID, StorageError: info.StorageError,
+		ExitStatus: info.ExitStatus, StorageState: info.StorageState, PublicationID: info.PublicationID, StorageError: info.StorageError,
 		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
 		MemoryRootObjects: append([]string(nil), info.MemoryRootObjects...),
 		ControlRoot:       info.ControlRoot, ControlRootObject: info.ControlRootObject,
@@ -16479,6 +16477,9 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		if err := b.completeWaitedInitExit(target, status); err != nil {
 			return status, err
 		}
+		return status, nil
+	}
+	if status, lost := b.lostRuntimeWaitStatus(target); lost {
 		return status, nil
 	}
 	return 0, commandErr

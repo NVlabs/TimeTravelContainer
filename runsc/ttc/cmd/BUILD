@@ -32,6 +32,7 @@ go_library(
         "long_operations.go",
 		"port_ingress.go",
         "runtime_command.go",
+        "runtime_loss.go",
 		"storage.go",
     ],
     visibility = [

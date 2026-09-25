@@ -349,7 +349,7 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := Store{Root: root}
-	if err := store.ReconcileNodeRuntimeUnavailable("example", "node-a", nil); err != nil {
+	if err := store.ReconcileNodeRuntimeUnavailable("example", "node-a", RuntimeLoss{}); err != nil {
 		t.Fatalf("ReconcileNodeRuntimeUnavailable: %v", err)
 	}
 	got, err := store.LoadContainer("example")
@@ -367,6 +367,76 @@ func TestReconcileNodeRuntimeUnavailable(t *testing.T) {
 	}
 	if got.State != "running" {
 		t.Errorf("family state = %q, want running", got.State)
+	}
+}
+
+// A branch that loses its runtime was killed with it, unless its init had
+// exited first; a family whose main was killed says why, as Docker does.
+func TestRuntimeLossRecordsHowEachBranchEnded(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		loss      RuntimeLoss
+		wantMain  int
+		wantChild int
+		wantOOM   bool
+		wantError string
+	}{
+		{name: "killed", loss: RuntimeLoss{}, wantMain: KilledExitStatus, wantChild: KilledExitStatus, wantError: RuntimeExitedUnexpectedly},
+		{name: "out of memory", loss: RuntimeLoss{OOMKilled: true}, wantMain: KilledExitStatus, wantChild: KilledExitStatus, wantOOM: true},
+		{name: "main exited first", loss: RuntimeLoss{ExitStatuses: map[string]int{"main": 3}, OOMKilled: true}, wantMain: 3, wantChild: KilledExitStatus},
+		{name: "all exited", loss: RuntimeLoss{ExitStatuses: map[string]int{"main": 0, "child": 1}}, wantMain: 0, wantChild: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			containerDir := filepath.Join(root, "containers", "example")
+			bundleDir := filepath.Join(containerDir, "bundle")
+			if err := os.MkdirAll(bundleDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info := ContainerInfo{
+				ID: "example", Name: "example", BundleDir: bundleDir, State: "running",
+				Branches: []BranchInfo{
+					{ID: "main", State: "running"},
+					{ID: "child", ParentID: "main", State: "paused"},
+				},
+			}
+			if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+				t.Fatal(err)
+			}
+			store := Store{Root: root}
+			if err := store.ReconcileRuntimeUnavailable("example", test.loss); err != nil {
+				t.Fatalf("ReconcileRuntimeUnavailable: %v", err)
+			}
+			got, err := store.LoadContainer("example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index, want := range []int{test.wantMain, test.wantChild} {
+				branch := got.Branches[index]
+				if branch.State != "exited" || branch.ExitStatus == nil || *branch.ExitStatus != want {
+					t.Errorf("%s = %s with status %v, want exited with %d", branch.ID, branch.State, branch.ExitStatus, want)
+				}
+			}
+			if got.State != "exited" || got.ExitStatus == nil || *got.ExitStatus != test.wantMain {
+				t.Errorf("family = %s with status %v, want exited with %d", got.State, got.ExitStatus, test.wantMain)
+			}
+			if got.OOMKilled != test.wantOOM || got.ExitError != test.wantError {
+				t.Errorf("family OOMKilled = %v, ExitError = %q; want %v, %q", got.OOMKilled, got.ExitError, test.wantOOM, test.wantError)
+			}
+			// Starting it again forgets how it last ended.
+			if err := store.UpdateBranchState("example", "main", "running"); err != nil {
+				t.Fatal(err)
+			}
+			if got, err = store.LoadContainer("example"); err != nil {
+				t.Fatal(err)
+			}
+			if got.ExitStatus != nil || got.OOMKilled || got.ExitError != "" {
+				t.Errorf("restarted family keeps its last end: status %v, OOMKilled %v, ExitError %q", got.ExitStatus, got.OOMKilled, got.ExitError)
+			}
+		})
 	}
 }
 
@@ -429,7 +499,7 @@ func TestResidentDehydrationLifecycle(t *testing.T) {
 	if b := before["stopped"]; b.State != "exited" || b.StorageState != "local" {
 		t.Fatalf("stopped resident branch = %s/%s, want exited/local", b.State, b.StorageState)
 	}
-	if err := store.ReconcileNodeRuntimeUnavailable("example", "", nil); err != nil {
+	if err := store.ReconcileNodeRuntimeUnavailable("example", "", RuntimeLoss{}); err != nil {
 		t.Fatal(err)
 	}
 	after := branches()
