@@ -10970,7 +10970,7 @@ func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 
 func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]byte, error) {
 	if len(files) == 0 && embeddedRuntime(b.runsc) {
-		if output, answered, err := embeddedRuntimeQuery(b.root, args); answered {
+		if output, answered, err := embeddedRuntimeCommand(b.root, args); answered {
 			return output, err
 		}
 	}

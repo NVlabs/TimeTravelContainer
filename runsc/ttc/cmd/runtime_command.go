@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -40,13 +41,53 @@ func embeddedRuntime(path string) bool {
 	return filepath.Base(path) == "ttcd"
 }
 
-// embeddedRuntimeQuery answers, in ttcd's own process, the read-only runtime
-// commands it runs most: the sandboxes in root, and a family's branches, the
-// processes of a branch and its exec sessions. It returns what the command
-// would print, and false for any other command. Each is a state file read and
-// a call to a Sentry, which is far cheaper than starting a copy of ttcd to
-// make it. Errors are flattened to their text, as a command's are.
-func embeddedRuntimeQuery(root string, args []string) ([]byte, bool, error) {
+// embeddedBranchActions are the runtime's timetravel actions on one branch
+// that take no flags or files: each is one call to the family's Sentry, and
+// returns what the action prints, if anything.
+var embeddedBranchActions = map[string]func(c *container.Container, branch string) (any, error){
+	"ps": func(c *container.Container, branch string) (any, error) {
+		return c.Sandbox.BranchProcesses(branch, c.ID)
+	},
+	"exec-list": func(c *container.Container, branch string) (any, error) {
+		return c.Sandbox.ExecSessions(&boot.ExecSessionsArgs{BranchID: branch, CID: c.ID})
+	},
+	"dehydrate": func(c *container.Container, branch string) (any, error) {
+		return c.Sandbox.DehydrateBranch(branch, nil)
+	},
+	"pause": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.PauseBranch(branch)
+	},
+	"resume": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.ResumeBranch(branch)
+	},
+	"quarantine": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.SetBranchQuarantine(branch, true)
+	},
+	"unquarantine": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.SetBranchQuarantine(branch, false)
+	},
+	"rehydrate": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.RehydrateBranch(branch)
+	},
+	"destroy": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.DestroyBranch(branch)
+	},
+	"destroy-reclaim": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.DestroyBranchAndReclaim(branch)
+	},
+	"prepare-stop": func(c *container.Container, branch string) (any, error) {
+		return nil, c.Sandbox.PrepareStopBranch(branch)
+	},
+}
+
+// embeddedRuntimeCommand runs, in ttcd's own process, the runtime commands
+// ttcd runs most, each a read of runsc's state and at most one call to a
+// Sentry: listing the sandboxes in root, a sandbox's state, a family's
+// branches, a signal to a branch, and the branch actions above. Starting a
+// copy of ttcd to run one costs more than the call. It returns what the
+// command would print, and false for any other command, which must be run as
+// a command. Errors are flattened to their text, as a command's are.
+func embeddedRuntimeCommand(root string, args []string) ([]byte, bool, error) {
 	var output any
 	switch {
 	case len(args) == 3 && args[0] == "list" && args[1] == "--format=json" && args[2] == "--sandbox":
@@ -62,25 +103,60 @@ func embeddedRuntimeQuery(root string, args []string) ([]byte, bool, error) {
 			}
 		}
 		output = states
-	case len(args) >= 3 && args[0] == "timetravel" && (args[2] == "branches" && len(args) == 3 ||
-		(args[2] == "ps" || args[2] == "exec-list") && len(args) == 4):
-		cont, err := container.Load(root, container.FullID{ContainerID: args[1]}, container.LoadOpts{SkipCheck: true})
+	case len(args) == 2 && args[0] == "state":
+		c, err := container.Load(root, container.FullID{ContainerID: args[1]}, container.LoadOpts{})
 		if err != nil {
 			return nil, true, fmt.Errorf("loading container: %v", err)
 		}
-		switch args[2] {
-		case "branches":
-			output, err = cont.Sandbox.ListBranches()
-		case "ps":
-			output, err = cont.Sandbox.BranchProcesses(args[3], cont.ID)
-		case "exec-list":
-			output, err = cont.Sandbox.ExecSessions(&boot.ExecSessionsArgs{BranchID: args[3], CID: cont.ID})
+		output = c.State()
+	case len(args) >= 3 && args[0] == "timetravel":
+		// timetravel ID ACTION [BRANCH], or timetravel --signal N [--all] ID
+		// signal BRANCH.
+		rest := args[1:]
+		signal, all := -1, false
+		if rest[0] == "--signal" && len(rest) >= 2 {
+			n, err := strconv.Atoi(rest[1])
+			if err != nil {
+				return nil, false, nil
+			}
+			signal, rest = n, rest[2:]
+			if len(rest) != 0 && rest[0] == "--all" {
+				all, rest = true, rest[1:]
+			}
 		}
+		var action func(*container.Container, string) (any, error)
+		switch {
+		case signal < 0 && len(rest) == 2 && rest[1] == "branches":
+			action = func(c *container.Container, _ string) (any, error) { return c.Sandbox.ListBranches() }
+		case signal < 0 && len(rest) == 3 && embeddedBranchActions[rest[1]] != nil:
+			action = embeddedBranchActions[rest[1]]
+		case signal >= 0 && len(rest) == 3 && rest[1] == "signal":
+			mode := boot.DeliverToProcess
+			if all {
+				mode = boot.DeliverToAllProcesses
+			}
+			action = func(c *container.Container, branch string) (any, error) {
+				return nil, c.Sandbox.SignalBranch(&boot.BranchSignalArgs{BranchID: branch, CID: c.ID, Signo: int32(signal), Mode: mode})
+			}
+		default:
+			return nil, false, nil
+		}
+		c, err := container.Load(root, container.FullID{ContainerID: rest[0]}, container.LoadOpts{SkipCheck: true})
 		if err != nil {
-			return nil, true, fmt.Errorf("timetravel %s failed: %v", args[2], err)
+			return nil, true, fmt.Errorf("loading container: %v", err)
+		}
+		branch := ""
+		if len(rest) == 3 {
+			branch = rest[2]
+		}
+		if output, err = action(c, branch); err != nil {
+			return nil, true, fmt.Errorf("timetravel %s failed: %v", rest[1], err)
 		}
 	default:
 		return nil, false, nil
+	}
+	if output == nil {
+		return nil, true, nil
 	}
 	encoded, err := json.Marshal(output)
 	if err != nil {

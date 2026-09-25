@@ -35,27 +35,38 @@ func TestRunscCommandKeepsExplicitDevelopmentRuntime(t *testing.T) {
 	}
 }
 
-func TestEmbeddedRuntimeQueryAnswersOnlyReadOnlyQueries(t *testing.T) {
+func TestEmbeddedRuntimeCommandAnswersOnlyWhatItRuns(t *testing.T) {
 	root := t.TempDir()
 	for _, args := range [][]string{
 		{"list"},
 		{"list", "--format=json"},
-		{"state", "family"},
+		{"state"},
 		{"delete", "--force", "family"},
-		{"timetravel", "family", "pause", "main"},
-		{"timetravel", "--signal", "15", "family", "signal", "main"},
+		{"timetravel", "family", "fork", "b1"},
+		{"timetravel", "--source", "main", "family", "fork", "b1"},
+		{"timetravel", "--signal", "15", "family", "pause", "main"},
+		{"timetravel", "--signal", "TERM", "family", "signal", "main"},
+		{"timetravel", "family", "signal", "main"},
 		{"timetravel", "family", "ps"},
 		{"timetravel", "family", "branches", "main"},
+		{"timetravel", "family", "pause", "main", "extra"},
 	} {
-		if output, answered, err := embeddedRuntimeQuery(root, args); answered {
-			t.Errorf("embeddedRuntimeQuery(%q) = %q, %v, answered; want it left to the runtime", args, output, err)
+		if output, answered, err := embeddedRuntimeCommand(root, args); answered {
+			t.Errorf("embeddedRuntimeCommand(%q) = %q, %v, answered; want it left to the runtime", args, output, err)
 		}
 	}
-	output, answered, err := embeddedRuntimeQuery(root, []string{"list", "--format=json", "--sandbox"})
+	output, answered, err := embeddedRuntimeCommand(root, []string{"list", "--format=json", "--sandbox"})
 	if !answered || err != nil || string(output) != "null" {
 		t.Fatalf("listing an empty root = %q, %t, %v; want null, answered", output, answered, err)
 	}
-	if _, answered, err := embeddedRuntimeQuery(root, []string{"timetravel", "missing", "branches"}); !answered || err == nil {
-		t.Fatalf("branches of a missing sandbox: answered %t, err %v; want an error", answered, err)
+	for _, args := range [][]string{
+		{"state", "missing"},
+		{"timetravel", "missing", "branches"},
+		{"timetravel", "missing", "pause", "main"},
+		{"timetravel", "--signal", "15", "--all", "missing", "signal", "main"},
+	} {
+		if _, answered, err := embeddedRuntimeCommand(root, args); !answered || err == nil {
+			t.Errorf("embeddedRuntimeCommand(%q) of a missing sandbox: answered %t, err %v; want an error", args, answered, err)
+		}
 	}
 }
