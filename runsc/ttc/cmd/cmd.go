@@ -9087,6 +9087,9 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 	commandArgs = append(commandArgs, target.container, "console-follow", target.branch)
 	command := runscCommand(b.runsc, commandArgs...)
 	command.Stderr = errorFile
+	// A follower mostly waits. On one processor its Go runtime keeps an idle
+	// thread fewer: four threads in all, not five.
+	command.Env = append(os.Environ(), "GOMAXPROCS=1")
 	// The inherited duplicate keeps the advisory lock held for exactly the
 	// lifetime of the drainer, preventing multiple consumers of one pipe.
 	command.ExtraFiles = []*os.File{lockFile, readyWriter}
