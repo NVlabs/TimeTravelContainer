@@ -5161,20 +5161,36 @@ func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{},
 	if err != nil {
 		return nil, err
 	}
+	if err := s.addContainerRepositoryPaths(paths, containers); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+// addContainerRepositoryPaths adds to paths the repositories of the listed
+// containers.
+func (s Store) addContainerRepositoryPaths(paths map[string]struct{}, containers []ContainerInfo) error {
 	for _, container := range containers {
 		spec, err := s.LoadSpec(container.ID)
 		if err != nil {
-			return nil, err
+			// Removed since it was listed, as a migrated or forked branch's
+			// staging record may be meanwhile: removal renames the record
+			// away before anything else, so nothing it held is reachable
+			// from it.
+			if _, statErr := os.Lstat(filepath.Join(s.Root, "containers", container.ID)); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			return err
 		}
 		repositories, err := specutils.TTCVolumeRepositories(spec)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, repository := range repositories {
 			paths[filepath.Clean(repository.Path)] = struct{}{}
 		}
 	}
-	return paths, nil
+	return nil
 }
 
 // repositoryCanonicalBranchBelongsToFamily reports whether the initial main

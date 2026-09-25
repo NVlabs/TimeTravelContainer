@@ -640,3 +640,25 @@ func TestLoadContainerByNameFollowsRenameRemovalAndReuse(t *testing.T) {
 	write("id-three", "db")
 	want("db", "id-three")
 }
+
+// A container removed after it was listed holds no repository an inventory
+// must keep; one still present whose spec cannot be read fails the inventory.
+func TestRepositoryInventoryPassesOverAContainerRemovedSinceListing(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	paths := make(map[string]struct{})
+	removed := ContainerInfo{ID: "removed-since-listing", Name: "gone"}
+	if err := store.addContainerRepositoryPaths(paths, []ContainerInfo{removed}); err != nil {
+		t.Fatalf("inventory of a container removed since listing: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("inventory of a removed container = %v, want nothing", paths)
+	}
+	present := ContainerInfo{ID: "present", Name: "present"}
+	if err := os.MkdirAll(filepath.Join(root, "containers", present.ID), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.addContainerRepositoryPaths(paths, []ContainerInfo{present}); err == nil {
+		t.Fatal("inventory of a present container whose spec cannot be read succeeded")
+	}
+}
