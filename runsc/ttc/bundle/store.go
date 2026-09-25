@@ -453,6 +453,9 @@ type RestoreOptions struct {
 	RestorePaused    bool
 	CheckpointBranch string
 	NodeID           string
+	// AllocateSnapshotOrigins allocates the working origins of a clustered
+	// node's repositories, as PrepareOptions' does.
+	AllocateSnapshotOrigins func(uint32) ([]ttcsnapshot.SnapshotID, error)
 }
 
 // DistributedForkOptions materializes a hidden target bundle that refers to
@@ -1566,6 +1569,41 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		return Prepared{}, fmt.Errorf("volume backing capability changed during restore: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 	}
 	copyMode := manager.Capability().Mode
+	// A cluster node's repositories have working origins the cluster
+	// authority allocates, as those of a family it creates do.
+	importOrigin := func() (ttcsnapshot.SnapshotID, error) {
+		if opts.AllocateSnapshotOrigins == nil {
+			return 0, nil
+		}
+		origins, err := opts.AllocateSnapshotOrigins(1)
+		if err != nil {
+			return 0, err
+		}
+		if len(origins) != 1 || origins[0] == 0 {
+			return 0, fmt.Errorf("snapshot allocator returned %v, want one origin", origins)
+		}
+		return origins[0], nil
+	}
+	importPrivate := func(path, name, source string) (*ttcvolume.Repository, ttcvolume.SnapshotInfo, error) {
+		origin, err := importOrigin()
+		if err != nil || origin == 0 {
+			if err != nil {
+				return nil, ttcvolume.SnapshotInfo{}, err
+			}
+			return manager.ImportPrivateSnapshot(path, name, source)
+		}
+		return manager.ImportPrivateSnapshotWithOrigin(path, name, source, origin)
+	}
+	importVolume := func(name, source string) (*ttcvolume.Repository, ttcvolume.SnapshotInfo, error) {
+		origin, err := importOrigin()
+		if err != nil || origin == 0 {
+			if err != nil {
+				return nil, ttcvolume.SnapshotInfo{}, err
+			}
+			return manager.ImportSnapshot(name, source)
+		}
+		return manager.ImportSnapshotWithOrigin(name, source, origin)
+	}
 	var rootfsUpperID string
 	volumeIDMap := make(map[string]ttcvolume.VolumeInfo)
 	for index := range repositories {
@@ -1576,7 +1614,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		}
 		if repository.Source == specutils.TTCRootfsUpperSource {
 			path := filepath.Join(activeContainerDir, rootfsUpperRepositoryDir)
-			imported, snapshot, err := manager.ImportPrivateSnapshot(path, "rootfs", snapshotPath)
+			imported, snapshot, err := importPrivate(path, "rootfs", snapshotPath)
 			if err != nil {
 				return Prepared{}, fmt.Errorf("importing rootfs upper: %w", err)
 			}
@@ -1596,7 +1634,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				return Prepared{}, fmt.Errorf("creating restored private repository root: %w", err)
 			}
-			imported, snapshot, err := manager.ImportPrivateSnapshot(path, fmt.Sprintf("host-%d", index), snapshotPath)
+			imported, snapshot, err := importPrivate(path, fmt.Sprintf("host-%d", index), snapshotPath)
 			if err != nil {
 				return Prepared{}, fmt.Errorf("importing private host-mount repository %q: %w", repository.Source, err)
 			}
@@ -1610,7 +1648,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			continue
 		}
 		name := fmt.Sprintf("restore-%s-%d", id[:12], index)
-		imported, snapshot, err := manager.ImportSnapshot(name, snapshotPath)
+		imported, snapshot, err := importVolume(name, snapshotPath)
 		if err != nil {
 			return Prepared{}, fmt.Errorf("importing managed volume %q: %w", repository.Source, err)
 		}

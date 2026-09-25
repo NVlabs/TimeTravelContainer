@@ -758,19 +758,24 @@ func (b *runtimeBackend) restoreCheckpoint(source, name string) (id string, retE
 			SnapshotPath: filepath.Join(stage, mount.Path),
 		})
 	}
+	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
 	prepared, err := b.containerStore().PrepareRestore(context.Background(), ttcbundle.RestoreOptions{
-		Name:             name,
-		Container:        manifest.Container,
-		Spec:             &manifest.Spec,
-		Repositories:     repositories,
-		HostMounts:       hostMounts,
-		VolumeCopyMode:   b.volumeCopyMode,
-		RestorePaused:    manifest.RestorePaused,
-		CheckpointBranch: manifest.SourceBranch,
-		NodeID:           b.nodeID,
+		Name:                    name,
+		Container:               manifest.Container,
+		Spec:                    &manifest.Spec,
+		Repositories:            repositories,
+		HostMounts:              hostMounts,
+		VolumeCopyMode:          b.volumeCopyMode,
+		RestorePaused:           manifest.RestorePaused,
+		CheckpointBranch:        manifest.SourceBranch,
+		NodeID:                  b.nodeID,
+		AllocateSnapshotOrigins: filesystemOrigins,
 	})
 	if err != nil {
-		return "", err
+		return "", errors.Join(err, finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return "", errors.Join(err, b.containerStore().RemoveContainer(prepared.Container.ID))
 	}
 	id = prepared.Container.ID
 	reservation, err := b.reserveNewContainerPlacement(prepared.Container)

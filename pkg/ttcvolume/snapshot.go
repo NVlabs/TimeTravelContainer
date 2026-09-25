@@ -341,7 +341,20 @@ func (r *Repository) exportSnapshot(branchID, destination string) (SnapshotInfo,
 // its main branch. The new repository has a new identity; RestoreID reconnects
 // checkpoint state to it.
 func (m *Manager) ImportPrivateSnapshot(path, name, source string) (*Repository, SnapshotInfo, error) {
-	repository, err := m.CreatePrivate(path, name)
+	return m.importPrivateSnapshot(path, name, source, 0)
+}
+
+// ImportPrivateSnapshotWithOrigin is ImportPrivateSnapshot for a clustered
+// repository, whose working origin the cluster authority allocated.
+func (m *Manager) ImportPrivateSnapshotWithOrigin(path, name, source string, working ttcsnapshot.SnapshotID) (*Repository, SnapshotInfo, error) {
+	if working == 0 {
+		return nil, SnapshotInfo{}, errors.New("clustered repository requires an allocated working snapshot origin")
+	}
+	return m.importPrivateSnapshot(path, name, source, working)
+}
+
+func (m *Manager) importPrivateSnapshot(path, name, source string, working ttcsnapshot.SnapshotID) (*Repository, SnapshotInfo, error) {
+	repository, err := m.createPrivate(path, name, working)
 	if err != nil {
 		return nil, SnapshotInfo{}, err
 	}
@@ -445,7 +458,20 @@ func (m *Manager) importPrivateRemoteDescriptor(path, name string, descriptor Re
 
 // ImportSnapshot creates a catalogued managed volume from snapshot.
 func (m *Manager) ImportSnapshot(name, source string) (*Repository, SnapshotInfo, error) {
-	repository, err := m.Create(name)
+	return m.importSnapshot(name, source, 0)
+}
+
+// ImportSnapshotWithOrigin is ImportSnapshot for a clustered volume, whose
+// working origin the cluster authority allocated.
+func (m *Manager) ImportSnapshotWithOrigin(name, source string, working ttcsnapshot.SnapshotID) (*Repository, SnapshotInfo, error) {
+	if working == 0 {
+		return nil, SnapshotInfo{}, errors.New("clustered repository requires an allocated working snapshot origin")
+	}
+	return m.importSnapshot(name, source, working)
+}
+
+func (m *Manager) importSnapshot(name, source string, working ttcsnapshot.SnapshotID) (*Repository, SnapshotInfo, error) {
+	repository, err := m.create(name, working)
 	if err != nil {
 		return nil, SnapshotInfo{}, err
 	}
