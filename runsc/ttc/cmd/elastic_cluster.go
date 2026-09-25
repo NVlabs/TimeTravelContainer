@@ -2507,7 +2507,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 			for transactionID := range ids {
 				cancelByNode[node][transactionID] = struct{}{}
-				if tx := transactionsByID[transactionID]; tx != nil {
+				// A target migrated on since no longer holds its branch's
+				// placement, which the migration's target holds: that branch
+				// is removed as any other, and canceling only discards the
+				// target left behind.
+				if tx := transactionsByID[transactionID]; tx != nil && transactionOwnsCurrentPlacement(*tx, placements) {
 					logicalBranch := distributedTransactionLogicalBranch(*tx, placements)
 					canceledTargets[info.ID+"\x00"+logicalBranch] = transactionID
 				}
@@ -2522,20 +2526,12 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			}
 		}
 	}
+	// Settle before canceling. A remote fork's target that is removed, and
+	// so canceled, may meanwhile have been migrated on: its physical runtime
+	// is then the source of a migration whose target depends on it until the
+	// migration is independent, and canceling first would destroy that source
+	// and strand the migration's target.
 	nodes := make([]string, 0, max(len(cancelByNode), len(settleByNode)))
-	for node := range cancelByNode {
-		nodes = append(nodes, node)
-	}
-	sort.Strings(nodes)
-	for _, node := range nodes {
-		ids := make([]string, 0, len(cancelByNode[node]))
-		for transactionID := range cancelByNode[node] {
-			ids = append(ids, transactionID)
-		}
-		sort.Strings(ids)
-		preflight = append(preflight, child{node: node, args: append([]string{"_cancel-source-transactions"}, ids...)})
-	}
-	nodes = nodes[:0]
 	for node := range settleByNode {
 		nodes = append(nodes, node)
 	}
@@ -2547,6 +2543,19 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		}
 		sort.Strings(ids)
 		preflight = append(preflight, child{node: node, args: append([]string{"_settle-source-transactions"}, ids...)})
+	}
+	nodes = nodes[:0]
+	for node := range cancelByNode {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		ids := make([]string, 0, len(cancelByNode[node]))
+		for transactionID := range cancelByNode[node] {
+			ids = append(ids, transactionID)
+		}
+		sort.Strings(ids)
+		preflight = append(preflight, child{node: node, args: append([]string{"_cancel-source-transactions"}, ids...)})
 	}
 	// Once migration targets are independent, their retired physical sources
 	// are unnecessary to a removal. Reclaim them while the target placement is
