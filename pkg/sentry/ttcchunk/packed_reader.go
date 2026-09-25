@@ -15,7 +15,6 @@
 package ttcchunk
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -36,7 +35,7 @@ type GraphPackedManifestReader struct {
 	remote  *ttcsnapshot.ObjectRelayClient
 	pages   map[uint64]graphPackedPage
 	ownData bool
-	fetchMu sync.Mutex
+	fetcher objectFetcher
 	mu      sync.Mutex
 	closed  bool
 }
@@ -109,28 +108,11 @@ func NewGraphPackedManifestReader(data *ttcsnapshot.LocalDataStore, remote *ttcs
 	if uint64(len(pages)) != totalPages {
 		return fail(fmt.Errorf("graph manifest maps %d pages, load ranges require %d", len(pages), totalPages))
 	}
-	return &GraphPackedManifestReader{data: data, remote: remote, pages: pages, ownData: ownData}, nil
+	return &GraphPackedManifestReader{data: data, remote: remote, pages: pages, ownData: ownData, fetcher: objectFetcher{data: data, remote: remote}}, nil
 }
 
 func (r *GraphPackedManifestReader) openObject(id ttcsnapshot.ObjectID) (*os.File, error) {
-	const length = int64(pgalloc.SparseChunkBytes)
-	file, err := r.data.Open(id, length)
-	if err == nil || r.remote == nil || !errors.Is(err, os.ErrNotExist) {
-		return file, err
-	}
-	r.fetchMu.Lock()
-	defer r.fetchMu.Unlock()
-	if file, err = r.data.Open(id, length); err == nil || !errors.Is(err, os.ErrNotExist) {
-		return file, err
-	}
-	payload, err := r.remote.Fetch(id, uint64(length))
-	if err != nil {
-		return nil, err
-	}
-	if err := r.data.Install(id, bytes.NewReader(payload), length); err != nil {
-		return nil, err
-	}
-	return r.data.Open(id, length)
+	return r.fetcher.open(id, int64(pgalloc.SparseChunkBytes))
 }
 
 // ReadAt implements io.ReaderAt without decoding a compatibility chunk.

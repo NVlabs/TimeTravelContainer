@@ -609,9 +609,60 @@ type GraphChunkReader struct {
 	chunks  []ttcsnapshot.ObjectID
 	remote  *ttcsnapshot.ObjectRelayClient
 	ownData bool
-	fetchMu sync.Mutex
+	fetcher objectFetcher
 	mu      sync.RWMutex
 	closed  bool
+}
+
+// objectFetcher opens immutable objects from data, first fetching those it
+// lacks from remote and installing them. Readers of one object share one
+// fetch of it, and different objects are fetched at once, so that each
+// install's sync overlaps the others' rather than waiting for them: a
+// rehydration on another node that fetched its chunks one at a time spent
+// 28 s on 1,500 of them.
+type objectFetcher struct {
+	data   *ttcsnapshot.LocalDataStore
+	remote *ttcsnapshot.ObjectRelayClient
+
+	mu       sync.Mutex
+	fetching map[ttcsnapshot.ObjectID]chan struct{}
+}
+
+func (f *objectFetcher) open(id ttcsnapshot.ObjectID, length int64) (*os.File, error) {
+	for {
+		file, err := f.data.Open(id, length)
+		if err == nil || f.remote == nil || !errors.Is(err, fs.ErrNotExist) {
+			return file, err
+		}
+		f.mu.Lock()
+		if done, ok := f.fetching[id]; ok {
+			f.mu.Unlock()
+			<-done
+			continue
+		}
+		if f.fetching == nil {
+			f.fetching = make(map[ttcsnapshot.ObjectID]chan struct{})
+		}
+		done := make(chan struct{})
+		f.fetching[id] = done
+		f.mu.Unlock()
+		err = f.fetch(id, length)
+		f.mu.Lock()
+		delete(f.fetching, id)
+		f.mu.Unlock()
+		close(done)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (f *objectFetcher) fetch(id ttcsnapshot.ObjectID, length int64) error {
+	data, err := f.remote.Fetch(id, uint64(length))
+	if err != nil {
+		return err
+	}
+	return f.data.Install(id, bytes.NewReader(data), length)
 }
 
 // NewGraphChunkReader constructs a demand reader without materializing a
@@ -647,7 +698,7 @@ func NewGraphChunkReaderWithRelay(data *ttcsnapshot.LocalDataStore, chunkObjects
 		}
 		chunks[index] = object
 	}
-	return &GraphChunkReader{data: data, chunks: chunks, remote: remote, ownData: ownData}, nil
+	return &GraphChunkReader{data: data, chunks: chunks, remote: remote, ownData: ownData, fetcher: objectFetcher{data: data, remote: remote}}, nil
 }
 
 // Close prevents future reads and releases a donated data directory.
@@ -669,26 +720,7 @@ func (r *GraphChunkReader) Close() error {
 }
 
 func (r *GraphChunkReader) openChunk(id ttcsnapshot.ObjectID) (*os.File, error) {
-	const length = int64(pgalloc.SparseChunkBytes)
-	file, err := r.data.Open(id, length)
-	if err == nil || r.remote == nil || !errors.Is(err, fs.ErrNotExist) {
-		return file, err
-	}
-	// Multiple asynchronous MemoryFile readers may fault the same chunk. Only
-	// one may relay and atomically install it; later readers observe the cache.
-	r.fetchMu.Lock()
-	defer r.fetchMu.Unlock()
-	if file, err = r.data.Open(id, length); err == nil || !errors.Is(err, fs.ErrNotExist) {
-		return file, err
-	}
-	data, err := r.remote.Fetch(id, uint64(length))
-	if err != nil {
-		return nil, err
-	}
-	if err := r.data.Install(id, bytes.NewReader(data), length); err != nil {
-		return nil, err
-	}
-	return r.data.Open(id, length)
+	return r.fetcher.open(id, int64(pgalloc.SparseChunkBytes))
 }
 
 // ReadAt reads each touched chunk completely before exposing any of its bytes
