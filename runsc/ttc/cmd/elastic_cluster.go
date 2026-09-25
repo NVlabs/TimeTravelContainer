@@ -1945,10 +1945,11 @@ func distributedMutationSourceTransactions(transactions []cluster.Transaction, i
 // surviving reader: materializing it first makes family rm proportional to the
 // deleted family's resident memory and can wedge on a source that has already
 // handed its backing to another generation.
-func distributedRemovalSourceTransactions(transactions []cluster.Transaction, placements []cluster.PlacementRecord, info ttcbundle.ContainerInfo, branchID string) (settle, cancel, discard map[string]map[string]struct{}) {
+func distributedRemovalSourceTransactions(transactions []cluster.Transaction, placements []cluster.PlacementRecord, info ttcbundle.ContainerInfo, branchID string) (settle, cancel, discard, abort map[string]map[string]struct{}) {
 	settle = make(map[string]map[string]struct{})
 	cancel = make(map[string]map[string]struct{})
 	discard = make(map[string]map[string]struct{})
+	abort = make(map[string]map[string]struct{})
 	for _, tx := range transactions {
 		if tx.Identity.SourceContainer != info.ID && tx.Identity.TargetContainer != info.ID {
 			continue
@@ -2002,6 +2003,16 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 			continue
 		}
 		if tx.Identity.Migration {
+			// A migration whose target this removes, with the target's
+			// runtime, is canceled rather than drained: its target is removed
+			// as any branch, and then its source (see abortedMigrationFollowUps).
+			if removesTarget && tx.OwnershipCommitted && !migrationTargetHasSurvivingPhysicalPeer(tx, placements, branchID) {
+				if abort[node] == nil {
+					abort[node] = make(map[string]struct{})
+				}
+				abort[node][tx.Identity.TransactionID] = struct{}{}
+				continue
+			}
 			// Every migration needs a post-delete source discard. A still-live
 			// dependency is first made independent, then follows the same path;
 			// categorizing only its initial state lost that postflight.
@@ -2018,7 +2029,7 @@ func distributedRemovalSourceTransactions(transactions []cluster.Transaction, pl
 		}
 		settle[node][tx.Identity.TransactionID] = struct{}{}
 	}
-	return settle, cancel, discard
+	return settle, cancel, discard, abort
 }
 
 func transactionOwnsCurrentPlacement(tx cluster.Transaction, placements []cluster.PlacementRecord) bool {
@@ -2060,6 +2071,28 @@ func distributedTransactionLogicalBranch(tx cluster.Transaction, placements []cl
 		}
 	}
 	return tx.Identity.VisibleTargetBranch()
+}
+
+// migrationTargetHasSurvivingPhysicalPeer reports whether a branch that
+// outlives the removal of removedBranch shares the runtime of a migration's
+// target, and so may read the migration's source: a branch forked from the
+// target on its node. Removing the whole family leaves none.
+func migrationTargetHasSurvivingPhysicalPeer(tx cluster.Transaction, placements []cluster.PlacementRecord, removedBranch string) bool {
+	if removedBranch == "" {
+		return false
+	}
+	physicalContainer := tx.TargetPhysicalContainer
+	for i := range placements {
+		record := placements[i]
+		candidate := record.PhysicalContainer
+		if candidate == "" {
+			candidate = record.FamilyID
+		}
+		if record.BranchID != removedBranch && record.OwnerNode == tx.Identity.TargetNodeID && candidate == physicalContainer {
+			return true
+		}
+	}
+	return false
 }
 
 func remoteForkTargetHasSurvivingPhysicalPeer(tx cluster.Transaction, placements []cluster.PlacementRecord, removedBranch string) bool {
@@ -2461,6 +2494,9 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 	cancelByNode := make(map[string]map[string]struct{})
 	discardByNode := make(map[string]map[string]struct{})
 	canceledTargets := make(map[string]string)
+	// abortedByBranch has, by family and branch, the migrations canceled
+	// once that branch is removed.
+	abortedByBranch := make(map[string][]string)
 	for _, operand := range mutation.targets {
 		name := operand
 		branchID := ""
@@ -2484,6 +2520,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		settle := distributedMutationSourceTransactions(transactions, info, branchID, retiredNodes)
 		cancel := map[string]map[string]struct{}{}
 		discard := map[string]map[string]struct{}{}
+		abort := map[string]map[string]struct{}{}
 		var placements []cluster.PlacementRecord
 		if request.Args[0] == "rm" {
 			var placementErr error
@@ -2491,7 +2528,15 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			if placementErr != nil {
 				return true, 1, nil, nil, fmt.Errorf("listing logical branches for %q: %w", operand, placementErr)
 			}
-			settle, cancel, discard = distributedRemovalSourceTransactions(transactions, placements, info, branchID)
+			settle, cancel, discard, abort = distributedRemovalSourceTransactions(transactions, placements, info, branchID)
+		}
+		for _, ids := range abort {
+			for transactionID := range ids {
+				if tx := transactionsByID[transactionID]; tx != nil {
+					key := info.ID + "\x00" + distributedTransactionLogicalBranch(*tx, placements)
+					abortedByBranch[key] = append(abortedByBranch[key], transactionID)
+				}
+			}
 		}
 		for node, ids := range settle {
 			if settleByNode[node] == nil {
@@ -2525,6 +2570,41 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				discardByNode[node][transactionID] = struct{}{}
 			}
 		}
+	}
+	// A remote fork an aborted migration inherited has for its target the
+	// migration's source, which the migration's target reads until it is
+	// removed: it is canceled after that, with the source.
+	deferredCancels := make(map[string][]child)
+	for _, ids := range abortedByBranch {
+		for _, abortedID := range ids {
+			for _, inheritedID := range transactionsByID[abortedID].InheritedDependencies {
+				for node, pending := range cancelByNode {
+					if _, ok := pending[inheritedID]; !ok {
+						continue
+					}
+					delete(pending, inheritedID)
+					if len(pending) == 0 {
+						delete(cancelByNode, node)
+					}
+					deferredCancels[abortedID] = append(deferredCancels[abortedID], child{node: node, args: []string{"_cancel-source-transactions", inheritedID}})
+				}
+			}
+		}
+	}
+	// afterRemoval returns what follows the removal of a branch: for each
+	// migration it aborts, discarding the migration's source and canceling
+	// what the migration inherited.
+	afterRemoval := func(familyID, branchID string) ([]child, error) {
+		var result []child
+		for _, transactionID := range abortedByBranch[familyID+"\x00"+branchID] {
+			cleanupNode, err := s.distributedCleanupNode(transactionsByID[transactionID].Identity.SourceNodeID)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, child{node: cleanupNode, args: []string{"_discard-removed-migration-sources", transactionID}})
+			result = append(result, deferredCancels[transactionID]...)
+		}
+		return result, nil
 	}
 	// Settle before canceling. A remote fork's target that is removed, and
 	// so canceled, may meanwhile have been migrated on: its physical runtime
@@ -2633,6 +2713,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			} else {
 				children = append(children, child{node: node, args: append(append([]string(nil), mutation.prefix...), operand)})
 			}
+			followUps, err := afterRemoval(info.ID, selected.branch)
+			if err != nil {
+				return true, 1, nil, nil, err
+			}
+			children = append(children, followUps...)
 			if request.Args[0] == "rm" {
 				familyPlacements, err := logicalFamilyPlacements(s.clusterPlacements, info.ID)
 				if err != nil {
@@ -2697,6 +2782,11 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 				target := operand + "@" + placement.BranchID
 				children = append(children, child{node: node, args: append(append([]string(nil), branchPrefix...), target)})
 			}
+			followUps, err := afterRemoval(info.ID, placement.BranchID)
+			if err != nil {
+				return true, 1, nil, nil, err
+			}
+			children = append(children, followUps...)
 		}
 		if request.Args[0] == "rm" {
 			// Every logical branch above is removed through its exact Raft physical

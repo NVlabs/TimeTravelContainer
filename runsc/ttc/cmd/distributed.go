@@ -288,6 +288,23 @@ type distributedSourceRuntime struct {
 	reclamationMu sync.Mutex
 	pageListen    string
 	pageAdvertise string
+	// exports has, by transaction, a function that stops the transaction's
+	// live graph export: one that no target will read.
+	exports sync.Map
+}
+
+// errExportAbandoned is the error of a live graph export stopped because
+// no target will read it.
+var errExportAbandoned = errors.New("live graph export was abandoned: its target was removed")
+
+// abortExport stops the live graph export of transactionID, if one runs.
+func (r *distributedSourceRuntime) abortExport(transactionID string) {
+	if r == nil {
+		return
+	}
+	if stop, ok := r.exports.Load(transactionID); ok {
+		stop.(func())()
+	}
 }
 
 func (r *distributedSourceRuntime) lockReclamation() func() {
@@ -1785,6 +1802,14 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
+	// Closing the daemon's end fails the Sentry's writes, which ends the
+	// export and frees the source's session for its removal.
+	var aborted atomic.Bool
+	b.distributedSource.exports.Store(transactionID, func() {
+		aborted.Store(true)
+		_ = reader.Close()
+	})
+	defer b.distributedSource.exports.Delete(transactionID)
 	type importResult struct {
 		capture ttcchunk.GraphImportResult
 		err     error
@@ -1811,6 +1836,9 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	for _, root := range outcome.capture.Roots {
 		rootNames = append(rootNames, root.Name)
 		rootObjects = append(rootObjects, root.Root.String())
+	}
+	if aborted.Load() {
+		return cluster.GraphHandoffDescriptor{}, nil, nil, errExportAbandoned
 	}
 	if outcome.err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("importing live graph memory: %w", outcome.err)
@@ -3340,7 +3368,9 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 		// dependent on a live source indefinitely. Background monitors do not own
 		// a client response stream, so report the fallback in the daemon log
 		// instead of silently discarding the only useful diagnosis.
-		fmt.Fprintf(os.Stderr, "ttcd: distributed graph handoff %s fell back to live paging: %v\n", transactionID, err)
+		if !errors.Is(err, errExportAbandoned) {
+			fmt.Fprintf(os.Stderr, "ttcd: distributed graph handoff %s fell back to live paging: %v\n", transactionID, err)
+		}
 		// Ordinary demand paging may remain live for the lifetime of the target
 		// when graph publication is unavailable. It must not occupy one of the
 		// bounded graph-export workers and prevent independent siblings from

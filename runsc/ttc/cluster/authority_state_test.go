@@ -1237,6 +1237,56 @@ func TestAuthorityMigrationIndependenceSettlesUnreferencedPredecessor(t *testing
 	}
 }
 
+// A committed migration cannot be canceled while its branch exists, and can
+// once removal has deleted the branch: nothing reads its target any more.
+func TestAuthorityCommittedMigrationCancelsOnlyOnceItsBranchIsRemoved(t *testing.T) {
+	at := time.Unix(3860, 0).UTC()
+	state := NewAuthorityState()
+	migration := Transaction{
+		Identity: ForkIdentity{
+			TransactionID: "move-removed", SourceNodeID: "node-b", TargetNodeID: "node-c",
+			SourceContainer: "family", SourceBranch: "main", TargetContainer: "family",
+			TargetBranch: "move-hidden", TargetVisibleBranch: "main", Migration: true,
+		},
+		SourceNeeded: true, State: TransactionDraining, Revision: 8, CreatedAt: at, UpdatedAt: at,
+		OwnershipCommitted: true,
+	}
+	state.Transactions[migration.Identity.TransactionID] = migration
+	key := logicalBranchKey("family", "main")
+	state.Branches[key] = BranchAuthority{
+		FamilyID: "family", BranchID: "main", Generation: 3, Lifecycle: "running", UpdatedAt: at,
+		VolatileDependencies: []VolatileDependency{{TransactionID: migration.Identity.TransactionID, SourceNode: "node-b", SourceIncarnation: "inc-b"}},
+	}
+	state.Placements[key] = PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-c", OwnerIncarnation: "inc-c", Generation: 3, State: PlacementRunning, Revision: 3, UpdatedAt: at,
+		LastOperationID: migration.Identity.TransactionID,
+	}
+	cancel := func(id string, next TransactionState, failure string) AuthorityResult {
+		command, err := NewAuthorityCommand(id, at.Add(time.Second), AuthorityTransactionAdvance, AuthorityTransactionPayload{
+			ID: migration.Identity.TransactionID, Revision: migration.Revision, Next: next, Failure: failure,
+		})
+		if err != nil {
+			t.Fatalf("NewAuthorityCommand: %v", err)
+		}
+		return state.Apply(command)
+	}
+	if err := cancel("cancel-live", TransactionCanceled, "").Err(); err == nil {
+		t.Fatal("a committed migration whose branch exists was canceled")
+	}
+	delete(state.Placements, key)
+	delete(state.Branches, key)
+	if err := cancel("fail-removed", TransactionFailed, "lost").Err(); err == nil {
+		t.Fatal("a committed migration was failed")
+	}
+	if err := cancel("cancel-removed", TransactionCanceled, "").Err(); err != nil {
+		t.Fatalf("canceling the migration of a removed branch: %v", err)
+	}
+	if got := state.Transactions[migration.Identity.TransactionID]; got.State != TransactionCanceled || got.SourceNeeded {
+		t.Fatalf("canceled migration is %+v", got)
+	}
+}
+
 func TestAuthorityMigrationIndependenceRetainsSharedPredecessor(t *testing.T) {
 	at := time.Unix(3875, 0).UTC()
 	state := NewAuthorityState()

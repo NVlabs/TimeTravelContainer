@@ -7221,7 +7221,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, "", nil); len(got) != 0 {
 		t.Fatalf("unrelated family selected transactions: %v", got)
 	}
-	settle, cancel, discard := distributedRemovalSourceTransactions(transactions, nil, info, "")
+	settle, cancel, discard, _ := distributedRemovalSourceTransactions(transactions, nil, info, "")
 	if len(settle) != 1 || len(cancel) != 2 || len(discard) != 2 {
 		t.Fatalf("removal transaction split settle=%v cancel=%v discard=%v", settle, cancel, discard)
 	}
@@ -7240,7 +7240,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	if _, ok := settle["node-d"]; ok {
 		t.Fatalf("removal would publish an obsolete independent migration: %v", settle)
 	}
-	branchSettle, branchCancel, _ := distributedRemovalSourceTransactions(transactions, nil, info, "child")
+	branchSettle, branchCancel, _, _ := distributedRemovalSourceTransactions(transactions, nil, info, "child")
 	if _, ok := branchCancel["node-a"]["incoming"]; !ok {
 		t.Fatalf("target branch removal did not cancel its incoming fork: %v", branchCancel)
 	}
@@ -7253,7 +7253,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	}
 	sharedTransactions := append([]cluster.Transaction(nil), transactions...)
 	sharedTransactions[0].Identity.TargetNodeID = "node-a"
-	sharedSettle, sharedCancel, _ := distributedRemovalSourceTransactions(sharedTransactions, sharedRuntime, info, "child")
+	sharedSettle, sharedCancel, _, _ := distributedRemovalSourceTransactions(sharedTransactions, sharedRuntime, info, "child")
 	if _, ok := sharedSettle["node-a"]["incoming"]; !ok {
 		t.Fatalf("shared physical descendant did not retain its source handoff: settle=%v cancel=%v", sharedSettle, sharedCancel)
 	}
@@ -7271,7 +7271,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 		{FamilyID: "family-id", BranchID: "moved", PhysicalContainer: "old-runtime", OwnerNode: "node-b", LastOperationID: "old-migration"},
 		{FamilyID: "family-id", BranchID: "remote", PhysicalContainer: "new-runtime", OwnerNode: "node-b", OperationID: "new-fork"},
 	}
-	_, reusedCancel, reusedDiscard := distributedRemovalSourceTransactions([]cluster.Transaction{oldMigration, newFork}, renameReusePlacements, info, "remote")
+	_, reusedCancel, reusedDiscard, _ := distributedRemovalSourceTransactions([]cluster.Transaction{oldMigration, newFork}, renameReusePlacements, info, "remote")
 	if _, ok := reusedCancel["node-a"]["new-fork"]; !ok {
 		t.Fatalf("reused branch removal did not select its current fork: %v", reusedCancel)
 	}
@@ -7291,7 +7291,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 		FamilyID: "family-id", BranchID: "renamed-child", OwnerNode: "node-b",
 		PhysicalContainer: "fork-runtime", LastOperationID: "canceled-fork",
 	}}
-	_, recoveredCancel, _ := distributedRemovalSourceTransactions([]cluster.Transaction{canceledFork}, canceledPlacements, info, "renamed-child")
+	_, recoveredCancel, _, _ := distributedRemovalSourceTransactions([]cluster.Transaction{canceledFork}, canceledPlacements, info, "renamed-child")
 	if _, ok := recoveredCancel["node-a"]["canceled-fork"]; !ok {
 		t.Fatalf("terminal canceled target did not retain metadata-only removal: %v", recoveredCancel)
 	}
@@ -7300,7 +7300,7 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 		{FamilyID: "family-id", BranchID: "child", State: cluster.PlacementCorrupted},
 		{FamilyID: "family-id", BranchID: "grandchild", State: cluster.PlacementRunning},
 	}
-	corruptSettle, corruptCancel, corruptDiscard := distributedRemovalSourceTransactions(transactions, corruptedPlacements, info, "child")
+	corruptSettle, corruptCancel, corruptDiscard, _ := distributedRemovalSourceTransactions(transactions, corruptedPlacements, info, "child")
 	if _, ok := corruptCancel["node-a"]; ok {
 		t.Fatalf("corrupted target removal attempted remote cancellation: %v", corruptCancel)
 	}
@@ -7309,6 +7309,26 @@ func TestDistributedMutationSourceTransactions(t *testing.T) {
 	}
 	if _, ok := corruptDiscard["node-e"]["active-migration"]; ok {
 		t.Fatalf("corrupted migration target retained physical cleanup: %v", corruptDiscard)
+	}
+
+	// A committed migration whose branch is removed with its target's runtime
+	// is canceled after the target instead of drained into it; one whose
+	// target runtime a surviving branch shares is still drained.
+	committed := transaction("committed-migration", "node-f", "moved", "moved", cluster.TransactionDraining, true, true)
+	committed.OwnershipCommitted = true
+	committed.Identity.TargetNodeID = "node-g"
+	committed.TargetPhysicalContainer = "move-runtime"
+	movedPlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "moved", PhysicalContainer: "move-runtime", OwnerNode: "node-g", LastOperationID: "committed-migration"},
+	}
+	abortSettle, _, abortDiscard, abort := distributedRemovalSourceTransactions([]cluster.Transaction{committed}, movedPlacements, info, "moved")
+	if _, ok := abort["node-f"]["committed-migration"]; !ok || len(abortSettle) != 0 || len(abortDiscard) != 0 {
+		t.Fatalf("removing a migrated branch: settle=%v discard=%v abort=%v, want it aborted", abortSettle, abortDiscard, abort)
+	}
+	sharedMoved := append(movedPlacements, cluster.PlacementRecord{FamilyID: "family-id", BranchID: "local-fork", PhysicalContainer: "move-runtime", OwnerNode: "node-g"})
+	keptSettle, _, _, keptAbort := distributedRemovalSourceTransactions([]cluster.Transaction{committed}, sharedMoved, info, "moved")
+	if _, ok := keptSettle["node-f"]["committed-migration"]; !ok || len(keptAbort) != 0 {
+		t.Fatalf("a migration a surviving branch reads was aborted: settle=%v abort=%v", keptSettle, keptAbort)
 	}
 }
 

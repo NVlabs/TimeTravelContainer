@@ -1814,7 +1814,11 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 		delete(s.Transactions, p.ID)
 		return nil, nil
 	case AuthorityTransactionAdvance:
-		if tx.OwnershipCommitted && (p.Next == TransactionCanceled || p.Next == TransactionFailed) {
+		// A migration whose branch was removed is canceled instead: nothing
+		// reads its target any more, and draining the rest of the branch into
+		// a target already deleted would only copy it.
+		if tx.OwnershipCommitted && (p.Next == TransactionCanceled || p.Next == TransactionFailed) && tx.State != p.Next &&
+			(p.Next == TransactionFailed || s.migrationBranchExists(tx)) {
 			return nil, errors.New("authoritative migration target cannot be canceled or failed")
 		}
 		if tx.State == p.Next {
@@ -1957,6 +1961,18 @@ func (s *AuthorityState) applyTransaction(command AuthorityCommand) (json.RawMes
 	}
 	s.Transactions[p.ID] = tx
 	return authorityValue(tx)
+}
+
+// migrationBranchExists reports whether the branch a migration moved still
+// exists: a placement names the migration or is its branch, or a branch
+// depends on it.
+func (s *AuthorityState) migrationBranchExists(tx Transaction) bool {
+	for _, placement := range s.Placements {
+		if placement.OperationID == tx.Identity.TransactionID || placement.LastOperationID == tx.Identity.TransactionID || transactionTargetsPlacement(tx, placement) {
+			return true
+		}
+	}
+	return volatileDependencyReferenced(s.Branches, tx.Identity.TransactionID)
 }
 
 func transactionTargetsPlacement(tx Transaction, placement PlacementRecord) bool {

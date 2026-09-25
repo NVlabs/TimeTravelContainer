@@ -3025,6 +3025,9 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 		}
 		switch tx.State {
 		case cluster.TransactionCanceled, cluster.TransactionFailed, cluster.TransactionIndependent:
+			if err := b.retireTransactionWithoutBranch(store, *tx); err != nil {
+				return fmt.Errorf("retiring removable distributed target %q: %w", transactionID, err)
+			}
 			continue
 		case cluster.TransactionDraining:
 			if err := drainSourceDependency(b, b.distributedSource, store, *tx); err != nil {
@@ -3050,6 +3053,10 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 			// Independent means draining won the race with removal. The physical
 			// target was not canceled and the metadata child below will delete it
 			// through the ordinary branch path.
+			b.distributedSource.abortExport(transactionID)
+			if err := b.retireTransactionWithoutBranch(store, *canceled); err != nil {
+				return fmt.Errorf("retiring removable distributed target %q: %w", transactionID, err)
+			}
 		case cluster.TransactionDraining:
 			if err := drainSourceDependency(b, b.distributedSource, store, *canceled); err != nil {
 				return fmt.Errorf("finishing raced distributed target %q: %w", transactionID, err)
@@ -3057,6 +3064,32 @@ func (b *runtimeBackend) cancelDistributedForkTargets(transactionIDs []string) e
 		default:
 			return fmt.Errorf("canceling removable distributed target %q returned %s", transactionID, canceled.State)
 		}
+	}
+	return nil
+}
+
+// retireTransactionWithoutBranch retires a finished remote fork whose target
+// branch is gone: one canceled after the removal of its target, which a
+// migration had moved on and which removing the placement could not retire.
+func (b *runtimeBackend) retireTransactionWithoutBranch(store cluster.TransactionCatalog, tx cluster.Transaction) error {
+	if tx.Identity.Migration || !tx.Terminal() {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.OperationID == tx.Identity.TransactionID || record.LastOperationID == tx.Identity.TransactionID || transactionTargetsRemovedPlacement(tx, record) {
+			return nil
+		}
+	}
+	if err := store.Delete(tx.Identity.TransactionID, tx.Revision); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }
@@ -3228,6 +3261,9 @@ func (b *runtimeBackend) cleanupRemovedMigrationSource(tx cluster.Transaction) e
 	transactionID := tx.Identity.TransactionID
 	if tx.Identity.SourceNodeID == b.nodeID {
 		sourceContainer, sourceBranch := migrationSourceRuntime(tx)
+		// Its target reads the source no more: publishing the source's
+		// memory for it would only delay this.
+		b.distributedSource.abortExport(transactionID)
 		unlockSource := b.distributedSource.lockSourceFamily(sourceContainer)
 		defer unlockSource()
 		_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
@@ -3306,13 +3342,20 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 		if err != nil {
 			return fmt.Errorf("loading removed migration transaction %q: %w", transactionID, err)
 		}
-		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent {
+		if !tx.Identity.Migration || (tx.State != cluster.TransactionIndependent && !abortedMigration(*tx)) {
 			return fmt.Errorf("transaction %q is not an independent migration", transactionID)
 		}
 		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
 			return fmt.Errorf("cannot retire migration source %q while placement %s@%s still exists", transactionID, tx.Identity.SourceContainer, tx.Identity.SourceBranch)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("checking removed migration placement %q: %w", transactionID, err)
+		}
+		if tx.State != cluster.TransactionIndependent {
+			// The branch was removed before its target was independent, and
+			// its target with it: nothing reads the source any more.
+			if tx, err = cancelRemovedMigration(store, *tx); err != nil {
+				return err
+			}
 		}
 		if err := b.cleanupRemovedMigrationSource(*tx); err != nil {
 			return err
@@ -3329,6 +3372,37 @@ func (b *runtimeBackend) discardRemovedMigrationSources(transactionIDs []string)
 		}
 	}
 	return nil
+}
+
+// abortedMigration reports whether tx is a migration whose target became
+// its branch but not yet independent: removing the branch cancels it.
+func abortedMigration(tx cluster.Transaction) bool {
+	if !tx.Identity.Migration || !tx.OwnershipCommitted {
+		return false
+	}
+	switch tx.State {
+	case cluster.TransactionPublished, cluster.TransactionDraining, cluster.TransactionCanceled:
+		return true
+	}
+	return false
+}
+
+// cancelRemovedMigration cancels the migration of a removed branch, which
+// its target may be advancing meanwhile. Raft refuses while the branch
+// exists.
+func cancelRemovedMigration(store cluster.TransactionCatalog, tx cluster.Transaction) (*cluster.Transaction, error) {
+	for tx.State != cluster.TransactionCanceled && tx.State != cluster.TransactionIndependent {
+		canceled, err := store.Advance(tx.Identity.TransactionID, tx.Revision, cluster.TransactionCanceled, "", time.Now())
+		if err == nil {
+			return canceled, nil
+		}
+		current, loadErr := store.Load(tx.Identity.TransactionID)
+		if loadErr != nil || current.Revision == tx.Revision {
+			return nil, fmt.Errorf("canceling the migration %q of a removed branch: %w", tx.Identity.TransactionID, errors.Join(err, loadErr))
+		}
+		tx = *current
+	}
+	return &tx, nil
 }
 
 // reconcileRemovedMigrationSources resumes the rm postflight after a daemon
@@ -3351,15 +3425,29 @@ func (b *runtimeBackend) reconcileRemovedMigrationSources() error {
 	if err != nil {
 		return err
 	}
+	var records []cluster.PlacementRecord
 	var ids []string
 	for _, tx := range transactions {
-		if !tx.Identity.Migration || tx.State != cluster.TransactionIndependent || tx.Identity.SourceNodeID != b.nodeID {
+		if !tx.Identity.Migration || (tx.State != cluster.TransactionIndependent && !abortedMigration(tx)) || tx.Identity.SourceNodeID != b.nodeID {
 			continue
 		}
 		if _, err := placements.Lookup(tx.Identity.SourceContainer, tx.Identity.SourceBranch); err == nil {
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
+		}
+		if tx.State != cluster.TransactionIndependent {
+			// A renamed branch keeps the migration that moved it.
+			if records == nil {
+				if records, err = placements.List(); err != nil {
+					return err
+				}
+			}
+			if slices.ContainsFunc(records, func(record cluster.PlacementRecord) bool {
+				return record.OperationID == tx.Identity.TransactionID || record.LastOperationID == tx.Identity.TransactionID
+			}) {
+				continue
+			}
 		}
 		ids = append(ids, tx.Identity.TransactionID)
 	}
