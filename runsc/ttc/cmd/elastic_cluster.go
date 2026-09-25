@@ -3372,10 +3372,20 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 			unlockLifecycle()
 			b.distributedSource.lockSourceFamily(containerID)()
 		}
+		family := ttcbundle.ContainerInfo{ID: containerID}
+		if info, err := b.containerStore().LoadRuntimeContainer(containerID); err == nil {
+			family = info
+		}
 		if !sourceReleased {
-			_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
-			relay.Close()
-			if err := b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID)); err != nil {
+			// Releasing the transfer's graph references retries for as long
+			// as the shared-reference coordinator is in transition, seconds
+			// at times; other commands on this node go on meanwhile, except
+			// on its family.
+			if err := b.withoutLifecycleLock(family, longOperation{branch: branchID, state: "migrating"}, func() error {
+				_, _ = b.command("timetravel", containerID, "distributed-complete", transactionID)
+				relay.Close()
+				return b.releaseDistributedGraphReferences(graphTransferReferenceOperation(transactionID))
+			}); err != nil {
 				unlockSource()
 				unlockLifecycle()
 				if lastWarning.IsZero() || time.Since(lastWarning) >= 30*time.Second {
@@ -3398,10 +3408,6 @@ func (b *runtimeBackend) monitorSparseMigrationCleanup(peer *cluster.Client, con
 		// Releasing the source materializes what it has yet to fetch and
 		// publishes its memory, which takes time in proportion to it; other
 		// commands on this node go on meanwhile, except on its family.
-		family := ttcbundle.ContainerInfo{ID: containerID}
-		if info, err := b.containerStore().LoadRuntimeContainer(containerID); err == nil {
-			family = info
-		}
 		releaseErr := b.withoutLifecycleLock(family, longOperation{branch: branchID, state: "migrating"}, func() error {
 			if discard {
 				return b.releaseMigratedSourceRuntimeDiscard(containerID, branchID)
