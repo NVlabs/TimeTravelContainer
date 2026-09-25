@@ -1493,8 +1493,8 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 
 	minUnloaded := uint64(math.MaxUint64)
 	pages.mu.Lock()
-	for _, item := range attached {
-		amfl.unloaded.InsertRange(item.load.Target, aplUnloadedInfo{off: item.load.StreamOffset, logicalChunk: item.chunk})
+	for index, item := range attached {
+		amfl.unloaded.InsertRange(item.load.Target, aplUnloadedInfo{off: item.load.StreamOffset, logicalChunk: item.chunk, unit: uint64(index) + 1})
 		if item.load.Target.Start < minUnloaded {
 			minUnloaded = item.load.Target.Start
 		}

@@ -1002,6 +1002,46 @@ func TestSparseChunkDemandLoadsWholeResidencyUnit(t *testing.T) {
 	}
 }
 
+// Residency units a sparse load lays out one after another, in the MemoryFile
+// as in the stream, stay separate: a demand for a page of one loads that one.
+func TestSparseChunkDemandLoadsOnlyItsUnitOfContiguousUnits(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, 2*pagesPerChunk)
+	target, targetFR := newRemoteTestMemoryFile(t, 2*pagesPerChunk)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*31 + 9)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	reader := NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	units := []RemoteLoadRange{
+		{Target: memmap.FileRange{Start: targetFR.Start, End: targetFR.Start + SparseChunkBytes}, StreamOffset: 0},
+		{Target: memmap.FileRange{Start: targetFR.Start + SparseChunkBytes, End: targetFR.End}, StreamOffset: SparseChunkBytes},
+	}
+	if err := target.AttachSparseChunkPageLoad(pages, units, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	page := memmap.FileRange{Start: targetFR.Start + 5*hostarch.PageSize, End: targetFR.Start + 6*hostarch.PageSize}
+	if _, err := target.MapInternal(page, hostarch.Read); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != SparseChunkBytes {
+		t.Fatalf("a demand for one page of the first unit loaded %d bytes, want %d: %+v", stats.BytesLoaded, SparseChunkBytes, stats)
+	}
+	pages.Cancel()
+	_ = pages.Wait()
+}
+
 func TestRemoteSnapshotOutstandingStreamRanges(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 6)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
