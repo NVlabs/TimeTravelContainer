@@ -512,9 +512,13 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 		endStage()
 		stageEnded := time.Now()
 
+		// Stage timings are wall-clock timestamps, which the host may slew
+		// relative to the monotonic clock that measures these bounds: macOS
+		// slews only its wall clock.
+		const clockSlew = time.Millisecond
 		expectedTimings[stage] = struct{ min, max time.Duration }{
-			min: bodyEnded.Sub(bodyStarted),
-			max: stageEnded.Sub(stageStarted),
+			min: bodyEnded.Sub(bodyStarted) - clockSlew,
+			max: stageEnded.Sub(stageStarted) + clockSlew,
 		}
 	}
 	checkStage := func(got *pb.StageTiming, want InitStage) {
