@@ -360,130 +360,118 @@ func (fd *FileDescription) ProcessSubmissions(t *kernel.Task, toSubmit uint32, m
 
 	// The rest of this function is a critical section with respect to
 	// concurrent callers.
+
+	if err := fd.mapSharedBuffers(); err != nil {
+		return -1, err
+	}
+	defer fd.unmapSharedBuffers()
 	fd.remap = false
 
+	var err error
+	var sqe linux.IOUringSqe
+
+	sqOff := linux.PreComputedIOSqRingOffsets()
+	cqOff := linux.PreComputedIOCqRingOffsets()
+	sqArraySize := sqe.SizeBytes() * int(fd.ioRings.SqRingEntries)
+	cqArraySize := (*linux.IOUringCqe)(nil).SizeBytes() * int(fd.ioRings.CqRingEntries)
+
+	// Fetch all buffers initially.
+	fetchRB := true
+	fetchSQA := true
+	fetchCQA := true
+
+	var view, sqaView, cqaView []byte
 	submitted := uint32(0)
+
 	for toSubmit > submitted {
 		// This loop can take a long time to process, so periodically check for
 		// interrupts. This also pets the watchdog.
 		if t.Interrupted() {
 			return -1, linuxerr.EINTR
 		}
-		sqe, ok, err := fd.nextSubmission()
+
+		if fetchRB {
+			view, err = fd.ioRingsBuf.view(fd.ioRings.SizeBytes())
+			if err != nil {
+				return -1, err
+			}
+		}
+
+		// Note: The kernel uses sqHead as a cursor and writes cqTail. Userspace
+		// uses cqHead as a cursor and writes sqTail.
+
+		sqHeadPtr := atomicUint32AtOffset(view, int(sqOff.Head))
+		sqTailPtr := atomicUint32AtOffset(view, int(sqOff.Tail))
+		cqHeadPtr := atomicUint32AtOffset(view, int(cqOff.Head))
+		cqTailPtr := atomicUint32AtOffset(view, int(cqOff.Tail))
+		overflowPtr := atomicUint32AtOffset(view, int(cqOff.Overflow))
+
+		// Load the pointers once, so we work with a stable value. Particularly,
+		// userspace can update the SQ tail at any time.
+		sqHead := sqHeadPtr.Load()
+		sqTail := sqTailPtr.Load()
+
+		// Is the submission queue is empty?
+		if sqHead == sqTail {
+			return int(submitted), nil
+		}
+
+		// We have at least one pending sqe, unmarshal the first from the
+		// submission queue.
+		if fetchSQA {
+			sqaView, err = fd.sqesBuf.view(sqArraySize)
+			if err != nil {
+				return -1, err
+			}
+		}
+		sqaOff := int(sqHead&fd.ioRings.SqRingMask) * sqe.SizeBytes()
+		sqe.UnmarshalUnsafe(sqaView[sqaOff : sqaOff+sqe.SizeBytes()])
+		fetchSQA = fd.sqesBuf.drop()
+
+		// Dispatch request from unmarshalled entry.
+		cqe := fd.ProcessSubmission(t, &sqe, flags)
+
+		// Advance sq head.
+		sqHeadPtr.Add(1)
+
+		// Load once so we have stable values. Particularly, userspace can
+		// update the CQ head at any time.
+		cqHead := cqHeadPtr.Load()
+		cqTail := cqTailPtr.Load()
+
+		// Marshal response to completion queue.
+		if (cqTail - cqHead) >= fd.ioRings.CqRingEntries {
+			// CQ ring full.
+			fd.ioRings.CqOverflow++
+			overflowPtr.Store(fd.ioRings.CqOverflow)
+		} else {
+			// Have room in CQ, marshal CQE.
+			if fetchCQA {
+				cqaView, err = fd.cqesBuf.view(cqArraySize)
+				if err != nil {
+					return -1, err
+				}
+			}
+			cqaOff := int(cqTail&fd.ioRings.CqRingMask) * cqe.SizeBytes()
+			cqe.MarshalUnsafe(cqaView[cqaOff : cqaOff+cqe.SizeBytes()])
+			fetchCQA, err = fd.cqesBuf.writebackWindow(cqaOff, cqe.SizeBytes())
+			if err != nil {
+				return -1, err
+			}
+
+			// Advance cq tail.
+			cqTailPtr.Add(1)
+		}
+
+		fetchRB, err = fd.ioRingsBuf.writeback(fd.ioRings.SizeBytes())
 		if err != nil {
 			return -1, err
 		}
-		if !ok {
-			return int(submitted), nil
-		}
-		// Dispatch request from unmarshalled entry. The rings are mapped only
-		// while they are accessed, not while the request runs: it may map
-		// memory itself, and a goroutine that holds a mapping lease must not
-		// wait for another, since new leases queue behind operations that
-		// wait for the held ones.
-		cqe := fd.ProcessSubmission(t, &sqe, flags)
-		if err := fd.completeSubmission(cqe); err != nil {
-			return -1, err
-		}
+
 		submitted++
 	}
 
 	return int(submitted), nil
-}
-
-// nextSubmission returns the entry at the head of the submission queue, if
-// the queue isn't empty.
-//
-// Preconditions: The caller is the active task of fd.running.
-func (fd *FileDescription) nextSubmission() (linux.IOUringSqe, bool, error) {
-	var sqe linux.IOUringSqe
-	if err := fd.mapSharedBuffers(); err != nil {
-		return sqe, false, err
-	}
-	defer fd.unmapSharedBuffers()
-	view, err := fd.ioRingsBuf.view(fd.ioRings.SizeBytes())
-	if err != nil {
-		return sqe, false, err
-	}
-	defer fd.ioRingsBuf.drop()
-
-	// Note: The kernel uses sqHead as a cursor and writes cqTail. Userspace
-	// uses cqHead as a cursor and writes sqTail.
-	//
-	// Load the pointers once, so we work with a stable value. Particularly,
-	// userspace can update the SQ tail at any time.
-	sqOff := linux.PreComputedIOSqRingOffsets()
-	sqHead := atomicUint32AtOffset(view, int(sqOff.Head)).Load()
-	sqTail := atomicUint32AtOffset(view, int(sqOff.Tail)).Load()
-
-	// Is the submission queue is empty?
-	if sqHead == sqTail {
-		return sqe, false, nil
-	}
-
-	// We have at least one pending sqe, unmarshal the first from the
-	// submission queue.
-	sqaView, err := fd.sqesBuf.view(sqe.SizeBytes() * int(fd.ioRings.SqRingEntries))
-	if err != nil {
-		return sqe, false, err
-	}
-	sqaOff := int(sqHead&fd.ioRings.SqRingMask) * sqe.SizeBytes()
-	sqe.UnmarshalUnsafe(sqaView[sqaOff : sqaOff+sqe.SizeBytes()])
-	fd.sqesBuf.drop()
-	return sqe, true, nil
-}
-
-// completeSubmission consumes the entry at the head of the submission queue,
-// which nextSubmission returned, and posts cqe to the completion queue.
-//
-// Preconditions: The caller is the active task of fd.running.
-func (fd *FileDescription) completeSubmission(cqe *linux.IOUringCqe) error {
-	if err := fd.mapSharedBuffers(); err != nil {
-		return err
-	}
-	defer fd.unmapSharedBuffers()
-	view, err := fd.ioRingsBuf.view(fd.ioRings.SizeBytes())
-	if err != nil {
-		return err
-	}
-	sqOff := linux.PreComputedIOSqRingOffsets()
-	cqOff := linux.PreComputedIOCqRingOffsets()
-	cqHeadPtr := atomicUint32AtOffset(view, int(cqOff.Head))
-	cqTailPtr := atomicUint32AtOffset(view, int(cqOff.Tail))
-
-	// Advance sq head.
-	atomicUint32AtOffset(view, int(sqOff.Head)).Add(1)
-
-	// Load once so we have stable values. Particularly, userspace can
-	// update the CQ head at any time.
-	cqHead := cqHeadPtr.Load()
-	cqTail := cqTailPtr.Load()
-
-	// Marshal response to completion queue.
-	if (cqTail - cqHead) >= fd.ioRings.CqRingEntries {
-		// CQ ring full.
-		fd.ioRings.CqOverflow++
-		atomicUint32AtOffset(view, int(cqOff.Overflow)).Store(fd.ioRings.CqOverflow)
-	} else {
-		// Have room in CQ, marshal CQE.
-		cqaView, err := fd.cqesBuf.view(cqe.SizeBytes() * int(fd.ioRings.CqRingEntries))
-		if err != nil {
-			fd.ioRingsBuf.drop()
-			return err
-		}
-		cqaOff := int(cqTail&fd.ioRings.CqRingMask) * cqe.SizeBytes()
-		cqe.MarshalUnsafe(cqaView[cqaOff : cqaOff+cqe.SizeBytes()])
-		if _, err := fd.cqesBuf.writebackWindow(cqaOff, cqe.SizeBytes()); err != nil {
-			fd.ioRingsBuf.drop()
-			return err
-		}
-
-		// Advance cq tail.
-		cqTailPtr.Add(1)
-	}
-
-	_, err = fd.ioRingsBuf.writeback(fd.ioRings.SizeBytes())
-	return err
 }
 
 // ProcessSubmission processes a single submission request.
