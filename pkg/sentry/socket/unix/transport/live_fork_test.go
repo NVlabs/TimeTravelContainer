@@ -16,13 +16,42 @@ package transport
 
 import (
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 type liveForkTestIDProvider struct {
 	next uint64
+}
+
+func TestLocalShutdownNotifiesHangupWaiters(t *testing.T) {
+	ctx := context.Background()
+	a, b := NewPair(ctx, linux.SOCK_STREAM, &liveForkTestIDProvider{})
+	defer a.Close(ctx)
+	defer b.Close(ctx)
+
+	mask := waiter.EventHUp | waiter.EventRdHUp
+	entry, ch := waiter.NewChannelEntry(mask)
+	if err := a.EventRegister(&entry); err != nil {
+		t.Fatalf("EventRegister: %v", err)
+	}
+	defer a.EventUnregister(&entry)
+
+	if err := a.Shutdown(tcpip.ShutdownRead | tcpip.ShutdownWrite); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("local shutdown did not notify hangup waiter")
+	}
+	if got := a.Readiness(mask); got != mask {
+		t.Fatalf("Readiness after SHUT_RDWR: got %#x, want %#x", got, mask)
+	}
 }
 
 func (p *liveForkTestIDProvider) UniqueID() uint64 {

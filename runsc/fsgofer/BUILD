@@ -41,6 +41,17 @@ go_test(
 )
 
 go_test(
+    name = "lend_test",
+    size = "small",
+    srcs = ["lend_test.go"],
+    library = ":fsgofer",
+    deps = [
+        "//pkg/abi/linux",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
     name = "virtual_ownership_test",
     size = "small",
     srcs = ["virtual_ownership_test.go"],

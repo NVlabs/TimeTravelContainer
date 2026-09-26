@@ -18,15 +18,220 @@ import (
 	"errors"
 	"fmt"
 	stdfs "io/fs"
+	"os"
+	"syscall"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	gerrors "gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
+
+// diskVolumeError translates repository implementation failures at the guest
+// syscall boundary. Linux errors retain their exact errno; graph/WAL
+// invariants and other implementation errors are logged and become EIO. An
+// arbitrary Go error must never escape into kernel.ExtractErrno, which treats
+// unknown syscall errors as a Sentry invariant violation and panics.
+func diskVolumeError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var linuxError *gerrors.Error
+	if errors.As(err, &linuxError) {
+		if linuxError == linuxerr.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
+		return linuxError
+	}
+	var syscallError syscall.Errno
+	if errors.As(err, &syscallError) {
+		if syscallError == syscall.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
+		return syscallError
+	}
+	var unixError unix.Errno
+	if errors.As(err, &unixError) {
+		if unixError == unix.EIO {
+			reportDiskVolumeFailure(op, err)
+		}
+		return unixError
+	}
+	switch {
+	case errors.Is(err, stdfs.ErrNotExist):
+		return linuxerr.ENOENT
+	case errors.Is(err, stdfs.ErrExist):
+		return linuxerr.EEXIST
+	case errors.Is(err, stdfs.ErrPermission):
+		return linuxerr.EACCES
+	case errors.Is(err, stdfs.ErrInvalid):
+		return linuxerr.EINVAL
+	}
+	reportDiskVolumeFailure(op, err)
+	return linuxerr.EIO
+}
+
+// reportDiskVolumeFailure preserves the full failing operation even when the
+// underlying implementation already returned EIO. Sentries normally discard
+// informational logs, but preserve fd 2 in the daemon-local panic log. An EIO
+// without its repository cause is otherwise indistinguishable from a host
+// storage failure at the guest syscall boundary.
+func reportDiskVolumeFailure(op string, err error) {
+	log.Warningf("TTC persistent filesystem %s failed: %v", op, err)
+	fmt.Fprintf(os.Stderr, "TTC persistent filesystem %s failed: %v\n", op, err)
+}
+
+// registerDiskMaterializationHook keeps the guest's cached host descriptors
+// and mappings coherent when a remotely inherited placeholder is atomically
+// replaced by its authoritative whole-file contents.
+func (fs *filesystem) registerDiskMaterializationHook() {
+	if fs.diskVolume == nil || fs.diskVolume.Repository == nil {
+		return
+	}
+	if fs.unregisterMaterializationHook != nil {
+		fs.unregisterMaterializationHook()
+	}
+	fs.unregisterMaterializationHook = fs.diskVolume.Repository.RegisterMaterializationHook(fs.invalidateMaterializedObject)
+}
+
+// markDiskForkFile records that file owns runtime-local cache state which must
+// be invalidated before the next repository seal. Entries are cleared by
+// PrepareSave, so repeated forks cost only the files touched since the prior
+// fork rather than every instantiated file in the namespace.
+func (fs *filesystem) markDiskForkFile(file *regularFile) {
+	if fs.diskVolume == nil {
+		return
+	}
+	fs.liveForkMu.Lock()
+	if fs.diskForkFiles == nil {
+		fs.diskForkFiles = make(map[*regularFile]struct{})
+	}
+	fs.diskForkFiles[file] = struct{}{}
+	fs.liveForkMu.Unlock()
+}
+
+func updateDiskCacheIndexLocked(index *map[string]map[*regularFile]struct{}, file *regularFile, oldObject, newObject string) {
+	if oldObject == newObject {
+		return
+	}
+	if oldObject != "" {
+		files := (*index)[oldObject]
+		delete(files, file)
+		if len(files) == 0 {
+			delete(*index, oldObject)
+		}
+	}
+	if newObject != "" {
+		if *index == nil {
+			*index = make(map[string]map[*regularFile]struct{})
+		}
+		files := (*index)[newObject]
+		if files == nil {
+			files = make(map[*regularFile]struct{})
+			(*index)[newObject] = files
+		}
+		files[file] = struct{}{}
+	}
+}
+
+// setDiskMmapObjectLocked updates the mmap cache identity and its exact
+// materialization index. rf.mapsMu must be held.
+func (rf *regularFile) setDiskMmapObjectLocked(object string) {
+	fs := rf.inode.fs
+	if fs != nil && fs.diskVolume != nil {
+		fs.liveForkMu.Lock()
+		updateDiskCacheIndexLocked(&fs.diskMmapObjectFiles, rf, rf.diskObject, object)
+		fs.liveForkMu.Unlock()
+	}
+	rf.diskObject = object
+}
+
+// setDiskIOObjectLocked updates the read/write cache identity and its exact
+// materialization index. rf.diskIOMu must be held.
+func (rf *regularFile) setDiskIOObjectLocked(object string) {
+	fs := rf.inode.fs
+	if fs != nil && fs.diskVolume != nil {
+		fs.liveForkMu.Lock()
+		updateDiskCacheIndexLocked(&fs.diskIOObjectFiles, rf, rf.diskIOObject, object)
+		fs.liveForkMu.Unlock()
+	}
+	rf.diskIOObject = object
+}
+
+func (fs *filesystem) markDiskInodeDirty(node *inode) {
+	fs.diskDirtyMu.Lock()
+	node.diskMetadataGeneration.Add(1)
+	if fs.diskDirtyInodes == nil {
+		fs.diskDirtyInodes = make(map[*inode]struct{})
+	}
+	fs.diskDirtyInodes[node] = struct{}{}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) finishDiskInodeMetadata(node *inode, generation uint64) {
+	fs.diskDirtyMu.Lock()
+	if node.diskMetadataGeneration.CompareAndSwap(generation, 0) {
+		delete(fs.diskDirtyInodes, node)
+	}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) markDiskFileDirty(file *regularFile) {
+	fs.diskDirtyMu.Lock()
+	file.diskMetadataDirty.Add(1)
+	if fs.diskDirtyFiles == nil {
+		fs.diskDirtyFiles = make(map[*regularFile]struct{})
+	}
+	fs.diskDirtyFiles[file] = struct{}{}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) finishDiskFileMetadata(file *regularFile, generation uint64) {
+	fs.diskDirtyMu.Lock()
+	if file.diskMetadataDirty.CompareAndSwap(generation, 0) {
+		delete(fs.diskDirtyFiles, file)
+	}
+	fs.diskDirtyMu.Unlock()
+}
+
+func (fs *filesystem) invalidateMaterializedObject(object string) {
+	fs.liveForkMu.Lock()
+	selected := make(map[*regularFile]struct{})
+	for file := range fs.diskMmapObjectFiles[object] {
+		selected[file] = struct{}{}
+	}
+	for file := range fs.diskIOObjectFiles[object] {
+		selected[file] = struct{}{}
+	}
+	files := make([]*regularFile, 0, len(selected))
+	for file := range selected {
+		files = append(files, file)
+	}
+	fs.liveForkMu.Unlock()
+	for _, file := range files {
+		file.mapsMu.Lock()
+		file.diskIOMu.Lock()
+		if file.diskIOObject == object {
+			file.invalidateDiskIOLocked()
+		}
+		if file.diskObject == object {
+			// Preserve already-private application pages while forcing clean
+			// translations to fault against the newly installed backing inode.
+			file.mappings.InvalidateAll(memmap.InvalidateOpts{})
+			file.diskMmap.ResetFD()
+			file.setDiskMmapObjectLocked("")
+		}
+		file.diskIOMu.Unlock()
+		file.mapsMu.Unlock()
+	}
+}
 
 func (fs *filesystem) loadDiskVolume(ctx context.Context) (*dentry, error) {
 	if fs.diskVolume == nil || fs.diskVolume.Repository == nil {
@@ -129,11 +334,11 @@ func (fs *filesystem) diskChildLocked(dir *directory, name string) (*dentry, err
 		if errors.Is(err, stdfs.ErrNotExist) {
 			return nil, linuxerr.ENOENT
 		}
-		return nil, err
+		return nil, diskVolumeError("lookup", err)
 	}
 	childInode, err := fs.loadDiskInode(ino, dir)
 	if err != nil {
-		return nil, fmt.Errorf("loading %q: %w", name, err)
+		return nil, diskVolumeError("load lookup inode", fmt.Errorf("loading %q: %w", name, err))
 	}
 	var child *dentry
 	if childDir, ok := childInode.impl.(*directory); ok {
@@ -160,7 +365,7 @@ func (fs *filesystem) diskDirectoryEmptyLocked(dir *directory) (bool, error) {
 		return len(dir.childMap) == 0, nil
 	}
 	entries, err := fs.diskVolume.Repository.ListDirectory(fs.diskVolume.Branch, dir.inode.ino)
-	return len(entries) == 0, err
+	return len(entries) == 0, diskVolumeError("test directory emptiness", err)
 }
 
 func pageRoundedDiskBytes(size uint64) uint64 {
@@ -216,9 +421,13 @@ func (fs *filesystem) applyDiskMetadata(node *inode, meta ttcvolume.Inode) {
 
 func (fs *filesystem) rebuildDiskInodeCache() {
 	inodes := make(map[uint64]*inode)
+	saveDentries := make(map[*dentry]struct{})
 	var visit func(*dentry)
 	visit = func(d *dentry) {
 		inodes[d.inode.ino] = d.inode
+		if d != fs.root && (d.diskSaveRefs.Load() != 0 || d.diskSavePersistent.Load() != 0) {
+			saveDentries[d] = struct{}{}
+		}
 		if dir, ok := d.inode.impl.(*directory); ok {
 			for _, child := range dir.childMap {
 				visit(child)
@@ -229,11 +438,21 @@ func (fs *filesystem) rebuildDiskInodeCache() {
 	fs.liveForkMu.Lock()
 	for file := range fs.liveForkFiles {
 		inodes[file.inode.ino] = &file.inode
+		// A restored regular file is present in the state graph only because it
+		// carries runtime state. Conservatively invalidate it at the next seal;
+		// subsequent seals use the touched-since-last-seal registry normally.
+		if fs.diskForkFiles == nil {
+			fs.diskForkFiles = make(map[*regularFile]struct{})
+		}
+		fs.diskForkFiles[file] = struct{}{}
 	}
 	fs.liveForkMu.Unlock()
 	fs.diskInodesMu.Lock()
 	fs.diskInodes = inodes
 	fs.diskInodesMu.Unlock()
+	fs.diskSaveMu.Lock()
+	fs.diskSaveDentries = saveDentries
+	fs.diskSaveMu.Unlock()
 }
 
 func (fs *filesystem) unregisterDiskInode(node *inode) {
@@ -245,6 +464,12 @@ func (fs *filesystem) unregisterDiskInode(node *inode) {
 		delete(fs.diskInodes, node.ino)
 	}
 	fs.diskInodesMu.Unlock()
+	fs.diskDirtyMu.Lock()
+	delete(fs.diskDirtyInodes, node)
+	if file, ok := node.impl.(*regularFile); ok {
+		delete(fs.diskDirtyFiles, file)
+	}
+	fs.diskDirtyMu.Unlock()
 }
 
 // pruneDiskNamespaceForSave makes state serialization proportional to live
@@ -252,44 +477,49 @@ func (fs *filesystem) unregisterDiskInode(node *inode) {
 // process. The complete source cache is restored by
 // restoreDiskNamespaceAfterSave; the clone resolves omitted entries from its
 // already-forked repository branch.
-func (fs *filesystem) pruneDiskNamespaceForSave() {
+func (fs *filesystem) pruneDiskNamespaceForSave() int {
 	if fs.diskVolume == nil || fs.diskSaveChildren != nil {
-		return
+		return 0
 	}
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	root, ok := fs.root.inode.impl.(*directory)
 	if !ok {
-		// A TTC :copy mount may have a regular file as its filesystem root.
-		// Such a filesystem has no directory namespace cache to prune.
-		return
+		// A ttcvol may expose one regular file as its mount root. Such a
+		// filesystem has no cached directory namespace to prune; the root is
+		// already retained by the mount itself.
+		return 0
 	}
-	fs.diskSaveChildren = make(map[*directory]map[string]*dentry)
-	var collect func(*directory)
-	collect = func(dir *directory) {
-		original := dir.childMap
-		fs.diskSaveChildren[dir] = original
-		for _, child := range original {
-			if childDir, ok := child.inode.impl.(*directory); ok {
-				collect(childDir)
+	fs.diskSaveMu.Lock()
+	candidates := make([]*dentry, 0, len(fs.diskSaveDentries))
+	for d := range fs.diskSaveDentries {
+		candidates = append(candidates, d)
+	}
+	fs.diskSaveMu.Unlock()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	filtered := map[*directory]map[string]*dentry{root: nil}
+	for _, candidate := range candidates {
+		child := candidate
+		for child != fs.root {
+			parent := child.parent.Load()
+			if parent == nil {
+				break
 			}
-		}
-	}
-	collect(root)
-	filtered := make(map[*directory]map[string]*dentry, len(fs.diskSaveChildren))
-	for dir, original := range fs.diskSaveChildren {
-		kept := make(map[string]*dentry)
-		for name, child := range original {
-			if diskDentryNeedsSave(child) {
-				kept[name] = child
+			parentDir, ok := parent.inode.impl.(*directory)
+			if !ok || parentDir.childMap[child.name] != child {
+				break
 			}
+			children := filtered[parentDir]
+			if children == nil {
+				children = make(map[string]*dentry)
+				filtered[parentDir] = children
+			}
+			children[child.name] = child
+			child = parent
 		}
-		if len(kept) == 0 {
-			kept = nil
-		}
-		filtered[dir] = kept
 	}
+	fs.diskSaveChildren = make(map[*directory]map[string]*dentry, len(filtered))
 	for dir, kept := range filtered {
+		fs.diskSaveChildren[dir] = dir.childMap
 		dir.childMap = kept
 		dir.childList.Reset()
 		for _, child := range kept {
@@ -298,6 +528,7 @@ func (fs *filesystem) pruneDiskNamespaceForSave() {
 			dir.childList.PushBack(child)
 		}
 	}
+	return len(candidates)
 }
 
 func (fs *filesystem) restoreDiskNamespaceAfterSave() {
@@ -362,13 +593,21 @@ func (fs *filesystem) persistDiskMetadata(inode *inode) error {
 	}
 	generation := inode.diskMetadataGeneration.Load()
 	if err := fs.diskVolume.Repository.UpdateMetadata(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
-		return err
+		return diskVolumeError("update inode metadata", err)
 	}
-	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	fs.finishDiskInodeMetadata(inode, generation)
 	return nil
 }
 
 func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
+	return diskVolumeError("publish written inode metadata", fs.persistDiskWriteMetadataRaw(inode))
+}
+
+// persistDiskWriteMetadataRaw is the control-plane form of
+// persistDiskWriteMetadata. Internal lifecycle operations must preserve the
+// repository's diagnostic instead of translating it to a guest errno; syscall
+// callers use persistDiskWriteMetadata above.
+func (fs *filesystem) persistDiskWriteMetadataRaw(inode *inode) error {
 	if fs.diskVolume == nil {
 		return nil
 	}
@@ -376,7 +615,7 @@ func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 	if err := fs.diskVolume.Repository.UpdateAfterWrite(fs.diskVolume.Branch, fs.diskMetadata(inode)); err != nil {
 		return err
 	}
-	inode.diskMetadataGeneration.CompareAndSwap(generation, 0)
+	fs.finishDiskInodeMetadata(inode, generation)
 	return nil
 }
 
@@ -384,24 +623,30 @@ func (fs *filesystem) persistDiskWriteMetadata(inode *inode) error {
 // writes. liveForkFiles contains every live regular file, including unlinked
 // files that remain reachable through an open description.
 func (fs *filesystem) flushDiskWriteMetadata() error {
+	return diskVolumeError("flush write metadata", fs.flushDiskWriteMetadataRaw())
+}
+
+// flushDiskWriteMetadataRaw is used by lifecycle operations, where preserving
+// the complete repository diagnostic is more useful than a guest errno.
+func (fs *filesystem) flushDiskWriteMetadataRaw() error {
 	if fs.diskVolume == nil {
 		return nil
 	}
-	fs.liveForkMu.Lock()
-	for file := range fs.liveForkFiles {
-		if err := file.flushDiskMetadata(); err != nil {
-			fs.liveForkMu.Unlock()
+	fs.diskDirtyMu.Lock()
+	files := make([]*regularFile, 0, len(fs.diskDirtyFiles))
+	for file := range fs.diskDirtyFiles {
+		files = append(files, file)
+	}
+	inodes := make([]*inode, 0, len(fs.diskDirtyInodes))
+	for node := range fs.diskDirtyInodes {
+		inodes = append(inodes, node)
+	}
+	fs.diskDirtyMu.Unlock()
+	for _, file := range files {
+		if err := file.flushDiskMetadataRaw(); err != nil {
 			return err
 		}
 	}
-	fs.liveForkMu.Unlock()
-
-	fs.diskInodesMu.Lock()
-	inodes := make([]*inode, 0, len(fs.diskInodes))
-	for _, node := range fs.diskInodes {
-		inodes = append(inodes, node)
-	}
-	fs.diskInodesMu.Unlock()
 	type pendingMetadata struct {
 		inode      *inode
 		generation uint64
@@ -427,10 +672,33 @@ func (fs *filesystem) flushDiskWriteMetadata() error {
 		updates[idx] = pending[idx].metadata
 	}
 	if err := fs.diskVolume.Repository.UpdateMetadataBatch(fs.diskVolume.Branch, updates); err != nil {
-		return err
+		return fmt.Errorf("updating inode metadata batch: %w", err)
 	}
 	for _, update := range pending {
-		update.inode.diskMetadataGeneration.CompareAndSwap(update.generation, 0)
+		fs.finishDiskInodeMetadata(update.inode, update.generation)
+	}
+	return nil
+}
+
+// syncDiskData synchronizes the data objects represented by live regular-file
+// inodes. This includes MAP_SHARED writes, which can modify the donated host
+// mapping without passing through regularFileFD.PWrite. Namespace-created
+// objects that have already left the runtime inode cache remain covered by the
+// repository's dirty-object set.
+func (fs *filesystem) syncDiskData() error {
+	if fs.diskVolume == nil {
+		return nil
+	}
+	fs.liveForkMu.Lock()
+	files := make([]*regularFile, 0, len(fs.liveForkFiles))
+	for file := range fs.liveForkFiles {
+		files = append(files, file)
+	}
+	fs.liveForkMu.Unlock()
+	for _, file := range files {
+		if err := fs.diskVolume.Repository.SyncData(fs.diskVolume.Branch, file.inode.ino, false); err != nil {
+			return diskVolumeError("sync regular-file data", err)
+		}
 	}
 	return nil
 }

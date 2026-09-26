@@ -47,34 +47,6 @@ type directory struct {
 	childList dentryList
 }
 
-func diskDentryNeedsSave(d *dentry) bool {
-	if d.inode.watches.Size() != 0 {
-		return true
-	}
-	switch impl := d.inode.impl.(type) {
-	case *directory:
-		// Each instantiated child directory holds one lifetime reference on
-		// this directory. Discount those references when deciding whether an
-		// external object (cwd, open FD, mount, etc.) retains this dentry.
-		baseline := int64(1)
-		for _, child := range impl.childMap {
-			if child.inode.isDir() {
-				baseline++
-			}
-			if diskDentryNeedsSave(child) {
-				return true
-			}
-		}
-		return d.inode.refs.ReadRefs() > baseline
-	case *socketFile:
-		// A bound pathname socket's endpoint is runtime state even when no FD
-		// currently refers to the dentry.
-		return impl.ep != nil || d.inode.refs.ReadRefs() > 1
-	default:
-		return d.inode.refs.ReadRefs() > 1
-	}
-}
-
 // newDirectory creates a new directory.
 //
 // If parentDir is not nil, certain fields (such as setgid and default ACL) will be inherited
@@ -101,6 +73,9 @@ func (dir *directory) insertChildLocked(child *dentry, name string) {
 	}
 	dir.childMap[name] = child
 	dir.numChildren.Add(1)
+	if socket, ok := child.inode.impl.(*socketFile); ok && socket.ep != nil {
+		child.setDiskSavePersistent(diskSavePersistentSocket)
+	}
 	dir.iterMu.Lock()
 	dir.childList.PushBack(child)
 	dir.iterMu.Unlock()
@@ -110,6 +85,7 @@ func (dir *directory) insertChildLocked(child *dentry, name string) {
 func (dir *directory) removeChildLocked(child *dentry) {
 	delete(dir.childMap, child.name)
 	dir.numChildren.Add(-1)
+	child.clearDiskSavePersistent(diskSavePersistentSocket)
 	dir.iterMu.Lock()
 	dir.childList.Remove(child)
 	dir.iterMu.Unlock()
@@ -187,7 +163,7 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 	if fs.diskVolume != nil {
 		items, err := fs.diskVolume.Repository.ListDirectoryItems(fs.diskVolume.Branch, dir.inode.ino)
 		if err != nil {
-			return err
+			return diskVolumeError("list directory", err)
 		}
 		start := fd.off - 2
 		if start < 0 {

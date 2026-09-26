@@ -200,6 +200,8 @@ func appendArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
 					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_CPUID), seccomp.EqualTo(0)},
 					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_FS)},
 					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_GET_FS)},
+					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_SET_GS)},
+					seccomp.PerArg{seccomp.EqualTo(linux.ARCH_GET_GS)},
 				},
 			}),
 			Action: seccomp.Allow,

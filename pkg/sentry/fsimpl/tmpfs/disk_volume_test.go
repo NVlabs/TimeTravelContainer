@@ -15,20 +15,103 @@
 package tmpfs
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+func TestMaterializationDoesNotLockUnrelatedFile(t *testing.T) {
+	fs := &filesystem{diskVolume: &diskVolumeState{}}
+	target := &regularFile{}
+	target.inode.fs = fs
+	target.diskMmap.SetFD(-1)
+	target.mapsMu.Lock()
+	target.setDiskMmapObjectLocked("target-object")
+	target.mapsMu.Unlock()
+
+	unrelated := &regularFile{}
+	unrelated.inode.fs = fs
+	unrelated.diskMmap.SetFD(-1)
+	unrelated.mapsMu.Lock()
+	unrelated.setDiskMmapObjectLocked("unrelated-object")
+	// Model an unrelated write that holds mapsMu while waiting for the remote
+	// client. Materializing target-object must not wait for this file.
+	done := make(chan struct{})
+	go func() {
+		fs.invalidateMaterializedObject("target-object")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		unrelated.mapsMu.Unlock()
+		t.Fatal("materialization waited for an unrelated file cache")
+	}
+	if target.diskObject != "" {
+		unrelated.mapsMu.Unlock()
+		t.Fatalf("target cache was not invalidated: %q", target.diskObject)
+	}
+	if unrelated.diskObject != "unrelated-object" {
+		unrelated.mapsMu.Unlock()
+		t.Fatalf("unrelated cache changed: %q", unrelated.diskObject)
+	}
+	unrelated.mapsMu.Unlock()
+}
+
+func TestInstallDiskVolumeRepositoryCanonicalizesRemoteIdentity(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("restore-identity-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+
+	fs := &filesystem{diskVolume: &diskVolumeState{
+		ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: "source-node-repository"},
+	}}
+	fs.installDiskVolumeRepository(repository, "remote-child")
+	want := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
+	if got := fs.diskVolume.ResourceID; got != want {
+		t.Fatalf("installed resource ID=%q, want target-local %q", got, want)
+	}
+	if fs.diskVolume.Repository != repository || fs.diskVolume.Branch != "remote-child" {
+		t.Fatalf("installed disk volume=%+v", fs.diskVolume)
+	}
+}
+
+func TestDiskVolumeErrorNeverLeaksUnknownSyscallError(t *testing.T) {
+	if got := diskVolumeError("test invariant", errors.New("broken graph edge")); !linuxerr.Equals(linuxerr.EIO, got) {
+		t.Fatalf("generic repository error translated to %v, want EIO", got)
+	}
+	if got := diskVolumeError("test errno", linuxerr.ENOSPC); !linuxerr.Equals(linuxerr.ENOSPC, got) {
+		t.Fatalf("Linux error translated to %v, want ENOSPC", got)
+	}
+	pathErr := &os.PathError{Op: "open", Path: "object", Err: unix.EROFS}
+	if got := diskVolumeError("test path errno", pathErr); !linuxerr.Equals(linuxerr.EROFS, got) {
+		t.Fatalf("host path error translated to %v, want EROFS", got)
+	}
+	if got := diskVolumeError("test missing", os.ErrNotExist); !linuxerr.Equals(linuxerr.ENOENT, got) {
+		t.Fatalf("portable missing error translated to %v, want ENOENT", got)
+	}
+}
+
 func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -138,8 +221,70 @@ func TestDiskVolumeMmapCoWClosesStaleIOObject(t *testing.T) {
 	}
 }
 
+func TestDiskVolumeReadDataPathDoesNotTakeInodeLock(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	repository, err := manager.Create("read-lock-order-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "growing", 0644, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateRegular: %v", err)
+	}
+	want := bytes.Repeat([]byte("x"), 64<<10)
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, want, 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	fs := &filesystem{diskVolume: &diskVolumeState{Repository: repository, Branch: ttcvolume.MainBranch}}
+	file := &regularFile{}
+	file.inode.fs = fs
+	file.inode.impl = file
+	file.inode.ino = ino
+	file.inode.mode.Store(uint32(linux.S_IFREG | 0644))
+	file.inode.nlink.Store(1)
+	file.size.Store(uint64(len(want)))
+	defer file.invalidateDiskIO()
+	ctx := contexttest.Context(t)
+
+	// A growing write holds inode.mu and then takes diskIOMu. The read data
+	// path must therefore finish without inode.mu; PRead applies atime only
+	// after preadDisk has released diskIOMu. The former reverse order deadlocked
+	// a reader against the final growing write of a large file.
+	file.inode.mu.Lock()
+	type result struct {
+		data        []byte
+		n           int64
+		err         error
+		updateAtime bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		got := make([]byte, len(want))
+		n, err, updateAtime := file.preadDisk(ctx, usermem.BytesIOSequence(got), 0)
+		done <- result{data: got, n: n, err: err, updateAtime: updateAtime}
+	}()
+	select {
+	case got := <-done:
+		file.inode.mu.Unlock()
+		if got.err != nil || got.n != int64(len(want)) || !got.updateAtime {
+			t.Fatalf("preadDisk: n=%d updateAtime=%t err=%v", got.n, got.updateAtime, got.err)
+		}
+		if !bytes.Equal(got.data, want) {
+			t.Fatal("preadDisk data mismatch")
+		}
+	case <-time.After(time.Second):
+		file.inode.mu.Unlock()
+		t.Fatal("disk read data path waited for inode.mu")
+	}
+}
+
 func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +334,12 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	if !ms.invalidated {
 		t.Fatal("prepareLiveFork did not invalidate the application mapping")
 	}
+	// Filesystem PrepareSave removes the current invalidation set before it
+	// calls prepareLiveFork. Existing VMAs survive, so their next fault reaches
+	// Translate without another AddMapping call. Model that boundary here.
+	fs.liveForkMu.Lock()
+	fs.diskForkFiles = nil
+	fs.liveForkMu.Unlock()
 	if err := repository.Fork(ttcvolume.MainBranch, "child"); err != nil {
 		t.Fatalf("Fork: %v", err)
 	}
@@ -201,12 +352,18 @@ func TestPrepareLiveForkClosesDiskMmapObject(t *testing.T) {
 	if got := file.diskMmap.FD(); got < 0 {
 		t.Fatal("mmap cache did not install a new FD after fork")
 	}
+	fs.liveForkMu.Lock()
+	_, trackedAfterRefault := fs.diskForkFiles[file]
+	fs.liveForkMu.Unlock()
+	if !trackedAfterRefault {
+		t.Fatal("post-fork mmap refault was not tracked for the next lifecycle fence")
+	}
 	file.RemoveMapping(ctx, ms, ar, 0, false)
 	file.diskMmap.MappableRelease()
 }
 
 func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -285,7 +442,7 @@ func TestDiskVolumeWriteMetadataIsCoalesced(t *testing.T) {
 }
 
 func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,10 +473,10 @@ func TestDiskVolumeReapedOrphanLeavesNoSaveCache(t *testing.T) {
 	file.inode.nlink.Store(0)
 	file.inode.refs.InitRefs()
 	file.diskMmap.SetFD(-1)
-	file.diskMetadataDirty.Store(1)
-	file.inode.diskMetadataGeneration.Store(1)
 	fs.diskInodes[ino] = &file.inode
 	fs.liveForkFiles[file] = struct{}{}
+	fs.markDiskFileDirty(file)
+	fs.markDiskInodeDirty(&file.inode)
 
 	file.inode.decRef(contexttest.Context(t))
 	if _, ok := fs.diskInodes[ino]; ok {
@@ -358,15 +515,17 @@ func TestDiskNamespaceSavePrunesClosedPathsAndRestoresSource(t *testing.T) {
 	fs.root = &root.dentry
 	inactive := newFile()
 	active := newFile()
-	active.inode.incRef() // An open FD, cwd, mount, or equivalent VFS owner.
+	active.IncRef() // An open FD, cwd, mount, or equivalent VFS owner.
 	subdir := newDir()
-	subdir.inode.incRef() // Keep the directory itself live.
+	subdir.dentry.IncRef() // Keep the directory itself live.
 	root.childMap = map[string]*dentry{
 		"inactive": inactive,
 		"active":   active,
 		"subdir":   &subdir.dentry,
 	}
-	for _, child := range root.childMap {
+	for name, child := range root.childMap {
+		child.name = name
+		child.parent.Store(&root.dentry)
 		root.childList.PushBack(child)
 	}
 
@@ -393,7 +552,7 @@ func TestDiskNamespaceSaveAcceptsRegularFileRoot(t *testing.T) {
 
 	fs.pruneDiskNamespaceForSave()
 	if fs.diskSaveChildren != nil {
-		t.Fatalf("regular-file root created a directory save cache: %+v", fs.diskSaveChildren)
+		t.Fatalf("regular-file root unexpectedly created saved namespace: %+v", fs.diskSaveChildren)
 	}
 	fs.restoreDiskNamespaceAfterSave()
 }

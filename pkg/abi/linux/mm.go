@@ -137,24 +137,26 @@ const (
 )
 
 // TaskSize is the address space size.
-var TaskSize = func() uintptr {
-	pageSize := uintptr(unix.Getpagesize())
-	for _, s := range feasibleTaskSizes {
-		// mmap returns ENOMEM if addr is greater than TASK_SIZE,
-		// otherwise it returns EINVAL, because addr isn't aligned to
-		// the page size.
-		_, _, errno := unix.RawSyscall6(
-			unix.SYS_MMAP,
-			s-pageSize-1,
-			512,
-			uintptr(unix.PROT_NONE),
-			uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
-		if errno == unix.EINVAL {
-			return s
-		}
-		if errno != unix.ENOMEM {
-			panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
-		}
+var TaskSize = detectTaskSize(uintptr(unix.Getpagesize()))
+
+// taskSizeUsable tests whether s is within the caller's task address space
+// without creating or replacing a mapping. Linux reports ENOMEM when the
+// deliberately unaligned fixed address is outside TASK_SIZE and EINVAL when it
+// is inside. TTC's mmap implementation preserves the same error precedence so
+// this also works when gVisor is nested inside gVisor.
+func taskSizeUsable(s, pageSize uintptr) bool {
+	_, _, errno := unix.RawSyscall6(
+		unix.SYS_MMAP,
+		s-pageSize-1,
+		512,
+		uintptr(unix.PROT_NONE),
+		uintptr(unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_FIXED), 0, 0)
+	switch errno {
+	case unix.EINVAL:
+		return true
+	case unix.ENOMEM:
+		return false
+	default:
+		panic(fmt.Sprintf("mmap returned unexpected error: %d", errno))
 	}
-	panic("None of the address space sizes could be successfully mmaped")
-}()
+}

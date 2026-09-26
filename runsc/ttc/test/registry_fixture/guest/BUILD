@@ -6,9 +6,8 @@ package(
 )
 
 go_binary(
-    name = "guest",
-    testonly = 1,
+    name = "guest_fixture",
     srcs = ["main.go"],
-    features = ["fully_static_link"],
+    pure = "on",
     visibility = ["//runsc/ttc/test:__pkg__"],
 )

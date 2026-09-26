@@ -8,6 +8,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func cloneOpenFile(destination, source *os.File, _ string) (*os.File, error) {
+func cloneOpenFile(destination, source *os.File) (*os.File, error) {
 	return destination, unix.IoctlFileClone(int(destination.Fd()), int(source.Fd()))
 }

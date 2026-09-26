@@ -233,6 +233,7 @@ go_test(
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "remote_snapshot_test.go",
+        "save_restore_test.go",
         "sparse_import_test.go",
     ],
     library = ":pgalloc",

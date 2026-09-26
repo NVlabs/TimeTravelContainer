@@ -18,7 +18,7 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 REGISTRY_FIXTURE=${REGISTRY_FIXTURE:-}
 FIXTURE_BINARY=${FIXTURE_BINARY:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
@@ -36,11 +36,11 @@ fail() {
 }
 
 [ -n "$TTC" ] || fail "set TTC"
-[ -n "$RUNSC" ] || fail "set RUNSC"
+[ -n "$TTCD" ] || fail "set TTCD"
 [ -n "$REGISTRY_FIXTURE" ] || fail "set REGISTRY_FIXTURE"
 [ -n "$FIXTURE_BINARY" ] || fail "set FIXTURE_BINARY"
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
-[ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
+[ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
 [ -x "$REGISTRY_FIXTURE" ] || fail "REGISTRY_FIXTURE is not executable: $REGISTRY_FIXTURE"
 [ -x "$FIXTURE_BINARY" ] || fail "FIXTURE_BINARY is not executable: $FIXTURE_BINARY"
 
@@ -57,14 +57,22 @@ else
 fi
 ADDRESS_FILE="$TTC_E2E_ROOT/registry-address"
 REGISTRY_PID=
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$TTC_E2E_ROOT/data"
 
 ttc() {
-  "$TTC" \
-    --data-root "$TTC_E2E_ROOT/data" \
-    --daemon-socket "$TTC_E2E_ROOT/ttcd.sock" \
-    --root "$TTC_E2E_ROOT/runsc" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$TTC_E2E_ROOT/ttcd.sock" "$@"
 }
 
 cleanup() {

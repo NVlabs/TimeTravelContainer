@@ -161,20 +161,20 @@ fpu_saved:
   // We only need to restore fpstate if we were signalled that it changed (syshandler
   // does not modify fpstate).
   cmpl $0, offsetof_thread_context_fpstate_changed(%rcx)
-  je fpu_restored
+  je fpu_restored\@
 
   lea offsetof_thread_context_fpstate(%rcx), %rdi
   mov __export_arch_state+offsetof_arch_state_xsave_mode(%rip), %eax
   cmpl $XSAVE_MODE_FXSAVE, %eax
-  jz use_fxrstor
-use_xrstor:
+  jz use_fxrstor\@
+use_xrstor\@:
   movl $XCR0_EAX, %eax
   movl $XCR0_EDX, %edx
   xrstor (%rdi)
-  jmp fpu_restored
-use_fxrstor:
+  jmp fpu_restored\@
+use_fxrstor\@:
   fxrstor (%rdi)
-fpu_restored:
+fpu_restored\@:
 .endm
 
 // Syshandler:
@@ -196,6 +196,15 @@ __export_syshandler:
 
   callq __syshandler
 
+  // A patched syscall may have entered this handler immediately before its
+  // address space disabled patching. switch_context may then assign this stub
+  // thread a context that owns GS. It cannot use the normal GS-relative return
+  // path, so transfer to a variant that restores entirely from its context
+  // pointer and installs guest GS before the final jump.
+  movq %gs:offsetof_sysmsg_context, %rdi
+  cmpl $0, offsetof_thread_context_guest_gs(%rdi)
+  jne restore_guest_gs
+
 .globl asm_restore_state;
 .type asm_restore_state, @function;
 asm_restore_state:
@@ -209,5 +218,44 @@ asm_restore_state:
   popfq
   movq 0(%rsp), %rsp
   jmp *%gs:offsetof_sysmsg_ret_addr // msg->ret_addr
+
+restore_guest_gs:
+  callq restore_state_guest_gs
+  ud2
+
+.globl asm_restore_state_guest_gs;
+.type asm_restore_state_guest_gs, @function;
+asm_restore_state_guest_gs:
+  // %rdi is the selected thread_context. GS already belongs to the guest and
+  // must not be referenced from this point onward.
+  movq %rdi, %rcx
+  restore_fpstate
+
+  movq offsetof_thread_context_ptregs_rsp(%rcx), %rax
+  push %rax
+  movq offsetof_thread_context_ptregs_eflags(%rcx), %rbx
+  push %rbx
+
+  // Restore all registers except RCX. A native syscall leaves RCX containing
+  // its return address, so use it for the final jump as well.
+  movq offsetof_thread_context_ptregs_r15(%rcx), %r15
+  movq offsetof_thread_context_ptregs_r14(%rcx), %r14
+  movq offsetof_thread_context_ptregs_r13(%rcx), %r13
+  movq offsetof_thread_context_ptregs_r12(%rcx), %r12
+  movq offsetof_thread_context_ptregs_rbp(%rcx), %rbp
+  movq offsetof_thread_context_ptregs_rbx(%rcx), %rbx
+  movq offsetof_thread_context_ptregs_r11(%rcx), %r11
+  movq offsetof_thread_context_ptregs_r10(%rcx), %r10
+  movq offsetof_thread_context_ptregs_r9(%rcx), %r9
+  movq offsetof_thread_context_ptregs_r8(%rcx), %r8
+  movq offsetof_thread_context_ptregs_rax(%rcx), %rax
+  movq offsetof_thread_context_ptregs_rdx(%rcx), %rdx
+  movq offsetof_thread_context_ptregs_rsi(%rcx), %rsi
+  movq offsetof_thread_context_ptregs_rdi(%rcx), %rdi
+  movq offsetof_thread_context_ptregs_rip(%rcx), %rcx
+
+  popfq
+  movq 0(%rsp), %rsp
+  jmp *%rcx
 
 .size __export_syshandler, . - __export_syshandler

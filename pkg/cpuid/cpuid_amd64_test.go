@@ -76,6 +76,33 @@ func TestFixedExtendedState(t *testing.T) {
 
 }
 
+func TestUnsetXsaveSubfeatureDoesNotEnableXsave(t *testing.T) {
+	features := make(Static)
+	X86FeatureXSAVEOPT.Unset(features)
+	got := features.ToFeatureSet()
+	if got.HasFeature(X86FeatureXSAVE) {
+		t.Fatal("unsetting XSAVEOPT unexpectedly enabled XSAVE")
+	}
+	if got.HasFeature(X86FeatureXSAVEOPT) {
+		t.Fatal("XSAVEOPT remains enabled")
+	}
+}
+
+func TestIntersectWithoutXsaveClearsEnumerationLeaf(t *testing.T) {
+	allowed := map[Feature]struct{}{
+		X86FeatureFPU: {}, X86FeatureFXSR: {}, X86FeatureSSE: {}, X86FeatureSSE2: {},
+	}
+	got, err := HostFeatureSet().Intersect(allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for subleaf := uint32(0); subleaf < xSaveInfoNumLeaves; subleaf++ {
+		if out := got.Query(In{Eax: uint32(xSaveInfo), Ecx: subleaf}); out != (Out{}) {
+			t.Fatalf("CPUID.0xd.%d=%+v, want zero without XSAVE", subleaf, out)
+		}
+	}
+}
+
 func featureSetWithIdentity(signature uint32, vendor, brand string) FeatureSet {
 	static := make(Static)
 	var vendorBytes [12]byte
@@ -187,5 +214,20 @@ func TestRemove(t *testing.T) {
 	testFeatures.Function.(Static).Remove(X86FeatureRDRAND)
 	if !testFeatures.HasFeature(X86FeatureFPU) {
 		t.Errorf("Remove failed, got %q want %q", testFeatures.FlagString(), justFPU.FlagString())
+	}
+}
+
+func TestWithoutFSGSBASE(t *testing.T) {
+	fs := makeFeatureSet(X86FeatureFSGSBase, X86FeatureFPU)
+	fs.hwCap.hwCap2 = HWCAP2_FSGSBASE
+	masked := fs.WithoutFSGSBASE()
+	if masked.HasFeature(X86FeatureFSGSBase) {
+		t.Fatalf("WithoutFSGSBASE left CPUID feature enabled: %q", masked.FlagString())
+	}
+	if masked.hwCap.hwCap2&HWCAP2_FSGSBASE != 0 {
+		t.Fatalf("WithoutFSGSBASE left AT_HWCAP2 bit enabled: %#x", masked.hwCap.hwCap2)
+	}
+	if !masked.HasFeature(X86FeatureFPU) {
+		t.Fatalf("WithoutFSGSBASE removed unrelated features: %q", masked.FlagString())
 	}
 }

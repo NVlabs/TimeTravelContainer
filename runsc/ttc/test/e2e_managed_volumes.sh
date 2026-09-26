@@ -18,10 +18,9 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
-TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 
 fail() {
@@ -30,7 +29,7 @@ fail() {
 }
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
-[ -x "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
+[ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -40,8 +39,20 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 PREFIX="volume-$$"
 MAIN="$PREFIX-main"
 SECOND="$PREFIX-second"
@@ -56,16 +67,11 @@ HOST_COW_RESTORED="$PREFIX-host-cow-restored"
 HOST_COPY_RESTORED="$PREFIX-host-copy-restored"
 
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 cleanup() {
-  ttc daemon stop >/dev/null 2>&1 || true
+  ttc daemon stop --stop-all >/dev/null 2>&1 || true
   if [ "$owned_root" = true ]; then
     rm -rf "$TTC_E2E_ROOT"
   fi
@@ -75,9 +81,6 @@ trap cleanup EXIT HUP INT TERM
 set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
-fi
-if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
-  set -- "$@" --allow-slow-volume-copy
 fi
 ttc "$@"
 
@@ -93,19 +96,36 @@ ttc run -d --name "$ROOTFS_CONTAINER" "$BUSYBOX_IMAGE" \
 ttc fork "$ROOTFS_CONTAINER@main" child >/dev/null
 ttc exec "$ROOTFS_CONTAINER@child" sh -c 'echo child >/rootfs-child'
 ttc exec "$ROOTFS_CONTAINER@main" test ! -e /rootfs-child
+# An existing VMA does not receive another AddMapping call when it refaults
+# after a fork. Execute an upper-layer file after that boundary and require the
+# next dehydration to invalidate its host-backed PMAs and retain the process.
+ttc exec "$ROOTFS_CONTAINER@main" mkdir -p /tmp/upper
+ttc exec "$ROOTFS_CONTAINER@main" cp /bin/busybox /tmp/upper/busybox
+ttc fork "$ROOTFS_CONTAINER@main" mapped-child >/dev/null
+ttc exec -d --session upper-mmap "$ROOTFS_CONTAINER@main" \
+  /tmp/upper/busybox sh -c 'while :; do sleep 60; done'
+ttc exec ls "$ROOTFS_CONTAINER@main" | grep -E \
+  '^upper-mmap[[:space:]]+[0-9]+[[:space:]]+running' >/dev/null ||
+  fail "upper-layer executable session did not remain running"
+ttc dehydrate "$ROOTFS_CONTAINER@main" >/dev/null
+ttc rehydrate "$ROOTFS_CONTAINER@main" >/dev/null
+ttc exec ls "$ROOTFS_CONTAINER@main" | grep -E \
+  '^upper-mmap[[:space:]]+[0-9]+[[:space:]]+running' >/dev/null ||
+  fail "upper-layer executable session did not survive dehydration"
 ROOTFS_ID=$(ttc inspect -f '{{.Id}}' "$ROOTFS_CONTAINER")
-find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/objects" -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/containers/$ROOTFS_ID/rootfs-upper/data/files" -type f -size +0c | grep . >/dev/null ||
   fail "running rootfs did not create a non-empty disk object"
 if find "$DATA_ROOT/containers/$ROOTFS_ID" -type f -name '*.tar' | grep . >/dev/null; then
   fail "writable rootfs unexpectedly created a tar persistence image"
 fi
 ttc stop "$ROOTFS_CONTAINER@child" >/dev/null
+ttc stop "$ROOTFS_CONTAINER@mapped-child" >/dev/null
 ttc stop "$ROOTFS_CONTAINER@main" >/dev/null
 ttc cp "$ROOTFS_CONTAINER@child:/rootfs-child" "$CHILD_EXPORT"
 [ "$(cat "$CHILD_EXPORT")" = child ] ||
   fail "stopped child cp selected the wrong persistent rootfs branch"
 ttc cp "$HOST_IMPORT" "$ROOTFS_CONTAINER@main:/rootfs-offline-import"
-ttc start "$ROOTFS_CONTAINER" >/dev/null
+ttc start "$ROOTFS_CONTAINER@main" >/dev/null
 ttc exec "$ROOTFS_CONTAINER@main" sh -c '
   test "$(cat /rootfs-base)" = base
   test "$(cat /rootfs-offline-import)" = offline-import
@@ -121,7 +141,7 @@ ttc cp "$HOST_IMPORT" "$CREATED_CONTAINER@main:/created-import"
 ttc cp "$CREATED_CONTAINER@main:/created-import" "$CREATED_EXPORT"
 [ "$(cat "$CREATED_EXPORT")" = offline-import ] ||
   fail "created-container offline cp did not round-trip"
-ttc start "$CREATED_CONTAINER" >/dev/null
+ttc start "$CREATED_CONTAINER@main" >/dev/null
 ttc exec "$CREATED_CONTAINER@main" test -f /created-import
 ttc stop "$CREATED_CONTAINER@main" >/dev/null
 ttc rm "$CREATED_CONTAINER" >/dev/null
@@ -142,7 +162,7 @@ ttc exec "$HOST_COW_CONTAINER@main" sh -c 'echo parent >/data/value; echo parent
 test ! -e "$HOST_COW_SOURCE/created" ||
   fail "writable host mount created a host file"
 HOST_COW_ID=$(ttc inspect -f '{{.Id}}' "$HOST_COW_CONTAINER")
-find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/containers/$HOST_COW_ID/host-mounts" -path '*/data/files/*' -type f -size +0c | grep . >/dev/null ||
   fail "writable host mount did not write directly to a private repository"
 ttc fork "$HOST_COW_CONTAINER@main" child >/dev/null
 ttc exec "$HOST_COW_CONTAINER@child" sh -c 'test "$(cat /data/value)" = parent; echo child >/data/value; echo child >/data/child'
@@ -173,7 +193,7 @@ ttc cp "$HOST_COW_CONTAINER@main:/data/value" "$HOST_COW_EXPORT"
 [ "$(cat "$HOST_COW_EXPORT")" = parent ] ||
   fail "stopped-container cp did not read the writable host mount upper"
 ttc cp "$HOST_COW_IMPORT" "$HOST_COW_CONTAINER@main:/data/offline"
-ttc start "$HOST_COW_CONTAINER" >/dev/null
+ttc start "$HOST_COW_CONTAINER@main" >/dev/null
 ttc exec "$HOST_COW_CONTAINER@main" sh -c '
   test "$(cat /data/value)" = parent
   test "$(cat /data/created)" = parent-created
@@ -259,14 +279,14 @@ ttc exec "$MAIN@main" sh -c '
 
 # The canonical bytes and namespace are already disk objects while running;
 # no tmpfs/tar export is involved.
-find "$DATA_ROOT/volumes-v2" -path '*/objects/*' -type f -size +0c | grep . >/dev/null ||
+find "$DATA_ROOT/filesystems/volumes" -path '*/data/files/*' -type f -size +0c | grep . >/dev/null ||
   fail "running volume did not create a non-empty disk object"
-if find "$DATA_ROOT/volumes-v2" -type f -name '*.tar' | grep . >/dev/null; then
+if find "$DATA_ROOT/filesystems/volumes" -type f -name '*.tar' | grep . >/dev/null; then
   fail "managed volume unexpectedly created a tar persistence image"
 fi
 
 ttc stop "$MAIN@main" >/dev/null
-ttc start "$MAIN" >/dev/null
+ttc start "$MAIN@main" >/dev/null
 ttc exec "$MAIN@main" sh -c '
   test "$(cat /data/value)" = base
   test "$(cat /data/sub/hard)" = base
@@ -377,13 +397,18 @@ ttc exec "$MAIN@fdchild" sh -c 'test "$(tail -n 1 /data/openfd)" = child-fd'
 ttc run -d --name "$SECOND" -v "$VOLUME:/data:ro" "$BUSYBOX_IMAGE" \
   sh -c 'while :; do sleep 60; done' >/dev/null
 ttc fork "$SECOND@main" f1 >/dev/null
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
+ttc exec "$SECOND@f1" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 
 ttc exec "$MAIN@main" sh -c 'echo daemon-restart >>/data/value; sync'
-# The daemon deliberately refuses to strand active families unless shutdown
-# policy is explicit. Stop them durably before exercising daemon restart.
+ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
+ttc exec "$SECOND@f1" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 ttc daemon stop --stop-all >/dev/null
 ttc "$@"
-ttc start "$MAIN" >/dev/null
+ttc start "$MAIN@main" >/dev/null
 ttc exec "$MAIN@main" sh -c 'test "$(tail -n 1 /data/value)" = daemon-restart'
+ttc start "$SECOND@main" >/dev/null
+ttc exec "$SECOND@main" sh -c 'test "$(tail -n 1 /data/value)" = main-2'
 
 echo "ttc managed-volume e2e: PASS"

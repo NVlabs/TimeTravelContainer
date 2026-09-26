@@ -43,6 +43,9 @@ type FeatureSet struct {
 	cpuRevDec  uint64
 }
 
+// HostXsaveABI is empty on architectures without x86 XSAVE.
+func HostXsaveABI() string { return "" }
+
 // CPUImplementer is part of the processor signature.
 func (fs FeatureSet) CPUImplementer() uint8 {
 	return uint8(fs.cpuImplHex)
@@ -107,6 +110,11 @@ func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
 // archCheckHostCompatible is a noop on arm64.
 func (FeatureSet) archCheckHostCompatible(FeatureSet) error {
 	return nil
+}
+
+// WithoutFSGSBASE is a no-op on arm64, which has no x86 FSGSBASE feature.
+func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
+	return fs
 }
 
 // AllowedHWCap1 returns the HWCAP1 bits that the guest is allowed to depend

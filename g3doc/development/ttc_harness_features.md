@@ -57,7 +57,8 @@ feature is marked verified.
 ## Findings from complex regression runs
 
 - 2026-08-16: the full matrix exercised local systrap, KVM, an NFS-backed data
-  root, and mutually authenticated source/target daemons. The workload included
+  root, and token-authenticated source/target daemons on a trusted network. The
+  workload included
   six threads, a child process, anonymous and shared mappings, loopback TCP,
   Unix datagrams, queued real `SCM_RIGHTS`, a pipe, epoll, 128 files, and an
   active named exec session. It crossed batch fork, pause/resume, dehydration,

@@ -19,10 +19,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
@@ -337,6 +341,65 @@ func TestOwnershipStateTracksLayersAndAllFileTypes(t *testing.T) {
 		t.Fatal(err)
 	} else if stat.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) {
 		t.Errorf("physical uid=%d, want invoking uid %d", stat.Sys().(*syscall.Stat_t).Uid, os.Geteuid())
+	}
+}
+
+// Replacing a path deletes what was recorded beneath it, including beneath
+// directories that no header named, and a replaced hard link leaves its group.
+func TestOwnershipStateDeletesSubtreesAndRelinks(t *testing.T) {
+	owners := newOwnershipState()
+	record := func(name string, typeflag byte, uid int, linkname string) {
+		t.Helper()
+		if _, err := owners.record(&tar.Header{Name: name, Typeflag: typeflag, Uid: uid, Gid: uid, Linkname: linkname}); err != nil {
+			t.Fatalf("recording %q: %v", name, err)
+		}
+	}
+	record("implicit/child/file", tar.TypeReg, 10, "")
+	record("implicit/other", tar.TypeReg, 11, "")
+	record("kept/file", tar.TypeReg, 12, "")
+	record("kept/alias", tar.TypeLink, 13, "kept/file")
+	// A file replaces the directory its children implied.
+	record("implicit", tar.TypeReg, 14, "")
+	// An opaque directory drops what lay beneath it.
+	record("kept/.wh..wh..opq", tar.TypeReg, 0, "")
+	record("kept/file", tar.TypeReg, 15, "")
+	record("kept/alias", tar.TypeReg, 16, "")
+	record("kept/file2", tar.TypeLink, 17, "kept/file")
+	got := make(map[string]int)
+	for name, entry := range owners.entries {
+		got[name] = int(entry.owner.UID)
+	}
+	want := map[string]int{".": 0, "implicit": 14, "kept/file": 17, "kept/alias": 16, "kept/file2": 17}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("owners %v, want %v", got, want)
+	}
+	group := owners.groups["kept/file"]
+	if owners.groups["kept/file2"] != group || owners.groups["kept/alias"] == group {
+		t.Errorf("hardlink groups %v", owners.groups)
+	}
+	if members := owners.members[group]; len(members) != 2 {
+		t.Errorf("group of kept/file has members %v, want kept/file and kept/file2", members)
+	}
+}
+
+// Recording a layer costs what each entry touches, not a scan of every path
+// recorded before it: 200,000 files took seven minutes when it did.
+func TestOwnershipStateScalesWithTheLayer(t *testing.T) {
+	owners := newOwnershipState()
+	start := time.Now()
+	for i := 0; i < 200000; i++ {
+		if _, err := owners.record(&tar.Header{Name: fmt.Sprintf("many/%d/%d", i/1000, i%1000), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := owners.record(&tar.Header{Name: "many/.wh.7", Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Errorf("recording 200,000 files took %v", elapsed)
+	}
+	if got, want := len(owners.entries), 200000-1000+1; got != want {
+		t.Errorf("%d paths recorded, want %d", got, want)
 	}
 }
 

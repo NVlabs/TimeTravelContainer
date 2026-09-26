@@ -28,6 +28,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
@@ -259,6 +260,11 @@ type Loader struct {
 	// reserved by a distributed target's bootstrap Kernel. Ownership transfers
 	// to the restored Kernel in restoreDistributedFork or dehydration restore.
 	distributedMemoryFile *os.File
+
+	// restoringDehydration is set while a durable dehydration restore
+	// installs a branch image into an unstarted sandbox, which holds mu for
+	// as long as that takes: in proportion to the branch's memory.
+	restoringDehydration atomicbitops.Bool
 
 	// sandboxID is the ID for the whole sandbox.
 	sandboxID string
@@ -859,6 +865,9 @@ func New(args Args) (*Loader, error) {
 	}
 
 	cpufs := cpuid.HostFeatureSet()
+	if args.Conf.Platform == "systrap" && !args.Conf.SystrapDisableSyscallPatching {
+		cpufs = cpufs.WithoutFSGSBASE()
+	}
 	if value, ok := args.Spec.Annotations[specutils.AnnotationCPUFeatures]; ok {
 		allowedFeatures := make(map[cpuid.Feature]struct{})
 		for str := range strings.SplitSeq(value, ",") {
@@ -915,6 +924,11 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 	l.destroyCtx = l.k.SupervisorContext()
+	if args.Conf.TimeTravelNetworkQuarantine {
+		if err := l.k.SetLiveForkQuarantine(true); err != nil {
+			return nil, fmt.Errorf("setting initial TTC quarantine: %w", err)
+		}
+	}
 
 	// Create a watchdog.
 	dogOpts := watchdog.DefaultOpts
@@ -947,6 +961,15 @@ func New(args Args) (*Loader, error) {
 			for _, volume := range l.ttcVolumeRepositories {
 				volume.repository.ForgetBranch(branch)
 			}
+		},
+		ReclaimFilesystemBranch: func(branch string) error {
+			var result error
+			for source, volume := range l.ttcVolumeRepositories {
+				if err := volume.repository.RemoveBranchAndCollect(branch); err != nil {
+					result = errors.Join(result, fmt.Errorf("reclaiming TTC filesystem %q branch %q: %w", source, branch, err))
+				}
+			}
+			return result
 		},
 		InitialBranchID:         initialBranchID,
 		InitialBranchParentID:   initialBranchParentID,
@@ -1110,12 +1133,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 		// setup would discard or collide with interfaces and routes created by
 		// the workload after container start.
 		if networkArgs.TimeTravel != nil {
-			if _, ok := eps.Interfaces()[int32(timeTravelNICID)]; ok {
-				if err := eps.Stack.RemoveNIC(timeTravelNICID); err != nil {
-					return fmt.Errorf("removing restored TTC interface: %v", err)
-				}
-			}
-			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false)
+			return configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, k.LiveForkQuarantine())
 		}
 		return nil
 	}
@@ -1127,7 +1145,7 @@ func (l *Loader) configureNetworkWithArgs(k *kernel.Kernel, s inet.Stack, networ
 		return err
 	}
 	if networkArgs.TimeTravel != nil {
-		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, false); err != nil {
+		if err := configureTimeTravelNetwork(eps, *networkArgs.TimeTravel, false, k.LiveForkQuarantine()); err != nil {
 			return err
 		}
 	}
@@ -2934,6 +2952,12 @@ func (l *Loader) SpecEnviron(containerName string) []string {
 }
 
 func (l *Loader) containerRuntimeState(cid string) ContainerRuntimeState {
+	if l.restoringDehydration.Load() {
+		// The container is being created until the restore finishes, as it
+		// was before the restore began; waiting for mu would hold up every
+		// runtime that lists this sandbox.
+		return RuntimeStateCreating
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	exec, ok := l.processes[execID{cid: cid}]

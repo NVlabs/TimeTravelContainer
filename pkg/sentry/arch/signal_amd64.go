@@ -86,6 +86,37 @@ type UContext64 struct {
 	Sigset   linux.SignalSet
 }
 
+const x86TrapPageFault = 14
+
+// SetSignalFault implements Context.SetSignalFault.
+func (c *Context64) SetSignalFault(addr hostarch.Addr, at hostarch.AccessType) {
+	c.signalFaultAddr = addr
+	c.signalFaultAccess = at
+}
+
+func (c *Context64) applySignalFault(info *linux.SignalInfo, sc *SignalContext64) {
+	sig := linux.Signal(info.Signo)
+	if (sig != linux.SIGSEGV && sig != linux.SIGBUS) ||
+		hostarch.Addr(info.Addr()) != c.signalFaultAddr || !c.signalFaultAccess.Any() {
+		return
+	}
+	at := c.signalFaultAccess
+	c.signalFaultAccess = hostarch.NoAccess
+	sc.Trapno = x86TrapPageFault
+	sc.Err = linux.X86_PF_USER
+	if at.Write {
+		sc.Err |= linux.X86_PF_WRITE
+	}
+	if at.Execute {
+		sc.Err |= linux.X86_PF_INSTR
+	}
+	// SEGV_ACCERR means that a mapping existed but its permissions rejected
+	// the access, which is x86's page-fault protection bit.
+	if info.Code == 2 {
+		sc.Err |= linux.X86_PF_PROT
+	}
+}
+
 // SignalSetup implements Context.SignalSetup. (Compare to Linux's
 // arch/x86/kernel/signal.c:__setup_rt_frame().)
 func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error {
@@ -143,12 +174,11 @@ func (c *Context64) SignalSetup(st *Stack, act *linux.SigAction, info *linux.Sig
 		uc.Flags |= _UC_FP_XSTATE
 	}
 
-	// TODO(gvisor.dev/issue/159): Set SignalContext64.Err, Trapno, and Cr2
-	// based on the fault that caused the signal. For now, leave Err and
-	// Trapno unset and assume CR2 == info.Addr() for SIGSEGVs and
-	// SIGBUSes.
+	// Populate the fault address and, when the kernel generated this signal
+	// from a platform fault, the architecture-specific page-fault metadata.
 	if linux.Signal(info.Signo) == linux.SIGSEGV || linux.Signal(info.Signo) == linux.SIGBUS {
 		uc.MContext.Cr2 = info.Addr()
+		c.applySignalFault(info, &uc.MContext)
 	}
 
 	// "... the value (%rsp+8) is always a multiple of 16 (...) when

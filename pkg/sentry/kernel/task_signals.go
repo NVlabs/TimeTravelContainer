@@ -197,7 +197,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 			ucs.FaultAddr = info.Addr()
 		}
 
-		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, ucs.FaultAddr)
+		t.Debugf("Signal %d, PID: %d, TID: %d, ip: %#x, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, t.Arch().IP(), ucs.FaultAddr)
 		eventchannel.Emit(ucs)
 
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
@@ -213,7 +213,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 
 	case SignalActionHandler:
 		// Try to deliver the signal to the user-configured handler.
-		t.Debugf("Signal %d: delivering to handler", info.Signo)
+		t.Debugf("Signal %d: delivering to handler at ip=%#x fault addr=%#x", info.Signo, t.Arch().IP(), info.Addr())
 		if err := t.deliverSignalToHandler(info, act); err != nil {
 			// This is not a warning, it can occur during normal operation.
 			t.Debugf("Failed to deliver signal %+v to user handler: %v", info, err)
@@ -393,6 +393,38 @@ func (tg *ThreadGroup) SendSignal(info *linux.SignalInfo) error {
 	tg.signalHandlers.mu.Lock()
 	defer tg.signalHandlers.mu.Unlock()
 	return tg.leader.sendSignalLocked(info, true /* group */)
+}
+
+// sendExternalSignal is SendSignal for a signal from outside the sandbox,
+// which tg discards if externalSignalIgnoredLocked says so.
+func (tg *ThreadGroup) sendExternalSignal(info *linux.SignalInfo) error {
+	tg.pidns.owner.mu.RLock()
+	defer tg.pidns.owner.mu.RUnlock()
+	tg.signalHandlers.mu.Lock()
+	defer tg.signalHandlers.mu.Unlock()
+	if sig := linux.Signal(info.Signo); tg.externalSignalIgnoredLocked(sig) {
+		// As in sendSignalTimerLocked, side effects such as a SIGCONT
+		// resuming a stopped init apply even to a discarded signal.
+		tg.applySignalSideEffectsLocked(sig)
+		return nil
+	}
+	return tg.leader.sendSignalLocked(info, true /* group */)
+}
+
+// externalSignalIgnoredLocked reports whether tg discards sig when it comes
+// from outside the sandbox, as Linux discards a signal sent to a PID
+// namespace's init from an ancestor namespace: it forces only SIGKILL and
+// SIGSTOP on that init, and any other signal reaches it only through a
+// handler the init installed (pid_namespaces(7)). Container runtimes rely on
+// this: a TERM from `docker stop` does not end an init that has no handler
+// for it, and the stop escalates to SIGKILL once its timeout expires.
+//
+// Preconditions: The TaskSet mutex and the signal mutex must be locked.
+func (tg *ThreadGroup) externalSignalIgnoredLocked(sig linux.Signal) bool {
+	if !sig.IsValid() || sig == linux.SIGKILL || sig == linux.SIGSTOP || !tg.isInitInLocked(tg.pidns) {
+		return false
+	}
+	return tg.signalHandlers.actions[sig].Handler == linux.SIG_DFL
 }
 
 // Preconditions: The signal mutex must be locked.

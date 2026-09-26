@@ -36,6 +36,9 @@ func omitTimespec() unix.Timespec {
 	return unix.Timespec{Nsec: unix.UTIME_OMIT}
 }
 
+// pathOpenFlagMask identifies control FDs opened only as path references.
+const pathOpenFlagMask = unix.O_PATH
+
 func pathOpenFlags() []int {
 	return []int{unix.O_PATH}
 }

@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 
@@ -35,73 +35,6 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/timing"
 )
-
-// ExportPackedSnapshot writes the snapshot's immutable packed byte stream to
-// dst. It prefers extent reflinks, so exporting a large resident branch does
-// not copy its bytes. allowCopy permits a byte-copy fallback on filesystems
-// without FICLONERANGE support.
-func (s *RemoteSnapshot) ExportPackedSnapshot(dst *os.File, allowCopy bool) error {
-	if s == nil || dst == nil {
-		return errors.New("remote snapshot export requires a snapshot and destination")
-	}
-	type exportRegion struct {
-		lease       *RemotePageLease
-		streamStart uint64
-	}
-	regions := make([]exportRegion, 0, len(s.regions))
-	for i := range s.regions {
-		region := &s.regions[i]
-		lease, err := s.AcquireRegion(region.ID, memmap.FileRange{End: region.Range.Length()})
-		if err != nil {
-			for _, acquired := range regions {
-				_ = acquired.lease.Close()
-			}
-			return fmt.Errorf("pinning remote snapshot region %d for export: %w", region.ID, err)
-		}
-		regions = append(regions, exportRegion{lease: lease, streamStart: region.streamStart})
-	}
-	defer func() {
-		for _, region := range regions {
-			_ = region.lease.Close()
-		}
-	}()
-
-	synced := make(map[*os.File]struct{})
-	for _, region := range regions {
-		source := region.lease.File().File()
-		if _, ok := synced[source]; ok {
-			continue
-		}
-		if err := source.Sync(); err != nil {
-			return fmt.Errorf("synchronizing remote snapshot source: %w", err)
-		}
-		synced[source] = struct{}{}
-	}
-	if err := dst.Truncate(int64(s.StreamBytes())); err != nil {
-		return fmt.Errorf("sizing packed remote snapshot: %w", err)
-	}
-	for _, region := range regions {
-		source := region.lease.File().File()
-		fr := region.lease.Range()
-		if err := cloneHostFileRange(dst, source, fr.Start, fr.Length(), region.streamStart); err == nil {
-			continue
-		} else if !allowCopy {
-			return fmt.Errorf("reflinking packed remote snapshot range %v: %w", fr, err)
-		}
-		reader := io.NewSectionReader(source, int64(fr.Start), int64(fr.Length()))
-		writer := io.NewOffsetWriter(dst, int64(region.streamStart))
-		if copied, err := io.CopyBuffer(writer, reader, make([]byte, 1<<20)); err != nil || uint64(copied) != fr.Length() {
-			if err == nil {
-				err = io.ErrUnexpectedEOF
-			}
-			return fmt.Errorf("copying packed remote snapshot range %v: %w", fr, err)
-		}
-	}
-	if err := dst.Sync(); err != nil {
-		return fmt.Errorf("synchronizing packed remote snapshot: %w", err)
-	}
-	return nil
-}
 
 // RemoteRegionID identifies a MemoryFile range within one RemoteSnapshot.
 // IDs are stable for the lifetime of the snapshot and are carried by the
@@ -164,7 +97,10 @@ type RemoteSnapshot struct {
 type remoteSnapshotShared struct {
 	views  map[*RemoteSnapshot]struct{}
 	owners []*MemoryFile
-	active sync.WaitGroup
+	// pageLoads keep upstream sparse readers alive when this snapshot captures
+	// a remotely backed Kernel and subsequently outlives that Kernel.
+	pageLoads []*AsyncPagesFileLoad
+	active    sync.WaitGroup
 }
 
 // RemotePushHint identifies fork-time bytes that became especially valuable
@@ -348,10 +284,18 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 		pagesTotal += region.Range.Length() / hostarch.PageSize
 		ownerSet[region.File] = struct{}{}
 	}
+	// Regions of one MemoryFile overlap if, in order of their starts, one
+	// ends after the next starts. Comparing every pair took seconds for the
+	// many small regions of a fork's scattered writes.
+	byFile := make(map[*MemoryFile][]int)
 	for i := range regions {
-		for j := 0; j < i; j++ {
-			left, right := &regions[i], &regions[j]
-			if left.File == right.File && left.Range.Start < right.Range.End && right.Range.Start < left.Range.End {
+		byFile[regions[i].File] = append(byFile[regions[i].File], i)
+	}
+	for _, indexes := range byFile {
+		sort.Slice(indexes, func(a, b int) bool { return regions[indexes[a]].Range.Start < regions[indexes[b]].Range.Start })
+		for k := 1; k < len(indexes); k++ {
+			left, right := &regions[indexes[k-1]], &regions[indexes[k]]
+			if right.Range.Start < left.Range.End {
 				return nil, fmt.Errorf("remote regions %d and %d overlap in one MemoryFile: %v and %v", left.ID, right.ID, left.Range, right.Range)
 			}
 		}
@@ -416,6 +360,101 @@ func NewRemoteSnapshots(regions []RemoteSnapshotRegion, count int) ([]*RemoteSna
 	return snapshots, nil
 }
 
+// RetainPageLoads keeps upstream asynchronous readers alive for all sibling
+// views of s. It must be called at most once for a snapshot sibling group and
+// while the caller still owns every load.
+func (s *RemoteSnapshot) RetainPageLoads(loads []*AsyncPagesFileLoad) error {
+	if s == nil || len(loads) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("remote snapshot is closed")
+	}
+	if len(s.shared.pageLoads) != 0 {
+		return errors.New("remote snapshot page loads were already retained")
+	}
+	seen := make(map[*AsyncPagesFileLoad]struct{}, len(loads))
+	for _, load := range loads {
+		if load == nil {
+			return errors.New("remote snapshot cannot retain a nil page load")
+		}
+		if _, ok := seen[load]; ok {
+			continue
+		}
+		seen[load] = struct{}{}
+		load.IncOwner()
+		s.shared.pageLoads = append(s.shared.pageLoads, load)
+	}
+	return nil
+}
+
+// RetainGraphPageLoads keeps s's pages that are still loading readable after
+// the Kernels that loaded them are released, by owning their loaders, if each
+// of those reads an immutable snapshot graph, and reports whether it did. A
+// page still loading from anything else, such as a live source that may
+// leave, is not kept readable this way; s must be made resident instead.
+func (s *RemoteSnapshot) RetainGraphPageLoads() (bool, error) {
+	if s == nil {
+		return false, errors.New("remote snapshot is nil")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false, errors.New("remote snapshot is closed")
+	}
+	// A snapshot's regions do not change once it is made.
+	regions := s.regions
+	s.mu.Unlock()
+	var loads []*AsyncPagesFileLoad
+	for i := range regions {
+		for _, load := range regions[i].File.pendingPageLoads(regions[i].Range) {
+			if !load.HasDurableBacking() {
+				return false, nil
+			}
+			if err := load.err(); err != nil {
+				return false, err
+			}
+			if !slices.Contains(loads, load) {
+				loads = append(loads, load)
+			}
+		}
+	}
+	s.mu.Lock()
+	retained := make([]*AsyncPagesFileLoad, 0, len(loads))
+	complete := !s.closed
+	for _, load := range loads {
+		if !complete || slices.Contains(s.shared.pageLoads, load) {
+			continue
+		}
+		if !load.tryIncOwner() {
+			complete = false
+			continue
+		}
+		retained = append(retained, load)
+	}
+	if complete {
+		s.shared.pageLoads = append(s.shared.pageLoads, retained...)
+	}
+	s.mu.Unlock()
+	if !complete {
+		for _, load := range retained {
+			_ = load.DecOwner()
+		}
+		return false, errors.New("remote snapshot closed, or a loader of its pages released, while retaining page loads")
+	}
+	return true, nil
+}
+
+// PageLoads returns the loaders s keeps alive for pages still loading; see
+// RetainGraphPageLoads.
+func (s *RemoteSnapshot) PageLoads() []*AsyncPagesFileLoad {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*AsyncPagesFileLoad(nil), s.shared.pageLoads...)
+}
+
 // ExportMemoryFileMetadataForRemote captures allocator metadata and the packed
 // page-stream layout without reading page contents. The returned bytes contain
 // no process-local pointers and may be sent to another Sentry process.
@@ -455,15 +494,32 @@ func exportMemoryFileMetadataForRemote(ctx context.Context, source *MemoryFile, 
 	}
 	var metadata bytes.Buffer
 	var used []memmap.FileRange
-	source.mu.Lock()
-	for source.haveWaste {
-		source.mu.Unlock()
-		runtime.Gosched()
+	// File-backed cache pages may still be registered for eviction when a
+	// branch is paused for capture. They are ordinary reclaimable cache state,
+	// not a reason to reject an otherwise eligible live fork. Drain them before
+	// serializing the allocator. The loop is required because another Kernel
+	// sharing this family MemoryFile may register a new evictable range while
+	// an earlier eviction is completing. Observing an empty registry while
+	// holding source.mu closes that race with MarkEvictable.
+	for {
 		source.mu.Lock()
-	}
-	if len(source.evictable) != 0 {
+		if source.haveWaste {
+			source.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return nil, nil, nil, nil, err
+			}
+			runtime.Gosched()
+			continue
+		}
+		if len(source.evictable) == 0 {
+			break
+		}
+		source.startEvictionsLocked()
 		source.mu.Unlock()
-		return nil, nil, nil, nil, fmt.Errorf("source MemoryFile has %d pending evictable users", len(source.evictable))
+		source.WaitForEvictions()
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, nil, err
+		}
 	}
 	defer source.mu.Unlock()
 	collectUsed := func(set *unfreeSet) {
@@ -1032,6 +1088,9 @@ func (s *RemoteSnapshot) Close() error {
 	s.active.Wait()
 	if lastView {
 		s.shared.active.Wait()
+		for _, load := range s.shared.pageLoads {
+			_ = load.DecOwner()
+		}
 		for _, file := range s.owners {
 			file.Destroy()
 		}
@@ -1123,12 +1182,9 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 			!hostarch.IsPageAligned(loadRange.StreamOffset) {
 			return fmt.Errorf("remote load range %d is invalid: target=%v stream offset=%#x", i, loadRange.Target, loadRange.StreamOffset)
 		}
-		for j := 0; j < i; j++ {
-			other := ranges[j].Target
-			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
-				return fmt.Errorf("remote target ranges %v and %v overlap", loadRange.Target, other)
-			}
-		}
+	}
+	if left, right, overlap := overlappingLoadTargets(ranges); overlap {
+		return fmt.Errorf("remote target ranges %v and %v overlap", left, right)
 	}
 	type attachedRange struct {
 		load  RemoteLoadRange
@@ -1278,6 +1334,25 @@ func (f *MemoryFile) AttachRemotePageLoad(pages *AsyncPagesFileLoad, ranges []Re
 	return nil
 }
 
+// overlappingLoadTargets returns two of the non-empty targets of ranges that
+// overlap, if any do: in order of their starts, one that ends after the next
+// starts. Comparing every pair took seconds for the many small ranges of a
+// branch whose writes were scattered.
+func overlappingLoadTargets(ranges []RemoteLoadRange) (memmap.FileRange, memmap.FileRange, bool) {
+	order := make([]int, len(ranges))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return ranges[order[a]].Target.Start < ranges[order[b]].Target.Start })
+	for k := 1; k < len(order); k++ {
+		left, right := ranges[order[k-1]].Target, ranges[order[k]].Target
+		if right.Start < left.End {
+			return left, right, true
+		}
+	}
+	return memmap.FileRange{}, memmap.FileRange{}, false
+}
+
 // AttachSparseChunkPageLoad attaches another independent demand loader to an
 // existing family MemoryFile. Ranges may describe full durable chunks or
 // page-aligned pieces of a live packed stream; logicalChunkDemand groups all
@@ -1293,12 +1368,9 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 			!hostarch.IsPageAligned(loadRange.StreamOffset) {
 			return fmt.Errorf("invalid sparse chunk load range %d: %+v", i, loadRange)
 		}
-		for j := 0; j < i; j++ {
-			other := ranges[j].Target
-			if loadRange.Target.Start < other.End && other.Start < loadRange.Target.End {
-				return fmt.Errorf("sparse chunk target ranges %v and %v overlap", loadRange.Target, other)
-			}
-		}
+	}
+	if left, right, overlap := overlappingLoadTargets(ranges); overlap {
+		return fmt.Errorf("sparse chunk target ranges %v and %v overlap", left, right)
 	}
 	type attachedRange struct {
 		load  RemoteLoadRange
@@ -1421,8 +1493,8 @@ func (f *MemoryFile) AttachSparseChunkPageLoad(pages *AsyncPagesFileLoad, ranges
 
 	minUnloaded := uint64(math.MaxUint64)
 	pages.mu.Lock()
-	for _, item := range attached {
-		amfl.unloaded.InsertRange(item.load.Target, aplUnloadedInfo{off: item.load.StreamOffset, logicalChunk: item.chunk})
+	for index, item := range attached {
+		amfl.unloaded.InsertRange(item.load.Target, aplUnloadedInfo{off: item.load.StreamOffset, logicalChunk: item.chunk, unit: uint64(index) + 1})
 		if item.load.Target.Start < minUnloaded {
 			minUnloaded = item.load.Target.Start
 		}
@@ -1494,7 +1566,7 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		src, mappingLease, err := memmap.MapInternalWithLease(lease.File(), lease.Range(), hostarch.Read)
 		if err != nil {
 			lease.Close()
-			return written, err
+			return written, fmt.Errorf("mapping remote snapshot region %d source range %v for stream offset %#x: %w", region.ID, lease.Range(), streamOff, err)
 		}
 		dstSeq := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(dst[written : written+int(length)]))
 		copied, copyErr := safemem.CopySeq(dstSeq, src)

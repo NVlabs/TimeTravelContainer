@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -144,6 +145,137 @@ func TestCaptureMemoryFileRangesIncludesUnfaultedAliasedMappableOwnerOnce(t *tes
 	}
 }
 
+func TestInvalidateMappingsForReboundSpecialMappable(t *testing.T) {
+	ctx := contexttest.Context(t)
+	memMgr := testMemoryManager(ctx, t)
+	defer memMgr.DecUsers(ctx)
+
+	writePage := func(value byte) memmap.FileRange {
+		fr, err := memMgr.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks, err := memMgr.mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		if _, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice([]byte{value}))); err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		return fr
+	}
+	oldRange := writePage(1)
+	newRange := writePage(2)
+	mappable := NewSpecialMappable("[rebind-test]", memMgr.mf, oldRange)
+	defer mappable.DecRef(ctx)
+	addr, err := memMgr.MMap(ctx, memmap.MMapOpts{
+		Length: hostarch.PageSize, MappingIdentity: mappable, Mappable: mappable,
+		Perms: hostarch.Read, MaxPerms: hostarch.Read,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() byte {
+		var got [1]byte
+		if n, err := memMgr.CopyIn(ctx, addr, got[:], usermem.IOOpts{}); err != nil || n != 1 {
+			t.Fatalf("CopyIn: n=%d err=%v", n, err)
+		}
+		return got[0]
+	}
+	if got := read(); got != 1 {
+		t.Fatalf("initial byte=%d, want 1", got)
+	}
+	mappable.RebindMemoryFileRange(memMgr.mf, newRange)
+	memMgr.InvalidateMappingsForMappable(mappable)
+	if got := read(); got != 2 {
+		t.Fatalf("byte after rebind=%d, want 2", got)
+	}
+}
+
+func TestSpecialMappableSparseRestoreLinearizesDiscontiguousRanges(t *testing.T) {
+	ctx := contexttest.Context(t)
+	memMgr := testMemoryManager(ctx, t)
+	defer memMgr.DecUsers(ctx)
+
+	allocatePage := func(value byte) memmap.FileRange {
+		fr, err := memMgr.mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks, err := memMgr.mf.MapInternal(fr, hostarch.ReadWrite)
+		if err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		data := bytes.Repeat([]byte{value}, hostarch.PageSize)
+		if _, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(data))); err != nil {
+			memMgr.mf.DecRef(fr)
+			t.Fatal(err)
+		}
+		return fr
+	}
+	source, err := memMgr.mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := allocatePage(0x11)
+	gap := allocatePage(0x99)
+	defer memMgr.mf.DecRef(gap)
+	second := allocatePage(0x22)
+	relocation := pgalloc.NewSparseRelocation()
+	if err := relocation.Add(memMgr.mf.ResourceID(), source.Start, first.Start); err != nil {
+		t.Fatal(err)
+	}
+	if err := relocation.Add(memMgr.mf.ResourceID(), source.Start+hostarch.PageSize, second.Start); err != nil {
+		t.Fatal(err)
+	}
+	mappable := NewSpecialMappable("[sparse-test]", memMgr.mf, source)
+	references := pgalloc.NewSparseReferenceTransaction()
+	loadCtx := context.WithValues(ctx, map[any]any{
+		pgalloc.CtxMemoryFile:        memMgr.mf,
+		pgalloc.CtxSparseRelocation:  relocation,
+		pgalloc.CtxSparseRestoreRefs: references,
+		pgalloc.CtxLiveForkClone:     true,
+	})
+	mappable.afterLoad(loadCtx)
+	if err := references.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// In a real sparse restore the serialized source offsets do not own ranges
+	// in the target MemoryFile. This test allocated them only to obtain valid
+	// logical page identities.
+	memMgr.mf.DecRef(source)
+	memMgr.mf.DecRef(first)
+	memMgr.mf.DecRef(second)
+	defer mappable.DecRef(ctx)
+
+	translations, err := mappable.Translate(ctx,
+		memmap.MappableRange{End: 2 * hostarch.PageSize},
+		memmap.MappableRange{End: 2 * hostarch.PageSize}, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(translations) != 1 || translations[0].Offset == first.Start || translations[0].Offset == second.Start {
+		t.Fatalf("translations=%+v, want one newly allocated contiguous range", translations)
+	}
+	if mappable.Length() != 2*hostarch.PageSize {
+		t.Fatalf("length=%d, want %d", mappable.Length(), 2*hostarch.PageSize)
+	}
+	contents, err := memMgr.mf.MapInternal(mappable.FileRange(), hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [2]byte
+	for i, offset := range []uint64{0, hostarch.PageSize} {
+		got[i] = contents.DropFirst64(offset).Head().ToSlice()[0]
+	}
+	if got != [2]byte{0x11, 0x22} {
+		t.Fatalf("linearized page prefixes=%#x, want 0x11,0x22", got)
+	}
+}
+
 func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	ctx := contexttest.Context(t)
 	parent := testMemoryManager(ctx, t)
@@ -181,6 +313,13 @@ func TestLiveForkRemoteMemoryClone(t *testing.T) {
 	snapshot, err := pgalloc.NewRemoteSnapshot(regions)
 	if err != nil {
 		t.Fatalf("NewRemoteSnapshot: %v", err)
+	}
+	// A distributed source resumes before its target necessarily faults any
+	// pages. Verify that a subsequent source write cannot change the fork-time
+	// bytes served to the demand-paged child.
+	mutated := bytes.Repeat([]byte("source-after-fork---"), 200)
+	if n, err := parent.CopyOut(ctx, addr+hostarch.PageSize-100, mutated, usermem.IOOpts{}); err != nil || n != len(mutated) {
+		t.Fatalf("parent.CopyOut after snapshot: n=%d err=%v", n, err)
 	}
 	reader := pgalloc.NewLoopbackRemoteReader(snapshot, 64<<10, 16, 4)
 	loaderDone := make(chan error, 1)
@@ -437,6 +576,181 @@ func TestLiveForkPrivateAnonymousMemoryCOW(t *testing.T) {
 	}
 	if got := read("child", child); got != string(childBytes) {
 		t.Errorf("parent write changed child: got %q, want %q", got, childBytes)
+	}
+}
+
+// populatedPrivateMapping maps length bytes of private anonymous memory in
+// memMgr and touches every page, so that all of it is resident.
+func populatedPrivateMapping(ctx context.Context, t testing.TB, memMgr *MemoryManager, length uint64) hostarch.Addr {
+	t.Helper()
+	addr, err := memMgr.MMap(ctx, memmap.MMapOpts{
+		Length:   length,
+		Private:  true,
+		Perms:    hostarch.ReadWrite,
+		MaxPerms: hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap: %v", err)
+	}
+	for page := addr; page < addr+hostarch.Addr(length); page += hostarch.PageSize {
+		if _, err := memMgr.CopyOut(ctx, page, []byte{1}, usermem.IOOpts{}); err != nil {
+			t.Fatalf("faulting page %#x: %v", page, err)
+		}
+	}
+	return addr
+}
+
+// sharesPage reports whether a and b hold the same version of the page at
+// addr, which is to say that neither has copied it since they forked.
+func sharesPage(t testing.TB, a, b *MemoryManager, addr hostarch.Addr) bool {
+	t.Helper()
+	version := func(memMgr *MemoryManager) pgalloc.PageVersionID {
+		pseg := memMgr.pmas.FindSegment(addr)
+		if !pseg.Ok() {
+			t.Fatalf("no pma at %#x", addr)
+		}
+		_, v, ok := memMgr.mf.LogicalPageVersionAt(pseg.fileRange().Start + uint64(addr-pseg.Start()))
+		if !ok {
+			t.Fatalf("no page identity at %#x", addr)
+		}
+		return v
+	}
+	return version(a) == version(b)
+}
+
+// A write after a live fork copies the page written and nothing around it.
+//
+// The copy used to be widened to the surrounding huge page, so one written
+// byte duplicated 2 MiB and gave all 512 pages new content versions: the
+// branches diverged 512 times faster than either wrote, and every later
+// capture or transfer saw 512 changed pages where one had changed.
+func TestLiveForkCopyOnWriteCopiesOnlyTheWrittenPage(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+	// Two huge pages of address space guarantee one aligned huge page inside.
+	addr := populatedPrivateMapping(ctx, t, parent, 2*hostarch.HugePageSize)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer child.DecUsers(ctx)
+
+	target := addr.HugeRoundDown() + hostarch.HugePageSize + 7*hostarch.PageSize
+	if err := child.HandleUserFault(ctx, target, hostarch.Write, 0); err != nil {
+		t.Fatalf("child write fault: %v", err)
+	}
+	if got := child.pmas.FindSegment(target).Range().Length(); got != hostarch.PageSize {
+		t.Fatalf("a one-page write fault copied %d bytes, want one page", got)
+	}
+	if sharesPage(t, child, parent, target) {
+		t.Fatal("the written page still shares the parent's version")
+	}
+	for _, neighbor := range []hostarch.Addr{target - hostarch.PageSize, target + hostarch.PageSize} {
+		if !sharesPage(t, child, parent, neighbor) {
+			t.Fatalf("the unwritten page at %#x was copied with the written one", neighbor)
+		}
+	}
+}
+
+// A write fault that continues a sequential run copies ahead; any other
+// copies only its page.
+//
+// Page-by-page copying costs a platform round trip per page, which made a
+// front-to-back rewrite after a fork thirteen times slower. A run of write
+// faults that each begin where the previous one ended asks for twice as much
+// each time, so a sweep reaches huge-page copies quickly while scattered
+// writes stay exact.
+func TestLiveForkCopyOnWriteWidensOnlyForSequentialRuns(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+	addr := populatedPrivateMapping(ctx, t, parent, 2*hostarch.HugePageSize)
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer child.DecUsers(ctx)
+	base := addr.HugeRoundDown() + hostarch.HugePageSize
+	page := func(n int) hostarch.Addr { return base + hostarch.Addr(n)*hostarch.PageSize }
+
+	// A sequential run: pages 0 and 1 are written; the second copy doubles.
+	for _, n := range []int{0, 1} {
+		if err := child.HandleUserFault(ctx, page(n), hostarch.Write, 0); err != nil {
+			t.Fatalf("write fault on page %d: %v", n, err)
+		}
+	}
+	if sharesPage(t, child, parent, page(2)) {
+		t.Fatal("a write continuing a run did not copy ahead")
+	}
+	if !sharesPage(t, child, parent, page(3)) {
+		t.Fatal("the second copy of a run copied more than twice the first")
+	}
+	// A write elsewhere breaks the run and copies one page.
+	if err := child.HandleUserFault(ctx, page(100), hostarch.Write, 0); err != nil {
+		t.Fatalf("write fault on page 100: %v", err)
+	}
+	if !sharesPage(t, child, parent, page(101)) || !sharesPage(t, child, parent, page(99)) {
+		t.Fatal("a write outside the run copied its neighbours")
+	}
+}
+
+// A sequential run copies ahead across the pmas that earlier page-sized copies
+// split memory into, rather than faulting once per piece, and copies them into
+// one allocation, rather than one per piece.
+//
+// Scattered writes in one fork generation leave a pma per copied page, and
+// the next fork shares all of them again. Copying ahead only within the pma
+// that faulted made a sweep over such memory take six times as long as it had
+// with huge-page copies, and copying each piece separately still took half as
+// long again.
+func TestLiveForkCopyOnWriteRunCrossesSplitPMAs(t *testing.T) {
+	ctx := contexttest.Context(t)
+	parent := testMemoryManager(ctx, t)
+	defer parent.DecUsers(ctx)
+	addr := populatedPrivateMapping(ctx, t, parent, 2*hostarch.HugePageSize)
+	base := addr.HugeRoundDown() + hostarch.HugePageSize
+	page := func(n int) hostarch.Addr { return base + hostarch.Addr(n)*hostarch.PageSize }
+
+	// One fork generation writes every fourth page, splitting the pmas.
+	earlier, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	for n := 2; n < 64; n += 4 {
+		if err := parent.HandleUserFault(ctx, page(n), hostarch.Write, 0); err != nil {
+			t.Fatalf("write fault on page %d: %v", n, err)
+		}
+	}
+	earlier.DecUsers(ctx)
+	if got := parent.pmas.FindSegment(page(2)).Range().Length(); got != hostarch.PageSize {
+		t.Fatalf("setup: the page written after the first fork is in a %d-byte pma, want its own", got)
+	}
+
+	child, err := cloneMemoryManagerMetadata(ctx, parent)
+	if err != nil {
+		t.Fatalf("cloneMemoryManagerMetadata: %v", err)
+	}
+	defer child.DecUsers(ctx)
+	// A run of faults at 0, 1, 3 and 7 asks for 1, 2, 4 and 8 pages; the last
+	// spans pmas split at pages 10, 11, 14 and 15.
+	for _, n := range []int{0, 1, 3, 7} {
+		if err := child.HandleUserFault(ctx, page(n), hostarch.Write, 0); err != nil {
+			t.Fatalf("write fault on page %d: %v", n, err)
+		}
+	}
+	for n := 0; n < 15; n++ {
+		if sharesPage(t, child, parent, page(n)) {
+			t.Fatalf("page %d, inside the run, was not copied", n)
+		}
+	}
+	if !sharesPage(t, child, parent, page(15)) {
+		t.Fatal("the run copied past what it asked for")
+	}
+	// And into one allocation, which leaves the pieces joined again.
+	run := hostarch.AddrRange{Start: page(7), End: page(15)}
+	if got := child.pmas.FindSegment(page(7)).Range(); !got.IsSupersetOf(run) {
+		t.Fatalf("the copy of %v is in a pma covering only %v", run, got)
 	}
 }
 
@@ -913,6 +1227,74 @@ func TestGetAllocationDirection(t *testing.T) {
 			if actual != test.expected {
 				t.Errorf("Unexpected allocation direction. Expected: %s, Actual: %s", test.expected, actual)
 			}
+		})
+	}
+}
+
+// BenchmarkLiveForkWriteFault measures the Sentry's side of copy-on-write
+// write faults after a live fork — pma lookup, copy, identity adoption, pma
+// and AddressSpace bookkeeping — per page written, for a front-to-back sweep, for
+// writes scattered one per huge page, and for a sweep over memory that an
+// earlier fork generation's scattered writes split into small pmas.
+func BenchmarkLiveForkWriteFault(b *testing.B) {
+	sequential := func(i int) int { return i }
+	for _, pattern := range []struct {
+		name  string
+		order func(i int) int
+		// split, if not zero, is the stride of pages written in an earlier
+		// fork generation, each of which then has a pma of its own.
+		split int
+	}{
+		{name: "sequential", order: sequential},
+		// One page per huge page, then the next page of each, and so on.
+		{name: "scattered", order: func(i int) int { return (i%32)*512 + i/32 }},
+		{name: "sequential-over-split", order: sequential, split: 16},
+	} {
+		b.Run(pattern.name, func(b *testing.B) {
+			ctx := contexttest.Context(b)
+			parent := testMemoryManager(ctx, b)
+			defer parent.DecUsers(ctx)
+			const length = 64 << 20
+			const pages = length / hostarch.PageSize
+			addr := populatedPrivateMapping(ctx, b, parent, length)
+			if pattern.split != 0 {
+				earlier, err := cloneMemoryManagerMetadata(ctx, parent)
+				if err != nil {
+					b.Fatalf("cloneMemoryManagerMetadata: %v", err)
+				}
+				for n := pattern.split / 2; n < pages; n += pattern.split {
+					if err := parent.HandleUserFault(ctx, addr+hostarch.Addr(n)*hostarch.PageSize, hostarch.Write, 0); err != nil {
+						b.Fatalf("write fault: %v", err)
+					}
+				}
+				earlier.DecUsers(ctx)
+			}
+			faults := 0
+			b.ResetTimer()
+			for done := 0; done < b.N; {
+				b.StopTimer()
+				child, err := cloneMemoryManagerMetadata(ctx, parent)
+				if err != nil {
+					b.Fatalf("cloneMemoryManagerMetadata: %v", err)
+				}
+				b.StartTimer()
+				for i := 0; i < pages && done < b.N; i++ {
+					// Only a page that is still shared faults; one copied
+					// ahead is already writable.
+					page := addr + hostarch.Addr(pattern.order(i))*hostarch.PageSize
+					if pseg := child.pmas.FindSegment(page); !pseg.Ok() || pseg.ValuePtr().needCOW {
+						if err := child.HandleUserFault(ctx, page, hostarch.Write, 0); err != nil {
+							b.Fatalf("write fault: %v", err)
+						}
+						faults++
+					}
+					done++
+				}
+				b.StopTimer()
+				child.DecUsers(ctx)
+				b.StartTimer()
+			}
+			b.ReportMetric(float64(faults)/float64(b.N), "faults/page")
 		})
 	}
 }

@@ -411,7 +411,7 @@ func TestTCPRemoteTargetSubprocess(t *testing.T) {
 			t.Fatal(err)
 		}
 		session, err := UnmarshalSessionMetadata(encoded, SessionMetadataLimits{
-			MaxTotalBytes: 4 << 20, MaxKernelBytes: 1, MaxAllocatorBytes: 2 << 20, MaxExecBytes: 1 << 20, MaxLoadRanges: 1024,
+			MaxTotalBytes: 4 << 20, MaxKernelBytes: 1, MaxAllocatorBytes: 2 << 20, MaxLoadRanges: 1024,
 		})
 		if err != nil {
 			t.Fatal(err)

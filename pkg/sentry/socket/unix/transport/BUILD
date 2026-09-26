@@ -127,5 +127,7 @@ go_test(
         "//pkg/context",
         "//pkg/syserr",
         "@org_golang_x_sys//unix:go_default_library",
+        "//pkg/tcpip",
+        "//pkg/waiter",
     ],
 )

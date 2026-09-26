@@ -35,17 +35,39 @@ const maxPlacementRecordBytes = 1 << 20
 type PlacementState string
 
 const (
-	PlacementRunning   PlacementState = "running"
-	PlacementPaused    PlacementState = "paused"
-	PlacementMigrating PlacementState = "migrating"
-	PlacementUnplaced  PlacementState = "unplaced"
+	PlacementRunning PlacementState = "running"
+	PlacementPaused  PlacementState = "paused"
+	// PlacementMaterializing exclusively assigns construction of a durable
+	// process-free branch to one node. It is routable for idempotent start or
+	// rehydrate retries, but it grants no authority to execute guest code.
+	PlacementMaterializing PlacementState = "materializing"
+	PlacementMigrating     PlacementState = "migrating"
+	PlacementUnplaced      PlacementState = "unplaced"
+	PlacementCorrupted     PlacementState = "corrupted"
 )
 
 // PlacementRecord maps a stable logical branch to its current physical
 // runtime. Generation is the fencing token presented by routed commands.
 type PlacementRecord struct {
-	FamilyID          string         `json:"family_id"`
-	BranchID          string         `json:"branch_id"`
+	FamilyID string `json:"family_id"`
+	BranchID string `json:"branch_id"`
+	// Display metadata is replicated with placement so name resolution and
+	// cluster-wide inventory never depend on shared-filesystem directory-cache
+	// convergence. It is not part of execution authority.
+	FamilyName       string    `json:"family_name,omitempty"`
+	ImageReference   string    `json:"image_reference,omitempty"`
+	ImageDigest      string    `json:"image_digest,omitempty"`
+	ImageSize        int64     `json:"image_size,omitempty"`
+	LiveForkEligible bool      `json:"live_fork_eligible,omitempty"`
+	LiveForkWaiver   string    `json:"live_fork_waiver,omitempty"`
+	FamilyCreatedAt  time.Time `json:"family_created_at,omitempty"`
+	ParentBranch     string    `json:"parent_branch,omitempty"`
+	BranchCreatedAt  time.Time `json:"branch_created_at,omitempty"`
+	// Quarantined is cluster-wide branch policy. It belongs beside placement
+	// authority rather than in one physical runtime's metadata, because that
+	// runtime is replaced during migration and may be invisible to control-only
+	// nodes.
+	Quarantined       bool           `json:"quarantined,omitempty"`
 	PhysicalContainer string         `json:"physical_container,omitempty"`
 	PhysicalBranch    string         `json:"physical_branch,omitempty"`
 	OwnerNode         string         `json:"owner_node,omitempty"`
@@ -71,7 +93,7 @@ func (r PlacementRecord) validate() error {
 		return errors.New("placement has invalid last operation")
 	}
 	switch r.State {
-	case PlacementRunning, PlacementPaused:
+	case PlacementRunning, PlacementPaused, PlacementMaterializing:
 		if !transactionIDPattern.MatchString(r.OwnerNode) || !transactionIDPattern.MatchString(r.OwnerIncarnation) ||
 			!transactionIDPattern.MatchString(r.PhysicalContainer) || !transactionIDPattern.MatchString(r.PhysicalBranch) {
 			return errors.New("placed branch lacks a valid owner or physical identity")
@@ -85,7 +107,7 @@ func (r PlacementRecord) validate() error {
 			(r.ResumeState != PlacementRunning && r.ResumeState != PlacementPaused) {
 			return errors.New("migrating placement lacks source, target, operation, or resume state")
 		}
-	case PlacementUnplaced:
+	case PlacementUnplaced, PlacementCorrupted:
 		if r.OwnerNode != "" || r.OwnerIncarnation != "" || r.PhysicalContainer != "" || r.PhysicalBranch != "" ||
 			r.OperationID != "" || r.LastOperationID != "" || r.TargetNode != "" || r.ResumeState != "" {
 			return errors.New("unplaced branch retains an owner")
@@ -117,6 +139,8 @@ type PlacementCatalog interface {
 	Unplace(family, branch, owner, incarnation string, generation uint64, now time.Time) (*PlacementRecord, error)
 	ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
 	UpdateStableState(family, branch, owner, incarnation string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error)
+	SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error)
+	Rename(family, branch, newBranch, owner, incarnation, physicalBranch string, generation uint64, now time.Time) (*PlacementRecord, error)
 	Remove(family, branch string, generation uint64) error
 	Lookup(family, branch string) (*PlacementRecord, error)
 	List() ([]PlacementRecord, error)
@@ -457,7 +481,7 @@ func (s *PlacementStore) Unplace(family, branch, owner, incarnation string, gene
 
 // ClaimUnplaced assigns a durable process-free branch to a ready node.
 func (s *PlacementStore) ClaimUnplaced(family, branch, owner, incarnation, physicalContainer, physicalBranch string, generation uint64, state PlacementState, now time.Time) (*PlacementRecord, error) {
-	if state != PlacementRunning && state != PlacementPaused {
+	if state != PlacementRunning && state != PlacementPaused && state != PlacementMaterializing {
 		return nil, fmt.Errorf("invalid claimed placement state %q", state)
 	}
 	var result PlacementRecord
@@ -506,7 +530,7 @@ func (s *PlacementStore) UpdateStableState(family, branch, owner, incarnation st
 			return nil
 		}
 		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != incarnation ||
-			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			(record.State != PlacementRunning && record.State != PlacementPaused && record.State != PlacementMaterializing) {
 			return errors.New("stale or non-stable placement cannot change lifecycle")
 		}
 		record.State = state
@@ -521,6 +545,94 @@ func (s *PlacementStore) UpdateStableState(family, branch, owner, incarnation st
 		}
 		result = record
 		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// SetQuarantine changes externally visible network policy without replacing
+// execution authority. A concurrent migration wins or loses as one catalog
+// operation, so policy cannot be changed on a stale physical incarnation.
+func (s *PlacementStore) SetQuarantine(family, branch, owner, incarnation string, generation uint64, quarantined bool, now time.Time) (*PlacementRecord, error) {
+	var result PlacementRecord
+	err := s.withRecordLock(family, branch, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if record.Generation != generation || record.OwnerNode != owner || record.OwnerIncarnation != incarnation ||
+			(record.State != PlacementRunning && record.State != PlacementPaused) {
+			return errors.New("stale or non-stable placement cannot change quarantine policy")
+		}
+		if record.Quarantined == quarantined {
+			result = record
+			return nil
+		}
+		record.Quarantined = quarantined
+		record.Revision++
+		record.UpdatedAt = now
+		if err := record.validate(); err != nil {
+			return err
+		}
+		if err := s.store(record); err != nil {
+			return err
+		}
+		result = record
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Rename moves a logical placement key without changing the runtime it owns.
+// The catalog-wide lock makes absence of the destination and removal of the
+// source one atomic filesystem transaction for this legacy implementation.
+func (s *PlacementStore) Rename(family, branch, newBranch, owner, incarnation, physicalBranch string, generation uint64, now time.Time) (*PlacementRecord, error) {
+	if branch == newBranch {
+		return s.Lookup(family, branch)
+	}
+	var result PlacementRecord
+	err := s.withCatalogLock(true, func() error {
+		record, err := s.load(family, branch)
+		if err != nil {
+			return err
+		}
+		if _, err := s.load(family, newBranch); err == nil {
+			return os.ErrExist
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if record.Generation != generation || record.State == PlacementMigrating || record.State == PlacementMaterializing || record.State == PlacementCorrupted {
+			return errors.New("stale or unstable placement cannot be renamed")
+		}
+		if record.State == PlacementRunning || record.State == PlacementPaused {
+			if record.OwnerNode != owner || record.OwnerIncarnation != incarnation {
+				return errors.New("rename does not match the physical placement owner")
+			}
+			record.PhysicalBranch = physicalBranch
+		} else if record.State != PlacementUnplaced {
+			return fmt.Errorf("branch is %s, not renameable", record.State)
+		}
+		oldKey, err := placementKey(family, branch)
+		if err != nil {
+			return err
+		}
+		record.BranchID = newBranch
+		record.Generation++
+		record.Revision++
+		record.UpdatedAt = now
+		if err := s.store(record); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(s.dir, oldKey+".json")); err != nil {
+			return err
+		}
+		result = record
+		return syncDirectory(s.dir)
 	})
 	if err != nil {
 		return nil, err
@@ -583,15 +695,7 @@ func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
 		return nil, err
 	}
 	result := make([]PlacementRecord, 0, len(entries))
-	removedLegacyLocks := false
 	for _, entry := range entries {
-		if isLegacyPlacementLock(entry.Name()) {
-			if err := os.Remove(filepath.Join(s.dir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return nil, err
-			}
-			removedLegacyLocks = true
-			continue
-		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
@@ -615,20 +719,7 @@ func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
 		}
 		return result[i].BranchID < result[j].BranchID
 	})
-	if removedLegacyLocks {
-		if err := syncDirectory(s.dir); err != nil {
-			return nil, err
-		}
-	}
 	return result, nil
-}
-
-func isLegacyPlacementLock(name string) bool {
-	if len(name) != sha256.Size*2+len(".lock") || !strings.HasSuffix(name, ".lock") {
-		return false
-	}
-	_, err := hex.DecodeString(strings.TrimSuffix(name, ".lock"))
-	return err == nil
 }
 
 func (s *PlacementStore) load(family, branch string) (PlacementRecord, error) {

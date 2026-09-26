@@ -36,6 +36,16 @@ const (
 // Client helps manage a connection to the lisafs server and pass messages
 // efficiently. There is a 1:1 mapping between a Connection and a Client.
 type Client struct {
+	// OnStarved is called when the server reports that it has run out of file
+	// descriptors. It is immutable once the client is in use, and may be nil.
+	//
+	// A hook rather than a flag on the client, because the client is per mount
+	// and the shortage is not: one gofer process serves every mount of a
+	// sandbox out of one descriptor table, so whoever can give descriptors back
+	// is not necessarily whoever was refused. The caller knows that; this does
+	// not.
+	OnStarved func()
+
 	// sockComm is the main socket by which this connections is established.
 	// Communication over the socket is synchronized by sockMu.
 	sockMu   sync.Mutex
@@ -387,6 +397,12 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal marshalFunc,
 		var resp ErrorResp
 		resp.UnmarshalUnsafe(comm.PayloadBuf(respPayloadLen))
 		debugf("recv", comm, resp.String)
+		errno := unix.Errno(resp.errno)
+		// Every error the server reports comes back through here, which is the
+		// one place that can see a descriptor shortage whatever caused it.
+		if starvedErrno(errno) && c.OnStarved != nil {
+			c.OnStarved()
+		}
 		return protocolError(resp.errno)
 	}
 	if respM != m {
@@ -403,6 +419,16 @@ func (c *Client) SndRcvMessage(m MID, payloadLen uint32, reqMarshal marshalFunc,
 	}
 	debugf("recv", comm, respString)
 	return nil
+}
+
+// starvedErrno reports whether an error from the server means it has no file
+// descriptors left.
+//
+// Both of them: EMFILE is this process's own limit and ENFILE is the machine's,
+// and a client can do something about either — what it is holding is a cost to
+// both.
+func starvedErrno(e unix.Errno) bool {
+	return e == unix.EMFILE || e == unix.ENFILE
 }
 
 func debugf(action string, comm Communicator, debugMsg debugStringer) {

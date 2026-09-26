@@ -58,6 +58,10 @@ type LiveForkOptions struct {
 	// filesystems.
 	ChildBranchID string
 
+	// FilesystemOrigins contains Raft-allocated [newSource,newChild] pairs for
+	// every persistent filesystem. Nil selects standalone local allocation.
+	FilesystemOrigins vfs.LiveForkFilesystemOrigins
+
 	// RestoreOptions are passed to filesystem restore completion hooks.
 	RestoreOptions vfs.CompleteRestoreOptions
 
@@ -114,12 +118,21 @@ type LiveForkValidationOptions struct {
 // LiveForkMetrics separates parent preparation, metadata, and child restore
 // costs. Durations include only work performed by Kernel.LiveFork.
 type LiveForkMetrics struct {
-	Validation        time.Duration
-	ParentPreparation time.Duration
-	MetadataStream    time.Duration
-	MetadataBytes     int64
-	ChildRestore      time.Duration
-	Total             time.Duration
+	Validation                    time.Duration
+	ParentPreparation             time.Duration
+	SharedMemoryPreparation       time.Duration
+	MappingInvalidation           time.Duration
+	VFSPreparation                time.Duration
+	FilesystemMetadataFlush       time.Duration
+	FilesystemRuntimeInvalidation time.Duration
+	FilesystemBranchSeal          time.Duration
+	FilesystemNamespacePrune      time.Duration
+	FilesystemNamespaceCandidates int64
+	MemoryPreparation             time.Duration
+	MetadataStream                time.Duration
+	MetadataBytes                 int64
+	ChildRestore                  time.Duration
+	Total                         time.Duration
 }
 
 // LiveForkStage identifies a completed live-fork transaction stage.
@@ -267,7 +280,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return err
 		}
 		preparationStarted := time.Now()
+		sharedMemoryStarted := time.Now()
 		k.prepareSharedMemoryForLiveFork(ctx)
+		if opts.Metrics != nil {
+			opts.Metrics.SharedMemoryPreparation = time.Since(sharedMemoryStarted)
+		}
 		if err := injectLiveForkFailure(opts, LiveForkStageSharedMemoryPrepared); err != nil {
 			return err
 		}
@@ -275,8 +292,12 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		// such as a gofer MmapCachedFile. The VMAs remain and refault from their
 		// branch-local cloned filesystem graph. This must precede VFS.PrepareSave
 		// for the same reason as in Kernel.SaveTo.
+		mappingInvalidationStarted := time.Now()
 		if err := k.invalidateUnsavableMappings(ctx); err != nil {
 			return fmt.Errorf("invalidating unsavable mappings for live fork: %w", err)
+		}
+		if opts.Metrics != nil {
+			opts.Metrics.MappingInvalidation = time.Since(mappingInvalidationStarted)
 		}
 		if err := injectLiveForkFailure(opts, LiveForkStageMappingsInvalidated); err != nil {
 			return err
@@ -287,6 +308,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			fsResources = make(vfs.LiveForkFilesystemResources)
 		}
 		fsTransactions := &vfs.LiveForkTransactions{}
+		fsPreparationMetrics := &vfs.LiveForkPreparationMetrics{}
 		fsTransactionsCommitted := false
 		defer func() {
 			if fsTransactionsCommitted {
@@ -308,9 +330,20 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			vfs.CtxLiveForkChildBranchID:       opts.ChildBranchID,
 			vfs.CtxLiveForkChildBranchIDs:      opts.batchChildBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
+			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
+			vfs.CtxLiveForkPreparationMetrics:  fsPreparationMetrics,
 		})
+		vfsPreparationStarted := time.Now()
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for live fork: %w", err)
+		}
+		if opts.Metrics != nil {
+			opts.Metrics.VFSPreparation = time.Since(vfsPreparationStarted)
+			opts.Metrics.FilesystemMetadataFlush = fsPreparationMetrics.MetadataFlush
+			opts.Metrics.FilesystemRuntimeInvalidation = fsPreparationMetrics.RuntimeInvalidation
+			opts.Metrics.FilesystemBranchSeal = fsPreparationMetrics.BranchSeal
+			opts.Metrics.FilesystemNamespacePrune = fsPreparationMetrics.NamespacePrune
+			opts.Metrics.FilesystemNamespaceCandidates = fsPreparationMetrics.NamespaceCandidates
 		}
 		defer k.vfs.BeforeResume(saveCtx)
 		if err := injectLiveForkFailure(opts, LiveForkStageVFSPrepared); err != nil {
@@ -320,9 +353,13 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			return fmt.Errorf("live fork does not yet support %d private filesystem MemoryFiles", len(mfs))
 		}
 
+		memoryPreparationStarted := time.Now()
 		pmaSnapshots, clearPMASnapshots := k.prepareMemoryManagersForLiveFork()
 		defer clearPMASnapshots()
 		k.mf.MarkSavable()
+		if opts.Metrics != nil {
+			opts.Metrics.MemoryPreparation = time.Since(memoryPreparationStarted)
+		}
 		childMemoryFile := k.mf
 		var remotePageLoad *pgalloc.AsyncPagesFileLoad
 		var remoteLoadRanges []pgalloc.RemoteLoadRange
@@ -422,6 +459,11 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 			if opts.RemotePageReaderFactory == nil {
 				pgalloc.StartLoopbackRemotePush(remoteSnapshot, remotePageLoad, 256<<10)
 			}
+		} else {
+			// An ordinary local fork shares the source MemoryFile, including any
+			// not-yet-resident chunks. Give the child an explicit owner of those
+			// readers; page references alone do not preserve their lifetime.
+			child.InheritDistributedForkMemorySources(k, k.remoteLoadRanges)
 		}
 		if opts.Metrics != nil {
 			opts.Metrics.MetadataStream = time.Since(metadataStarted)
@@ -439,7 +481,10 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 		if err := injectLiveForkFailure(opts, LiveForkStageVDSOPrivatized); err != nil {
 			return err
 		}
-		child.liveForkQuarantine = opts.Quarantine
+		// Quarantine is inherited. A child cannot regain an external edge merely
+		// by forking a quarantined source; it may be explicitly unquarantined by
+		// a later branch operation.
+		child.liveForkQuarantine = k.liveForkQuarantine || opts.Quarantine
 		if err := child.restoreLiveForkNetworkStacks(k.rootNetworkNamespace.Stack()); err != nil {
 			return err
 		}
@@ -522,6 +567,15 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	primaryOpts := opts[0]
 	primaryOpts.batchChildBranchIDs = ids[:1]
 	primaryOpts.batchFilesystemResources = fsResources
+	if primaryOpts.FilesystemOrigins != nil {
+		primaryOpts.FilesystemOrigins = make(vfs.LiveForkFilesystemOrigins, len(opts[0].FilesystemOrigins))
+		for resource, origins := range opts[0].FilesystemOrigins {
+			if len(origins) != 2*len(opts) {
+				return nil, fmt.Errorf("filesystem resource %q has %d clustered origins, want %d", resource, len(origins), 2*len(opts))
+			}
+			primaryOpts.FilesystemOrigins[resource] = append([]uint64(nil), origins[:2]...)
+		}
+	}
 	primary, err := k.LiveFork(ctx, primaryOpts)
 	if err != nil {
 		return nil, err
@@ -562,7 +616,7 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 	// fdnotifier.Pause. Finish the reusable child capture before sourceReady
 	// resumes another Kernel in this Sentry. Only decoding the additional
 	// children is safe to overlap with source execution.
-	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:]); err != nil {
+	if err := forkPreparedFilesystemBranches(fsResources, ids[0], ids[1:], opts[0].FilesystemOrigins); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -616,14 +670,29 @@ func (k *Kernel) LiveForkMany(ctx context.Context, opts []LiveForkOptions, sourc
 // forkPreparedFilesystemBranches creates remaining persistent siblings from
 // the paused primary child. Its metadata root is the exact root captured from
 // the original source, but this work no longer contributes to source downtime.
-func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, primary string, siblings []string) error {
+func forkPreparedFilesystemBranches(resources vfs.LiveForkFilesystemResources, primary string, siblings []string, originPlan vfs.LiveForkFilesystemOrigins) error {
 	for resourceID, resource := range resources {
 		brancher, ok := resource.(vfs.LiveForkBranchingResource)
 		if !ok {
 			continue
 		}
-		for _, sibling := range siblings {
-			if err := brancher.Fork(primary, sibling); err != nil {
+		origins, clustered := originPlan[resourceID]
+		if clustered && len(origins) != 2*(len(siblings)+1) {
+			return fmt.Errorf("filesystem resource %q has %d clustered origins, want %d", resourceID, len(origins), 2*(len(siblings)+1))
+		}
+		for index, sibling := range siblings {
+			var err error
+			if clustered {
+				originBrancher, ok := resource.(vfs.LiveForkOriginBranchingResource)
+				if !ok {
+					return fmt.Errorf("filesystem resource %q cannot accept clustered snapshot origins", resourceID)
+				}
+				offset := 2 * (index + 1)
+				err = originBrancher.ForkWithOrigins(primary, sibling, origins[offset], origins[offset+1])
+			} else {
+				err = brancher.Fork(primary, sibling)
+			}
+			if err != nil {
 				return fmt.Errorf("forking prepared filesystem resource %q from %q as %q: %w", resourceID, primary, sibling, err)
 			}
 		}
@@ -964,6 +1033,38 @@ func (k *Kernel) restoreReconfiguredNetworkStacks(configureRoot func(inet.Stack)
 	return nil
 }
 
+// LiveForkQuarantine reports whether this Kernel's runtime-managed external
+// network edge is quarantined.
+func (k *Kernel) LiveForkQuarantine() bool {
+	return k.liveForkQuarantine
+}
+
+// SetLiveForkQuarantine changes quarantine for a paused Kernel. It changes
+// only the runtime-owned root link; all Sentry-owned network state remains in
+// place. Callers are responsible for pausing and resuming tasks.
+func (k *Kernel) SetLiveForkQuarantine(quarantine bool) error {
+	if k.liveForkQuarantine == quarantine {
+		return nil
+	}
+	if k.rootNetworkNamespace == nil || k.rootNetworkNamespace.Stack() == nil {
+		k.liveForkQuarantine = quarantine
+		return nil
+	}
+	stack := k.rootNetworkNamespace.Stack()
+	controller, ok := stack.(inet.LiveForkQuarantineController)
+	if !ok {
+		return fmt.Errorf("network stack %T cannot change TTC quarantine", stack)
+	}
+	stack.Pause()
+	err := controller.SetLiveForkQuarantineState(quarantine)
+	stack.Resume()
+	if err != nil {
+		return err
+	}
+	k.liveForkQuarantine = quarantine
+	return nil
+}
+
 // validateLiveForkMappings walks each unique task address space and rejects
 // special or host-backed VMAs that cannot yet be made branch-local. It runs
 // before any live-fork CoW mutation.
@@ -1211,6 +1312,30 @@ func (k *Kernel) privatizeLiveForkVDSOParamPage() error {
 		return fmt.Errorf("zeroing live-fork VDSO parameter page wrote %d bytes, want %d", n, hostarch.PageSize)
 	}
 	k.vdso.ParamPage.RebindMemoryFileRange(k.mf, fr)
+	// Rebinding the SpecialMappable changes future translations, but restored
+	// address spaces may already have PMAs and host mappings for the fork-time
+	// page. Drop those cached translations before the target starts. Otherwise
+	// vDSO clock reads continue using source-host calibration even though the
+	// child Timekeeper updates the new target-local page.
+	seen := make(map[*mm.MemoryManager]struct{})
+	invalidate := func(memMgr *mm.MemoryManager) {
+		if memMgr == nil {
+			return
+		}
+		if _, ok := seen[memMgr]; ok {
+			return
+		}
+		seen[memMgr] = struct{}{}
+		memMgr.InvalidateMappingsForMappable(k.vdso.ParamPage)
+	}
+	k.tasks.mu.RLock()
+	for task := range k.tasks.Root.tids {
+		invalidate(task.image.MemoryManager)
+		if r, ok := task.runState.(*runExecveAfterSiblingExitStop); ok {
+			invalidate(r.image.MemoryManager)
+		}
+	}
+	k.tasks.mu.RUnlock()
 	// Do not mutate the deserialized wrapper in place. State graphs created by
 	// older TTC branches may contain a stale cross-branch wrapper reference,
 	// and VDSO sequence state is an execution cache rather than branch state.

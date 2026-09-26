@@ -47,6 +47,10 @@ func omitTimespec() unix.Timespec {
 	return unix.Timespec{Nsec: darwinUtimeOmit}
 }
 
+// pathOpenFlagMask identifies control FDs opened only as path references:
+// the Darwin substitutes returned by pathOpenFlags for Linux O_PATH.
+const pathOpenFlagMask = unix.O_SYMLINK | unix.O_EVTONLY
+
 func pathOpenFlags() []int {
 	// O_SYMLINK opens a symlink itself; O_EVTONLY is the closest descriptor
 	// capability to Linux O_PATH for sockets and other non-readable nodes.

@@ -109,7 +109,7 @@ type regularFile struct {
 	// creations and fsyncs per chunk. Linux does not make ordinary write(2)
 	// metadata durable until a later synchronization point, so TTC coalesces
 	// publication until close, fsync/sync, live fork, or filesystem teardown.
-	diskMetadataDirty atomicbitops.Uint32
+	diskMetadataDirty atomicbitops.Uint64
 
 	// initiallyUnlinked is true if this file was created using NewZeroFile or
 	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
@@ -170,7 +170,19 @@ func (fs *filesystem) registerLiveForkFile(file *regularFile) {
 func (fs *filesystem) unregisterLiveForkFile(file *regularFile) {
 	fs.liveForkMu.Lock()
 	delete(fs.liveForkFiles, file)
+	delete(fs.diskForkFiles, file)
+	removeDiskCacheFileLocked(fs.diskMmapObjectFiles, file)
+	removeDiskCacheFileLocked(fs.diskIOObjectFiles, file)
 	fs.liveForkMu.Unlock()
+}
+
+func removeDiskCacheFileLocked(index map[string]map[*regularFile]struct{}, file *regularFile) {
+	for object, files := range index {
+		delete(files, file)
+		if len(files) == 0 {
+			delete(index, object)
+		}
+	}
 }
 
 // afterLoad is invoked by stateify.
@@ -198,6 +210,9 @@ func (rf *regularFile) afterLoad(ctx goContext.Context) {
 			for mapping := range seg.Value() {
 				rf.diskMmap.AddMapping(mapping.AddrRange, seg.Start())
 			}
+		}
+		if !rf.mappings.IsEmpty() {
+			rf.inode.fs.markDiskForkFile(rf)
 		}
 	}
 	if !pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
@@ -227,7 +242,7 @@ func (rf *regularFile) prepareLiveFork() {
 		// still pinned by this runtime cache. The restored child starts without
 		// a runtime-local mmap FD via afterLoad.
 		rf.diskMmap.ResetFD()
-		rf.diskObject = ""
+		rf.setDiskMmapObjectLocked("")
 		rf.diskIOMu.Unlock()
 		rf.mapsMu.Unlock()
 		return
@@ -248,6 +263,10 @@ func (rf *regularFile) prepareLiveFork() {
 // diskMmap may remain valid when diskObject is empty.
 func (rf *regularFile) ensureDiskMmapLocked() error {
 	if rf.diskObject != "" && rf.diskMmap.FD() >= 0 {
+		// AddMapping is not called again when an existing VMA refaults after
+		// prepareLiveFork invalidated its PMAs. Keep the file in the next
+		// lifecycle fence's invalidation set even on this fast path.
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	volume := rf.inode.fs.diskVolume
@@ -259,13 +278,14 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		// while repository GC is excluded by the mutation lock.
 		rf.invalidateDiskIOLocked()
 		rf.diskMmap.ResetFD()
-		rf.diskObject = ""
+		rf.setDiskMmapObjectLocked("")
 	})
 	if err != nil {
-		return err
+		return diskVolumeError("open mmap backing", err)
 	}
 	defer file.Close()
 	if rf.diskObject == meta.Object && rf.diskMmap.FD() >= 0 {
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	newFD, err := unix.Dup(int(file.Fd()))
@@ -276,7 +296,13 @@ func (rf *regularFile) ensureDiskMmapLocked() error {
 		unix.Close(newFD)
 		return err
 	}
-	rf.diskObject = meta.Object
+	rf.setDiskMmapObjectLocked(meta.Object)
+	// An existing VMA can reach Translate after a fork without another
+	// AddMapping call. Record the newly installed host-backed translation so
+	// the next fork, checkpoint, or dehydration invalidates it before PMA
+	// serialization. Otherwise an idle-then-refaulted branch can retain an
+	// fsutil.MmapCachedFile PMA that the memory graph cannot serialize.
+	rf.inode.fs.markDiskForkFile(rf)
 	return nil
 }
 
@@ -294,11 +320,12 @@ func (rf *regularFile) openDiskIOLocked(writable bool, onCoW func()) (*os.File, 
 	volume := rf.inode.fs.diskVolume
 	file, meta, cloned, err := volume.Repository.OpenDataFileWithCoW(volume.Branch, rf.inode.ino, writable, onCoW)
 	if err != nil {
-		return nil, false, err
+		return nil, false, diskVolumeError("open regular-file data", err)
 	}
 	rf.diskIOFile = file
-	rf.diskIOObject = meta.Object
+	rf.setDiskIOObjectLocked(meta.Object)
 	rf.diskIOWritable = writable
+	rf.inode.fs.markDiskForkFile(rf)
 	return file, cloned, nil
 }
 
@@ -308,7 +335,7 @@ func (rf *regularFile) invalidateDiskIOLocked() {
 		_ = rf.diskIOFile.Close()
 		rf.diskIOFile = nil
 	}
-	rf.diskIOObject = ""
+	rf.setDiskIOObjectLocked("")
 	rf.diskIOWritable = false
 }
 
@@ -318,6 +345,19 @@ func (rf *regularFile) invalidateDiskIO() {
 	rf.diskIOMu.Unlock()
 }
 
+// ensureDiskData materializes a remotely inherited whole-file object before
+// any runtime cache can open it. Materialization is
+// deliberately outside mapsMu and diskIOMu: repository callbacks acquire
+// those locks to invalidate caches in every branch sharing the repository.
+func (rf *regularFile) ensureDiskData() error {
+	if rf.inode.fs.diskVolume == nil {
+		return nil
+	}
+	size := int64(rf.size.Load())
+	return diskVolumeError("materialize file", rf.inode.fs.diskVolume.Repository.EnsureDataRange(
+		rf.inode.fs.diskVolume.Branch, rf.inode.ino, 0, size))
+}
+
 // resetDiskMmapLocked revokes application translations and drops the mmap
 // cache's host reference to an object that repository CoW made unreachable.
 //
@@ -325,13 +365,15 @@ func (rf *regularFile) invalidateDiskIO() {
 func (rf *regularFile) resetDiskMmapLocked() {
 	rf.mappings.InvalidateAll(memmap.InvalidateOpts{})
 	rf.diskMmap.ResetFD()
-	rf.diskObject = ""
+	rf.setDiskMmapObjectLocked("")
 }
 
 // markDiskMetadataDirty defers repository metadata publication. The flag is
 // atomic because atime may be updated by concurrent readers without inode.mu.
 func (rf *regularFile) markDiskMetadataDirty() {
-	rf.diskMetadataDirty.Store(1)
+	if rf.inode.fs.diskVolume != nil {
+		rf.inode.fs.markDiskFileDirty(rf)
+	}
 }
 
 // markDiskMetadataDirtyLocked is the write-side spelling used when inode.mu is
@@ -344,13 +386,25 @@ func (rf *regularFile) markDiskMetadataDirtyLocked() {
 //
 // Preconditions: rf.inode.mu is locked.
 func (rf *regularFile) flushDiskMetadataLocked() error {
-	if rf.inode.fs.diskVolume == nil || rf.diskMetadataDirty.Load() == 0 {
+	return diskVolumeError("publish written inode metadata", rf.flushDiskMetadataRawLocked())
+}
+
+// flushDiskMetadataRawLocked preserves repository diagnostics for lifecycle
+// operations that are not guest syscall boundaries.
+//
+// Preconditions: rf.inode.mu is locked.
+func (rf *regularFile) flushDiskMetadataRawLocked() error {
+	if rf.inode.fs.diskVolume == nil {
 		return nil
 	}
-	if err := rf.inode.fs.persistDiskWriteMetadata(&rf.inode); err != nil {
+	generation := rf.diskMetadataDirty.Load()
+	if generation == 0 {
+		return nil
+	}
+	if err := rf.inode.fs.persistDiskWriteMetadataRaw(&rf.inode); err != nil {
 		return err
 	}
-	rf.diskMetadataDirty.Store(0)
+	rf.inode.fs.finishDiskFileMetadata(rf, generation)
 	return nil
 }
 
@@ -358,6 +412,15 @@ func (rf *regularFile) flushDiskMetadata() error {
 	rf.inode.mu.Lock()
 	defer rf.inode.mu.Unlock()
 	return rf.flushDiskMetadataLocked()
+}
+
+func (rf *regularFile) flushDiskMetadataRaw() error {
+	if rf.diskMetadataDirty.Load() == 0 {
+		return nil
+	}
+	rf.inode.mu.Lock()
+	defer rf.inode.mu.Unlock()
+	return rf.flushDiskMetadataRawLocked()
 }
 
 // copyOnWriteLocked gives rf private backing for shared pages in mr.
@@ -533,6 +596,9 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 		return nil
 	}
 	if rf.inode.fs.diskVolume != nil {
+		if err := rf.ensureDiskData(); err != nil {
+			return err
+		}
 		if newSize > oldSize {
 			if rf.seals&linux.F_SEAL_GROW != 0 {
 				return linuxerr.EPERM
@@ -547,12 +613,12 @@ func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
 				rf.invalidateDiskIOLocked()
 				rf.mappings.InvalidateAll(memmap.InvalidateOpts{InvalidatePrivate: true})
 				rf.diskMmap.ResetFD()
-				rf.diskObject = ""
+				rf.setDiskMmapObjectLocked("")
 			})
 		rf.diskIOMu.Unlock()
 		if err != nil {
 			rf.mapsMu.Unlock()
-			return err
+			return diskVolumeError("truncate", err)
 		}
 		rf.size.Store(newSize)
 		rf.inode.fs.adjustDiskBytes(oldSize, newSize)
@@ -617,6 +683,7 @@ func (rf *regularFile) AddMapping(ctx context.Context, ms memmap.MappingSpace, a
 	if rf.inode.fs.diskVolume != nil {
 		rf.diskMmap.AddMapping(ar, offset)
 		rf.mappings.AddMapping(ms, ar, offset, writable)
+		rf.inode.fs.markDiskForkFile(rf)
 		return nil
 	}
 	rf.dataMu.RLock()
@@ -673,6 +740,9 @@ func (rf *regularFile) CopyMapping(ctx context.Context, ms memmap.MappingSpace, 
 // Translate implements memmap.Mappable.Translate.
 func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	if rf.inode.fs.diskVolume != nil {
+		if err := rf.ensureDiskData(); err != nil {
+			return nil, &memmap.BusError{err}
+		}
 		rf.mapsMu.Lock()
 		defer rf.mapsMu.Unlock()
 		// Privatize on the first mapping fault after a fork, including a read
@@ -857,12 +927,24 @@ func (fd *regularFileFD) Sync(_ context.Context, opts vfs.SyncOptions) error {
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
 	if err := f.inode.fs.diskVolume.Repository.SyncData(f.inode.fs.diskVolume.Branch, f.inode.ino, opts.DataOnly); err != nil {
-		return err
+		// Sync failures are never an expected pathname-control-flow result. Keep
+		// the repository cause even when it maps to a familiar errno such as
+		// ENOENT or EINVAL; applications such as SQLite collapse all of these to
+		// SQLITE_IOERR_FSYNC, which otherwise conceals lifecycle races.
+		reportDiskVolumeFailure("sync regular-file data", err)
+		return diskVolumeError("sync regular-file data", err)
 	}
 	if err := f.flushDiskMetadataLocked(); err != nil {
 		return err
 	}
-	return f.inode.fs.diskVolume.Repository.SyncMetadata()
+	// This file's metadata and names, not the repository's every dirty
+	// object: fsync(2) promises this file, and sync(2) is the call that
+	// promises everything.
+	if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
+		reportDiskVolumeFailure("sync filesystem metadata", err)
+		return diskVolumeError("sync filesystem metadata", err)
+	}
+	return nil
 }
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
@@ -877,6 +959,9 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		return linuxerr.EFBIG
 	}
 	if f.inode.fs.diskVolume != nil {
+		if err := f.ensureDiskData(); err != nil {
+			return err
+		}
 		oldSize := f.size.Load()
 		f.mapsMu.Lock()
 		f.diskIOMu.Lock()
@@ -888,7 +973,7 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 		f.diskIOMu.Unlock()
 		f.mapsMu.Unlock()
 		if err != nil {
-			return err
+			return diskVolumeError("allocate file range", err)
 		}
 		if end > f.size.Load() {
 			f.size.Store(end)
@@ -1004,50 +1089,18 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 	f := fd.inode().impl.(*regularFile)
 	if f.inode.fs.diskVolume != nil {
-		f.diskIOMu.Lock()
-		defer f.diskIOMu.Unlock()
-		file, _, err := f.openDiskIOLocked(false, nil)
-		if err != nil {
-			return 0, err
-		}
-		const maxBounce = 64 << 10
-		buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
-		var done int64
-		for dst.NumBytes() != 0 {
-			want := min(dst.NumBytes(), int64(len(buf)))
-			n, readErr := file.ReadAt(buf[:want], offset+done)
-			if n != 0 {
-				copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
-				done += int64(copied)
-				dst = dst.DropFirst(copied)
-				if copyErr != nil {
-					return done, copyErr
-				}
-				if copied != n {
-					return done, io.ErrShortWrite
-				}
-			}
-			if readErr != nil {
-				if readErr == io.EOF && done != 0 {
-					readErr = nil
-				}
-				oldAtime := f.inode.atime.Load()
-				f.inode.touchAtime(fd.vfsfd.Mount())
-				if f.inode.atime.Load() != oldAtime {
-					f.markDiskMetadataDirty()
-				}
-				return done, readErr
-			}
-			if n == 0 {
-				return done, io.ErrNoProgress
+		n, err, updateAtime := f.preadDisk(ctx, dst, offset)
+		// Writers take inode.mu before diskIOMu. Release diskIOMu before
+		// touchAtime takes inode.mu to preserve that global order; retaining
+		// diskIOMu here deadlocks a growing writer against a concurrent reader.
+		if updateAtime {
+			oldAtime := f.inode.atime.Load()
+			f.inode.touchAtime(fd.vfsfd.Mount())
+			if f.inode.atime.Load() != oldAtime {
+				f.markDiskMetadataDirty()
 			}
 		}
-		oldAtime := f.inode.atime.Load()
-		f.inode.touchAtime(fd.vfsfd.Mount())
-		if f.inode.atime.Load() != oldAtime {
-			f.markDiskMetadataDirty()
-		}
-		return done, nil
+		return n, err
 	}
 	// memCgID can be 0 here because regularFileReadWriter.ReadToBlocks() never
 	// allocates from pgalloc.
@@ -1056,6 +1109,48 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	putRegularFileReadWriter(rw)
 	fd.inode().touchAtime(fd.vfsfd.Mount())
 	return n, err
+}
+
+// preadDisk reads from the branch's current disk object. updateAtime reports
+// whether the read reached an ordinary completion point. The caller must apply
+// that metadata update only after this method releases diskIOMu.
+func (rf *regularFile) preadDisk(ctx context.Context, dst usermem.IOSequence, offset int64) (done int64, err error, updateAtime bool) {
+	if err := rf.ensureDiskData(); err != nil {
+		return 0, err, false
+	}
+	rf.diskIOMu.Lock()
+	defer rf.diskIOMu.Unlock()
+	file, _, err := rf.openDiskIOLocked(false, nil)
+	if err != nil {
+		return 0, err, false
+	}
+	const maxBounce = 64 << 10
+	buf := make([]byte, min(dst.NumBytes(), int64(maxBounce)))
+	for dst.NumBytes() != 0 {
+		want := min(dst.NumBytes(), int64(len(buf)))
+		n, readErr := file.ReadAt(buf[:want], offset+done)
+		if n != 0 {
+			copied, copyErr := dst.TakeFirst64(int64(n)).CopyOut(ctx, buf[:n])
+			done += int64(copied)
+			dst = dst.DropFirst(copied)
+			if copyErr != nil {
+				return done, copyErr, false
+			}
+			if copied != n {
+				return done, io.ErrShortWrite, false
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF && done != 0 {
+				readErr = nil
+			}
+			return done, readErr, true
+		}
+		if n == 0 {
+			return done, io.ErrNoProgress, false
+		}
+	}
+	return done, nil, true
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -1113,6 +1208,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	src = src.TakeFirst64(srclen)
 
 	if f.inode.fs.diskVolume != nil {
+		if err := f.ensureDiskData(); err != nil {
+			return 0, offset, err
+		}
 		oldSize := f.size.Load()
 		// Object transitions always take mapsMu before diskIOMu. The CoW
 		// callback runs while repository GC is excluded, so it can revoke the
@@ -1152,8 +1250,10 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 				return done, offset + done, io.ErrNoProgress
 			}
 		}
+		grew := false
 		if end := uint64(offset + done); end > f.size.Load() {
 			f.size.Store(end)
+			grew = true
 		}
 		f.inode.fs.adjustDiskBytes(oldSize, f.size.Load())
 		f.inode.touchCMtimeLocked()
@@ -1165,6 +1265,20 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		}
 		f.inode.xattrs.KillPriv()
 		f.markDiskMetadataDirtyLocked()
+		if err := f.inode.fs.diskVolume.Repository.MarkDataDirty(f.diskIOObject); err != nil {
+			return done, offset + done, diskVolumeError("mark regular-file data dirty", err)
+		}
+		// A newly created or extended file must become visible to an immediate
+		// live-fork capture even if the writing task has exited but its FD-table
+		// teardown has not yet invoked OnClose/Release. UpdateAfterWrite only
+		// appends to the repository's bounded metadata batch; it does not fsync
+		// or publish a graph root here. BeginFork flushes that batch atomically.
+		// Same-size writes retain the normal close/fsync/fork coalescing path.
+		if grew {
+			if err := f.flushDiskMetadataLocked(); err != nil {
+				return done, offset + done, err
+			}
+		}
 		status := fd.vfsfd.StatusFlags()
 		if opts.Flags&(linux.RWF_DSYNC|linux.RWF_SYNC) != 0 || status&(linux.O_DSYNC|linux.O_SYNC) != 0 {
 			dataOnly := opts.Flags&linux.RWF_SYNC == 0 && status&linux.O_SYNC == 0
@@ -1180,8 +1294,8 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			if err := f.flushDiskMetadataLocked(); err != nil {
 				return done, offset + done, err
 			}
-			if err := f.inode.fs.diskVolume.Repository.SyncMetadata(); err != nil {
-				return done, offset + done, err
+			if err := f.inode.fs.diskVolume.Repository.SyncBranchMetadata(f.inode.fs.diskVolume.Branch); err != nil {
+				return done, offset + done, diskVolumeError("sync filesystem metadata", err)
 			}
 		}
 		return done, offset + done, nil

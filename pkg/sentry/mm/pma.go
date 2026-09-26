@@ -107,6 +107,37 @@ func (mm *MemoryManager) existingVecPMAsLocked(ars hostarch.AddrRangeSeq, at hos
 //   - vmas must exist for all addresses in ar, and support accesses of type at
 //     (i.e. permission checks must have been performed against vmas).
 func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, callerIndirectCommit bool) (pmaIterator, pmaGapIterator, error) {
+	return mm.getPMAsRemappingLocked(ctx, vseg, ar, at, callerIndirectCommit, nil)
+}
+
+// faultRemap is lent to getPMAsRemappingLocked by a caller that maps ar into
+// the AddressSpace as soon as it returns, as the page-fault handler does.
+//
+// A pma replaced inside ar, as breaking copy-on-write replaces one, is left
+// mapped to what it replaced instead of being unmapped: MapFile replaces
+// existing mappings, so the unmap would be a second platform round trip on
+// every copy-on-write fault for nothing. The references to what was replaced
+// wait in decRefs until the caller has mapped ar or unmapped it. Until then
+// the old translation can still be read through by the faulting thread's
+// siblings, and a page released early can be taken over and written in place
+// by the branch it was shared with.
+type faultRemap struct {
+	ar      hostarch.AddrRange
+	decRefs *pendingFileDecRefs
+}
+
+// release drops the references remap held.
+//
+// Preconditions: remap.ar has been mapped into the AddressSpace or unmapped
+// from it since getPMAsRemappingLocked returned.
+func (remap *faultRemap) release() {
+	remap.decRefs.Cleanup()
+	remap.decRefs = nil
+}
+
+// getPMAsRemappingLocked is getPMAsLocked for a caller that maps remap.ar into
+// the AddressSpace as soon as it returns. See faultRemap.
+func (mm *MemoryManager) getPMAsRemappingLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, callerIndirectCommit bool, remap *faultRemap) (pmaIterator, pmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
@@ -128,7 +159,7 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	}
 	ar = hostarch.AddrRange{ar.Start.RoundDown(), end}
 
-	pstart, pend, perr := mm.getPMAsInternalLocked(ctx, vseg, ar, at, callerIndirectCommit)
+	pstart, pend, perr := mm.getPMAsInternalLocked(ctx, vseg, ar, at, callerIndirectCommit, remap)
 	if pend.Start() <= ar.Start {
 		return pmaIterator{}, pend, perr
 	}
@@ -174,7 +205,7 @@ func (mm *MemoryManager) getVecPMAsLocked(ctx context.Context, ars hostarch.Addr
 		}
 		ar = hostarch.AddrRange{ar.Start.RoundDown(), end}
 
-		_, pend, perr := mm.getPMAsInternalLocked(ctx, mm.vmas.FindSegment(ar.Start), ar, at, callerIndirectCommit)
+		_, pend, perr := mm.getPMAsInternalLocked(ctx, mm.vmas.FindSegment(ar.Start), ar, at, callerIndirectCommit, nil)
 		if perr != nil {
 			return truncatedAddrRangeSeq(ars, arsit, pend.Start()), perr
 		}
@@ -225,7 +256,7 @@ func (mm *MemoryManager) getAllocationDirection(ar hostarch.AddrRange, vma *vma)
 //   - getPMAsInternalLocked additionally requires that ar is page-aligned.
 //     getPMAsInternalLocked is an implementation helper for getPMAsLocked and
 //     getVecPMAsLocked; other clients should call one of those instead.
-func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, callerIndirectCommit bool) (pmaIterator, pmaGapIterator, error) {
+func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, callerIndirectCommit bool, remap *faultRemap) (pmaIterator, pmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
@@ -239,11 +270,30 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 	}
 	var pfdrs *pendingFileDecRefs
 	defer func() { // must be a closure to avoid evaluating pfdrs immediately
+		if remap != nil {
+			// Released by the caller once it has remapped remap.ar.
+			if checkInvariants && remap.decRefs != nil {
+				panic("faultRemap lent twice")
+			}
+			remap.decRefs = pfdrs
+			return
+		}
 		pfdrs.Cleanup()
 	}()
 	var unmapAR hostarch.AddrRange
 	defer func() {
-		mm.unmapASLocked(unmapAR)
+		// The caller maps remap.ar immediately, replacing whatever is there.
+		// Only what lies outside it needs an explicit unmap.
+		if remap == nil || !unmapAR.Overlaps(remap.ar) {
+			mm.unmapASLocked(unmapAR)
+			return
+		}
+		if unmapAR.Start < remap.ar.Start {
+			mm.unmapASLocked(hostarch.AddrRange{Start: unmapAR.Start, End: remap.ar.Start})
+		}
+		if unmapAR.End > remap.ar.End {
+			mm.unmapASLocked(hostarch.AddrRange{Start: remap.ar.End, End: unmapAR.End})
+		}
 	}()
 
 	vma := vseg.ValuePtr()
@@ -451,13 +501,25 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						}
 						copyAR = pseg.Range().Intersect(stackMaskAR)
 					} else {
-						// Hugepage-align the range to be copied, for the same
-						// reasons as for private anonymous allocations.
-						copyAR = pseg.Range().Intersect(hugeMaskAR)
+						// Copy what was asked for and no more. A page fault
+						// asks for more when it continues a sequential run;
+						// see writeFaultRangeLocked.
+						copyAR = pseg.Range().Intersect(ar)
 					}
 					// Get internal mappings from the pma to copy from.
 					if err := pseg.getInternalMappingsLocked(); err != nil {
 						return pstart, pseg.PrevGap(), err
+					}
+					// Copy the pmas that follow in ar along with it, when they
+					// need copying too, into the same allocation. Page-sized
+					// copies split pmas finely, and copying the pieces one at
+					// a time would keep them split and cost an allocation and
+					// a mapping apiece.
+					for next := pseg.NextSegment(); next.Ok() && next.Start() == copyAR.End && copyAR.End < vsegAR.End; next = next.NextSegment() {
+						if !mm.isPMACopyOnWriteLocked(vseg, next) || next.getInternalMappingsLocked() != nil {
+							break
+						}
+						copyAR.End = min(next.End(), vsegAR.End)
 					}
 					// Copy contents.
 					huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
@@ -479,45 +541,29 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					if fr.Length() == 0 {
 						return pstart, pseg.PrevGap(), err
 					}
-					// Replace the pma with a copy in the part of the address
+					// Replace the pmas with a copy in the part of the address
 					// range where copying was successful. This doesn't change
 					// RSS.
 					copyAR.End = copyAR.Start + hostarch.Addr(fr.Length())
-					if copyAR != pseg.Range() {
-						pseg = mm.pmas.Isolate(pseg, copyAR)
-						pstart = pmaIterator{} // iterators invalidated
-					}
-					oldpma = pseg.ValuePtr()
-					if sourceMF, ok := oldpma.file.(*pgalloc.MemoryFile); ok {
-						if err := mm.mf.AdoptCOWIdentities(sourceMF, pseg.fileRange(), fr); err != nil {
-							mm.mf.DecRef(fr)
-							return pstart, pseg.PrevGap(), fmt.Errorf("adopting logical page identities during CoW: %w", err)
-						}
+					if err := mm.adoptCOWIdentitiesLocked(pseg, copyAR, fr); err != nil {
+						mm.mf.DecRef(fr)
+						return pstart, pseg.PrevGap(), fmt.Errorf("adopting logical page identities during CoW: %w", err)
 					}
 					unmapAR = joinAddrRanges(unmapAR, copyAR)
-					pfdrs = appendPendingCOWFileDecRef(pfdrs, oldpma.file, pseg.fileRange())
-					oldpma.file = mm.mf
-					oldpma.off = fr.Start
-					oldpma.translatePerms = hostarch.AnyAccess
-					oldpma.effectivePerms = vma.effectivePerms
-					oldpma.maxPerms = vma.maxPerms
-					oldpma.needCOW = false
-					oldpma.private = true
-					oldpma.huge = huge
-					oldpma.internalMappings = safemem.BlockSeq{}
-					// Try to merge the pma with its neighbors.
-					if prev := pseg.PrevSegment(); prev.Ok() {
-						if merged := mm.pmas.Merge(prev, pseg); merged.Ok() {
-							pseg = merged
-							pstart = pmaIterator{} // iterators invalidated
-						}
+					for seg := pseg; seg.Ok() && seg.Start() < copyAR.End; seg = seg.NextSegment() {
+						pfdrs = appendPendingCOWFileDecRef(pfdrs, seg.ValuePtr().file, seg.fileRangeOf(seg.Range().Intersect(copyAR)))
 					}
-					if next := pseg.NextSegment(); next.Ok() {
-						if merged := mm.pmas.Merge(pseg, next); merged.Ok() {
-							pseg = merged
-							pstart = pmaIterator{} // iterators invalidated
-						}
-					}
+					// Insert merges the copy with its neighbors if it can.
+					pseg = mm.pmas.Insert(mm.pmas.RemoveRange(copyAR), copyAR, pma{
+						file:           mm.mf,
+						off:            fr.Start,
+						translatePerms: hostarch.AnyAccess,
+						effectivePerms: vma.effectivePerms,
+						maxPerms:       vma.maxPerms,
+						private:        true,
+						huge:           huge,
+					})
+					pstart = pmaIterator{} // iterators invalidated
 					// The error returned by AllocateAndFill is only
 					// significant if it occurred before ar.End.
 					if err != nil && pseg.End() < ar.End {
@@ -607,6 +653,90 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 		}
 		vseg = vseg.NextSegment()
 	}
+}
+
+// writeFaultRangeLocked returns the range a write fault at ar should make
+// usable: ar itself, or more when the fault continues a sequential run of
+// write faults in a private mapping.
+//
+// Breaking copy-on-write copies only the range asked for. gVisor used to widen
+// every copy to the surrounding huge page, so one written byte duplicated 2
+// MiB: a TTC fork and its source diverged by 512 pages for every page either
+// one wrote, and every copied page received a new content version, so each
+// later capture or transfer saw 512 changed pages where one had changed.
+//
+// Copying one page per fault is exact but not free. Each fault is a round
+// trip to the platform, which the huge-page copy amortized: a program
+// rewriting a buffer front to back after a fork took thirteen times as long.
+// So a write fault that begins where the previous one in this vma ended asks
+// for twice as many pages as that one did, up to a huge page and never past
+// the next huge-page boundary. Scattered writes copy one page each; a sweep
+// asks for a whole huge page by its tenth fault and then one per fault.
+//
+// The range spans pmas, because page-sized copies split pmas finely: a sweep
+// over memory that scattered writes copied earlier would otherwise fault once
+// per piece. It spans only pmas that already exist, because a gap in a file
+// mapping must be translated, and a translation that failed past the faulting
+// page would fail the fault.
+//
+// Preconditions:
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
+//   - ar is the page that faulted, and vseg.Range().Contains(ar.Start).
+func (mm *MemoryManager) writeFaultRangeLocked(vseg vmaIterator, ar hostarch.AddrRange) hostarch.AddrRange {
+	vma := vseg.ValuePtr()
+	if !vma.private || vma.effectivePerms.Execute || vma.growsDown || vma.isStack {
+		// Shared mappings never copy; executable and stack mappings copy by
+		// their own rules in getPMAsInternalLocked.
+		return ar
+	}
+	pages := uintptr(1)
+	if uintptr(ar.Start) == atomic.LoadUintptr(&vma.writeRunEnd) {
+		pages = min(2*atomic.LoadUintptr(&vma.writeRunPages), uintptr(hostarch.HugePageSize/hostarch.PageSize))
+	}
+	end := ar.End
+	if pages > 1 {
+		limit := vseg.End()
+		if boundary, ok := ar.Start.HugeRoundUp(); ok && boundary > ar.Start && boundary < limit {
+			limit = boundary
+		}
+		if want, ok := ar.Start.AddLength(uint64(pages) * hostarch.PageSize); ok && want < limit {
+			limit = want
+		}
+		covered := ar.Start
+		for pseg := mm.pmas.FindSegment(ar.Start); pseg.Ok() && pseg.Start() <= covered && covered < limit; pseg = pseg.NextSegment() {
+			covered = pseg.End()
+		}
+		end = max(end, min(covered, limit))
+	}
+	atomic.StoreUintptr(&vma.writeRunEnd, uintptr(end))
+	atomic.StoreUintptr(&vma.writeRunPages, pages)
+	return hostarch.AddrRange{Start: ar.Start, End: end}
+}
+
+// adoptCOWIdentitiesLocked gives the pages of fr, a copy of the pmas in ar
+// beginning with pseg, the logical identities of the pages they copy.
+//
+// Preconditions:
+//   - mm.activeMu must be locked.
+//   - pseg.Range().Contains(ar.Start), and pmas exist for all of ar.
+//   - fr.Length() == ar.Length().
+func (mm *MemoryManager) adoptCOWIdentitiesLocked(pseg pmaIterator, ar hostarch.AddrRange, fr memmap.FileRange) error {
+	for ; pseg.Ok() && pseg.Start() < ar.End; pseg = pseg.NextSegment() {
+		sourceMF, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile)
+		if !ok {
+			continue
+		}
+		segAR := pseg.Range().Intersect(ar)
+		target := memmap.FileRange{
+			Start: fr.Start + uint64(segAR.Start-ar.Start),
+			End:   fr.Start + uint64(segAR.End-ar.Start),
+		}
+		if err := mm.mf.AdoptCOWIdentities(sourceMF, pseg.fileRangeOf(segAR), target); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func hugepageAligned(ar hostarch.AddrRange) hostarch.AddrRange {

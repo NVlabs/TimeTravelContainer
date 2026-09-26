@@ -38,11 +38,16 @@ ttc.pull("alpine:3.20").check()
 ttc.run("alpine:3.20", ["sleep", "infinity"],
         options=["-d", "--name", "demo"]).check()
 ttc.fork("demo@main", "experiment").check()
+ttc.quarantine("demo@experiment").check()
+ttc.unquarantine("demo@experiment").check()
 ttc.dehydrate("demo@experiment").check()
 ttc.rehydrate("demo@experiment").check()
 
 for family in ttc.list():
     print(family)
+
+# inspect takes a family name; its TTC.branches array contains branch details.
+print(ttc.inspect("demo"))
 
 result = ttc.exec("demo@experiment", ["sh", "-c", "uname -a"])
 print(result.stdout_text())
@@ -62,16 +67,23 @@ ttc.fork_many(
 ).check()
 ttc.migrate("demo@candidate-a", "node-b").check()
 print(ttc.nodes())
-print(ttc.rebalance_node("node-a", target_node="node-b"))
+print(ttc.rebalance_node("node-a", destination_node="node-b"))
+ttc.stop_node("node-a", policy="migrate").check()
 ```
+
+Pass `node="node-b"` to `run`, `start`, `fork`, `rehydrate`, or `restore` to
+request a particular cluster node. Omit it to let TTC select a ready node.
 
 Harness-oriented helpers return structured JSON or ordinary command results:
 
 ```python
 ttc.exec_session("demo@candidate-a", ["sh"], session="build1", tty=True).check()
 print(ttc.tty_stat("demo@candidate-a", "build1"))
+# Includes placement, snapshot/root IDs, publication errors, graph/GC counts,
+# and private/shared memory and filesystem bytes.
 print(ttc.stats("demo@candidate-a"))
 print(ttc.diff("demo@candidate-a"))
+ttc.wait("demo@candidate-a", condition="durable").check()
 ttc.commit("demo@candidate-a", "local/result:latest",
            changes=["LABEL timetravel.usage=review"]).check()
 archive = ttc.save(["local/result:latest"]).stdout
@@ -127,8 +139,10 @@ sending them to `ttcd`. Other raw commands that name host files should likewise
 use absolute paths because the daemon does not share the SDK process's current
 working directory.
 
-Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR` as for the CLI, or pass
-`Client("/path/to/ttcd.sock")`.
+Set `TTC_SOCKET` or `XDG_RUNTIME_DIR` as for the CLI, or pass
+`Client("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
+`TTC_LOCAL_ROOT`. They negotiate the public API/features reported by `ping`;
+the exact-build restriction applies to the official `ttc` binary, not SDKs.
 
 ## Test
 

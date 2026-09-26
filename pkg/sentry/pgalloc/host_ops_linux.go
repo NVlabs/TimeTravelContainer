@@ -17,8 +17,6 @@
 package pgalloc
 
 import (
-	"os"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -74,12 +72,4 @@ func commitHostFile(fd int, fr memmap.FileRange) error {
 
 func decommitHostFile(fd int, fr memmap.FileRange) error {
 	return unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(fr.Start), int64(fr.Length()))
-}
-
-func cloneHostFileRange(dst, src *os.File, srcOffset, length, dstOffset uint64) error {
-	clone := unix.FileCloneRange{
-		Src_fd: int64(src.Fd()), Src_offset: srcOffset,
-		Src_length: length, Dest_offset: dstOffset,
-	}
-	return unix.IoctlFileCloneRange(int(dst.Fd()), &clone)
 }

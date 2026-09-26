@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &["-d", "--name", "demo"],
     )?.check()?;
     ttc.fork("demo@main", "experiment", false)?.check()?;
+    ttc.quarantine("demo@experiment")?.check()?;
+    ttc.unquarantine("demo@experiment")?.check()?;
     ttc.dehydrate("demo@experiment")?.check()?;
     ttc.rehydrate("demo@experiment")?.check()?;
 
@@ -54,12 +56,21 @@ ttc.fork_many(
 ttc.migrate("demo@candidate-a", "node-b")?.check()?;
 println!("{}", ttc.nodes()?);
 println!("{}", ttc.rebalance_node("node-a", Some("node-b"))?);
+ttc.stop_node("node-a", Some("migrate"))?.check()?;
 ```
 
+Use `run_on`, `start_on`, `fork_many`, `rehydrate_on`, or `restore_on` to
+request a node. Their ordinary counterparts leave placement to TTC.
+
 `exec_session`, `exec_sessions`, `exec_logs`, and `exec_wait` manage durable
-named work. `tty_stat`, `stats`, and `diff` return structured JSON; `commit`
+named work. `inspect` takes a family name and returns its branches under
+`TTC.branches`. `tty_stat`, `stats`, and `diff` return structured JSON;
+`stats` includes placement, immutable snapshot/root IDs, publication errors,
+graph/GC counts, and private/shared bytes. `commit`
 accepts Docker-style image changes, while `load` and `save` exchange standard
 image archives. `copy` exposes branch-aware file transfer.
+`wait_for(target, "durable")` waits for shared publication instead of process
+exit.
 
 The byte-oriented `load`/`save` forms buffer archives in the client. Prefer
 daemon-host `input`/`output` paths or `stream` for large archives.
@@ -97,8 +108,10 @@ non-forkable.
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.
 
-Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or use
-`Client::new("/path/to/ttcd.sock")`.
+Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or use
+`Client::new("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
+`TTC_LOCAL_ROOT`. They negotiate the public API/features returned by `ping`;
+exact build matching is specific to the official CLI.
 
 ## Test
 

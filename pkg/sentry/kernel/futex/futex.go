@@ -130,11 +130,17 @@ func check(t Target, addr hostarch.Addr, val uint32) error {
 func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 	opType := (opIn >> 28) & 0xf
 	cmp := (opIn >> 24) & 0xf
-	opArg := (opIn >> 12) & 0xfff
-	cmpArg := opIn & 0xfff
+	// Linux interprets both 12-bit arguments as signed values. In
+	// particular, the relational comparison below is between two signed
+	// 32-bit integers even though futex words are otherwise represented as
+	// uint32 values in the Sentry.
+	opArg := int32(opIn<<8) >> 20
+	cmpArg := int32(opIn<<20) >> 20
 
 	if opType&linux.FUTEX_OP_OPARG_SHIFT != 0 {
-		opArg = 1 << opArg
+		// Linux accepts invalid shift counts for historical compatibility and
+		// masks them to five bits after emitting a rate-limited warning.
+		opArg = int32(uint32(1) << (uint32(opArg) & 31))
 		opType &^= linux.FUTEX_OP_OPARG_SHIFT // Clear flag.
 	}
 
@@ -143,7 +149,7 @@ func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 		err    error
 	)
 	if opType == linux.FUTEX_OP_SET {
-		oldVal, err = t.SwapUint32(addr, opArg)
+		oldVal, err = t.SwapUint32(addr, uint32(opArg))
 		if err != nil {
 			return false, err
 		}
@@ -156,13 +162,13 @@ func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 			var newVal uint32
 			switch opType {
 			case linux.FUTEX_OP_ADD:
-				newVal = oldVal + opArg
+				newVal = oldVal + uint32(opArg)
 			case linux.FUTEX_OP_OR:
-				newVal = oldVal | opArg
+				newVal = oldVal | uint32(opArg)
 			case linux.FUTEX_OP_ANDN:
-				newVal = oldVal &^ opArg
+				newVal = oldVal &^ uint32(opArg)
 			case linux.FUTEX_OP_XOR:
-				newVal = oldVal ^ opArg
+				newVal = oldVal ^ uint32(opArg)
 			default:
 				return false, linuxerr.ENOSYS
 			}
@@ -176,19 +182,20 @@ func atomicOp(t Target, addr hostarch.Addr, opIn uint32) (bool, error) {
 		}
 	}
 
+	oldValSigned := int32(oldVal)
 	switch cmp {
 	case linux.FUTEX_OP_CMP_EQ:
-		return oldVal == cmpArg, nil
+		return oldValSigned == cmpArg, nil
 	case linux.FUTEX_OP_CMP_NE:
-		return oldVal != cmpArg, nil
+		return oldValSigned != cmpArg, nil
 	case linux.FUTEX_OP_CMP_LT:
-		return oldVal < cmpArg, nil
+		return oldValSigned < cmpArg, nil
 	case linux.FUTEX_OP_CMP_LE:
-		return oldVal <= cmpArg, nil
+		return oldValSigned <= cmpArg, nil
 	case linux.FUTEX_OP_CMP_GT:
-		return oldVal > cmpArg, nil
+		return oldValSigned > cmpArg, nil
 	case linux.FUTEX_OP_CMP_GE:
-		return oldVal >= cmpArg, nil
+		return oldValSigned >= cmpArg, nil
 	default:
 		return false, linuxerr.ENOSYS
 	}

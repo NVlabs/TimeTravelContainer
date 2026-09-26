@@ -137,6 +137,25 @@ func (m *SpecialMappable) RebindMemoryFileRange(mf *pgalloc.MemoryFile, fr memma
 	oldMF.DecRef(oldFR)
 }
 
+// InvalidateMappingsForMappable drops all cached PMAs and host address-space
+// mappings derived from m. The VMAs remain intact, so their next access calls
+// m.Translate again. This is required when an otherwise immutable Mappable is
+// rebound to different backing while tasks are stopped, as happens when a
+// restored live-fork child replaces its host-specific VVAR page.
+//
+// Preconditions: m is not concurrently rebound.
+func (mm *MemoryManager) InvalidateMappingsForMappable(m memmap.Mappable) {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
+	mm.activeMu.Lock()
+	defer mm.activeMu.Unlock()
+	for vseg := mm.vmas.FirstSegment(); vseg.Ok(); vseg = vseg.NextSegment() {
+		if vseg.ValuePtr().mappable == m {
+			mm.invalidateLocked(vseg.Range(), true, true)
+		}
+	}
+}
+
 // FileRange returns the offsets into m.mf that stores the SpecialMappable's
 // contents.
 func (m *SpecialMappable) FileRange() memmap.FileRange {

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -405,7 +406,7 @@ func TestCommittedWhiteoutsSurviveSaveLoadAndMaterialize(t *testing.T) {
 	}
 	store.close()
 
-	manager, err := ttcvolume.OpenManager(filepath.Join(t.TempDir(), "volumes"), true)
+	manager, err := ttcvolume.OpenManager(filepath.Join(t.TempDir(), "volumes"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,5 +689,29 @@ func TestDockerCredentialCallbackUsesDockerConfig(t *testing.T) {
 	username, secret, err := callback("registry.example")
 	if err != nil || username != "configured" || secret != "secret" {
 		t.Fatalf("callback credentials=%q:%q err=%v", username, secret, err)
+	}
+}
+
+func TestPruneEmptyNativeIngestDirectories(t *testing.T) {
+	root := t.TempDir()
+	empty := filepath.Join(root, "empty")
+	nonempty := filepath.Join(root, "nonempty")
+	if err := os.Mkdir(empty, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(nonempty, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonempty, "data"), []byte("pending"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneEmptyNativeIngestDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(empty); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty ingest directory remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(nonempty, "data")); err != nil {
+		t.Fatalf("nonempty ingest transaction was modified: %v", err)
 	}
 }

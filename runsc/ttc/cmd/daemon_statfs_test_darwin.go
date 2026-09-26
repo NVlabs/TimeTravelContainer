@@ -42,7 +42,7 @@ func setTestFilesystemName(statfs *unix.Statfs_t, name string) {
 }
 
 func TestCurrentNodeMemoryBytesDarwin(t *testing.T) {
-	resident, err := currentNodeMemoryBytes()
+	resident, err := currentNodeMemoryBytes("")
 	if err != nil {
 		t.Fatalf("currentNodeMemoryBytes: %v", err)
 	}

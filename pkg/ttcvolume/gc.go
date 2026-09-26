@@ -17,16 +17,21 @@ package ttcvolume
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-const metadataCompactionLayerThreshold = 64
+// ErrEmptyRepository reports a repository whose last branch pointer was
+// already removed by the runtime before daemon-side lifecycle cleanup. The
+// caller may remove a family-private repository as a whole; named repositories
+// retain the error because losing their canonical pointer is corruption.
+var ErrEmptyRepository = errors.New("repository has no published branches")
 
-// GarbageCollect removes metadata layers and data objects that are unreachable
+// GarbageCollect removes graph metadata and data objects that are unreachable
 // from every published branch pointer. Repository mutation and collection use
 // the same cross-process flock, so a concurrent Sentry fork or write either
 // precedes the reachability scan or follows all removals.
@@ -38,73 +43,106 @@ func (r *Repository) GarbageCollect() error {
 	if r == nil || r.path == "" {
 		return errors.New("garbage collection requires a path-backed repository")
 	}
+	// A live Sentry may have installed complete bulk bytes whose corresponding
+	// graph objects are intentionally still in its bounded metadata batch. That
+	// process-local tail is invisible to a separately opened manager handle.
+	// Skip this maintenance pass while any descriptor-backed runtime holds a
+	// shared lifecycle lease; the Sentry flushes the tail on close, and a later
+	// pass (including crash recovery) can then collect safely.
+	active, err := os.OpenFile(filepath.Join(r.path, "active.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening repository lifecycle lock: %w", err)
+	}
+	if err := unix.Flock(int(active.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		closeErr := active.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return closeErr
+		}
+		return errors.Join(fmt.Errorf("locking repository lifecycle: %w", err), closeErr)
+	}
+	defer func() {
+		_ = unix.Flock(int(active.Fd()), unix.LOCK_UN)
+		_ = active.Close()
+	}()
 	return r.withLock(r.garbageCollectLocked)
 }
 
+// GarbageCollectActive performs collection from a descriptor-backed runtime
+// repository when this runtime is its only active user. The lifecycle lock is
+// upgraded while holding the repository mutation lock, so another Sentry's
+// unpublished metadata tail can never be mistaken for unreachable data. If a
+// peer runtime also has the repository open, collection is safely deferred to
+// a later branch teardown or manager-side pass.
+func (r *Repository) GarbageCollectActive() (collected bool, result error) {
+	if r == nil || r.activeLock == nil {
+		return false, errors.New("active garbage collection requires a donated runtime repository")
+	}
+	err := r.withLock(func() (innerErr error) {
+		fd := int(r.activeLock.Fd())
+		if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			// flock upgrades are not guaranteed to retain the old shared lock
+			// after a failed conversion. Reacquire it before returning.
+			relockErr := unix.Flock(fd, unix.LOCK_SH)
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				return relockErr
+			}
+			return errors.Join(fmt.Errorf("upgrading repository lifecycle lock: %w", err), relockErr)
+		}
+		defer func() {
+			innerErr = errors.Join(innerErr, unix.Flock(fd, unix.LOCK_SH))
+		}()
+		if err := r.garbageCollectLocked(); err != nil {
+			return err
+		}
+		collected = true
+		return nil
+	})
+	return collected, err
+}
+
+func (r *Repository) branchNamesLocked() ([]string, error) {
+	branchDir, err := r.openFile("branches", os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	names, readErr := branchDir.Readdirnames(-1)
+	closeErr := branchDir.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	return names, nil
+}
+
 func (r *Repository) garbageCollectLocked() error {
-	branchDir := filepath.Join(r.path, "branches")
-	entries, err := os.ReadDir(branchDir)
+	if err := r.flushAllMetadataBatchesLocked(); err != nil {
+		return fmt.Errorf("publishing metadata before garbage collection: %w", err)
+	}
+	names, err := r.branchNamesLocked()
 	if err != nil {
 		return err
 	}
-	var branches []Branch
 	liveBranchIDs := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	var workingSnapshots []ttcsnapshot.SnapshotID
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		id := strings.TrimSuffix(entry.Name(), ".json")
+		id := strings.TrimSuffix(name, ".json")
 		if err := validateName(id, "branch"); err != nil {
-			return fmt.Errorf("invalid branch pointer %q during garbage collection: %w", entry.Name(), err)
+			return fmt.Errorf("invalid branch pointer %q during garbage collection: %w", name, err)
 		}
 		branch, err := r.readBranch(id)
 		if err != nil {
 			return err
 		}
-		branches = append(branches, branch)
 		liveBranchIDs[id] = struct{}{}
+		workingSnapshots = append(workingSnapshots, ttcsnapshot.SnapshotID(branch.WorkingSnapshot))
 	}
-	if len(branches) == 0 {
-		return errors.New("repository has no published branches")
-	}
-	for i := range branches {
-		layers, err := r.metadataLayers(branches[i].Root)
-		if err != nil {
-			return fmt.Errorf("walking branch %q metadata layers: %w", branches[i].ID, err)
-		}
-		if len(layers) > metadataCompactionLayerThreshold {
-			compacted, err := r.compactBranchMetadataLocked(branches[i])
-			if err != nil {
-				return fmt.Errorf("compacting branch %q metadata: %w", branches[i].ID, err)
-			}
-			branches[i] = compacted
-		}
+	if len(liveBranchIDs) == 0 {
+		return ErrEmptyRepository
 	}
 
-	reachableLayers := make(map[string]struct{})
-	reachableObjects := make(map[string]struct{})
-	for _, branch := range branches {
-		layers, err := r.metadataLayers(branch.Root)
-		if err != nil {
-			return fmt.Errorf("walking branch %q metadata layers: %w", branch.ID, err)
-		}
-		for _, layer := range layers {
-			reachableLayers[layer] = struct{}{}
-		}
-		state, err := r.metadataForBranch(branch)
-		if err != nil {
-			return fmt.Errorf("resolving branch %q metadata: %w", branch.ID, err)
-		}
-		state.mu.RLock()
-		for _, inode := range state.inodes {
-			if inode.Object != "" {
-				reachableObjects[inode.Object] = struct{}{}
-			}
-		}
-		state.mu.RUnlock()
-	}
-
-	// Drop decoded state for removed branch IDs before their layers disappear.
+	// Drop decoded state for removed branch IDs before graph collection.
 	r.metadataMu.Lock()
 	for id := range r.metadata {
 		if _, ok := liveBranchIDs[id]; !ok {
@@ -113,178 +151,36 @@ func (r *Repository) garbageCollectLocked() error {
 	}
 	r.metadataMu.Unlock()
 
-	layerEntries, err := os.ReadDir(filepath.Join(r.path, "layers"))
-	if err != nil {
-		return err
-	}
-	for _, entry := range layerEntries {
-		if !entry.IsDir() || !validID(entry.Name()) {
-			continue
-		}
-		if _, ok := reachableLayers[entry.Name()]; ok {
-			// Format 2 briefly wrote per-inode and per-dentry lookup caches.
-			// Journals have always been authoritative, so these directories are
-			// safe to reclaim when a new runtime next collects the repository.
-			for _, obsolete := range []string{"inodes", "dirents"} {
-				if err := os.RemoveAll(filepath.Join(r.path, "layers", entry.Name(), obsolete)); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		r.journalMu.Lock()
-		if journal := r.journals[entry.Name()]; journal != nil {
-			if err := journal.Close(); err != nil {
-				r.journalMu.Unlock()
-				return err
-			}
-			delete(r.journals, entry.Name())
-		}
-		r.journalMu.Unlock()
-		if err := os.RemoveAll(filepath.Join(r.path, "layers", entry.Name())); err != nil {
+	for {
+		collected, err := r.graph.Collect(1024)
+		if err != nil {
 			return err
 		}
+		if collected == 0 {
+			break
+		}
 	}
-
-	objectsRoot := filepath.Join(r.path, "objects")
-	err = filepath.WalkDir(objectsRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == objectsRoot {
-			return nil
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("unexpected symlink in repository object store: %s", path)
-		}
-		id := entry.Name()
-		if !validID(id) {
-			return fmt.Errorf("invalid object name %q during garbage collection", id)
-		}
-		if _, ok := reachableObjects[id]; ok {
-			return nil
-		}
-		return os.Remove(path)
-	})
+	if _, err := r.graph.CollectEmptySnapshots(workingSnapshots); err != nil {
+		return err
+	}
+	_, _, err = r.data.ReclaimUnreferenced(r.graph)
 	if err != nil {
 		return err
 	}
-
-	if err := syncHostDirectory(filepath.Join(r.path, "layers")); err != nil {
-		return err
-	}
-	if err := syncHostDirectory(objectsRoot); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (r *Repository) compactBranchMetadataLocked(branch Branch) (Branch, error) {
-	state, err := r.metadataForBranch(branch)
-	if err != nil {
-		return Branch{}, err
-	}
-	state.mu.RLock()
-	inodeNumbers := make([]uint64, 0, len(state.inodes))
-	for number := range state.inodes {
-		inodeNumbers = append(inodeNumbers, number)
-	}
-	sort.Slice(inodeNumbers, func(i, j int) bool { return inodeNumbers[i] < inodeNumbers[j] })
-	entryKeys := make([]metadataEntryKey, 0, len(state.entries))
-	for key := range state.entries {
-		entryKeys = append(entryKeys, key)
-	}
-	sort.Slice(entryKeys, func(i, j int) bool {
-		if entryKeys[i].Parent != entryKeys[j].Parent {
-			return entryKeys[i].Parent < entryKeys[j].Parent
+	// ReclaimUnreferenced may remove objects dirtied before their branch was
+	// deleted. Drop only bookkeeping whose graph object is now absent; a later
+	// durability fence must not try to reopen reclaimed payloads.
+	r.dirtyMu.Lock()
+	for name := range r.dirtyData {
+		id, parseErr := ttcsnapshot.ParseObjectID(name)
+		if parseErr != nil {
+			continue
 		}
-		return entryKeys[i].Name < entryKeys[j].Name
-	})
-	ops := make([]metadataOp, 0, len(inodeNumbers)+len(entryKeys))
-	for _, number := range inodeNumbers {
-		inode := state.inodes[number]
-		ops = append(ops, metadataOp{Kind: metadataSetInode, Inode: &inode})
-	}
-	for _, key := range entryKeys {
-		entry := state.entries[key]
-		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: key.Parent, Entry: &entry})
-	}
-	state.mu.RUnlock()
-
-	root, err := r.createMetadataLayer("")
-	if err != nil {
-		return Branch{}, err
-	}
-	compacted := branch
-	compacted.Root = root
-	compactedState := newBranchMetadata(compacted)
-	compactedState.layers = []string{root}
-	const maxOpsPerTransaction = 1000
-	for len(ops) != 0 {
-		count := len(ops)
-		if count > maxOpsPerTransaction {
-			count = maxOpsPerTransaction
+		if _, ok := r.graph.Object(id); !ok {
+			delete(r.dirtyData, name)
+			delete(r.pendingReclaims, name)
 		}
-		if err := r.commitMetadata(&compacted, compactedState, ops[:count]); err != nil {
-			return Branch{}, err
-		}
-		ops = ops[count:]
 	}
-	if err := r.syncRepositoryFile(filepath.Join("layers", root, "layer.json")); err != nil {
-		return Branch{}, err
-	}
-	if err := r.syncRepositoryFile(filepath.Join("layers", root, "journal")); err != nil {
-		return Branch{}, err
-	}
-	if err := r.syncDirectory(filepath.Join("layers", root)); err != nil {
-		return Branch{}, err
-	}
-	if err := r.syncDirectory("layers"); err != nil {
-		return Branch{}, err
-	}
-	if err := r.writeBranch(compacted); err != nil {
-		return Branch{}, err
-	}
-	if err := r.syncRepositoryFile(filepath.Join("branches", compacted.ID+".json")); err != nil {
-		return Branch{}, err
-	}
-	if err := r.syncDirectory("branches"); err != nil {
-		return Branch{}, err
-	}
-	r.metadataMu.Lock()
-	if r.metadata == nil {
-		r.metadata = make(map[string]*branchMetadata)
-	}
-	r.metadata[compacted.ID] = compactedState
-	r.metadataMu.Unlock()
-	return compacted, nil
-}
-
-func (r *Repository) syncRepositoryFile(name string) error {
-	file, err := r.openFile(name, os.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-	err = file.Sync()
-	closeErr := file.Close()
-	if err != nil {
-		return err
-	}
-	return closeErr
-}
-
-func syncHostDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	err = dir.Sync()
-	closeErr := dir.Close()
-	if err != nil {
-		return err
-	}
-	return closeErr
+	r.dirtyMu.Unlock()
+	return r.graph.CheckpointExternallyCoordinated()
 }

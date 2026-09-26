@@ -16,6 +16,7 @@ package vfs
 
 import (
 	goContext "context"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -63,7 +64,37 @@ const (
 	// Filesystems must still prepare their in-memory state for CoW, but must
 	// not create the branches again.
 	CtxLiveForkBranchesPrepared
+
+	// CtxLiveForkFilesystemResource restricts filesystem preparation to one
+	// persistent resource. It is used to snapshot a named volume for a new
+	// read-only attachment without cloning the source Kernel.
+	CtxLiveForkFilesystemResource
+
+	// CtxLiveForkFilesystemOrigins maps a persistent filesystem resource to
+	// pairs of Raft-allocated working snapshot IDs. Pair zero is consumed by
+	// the source-to-primary fork; later pairs are consumed by batch siblings.
+	CtxLiveForkFilesystemOrigins
+
+	// CtxLiveForkPreparationMetrics carries an optional accumulator for
+	// persistent filesystem seal costs.
+	CtxLiveForkPreparationMetrics
 )
+
+// LiveForkPreparationMetrics breaks persistent filesystem preparation into
+// mutation-proportional work.
+type LiveForkPreparationMetrics struct {
+	MetadataFlush       time.Duration
+	RuntimeInvalidation time.Duration
+	BranchSeal          time.Duration
+	NamespacePrune      time.Duration
+	NamespaceCandidates int64
+}
+
+// LiveForkPreparationMetricsFromContext returns the optional accumulator.
+func LiveForkPreparationMetricsFromContext(ctx goContext.Context) *LiveForkPreparationMetrics {
+	metrics, _ := ctx.Value(CtxLiveForkPreparationMetrics).(*LiveForkPreparationMetrics)
+	return metrics
+}
 
 // RestoreFilesystemResource associates an implementation-specific resource
 // with the persistent branch that should back the restored filesystem.
@@ -97,12 +128,29 @@ func MountNamespaceFromContext(ctx goContext.Context) *MountNamespace {
 // specific resources borrowed by an in-process clone.
 type LiveForkFilesystemResources map[checkpoint.ResourceID]any
 
+// LiveForkFilesystemOrigins carries exact clustered working origins. Each
+// resource value contains [newSource, newChild] pairs in fork order.
+type LiveForkFilesystemOrigins map[checkpoint.ResourceID][]uint64
+
+// LiveForkFilesystemOriginsFromContext returns clustered origin assignments,
+// or nil for standalone repository-local allocation.
+func LiveForkFilesystemOriginsFromContext(ctx goContext.Context) LiveForkFilesystemOrigins {
+	origins, _ := ctx.Value(CtxLiveForkFilesystemOrigins).(LiveForkFilesystemOrigins)
+	return origins
+}
+
 // LiveForkBranchingResource is a persistent filesystem resource whose
 // immutable metadata root can be forked after the original source resumes.
 // The new source branch belongs to a paused primary child.
 type LiveForkBranchingResource interface {
 	Fork(source, child string) error
 	RemoveBranch(branch string) error
+}
+
+// LiveForkOriginBranchingResource accepts exact working origins allocated by
+// the cluster authority state machine.
+type LiveForkOriginBranchingResource interface {
+	ForkWithOrigins(source, child string, sourceWorking, childWorking uint64) error
 }
 
 // DehydrationFilesystemResource keeps a process-local filesystem transport
@@ -187,6 +235,13 @@ func LiveForkTransactionsFromContext(ctx goContext.Context) *LiveForkTransaction
 func LiveForkBranchesPreparedFromContext(ctx goContext.Context) bool {
 	prepared, _ := ctx.Value(CtxLiveForkBranchesPrepared).(bool)
 	return prepared
+}
+
+// LiveForkFilesystemResourceFromContext returns the optional persistent
+// resource filter for a filesystem-only snapshot.
+func LiveForkFilesystemResourceFromContext(ctx goContext.Context) (checkpoint.ResourceID, bool) {
+	resource, ok := ctx.Value(CtxLiveForkFilesystemResource).(checkpoint.ResourceID)
+	return resource, ok
 }
 
 // RestoreFilesystemFDMapFromContext returns the RestoreFilesystemFDMap used

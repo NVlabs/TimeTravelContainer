@@ -17,10 +17,9 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
-TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 
 fail() {
@@ -29,7 +28,7 @@ fail() {
 }
 
 [ -x "$TTC" ] || fail "set TTC to the ttc binary"
-[ -x "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
+[ -x "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -39,8 +38,20 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 CONTAINER="cp-$$"
 VOLUME="cp-volume-$$"
 HOST_SOURCE="$TTC_E2E_ROOT/host-source"
@@ -49,16 +60,13 @@ HOST_CONTENTS="$TTC_E2E_ROOT/host-contents"
 ARCHIVE="$TTC_E2E_ROOT/export.tar"
 
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 cleanup() {
-  ttc daemon stop >/dev/null 2>&1 || true
+  ttc rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  ttc volume rm "$VOLUME" >/dev/null 2>&1 || true
+  ttc daemon stop --stop-all >/dev/null 2>&1 || true
   if [ "$owned_root" = true ]; then
     rm -rf "$TTC_E2E_ROOT"
   fi
@@ -77,9 +85,6 @@ chmod 0640 "$HOST_SOURCE/nested/value"
 set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
-fi
-if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
-  set -- "$@" --allow-slow-volume-copy
 fi
 ttc "$@"
 

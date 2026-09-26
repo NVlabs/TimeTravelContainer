@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -26,4 +26,11 @@ go_library(
         "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "fpu_test",
+    size = "small",
+    srcs = ["fpu_amd64_test.go"],
+    library = ":fpu",
 )

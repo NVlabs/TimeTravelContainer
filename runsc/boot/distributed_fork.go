@@ -15,7 +15,7 @@
 package boot
 
 import (
-	"encoding/json"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -36,6 +36,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 )
 
@@ -47,6 +49,7 @@ type DistributedForkRestoreArgs struct {
 	SessionID           string
 	FamilyID            string
 	TargetBranchID      string
+	Quarantined         bool
 	Address             string
 	SnapshotToken       ttcremote.SnapshotToken
 	MetadataBytes       uint64
@@ -59,9 +62,6 @@ type DistributedForkRestoreArgs struct {
 	AckBatchPages       int
 	AckInterval         time.Duration
 	PushPolicy          ttcremote.TCPPushPolicy
-	// SharedSnapshot selects the first donated file as an immutable packed
-	// memory stream. Network connections are then used only to fetch metadata.
-	SharedSnapshot bool
 	// SharedMetadata selects the first donated file as an immutable
 	// SessionMetadata envelope. This removes the source-process dependency for
 	// forks of dehydrated branches.
@@ -69,12 +69,11 @@ type DistributedForkRestoreArgs struct {
 	// DurableDehydration interprets SharedMetadata using the durable
 	// dehydration format and restores all captured private MemoryFiles.
 	DurableDehydration bool
-	// SparseManifest selects the first donated file as a TTC sparse chunk
-	// repository. Network connections are then used only to fetch metadata.
-	SparseManifest ttcchunk.ManifestID
-	// SparseBranch identifies the durable retention root paired with
-	// SparseManifest. The Sentry advances its per-chunk consumption record.
-	SparseBranch string
+	// GraphSparse selects a graph-native manifest, local complete-object
+	// directory, and optional resolver relay.
+	GraphSparse      bool
+	GraphRemote      bool
+	GraphRemoteToken ttcsnapshot.ObjectRelayToken
 	// Peer imports the captured branch into an already-running SandboxFamily
 	// instead of replacing a newly-created placeholder kernel.
 	Peer bool
@@ -83,6 +82,38 @@ type DistributedForkRestoreArgs struct {
 	VisibleBranchID string
 	// FilesystemBranch is the prepared target branch in each TTC repository.
 	FilesystemBranch string
+	// FilesystemConnections is the prefix of donated TCP streams used for
+	// authenticated TTC-volume range requests.
+	FilesystemConnections int
+	// FilesystemRestoreIDs maps each target-local repository identity to the
+	// repository identity serialized in the cold source metadata.
+	FilesystemRestoreIDs map[string]string
+	// ExecSessions preserves branch-local control identities for exec task
+	// groups already present in the captured Kernel.
+	ExecSessions []ExecSessionInfo
+}
+
+// pinRemoteFilesystemRestore protects freshly attached lazy sources until the
+// complete peer restore has finished. Repositories may appear more than once
+// in the mount table, so pin each physical repository exactly once.
+func pinRemoteFilesystemRestore(volumes map[string]ttcVolumeRepository) func() {
+	seen := make(map[*ttcvolume.Repository]struct{}, len(volumes))
+	releases := make([]func(), 0, len(volumes))
+	for _, volume := range volumes {
+		if volume.repository == nil {
+			continue
+		}
+		if _, ok := seen[volume.repository]; ok {
+			continue
+		}
+		seen[volume.repository] = struct{}{}
+		releases = append(releases, volume.repository.PinRemoteRestore())
+	}
+	return func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
 }
 
 // DistributedForkRestoreInfo reports the hidden target's initial dependency.
@@ -132,32 +163,60 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		sharedMetadata = files[0]
 		files = files[1:]
 	}
-	var sharedSnapshot *os.File
-	var sparseRepository *ttcchunk.MemoryRepository
-	sparse := args.SparseManifest != (ttcchunk.ManifestID{})
-	if sparse && args.SharedSnapshot {
-		return nil, errors.New("packed and sparse distributed snapshots are mutually exclusive")
-	}
-	if args.SharedSnapshot {
-		if len(files) == 0 {
-			return nil, errors.New("distributed target is missing its shared memory snapshot")
+	var graphManifest ttcchunk.Manifest
+	var graphChunks map[ttcchunk.ID]ttcsnapshot.ObjectID
+	var graphData *ttcsnapshot.LocalDataStore
+	var graphRemote *ttcsnapshot.ObjectRelayClient
+	graphOwned := false
+	if args.GraphSparse {
+		want := 2
+		if args.GraphRemote {
+			want++
 		}
-		sharedSnapshot = files[0]
-		files = files[1:]
-	}
-	if sparse {
-		if len(files) == 0 {
-			return nil, errors.New("distributed target is missing its sparse memory repository")
+		if len(files) < want {
+			return nil, errors.New("distributed target is missing graph memory descriptors")
 		}
-		var err error
-		sparseRepository, err = ttcchunk.OpenMemoryRepositoryFD(files[0])
-		if err != nil {
-			return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
+		encodedManifest, readErr := io.ReadAll(files[0])
+		if readErr != nil {
+			return nil, fmt.Errorf("reading distributed graph manifest: %w", readErr)
 		}
-		files = files[1:]
+		graphManifest, readErr = ttcchunk.DecodeManifest(encodedManifest)
+		if readErr != nil {
+			return nil, fmt.Errorf("decoding distributed graph manifest: %w", readErr)
+		}
+		graphChunks, readErr = ttcchunk.GraphChunkObjects(graphManifest)
+		if readErr != nil {
+			return nil, readErr
+		}
+		graphData, readErr = ttcsnapshot.OpenLocalDataStoreFD(files[1])
+		if readErr != nil {
+			return nil, readErr
+		}
+		files = files[2:]
+		if args.GraphRemote {
+			fd, dupErr := unix.Dup(int(files[0].Fd()))
+			if dupErr != nil {
+				graphData.Close()
+				return nil, dupErr
+			}
+			graphRemote, readErr = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "distributed-graph-memory-stream"), args.GraphRemoteToken)
+			if readErr != nil {
+				graphData.Close()
+				return nil, readErr
+			}
+			files = files[1:]
+		}
+		graphOwned = true
+		defer func() {
+			if graphOwned {
+				_ = graphData.Close()
+				if graphRemote != nil {
+					_ = graphRemote.Close()
+				}
+			}
+		}()
 	}
 	var donated []net.Conn
-	donatedMode := len(files) != 0
 	for _, file := range files {
 		conn, err := ttcremote.NewDonatedTCPConn(file)
 		if err != nil {
@@ -176,8 +235,23 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			}
 		}
 	}()
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || args.FilesystemConnections != len(l.ttcVolumeRepositories) {
+		return nil, fmt.Errorf("distributed target has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], args.SnapshotToken[:])
+	connectionIndex := 0
+	for _, volume := range l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
+		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, volume.config.Branch); err != nil {
+			return nil, fmt.Errorf("attaching distributed filesystem source %q: %w", volume.config.Source, err)
+		}
+		connectionIndex++
+	}
+	donated = donated[args.FilesystemConnections:]
+	donatedMode := len(donated) != 0
 	var pushConn net.Conn
-	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if !args.GraphSparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if !donatedMode || len(donated) < 2 {
 			return nil, errors.New("distributed reverse push requires a dedicated donated stream")
 		}
@@ -190,18 +264,14 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}()
 	}
 	var metadata *ttcremote.SessionMetadata
-	var execSessions []ExecSessionInfo
 	var durableMetadata kernel.DurableDehydrationMetadata
 	var encoded []byte
 	var err error
 	if args.DurableDehydration {
-		if sharedMetadata == nil || !sparse {
-			return nil, errors.New("distributed durable dehydration requires shared metadata and sparse memory")
+		if sharedMetadata == nil || !args.GraphSparse {
+			return nil, errors.New("distributed durable dehydration requires shared metadata and graph memory")
 		}
 		durableMetadata, err = kernel.ReadDurableDehydrationMetadata(sharedMetadata)
-		if err == nil && durableMetadata.SparseManifest != args.SparseManifest {
-			err = fmt.Errorf("durable dehydration manifest %s does not match requested %s", durableMetadata.SparseManifest, args.SparseManifest)
-		}
 	} else if sharedMetadata != nil {
 		encoded, err = io.ReadAll(io.LimitReader(sharedMetadata, int64(args.MetadataBytes)+1))
 	} else if donatedMode {
@@ -220,17 +290,13 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		metadata, err = ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 			MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-			MaxAllocatorBytes: args.MetadataBytes, MaxExecBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+			MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
 		})
 		if err != nil {
 			return nil, err
 		}
 		if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
 			return nil, fmt.Errorf("distributed metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
-		}
-		execSessions, err = decodeDistributedExecSessions(metadata.ExecSessions, l.sandboxID)
-		if err != nil {
-			return nil, err
 		}
 	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
@@ -239,18 +305,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
 	var reader stateio.AsyncReader
-	if args.SharedSnapshot {
+	if args.GraphSparse {
 		if len(donated) != 0 {
-			return nil, fmt.Errorf("shared distributed snapshot has %d unused page connections", len(donated))
-		}
-		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
-		if err != nil {
-			return nil, fmt.Errorf("duplicating shared distributed snapshot: %w", err)
-		}
-		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
-	} else if sparse {
-		if len(donated) != 0 {
-			return nil, fmt.Errorf("sparse distributed snapshot has %d unused page connections", len(donated))
+			return nil, fmt.Errorf("graph distributed snapshot has %d unused page connections", len(donated))
 		}
 	} else if donatedMode {
 		var tcpReader *ttcremote.TCPRemoteReader
@@ -351,26 +408,32 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	filesystemBranch := ""
 	for _, donated := range l.ttcVolumeRepositories {
 		info := donated.repository.Info()
-		restoreID := donated.config.RestoreID
-		if restoreID == "" {
-			restoreID = info.ID
+		resource := vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
+		// Always publish the physical node-local identity. The bundle config can
+		// carry the identity used by an earlier restore, so retain that as an
+		// alias rather than letting it replace the current identity.
+		resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}] = resource
+		if restoreID := donated.config.RestoreID; restoreID != "" {
+			resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
 		}
-		key := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}
-		resources[key] = vfs.RestoreFilesystemResource{Resource: donated.repository, Branch: donated.config.Branch}
 		if filesystemBranch == "" {
 			filesystemBranch = donated.config.Branch
 		} else if filesystemBranch != donated.config.Branch {
 			return nil, fmt.Errorf("distributed target repositories use inconsistent branches %q and %q", filesystemBranch, donated.config.Branch)
 		}
 	}
+	resources, err = aliasRestoreFilesystemResources(resources, args.FilesystemRestoreIDs)
+	if err != nil {
+		return nil, err
+	}
 	targetMFOwned = false
 	fdmapOwned = false // Load/CompleteRestore owns or consumes these descriptors.
 	loadOpts := kernel.DistributedForkLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.TargetBranchID,
+		Quarantined: args.Quarantined, OverrideQuarantine: true,
 		RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
-		LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork, OwnSparseRepository: sparse,
-		SparseBranch: args.SparseBranch,
+		LogicalChunkDemand: !args.GraphSparse, ConfigureNetwork: l.configureNetwork,
 	}
 	loadCtx := l.k.SupervisorContext()
 	old := l.k
@@ -400,18 +463,17 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		if len(mfmap) != len(memoryFiles)-1 {
 			return nil, fmt.Errorf("distributed dehydration target has %d unexpected private memory files", len(mfmap))
 		}
-		targetMFOwned = false // LoadSparseDurableDehydration consumes all files.
-		mfmapOwned = false    // LoadSparseDurableDehydration consumes all files.
-		child, err = kernel.LoadSparseDurableDehydration(loadCtx, p, durableMetadata,
-			memoryFiles, sparseRepository, kernel.DurableDehydrationLoadOptions{
-				Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
-				SparseBranch:               args.SparseBranch,
-				RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
-				ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
-			})
-	} else if sparse {
-		child, err = kernel.LoadSparseDistributedFork(loadCtx, p, targetMF,
-			metadata.KernelMetadata, sparseRepository, args.SparseManifest, loadOpts)
+		targetMFOwned = false // LoadGraphDurableDehydration consumes all files.
+		mfmapOwned = false    // LoadGraphDurableDehydration consumes all files.
+		durableOpts := kernel.DurableDehydrationLoadOptions{
+			Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
+			RestoreFilesystemResources: resources, RestoreFilesystemFDMap: fdmap,
+			ConfigureNetwork: l.configureNetwork,
+		}
+		graphOwned = false
+		child, err = kernel.LoadGraphDurableDehydration(loadCtx, p, durableMetadata,
+			memoryFiles, graphManifest, graphChunks, graphData, graphRemote, durableOpts)
 	} else {
 		readerOwned = false
 		child, err = kernel.LoadDistributedFork(loadCtx, p, targetMF,
@@ -439,6 +501,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	for _, task := range child.TaskSet().Root.Tasks() {
 		task.RestoreContainerID(l.sandboxID)
 	}
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
 	child.RegisterContainerName(l.sandboxID, l.root.containerName)
 	dogOpts := watchdog.DefaultOpts
 	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
@@ -457,11 +522,11 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		}
 		return nil, err
 	}
-	if err := l.family.RestoreLoaderExecSessions(execSessions); err != nil {
+	if err := l.family.RestoreLoaderExecSessions(args.ExecSessions); err != nil {
 		if !bootstrapReleased {
 			old.Release()
 		}
-		return nil, fmt.Errorf("restoring distributed exec sessions: %w", err)
+		return nil, err
 	}
 	if filesystemBranch != "" {
 		if err := l.family.SetDefaultFilesystemBranch(filesystemBranch); err != nil {
@@ -503,6 +568,56 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 	return &info, nil
 }
 
+// aliasLiveForkFilesystemResources adds the repository identities recorded by
+// an incoming checkpoint as aliases for the repositories already active in
+// this Sentry. A branch that has crossed nodes more than once is serialized
+// against the repository identity on its immediately previous node, which is
+// not necessarily the identity cached in Loader.ttcVolumeRepositories from
+// the first branch that bootstrapped the local Sentry.
+func aliasLiveForkFilesystemResources(resources vfs.LiveForkFilesystemResources, restoreIDs map[string]string) (vfs.LiveForkFilesystemResources, error) {
+	if len(restoreIDs) == 0 {
+		return resources, nil
+	}
+	aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(restoreIDs))
+	for id, resource := range resources {
+		aliased[id] = resource
+	}
+	for current, restoreID := range restoreIDs {
+		currentID := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: current}
+		resource, ok := resources[currentID]
+		if !ok {
+			return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
+		}
+		aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+	}
+	return aliased, nil
+}
+
+// aliasRestoreFilesystemResources is the process-bootstrap counterpart of
+// aliasLiveForkFilesystemResources. A returning multi-hop branch may be
+// serialized against node A's repository while node B's unstarted bundle
+// still names an older node-B identity. The daemon supplies the current-local
+// to incoming identity edge explicitly; accepting both keys makes the mapping
+// independent of how many nodes the branch has crossed.
+func aliasRestoreFilesystemResources(resources vfs.RestoreFilesystemResources, restoreIDs map[string]string) (vfs.RestoreFilesystemResources, error) {
+	if len(restoreIDs) == 0 {
+		return resources, nil
+	}
+	aliased := make(vfs.RestoreFilesystemResources, len(resources)+len(restoreIDs))
+	for id, resource := range resources {
+		aliased[id] = resource
+	}
+	for current, restoreID := range restoreIDs {
+		currentID := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: current}
+		resource, ok := resources[currentID]
+		if !ok {
+			return nil, fmt.Errorf("active TTC volume restore resource %q was not exported", current)
+		}
+		aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+	}
+	return aliased, nil
+}
+
 // restoreDistributedForkPeer reconstructs a branch beside an active peer. It
 // deliberately reuses the peer's Platform and application MemoryFile, which is
 // what makes repeated imports of identical chunks share resident host pages in
@@ -511,6 +626,8 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	if args.DurableDehydration {
 		return l.restoreDistributedDurablePeer(args)
 	}
+	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
+	defer releaseFilesystemRestore()
 	files := args.FilePayload.Files
 	var sharedMetadata *os.File
 	if args.SharedMetadata {
@@ -519,38 +636,12 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 		sharedMetadata, files = files[0], files[1:]
 	}
-	var sharedSnapshot *os.File
-	if args.SharedSnapshot {
-		if len(files) == 0 {
-			return nil, errors.New("distributed peer is missing shared memory")
-		}
-		sharedSnapshot, files = files[0], files[1:]
-	}
-	sparse := args.SparseManifest != (ttcchunk.ManifestID{})
-	if sparse && args.SharedSnapshot {
-		return nil, errors.New("packed and sparse distributed peer snapshots are mutually exclusive")
-	}
-	var sparseRepository *ttcchunk.MemoryRepository
-	if sparse {
-		if len(files) == 0 {
-			return nil, errors.New("distributed peer is missing sparse memory repository")
-		}
-		var err error
-		sparseRepository, err = ttcchunk.OpenMemoryRepositoryFD(files[0])
-		if err != nil {
-			return nil, fmt.Errorf("opening distributed peer sparse repository: %w", err)
-		}
-		files = files[1:]
-	}
 	var donated []net.Conn
 	for _, file := range files {
 		conn, err := ttcremote.NewDonatedTCPConn(file)
 		if err != nil {
 			for _, opened := range donated {
 				opened.Close()
-			}
-			if sparseRepository != nil {
-				sparseRepository.Close()
 			}
 			return nil, fmt.Errorf("opening donated distributed peer connection: %w", err)
 		}
@@ -564,8 +655,26 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 			}
 		}
 	}()
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(donated) || args.FilesystemConnections != len(l.ttcVolumeRepositories) {
+		return nil, fmt.Errorf("distributed peer has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
+	}
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], args.SnapshotToken[:])
+	connectionIndex := 0
+	for _, volume := range l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(volume.config.Source)))
+		// Loader.ttcVolumeRepositories is initialized by the branch that first
+		// bootstrapped this Sentry, so volume.config.Branch may name that older
+		// branch after a remote branch migrates back to the same node. Attach the
+		// donated source to the freshly imported generation named by the request.
+		if err := volume.repository.AttachRemoteObjectSource(donated[connectionIndex], filesystemToken, key, args.FilesystemBranch); err != nil {
+			return nil, fmt.Errorf("attaching distributed peer filesystem source %q branch %q: %w", volume.config.Source, args.FilesystemBranch, err)
+		}
+		connectionIndex++
+	}
+	donated = donated[args.FilesystemConnections:]
 	var pushConn net.Conn
-	if !args.SharedSnapshot && !sparse && args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
+	if args.PushPolicy != "" && args.PushPolicy != ttcremote.TCPPushDemandOnly {
 		if len(donated) < 2 {
 			return nil, errors.New("distributed peer reverse push requires a dedicated donated stream")
 		}
@@ -596,7 +705,7 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}
 	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 		MaxTotalBytes: args.MetadataBytes, MaxKernelBytes: args.MetadataBytes,
-		MaxAllocatorBytes: args.MetadataBytes, MaxExecBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
+		MaxAllocatorBytes: args.MetadataBytes, MaxLoadRanges: 1 << 20,
 	})
 	if err != nil {
 		return nil, err
@@ -604,30 +713,13 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	if metadata.FamilyID != args.FamilyID || metadata.TargetBranchID != args.TargetBranchID {
 		return nil, fmt.Errorf("distributed peer metadata identity %q/%q does not match %q/%q", metadata.FamilyID, metadata.TargetBranchID, args.FamilyID, args.TargetBranchID)
 	}
-	execSessions, err := decodeDistributedExecSessions(metadata.ExecSessions, l.sandboxID)
-	if err != nil {
-		return nil, err
-	}
 	readerOpts := ttcremote.TCPRemoteReaderOpts{
 		MaxReadBytes: args.MaxTransferBytes, MaxRanges: pgalloc.PagesPerSparseChunk(), MaxParallel: args.MaxParallel,
 		Timeout: args.Timeout, RetryLimit: args.RetryLimit, RetryBackoff: 10 * time.Millisecond,
 		AckBatchPages: args.AckBatchPages, AckInterval: args.AckInterval,
 	}
 	var reader stateio.AsyncReader
-	if args.SharedSnapshot {
-		if len(donated) != 0 {
-			return nil, fmt.Errorf("shared distributed peer snapshot has %d unused connections", len(donated))
-		}
-		fd, err := unix.Dup(int(sharedSnapshot.Fd()))
-		if err != nil {
-			return nil, err
-		}
-		reader = stateio.NewFDReader(int32(fd), args.MaxTransferBytes, pgalloc.PagesPerSparseChunk(), args.MaxParallel)
-	} else if sparse {
-		if len(donated) != 0 {
-			return nil, fmt.Errorf("sparse distributed peer snapshot has %d unused connections", len(donated))
-		}
-	} else if len(donated) != 0 {
+	if len(donated) != 0 {
 		reader, err = ttcremote.NewTCPRemoteReaderWithConns(args.Address, args.SnapshotToken, readerOpts, donated)
 		if err == nil {
 			donatedOwned = false
@@ -645,27 +737,46 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 		}
 	}()
 	var child *kernel.Kernel
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, execSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, args.ExecSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		resources, err = aliasLiveForkFilesystemResources(resources, args.FilesystemRestoreIDs)
+		if err != nil {
+			return nil, err
+		}
+		// The live target filesystem records its node-local repository ID, while
+		// the incoming Kernel was serialized against the source repository ID.
+		// Both identities refer to the same imported generation. Make the source
+		// identity an alias for this restore without changing either persistent
+		// repository's identity.
+		for _, volume := range l.ttcVolumeRepositories {
+			restoreID := volume.config.RestoreID
+			if restoreID == "" {
+				continue
+			}
+			resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = volume.repository
+		}
 		loadOpts := kernel.DistributedForkLoadOptions{
 			// ChildBranchID selects the prepared persistent filesystem branch
 			// during an in-Sentry restore. TargetBranchID is the immutable remote
 			// transaction identity and is deliberately not a repository branch.
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: args.FilesystemBranch,
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
 			FilesystemResources: resources, DemandOnly: true,
 			PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
-			LogicalChunkDemand: !sparse, ConfigureNetwork: l.configureNetwork,
-			OwnSparseRepository: sparse, SparseBranch: args.SparseBranch,
+			LogicalChunkDemand: true, ConfigureNetwork: l.configureNetwork,
 		}
-		var loadErr error
-		if sparse {
-			child, loadErr = kernel.LoadSparseDistributedFork(source.SupervisorContext(), source.Platform, source.MemoryFile(), metadata.KernelMetadata, sparseRepository, args.SparseManifest, loadOpts)
-		} else {
-			readerOwned = false
-			child, loadErr = kernel.LoadDistributedFork(source.SupervisorContext(), source.Platform, source.MemoryFile(), metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, metadata.MemoryBindings, reader, loadOpts)
-		}
+		readerOwned = false
+		child, loadErr := kernel.LoadDistributedFork(source.SupervisorContext(), source.Platform, source.MemoryFile(), metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, metadata.MemoryBindings, reader, loadOpts)
 		if loadErr != nil {
 			return nil, loadErr
 		}
+		// InstallRemoteBindings intentionally reuses identical chunks already
+		// present in the family MemoryFile. Retain the peer's loaders as well as
+		// its pages so an unresolved reused chunk cannot lose its only backing
+		// reader when another branch or source transaction completes.
+		child.InheritDistributedForkMemorySources(source, metadata.LoadRanges)
 		for _, task := range child.TaskSet().Root.Tasks() {
 			task.RestoreContainerID(l.sandboxID)
 		}
@@ -694,41 +805,95 @@ func (l *Loader) restoreDistributedForkPeer(args *DistributedForkRestoreArgs) (*
 	}, nil
 }
 
-// restoreDistributedDurablePeer imports a process-free sparse dehydration
+// restoreDistributedDurablePeer imports a process-free graph dehydration
 // image into an existing family. Durable metadata is not a SessionMetadata
 // envelope, so it must be dispatched before the live transport decoder.
 func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs) (*DistributedForkRestoreInfo, error) {
+	releaseFilesystemRestore := pinRemoteFilesystemRestore(l.ttcVolumeRepositories)
+	defer releaseFilesystemRestore()
 	files := args.FilePayload.Files
-	if !args.SharedMetadata || len(files) == 0 || args.SparseManifest == (ttcchunk.ManifestID{}) {
-		return nil, errors.New("distributed durable peer requires shared metadata and sparse memory")
+	if !args.SharedMetadata || len(files) == 0 || !args.GraphSparse {
+		return nil, errors.New("distributed durable peer requires shared metadata and graph memory")
 	}
 	sharedMetadata, files := files[0], files[1:]
-	if len(files) == 0 {
-		return nil, errors.New("distributed durable peer is missing sparse memory repository")
+	if args.FilesystemConnections < 0 || args.FilesystemConnections > len(files) || (args.FilesystemConnections != 0 && args.FilesystemConnections != len(l.ttcVolumeRepositories)) {
+		return nil, fmt.Errorf("distributed durable peer has %d filesystem streams for %d repositories", args.FilesystemConnections, len(l.ttcVolumeRepositories))
 	}
-	sparseRepository, err := ttcchunk.OpenMemoryRepositoryFD(files[0])
+	memoryFiles := files[:len(files)-args.FilesystemConnections]
+	filesystemFiles := files[len(memoryFiles):]
+	var filesystemToken ttcvolume.RemoteToken
+	copy(filesystemToken[:], args.SnapshotToken[:])
+	if err := l.attachColdFilesystemSources(filesystemFiles, filesystemToken, args.FilesystemBranch); err != nil {
+		return nil, err
+	}
+	files = memoryFiles
+	var graphManifest ttcchunk.Manifest
+	var graphChunks map[ttcchunk.ID]ttcsnapshot.ObjectID
+	var graphData *ttcsnapshot.LocalDataStore
+	var graphRemote *ttcsnapshot.ObjectRelayClient
+	want := 2 + boolInt(args.GraphRemote)
+	if len(files) < want {
+		return nil, errors.New("distributed durable peer is missing graph memory descriptors")
+	}
+	encoded, err := io.ReadAll(files[0])
 	if err != nil {
-		return nil, fmt.Errorf("opening distributed durable peer sparse repository: %w", err)
+		return nil, err
 	}
-	files = files[1:]
+	graphManifest, err = ttcchunk.DecodeManifest(encoded)
+	if err != nil {
+		return nil, err
+	}
+	graphChunks, err = ttcchunk.GraphChunkObjects(graphManifest)
+	if err != nil {
+		return nil, err
+	}
+	graphData, err = ttcsnapshot.OpenLocalDataStoreFD(files[1])
+	if err != nil {
+		return nil, err
+	}
+	files = files[2:]
+	if args.GraphRemote {
+		fd, err := unix.Dup(int(files[0].Fd()))
+		if err != nil {
+			graphData.Close()
+			return nil, err
+		}
+		graphRemote, err = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "distributed-durable-peer-graph-stream"), args.GraphRemoteToken)
+		if err != nil {
+			graphData.Close()
+			return nil, err
+		}
+		files = files[1:]
+	}
 	metadataFD, err := unix.Dup(int(sharedMetadata.Fd()))
 	if err != nil {
-		sparseRepository.Close()
+		if graphData != nil {
+			graphData.Close()
+		}
+		if graphRemote != nil {
+			graphRemote.Close()
+		}
 		return nil, err
 	}
 	metadataFile := os.NewFile(uintptr(metadataFD), "distributed-durable-peer-metadata")
 	durable, err := kernel.ReadDurableDehydrationMetadata(metadataFile)
 	metadataFile.Close()
 	if err != nil {
-		sparseRepository.Close()
+		if graphData != nil {
+			graphData.Close()
+		}
+		if graphRemote != nil {
+			graphRemote.Close()
+		}
 		return nil, err
 	}
-	if durable.SparseManifest != args.SparseManifest {
-		sparseRepository.Close()
-		return nil, fmt.Errorf("durable peer manifest %s does not match requested %s", durable.SparseManifest, args.SparseManifest)
-	}
 	if got, want := len(files), len(durable.Memories)-1; got != want {
-		sparseRepository.Close()
+		if graphData != nil {
+			graphData.Close()
+		}
+		if graphRemote != nil {
+			graphRemote.Close()
+		}
 		return nil, fmt.Errorf("distributed durable peer got %d private memory files, want %d", got, want)
 	}
 	private := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(files))
@@ -739,7 +904,12 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			for _, opened := range private {
 				opened.Destroy()
 			}
-			sparseRepository.Close()
+			if graphData != nil {
+				graphData.Close()
+			}
+			if graphRemote != nil {
+				graphRemote.Close()
+			}
 			return nil, fmt.Errorf("creating distributed durable peer memory %q: %w", resource, err)
 		}
 		private[resource] = mf
@@ -750,12 +920,34 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 			for _, mf := range private {
 				mf.Destroy()
 			}
-			_ = sparseRepository.Close()
+			if graphData != nil {
+				_ = graphData.Close()
+			}
+			if graphRemote != nil {
+				_ = graphRemote.Close()
+			}
 		}
 	}()
-	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, nil, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+	for i := range args.ExecSessions {
+		args.ExecSessions[i].ContainerID = l.sandboxID
+	}
+	err = l.family.RestoreDistributedPeer(args.VisibleBranchID, args.FilesystemBranch, args.Quarantined, args.ExecSessions, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
+		if len(args.FilesystemRestoreIDs) != 0 {
+			aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(args.FilesystemRestoreIDs))
+			for id, resource := range resources {
+				aliased[id] = resource
+			}
+			for current, restoreID := range args.FilesystemRestoreIDs {
+				resource, ok := resources[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: current}]
+				if !ok {
+					return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
+				}
+				aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
+			}
+			resources = aliased
+		}
 		memories := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile, len(private)+1)
-		// LoadSparseDurableDehydration consumes one ownership reference for
+		// LoadGraphDurableDehydration consumes one ownership reference for
 		// every MemoryFile. Application memory is shared with the active family,
 		// so donate a new owner rather than transferring the source's owner.
 		source.MemoryFile().IncOwner()
@@ -763,12 +955,13 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 		for resource, mf := range private {
 			memories[resource] = mf
 		}
-		consumed = true
-		child, err := kernel.LoadSparseDurableDehydration(source.SupervisorContext(), source.Platform, durable, memories, sparseRepository, kernel.DurableDehydrationLoadOptions{
+		loadOpts := kernel.DurableDehydrationLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), BranchID: args.FilesystemBranch,
-			SparseBranch: args.SparseBranch, FilesystemResources: resources,
-			ConfigureNetwork: l.configureNetwork, OwnSparseRepository: true,
-		})
+			Quarantined: args.Quarantined, OverrideQuarantine: true,
+			FilesystemResources: resources, ConfigureNetwork: l.configureNetwork,
+		}
+		consumed = true
+		child, err := kernel.LoadGraphDurableDehydration(source.SupervisorContext(), source.Platform, durable, memories, graphManifest, graphChunks, graphData, graphRemote, loadOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -782,23 +975,4 @@ func (l *Loader) restoreDistributedDurablePeer(args *DistributedForkRestoreArgs)
 		return nil, err
 	}
 	return &DistributedForkRestoreInfo{SessionID: args.SessionID, FamilyID: args.FamilyID, TargetBranchID: args.TargetBranchID}, nil
-}
-
-func decodeDistributedExecSessions(encoded []byte, targetContainerID string) ([]ExecSessionInfo, error) {
-	if len(encoded) == 0 {
-		return nil, nil
-	}
-	var sessions []ExecSessionInfo
-	if err := json.Unmarshal(encoded, &sessions); err != nil {
-		return nil, fmt.Errorf("decoding distributed exec sessions: %w", err)
-	}
-	for i := range sessions {
-		// The Kernel tasks are rebound to the target sandbox ID above. Managed
-		// session metadata is loader state rather than Kernel state, so remap it
-		// explicitly as checkpoint restore does. ExecSessions filters by this ID;
-		// retaining the source's physical container ID makes a restored session
-		// run but disappear from list/log/reattach and skips its console follower.
-		sessions[i].ContainerID = targetContainerID
-	}
-	return sessions, nil
 }

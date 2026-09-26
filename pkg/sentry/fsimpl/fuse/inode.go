@@ -238,6 +238,14 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if err != nil {
 		return nil, err
 	}
+	// A successful FUSE_LOOKUP response with node ID 0 is a negative entry,
+	// not a malformed inode. Linux uses the accompanying entry timeout to
+	// cache absence; kernfs does not currently cache negative dentries here,
+	// so report ENOENT and allow callers such as open(O_CREAT) to continue to
+	// FUSE_CREATE. libfuse servers commonly use this form.
+	if opcode == linux.FUSE_LOOKUP && out.NodeID == 0 {
+		return nil, linuxerr.ENOENT
+	}
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}

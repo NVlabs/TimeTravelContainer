@@ -23,6 +23,8 @@ import (
 
 // afterLoad is invoked by stateify.
 func (rb *ringBuffer) afterLoad(ctx context.Context) {
+	rb.dataMu.Lock()
+	defer rb.dataMu.Unlock()
 	mf := pgalloc.MemoryFileFromContext(ctx)
 	if mf == nil {
 		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, pgalloc.CtxMemoryFile))

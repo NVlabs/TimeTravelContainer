@@ -97,6 +97,11 @@ func (*SlimVM) SupportsAddressSpaceIO() bool {
 	return false
 }
 
+// SupportsGuestGSBase implements platform.GuestGSBaseSupport.
+func (*SlimVM) SupportsGuestGSBase() bool {
+	return true
+}
+
 // CooperativelySchedulesAddressSpace implements platform.Platform.CooperativelySchedulesAddressSpace.
 func (*SlimVM) CooperativelySchedulesAddressSpace() bool {
 	return false

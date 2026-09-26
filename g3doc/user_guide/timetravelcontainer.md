@@ -69,17 +69,12 @@ probe automatically and refuses to start in rootless mode when the probe fails,
 so an apparently healthy daemon cannot defer this error until container launch.
 Directly launching `ttcd` performs the same preflight.
 
-The daemon also probes the actual volume object store under `--data-root` with
-`FICLONE`. It fails startup if the backing filesystem lacks working reflinks.
-To explicitly trade first-write performance for compatibility, use:
-
-```shell
-ttc daemon start --allow-slow-volume-copy
-```
-
-This fallback copies a complete shared file on its first write after a fork.
-It is never selected silently. `ttc daemon status` reports the fixed
-`volume_copy_mode`, data root, backing device, and filesystem type.
+The daemon also probes the node-local volume object store under `TTC_ROOT`
+(standalone) or `TTC_LOCAL_ROOT` (cluster mode) with `FICLONE`. Working
+reflinks are used automatically. When they are unavailable, TTC transparently
+copies a complete shared file on its first write after a fork. `ttc daemon
+status` reports the selected `volume_copy_mode`, data root, backing device, and
+filesystem type.
 
 For trusted local testing only, start the daemon with
 `--unsafe-no-host-isolation` to bypass the host user-namespace and chroot
@@ -104,17 +99,29 @@ ttc daemon start --platform=kvm
 The KVM device is checked during daemon startup. Platform selection is
 daemon-wide; `ttc run` and `ttc create` always use the daemon's native CPU
 architecture and runtime platform. TTC does not emulate foreign CPU
-architectures. Stop and explicitly restart the daemon to change isolation,
-volume-copy, or runtime-platform modes. Ordinary commands do not autostart the service; if it is absent, they
-tell you to run `ttc daemon start`.
+architectures. Stop and explicitly restart the daemon to change isolation or
+runtime-platform modes. Ordinary commands do not autostart the service; if it
+is absent, they tell you to run `ttc daemon start`.
 
 Unsafe mode retains Sentry-level guest isolation and branch semantics, but
-removes host-side defense in depth. Do not use it for untrusted images. For a
-one-off recovery command that bypasses the daemon, the equivalent opt-in is:
+removes host-side defense in depth. Do not use it for untrusted images.
 
-```shell
-ttc --direct --unsafe-no-host-isolation run --rm busybox:1.36 echo hello
-```
+The default `--cpu-profile=portable` uses an x86-64-v2-class instruction set on
+amd64, suitable for moving workloads between compatible AMD and Intel nodes.
+It hides AVX, AVX-512, and guest XSAVE. Systrap still uses the host's extended
+register save format internally. For vector-heavy workloads, initialize the
+root or cluster with `--cpu-profile=host`, or select feature names with
+`--cpu-profile=explicit --cpu-features=...`. The profile is fixed at
+initialization. Joining nodes must support every selected feature. Profiles
+exposing XSAVE also require identical native XCR0 and XSAVE layouts: libraries
+may cache their buffer size, and these instructions execute directly on the
+CPU. AVX-512 register state is preserved by fork and hydration on compatible
+hosts; AMX is not exposed. A systrap cluster also requires host CPUID faulting
+(`ARCH_SET_CPUID`) on every member. Without it, an application can observe the
+physical CPU instead of the immutable profile; TTC rejects that node at daemon
+startup rather than allowing a later cross-CPU migration to corrupt userspace
+XSAVE buffers. This restriction applies to distributed systrap execution, not
+standalone TTC.
 
 ## Compile
 
@@ -150,8 +157,8 @@ TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc"
 
 ## Optional per-user installation
 
-Keep `ttc` and `ttcd` together so the client can locate its service and
-embedded runtime automatically:
+Keep `ttc` and `ttcd` together so `daemon start` can locate and build-check its
+matching service/runtime:
 
 ```shell
 mkdir -p "$HOME/.local/bin"
@@ -164,6 +171,7 @@ install -m 0755 bazel-bin/runsc/ttcd/ttcd_/ttcd \
 Add `$HOME/.local/bin` to `PATH` if necessary, then verify the installation:
 
 ```shell
+export TTC_ROOT="$HOME/.local/share/ttc"
 ttc --version
 ttc daemon start
 ttc daemon status
@@ -175,47 +183,45 @@ place both files together under `/usr/local/bin`.
 
 ## State and runtime paths
 
-Image content, materialized immutable roots, container metadata, and logs
-default to:
-
-```text
-$TTC_DATA_ROOT
-$XDG_DATA_HOME/ttc
-$HOME/.local/share/ttc
-```
-
-The first defined location wins. The native OCI content store is the
-`image-store` subdirectory of that data root.
-
-`TTC_RUNTIME_DIR` may set one private base directory containing both the
-runtime state and daemon socket. Otherwise, the default runtime root is
-`$XDG_RUNTIME_DIR/runsc`. Without
-`XDG_RUNTIME_DIR`, TTC uses `/tmp/ttc-$UID/runsc`, alongside its per-user
-daemon socket. Both locations are writable only by the invoking user. Explicit
-paths remain available for independent installations or test runs:
-
-Keep `TTC_RUNTIME_DIR` and the runsc state root on node-local storage. They
-must not be placed on NFS; `ttcd` rejects that configuration at startup. In a
-cluster, share `TTC_DATA_ROOT` instead.
+`ttcd` refuses to start until `TTC_ROOT` names an explicit absolute path. In
+standalone mode it contains the image store, container catalog, active runtime
+state, writable filesystems, and durable cold state:
 
 ```shell
-RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp/ttc-$UID}"
-
-ttc \
-  --root "$RUNTIME_BASE/runsc" \
-  --daemon-socket "$RUNTIME_BASE/ttcd.sock" \
-  run --rm busybox:1.36 echo hello
+export TTC_ROOT="$HOME/.local/share/ttc"
+ttc daemon start
 ```
 
-Global options must appear before the command. Use a dedicated data root for
-each independent TTC installation or test run:
+Existing roots created before this format are deliberately not migrated; use
+a fresh directory. `TTC_DATA_ROOT`, `TTC_RUNTIME_DIR`, `--data-root`, runtime
+`--root` forwarding, and direct/embedded-daemon operation are unsupported.
+
+In cluster mode, every node uses the same shared `TTC_ROOT` and its own fast,
+node-local scratch directory:
 
 ```shell
-export TTC_DATA_ROOT="$HOME/.local/share/ttc"
-export TTC_RUNTIME_DIR="$HOME/.local/state/ttc/runtime"
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
+ttc daemon start --cluster-init --node node-a \
+  --listen 0.0.0.0:7443 --advertise node-a.example:7443
 ```
 
-Do not point two incompatible TTC versions at the same live runtime root.
+`TTC_LOCAL_ROOT` is required on cluster compute nodes, must differ from
+`TTC_ROOT`, and is exclusively locked to one daemon. Active filesystems,
+runtime state, console/exec buffers, caches, and publication staging remain
+local. Sealed generations publish asynchronously as immutable indexed packs;
+after a clean node stop, remaining local files are disposable caches or
+staging residue.
+
+The client locates the daemon through `TTC_SOCKET`, then
+`$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
+`--daemon-socket` takes precedence for one invocation. The client never needs
+access to either storage root. Help, shell completion, argument validation, and
+`ttc --version` are client-local and work without a daemon. Ordinary CLI
+operations require the client and daemon build IDs to match exactly; `daemon
+stop` remains available as the version-independent recovery operation. SDK and
+MCP clients negotiate the public API and features instead of asserting a CLI
+build ID.
 
 ## Images
 
@@ -337,6 +343,8 @@ Manage branches independently:
 ```shell
 ttc pause web@test-a
 ttc resume web@test-a
+ttc quarantine web@test-a
+ttc unquarantine web@test-a
 ttc kill --signal TERM web@test-a
 ttc wait web@test-a
 ttc rm web@test-a
@@ -347,6 +355,15 @@ not remove surviving peers. Use `-f` to remove a running or paused branch.
 
 `ttc rm web` removes the whole family and requires all live branches to be
 exited unless `--force` is used.
+
+Quarantine is an independent per-branch flag, not a lifecycle state. It can be
+changed while a branch is running, paused, dehydrated, or exited. A quarantined
+branch retains its virtual NIC, internal sockets, and guest network
+configuration, but TTC disconnects its runtime-managed external edge and does
+not expose its published ports. The flag survives local and remote forks,
+migration, dehydration, rehydration, stop/start, and checkpoint/restore.
+Unquarantining recreates the external edge and published-port listeners;
+external connections that could not remain valid while disconnected are reset.
 
 Starting or restarting an exited branch does not require its peers to stop.
 TTC starts only the selected branch in a short-lived paused bootstrap, imports
@@ -365,63 +382,109 @@ ttc fork web@archived candidate-a candidate-b
 ## Distributed live fork
 
 Configured TTC nodes can place a live child on another host without first
-copying all container memory or creating a checkpoint. The target starts from
-a sparse memory manifest. It can temporarily fetch missing 1 MiB chunks from
-the live source while immutable copies are published to shared storage; once a
-chunk is durable, the target no longer depends on the source process for it.
+copying all container memory or extracting its filesystem, and without
+creating a checkpoint. The target starts from sparse memory and filesystem
+manifests. It can temporarily fetch missing 1 MiB ranges from the transaction-
+fenced live source while immutable copies are published to shared storage;
+target writes always create target-local data. Once every required range is
+local or durable, the target no longer depends on the source process.
 
-The nodes must use the same shared TTC data root and repository ID, have the
-same image content available, and be able to reach each other's control and
-page-transfer listeners. Give every daemon a certificate issued by one cluster
-CA whose identity matches its node ID. Dynamic discovery is preferred: a node
-publishes a lease and advertised mTLS endpoint in the shared root, so other
-daemons discover it without restarting. For example, start node A with:
+The nodes must use the same shared TTC data root, run the exact same TTC build
+and architecture, and be able to reach each other's cluster addresses. TTC's
+cluster transport is plaintext because the cluster assumes an OpenMPI-style
+trusted private network. Set the same `TTC_CLUSTER_TOKEN` on every node when a
+shared bearer secret is useful; omit it only when every process that can reach
+the cluster network is trusted as a cluster administrator.
+
+Cluster authority is one Raft group. Its WAL and snapshots live in each node's
+local root, never on the shared filesystem. Bootstrap node A with:
 
 ```shell
-ttc daemon start \
-  --cluster-node-id node-a \
-  --cluster-repository-id team-repository \
-  --cluster-listen 0.0.0.0:7443 \
-  --cluster-advertise https://node-a.example:7443,node-a.example \
-  --cluster-page-listen 0.0.0.0:0 \
-  --cluster-cert /shared/cluster/node-a.pem \
-  --cluster-key /shared/cluster/node-a.key \
-  --cluster-ca /shared/cluster/ca.pem \
-  --cluster-memory-target 64GiB \
-  --cluster-auto-rebalance \
-  --cluster-capacity-webhook https://scheduler.example/v1/ttc-capacity
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # optional
+ttc daemon start --cluster-init --node node-a \
+  --listen 0.0.0.0:7443 --advertise node-a.example:7443 \
+  --memory-target 64GiB
 ```
 
-Start node B with its own node ID, advertised address, and certificate.
-`--cluster-peer` remains available as a static override but is unnecessary
-when every daemon has `--cluster-advertise`. `TTC_DATA_ROOT`
-should name the shared repository path on both hosts; `TTC_RUNTIME_DIR` should
-remain a fast, node-local path. `ttc daemon status` reports the active cluster
-identity and negotiated capabilities. Both page-transfer addresses must use
-port `0`: TTC assigns an independent ephemeral listener to every concurrent
-remote fork.
+Start node B by naming any live seed:
+
+```shell
+export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-node-b
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
+ttc daemon start --cluster-join node-a.example:7443 --node node-b \
+  --listen 0.0.0.0:7443 --advertise node-b.example:7443 \
+  --memory-target 64GiB
+```
+
+A login node that should control the cluster but never execute containers can
+run an outbound-only gateway:
+
+```shell
+export TTC_ROOT=/shared/ttc
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
+ttc daemon start --control-only --cluster-join node-a.example:7443
+```
+
+This mode does not require `TTC_LOCAL_ROOT`. It opens only the per-user Unix
+socket selected by `TTC_SOCKET`; it does not open or advertise a TCP port,
+join Raft, create a cluster `NodeRecord`, provide page data, or accept branch
+placement. The login host therefore needs outbound connectivity to one compute
+seed, but compute nodes never initiate connections to it. Commands such as
+`run`, `exec`, `fork`, `migrate`, `ps`, and `node ls` are tunneled to the seed
+and then routed by the normal cluster placement authority. `ttc daemon stop`
+stops only the login-node gateway; use `ttc node stop` to retire a compute
+node. The shared `TTC_ROOT` marker is read to prevent accidentally controlling
+a different repository, but the gateway does not write container data there.
+
+For seed redundancy, repeat `--cluster-join HOST:PORT`. TTC verifies at least
+one seed and exact build/repository compatibility before publishing its local
+Unix socket. A failed stream is never replayed ambiguously; the next command
+rotates to another configured seed.
+
+Only one seed is needed. Membership and leader discovery come from Raft after
+admission. HTTP control requests and Raft streams share the single TCP port
+named by `--listen` and `--advertise`; page-transfer listeners are ephemeral
+per operation. Cluster-wide paging, lease,
+transaction, and automatic-rebalance policy is created once by the bootstrap
+node and adopted by joiners. Node names, addresses, local memory targets, and
+capacity-provider hooks remain node-local settings.
+
+Node names default to their hostnames. Admission checks connectivity in both
+directions between the candidate and every current member before joining
+Raft. Use `--advertise` when the hostname does not resolve to an address that
+the other nodes can reach. Firewalls must also allow the ephemeral page-data
+connections used during remote fork and migration.
+
+The first three admitted members are voting replicas; further elastic compute
+nodes remain non-voting replicas. Thus a large worker fleet does not enlarge
+the commit quorum. Membership, leases, placements, distributed transactions,
+publication generations, and durable root IDs are Raft state. Memory pages,
+filesystem extents, and immutable packs remain on the data plane and ordinary
+guest reads and writes perform no consensus operation.
 
 From node A, create one child on node B:
 
 ```shell
-ttc fork --target node-b web@main remote-web@main
+ttc fork --node node-b web@main remote-web
 ```
 
 Create several siblings from one source pause and one metadata capture by
 listing all destinations in a single command:
 
 ```shell
-ttc fork --target node-b web@main \
-  remote-web@candidate-a remote-web@candidate-b remote-web@candidate-c
+ttc fork --node node-b web@main candidate-a candidate-b candidate-c
 ```
 
 Using one destination family lets compatible branches share one Sentry and
 resident page cache on node B. Each child still has an independent filesystem
-and process state. A child becomes source-independent when every live memory
-dependency has been promoted to shared storage; it need not fault every chunk
-into RAM. `ttc inspect` reports transaction state and transfer metrics. Source
-shutdown drains or promotes remaining dependencies before allowing the source
-daemon to exit.
+and process state. A child becomes source-independent when every volatile
+memory and filesystem dependency is cached locally or promoted to shared
+storage; it need not fault every range into RAM. `ttc inspect` and `ttc stats`
+report the source node and remaining dependent bytes. Source shutdown drains
+or promotes all dependencies before allowing the source daemon to exit.
 
 Distributed live fork currently targets one remote node per command. Use a
 durable checkpoint for offline transfer or for TTC installations that do not
@@ -436,44 +499,57 @@ ttc node ls
 ```
 
 New containers are admitted on the compatible ready node with the lowest
-normalized memory load, including outstanding placement reservations. You may
-therefore send `ttc run`, `ttc create`, and restore commands to any ready
-daemon; the chosen node is transparent in the normal CLI view.
+normalized memory load, including outstanding placement reservations. `run`,
+`start`, `restore`, `rehydrate`, and `fork` accept an optional `--node`; without
+it, TTC chooses a compatible ready node. Commands naming an existing branch
+are routed to its current owner.
+
+```shell
+ttc run --node node-b -d --name build ubuntu:26.04 sleep infinity
+ttc rehydrate --node node-c build@main
+```
 
 Commands naming `CONTAINER@BRANCH` are routed to the recorded owner. Move a
 branch without changing its family, branch name, filesystem identity, or
 process state with:
 
 ```shell
-ttc migrate --target node-b web@candidate-a
+ttc migrate --node node-b web@candidate-a
 ```
 
 Family-wide `ttc stop FAMILY`, `ttc dehydrate FAMILY`, and `ttc rm FAMILY`
 also work when the family's branches are spread across nodes. TTC coordinates
 the owner-local operations and prints one result for the original family.
 
-The current migration path uses a durable conservative cutover: it dehydrates
-the branch, transfers its fenced ownership, then rehydrates it on the target.
-The source cannot execute after ownership changes. External connections are
-interrupted according to the same policy as remote fork.
+Migration uses a live sparse cutover. It pauses and captures the selected
+branch once, prepares a paused target that can demand-page memory and
+materialize whole files on demand, atomically transfers fenced ownership, and
+only then lets the target run. The source cannot execute after ownership
+changes, while its sealed snapshot remains available until all target
+dependencies are local or shared-durable. External connections are interrupted
+according to the same policy as remote fork.
 
-To remove a compute node, drain it from any TTC client:
+To remove a compute node, stop it from any TTC client. Exactly one policy is
+chosen when it still owns active branches:
 
 ```shell
-ttc node drain node-a
-ttc daemon stop                 # run against node-a after drain succeeds
+ttc node stop --migrate-all node-a
+ttc node stop --dehydrate-all node-b
+ttc node stop --stop-all node-c
 ```
 
-Drain first changes the node to `draining`, which rejects new runs, forks,
-rehydrations, and incoming migrations. It migrates running/paused branches,
-transfers cold branch placement without waking them, and makes remote page
-dependencies durable. If a step fails, the node stays cordoned and the same
-command can be retried. The intent is durable: after an abnormal `ttcd` exit,
-the same node ID rejoins as `draining` and automatically resumes remaining
-work. A retry may supply a different `--target node-b`; already transferred
-branches remain where they are. A clean `ttc daemon stop` consumes a completed
-intent so the node ID can later join normally. Without `--target`, TTC selects
-ready nodes by reported load.
+Node stop first changes the node to `draining`, which rejects new runs, forks,
+rehydrations, and incoming migrations. `--migrate-all` partitions and moves
+running and paused branches to scheduler-selected ready nodes.
+`--dehydrate-all` durably captures them as unplaced cold branches;
+`--stop-all` terminates them and publishes their filesystems. With no policy,
+the operation rejects while active branches remain. After dependencies and
+publications are durable, `ttcd` stops automatically and retires its cluster
+membership. If a step fails, the node stays cordoned and the same command can
+be retried; the durable stop intent resumes after a daemon restart.
+
+`ttc daemon stop --migrate-all` applies the same scheduler-selected evacuation
+to the daemon reached by `TTC_SOCKET`. It is rejected outside distributed mode.
 
 If a daemon disappears during an individual migration, TTC reconciles the
 fenced transaction automatically. A branch still owned by the source waits for
@@ -492,7 +568,7 @@ If a drain or pressure rebalance has no feasible destination, TTC writes one
 durable request per source node to:
 
 ```text
-$TTC_DATA_ROOT/cluster/capacity-requests/<node-id>.json
+$TTC_ROOT/cluster/capacity-requests/<node-id>.json
 ```
 
 Configure exactly one delivery adapter on every daemon:
@@ -612,10 +688,13 @@ forwardings to the restored container with `ttc port publish`. Connections to
 external hosts are disconnected in the snapshot, as they are for the child of
 a live fork; internal sockets and pipes are retained when supported.
 
-Checkpoint files are intended to be restored by a compatible TTC build. They
-wrap gVisor's versioned state data and are not a stable interchange format
-between arbitrary TTC or upstream gVisor versions. Compression defaults to
-fast DEFLATE and may be disabled:
+A checkpoint holds the branch's own memory, only the pages it uses however
+much its family holds, as a dehydration of the branch; restore imports it and
+rehydrates it as `main`. Checkpoint files are intended to be restored by a
+compatible TTC build. They hold TTC's dehydration state, which is not a stable
+interchange format between arbitrary TTC or upstream gVisor versions, and a
+checkpoint made before TTC saved branches this way can be restored only by the
+build that made it. Compression defaults to fast DEFLATE and may be disabled:
 
 ```shell
 ttc checkpoint --compression none web@main raw-checkpoint.ttc
@@ -790,6 +869,15 @@ does not estimate the Sentry's Go heap or unmapped cache. Filesystem sharing is
 reported at TTC's immutable file-object boundary, while durable memory backing
 is reported from still-present sparse chunk objects.
 
+JSON inspection reports storage separately from lifecycle. `storage_state` is
+`local`, `publishing`, `shared`, `materializing`, or `error`; publication
+errors include retry details. This lets an orchestrator use a branch as soon
+as local capture finishes while independently waiting for shared durability:
+
+```shell
+ttc wait --condition durable web@test-b
+```
+
 ## Filesystems and volumes
 
 The ordinary container root is writable by default. Its immutable image lower
@@ -844,14 +932,23 @@ filesystem performs extent CoW. Stop/start reopens the same repository; there
 is no tar export/import. `ttc rm -v` also removes anonymous volumes, while
 named volumes remain until `ttc volume rm`.
 
-The daemon requires `FICLONE` by default. On a host without reflinks, starting
-it with `--allow-slow-volume-copy` explicitly selects whole-file copying on
-the first write after each fork. See the
+The daemon uses `FICLONE` when available and otherwise automatically selects
+whole-file copying on the first write after each fork. See the
 [disk-backed volume design](../proposals/ttc_disk_backed_volumes.md).
 
 One named volume may have one writable container family at a time. TTC rejects
 a second writable attachment because separate Sentry namespace caches are not
 yet coherent; additional read-only attachments are allowed.
+
+In a cluster, a named volume belongs to one node, as a Docker Swarm node's
+local volumes do: it lives in that node's `TTC_LOCAL_ROOT`, and a branch uses
+the volume of its name on the node it runs on, created on first use. The same
+name on another node is another, separate volume, so branches placed on
+different nodes do not see each other's writes to it. `ttc volume create`,
+`inspect` and `rm` act on the node that runs the command, and `inspect` names
+it; `ttc volume ls` lists the volumes of every node, with a `NODE` column.
+Keep data that branches on several nodes must share on shared storage, and
+bind it read-only.
 
 Use `:ro` for a live read-only view of a host path:
 
@@ -958,9 +1055,12 @@ curl http://127.0.0.1:8080/
 
 Accepted forms are `HOST_PORT:CONTAINER_PORT` and
 `HOST_IP:HOST_PORT:CONTAINER_PORT[/tcp]`. Host addresses and published ports are
-currently IPv4/TCP only. The binding is persistent configuration: `ttcd`
-reconciles its rootless user-mode listener after restart. It is also shown in
-Docker-compatible `.HostConfig.PortBindings` inspect output.
+currently IPv4/TCP only. A published listener belongs to the daemon receiving
+the command and lasts until it is unpublished or that daemon stops. In a
+cluster, it routes new connections to the branch's current owner, so the same
+host address continues working after migration. Existing connections can be
+interrupted during migration. This does not create an all-node guest network
+or DNS service.
 
 Add or remove a listener on any existing live branch without restarting it:
 
@@ -973,10 +1073,9 @@ ttc port unpublish web@child 127.0.0.1:8082:80
 ```
 
 `publish`, `unpublish`, and `port ls` all require a full branch selector.
-Dynamically published listeners are persistent and reconciled after
-`ttcd` restarts. Docker-compatible `.HostConfig.PortBindings` continues to
-show only `main`; the complete branch-aware list is available through
-`ttc port ls --json` and `.TTC.container.published_ports` in `ttc inspect`.
+Run `ttc port ls --json` against the publishing daemon to inspect its local
+listeners. Publish them again after a daemon restart. Publishing the same
+branch on another node creates an independent ingress listener there.
 
 Live-fork policy deliberately distinguishes internal from external flows:
 
@@ -1033,8 +1132,6 @@ does not reconfigure an already-running daemon; stop it first if you want to
 change modes. `daemon status` returns the active platform and isolation mode in
 JSON.
 
-`--direct` bypasses `ttcd` for recovery and debugging. Do not routinely mix
-direct mutations with daemon-mediated commands against the same data root.
 Durable mutation records can be inspected with `ttc daemon requests` after an
 interrupted operation.
 

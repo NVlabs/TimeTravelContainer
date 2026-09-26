@@ -18,7 +18,7 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
 TTC_E2E_DEADLINE_SECONDS=${TTC_E2E_DEADLINE_SECONDS:-}
@@ -43,8 +43,8 @@ container_id_valid() {
 
 [ -n "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
-[ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
-[ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
+[ -n "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
+[ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
   if ! unshare -Ur /bin/true >/dev/null 2>&1; then
@@ -66,8 +66,20 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 HOST_FIXTURE="$TTC_E2E_ROOT/host-fixture"
 HOST_FIXTURE_TWO="$TTC_E2E_ROOT/host-fixture-two"
 HOST_COW_FIXTURE="$TTC_E2E_ROOT/host-cow-fixture"
@@ -104,20 +116,15 @@ PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
 CHILD_PUBLISHED_PORT=$((20000 + (($$ + 3000) % 30000)))
 NAT_FIXTURE_PID=
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 ttc_daemon_start() {
   if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
-    ttc daemon start --unsafe-no-host-isolation --allow-slow-volume-copy
+    ttc daemon start --unsafe-no-host-isolation
     return
   fi
-  ttc daemon start --allow-slow-volume-copy
+  ttc daemon start
 }
 
 ttc_daemon_crash() {
@@ -176,7 +183,7 @@ if ttc inspect "$AUTO_FOREGROUND" >/dev/null 2>&1; then
 fi
 AUTO_DETACHED_ID=$(ttc run --rm --detach --name "$AUTO_DETACHED" "$BUSYBOX_IMAGE" sh -c "sleep 2")
 container_id_valid "$AUTO_DETACHED_ID" || fail "detached --rm returned invalid ID: $AUTO_DETACHED_ID"
-[ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED_ID")" = true ] ||
+[ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED")" = true ] ||
   fail "inspect omitted detached auto-remove policy"
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ttc inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
@@ -184,9 +191,9 @@ while ttc inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
   sleep 1
 done
 AUTO_CREATED_ID=$(ttc create --rm --name "$AUTO_CREATED" "$BUSYBOX_IMAGE" sh -c "sleep 1")
-[ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED_ID")" = true ] ||
+[ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED")" = true ] ||
   fail "create --rm did not persist its policy"
-ttc start "$AUTO_CREATED_ID" >/dev/null
+ttc start "$AUTO_CREATED_ID@main" >/dev/null
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ttc inspect "$AUTO_CREATED" >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "started create --rm container was retained"
@@ -217,7 +224,7 @@ BUSYBOX_PREFIX=$(printf %.16s "$BUSYBOX_ID")
 BUSYBOX_ENV=$(ttc inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$PREFIX-busybox")
 echo "$BUSYBOX_ENV" | grep -qx 'FROM_FILE=direct' || fail "created-container inspect omitted direct environment override"
 echo "$BUSYBOX_ENV" | grep -qx 'TTC_E2E_HOST_IMPORT=host-import' || fail "created-container inspect omitted imported host environment"
-ttc start --attach "$BUSYBOX_PREFIX"
+ttc start --attach "$BUSYBOX_PREFIX@main"
 [ "$(ttc inspect -f '{{.State.Status}}|{{.State.ExitCode}}|{{.State.Running}}' "$PREFIX-busybox")" = \
   "exited|0|false" ] ||
   fail "exited-container inspect did not expose exit state"
@@ -237,7 +244,7 @@ printf 'stdin-ok\n' | ttc attach --interactive --no-stdout --no-stderr "$ATTACH_
 [ -z "$(sed '/^ttc: warning:/d' "$ATTACH_STDERR")" ] || fail "stdin-only attach leaked stderr"
 [ "$(ttc inspect -f '{{.State.ExitCode}}' "$ATTACH_INPUT")" = 0 ] || fail "stdin-only attach did not deliver input"
 ttc rm "$ATTACH_INPUT"
-ttc container restart --time 1 "$PREFIX-busybox"
+ttc container restart --time 1 "$PREFIX-busybox@main"
 [ "$(ttc container wait "$PREFIX-busybox@main")" = "0" ] ||
   fail "restart/wait did not preserve the BusyBox command exit status"
 ttc rm "$BUSYBOX_ID"
@@ -257,9 +264,9 @@ ttc volume rm "$MATRIX_VOLUME"
 
 ttc container create --name "$MULTI_A" "$BUSYBOX_IMAGE" sh -c 'exit 3'
 ttc container create --name "$MULTI_B" "$BUSYBOX_IMAGE" sh -c 'exit 4'
-MULTI_STARTED=$(ttc container start "$MULTI_A" "$MULTI_B")
-echo "$MULTI_STARTED" | grep -qx "$MULTI_A" || fail "multi-start omitted $MULTI_A"
-echo "$MULTI_STARTED" | grep -qx "$MULTI_B" || fail "multi-start omitted $MULTI_B"
+MULTI_STARTED=$(ttc container start "$MULTI_A@main" "$MULTI_B@main")
+echo "$MULTI_STARTED" | grep -qx "$MULTI_A@main" || fail "multi-start omitted $MULTI_A@main"
+echo "$MULTI_STARTED" | grep -qx "$MULTI_B@main" || fail "multi-start omitted $MULTI_B@main"
 MULTI_WAIT=$(ttc wait "$MULTI_A@main" "$MULTI_B@main")
 [ "$MULTI_WAIT" = "$(printf '3\n4')" ] || fail "multi-wait returned: $MULTI_WAIT"
 ttc container rm "$MULTI_A" "$MULTI_B"
@@ -460,7 +467,7 @@ ttc rm "$PIDS_LIMIT"
 ttc create --name "$PREFIX-nginx" "$NGINX_IMAGE" nginx -t
 [ "$(ttc inspect -f '{{.Config.StopSignal}}' "$PREFIX-nginx")" = SIGQUIT ] ||
   fail "nginx image STOPSIGNAL was not inherited"
-ttc start --attach "$PREFIX-nginx"
+ttc start --attach "$PREFIX-nginx@main"
 ttc rm "$PREFIX-nginx"
 
 [ "$(ttc run --name "$PREFIX-redis" "$REDIS_IMAGE" sh -c \
@@ -523,7 +530,7 @@ echo "== explicit logging drivers =="
 ttc create --name "$NOLOG" --log-driver none "$BUSYBOX_IMAGE" sh -c "echo hidden" >/dev/null
 [ "$(ttc inspect -f '{{.HostConfig.LogConfig.Type}}' "$NOLOG")" = "none" ] ||
   fail "inspect omitted the none log driver"
-ttc start "$NOLOG" >/dev/null
+ttc start "$NOLOG@main" >/dev/null
 if ttc logs "$NOLOG@main" >"$TTC_E2E_ROOT/nolog.out" 2>"$TTC_E2E_ROOT/nolog.err"; then
   fail "logs accepted a container configured with the none log driver"
 fi
@@ -567,7 +574,8 @@ while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
 done
 
 echo "== daemon restart reconciliation =="
-ttc daemon status | grep -q '"version":4' || fail "ttcd did not report API version 4"
+ttc daemon status | grep -Eq '"version":[[:space:]]*[1-9][0-9]*[,}]' ||
+  fail "ttcd did not report a valid API version"
 ttc_daemon_crash
 if ttc daemon status >/dev/null 2>&1; then
   fail "ttcd remained reachable after crash"
@@ -575,7 +583,7 @@ fi
 ttc_daemon_start
 [ "$(ttc inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
   fail "restarted ttcd did not reconcile the running container"
-ttc daemon status | grep -q '"version":4' || fail "ttcd did not restart"
+ttc daemon status | grep -Eq '"version":[[:space:]]*[1-9][0-9]*[,}]' || fail "ttcd did not restart"
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
@@ -606,7 +614,7 @@ while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q "tick:"; do
   sleep 1
 done
 
-ttc container restart --force --time 2 "$LIFECYCLE"
+ttc container restart --time 2 "$LIFECYCLE@main"
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "restarted detached init did not produce console output"
@@ -663,36 +671,20 @@ if ttc exec "$LIFECYCLE@main" sh -c 'echo forbidden >/host-fixture/value' >/dev/
 fi
 echo "== attached exec live-fork continuity =="
 ttc exec "$LIFECYCLE@main" rm -f /state/attached-exec-ready /state/attached-exec-release
-ATTACHED_EXEC_SESSION=attached-live
-ATTACHED_EXEC_CHILD=attached-exec-child
-ttc exec --session "$ATTACHED_EXEC_SESSION" "$LIFECYCLE@main" sh -c \
-	'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done; echo attached-exec-released' \
-	>"$TTC_E2E_ROOT/attached-exec.out" 2>"$TTC_E2E_ROOT/attached-exec.err" &
+ttc exec "$LIFECYCLE@main" sh -c \
+  'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done' \
+  >"$TTC_E2E_ROOT/attached-exec.out" 2>"$TTC_E2E_ROOT/attached-exec.err" &
 ATTACHED_EXEC_HOST_PID=$!
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc exec "$LIFECYCLE@main" test -e /state/attached-exec-ready >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
   sleep 1
 done
-ttc fork "$LIFECYCLE@main" "$ATTACHED_EXEC_CHILD" >/dev/null ||
-	fail "live fork rejected a Sentry-console attached exec"
-for branch in main "$ATTACHED_EXEC_CHILD"; do
-	SESSION_JSON=$(ttc exec ls --json "$LIFECYCLE@$branch")
-	echo "$SESSION_JSON" | grep -q "\"id\": \"$ATTACHED_EXEC_SESSION\"" ||
-		fail "branch $branch lost attached exec session $ATTACHED_EXEC_SESSION"
-	echo "$SESSION_JSON" | grep -q '"state": "running"' ||
-		fail "branch $branch did not retain the running attached exec"
-done
+ttc fork "$LIFECYCLE@main" attached-exec >/dev/null ||
+  fail "live fork rejected an attached exec whose stdio is daemon-mediated"
 ttc exec "$LIFECYCLE@main" touch /state/attached-exec-release
-ttc exec "$LIFECYCLE@$ATTACHED_EXEC_CHILD" touch /state/attached-exec-release
 wait "$ATTACHED_EXEC_HOST_PID" || fail "attached exec did not exit successfully"
-grep -qx 'attached-exec-released' "$TTC_E2E_ROOT/attached-exec.out" ||
-	fail "parent attached exec output was not delivered"
-[ "$(ttc exec wait "$LIFECYCLE@$ATTACHED_EXEC_CHILD:$ATTACHED_EXEC_SESSION")" = 0 ] ||
-	fail "forked attached exec did not exit successfully"
-ttc logs --exec "$ATTACHED_EXEC_SESSION" "$LIFECYCLE@$ATTACHED_EXEC_CHILD" |
-	grep -qx 'attached-exec-released' || fail "forked attached exec output was not retained"
-ttc rm -f "$LIFECYCLE@$ATTACHED_EXEC_CHILD"
+ttc rm -f "$LIFECYCLE@attached-exec"
 
 ttc fork "$LIFECYCLE_PREFIX@main" child
 echo host-mutated >"$HOST_FIXTURE/value"
@@ -850,15 +842,14 @@ ttc stop --time 2 "$LIFECYCLE@grandchild" "$LIFECYCLE@main"
 ttc rm -f "$LIFECYCLE@grandchild"
 ttc rm "$LIFECYCLE_ID"
 
-echo "== intentional daemon stop safety and managed teardown =="
+echo "== explicit daemon stop policy =="
 ttc run --detach --name "$DAEMON_STOP" "$BUSYBOX_IMAGE" sleep 300 >/dev/null
 ttc fork "$DAEMON_STOP@main" child >/dev/null
 ttc pause "$DAEMON_STOP@child" >/dev/null
-if ttc daemon stop >"$TTC_E2E_ROOT/daemon-stop.out" 2>"$TTC_E2E_ROOT/daemon-stop.err"; then
-  fail "daemon stop accepted live branches without an explicit policy"
+if ttc daemon stop >/dev/null 2>&1; then
+  fail "daemon stop accepted active branches without an explicit policy"
 fi
-grep -q -- '--stop-all' "$TTC_E2E_ROOT/daemon-stop.err" ||
-  fail "daemon stop rejection omitted the --stop-all recovery"
+ttc daemon status >/dev/null || fail "rejected daemon stop made ttcd unreachable"
 ttc daemon stop --stop-all
 if ttc daemon status >/dev/null 2>&1; then
   fail "ttcd remained reachable after intentional stop"

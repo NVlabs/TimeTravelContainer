@@ -17,21 +17,215 @@ package tcp_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"reflect"
 	"testing"
+	"time"
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp/test/e2e"
 	testcontext "gvisor.dev/gvisor/pkg/tcpip/transport/tcp/testing/context"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+func restoredEndpoints(t *testing.T, s *stack.Stack) []stack.RestoredEndpoint {
+	t.Helper()
+	stackType := reflect.TypeOf(s).Elem()
+	sf, ok := stackType.FieldByName("restoredEndpoints")
+	if !ok {
+		t.Fatalf("Field restoredEndpoints not found")
+	}
+	ptr := unsafe.Pointer(uintptr(unsafe.Pointer(s)) + sf.Offset)
+	return *(*[]stack.RestoredEndpoint)(ptr)
+}
+
+func endpointWaiterQueue(t *testing.T, ep tcpip.Endpoint) *waiter.Queue {
+	t.Helper()
+	v := reflect.ValueOf(ep)
+	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
+		t.Fatalf("endpoint has unexpected type %T", ep)
+	}
+	sf, ok := v.Elem().Type().FieldByName("waiterQueue")
+	if !ok {
+		t.Fatalf("endpoint %T has no waiterQueue", ep)
+	}
+	ptr := unsafe.Pointer(v.Pointer() + sf.Offset)
+	return *(**waiter.Queue)(ptr)
+}
+
+func configureLoopback(t *testing.T, s *stack.Stack) {
+	t.Helper()
+	if err := s.CreateNIC(1, loopback.New()); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}).WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol:          header.IPv6ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom16([16]byte{15: 1}).WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress IPv6: %v", err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+}
+
+func TestTCPDualStackListeningEndpointAcceptsIPv4AfterRestore(t *testing.T) {
+	s := stack.New(stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+	})
+	defer s.Destroy()
+	configureLoopback(t, s)
+	listener, err := gonet.ListenTCP(s, tcpip.FullAddress{Port: 8080}, header.IPv6ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP IPv6 wildcard: %v", err)
+	}
+	defer listener.Close()
+
+	s.SetLiveForkSaveConfig(true)
+	var buf bytes.Buffer
+	if _, err := state.Save(context.Background(), &buf, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	s.SetLiveForkSaveConfig(false)
+	restored := stack.New(stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+	})
+	defer restored.Destroy()
+	if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), restored); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := restored.PrepareLiveForkRestore(); err != nil {
+		t.Fatalf("PrepareLiveForkRestore: %v", err)
+	}
+	eps := restoredEndpoints(t, restored)
+	if len(eps) != 1 {
+		t.Fatalf("restored endpoint count: got %d, want 1", len(eps))
+	}
+	ep := eps[0].(tcpip.Endpoint)
+	restoredListener := gonet.NewTCPListener(restored, endpointWaiterQueue(t, ep), ep)
+	defer restoredListener.Close()
+	restored.Restore()
+
+	acceptResult := make(chan error, 1)
+	go func() {
+		conn, err := restoredListener.Accept()
+		if err == nil {
+			_, err = io.WriteString(conn, "dual-stack")
+			conn.Close()
+		}
+		acceptResult <- err
+	}()
+	client, err := gonet.DialTCP(restored, tcpip.FullAddress{
+		NIC: 1, Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: 8080,
+	}, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("IPv4 DialTCP after restore: %v", err)
+	}
+	defer client.Close()
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := "dual-stack"; string(got) != want {
+		t.Fatalf("payload: got %q, want %q", got, want)
+	}
+	if err := <-acceptResult; err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+}
+
+func TestTCPListeningEndpointAcceptsAfterRestore(t *testing.T) {
+	s := stack.New(stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+	})
+	defer s.Destroy()
+	configureLoopback(t, s)
+	listener, err := gonet.ListenTCP(s, tcpip.FullAddress{
+		NIC: 1, Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: 8080,
+	}, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer listener.Close()
+
+	var buf bytes.Buffer
+	if _, err := state.Save(context.Background(), &buf, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	restored := stack.New(stack.Options{
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+	})
+	defer restored.Destroy()
+	if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), restored); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	configureLoopback(t, restored)
+	eps := restoredEndpoints(t, restored)
+	if len(eps) != 1 {
+		t.Fatalf("restored endpoint count: got %d, want 1", len(eps))
+	}
+	ep, ok := eps[0].(tcpip.Endpoint)
+	if !ok {
+		t.Fatalf("restored endpoint has type %T, want tcpip.Endpoint", eps[0])
+	}
+	restoredListener := gonet.NewTCPListener(restored, endpointWaiterQueue(t, ep), ep)
+	defer restoredListener.Close()
+	restored.Restore()
+
+	acceptResult := make(chan error, 1)
+	go func() {
+		conn, err := restoredListener.Accept()
+		if err != nil {
+			acceptResult <- err
+			return
+		}
+		defer conn.Close()
+		_, err = io.WriteString(conn, "restored")
+		acceptResult <- err
+	}()
+	client, err := gonet.DialTCP(restored, tcpip.FullAddress{
+		NIC: 1, Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: 8080,
+	}, header.IPv4ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialTCP after restore: %v", err)
+	}
+	defer client.Close()
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := "restored"; string(got) != want {
+		t.Fatalf("payload: got %q, want %q", got, want)
+	}
+	if err := <-acceptResult; err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+}
 
 func TestTCPMigration(t *testing.T) {
 	testCases := []struct {

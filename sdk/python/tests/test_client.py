@@ -72,7 +72,7 @@ class ClientTest(unittest.TestCase):
     def test_ping_uses_direct_protocol(self):
         def handler(conn, request):
             self.assertEqual(request, {"version": API_VERSION, "action": "ping"})
-            conn.sendall(frame(b"O", b'{"version":4,"isolation_mode":"rootless"}\n'))
+            conn.sendall(frame(b"O", b'{"version":9,"isolation_mode":"rootless"}\n'))
             conn.sendall(frame(b"X", struct.pack(">I", 0)))
 
         with __import__("tempfile").TemporaryDirectory() as directory:
@@ -117,8 +117,8 @@ class ClientTest(unittest.TestCase):
 
     def test_default_socket_path_precedence(self):
         self.assertEqual(
-            default_socket_path({"TTC_RUNTIME_DIR": "/run/a", "XDG_RUNTIME_DIR": "/run/b"}),
-            "/run/a/ttcd.sock",
+            default_socket_path({"TTC_SOCKET": "/run/a/custom.sock", "XDG_RUNTIME_DIR": "/run/b"}),
+            "/run/a/custom.sock",
         )
         self.assertEqual(
             default_socket_path({"XDG_RUNTIME_DIR": "/run/b"}),
@@ -149,7 +149,7 @@ class ClientTest(unittest.TestCase):
                 [
                     "fork",
                     "--paused",
-                    "--target",
+                    "--node",
                     "node-b",
                     "demo@main",
                     "remote@one",
@@ -165,7 +165,7 @@ class ClientTest(unittest.TestCase):
                     "demo@main",
                     ["remote@one", "remote@two"],
                     paused=True,
-                    target_node="node-b",
+                    node="node-b",
                 )
                 self.assertTrue(result.ok)
             finally:
@@ -175,7 +175,7 @@ class ClientTest(unittest.TestCase):
         def migrate_handler(conn, request):
             self.assertEqual(
                 request["args"],
-                ["migrate", "--target", "node-b", "demo@main"],
+                ["migrate", "--node", "node-b", "demo@main"],
             )
             conn.sendall(frame(b"X", struct.pack(">I", 0)))
 
@@ -195,6 +195,41 @@ class ClientTest(unittest.TestCase):
             daemon = MockDaemon(Path(directory) / "ttcd.sock", nodes_handler)
             try:
                 self.assertEqual(Client(daemon.path).nodes()[0]["node_id"], "node-a")
+            finally:
+                daemon.close()
+
+        def stop_handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["node", "stop", "--migrate-all", "node-a"],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", stop_handler)
+            try:
+                self.assertTrue(
+                    Client(daemon.path).stop_node("node-a", policy="migrate").ok
+                )
+            finally:
+                daemon.close()
+
+    def test_wait_durable_uses_current_cli_shape(self):
+        def handler(conn, request):
+            self.assertEqual(
+                request["args"],
+                ["wait", "--condition", "durable", "demo@main"],
+            )
+            conn.sendall(frame(b"X", struct.pack(">I", 0)))
+
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            daemon = MockDaemon(Path(directory) / "ttcd.sock", handler)
+            try:
+                self.assertTrue(
+                    Client(daemon.path).wait("demo@main", condition="durable").ok
+                )
+                with self.assertRaisesRegex(ValueError, "condition"):
+                    Client(daemon.path).wait("demo@main", condition="invalid")
             finally:
                 daemon.close()
 

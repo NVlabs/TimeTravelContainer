@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-API_VERSION = 4
+API_VERSION = 9
 MAX_FRAME = 1 << 20
 STDIN_WINDOW = 1 << 20
 
@@ -85,8 +85,8 @@ class Result:
 
 def default_socket_path(env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
-    if runtime := values.get("TTC_RUNTIME_DIR"):
-        return str(Path(runtime) / "ttcd.sock")
+    if socket := values.get("TTC_SOCKET"):
+        return socket
     if runtime := values.get("XDG_RUNTIME_DIR"):
         return str(Path(runtime) / "ttc" / "ttcd.sock")
     return f"/tmp/ttc-{os.geteuid()}/ttcd.sock"
@@ -343,17 +343,18 @@ class Client:
     def list(self) -> Any:
         return self.command(["ls", "--json"], check=True).json()
 
-    def inspect(self, target: str) -> Any:
-        return self.command(["inspect", target], check=True).json()
+    def inspect(self, container: str) -> Any:
+        """Inspect a container family; branch details are included in TTC.branches."""
+        return self.command(["inspect", container], check=True).json()
 
     def pull(self, image: str) -> Result:
         return self.command(["pull", image])
 
-    def run(self, image: str, command: Sequence[str] = (), *, options: Sequence[str] = ()) -> Result:
-        return self.command(["run", *options, image, *command])
+    def run(self, image: str, command: Sequence[str] = (), *, options: Sequence[str] = (), node: str | None = None) -> Result:
+        return self.command(["run", *(["--node", node] if node else []), *options, image, *command])
 
-    def start(self, target: str) -> Result:
-        return self.command(["start", target])
+    def start(self, target: str, *, node: str | None = None) -> Result:
+        return self.command(["start", *(["--node", node] if node else []), target])
 
     def exec(self, target: str, command: Sequence[str], *, input: bytes | str | None = None) -> Result:
         return self.command(["exec", target, *command], input=input)
@@ -461,10 +462,10 @@ class Client:
         destination: str,
         *,
         paused: bool = False,
-        target_node: str | None = None,
+        node: str | None = None,
     ) -> Result:
         return self.fork_many(
-            source, [destination], paused=paused, target_node=target_node
+            source, [destination], paused=paused, node=node
         )
 
     def fork_many(
@@ -473,35 +474,35 @@ class Client:
         destinations: Sequence[str],
         *,
         paused: bool = False,
-        target_node: str | None = None,
+        node: str | None = None,
     ) -> Result:
         if not destinations:
             raise ValueError("destinations must not be empty")
         args = ["fork"]
         if paused:
             args.append("--paused")
-        if target_node is not None:
-            args.extend(["--target", target_node])
+        if node is not None:
+            args.extend(["--node", node])
         return self.command([*args, source, *destinations])
 
-    def migrate(self, target: str, target_node: str) -> Result:
+    def migrate(self, target: str, node: str) -> Result:
         """Move a branch to another elastic-cluster node without renaming it."""
-        return self.command(["migrate", "--target", target_node, target])
+        return self.command(["migrate", "--node", node, target])
 
     def nodes(self) -> Any:
         """Return dynamic cluster membership and current memory accounting."""
         return self.command(["node", "ls", "--json"], check=True).json()
 
-    def drain_node(self, node: str, *, target_node: str | None = None) -> Result:
-        args = ["node", "drain"]
-        if target_node is not None:
-            args.extend(["--target", target_node])
-        return self.command([*args, node])
+    def stop_node(self, node: str, *, policy: str | None = None) -> Result:
+        if policy not in (None, "stop", "dehydrate", "migrate"):
+            raise ValueError("policy must be stop, dehydrate, migrate, or None")
+        option = f"--{policy}-all" if policy else None
+        return self.command(["node", "stop", *([option] if option else []), node])
 
-    def rebalance_node(self, node: str, *, target_node: str | None = None) -> Any:
+    def rebalance_node(self, node: str, *, destination_node: str | None = None) -> Any:
         args = ["node", "rebalance"]
-        if target_node is not None:
-            args.extend(["--target", target_node])
+        if destination_node is not None:
+            args.extend(["--node", destination_node])
         return self.command([*args, node], check=True).json()
 
     def pause(self, target: str) -> Result:
@@ -510,11 +511,19 @@ class Client:
     def resume(self, target: str) -> Result:
         return self.command(["resume", target])
 
+    def quarantine(self, target: str) -> Result:
+        """Disconnect a branch's runtime-managed external network edge."""
+        return self.command(["quarantine", target])
+
+    def unquarantine(self, target: str) -> Result:
+        """Reconnect a quarantined branch to TTC-managed external networking."""
+        return self.command(["unquarantine", target])
+
     def dehydrate(self, target: str) -> Result:
         return self.command(["dehydrate", target])
 
-    def rehydrate(self, target: str) -> Result:
-        return self.command(["rehydrate", target])
+    def rehydrate(self, target: str, *, node: str | None = None) -> Result:
+        return self.command(["rehydrate", *(["--node", node] if node else []), target])
 
     def checkpoint(
         self,
@@ -529,10 +538,10 @@ class Client:
         )
 
     def restore(
-        self, file: str | os.PathLike[str], *, name: str | None = None
+        self, file: str | os.PathLike[str], *, name: str | None = None, node: str | None = None
     ) -> Result:
         source = str(Path(file).expanduser().resolve())
-        return self.command(["restore", *(["--name", name] if name else []), source])
+        return self.command(["restore", *(["--node", node] if node else []), *(["--name", name] if name else []), source])
 
     def stop(self, target: str, *, timeout: int | None = None) -> Result:
         return self.command(
@@ -549,8 +558,10 @@ class Client:
             ["kill", *(["--signal", str(signal)] if signal is not None else []), target]
         )
 
-    def wait(self, target: str) -> Result:
-        return self.command(["wait", target], timeout=None)
+    def wait(self, target: str, *, condition: str = "not-running") -> Result:
+        if condition not in ("not-running", "durable"):
+            raise ValueError("condition must be 'not-running' or 'durable'")
+        return self.command(["wait", "--condition", condition, target], timeout=None)
 
     def remove(self, target: str, *, force: bool = False) -> Result:
         return self.command(["rm", *(["--force"] if force else []), target])

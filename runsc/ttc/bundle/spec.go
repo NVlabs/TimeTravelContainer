@@ -31,6 +31,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -108,6 +110,7 @@ type SpecOptions struct {
 	StopSignal       string
 	PidsLimit        *int64
 	MemoryLimit      *int64
+	MemorySwap       *int64
 	NanoCPUs         *int64
 	CPUShares        *uint64
 	CPUPeriod        *uint64
@@ -143,7 +146,11 @@ type ManagedVolume struct {
 	Anonymous      bool   `json:"anonymous,omitempty"`
 	NoCopy         bool   `json:"no_copy,omitempty"`
 	RepositoryPath string `json:"-"`
-	CopyMode       string `json:"-"`
+	// RepositoryBranch is the physical branch mounted by this family's
+	// initial branch. Read-only attachments use an isolated snapshot rather
+	// than sharing a mutable repository pointer with another Sentry.
+	RepositoryBranch string `json:"-"`
+	CopyMode         string `json:"-"`
 }
 
 // HostMount describes a host path exposed through a read-only gofer bind, a
@@ -403,6 +410,32 @@ func ParseMemoryLimit(value string) (int64, error) {
 	return bytes, nil
 }
 
+// ParseMemorySwap parses Docker's --memory-swap: a byte count for memory and
+// swap together, or -1 for unlimited swap.
+func ParseMemorySwap(value string) (int64, error) {
+	if value == "-1" {
+		return -1, nil
+	}
+	bytes, err := units.RAMInBytes(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory-swap limit %q: %w", value, err)
+	}
+	if bytes < 0 {
+		return 0, fmt.Errorf("memory-swap limit must be -1 or greater: %d", bytes)
+	}
+	return bytes, nil
+}
+
+// EffectiveMemorySwap is the memory-swap limit Docker gives a container with
+// a memory limit: the one asked for, or when none was, twice the memory
+// limit, which lets it swap out as much as it may hold.
+func EffectiveMemorySwap(memory, swap int64) int64 {
+	if memory > 0 && swap == 0 {
+		return 2 * memory
+	}
+	return swap
+}
+
 func hasHardResourceLimits(opts SpecOptions) bool {
 	return opts.MemoryLimit != nil && *opts.MemoryLimit > 0 ||
 		opts.NanoCPUs != nil && *opts.NanoCPUs > 0 ||
@@ -421,6 +454,16 @@ func validateResourceLimits(opts SpecOptions) error {
 		}
 		if *opts.MemoryLimit != 0 && *opts.MemoryLimit < MinimumMemoryLimitBytes {
 			return fmt.Errorf("minimum memory limit allowed is 6 MiB")
+		}
+	}
+	if opts.MemorySwap != nil && *opts.MemorySwap != 0 {
+		switch {
+		case *opts.MemorySwap < -1:
+			return fmt.Errorf("memory-swap limit must be -1 or greater")
+		case opts.MemoryLimit == nil || *opts.MemoryLimit == 0:
+			return fmt.Errorf("a memory-swap limit needs a memory limit")
+		case *opts.MemorySwap > 0 && *opts.MemorySwap < *opts.MemoryLimit:
+			return fmt.Errorf("the memory-swap limit must be at least the memory limit")
 		}
 	}
 	if opts.NanoCPUs != nil {
@@ -657,6 +700,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			resources = &specs.LinuxResources{}
 		}
 		resources.Memory = &specs.LinuxMemory{Limit: cloneInt64Pointer(opts.MemoryLimit)}
+		// Unlimited swap is a new cgroup's own default, and needs no
+		// memory.swap.max, which a kernel that does not account swap lacks.
+		if opts.MemorySwap != nil && *opts.MemorySwap > 0 {
+			resources.Memory.Swap = cloneInt64Pointer(opts.MemorySwap)
+		}
 	}
 	cpu := &specs.LinuxCPU{}
 	hasCPU := false
@@ -693,6 +741,11 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		annotations[ownership.Annotation] = ownerManifest
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("loading rootfs ownership: %w", err)
+	}
+	if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
+		annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("loading lazy rootfs image descriptor: %w", err)
 	}
 	entrypointJSON, err := json.Marshal(entrypoint)
 	if err != nil {
@@ -810,6 +863,10 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 		if volume.Readonly {
 			options[0] = "ro"
 		}
+		repositoryBranch := volume.RepositoryBranch
+		if repositoryBranch == "" {
+			repositoryBranch = ttcvolume.MainBranch
+		}
 		mounts = append(mounts, specs.Mount{
 			Destination: destination,
 			Type:        "ttcvol",
@@ -817,7 +874,7 @@ func BuildSpec(image ocispec.Image, opts SpecOptions) (*specs.Spec, error) {
 			Options:     options,
 		})
 		volumeRepositories = append(volumeRepositories, specutils.TTCVolumeRepository{
-			Source: source, Path: volume.RepositoryPath, Branch: "main", CopyMode: volume.CopyMode,
+			Source: source, Path: volume.RepositoryPath, Branch: repositoryBranch, CopyMode: volume.CopyMode,
 		})
 	}
 	copiedHostMounts := make(map[string]string)

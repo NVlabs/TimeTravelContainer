@@ -161,6 +161,34 @@ static void set_fsbase(uint64_t fsbase) {
   }
 }
 
+// get_gsbase returns the current thread's GS base. Unlike FS, which Linux uses
+// for TLS, applications are free to use GS on x86-64. In particular, Firefox's
+// RLBox/wasm2c runtime uses it as the base of a sandboxed Wasm linear memory.
+static uint64_t get_gsbase(void) {
+  uint64_t gsbase;
+  if (__export_arch_state.fsgsbase) {
+    asm volatile("rdgsbase %0" : "=r"(gsbase));
+  } else {
+    int ret =
+        __syscall(__NR_arch_prctl, ARCH_GET_GS, (long)&gsbase, 0, 0, 0, 0);
+    if (ret) {
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
+    }
+  }
+  return gsbase;
+}
+
+static void set_gsbase(uint64_t gsbase) {
+  if (__export_arch_state.fsgsbase) {
+    asm volatile("wrgsbase %0" : : "r"(gsbase) : "memory");
+  } else {
+    int ret = __syscall(__NR_arch_prctl, ARCH_SET_GS, gsbase, 0, 0, 0, 0);
+    if (ret) {
+      panic(STUB_ERROR_ARCH_PRCTL, ret);
+    }
+  }
+}
+
 // switch_context_amd64 is a wrapper of switch_context() which does checks
 // specific to amd64.
 struct thread_context *switch_context_amd64(
@@ -209,6 +237,9 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   struct thread_context *ctx = NULL;
   enum context_state ctx_state = CONTEXT_STATE_INVALID;
   long fs_base = 0;
+  // Syscall-patched contexts use GS for sysmsg. Guest-GS contexts instead
+  // carry the application's GS base in ptregs.
+  uint64_t gs_base = (uint64_t)sysmsg;
 
   if (thread_state == THREAD_STATE_INITIALIZING) {
     // Find a new context and exit to restore it.
@@ -232,6 +263,9 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   }
 
   fs_base = get_fsbase();
+  if (ctx->guest_gs) {
+    gs_base = get_gsbase();
+  }
 
   ctx->signo = signo;
   ctx->siginfo = *siginfo;
@@ -241,10 +275,23 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   if (signo != SIGCHLD ||
       ucontext->uc_mcontext.gregs[REG_RIP] < __export_stub_start) {
     ctx->ptregs.fs_base = fs_base;
+    if (ctx->guest_gs) {
+      ctx->ptregs.gs_base = gs_base;
+    }
     ctx->err = 0;
     gregs_to_ptregs(ucontext, &ctx->ptregs);
     memcpy(ctx->fpstate, (uint8_t *)ucontext->uc_mcontext.fpregs,
            __export_arch_state.fp_len);
+    // The host kernel's signal frame contains every XSAVE component enabled
+    // by the host, including components that systrap deliberately does not
+    // expose to the application. Keep the saved context consistent with the
+    // mask used by the fast syscall path and XRSTOR. Otherwise an interrupt
+    // on an AVX-512 host can make a completely ordinary guest context
+    // unrestorable on an AVX-only host.
+    if (__export_arch_state.xsave_mode != XSAVE_MODE_FXSAVE &&
+        __export_arch_state.fp_len >= 520) {
+      *(uint64_t *)(ctx->fpstate + 512) &= XCR0_EAX;
+    }
   }
 
   switch (signo) {
@@ -341,6 +388,11 @@ init:
     set_fsbase(ctx->ptregs.fs_base);
   }
 
+  uint64_t next_gs_base = ctx->guest_gs ? ctx->ptregs.gs_base : (uint64_t)sysmsg;
+  if (gs_base != next_gs_base) {
+    set_gsbase(next_gs_base);
+  }
+
   if (atomic_load(&ctx->fpstate_changed)) {
     prep_fpstate_for_sigframe(
         ctx->fpstate, __export_arch_state.fp_len,
@@ -382,6 +434,19 @@ void __syshandler() {
 
 // asm_restore_state is implemented in syshandler_amd64.S
 void asm_restore_state();
+__attribute__((noreturn)) void asm_restore_state_guest_gs(
+    struct thread_context *ctx);
+
+// restore_state_guest_gs transfers from a GS-dependent fast syscall handler
+// to a context that owns GS. Nothing after set_gsbase may depend on systrap's
+// GS-relative sysmsg pointer.
+__attribute__((noreturn)) void restore_state_guest_gs(
+    struct thread_context *ctx) {
+  set_fsbase(ctx->ptregs.fs_base);
+  set_gsbase(ctx->ptregs.gs_base);
+  asm_restore_state_guest_gs(ctx);
+  __builtin_unreachable();
+}
 
 // On x86 restore_state jumps straight to user code and does not return.
 void restore_state(struct sysmsg *sysmsg, struct thread_context *ctx,
@@ -447,6 +512,8 @@ void verify_offsets_amd64() {
                (offsetof(struct user_regs_struct, fs) + PTREGS_OFFSET));
   BUILD_BUG_ON(offsetof_thread_context_ptregs_gs !=
                (offsetof(struct user_regs_struct, gs) + PTREGS_OFFSET));
+  BUILD_BUG_ON(offsetof_thread_context_guest_gs !=
+               offsetof(struct thread_context, guest_gs));
 #undef PTREGS_OFFSET
 }
 

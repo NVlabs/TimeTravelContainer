@@ -18,8 +18,10 @@
 package usertrap
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
@@ -62,7 +64,18 @@ type State struct {
 	mu        sync.RWMutex `state:"nosave"`
 	nextTrap  uint32
 	tableAddr hostarch.Addr
+	// mode is one of the usertrapMode* values. It is reconstructed from the
+	// usertrap table header after address-space fork or restore.
+	mode uint32 `state:"nosave"`
 }
+
+const (
+	usertrapModeUnknown uint32 = iota
+	usertrapModeEnabled
+	usertrapModeDisabled
+
+	headerFlagDisabled = uint32(1 << 0)
+)
 
 // New returns the new state structure.
 func New() *State {
@@ -72,10 +85,80 @@ func New() *State {
 // +marshal
 type header struct {
 	nextTrap uint32
+	flags    uint32
 }
 
 func (s *State) trapAddr(trap uint32) hostarch.Addr {
 	return s.tableAddr + hostarch.Addr(trapSize*trap)
+}
+
+// initLocked reconstructs the usertrap state from the guest mapping, creating
+// the mapping if create is true and it does not exist.
+//
+// Preconditions: s.mu must be locked.
+func (s *State) initLocked(ctx context.Context, mm memoryManager, create bool) error {
+	if s.nextTrap != 0 {
+		return nil
+	}
+	task := kernel.TaskFromContext(ctx)
+	if task == nil {
+		return fmt.Errorf("no task found")
+	}
+	addr, off, err := mm.FindVMAByName(trapTableAddrRange, tableVMAName)
+	if off != 0 {
+		return fmt.Errorf("the usertrap vma has been overmounted")
+	}
+	if err != nil {
+		if !create {
+			atomic.StoreUint32(&s.mode, usertrapModeEnabled)
+			return nil
+		}
+		addr = trapTableAddrRange.Start
+		if task.MemoryManager().MmapLayoutRandomized() {
+			addr += hostarch.Addr(rand.Int63n(int64(trapTableAddrRange.Length() - trapTableSize))).RoundDown()
+		}
+		ctx.Debugf("Map a usertrap vma at %x", addr)
+		if err := loadUsertrap(ctx, mm, addr); err != nil {
+			return err
+		}
+		s.nextTrap = 1
+		s.tableAddr = addr
+		atomic.StoreUint32(&s.mode, usertrapModeEnabled)
+		hdr := header{nextTrap: s.nextTrap}
+		_, err := hdr.CopyOut(task.OwnCopyContext(usermem.IOOpts{IgnorePermissions: true}), addr)
+		return err
+	}
+	var hdr header
+	if _, err := hdr.CopyIn(task.OwnCopyContext(usermem.IOOpts{}), addr); err != nil {
+		return err
+	}
+	if hdr.nextTrap == 0 || hdr.nextTrap > trapNR {
+		return fmt.Errorf("invalid next usertrap index %d", hdr.nextTrap)
+	}
+	s.nextTrap = hdr.nextTrap
+	s.tableAddr = addr
+	if hdr.flags&headerFlagDisabled != 0 {
+		atomic.StoreUint32(&s.mode, usertrapModeDisabled)
+	} else {
+		atomic.StoreUint32(&s.mode, usertrapModeEnabled)
+	}
+	return nil
+}
+
+// GuestGSMode reports whether syscall patching has been retired for this
+// address space and guest GS should be installed while application code runs.
+func (s *State) GuestGSMode(ctx context.Context, mm memoryManager) (bool, error) {
+	if mode := atomic.LoadUint32(&s.mode); mode != usertrapModeUnknown {
+		return mode == usertrapModeDisabled, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if atomic.LoadUint32(&s.mode) == usertrapModeUnknown {
+		if err := s.initLocked(ctx, mm, false); err != nil {
+			return false, err
+		}
+	}
+	return atomic.LoadUint32(&s.mode) == usertrapModeDisabled, nil
 }
 
 // newTrapLocked allocates a new trap entry.
@@ -88,39 +171,10 @@ func (s *State) newTrapLocked(ctx context.Context, mm memoryManager) (hostarch.A
 		return 0, fmt.Errorf("no task found")
 	}
 
-	// s.nextTrap is zero if it isn't initialized. Here are three cases
-	// when this can happen:
-	//	* A usertrap vma has not been mapped yet.
-	//	* The address space has been forked.
-	//	* The address space has been restored.
-	// nextTrap is saved on the usertrap vma to handle the third and second
-	// cases.
-	if s.nextTrap == 0 {
-		addr, off, err := mm.FindVMAByName(trapTableAddrRange, tableVMAName)
-		if off != 0 {
-			return 0, fmt.Errorf("the usertrap vma has been overmounted")
-		}
-		if err != nil {
-			// The usertrap table has not been mapped yet.
-			addr := trapTableAddrRange.Start
-			if task.MemoryManager().MmapLayoutRandomized() {
-				addr += hostarch.Addr(rand.Int63n(int64(trapTableAddrRange.Length() - trapTableSize))).RoundDown()
-			}
-			ctx.Debugf("Map a usertrap vma at %x", addr)
-			if err := loadUsertrap(ctx, mm, addr); err != nil {
-				return 0, err
-			}
-			// The first cell in the table is used to save an index of a
-			// next unused trap.
-			s.nextTrap = 1
-			s.tableAddr = addr
-		} else if _, err := hdr.CopyIn(task.OwnCopyContext(usermem.IOOpts{}), addr); err != nil {
-			return 0, err
-		} else {
-			// Read an index of a next unused trap.
-			s.nextTrap = hdr.nextTrap
-			s.tableAddr = addr
-		}
+	// nextTrap and the mode are saved in the usertrap VMA so address-space
+	// fork and restore can reconstruct them.
+	if err := s.initLocked(ctx, mm, true); err != nil {
+		return 0, err
 	}
 	ctx.Debugf("Allocate a new trap: %p %d", s, s.nextTrap)
 	if s.nextTrap >= trapNR {
@@ -207,6 +261,9 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 	//     process).
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if atomic.LoadUint32(&s.mode) == usertrapModeDisabled {
+		return nil
+	}
 	if task.Tracer() != nil {
 		if s.nextTrap > 0 {
 			ctx.Warningf("LIKELY ERROR: Attached tracer to process with patched syscalls (traps %d)! Systrap is not fully compatible with ptrace/debuggers, program may die unexpectedly soon! Use `--systrap-disable-syscall-patching` as a workaround.", s.nextTrap)
@@ -295,6 +352,86 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 	return nil
 }
 
+// Disable atomically retires all syscall patches in mm and prevents creation
+// of new ones. The disabled bit is stored in the usertrap VMA so it survives
+// address-space fork, checkpoint/restore, TTC live fork, and dehydration.
+func (s *State) Disable(ctx context.Context, mm memoryManager) error {
+	task := kernel.TaskFromContext(ctx)
+	if task == nil {
+		return fmt.Errorf("no task found")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if atomic.LoadUint32(&s.mode) == usertrapModeDisabled {
+		return nil
+	}
+	if err := s.initLocked(ctx, mm, true); err != nil {
+		return err
+	}
+
+	ignorePermContext := task.OwnCopyContext(usermem.IOOpts{IgnorePermissions: true})
+	for trap := uint32(1); trap < s.nextTrap; trap++ {
+		trapAddr := s.trapAddr(trap)
+		trapCode := make([]byte, trapSize)
+		if _, err := primitive.CopyUint8SliceIn(task, trapAddr, trapCode); err != nil {
+			return fmt.Errorf("reading usertrap %d: %w", trap, err)
+		}
+		// Padding entries and entries never fully initialized have no self
+		// pointer. Fully validate the fields needed to reconstruct the patch;
+		// the trap table is guest-mapped and therefore untrusted.
+		if binary.LittleEndian.Uint64(trapCode[:8]) != uint64(trapAddr)+8 ||
+			trapCode[57] != 0xb8 {
+			continue
+		}
+		returnAddr := binary.LittleEndian.Uint64(trapCode[40:48])
+		if returnAddr < uint64(len(jmpInst)) {
+			continue
+		}
+		patchAddr := hostarch.Addr(returnAddr - uint64(len(jmpInst)))
+		sysno := binary.LittleEndian.Uint32(trapCode[58:62])
+
+		expectedPatch := jmpInst
+		binary.LittleEndian.PutUint32(expectedPatch[jmpInstOpcodeLen:], uint32(trapAddr))
+		current := make([]byte, len(jmpInst))
+		if _, err := primitive.CopyUint8SliceIn(task, patchAddr, current); err != nil {
+			// The patched mapping may have been legitimately unmapped since the
+			// trap was allocated.
+			continue
+		}
+		if !bytes.Equal(current, expectedPatch[:]) {
+			// Do not overwrite code that the application changed after TTC
+			// installed the patch.
+			continue
+		}
+
+		original := [7]byte{0xb8, 0, 0, 0, 0, 0x0f, 0x05}
+		binary.LittleEndian.PutUint32(original[1:5], sysno)
+		// Reverse the installation protocol. The invalid first byte makes
+		// concurrent entrants fault until the complete original instruction
+		// sequence is visible; HandleFault restarts them after this lock drops.
+		faultInstB := primitive.ByteSlice(faultInst[:])
+		if _, err := faultInstB.CopyOut(ignorePermContext, patchAddr); err != nil {
+			return fmt.Errorf("arming usertrap retirement at %#x: %w", patchAddr, err)
+		}
+		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, patchAddr+1, original[1:]); err != nil {
+			// Best effort: restore the old jump opcode so a failed transition
+			// does not strand the instruction at the fault byte.
+			_, _ = primitive.CopyUint8SliceOut(ignorePermContext, patchAddr, expectedPatch[:1])
+			return fmt.Errorf("retiring usertrap at %#x: %w", patchAddr, err)
+		}
+		if _, err := primitive.CopyUint8SliceOut(ignorePermContext, patchAddr, original[:1]); err != nil {
+			return fmt.Errorf("completing usertrap retirement at %#x: %w", patchAddr, err)
+		}
+	}
+
+	hdr := header{nextTrap: s.nextTrap, flags: headerFlagDisabled}
+	if _, err := hdr.CopyOut(ignorePermContext, s.tableAddr); err != nil {
+		return fmt.Errorf("persisting disabled usertrap mode: %w", err)
+	}
+	atomic.StoreUint32(&s.mode, usertrapModeDisabled)
+	return nil
+}
+
 func isPatchableSyscall(code []byte, sysno uintptr) bool {
 	if len(code) != len(jmpInst) || sysno != uintptr(uint32(sysno)) {
 		return false
@@ -324,6 +461,26 @@ func (s *State) HandleFault(ctx context.Context, ac *arch.Context64, mm memoryMa
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	if atomic.LoadUint32(&s.mode) == usertrapModeDisabled {
+		// During retirement, a concurrent thread may have decoded the invalid
+		// guard byte before the original instruction was restored. It reaches
+		// here only after Disable releases s.mu, so restart at the now-complete
+		// original sequence. Handle both the inverse guard at patchAddr and the
+		// forward-patching guard at patchAddr+faultInstOffset.
+		for _, delta := range []uintptr{0, faultInstOffset} {
+			if ac.IP() < delta {
+				continue
+			}
+			ip := ac.IP() - delta
+			code := make([]byte, len(jmpInst))
+			if _, err := primitive.CopyUint8SliceIn(task, hostarch.Addr(ip), code); err == nil &&
+				isPatchableSyscall(code, uintptr(binary.LittleEndian.Uint32(code[1:5]))) {
+				ac.SetIP(ip)
+				return ErrFaultRestart
+			}
+		}
+	}
 
 	code := make([]uint8, len(jmpInst))
 	ip := ac.IP() - faultInstOffset

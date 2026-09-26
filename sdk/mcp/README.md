@@ -25,7 +25,7 @@ to:
       "command": "npx",
       "args": ["-y", "ttcx-mcp"],
       "env": {
-        "TTC_RUNTIME_DIR": "/run/user/1000/ttc"
+        "TTC_SOCKET": "/run/user/1000/ttc/ttcd.sock"
       }
     }
   }
@@ -33,19 +33,25 @@ to:
 ```
 
 The environment entry is optional when the host inherits the same
-`TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR` used to start ttcd.
+`TTC_SOCKET` or `XDG_RUNTIME_DIR` used by the TTC client. The MCP server does
+not need access to the daemon's storage roots.
 
 ## Tools
 
 The server provides tools for daemon status, listing and inspection, image
 pull, run/start/exec, durable named exec sessions, local or remote batch fork,
-elastic node listing/migration/drain/rebalance, pause/resume,
-dehydrate/rehydrate, Docker-style image load/save and commit,
+elastic node listing/migration/stop/rebalance, pause/resume,
+quarantine/unquarantine, dehydrate/rehydrate, Docker-style image load/save and commit,
 resource accounting, filesystem diff, copy, synchronous terminal observation, checkpoint/restore,
 stop/restart, signal, wait, and removal. Tool names use the `ttc_` prefix, for
 example `ttc_fork_many`, `ttc_exec_logs`, `ttc_stats`, `ttc_diff`,
 `ttc_tty_stat`, and `ttc_checkpoint`. `ttc_command` provides the rest of TTC's
 non-interactive command surface.
+
+`ttc_inspect` accepts a container family name and returns every branch under
+`TTC.branches`. `ttc_stats` accepts a full branch selector and includes
+placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
+and private/shared resource usage.
 
 `ttc_image_load` and `ttc_image_save` accept archive paths on the machine
 running `ttcd`; the MCP transport does not copy image archives through JSON.
@@ -53,10 +59,15 @@ running `ttcd`; the MCP transport does not copy image archives through JSON.
 `ttc_run` creates a live-fork-eligible family by default. Set
 `waiveLiveFork: true` only when also requesting a deliberately incompatible
 feature such as host networking; the resulting family can never be forked.
+The run, start, fork, rehydrate, and restore tools accept an optional `node`;
+omitting it delegates placement to TTC. `ttc_stop_node` requires an explicit
+`stop`, `dehydrate`, or `migrate` policy when the node still owns live work.
 
 Long operations use the SDK's 30-second timeout by default. Set `timeoutMs` on
 `ttc_wait` or `ttc_command` when a pull, checkpoint, remote fork, or wait may
-take longer.
+take longer. Set `ttc_wait.condition` to `durable` when an orchestrator must
+wait until the branch's current immutable publication is committed to shared
+storage.
 
 Tools return TTC's output as text and mark nonzero command results as MCP
 errors. `ttc_list` includes each non-root branch's `parent`, allowing MCP hosts

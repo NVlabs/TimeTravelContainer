@@ -18,54 +18,65 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
-type packedPage struct {
-	object ID
-	slot   uint8
+// GraphPackedManifestReader exposes graph-native 1 MiB memory objects through
+// the dense byte offsets of an already-running remote page load. It allows a
+// live target to change its backing source without moving resident pages.
+type GraphPackedManifestReader struct {
+	data    *ttcsnapshot.LocalDataStore
+	remote  *ttcsnapshot.ObjectRelayClient
+	pages   map[uint64]graphPackedPage
+	ownData bool
+	fetcher objectFetcher
+	mu      sync.Mutex
+	closed  bool
 }
 
-// PackedManifestReader exposes a sparse manifest using the packed stream
-// offsets from a distributed snapshot. It permits an existing target
-// MemoryFile to retain its original offsets while its demand loader switches
-// from a live TCP source to immutable shared chunks.
-type PackedManifestReader struct {
-	repository *MemoryRepository
-	pages      map[uint64]packedPage
-	mu         sync.Mutex
-	closed     bool
+type graphPackedPage struct {
+	object ttcsnapshot.ObjectID
+	// page is the page of object that holds it.
+	page uint8
 }
 
-// NewPackedManifestReader verifies manifest and constructs its packed-stream
-// index. It takes ownership of repository on success and failure.
-func NewPackedManifestReader(repository *MemoryRepository, id ManifestID, loads []pgalloc.RemoteLoadRange) (*PackedManifestReader, error) {
-	if repository == nil {
-		return nil, errors.New("packed manifest reader repository is nil")
-	}
-	fail := func(err error) (*PackedManifestReader, error) {
-		_ = repository.Close()
+// NewGraphPackedManifestReader constructs a graph-backed reader in the packed
+// stream coordinate system described by loads. remote may be nil when every
+// graph object is already local. The reader adopts remote and, when ownData is
+// true, data.
+func NewGraphPackedManifestReader(data *ttcsnapshot.LocalDataStore, remote *ttcsnapshot.ObjectRelayClient, manifest Manifest, loads []pgalloc.RemoteLoadRange, ownData bool) (*GraphPackedManifestReader, error) {
+	fail := func(err error) (*GraphPackedManifestReader, error) {
+		if remote != nil {
+			err = errors.Join(err, remote.Close())
+		}
+		if ownData && data != nil {
+			err = errors.Join(err, data.Close())
+		}
 		return nil, err
 	}
-	manifest, err := repository.LoadManifest(id)
+	if data == nil {
+		return fail(errors.New("graph packed manifest reader data store is nil"))
+	}
+	objects, err := GraphChunkObjects(manifest)
 	if err != nil {
-		return fail(fmt.Errorf("loading packed memory manifest: %w", err))
+		return fail(err)
 	}
 	ordered := append([]pgalloc.RemoteLoadRange(nil), loads...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Target.Start < ordered[j].Target.Start })
-	var previousEnd uint64
-	var totalPages uint64
+	var previousEnd, totalPages uint64
 	for i, load := range ordered {
 		if !load.Target.WellFormed() || load.Target.Length() == 0 || !hostarch.IsPageAligned(load.Target.Start) ||
 			!hostarch.IsPageAligned(load.Target.End) || !hostarch.IsPageAligned(load.StreamOffset) {
-			return fail(fmt.Errorf("invalid packed load range %d: %+v", i, load))
+			return fail(fmt.Errorf("invalid graph packed load range %d: %+v", i, load))
 		}
 		if i != 0 && load.Target.Start < previousEnd {
-			return fail(fmt.Errorf("overlapping packed load ranges at %#x", load.Target.Start))
+			return fail(fmt.Errorf("overlapping graph packed load ranges at %#x", load.Target.Start))
 		}
 		previousEnd = load.Target.End
 		totalPages += load.Target.Length() / hostarch.PageSize
@@ -77,39 +88,45 @@ func NewPackedManifestReader(repository *MemoryRepository, id ManifestID, loads 
 		}
 		return ordered[i].StreamOffset + old - ordered[i].Target.Start, true
 	}
-	pages := make(map[uint64]packedPage, totalPages)
+	pages := make(map[uint64]graphPackedPage, totalPages)
 	for _, run := range manifest.Runs {
+		object, ok := objects[run.Object]
+		if !ok {
+			return fail(fmt.Errorf("graph manifest object %s has no graph identity", run.Object))
+		}
 		for i := uint16(0); i < run.Pages; i++ {
 			old := run.OldOffset + uint64(i)*hostarch.PageSize
 			stream, ok := findStreamOffset(old)
 			if !ok {
-				return fail(fmt.Errorf("manifest offset %#x has no packed load range", old))
+				return fail(fmt.Errorf("graph manifest offset %#x has no packed load range", old))
 			}
 			if _, exists := pages[stream]; exists {
-				return fail(fmt.Errorf("packed stream repeats page at %#x", stream))
+				return fail(fmt.Errorf("graph packed stream repeats page at %#x", stream))
 			}
-			pages[stream] = packedPage{object: run.Object, slot: run.FirstSlot + uint8(i)}
+			pages[stream] = graphPackedPage{object: object, page: run.ObjectPage + uint8(i)}
 		}
 	}
 	if uint64(len(pages)) != totalPages {
-		return fail(fmt.Errorf("packed manifest maps %d pages, load ranges require %d", len(pages), totalPages))
+		return fail(fmt.Errorf("graph manifest maps %d pages, load ranges require %d", len(pages), totalPages))
 	}
-	return &PackedManifestReader{repository: repository, pages: pages}, nil
+	return &GraphPackedManifestReader{data: data, remote: remote, pages: pages, ownData: ownData, fetcher: objectFetcher{data: data, remote: remote}}, nil
 }
 
-// ReadAt implements io.ReaderAt. Reads may be smaller than a chunk; immutable
-// chunks touched by one call are decoded once and discarded afterward.
-func (r *PackedManifestReader) ReadAt(dst []byte, offset int64) (int, error) {
+func (r *GraphPackedManifestReader) openObject(id ttcsnapshot.ObjectID) (*os.File, error) {
+	return r.fetcher.open(id, int64(pgalloc.SparseChunkBytes))
+}
+
+// ReadAt implements io.ReaderAt without decoding a compatibility chunk.
+func (r *GraphPackedManifestReader) ReadAt(dst []byte, offset int64) (int, error) {
 	if offset < 0 {
-		return 0, errors.New("negative packed manifest offset")
+		return 0, errors.New("negative graph packed manifest offset")
 	}
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return 0, errors.New("packed manifest reader is closed")
-	}
+	closed := r.closed
 	r.mu.Unlock()
-	chunks := make(map[ID]Chunk)
+	if closed {
+		return 0, errors.New("graph packed manifest reader is closed")
+	}
 	written := 0
 	for written < len(dst) {
 		absolute := uint64(offset) + uint64(written)
@@ -121,44 +138,37 @@ func (r *PackedManifestReader) ReadAt(dst []byte, offset int64) (int, error) {
 			}
 			return written, io.EOF
 		}
-		chunk, ok := chunks[page.object]
-		if !ok {
-			var err error
-			chunk, err = r.repository.chunks.Get(page.object)
-			if err != nil {
-				return written, err
-			}
-			chunks[page.object] = chunk
-		}
-		var stored *Page
-		for i := range chunk.Pages {
-			if chunk.Pages[i].Slot == page.slot {
-				stored = &chunk.Pages[i]
-				break
-			}
-		}
-		if stored == nil {
-			return written, fmt.Errorf("memory object %s omits slot %d", page.object, page.slot)
-		}
 		within := absolute - pageOffset
 		n := min(len(dst)-written, int(hostarch.PageSize-within))
-		if stored.Zero {
-			clear(dst[written : written+n])
-		} else {
-			copy(dst[written:written+n], stored.Data[within:within+uint64(n)])
+		file, err := r.openObject(page.object)
+		if err != nil {
+			return written, err
 		}
-		written += n
+		readOffset := int64(page.page)*hostarch.PageSize + int64(within)
+		read, readErr := file.ReadAt(dst[written:written+n], readOffset)
+		closeErr := file.Close()
+		written += read
+		if readErr != nil || closeErr != nil {
+			return written, errors.Join(readErr, closeErr)
+		}
 	}
 	return written, nil
 }
 
-// Close releases the donated repository descriptor.
-func (r *PackedManifestReader) Close() error {
+// Close releases the relay and donated local data store.
+func (r *GraphPackedManifestReader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return nil
 	}
 	r.closed = true
-	return r.repository.Close()
+	var remoteErr, dataErr error
+	if r.remote != nil {
+		remoteErr = r.remote.Close()
+	}
+	if r.ownData {
+		dataErr = r.data.Close()
+	}
+	return errors.Join(remoteErr, dataErr)
 }

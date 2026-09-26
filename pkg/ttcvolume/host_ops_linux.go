@@ -17,6 +17,7 @@
 package ttcvolume
 
 import (
+	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -35,4 +36,9 @@ func syncFileData(file *os.File) error {
 
 func allocateFile(file *os.File, offset, length int64) error {
 	return unix.Fallocate(int(file.Fd()), 0, offset, length)
+}
+
+// directoryFDPath returns a path that names the open directory dir.
+func directoryFDPath(dir *os.File) (string, error) {
+	return fmt.Sprintf("/proc/self/fd/%d", dir.Fd()), nil
 }

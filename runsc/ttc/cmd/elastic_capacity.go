@@ -264,10 +264,18 @@ func elasticCapacityFulfilled(request elasticCapacityRequest, source cluster.Nod
 // processElasticCapacityRequest performs at most one delivery attempt. It is
 // intentionally restart-safe: provider calls happen without the file lock and
 // the result is committed only if the same request ID is still outstanding.
-func processElasticCapacityRequest(ctx context.Context, dataRoot, nodeID string, directory *cluster.NodeDirectory, sink elasticCapacitySink, now time.Time) (bool, error) {
+func processElasticCapacityRequest(ctx context.Context, dataRoot, nodeID string, directory cluster.NodeCatalog, sink elasticCapacitySink, now time.Time) (bool, error) {
 	request, err := loadElasticCapacityRequest(dataRoot, nodeID)
 	if err != nil || request == nil {
 		return false, err
+	}
+	// The maintainer passes the timestamp delivered with its timer event. A
+	// request may be created concurrently after that timer fires but before it
+	// acquires the outbox lock. Never persist an attempt timestamp before the
+	// request itself; otherwise the next retry correctly rejects the durable
+	// record as causally impossible.
+	if now.Before(request.CreatedAt) {
+		now = request.CreatedAt
 	}
 	source, err := directory.Lookup(nodeID)
 	if err != nil {
@@ -318,7 +326,7 @@ func processElasticCapacityRequest(ctx context.Context, dataRoot, nodeID string,
 	return false, errors.Join(deliveryErr, err)
 }
 
-func maintainElasticCapacityRequests(dataRoot, nodeID string, directory *cluster.NodeDirectory, sink elasticCapacitySink, stderr io.Writer, done <-chan struct{}) {
+func maintainElasticCapacityRequests(dataRoot, nodeID string, directory cluster.NodeCatalog, sink elasticCapacitySink, stderr io.Writer, done <-chan struct{}) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {

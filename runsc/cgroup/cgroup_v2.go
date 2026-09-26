@@ -26,6 +26,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -99,7 +100,14 @@ func (c *cgroupV2) createCgroupPaths() (bool, error) {
 	// the controllers to:
 	//	* /sys/fs/cgroup/cgroup.subtree_control
 	//	* /sys/fs/cgroup/foo/cgroup.subtree_control
-	val := "+" + strings.Join(c.Controllers, " +")
+	//
+	// Only controllers a level has available and does not already pass down
+	// are written. An unprivileged runtime in a delegated subtree cannot write
+	// the ancestors above its delegation, and needs not to: they already pass
+	// down what was delegated, and nothing else can reach the new cgroup
+	// anyway. A requested limit whose controller is thus unavailable still
+	// fails, when it is set.
+	wanted := c.Controllers
 	elements := strings.Split(c.Path, "/")
 	current := c.Mountpoint
 	created := false
@@ -116,14 +124,53 @@ func (c *cgroupV2) createCgroupPaths() (bool, error) {
 				c.Own = append(c.Own, current)
 			}
 		}
-		// enable all known controllers for subtree
-		if i < len(elements)-1 {
-			if err := writeFile(filepath.Join(current, subtreeControl), []byte(val), 0700); err != nil {
+		if i == len(elements)-1 {
+			break
+		}
+		enabled, available := subtreeControllers(current)
+		var missing []string
+		for _, controller := range wanted {
+			if (available == nil || available[controller]) && !enabled[controller] {
+				missing = append(missing, controller)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		if err := writeFile(filepath.Join(current, subtreeControl), []byte("+"+strings.Join(missing, " +")), 0700); err != nil {
+			if !errors.Is(err, os.ErrPermission) {
 				return false, err
 			}
+			// Above the delegation: only what this level already passes down
+			// can reach the new cgroup.
+			var passed []string
+			for _, controller := range wanted {
+				if enabled[controller] {
+					passed = append(passed, controller)
+				}
+			}
+			wanted = passed
 		}
 	}
 	return created, nil
+}
+
+// subtreeControllers returns the controllers the cgroup at path passes down
+// to its children and those it has available to pass down. available is nil
+// if the cgroup does not say, in which case every controller is assumed to be.
+func subtreeControllers(path string) (enabled, available map[string]bool) {
+	fields := func(name string) map[string]bool {
+		data, err := os.ReadFile(filepath.Join(path, name))
+		if err != nil {
+			return nil
+		}
+		set := make(map[string]bool)
+		for _, controller := range strings.Fields(string(data)) {
+			set[controller] = true
+		}
+		return set
+	}
+	return fields(subtreeControl), fields(controllersFile)
 }
 
 // Install creates and configures cgroups.
@@ -377,13 +424,27 @@ func (c *cgroupV2) CPUUsage() (uint64, error) {
 	return 0, nil
 }
 
-// NumCPU returns the number of CPUs configured in 'cpuset/cpuset.cpus'.
+// NumCPU returns the number of CPUs in the cgroup's effective cpuset.
+//
+// A cgroup that was not given the cpuset controller, as in a delegated
+// subtree that was delegated only memory, pids and cpu, has no cpuset files
+// and runs on the set of its nearest ancestor that has them. With no cpuset
+// controller anywhere, every CPU the runtime may use is available.
 func (c *cgroupV2) NumCPU() (int, error) {
-	cpuset, err := getValue(c.MakePath(""), "cpuset.cpus.effective")
-	if err != nil {
-		return 0, err
+	path := c.MakePath("")
+	for {
+		cpuset, err := getValue(path, "cpuset.cpus.effective")
+		if err == nil {
+			return countCpuset(strings.TrimSpace(cpuset))
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		if path == filepath.Clean(c.Mountpoint) || !strings.HasPrefix(path, filepath.Clean(c.Mountpoint)) {
+			return runtime.NumCPU(), nil
+		}
+		path = filepath.Dir(path)
 	}
-	return countCpuset(strings.TrimSpace(cpuset))
 }
 
 func getMemoryLimit(path string) (string, error) {

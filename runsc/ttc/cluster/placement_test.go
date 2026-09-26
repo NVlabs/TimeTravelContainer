@@ -54,8 +54,8 @@ func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
 	if _, err := store.Lookup("family", "main"); !os.IsNotExist(err) {
 		t.Fatalf("removed placement lookup error=%v, want not exist", err)
 	}
-	legacy := strings.Repeat("a", 64) + ".lock"
-	if err := os.WriteFile(filepath.Join(root, legacy), nil, 0600); err != nil {
+	unknown := strings.Repeat("a", 64) + ".lock"
+	if err := os.WriteFile(filepath.Join(root, unknown), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 32; i++ {
@@ -78,10 +78,101 @@ func TestPlacementLifecycleAndRemovalAreGenerationFenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	foundUnknown := false
 	for _, entry := range entries {
-		if isLegacyPlacementLock(entry.Name()) {
-			t.Fatalf("unbounded legacy record lock remains: %s", entry.Name())
+		if entry.Name() == unknown {
+			foundUnknown = true
 		}
+	}
+	if !foundUnknown {
+		t.Fatalf("unknown placement artifact %q was modified", unknown)
+	}
+}
+
+func TestMaterializingPlacementBecomesStable(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(850, 0).UTC()
+	unplaced, err := store.Create(PlacementRecord{FamilyID: "family", BranchID: "main", State: PlacementUnplaced}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimUnplaced("family", "main", "node-a", "boot-a", "family", "main", unplaced.Generation, PlacementMaterializing, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := store.UpdateStableState("family", "main", "node-a", "boot-a", claimed.Generation, PlacementRunning, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running.State != PlacementRunning || running.Generation != claimed.Generation+1 {
+		t.Fatalf("stable placement=%+v after materializing=%+v", running, claimed)
+	}
+}
+
+func TestPlacementQuarantineIsMigrationStableAndGenerationFenced(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(875, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "fork-a",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined, err := store.SetQuarantine("family", "child", "node-a", "boot-a", created.Generation, true, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quarantined.Quarantined || quarantined.Generation != created.Generation {
+		t.Fatalf("quarantined placement=%+v", quarantined)
+	}
+	if _, err := store.SetQuarantine("family", "child", "node-b", "boot-b", created.Generation, false, now.Add(2*time.Second)); err == nil {
+		t.Fatal("stale owner changed quarantine policy")
+	}
+	migrating, err := store.BeginMigration("family", "child", "node-a", "boot-a", created.Generation, "move-1", "node-b", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := store.CommitMigration("family", "child", "move-1", "node-b", "boot-b", "runtime-b", "fork-b", now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrating.Quarantined || !moved.Quarantined {
+		t.Fatalf("migration lost quarantine policy: migrating=%+v moved=%+v", migrating, moved)
+	}
+}
+
+func TestPlacementRenameReleasesOldName(t *testing.T) {
+	store, err := OpenPlacementStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(890, 0).UTC()
+	created, err := store.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "child", PhysicalContainer: "runtime-a", PhysicalBranch: "child",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: PlacementRunning,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := store.Rename("family", "child", "renamed", "node-a", "boot-a", "renamed", created.Generation, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.BranchID != "renamed" || renamed.PhysicalBranch != "renamed" || renamed.Generation != created.Generation+1 {
+		t.Fatalf("renamed placement=%+v", renamed)
+	}
+	if _, err := store.Lookup("family", "child"); !os.IsNotExist(err) {
+		t.Fatalf("old placement lookup error=%v, want not exist", err)
+	}
+	if _, err := store.Create(PlacementRecord{FamilyID: "family", BranchID: "child", State: PlacementUnplaced}, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("reusing old branch name: %v", err)
 	}
 }
 

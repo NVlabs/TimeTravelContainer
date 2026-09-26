@@ -95,9 +95,44 @@ func (s *nativeStore) close() {
 	if s.lock == nil {
 		return
 	}
+	// containerd's local content writer removes its ingest directory before
+	// releasing every descriptor used by that write. On NFS this may be
+	// observed as a failed rmdir even though the directory becomes empty as the
+	// writer closes. Prune only empty, direct ingest children at the outer store
+	// lifetime boundary; never hide a nonempty or malformed transaction.
+	_ = pruneEmptyNativeIngestDirectories(filepath.Join(s.root, "content", "ingest"))
 	_ = syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 	_ = s.lock.Close()
 	s.lock = nil
+}
+
+func pruneEmptyNativeIngestDirectories(root string) error {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		children, err := os.ReadDir(path)
+		if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		if len(children) != 0 {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
 }
 
 func newNativeCatalog() nativeCatalog {

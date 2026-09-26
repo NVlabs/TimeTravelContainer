@@ -45,17 +45,9 @@ TTC is designed for efficiency. Memory and writable storage are
 - **Dehydrate/rehydrate:** dehydrate a branch to free its CPU and memory, then
   rehydrate it later with its processes and CoW relationships intact.
 - **Remote fork/migration:** fork a branch to another TTC node and start it
-  without first transferring all of its memory. Missing memory is fetched on
-  demand over the network or from shared storage.
-
-Live-fork eligibility is a lifetime property of a container family. Families
-are eligible by default, and TTC rejects incompatible features when they are
-requested rather than allowing a running workload to become unexpectedly
-unforkable. A feature whose state is deliberately outside the Sentry, such as
-host networking, can be selected only together with `--waive-live-fork`; every
-fork of that family then fails predictably. Guest-created, Sentry-managed
-resources—including network namespaces, virtual interfaces, routes, iptables,
-and internal sockets—remain forkable.
+  without first transferring all of its memory or filesystem. Missing 1 MiB
+  memory chunks and whole files are fetched on demand from the fenced source
+  or shared storage; target writes are always node-local.
 
 ## Get Started
 
@@ -65,6 +57,7 @@ server daemon; `ttcd` also contains the re-executed `runsc` runtime entry point.
 \<Download instruction TBA, do not remove this yet\>
 
 ```console
+$ export TTC_ROOT="$HOME/.local/share/ttc"
 $ ttc daemon start
 ttcd started
 $ ttc run -itd --network=ttc --nat -v /home:/home:ro \
@@ -74,10 +67,10 @@ CONTAINER  BRANCH  IMAGE         STATE    CREATED    PARENT
 myapp      main    ubuntu:26.04  running  1 day ago  -
 ```
 
-`daemon start` always launches the `ttcd` executable; `ttc` does not contain a
-fallback daemon entry point. Install `ttcd` beside `ttc`, point `TTC_RUNSC` at
-an executable named `ttcd`, or make `ttcd` available in `PATH`. If it cannot be
-found or executed, startup fails immediately without creating a daemon socket.
+`daemon start` always launches the `ttcd` installed beside `ttc`, and requires
+both binaries to come from the same build; `ttc` does not contain a fallback
+daemon entry point. If it cannot be found or executed, startup fails
+immediately without creating a daemon socket.
 
 ### Native Apple-Silicon macOS
 
@@ -110,11 +103,16 @@ codesign --force --sign - \
   bin/ttcd
 ```
 
-Start the daemon only with the explicit trusted-mode opt-in:
+Start the daemon only with the explicit trusted-mode opt-in. `ttcd` checks
+its own Hypervisor.framework entitlement at startup:
 
 ```sh
+export TTC_ROOT="$HOME/.local/share/ttc"
 bin/ttc daemon start --unsafe-no-host-isolation
 ```
+
+TTC_ROOT must name a new-format data root; data roots created by earlier TTC
+builds are not migrated.
 
 For OCI-runtime integration, invoke the embedded runtime as `ttcd runsc ...`,
 or install a `runsc` symlink to `ttcd`; argv-based re-execution preserves the
@@ -146,6 +144,8 @@ ttc ls --tree
 # Suspend cheaply, or release memory for longer idle periods.
 ttc pause agent@approach-a
 ttc resume agent@approach-a
+ttc quarantine agent@approach-a
+ttc unquarantine agent@approach-a
 ttc dehydrate agent@approach-b
 ttc cp agent@approach-b:/workspace/result.patch ./result.patch
 ttc rehydrate agent@approach-b
@@ -164,7 +164,7 @@ Common workflows include:
 | Manage branches | `ttc fork`, `ttc pause`, `ttc resume`, `ttc rm` |
 | Persist live state | `ttc dehydrate`, `ttc rehydrate`, `ttc checkpoint`, `ttc restore` |
 | Inspect CoW state | `ttc stats`, `ttc diff`, `ttc tty stat` |
-| Manage networking | `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
+| Manage networking | `ttc quarantine`, `ttc unquarantine`, `ttc port publish`, `ttc port ls`, `ttc port unpublish` |
 | Manage storage | `ttc volume create`, `ttc volume ls`, `ttc volume rm` |
 
 The [end-user guide](g3doc/user_guide/timetravelcontainer.md) covers daemon
@@ -207,6 +207,9 @@ TTC includes:
   restore.
 - Per-branch CoW resource accounting, metadata-based filesystem diffs, named
   reattachable exec sessions, and terminal-observation APIs for agent harnesses.
+- Stable JSON observability for placement, immutable snapshot and root IDs,
+  publication errors, volatile dependencies, graph/GC counts, and image-cache
+  progress.
 - Copy-on-write process memory, tmpfs, internal IPC and sockets, and persistent
   writable filesystems.
 - Rootless userspace networking with isolated virtual NICs, outbound NAT,
@@ -216,35 +219,51 @@ TTC includes:
 - In-sandbox FUSE filesystems, including executable and writable shared
   mappings; AppImages, the FUSE daemon, mount state, and cached pages remain
   forkable.
-- Optional multi-node live fork using authenticated TTC peers, a shared TTC
-  data root, common image content, and a page-transfer network. Elastic mode
-  adds dynamic node discovery, transparent command routing, branch migration,
-  node draining, and pressure-aware placement.
+- Optional multi-node live fork over a trusted private network, with an
+  optional shared token, a shared TTC data root, and a page-transfer network.
+  Elastic mode adds dynamic node discovery, transparent command routing,
+  branch migration, policy-driven node shutdown, and pressure-aware placement.
 
 Unlike [CRIU](https://github.com/checkpoint-restore/criu) or a
 [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, a
 TTC live fork does not save the container's memory to a checkpoint first.
 Durable storage is used only for explicitly requested operations such as
 dehydration and checkpointing, or when a remote branch must no longer depend
-on a source node. When one branch is dehydrated, TTC initially writes only the
-memory that must become durable for that branch; CoW-shared pages can remain
-resident and are saved lazily if an active peer later writes them.
+on a source node. Dehydration stores branch-reachable memory in compact 1 MiB
+records while retaining independent 4 KiB page identities. Immutable pages
+already represented in the snapshot graph are referenced again rather than
+written a second time.
+
+Live-fork eligibility is a lifetime property of a container family. Families
+are eligible by default, and TTC rejects incompatible features when they are
+requested rather than allowing a running workload to become unexpectedly
+unforkable. A feature whose state is deliberately outside the Sentry, such as
+host networking, can be selected only together with `--waive-live-fork`; every
+fork of that family then fails predictably. Guest-created, Sentry-managed
+resources—including network namespaces, virtual interfaces, routes, iptables,
+and internal sockets—remain forkable.
 
 Host requirements are deliberately small:
 
 - Linux 3.17 or newer on x86-64 or ARM64. Linux 4.14.77+ is recommended for
   full network performance.
-- An unprivileged user namespace for normal rootless isolation. No subordinate
-  UID/GID ranges or `newuidmap` helpers are required. Trusted environments that
-  prohibit user namespaces can explicitly use `--unsafe-no-host-isolation`.
-- A data root on a filesystem with reflink support for efficient persistent
-  file CoW. `--allow-slow-volume-copy` enables a compatible whole-file-copy
-  fallback.
-- A delegated cgroup v2 subtree only when hard host CPU or memory limits are
-  requested.
+- (Optional) An unprivileged user namespace for normal rootless isolation. No
+  subordinate UID/GID ranges or `newuidmap` helpers are required. Trusted
+  environments that prohibit user namespaces can explicitly use
+  `--unsafe-no-host-isolation`.
+- A data root on any supported local filesystem. TTC uses reflinks when
+  available and otherwise transparently falls back to whole-file copying on
+  the first write after a fork.
+- (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
+  limits are requested.
 
-KVM is optional, not required. Docker, containerd, CRIU, and a privileged
-system-wide installation are not runtime dependencies.
+`TTC_ROOT` is always explicit. In standalone mode it contains all TTC state.
+Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
+node-local `TTC_LOCAL_ROOT` for active runtimes and caches. `TTC_SOCKET` may
+override the per-user daemon socket; `--daemon-socket` takes precedence for a
+single client invocation. `ttc` owns its help and command grammar locally, so
+help, completion, and version output do not depend on a running daemon. For
+daemon operations, the official client and daemon builds must match exactly.
 
 ## Current Limitations
 
@@ -286,7 +305,9 @@ recovery, and nested execution.
 
 ### Development Docs
 
+- [Snapshot-graph storage refactor plan](g3doc/proposals/ttc_snapshot_graph_refactor.md)
 - [Harness feature tracker and stress-test policy](g3doc/development/ttc_harness_features.md)
+- [Client/daemon boundary and size audit](g3doc/development/ttc_client_boundary.md)
 - [Live-fork design](g3doc/proposals/timetravel_live_fork.md)
 - [Branch state machine](g3doc/ttc_state_machine.md)
 - [Distributed live-fork plan](g3doc/proposals/ttc_distributed_live_fork.md)

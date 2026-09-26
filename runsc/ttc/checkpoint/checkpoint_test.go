@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gvisor.dev/gvisor/runsc/ttc/bundle"
@@ -188,5 +189,17 @@ func TestReadManifestRejectsSymlinkedSnapshotParent(t *testing.T) {
 	}
 	if _, err := ReadManifest(root); err == nil {
 		t.Fatal("ReadManifest followed a symlinked repository parent")
+	}
+}
+
+// A checkpoint of the format before this one held a gVisor checkpoint that
+// only the build which wrote it could restore; reading one says so.
+func TestReadManifestRefusesAKernelCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ManifestName), []byte(`{"format_version":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadManifest(root); err == nil || !strings.Contains(err.Error(), "earlier TTC build") {
+		t.Fatalf("ReadManifest of a format 1 checkpoint: %v", err)
 	}
 }

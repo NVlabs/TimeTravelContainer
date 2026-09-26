@@ -142,6 +142,13 @@ func putDentrySlice(ds *[]*dentry) {
 // +checklocksreleaseread:fs.renameMu
 func (fs *filesystem) renameMuRUnlockAndCheckCaching(ctx context.Context, dsp **[]*dentry) {
 	fs.renameMu.RUnlock()
+	// Here rather than only where a dentry goes idle, because an operation
+	// that failed leaves no dentries behind: a sandbox whose gofer has run out
+	// of descriptors fails every path it touches, so nothing is released, and a
+	// reclaim that waited to be asked by a dentry would never be asked at all.
+	// This runs on the way out of every operation, whether it worked or not,
+	// and renameMu has just been given up.
+	fs.reclaimIfStarved(ctx, false /* renameMuWriteLocked */)
 	if *dsp == nil {
 		return
 	}
@@ -154,6 +161,7 @@ func (fs *filesystem) renameMuRUnlockAndCheckCaching(ctx context.Context, dsp **
 
 // +checklocksrelease:fs.renameMu
 func (fs *filesystem) renameMuUnlockAndCheckCaching(ctx context.Context, ds **[]*dentry) {
+	fs.reclaimIfStarved(ctx, true /* renameMuWriteLocked */)
 	if *ds == nil {
 		fs.renameMu.Unlock()
 		return

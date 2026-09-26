@@ -50,10 +50,10 @@ type ForkIdentity struct {
 	SourceBranch    string `json:"source_branch"`
 	TargetContainer string `json:"target_container"`
 	TargetBranch    string `json:"target_branch"`
-	// TargetVisibleBranch is the user-facing branch name on the target. Empty
-	// is the legacy spelling of main. TargetBranch remains the transaction-
-	// unique filesystem/state identity embedded in captured metadata.
-	TargetVisibleBranch string `json:"target_visible_branch,omitempty"`
+	// TargetVisibleBranch is the explicit user-facing branch name on the
+	// target. TargetBranch remains the transaction-unique filesystem/state
+	// identity embedded in captured metadata.
+	TargetVisibleBranch string `json:"target_visible_branch"`
 	ImageDigest         string `json:"image_digest"`
 	RootfsDigest        string `json:"rootfs_digest"`
 	RepositoryID        string `json:"repository_id"`
@@ -65,9 +65,6 @@ type ForkIdentity struct {
 
 // VisibleTargetBranch returns the external target-family branch identity.
 func (i ForkIdentity) VisibleTargetBranch() string {
-	if i.TargetVisibleBranch == "" {
-		return "main"
-	}
 	return i.TargetVisibleBranch
 }
 
@@ -112,7 +109,7 @@ func (i ForkIdentity) Validate() error {
 	if i.SourceNodeID == "" || i.TargetNodeID == "" || i.SourceNodeID == i.TargetNodeID {
 		return errors.New("fork identity requires distinct source and target node IDs")
 	}
-	if i.SourceContainer == "" || i.SourceBranch == "" || i.TargetContainer == "" || i.TargetBranch == "" || i.RepositoryID == "" {
+	if i.SourceContainer == "" || i.SourceBranch == "" || i.TargetContainer == "" || i.TargetBranch == "" || i.TargetVisibleBranch == "" || i.RepositoryID == "" {
 		return errors.New("fork identity omits a container, branch, or repository field")
 	}
 	if i.Migration && (i.TargetContainer != i.SourceContainer || i.VisibleTargetBranch() != i.SourceBranch) {
@@ -141,27 +138,60 @@ func validateSHA256Digest(digest string) error {
 // Transaction is the durable control-plane record. A target container is not
 // externally visible until State reaches TransactionPublished.
 type Transaction struct {
-	Identity     ForkIdentity           `json:"identity"`
-	Negotiated   NegotiatedCapabilities `json:"negotiated"`
-	State        TransactionState       `json:"state"`
-	Revision     uint64                 `json:"revision"`
-	CreatedAt    time.Time              `json:"created_at"`
-	UpdatedAt    time.Time              `json:"updated_at"`
-	Failure      string                 `json:"failure,omitempty"`
-	SourceNeeded bool                   `json:"source_needed"`
-	Metrics      *TransferMetrics       `json:"metrics,omitempty"`
+	Identity   ForkIdentity           `json:"identity"`
+	Negotiated NegotiatedCapabilities `json:"negotiated"`
+	State      TransactionState       `json:"state"`
+	Revision   uint64                 `json:"revision"`
+	CreatedAt  time.Time              `json:"created_at"`
+	UpdatedAt  time.Time              `json:"updated_at"`
+	Failure    string                 `json:"failure,omitempty"`
+	// SourceIncarnation is assigned by the replicated state machine when the
+	// transaction is created. Reusing a human node ID cannot satisfy an old
+	// target's volatile dependency.
+	SourceIncarnation string `json:"source_incarnation,omitempty"`
+	TargetIncarnation string `json:"target_incarnation,omitempty"`
+	// SourcePhysical* binds the transaction's provider to the exact node-local
+	// container selected when the transaction began. For migration this comes
+	// from the Raft placement. For an ordinary fork the authenticated source
+	// reports it, which is essential when an unplaced cold branch is served
+	// from a temporary materialization. SourceBranch remains the stable logical
+	// identity and may be reused while the physical provider is still fenced.
+	SourcePhysicalContainer string           `json:"source_physical_container,omitempty"`
+	SourcePhysicalBranch    string           `json:"source_physical_branch,omitempty"`
+	SourceNeeded            bool             `json:"source_needed"`
+	Metrics                 *TransferMetrics `json:"metrics,omitempty"`
 	// SessionDigest binds retries to the same bearer-token-bearing data-plane
 	// descriptor without persisting or exposing that descriptor itself.
 	SessionDigest string `json:"session_digest,omitempty"`
-	// SparseHandoff is durable and non-secret, allowing either daemon to retry
+	// GraphHandoff is durable and non-secret, allowing either daemon to retry
 	// the live-to-shared reader transition after a control-plane restart.
-	SparseHandoff *SparseHandoffDescriptor `json:"sparse_handoff,omitempty"`
-	// DesiredPaused is the source-visible state requested at publication.
-	// Migration targets are always first published physically paused and become
-	// runnable only after placement CAS; Activated records that this final step
-	// completed. For a requested paused target, Activated is immediately true.
+	GraphHandoff *GraphHandoffDescriptor `json:"graph_handoff,omitempty"`
+	// DesiredPaused is the source-visible state requested at publication. All
+	// distributed targets are first published physically paused and become
+	// runnable only after their placement grant commits; Activated records that
+	// this final step completed. For a requested paused target, Activated is
+	// immediately true.
 	DesiredPaused bool `json:"desired_paused,omitempty"`
 	Activated     bool `json:"activated,omitempty"`
+	// TargetPhysical* is the target-reported runtime identity. It is recorded
+	// while a migration target is still paused, before the atomic ownership
+	// cutover. A target may reuse a Sentry that already hosts a sibling branch,
+	// so the physical container is not necessarily TargetBranch or the
+	// transaction ID.
+	TargetPhysicalContainer   string `json:"target_physical_container,omitempty"`
+	TargetPhysicalBranch      string `json:"target_physical_branch,omitempty"`
+	TargetPhysicalIncarnation string `json:"target_physical_incarnation,omitempty"`
+	// InheritedDependencies is the exact set of older volatile transactions
+	// captured by a migration. It is frozen at ownership cutover, before this
+	// transaction's own dependency is appended. A later migration may begin
+	// before this one finishes draining; recording the set explicitly prevents
+	// the older completion from mistaking that newer dependency for an ancestor
+	// and releasing its source prematurely.
+	InheritedDependencies []string `json:"inherited_dependencies,omitempty"`
+	// OwnershipCommitted is set in the same Raft entry that moves a migrated
+	// branch's placement. It separates a physically prepared target from the
+	// sole authoritative target before activation.
+	OwnershipCommitted bool `json:"ownership_committed,omitempty"`
 }
 
 var transactionTransitions = map[TransactionState]map[TransactionState]bool{

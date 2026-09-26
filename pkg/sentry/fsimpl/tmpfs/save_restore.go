@@ -17,11 +17,13 @@ package tmpfs
 import (
 	goContext "context"
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 )
 
@@ -85,18 +87,35 @@ func (i *inode) loadDefaultACL(_ goContext.Context, defaultACL *vfs.PosixACL) {
 // PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
 func (fs *filesystem) PrepareSave(ctx context.Context) error {
 	if pgalloc.IsLiveForkSource(ctx) {
-		if err := fs.flushDiskWriteMetadata(); err != nil {
+		prepareStarted := time.Now()
+		preparationMetrics := vfs.LiveForkPreparationMetricsFromContext(ctx)
+		if resource, filtered := vfs.LiveForkFilesystemResourceFromContext(ctx); filtered &&
+			(fs.diskVolume == nil || fs.diskVolume.ResourceID != resource) {
+			return nil
+		}
+		if err := fs.flushDiskWriteMetadataRaw(); err != nil {
 			return fmt.Errorf("flushing TTC volume metadata before live fork: %w", err)
 		}
+		metadataDone := time.Now()
 		fs.liveForkMu.Lock()
-		files := make([]*regularFile, 0, len(fs.liveForkFiles))
-		for file := range fs.liveForkFiles {
-			files = append(files, file)
+		var files []*regularFile
+		if fs.diskVolume == nil {
+			files = make([]*regularFile, 0, len(fs.liveForkFiles))
+			for file := range fs.liveForkFiles {
+				files = append(files, file)
+			}
+		} else {
+			files = make([]*regularFile, 0, len(fs.diskForkFiles))
+			for file := range fs.diskForkFiles {
+				files = append(files, file)
+			}
+			fs.diskForkFiles = nil
 		}
+		fs.liveForkMu.Unlock()
 		for _, file := range files {
 			file.prepareLiveFork()
 		}
-		fs.liveForkMu.Unlock()
+		filesDone := time.Now()
 		if fs.diskVolume != nil && vfs.LiveForkBranchesPreparedFromContext(ctx) {
 			resources := vfs.LiveForkFilesystemResourcesFromContext(ctx)
 			if resources == nil {
@@ -123,8 +142,20 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			if transactions == nil {
 				return fmt.Errorf("CtxLiveForkTransactions was not provided for TTC volume")
 			}
-			for _, childBranch := range childBranches {
-				tx, err := fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+			originPlan := vfs.LiveForkFilesystemOriginsFromContext(ctx)
+			origins, clustered := originPlan[fs.diskVolume.ResourceID]
+			if clustered && len(origins) != 2*len(childBranches) {
+				return fmt.Errorf("TTC volume %q has %d clustered origins, want %d", fs.diskVolume.ResourceID, len(origins), 2*len(childBranches))
+			}
+			for index, childBranch := range childBranches {
+				var tx *ttcvolume.ForkTransaction
+				var err error
+				if clustered {
+					tx, err = fs.diskVolume.Repository.BeginForkWithOrigins(fs.diskVolume.Branch, childBranch,
+						ttcsnapshot.SnapshotID(origins[2*index]), ttcsnapshot.SnapshotID(origins[2*index+1]))
+				} else {
+					tx, err = fs.diskVolume.Repository.BeginFork(fs.diskVolume.Branch, childBranch)
+				}
 				if err != nil {
 					return fmt.Errorf("forking TTC volume %q as branch %q: %w", fs.diskVolume.ResourceID, childBranch, err)
 				}
@@ -132,10 +163,22 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 			}
 			resources[fs.diskVolume.ResourceID] = fs.diskVolume.Repository
 		}
+		if fs.diskVolume != nil && preparationMetrics != nil {
+			preparationMetrics.MetadataFlush += metadataDone.Sub(prepareStarted)
+			preparationMetrics.RuntimeInvalidation += filesDone.Sub(metadataDone)
+			preparationMetrics.BranchSeal += time.Since(filesDone)
+		}
 	}
 	resourceID := fs.mf.ResourceID()
 	if !resourceID.Ok() {
-		fs.pruneDiskNamespaceForSave()
+		pruneStarted := time.Now()
+		candidates := fs.pruneDiskNamespaceForSave()
+		if fs.diskVolume != nil {
+			if preparationMetrics := vfs.LiveForkPreparationMetricsFromContext(ctx); preparationMetrics != nil {
+				preparationMetrics.NamespacePrune += time.Since(pruneStarted)
+				preparationMetrics.NamespaceCandidates += int64(candidates)
+			}
+		}
 		return nil
 	}
 	mfmap := pgalloc.MemoryFileMapFromContext(ctx)
@@ -152,6 +195,10 @@ func (fs *filesystem) PrepareSave(ctx context.Context) error {
 
 // BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
 func (fs *filesystem) BeforeResume(ctx context.Context) {
+	if resource, filtered := vfs.LiveForkFilesystemResourceFromContext(ctx); filtered &&
+		(fs.diskVolume == nil || fs.diskVolume.ResourceID != resource) {
+		return
+	}
 	fs.restoreDiskNamespaceAfterSave()
 }
 
@@ -175,8 +222,8 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 			if _, err := repository.Branch(childBranch); err != nil {
 				return fmt.Errorf("TTC volume child branch %q was not prepared: %w", childBranch, err)
 			}
-			fs.diskVolume.Repository = repository
-			fs.diskVolume.Branch = childBranch
+			fs.installDiskVolumeRepository(repository, childBranch)
+			fs.registerDiskMaterializationHook()
 			fs.rebuildDiskInodeCache()
 			return nil
 		}
@@ -184,7 +231,11 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	resources := vfs.RestoreFilesystemResourcesFromContext(ctx)
 	resource, ok := resources[fs.diskVolume.ResourceID]
 	if !ok {
-		return fmt.Errorf("TTC volume restore resource %q was not provided", fs.diskVolume.ResourceID)
+		available := make([]checkpoint.ResourceID, 0, len(resources))
+		for id := range resources {
+			available = append(available, id)
+		}
+		return fmt.Errorf("TTC volume restore resource %q was not provided (available count=%d: %#v)", fs.diskVolume.ResourceID, len(available), available)
 	}
 	repository, ok := resource.Resource.(*ttcvolume.Repository)
 	if !ok {
@@ -193,10 +244,21 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	if resource.Branch == "" {
 		return fmt.Errorf("TTC volume restore resource %q has no branch", fs.diskVolume.ResourceID)
 	}
-	fs.diskVolume.Repository = repository
-	fs.diskVolume.Branch = resource.Branch
-	info := repository.Info()
-	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: info.ID}
+	fs.installDiskVolumeRepository(repository, resource.Branch)
+	fs.registerDiskMaterializationHook()
 	fs.rebuildDiskInodeCache()
 	return nil
+}
+
+// installDiskVolumeRepository canonicalizes a restored filesystem onto the
+// identity of the repository that is authoritative in this Sentry. In
+// particular, a distributed peer is serialized with the source node's
+// repository identity, but must export the target-local identity if it is
+// later selected as the source for another fork. Retaining the incoming ID
+// makes a multi-sibling restore depend on which peer the SandboxFamily happens
+// to select and eventually causes the daemon's local-to-incoming alias to miss.
+func (fs *filesystem) installDiskVolumeRepository(repository *ttcvolume.Repository, branch string) {
+	fs.diskVolume.Repository = repository
+	fs.diskVolume.Branch = branch
+	fs.diskVolume.ResourceID = checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
 }

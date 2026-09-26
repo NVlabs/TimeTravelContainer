@@ -42,7 +42,7 @@ func TestCloneOpenFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	destination, cloneErr := cloneOpenFile(destination, source, destinationPath)
+	destination, cloneErr := cloneOpenFile(destination, source)
 	if destination == nil {
 		t.Fatalf("cloneOpenFile returned no fallback destination: %v", cloneErr)
 	}

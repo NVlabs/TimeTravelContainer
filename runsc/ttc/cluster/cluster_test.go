@@ -24,15 +24,18 @@ import (
 )
 
 func testCapabilities(node string) Capabilities {
+	policy := ttcremote.DefaultPolicy()
+	policy.PageSize = 4096
 	return Capabilities{
 		NodeID: node, ProtocolMin: 1, ProtocolMax: 2, BuildID: "test-build",
-		Architecture: "amd64", BasePageSize: 4096, MaxTransferSize: 2 << 20,
+		Architecture: "amd64", CPUProfile: "portable", CPUFeatures: []string{"sse", "sse2"}, BasePageSize: 4096, MaxTransferSize: 2 << 20,
 		RepositoryID: "shared-repository",
 		Features: []string{
 			FeatureRemotePull, FeatureReversePush, FeatureAckBatch,
 			FeatureNetworkRecreate, FeatureRuntimePrefetch, FeatureFilesystemBranch,
 			FeatureSharedMemorySnapshot,
 		},
+		PagingPolicy: policy,
 	}
 }
 
@@ -58,16 +61,11 @@ func TestNegotiateCapabilities(t *testing.T) {
 	}
 }
 
-func TestLegacyCapabilitiesReceiveDefaultPagingPolicy(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := negotiated.PagingPolicy.TransferBytes, uint64(1<<20); got != want {
-		t.Fatalf("transfer bytes=%d, want %d", got, want)
-	}
-	if got, want := negotiated.PagingPolicy.PageSize, uint64(4096); got != want {
-		t.Fatalf("page size=%d, want %d", got, want)
+func TestCapabilitiesRequireExplicitPagingPolicy(t *testing.T) {
+	capabilities := testCapabilities("source")
+	capabilities.PagingPolicy = ttcremote.Policy{}
+	if err := capabilities.Validate(); err == nil {
+		t.Fatal("capabilities without an explicit paging policy were accepted")
 	}
 }
 
@@ -84,82 +82,158 @@ func TestNegotiateRejectsRepositoryAndRequiredFeatureMismatch(t *testing.T) {
 	}
 }
 
-func TestRemoteSessionDescriptorSharedSnapshotPath(t *testing.T) {
-	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := RemoteSessionDescriptor{
-		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
-		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedSnapshot: "cluster/memory-snapshots/tx.mem",
-	}
-	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid shared snapshot: %v", err)
-	}
-	for _, path := range []string{"/tmp/tx.mem", "../tx.mem", "cluster/../tx.mem", "."} {
-		invalid := base
-		invalid.SharedSnapshot = path
-		if err := invalid.validate(negotiated); err == nil {
-			t.Errorf("accepted invalid shared snapshot path %q", path)
-		}
+func TestNegotiateRejectsXsaveABIMismatch(t *testing.T) {
+	source, target := testCapabilities("source"), testCapabilities("target")
+	source.XsaveABI = "xcr0=7;layout-a"
+	target.XsaveABI = "xcr0=e7;layout-b"
+	if _, err := Negotiate(source, target); err == nil {
+		t.Fatal("accepted incompatible native XSAVE ABIs")
 	}
 }
 
-func TestRemoteSessionDescriptorSparseRepository(t *testing.T) {
+func TestNegotiateRejectsCPUProfileMismatch(t *testing.T) {
+	source, target := testCapabilities("source"), testCapabilities("target")
+	target.CPUFeatures = []string{"avx512f", "sse", "sse2"}
+	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), "CPU profile") {
+		t.Fatalf("CPU feature mismatch error=%v", err)
+	}
+	target = testCapabilities("target")
+	target.CPUProfile = "host"
+	if _, err := Negotiate(source, target); err == nil || !strings.Contains(err.Error(), "CPU profile") {
+		t.Fatalf("CPU profile-name mismatch error=%v", err)
+	}
+}
+
+func TestRemoteSessionDescriptorGraphMetadata(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	base := RemoteSessionDescriptor{
-		Address: "127.0.0.1:1", SnapshotToken: strings.Repeat("11", 16),
-		MetadataBytes: 1, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SparseRepository: "containers/family/memory/chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
+		MetadataArtifact: "kernel-metadata",
+		GraphArtifact:    "memory-graph", GraphArtifactBytes: 64, GraphSnapshot: 7,
+		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"}, DurableDehydration: true,
 	}
 	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid sparse repository: %v", err)
+		t.Fatalf("valid graph metadata descriptor: %v", err)
 	}
 	for _, mutate := range []func(*RemoteSessionDescriptor){
-		func(d *RemoteSessionDescriptor) { d.SparseManifest = "" },
-		func(d *RemoteSessionDescriptor) { d.SparseBranch = "" },
-		func(d *RemoteSessionDescriptor) { d.SparseBranch = "../remote" },
-		func(d *RemoteSessionDescriptor) { d.SparseManifest = "xyz" },
-		func(d *RemoteSessionDescriptor) { d.SparseRepository = "../chunks" },
-		func(d *RemoteSessionDescriptor) { d.SharedSnapshot = "cluster/snapshot.mem" },
+		func(d *RemoteSessionDescriptor) { d.GraphArtifact = "../manifest" },
+		func(d *RemoteSessionDescriptor) { d.MetadataArtifact = "" },
+		func(d *RemoteSessionDescriptor) { d.DurableDehydration = false },
+		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
+		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
 	} {
 		invalid := base
 		mutate(&invalid)
 		if err := invalid.validate(negotiated); err == nil {
-			t.Fatalf("accepted invalid sparse descriptor: %+v", invalid)
+			t.Fatalf("accepted invalid graph descriptor: %+v", invalid)
 		}
 	}
 }
 
-func TestRemoteSessionDescriptorSharedMetadata(t *testing.T) {
+func TestRemoteSessionDescriptorLiveGraphIdentity(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 1 << 20, MaxTransferBytes: 4096,
+		GraphSnapshot: 7, GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
+	}
+	if err := live.validate(negotiated); err != nil {
+		t.Fatalf("valid live graph identity: %v", err)
+	}
+	for _, mutate := range []func(*RemoteSessionDescriptor){
+		func(d *RemoteSessionDescriptor) { d.GraphSnapshot = 0 },
+		func(d *RemoteSessionDescriptor) { d.GraphRootObjects = nil },
+	} {
+		invalid := live
+		mutate(&invalid)
+		if err := invalid.validate(negotiated); err == nil {
+			t.Fatalf("accepted incomplete live graph identity: %+v", invalid)
+		}
+	}
+}
+
+func TestRemoteSessionDescriptorExecSessions(t *testing.T) {
 	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	base := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
 		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
-		SharedMetadata:   "cluster/memory-metadata/tx.state",
-		SparseRepository: "cluster/memory-chunks", SparseManifest: strings.Repeat("ab", 32), SparseBranch: "b-remote",
+		ExecSessions:    []RemoteExecSessionDescriptor{{ID: "build", PID: 42, State: "running"}},
+		ExecConsoleLogs: []RemoteConsoleLogDescriptor{{ExecID: "build", Size: 4096}},
 	}
 	if err := base.validate(negotiated); err != nil {
-		t.Fatalf("valid shared metadata descriptor: %v", err)
+		t.Fatalf("valid exec session: %v", err)
+	}
+	exitStatus := uint32(7 << 8)
+	exited := base
+	exited.ExecSessions = []RemoteExecSessionDescriptor{{ID: "finished", PID: 43, State: "exited", ExitStatus: &exitStatus}}
+	exited.ExecConsoleLogs = []RemoteConsoleLogDescriptor{{ExecID: "finished", Size: 4096}}
+	if err := exited.validate(negotiated); err != nil {
+		t.Fatalf("valid exited exec session: %v", err)
 	}
 	for _, mutate := range []func(*RemoteSessionDescriptor){
-		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "../metadata" },
-		func(d *RemoteSessionDescriptor) { d.SharedMetadata = "" },
-		func(d *RemoteSessionDescriptor) { d.Address = "127.0.0.1:1" },
-		func(d *RemoteSessionDescriptor) { d.SnapshotToken = strings.Repeat("11", 16) },
-		func(d *RemoteSessionDescriptor) { d.SparseRepository = "" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].ID = "" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].PID = 0 },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions[0].State = "unknown" },
+		func(d *RemoteSessionDescriptor) { d.ExecSessions = append(d.ExecSessions, d.ExecSessions[0]) },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].ExecID = "unknown" },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs[0].Size = 0 },
+		func(d *RemoteSessionDescriptor) { d.ExecConsoleLogs = append(d.ExecConsoleLogs, d.ExecConsoleLogs[0]) },
 	} {
 		invalid := base
+		invalid.ExecSessions = append([]RemoteExecSessionDescriptor(nil), base.ExecSessions...)
+		invalid.ExecConsoleLogs = append([]RemoteConsoleLogDescriptor(nil), base.ExecConsoleLogs...)
 		mutate(&invalid)
 		if err := invalid.validate(negotiated); err == nil {
-			t.Fatalf("accepted invalid shared metadata descriptor: %+v", invalid)
+			t.Fatalf("accepted invalid exec sessions: %+v", invalid.ExecSessions)
 		}
+	}
+	exitedWithoutStatus := exited
+	exitedWithoutStatus.ExecSessions = append([]RemoteExecSessionDescriptor(nil), exited.ExecSessions...)
+	exitedWithoutStatus.ExecSessions[0].ExitStatus = nil
+	if err := exitedWithoutStatus.validate(negotiated); err == nil {
+		t.Fatal("accepted exited exec session without status")
+	}
+}
+
+func TestRemoteSessionDescriptorSharedMemoryWithVolatileFilesystem(t *testing.T) {
+	negotiated, err := Negotiate(testCapabilities("source"), testCapabilities("target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := RemoteSessionDescriptor{
+		Address: "127.0.0.1:1234", SnapshotToken: strings.Repeat("11", 16),
+		MetadataBytes: 128, StreamBytes: 4096, MaxTransferBytes: 4096,
+		MetadataArtifact: "kernel-metadata", DurableDehydration: true,
+		GraphArtifact: "memory-graph", GraphArtifactBytes: 64, GraphSnapshot: 7,
+		GraphRootObjects: []string{"0000000000000007-03-0000000000000001"},
+		FilesystemRoots: []FilesystemRootDescriptor{{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "fedcba9876543210fedcba9876543210", BranchID: "branch-a",
+			Root: "0000000000000008-07-0000000000000001", NextInode: 2, LogicalBytes: 1 << 20,
+		}}, FilesystemBytes: 1 << 20,
+	}
+	if err := descriptor.validate(negotiated); err != nil {
+		t.Fatalf("valid shared-memory/volatile-filesystem descriptor: %v", err)
+	}
+	invalid := descriptor
+	invalid.SnapshotToken = "bad"
+	if err := invalid.validate(negotiated); err == nil {
+		t.Fatal("accepted invalid filesystem range token")
+	}
+	invalid = descriptor
+	invalid.FilesystemRoots[0].LogicalBytes++
+	if err := invalid.validate(negotiated); err == nil {
+		t.Fatal("accepted mismatched filesystem dependency bytes")
 	}
 }
 
@@ -168,7 +242,8 @@ func testForkIdentity() ForkIdentity {
 	return ForkIdentity{
 		TransactionID: "tx-1", SourceNodeID: "source", TargetNodeID: "target",
 		SourceContainer: "app", SourceBranch: "main", TargetContainer: "app-copy", TargetBranch: "main",
-		ImageDigest: digest, RootfsDigest: digest, RepositoryID: "shared-repository",
+		TargetVisibleBranch: "main",
+		ImageDigest:         digest, RootfsDigest: digest, RepositoryID: "shared-repository",
 	}
 }
 

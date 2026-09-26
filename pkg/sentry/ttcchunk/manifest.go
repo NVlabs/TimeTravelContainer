@@ -16,13 +16,12 @@ package ttcchunk
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"cmp"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -30,29 +29,15 @@ import (
 )
 
 const (
-	manifestVersion        = 1
+	// A manifest of version 1 has every page at its slot in its object; one
+	// of version 2 says where each run's pages are.
+	manifestVersionSlotted = 1
+	manifestVersion        = 2
 	maxManifestStringBytes = 1 << 20
 	maxManifestRuns        = 1 << 32
 )
 
 var manifestMagic = [16]byte{'T', 'T', 'C', 'M', 'E', 'M', 'M', 'A', 'N', 'I', 'F', 'E', 'S', 'T', 0, 1}
-
-// ManifestID is the content address of an encoded memory manifest.
-type ManifestID [sha256.Size]byte
-
-// String returns the lowercase hexadecimal manifest content address.
-func (id ManifestID) String() string { return hex.EncodeToString(id[:]) }
-
-// ParseManifestID parses a manifest content address.
-func ParseManifestID(value string) (ManifestID, error) {
-	var id ManifestID
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != len(id) {
-		return id, fmt.Errorf("invalid TTC memory manifest ID %q", value)
-	}
-	copy(id[:], decoded)
-	return id, nil
-}
 
 // ManifestRun maps a contiguous source MemoryFile range and logical identity
 // run to slots in one immutable object.
@@ -66,6 +51,10 @@ type ManifestRun struct {
 	FirstSlot    uint8
 	Pages        uint16
 	Object       ID
+	// ObjectPage is the page of Object that holds the run's first page; the
+	// others follow it. A capture object holds each page at its slot, and a
+	// graph chunk may hold the pages of several logical chunks packed.
+	ObjectPage uint8
 }
 
 // Manifest is an immutable branch memory root.
@@ -73,26 +62,43 @@ type Manifest struct {
 	Runs []ManifestRun
 }
 
-func bindingLess(left, right *StoredBinding) bool {
-	if left.Binding.ResourceID.ContainerName != right.Binding.ResourceID.ContainerName {
-		return left.Binding.ResourceID.ContainerName < right.Binding.ResourceID.ContainerName
+// StoredBinding extends a branch binding with the transaction-local object
+// carrying its page bytes in the capture stream.
+type StoredBinding struct {
+	Binding pgalloc.CapturedPageBinding
+	Object  ID
+	// ObjectPage is the page of Object that holds the binding's page.
+	ObjectPage uint8
+}
+
+// capturedBinding is binding, carried by object of a capture, which holds each
+// page at its slot.
+func capturedBinding(binding pgalloc.CapturedPageBinding, object ID) StoredBinding {
+	return StoredBinding{Binding: binding, Object: object, ObjectPage: binding.Slot}
+}
+
+func compareAllocator(a, b pgalloc.LogicalAllocatorID) int { return bytes.Compare(a[:], b[:]) }
+
+func compareBindings(left, right *StoredBinding) int {
+	if c := cmp.Compare(left.Binding.ResourceID.ContainerName, right.Binding.ResourceID.ContainerName); c != 0 {
+		return c
 	}
-	if left.Binding.ResourceID.Path != right.Binding.ResourceID.Path {
-		return left.Binding.ResourceID.Path < right.Binding.ResourceID.Path
+	if c := cmp.Compare(left.Binding.ResourceID.Path, right.Binding.ResourceID.Path); c != 0 {
+		return c
 	}
-	if left.Binding.OldOffset != right.Binding.OldOffset {
-		return left.Binding.OldOffset < right.Binding.OldOffset
+	if c := cmp.Compare(left.Binding.OldOffset, right.Binding.OldOffset); c != 0 {
+		return c
 	}
-	if cmp := compareAllocator(left.Binding.Page.Allocator, right.Binding.Page.Allocator); cmp != 0 {
-		return cmp < 0
+	if c := compareAllocator(left.Binding.Page.Allocator, right.Binding.Page.Allocator); c != 0 {
+		return c
 	}
-	if left.Binding.Page.Sequence != right.Binding.Page.Sequence {
-		return left.Binding.Page.Sequence < right.Binding.Page.Sequence
+	if c := cmp.Compare(left.Binding.Page.Sequence, right.Binding.Page.Sequence); c != 0 {
+		return c
 	}
-	if cmp := compareAllocator(left.Binding.Version.Allocator, right.Binding.Version.Allocator); cmp != 0 {
-		return cmp < 0
+	if c := compareAllocator(left.Binding.Version.Allocator, right.Binding.Version.Allocator); c != 0 {
+		return c
 	}
-	return left.Binding.Version.Sequence < right.Binding.Version.Sequence
+	return cmp.Compare(left.Binding.Version.Sequence, right.Binding.Version.Sequence)
 }
 
 func validateStoredBinding(stored StoredBinding) error {
@@ -115,18 +121,25 @@ func runCanAppend(run *ManifestRun, stored *StoredBinding) bool {
 	return stored.Binding.OldOffset == run.OldOffset+delta*hostarch.PageSize &&
 		stored.Binding.Page.Allocator == run.FirstPage.Allocator && stored.Binding.Page.Sequence == run.FirstPage.Sequence+delta &&
 		stored.Binding.Version.Allocator == run.FirstVersion.Allocator && stored.Binding.Version.Sequence == run.FirstVersion.Sequence+delta &&
-		uint16(stored.Binding.Slot) == uint16(run.FirstSlot)+run.Pages
+		uint16(stored.Binding.Slot) == uint16(run.FirstSlot)+run.Pages &&
+		uint16(stored.ObjectPage) == uint16(run.ObjectPage)+run.Pages
 }
 
 // CompactBindings builds a deterministic run-compressed manifest.
 func CompactBindings(bindings []StoredBinding) (Manifest, error) {
-	ordered := append([]StoredBinding(nil), bindings...)
-	for _, binding := range ordered {
-		if err := validateStoredBinding(binding); err != nil {
+	sorted := true
+	for i := range bindings {
+		if err := validateStoredBinding(bindings[i]); err != nil {
 			return Manifest{}, err
 		}
+		sorted = sorted && (i == 0 || compareBindings(&bindings[i-1], &bindings[i]) <= 0)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return bindingLess(&ordered[i], &ordered[j]) })
+	// A capture lists its bindings in this order already.
+	ordered := bindings
+	if !sorted {
+		ordered = slices.Clone(bindings)
+		slices.SortFunc(ordered, func(left, right StoredBinding) int { return compareBindings(&left, &right) })
+	}
 	manifest := Manifest{Runs: make([]ManifestRun, 0, len(ordered))}
 	for i := range ordered {
 		stored := &ordered[i]
@@ -144,6 +157,7 @@ func CompactBindings(bindings []StoredBinding) (Manifest, error) {
 			FirstSlot:    stored.Binding.Slot,
 			Pages:        1,
 			Object:       stored.Object,
+			ObjectPage:   stored.ObjectPage,
 		})
 	}
 	return manifest, nil
@@ -170,30 +184,39 @@ func appendString(dst []byte, value string) ([]byte, error) {
 }
 
 // EncodeManifest validates and deterministically encodes manifest.
-func EncodeManifest(manifest Manifest) ([]byte, ManifestID, error) {
+func EncodeManifest(manifest Manifest) ([]byte, error) {
 	if uint64(len(manifest.Runs)) > maxManifestRuns {
-		return nil, ManifestID{}, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
+		return nil, fmt.Errorf("memory manifest has %d runs", len(manifest.Runs))
+	}
+	// A manifest whose pages are all at their slots is written as version 1,
+	// which daemons predating packed chunks read too.
+	version := uint32(manifestVersionSlotted)
+	for _, run := range manifest.Runs {
+		if run.ObjectPage != run.FirstSlot {
+			version = manifestVersion
+			break
+		}
 	}
 	data := append([]byte(nil), manifestMagic[:]...)
-	data = appendUint32(data, manifestVersion)
+	data = appendUint32(data, version)
 	data = appendUint32(data, uint32(hostarch.PageSize))
 	data = appendUint64(data, uint64(len(manifest.Runs)))
 	for i, run := range manifest.Runs {
-		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk || run.References == 0 || run.Object == (ID{}) || !hostarch.IsPageAligned(run.OldOffset) {
-			return nil, ManifestID{}, fmt.Errorf("invalid memory manifest run %d: %+v", i, run)
+		if run.Pages == 0 || uint16(run.FirstSlot)+run.Pages > PagesPerChunk || uint16(run.ObjectPage)+run.Pages > PagesPerChunk || run.References == 0 || run.Object == (ID{}) || !hostarch.IsPageAligned(run.OldOffset) {
+			return nil, fmt.Errorf("invalid memory manifest run %d: %+v", i, run)
 		}
 		chunk, slot := run.FirstPage.Chunk()
 		if chunk != run.Logical || slot != run.FirstSlot || run.FirstVersion.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, ManifestID{}, fmt.Errorf("inconsistent memory manifest run %d: %+v", i, run)
+			return nil, fmt.Errorf("inconsistent memory manifest run %d: %+v", i, run)
 		}
 		var err error
 		data, err = appendString(data, run.ResourceID.ContainerName)
 		if err != nil {
-			return nil, ManifestID{}, err
+			return nil, err
 		}
 		data, err = appendString(data, run.ResourceID.Path)
 		if err != nil {
-			return nil, ManifestID{}, err
+			return nil, err
 		}
 		data = appendUint64(data, run.OldOffset)
 		data = appendUint64(data, run.References)
@@ -206,9 +229,11 @@ func EncodeManifest(manifest Manifest) ([]byte, ManifestID, error) {
 		data = append(data, run.FirstSlot)
 		data = appendUint32(data, uint32(run.Pages))
 		data = append(data, run.Object[:]...)
+		if version == manifestVersion {
+			data = append(data, run.ObjectPage)
+		}
 	}
-	id := sha256.Sum256(data)
-	return data, id, nil
+	return data, nil
 }
 
 type manifestReader struct {
@@ -254,17 +279,14 @@ func (r *manifestReader) string() (string, error) {
 }
 
 // DecodeManifest verifies and decodes one manifest.
-func DecodeManifest(data []byte, expected *ManifestID) (Manifest, error) {
-	if expected != nil && ManifestID(sha256.Sum256(data)) != *expected {
-		return Manifest{}, errors.New("memory manifest content address mismatch")
-	}
+func DecodeManifest(data []byte) (Manifest, error) {
 	r := manifestReader{data: data}
 	magic, err := r.take(len(manifestMagic))
 	if err != nil || !bytes.Equal(magic, manifestMagic[:]) {
 		return Manifest{}, errors.New("invalid TTC memory manifest header")
 	}
 	version, err := r.uint32()
-	if err != nil || version != manifestVersion {
+	if err != nil || (version != manifestVersion && version != manifestVersionSlotted) {
 		return Manifest{}, fmt.Errorf("unsupported TTC memory manifest version %d", version)
 	}
 	pageSize, err := r.uint32()
@@ -329,12 +351,20 @@ func DecodeManifest(data []byte, expected *ManifestID) (Manifest, error) {
 			return Manifest{}, err
 		}
 		copy(run.Object[:], value)
+		run.ObjectPage = run.FirstSlot
+		if version == manifestVersion {
+			value, err = r.take(1)
+			if err != nil {
+				return Manifest{}, err
+			}
+			run.ObjectPage = value[0]
+		}
 	}
 	if r.off != len(data) {
 		return Manifest{}, errors.New("memory manifest has trailing bytes")
 	}
 	// Reuse the encoder's complete structural validation.
-	if _, _, err := EncodeManifest(manifest); err != nil {
+	if _, err := EncodeManifest(manifest); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
@@ -363,7 +393,8 @@ func (m Manifest) Expand() []StoredBinding {
 					Chunk: run.Logical,
 					Slot:  slot,
 				},
-				Object: run.Object,
+				Object:     run.Object,
+				ObjectPage: run.ObjectPage + uint8(page),
 			})
 		}
 	}

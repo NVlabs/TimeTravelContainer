@@ -8,12 +8,19 @@ MCP packages in this directory.
 
 The default socket is selected in this order:
 
-1. `$TTC_RUNTIME_DIR/ttcd.sock`
+1. `$TTC_SOCKET`
 2. `$XDG_RUNTIME_DIR/ttc/ttcd.sock`
 3. `/tmp/ttc-$EUID/ttcd.sock`
 
 ttcd accepts clients owned by the same Unix user. Each operation uses a new
 connection.
+
+The official `ttc` binary includes its build ID and requires an exact match
+with `ttcd` for daemon operations. SDK and MCP clients intentionally omit that
+private build assertion: they negotiate the public API version and inspect the
+feature/status fields returned by `ping`. This lets an SDK remain usable across
+daemon builds that preserve the same public protocol. Storage roots never
+cross this interface.
 
 ## Request
 
@@ -21,7 +28,7 @@ The client writes one newline-terminated JSON object:
 
 ```json
 {
-  "version": 4,
+  "version": 9,
   "action": "command",
   "request_id": "optional-32-character-hex-id",
   "args": ["ls", "--json"],
@@ -36,12 +43,21 @@ its own paths, data root, isolation mode, and runtime platform.
 `request_id` makes supported mutating commands idempotent when a caller
 deliberately retries the same request.
 
-Existing branches use full `CONTAINER@BRANCH` selectors. A local fork
-destination is a branch name; a remote fork destination is a
-`CONTAINER@BRANCH` selector on the target node. The protocol does not add
-implicit `main` selection beyond what the CLI command itself documents.
+Existing branches use full `CONTAINER@BRANCH` selectors. A fork destination is
+a new branch name in the source family; `--node NODE` selects where it runs.
+`run`, `start`, `restore`, `rehydrate`, and `fork` accept this optional
+placement constraint and otherwise use scheduler placement. The protocol does
+not add implicit `main` selection beyond what the CLI command itself documents.
 
 `ttc ls --json` reports branch ancestry as `parent`. Root branches omit it.
+Inspection and statistics also expose storage placement (`local`,
+`publishing`, `shared`, `materializing`, or `error`) and any volatile source
+dependencies. `inspect` accepts a family name and returns branch records under
+`TTC.branches`; `stats --json` accepts a full branch selector and reports
+placement, immutable snapshot/root IDs, publication errors, graph/GC counts,
+and private/shared resource bytes. `wait --condition durable` completes only
+after the branch's current immutable publication is committed to shared
+storage.
 
 Host file paths are interpreted by the daemon. SDK convenience methods for
 checkpoint and restore make paths absolute; callers using raw `command`

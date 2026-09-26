@@ -125,6 +125,11 @@ type Config struct {
 	// in-process virtual NIC.
 	TimeTravelNetworkNAT bool `flag:"ttc-network-nat"`
 
+	// TimeTravelNetworkQuarantine creates the TTC virtual NIC without an
+	// external proxy peer. TTC uses this when starting a persistently
+	// quarantined branch.
+	TimeTravelNetworkQuarantine bool `flag:"ttc-network-quarantine"`
+
 	// TimeTravelNetworkIP is the IPv4 address assigned to the TTC in-process
 	// virtual NIC. An empty value selects the runtime default.
 	TimeTravelNetworkIP string `flag:"ttc-network-ip"`
@@ -527,6 +532,9 @@ func (c *Config) Validate() error {
 	}
 	if c.TimeTravelNetworkNAT && c.Network != NetworkTimeTravel {
 		return fmt.Errorf("ttc-network-nat is only supported with ttc networking")
+	}
+	if c.TimeTravelNetworkQuarantine && c.Network != NetworkTimeTravel && c.Network != NetworkNone {
+		return fmt.Errorf("ttc-network-quarantine is only supported with ttc or none networking")
 	}
 	if c.TimeTravelNetworkIP != "" {
 		if c.Network != NetworkTimeTravel {

@@ -24,6 +24,8 @@ console.log(await ttc.ping());
 (await ttc.run("alpine:3.20", ["sleep", "infinity"],
                ["-d", "--name", "demo"])).check();
 (await ttc.fork("demo@main", "experiment")).check();
+(await ttc.quarantine("demo@experiment")).check();
+(await ttc.unquarantine("demo@experiment")).check();
 (await ttc.dehydrate("demo@experiment")).check();
 (await ttc.rehydrate("demo@experiment")).check();
 
@@ -47,15 +49,22 @@ wait, and removal. A coordinated local fan-out uses one source pause:
 (await ttc.migrate("demo@candidate-a", "node-b")).check();
 console.log(await ttc.nodes());
 console.log(await ttc.rebalanceNode("node-a", "node-b"));
+(await ttc.stopNode("node-a", "migrate")).check();
 ```
+
+`run`, `start`, `fork`, `rehydrate`, and `restore` accept an optional node.
+Omit it to let TTC select a compatible ready node.
 
 Harness-oriented helpers are available directly:
 
 ```ts
+// inspect() takes a family name and returns branch details in TTC.branches.
+console.log(await ttc.inspect("demo"));
 (await ttc.execSession("demo@candidate-a", ["sh"], "build1", { tty: true })).check();
 console.log(await ttc.ttyStat("demo@candidate-a", "build1"));
 console.log(await ttc.stats("demo@candidate-a"));
 console.log(await ttc.diff("demo@candidate-a"));
+(await ttc.wait("demo@candidate-a", { condition: "durable" })).check();
 (await ttc.commit("demo@candidate-a", "local/result:latest",
                   { changes: ["LABEL timetravel.usage=review"] })).check();
 const archive = await ttc.save(["local/result:latest"]);
@@ -101,8 +110,10 @@ retrying the same mutation.
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.
 
-Set `TTC_RUNTIME_DIR` or `XDG_RUNTIME_DIR`, or construct
-`new Client({socketPath: "/path/to/ttcd.sock"})`.
+Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or construct
+`new Client({socketPath: "/path/to/ttcd.sock"})`. SDK clients never need
+`TTC_ROOT` or `TTC_LOCAL_ROOT`. They negotiate the public API/features
+reported by `ping`; exact build matching is specific to the official CLI.
 
 ## Develop and test
 

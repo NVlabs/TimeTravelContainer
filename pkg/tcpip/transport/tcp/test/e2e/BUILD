@@ -22,6 +22,7 @@ go_test(
         "//pkg/state",
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",

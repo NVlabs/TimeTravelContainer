@@ -16,12 +16,15 @@ package cmd
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -29,6 +32,115 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
+
+func TestDistributedCopyRoute(t *testing.T) {
+	upload, ok, err := parseDistributedCopyRoute([]string{"cp", "-aL", "/host/source", "demo@main:/guest/destination"})
+	if err != nil || !ok {
+		t.Fatalf("parse upload = (%+v, %t, %v)", upload, ok, err)
+	}
+	if upload.sourceContainer || !upload.destContainer || !upload.opts.archive || !upload.opts.followLink {
+		t.Fatalf("upload route = %+v", upload)
+	}
+	download, ok, err := parseDistributedCopyRoute([]string{"cp", "demo@main:/guest/source", "/host/destination"})
+	if err != nil || !ok || !download.sourceContainer || download.destContainer {
+		t.Fatalf("parse download = (%+v, %t, %v)", download, ok, err)
+	}
+	if got := distributedCopyArgs(upload.opts, "-", upload.destination); strings.Join(got, "\x00") != "cp\x00--archive\x00--follow-link\x00-\x00demo@main:/guest/destination" {
+		t.Fatalf("rewritten upload = %q", got)
+	}
+}
+
+func TestDaemonStdinFrameReader(t *testing.T) {
+	payload := bytes.Repeat([]byte("distributed-copy"), 8192)
+	reader := bufio.NewReader(&daemonStdinFrameReader{raw: bytes.NewReader(payload)})
+	var got bytes.Buffer
+	for {
+		typ, frame, err := readDaemonFrame(reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch typ {
+		case daemonFrameStdin:
+			got.Write(frame)
+		case daemonFrameEOF:
+			if got.String() != string(payload) {
+				t.Fatalf("framed payload size=%d, want %d", got.Len(), len(payload))
+			}
+			return
+		default:
+			t.Fatalf("unexpected frame %q", typ)
+		}
+	}
+}
+
+func TestDistributedCopyUploadConsumesFlowControl(t *testing.T) {
+	flow := newDaemonStdinFlow()
+	payload := bytes.Repeat([]byte("large-distributed-copy"), daemonStdinWindowBytes/(len("large-distributed-copy"))*3)
+	framed := bufio.NewReader(&daemonStdinFrameReader{raw: bytes.NewReader(payload), flow: flow})
+	var response bytes.Buffer
+	var responseMu sync.Mutex
+	var received bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		for {
+			typ, frame, err := readDaemonFrame(framed)
+			if err != nil {
+				done <- err
+				return
+			}
+			switch typ {
+			case daemonFrameStdin:
+				received.Write(frame)
+				if err := flow.acknowledge(len(frame)); err != nil {
+					done <- err
+					return
+				}
+			case daemonFrameEOF:
+				done <- nil
+				return
+			default:
+				done <- fmt.Errorf("unexpected frame %q", typ)
+				return
+			}
+		}
+	}()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received.Bytes(), payload) {
+		t.Fatalf("received %d bytes, want %d", received.Len(), len(payload))
+	}
+	// Keep imports and the framing writer exercised together; the network
+	// response filter forwards non-acknowledgement frames unchanged.
+	if err := writeDaemonStatus(&response, &responseMu, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonCopyArchiveReader(t *testing.T) {
+	var frames bytes.Buffer
+	var mu sync.Mutex
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStdout, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStderr, []byte("diagnostic")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonFrame(&frames, &mu, daemonFrameStdout, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonStatus(&frames, &mu, 7); err != nil {
+		t.Fatal(err)
+	}
+	reader := newDaemonCopyArchiveReader(&frames)
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "firstsecond" || reader.diagnostic.String() != "diagnostic" || !reader.statusSeen || reader.status != 7 {
+		t.Fatalf("archive=%q diagnostic=%q status=(%t,%d)", got, reader.diagnostic.String(), reader.statusSeen, reader.status)
+	}
+}
 
 func TestParseCopyCommandArgs(t *testing.T) {
 	opts, source, destination, err := parseCopyCommandArgs([]string{"-aL", "demo@child:/src/.", "/tmp/dest"})
@@ -89,6 +201,7 @@ func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
 		Annotations: map[string]string{
 			specutils.AnnotationTTCVolumeRepositories:  string(encoded),
 			"dev.timetravelcontainer.internal-console": "init",
+			ttcbundle.PidsLimitAnnotation:              "sentry",
 		},
 	}
 	cloned, err := offlineCopySpec(original, ttcbundle.ContainerInfo{ID: "family"}, "child", []string{"export", "/tmp/value"})
@@ -106,6 +219,9 @@ func TestOfflineCopySpecSelectsPersistentBranchAndHelper(t *testing.T) {
 	}
 	if _, ok := cloned.Annotations["dev.timetravelcontainer.internal-console"]; ok {
 		t.Fatal("offline helper retained TTC console interception")
+	}
+	if _, ok := cloned.Annotations[ttcbundle.PidsLimitAnnotation]; ok {
+		t.Fatal("offline helper retained Sentry PID-limit marker after dropping Linux resources")
 	}
 	gotRepositories, err := specutils.TTCVolumeRepositories(cloned)
 	if err != nil {
@@ -333,4 +449,27 @@ func TestRunCopyStreamsBothDirections(t *testing.T) {
 			t.Fatalf("import data=%q target=%+v path=%q archive=%t raw=%t", backend.copyImportData, backend.copyImportTarget, backend.copyImportPath, backend.copyImportArchive, backend.copyImportRaw)
 		}
 	})
+
+	t.Run("prepared archive to container", func(t *testing.T) {
+		backend := &fakeBackend{copyStdin: strings.NewReader("archive")}
+		if err := runCopy([]string{copyPreparedInputArg, "-", "demo@child:/destination"}, io.Discard, io.Discard, backend); err != nil {
+			t.Fatal(err)
+		}
+		if string(backend.copyImportData) != "archive" || backend.copyImportRaw {
+			t.Fatalf("prepared import data=%q raw=%t", backend.copyImportData, backend.copyImportRaw)
+		}
+	})
+}
+
+func TestOfflineCopyState(t *testing.T) {
+	for _, state := range []string{"dehydrated", "exited", "stopped"} {
+		if !offlineCopyState(state) {
+			t.Errorf("offlineCopyState(%q)=false, want true", state)
+		}
+	}
+	for _, state := range []string{"", "created", "running", "paused", "dehydrating"} {
+		if offlineCopyState(state) {
+			t.Errorf("offlineCopyState(%q)=true, want false", state)
+		}
+	}
 }

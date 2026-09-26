@@ -248,67 +248,109 @@ func TestMemoryRangeCaptureSnapshotPinsOnlyCapturedPages(t *testing.T) {
 	f.DecRef(fr)
 }
 
-func TestCapturedMemoryLayoutPacksLogicalChunksContiguously(t *testing.T) {
+func TestCapturedMemoryLayoutChunkOrdered(t *testing.T) {
 	f := newLogicalPageTestMemoryFile()
 	fr, err := f.findAllocatableAndMarkUsed(&allocState{
-		length: 4 * page,
+		length: 3 * page,
 		opts:   AllocOpts{Dir: BottomUp},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.DecRef(fr)
-	capture := NewMemoryRangeCapture()
-	if err := capture.Record(f, fr); err != nil {
-		t.Fatal(err)
+	type identity struct {
+		page    LogicalPageID
+		version PageVersionID
+		chunk   LogicalChunkID
+		slot    uint8
 	}
-	layout, err := capture.SnapshotLayout()
+	identities := make([]identity, 3)
+	for i := range identities {
+		pageID, versionID, ok := f.LogicalPageVersionAt(fr.Start + uint64(i)*page)
+		if !ok {
+			t.Fatalf("page %d has no logical identity", i)
+		}
+		chunk, slot := pageID.Chunk()
+		identities[i] = identity{page: pageID, version: versionID, chunk: chunk, slot: slot}
+	}
+	// Model CoW relocation: logical pages 2, 0, 1 occupy physical offsets 0,
+	// 1, 2. Address order therefore splits the logical chunk, while chunk order
+	// must produce stream offsets 0, 1, 2 without changing physical sources.
+	physicalToLogical := []int{2, 0, 1}
+	layout := CapturedMemoryLayout{Regions: []RemoteSnapshotRegion{{
+		ID: 1, File: f, Range: fr,
+	}}}
+	for physical, logical := range physicalToLogical {
+		id := identities[logical]
+		layout.Bindings = append(layout.Bindings, CapturedPageBinding{
+			OldOffset: fr.Start + uint64(physical)*page, StreamOffset: uint64(physical) * page,
+			References: 1, Page: id.page, Version: id.version, Chunk: id.chunk, Slot: id.slot,
+		})
+	}
+	ordered, err := layout.ChunkOrdered()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(ordered.Bindings) != 3 || len(ordered.Regions) != 2 {
+		t.Fatalf("ordered layout=%+v", ordered)
+	}
+	wantPhysical := []uint64{fr.Start + page, fr.Start + 2*page, fr.Start}
+	for i, binding := range ordered.Bindings {
+		if binding.Page != identities[i].page || binding.OldOffset != wantPhysical[i] || binding.StreamOffset != uint64(i)*page {
+			t.Fatalf("binding %d=%+v, want page=%+v old=%#x stream=%#x", i, binding, identities[i].page, wantPhysical[i], uint64(i)*page)
+		}
+	}
+}
 
-	// Deliberately make physical offset order disagree with logical chunk
-	// order. This is representative of CoW versions and sparse imports after a
-	// few live migrations.
-	var low, high, version LogicalAllocatorID
-	low[0], high[0], version[0] = 1, 2, 3
-	type logical struct {
-		allocator LogicalAllocatorID
-		slot      uint64
-	}
-	identities := []logical{{high, 0}, {low, 1}, {high, 1}, {low, 0}}
-	for i := range layout.Bindings {
-		identity := identities[i]
-		layout.Bindings[i].Page = LogicalPageID{Allocator: identity.allocator, Sequence: identity.slot}
-		layout.Bindings[i].Version = PageVersionID{Allocator: version, Sequence: uint64(i + 1)}
-		layout.Bindings[i].Chunk, layout.Bindings[i].Slot = layout.Bindings[i].Page.Chunk()
-	}
-	packed, err := layout.PackByLogicalChunk()
+func TestCapturedMemoryLayoutChunkOrderedAllowsDivergedCOWAliases(t *testing.T) {
+	f := newLogicalPageTestMemoryFile()
+	source, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPhysicalPages := []uint64{3, 1, 0, 2}
-	for i, binding := range packed.Bindings {
-		if got, want := binding.OldOffset, fr.Start+wantPhysicalPages[i]*page; got != want {
-			t.Fatalf("packed binding %d offset=%#x, want %#x", i, got, want)
-		}
-		if got, want := binding.StreamOffset, uint64(i)*page; got != want {
-			t.Fatalf("packed binding %d stream offset=%#x, want %#x", i, got, want)
-		}
-		if i != 0 && packed.Bindings[i-1].Chunk == binding.Chunk &&
-			packed.Bindings[i-1].StreamOffset+page != binding.StreamOffset {
-			t.Fatalf("logical chunk is not contiguous at binding %d", i)
-		}
+	target, err := f.findAllocatableAndMarkUsed(&allocState{
+		length: page,
+		opts:   AllocOpts{Dir: BottomUp},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	var packedBytes uint64
-	for i, region := range packed.Regions {
-		if !region.LogicalChunked || region.ID != RemoteRegionID(i+1) {
-			t.Fatalf("packed region %d = %+v", i, region)
-		}
-		packedBytes += region.Range.Length()
+	defer f.DecRef(target)
+	defer f.DecRef(source)
+	if err := f.AdoptCOWIdentities(f, source, target); err != nil {
+		t.Fatal(err)
 	}
-	if packedBytes != fr.Length() {
-		t.Fatalf("packed regions contain %#x bytes, want %#x", packedBytes, fr.Length())
+	sourcePage, sourceVersion, ok := f.LogicalPageVersionAt(source.Start)
+	if !ok {
+		t.Fatal("source page has no identities")
+	}
+	targetPage, targetVersion, ok := f.LogicalPageVersionAt(target.Start)
+	if !ok {
+		t.Fatal("target page has no identities")
+	}
+	if sourcePage != targetPage || sourceVersion == targetVersion {
+		t.Fatalf("CoW identities source=(%+v,%+v) target=(%+v,%+v)", sourcePage, sourceVersion, targetPage, targetVersion)
+	}
+	chunk, slot := sourcePage.Chunk()
+	layout := CapturedMemoryLayout{
+		Regions: []RemoteSnapshotRegion{{ID: 1, File: f, Range: memmap.FileRange{Start: source.Start, End: target.End}}},
+		Bindings: []CapturedPageBinding{
+			{OldOffset: source.Start, References: 1, Page: sourcePage, Version: sourceVersion, Chunk: chunk, Slot: slot},
+			{OldOffset: target.Start, References: 1, Page: targetPage, Version: targetVersion, Chunk: chunk, Slot: slot},
+		},
+	}
+	ordered, err := layout.ChunkOrdered()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(ordered.Bindings); got != 2 {
+		t.Fatalf("got %d bindings, want 2", got)
+	}
+	if ordered.Bindings[0].Page != ordered.Bindings[1].Page || ordered.Bindings[0].Version == ordered.Bindings[1].Version {
+		t.Fatalf("ordered bindings lost divergent CoW versions: %+v", ordered.Bindings)
 	}
 }
 

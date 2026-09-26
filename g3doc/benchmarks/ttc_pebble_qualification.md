@@ -9,10 +9,12 @@ durable commits, branch deletion, and crash recovery. It does not exercise the
 gVisor `MemoryFile`, guest page faults, VFS coherence, remote reads, or the
 eventual TTC reachability collector.
 
-The runtime subsequently implemented immutable **1 MiB loose chunk files on
-TTC's shared filesystem** and postponed Pebble entirely. The
-64 KiB loose-file and Pebble results below remain historical qualification
-data; they do not qualify or predict the new 1 MiB format.
+The runtime subsequently postponed Pebble and implemented immutable **1 MiB
+snapshot-graph records**. Standalone roots store those records directly in the
+authoritative graph object store; clustered roots publish them in indexed
+shared packs and cache them on demand. The 64 KiB loose-file and Pebble results
+below remain historical qualification data; they do not qualify or predict the
+current format.
 
 The harness is in `tools/ttc/storage_benchmark`. It intentionally lives in a
 small standalone Go module so that changing the candidate storage engine does
@@ -320,12 +322,12 @@ acceptance tests.
 ## Conclusion and gate
 
 Pebble passed this synthetic functional gate but is not in TTC's runtime. TTC
-now uses 1 MiB loose chunk files for memory hydration and shared-filesystem
-remote fork. Pebble is not selected for memory, rootfs, or managed-volume
-storage.
+now uses immutable 1 MiB snapshot-graph records for memory hydration and
+shared-filesystem remote fork. Pebble is not selected for memory, rootfs, or
+managed-volume storage.
 
 No Pebble integration work is planned. If that decision is revisited after the
-loose-chunk implementation is measured, ordinary SST values were the safer
+snapshot-graph implementation is measured, ordinary SST values were the safer
 mode in this historical test. Pebble's experimental blob mode had a real
 write-amplification advantage under complete overwrite churn, but lost
 branch-read latency and steady-state disk space.

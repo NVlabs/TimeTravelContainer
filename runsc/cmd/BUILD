@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "checkpoint.go",
         "cmd.go",
+        "console_follower.go",
         "cpu_features.go",
         "create.go",
         "debug.go",
@@ -63,6 +64,8 @@ go_library(
         "//pkg/cpuid",
         "//pkg/lisafs",
         "//pkg/log",
+		"//pkg/ttcpack",
+		"//pkg/ttcsnapshot",
         "//pkg/metric",
         "//pkg/prometheus",
         "//pkg/sentry/checkpoint",

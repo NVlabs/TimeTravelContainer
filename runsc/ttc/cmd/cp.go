@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,8 +38,9 @@ import (
 )
 
 const (
-	copyContentsPAXKey = "TTC.source-contents"
-	copyHelperArg      = "_cp-helper"
+	copyContentsPAXKey   = "TTC.source-contents"
+	copyHelperArg        = "_cp-helper"
+	copyPreparedInputArg = "--ttc-prepared-input"
 )
 
 // guestCopyHelper contains a Linux executable used for copy operations inside
@@ -53,8 +55,9 @@ func SetGuestCopyHelper(binary []byte) {
 }
 
 type copyCommandOptions struct {
-	archive    bool
-	followLink bool
+	archive       bool
+	followLink    bool
+	preparedInput bool
 }
 
 type copyContainerEndpoint struct {
@@ -84,6 +87,11 @@ func parseCopyCommandArgs(args []string) (copyCommandOptions, string, string, er
 		}
 		if arg == "--follow-link" || arg == "-L" {
 			opts.followLink = true
+			index++
+			continue
+		}
+		if arg == copyPreparedInputArg {
+			opts.preparedInput = true
 			index++
 			continue
 		}
@@ -249,8 +257,8 @@ func runCopy(args []string, stdout, _ io.Writer, backend backend) error {
 	}
 
 	input := copyBackend.copyInput()
-	rawArchive := source == "-"
-	if !rawArchive {
+	rawArchive := source == "-" && !opts.preparedInput
+	if source != "-" {
 		reader, writer := io.Pipe()
 		producer := make(chan error, 1)
 		go func() {
@@ -265,7 +273,7 @@ func runCopy(args []string, stdout, _ io.Writer, backend backend) error {
 	if input == nil {
 		return errors.New("cp from '-' requires standard input")
 	}
-	return copyBackend.importContainerPath(destinationEndpoint.target, destinationEndpoint.path, opts.archive, true, input)
+	return copyBackend.importContainerPath(destinationEndpoint.target, destinationEndpoint.path, opts.archive, rawArchive, input)
 }
 
 func (b *runtimeBackend) copyInput() io.Reader {
@@ -298,7 +306,13 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 	if err != nil {
 		return err
 	}
-	families, err := b.listRuntimeFamilies()
+	// A copy takes time in proportion to what it copies. Other commands go
+	// on meanwhile, and none may change the family: the copy's helper runs
+	// in the branch's Kernel, or mounts the branch's filesystem itself.
+	copying := func(copy func() error) error {
+		return b.withoutLifecycleLock(info, longOperation{branch: resolved.branch, state: "copying"}, copy)
+	}
+	families, err := b.listRuntimeFamiliesOf(resolved.container)
 	if err != nil {
 		return err
 	}
@@ -314,23 +328,27 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 				continue
 			}
 			switch branch.State {
-			case "running":
-				return b.runLiveCopyHelper(resolved, helperArgs, input, output, false)
-			case "paused":
-				return b.runLiveCopyHelper(resolved, helperArgs, input, output, true)
-			case "dehydrated":
-				// A dehydrated branch has no Kernel or open filesystem handles.
-				// Its persistent TTC volume branches can therefore be mounted by
-				// the short-lived offline helper without rehydrating it or
-				// disturbing live peers in the family.
-				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+			case "running", "paused":
+				return copying(func() error {
+					return b.runLiveCopyHelper(resolved, helperArgs, input, output, branch.State == "paused")
+				})
 			default:
+				if offlineCopyState(branch.State) {
+					// These states have no Kernel or open filesystem handles for this
+					// branch. Its persistent TTC volume branches can therefore be
+					// mounted by the short-lived helper without disturbing live peers.
+					return copying(func() error {
+						return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+					})
+				}
 				return fmt.Errorf("cannot copy to or from branch %q while it is %s", resolved.branch, branch.State)
 			}
 		}
 		for _, branch := range info.Branches {
-			if branch.ID == resolved.branch && branch.State == "dehydrated" {
-				return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+			if branch.ID == resolved.branch && offlineCopyState(branch.State) {
+				return copying(func() error {
+					return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+				})
 			}
 		}
 		return fmt.Errorf("cannot copy the offline branch %q while another branch in its family is live", resolved.branch)
@@ -339,9 +357,20 @@ func (b *runtimeBackend) runCopyHelper(target selector, helperArgs []string, inp
 		if branch.ID != resolved.branch {
 			continue
 		}
-		return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+		return copying(func() error {
+			return b.runOfflineCopyHelper(resolved, info, helperArgs, input, output)
+		})
 	}
 	return fmt.Errorf("branch %q does not exist", resolved.branch)
+}
+
+func offlineCopyState(state string) bool {
+	switch state {
+	case "dehydrated", "exited", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
@@ -372,10 +401,9 @@ func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
 		_ = os.Remove(name)
 		return helper, nil
 	}
-	executable := b.clientExecutable
-	if executable == "" {
-		executable = currentExecutable()
-	}
+	// The copy helper is built into ttcd. Donating the daemon executable keeps
+	// the client binary out of the Sentry and out of the wire protocol.
+	executable := currentExecutable()
 	helper, err := os.Open(executable)
 	if err != nil {
 		return nil, fmt.Errorf("opening TTC copy helper %q: %w", executable, err)
@@ -464,6 +492,17 @@ func offlineCopyBranch(info ttcbundle.ContainerInfo, visible string) string {
 	return ttcvolume.ScopedBranchID(info.ID, visible)
 }
 
+// repositoryPhysicalBranch resolves the one intentional heterogeneous case:
+// an initial container branch may mount a read-only named-volume snapshot
+// whose physical branch differs from the family-private rootfs branch.
+// Descendants use one scoped identity across all repositories.
+func repositoryPhysicalBranch(config specutils.TTCVolumeRepository, filesystemBranch string) string {
+	if filesystemBranch == ttcvolume.MainBranch && config.Branch != "" {
+		return config.Branch
+	}
+	return filesystemBranch
+}
+
 func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch string, helperArgs []string) (*specs.Spec, error) {
 	encoded, err := json.Marshal(original)
 	if err != nil {
@@ -494,6 +533,12 @@ func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch 
 		cloned.Annotations = make(map[string]string)
 	}
 	delete(cloned.Annotations, "dev.timetravelcontainer.internal-console")
+	// The copy helper deliberately runs outside the container's host cgroup and
+	// therefore drops Linux.Resources above. PidsLimitAnnotation is a contract
+	// with the Sentry that linux.resources.pids is present; retaining only the
+	// marker makes loader construction fail before the helper can inspect a
+	// stopped or dehydrated filesystem.
+	delete(cloned.Annotations, ttcbundle.PidsLimitAnnotation)
 	repositories, err := specutils.TTCVolumeRepositories(&cloned)
 	if err != nil {
 		return nil, err
@@ -512,7 +557,7 @@ func offlineCopySpec(original *specs.Spec, info ttcbundle.ContainerInfo, branch 
 	}
 	persistentBranch := offlineCopyBranch(info, branch)
 	for i := range repositories {
-		repositories[i].Branch = persistentBranch
+		repositories[i].Branch = repositoryPhysicalBranch(repositories[i], persistentBranch)
 	}
 	encoded, err = json.Marshal(repositories)
 	if err != nil {
@@ -539,6 +584,36 @@ func writeOfflineCopySpec(bundleDir string, spec *specs.Spec) error {
 }
 
 func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.ContainerInfo, helperArgs []string, input io.Reader, output io.Writer) error {
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if b.nodeID != "" && branch.StorageManifest != "" {
+		if len(helperArgs) == 0 || helperArgs[0] != "export" {
+			return fmt.Errorf("cannot copy into durable unplaced branch %q; rehydrate it first", resolved.branch)
+		}
+		// The canonical OCI spec records image identity, but its rootfs path was
+		// created on the branch's previous owner. Offline cp has no live target
+		// runtime that would normally populate this node's image cache, so do it
+		// explicitly before asking the gofer to open the rewritten local path.
+		refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+		if err != nil {
+			return fmt.Errorf("materializing immutable image for offline copy: %w", err)
+		}
+		info = refreshed
+		branch, err = persistentBranchInfo(info, resolved.branch)
+		if err != nil {
+			return err
+		}
+		// StorageState describes an in-progress local cache/placement action,
+		// not whether the durable immutable backing ceased to exist. A cold fork
+		// can leave its dehydrated source marked materializing while the child
+		// starts from the same lazy repository. Offline helpers have no donated
+		// relay FDs, so always make a manifested cold branch self-contained.
+		if err := b.materializeColdFilesystem(info, branch); err != nil {
+			return fmt.Errorf("materializing filesystem for durable branch %q: %w", resolved.branch, err)
+		}
+	}
 	original, err := b.containerStore().LoadSpec(info.ID)
 	if err != nil {
 		return err
@@ -547,7 +622,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 	if err != nil {
 		return err
 	}
-	tempRoot := filepath.Join(b.dataRoot, "tmp")
+	tempRoot := filepath.Join(b.activeDataRoot(), "tmp")
 	if err := os.MkdirAll(tempRoot, 0700); err != nil {
 		return fmt.Errorf("creating TTC temporary directory: %w", err)
 	}
@@ -601,6 +676,11 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 
 func runCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return copyhelper.Run(args, stdin, stdout, stderr)
+}
+
+// RunCopyHelper runs the private container-side copy helper embedded in ttcd.
+func RunCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runCopyHelper(args, stdin, stdout, stderr)
 }
 
 type copyFileIdentity struct {

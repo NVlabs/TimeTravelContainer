@@ -20,10 +20,12 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -237,12 +239,55 @@ func (mm *MemoryManager) loadPmas(ctx goContext.Context, saved []pmaFlatSegment)
 // afterLoad is invoked by stateify.
 func (m *SpecialMappable) afterLoad(ctx goContext.Context) {
 	m.mf = pgalloc.MemoryFileFromContext(ctx)
-	if relocated, err := pgalloc.RelocateMemoryFileRange(ctx, m.mf, m.fr); err != nil {
-		panic(fmt.Sprintf("relocating SpecialMappable %q: %v", m.name, err))
-	} else {
-		m.fr = relocated
+	allocated := false
+	if relocation := pgalloc.SparseRelocationFromContext(ctx); relocation != nil {
+		runs, err := relocation.Runs(m.mf.ResourceID(), m.fr)
+		if err != nil {
+			panic(fmt.Sprintf("relocating SpecialMappable %q: %v", m.name, err))
+		}
+		if len(runs) == 1 {
+			m.fr = runs[0]
+		} else {
+			// SpecialMappable's stable state schema represents a single range.
+			// Sparse chunk reuse may place adjacent logical pages in multiple
+			// physical runs, so materialize only this small special mapping into
+			// a contiguous target-owned range. This preserves wire compatibility
+			// with already-running Sentries while ordinary application memory
+			// remains lazy and page-granular CoW.
+			contiguous, err := m.mf.Allocate(m.fr.Length(), pgalloc.AllocOpts{
+				Kind: usage.System,
+				Mode: pgalloc.AllocateAndCommit,
+			})
+			if err != nil {
+				panic(fmt.Sprintf("allocating relocated SpecialMappable %q: %v", m.name, err))
+			}
+			transaction, ok := ctx.Value(pgalloc.CtxSparseRestoreRefs).(*pgalloc.SparseReferenceTransaction)
+			if !ok || transaction == nil {
+				m.mf.DecRef(contiguous)
+				panic(fmt.Sprintf("relocating discontiguous SpecialMappable %q without a restore transaction", m.name))
+			}
+			transaction.AddAllocation(m.mf, contiguous, 0)
+			destination, err := m.mf.MapInternal(contiguous, hostarch.Write)
+			if err != nil {
+				panic(fmt.Sprintf("mapping relocated SpecialMappable %q destination: %v", m.name, err))
+			}
+			var copied uint64
+			for _, run := range runs {
+				source, err := m.mf.MapInternal(run, hostarch.Read)
+				if err != nil {
+					panic(fmt.Sprintf("mapping relocated SpecialMappable %q source: %v", m.name, err))
+				}
+				n, err := safemem.CopySeq(destination.DropFirst64(copied), source)
+				copied += n
+				if err != nil || n != run.Length() {
+					panic(fmt.Sprintf("copying relocated SpecialMappable %q: copied %d of %d bytes: %v", m.name, n, run.Length(), err))
+				}
+			}
+			m.fr = contiguous
+			allocated = true
+		}
 	}
-	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) {
+	if pgalloc.LiveForkCloneNeedsPageRefs(ctx) && !allocated {
 		pgalloc.AcquireRestoreRef(ctx, m.mf, m.fr, 0)
 	}
 }

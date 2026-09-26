@@ -3,6 +3,7 @@
 
 import argparse
 import concurrent.futures
+import errno
 import json
 import os
 import pathlib
@@ -28,25 +29,35 @@ def run(argv, *, env=None, timeout=120, check=True, capture=True):
     return result
 
 
-def make_certificates(root):
-    ca = root / "ca.pem"
-    if ca.exists():
-        return
-    run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-         "-days", "2", "-subj", "/CN=ttc-benchmark-ca",
-         "-keyout", root / "ca.key", "-out", ca])
-    for node in ("node-a", "node-b"):
-        run(["openssl", "req", "-newkey", "rsa:2048", "-nodes",
-             "-subj", f"/CN={node}", "-keyout", root / f"{node}.key",
-             "-out", root / f"{node}.csr"])
-        ext = root / f"{node}.ext"
-        ext.write_text(
-            f"subjectAltName=DNS:{node},IP:127.0.0.1\n"
-            "extendedKeyUsage=serverAuth,clientAuth\n", encoding="utf-8")
-        run(["openssl", "x509", "-req", "-days", "2",
-             "-in", root / f"{node}.csr", "-CA", ca,
-             "-CAkey", root / "ca.key", "-CAcreateserial",
-             "-extfile", ext, "-out", root / f"{node}.pem"])
+def remove_tree(path, timeout=30):
+    """Remove a dedicated test tree after network-FS close propagation."""
+    deadline = time.monotonic() + timeout
+    while path.exists():
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EBUSY, errno.ENOTEMPTY) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
+def processes_using_root(root):
+    """Returns processes whose argv still names this dedicated test root."""
+    needle = os.fsencode(str(root))
+    result = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        argv0 = command.split(b"\0", 1)[0].rsplit(b"/", 1)[-1]
+        is_runtime = argv0 in (b"ttcd", b"runsc", b"runsc-gofer") or argv0.startswith(b"ttc-sentry[")
+        if is_runtime and needle in command:
+            result.append((int(entry.name), command.replace(b"\0", b" ").decode(errors="replace")))
+    return result
 
 
 def make_worker(root):
@@ -91,10 +102,10 @@ class Experiment:
         self.root = root
         self.runtime_a = root / "runtime-a"
         self.runtime_b = root / "runtime-b"
-        self.data = root / "data"
+        self.data = args.data_dir or (root / "data")
         unique = f"{os.getpid()}-{repetition}-{time.time_ns()}"
         self.source = f"bench-source-{unique}"
-        self.targets = [f"bench-target-{unique}-{i}" for i in range(int(case.get("fanout", 1)))]
+        self.targets = [f"target-{i}" for i in range(int(case.get("fanout", 1)))]
         self.source_id = ""
         self.target_ids = []
         self.txids = []
@@ -102,16 +113,24 @@ class Experiment:
         self.source_node = "node-a"
         self.target_node = "node-b"
 
-    @staticmethod
-    def branch(container):
-        return f"{container}@main"
+    def branch(self, branch):
+        return f"{self.source}@{branch}"
 
     def env(self, node):
         runtime = self.runtime_a if node == "a" else self.runtime_b
         result = os.environ.copy()
-        result["TTC_RUNTIME_DIR"] = str(runtime)
-        result["TTC_DATA_ROOT"] = str(self.data)
+        result.update({
+            "TTC_ROOT": str(self.data),
+            "TTC_LOCAL_ROOT": str(runtime / "data"),
+            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
+        })
+        result.pop("TTC_DATA_ROOT", None)
+        result.pop("TTC_RUNTIME_DIR", None)
         return result
+
+    def runsc_root(self, node):
+        runtime = self.runtime_a if node == "a" else self.runtime_b
+        return runtime / "data" / "runtime" / "runsc"
 
     def ttc(self, node, *argv, timeout=120, check=True):
         return run([self.args.ttc, *argv], env=self.env(node), timeout=timeout, check=check)
@@ -129,11 +148,9 @@ class Experiment:
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(0o700)
         common = [
-            "--unsafe-no-host-isolation", "--allow-slow-volume-copy",
+            "--unsafe-no-host-isolation",
             "--cluster-repository-id", "ttc-benchmark",
-            "--cluster-ca", self.root / "ca.pem",
-            "--cluster-page-listen", "127.0.0.1:0",
-            "--cluster-page-advertise", "127.0.0.1:0",
+            "--cluster-lease", self.args.cluster_lease,
             "--cluster-transfer-bytes", self.case["transfer_bytes"],
             "--cluster-max-outstanding-bytes", self.case["max_outstanding_bytes"],
             "--cluster-max-parallel", self.case["max_parallel"],
@@ -143,23 +160,13 @@ class Experiment:
             "--cluster-push", self.case["push"],
         ]
         node_a = [
-            "--cluster-listen", "127.0.0.1:27443",
-            "--cluster-node-id", "node-a",
-            "--cluster-cert", self.root / "node-a.pem",
-            "--cluster-key", self.root / "node-a.key",
+            "--cluster-init", "--listen", "127.0.0.1:27443",
+            "--node", "node-a", "--advertise", "127.0.0.1:27443",
         ]
         node_b = [
-            "--cluster-listen", "127.0.0.1:37443",
-            "--cluster-node-id", "node-b",
-            "--cluster-cert", self.root / "node-b.pem",
-            "--cluster-key", self.root / "node-b.key",
+            "--cluster-join", "127.0.0.1:27443", "--listen", "127.0.0.1:37443",
+            "--node", "node-b", "--advertise", "127.0.0.1:37443",
         ]
-        if self.args.dynamic_discovery:
-            node_a += ["--cluster-advertise", "https://127.0.0.1:27443,node-a"]
-            node_b += ["--cluster-advertise", "https://127.0.0.1:37443,node-b"]
-        else:
-            node_a += ["--cluster-peer", "node-b=https://127.0.0.1:37443,node-b"]
-            node_b += ["--cluster-peer", "node-a=https://127.0.0.1:27443,node-a"]
         self.ttc("a", "daemon", "start", *common, *node_a)
         try:
             self.ttc("b", "daemon", "start", *common, *node_b)
@@ -201,27 +208,30 @@ class Experiment:
             raise RuntimeError(f"inspect returned {len(records)} records")
         return records[0]
 
+    def stats(self, node):
+        return json.loads(self.ttc(node, "stats", "--json", self.branch("main")).stdout)
+
     def source_status(self, transaction):
         if not self.source_id or not transaction:
             return None
         source_client = self.client_for_node(self.source_node)
         runtime = self.runtime_a if source_client == "a" else self.runtime_b
         result = run([
-            self.args.ttcd, "runsc", "--root", runtime / "runsc",
+            self.args.ttcd, "runsc", "--root", self.runsc_root("a"),
             "timetravel", self.source_id, "distributed-status", transaction,
         ], check=False, timeout=15)
         if result.returncode:
             return None
         return json.loads(result.stdout)
 
-    def target_status(self, target_id):
-        if not target_id:
+    def target_status(self, branch):
+        if not self.source_id:
             return None
         target_client = self.client_for_node(self.target_node)
         runtime = self.runtime_a if target_client == "a" else self.runtime_b
         result = run([
-            self.args.ttcd, "runsc", "--root", runtime / "runsc",
-            "timetravel", target_id, "distributed-dependency", "main",
+            self.args.ttcd, "runsc", "--root", self.runsc_root("b"),
+            "timetravel", self.source_id, "distributed-dependency", branch,
         ], check=False, timeout=15)
         if result.returncode:
             return None
@@ -235,38 +245,33 @@ class Experiment:
             self.ttc("a", "pull", self.args.image, timeout=600)
         assets = make_worker(self.root)
         result = self.ttc(
-            "a", "run", "-d", "--name", self.source,
+            "a", "run", "--node", "node-a", "-d", "--name", self.source,
             "-v", f"{assets}:/bench:copy", self.args.image,
             "/bench/page-worker", self.case["memory_mib"], self.case["workload"],
             self.case["touch_fraction"], self.case["rounds"],
         )
         self.source_id = result.stdout.strip()
-        source_record = self.inspect("a", self.source)
-        source_branches = source_record["TTC"]["container"]["branches"]
-        source_main = next((branch for branch in source_branches if branch["id"] == "main"), None)
-        if source_main is None or not source_main.get("node_id"):
-            raise RuntimeError(f"source placement omitted node ownership: {source_branches!r}")
-        self.source_node = source_main["node_id"]
-        self.target_node = "node-b" if self.source_node == "node-a" else "node-a"
-        source_client = self.client_for_node(self.source_node)
-        target_client = self.client_for_node(self.target_node)
-        self.wait_exec(source_client, self.branch(self.source),
+        self.wait_exec("a", self.branch("main"),
                        "while [ ! -f /tmp/ttc-bench-ready ]; do sleep 0.05; done", 120)
         self.shape_network()
         fork_start = time.monotonic_ns()
         if self.case["capture_mode"] == "batch":
-            self.ttc(source_client, "fork", "--target", self.target_node, self.branch(self.source),
-                     *(self.branch(target) for target in self.targets), timeout=300)
+            self.ttc("a", "fork", "--node", "node-b", self.branch("main"),
+                     *self.targets, timeout=300)
         elif self.case["capture_mode"] == "sequential":
             for target in self.targets:
-                self.ttc(source_client, "fork", "--target", self.target_node, self.branch(self.source),
-                         self.branch(target), timeout=300)
+                self.ttc("a", "fork", "--node", "node-b", self.branch("main"),
+                         target, timeout=300)
         else:
             raise ValueError(f"unknown capture_mode {self.case['capture_mode']!r}")
         fork_end = time.monotonic_ns()
-        inspected = [self.inspect(target_client, target) for target in self.targets]
-        self.target_ids = [target["TTC"]["container"]["id"] for target in inspected]
-        self.txids = [target["TTC"]["distributed_fork"]["identity"]["transaction_id"] for target in inspected]
+        inspected = self.inspect("b", self.source)
+        branch_metadata = {
+            branch["id"]: branch
+            for branch in inspected["TTC"]["container"]["branches"]
+        }
+        self.target_ids = [self.source_id for _ in self.targets]
+        self.txids = [branch_metadata[target]["distributed_fork_transaction_id"] for target in self.targets]
         dehydrate_ms = None
         rehydrate_ms = None
         if self.args.verify_dehydrate:
@@ -291,18 +296,37 @@ class Experiment:
         work_end = time.monotonic_ns()
         independent_ms = None
         deadline = time.monotonic() + self.args.independence_timeout
-        final = inspected
+        final = []
         while time.monotonic() < deadline:
-            final = [self.inspect(target_client, target) for target in self.targets]
-            if all(target["TTC"]["distributed_fork"]["state"] == "independent" for target in final):
+            resource = self.stats("b")
+            by_target = {branch["target"]: branch for branch in resource["branches"]}
+            final = [by_target.get(self.branch(target)) for target in self.targets]
+            if all(status is not None and
+                   status.get("dependent_memory_bytes", 0) == 0 and
+                   status.get("dependent_filesystem_bytes", 0) == 0
+                   for status in final):
                 independent_ms = (time.monotonic_ns() - fork_start) / 1e6
                 break
             time.sleep(0.05)
         statuses = [self.source_status(txid) for txid in self.txids]
-        target_statuses = [self.target_status(target_id) for target_id in self.target_ids]
-        source_ok = self.ttc(source_client, "exec", self.branch(self.source), "true", check=False).returncode == 0
-        target_ok = [self.ttc(target_client, "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
-        routed_target_ok = [self.ttc(source_client, "exec", self.branch(target), "true", check=False).returncode == 0 for target in self.targets]
+        target_statuses = [self.target_status(target) for target in self.targets]
+        source_probe = self.ttc("a", "exec", self.branch("main"), "true", check=False)
+        target_probes = [self.ttc("b", "exec", self.branch(target), "true", check=False) for target in self.targets]
+        routed_target_probes = [self.ttc("a", "exec", self.branch(target), "true", check=False) for target in self.targets]
+        source_ok = source_probe.returncode == 0
+        target_ok = [probe.returncode == 0 for probe in target_probes]
+        routed_target_ok = [probe.returncode == 0 for probe in routed_target_probes]
+        if not source_ok or not all(target_ok) or not all(routed_target_ok):
+            diagnostics = []
+            if not source_ok:
+                diagnostics.append(f"source via node-a: {source_probe.stderr.strip()}")
+            for index, probe in enumerate(target_probes):
+                if probe.returncode:
+                    diagnostics.append(f"target {index} via node-b: {probe.stderr.strip()}")
+            for index, probe in enumerate(routed_target_probes):
+                if probe.returncode:
+                    diagnostics.append(f"target {index} via node-a: {probe.stderr.strip()}")
+            raise RuntimeError("post-workload cluster routing validation failed:\n" + "\n".join(diagnostics))
         return {
             "schema_version": 2,
             "case": self.case,
@@ -317,9 +341,8 @@ class Experiment:
             "target_ok": target_ok,
             "routed_target_ok": routed_target_ok,
             "dynamic_discovery": self.args.dynamic_discovery,
-            "source_node": self.source_node,
-            "target_node": self.target_node,
-            "transactions": [target["TTC"]["distributed_fork"] for target in final],
+            "transaction_ids": self.txids,
+            "target_resources": final,
             "source_live_statuses": statuses,
             "target_loader_statuses": target_statuses,
             "wall_ms": (time.time_ns() - started) / 1e6,
@@ -335,36 +358,43 @@ class Experiment:
                 return self.ttc(node, *argv, check=False, timeout=timeout).returncode == 0
             except Exception:
                 return False
-        # Stop the source first while its peer is reachable. This lets ttcd
-        # request a complete target drain for demand-only runs; stopping the
-        # target first can intentionally make source shutdown refuse to lose
-        # remotely-owned pages.
-        source_client = self.client_for_node(self.source_node)
-        target_client = self.client_for_node(self.target_node)
-        stopped_source = safe_ttc(source_client, "daemon", "stop", timeout=120)
-        if not stopped_source and self.source_id:
+        # Remove the logical family while both owners and every dependency are
+        # reachable, then stop the now-empty daemons independently.
+        removed = safe_ttc("a", "rm", "-f", self.source, timeout=120)
+        if not removed and self.source_id:
             # Preserve teardown even when the experiment exposed a dependency
             # bug: explicitly cancel each source snapshot while its Sentry is
             # still reachable, then retry daemon shutdown after target removal.
             for transaction in self.txids:
                 try:
                     run([
-                        self.args.ttcd, "runsc", "--root",
-                        self.runtime_a / "runsc" if source_client == "a" else self.runtime_b / "runsc",
+                        self.args.ttcd, "runsc", "--root", self.runsc_root("a"),
                         "timetravel", self.source_id, "distributed-cancel", transaction,
                     ], check=False, timeout=15)
                 except Exception:
                     pass
-        for target in self.targets:
-            safe_ttc(target_client, "rm", "-f", target)
-        stopped_target = safe_ttc(target_client, "daemon", "stop", timeout=60)
-        if not stopped_source:
-            safe_ttc(source_client, "rm", "-f", self.source)
-            stopped_source = safe_ttc(source_client, "daemon", "stop", timeout=60)
-        if stopped_source:
-            shutil.rmtree(self.runtime_a if source_client == "a" else self.runtime_b, ignore_errors=True)
-        if stopped_target:
-            shutil.rmtree(self.runtime_a if target_client == "a" else self.runtime_b, ignore_errors=True)
+            safe_ttc("b", "rm", "-f", self.source, timeout=120)
+        stopped_b = safe_ttc("b", "daemon", "stop", "--stop-all", timeout=60)
+        stopped_a = safe_ttc("a", "daemon", "stop", "--stop-all", timeout=60)
+        # A completed daemon response can precede the final Sentry/gofer reap.
+        # Never delete the dedicated roots while one of those children can still
+        # flush metadata or hold donated descriptors into them.
+        stopped_a = stopped_a or not (self.runtime_a / "run" / "ttcd.sock").exists()
+        stopped_b = stopped_b or not (self.runtime_b / "run" / "ttcd.sock").exists()
+        if stopped_a and stopped_b:
+            # The cluster HTTP server permits an in-flight proxied stop
+            # response to drain for up to 30 seconds before forcing close.
+            deadline = time.monotonic() + 45
+            while active := processes_using_root(self.root):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"test-root processes survived daemon shutdown: {active!r}")
+                time.sleep(0.1)
+        if stopped_a:
+            shutil.rmtree(self.runtime_a, ignore_errors=True)
+        if stopped_b:
+            shutil.rmtree(self.runtime_b, ignore_errors=True)
+        if stopped_a and stopped_b:
+            remove_tree(self.data)
 
 
 DEFAULT_CASE = {
@@ -417,8 +447,16 @@ def main():
     parser.add_argument("--matrix", help="JSON matrix file; omit for one default case")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--work-dir", help="persistent cache/results directory")
+    parser.add_argument(
+        "--data-dir",
+        help="fresh shared TTC_ROOT; defaults to WORK_DIR/data",
+    )
     parser.add_argument("--output", help="JSONL output (default: stdout only)")
     parser.add_argument("--independence-timeout", type=float, default=2.0)
+    parser.add_argument(
+        "--cluster-lease", default="3s",
+        help="cluster membership lease (increase when shared storage is throttled)",
+    )
     parser.add_argument(
         "--dynamic-discovery", action="store_true",
         help="discover peers from shared lease records instead of --cluster-peer",
@@ -427,27 +465,43 @@ def main():
         "--verify-dehydrate", action="store_true",
         help="dehydrate and rehydrate every remote target before its workload",
     )
+    parser.add_argument(
+        "--preserve-on-failure", action="store_true",
+        help="leave daemons and dedicated roots intact when a run fails",
+    )
     args = parser.parse_args()
-    root = pathlib.Path(args.work_dir or tempfile.mkdtemp(prefix="ttc-distributed-benchmark."))
+    root = pathlib.Path(args.work_dir or tempfile.mkdtemp(prefix="ttc-distributed-benchmark.")).resolve()
+    if args.data_dir:
+        args.data_dir = pathlib.Path(args.data_dir).resolve()
+        if args.data_dir.exists():
+            parser.error("--data-dir must name a new, dedicated test directory")
     root.mkdir(parents=True, exist_ok=True)
-    make_certificates(root)
     output = open(args.output, "a", encoding="utf-8") if args.output else None
+    preserve_root = False
     try:
         for case in load_cases(args.matrix):
             for repetition in range(args.repetitions):
                 experiment = Experiment(args, case, repetition, root)
+                failed = False
                 try:
                     record = experiment.run()
                 except Exception as error:
+                    failed = True
                     record = {
                         "schema_version": 2, "case": case,
                         "repetition": repetition, "error": str(error),
                     }
                 finally:
-                    try:
-                        experiment.cleanup()
-                    except Exception as cleanup_error:
-                        record["cleanup_error"] = str(cleanup_error)
+                    if failed and args.preserve_on_failure:
+                        preserve_root = True
+                        record["preserved_work_dir"] = str(root)
+                        record["preserved_data_dir"] = str(experiment.data)
+                    else:
+                        try:
+                            experiment.cleanup()
+                        except Exception as cleanup_error:
+                            preserve_root = True
+                            record["cleanup_error"] = str(cleanup_error)
                 line = json.dumps(record, sort_keys=True)
                 print(line, flush=True)
                 if output:
@@ -458,7 +512,7 @@ def main():
     finally:
         if output:
             output.close()
-        if not args.work_dir:
+        if not args.work_dir and not preserve_root:
             shutil.rmtree(root, ignore_errors=True)
     return 0
 

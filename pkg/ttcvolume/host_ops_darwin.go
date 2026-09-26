@@ -19,6 +19,7 @@ package ttcvolume
 import (
 	"errors"
 	"os"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -74,4 +75,15 @@ func allocateFile(file *os.File, offset, length int64) error {
 		}
 	}
 	return file.Truncate(end)
+}
+
+// directoryFDPath returns a path that names the open directory dir. Darwin
+// has no /proc/self/fd directory traversal; F_GETPATH recovers the path,
+// which is valid because the trusted-mode Sentry shares the host namespace.
+func directoryFDPath(dir *os.File) (string, error) {
+	var path [unix.PathMax]byte
+	if _, _, errno := unix.Syscall(unix.SYS_FCNTL, dir.Fd(), unix.F_GETPATH, uintptr(unsafe.Pointer(&path[0]))); errno != 0 {
+		return "", errno
+	}
+	return unix.ByteSliceToString(path[:]), nil
 }

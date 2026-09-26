@@ -30,6 +30,9 @@ import (
 const (
 	daemonMutationSchemaVersion = 1
 	daemonMutationRetention     = 2048
+	// Directory enumeration and JSON parsing are O(retained requests). Keep
+	// them off the foreground path while still bounding durable replay history.
+	daemonMutationCompactionInterval = 128
 )
 
 type daemonMutationRecord struct {
@@ -57,12 +60,11 @@ func newDaemonRequestID() (string, error) {
 
 func daemonMutationFingerprint(request daemonRequest) (string, error) {
 	value := struct {
-		Version int               `json:"version"`
-		Action  string            `json:"action"`
-		Options daemonWireOptions `json:"options"`
-		Args    []string          `json:"args"`
-		Stdin   bool              `json:"stdin"`
-	}{request.Version, request.Action, request.Options, request.Args, request.Stdin}
+		Version int      `json:"version"`
+		Action  string   `json:"action"`
+		Args    []string `json:"args"`
+		Stdin   bool     `json:"stdin"`
+	}{request.Version, request.Action, request.Args, request.Stdin}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return "", err
@@ -179,6 +181,37 @@ func beginDaemonMutation(dataRoot string, request daemonRequest) (daemonMutation
 	return record, false, nil
 }
 
+// replayCompletedDaemonMutation returns a previously committed result without
+// creating a new journal entry. Callers use this before validating mutable
+// routing and lifecycle state: a successful mutation may have intentionally
+// removed the very placement or runtime that guarded its first execution, and
+// a lost response must still replay that committed result. Fresh requests are
+// journaled only after ordinary preflight succeeds.
+func replayCompletedDaemonMutation(dataRoot string, request daemonRequest) (daemonMutationRecord, bool, error) {
+	path, err := daemonMutationPath(dataRoot, request.RequestID)
+	if err != nil {
+		return daemonMutationRecord{}, false, err
+	}
+	fingerprint, err := daemonMutationFingerprint(request)
+	if err != nil {
+		return daemonMutationRecord{}, false, err
+	}
+	record, err := loadDaemonMutation(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return daemonMutationRecord{}, false, nil
+	}
+	if err != nil {
+		return daemonMutationRecord{}, false, fmt.Errorf("loading daemon mutation record: %w", err)
+	}
+	if record.RequestID != request.RequestID || record.Fingerprint != fingerprint {
+		return daemonMutationRecord{}, false, fmt.Errorf("daemon request ID %s was reused for a different command", request.RequestID)
+	}
+	if record.State != "completed" {
+		return daemonMutationRecord{}, false, nil
+	}
+	return record, true, nil
+}
+
 func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status int, stdout, stderr []byte) (daemonMutationRecord, error) {
 	path, err := daemonMutationPath(dataRoot, record.RequestID)
 	if err != nil {
@@ -192,7 +225,6 @@ func completeDaemonMutation(dataRoot string, record daemonMutationRecord, status
 	if err := writeDurableJSON(path, &record); err != nil {
 		return daemonMutationRecord{}, fmt.Errorf("persisting daemon mutation result: %w", err)
 	}
-	_ = compactDaemonMutations(dataRoot, daemonMutationRetention)
 	return record, nil
 }
 

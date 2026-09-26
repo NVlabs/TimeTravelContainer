@@ -35,6 +35,36 @@ type Store struct {
 	mu  sync.Mutex
 }
 
+// TransactionCatalog is the linearizable distributed-operation authority.
+// Store is the previous local/shared-file implementation; cluster mode uses
+// the Raft implementation through this interface.
+type TransactionCatalog interface {
+	Create(*Transaction) error
+	Load(id string) (*Transaction, error)
+	Advance(id string, revision uint64, next TransactionState, failure string, now time.Time) (*Transaction, error)
+	AdvanceIndependent(id string, revision uint64, metrics TransferMetrics, now time.Time) (*Transaction, error)
+	Publish(id string, revision uint64, desiredPaused, activated bool, now time.Time) (*Transaction, error)
+	MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error)
+	BindSession(id string, revision uint64, digest string, now time.Time) (*Transaction, error)
+	BindGraphHandoff(id string, revision uint64, sparse GraphHandoffDescriptor, now time.Time) (*Transaction, error)
+	Delete(id string, revision uint64) error
+	List() ([]Transaction, error)
+}
+
+// AtomicTargetPublisher is implemented by the cluster Raft catalog. It binds
+// a published remote-fork transaction to its first placement in one revision.
+type AtomicTargetPublisher interface {
+	PublishTarget(id string, revision uint64, desiredPaused bool, family, branch, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error)
+}
+
+// AtomicMigrationTargetPublisher records the physical identity of a paused
+// migration target before the separate Raft cutover transfers ownership.
+type AtomicMigrationTargetPublisher interface {
+	PublishMigrationTarget(id string, revision uint64, desiredPaused bool, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error)
+}
+
+var _ TransactionCatalog = (*Store)(nil)
+
 // OpenStore opens or creates a private transaction directory.
 func OpenStore(dir string) (*Store, error) {
 	if dir == "" {
@@ -157,8 +187,51 @@ func (s *Store) Publish(id string, revision uint64, desiredPaused, activated boo
 	return tx, nil
 }
 
-// MarkActivated durably records that a migrated target reached its requested
-// running state after ownership CAS.
+// PublishMigrationTarget is the local-store equivalent used by control-plane
+// tests. Production clustered TTC uses the Raft implementation.
+func (s *Store) PublishMigrationTarget(id string, revision uint64, desiredPaused bool, physicalContainer, physicalBranch, targetIncarnation string) (*Transaction, error) {
+	path, err := s.path(id)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := loadTransaction(path, id)
+	if err != nil {
+		return nil, err
+	}
+	if tx.State == TransactionPublished {
+		if tx.DesiredPaused != desiredPaused || tx.Activated || tx.TargetPhysicalContainer != physicalContainer ||
+			tx.TargetPhysicalBranch != physicalBranch || tx.TargetPhysicalIncarnation != targetIncarnation {
+			return nil, errors.New("idempotent migration publication changed target identity")
+		}
+		return tx, nil
+	}
+	if tx.Revision != revision || tx.State != TransactionTargetPaused || !tx.Identity.Migration {
+		return nil, fmt.Errorf("migration transaction %q is %s revision %d, not target-paused revision %d", id, tx.State, tx.Revision, revision)
+	}
+	if physicalContainer == "" || physicalBranch == "" || targetIncarnation == "" {
+		return nil, errors.New("migration target physical identity is incomplete")
+	}
+	if err := tx.Advance(TransactionPublished, "", time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	tx.DesiredPaused = desiredPaused
+	tx.TargetPhysicalContainer = physicalContainer
+	tx.TargetPhysicalBranch = physicalBranch
+	tx.TargetPhysicalIncarnation = targetIncarnation
+	data, err := marshalTransaction(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.replace(path, data); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// MarkActivated durably records that a target reached its requested running
+// state after its placement grant committed.
 func (s *Store) MarkActivated(id string, revision uint64, now time.Time) (*Transaction, error) {
 	path, err := s.path(id)
 	if err != nil {
@@ -173,7 +246,8 @@ func (s *Store) MarkActivated(id string, revision uint64, now time.Time) (*Trans
 	if tx.Activated {
 		return tx, nil
 	}
-	if tx.Revision != revision || tx.State != TransactionPublished || !tx.Identity.Migration {
+	activatable := tx.State == TransactionPublished || tx.State == TransactionDraining || tx.State == TransactionIndependent
+	if tx.Revision != revision || !activatable {
 		return nil, fmt.Errorf("transaction %q cannot activate from %s revision %d", id, tx.State, tx.Revision)
 	}
 	tx.Activated = true
@@ -282,11 +356,11 @@ func (s *Store) BindSession(id string, revision uint64, digest string, now time.
 	return tx, nil
 }
 
-// BindSparseHandoff durably records the immutable shared-memory identity
+// BindGraphHandoff durably records the immutable shared-memory identity
 // before the target reader is switched. It deliberately does not advance the
 // transaction so a crash can safely retry the idempotent runtime operation.
-func (s *Store) BindSparseHandoff(id string, revision uint64, sparse SparseHandoffDescriptor, now time.Time) (*Transaction, error) {
-	if err := sparse.validate(); err != nil {
+func (s *Store) BindGraphHandoff(id string, revision uint64, graph GraphHandoffDescriptor, now time.Time) (*Transaction, error) {
+	if err := graph.validate(); err != nil {
 		return nil, err
 	}
 	path, err := s.path(id)
@@ -299,17 +373,17 @@ func (s *Store) BindSparseHandoff(id string, revision uint64, sparse SparseHando
 	if err != nil {
 		return nil, err
 	}
-	if tx.SparseHandoff != nil {
-		if *tx.SparseHandoff != sparse {
-			return nil, fmt.Errorf("transaction %q is bound to another sparse handoff", id)
+	if tx.GraphHandoff != nil {
+		if *tx.GraphHandoff != graph {
+			return nil, fmt.Errorf("transaction %q is bound to another graph handoff", id)
 		}
 		return tx, nil
 	}
 	if tx.Revision != revision || tx.State != TransactionPublished {
 		return nil, fmt.Errorf("transaction %q is %s revision %d, not published revision %d", id, tx.State, tx.Revision, revision)
 	}
-	copy := sparse
-	tx.SparseHandoff = &copy
+	copy := graph
+	tx.GraphHandoff = &copy
 	tx.UpdatedAt = now
 	data, err := marshalTransaction(tx)
 	if err != nil {
@@ -454,9 +528,9 @@ func loadTransaction(path, id string) (*Transaction, error) {
 			return nil, fmt.Errorf("transaction %q session digest: %w", id, err)
 		}
 	}
-	if tx.SparseHandoff != nil {
-		if err := tx.SparseHandoff.validate(); err != nil {
-			return nil, fmt.Errorf("transaction %q sparse handoff: %w", id, err)
+	if tx.GraphHandoff != nil {
+		if err := tx.GraphHandoff.validate(); err != nil {
+			return nil, fmt.Errorf("transaction %q graph handoff: %w", id, err)
 		}
 	}
 	if _, known := transactionTransitions[tx.State]; !known && !tx.Terminal() {

@@ -23,10 +23,10 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -37,9 +37,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 type captureCoherencePlatform struct {
@@ -94,6 +94,55 @@ func newRemoteKernelMemoryFile(t *testing.T) *pgalloc.MemoryFile {
 }
 
 var errInjectedLiveForkFailure = errors.New("injected live-fork failure")
+
+func TestResidentPageVersionsIncludesUnmappedTmpfs(t *testing.T) {
+	k, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	// testutil.Boot leaves the externally supplied host mount unset. Kernel
+	// teardown requires one, so use the ordinary test stand-in before Release.
+	k.PipeMount().IncRef()
+	k.SetHostMount(k.PipeMount())
+	defer k.Release()
+	ctx := k.SupervisorContext()
+	creds := auth.CredentialsFromContext(ctx)
+	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{}, k)
+	if err != nil {
+		t.Fatalf("NewMountNamespace: %v", err)
+	}
+	defer mntns.DecRef(ctx)
+	root := mntns.Root(ctx)
+	defer root.DecRef(ctx)
+
+	before, err := k.ResidentPageVersions()
+	if err != nil {
+		t.Fatalf("ResidentPageVersions before write: %v", err)
+	}
+	fd, err := k.VFS().OpenAt(ctx, creds, &vfs.PathOperation{
+		Root: root, Start: root, Path: fspath.Parse("resident"),
+	}, &vfs.OpenOptions{Flags: linux.O_CREAT | linux.O_RDWR, Mode: 0600})
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	data := make([]byte, 3*hostarch.PageSize)
+	for i := range data {
+		data[i] = byte(i + 1)
+	}
+	if n, err := fd.PWrite(ctx, usermem.BytesIOSequence(data), 0, vfs.WriteOptions{}); err != nil || n != int64(len(data)) {
+		fd.DecRef(ctx)
+		t.Fatalf("PWrite: n=%d err=%v", n, err)
+	}
+	fd.DecRef(ctx) // The file remains linked, but has no FD or VMA reference.
+
+	after, err := k.ResidentPageVersions()
+	if err != nil {
+		t.Fatalf("ResidentPageVersions after write: %v", err)
+	}
+	if got, want := len(after)-len(before), 3; got != want {
+		t.Fatalf("resident page increase after unmapped tmpfs write: got %d pages, want %d", got, want)
+	}
+}
 
 func TestLiveForkFailureCleanup(t *testing.T) {
 	stages := []kernel.LiveForkStage{
@@ -311,149 +360,6 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	parent.Release()
 }
 
-func TestDurableDehydrationLoadsPackedMemoryOnDemand(t *testing.T) {
-	parent, err := testutil.Boot()
-	if err != nil {
-		t.Fatalf("Boot: %v", err)
-	}
-	parent.PipeMount().IncRef()
-	parent.SetHostMount(parent.PipeMount())
-	parent.Pause()
-	image, err := parent.CaptureDehydration(parent.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "durable"})
-	if err != nil {
-		parent.Release()
-		t.Fatalf("CaptureDehydration: %v", err)
-	}
-	metadata := image.DurableMetadata()
-	snapshots := make([]*os.File, len(metadata.Memories))
-	for i := range snapshots {
-		snapshots[i], err = os.CreateTemp(t.TempDir(), "packed-*.mem")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := image.ExportPackedSnapshots(snapshots, true); err != nil {
-		t.Fatalf("ExportPackedSnapshots: %v", err)
-	}
-	loads := make([]kernel.DurableDehydrationLoadMemory, len(metadata.Memories))
-	for i := range loads {
-		fd, err := unix.Dup(int(snapshots[i].Fd()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		loads[i].Reader = stateio.NewFDReader(int32(fd), 256<<10, 16, 2)
-		target, err := os.CreateTemp(t.TempDir(), "target-*.mem")
-		if err != nil {
-			t.Fatal(err)
-		}
-		loads[i].MemoryFile, err = pgalloc.NewMemoryFile(target, pgalloc.MemoryFileOpts{
-			DiskBackedFile: true, DisableIMAWorkAround: true, DisableMemoryAccounting: true,
-			ResourceID: metadata.Memories[i].ResourceID,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	var restored *kernel.Kernel
-	if err := parent.WithDehydrationFilesystemResources(parent.SupervisorContext(), "durable", func(resources vfs.LiveForkFilesystemResources) error {
-		var err error
-		restored, err = kernel.LoadDurableDehydration(parent.SupervisorContext(), parent.Platform, metadata, loads, kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: "durable", FilesystemResources: resources,
-		})
-		return err
-	}); err != nil {
-		t.Fatalf("LoadDurableDehydration: %v", err)
-	}
-	if !restored.MemoryFile().IsAsyncLoading() {
-		t.Fatal("durable application memory was eagerly loaded")
-	}
-	if err := image.Close(); err != nil {
-		t.Fatalf("closing capture: %v", err)
-	}
-	if err := restored.StartPaused(); err != nil {
-		t.Fatalf("StartPaused: %v", err)
-	}
-	restored.Release()
-	parent.Release()
-}
-
-func TestDehydrationPublishesSparseBranchGraph(t *testing.T) {
-	parent, err := testutil.Boot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	parent.PipeMount().IncRef()
-	parent.SetHostMount(parent.PipeMount())
-	parent.Pause()
-	image, err := parent.CaptureDehydration(parent.SupervisorContext(), kernel.DehydrationCaptureOptions{BranchID: "sparse-dehydrated"})
-	if err != nil {
-		parent.Release()
-		t.Fatal(err)
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		image.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	manifestID, err := image.PublishSparse(repository)
-	if err != nil {
-		image.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	if image.DurableMetadata().SparseManifest != manifestID {
-		t.Fatal("durable metadata did not record its sparse manifest")
-	}
-	manifest, err := repository.LoadManifest(manifestID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(manifest.Runs) == 0 || len(manifest.Expand()) != len(image.SparseBindings) {
-		t.Fatalf("published manifest has %d runs/%d bindings, want %d bindings", len(manifest.Runs), len(manifest.Expand()), len(image.SparseBindings))
-	}
-	memoryFiles := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
-	for _, run := range manifest.Runs {
-		if _, ok := memoryFiles[run.ResourceID]; ok {
-			continue
-		}
-		file, err := os.CreateTemp(t.TempDir(), "sparse-target-*.mem")
-		if err != nil {
-			t.Fatal(err)
-		}
-		mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
-			ResourceID: run.ResourceID, DiskBackedFile: true,
-			DisableIMAWorkAround: true, DisableMemoryAccounting: true,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		memoryFiles[run.ResourceID] = mf
-	}
-	var restored *kernel.Kernel
-	if err := parent.WithDehydrationFilesystemResources(parent.SupervisorContext(), "sparse-dehydrated", func(resources vfs.LiveForkFilesystemResources) error {
-		var err error
-		restored, err = kernel.LoadSparseDurableDehydration(parent.SupervisorContext(), parent.Platform, image.DurableMetadata(), memoryFiles, repository, kernel.DurableDehydrationLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), BranchID: "sparse-dehydrated", FilesystemResources: resources,
-		})
-		return err
-	}); err != nil {
-		t.Fatalf("LoadSparseDurableDehydration: %v", err)
-	}
-	// Boot's tiny test kernel fits in one sparse chunk. Materializing the VDSO
-	// parameter page during restore therefore commits that complete 1 MiB
-	// residency unit and may finish the loader before this check. Larger images
-	// retain demand loaders for their untouched chunks.
-	if err := restored.StartPaused(); err != nil {
-		t.Fatal(err)
-	}
-	restored.Release()
-	if err := image.Close(); err != nil {
-		t.Fatal(err)
-	}
-	parent.Release()
-}
-
 func TestLiveForkRemoteMemoryFileTCP(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -624,204 +530,6 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 	parent.Release()
 }
 
-func TestDistributedForkHandsLiveReaderToSparseManifest(t *testing.T) {
-	parent, err := testutil.Boot()
-	if err != nil {
-		t.Fatalf("Boot: %v", err)
-	}
-	parent.PipeMount().IncRef()
-	parent.SetHostMount(parent.PipeMount())
-	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
-	if err != nil {
-		parent.Release()
-		t.Fatal(err)
-	}
-	parent.Pause()
-	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "handoff"})
-	if err != nil {
-		parent.MemoryFile().DecRef(orphan)
-		parent.Release()
-		t.Fatalf("CaptureDistributedFork: %v", err)
-	}
-	parent.MemoryFile().DecRef(orphan)
-	if len(capture.HandoffBindings) != len(capture.MemoryBindings) {
-		capture.Close()
-		parent.Release()
-		t.Fatalf("handoff bindings=%d, exact bindings=%d", len(capture.HandoffBindings), len(capture.MemoryBindings))
-	}
-	for _, binding := range capture.HandoffBindings {
-		if orphan.Start <= binding.OldOffset && binding.OldOffset < orphan.End {
-			capture.Close()
-			parent.Release()
-			t.Fatal("branch-scoped handoff included an unreachable allocator page")
-		}
-	}
-	repositoryDir := t.TempDir()
-	publisher, err := ttcchunk.OpenMemoryRepository(repositoryDir)
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	objects, bindings, err := ttcchunk.ReadSnapshot(capture.HandoffSnapshot, capture.HandoffBindings)
-	var manifest ttcchunk.ManifestID
-	if err == nil {
-		manifest, err = publisher.Publish(objects, bindings)
-		if err == nil {
-			if closeErr := capture.HandoffSnapshot.Close(); closeErr != nil {
-				err = closeErr
-			} else {
-				capture.HandoffSnapshot = nil
-			}
-		}
-	}
-	if closeErr := publisher.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	token := ttcremote.SnapshotToken{0x54, 0x54, 0x43, 4}
-	server, err := ttcremote.NewTCPPageServer(listener, token, capture.Snapshot, 256<<10)
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	capture.Snapshot = nil
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve() }()
-	reader, err := ttcremote.NewTCPRemoteReader(listener.Addr().String(), token, pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4, 5*time.Second)
-	if err != nil {
-		server.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	targetMF := newRemoteKernelMemoryFile(t)
-	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings,
-		&ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone},
-		kernel.DistributedForkLoadOptions{
-			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "handoff",
-			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
-		})
-	if err != nil {
-		parent.Release()
-		t.Fatalf("LoadDistributedFork: %v", err)
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryDir)
-	if err != nil {
-		child.Release()
-		parent.Release()
-		t.Fatal(err)
-	}
-	if err := child.HandoffDistributedForkMemory(repository, manifest); err != nil {
-		child.Release()
-		parent.Release()
-		t.Fatalf("HandoffDistributedForkMemory: %v", err)
-	}
-	// Retrying the same command after a lost daemon response is harmless.
-	retryRepository, err := ttcchunk.OpenMemoryRepository(repositoryDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := child.HandoffDistributedForkMemory(retryRepository, manifest); err != nil {
-		t.Fatalf("retrying HandoffDistributedForkMemory: %v", err)
-	}
-	child.DrainDistributedForkMemory()
-	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
-		t.Fatalf("draining sparse handoff: %v", err)
-	}
-	child.Release()
-	parent.Release()
-}
-
-func TestSparseDistributedForkLoadsIntoFamilyMemoryFile(t *testing.T) {
-	parent, err := testutil.Boot()
-	if err != nil {
-		t.Fatalf("Boot: %v", err)
-	}
-	parent.PipeMount().IncRef()
-	parent.SetHostMount(parent.PipeMount())
-	// Keep an allocator page that is deliberately unreachable from this branch.
-	// All portable transports must exclude it from the exact branch layout.
-	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
-	if err != nil {
-		parent.Release()
-		t.Fatal(err)
-	}
-	parent.Pause()
-	capture, err := parent.CaptureDistributedFork(parent.SupervisorContext(), kernel.DistributedForkCaptureOptions{ChildBranchID: "sparse"})
-	if err != nil {
-		parent.MemoryFile().DecRef(orphan)
-		parent.Release()
-		t.Fatalf("CaptureDistributedFork: %v", err)
-	}
-	parent.MemoryFile().DecRef(orphan)
-	if capture.SparseSnapshot == nil || capture.Snapshot == nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal("distributed capture omitted a snapshot reservation")
-	}
-	if sparseBytes, transportBytes := capture.SparseSnapshot.StreamBytes(), capture.Snapshot.StreamBytes(); sparseBytes != transportBytes {
-		capture.Close()
-		parent.Release()
-		t.Fatalf("sparse snapshot bytes=%d, transport bytes=%d", sparseBytes, transportBytes)
-	}
-	for _, load := range capture.LoadRanges {
-		if load.Target.Start <= orphan.Start && orphan.End <= load.Target.End {
-			capture.Close()
-			parent.Release()
-			t.Fatal("branch-scoped transport included an unreachable allocator page")
-		}
-	}
-	repository, err := ttcchunk.OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	manifestID, err := capture.PublishSparse(repository)
-	if err != nil {
-		capture.Close()
-		parent.Release()
-		t.Fatal(err)
-	}
-	child, err := kernel.LoadSparseDistributedFork(parent.SupervisorContext(), parent.Platform, parent.MemoryFile(), capture.KernelMetadata, repository, manifestID, kernel.DistributedForkLoadOptions{
-		Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "sparse", FilesystemResources: capture.FilesystemResources,
-	})
-	if err != nil {
-		parent.Release()
-		t.Fatalf("LoadSparseDistributedFork: %v", err)
-	}
-	if child.MemoryFile() != parent.MemoryFile() {
-		t.Fatal("sparse child did not join the family MemoryFile")
-	}
-	if err := child.MemoryFile().AwaitLoadAll(); err != nil {
-		t.Fatalf("draining sparse child: %v", err)
-	}
-	if err := parent.StartPaused(); err != nil {
-		t.Fatal(err)
-	}
-	if err := child.StartPaused(); err != nil {
-		t.Fatal(err)
-	}
-	parent.Unpause()
-	child.Unpause()
-	parent.Pause()
-	child.Pause()
-	child.Release()
-	parent.Release()
-}
-
 func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -832,7 +540,7 @@ func TestPortableDistributedForkCaptureManySharesPages(t *testing.T) {
 	parent.Pause()
 	defer parent.Release()
 	// Simulate a page owned by another branch in the family-wide MemoryFile.
-	// Neither the binding graph nor the transport ranges may include it.
+	// No branch-scoped stream may include it.
 	orphan, err := parent.MemoryFile().Allocate(hostarch.PageSize, pgalloc.AllocOpts{Mode: pgalloc.AllocateAndCommit})
 	if err != nil {
 		t.Fatal(err)
@@ -909,7 +617,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 			t.Fatal(err)
 		}
 		session, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
-			MaxTotalBytes: 32 << 20, MaxKernelBytes: 24 << 20, MaxAllocatorBytes: 8 << 20, MaxExecBytes: 1 << 20, MaxLoadRanges: 1 << 16,
+			MaxTotalBytes: 32 << 20, MaxKernelBytes: 24 << 20, MaxAllocatorBytes: 8 << 20, MaxLoadRanges: 1 << 16,
 		})
 		if err != nil {
 			t.Fatal(err)

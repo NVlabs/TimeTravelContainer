@@ -60,7 +60,8 @@ covers:
 - Docker `--pids-limit` OCI and inspect persistence, Sentry-side process and
   thread enforcement without delegated host cgroups, and branch-local limit and
   task-charge inheritance across live fork;
-- Docker `--memory`/`-m`, `--cpus`, `--cpu-shares`, `--cpu-period`, and
+- Docker `--memory`/`-m`, `--memory-swap` (twice the memory unless given; `-1`
+  for unlimited swap), `--cpus`, `--cpu-shares`, `--cpu-period`, and
   `--cpu-quota` parsing, OCI projection, persistence, inspect projection, and
   synthetic cgroup-v2 verification are covered by the focused Go suites. A live
   enforcement matrix requires a delegated cgroup-v2 subtree and is intentionally
@@ -92,14 +93,14 @@ covers:
   projection, rejection of log reads for `none`, and label/environment attributes
   in `logs --details`;
 - Docker-compatible `logs --since`, `--until`, `--timestamps`, and `--details`
-  over versioned timestamped records, including filtering and legacy-record decoding;
+  over versioned timestamped records, including filtering and malformed-record rejection;
 - `exec`, selective stdin/stdout/stderr `attach`, transactional `fork`
-  rejection diagnostics, live `fork`, `pause`,
+  behavior, live `fork`, `pause`,
   `resume`/`unpause`, `ps`, `top`, and the lineage tree, including
   branch/status/ancestor `ps` filters, templates, latest selection, JSON
   creation timestamps, and branch-local writable/virtual `ps --size` accounting;
-- attached exec live-fork continuity through Sentry-owned branch-local consoles,
-  independent parent/child completion and output, and detached exec-session ID/PID cloning
+- live fork while a daemon-mediated attached exec is active, and detached
+  exec-session ID/PID cloning
   through parent, child, and grandchild with branch-local signal/wait status;
 - user tmpfs copy-on-write isolation between a parent and child branch;
 - tmpfs live-fork `pwrite()` from a mapping in the same memory manager, covering
@@ -123,6 +124,60 @@ creation and divergence, exited main/child `ttc cp`, copy into a
 created-but-never-started container, and stop/start reopening without explicit
 save or restore.
 
+`e2e_fuse_lifecycle.sh` installs `fuse-overlayfs` inside an Ubuntu guest and
+keeps its `/dev/fuse` server and writable mount active across live fork,
+branch-local writes, dehydration, and rehydration. It requires an already
+running daemon and a TTC client selected through `TTC`:
+
+```shell
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+  "$PWD/runsc/ttc/test/e2e_fuse_lifecycle.sh"
+```
+
+`e2e_fanout_lifecycle.sh` creates 32 siblings from one source pause, writes a
+different 4 KiB page in every branch, and dehydrates/rehydrates alternating
+branches before verifying their private contents. Set
+`TTC_FANOUT_TEST_BRANCHES` to increase the fanout. Final snapshot-graph
+qualification runs this test with 256 siblings and requires zero remaining
+bulk objects after its cleanup.
+
+`e2e_distributed_fanout.sh` splits a configurable high-fanout family across
+three cluster nodes, dirties one private page in every remote branch, retires
+one owning node with `--migrate-all`, and verifies every value through unified
+command routing. Set `TTC_DISTRIBUTED_FANOUT_BRANCHES` to increase the fanout.
+
+`e2e_image_roundtrip.sh` commits running, paused, and exited branches to OCI
+images, saves and reloads those images through Docker-compatible archives, and
+verifies labels, file changes, and whiteout deletions after recreation. It uses
+a fresh explicit root and cleans it on completion:
+
+```shell
+TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+  "$PWD/runsc/ttc/test/e2e_image_roundtrip.sh"
+```
+
+`e2e_distributed_multihop.sh` starts a fresh two-node cluster, remotely forks
+A-to-B, migrates the child B-to-A, and remotely forks it A-to-B again. It
+verifies a continuously running process, exact 32 MiB memory contents, sparse
+whole-file materialization, and branch-local filesystem divergence after both
+handoffs. `TTC_DISTRIBUTED_TEST_PORT_A` and
+`TTC_DISTRIBUTED_TEST_PORT_B` select its host listener ports.
+
+`e2e_distributed_source_loss.sh` starts a three-voter cluster, retains a large
+demand-paged memory dependency on node A, then destroys node A before the
+target becomes independent. The surviving quorum must stop and permanently
+mark only the dependent branch `corrupted`; an unrelated branch on node C must
+remain executable. The test also verifies that removal is still available for
+the corrupted branch and reaps every process in the failed node's private test
+root.
+
+`e2e_control_only.sh` starts two compute nodes and an outbound-only login-node
+gateway. Every pull, run, exec, fork, migration, inventory, and port command is
+issued through the gateway. The test verifies that the gateway never enters
+placement inventory, transaction-private branches remain hidden, and a host
+listener transparently follows its branch between remote compute owners.
+
 Focused Go tests additionally cover custom TTC NIC IPv4/MAC validation and
 runtime propagation, line-oriented image pull/extraction progress, default
 guest SUID enablement in TTC's runsc arguments, daemon namespace preflight,
@@ -131,7 +186,7 @@ rebinding, and cloning of Sentry-owned netlink sockets.
 
 The test requires network access for image pulls. TTC resolves OCI registries
 directly and stores verified manifests, configs, and layers in its native
-rootless content store under `--data-root`; no Docker or containerd daemon is
+rootless content store under the explicitly configured `TTC_ROOT`; no Docker or containerd daemon is
 required. By default, the runtime user must be able to create a user namespace
 with a one-entry UID/GID map:
 
@@ -162,7 +217,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_image_matrix
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 
@@ -171,7 +226,7 @@ No-userns example:
 ```shell
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_image_matrix.sh"
 ```
 Use `TTC_E2E_ROOT` to retain the generated TTC state for inspection. Image
@@ -196,13 +251,13 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
   //runsc/ttc/test:e2e_cp
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_cp.sh"
 ```
 
 Use `TTC_UNSAFE_NO_HOST_ISOLATION=1` only on a trusted host that cannot create
-unprivileged user namespaces. Set `TTC_ALLOW_SLOW_VOLUME_COPY=1` when the
-test's data root is on a filesystem without `FICLONE`.
+unprivileged user namespaces. Filesystems without `FICLONE` are supported
+automatically through whole-file copying.
 
 ## Terminal and live-fork integration
 
@@ -230,7 +285,7 @@ bazel build //runsc:runsc //runsc/ttc:ttc //runsc/ttcd:ttcd \
 
 TTC_UNSAFE_NO_HOST_ISOLATION=1 \
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
@@ -275,13 +330,13 @@ the registry is stopped. It makes no public network request.
 ```shell
 bazel build //runsc:runsc //runsc/ttc:ttc \
   //runsc/ttc/test/registry_fixture:registry_fixture \
-  //runsc/ttc/test/registry_fixture/guest:guest \
+  //runsc/ttc/test/registry_fixture/guest:guest_fixture \
   //runsc/ttc/test:e2e_local_registry
 
 TTC="$PWD/bazel-bin/runsc/ttc/ttc_/ttc" \
-RUNSC="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
+TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
 REGISTRY_FIXTURE="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/registry_fixture_/registry_fixture" \
-FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_/guest" \
+FIXTURE_BINARY="$PWD/bazel-bin/runsc/ttc/test/registry_fixture/guest/guest_fixture_/guest_fixture" \
   "$PWD/runsc/ttc/test/e2e_local_registry.sh"
 ```
 

@@ -17,8 +17,6 @@
 package pgalloc
 
 import (
-	"os"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -38,9 +36,3 @@ func commitHostFile(int, memmap.FileRange) error { return nil }
 
 // Returning EOPNOTSUPP selects MemoryFile's mandatory manual-zero fallback.
 func decommitHostFile(int, memmap.FileRange) error { return unix.EOPNOTSUPP }
-
-// APFS clonefile is a whole-file operation; packed snapshots request arbitrary
-// extents, so let the caller's explicitly authorized copy fallback handle it.
-func cloneHostFileRange(*os.File, *os.File, uint64, uint64, uint64) error {
-	return unix.EOPNOTSUPP
-}

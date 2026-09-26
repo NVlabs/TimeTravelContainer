@@ -45,7 +45,7 @@ function mockDaemon(path: string) {
       requests.push(request);
       const args = request.args as string[] | undefined;
       const output = request.action === "ping"
-        ? '{"version":4,"isolation_mode":"rootless"}\n'
+        ? '{"version":9,"isolation_mode":"rootless"}\n'
         : args?.join(" ") === "ls --json"
           ? '[{"id":"demo","branches":[{"id":"main"},{"id":"child","parent":"main"}]}]\n'
           : `ran:${args?.join(" ")}\n`;
@@ -68,7 +68,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [resolve("dist/src/bin.js")],
-    env: { ...process.env, TTC_RUNTIME_DIR: runtime } as Record<string, string>,
+    env: { ...process.env, TTC_SOCKET: path } as Record<string, string>,
     stderr: "pipe",
   });
   const client = new McpClient({ name: "ttcx-mcp-test", version: "0.1.0" });
@@ -79,7 +79,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
     assert(listed.tools.some((tool) => tool.name === "ttc_fork_many"));
     assert(listed.tools.some((tool) => tool.name === "ttc_migrate"));
     assert(listed.tools.some((tool) => tool.name === "ttc_nodes"));
-    assert(listed.tools.some((tool) => tool.name === "ttc_drain_node"));
+    assert(listed.tools.some((tool) => tool.name === "ttc_stop_node"));
     assert(listed.tools.some((tool) => tool.name === "ttc_rebalance_node"));
     assert(listed.tools.some((tool) => tool.name === "ttc_checkpoint"));
     assert(listed.tools.some((tool) => tool.name === "ttc_restore"));
@@ -89,7 +89,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
 
     const status = await client.callTool({ name: "ttc_status", arguments: {} });
     assert.equal(status.isError, undefined);
-    assert.match((status.content[0] as { text: string }).text, /"version": 4/);
+    assert.match((status.content[0] as { text: string }).text, /"version": 9/);
 
     const families = await client.callTool({
       name: "ttc_list",
@@ -105,13 +105,13 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
         source: "demo@main",
         destinations: ["remote@one", "remote@two"],
         paused: true,
-        targetNode: "node-b",
+        node: "node-b",
       },
     });
     assert.deepEqual(mock.requests[2].args, [
       "fork",
       "--paused",
-      "--target",
+      "--node",
       "node-b",
       "demo@main",
       "remote@one",
@@ -150,12 +150,15 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       arguments: {
         image: "alpine:3.20",
         name: "hosted",
+        node: "node-b",
         options: ["--network=host"],
         waiveLiveFork: true,
       },
     });
     assert.deepEqual(mock.requests[5].args, [
       "run",
+      "--node",
+      "node-b",
       "--network=host",
       "-d",
       "--name",
@@ -194,6 +197,17 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
       "/srv/images.tar",
       "one:latest",
       "two:test",
+    ]);
+
+    await client.callTool({
+      name: "ttc_wait",
+      arguments: { target: "demo@main", condition: "durable", timeoutMs: 60_000 },
+    });
+    assert.deepEqual(mock.requests[8].args, [
+      "wait",
+      "--condition",
+      "durable",
+      "demo@main",
     ]);
   } finally {
     await client.close();

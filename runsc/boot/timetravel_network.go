@@ -388,20 +388,28 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 	_ = gatewayEP
 	guestEP.SetLinkAddress(guestMAC)
 	gatewayEP.SetLinkAddress(gatewayMAC)
-	if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
-		Name:               timeTravelNICName,
-		DeliverLinkPackets: true,
-	}); err != nil {
-		return fmt.Errorf("creating TTC guest NIC: %v", err)
-	}
-	if err := dst.Stack.AddProtocolAddress(timeTravelNICID, tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   guestAddress,
-			PrefixLen: 24,
-		},
-	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("adding TTC guest address: %v", err)
+	replacedRuntimeLink := false
+	if _, ok := dst.Interfaces()[int32(timeTravelNICID)]; ok {
+		if err := dst.Stack.ReplaceNICLinkEndpoint(timeTravelNICID, ethernet.New(guestEP)); err != nil {
+			return fmt.Errorf("replacing TTC guest link: %v", err)
+		}
+		replacedRuntimeLink = true
+	} else {
+		if err := dst.Stack.CreateNICWithOptions(timeTravelNICID, ethernet.New(guestEP), stack.NICOptions{
+			Name:               timeTravelNICName,
+			DeliverLinkPackets: true,
+		}); err != nil {
+			return fmt.Errorf("creating TTC guest NIC: %v", err)
+		}
+		if err := dst.Stack.AddProtocolAddress(timeTravelNICID, tcpip.ProtocolAddress{
+			Protocol: ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   guestAddress,
+				PrefixLen: 24,
+			},
+		}, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("adding TTC guest address: %v", err)
+		}
 	}
 	routes := dst.Stack.GetRouteTable()
 	if reset {
@@ -410,8 +418,10 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			{Destination: header.IPv6Loopback.WithPrefix().Subnet(), NIC: 1},
 		}
 	}
-	routes = append(routes, tcpip.Route{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID})
-	dst.Stack.SetRouteTable(routes)
+	if !replacedRuntimeLink {
+		routes = append(routes, tcpip.Route{Destination: header.IPv4EmptySubnet, Gateway: gatewayAddress, NIC: timeTravelNICID})
+		dst.Stack.SetRouteTable(routes)
+	}
 
 	if quarantine {
 		// No proxy at the other end, and nothing to close: the guest half of
@@ -430,43 +440,42 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			return fmt.Errorf("pinning the quarantined gateway address: %v", err)
 		}
 		realm.close()
-		return nil
-	}
-
-	gateway := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-		Clock: dst.Stack.Clock(),
-	})
-	realm.gateway = gateway
-	const gatewayNICID = tcpip.NICID(1)
-	if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
-		return fmt.Errorf("creating TTC proxy NIC: %v", err)
-	}
-	if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   gatewayAddress,
-			PrefixLen: 24,
-		},
-	}, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("adding TTC proxy address: %v", err)
-	}
-	if err := gateway.SetPromiscuousMode(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTC proxy promiscuous mode: %v", err)
-	}
-	if err := gateway.SetSpoofing(gatewayNICID, true); err != nil {
-		return fmt.Errorf("enabling TTC proxy spoofing: %v", err)
-	}
-	gateway.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: gatewayNICID}})
-	if cfg.NAT {
-		realm.installTCPForwarder(gateway)
-		realm.installUDPForwarder(gateway)
+	} else {
+		gateway := stack.New(stack.Options{
+			NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
+			TransportProtocols: []stack.TransportProtocolFactory{
+				tcp.NewProtocol,
+				udp.NewProtocol,
+				icmp.NewProtocol4,
+				icmp.NewProtocol6,
+			},
+			Clock: dst.Stack.Clock(),
+		})
+		realm.gateway = gateway
+		const gatewayNICID = tcpip.NICID(1)
+		if err := gateway.CreateNIC(gatewayNICID, ethernet.New(gatewayEP)); err != nil {
+			return fmt.Errorf("creating TTC proxy NIC: %v", err)
+		}
+		if err := gateway.AddProtocolAddress(gatewayNICID, tcpip.ProtocolAddress{
+			Protocol: ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   gatewayAddress,
+				PrefixLen: 24,
+			},
+		}, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("adding TTC proxy address: %v", err)
+		}
+		if err := gateway.SetPromiscuousMode(gatewayNICID, true); err != nil {
+			return fmt.Errorf("enabling TTC proxy promiscuous mode: %v", err)
+		}
+		if err := gateway.SetSpoofing(gatewayNICID, true); err != nil {
+			return fmt.Errorf("enabling TTC proxy spoofing: %v", err)
+		}
+		gateway.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: gatewayNICID}})
+		if cfg.NAT {
+			realm.installTCPForwarder(gateway)
+			realm.installUDPForwarder(gateway)
+		}
 	}
 
 	hooks := &sentrynetstack.LiveForkNetworkHooks{
@@ -474,14 +483,8 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 		Clone: func(child *sentrynetstack.Stack) error {
 			// The child already contains the serialized Sentry-owned network
 			// graph. Replace only TTC's runtime link, whose proxy peer is
-			// deliberately not serialized. RemoveNIC also drops routes through
-			// the obsolete endpoint while preserving guest-created interfaces,
-			// veth pairs, routes, iptables, and nftables state.
-			if _, ok := child.Interfaces()[int32(timeTravelNICID)]; ok {
-				if err := child.Stack.RemoveNIC(timeTravelNICID); err != nil {
-					return fmt.Errorf("removing inherited TTC interface: %v", err)
-				}
-			}
+			// deliberately not serialized. Removing the NIC would also close its
+			// protocol addresses and silently unregister listening sockets.
 			return configureTimeTravelNetwork(child, cfg, false, child.LiveForkQuarantine())
 		},
 		ResetChild: func(child *sentrynetstack.Stack) error {
@@ -494,8 +497,21 @@ func configureTimeTravelNetwork(dst *sentrynetstack.Stack, cfg TimeTravelNetwork
 			}
 			return resetTimeTravelChildConnections(child, guestAddress)
 		},
+		SetQuarantine: func(current *sentrynetstack.Stack, quarantine bool) error {
+			if err := configureTimeTravelNetwork(current, cfg, false, quarantine); err != nil {
+				return err
+			}
+			if !quarantine {
+				// Packets emitted while quarantined never reached the real peer.
+				// Existing external flows therefore cannot be continued honestly;
+				// reset them while leaving internal-only flows untouched.
+				return resetTimeTravelChildConnections(current, guestAddress)
+			}
+			return nil
+		},
 		Close: realm.close,
 	}
+	dst.SetLiveForkQuarantine(quarantine)
 	dst.SetLiveForkNetworkHooks(hooks)
 	log.Infof("Configured TTC virtual NIC %s at %s/24, MAC %s (NAT=%t)", timeTravelNICName, guestAddress, net.HardwareAddr(guestMAC), cfg.NAT)
 	return nil

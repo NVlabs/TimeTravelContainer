@@ -16,25 +16,32 @@ package ttcchunk
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sync"
 	"testing"
-	"time"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
+
+type graphRelaySource map[ttcsnapshot.ObjectID][]byte
+
+func (source graphRelaySource) Fetch(_ context.Context, id ttcsnapshot.ObjectID) (io.ReadCloser, uint64, error) {
+	data, ok := source[id]
+	if !ok {
+		return nil, 0, os.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), uint64(len(data)), nil
+}
 
 func testAllocator(seed byte) pgalloc.LogicalAllocatorID {
 	var id pgalloc.LogicalAllocatorID
@@ -57,11 +64,11 @@ func testChunk() Chunk {
 
 func TestChunkRoundTrip(t *testing.T) {
 	want := testChunk()
-	data, id, err := Encode(want)
+	data, err := Encode(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Decode(data, &id)
+	got, err := Decode(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,180 +80,715 @@ func TestChunkRoundTrip(t *testing.T) {
 			t.Fatalf("decoded page %d = %+v, want %+v", i, got.Pages[i], want.Pages[i])
 		}
 	}
-	data[len(data)-1] ^= 1
-	if _, err := Decode(data, &id); err == nil {
-		t.Fatal("corrupted chunk passed content-address verification")
+	data[0] ^= 1
+	if _, err := Decode(data); err == nil {
+		t.Fatal("invalid chunk header passed structural validation")
 	}
 }
 
-func TestStoreConcurrentIdempotentPutAndCorruption(t *testing.T) {
-	root := t.TempDir()
-	store, err := OpenStore(root)
+func TestGraphChunkReaderRelaysMissingObject(t *testing.T) {
+	data, err := ttcsnapshot.OpenLocalDataStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunk := testChunk()
-	const writers = 8
-	ids := make(chan ID, writers)
-	errs := make(chan error, writers)
-	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			id, err := store.Put(chunk)
-			ids <- id
-			errs <- err
-		}()
+	var chunk ID
+	chunk[0] = 1
+	object := ttcsnapshot.ObjectID{Snapshot: 17, Kind: ttcsnapshot.ObjectKindMemoryChunk, Ordinal: 3}
+	want := bytes.Repeat([]byte{0x6d}, pgalloc.SparseChunkBytes)
+	server, client := net.Pipe()
+	var token ttcsnapshot.ObjectRelayToken
+	token[0] = 9
+	done := make(chan error, 1)
+	go func() {
+		done <- ttcsnapshot.ServeObjectRelay(server, token, graphRelaySource{object: want}, map[ttcsnapshot.ObjectID]uint64{object: uint64(len(want))})
+	}()
+	remote, err := ttcsnapshot.NewObjectRelayClient(client, token)
+	if err != nil {
+		t.Fatal(err)
 	}
-	wg.Wait()
-	close(ids)
-	close(errs)
-	for err := range errs {
+	reader, err := NewGraphChunkReaderWithRelay(data, map[ID]ttcsnapshot.ObjectID{chunk: object}, []InstalledChunk{{
+		Object: chunk,
+		Target: memmap.FileRange{End: pgalloc.SparseChunkBytes},
+	}}, remote, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if _, err := reader.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want[:len(got)]) {
+		t.Fatal("relayed graph chunk bytes differ")
+	}
+	if file, err := data.Open(object, int64(len(want))); err != nil {
+		t.Fatalf("relayed graph chunk was not installed: %v", err)
+	} else {
+		file.Close()
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		t.Fatal(err)
+	}
+}
+
+func TestGraphCaptureStreamImportsWithoutRepository(t *testing.T) {
+	chunk := testChunk()
+	encoded, err := Encode(chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID := graphCaptureObjectID(1)
+	page := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)}
+	stored := []StoredBinding{
+		capturedBinding(pgalloc.CapturedPageBinding{OldOffset: 0, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, chunkID),
+		capturedBinding(pgalloc.CapturedPageBinding{OldOffset: hostarch.PageSize, References: 2, Page: page, Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot}, chunkID),
+	}
+	var stream bytes.Buffer
+	if err := writeGraphCaptureHeader(&stream, graphCaptureMagic, stored, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGraphCaptureObject(&stream, chunkID, encoded); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ImportGraphCapture(bytes.NewReader(stream.Bytes()), graph, data, origin, "stream/main/memory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Chunks != 1 || result.Pages != 2 || len(result.Roots) != 1 {
+		t.Fatalf("graph stream import=%+v, want one chunk, two mappings, and one root", result)
+	}
+	locations := memoryLocations(t, graph, result.Roots[0].Root)
+	if len(locations) != 2 || locations[1] != locations[0] {
+		t.Fatalf("aliased pages are at %v, want both in one place", locations)
+	}
+
+	for name, input := range map[string][]byte{
+		"truncated": stream.Bytes()[:len(stream.Bytes())-1],
+		"trailing":  append(append([]byte(nil), stream.Bytes()...), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			otherGraph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherGraph.Close()
+			otherData, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(t.TempDir(), "objects"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherData.Close()
+			otherOrigin, err := otherGraph.AllocateWorking()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ImportGraphCapture(bytes.NewReader(input), otherGraph, otherData, otherOrigin, "bad/memory"); err == nil {
+				t.Fatal("malformed graph capture stream imported successfully")
+			}
+		})
+	}
+}
+
+// memoryLocations returns where the memory tree at root maps each page index.
+func memoryLocations(t *testing.T, graph *ttcsnapshot.Store, root ttcsnapshot.ObjectID) map[uint64]ttcsnapshot.MemoryPageLocation {
+	t.Helper()
+	entries, err := graph.MemoryPageEntries(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := make(map[uint64]ttcsnapshot.MemoryPageLocation, len(entries))
+	for _, entry := range entries {
+		locations[entry.Index] = entry.Location
+	}
+	return locations
+}
+
+// storedChunk binds every page of chunk at the page index of its slot.
+func storedChunk(chunk Chunk, object ID) []StoredBinding {
+	stored := make([]StoredBinding, 0, len(chunk.Pages))
+	for _, page := range chunk.Pages {
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 1,
+			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, object))
+	}
+	return stored
+}
+
+// filteredSentry plays the Sentry's part of a filtered capture of chunk over
+// conn, and returns the daemon's answer to its manifest.
+func filteredSentry(conn net.Conn, chunk Chunk, object ID) <-chan [slotBitmapBytes]byte {
+	answered := make(chan [slotBitmapBytes]byte, 1)
+	go func() {
+		defer conn.Close()
+		var answer [slotBitmapBytes]byte
+		defer func() { answered <- answer }()
+		if err := writeGraphCaptureHeader(conn, graphCaptureFilteredMagic, storedChunk(chunk, object), 1); err != nil {
+			return
+		}
+		if _, err := io.ReadFull(conn, answer[:]); err != nil {
+			return
+		}
+		sent := Chunk{Logical: chunk.Logical}
+		for _, page := range chunk.Pages {
+			if hasBit(&answer, page.Slot) {
+				sent.Pages = append(sent.Pages, page)
+			}
+		}
+		if len(sent.Pages) == 0 {
+			return
+		}
+		encoded, err := Encode(sent)
+		if err != nil {
+			return
+		}
+		_ = writeGraphCaptureObject(conn, object, encoded)
+	}()
+	return answered
+}
+
+// A filtered capture sends only the pages the graph lacks: all of them the
+// first time, and only the rewritten one when a later capture shares the rest.
+func TestFilteredGraphCaptureSendsOnlyWhatTheGraphLacks(t *testing.T) {
+	first := testChunk()
+	second := testChunk()
+	second.Pages[2] = Page{Slot: 255, Version: pgalloc.PageVersionID{Allocator: testAllocator(3), Sequence: 1000}, Data: bytes.Repeat([]byte{0x77}, hostarch.PageSize)}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	object := graphCaptureObjectID(1)
+	var pages []map[uint64]ttcsnapshot.MemoryPageLocation
+	for i, capture := range []Chunk{first, second} {
+		origin, err := graph.AllocateWorking()
 		if err != nil {
 			t.Fatal(err)
 		}
+		daemon, sentry := net.Pipe()
+		answered := filteredSentry(sentry, capture, object)
+		result, err := ImportGraphCapture(daemon, graph, data, origin, fmt.Sprintf("filtered/%d", i))
+		daemon.Close()
+		answer := <-answered
+		if err != nil {
+			t.Fatalf("capture %d: %v", i, err)
+		}
+		var want [slotBitmapBytes]byte
+		for _, page := range capture.Pages {
+			if i == 0 || page.Slot == 255 {
+				setBit(&want, page.Slot)
+			}
+		}
+		if answer != want {
+			t.Fatalf("capture %d asked for slots %x, want %x", i, answer, want)
+		}
+		mapped := memoryLocations(t, graph, result.Roots[0].Root)
+		if len(mapped) != 3 {
+			t.Fatalf("capture %d maps %v, want three pages", i, mapped)
+		}
+		pages = append(pages, mapped)
 	}
-	var id ID
-	for got := range ids {
-		if id == (ID{}) {
-			id = got
-		} else if got != id {
-			t.Fatalf("concurrent Put returned %s and %s", id, got)
+	for _, index := range []uint64{0, 17} {
+		if pages[1][index] != pages[0][index] {
+			t.Fatalf("page %d was stored again: %v, first %v", index, pages[1][index], pages[0][index])
 		}
 	}
-	got, err := store.Get(id)
-	if err != nil || len(got.Pages) != len(chunk.Pages) {
-		t.Fatalf("Get: pages=%d err=%v", len(got.Pages), err)
-	}
-	dir, path := store.path(id)
-	if filepath.Base(dir) != id.String()[:4] {
-		t.Fatalf("chunk shard = %q, want %q", filepath.Base(dir), id.String()[:4])
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data[len(data)-1] ^= 1
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Get(id); err == nil {
-		t.Fatal("Get accepted corrupted immutable chunk")
+	if pages[1][255] == pages[0][255] {
+		t.Fatal("the rewritten page shares the first capture's")
 	}
 }
 
-func TestAssembleSeparatesDivergedSlotVersions(t *testing.T) {
-	allocator := testAllocator(1)
-	logicalChunk := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 7}
-	pageAt := func(slot uint8, version uint64, fill byte) SourcePage {
-		return SourcePage{
-			Binding: pgalloc.CapturedPageBinding{
-				OldOffset:  uint64(version) * hostarch.PageSize,
-				References: 1,
-				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logicalChunk.Sequence*PagesPerChunk + uint64(slot)},
-				Version:    pgalloc.PageVersionID{Allocator: testAllocator(5), Sequence: version},
-				Chunk:      logicalChunk,
-				Slot:       slot,
-			},
-			Data: bytes.Repeat([]byte{fill}, hostarch.PageSize),
-		}
+func TestFilteredGraphCaptureNeedsATwoWayStream(t *testing.T) {
+	chunk := testChunk()
+	var stream bytes.Buffer
+	if err := writeGraphCaptureHeader(&stream, graphCaptureFilteredMagic, storedChunk(chunk, graphCaptureObjectID(1)), 1); err != nil {
+		t.Fatal(err)
 	}
-	source := []SourcePage{
-		pageAt(3, 30, 0x30),
-		pageAt(3, 31, 0x31),
-		pageAt(9, 90, 0x90),
-	}
-	objects, bindings, err := Assemble(source)
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objects) != 2 || len(bindings) != 3 {
-		t.Fatalf("Assemble produced %d objects and %d bindings, want 2 and 3", len(objects), len(bindings))
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	objectForVersion := make(map[uint64]ID)
-	for _, binding := range bindings {
-		objectForVersion[binding.Binding.Version.Sequence] = binding.Object
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if objectForVersion[30] == objectForVersion[31] {
-		t.Fatal("two versions of one logical slot were packed into the same object")
+	if _, err := ImportGraphCapture(bytes.NewReader(stream.Bytes()), graph, data, origin, "one-way/memory"); err == nil {
+		t.Fatal("a filtered capture imported from a one-way stream")
 	}
-	if objectForVersion[90] != objectForVersion[30] {
-		t.Fatal("first-fit deterministic packing did not coalesce a non-conflicting slot")
+}
+
+// A capture that sends every page, from a Sentry predating filtering, still
+// imports when the graph holds all of its pages: its objects are read past.
+func TestUnfilteredGraphCaptureOfHeldPagesIsReadPast(t *testing.T) {
+	chunk := testChunk()
+	object := graphCaptureObjectID(1)
+	encoded, err := Encode(chunk)
+	if err != nil {
+		t.Fatal(err)
 	}
+	var stream bytes.Buffer
+	if err := writeGraphCaptureHeader(&stream, graphCaptureMagic, storedChunk(chunk, object), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeGraphCaptureObject(&stream, object, encoded); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	for i := range 2 {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ImportGraphCapture(bytes.NewReader(stream.Bytes()), graph, data, origin, fmt.Sprintf("full/%d", i)); err != nil {
+			t.Fatalf("import %d: %v", i, err)
+		}
+	}
+	trailing := append(append([]byte(nil), stream.Bytes()...), 1)
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportGraphCapture(bytes.NewReader(trailing), graph, data, origin, "full/trailing"); err == nil {
+		t.Fatal("a capture with trailing data imported")
+	}
+	if graph.HasRootUnder("full/trailing") {
+		t.Fatal("a failed import left its roots")
+	}
+}
+
+func TestGraphImportReusesStableMemoryPages(t *testing.T) {
+	chunk := testChunk()
+	object := graphCaptureObjectID(1)
+	stored := make([]StoredBinding, 0, len(chunk.Pages))
+	for _, page := range chunk.Pages {
+		logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
+			Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, object))
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	firstOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := importSnapshotGraph(graph, data, firstOrigin, manifest, "reuse/first", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPages := memoryLocations(t, graph, first.Roots[0].Root)
+	chunksBefore := 0
+	for _, object := range graph.Inspect().Objects {
+		if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+			chunksBefore++
+		}
+	}
+	secondOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := importSnapshotGraph(graph, data, secondOrigin, manifest, "reuse/second", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPages := memoryLocations(t, graph, second.Roots[0].Root)
+	if !reflect.DeepEqual(secondPages, firstPages) {
+		t.Fatalf("second capture pages=%v, want them shared with %v", secondPages, firstPages)
+	}
+	if second.Roots[0].Root == first.Roots[0].Root {
+		t.Fatal("two captures share a root")
+	}
+	chunksAfter := 0
+	for _, object := range graph.Inspect().Objects {
+		if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+			chunksAfter++
+		}
+	}
+	if chunksAfter != chunksBefore {
+		t.Fatalf("second capture stored %d chunks, want unchanged %d", chunksAfter, chunksBefore)
+	}
+}
+
+// A capture's new chunk object holds only the pages the graph did not have,
+// packed from its start in slot order.
+func TestGraphImportStoresOnlyNewPages(t *testing.T) {
+	first := testChunk()
+	second := testChunk()
+	second.Pages[2] = Page{Slot: 255, Version: pgalloc.PageVersionID{Allocator: testAllocator(3), Sequence: 1000}, Data: bytes.Repeat([]byte{0x77}, hostarch.PageSize)}
+	manifestFor := func(chunk Chunk) Manifest {
+		object := graphCaptureObjectID(1)
+		stored := make([]StoredBinding, 0, len(chunk.Pages))
+		for _, page := range chunk.Pages {
+			logicalPage := pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)}
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 1,
+				Page: logicalPage, Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+			}, object))
+		}
+		manifest, err := CompactBindings(stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return manifest
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	chunks := func() map[ttcsnapshot.ObjectID]struct{} {
+		ids := make(map[ttcsnapshot.ObjectID]struct{})
+		for _, object := range graph.Inspect().Objects {
+			if object.ID.Kind == ttcsnapshot.ObjectKindMemoryChunk {
+				ids[object.ID] = struct{}{}
+			}
+		}
+		return ids
+	}
+	for i, chunk := range []Chunk{first, second} {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := chunks()
+		if _, err := importSnapshotGraph(graph, data, origin, manifestFor(chunk), fmt.Sprintf("new/%d", i), func(ID) (Chunk, error) { return chunk, nil }); err != nil {
+			t.Fatal(err)
+		}
+		var added []ttcsnapshot.ObjectID
+		for id := range chunks() {
+			if _, ok := before[id]; !ok {
+				added = append(added, id)
+			}
+		}
+		if len(added) != 1 {
+			t.Fatalf("capture %d added chunk objects %v, want one", i, added)
+		}
+		file, err := data.Open(added[0], ttcsnapshot.MemoryChunkBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := io.ReadAll(file)
+		file.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := make([]byte, ttcsnapshot.MemoryChunkBytes)
+		position := 0
+		for _, page := range chunk.Pages {
+			if i == 0 || page.Slot == 255 {
+				copy(want[position*hostarch.PageSize:], page.Data)
+				position++
+			}
+		}
+		if !bytes.Equal(raw, want) {
+			t.Fatalf("capture %d stored a chunk object with other pages than its new ones", i)
+		}
+	}
+}
+
+// The pages the graph lacks from several capture objects share new chunks,
+// packed in object and slot order. The manifest a rehydration builds says
+// where in its chunk each page is, which a version 2 manifest encodes.
+func TestGraphImportPacksNewPagesOfSeveralObjects(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	type captured struct {
+		id    ID
+		chunk Chunk
+	}
+	objects := []captured{
+		{graphCaptureObjectID(1), Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 5}, Pages: []Page{
+			{Slot: 9, Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: 1}, Data: bytes.Repeat([]byte{0x11}, hostarch.PageSize)},
+		}}},
+		{graphCaptureObjectID(2), Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 6}, Pages: []Page{
+			{Slot: 200, Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: 2}, Data: bytes.Repeat([]byte{0x22}, hostarch.PageSize)},
+		}}},
+	}
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
 	for _, object := range objects {
-		if got := sha256ID(object.Data); got != object.ID {
-			t.Fatalf("object ID = %s, content hash = %s", object.ID, got)
+		byID[object.id] = object.chunk
+		for _, page := range object.chunk.Pages {
+			index := object.chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				OldOffset: index * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: object.chunk.Logical.Allocator, Sequence: index},
+				Version: page.Version, Chunk: object.chunk.Logical, Slot: page.Slot,
+			}, object.id))
 		}
 	}
-}
-
-func sha256ID(data []byte) ID {
-	return ID(sha256.Sum256(data))
-}
-
-func TestReadSnapshotBuildsObjectsWithoutAcknowledging(t *testing.T) {
-	file, err := os.CreateTemp("", "ttc-chunk-snapshot-")
+	manifest, err := CompactBindings(stored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(file.Name()); err != nil {
+	origin, err := graph.AllocateWorking()
+	if err != nil {
 		t.Fatal(err)
 	}
-	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
-		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
-		DisableIMAWorkAround:    true,
-		DisableMemoryAccounting: true,
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "packed", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := memoryLocations(t, graph, result.Roots[0].Root)
+	first, second := locations[5*PagesPerChunk+9], locations[6*PagesPerChunk+200]
+	if first.Chunk != second.Chunk || first.Page != 0 || second.Page != 1 {
+		t.Fatalf("new pages at %+v and %+v, want pages 0 and 1 of one chunk", first, second)
+	}
+	file, err := data.Open(first.Chunk, ttcsnapshot.MemoryChunkBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(file)
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, ttcsnapshot.MemoryChunkBytes)
+	copy(want, objects[0].chunk.Pages[0].Data)
+	copy(want[hostarch.PageSize:], objects[1].chunk.Pages[0].Data)
+	if !bytes.Equal(raw, want) {
+		t.Fatal("the packed chunk does not hold the two pages at its first two pages")
+	}
+
+	built, err := BuildGraphManifest(graph, result.Roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range built.Manifest.Runs {
+		if want := map[uint8]uint8{9: 0, 200: 1}[run.FirstSlot]; run.Pages != 1 || run.ObjectPage != want {
+			t.Fatalf("rehydration manifest run %+v, want slot 9 at page 0 and slot 200 at page 1", run)
+		}
+	}
+	encoded, err := EncodeManifest(built.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version := binary.LittleEndian.Uint32(encoded[len(manifestMagic):]); version != manifestVersion {
+		t.Fatalf("a packed manifest encodes as version %d, want %d", version, manifestVersion)
+	}
+	decoded, err := DecodeManifest(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, built.Manifest) {
+		t.Fatalf("decoded %+v, encoded %+v", decoded, built.Manifest)
+	}
+}
+
+// An object's new pages share one chunk, as rehydration loads memory a logical
+// chunk at a time: an object that does not fit where the chunk has room
+// starts the next one.
+func TestGraphImportKeepsAnObjectsNewPagesInOneChunk(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	var stored []StoredBinding
+	byID := make(map[ID]Chunk)
+	for object := uint64(0); object < 3; object++ {
+		id := graphCaptureObjectID(object + 1)
+		chunk := Chunk{Logical: pgalloc.LogicalChunkID{Allocator: testAllocator(1), Sequence: 10 + object}}
+		for slot := 0; slot < 100; slot++ {
+			chunk.Pages = append(chunk.Pages, Page{Slot: uint8(slot), Version: pgalloc.PageVersionID{Allocator: testAllocator(2), Sequence: object*1000 + uint64(slot)}, Data: bytes.Repeat([]byte{byte(object + 1)}, hostarch.PageSize)})
+			index := chunk.Logical.Sequence*PagesPerChunk + uint64(slot)
+			stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+				OldOffset: index * hostarch.PageSize, References: 1,
+				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: index},
+				Version: chunk.Pages[slot].Version, Chunk: chunk.Logical, Slot: uint8(slot),
+			}, id))
+		}
+		byID[id] = chunk
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := importSnapshotGraph(graph, data, origin, manifest, "aligned", func(id ID) (Chunk, error) { return byID[id], nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := memoryLocations(t, graph, result.Roots[0].Root)
+	first := func(object uint64) ttcsnapshot.MemoryPageLocation { return locations[(10+object)*PagesPerChunk] }
+	last := func(object uint64) ttcsnapshot.MemoryPageLocation { return locations[(10+object)*PagesPerChunk+99] }
+	for object := uint64(0); object < 3; object++ {
+		if first(object).Chunk != last(object).Chunk {
+			t.Fatalf("object %d's pages span chunks: %+v to %+v", object, first(object), last(object))
+		}
+	}
+	if first(1).Chunk != first(0).Chunk || first(0).Page != 0 || first(1).Page != 100 {
+		t.Fatalf("the first two objects at %+v and %+v, want pages 0 and 100 of one chunk", first(0), first(1))
+	}
+	if first(2).Chunk == first(0).Chunk || first(2).Page != 0 {
+		t.Fatalf("the third object at %+v, want page 0 of a chunk of its own", first(2))
+	}
+}
+
+func TestGraphImportCheckpointBoundsRecoveryJournal(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	if _, err := graph.AllocateWorking(); err != nil {
+		t.Fatal(err)
+	}
+	before := graph.JournalBytes()
+	if before <= int64(len("TTCSGJ2\n")) {
+		t.Fatalf("graph mutation did not grow journal: %d", before)
+	}
+	if err := checkpointGraphImportIfNeeded(graph, before+1); err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.JournalBytes(); got != before {
+		t.Fatalf("journal checkpointed below threshold: got %d, want %d", got, before)
+	}
+	if err := checkpointGraphImportIfNeeded(graph, before); err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.JournalBytes(); got >= before {
+		t.Fatalf("journal remained at %d bytes after checkpoint, was %d", got, before)
+	}
+}
+
+func TestGraphImportDoesNotReuseSharedCachePages(t *testing.T) {
+	chunk := testChunk()
+	object := graphCaptureObjectID(1)
+	stored := make([]StoredBinding, 0, len(chunk.Pages))
+	for _, page := range chunk.Pages {
+		stored = append(stored, capturedBinding(pgalloc.CapturedPageBinding{
+			OldOffset: uint64(page.Slot) * hostarch.PageSize, References: 2,
+			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
+			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
+		}, object))
+	}
+	manifest, err := CompactBindings(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	firstOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := importSnapshotGraph(graph, data, firstOrigin, manifest, "shared/first", func(ID) (Chunk, error) { return chunk, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstPages := memoryLocations(t, graph, first.Roots[0].Root)
+	if err := graph.Seal(firstOrigin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.MarkShared(firstOrigin); err != nil {
+		t.Fatal(err)
+	}
+	secondOrigin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := importSnapshotGraphWithReusableStates(graph, data, secondOrigin, manifest, "shared/second", func(ID) (Chunk, error) { return chunk, nil }, []ttcsnapshot.SnapshotState{
+		ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedVolatile,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer mf.Destroy()
-	fr, err := mf.Allocate(2*hostarch.PageSize, pgalloc.AllocOpts{
-		Kind: usage.Anonymous,
-		Mode: pgalloc.AllocateAndWritePopulate,
-	})
-	if err != nil {
-		t.Fatal(err)
+	secondPages := memoryLocations(t, graph, second.Roots[0].Root)
+	if reflect.DeepEqual(secondPages, firstPages) {
+		t.Fatalf("cluster capture shared shared-cache pages %v", secondPages)
 	}
-	defer mf.DecRef(fr)
-	firstPage := bytes.Repeat([]byte{0x7b}, hostarch.PageSize)
-	dst, err := mf.MapInternal(fr, hostarch.Write)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, err := safemem.CopySeq(dst.TakeFirst64(hostarch.PageSize), safemem.BlockSeqOf(safemem.BlockFromSafeSlice(firstPage))); err != nil || n != hostarch.PageSize {
-		t.Fatalf("writing source page: n=%d err=%v", n, err)
-	}
-	capture := pgalloc.NewMemoryRangeCapture()
-	if err := capture.Record(mf, fr); err != nil {
-		t.Fatal(err)
-	}
-	layout, err := capture.SnapshotLayout()
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, err := pgalloc.NewRemoteSnapshot(layout.Regions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	objects, bindings, err := ReadSnapshot(snapshot, layout.Bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(objects) != 1 || len(bindings) != 2 {
-		t.Fatalf("ReadSnapshot produced %d objects and %d bindings", len(objects), len(bindings))
-	}
-	decoded, err := Decode(objects[0].Data, &objects[0].ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(decoded.Pages) != 2 || decoded.Pages[0].Zero || !bytes.Equal(decoded.Pages[0].Data, firstPage) || !decoded.Pages[1].Zero {
-		t.Fatalf("decoded snapshot pages = %+v", decoded.Pages)
-	}
-	if stats := snapshot.Stats(); stats.PagesReleased != 0 || stats.PagesOutstanding != 2 {
-		t.Fatalf("ReadSnapshot acknowledged source pages: %+v", stats)
+	for index, page := range secondPages {
+		if page.Chunk.Snapshot != secondOrigin {
+			t.Fatalf("second capture page %d is in chunk %s of shared origin %d", index, page.Chunk, firstOrigin)
+		}
 	}
 }
 
@@ -254,20 +796,17 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	allocator := testAllocator(11)
 	versionAllocator := testAllocator(22)
 	logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: 9}
-	object := ID(sha256.Sum256([]byte("dense-object")))
+	object := graphCaptureObjectID(9)
 	stored := make([]StoredBinding, PagesPerChunk)
 	for i := range stored {
-		stored[i] = StoredBinding{
-			Binding: pgalloc.CapturedPageBinding{
-				OldOffset:  uint64(i) * hostarch.PageSize,
-				References: 2,
-				Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(i)},
-				Version:    pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1000 + uint64(i)},
-				Chunk:      logical,
-				Slot:       uint8(i),
-			},
-			Object: object,
-		}
+		stored[i] = capturedBinding(pgalloc.CapturedPageBinding{
+			OldOffset:  uint64(i) * hostarch.PageSize,
+			References: 2,
+			Page:       pgalloc.LogicalPageID{Allocator: allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(i)},
+			Version:    pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: 1000 + uint64(i)},
+			Chunk:      logical,
+			Slot:       uint8(i),
+		}, object)
 	}
 	manifest, err := CompactBindings(stored)
 	if err != nil {
@@ -276,14 +815,14 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	if len(manifest.Runs) != 1 || manifest.Runs[0].Pages != PagesPerChunk {
 		t.Fatalf("dense chunk compacted to %+v, want one 256-page run", manifest.Runs)
 	}
-	data, id, err := EncodeManifest(manifest)
+	data, err := EncodeManifest(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(data) >= 512 {
 		t.Fatalf("one dense chunk manifest uses %d bytes, want less than 512", len(data))
 	}
-	decoded, err := DecodeManifest(data, &id)
+	decoded, err := DecodeManifest(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,974 +832,58 @@ func TestManifestCompactsDenseChunkAndRoundTrips(t *testing.T) {
 	if expanded := decoded.Expand(); !reflect.DeepEqual(expanded, stored) {
 		t.Fatalf("expanded bindings differ from source")
 	}
-	data[len(data)-1] ^= 1
-	if _, err := DecodeManifest(data, &id); err == nil {
-		t.Fatal("corrupt manifest passed content-address verification")
+	data[0] ^= 1
+	if _, err := DecodeManifest(data); err == nil {
+		t.Fatal("invalid manifest header passed structural validation")
 	}
 }
 
-func TestMemoryRepositoryPublishesDataBeforeMutableBranchRoot(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunk := testChunk()
-	source := make([]SourcePage, len(chunk.Pages))
-	for i, page := range chunk.Pages {
-		source[i] = SourcePage{
-			Binding: pgalloc.CapturedPageBinding{
-				OldOffset:  uint64(i) * hostarch.PageSize,
-				References: 1,
-				Page:       pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
-				Version:    page.Version,
-				Chunk:      chunk.Logical,
-				Slot:       page.Slot,
-			},
-			Zero: page.Zero,
-			Data: page.Data,
+// A manifest whose runs are out of order still plans an object's pages in slot
+// order and a resource's mappings in index order, maps a page index mapped
+// twice alike once, and refuses one mapped to two pages.
+func TestCaptureImportPlanOrdersPagesAndMappings(t *testing.T) {
+	logical := pgalloc.LogicalChunkID{Allocator: testAllocator(11), Sequence: 9}
+	object := graphCaptureObjectID(9)
+	run := func(index uint64, slot uint8, pages uint16) ManifestRun {
+		return ManifestRun{
+			OldOffset:    index * hostarch.PageSize,
+			References:   1,
+			FirstPage:    pgalloc.LogicalPageID{Allocator: logical.Allocator, Sequence: logical.Sequence*PagesPerChunk + uint64(slot)},
+			FirstVersion: pgalloc.PageVersionID{Allocator: testAllocator(22), Sequence: 1000 + uint64(slot)},
+			Logical:      logical,
+			FirstSlot:    slot,
+			Pages:        pages,
+			Object:       object,
+			ObjectPage:   slot,
 		}
 	}
-	objects, bindings, err := Assemble(source)
+	manifest := Manifest{Runs: []ManifestRun{run(8, 200, 2), run(0, 3, 2), run(8, 200, 1)}}
+	objects, resources, mappings, err := planCaptureImport(manifest, "plan")
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifestID, err := repository.Publish(objects, bindings)
-	if err != nil {
-		t.Fatal(err)
+	if len(objects) != 1 || len(resources) != 1 {
+		t.Fatalf("planned %d objects and %d resources, want one of each", len(objects), len(resources))
 	}
-	manifest, err := repository.LoadManifest(manifestID)
-	if err != nil {
-		t.Fatal(err)
+	var slots []uint8
+	for index := range objects[0].slots {
+		slots = append(slots, objects[0].slots[index].number())
 	}
-	if got := manifest.Expand(); !reflect.DeepEqual(got, bindings) {
-		t.Fatalf("published manifest bindings differ: got=%+v want=%+v", got, bindings)
+	if want := []uint8{3, 4, 200, 201}; !reflect.DeepEqual(slots, want) {
+		t.Fatalf("planned slots %v, want %v", slots, want)
 	}
-	if reusedID, err := repository.Publish(nil, bindings); err != nil || reusedID != manifestID {
-		t.Fatalf("reusing published objects = %s, %v; want %s", reusedID, err, manifestID)
-	}
-	badBindings := append([]StoredBinding(nil), bindings...)
-	badBindings[0].Binding.Version.Sequence++
-	if _, err := repository.Publish(nil, badBindings); err == nil {
-		t.Fatal("repository accepted a manifest binding absent from its object")
-	}
-	const branch = "feature/one@remote"
-	if err := repository.SetBranch(branch, manifestID); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.Branch(branch); err != nil || got != manifestID {
-		t.Fatalf("Branch = %s, %v; want %s", got, err, manifestID)
-	}
-	if roots, err := repository.ListBranches(); err != nil || len(roots) != 1 || roots[branch] != manifestID {
-		t.Fatalf("ListBranches = %+v, %v; want %q=%s", roots, err, branch, manifestID)
-	}
-	emptyID, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.SetBranch(branch, emptyID); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.Branch(branch); err != nil || got != emptyID {
-		t.Fatalf("replaced Branch = %s, %v; want %s", got, err, emptyID)
-	}
-	if err := repository.DeleteBranch(branch); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.Branch(branch); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("deleted Branch error = %v, want not-exist", err)
-	}
-	if roots, err := repository.ListBranches(); err != nil || len(roots) != 0 {
-		t.Fatalf("ListBranches after delete = %+v, %v; want empty", roots, err)
-	}
-}
-
-func TestMemoryRepositoryImportManifest(t *testing.T) {
-	source, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	destination, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunk := testChunk()
-	pages := make([]SourcePage, len(chunk.Pages))
-	for i, page := range chunk.Pages {
-		pages[i] = SourcePage{Binding: pgalloc.CapturedPageBinding{
-			OldOffset: uint64(i) * hostarch.PageSize, References: 1,
-			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
-			Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-		}, Zero: page.Zero, Data: page.Data}
-	}
-	objects, bindings, err := Assemble(pages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := source.Publish(objects, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	imported, err := destination.ImportManifest(source, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if imported != id {
-		t.Fatalf("imported manifest = %s, want %s", imported, id)
-	}
-	manifest, err := destination.LoadManifest(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(manifest.Expand(), bindings) {
-		t.Fatal("imported bindings differ from source")
-	}
-	for _, object := range objects {
-		if _, err := destination.chunks.Get(object.ID); err != nil {
-			t.Fatalf("imported object %s: %v", object.ID, err)
+	var indexes []uint64
+	for _, mapping := range mappings {
+		indexes = append(indexes, mapping.index)
+		if page := objects[0].slot(mapping.slot); page.number() != mapping.slot || page.identity.VersionSequence != 1000+uint64(mapping.slot) {
+			t.Fatalf("page index %d maps slot %d to %+v", mapping.index, mapping.slot, page.identity)
 		}
 	}
-	// Re-import must safely reuse immutable content.
-	for _, object := range objects {
-		_, path := source.chunks.path(object.ID)
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := destination.ImportManifest(source, id); err != nil {
-		t.Fatalf("idempotent import without source object reads: %v", err)
-	}
-}
-
-func TestMemoryRepositoryImportManifestConcurrentGarbageCollection(t *testing.T) {
-	source, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	destinationRoot := t.TempDir()
-	destination, err := OpenMemoryRepository(destinationRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector, err := OpenMemoryRepository(destinationRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Make import long enough for an independently-opened repository to run
-	// several collections while objects are arriving. The transaction written
-	// before the first object must protect the incomplete graph until SetBranch
-	// replaces it with a durable root.
-	const chunks = 16
-	allocator := testAllocator(40)
-	versionAllocator := testAllocator(80)
-	pages := make([]SourcePage, 0, chunks*PagesPerChunk)
-	for chunkIndex := 0; chunkIndex < chunks; chunkIndex++ {
-		logical := pgalloc.LogicalChunkID{Allocator: allocator, Sequence: uint64(chunkIndex)}
-		for slot := 0; slot < PagesPerChunk; slot++ {
-			sequence := uint64(chunkIndex*PagesPerChunk + slot)
-			pages = append(pages, SourcePage{
-				Binding: pgalloc.CapturedPageBinding{
-					OldOffset: sequence * hostarch.PageSize, References: 1,
-					Page:    pgalloc.LogicalPageID{Allocator: allocator, Sequence: sequence},
-					Version: pgalloc.PageVersionID{Allocator: versionAllocator, Sequence: sequence + 1},
-					Chunk:   logical, Slot: uint8(slot),
-				},
-				Data: bytes.Repeat([]byte{byte(chunkIndex + slot)}, hostarch.PageSize),
-			})
-		}
-	}
-	objects, bindings, err := Assemble(pages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestID, err := source.Publish(objects, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	stop := make(chan struct{})
-	collectorErr := make(chan error, 1)
-	go func() {
-		for {
-			select {
-			case <-stop:
-				collectorErr <- nil
-				return
-			default:
-			}
-			if _, err := collector.CollectGarbage(GCOptions{}); err != nil {
-				collectorErr <- err
-				return
-			}
-		}
-	}()
-	imported, err := destination.ImportManifest(source, manifestID)
-	if err == nil {
-		err = destination.SetBranch("remote", imported)
-	}
-	close(stop)
-	if collectorResult := <-collectorErr; collectorResult != nil {
-		t.Fatal(collectorResult)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	if imported != manifestID {
-		t.Fatalf("imported manifest = %s, want %s", imported, manifestID)
-	}
-	if err := destination.validateManifestObjects(manifestID); err != nil {
-		t.Fatalf("collector reclaimed an imported object: %v", err)
-	}
-}
-
-func TestInstallManifestRelocatesAndReadsWholeChunk(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunk := testChunk()
-	resource := checkpoint.ResourceID{Path: "/memory"}
-	source := make([]SourcePage, len(chunk.Pages))
-	for i, page := range chunk.Pages {
-		source[i] = SourcePage{
-			Binding: pgalloc.CapturedPageBinding{
-				ResourceID: resource, OldOffset: uint64(i) * hostarch.PageSize, References: 1,
-				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(page.Slot)},
-				Version: page.Version, Chunk: chunk.Logical, Slot: page.Slot,
-			},
-			Zero: page.Zero, Data: page.Data,
-		}
-	}
-	objects, bindings, err := Assemble(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestID, err := repository.Publish(objects, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.LoadManifest(manifestID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.CreateTemp("", "ttc-chunk-install-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(file.Name()); err != nil {
-		t.Fatal(err)
-	}
-	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
-		ResourceID: resource, DelayedEviction: pgalloc.DelayedEvictionDisabled,
-		DisableIMAWorkAround: true, DisableMemoryAccounting: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mf.Destroy()
-	installed, err := repository.InstallManifest(mf, manifest, usage.Anonymous, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(installed.Chunks) != 1 {
-		t.Fatalf("installed %d new chunks, want 1", len(installed.Chunks))
-	}
-	if err := installed.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewChunkReader(repository, installed.Chunks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded := make([]byte, pgalloc.SparseChunkBytes)
-	if n, err := reader.ReadAt(decoded, 0); err != nil || n != len(decoded) {
-		t.Fatalf("ReadAt: n=%d err=%v", n, err)
-	}
-	for i, page := range chunk.Pages {
-		gotOffset, ok := installed.Relocation.Page(resource, uint64(i)*hostarch.PageSize)
-		wantOffset := installed.Chunks[0].Target.Start + uint64(page.Slot)*hostarch.PageSize
-		if !ok || gotOffset != wantOffset {
-			t.Fatalf("page %d relocation=(%#x,%t), want %#x", i, gotOffset, ok, wantOffset)
-		}
-		got := decoded[uint64(page.Slot)*hostarch.PageSize : (uint64(page.Slot)+1)*hostarch.PageSize]
-		if page.Zero {
-			if !bytes.Equal(got, make([]byte, hostarch.PageSize)) {
-				t.Fatalf("zero slot %d is nonzero", page.Slot)
-			}
-		} else if !bytes.Equal(got, page.Data) {
-			t.Fatalf("slot %d payload mismatch", page.Slot)
-		}
-	}
-	reused, err := repository.InstallManifest(mf, manifest, usage.Anonymous, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(reused.Chunks) != 0 {
-		t.Fatalf("reinstall allocated chunks: %+v", reused.Chunks)
-	}
-	if err := reused.Commit(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func newChunkTestMemoryFile(t *testing.T, resource checkpoint.ResourceID) *pgalloc.MemoryFile {
-	t.Helper()
-	file, err := os.CreateTemp("", "ttc-chunk-memory-file-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(file.Name()); err != nil {
-		t.Fatal(err)
-	}
-	mf, err := pgalloc.NewMemoryFile(file, pgalloc.MemoryFileOpts{
-		ResourceID: resource, DelayedEviction: pgalloc.DelayedEvictionDisabled,
-		DisableIMAWorkAround: true, DisableMemoryAccounting: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return mf
-}
-
-func TestInstallManifestSetUsesResourceMemoryFiles(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	resources := []checkpoint.ResourceID{{}, {Path: "/private-tmpfs"}}
-	objects := make([]Object, 0, len(resources))
-	bindings := make([]StoredBinding, 0, len(resources))
-	files := make(map[checkpoint.ResourceID]*pgalloc.MemoryFile)
-	for i, resource := range resources {
-		chunk := testChunk()
-		chunk.Logical.Allocator = testAllocator(byte(40 + i))
-		chunk.Logical.Sequence += uint64(i)
-		chunk.Pages = chunk.Pages[:1]
-		chunk.Pages[0].Data = bytes.Repeat([]byte{byte(0x70 + i)}, hostarch.PageSize)
-		data, object, err := Encode(chunk)
-		if err != nil {
-			t.Fatal(err)
-		}
-		objects = append(objects, Object{ID: object, Logical: chunk.Logical, Data: data})
-		bindings = append(bindings, StoredBinding{
-			Binding: pgalloc.CapturedPageBinding{
-				ResourceID: resource, OldOffset: 0, References: 1,
-				Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)},
-				Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot,
-			},
-			Object: object,
-		})
-		mf := newChunkTestMemoryFile(t, resource)
-		defer mf.Destroy()
-		files[resource] = mf
-	}
-	manifestID, err := repository.Publish(objects, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.LoadManifest(manifestID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	installed, err := repository.InstallManifestSet(files, manifest, usage.Anonymous, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(installed.Chunks) != len(resources) {
-		t.Fatalf("installed %d chunks, want %d", len(installed.Chunks), len(resources))
-	}
-	for _, resource := range resources {
-		offset, ok := installed.Relocation.Page(resource, 0)
-		if !ok {
-			t.Fatalf("missing relocation for %s", resource)
-		}
-		found := false
-		for _, chunk := range installed.Chunks {
-			if chunk.ResourceID == resource {
-				found = true
-				if chunk.MemoryFile != files[resource] || offset < chunk.Target.Start || offset >= chunk.Target.End {
-					t.Fatalf("chunk for %s installed into wrong MemoryFile/range: %+v, offset=%#x", resource, chunk, offset)
-				}
-			}
-		}
-		if !found {
-			t.Fatalf("no installed chunk for %s", resource)
-		}
-	}
-	if err := installed.Commit(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func publishLifecycleManifest(t *testing.T, repository *MemoryRepository, fill byte) ManifestID {
-	t.Helper()
-	chunk := testChunk()
-	chunk.Pages[0].Data = bytes.Repeat([]byte{fill}, hostarch.PageSize)
-	data, object, err := Encode(chunk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding := StoredBinding{
-		Binding: pgalloc.CapturedPageBinding{
-			ResourceID: checkpoint.ResourceID{Path: "/memory"}, OldOffset: 0, References: 1,
-			Page:    pgalloc.LogicalPageID{Allocator: chunk.Logical.Allocator, Sequence: chunk.Logical.Sequence*PagesPerChunk + uint64(chunk.Pages[0].Slot)},
-			Version: chunk.Pages[0].Version, Chunk: chunk.Logical, Slot: chunk.Pages[0].Slot,
-		},
-		Object: object,
-	}
-	id, err := repository.Publish([]Object{{ID: object, Logical: chunk.Logical, Data: data}}, []StoredBinding{binding})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
-}
-
-func TestPackedManifestReaderPreservesDistributedStreamLayout(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x5a)
-	reader, err := NewPackedManifestReader(repository, manifest, []pgalloc.RemoteLoadRange{{
-		Target: memmap.FileRange{Start: 0, End: hostarch.PageSize}, StreamOffset: 2 * hostarch.PageSize,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	got := make([]byte, hostarch.PageSize)
-	if n, err := reader.ReadAt(got, 2*hostarch.PageSize); err != nil || n != len(got) {
-		t.Fatalf("ReadAt: n=%d err=%v", n, err)
-	}
-	if !bytes.Equal(got, bytes.Repeat([]byte{0x5a}, len(got))) {
-		t.Fatal("packed reader returned incorrect page contents")
-	}
-	if _, err := reader.ReadAt(make([]byte, hostarch.PageSize), 0); !errors.Is(err, io.EOF) {
-		t.Fatalf("unmapped packed offset error=%v, want EOF", err)
-	}
-}
-
-func TestDonatedRepositoryPublishesAndReadsRelativeToFD(t *testing.T) {
-	root := t.TempDir()
-	owner, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dir.Close()
-	donated, err := OpenMemoryRepositoryFD(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, donated, 0x42)
-	loaded, err := donated.LoadManifest(manifest)
-	if err != nil || len(loaded.Runs) != 1 {
-		t.Fatalf("donated LoadManifest: runs=%d err=%v", len(loaded.Runs), err)
-	}
-	if _, err := donated.chunks.Get(loaded.Runs[0].Object); err != nil {
-		t.Fatalf("donated chunk Get: %v", err)
-	}
-	if err := donated.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := owner.SetBranch("branch", manifest); err != nil {
-		t.Fatalf("rooting donated publication: %v", err)
-	}
-	if got, err := owner.Branch("branch"); err != nil || got != manifest {
-		t.Fatalf("owner branch=(%v, %v), want %v", got, err, manifest)
-	}
-}
-
-func TestBranchSetUsageTracksDurableSharedPages(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x4d)
-	for _, branch := range []string{"main", "child"} {
-		if err := repository.SetBranch(branch, manifest); err != nil {
-			t.Fatal(err)
-		}
-	}
-	usage, err := repository.BranchSetUsage(map[string]string{"main": "main", "child": "child"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if usage.UniqueBytes != hostarch.PageSize || len(usage.Branches) != 2 {
-		t.Fatalf("usage=%+v, want one unique page", usage)
-	}
-	for _, branch := range usage.Branches {
-		if branch.PrivateBytes != 0 || branch.SharedBytes != hostarch.PageSize {
-			t.Fatalf("branch usage=%+v, want one shared page", branch)
-		}
-	}
-	loaded, err := repository.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, branch := range []string{"main", "child"} {
-		if err := repository.MarkConsumed(branch, manifest, []ID{loaded.Runs[0].Object}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := repository.CollectGarbage(GCOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	usage, err = repository.BranchSetUsage(map[string]string{"main": "main", "child": "child"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if usage.UniqueBytes != 0 {
-		t.Fatalf("consumed durable usage=%+v, want zero", usage)
-	}
-}
-
-func TestRepositoryLeaseProtectsThenReclaimsManifest(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x31)
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	lease, err := repository.AcquireLease(manifest, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.DeleteBranch("branch"); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
-		t.Fatalf("GC with active lease = %+v, %v", got, err)
-	}
-	if err := lease.Renew(); err != nil {
-		t.Fatal(err)
-	}
-	if err := lease.Release(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
-		t.Fatalf("GC after lease release = %+v, %v", got, err)
-	}
-	if err := repository.validateManifestObjects(manifest); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("reclaimed manifest remains available: %v", err)
-	}
-}
-
-func TestRepositoryConsumptionReclaimsInstalledChunk(t *testing.T) {
-	root := t.TempDir()
-	repository, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x71)
-	loaded, err := repository.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := loaded.Runs[0].Object
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.MarkConsumed("branch", manifest, []ID{object}); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.MarkConsumed("branch", manifest, []ID{object}); err != nil {
-		t.Fatalf("idempotent consumption update: %v", err)
-	}
-	result, err := repository.CollectGarbage(GCOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Chunks != 1 || result.Manifests != 0 {
-		t.Fatalf("consumption GC = %+v, want one chunk and retained manifest", result)
-	}
-	if _, err := repository.LoadManifest(manifest); err != nil {
-		t.Fatalf("consumption reclaimed branch manifest: %v", err)
-	}
-	if err := repository.chunks.Contains(object); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("consumed object remains: %v", err)
-	}
-
-	// A new root replaces the old consumption generation conservatively.
-	newManifest := publishLifecycleManifest(t, repository, 0x72)
-	if err := repository.SetBranch("branch", newManifest); err != nil {
-		t.Fatal(err)
-	}
-	newLoaded, err := repository.LoadManifest(newManifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 {
-		t.Fatalf("replacement root lost unconsumed object: %+v, %v", got, err)
-	}
-	if err := repository.chunks.Contains(newLoaded.Runs[0].Object); err != nil {
-		t.Fatalf("replacement object unavailable: %v", err)
-	}
-}
-
-func TestDonatedRepositoryRecordsConsumption(t *testing.T) {
-	root := t.TempDir()
-	owner, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, owner, 0x73)
-	loaded, err := owner.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := owner.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	donated, err := OpenMemoryRepositoryFD(dir)
-	dir.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := donated.MarkConsumed("branch", manifest, []ID{loaded.Runs[0].Object}); err != nil {
-		t.Fatal(err)
-	}
-	if err := donated.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := owner.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 {
-		t.Fatalf("donated consumption GC = %+v, %v", got, err)
-	}
-}
-
-func TestConsumptionTrackerWaitsForRestoreCommit(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x74)
-	loaded, err := repository.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := loaded.Runs[0].Object
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewOwnedConsumingChunkReader(repository, []InstalledChunk{{
-		Object: object, Target: memmap.FileRange{Start: 0, End: pgalloc.SparseChunkBytes}, StreamOffset: 0,
-	}}, "branch", manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader.RangeLoaded(0, pgalloc.SparseChunkBytes)
-	time.Sleep(150 * time.Millisecond)
-	record, err := repository.readConsumption("branch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(record.Objects) != 0 {
-		t.Fatalf("uncommitted restore recorded consumption: %+v", record.Objects)
-	}
-	reader.ActivateConsumption(nil)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		record, err = repository.readConsumption("branch")
-		if err == nil {
-			if _, ok := record.Objects[object]; ok {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("committed consumption was not persisted: %+v, %v", record, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestConsumptionTrackerLeaseProtectsUnreadObjects(t *testing.T) {
-	root := t.TempDir()
-	repository, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x75)
-	loaded, err := repository.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := loaded.Runs[0].Object
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	donated, err := OpenMemoryRepositoryFD(dir)
-	dir.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewOwnedConsumingChunkReader(donated, []InstalledChunk{{
-		Object: object, Target: memmap.FileRange{Start: 0, End: pgalloc.SparseChunkBytes}, StreamOffset: 0,
-	}}, "branch", manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader.ActivateConsumption(nil)
-	if err := repository.DeleteBranch("branch"); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
-		t.Fatalf("GC with live sparse reader = %+v, %v", got, err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
-		t.Fatalf("GC after sparse reader close = %+v, %v", got, err)
-	}
-}
-
-func TestRepositoryPublicationTransactionExpires(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x32)
-	if got, err := repository.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 0 || got.Manifests != 0 {
-		t.Fatalf("GC with publication transaction = %+v, %v", got, err)
-	}
-	old := time.Now().Add(-2 * time.Hour)
-	entries, err := os.ReadDir(repository.txnRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if err := os.Chtimes(filepath.Join(repository.txnRoot, entry.Name()), old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := repository.CollectGarbage(GCOptions{Now: time.Now(), TransactionTTL: time.Hour})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Chunks != 1 || got.Manifests != 1 || got.ExpiredTransactions != 1 {
-		t.Fatalf("expired transaction GC = %+v", got)
-	}
-	if err := repository.validateManifestObjects(manifest); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired publication remains available: %v", err)
-	}
-}
-
-func TestRepositoryExpiredLeaseDoesNotProtect(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x33)
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	lease, err := repository.AcquireLease(manifest, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.DeleteBranch("branch"); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-time.Minute)
-	if err := os.Chtimes(lease.path, old, old); err != nil {
-		t.Fatal(err)
-	}
-	got, err := repository.CollectGarbage(GCOptions{Now: time.Now()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Chunks != 1 || got.Manifests != 1 || got.ExpiredLeases != 1 {
-		t.Fatalf("expired lease GC = %+v", got)
-	}
-	if err := lease.Renew(); err == nil {
-		t.Fatal("renewed a lease after its manifest was reclaimed")
-	}
-}
-
-func TestRepositoryGarbageCollectionWaitsForDemandReader(t *testing.T) {
-	root := t.TempDir()
-	readerRepository, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, readerRepository, 0x35)
-	if err := readerRepository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := readerRepository.DeleteBranch("branch"); err != nil {
-		t.Fatal(err)
-	}
-
-	readLock, err := readerRepository.lockGarbageCollection(unix.LOCK_SH)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := collector.CollectGarbage(GCOptions{})
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("garbage collection completed while a demand-reader lock was held: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if err := unlockGarbageCollection(readLock); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("garbage collection did not continue after demand-reader unlock")
-	}
-}
-
-func TestRepositoryLeaseRenewConcurrentGarbageCollection(t *testing.T) {
-	root := t.TempDir()
-	owner, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	collector, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, owner, 0x34)
-	if err := owner.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	lease, err := owner.AcquireLease(manifest, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := owner.DeleteBranch("branch"); err != nil {
-		t.Fatal(err)
-	}
-	errCh := make(chan error, 2)
-	go func() {
-		for i := 0; i < 100; i++ {
-			if err := lease.Renew(); err != nil {
-				errCh <- err
-				return
-			}
-		}
-		errCh <- nil
-	}()
-	go func() {
-		for i := 0; i < 100; i++ {
-			if got, err := collector.CollectGarbage(GCOptions{}); err != nil {
-				errCh <- err
-				return
-			} else if got.Chunks != 0 || got.Manifests != 0 {
-				errCh <- fmt.Errorf("collector reclaimed leased data: %+v", got)
-				return
-			}
-		}
-		errCh <- nil
-	}()
-	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := lease.Release(); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := collector.CollectGarbage(GCOptions{}); err != nil || got.Chunks != 1 || got.Manifests != 1 {
-		t.Fatalf("final GC = %+v, %v", got, err)
-	}
-}
-
-func TestRepositoryCorruptRootFailsClosed(t *testing.T) {
-	repository, err := OpenMemoryRepository(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x35)
-	if err := repository.SetBranch("branch", manifest); err != nil {
-		t.Fatal(err)
-	}
-	path, err := repository.branchPath("branch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.CollectGarbage(GCOptions{}); err == nil {
-		t.Fatal("GC accepted a corrupt durable root")
-	}
-	if err := repository.validateManifestObjects(manifest); err != nil {
-		t.Fatalf("fail-closed GC modified rooted data: %v", err)
-	}
-}
-
-func TestRepositoryOpenRecoversInterruptedCollection(t *testing.T) {
-	root := t.TempDir()
-	repository, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := publishLifecycleManifest(t, repository, 0x36)
-	loaded, err := repository.LoadManifest(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	object := loaded.Runs[0].Object
-	manifestDir, manifestPath := repository.manifestPath(manifest)
-	_, objectPath := repository.chunks.path(object)
-	quarantine := filepath.Join(repository.trashRoot, "interrupted")
-	if err := os.Mkdir(quarantine, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(manifestPath, filepath.Join(quarantine, "manifest-"+manifest.String())); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(objectPath, filepath.Join(quarantine, "chunk-"+object.String())); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * DefaultTransactionTTL)
-	if err := os.Chtimes(quarantine, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(manifestDir); err != nil {
-		t.Fatal(err)
-	}
-	recovered, err := OpenMemoryRepository(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recovered.validateManifestObjects(manifest); err != nil {
-		t.Fatalf("recovered repository is incomplete: %v", err)
-	}
-	entries, err := os.ReadDir(recovered.trashRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("recovery left trash entries: %v", entries)
+	if want := []uint64{0, 1, 8, 9}; !reflect.DeepEqual(indexes, want) {
+		t.Fatalf("planned page indexes %v, want %v", indexes, want)
+	}
+	manifest.Runs = append(manifest.Runs, run(8, 7, 1))
+	if _, _, _, err := planCaptureImport(manifest, "plan"); err == nil {
+		t.Fatal("a page index mapped to two pages was planned")
 	}
 }

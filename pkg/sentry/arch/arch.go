@@ -164,6 +164,11 @@ type contextInterface interface {
 	// featureSet is the application CPU feature set.
 	SignalSetup(st *Stack, act *linux.SigAction, info *linux.SignalInfo, alt *linux.SignalStack, sigset linux.SignalSet, featureSet cpuid.FeatureSet) error
 
+	// SetSignalFault records architecture-specific information for the next
+	// synchronous fault signal delivered at addr. Linux exposes this information
+	// in ucontext rather than siginfo (for example, x86 REG_ERR/REG_TRAPNO).
+	SetSignalFault(addr hostarch.Addr, at hostarch.AccessType)
+
 	// SignalRestore restores context after returning from a signal
 	// handler.
 	//

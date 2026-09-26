@@ -22,7 +22,7 @@ import (
 	"io"
 	"math"
 	"runtime"
-	"sort"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -310,7 +310,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		ma := maseg.ValuePtr()
 		if ma.wasteOrReleasing {
 			// This shouldn't be possible since we waited for memory release
-			// above, and f shouldn't be mutated during saving.
+			// above, and f isn't mutated during saving.
 			panic(fmt.Sprintf("found waste or releasing pages %v during pgalloc.MemoryFile.SaveTo()", maseg.Range()))
 		}
 		fr := maseg.Range()
@@ -1243,6 +1243,13 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 
 // AsyncPagesFileLoad holds async page loading state for a single pages file.
 type AsyncPagesFileLoad struct {
+	// owners keeps the asynchronous reader alive while either a Kernel or a
+	// source-side RemoteSnapshot may still fault retained pages through it.
+	// Page references alone are insufficient: an unloaded page remains
+	// allocated after capture, but loses its contents if the last reader owner
+	// cancels the load.
+	owners atomic.Int64
+
 	mu apflMutex
 
 	// If errVal is not nil, it is an error that has terminated asynchronous
@@ -1251,10 +1258,24 @@ type AsyncPagesFileLoad struct {
 	// immutable. errVal is stored with mu locked.
 	errVal atomic.Value
 
+	// errDetail retains the causal asynchronous-reader error for diagnostics.
+	// errVal intentionally remains a Linux EIO for guest-facing fault paths,
+	// which cannot safely expose arbitrary transport errors. Stats, however,
+	// must preserve the cause so a failed remote migration can be diagnosed and
+	// fenced instead of appearing as an unexplained "I/O error".
+	errDetail atomic.Pointer[string]
+
 	// demandOnly is true while unawaited pages must not be loaded. It may
 	// transition from true to false exactly once when Drain is called.
 	demandOnly atomic.Bool
-	drainOnce  sync.Once
+
+	// durableBacking is true after the volatile reader has been replaced by
+	// an immutable snapshot-graph reader. Multiple TTC branches can share one
+	// sparse residency unit and therefore the same loader; this bit lets every
+	// owner observe that the shared loader no longer depends on its original
+	// source node.
+	durableBacking atomic.Bool
+	drainOnce      sync.Once
 
 	// logicalChunkDemand makes every fault wait for all extant pages in the
 	// same stable logical 1 MiB chunk. The source stream must place each
@@ -1452,6 +1473,13 @@ type aplUnloadedInfo struct {
 	// logicalChunk is non-nil when this range participates in an atomic
 	// logical-chunk demand load.
 	logicalChunk *logicalChunkLoad
+
+	// unit, if not zero, is the sparse residency unit the range belongs to.
+	// A sparse load makes every unit a demand touches resident at once, so
+	// ranges of different units must not merge, however contiguous: merged,
+	// the first fault of a restored branch whose units lay in stream order
+	// loaded every unit of it.
+	unit uint64
 }
 
 type logicalChunkLoad struct {
@@ -1525,6 +1553,13 @@ type AsyncPagesFileLoadOpts struct {
 	// by a current waiter are read until Drain is called.
 	DemandOnly bool
 
+	// DurableBacking declares that ar reads immutable durable storage rather
+	// than a live source runtime. Most remote loaders become durable later via
+	// SwitchReader, but graph-native cold restores start in this state. This is
+	// lifecycle authority, not an I/O-success assertion: terminal reader errors
+	// remain observable through Stats.
+	DurableBacking bool
+
 	// PrefetchBytes speculatively loads up to this many page-aligned bytes
 	// immediately following a demanded range. It is effective only while
 	// DemandOnly is true; Drain already loads every remaining page.
@@ -1595,7 +1630,11 @@ func (apfl *AsyncPagesFileLoad) Stats() AsyncPagesFileLoadStats {
 	apfl.mu.Unlock()
 	apfl.amflsMu.Unlock()
 	if err := apfl.err(); err != nil {
-		stats.Error = err.Error()
+		if detail := apfl.errDetail.Load(); detail != nil {
+			stats.Error = *detail
+		} else {
+			stats.Error = err.Error()
+		}
 	}
 	return stats
 }
@@ -1640,6 +1679,8 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 		ops:                        make([]aplOp, maxParallel),
 		done:                       make(chan struct{}),
 	}
+	apfl.owners.Store(1)
+	apfl.durableBacking.Store(opts.DurableBacking)
 	apfl.prefetchAheadBytes.Store(opts.PrefetchBytes)
 	apfl.prefetchBehindBytes.Store(opts.PrefetchBehindBytes)
 	apfl.demandOnly.Store(opts.DemandOnly)
@@ -1658,6 +1699,43 @@ func StartAsyncPagesFileLoadWithOpts(ar stateio.AsyncReader, doneCallback func(e
 	apfl.lfStatus.Init()
 	go apfl.main()
 	return apfl, nil
+}
+
+// IncOwner retains apfl's asynchronous reader. The caller must already own a
+// reference, which prevents resurrection after the final owner has canceled
+// the load.
+func (apfl *AsyncPagesFileLoad) IncOwner() {
+	if !apfl.tryIncOwner() {
+		panic("retaining released asynchronous page load")
+	}
+}
+
+// tryIncOwner retains apfl's asynchronous reader, unless its last owner has
+// already released it.
+func (apfl *AsyncPagesFileLoad) tryIncOwner() bool {
+	for {
+		owners := apfl.owners.Load()
+		if owners <= 0 {
+			return false
+		}
+		if apfl.owners.CompareAndSwap(owners, owners+1) {
+			return true
+		}
+	}
+}
+
+// DecOwner releases one asynchronous-reader owner. The last release cancels
+// any unresolved reads and waits until the reader has closed.
+func (apfl *AsyncPagesFileLoad) DecOwner() error {
+	owners := apfl.owners.Add(-1)
+	if owners < 0 {
+		panic("negative asynchronous page load owner count")
+	}
+	if owners != 0 {
+		return nil
+	}
+	apfl.Cancel()
+	return apfl.Wait()
 }
 
 // SwitchReader atomically replaces the backing page source without loading
@@ -1693,15 +1771,27 @@ func (apfl *AsyncPagesFileLoad) SwitchReader(replacement stateio.AsyncReader) er
 	apfl.lfStatus.Notify(aplLFSwitchReader)
 	select {
 	case err := <-request.done:
+		if err == nil {
+			apfl.durableBacking.Store(true)
+		}
 		return err
 	case <-apfl.done:
 		select {
 		case err := <-request.done:
+			if err == nil {
+				apfl.durableBacking.Store(true)
+			}
 			return err
 		default:
 			return errors.New("async page loader stopped during reader handoff")
 		}
 	}
+}
+
+// HasDurableBacking reports whether unresolved pages are backed by an
+// immutable graph rather than a live source runtime.
+func (apfl *AsyncPagesFileLoad) HasDurableBacking() bool {
+	return apfl != nil && apfl.durableBacking.Load()
 }
 
 // ReaderGeometry returns the queue shape required for a reader handoff.
@@ -1717,23 +1807,27 @@ func (apfl *AsyncPagesFileLoad) Drain() {
 	if apfl.logicalChunkDemand {
 		apfl.drainOnce.Do(func() {
 			go func() {
-				type demand struct {
-					amfl  *asyncMemoryFileLoad
-					chunk *logicalChunkLoad
-				}
-				var demands []demand
+				var loads []*asyncMemoryFileLoad
 				apfl.amflsMu.Lock()
 				for amfl := apfl.amfls.Front(); amfl != nil; amfl = amfl.Next() {
-					for _, chunk := range amfl.logicalChunks {
-						demands = append(demands, demand{amfl: amfl, chunk: chunk})
-					}
+					loads = append(loads, amfl)
 				}
 				apfl.amflsMu.Unlock()
-				sort.Slice(demands, func(i, j int) bool {
-					return demands[i].chunk.ranges[0].StreamOffset < demands[j].chunk.ranges[0].StreamOffset
-				})
-				for _, item := range demands {
-					if err := item.amfl.awaitLoad(item.chunk.ranges[0].Target); err != nil {
+				for _, amfl := range loads {
+					// awaitLoad expands this physical span to exact logical
+					// chunks and queues all discontiguous members of each chunk.
+					// Use the current unresolved span instead of a chunk's first
+					// historical range: imports can reuse that leading range from
+					// an already-resident CoW version.
+					apfl.mu.Lock()
+					first, last := amfl.unloaded.FirstSegment(), amfl.unloaded.LastSegment()
+					if !first.Ok() {
+						apfl.mu.Unlock()
+						continue
+					}
+					unresolved := memmap.FileRange{Start: first.Start(), End: last.End()}
+					apfl.mu.Unlock()
+					if err := amfl.awaitLoad(unresolved); err != nil {
 						break
 					}
 				}
@@ -2017,6 +2111,30 @@ func (apfl *AsyncPagesFileLoad) TryInstallRemotePagesState(streamOffset uint64, 
 // calls have no effect.
 func (apfl *AsyncPagesFileLoad) MemoryFilesDone() {
 	apfl.lfStatus.Notify(aplLFDone)
+}
+
+// pendingPageLoads returns the loaders of the pages in fr that are still to be
+// loaded.
+func (f *MemoryFile) pendingPageLoads(fr memmap.FileRange) []*AsyncPagesFileLoad {
+	var loads []*AsyncPagesFileLoad
+	add := func(amfl *asyncMemoryFileLoad) {
+		if amfl == nil || fr.End <= amfl.minUnloaded.Load() {
+			return
+		}
+		amfl.pf.mu.Lock()
+		pending := !amfl.unloaded.IsEmptyRange(fr)
+		amfl.pf.mu.Unlock()
+		if pending && !slices.Contains(loads, amfl.pf) {
+			loads = append(loads, amfl.pf)
+		}
+	}
+	add(f.asyncPageLoad.Load())
+	if sparse := f.sparseAsyncLoads.Load(); sparse != nil {
+		for _, amfl := range *sparse {
+			add(amfl)
+		}
+	}
+	return loads
 }
 
 // IsAsyncLoading returns true if async page loading is in progress or has
@@ -2794,6 +2912,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 		if err != nil {
 			log.Warningf("Async page loading failed: stateio.AsyncReader.Wait failed: %v", err)
 			apfl.mu.Lock()
+			detail := fmt.Sprintf("waiting for remote page read: %v", err)
+			apfl.errDetail.Store(&detail)
 			apfl.errVal.Store(linuxerr.EIO)
 			apfl.mu.Unlock()
 			return
@@ -2818,6 +2938,8 @@ func (apfl *AsyncPagesFileLoad) main() {
 			}
 			if c.N != op.total {
 				log.Warningf("Async page loading failed: read for MemoryFile(%p) pages %v (total %d bytes) returned %d bytes, error: %v", op.amfl.f, op.frs, op.total, c.N, c.Err)
+				detail := fmt.Sprintf("remote page read at offset %d returned %d of %d bytes: %v", op.off(), c.N, op.total, c.Err)
+				apfl.errDetail.Store(&detail)
 				apfl.errVal.Store(linuxerr.EIO)
 				apfl.mu.Unlock()
 				apfl.amflsMu.Unlock()
@@ -2952,7 +3074,7 @@ func (aplUnloadedSetFunctions) ClearValue(ul *aplUnloadedInfo) {
 }
 
 func (aplUnloadedSetFunctions) Merge(fr1 memmap.FileRange, ul1 aplUnloadedInfo, fr2 memmap.FileRange, ul2 aplUnloadedInfo) (aplUnloadedInfo, bool) {
-	if ul1.off+fr1.Length() != ul2.off || ul1.logicalChunk != ul2.logicalChunk {
+	if ul1.off+fr1.Length() != ul2.off || ul1.logicalChunk != ul2.logicalChunk || ul1.unit != ul2.unit {
 		return aplUnloadedInfo{}, false
 	}
 	if ul1.started || ul2.started || len(ul1.waiters) != 0 || len(ul2.waiters) != 0 {
@@ -2969,6 +3091,7 @@ func (aplUnloadedSetFunctions) Split(fr memmap.FileRange, ul aplUnloadedInfo, sp
 		off:          ul.off + (splitAt - fr.Start),
 		started:      ul.started,
 		logicalChunk: ul.logicalChunk,
+		unit:         ul.unit,
 		// Setting cap(ul2.waiters) == len(ul2.waiters) makes ul2
 		// "copy-on-append", saving an allocation if ul2 is never appended-to.
 		// This is safe since existing elements in ul.waiters will never be

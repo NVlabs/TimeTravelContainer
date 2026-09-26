@@ -22,6 +22,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
+	gsync "gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -30,6 +31,23 @@ import (
 type ErrCorruption struct {
 	// Err is the wrapped error.
 	Err error
+}
+
+// afterLoad is called by stateify after reconstructing a Dentry.
+//
+// Dentry.mu is runtime synchronization state, not part of the Linux object
+// graph. In particular, a live-fork source can be stopped while a task or an
+// internal VFS operation holds the mutex. A restored dentry must never inherit
+// that transient ownership: the owner goroutine exists only in the source
+// kernel, so retaining the locked word leaves the child permanently blocked
+// in operations such as close(2), unlink(2), and branch destruction.
+//
+// The field is state:"nosave", which normally causes a newly allocated
+// object to receive the zero value. Reset it explicitly as a restore invariant
+// as well: state loading is also allowed to populate an existing object, and
+// live-fork correctness must not depend on allocator freshness.
+func (d *Dentry) afterLoad(goContext.Context) {
+	d.mu = gsync.Mutex{}
 }
 
 // Error returns a sensible description of the restore error.

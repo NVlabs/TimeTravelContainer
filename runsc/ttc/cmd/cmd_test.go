@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,14 +36,527 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
-	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
-	"gvisor.dev/gvisor/pkg/ttcvolume"
+	"gvisor.dev/gvisor/pkg/ttcremote"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/runsc/boot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 )
+
+func TestRemoteExecSessionRoundTrip(t *testing.T) {
+	runningExit := uint32(17)
+	exitedStatus := uint32(7 << 8)
+	created := time.Unix(123, 456).UTC()
+	source := []boot.ExecSessionInfo{{
+		ID: "build", ContainerID: "source-runtime", PID: 42, ConsoleID: "console-build",
+		Terminal: true, State: boot.ExecSessionRunning, CreatedAt: created, ExitStatus: &runningExit,
+	}, {
+		ID: "finished", ContainerID: "source-runtime", PID: 43, ConsoleID: "console-finished",
+		State: boot.ExecSessionExited, CreatedAt: created.Add(time.Second), ExitStatus: &exitedStatus,
+	}}
+	transport := remoteExecSessions(source)
+	if len(transport) != 2 || transport[0].ID != "build" || transport[1].ID != "finished" {
+		t.Fatalf("transport sessions=%+v", transport)
+	}
+	restored := bootExecSessions(transport, "target-runtime")
+	if len(restored) != 2 {
+		t.Fatalf("restored sessions=%+v", restored)
+	}
+	got := restored[0]
+	if got.ID != "build" || got.ContainerID != "target-runtime" || got.PID != 42 || got.ConsoleID != "console-build" || !got.Terminal || got.State != boot.ExecSessionRunning || !got.CreatedAt.Equal(created) || got.ExitStatus == nil || *got.ExitStatus != runningExit {
+		t.Fatalf("restored session=%+v", got)
+	}
+	finished := restored[1]
+	if finished.ID != "finished" || finished.ContainerID != "target-runtime" || finished.State != boot.ExecSessionExited || finished.ExitStatus == nil || *finished.ExitStatus != exitedStatus {
+		t.Fatalf("restored exited session=%+v", finished)
+	}
+	*source[0].ExitStatus = 99
+	if *transport[0].ExitStatus != 17 || *restored[0].ExitStatus != 17 {
+		t.Fatal("exec-session exit status aliases source storage")
+	}
+}
+
+func TestBranchRemovalRequiresForce(t *testing.T) {
+	if !branchRemovalRequiresForce("running", false) || !branchRemovalRequiresForce("paused", false) {
+		t.Fatal("live healthy branch did not require forced removal")
+	}
+	if branchRemovalRequiresForce("exited", false) {
+		t.Fatal("exited branch required forced removal")
+	}
+	if branchRemovalRequiresForce("running", true) {
+		t.Fatal("fenced corrupted branch retained stale force requirement")
+	}
+}
+
+func TestDistributedConsoleLogRelay(t *testing.T) {
+	dir := t.TempDir()
+	older := filepath.Join(dir, "older.log")
+	newer := filepath.Join(dir, "newer.log")
+	if err := os.WriteFile(older, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newer, []byte("newer\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "", "")
+	defer relay.Close()
+	var token [16]byte
+	copy(token[:], "console-log-test")
+	openExtent := func(path string) remoteConsoleLogExtent {
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := file.Stat()
+		if err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		return remoteConsoleLogExtent{file: file, size: info.Size()}
+	}
+	if err := relay.ConfigureConsoleLogs(token, map[string][]remoteConsoleLogExtent{"build": {openExtent(older), openExtent(newer)}}); err != nil {
+		t.Fatal(err)
+	}
+	// A running session may append after capture. The relay must expose exactly
+	// the captured prefix, not the file's later length.
+	file, err := os.OpenFile(newer, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("late\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(dir, "target", "build.log")
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "older\nnewer\n"; string(got) != want {
+		t.Fatalf("retained output=%q, want %q", got, want)
+	}
+	// Installation is idempotent after a lost Prepare response.
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len(got)), destination); err != nil {
+		t.Fatalf("idempotent fetch: %v", err)
+	}
+	got, err = os.ReadFile(destination)
+	if err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("idempotent retained output=%q, err=%v", got, err)
+	}
+	// Returning to a node can find an older disjoint segment of the same
+	// session. It precedes the current source segment and must not be replaced.
+	disjoint := filepath.Join(dir, "target", "disjoint.log")
+	if err := os.WriteFile(disjoint, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), disjoint); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(disjoint); err != nil || string(got) != "previous\nolder\nnewer\n" {
+		t.Fatalf("merged retained output=%q, err=%v", got, err)
+	}
+	// An existing prefix is already included by the source and must not be
+	// duplicated.
+	prefix := filepath.Join(dir, "target", "prefix.log")
+	if err := os.WriteFile(prefix, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fetchRemoteConsoleLog(t.Context(), listener.Addr().String(), token, "build", uint64(len("older\nnewer\n")), prefix); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(prefix); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("prefix retained output=%q, err=%v", got, err)
+	}
+}
+
+func TestDistributedArtifactRelay(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "", "")
+	defer relay.Close()
+	var token [16]byte
+	copy(token[:], "artifact-test")
+	payload := bytes.Repeat([]byte("kernel-state\n"), 1<<12)
+	if err := relay.ConfigureArtifacts(token, map[string][]byte{"metadata": payload}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), token, "metadata", uint64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("artifact bytes=%d, want %d, err=%v", len(got), len(payload), err)
+	}
+	if _, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), token, "metadata", uint64(len(payload))+1); err == nil {
+		t.Fatal("accepted mismatched artifact size")
+	}
+	wrong := token
+	wrong[0]++
+	if _, err := fetchRemoteArtifact(t.Context(), listener.Addr().String(), wrong, "metadata", uint64(len(payload))); err == nil {
+		t.Fatal("accepted wrong artifact token")
+	}
+}
+
+func TestApplyColdFilesystemRestoreIDs(t *testing.T) {
+	roots := []cluster.FilesystemRootDescriptor{
+		{Source: "/run/ttc/rootfs-upper", RepositoryID: "cache-rootfs", RestoreID: "cache-rootfs"},
+		{Source: "/run/ttc/volume-data", RepositoryID: "cache-data", RestoreID: "cache-data"},
+	}
+	cold := []coldFilesystemSnapshot{
+		{Root: cluster.FilesystemRootDescriptor{Source: "/run/ttc/volume-data", RestoreID: "captured-data"}},
+		{Root: cluster.FilesystemRootDescriptor{Source: "/run/ttc/rootfs-upper", RestoreID: "captured-rootfs"}},
+	}
+	if err := applyColdFilesystemRestoreIDs(roots, cold); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "captured-rootfs"; got != want {
+		t.Fatalf("rootfs restore ID=%q, want %q", got, want)
+	}
+	if got, want := roots[1].RestoreID, "captured-data"; got != want {
+		t.Fatalf("data restore ID=%q, want %q", got, want)
+	}
+	if err := applyColdFilesystemRestoreIDs(roots[:1], cold); err == nil || !strings.Contains(err.Error(), "unmatched") {
+		t.Fatalf("unmatched cold filesystem error=%v", err)
+	}
+	duplicate := append(append([]coldFilesystemSnapshot(nil), cold...), cold[0])
+	if err := applyColdFilesystemRestoreIDs(roots, duplicate); err == nil || !strings.Contains(err.Error(), "repeats") {
+		t.Fatalf("duplicate cold filesystem error=%v", err)
+	}
+}
+
+func TestApplyDehydratedFilesystemRestoreIDsAllowsPendingPublication(t *testing.T) {
+	roots := []cluster.FilesystemRootDescriptor{{
+		Source: "/run/ttc/rootfs-upper", RepositoryID: "local-rootfs", RestoreID: "local-rootfs",
+	}}
+	if err := applyDehydratedFilesystemRestoreIDs(roots, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := roots[0].RestoreID, "local-rootfs"; got != want {
+		t.Fatalf("pending-publication restore ID=%q, want %q", got, want)
+	}
+}
+
+func writeCurrentBundleFixture(path string, input ttcbundle.ContainerInfo) error {
+	info := input
+	info.Branches = append([]ttcbundle.BranchInfo(nil), input.Branches...)
+	if info.ID == "" {
+		info.ID = filepath.Base(filepath.Dir(path))
+	}
+	if info.State == "" {
+		info.State = "created"
+	}
+	if len(info.Branches) == 0 {
+		info.Branches = []ttcbundle.BranchInfo{{ID: "main", CreatedAt: info.CreatedAt}}
+	}
+	for i := range info.Branches {
+		branch := &info.Branches[i]
+		if branch.FilesystemBranch == "" {
+			branch.FilesystemBranch = branch.ID
+		}
+		if branch.State == "" {
+			branch.State = info.State
+		}
+		if branch.StorageState == "" {
+			branch.StorageState = "local"
+		}
+	}
+	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
+		info.LiveForkEligible = true
+	}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	// Production metadata writers replace container.json atomically. Tests that
+	// exercise publication/read ordering must preserve that contract; truncating
+	// the file in place creates a partial-JSON race that cannot occur in TTC.
+	temp, err := os.CreateTemp(filepath.Dir(path), ".container.json.fixture-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(encoded); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
+}
+
+func TestLogicalFamilyID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info ttcbundle.ContainerInfo
+		want string
+	}{
+		{name: "local physical identity", info: ttcbundle.ContainerInfo{ID: "physical"}, want: "physical"},
+		{name: "migrated logical identity", info: ttcbundle.ContainerInfo{ID: "physical", DistributedFamilyID: "family"}, want: "family"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := logicalFamilyID(tc.info); got != tc.want {
+				t.Fatalf("logicalFamilyID(%+v) = %q, want %q", tc.info, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPortIngressPersistencePolicy(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		backend *runtimeBackend
+		want    bool
+	}{
+		{name: "no manager", backend: &runtimeBackend{}},
+		{name: "standalone manager", backend: &runtimeBackend{portIngress: newPortIngressManager(&daemonServer{})}},
+		{name: "cluster manager", backend: &runtimeBackend{portIngress: newPortIngressManager(&daemonServer{clusterPlacements: placements})}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.backend.usesEphemeralPortIngress(); got != tc.want {
+				t.Fatalf("usesEphemeralPortIngress()=%t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDistributedPortIngressUsesPlacementCatalogWithoutLocalBundle(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "physical", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPort := uint16(probe.Addr().(*net.TCPAddr).Port)
+	probe.Close()
+	server := &daemonServer{clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 8080, Protocol: "tcp"}
+	if err := manager.Publish(selector{container: "web", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := manager.List("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].HostPort != hostPort {
+		t.Fatalf("listed bindings=%+v", listed)
+	}
+	if err := manager.Unpublish(selector{container: "web", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDistributedPortIngressRejectsKnownNonTTCNetwork(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "family")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir, NetworkMode: "none",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-b", OwnerIncarnation: "boot-b", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	server := &daemonServer{dataRoot: root, clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	err = manager.Publish(selector{container: "web", branch: "main"}, ttcbundle.PortBinding{
+		HostIP: "127.0.0.1", HostPort: 1, ContainerPort: 8080, Protocol: "tcp",
+	})
+	if err == nil || !strings.Contains(err.Error(), `network mode "none", not ttc`) {
+		t.Fatalf("Publish() error=%v, want network-mode rejection", err)
+	}
+}
+
+func TestDistributedPortIngressCanPrecedeInitialPlacement(t *testing.T) {
+	placements, err := cluster.OpenPlacementStore(filepath.Join(t.TempDir(), "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPort := uint16(probe.Addr().(*net.TCPAddr).Port)
+	probe.Close()
+	server := &daemonServer{clusterPlacements: placements}
+	manager := newPortIngressManager(server)
+	server.portIngress = manager
+	defer manager.Close()
+	info := ttcbundle.ContainerInfo{
+		ID: "family", Name: "web", NetworkMode: "ttc",
+		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "creating"}},
+	}
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: hostPort, ContainerPort: 8080, Protocol: "tcp"}
+	if err := manager.PublishPrepared(info, "main", binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := placements.Create(cluster.PlacementRecord{
+		FamilyID: "family", FamilyName: "web", BranchID: "main",
+		PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "boot-a", State: cluster.PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := manager.List("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].HostPort != hostPort {
+		t.Fatalf("listed pre-placement bindings=%+v", listed)
+	}
+	if err := manager.Unpublish(selector{container: "family", branch: "main"}, binding); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareRunIngressKeepsListenerAtEntryDaemon(t *testing.T) {
+	args := []string{"run", "-dit", "--node", "node-b", "--name", "web", "--network=ttc", "-p", "127.0.0.1:18080:8080", "--publish=18081:8081", "image", "serve", "-p", "guest-argument"}
+	clean, prepared, err := prepareRunIngress(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared == nil || prepared.target != (selector{container: "web", branch: "main"}) {
+		t.Fatalf("prepared=%+v", prepared)
+	}
+	if len(prepared.bindings) != 2 || prepared.bindings[0].HostPort != 18080 || prepared.bindings[1].HostPort != 18081 {
+		t.Fatalf("bindings=%+v", prepared.bindings)
+	}
+	want := []string{"run", "-dit", "--node", "node-b", "--name", "web", "--network=ttc", "image", "serve", "-p", "guest-argument"}
+	if !slices.Equal(clean, want) {
+		t.Fatalf("clean=%q, want %q", clean, want)
+	}
+}
+
+func TestPrepareRunIngressMakesGeneratedNameExplicit(t *testing.T) {
+	clean, prepared, err := prepareRunIngress([]string{"run", "-d", "--network=ttc", "-p=18080:80", "image"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared == nil || !strings.HasPrefix(prepared.target.container, "ttc-") {
+		t.Fatalf("prepared=%+v", prepared)
+	}
+	if len(clean) < 4 || clean[1] != "--name" || clean[2] != prepared.target.container {
+		t.Fatalf("clean=%q does not expose generated name %q", clean, prepared.target.container)
+	}
+}
+
+func TestPrepareRunIngressRejectsNonTTCNetwork(t *testing.T) {
+	if _, _, err := prepareRunIngress([]string{"run", "-d", "-p", "18080:80", "image"}); err == nil || !strings.Contains(err.Error(), "--network=ttc") {
+		t.Fatalf("prepareRunIngress() error=%v, want network rejection", err)
+	}
+}
+
+func TestDaemonStatusWriterObservesSplitFrames(t *testing.T) {
+	var framed bytes.Buffer
+	var mu sync.Mutex
+	if err := writeDaemonFrame(&framed, &mu, daemonFrameStdout, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDaemonStatus(&framed, &mu, 7); err != nil {
+		t.Fatal(err)
+	}
+	var forwarded bytes.Buffer
+	observer := &daemonStatusWriter{writer: &forwarded}
+	data := framed.Bytes()
+	for len(data) != 0 {
+		n := min(3, len(data))
+		if _, err := observer.Write(data[:n]); err != nil {
+			t.Fatal(err)
+		}
+		data = data[n:]
+	}
+	if !bytes.Equal(forwarded.Bytes(), framed.Bytes()) {
+		t.Fatal("observer changed the daemon frame stream")
+	}
+	if !observer.statusSeen || observer.status != 7 {
+		t.Fatalf("statusSeen=%t status=%d", observer.statusSeen, observer.status)
+	}
+}
+
+func TestDistributedPageRelayAcceptsPastIdleFilesystemStream(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := newDistributedPageRelay(listener, nil, "source", "session")
+	defer relay.Close()
+	idle, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	active, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	if _, err := active.Write([]byte("TTCF")); err != nil {
+		t.Fatal(err)
+	}
+	if err := active.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := active.Read(one[:]); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("second stream was not classified while first stayed idle: %v", err)
+	}
+}
 
 func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "ttcd.sock")
@@ -146,10 +660,33 @@ func TestPortLockHolderHelper(t *testing.T) {
 	time.Sleep(time.Minute)
 }
 
+func TestQuarantineCommandsAddressBranchState(t *testing.T) {
+	b := &fakeBackend{}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"quarantine", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("quarantine status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := b.quarantineTarget, (selector{container: "web", branch: "child"}); got != want || !b.quarantineEnabled {
+		t.Fatalf("quarantine call=(%v, %t), want (%v, true)", got, b.quarantineEnabled, want)
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("quarantine output=%q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"unquarantine", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("unquarantine status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.quarantineTarget != (selector{container: "web", branch: "child"}) || b.quarantineEnabled {
+		t.Fatalf("unquarantine call=(%v, %t)", b.quarantineTarget, b.quarantineEnabled)
+	}
+}
+
 func TestMigrateCommand(t *testing.T) {
 	backend := &fakeBackend{}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"migrate", "--target", "node-b", "web@main"}, &stdout, &stderr, backend); status != 0 {
+	if status := runCommand([]string{"migrate", "--node", "node-b", "web@main"}, &stdout, &stderr, backend); status != 0 {
 		t.Fatalf("status=%d stderr=%q", status, stderr.String())
 	}
 	if backend.migrateTarget.String() != "web@main" || backend.migrateNode != "node-b" || stdout.String() != "web@main\n" {
@@ -200,10 +737,16 @@ func TestTTYStatHumanOutputIncludesCausalFields(t *testing.T) {
 func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	backend := &fakeBackend{resourceStatsResult: FamilyResourceStats{
 		Container: "demo", ResidentMemoryUniqueBytes: 4096, FilesystemUniqueBytes: 8192,
-		Branches: []BranchResourceStats{{Target: "demo@main", State: "running", ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096}}},
+		ImageCacheBytes: 16384, ImageCacheTotalBytes: 32768,
+		SnapshotGraph: &SnapshotGraphResourceStats{Sequence: 7, Objects: 11, FamilyReachableObjects: 5, PendingReferenceOperations: 1},
+		Branches: []BranchResourceStats{{
+			Target: "demo@main", State: "running", NodeID: "node-a", Quarantined: true,
+			SnapshotID: 3, MemoryRoots: []string{"memory/root"}, MemoryRootObjects: []string{"object-3"}, FilesystemRoot: "filesystem-root",
+			ResidentMemory: ResourceBytes{PrivateBytes: 4096, TotalBytes: 4096},
+		}},
 	}}
 	var stdout bytes.Buffer
-	if err := runStats([]string{"--json", "demo@main"}, &stdout, io.Discard, backend); err != nil {
+	if err := runStats([]string{"--json", "--no-stream", "demo@main"}, &stdout, io.Discard, backend); err != nil {
 		t.Fatal(err)
 	}
 	if backend.resourceStatsTarget != (selector{container: "demo", branch: "main"}) {
@@ -213,8 +756,27 @@ func TestStatsJSONIncludesFamilyTotals(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || len(got.Branches) != 1 {
+	if got.ResidentMemoryUniqueBytes != 4096 || got.FilesystemUniqueBytes != 8192 || got.ImageCacheBytes != 16384 || got.ImageCacheTotalBytes != 32768 || len(got.Branches) != 1 ||
+		got.SnapshotGraph == nil || got.SnapshotGraph.Sequence != 7 || got.SnapshotGraph.FamilyReachableObjects != 5 || got.Branches[0].SnapshotID != 3 || got.Branches[0].NodeID != "node-a" || !got.Branches[0].Quarantined || got.Branches[0].FilesystemRoot != "filesystem-root" {
 		t.Fatalf("stats=%+v", got)
+	}
+}
+
+func TestStatsHumanOutputUsesPrintablePadding(t *testing.T) {
+	stats := FamilyResourceStats{Container: "demo", Branches: []BranchResourceStats{{
+		Target: "demo@main", State: "running", StorageState: "local",
+	}}}
+	var stdout bytes.Buffer
+	if err := writeResourceStats(&stdout, stats, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range stdout.Bytes() {
+		if b < 0x20 && b != '\n' && b != '\t' {
+			t.Fatalf("human stats contains control byte %#x: %q", b, stdout.String())
+		}
+	}
+	if !strings.Contains(stdout.String(), "demo@main") {
+		t.Fatalf("human stats=%q", stdout.String())
 	}
 }
 
@@ -304,6 +866,16 @@ func TestPortCommandsAreBranchAware(t *testing.T) {
 	}
 }
 
+func TestParsePublishedPortsAssignsInitialBranch(t *testing.T) {
+	bindings, err := parsePublishedPorts([]string{"127.0.0.1:8080:80"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 || bindings[0].BranchID != "main" {
+		t.Fatalf("bindings = %+v, want one main-branch binding", bindings)
+	}
+}
+
 func TestWriteTree(t *testing.T) {
 	created := time.Date(2026, 7, 17, 8, 9, 10, 123, time.UTC)
 	families := []Family{{
@@ -325,6 +897,41 @@ func TestWriteTree(t *testing.T) {
 		"    └── test-b paused\n"
 	if got := out.String(); got != want {
 		t.Errorf("writeTree output:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestEnrichPersistentBranchDiagnosticsAcrossNodes(t *testing.T) {
+	family := Family{Branches: []Branch{
+		{ID: "a1", NodeID: "node-a", State: "running"},
+		{ID: "a2", NodeID: "node-a", State: "paused"},
+		{ID: "b1", NodeID: "node-b", State: "running"},
+		{ID: "cold", State: "dehydrated"},
+		{ID: "done", State: "exited"},
+		{ID: "observed", NodeID: "node-b", State: "running", InitPID: 7, InitState: "exited", MemorySharing: "cow"},
+	}}
+	enrichPersistentBranchDiagnostics(&family)
+	byID := make(map[string]Branch)
+	for _, branch := range family.Branches {
+		byID[branch.ID] = branch
+	}
+	for _, id := range []string{"a1", "a2"} {
+		if got := byID[id]; got.InitPID != 1 || got.InitState != got.State || got.MemorySharing != "cow" {
+			t.Errorf("%s diagnostics=%+v", id, got)
+		}
+	}
+	if got := byID["b1"]; got.InitPID != 1 || got.InitState != "running" || got.MemorySharing != "cow" {
+		// observed is another live Kernel on node-b even though its runtime
+		// supplied diagnostics must remain untouched below.
+		t.Errorf("b1 diagnostics=%+v", got)
+	}
+	if got := byID["cold"]; got.InitState != "unknown" || got.MemorySharing != "unknown" {
+		t.Errorf("cold diagnostics=%+v", got)
+	}
+	if got := byID["done"]; got.InitState != "exited" || got.MemorySharing != "released" {
+		t.Errorf("done diagnostics=%+v", got)
+	}
+	if got := byID["observed"]; got.InitPID != 7 || got.InitState != "exited" || got.MemorySharing != "cow" {
+		t.Errorf("runtime diagnostics were overwritten: %+v", got)
 	}
 }
 
@@ -397,6 +1004,14 @@ func TestPsFiltersAndUsesQualifiedSelectors(t *testing.T) {
 	}
 	if got, want := stdout.String(), "web@main\nweb@child\nweb@old\nprepared@main\n"; got != want {
 		t.Errorf("ps --all --quiet=%q, want %q", got, want)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"ps", "-aq"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("ps -aq status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@main\nweb@child\nweb@old\nprepared@main\n"; got != want {
+		t.Errorf("ps -aq=%q, want %q", got, want)
 	}
 }
 
@@ -714,6 +1329,52 @@ type fakeDistributedBackend struct {
 	targetPaused     bool
 }
 
+type fakeElasticNodeBackend struct {
+	*fakeBackend
+	stoppedNode  string
+	stoppedMode  string
+	stoppedLocal bool
+	removedNode  string
+}
+
+func (*fakeElasticNodeBackend) clusterNodes() ([]cluster.NodeRecord, error) { return nil, nil }
+func (b *fakeElasticNodeBackend) removeNode(node string) error {
+	b.removedNode = node
+	return nil
+}
+func (b *fakeElasticNodeBackend) stopNode(node, mode string, local bool) ([]selector, error) {
+	b.stoppedNode, b.stoppedMode, b.stoppedLocal = node, mode, local
+	return nil, nil
+}
+func (*fakeElasticNodeBackend) rebalanceNode(string, string, bool) (cluster.FixedTerminalPlan, error) {
+	return cluster.FixedTerminalPlan{}, nil
+}
+func (*fakeElasticNodeBackend) plannerSnapshot(string, bool) (cluster.PlannerSnapshot, error) {
+	return cluster.PlannerSnapshot{}, nil
+}
+
+func TestNodeStopAcceptsPolicyAfterNode(t *testing.T) {
+	b := &fakeElasticNodeBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"node", "stop", "node-b", "--migrate-all"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("node stop status=%d stderr=%q", status, stderr.String())
+	}
+	if b.stoppedNode != "node-b" || b.stoppedMode != "migrate" || b.stoppedLocal {
+		t.Fatalf("node stop call=(%q, %q, %t)", b.stoppedNode, b.stoppedMode, b.stoppedLocal)
+	}
+}
+
+func TestNodeRemoveForgetsOfflineIdentity(t *testing.T) {
+	b := &fakeElasticNodeBackend{fakeBackend: &fakeBackend{}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"node", "rm", "node-b"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("node rm status=%d stderr=%q", status, stderr.String())
+	}
+	if b.removedNode != "node-b" || stdout.String() != "node-b\n" {
+		t.Fatalf("node rm target=%q stdout=%q", b.removedNode, stdout.String())
+	}
+}
+
 func (b *fakeDistributedBackend) forkRemote(source selector, targetNode, targetContainer string, paused bool) (selector, error) {
 	b.source = source
 	b.targetNode = targetNode
@@ -741,230 +1402,16 @@ func (b *fakeDistributedBackend) forkRemoteMany(source selector, targetNode stri
 	return results, nil
 }
 
-func TestReleaseDistributedSparseRoot(t *testing.T) {
-	dataRoot := t.TempDir()
-	relative := filepath.Join("cluster", "memory-chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.SetBranch("remote-root", manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-	b := &runtimeBackend{dataRoot: dataRoot}
-	info := ttcbundle.ContainerInfo{
-		DistributedSparseRepository: relative,
-		DistributedSparseBranch:     "remote-root",
-	}
-	if err := b.releaseDistributedSparseRoot(info); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.releaseDistributedSparseRoot(info); err != nil {
-		t.Fatalf("replaying release after branch deletion: %v", err)
-	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repository.Close()
-	if _, err := repository.Branch("remote-root"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released branch remains: %v", err)
-	}
-	if err := b.releaseDistributedSparseRoot(ttcbundle.ContainerInfo{}); err != nil {
-		t.Fatalf("empty release is not idempotent: %v", err)
-	}
-}
-
-func TestReconcileClusterSparseMemoryRoots(t *testing.T) {
-	dataRoot := t.TempDir()
-	relative := filepath.Join("cluster", "memory-chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, branch := range []string{"referenced", "orphaned"} {
-		if err := repository.SetBranch(branch, manifest); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	containerDir := filepath.Join(dataRoot, "containers", "container-id")
-	if err := os.MkdirAll(containerDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	bundleDir := filepath.Join(dataRoot, "bundles", "container-id")
-	if err := os.MkdirAll(bundleDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	info := ttcbundle.ContainerInfo{
-		ID:                          "container-id",
-		Name:                        "container",
-		BundleDir:                   bundleDir,
-		DistributedSparseRepository: relative,
-		DistributedSparseBranch:     "referenced",
-	}
-	encoded, err := json.Marshal(&info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	b := &runtimeBackend{dataRoot: dataRoot}
-	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
-		t.Fatal(err)
-	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	roots, err := repository.ListBranches()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roots) != 1 || roots["referenced"] != manifest {
-		t.Fatalf("roots after reconciliation = %+v, want referenced=%s", roots, manifest)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	info.DistributedSparseRepository = ""
-	info.DistributedSparseBranch = ""
-	encoded, err = json.Marshal(&info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
-		t.Fatal(err)
-	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repository.Close()
-	roots, err = repository.ListBranches()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roots) != 0 {
-		t.Fatalf("roots after releasing final reference = %+v, want empty", roots)
-	}
-}
-
-func TestReconcileClusterSparseMemoryRootsProtectsNonterminalTransaction(t *testing.T) {
-	dataRoot := t.TempDir()
-	relative := filepath.Join("cluster", "memory-chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const transactionID = "tx-protected"
-	protected := ttcvolume.ScopedBranchID("source-id", transactionID)
-	for _, branch := range []string{protected, "orphaned"} {
-		if err := repository.SetBranch(branch, manifest); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := cluster.OpenStore(filepath.Join(dataRoot, "cluster", "transactions"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest := "sha256:" + strings.Repeat("0", 64)
-	tx, err := cluster.NewTransaction(cluster.ForkIdentity{
-		TransactionID: transactionID, SourceNodeID: "node-a", TargetNodeID: "node-b",
-		SourceContainer: "source-id", SourceBranch: "main",
-		TargetContainer: "target", TargetBranch: transactionID,
-		ImageDigest: digest, RootfsDigest: digest, RepositoryID: "shared",
-	}, cluster.NegotiatedCapabilities{
-		Protocol: cluster.ControlProtocolVersion, BasePageSize: 4096,
-		MaxTransferSize: 2 << 20, PagingPolicy: ttcpolicy.DefaultPolicy(),
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Create(tx); err != nil {
-		t.Fatal(err)
-	}
-
-	b := &runtimeBackend{dataRoot: dataRoot}
-	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
-		t.Fatal(err)
-	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	roots, err := repository.ListBranches()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roots) != 1 || roots[protected] != manifest {
-		t.Fatalf("roots with preparing transaction = %+v, want %q=%s", roots, protected, manifest)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := store.Advance(transactionID, tx.Revision, cluster.TransactionCanceled, "", time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.reconcileClusterSparseMemoryRoots(); err != nil {
-		t.Fatal(err)
-	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer repository.Close()
-	roots, err = repository.ListBranches()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(roots) != 0 {
-		t.Fatalf("roots after terminal transaction = %+v, want empty", roots)
-	}
-}
-
 func TestForkTargetsRemoteNode(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--paused", "--target", "node-b", "web@child", "remote@main"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--paused", "--node", "node-b", "web@child", "remote"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "remote@main" || !b.targetPaused {
+	if b.source != (selector{container: "web", branch: "child"}) || b.targetNode != "node-b" || b.targetContainer != "web@remote" || !b.targetPaused {
 		t.Fatalf("distributed fork call source=%+v node=%q container=%q paused=%t", b.source, b.targetNode, b.targetContainer, b.targetPaused)
 	}
-	if got, want := stdout.String(), "remote@main\n"; got != want {
+	if got, want := stdout.String(), "web@remote\n"; got != want {
 		t.Fatalf("fork output=%q, want %q", got, want)
 	}
 }
@@ -972,13 +1419,13 @@ func TestForkTargetsRemoteNode(t *testing.T) {
 func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote-a@main", "remote-b@main"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@main", "remote-a", "remote-b"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if got, want := b.targetContainers, []string{"remote-a@main", "remote-b@main"}; !reflect.DeepEqual(got, want) {
+	if got, want := b.targetContainers, []string{"web@remote-a", "web@remote-b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("distributed targets=%q, want %q", got, want)
 	}
-	if got, want := stdout.String(), "remote-a@main\nremote-b@main\n"; got != want {
+	if got, want := stdout.String(), "web@remote-a\nweb@remote-b\n"; got != want {
 		t.Fatalf("fork output=%q, want %q", got, want)
 	}
 }
@@ -986,10 +1433,10 @@ func TestForkTargetsRemoteSiblingBatch(t *testing.T) {
 func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@child"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
 	}
-	if !strings.HasPrefix(b.targetContainer, "fork-") {
+	if !strings.HasPrefix(b.targetContainer, "web@fork-") {
 		t.Fatalf("generated remote container=%q", b.targetContainer)
 	}
 	if got, want := stdout.String(), b.targetContainer+"\n"; got != want {
@@ -997,18 +1444,16 @@ func TestForkGeneratesQualifiedRemoteDestination(t *testing.T) {
 	}
 }
 
-func TestForkAcceptsRemotePeerBranch(t *testing.T) {
+func TestForkRejectsQualifiedRemoteDestination(t *testing.T) {
 	b := &fakeDistributedBackend{fakeBackend: &fakeBackend{}}
 	var stdout, stderr bytes.Buffer
-	if status := runCommand([]string{"fork", "--target", "node-b", "web@main", "remote@second"}, &stdout, &stderr, b); status != 0 {
-		t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+	if status := runCommand([]string{"fork", "--node", "node-b", "web@main", "remote@second"}, &stdout, &stderr, b); status != 0 {
+		if !strings.Contains(stderr.String(), "must be a branch name") {
+			t.Fatalf("fork status=%d, stderr=%q", status, stderr.String())
+		}
+		return
 	}
-	if got, want := b.targetContainer, "remote@second"; got != want {
-		t.Fatalf("distributed destination=%q, want %q", got, want)
-	}
-	if got, want := stdout.String(), "remote@second\n"; got != want {
-		t.Fatalf("fork output=%q, want %q", got, want)
-	}
+	t.Fatal("qualified remote destination was accepted")
 }
 
 func TestForkRejectsQualifiedLocalDestination(t *testing.T) {
@@ -1045,6 +1490,14 @@ func TestRemoveAcceptsFamiliesAndQualifiedBranches(t *testing.T) {
 	}
 	if !b.destroyForce {
 		t.Error("rm -f did not force branch removal")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if status := runCommand([]string{"rm", "-fv", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("combined family rm flags status=%d, stderr=%q", status, stderr.String())
+	}
+	if !b.removeForce || !b.removeVolumes {
+		t.Errorf("rm -fv parsed force=%t volumes=%t", b.removeForce, b.removeVolumes)
 	}
 }
 
@@ -1212,6 +1665,7 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 			Digest:       digest,
 			Platform:     "linux/arm64/v8",
 			Materialized: true,
+			LocalCache:   &ImageCacheInfo{CompleteFiles: 3, TotalFiles: 5, CompleteBytes: 1024, TotalBytes: 2048},
 		},
 	}
 	got, err := inspectImageFromInventory(infos, "busybox")
@@ -1220,6 +1674,9 @@ func TestImageInspectAggregatesAliasesAndTTCState(t *testing.T) {
 	}
 	if got.ID != digest || got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" || !got.Materialized {
 		t.Errorf("inspect info=%+v", got)
+	}
+	if got.LocalCache == nil || got.LocalCache.CompleteBytes != 1024 || got.LocalCache.TotalBytes != 2048 {
+		t.Errorf("LocalCache=%+v", got.LocalCache)
 	}
 	if want := []string{"busybox:latest", "busybox:stable"}; !reflect.DeepEqual(got.RepoTags, want) {
 		t.Errorf("RepoTags=%q, want %q", got.RepoTags, want)
@@ -1273,6 +1730,13 @@ func TestImageInspectAndRemoveCommandRouting(t *testing.T) {
 	}
 	if b.imageInspectID != "alpine" || !strings.Contains(stdout.String(), `"Id": "`+digest+`"`) {
 		t.Errorf("image inspect id=%q output=%q", b.imageInspectID, stdout.String())
+	}
+	stdout.Reset()
+	if status := runCommand([]string{"image", "inspect", "alpine", "--format", "{{.Id}}"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("formatted image inspect status=%d, stderr=%q", status, stderr.String())
+	}
+	if got := stdout.String(); got != digest+"\n" {
+		t.Errorf("formatted image inspect output=%q", got)
 	}
 	stdout.Reset()
 	if status := runCommand([]string{"rmi", "--force", "alpine"}, &stdout, &stderr, b); status != 0 {
@@ -1378,8 +1842,8 @@ func TestRunParsesDockerStyleOptions(t *testing.T) {
 
 func TestRunAndCreateParseTimeTravelNetworking(t *testing.T) {
 	wantPorts := []ttcbundle.PortBinding{
-		{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"},
-		{HostIP: "127.0.0.1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp"},
+		{HostIP: "0.0.0.0", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"},
+		{HostIP: "127.0.0.1", HostPort: 8443, ContainerPort: 443, Protocol: "tcp", BranchID: "main"},
 	}
 	for _, command := range []string{"run", "create"} {
 		t.Run(command, func(t *testing.T) {
@@ -2460,6 +2924,9 @@ func TestExecParsesBranchAndDockerStyleOptions(t *testing.T) {
 	if !strings.HasPrefix(request.execID, "exec-") {
 		t.Errorf("attached exec has no stable session ID: %q", request.execID)
 	}
+	if request.retain {
+		t.Error("ordinary foreground exec unexpectedly retained its session")
+	}
 }
 
 func TestExecSessionBeforeCombinedShortOptions(t *testing.T) {
@@ -2468,7 +2935,7 @@ func TestExecSessionBeforeCombinedShortOptions(t *testing.T) {
 	if status := runCommand([]string{"exec", "--session", "build1", "-dit", "demo@main", "sh"}, &stdout, &stderr, b); status != 0 {
 		t.Fatalf("exec status=%d, stderr=%q", status, stderr.String())
 	}
-	if b.execRequest.execID != "build1" || !b.execRequest.detach || !b.execRequest.interactive || !b.execRequest.terminal {
+	if b.execRequest.execID != "build1" || !b.execRequest.detach || !b.execRequest.interactive || !b.execRequest.terminal || !b.execRequest.retain {
 		t.Fatalf("exec request=%+v", b.execRequest)
 	}
 }
@@ -2515,7 +2982,7 @@ func TestExecDetachReturnsQualifiedSessionID(t *testing.T) {
 		t.Fatalf("detached exec status=%d, stderr=%q", status, stderr.String())
 	}
 	request := b.execRequest
-	if !request.detach || !request.interactive || !request.terminal || !strings.HasPrefix(request.execID, "exec-") {
+	if !request.detach || !request.interactive || !request.terminal || !request.retain || !strings.HasPrefix(request.execID, "exec-") {
 		t.Fatalf("detached exec request=%+v", request)
 	}
 	want := "demo@child:" + request.execID + "\n"
@@ -2532,6 +2999,9 @@ func TestExecNamedDurableSession(t *testing.T) {
 	}
 	if got := b.execRequest.execID; got != "build1" {
 		t.Fatalf("exec session=%q, want build1", got)
+	}
+	if !b.execRequest.retain {
+		t.Fatal("named exec did not retain its session")
 	}
 	if got, want := stdout.String(), "demo@child:build1\n"; got != want {
 		t.Fatalf("detached exec output=%q, want %q", got, want)
@@ -2597,6 +3067,34 @@ func TestDiffHumanAndJSON(t *testing.T) {
 	}
 }
 
+func TestSyntheticRootfsMountChange(t *testing.T) {
+	spec := &specs.Spec{Mounts: []specs.Mount{
+		{Destination: "/proc"},
+		{Destination: "/data"},
+		{Destination: "/etc/hostname"},
+	}}
+	tests := []struct {
+		name            string
+		repositoryMount string
+		repositoryPath  string
+		want            bool
+	}{
+		{name: "root entry", repositoryMount: "/", repositoryPath: "/", want: true},
+		{name: "runtime proc mount", repositoryMount: "/", repositoryPath: "/proc", want: true},
+		{name: "user data mount", repositoryMount: "/", repositoryPath: "/data/", want: true},
+		{name: "ordinary rootfs path", repositoryMount: "/", repositoryPath: "/root", want: false},
+		{name: "mounted repository root", repositoryMount: "/data", repositoryPath: "/", want: false},
+		{name: "mounted repository child", repositoryMount: "/data", repositoryPath: "/file", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := syntheticRootfsMountChange(spec, test.repositoryMount, test.repositoryPath); got != test.want {
+				t.Fatalf("syntheticRootfsMountChange(%q, %q) = %t, want %t", test.repositoryMount, test.repositoryPath, got, test.want)
+			}
+		})
+	}
+}
+
 func TestParseExecSelectorRejectsInvalidValues(t *testing.T) {
 	for _, value := range []string{"", "demo", "demo:", "demo:../bad", "demo@child:-bad"} {
 		if _, err := parseExecSelector(value); err == nil {
@@ -2656,6 +3154,22 @@ func TestInspect(t *testing.T) {
 	}
 	if status := runCommand([]string{"inspect", "--format", "{{", "demo"}, &stdout, &stderr, b); status == 0 {
 		t.Fatal("inspect accepted invalid template")
+	}
+}
+
+func TestPublishedPortStateUsesActiveRoot(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	backend := &runtimeBackend{dataRoot: shared, localRoot: local}
+	binding := ttcbundle.PortBinding{HostIP: "127.0.0.1", HostPort: 18080, ContainerPort: 80, Protocol: "tcp"}
+	lockPath, logPath := portSidecarPaths(backend.activeDataRoot(), "container", binding)
+	for _, path := range []string{lockPath, logPath} {
+		if !strings.HasPrefix(path, local+string(os.PathSeparator)) {
+			t.Fatalf("sidecar path %q is not below active root %q", path, local)
+		}
+		if strings.HasPrefix(path, shared+string(os.PathSeparator)) {
+			t.Fatalf("sidecar path %q leaked into shared root %q", path, shared)
+		}
 	}
 }
 
@@ -2792,23 +3306,20 @@ func TestBuildInspectInfo(t *testing.T) {
 	}
 }
 
-func TestInternalAutoRemoveWaitsThenForcesRemoval(t *testing.T) {
+func TestInternalAutoRemoveNowForcesRemoval(t *testing.T) {
 	b := &fakeBackend{
 		waitStatus: uint32(7 << 8),
 		inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
 			Metadata: Branch{ID: "main", State: "exited"},
 		}}}},
 	}
-	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
-		t.Fatalf("runAutoRemove: %v", err)
-	}
-	if b.waited != (selector{container: "demo", branch: "main"}) {
-		t.Errorf("waited=%+v", b.waited)
+	if err := runAutoRemoveNow([]string{"demo@main"}, b); err != nil {
+		t.Fatalf("runAutoRemoveNow: %v", err)
 	}
 	if b.removed != "demo" || !b.removeForce || !b.removeVolumes {
 		t.Errorf("remove=(%q, force=%t, volumes=%t)", b.removed, b.removeForce, b.removeVolumes)
 	}
-	if err := runAutoRemove([]string{"demo"}, b); err == nil {
+	if err := runAutoRemoveNow([]string{"demo"}, b); err == nil {
 		t.Fatal("internal auto-remove accepted an unqualified family")
 	}
 }
@@ -2820,8 +3331,8 @@ func TestInternalAutoRemovePreservesForkedPeers(t *testing.T) {
 			{Metadata: Branch{ID: "child", State: "running"}},
 		}}},
 	}
-	if err := runAutoRemove([]string{"demo@main"}, b); err != nil {
-		t.Fatalf("runAutoRemove: %v", err)
+	if err := runAutoRemoveNow([]string{"demo@main"}, b); err != nil {
+		t.Fatalf("runAutoRemoveNow: %v", err)
 	}
 	if b.destroyed != (selector{container: "demo", branch: "main"}) || !b.destroyForce {
 		t.Errorf("destroyed=%+v force=%t", b.destroyed, b.destroyForce)
@@ -2981,6 +3492,103 @@ func TestWaitPrintsDockerExitCodesInArgumentOrder(t *testing.T) {
 	}
 }
 
+func TestWaitDurableAcceptsAuthoritativeStandaloneLocalState(t *testing.T) {
+	b := &authoritativeWaitBackend{
+		fakeBackend: &fakeBackend{
+			localDurable: true,
+			inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+				Metadata: Branch{ID: "child", State: "dehydrated", StorageState: "local"},
+			}}}},
+		},
+		// runtimeBackend has this method even in standalone mode. Its false
+		// result means that Raft is inapplicable, not that local durability can
+		// never converge.
+		durable: false,
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("wait durable status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("wait durable output=%q, want %q", got, want)
+	}
+}
+
+// A live branch has no durable state, so waiting for it fails at once rather
+// than never returning.
+func TestWaitDurableRefusesALiveBranch(t *testing.T) {
+	for _, state := range []string{"running", "paused"} {
+		b := &fakeBackend{
+			localDurable: true,
+			inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+				Metadata: Branch{ID: "child", State: state, StorageState: "local"},
+			}}}},
+		}
+		var stdout, stderr bytes.Buffer
+		done := make(chan int, 1)
+		go func() {
+			done <- runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b)
+		}()
+		select {
+		case status := <-done:
+			if status == 0 || !strings.Contains(stderr.String(), "only a stopped or dehydrated branch") {
+				t.Fatalf("%s: wait durable status=%d stderr=%q, want a refusal", state, status, stderr.String())
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: wait durable on a live branch did not return", state)
+		}
+	}
+}
+
+// A family target pauses its running branches and resumes its paused ones,
+// as the help for pause and resume says.
+func TestPauseAndResumeAFamily(t *testing.T) {
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "main", State: "running"}},
+		{Metadata: Branch{ID: "held", State: "paused"}},
+		{Metadata: Branch{ID: "done", State: "exited"}},
+		{Metadata: Branch{ID: "work", State: "running"}},
+	}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"pause", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("pause web status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []selector{{container: "web", branch: "main"}, {container: "web", branch: "work"}}; !reflect.DeepEqual(b.pausedAll, want) {
+		t.Fatalf("paused %+v, want the running branches %+v", b.pausedAll, want)
+	}
+	if status := runCommand([]string{"resume", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("resume web status=%d stderr=%q", status, stderr.String())
+	}
+	if want := []selector{{container: "web", branch: "held"}}; !reflect.DeepEqual(b.resumedAll, want) {
+		t.Fatalf("resumed %+v, want the paused branch %+v", b.resumedAll, want)
+	}
+}
+
+type authoritativeWaitBackend struct {
+	*fakeBackend
+	durable bool
+}
+
+func (b *authoritativeWaitBackend) authoritativeBranchDurable(selector) (bool, error) {
+	return b.durable, nil
+}
+
+func TestWaitDurableUsesClusterAuthorityInsteadOfStaleLocalMetadata(t *testing.T) {
+	b := &authoritativeWaitBackend{
+		fakeBackend: &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+			Metadata: Branch{ID: "child", State: "dehydrating", StorageState: "local"},
+		}}}}},
+		durable: true,
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"wait", "--condition", "durable", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("wait durable status=%d, stderr=%q", status, stderr.String())
+	}
+	if got, want := stdout.String(), "web@child\n"; got != want {
+		t.Fatalf("wait durable output=%q, want %q", got, want)
+	}
+}
+
 func containsSelector(values []selector, target selector) bool {
 	for _, value := range values {
 		if value == target {
@@ -3004,7 +3612,31 @@ func TestStopPausedAndDehydratedDiscardsWithoutResume(t *testing.T) {
 			if b.discarded != (selector{container: "web", branch: "child"}) {
 				t.Fatalf("discarded=%+v", b.discarded)
 			}
+			wantPrepared := 0
+			if state == "paused" {
+				wantPrepared = 1
+			}
+			if got := len(b.preparedPausedStops); got != wantPrepared {
+				t.Fatalf("paused filesystem preparations=%+v, want %d", b.preparedPausedStops, wantPrepared)
+			}
 		})
+	}
+}
+
+func TestStopDehydratingWaitsForSealedFilesystemPublication(t *testing.T) {
+	fake := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{
+		{Metadata: Branch{ID: "child", State: "dehydrating", StorageState: "publishing"}},
+	}}}}
+	b := &authoritativeWaitBackend{
+		fakeBackend: fake,
+		durable:     true,
+	}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"stop", "web@child"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("stop status=%d stderr=%q", status, stderr.String())
+	}
+	if b.discarded != (selector{container: "web", branch: "child"}) {
+		t.Fatalf("discarded=%+v", b.discarded)
 	}
 }
 
@@ -3141,7 +3773,7 @@ func TestFreshStartPeers(t *testing.T) {
 		{ID: "cold", State: "dehydrated"},
 		{ID: "old", State: "stopped"},
 	}}
-	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"})
+	got, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, "")
 	if err != nil {
 		t.Fatalf("freshStartPeers: %v", err)
 	}
@@ -3154,8 +3786,37 @@ func TestFreshStartPeers(t *testing.T) {
 	}
 
 	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "busy", State: "dehydrating"})
-	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
+	if _, err := freshStartPeers(info, selector{container: "demo", branch: "target"}, ""); err == nil || !strings.Contains(err.Error(), "busy is dehydrating") {
 		t.Fatalf("freshStartPeers transient error=%v", err)
+	}
+
+	info.Branches = []ttcbundle.BranchInfo{
+		{ID: "target", NodeID: "node-a", State: "exited"},
+		{ID: "local", NodeID: "node-a", State: "running"},
+		{ID: "remote", NodeID: "node-b", State: "running"},
+		{ID: "unplaced", State: "dehydrating"},
+	}
+	got, err = freshStartPeers(info, selector{container: "demo", branch: "target"}, "node-a")
+	if err != nil {
+		t.Fatalf("freshStartPeers distributed: %v", err)
+	}
+	want = []selector{{container: "demo", branch: "local"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("distributed freshStartPeers=%+v, want %+v", got, want)
+	}
+}
+
+func TestRehydrateAcceptsPublishingCapture(t *testing.T) {
+	target := selector{container: "web", branch: "main"}
+	b := &fakeBackend{inspectInfo: InspectInfo{TTC: TTCInspectInfo{Branches: []InspectBranch{{
+		Metadata: Branch{ID: target.branch, State: "dehydrating"},
+	}}}}}
+	var stdout, stderr bytes.Buffer
+	if status := runCommand([]string{"rehydrate", target.String()}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("rehydrate publishing capture status=%d stderr=%q", status, stderr.String())
+	}
+	if got := b.rehydratedTargets; !reflect.DeepEqual(got, []selector{target}) {
+		t.Fatalf("rehydrated targets=%+v, want %+v", got, []selector{target})
 	}
 }
 
@@ -3225,6 +3886,132 @@ func TestReadConsoleWaitStatus(t *testing.T) {
 	}
 	if _, _, err := readConsoleWaitStatus(path); err == nil {
 		t.Fatal("invalid status was accepted")
+	}
+}
+
+// observedInitExitFixture is a standalone family, demo, whose running branch's
+// init exited with status 7, as its console follower recorded, while nothing
+// has yet finalized the exit.
+func observedInitExitFixture(t *testing.T) (*runtimeBackend, ttcbundle.Store) {
+	t.Helper()
+	dataRoot := t.TempDir()
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\n[ \"$3\" = list ] && { echo '[]'; exit 0; }\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(dataRoot, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "running",
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", StorageState: "local"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	paths, err := store.BranchConsolePaths("demo", defaultBranchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.WaitStatus), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.WaitStatus, []byte(strconv.FormatUint(uint64(7<<8), 10)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return &runtimeBackend{root: filepath.Join(dataRoot, "runsc-root"), runsc: runsc, dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}, store
+}
+
+func TestFinalizeObservedInitExit(t *testing.T) {
+	b, store := observedInitExitFixture(t)
+	changed, err := b.finalizeObservedInitExit(selector{container: "demo", branch: defaultBranchID})
+	if err != nil {
+		t.Fatalf("finalizeObservedInitExit: %v", err)
+	}
+	if !changed {
+		t.Fatal("completed init exit was not finalized")
+	}
+	info, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := persistentBranchInfo(info, defaultBranchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.State != "exited" || info.ExitStatus == nil || *info.ExitStatus != 7 {
+		t.Fatalf("finalized metadata=%+v branch=%+v", info, branch)
+	}
+}
+
+// An exit in a family a long operation works on is left to the operation;
+// reconciliation finalizes it once the operation is over.
+func TestReconcileLeavesTheExitsOfABusyFamily(t *testing.T) {
+	b, store := observedInitExitFixture(t)
+	var operations familyOperations
+	op := &familyOperation{id: "demo", name: "demo", longOperation: longOperation{branch: defaultBranchID, state: "stopping"}}
+	if err := operations.begin(op); err != nil {
+		t.Fatal(err)
+	}
+	b.operations = &operations
+	state := func() string {
+		t.Helper()
+		info, err := store.LoadContainer("demo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		branch, err := persistentBranchInfo(info, defaultBranchID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return branch.State
+	}
+	if err := b.reconcileObservedInitExits(); err != nil {
+		t.Fatalf("reconcileObservedInitExits: %v", err)
+	}
+	if got := state(); got != "running" {
+		t.Fatalf("reconciliation finalized an exit in a busy family: branch state=%q", got)
+	}
+	operations.end(op)
+	if err := b.reconcileObservedInitExits(); err != nil {
+		t.Fatalf("reconcileObservedInitExits: %v", err)
+	}
+	if got := state(); got != "exited" {
+		t.Fatalf("branch state=%q once the family was idle, want exited", got)
+	}
+}
+
+func TestFinalizeObservedInitExitSkipsCommittedColdPhysicalRecord(t *testing.T) {
+	dataRoot := t.TempDir()
+	containerDir := filepath.Join(dataRoot, "containers", "physical")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "physical", Name: "logical", BundleDir: bundleDir, State: "dehydrated",
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "private", State: "dehydrated", StorageState: "shared",
+			PublicationID: "publication-1", StorageManifest: "cold/manifest.json",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{dataRoot: dataRoot, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard}
+	changed, err := b.finalizeObservedInitExit(selector{container: "physical", branch: "private"})
+	if err != nil {
+		t.Fatalf("finalizeObservedInitExit: %v", err)
+	}
+	if changed {
+		t.Fatal("committed cold branch was treated as a newly exited runtime")
 	}
 }
 
@@ -3301,20 +4088,48 @@ func TestVerifyCgroupV2Resources(t *testing.T) {
 	}
 }
 
-func TestRuntimeRootIsWritableByDefault(t *testing.T) {
-	t.Setenv("TTC_RUNTIME_DIR", "/var/run/ttc-test")
-	if got, want := runtimeRoot(), "/var/run/ttc-test/runsc"; got != want {
-		t.Fatalf("runtimeRoot with TTC_RUNTIME_DIR=%q, want %q", got, want)
+func TestPreflightCgroupV2Delegation(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "delegated")
+	leaf := filepath.Join(parent, "daemon")
+	if err := os.MkdirAll(leaf, 0700); err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("TTC_RUNTIME_DIR", "")
-	t.Setenv("XDG_RUNTIME_DIR", "/run/user/test")
-	if got, want := runtimeRoot(), "/run/user/test/runsc"; got != want {
-		t.Fatalf("runtimeRoot with XDG_RUNTIME_DIR=%q, want %q", got, want)
+	for path, contents := range map[string]string{
+		filepath.Join(root, "cgroup.controllers"):       "cpu memory pids\n",
+		filepath.Join(parent, "cgroup.controllers"):     "cpu memory\n",
+		filepath.Join(parent, "cgroup.subtree_control"): "+cpu +memory\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	t.Setenv("XDG_RUNTIME_DIR", "")
-	want := filepath.Join(os.TempDir(), "ttc-"+strconv.Itoa(os.Geteuid()), "runsc")
-	if got := runtimeRoot(); got != want {
-		t.Fatalf("runtimeRoot without XDG_RUNTIME_DIR=%q, want %q", got, want)
+	proc := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.WriteFile(proc, []byte("0::/delegated/daemon\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"cpu", "memory"}); err != nil {
+		t.Fatalf("preflightCgroupV2Delegation: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"memory"}); err == nil || !strings.Contains(err.Error(), "Delegate=yes") {
+		t.Fatalf("non-delegated preflight error=%v", err)
+	}
+	if err := os.Chmod(filepath.Join(parent, "cgroup.subtree_control"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := preflightCgroupV2Delegation(proc, root, []string{"io"}); err == nil || !strings.Contains(err.Error(), `controller "io"`) {
+		t.Fatalf("missing-controller preflight error=%v", err)
+	}
+}
+
+func TestClientDoesNotAcceptStorageOrDirectOptions(t *testing.T) {
+	for _, option := range []string{"--root=/runtime", "--runsc=/ttcd", "--data-root=/data", "--direct"} {
+		if _, _, _, err := parseGlobalOptions([]string{option, "ps"}, io.Discard); err == nil {
+			t.Fatalf("legacy client option %q was accepted", option)
+		}
 	}
 }
 
@@ -3328,15 +4143,21 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("unsafe options=(%+v, %q, %t, %v), want explicit opt-in", opts, remaining, done, err)
 	}
 
-	wantHardened := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	// The dentry cache is sized from this process's descriptor limit, so what
+	// it should be is asked for rather than written down.
+	dcache := []string(nil)
+	if size, known := dentryCacheSize(); known {
+		dcache = []string{"--dcache=" + strconv.Itoa(size)}
+	}
+	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}
+	wantHost := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := []string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory", "--ttc-network-nat=true"}
+	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...), "--ttc-network-nat=true")
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -3344,10 +4165,10 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkConfig("ttc", true, "192.0.2.44", "02:aa:bb:cc:dd:ee"); !reflect.DeepEqual(got, wantCustomNIC) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
-	wantUnsafe := []string{
-		"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--rootless=false", "--unsafe-no-host-isolation=true",
+	wantUnsafe := append([]string{
+		"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
-	}
+	}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
 	}
@@ -3364,6 +4185,58 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if got := (&runtimeBackend{root: "/runtime", runtimePlatform: "kvm"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantKVM) {
 		t.Errorf("KVM runsc args=%q, want %q", got, wantKVM)
 	}
+}
+
+// The cache a sandbox is allowed fits in the descriptors it will be given.
+//
+// This is the whole of the fix: a login node hands its processes 8191
+// descriptors and no more, the gofer spends close to two of them on every
+// dentry the sentry holds, and the per-mount default of a thousand each meant a
+// seven-mount sandbox was permitted a cache it could not pay for. It reached
+// EMFILE with its caches still filling, and a gofer at EMFILE never recovers —
+// nothing evicts on a descriptor shortage.
+func TestTheDentryCacheFitsInTheDescriptorsTheGoferWillHave(t *testing.T) {
+	size, known := dentryCacheSize()
+	if !known {
+		t.Skip("this process cannot read its own descriptor limit")
+	}
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+	// What a full cache costs the gofer, against what the gofer has. The
+	// margin is the point: the other half is for the files the workload is
+	// holding open, which are not cache and cannot be evicted.
+	cost := size * goferFDsPerDentry
+	if uint64(cost) >= limit.Cur && size < maxDentryCache {
+		t.Fatalf("a full cache of %d dentries costs %d descriptors of %d", size, cost, limit.Cur)
+	}
+	if size < minDentryCache {
+		t.Fatalf("cache of %d dentries is too small to be worth having", size)
+	}
+	if size > maxDentryCache {
+		t.Fatalf("cache of %d dentries is past the ceiling of %d", size, maxDentryCache)
+	}
+}
+
+// The sandbox is told the size, so that one cache serves every mount.
+//
+// Without the flag the sentry gives each mount its own thousand, which is what
+// made the budget grow with the number of things mounted rather than staying
+// inside what the gofer can hold.
+func TestTheSandboxIsGivenOneCacheForAllOfItsMounts(t *testing.T) {
+	size, known := dentryCacheSize()
+	if !known {
+		t.Skip("this process cannot read its own descriptor limit")
+	}
+	args := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs()
+	want := "--dcache=" + strconv.Itoa(size)
+	for _, arg := range args {
+		if arg == want {
+			return
+		}
+	}
+	t.Fatalf("runsc args %q do not carry %q", args, want)
 }
 
 func TestDehydrationNetworkArgs(t *testing.T) {
@@ -3391,7 +4264,7 @@ func TestDehydrationNetworkArgs(t *testing.T) {
 	}
 }
 
-func TestRetainRehydrationPageSource(t *testing.T) {
+func TestRemoveConsumedRehydrationPageSource(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		branch    string
@@ -3424,31 +4297,27 @@ func TestRetainRehydrationPageSource(t *testing.T) {
 
 			var stderr bytes.Buffer
 			b := &runtimeBackend{dataRoot: dataRoot, stderr: &stderr}
-			branch := ttcbundle.BranchInfo{ID: test.branch}
+			branch := ttcbundle.BranchInfo{ID: test.branch, FilesystemBranch: test.branch}
 			argument := sourceDir
 			if !test.transient {
 				argument = ""
 			}
 			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
-				t.Fatalf("retaining page source warned: %s", stderr.String())
+				t.Fatalf("removing page source warned: %s", stderr.String())
 			}
 			if _, err := os.Lstat(sourceDir); !os.IsNotExist(err) {
 				t.Fatalf("source directory still exists: %v", err)
 			}
-			destination := filepath.Join(memoryRoot, "active", encodedBranch, "dehydration-source", "memory-0000.snapshot")
-			if got, err := os.ReadFile(destination); err != nil || string(got) != "lazy page data" {
-				t.Fatalf("retained snapshot=(%q, %v)", got, err)
-			}
 			got, err := io.ReadAll(openSnapshot)
 			if err != nil || string(got) != "lazy page data" {
-				t.Fatalf("open snapshot after rename=(%q, %v)", got, err)
+				t.Fatalf("open snapshot after unlink=(%q, %v)", got, err)
 			}
 
-			// The ownership transfer is idempotent after the source has moved.
+			// Cleanup is idempotent after the source has been removed.
 			b.retainRehydrationPageSource(containerID, branch, argument)
 			if stderr.Len() != 0 {
-				t.Fatalf("repeated retention warned: %s", stderr.String())
+				t.Fatalf("repeated cleanup warned: %s", stderr.String())
 			}
 		})
 	}
@@ -3548,7 +4417,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 		exit 128
 	fi
 	if [ -e "$0.child" ]; then
-		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}},{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}]'
+		echo '[{"ID":"main","ParentID":"","FilesystemBranch":"main","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}},{"ID":"child","ParentID":"main","FilesystemBranch":"child","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}]'
 	else
 		echo '[{"ID":"main","ParentID":"","State":"running","ForkMetrics":{"SourceDowntime":0,"Kernel":{"Total":0},"Total":0}}]'
 	fi
@@ -3556,7 +4425,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "branches" ]; then
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "--source" ] && [ "$5" = "main" ] && [ "$6" = "--paused" ] && [ "$7" = "web" ] && [ "$8" = "fork" ] && [ "$9" = "child" ]; then
 	touch "$0.child"
-	echo '{"ID":"child","ParentID":"main","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
+	echo '{"ID":"child","ParentID":"main","FilesystemBranch":"child","State":"paused","ForkMetrics":{"SourceDowntime":1000000,"Kernel":{"Total":2000000},"Total":3000000}}'
 	exit 0
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$6" = "child" ]; then
@@ -3564,10 +4433,8 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console" ] && [ "$5" = "init" ] && [ "$6" = "--console-log" ] && [ "$8" = "--console-log-max-bytes" ] && [ "$9" = "4096" ] && [ "${10}" = "--console-log-max-files" ] && [ "${11}" = "3" ] && [ "${12}" = "--console-wait-status" ] && [ "${14}" = "--console-retention-stats" ] && [ "${16}" = "--console-pid-file" ] && [ "${18}" = "--console-ready-fd" ] && [ "${19}" = "4" ] && [ "${20}" = "web" ] && [ "${21}" = "console-follow" ] && [ "${22}" = "child" ]; then
-	touch "$0.retention"
-	printf 1 >&4
-	exit 0
+if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-ready-fd" ] && [ "$7" = "3" ] && [ "$8" = "web" ] && [ "$9" = "console-follow-family" ]; then
+	exec env ` + fakeFollowerSocketEnv + `="$5" ` + fakeFollowerMarkerEnv + `="$0.retention" "` + testBinary(t) + `"
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "main" ]; then
 	echo '[{"uid":0,"pid":1,"ppid":0,"pgid":1,"threads":[1],"c":0,"tty":"?","stime":"12:00","time":"1ms","cmd":"init"}]'
@@ -3614,15 +4481,11 @@ exit 2
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		Name: "web", BundleDir: bundleDir, ImageSize: 2217006,
 		ConsoleLogMaxBytes: 4096, ConsoleLogMaxFiles: 3, State: "running", CreatedAt: time.Now(),
 		Branches: []ttcbundle.BranchInfo{{ID: "main", State: "running"}},
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 	consoleDir := filepath.Join(containerDir, "console")
@@ -3801,13 +4664,9 @@ esac
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatalf("writing config: %v", err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		ID: id, Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: time.Now(),
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 
@@ -3981,6 +4840,47 @@ exit 0
 	}
 }
 
+func TestPurgeRuntimeDoesNotRequireBranchControlServer(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	echo '[{"id":"private-source","pid":2468,"status":"running"}]'
+	;;
+timetravel)
+	echo 'branch control server is unavailable' >&2
+	exit 128
+	;;
+delete)
+	if [ "$4" != "--force" ] || [ "$5" != "private-source" ]; then
+		echo "unexpected delete: $*" >&2
+		exit 2
+	fi
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc}
+	if err := b.purgeRuntime("private-source"); err != nil {
+		t.Fatalf("purgeRuntime: %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Fatalf("runtime was not force-deleted: %v", err)
+	}
+}
+
 func TestRemoveStoppedRuntimeBeforeStart(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -4065,6 +4965,233 @@ exit 2
 	}
 }
 
+// interruptedDehydrationFixture is a standalone family, web, whose branch main
+// is recorded as dehydrating while its Sentry holds a capture that was never
+// made durable: what ttcd leaves if it dies in the middle of a dehydration.
+// The fake runsc records a rehydration by creating runsc+".rehydrated" and a
+// runtime deletion by creating runsc+".deleted". images are the capture's
+// incomplete image directories.
+func interruptedDehydrationFixture(t *testing.T) (runsc, dataRoot string, images []string) {
+	t.Helper()
+	dir := t.TempDir()
+	runsc = filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
+	;;
+timetravel)
+	if [ "$4" != "web" ]; then
+		echo "unexpected family: $*" >&2
+		exit 2
+	fi
+	case "$5" in
+	branches)
+		state=dehydrated
+		[ -f "$0.rehydrated" ] && state=running
+		printf '[{"ID":"main","State":"%s"}]\n' "$state"
+		;;
+	rehydrate)
+		[ "$6" = "main" ] || exit 2
+		touch "$0.rehydrated"
+		;;
+	*)
+		echo "unexpected timetravel command: $*" >&2
+		exit 2
+		;;
+	esac
+	;;
+delete)
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot = filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{ID: "main", FilesystemBranch: "main", State: "dehydrating"}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: bundleDir, State: "dehydrating", Branches: []ttcbundle.BranchInfo{branch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	memoryRoot := filepath.Join(containerDir, "memory", "dehydrated")
+	key := ttcbundle.MemoryBranchKey(branch)
+	for _, name := range []string{key, "." + key + "-interrupted"} {
+		path := filepath.Join(memoryRoot, name)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		images = append(images, path)
+	}
+	return runsc, dataRoot, images
+}
+
+func TestReconcileInterruptedStandaloneDehydrationRollsBackLiveCapture(t *testing.T) {
+	runsc, dataRoot, images := interruptedDehydrationFixture(t)
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if !complete {
+		t.Fatal("completed rollback was reported as still transitioning")
+	}
+	if _, err := os.Stat(runsc + ".rehydrated"); err != nil {
+		t.Fatalf("Sentry capture was not rehydrated: %v", err)
+	}
+	if _, err := os.Stat(runsc + ".deleted"); !os.IsNotExist(err) {
+		t.Fatalf("live rolled-back runtime was deleted: %v", err)
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "running" {
+		t.Fatalf("persistent branch state=%q, want running", got)
+	}
+	for _, path := range images {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("interrupted dehydration path %q remains: %v", path, err)
+		}
+	}
+}
+
+// A dehydration a long operation is making durable looks, to reconciliation,
+// like one a crash interrupted. It is the operation's to finish, not
+// reconciliation's to roll back.
+func TestReconcileLeavesALongOperationsDehydrationAlone(t *testing.T) {
+	runsc, dataRoot, images := interruptedDehydrationFixture(t)
+	var operations familyOperations
+	if err := operations.begin(&familyOperation{id: "web", name: "web", longOperation: longOperation{branch: "main", state: "dehydrating", shown: true}}); err != nil {
+		t.Fatal(err)
+	}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, operations: &operations}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if complete {
+		t.Error("reconciliation was reported complete while a long operation works on the family")
+	}
+	for _, mark := range []string{".rehydrated", ".deleted"} {
+		if _, err := os.Stat(runsc + mark); !os.IsNotExist(err) {
+			t.Errorf("reconciliation changed the runtime a long operation works on (%s): %v", mark, err)
+		}
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "dehydrating" {
+		t.Errorf("persistent branch state=%q, want dehydrating", got)
+	}
+	for _, path := range images {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("the capture's image %q was removed: %v", path, err)
+		}
+	}
+}
+
+func TestReconcileInterruptedStandaloneDehydrationCommitsCompleteCapture(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	script := `#!/bin/sh
+if [ "$1" != "--root" ] || [ "$2" != "/runtime" ]; then
+	echo "unexpected globals: $*" >&2
+	exit 2
+fi
+case "$3" in
+list)
+	printf '[{"id":"web","pid":%s,"status":"stopped"}]\n' "$PPID"
+	;;
+timetravel)
+	[ "$4" = "web" ] && [ "$5" = "branches" ] || exit 2
+	printf '[{"ID":"main","State":"dehydrated"}]\n'
+	;;
+delete)
+	touch "$0.deleted"
+	;;
+*)
+	echo "unexpected command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	containerDir := filepath.Join(dataRoot, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{
+		ID: "main", FilesystemBranch: "main", State: "dehydrating",
+		SnapshotID: 7, MemoryRoots: []string{"memory/7/root"}, MemoryRootObjects: []string{"object-7"},
+		ControlRoot: "control/7", ControlRootObject: "control-object-7",
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", BundleDir: bundleDir, State: "dehydrating", Branches: []ttcbundle.BranchInfo{branch},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	captureDir := memoryBranchDir(dataRoot, "web", "dehydrated", branch)
+	if err := os.MkdirAll(captureDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"control.json", "metadata.state"} {
+		if err := os.WriteFile(filepath.Join(captureDir, name), []byte("complete\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	complete, err := b.reconcileInterruptedStandaloneLifecycles()
+	if err != nil {
+		t.Fatalf("reconcileInterruptedStandaloneLifecycles: %v", err)
+	}
+	if !complete {
+		t.Fatal("completed capture was reported as still transitioning")
+	}
+	if _, err := os.Stat(runsc + ".deleted"); err != nil {
+		t.Fatalf("process-free runtime shell was not deleted: %v", err)
+	}
+	stored, err := (ttcbundle.Store{Root: dataRoot}).LoadContainer("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Branches[0].State; got != "dehydrated" {
+		t.Fatalf("persistent branch state=%q, want dehydrated", got)
+	}
+	for _, name := range []string{"control.json", "metadata.state"} {
+		if _, err := os.Stat(filepath.Join(captureDir, name)); err != nil {
+			t.Fatalf("complete dehydration image %q was removed: %v", name, err)
+		}
+	}
+}
+
 func TestSetCommandStdinDoesNotHoldWaitOpen(t *testing.T) {
 	input, inputWriter := io.Pipe()
 	command := exec.Command("/bin/sh", "-c", "exit 0")
@@ -4115,18 +5242,14 @@ exit 2
 		t.Fatalf("writing config: %v", err)
 	}
 	createdAt := time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC)
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "demo", "container.json"), ttcbundle.ContainerInfo{
 		Name:      "demo",
 		Reference: "docker.io/library/alpine:3.20",
 		Digest:    "sha256:abcd",
 		BundleDir: bundleDir,
 		State:     "created",
 		CreatedAt: createdAt,
-	})
-	if err != nil {
-		t.Fatalf("encoding metadata: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "demo", "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatalf("writing metadata: %v", err)
 	}
 
@@ -4182,6 +5305,51 @@ exit 2
 	}
 }
 
+// A listing that runs without the lifecycle lock repairs nothing: the runtime
+// it cannot find may be one that a long mutation is rebuilding.
+func TestListFamiliesWithoutTheLockRepairsNothing(t *testing.T) {
+	dir := t.TempDir()
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte(`#!/bin/sh
+if [ "$3" = "list" ]; then
+	echo '[]'
+	exit 0
+fi
+exit 2
+`), 0755); err != nil {
+		t.Fatalf("writing fake runsc: %v", err)
+	}
+	dataRoot := filepath.Join(dir, "data")
+	bundleDir := filepath.Join(dataRoot, "containers", "demo", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatalf("creating bundle: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "demo", "container.json"), ttcbundle.ContainerInfo{
+		Name: "demo", Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abcd", BundleDir: bundleDir,
+		State: "running", CreatedAt: time.Date(2026, time.July, 17, 1, 2, 3, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("writing metadata: %v", err)
+	}
+	store := ttcbundle.Store{Root: dataRoot}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, inventoryReadOnly: true}
+	if _, err := b.listFamilies(); err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if info, err := store.LoadContainer("demo"); err != nil || info.State != "running" {
+		t.Fatalf("a listing without the lock changed the record: state %q, err %v", info.State, err)
+	}
+	b.inventoryReadOnly = false
+	if _, err := b.listFamilies(); err != nil {
+		t.Fatalf("listFamilies: %v", err)
+	}
+	if info, err := store.LoadContainer("demo"); err != nil || info.State != "exited" {
+		t.Fatalf("a listing with the lock did not reconcile the lost runtime: state %q, err %v", info.State, err)
+	}
+}
+
 func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
@@ -4196,15 +5364,11 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", "remote", "container.json"), ttcbundle.ContainerInfo{
 		ID: "remote", Name: "remote", NodeID: "node-b", BundleDir: bundleDir,
 		State: "running", CreatedAt: time.Now(),
-		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "running", CreatedAt: time.Now()}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "remote", "container.json"), metadata, 0600); err != nil {
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, NodeID: "node-b", State: "running", CreatedAt: time.Now()}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a"}
@@ -4224,77 +5388,199 @@ func TestListFamiliesIncludesRemotePlacementWithoutReconcilingIt(t *testing.T) {
 	}
 }
 
-func TestListFamiliesReleasesSparseRootAfterRuntimeLoss(t *testing.T) {
+func TestListFamiliesHidesCompletedPhysicalMigrationRuntime(t *testing.T) {
 	dir := t.TempDir()
 	runsc := filepath.Join(dir, "runsc")
-	if err := os.WriteFile(runsc, []byte(`#!/bin/sh
+	const physicalID = "fork-0123456789abcdef"
+	script := `#!/bin/sh
 if [ "$3" = "list" ]; then
-	echo '[]'
+	echo '[{"id":"` + physicalID + `","pid":2468,"status":"paused"}]'
+	exit 0
+fi
+if [ "$3" = "timetravel" ] && [ "$4" = "` + physicalID + `" ] && [ "$5" = "branches" ]; then
+	echo '[{"ID":"main","State":"paused"}]'
 	exit 0
 fi
 exit 2
-`), 0755); err != nil {
+`
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	dataRoot := filepath.Join(dir, "data")
-	bundleDir := filepath.Join(dataRoot, "containers", "dead", "bundle")
+	bundleDir := filepath.Join(dataRoot, "containers", physicalID, "bundle")
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	relative := filepath.Join("cluster", "memory-chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
+	if err := writeCurrentBundleFixture(filepath.Join(dataRoot, "containers", physicalID, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, BundleDir: bundleDir, State: "paused", CreatedAt: time.Now(),
+		DistributedFamilyID: "logical-family", DistributedForkTransactionID: "completed-migration",
+		Branches: []ttcbundle.BranchInfo{{ID: defaultBranchID, State: "paused", CreatedAt: time.Now()}},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := repository.Publish(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.SetBranch("dead-root", manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-	createdAt := time.Now().UTC()
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
-		ID: "dead", Name: "dead", BundleDir: bundleDir, State: "running", CreatedAt: createdAt,
-		Branches:                     []ttcbundle.BranchInfo{{ID: "main", State: "running", CreatedAt: createdAt}},
-		DistributedForkTransactionID: "tx-dead", DistributedSparseRepository: relative,
-		DistributedSparseBranch: "dead-root",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dataRoot, "containers", "dead", "container.json"), metadata, 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot}
+	b := &runtimeBackend{root: "/runtime", runsc: runsc, dataRoot: dataRoot, nodeID: "node-a"}
 	families, err := b.listFamilies()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(families) != 1 || families[0].State != "exited" {
-		t.Fatalf("families after runtime loss = %+v", families)
+	if len(families) != 0 {
+		t.Fatalf("completed physical migration runtime leaked into inventory: %+v", families)
 	}
-	info, err := b.containerStore().LoadContainer("dead")
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestVisiblePhysicalRuntimeBranchesHidesSparseProviders(t *testing.T) {
+	branches := []Branch{
+		{ID: "main", State: "paused"},
+		{ID: "migration-current", State: "running"},
+		{ID: "migration-provisional", State: "paused"},
 	}
-	if info.DistributedSparseRepository != "" || info.DistributedSparseBranch != "" {
-		t.Fatalf("dead runtime retained sparse root metadata: %+v", info)
+	placements := []cluster.PlacementRecord{{
+		FamilyID: "logical-family", BranchID: "main",
+		PhysicalContainer: "physical-family", PhysicalBranch: "migration-current",
+		OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning,
+	}}
+	visible := visiblePhysicalRuntimeBranches(branches, placements, "physical-family")
+	if len(visible) != 1 || visible[0].ID != "main" || visible[0].State != "running" {
+		t.Fatalf("visible physical branches = %+v, want only logical main", visible)
 	}
-	repository, err = ttcchunk.OpenMemoryRepository(filepath.Join(dataRoot, relative))
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestBranchesInPlacementSnapshotDropsRenamedMetadata(t *testing.T) {
+	branches := []Branch{
+		{ID: "main", State: "running"},
+		{ID: "old-name", State: "running"},
+		{ID: "new-name", State: "running"},
 	}
-	defer repository.Close()
-	if _, err := repository.Branch("dead-root"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("dead runtime sparse root remains: %v", err)
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main"},
+		{FamilyID: "family", BranchID: "new-name"},
+	}
+	got := branchesInPlacementSnapshot(branches, placements)
+	if len(got) != 2 || got[0].ID != "main" || got[1].ID != "new-name" {
+		t.Fatalf("filtered branches=%+v, want main and new-name", got)
+	}
+}
+
+func TestProjectContainerAuthorityReplacesStaleSummary(t *testing.T) {
+	container := ttcbundle.ContainerInfo{NodeID: "old-node", State: "paused"}
+	family := Family{NodeID: "new-node", State: "running"}
+	projectContainerAuthority(&container, &family)
+	if container.NodeID != "new-node" || container.State != "running" {
+		t.Fatalf("projected container = %+v, want authoritative node and state", container)
+	}
+	projectContainerAuthority(&container, nil)
+	if container.NodeID != "new-node" || container.State != "running" {
+		t.Fatalf("nil family changed container = %+v", container)
+	}
+}
+
+func TestLogicalPersistentBranchInfosHidesMigrationNames(t *testing.T) {
+	created := time.Unix(123, 456).UTC()
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{
+			ID: "fork-current", ParentID: "main", State: "running", DistributedMigration: true,
+			DistributedForkTransactionID: "fork-current", DistributedGraphReferenceOperation: "graph-current",
+		},
+		{ID: "fork-retired", ParentID: "main", State: "paused", DistributedMigration: true},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", State: cluster.PlacementRunning},
+		{
+			FamilyID: "family", BranchID: "test", PhysicalContainer: "family", PhysicalBranch: "fork-current",
+			OwnerNode: "node-a", State: cluster.PlacementRunning, ParentBranch: "main", BranchCreatedAt: created, Quarantined: true,
+		},
+	}
+	visible := logicalPersistentBranchInfos(infos, placements, nil, "family")
+	if len(visible) != 2 || visible[0].ID != "main" || visible[1].ID != "test" {
+		t.Fatalf("logical persistent branches = %+v, want main and test", visible)
+	}
+	if visible[1].DistributedMigration || visible[1].DistributedForkTransactionID != "" || visible[1].DistributedGraphReferenceOperation != "" {
+		t.Fatalf("logical branch leaked private migration metadata: %+v", visible[1])
+	}
+	if visible[1].NodeID != "node-a" || !visible[1].CreatedAt.Equal(created) || !visible[1].Quarantined {
+		t.Fatalf("logical branch lost placement metadata: %+v", visible[1])
+	}
+}
+
+func TestLogicalPersistentBranchInfosUsesRaftNames(t *testing.T) {
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{ID: "old-name", ParentID: "main", State: "running"},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-a", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "new-name", PhysicalContainer: "remote-physical", PhysicalBranch: "private", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementRunning},
+	}
+	got := logicalPersistentBranchInfos(infos, placements, nil, "family")
+	if len(got) != 2 || got[0].ID != "main" || got[1].ID != "new-name" {
+		t.Fatalf("logical infos=%+v, want main and new-name", got)
+	}
+	if got[1].NodeID != "node-b" || got[1].ParentID != "main" || got[1].State != "running" {
+		t.Fatalf("synthesized renamed branch=%+v", got[1])
+	}
+}
+
+// A running or paused branch whose node is offline is neither: it is
+// unavailable until the node returns, or its removal gives the branch up.
+func TestLogicalPersistentBranchInfosShowsOfflineOwnersUnavailable(t *testing.T) {
+	infos := []ttcbundle.BranchInfo{
+		{ID: "main", State: "running"},
+		{ID: "held", ParentID: "main", State: "paused"},
+		{ID: "gone", ParentID: "main", State: "exited"},
+	}
+	placements := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main", OwnerNode: "node-b", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "held", PhysicalContainer: "family", PhysicalBranch: "held", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementPaused},
+		{FamilyID: "family", BranchID: "gone", PhysicalContainer: "family", PhysicalBranch: "gone", OwnerNode: "node-b", ParentBranch: "main", State: cluster.PlacementCorrupted},
+	}
+	got := logicalPersistentBranchInfos(infos, placements, map[string]bool{"node-b": true}, "family")
+	want := map[string]string{"main": "unavailable", "held": "unavailable", "gone": string(cluster.PlacementCorrupted)}
+	for _, info := range got {
+		if info.State != want[info.ID] {
+			t.Errorf("branch %s is %q, want %q", info.ID, info.State, want[info.ID])
+		}
+	}
+	for _, info := range logicalPersistentBranchInfos(infos, placements, nil, "family") {
+		if info.ID == "main" && info.State != string(cluster.PlacementRunning) {
+			t.Errorf("with its node online, main is %q, want running", info.State)
+		}
+	}
+}
+
+func TestMergeAuthoritativeBranchSynthesizesColdMigratedBranch(t *testing.T) {
+	created := time.Unix(123, 456).UTC()
+	family := Family{ID: "family", Branches: []Branch{{ID: "main", State: "running"}}}
+	authority := cluster.BranchAuthority{
+		FamilyID: "family", BranchID: "worker", Generation: 4,
+		PublicationID: "publication-worker", Lifecycle: "dehydrated",
+		Roots: cluster.DurableRoots{FilesystemRoot: "snapshot-packs/manifests/worker.json"},
+	}
+	placement := cluster.PlacementRecord{
+		FamilyID: "family", BranchID: "worker", ParentBranch: "main",
+		BranchCreatedAt: created, State: cluster.PlacementUnplaced, Quarantined: true,
+	}
+	got := mergeAuthoritativeBranch(family, authority, placement, true, "/shared")
+	if len(got.Branches) != 2 || got.Branches[0].ID != "main" || got.Branches[1].ID != "worker" {
+		t.Fatalf("merged family branches=%+v", got.Branches)
+	}
+	worker := got.Branches[1]
+	if worker.State != "dehydrated" || worker.NodeID != "" || worker.ParentID != "main" || !worker.Quarantined ||
+		worker.PublicationID != "publication-worker" || worker.StorageState != "shared" ||
+		worker.StorageManifest != "/shared/snapshot-packs/manifests/worker.json" || !worker.CreatedAt.Equal(created) {
+		t.Fatalf("synthesized worker=%+v", worker)
+	}
+
+	// Reapplying an authority snapshot updates the existing logical record and
+	// must not manufacture a duplicate branch.
+	authority.Lifecycle = "running"
+	placement.State, placement.OwnerNode = cluster.PlacementRunning, "node-b"
+	got = mergeAuthoritativeBranch(got, authority, placement, true, "/shared")
+	if len(got.Branches) != 2 || got.Branches[1].NodeID != "node-b" || got.Branches[1].State != "running" {
+		t.Fatalf("updated family branches=%+v", got.Branches)
 	}
 }
 
@@ -4313,6 +5599,66 @@ func TestAllBranchesColdOnNodeIgnoresRemoteRunningPeers(t *testing.T) {
 	allCold, count = allBranchesColdOnNode(info, "")
 	if allCold || count != 2 {
 		t.Fatalf("allBranchesColdOnNode(legacy)=(%t,%d), want (false,2)", allCold, count)
+	}
+}
+
+// A standalone dehydration stays resident only while a sibling on the node is
+// live; a clustered one never does, because other nodes find dehydrated
+// branches only through what was published.
+func TestDehydrationStaysResidentOnlyBesideALiveSibling(t *testing.T) {
+	family := func(states ...string) ttcbundle.ContainerInfo {
+		info := ttcbundle.ContainerInfo{ID: "family"}
+		for i, state := range states {
+			info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "b" + strconv.Itoa(i), State: state})
+		}
+		return info
+	}
+	standalone := &runtimeBackend{dataRoot: t.TempDir()}
+	for _, tc := range []struct {
+		states []string
+		want   bool
+	}{
+		{[]string{"dehydrating", "running"}, true},
+		{[]string{"dehydrating", "paused", "dehydrated"}, true},
+		{[]string{"dehydrating", "restarting"}, true},
+		{[]string{"dehydrating", "exited", "dehydrated", "created"}, false},
+		{[]string{"dehydrating", "dehydrating"}, false},
+		{[]string{"dehydrating"}, false},
+	} {
+		if got := standalone.dehydrationMayStayResident(family(tc.states...), "b0"); got != tc.want {
+			t.Errorf("siblings %v: resident=%t, want %t", tc.states[1:], got, tc.want)
+		}
+	}
+	clustered := &runtimeBackend{dataRoot: t.TempDir(), publicationQueue: &ttcstorage.Queue{}}
+	if clustered.dehydrationMayStayResident(family("dehydrating", "running"), "b0") {
+		t.Error("a clustered dehydration stayed resident")
+	}
+	noDataRoot := &runtimeBackend{}
+	if noDataRoot.dehydrationMayStayResident(family("dehydrating", "running"), "b0") {
+		t.Error("a dehydration without a data root stayed resident")
+	}
+	elsewhere := ttcbundle.ContainerInfo{ID: "family", Branches: []ttcbundle.BranchInfo{
+		{ID: "b0", NodeID: "node-a", State: "dehydrating"},
+		{ID: "b1", NodeID: "node-b", State: "running"},
+	}}
+	onNode := &runtimeBackend{dataRoot: t.TempDir(), nodeID: "node-a"}
+	if onNode.dehydrationMayStayResident(elsewhere, "b0") {
+		t.Error("a live sibling on another node kept a dehydration resident")
+	}
+}
+
+// A resident capture is in the runtime, so a family holding one needs it.
+func TestResidentDehydrationRequiresItsRuntime(t *testing.T) {
+	info := ttcbundle.ContainerInfo{Branches: []ttcbundle.BranchInfo{
+		{ID: "main", State: "exited"},
+		{ID: "fork", State: "dehydrated", StorageState: ttcbundle.StorageResident},
+	}}
+	if !persistentFamilyRequiredRuntime(info, "") {
+		t.Error("a family with a resident dehydration did not require its runtime")
+	}
+	info.Branches[1].StorageState = "local"
+	if persistentFamilyRequiredRuntime(info, "") {
+		t.Error("a family with only durable and exited branches required its runtime")
 	}
 }
 
@@ -4361,17 +5707,13 @@ exit 2
 		t.Fatal(err)
 	}
 	createdAt := time.Now().UTC()
-	metadata, err := json.Marshal(ttcbundle.ContainerInfo{
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
 		ID: "web", Name: "web", BundleDir: bundleDir, State: "running", CreatedAt: createdAt,
 		Branches: []ttcbundle.BranchInfo{
 			{ID: "main", State: "exited", CreatedAt: createdAt},
 			{ID: "test", ParentID: "main", State: "running", CreatedAt: createdAt},
 		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), metadata, 0600); err != nil {
+	}); err != nil {
 		t.Fatal(err)
 	}
 	store := ttcbundle.Store{Root: dataRoot}
@@ -4443,6 +5785,7 @@ type startCall struct {
 
 type fakeBackend struct {
 	loadedBytes         int
+	localDurable        bool
 	loadedPlatform      string
 	savedIdentifiers    []string
 	savedPlatform       string
@@ -4475,8 +5818,11 @@ type fakeBackend struct {
 	unpublishedBinding  ttcbundle.PortBinding
 	paused              selector
 	resumed             selector
+	quarantineTarget    selector
+	quarantineEnabled   bool
 	preparedStop        selector
 	preparedStops       []selector
+	preparedPausedStops []selector
 	discarded           selector
 	discards            []selector
 	dehydratedTargets   []selector
@@ -4514,6 +5860,8 @@ type fakeBackend struct {
 	logsTarget          selector
 	logsOptions         logsOptions
 	inspectInfo         InspectInfo
+	pausedAll           []selector
+	resumedAll          []selector
 	removed             string
 	removeForce         bool
 	removeVolumes       bool
@@ -4538,6 +5886,8 @@ type fakeBackend struct {
 	restoreName         string
 	renamed             []string
 }
+
+func (b *fakeBackend) localStorageIsDurable() bool { return b.localDurable }
 
 func (b *fakeBackend) migrate(target selector, node string) error {
 	b.migrateTarget = target
@@ -4756,11 +6106,19 @@ func (b *fakeBackend) unpublishPort(target selector, binding ttcbundle.PortBindi
 
 func (b *fakeBackend) pause(target selector) error {
 	b.paused = target
+	b.pausedAll = append(b.pausedAll, target)
 	return b.err
 }
 
 func (b *fakeBackend) resume(target selector) error {
 	b.resumed = target
+	b.resumedAll = append(b.resumedAll, target)
+	return b.err
+}
+
+func (b *fakeBackend) setQuarantine(target selector, enabled bool) error {
+	b.quarantineTarget = target
+	b.quarantineEnabled = enabled
 	return b.err
 }
 
@@ -4775,10 +6133,28 @@ func (b *fakeBackend) prepareStop(target selector) error {
 	return b.err
 }
 
+func (b *fakeBackend) preparePausedStop(target selector) error {
+	b.preparedPausedStops = append(b.preparedPausedStops, target)
+	return b.err
+}
+
 func (b *fakeBackend) discard(target selector) error {
 	b.discarded = target
 	b.discards = append(b.discards, target)
 	return b.err
+}
+
+func TestRuntimeFamilyExitedLoaderDoesNotDeleteLivePeers(t *testing.T) {
+	family := Family{
+		ID: "physical", State: "exited",
+		Branches: []Branch{{ID: "loader", State: "exited"}, {ID: "peer", State: "running"}},
+	}
+	if present, only := runtimeFamilyBranchDisposition(family, "loader"); !present || only {
+		t.Fatalf("loader disposition=(%t,%t), want present without whole-sandbox deletion", present, only)
+	}
+	if present, only := runtimeFamilyBranchDisposition(Family{Branches: []Branch{{ID: "last", State: "exited"}}}, "last"); !present || !only {
+		t.Fatalf("final branch disposition=(%t,%t), want final sandbox deletion", present, only)
+	}
 }
 
 func (b *fakeBackend) dehydrate(target selector) error {
@@ -4854,8 +6230,11 @@ func (b *fakeBackend) importContainerPath(target selector, destination string, p
 	return b.err
 }
 
-func (b *fakeBackend) checkpoint(request checkpointRequest) error {
+func (b *fakeBackend) checkpoint(request checkpointRequest, output io.Writer) error {
 	b.checkpointRequest = request
+	if request.destination == "-" {
+		_, _ = io.WriteString(output, "checkpoint-bytes")
+	}
 	return b.err
 }
 
@@ -4889,28 +6268,49 @@ func TestCheckpointAndRestoreCommands(t *testing.T) {
 	}
 }
 
-func TestNormalizeCheckpointCommandArgs(t *testing.T) {
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		args []string
-		path string
-	}{
-		{args: []string{"checkpoint", "--compression=none", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
-		{args: []string{"restore", "--name", "web", "snapshot.ttc"}, path: "snapshot.ttc"},
-	}
-	for _, test := range tests {
-		got, err := normalizeCheckpointCommandArgs(test.args)
+func TestPrepareCheckpointClientIO(t *testing.T) {
+	t.Run("checkpoint download", func(t *testing.T) {
+		destination := filepath.Join(t.TempDir(), "snapshot.ttc")
+		args, input, output, finish, err := prepareCheckpointClientIO(
+			[]string{"checkpoint", "--compression=none", "web@main", destination}, strings.NewReader("stdin"), io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := filepath.Join(workingDirectory, test.path)
-		if got[len(got)-1] != want {
-			t.Errorf("normalizeCheckpointCommandArgs(%q)=%q, want final path %q", test.args, got, want)
+		if args[len(args)-1] != "-" || input == nil || finish == nil {
+			t.Fatalf("prepared checkpoint args=%q input=%v finish-nil=%t", args, input, finish == nil)
 		}
-	}
+		if _, err := io.WriteString(output, "checkpoint-bytes"); err != nil {
+			t.Fatal(err)
+		}
+		if err := finish(true); err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(destination); err != nil || string(data) != "checkpoint-bytes" {
+			t.Fatalf("checkpoint output=(%q, %v)", data, err)
+		}
+	})
+
+	t.Run("restore upload", func(t *testing.T) {
+		source := filepath.Join(t.TempDir(), "snapshot.ttc")
+		if err := os.WriteFile(source, []byte("checkpoint-bytes"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args, input, _, finish, err := prepareCheckpointClientIO(
+			[]string{"restore", "--node", "node-b", "--name", "web", source}, strings.NewReader(""), io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if args[len(args)-1] != "-" || finish == nil {
+			t.Fatalf("prepared restore args=%q finish-nil=%t", args, finish == nil)
+		}
+		data, err := io.ReadAll(input)
+		if err != nil || string(data) != "checkpoint-bytes" {
+			t.Fatalf("restore input=(%q, %v)", data, err)
+		}
+		if err := finish(true); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestCopyCheckpointHostDirectory(t *testing.T) {
@@ -4988,11 +6388,139 @@ func TestManagedVolumeMountParsing(t *testing.T) {
 func TestMergeBranchHistoryUsesPersistedReparenting(t *testing.T) {
 	now := time.Now().UTC()
 	merged := mergeBranchHistory(
-		[]Branch{{ID: "child", ParentID: "", State: "running", CreatedAt: now}},
+		[]Branch{{ID: "child", ParentID: "", Quarantined: true, State: "running", CreatedAt: now, SnapshotID: 41, MemoryRoots: []string{"memory/41/root"}, MemoryRootObjects: []string{"0000000000000029-03-0000000000000001"}}},
 		[]Branch{{ID: "child", ParentID: "removed-parent", State: "paused", CreatedAt: now}},
 	)
-	if len(merged) != 1 || merged[0].ParentID != "" || merged[0].State != "paused" {
+	if len(merged) != 1 || merged[0].ParentID != "" || !merged[0].Quarantined || merged[0].State != "paused" ||
+		merged[0].SnapshotID != 41 || !slices.Equal(merged[0].MemoryRoots, []string{"memory/41/root"}) || !slices.Equal(merged[0].MemoryRootObjects, []string{"0000000000000029-03-0000000000000001"}) {
 		t.Fatalf("merged branch=%+v, want persisted parent and live state", merged)
+	}
+}
+
+func TestClearConsoleIncarnationStatusPreservesLogs(t *testing.T) {
+	dir := t.TempDir()
+	paths := ttcbundle.ConsolePaths{
+		Log: filepath.Join(dir, "main.log"), RetentionStats: filepath.Join(dir, "main.retention.json"),
+		PID: filepath.Join(dir, "main.pid"), WaitStatus: filepath.Join(dir, "main.wait-status"),
+	}
+	for path, contents := range map[string]string{
+		paths.Log: "old output\n", paths.RetentionStats: `{"evicted_bytes":1}`,
+		paths.PID: "123\n", paths.WaitStatus: "15\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := clearConsoleIncarnationStatus(paths); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.PID, paths.WaitStatus} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("terminal marker %q remains: %v", path, err)
+		}
+	}
+	for _, path := range []string{paths.Log, paths.RetentionStats} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("durable log state %q was removed: %v", path, err)
+		}
+	}
+}
+
+func TestLocalGraphCaptureRejectsStaleSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	control := `{"snapshot_id":8,"memory_roots":[{"name":"memory/8/root","root":"0000000000000008-03-0000000000000001"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "control.json"), []byte(control), 0600); err != nil {
+		t.Fatal(err)
+	}
+	branch := ttcbundle.BranchInfo{SnapshotID: 8, MemoryRoots: []string{"memory/8/root"}, MemoryRootObjects: []string{"0000000000000008-03-0000000000000001"}}
+	if !localGraphCaptureMatches(dir, branch) {
+		t.Fatal("matching local graph capture was rejected")
+	}
+	branch.SnapshotID = 9
+	if localGraphCaptureMatches(dir, branch) {
+		t.Fatal("stale local graph capture was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "control.json"), []byte("not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if localGraphCaptureMatches(dir, branch) {
+		t.Fatal("malformed local graph capture was accepted")
+	}
+}
+
+func TestValidateGraphRootObjectsAllowsInheritedOrigin(t *testing.T) {
+	if err := validateGraphRootObjects(9, []string{"memory/branch/main/resource-0000"}, []string{"0000000000000008-03-0000000000000001"}); err != nil {
+		t.Fatalf("inherited immutable origin was rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		objects []string
+	}{
+		{name: "missing", objects: nil},
+		{name: "wrong kind", objects: []string{"0000000000000008-02-0000000000000001"}},
+		{name: "malformed", objects: []string{"not-an-object"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateGraphRootObjects(9, []string{"memory/branch/main/resource-0000"}, test.objects); err == nil {
+				t.Fatal("invalid immutable root-object metadata was accepted")
+			}
+		})
+	}
+}
+
+func TestSharedSnapshotNeverUsesReclaimedLocalObjectsAsAuthority(t *testing.T) {
+	for _, state := range []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedLocal, ttcsnapshot.SnapshotSealedVolatile} {
+		if !localSnapshotObjectsAuthoritative(state) {
+			t.Errorf("%s should use local authoritative objects", state)
+		}
+	}
+	for _, state := range []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotShared} {
+		if localSnapshotObjectsAuthoritative(state) {
+			t.Errorf("%s must resolve through its provider/shared authority", state)
+		}
+	}
+}
+
+func TestGraphReferenceRootsPreserveLogicalSlots(t *testing.T) {
+	bindings := []cluster.SnapshotRootBinding{
+		{Slot: 7, Object: "000000000000002a-03-0000000000000001"},
+		{Slot: 11, Object: "000000000000002a-03-0000000000000001"},
+	}
+	roots, err := graphReferenceRoots(42, "tx-reference", bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 2 || roots["remote/42/tx-reference/00000007"] != roots["remote/42/tx-reference/0000000b"] {
+		t.Fatalf("reference roots=%+v", roots)
+	}
+	if _, err := graphReferenceRoots(42, "tx-reference", append(bindings, bindings[0])); err == nil {
+		t.Fatal("duplicate logical slot was accepted")
+	}
+	if _, err := graphReferenceRoots(42, "tx-reference", []cluster.SnapshotRootBinding{{Slot: 1, Object: "0000000000000029-03-0000000000000001"}}); err == nil {
+		t.Fatal("root from another origin was accepted")
+	}
+}
+
+func TestGroupGraphRootBindingsByInheritedOrigin(t *testing.T) {
+	groups, err := groupGraphRootBindings([]string{
+		"000000000000002a-03-0000000000000001",
+		"0000000000000011-03-0000000000000009",
+		"000000000000002a-03-0000000000000007",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("origin groups=%+v, want two", groups)
+	}
+	if got := groups[42]; len(got) != 2 || got[0].Slot != 0 || got[1].Slot != 2 {
+		t.Fatalf("origin 42 bindings=%+v", got)
+	}
+	if got := groups[17]; len(got) != 1 || got[0].Slot != 1 {
+		t.Fatalf("origin 17 bindings=%+v", got)
+	}
+	if _, err := groupGraphRootBindings([]string{"000000000000002a-01-0000000000000001"}); err == nil {
+		t.Fatal("non-memory root was accepted")
 	}
 }
 
@@ -5025,7 +6553,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		notWant string
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
-		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--allow-slow-volume-copy", "--platform", "--unsafe-no-host-isolation"}},
+		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--platform", "--unsafe-no-host-isolation"}},
 		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: platformCompletions},
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
@@ -5129,43 +6657,341 @@ func TestInspectCopiedHostMount(t *testing.T) {
 	}
 }
 
-func TestSparseMemoryRootsFollowBranchLifetime(t *testing.T) {
-	dataRoot := t.TempDir()
-	const containerID = "family-id"
-	repositoryPath := filepath.Join(dataRoot, "containers", containerID, "memory", "chunks")
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+func TestColdBranchManifestRequiresGraphFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	legacy := coldBranchManifest{Version: 1, Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop"}
+	data, err := json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := repository.Publish(nil, nil)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "snapshot-graph format 5") {
+		t.Fatalf("legacy cold manifest error=%v", err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	current := coldBranchManifest{
+		Version: 5, Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "stop",
+		InternalMounts: []cluster.InternalMountDescriptor{{Destination: "/etc/hostname", Contents: []byte("worker\n"), Mode: 0644}},
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef",
+			BranchID:  "main", Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{17}}},
+	}
+	data, err = json.Marshal(current)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.SetBranch("source-filesystem", manifest); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
+	if got, err := readColdBranchManifest(path); err != nil || len(got.Filesystems) != 1 || len(got.InternalMounts) != 1 || string(got.InternalMounts[0].Contents) != "worker\n" {
+		t.Fatalf("current cold manifest=%+v, %v", got, err)
+	}
+	current.InternalMounts = append(current.InternalMounts, current.InternalMounts[0])
+	data, err = json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "repeats internal mount") {
+		t.Fatalf("duplicate internal mount error=%v", err)
+	}
+}
 
-	backend := &runtimeBackend{dataRoot: dataRoot}
-	if err := backend.cloneSparseMemoryRoot(containerID, "source-filesystem", "child-filesystem"); err != nil {
-		t.Fatalf("cloneSparseMemoryRoot: %v", err)
+func TestColdManifestIdentityRetainsActivatedFilesystemAncestor(t *testing.T) {
+	manifest := coldBranchManifest{
+		Container: "physical", Branch: "child", PublicationID: "publication-cold",
 	}
-	if got, err := repository.Branch("child-filesystem"); err != nil || got != manifest {
-		t.Fatalf("child root=(%v, %v), want %v", got, err, manifest)
+	info := ttcbundle.ContainerInfo{ID: "physical"}
+	for _, state := range []string{"running", "paused", "exited"} {
+		branch := ttcbundle.BranchInfo{
+			ID: "child", State: state, StorageState: "local",
+			StorageManifest: "/shared/cold.json",
+		}
+		if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+			t.Errorf("activated %s ancestor rejected: %v", state, err)
+		}
 	}
-	if err := backend.releaseSparseMemoryRoot(containerID, "source-filesystem"); err != nil {
-		t.Fatalf("release source: %v", err)
+	if err := validateColdManifestIdentity(info, ttcbundle.BranchInfo{
+		ID: "child", State: "exited", StorageState: "shared", StorageManifest: "/shared/cold.json",
+	}, manifest); err != nil {
+		t.Fatalf("consumed stopped filesystem ancestor rejected: %v", err)
 	}
-	if got, err := repository.Branch("child-filesystem"); err != nil || got != manifest {
-		t.Fatalf("surviving child root=(%v, %v), want %v", got, err, manifest)
+	branch := ttcbundle.BranchInfo{
+		ID: "child", State: "dehydrated", StorageState: "shared",
+		PublicationID: "publication-cold",
 	}
-	if err := backend.releaseSparseMemoryRoot(containerID, "child-filesystem"); err != nil {
-		t.Fatalf("release child: %v", err)
+	if err := validateColdManifestIdentity(info, branch, manifest); err != nil {
+		t.Fatalf("matching cold publication rejected: %v", err)
 	}
-	if _, err := repository.Branch("child-filesystem"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released child root error=%v, want not-exist", err)
+	branch.PublicationID = "publication-other"
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("mismatched live publication was accepted")
 	}
-	if _, err := repository.LoadManifest(manifest); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unrooted manifest error=%v, want not-exist", err)
+	branch.PublicationID = ""
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("dehydrated branch without its publication fence was accepted")
+	}
+	branch.State, branch.StorageState = "running", "local"
+	manifest.Container = "other"
+	if err := validateColdManifestIdentity(info, branch, manifest); err == nil {
+		t.Fatal("foreign physical manifest was accepted as an ancestor")
+	}
+}
+
+func TestColdExecConsolePackRoundTrip(t *testing.T) {
+	shared, active := t.TempDir(), t.TempDir()
+	info := ttcbundle.ContainerInfo{ID: "physical", ConsoleLogMaxFiles: 3}
+	directory := coldExecConsoleDir(active, info.ID, "main")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(directory, "build.log")
+	if err := os.WriteFile(ttcconsole.GenerationPath(logPath, 1), []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("newer\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := coldManifestPath(shared, info.ID, "main", "publication-console")
+	logs, size, err := captureColdExecConsolePack(active, info, "main", manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].ExecID != "build" || logs[0].Offset != 0 || logs[0].Length != uint64(len("older\nnewer\n")) || size != logs[0].Length {
+		t.Fatalf("console descriptors=%+v size=%d", logs, size)
+	}
+	manifest := coldBranchManifest{
+		Version: 5, Container: info.ID, Branch: "main", PublicationID: "publication-console", Kind: "stop",
+		ExecConsoleLogs: logs, ConsolePackSize: size,
+	}
+	if err := writeDurableJSON(manifestPath, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readColdBranchManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// A previous residence may leave a prefix in this node's disposable cache.
+	if err := os.WriteFile(logPath, []byte("older\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := installColdExecConsolePack(active, info, "main", loaded, manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("restored console output=%q, err=%v", got, err)
+	}
+	if err := installColdExecConsolePack(active, info, "main", loaded, manifestPath); err != nil {
+		t.Fatalf("idempotent restore: %v", err)
+	}
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != "older\nnewer\n" {
+		t.Fatalf("idempotent restored console output=%q, err=%v", got, err)
+	}
+}
+
+func TestColdDehydrationManifestRequiresSameOriginControlRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	manifest := coldBranchManifest{
+		Version: 5, Container: "family", Branch: "main", PublicationID: "publication-1", Kind: "dehydrate",
+		MemorySnapshot: 17,
+		ControlRoot:    ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 9, Kind: ttcsnapshot.ObjectKindMetadata}.String(),
+	}
+	write := func() {
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	if _, err := readColdBranchManifest(path); err != nil {
+		t.Fatalf("graph-native dehydration manifest rejected: %v", err)
+	}
+	manifest.ControlRoot = ttcsnapshot.ObjectID{Snapshot: 18, Ordinal: 9, Kind: ttcsnapshot.ObjectKindMetadata}.String()
+	write()
+	if _, err := readColdBranchManifest(path); err == nil || !strings.Contains(err.Error(), "graph-native control state") {
+		t.Fatalf("foreign control origin error=%v", err)
+	}
+}
+
+func TestColdStorageReclaimsRetiredGraphHandoffManifest(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	root := filepath.Join(shared, "cluster", "memory-manifests")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	retired := filepath.Join(root, "fork-retired.manifest")
+	live := filepath.Join(root, "fork-live.manifest")
+	independent := filepath.Join(root, "fork-independent.manifest")
+	unbound := filepath.Join(root, "fork-unbound.manifest")
+	unknown := filepath.Join(root, "operator-note.manifest")
+	for _, path := range []string{retired, live, independent, unbound, unknown} {
+		if err := os.WriteFile(path, []byte("descriptor"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalog := transactionListCatalog{records: []cluster.Transaction{
+		{Identity: cluster.ForkIdentity{TransactionID: "fork-live"}, State: cluster.TransactionPublished},
+		{
+			Identity:     cluster.ForkIdentity{TransactionID: "fork-independent"},
+			State:        cluster.TransactionIndependent,
+			GraphHandoff: &cluster.GraphHandoffDescriptor{GraphManifest: filepath.Join("cluster", "memory-manifests", "fork-independent.manifest")},
+		},
+		{Identity: cluster.ForkIdentity{TransactionID: "fork-unbound"}, State: cluster.TransactionIndependent},
+	}}
+	if err := collectColdStorage(shared, local, nil, catalog, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(retired); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retired graph handoff manifest remains: %v", err)
+	}
+	if _, err := os.Stat(unknown); err != nil {
+		t.Fatalf("unknown file was not left untouched: %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("nonterminal graph handoff manifest was reclaimed: %v", err)
+	}
+	if _, err := os.Stat(independent); err != nil {
+		t.Fatalf("bound independent graph handoff manifest was reclaimed: %v", err)
+	}
+	if _, err := os.Stat(unbound); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unbound terminal graph handoff manifest remains: %v", err)
+	}
+}
+
+func TestFinalColdStorageCollectionHasNoPublicationGraceResidue(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	orphan := filepath.Join(shared, "cold", "manifests", "family", "branch", "0000000000000001.json")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("uncommitted"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := collectColdStorage(shared, local, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("ordinary grace did not retain a recent publication: %v", err)
+	}
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, nil, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final collection retained unreachable publication: %v", err)
+	}
+}
+
+func TestColdStorageRetainsDistributedPhysicalBranchManifest(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	const physicalID = "fork-physical-child"
+	manifestPath := coldManifestPath(shared, physicalID, "child", "publication-child")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 17, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	manifest := coldBranchManifest{
+		Version: 5, Container: physicalID, Branch: "child", PublicationID: "publication-child", Kind: "stop",
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef", BranchID: "child",
+			Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{17}}},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(manifestPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(shared, "containers", physicalID)
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), ttcbundle.ContainerInfo{
+		ID: physicalID, Name: physicalID, BundleDir: bundleDir,
+		DistributedFamilyID: "logical-family", DistributedForkTransactionID: "fork-child",
+		Branches: []ttcbundle.BranchInfo{{
+			ID: "child", State: "dehydrated", StorageState: "shared", PublicationID: "publication-child", StorageManifest: manifestPath,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("distributed physical branch manifest was reclaimed: %v", err)
+	}
+}
+
+func TestColdStorageRetainsRaftBranchBackingAfterPhysicalCleanup(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	manifestPath := coldManifestPath(shared, "fork-old-physical", "fork-old-physical", "publication-old")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := ttcsnapshot.ObjectID{Snapshot: 29, Ordinal: 1, Kind: ttcsnapshot.ObjectKindMetadata}
+	manifest := coldBranchManifest{
+		Version: 5, Container: "fork-old-physical", Branch: "fork-old-physical", PublicationID: "publication-old", Kind: "stop",
+		Filesystems: []coldFilesystemSnapshot{{Root: cluster.FilesystemRootDescriptor{
+			Source: "rootfs-upper", RepositoryID: "0123456789abcdef0123456789abcdef",
+			RestoreID: "0123456789abcdef0123456789abcdef", BranchID: "fork-old-physical",
+			Root: root.String(), NextInode: 2,
+		}, Origins: []uint64{29}}},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(manifestPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(shared, manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &cluster.AuthorityState{Branches: map[string]cluster.BranchAuthority{
+		"logical-family\x00main": {
+			FamilyID: "logical-family", BranchID: "main", Lifecycle: "running",
+			Roots: cluster.DurableRoots{FilesystemRoot: filepath.ToSlash(relative)},
+		},
+	}}
+	// The old physical container record has already been removed. The logical
+	// Raft branch is nevertheless still allowed to fault from this immutable
+	// manifest, so terminal collection must retain it.
+	if err := collectColdStorageOlderThan(shared, local, nil, nil, authority, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("Raft-selected branch backing was reclaimed: %v", err)
 	}
 }
 
@@ -5279,7 +7105,7 @@ func TestElasticDrainIntentSurvivesRetryAndIsConsumedAfterCompletion(t *testing.
 }
 
 func TestElasticCommandsTakeMutationLock(t *testing.T) {
-	for _, args := range [][]string{{"migrate", "--target", "node-b", "demo@main"}, {"node", "drain", "node-a"}, {"node", "rebalance", "node-a"}} {
+	for _, args := range [][]string{{"migrate", "--node", "node-b", "demo@main"}, {"node", "stop", "--migrate-all", "node-a"}, {"node", "rebalance", "node-a"}} {
 		if !daemonCommandNeedsMutationLock(args) {
 			t.Errorf("%v does not take the mutation lock", args)
 		}
@@ -5289,28 +7115,118 @@ func TestElasticCommandsTakeMutationLock(t *testing.T) {
 	}
 }
 
+func TestPersistentFamilyRequiredRuntime(t *testing.T) {
+	container := ttcbundle.ContainerInfo{
+		NodeID: "node-a",
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", NodeID: "node-a", State: "created"},
+			{ID: "cold", NodeID: "node-a", State: "dehydrated"},
+			{ID: "remote", NodeID: "node-b", State: "running"},
+		},
+	}
+	if persistentFamilyRequiredRuntime(container, "node-a") {
+		t.Fatal("process-free local branches unexpectedly require a runtime")
+	}
+	if !persistentFamilyRequiredRuntime(container, "node-b") {
+		t.Fatal("running remote branch did not require its node runtime")
+	}
+	container.Branches[0].State = "paused"
+	if !persistentFamilyRequiredRuntime(container, "node-a") {
+		t.Fatal("paused local branch did not require its runtime")
+	}
+}
+
+func TestPendingDistributedTargetProtectsHiddenRuntime(t *testing.T) {
+	container := ttcbundle.ContainerInfo{
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running"}},
+		DistributedForkImports: map[string]ttcbundle.DistributedForkImport{
+			"tx-migrate": {
+				BranchID: "main", TargetNode: "node-b", SourceNode: "node-a",
+				Migration: true, State: "paused",
+			},
+			"tx-fork": {
+				BranchID: "child", TargetNode: "node-b", SourceNode: "node-a",
+				Migration: false, State: "paused",
+			},
+		},
+	}
+	if !pendingDistributedTarget(container, "main", "node-b") {
+		t.Fatal("hidden migration target was not protected on its target node")
+	}
+	if pendingDistributedTarget(container, "main", "node-a") {
+		t.Fatal("hidden migration target protected the source node")
+	}
+	if !pendingDistributedTarget(container, "child", "node-b") {
+		t.Fatal("ordinary remote fork target was not protected before publication")
+	}
+	container.DistributedForkImports = nil
+	container.Branches = append(container.Branches, ttcbundle.BranchInfo{
+		ID: "child", NodeID: "node-b", State: "running", DistributedForkTransactionID: "tx-fork",
+	})
+	if !pendingDistributedTarget(container, "child", "node-b") {
+		t.Fatal("visible target was not protected before Raft placement publication")
+	}
+}
+
+func TestLocalFamilyStateNeeded(t *testing.T) {
+	info := ttcbundle.ContainerInfo{NodeID: "node-a", Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running"}}}
+	if localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("remote-only family retained node-local state")
+	}
+	info.Branches = append(info.Branches, ttcbundle.BranchInfo{ID: "child", NodeID: "node-b", State: "running"})
+	if !localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("locally owned branch did not retain node-local state")
+	}
+	info.Branches = info.Branches[:1]
+	info.DistributedForkImports = map[string]ttcbundle.DistributedForkImport{
+		"tx": {BranchID: "child", TargetNode: "node-b"},
+	}
+	if !localFamilyStateNeeded(info, "node-b") {
+		t.Fatal("provisional import did not retain node-local state")
+	}
+}
+
+func TestPendingPublicationProtectsPhysicalContainer(t *testing.T) {
+	intents := []ttcstorage.Intent{
+		{Container: "physical-a", AuthorityContainer: "family", Branch: "transaction-a"},
+		{Container: "physical-b", AuthorityContainer: "family", Branch: "transaction-b"},
+	}
+	for _, test := range []struct {
+		container string
+		want      bool
+	}{{"physical-a", true}, {"physical-b", true}, {"family", false}, {"", false}} {
+		if got := pendingPublicationProtectsContainer(intents, test.container); got != test.want {
+			t.Errorf("pendingPublicationProtectsContainer(%q)=%t, want %t", test.container, got, test.want)
+		}
+	}
+}
+
 func TestElasticNodeMutationRoutesToSourceBeforeLock(t *testing.T) {
 	for _, args := range [][]string{
-		{"node", "drain", "--target", "node-b", "node-a"},
-		{"node", "drain", "--_local", "--target=node-b", "node-a"},
+		{"node", "stop", "--migrate-all", "node-a"},
+		{"node", "stop", "--_local", "--dehydrate-all", "node-a"},
 		{"node", "rebalance", "node-a"},
 	} {
-		owner, err := daemonCommandOwner(t.TempDir(), args)
+		owner, _, err := daemonCommandPlacementWithCatalog(t.TempDir(), nil, args)
 		if err != nil {
-			t.Fatalf("daemonCommandOwner(%v): %v", args, err)
+			t.Fatalf("daemonCommandPlacementWithCatalog(%v): %v", args, err)
 		}
 		if owner != "node-a" {
-			t.Errorf("daemonCommandOwner(%v)=%q, want node-a", args, owner)
+			t.Errorf("daemonCommandPlacementWithCatalog(%v)=%q, want node-a", args, owner)
 		}
 	}
 }
 
 func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 	capabilities := func(node string) cluster.Capabilities {
+		policy := ttcremote.DefaultPolicy()
+		policy.PageSize = 4096
 		return cluster.Capabilities{
 			NodeID: node, ProtocolMin: 1, ProtocolMax: 1, BuildID: "test", Architecture: "amd64",
+			CPUProfile: "portable", CPUFeatures: []string{"sse", "sse2"},
 			BasePageSize: 4096, MaxTransferSize: 2 << 20, RepositoryID: "shared",
-			Features: []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
+			Features:     []string{cluster.FeatureRemotePull, cluster.FeatureNetworkRecreate, cluster.FeatureFilesystemBranch, cluster.FeatureSharedMemorySnapshot},
+			PagingPolicy: policy,
 		}
 	}
 	now := time.Unix(7000, 0).UTC()
@@ -5339,6 +7255,16 @@ func TestSelectAdmissionNodeUsesCompatibleLeastLoadedCapacity(t *testing.T) {
 	if selected, err := selectAdmissionNode([]cluster.NodeRecord{full}, local, now); err == nil {
 		t.Fatalf("selected full node %+v", selected)
 	}
+	selected, err = selectAdmissionNodeExcluding([]cluster.NodeRecord{
+		record("node-a", 1<<30, 8<<30, 0),
+		record("node-b", 2<<30, 8<<30, 0),
+	}, local, now, map[string]struct{}{"node-a": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.NodeID != "node-b" {
+		t.Fatalf("selected excluded node %q, want node-b", selected.NodeID)
+	}
 }
 
 func TestParseDistributedFamilyMutation(t *testing.T) {
@@ -5351,7 +7277,7 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 		{args: []string{"rm", "-fv", "demo"}, prefix: []string{"rm", "-fv"}, targets: []string{"demo"}, handle: true},
 		{args: []string{"stop", "--time", "2", "demo", "peer@main"}, prefix: []string{"stop", "--time", "2"}, targets: []string{"demo", "peer@main"}, handle: true},
 		{args: []string{"dehydrate", "demo"}, prefix: []string{"dehydrate"}, targets: []string{"demo"}, handle: true},
-		{args: []string{"stop", "demo@main"}, handle: false},
+		{args: []string{"stop", "demo@main"}, prefix: []string{"stop"}, targets: []string{"demo@main"}, handle: true},
 		{args: []string{"pause", "demo"}, handle: false},
 		{args: []string{"rm", "--unknown", "demo"}, handle: false},
 	} {
@@ -5363,6 +7289,13 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 		if ok && (!slices.Equal(got.prefix, test.prefix) || !slices.Equal(got.targets, test.targets)) {
 			t.Errorf("parseDistributedFamilyMutation(%v)=%+v, want prefix=%v targets=%v", test.args, got, test.prefix, test.targets)
 		}
+		if ok && got.removeVolumes != slices.Contains(test.args, "-fv") {
+			t.Errorf("parseDistributedFamilyMutation(%v) removeVolumes=%t", test.args, got.removeVolumes)
+		}
+	}
+	mutation, ok := parseDistributedFamilyMutation([]string{"rm", "-fv", "demo"})
+	if !ok || !slices.Equal(mutation.branchPrefix(), []string{"rm", "-f"}) {
+		t.Fatalf("distributed branch removal prefix=%v, want [rm -f]", mutation.branchPrefix())
 	}
 	first := distributedChildRequestID("parent", 2, []string{"stop", "demo@main"})
 	if _, err := daemonMutationPath(t.TempDir(), first); err != nil {
@@ -5373,6 +7306,197 @@ func TestParseDistributedFamilyMutation(t *testing.T) {
 	}
 	if other := distributedChildRequestID("parent", 3, []string{"stop", "demo@main"}); first == other {
 		t.Fatalf("different child operations collided at %q", first)
+	}
+}
+
+func TestDistributedMutationSourceTransactions(t *testing.T) {
+	transaction := func(id, sourceNode, sourceBranch, targetBranch string, state cluster.TransactionState, needed, migration bool) cluster.Transaction {
+		return cluster.Transaction{
+			Identity: cluster.ForkIdentity{
+				TransactionID: id, SourceNodeID: sourceNode, SourceContainer: "family-id", SourceBranch: sourceBranch,
+				TargetContainer: "family-id", TargetBranch: id, TargetVisibleBranch: targetBranch, Migration: migration,
+			},
+			State: state, SourceNeeded: needed, SourceIncarnation: sourceNode + "-incarnation",
+		}
+	}
+	transactions := []cluster.Transaction{
+		transaction("incoming", "node-a", "main", "child", cluster.TransactionPublished, true, false),
+		transaction("outgoing", "node-b", "child", "grandchild", cluster.TransactionDraining, true, false),
+		transaction("active-migration", "node-e", "child", "child", cluster.TransactionPublished, true, true),
+		transaction("independent-fork", "node-c", "main", "old", cluster.TransactionIndependent, false, false),
+		transaction("independent-migration", "node-d", "main", "moved", cluster.TransactionIndependent, false, true),
+	}
+	info := ttcbundle.ContainerInfo{ID: "family-id"}
+	all := distributedMutationSourceTransactions(transactions, info, "", nil)
+	if len(all) != 4 {
+		t.Fatalf("family settlement nodes=%v, want node-a, node-b, node-d, and node-e", all)
+	}
+	if _, ok := all["node-a"]["incoming"]; !ok {
+		t.Fatalf("family settlement omitted incoming transaction: %v", all)
+	}
+	if _, ok := all["node-b"]["outgoing"]; !ok {
+		t.Fatalf("family settlement omitted outgoing transaction: %v", all)
+	}
+	if _, ok := all["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("family settlement omitted independent migration cleanup: %v", all)
+	}
+	retired := distributedMutationSourceTransactions(transactions, info, "", map[string]string{
+		"node-d": "node-d-incarnation",
+		"node-e": "node-e-incarnation",
+	})
+	if _, ok := retired["node-d"]; ok {
+		t.Fatalf("cleanly retired independent migration still requires its removed source: %v", retired)
+	}
+	if _, ok := retired["node-e"]["active-migration"]; !ok {
+		t.Fatalf("retirement record hid an active source dependency: %v", retired)
+	}
+	wrongIncarnation := distributedMutationSourceTransactions(transactions, info, "", map[string]string{
+		"node-d": "replacement-incarnation",
+	})
+	if _, ok := wrongIncarnation["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("replacement node incarnation hid old migration cleanup: %v", wrongIncarnation)
+	}
+	child := distributedMutationSourceTransactions(transactions, info, "child", nil)
+	if len(child) != 3 {
+		t.Fatalf("branch settlement nodes=%v, want incoming, outgoing, and active migration sources", child)
+	}
+	if got := distributedMutationSourceTransactions(transactions, ttcbundle.ContainerInfo{ID: "other"}, "", nil); len(got) != 0 {
+		t.Fatalf("unrelated family selected transactions: %v", got)
+	}
+	settle, cancel, discard, _ := distributedRemovalSourceTransactions(transactions, nil, info, "")
+	if len(settle) != 1 || len(cancel) != 2 || len(discard) != 2 {
+		t.Fatalf("removal transaction split settle=%v cancel=%v discard=%v", settle, cancel, discard)
+	}
+	if _, ok := cancel["node-a"]["incoming"]; !ok {
+		t.Fatalf("family removal would materialize obsolete incoming fork: %v", cancel)
+	}
+	if _, ok := cancel["node-b"]["outgoing"]; !ok {
+		t.Fatalf("family removal would materialize obsolete outgoing fork: %v", cancel)
+	}
+	if _, ok := discard["node-d"]["independent-migration"]; !ok {
+		t.Fatalf("removal did not defer independent migration to discard postflight: %v", discard)
+	}
+	if _, ok := discard["node-e"]["active-migration"]; !ok {
+		t.Fatalf("removal omitted active migration from discard postflight: %v", discard)
+	}
+	if _, ok := settle["node-d"]; ok {
+		t.Fatalf("removal would publish an obsolete independent migration: %v", settle)
+	}
+	branchSettle, branchCancel, _, _ := distributedRemovalSourceTransactions(transactions, nil, info, "child")
+	if _, ok := branchCancel["node-a"]["incoming"]; !ok {
+		t.Fatalf("target branch removal did not cancel its incoming fork: %v", branchCancel)
+	}
+	if _, ok := branchSettle["node-b"]["outgoing"]; !ok {
+		t.Fatalf("source branch removal did not preserve its surviving child: %v", branchSettle)
+	}
+	sharedRuntime := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "child", PhysicalContainer: "fork-runtime", PhysicalBranch: "child", OwnerNode: "node-a"},
+		{FamilyID: "family-id", BranchID: "sibling", PhysicalContainer: "fork-runtime", PhysicalBranch: "sibling", OwnerNode: "node-a"},
+	}
+	sharedTransactions := append([]cluster.Transaction(nil), transactions...)
+	sharedTransactions[0].Identity.TargetNodeID = "node-a"
+	sharedSettle, sharedCancel, _, _ := distributedRemovalSourceTransactions(sharedTransactions, sharedRuntime, info, "child")
+	if _, ok := sharedSettle["node-a"]["incoming"]; !ok {
+		t.Fatalf("shared physical descendant did not retain its source handoff: settle=%v cancel=%v", sharedSettle, sharedCancel)
+	}
+	if _, ok := sharedCancel["node-a"]["incoming"]; ok {
+		t.Fatalf("shared physical descendant allowed target-family cancellation: %v", sharedCancel)
+	}
+
+	// Rename leaves immutable transaction identities untouched. Reusing the
+	// old branch name must not associate the new placement with the migration
+	// that now backs the renamed branch.
+	oldMigration := transaction("old-migration", "node-a", "remote", "remote", cluster.TransactionIndependent, false, true)
+	newFork := transaction("new-fork", "node-a", "main", "remote", cluster.TransactionPublished, true, false)
+	newFork.Identity.TargetNodeID = "node-b"
+	renameReusePlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "moved", PhysicalContainer: "old-runtime", OwnerNode: "node-b", LastOperationID: "old-migration"},
+		{FamilyID: "family-id", BranchID: "remote", PhysicalContainer: "new-runtime", OwnerNode: "node-b", OperationID: "new-fork"},
+	}
+	_, reusedCancel, reusedDiscard, _ := distributedRemovalSourceTransactions([]cluster.Transaction{oldMigration, newFork}, renameReusePlacements, info, "remote")
+	if _, ok := reusedCancel["node-a"]["new-fork"]; !ok {
+		t.Fatalf("reused branch removal did not select its current fork: %v", reusedCancel)
+	}
+	if _, ok := reusedDiscard["node-a"]["old-migration"]; ok {
+		t.Fatalf("reused branch removal selected renamed migration history: %v", reusedDiscard)
+	}
+	if got := distributedTransactionLogicalBranch(oldMigration, renameReusePlacements); got != "moved" {
+		t.Fatalf("renamed migration resolves to %q, want moved", got)
+	}
+
+	// Target cleanup happens before the cancellation CAS. Recovery must keep
+	// selecting metadata-only removal after the transaction becomes terminal,
+	// including when the public branch was renamed in the meantime.
+	canceledFork := transaction("canceled-fork", "node-a", "main", "child", cluster.TransactionCanceled, false, false)
+	canceledFork.Identity.TargetNodeID = "node-b"
+	canceledPlacements := []cluster.PlacementRecord{{
+		FamilyID: "family-id", BranchID: "renamed-child", OwnerNode: "node-b",
+		PhysicalContainer: "fork-runtime", LastOperationID: "canceled-fork",
+	}}
+	_, recoveredCancel, _, _ := distributedRemovalSourceTransactions([]cluster.Transaction{canceledFork}, canceledPlacements, info, "renamed-child")
+	if _, ok := recoveredCancel["node-a"]["canceled-fork"]; !ok {
+		t.Fatalf("terminal canceled target did not retain metadata-only removal: %v", recoveredCancel)
+	}
+
+	corruptedPlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "child", State: cluster.PlacementCorrupted},
+		{FamilyID: "family-id", BranchID: "grandchild", State: cluster.PlacementRunning},
+	}
+	corruptSettle, corruptCancel, corruptDiscard, _ := distributedRemovalSourceTransactions(transactions, corruptedPlacements, info, "child")
+	if _, ok := corruptCancel["node-a"]; ok {
+		t.Fatalf("corrupted target removal attempted remote cancellation: %v", corruptCancel)
+	}
+	if _, ok := corruptSettle["node-b"]["outgoing"]; !ok {
+		t.Fatalf("corrupted source removal did not preserve a healthy child: %v", corruptSettle)
+	}
+	if _, ok := corruptDiscard["node-e"]["active-migration"]; ok {
+		t.Fatalf("corrupted migration target retained physical cleanup: %v", corruptDiscard)
+	}
+
+	// A committed migration whose branch is removed with its target's runtime
+	// is canceled after the target instead of drained into it; one whose
+	// target runtime a surviving branch shares is still drained.
+	committed := transaction("committed-migration", "node-f", "moved", "moved", cluster.TransactionDraining, true, true)
+	committed.OwnershipCommitted = true
+	committed.Identity.TargetNodeID = "node-g"
+	committed.TargetPhysicalContainer = "move-runtime"
+	movedPlacements := []cluster.PlacementRecord{
+		{FamilyID: "family-id", BranchID: "moved", PhysicalContainer: "move-runtime", OwnerNode: "node-g", LastOperationID: "committed-migration"},
+	}
+	abortSettle, _, abortDiscard, abort := distributedRemovalSourceTransactions([]cluster.Transaction{committed}, movedPlacements, info, "moved")
+	if _, ok := abort["node-f"]["committed-migration"]; !ok || len(abortSettle) != 0 || len(abortDiscard) != 0 {
+		t.Fatalf("removing a migrated branch: settle=%v discard=%v abort=%v, want it aborted", abortSettle, abortDiscard, abort)
+	}
+	sharedMoved := append(movedPlacements, cluster.PlacementRecord{FamilyID: "family-id", BranchID: "local-fork", PhysicalContainer: "move-runtime", OwnerNode: "node-g"})
+	keptSettle, _, _, keptAbort := distributedRemovalSourceTransactions([]cluster.Transaction{committed}, sharedMoved, info, "moved")
+	if _, ok := keptSettle["node-f"]["committed-migration"]; !ok || len(keptAbort) != 0 {
+		t.Fatalf("a migration a surviving branch reads was aborted: settle=%v abort=%v", keptSettle, keptAbort)
+	}
+}
+
+func TestOrderFamilyRemovalPlacementsTreatsEmptyPhysicalContainerAsCanonical(t *testing.T) {
+	records := []cluster.PlacementRecord{
+		{FamilyID: "family", BranchID: "migrated", PhysicalContainer: "family", PhysicalBranch: "migration-private", State: cluster.PlacementRunning},
+		{FamilyID: "family", BranchID: "main", PhysicalContainer: "", PhysicalBranch: "", State: cluster.PlacementCorrupted},
+		{FamilyID: "family", BranchID: "remote", PhysicalContainer: "fork-runtime", PhysicalBranch: "remote", State: cluster.PlacementRunning},
+	}
+	orderFamilyRemovalPlacements(records, "family")
+	if got := records[len(records)-1].BranchID; got != "main" {
+		t.Fatalf("final removal branch=%q, want canonical main", got)
+	}
+}
+
+func TestFilesystemAccountingDefersZeroByteMetadataDependency(t *testing.T) {
+	branch := ttcbundle.BranchInfo{DistributedForkTransactionID: "fork-1"}
+	if !deferFilesystemAccounting(branch, map[string]bool{"fork-1": true}) {
+		t.Fatal("zero-byte volatile filesystem dependency was treated as independent")
+	}
+	if deferFilesystemAccounting(branch, map[string]bool{"fork-1": false}) {
+		t.Fatal("independent filesystem remained deferred")
+	}
+	branch.DependentFilesystemBytes = 1
+	if !deferFilesystemAccounting(branch, nil) {
+		t.Fatal("nonzero filesystem dependency was not deferred")
 	}
 }
 
@@ -5393,21 +7517,270 @@ func TestRunRenameNamesTheBranchAfterItsNewName(t *testing.T) {
 	}
 }
 
-func TestPipeReaderForBytesExceedsKernelBuffer(t *testing.T) {
-	want := bytes.Repeat([]byte("large-ttc-control-payload\n"), 16<<10)
-	reader, finish, err := pipeReaderForBytes(want)
+func TestReconcileStandaloneMemoryGraphReclaimsCrashResidue(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "catalog", "snapshot-graph"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, readErr := io.ReadAll(reader)
-	writeErr := finish()
-	if readErr != nil {
-		t.Fatalf("reading payload: %v", readErr)
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if writeErr != nil {
-		t.Fatalf("writing payload: %v", writeErr)
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("read %d bytes, want %d", len(got), len(want))
+	rootObject, err := graph.CreateObject(origin, "memory/crash/root-pin", ttcsnapshot.ObjectKindMetadata, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("memory/crash/resource-0000", rootObject); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("memory/crash/root-pin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.CreateObject(origin, "memory/crash/construction-pin", ttcsnapshot.ObjectKindMetadata, []byte("partial"), nil); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root, localRoot: root, snapshotGraph: graph, snapshotData: data}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	stats := graph.Stats()
+	if stats.Snapshots != 0 || stats.Objects != 0 || stats.Roots != 0 || stats.Pins != 0 || stats.Reclaiming != 0 {
+		t.Fatalf("graph after reconciliation = %+v, want empty", stats)
+	}
+	if got := graph.JournalBytes(); got > 1024 {
+		t.Fatalf("compacted journal has %d bytes, want at most 1024", got)
+	}
+}
+
+func TestReconcileStandaloneMemoryGraphRetainsRuntimeBacking(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "catalog", "snapshot-graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := graph.CreateObject(origin, "memory/runtime/pin", ttcsnapshot.ObjectKindMemoryNode, []byte("root"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rootName = "memory/runtime/resource-0000"
+	if err := graph.SetRoot(rootName, object); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("memory/runtime/pin"); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", "container-id")
+	if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "container-id", Name: "example", BundleDir: filepath.Join(containerDir, "bundle"), State: "exited", CreatedAt: time.Now(), LiveForkEligible: true,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", FilesystemBranch: "main", State: "exited", StorageState: "local", CreatedAt: time.Now()}},
+		RuntimeMemoryBackings: []ttcbundle.RuntimeMemoryBacking{{
+			ID: "runtime-1", SnapshotID: uint64(origin), MemoryRoots: []string{rootName}, MemoryRootObjects: []string{object.String()},
+		}},
+	}
+	encoded, err := json.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &runtimeBackend{dataRoot: root, localRoot: root, snapshotGraph: graph, snapshotData: data}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root(rootName); !ok {
+		t.Fatal("runtime backing root was reclaimed")
+	}
+	if err := backend.containerStore().RemoveRuntimeMemoryBacking("example", "runtime-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.reconcileStandaloneMemoryGraph(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root(rootName); ok {
+		t.Fatal("retired runtime backing root was retained")
+	}
+}
+
+func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		branch ttcbundle.BranchInfo
+		want   bool
+	}{
+		{name: "running-dependent", branch: ttcbundle.BranchInfo{State: "running", DependentMemoryBytes: 4096}, want: true},
+		{name: "paused-roots", branch: ttcbundle.BranchInfo{State: "paused", SnapshotID: 17, MemoryRootObjects: []string{"0000000000000011-03-0000000000000001"}}, want: true},
+		{name: "running-independent", branch: ttcbundle.BranchInfo{State: "running"}},
+		{name: "dehydrating", branch: ttcbundle.BranchInfo{State: "dehydrating"}},
+		{name: "dehydrated", branch: ttcbundle.BranchInfo{State: "dehydrated", Unplaced: true}},
+		{name: "exited", branch: ttcbundle.BranchInfo{State: "exited"}},
+		{name: "unplaced-running", branch: ttcbundle.BranchInfo{State: "running", Unplaced: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := distributedGraphHandoffHasLiveRuntime(test.branch); got != test.want {
+				t.Fatalf("distributedGraphHandoffHasLiveRuntime(%+v)=%t, want %t", test.branch, got, test.want)
+			}
+		})
+	}
+}
+
+func TestReconcileInterruptedMemoryGraphSealsOnlyReferencedResidue(t *testing.T) {
+	root := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(root, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(root, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+
+	interrupted, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := graph.CreateObject(interrupted, "capture/construction-child", ttcsnapshot.ObjectKindMetadata, []byte("child"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("capture/partial-root", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/construction-child"); err != nil {
+		t.Fatal(err)
+	}
+
+	completed, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := graph.CreateObject(completed, "capture/completed-parent", ttcsnapshot.ObjectKindMetadata, []byte("parent"), []ttcsnapshot.Edge{{Slot: 0, Child: child}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/completed-root", parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/completed-parent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(completed, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+
+	empty, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead, err := graph.CreateObject(empty, "capture/dead", ttcsnapshot.ObjectKindMetadata, []byte("dead"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("capture/dead-root", dead); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("capture/dead"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reconcileInterruptedMemoryGraph(graph, data, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root("capture/partial-root"); ok {
+		t.Fatal("interrupted construction root survived reconciliation")
+	}
+	if _, ok := graph.Root("capture/dead-root"); ok {
+		t.Fatal("unreferenced construction root survived reconciliation")
+	}
+	if got, ok := graph.Root("branch/completed-root"); !ok || got != parent {
+		t.Fatalf("completed root = %v, %t; want %v", got, ok, parent)
+	}
+	if record, ok := graph.Snapshot(interrupted); !ok || record.State != ttcsnapshot.SnapshotSealedVolatile {
+		t.Fatalf("referenced interrupted snapshot = %+v, %t; want sealed volatile", record, ok)
+	}
+	if objects, err := graph.SnapshotObjects(empty); err != nil || len(objects) != 0 {
+		t.Fatalf("empty interrupted snapshot objects = %v, %v; want none", objects, err)
+	}
+}
+
+// A kernel that accounts swap to cgroups gives a memory cgroup memory.swap.max
+// beside memory.max; one that does not gives only memory.max. With neither, as
+// on cgroup v1, runsc decides.
+func TestCgroupSwapAccounted(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "delegated")
+	if err := os.MkdirAll(filepath.Join(parent, "daemon"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	proc := filepath.Join(t.TempDir(), "cgroup")
+	if err := os.WriteFile(proc, []byte("0::/delegated/daemon\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !cgroupSwapAccounted(proc, root) {
+		t.Error("a cgroup with no memory interface was judged unaccounted")
+	}
+	if err := os.WriteFile(filepath.Join(parent, "memory.max"), []byte("max\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if cgroupSwapAccounted(proc, root) {
+		t.Error("a memory cgroup without memory.swap.max was judged accounted")
+	}
+	if err := os.WriteFile(filepath.Join(parent, "memory.swap.max"), []byte("max\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !cgroupSwapAccounted(proc, root) {
+		t.Error("a memory cgroup with memory.swap.max was judged unaccounted")
+	}
+}
+
+// A branch's record keeps its exit code, and its console the raw wait status:
+// the two agree however the process ended.
+func TestRetainedConsoleExitCodeMatchesItsWaitStatus(t *testing.T) {
+	dir := t.TempDir()
+	paths := ttcbundle.ConsolePaths{WaitStatus: filepath.Join(dir, "main.wait-status")}
+	if err := ttcconsole.WriteWaitStatus(paths.WaitStatus, 7<<8); err != nil {
+		t.Fatal(err)
+	}
+	if err := installRetainedConsoleExitCode(paths, 7); err != nil {
+		t.Fatalf("exit code 7 against a status of exit 7: %v", err)
+	}
+	if err := installRetainedConsoleExitCode(paths, 3); err == nil {
+		t.Fatal("exit code 3 was taken for a status of exit 7")
+	}
+	for code, want := range map[int]uint32{3: 3 << 8, 137: 9, 0: 0} {
+		if err := os.Remove(paths.WaitStatus); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := installRetainedConsoleExitCode(paths, code); err != nil {
+			t.Fatalf("installing exit code %d: %v", code, err)
+		}
+		if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil || !found || status != want || waitStatusExitCode(status) != code {
+			t.Fatalf("exit code %d installed status %d (found %t, %v), want %d", code, status, found, err, want)
+		}
 	}
 }

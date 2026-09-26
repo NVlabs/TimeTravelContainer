@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package ttcchunk implements TTC's immutable loose memory-chunk format.
+// Package ttcchunk implements TTC's bounded memory capture transport and the
+// adapters between Sentry memory and the authoritative snapshot graph.
 package ttcchunk
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -39,22 +39,12 @@ const (
 
 var formatMagic = [16]byte{'T', 'T', 'C', 'M', 'E', 'M', 'C', 'H', 'U', 'N', 'K', 0, 0, 0, 0, 1}
 
-// ID is the content address of an encoded chunk.
-type ID [sha256.Size]byte
+// ID is an opaque, transaction-local memory object identity. Persistent graph
+// objects use ttcsnapshot.ObjectID instead.
+type ID [32]byte
 
-// String returns the lowercase hexadecimal content address.
+// String returns the lowercase hexadecimal transport identity.
 func (id ID) String() string { return hex.EncodeToString(id[:]) }
-
-// ParseID parses a chunk content address.
-func ParseID(value string) (ID, error) {
-	var id ID
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(decoded) != len(id) {
-		return id, fmt.Errorf("invalid TTC memory chunk ID %q", value)
-	}
-	copy(id[:], decoded)
-	return id, nil
-}
 
 // Page is one valid logical slot. Data must contain exactly one base page.
 // Zero pages may omit Data and set Zero.
@@ -71,36 +61,39 @@ type Chunk struct {
 	Pages   []Page
 }
 
-func setBit(bitmap *[32]byte, slot uint8) { bitmap[slot/8] |= byte(1 << (slot % 8)) }
-func hasBit(bitmap *[32]byte, slot uint8) bool {
+// slotBitmapBytes is the size of a bitmap with a bit for each slot of a chunk.
+const slotBitmapBytes = PagesPerChunk / 8
+
+func setBit(bitmap *[slotBitmapBytes]byte, slot uint8) { bitmap[slot/8] |= byte(1 << (slot % 8)) }
+func hasBit(bitmap *[slotBitmapBytes]byte, slot uint8) bool {
 	return bitmap[slot/8]&(byte(1)<<(slot%8)) != 0
 }
 
-// Encode validates and encodes chunk, returning its content address.
-func Encode(chunk Chunk) ([]byte, ID, error) {
+// Encode validates and encodes a chunk for an ephemeral capture stream.
+func Encode(chunk Chunk) ([]byte, error) {
 	if chunk.Logical.Allocator == (pgalloc.LogicalAllocatorID{}) {
-		return nil, ID{}, errors.New("memory chunk has zero logical allocator ID")
+		return nil, errors.New("memory chunk has zero logical allocator ID")
 	}
 	if len(chunk.Pages) == 0 || len(chunk.Pages) > PagesPerChunk {
-		return nil, ID{}, fmt.Errorf("memory chunk has %d pages", len(chunk.Pages))
+		return nil, fmt.Errorf("memory chunk has %d pages", len(chunk.Pages))
 	}
 	pages := make([]*Page, PagesPerChunk)
 	var valid, zero [32]byte
 	for i := range chunk.Pages {
 		page := &chunk.Pages[i]
 		if pages[page.Slot] != nil {
-			return nil, ID{}, fmt.Errorf("memory chunk repeats slot %d", page.Slot)
+			return nil, fmt.Errorf("memory chunk repeats slot %d", page.Slot)
 		}
 		if page.Version.Allocator == (pgalloc.LogicalAllocatorID{}) {
-			return nil, ID{}, fmt.Errorf("memory chunk slot %d has zero version allocator ID", page.Slot)
+			return nil, fmt.Errorf("memory chunk slot %d has zero version allocator ID", page.Slot)
 		}
 		if page.Zero {
 			if len(page.Data) != 0 {
-				return nil, ID{}, fmt.Errorf("zero memory chunk slot %d has payload", page.Slot)
+				return nil, fmt.Errorf("zero memory chunk slot %d has payload", page.Slot)
 			}
 			setBit(&zero, page.Slot)
 		} else if len(page.Data) != hostarch.PageSize {
-			return nil, ID{}, fmt.Errorf("memory chunk slot %d has %d payload bytes, want %d", page.Slot, len(page.Data), hostarch.PageSize)
+			return nil, fmt.Errorf("memory chunk slot %d has %d payload bytes, want %d", page.Slot, len(page.Data), hostarch.PageSize)
 		}
 		setBit(&valid, page.Slot)
 		pages[page.Slot] = page
@@ -137,18 +130,25 @@ func Encode(chunk Chunk) ([]byte, ID, error) {
 			encoded = append(encoded, page.Data...)
 		}
 	}
-	id := sha256.Sum256(encoded)
-	return encoded, id, nil
+	return encoded, nil
 }
 
-// Decode validates data and its optional expected content address.
-func Decode(data []byte, expected *ID) (Chunk, error) {
-	if expected != nil {
-		actual := sha256.Sum256(data)
-		if actual != *expected {
-			return Chunk{}, fmt.Errorf("memory chunk checksum is %s, want %s", ID(actual), *expected)
+// Decode validates capture-stream chunk data.
+func Decode(data []byte) (Chunk, error) {
+	chunk, err := decodeInPlace(data)
+	if err != nil {
+		return Chunk{}, err
+	}
+	for i := range chunk.Pages {
+		if chunk.Pages[i].Data != nil {
+			chunk.Pages[i].Data = append([]byte(nil), chunk.Pages[i].Data...)
 		}
 	}
+	return chunk, nil
+}
+
+// decodeInPlace is Decode, except that the pages' data are slices of data.
+func decodeInPlace(data []byte) (Chunk, error) {
 	if len(data) < headerBytes || !bytes.Equal(data[:16], formatMagic[:]) {
 		return Chunk{}, errors.New("invalid TTC memory chunk header")
 	}
@@ -208,7 +208,7 @@ func Decode(data []byte, expected *ID) (Chunk, error) {
 		}
 		offset += entryBytes
 		if !page.Zero {
-			page.Data = append([]byte(nil), data[payloadOffset:payloadOffset+hostarch.PageSize]...)
+			page.Data = data[payloadOffset : payloadOffset+hostarch.PageSize : payloadOffset+hostarch.PageSize]
 			payloadOffset += hostarch.PageSize
 		}
 		result.Pages = append(result.Pages, page)
@@ -217,7 +217,7 @@ func Decode(data []byte, expected *ID) (Chunk, error) {
 }
 
 // Read decodes one bounded chunk stream.
-func Read(reader io.Reader, expected *ID) (Chunk, error) {
+func Read(reader io.Reader) (Chunk, error) {
 	const maxEncodedBytes = headerBytes + PagesPerChunk*entryBytes + PagesPerChunk*hostarch.PageSize
 	data, err := io.ReadAll(io.LimitReader(reader, maxEncodedBytes+1))
 	if err != nil {
@@ -226,5 +226,5 @@ func Read(reader io.Reader, expected *ID) (Chunk, error) {
 	if len(data) > maxEncodedBytes {
 		return Chunk{}, errors.New("TTC memory chunk exceeds maximum encoded size")
 	}
-	return Decode(data, expected)
+	return Decode(data)
 }

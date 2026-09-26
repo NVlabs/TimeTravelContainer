@@ -17,31 +17,8 @@ package cmd
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 )
-
-func TestPublishConsoleFollowerPID(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "console.pid")
-	if err := os.WriteFile(path, []byte("stale\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	cleanup, err := publishConsoleFollowerPID(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := string(data), strconv.Itoa(os.Getpid())+"\n"; got != want {
-		t.Fatalf("PID file=%q, want %q", got, want)
-	}
-	cleanup()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("PID file survived cleanup: %v", err)
-	}
-}
 
 func TestWritePidFile(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "test-*")

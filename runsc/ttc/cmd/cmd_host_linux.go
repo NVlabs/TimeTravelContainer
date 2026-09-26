@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -188,22 +189,54 @@ func legacyPortLockHolder(lockPath, container, branch, endpoint string) (int, er
 	return 0, fmt.Errorf("published-port lock is held by an unknown process")
 }
 
-// currentNodeMemoryBytes prefers the containing cgroup because Sentries are
-// daemon siblings rather than children whose RSS can be summed reliably.
-func currentNodeMemoryBytes() (uint64, error) {
-	if cgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		for _, line := range strings.Split(string(cgroup), "\n") {
-			parts := strings.SplitN(line, ":", 3)
-			if len(parts) != 3 || parts[0] != "0" || parts[1] != "" {
-				continue
-			}
-			path := "/sys/fs/cgroup/" + strings.TrimPrefix(parts[2], "/")
-			if value, err := readUintFile(path + "/memory.current"); err == nil {
-				return value, nil
-			}
-		}
+// currentNodeMemoryBytes accounts only memory controlled by this TTC node.
+//
+// A daemon is often launched directly from a login shell, systemd --user, or a
+// batch allocation. Its containing cgroup can therefore include unrelated
+// jobs, caches, and even other TTC roots. Using memory.current from that cgroup
+// made an idle daemon appear pressured and caused placement churn that TTC
+// could not relieve. Sentries are daemon siblings, but every runtime and
+// helper created for this node carries its node-local root in argv. Scan those
+// process leaders and add the daemon itself explicitly.
+func currentNodeMemoryBytes(localRoot string) (uint64, error) {
+	self := os.Getpid()
+	total, err := processResidentMemoryBytes(self)
+	if err != nil {
+		return 0, err
 	}
-	statm, err := os.ReadFile("/proc/self/statm")
+	if localRoot == "" {
+		return total, nil
+	}
+	localRoot = filepath.Clean(localRoot)
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == self {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || !bytes.Contains(cmdline, []byte(localRoot)) {
+			continue
+		}
+		resident, err := processResidentMemoryBytes(pid)
+		if err != nil {
+			// Processes naturally race the scan by exiting. An unreadable entry
+			// no longer contributes to current resident usage.
+			continue
+		}
+		total += resident
+	}
+	return total, nil
+}
+
+// processResidentMemoryBytes returns the resident bytes charged to one host
+// process. /proc contains process leaders, rather than every thread, so this
+// does not multiply the Sentry's shared address space by its systrap threads.
+func processResidentMemoryBytes(pid int) (uint64, error) {
+	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
 	if err != nil {
 		return 0, err
 	}
@@ -218,10 +251,7 @@ func currentNodeMemoryBytes() (uint64, error) {
 	return residentPages * uint64(os.Getpagesize()), nil
 }
 
-func readUintFile(path string) (uint64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+// cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair.
+func cloexecStreamSocketpair() ([2]int, error) {
+	return unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 }

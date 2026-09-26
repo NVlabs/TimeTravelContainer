@@ -431,6 +431,7 @@ go_library(
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/time",
         "//pkg/sentry/ttcchunk",
+        "//pkg/ttcsnapshot",
         "//pkg/sentry/unimpl",
         "//pkg/sentry/unimpl:unimplemented_syscall_go_proto",
         "//pkg/sentry/uniqueid",
@@ -492,6 +493,22 @@ go_test(
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/state",
+    ],
+)
+
+go_test(
+    name = "external_signal_test",
+    size = "small",
+    srcs = ["external_signal_test.go"],
+    library = ":kernel",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/sentry/fsimpl/testutil",
+        "//pkg/sentry/fsimpl/tmpfs",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/limits",
+        "//pkg/sentry/syscalls/linux",
+        "//pkg/sentry/vfs",
     ],
 )
 

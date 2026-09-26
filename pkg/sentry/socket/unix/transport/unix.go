@@ -1235,9 +1235,24 @@ func (e *baseEndpoint) shutdown(flags tcpip.ShutdownFlags, closePeerRead bool) *
 			c.CloseSend()
 		}
 	}
+	// Shutdown changes readiness on the local endpoint as well as its peer.
+	// In particular, shutdown(SHUT_RD) makes EPOLLRDHUP ready, and if the
+	// write side is also closed it makes EPOLLHUP ready. Receiver.CloseNotify
+	// wakes ordinary readers and writers, but waiters interested exclusively
+	// in hangup events are registered on e.Queue and must be notified directly.
+	localHangupEvents := waiter.EventMask(0)
+	if r.IsRecvClosed() {
+		localHangupEvents |= waiter.EventRdHUp
+		if c.IsSendClosed() || e.writeShutdown {
+			localHangupEvents |= waiter.EventHUp
+		}
+	}
 	e.Unlock()
 
 	// Don't hold e.Mutex while calling CloseNotify.
+	if localHangupEvents != 0 {
+		e.Queue.Notify(localHangupEvents)
+	}
 	if shutdownRead {
 		r.CloseNotify()
 	}

@@ -40,9 +40,13 @@ const (
 	// Temporary default value for max readahead, 128kb.
 	fuseDefaultMaxReadahead = 131072
 
-	// The FUSE_INIT_IN flags sent to the daemon.
-	// TODO(gvisor.dev/issue/3199): complete the flags.
-	fuseDefaultInitFlags = linux.FUSE_MAX_PAGES
+	// The FUSE_INIT_IN flags sent to the daemon. Creation requests already
+	// carry the caller's unmasked mode together with its umask, so advertise
+	// FUSE_DONT_MASK and let the userspace filesystem apply that mask. libfuse
+	// rejects a filesystem that requires this capability unless the kernel
+	// advertises it; fuse-overlayfs and AppImage runtimes commonly do so.
+	// TODO(gvisor.dev/issue/3199): complete the remaining flags.
+	fuseDefaultInitFlags = linux.FUSE_MAX_PAGES | linux.FUSE_DONT_MASK
 
 	// An INIT response needs to be at least this long.
 	minInitSize = 24

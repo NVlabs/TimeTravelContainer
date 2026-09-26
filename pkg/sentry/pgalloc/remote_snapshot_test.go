@@ -127,6 +127,46 @@ func fillRemoteTestRange(t *testing.T, mf *MemoryFile, fr memmap.FileRange, data
 	}
 }
 
+type blockingRemoteExportEvictable struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (u *blockingRemoteExportEvictable) Evict(context.Context, EvictableRange) {
+	close(u.started)
+	<-u.release
+}
+
+func TestRemoteAllocatorMetadataWaitsForEvictableCache(t *testing.T) {
+	source, _ := newRemoteTestMemoryFile(t, 1)
+	user := &blockingRemoteExportEvictable{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	source.MarkEvictable(user, EvictableRange{Start: 0, End: hostarch.PageSize})
+	<-user.started
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := ExportMemoryFileMetadataForRemote(context.Background(), source)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("remote export returned before eviction completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(user.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("remote export after eviction: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("remote export did not resume after eviction")
+	}
+}
+
 func TestRemoteSnapshotPageRelease(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 4)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 10, File: mf, Range: fr}})
@@ -169,40 +209,6 @@ func TestRemoteSnapshotPageRelease(t *testing.T) {
 	}
 	if !mf.HasUniqueRef(fr) {
 		t.Fatal("canceling remaining snapshot pages did not restore uniqueness")
-	}
-}
-
-func TestExportPackedSnapshotPreservesStreamOrder(t *testing.T) {
-	mf, fr := newRemoteTestMemoryFile(t, 2)
-	first := bytes.Repeat([]byte{0x31}, hostarch.PageSize)
-	second := bytes.Repeat([]byte{0x72}, hostarch.PageSize)
-	fillRemoteTestRange(t, mf, memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}, first)
-	fillRemoteTestRange(t, mf, memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}, second)
-	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{
-		{ID: 1, File: mf, Range: memmap.FileRange{Start: fr.Start + hostarch.PageSize, End: fr.End}},
-		{ID: 2, File: mf, Range: memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.PageSize}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snapshot.Close()
-	destination, err := os.CreateTemp("", "ttc-packed-snapshot-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	destinationPath := destination.Name()
-	defer os.Remove(destinationPath)
-	defer destination.Close()
-	if err := snapshot.ExportPackedSnapshot(destination, true); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(destinationPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := append(append([]byte(nil), second...), first...)
-	if !bytes.Equal(got, want) {
-		t.Fatal("packed snapshot did not preserve remote stream order")
 	}
 }
 
@@ -386,6 +392,9 @@ func TestAttachRemotePageLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	pages.MemoryFilesDone()
+	if pages.HasDurableBacking() {
+		t.Fatal("live reader unexpectedly reported durable backing")
+	}
 	if got := target.AsyncLoadingMapUnit(); got != 0 {
 		t.Fatalf("background-load map unit=%d, want default cap", got)
 	}
@@ -564,6 +573,75 @@ func TestRemoteSnapshotEnsureResidentBeforeLoaderCancellation(t *testing.T) {
 	}
 }
 
+// A capture of pages still loading from an immutable graph keeps their loader
+// instead of loading them, and reads them after the Kernel that owned the
+// loader has let it go. A capture of pages loading from a live source keeps
+// nothing, and must be made resident instead.
+func TestRemoteSnapshotRetainsGraphPageLoads(t *testing.T) {
+	for _, durable := range []bool{true, false} {
+		source, sourceFR := newRemoteTestMemoryFile(t, 8)
+		target, targetFR := newRemoteTestMemoryFile(t, 8)
+		want := make([]byte, sourceFR.Length())
+		for i := range want {
+			want[i] = byte(i*13 + 7)
+		}
+		fillRemoteTestRange(t, source, sourceFR, want)
+		sourceSnapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := NewLoopbackRemoteReader(sourceSnapshot, hostarch.PageSize, 1, 2)
+		pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true, DurableBacking: durable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := target.AttachRemotePageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		pages.MemoryFilesDone()
+		capture, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: targetFR}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		retained, err := capture.RetainGraphPageLoads()
+		if err != nil {
+			t.Fatalf("durable=%t: RetainGraphPageLoads: %v", durable, err)
+		}
+		if retained != durable || len(capture.PageLoads()) != map[bool]int{true: 1, false: 0}[durable] {
+			t.Fatalf("durable=%t: retained=%t, keeping %d loads", durable, retained, len(capture.PageLoads()))
+		}
+		if stats := pages.Stats(); stats.BytesLoaded != 0 {
+			t.Fatalf("durable=%t: retaining the load loaded %d bytes", durable, stats.BytesLoaded)
+		}
+		if !durable {
+			capture.Close()
+			pages.Cancel()
+			_ = pages.Wait()
+			sourceSnapshot.Close()
+			continue
+		}
+		// The Kernel that loaded the pages goes.
+		if err := pages.DecOwner(); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(want))
+		if n, err := capture.CopyStreamAt(got, 0); err != nil || n != len(got) {
+			t.Fatalf("CopyStreamAt after the loader's first owner went: n=%d err=%v", n, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatal("pages read through the retained loader differ")
+		}
+		if err := capture.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if stats := pages.Stats(); !stats.Done {
+			t.Fatalf("the retained loader did not end with the capture: %+v", stats)
+		}
+		sourceSnapshot.Close()
+	}
+}
+
 func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	const pageCount = 2 * SparseChunkBytes / hostarch.PageSize
 	target, targetFR := newRemoteTestMemoryFile(t, pageCount)
@@ -614,6 +692,54 @@ func TestLogicalChunkDemandLoadsWholeChunk(t *testing.T) {
 	}
 	if stats := pages.Stats(); stats.BytesLoaded != targetFR.Length() || stats.BytesOutstanding != 0 {
 		t.Fatalf("logical chunk drain did not install remaining chunks: %+v", stats)
+	}
+}
+
+func TestLogicalChunkDrainSkipsAlreadyResidentLeadingRange(t *testing.T) {
+	const pageCount = 2
+	target, targetFR := newRemoteTestMemoryFile(t, pageCount)
+	want := bytes.Repeat([]byte{0x5a}, pageCount*hostarch.PageSize)
+	reader := stateio.NewIOReader(bytes.NewReader(want), SparseChunkBytes, logicalPagesPerChunk, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, LogicalChunkDemand: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := []RemoteLoadRange{
+		{Target: memmap.FileRange{Start: targetFR.Start, End: targetFR.Start + hostarch.PageSize}, StreamOffset: 0},
+		{Target: memmap.FileRange{Start: targetFR.Start + hostarch.PageSize, End: targetFR.End}, StreamOffset: hostarch.PageSize},
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	// Model an import that reused the first page from an already-resident CoW
+	// version while the second page in the same logical chunk still needs the
+	// remote reader. This is the state that previously made Drain await only an
+	// already-resident leading range and leave the loader demand-only forever.
+	amfl := target.asyncPageLoad.Load()
+	if amfl == nil {
+		t.Fatal("target has no asynchronous page load")
+	}
+	pages.mu.Lock()
+	seg := amfl.unloaded.FindSegment(targetFR.Start)
+	if !seg.Ok() {
+		pages.mu.Unlock()
+		t.Fatal("first page is not tracked as unloaded")
+	}
+	seg = amfl.unloaded.SplitAfter(seg, targetFR.Start+hostarch.PageSize)
+	amfl.unloaded.Remove(seg)
+	amfl.minUnloaded.Store(targetFR.Start + hostarch.PageSize)
+	pages.mu.Unlock()
+
+	pages.Drain()
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); !stats.Done || stats.BytesOutstanding != 0 {
+		t.Fatalf("logical chunk drain left a trailing unresolved range: %+v", stats)
 	}
 }
 
@@ -813,6 +939,9 @@ func TestDemandOnlyRemotePageLoadSwitchesReaderAtQuiescence(t *testing.T) {
 	if err := pages.SwitchReader(replacement); err != nil {
 		t.Fatal(err)
 	}
+	if !pages.HasDurableBacking() {
+		t.Fatal("replacement reader did not report durable backing")
+	}
 	if got := readPage(1); got != 0x22 {
 		t.Fatalf("replacement reader page=%#x, want %#x", got, 0x22)
 	}
@@ -871,6 +1000,46 @@ func TestSparseChunkDemandLoadsWholeResidencyUnit(t *testing.T) {
 	if target.IsAsyncLoading() {
 		t.Fatal("target retained a sparse loader after its complete chunk loaded")
 	}
+}
+
+// Residency units a sparse load lays out one after another, in the MemoryFile
+// as in the stream, stay separate: a demand for a page of one loads that one.
+func TestSparseChunkDemandLoadsOnlyItsUnitOfContiguousUnits(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, 2*pagesPerChunk)
+	target, targetFR := newRemoteTestMemoryFile(t, 2*pagesPerChunk)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*31 + 9)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	reader := NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	units := []RemoteLoadRange{
+		{Target: memmap.FileRange{Start: targetFR.Start, End: targetFR.Start + SparseChunkBytes}, StreamOffset: 0},
+		{Target: memmap.FileRange{Start: targetFR.Start + SparseChunkBytes, End: targetFR.End}, StreamOffset: SparseChunkBytes},
+	}
+	if err := target.AttachSparseChunkPageLoad(pages, units, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	page := memmap.FileRange{Start: targetFR.Start + 5*hostarch.PageSize, End: targetFR.Start + 6*hostarch.PageSize}
+	if _, err := target.MapInternal(page, hostarch.Read); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); stats.BytesLoaded != SparseChunkBytes {
+		t.Fatalf("a demand for one page of the first unit loaded %d bytes, want %d: %+v", stats.BytesLoaded, SparseChunkBytes, stats)
+	}
+	pages.Cancel()
+	_ = pages.Wait()
 }
 
 func TestRemoteSnapshotOutstandingStreamRanges(t *testing.T) {
@@ -1303,6 +1472,85 @@ func TestRemoteSnapshotCloseWaitsForLease(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotRetainsUpstreamPageLoad(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 8)
+	want := make([]byte, sourceFR.Length())
+	for i := range want {
+		want[i] = byte(i*29 + 3)
+	}
+	fillRemoteTestRange(t, source, sourceFR, want)
+
+	target := newEmptyRemoteTestMemoryFile(t)
+	targetHasRefs := false
+	t.Cleanup(func() {
+		if targetHasRefs {
+			target.DecRef(sourceFR)
+		}
+		target.Destroy()
+	})
+	regions, loads, err := CloneMemoryFileMetadataForRemote(context.Background(), source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHasRefs = true
+	upstream, err := NewRemoteSnapshot(regions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(upstream, sourceFR.Length(), 16, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachRemotePageLoad(pages, loads, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	downstream, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: target, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := downstream.RetainPageLoads([]*AsyncPagesFileLoad{pages}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate destruction of the source Kernel. The downstream snapshot is
+	// now the only lifecycle owner of the upstream reader.
+	if err := pages.DecOwner(); err != nil {
+		t.Fatalf("releasing Kernel page-load owner: %v", err)
+	}
+
+	got := make([]byte, len(want))
+	if n, err := downstream.CopyStreamAt(got, 0); err != nil || n != len(got) {
+		t.Fatalf("reading chained snapshot after Kernel release: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("chained snapshot returned incorrect contents")
+	}
+	if err := downstream.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncPagesFileLoadStartsWithDurableBacking(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 1)
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, sourceFR.Length(), 16, 2)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{
+		DemandOnly: true, DurableBacking: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pages.HasDurableBacking() {
+		t.Fatal("graph-native page load was not marked durable")
+	}
+	_ = pages.DecOwner()
+}
+
 func TestRemoteSnapshotAcquireReleaseRace(t *testing.T) {
 	mf, fr := newRemoteTestMemoryFile(t, 1)
 	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: mf, Range: fr}})
@@ -1343,6 +1591,43 @@ func TestNewRemoteSnapshotRejectsOverlap(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("NewRemoteSnapshot accepted overlapping regions")
+	}
+}
+
+// Overlap among regions listed out of order, and not next to each other in
+// the list, is still found; regions that only touch do not overlap.
+func TestNewRemoteSnapshotRejectsOverlapOutOfOrder(t *testing.T) {
+	mf, fr := newRemoteTestMemoryFile(t, 4)
+	page := uint64(hostarch.PageSize)
+	region := func(id RemoteRegionID, first, last uint64) RemoteSnapshotRegion {
+		return RemoteSnapshotRegion{ID: id, File: mf, Range: memmap.FileRange{Start: fr.Start + first*page, End: fr.Start + last*page}}
+	}
+	if _, err := NewRemoteSnapshot([]RemoteSnapshotRegion{region(1, 2, 4), region(2, 1, 2), region(3, 0, 1)}); err != nil {
+		t.Fatalf("regions that only touch: %v", err)
+	}
+	if _, err := NewRemoteSnapshot([]RemoteSnapshotRegion{region(1, 3, 4), region(2, 0, 1), region(3, 1, 3), region(4, 2, 4)}); err == nil {
+		t.Fatal("NewRemoteSnapshot accepted overlapping regions listed out of order")
+	}
+}
+
+func TestOverlappingLoadTargets(t *testing.T) {
+	page := uint64(hostarch.PageSize)
+	load := func(first, last uint64) RemoteLoadRange {
+		return RemoteLoadRange{Target: memmap.FileRange{Start: first * page, End: last * page}}
+	}
+	for _, test := range []struct {
+		ranges  []RemoteLoadRange
+		overlap bool
+	}{
+		{nil, false},
+		{[]RemoteLoadRange{load(0, 1)}, false},
+		{[]RemoteLoadRange{load(4, 8), load(0, 2), load(2, 4)}, false},
+		{[]RemoteLoadRange{load(6, 9), load(0, 2), load(3, 4), load(8, 10)}, true},
+		{[]RemoteLoadRange{load(0, 10), load(4, 5), load(20, 30)}, true},
+	} {
+		if _, _, got := overlappingLoadTargets(test.ranges); got != test.overlap {
+			t.Errorf("overlappingLoadTargets(%v) = %t, want %t", test.ranges, got, test.overlap)
+		}
 	}
 }
 

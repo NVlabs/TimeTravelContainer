@@ -25,13 +25,17 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
@@ -68,13 +72,427 @@ func TestRehomeInternalMountsSurviveSourceRemoval(t *testing.T) {
 	}
 }
 
+func TestMaterializePortableInternalMountsDoesNotReadSourcePath(t *testing.T) {
+	bundleDir := t.TempDir()
+	internal, err := json.Marshal([]string{"/etc/hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Annotations: map[string]string{InternalMountsAnnotation: string(internal)},
+		Mounts: []specs.Mount{{
+			Source: "/source-node-private-tmp/hostname", Destination: "/etc/hostname",
+		}},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializePortableInternalMounts(bundleDir, []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("portable\n"), Mode: 0444,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got specs.Spec
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mounts) != 1 || !strings.HasPrefix(got.Mounts[0].Source, bundleDir+string(filepath.Separator)) {
+		t.Fatalf("rewritten mount=%+v", got.Mounts)
+	}
+	contents, err := os.ReadFile(got.Mounts[0].Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "portable\n" {
+		t.Fatalf("portable contents=%q", contents)
+	}
+	// Repeated imports into one physical distributed family reuse these
+	// read-only files. A changed value must replace rather than truncate the
+	// immutable inode.
+	if err := MaterializePortableInternalMounts(bundleDir, []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("second\n"), Mode: 0444,
+	}}); err != nil {
+		t.Fatalf("replacing read-only portable mount: %v", err)
+	}
+	contents, err = os.ReadFile(filepath.Join(bundleDir, "internal-mounts", "0-hostname"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "second\n" {
+		t.Fatalf("replacement contents=%q", contents)
+	}
+}
+
+func TestInstallPortableInternalMountsPersistsNodeLocalSources(t *testing.T) {
+	root := t.TempDir()
+	active := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "target")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	internal, err := json.Marshal([]string{"/etc/hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Annotations: map[string]string{InternalMountsAnnotation: string(internal)},
+		Mounts:      []specs.Mount{{Destination: "/etc/hostname", Source: "/source-node/private/hostname", Type: "bind"}},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "target", Name: "target", BundleDir: bundleDir, State: "running", LiveForkEligible: true,
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "running", StorageState: "local"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root, ActiveRoot: active}
+	if err := store.InstallPortableInternalMounts("target", []PortableInternalMount{{
+		Destination: "/etc/hostname", Contents: []byte("target-host\n"), Mode: 0644,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var canonical specs.Spec
+	canonicalData, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(canonicalData, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	if got := canonical.Mounts[0].Source; got != "/source-node/private/hostname" {
+		t.Fatalf("canonical shared mount source = %q, want original source", got)
+	}
+	got, err := store.LoadSpec("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Mounts) != 1 || !strings.HasPrefix(got.Mounts[0].Source, filepath.Join(active, "containers", "target", "internal-mounts")) {
+		t.Fatalf("persistent mount source = %q, want node-local active root", got.Mounts[0].Source)
+	}
+	contents, err := os.ReadFile(got.Mounts[0].Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "target-host\n" {
+		t.Fatalf("persistent mount contents = %q", contents)
+	}
+}
+
+// A container's image root is ready on a node once it is unpacked there, and
+// preparing it leaves the container's records as they were.
+func TestContainerImageRootReadyOnceUnpacked(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "web-id", Name: "web", Digest: "sha256:" + strings.Repeat("a", 64), Platform: "linux/amd64",
+		BundleDir: filepath.Join(root, "containers", "web-id", "bundle"),
+	}
+	imageRoot := filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform))
+	info.RootFS = filepath.Join(imageRoot, "rootfs")
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(root, "containers", info.ID, "container.json")
+	if err := writeCurrentContainerFixture(record, &info); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || ready {
+		t.Fatalf("ContainerImageRootReady before the root is unpacked=(%t, %v)", ready, err)
+	}
+	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imageRoot, "image.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(info.RootFS), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil || !ready {
+		t.Fatalf("ContainerImageRootReady once unpacked=(%t, %v)", ready, err)
+	}
+	before, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PrepareContainerImageRoot(context.Background(), info.ID); err != nil {
+		t.Fatalf("PrepareContainerImageRoot with the root unpacked: %v", err)
+	}
+	if after, err := os.ReadFile(record); err != nil || string(after) != string(before) {
+		t.Fatalf("PrepareContainerImageRoot changed the container's record: %v", err)
+	}
+}
+
+func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "hidden-target-id", Name: "hidden-target", Digest: "sha256:" + strings.Repeat("a", 64),
+		Platform: "linux/amd64", DistributedForkHidden: true,
+		DistributedForkTransactionID: "tx-hidden", DistributedFamilyID: "logical-family",
+		BundleDir: filepath.Join(root, "containers", "hidden-target-id", "bundle"),
+	}
+	info.RootFS = filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
+	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
+		t.Fatal(err)
+	}
+	containerDir := filepath.Join(root, "containers", info.ID)
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadContainer(info.ID); err == nil {
+		t.Fatal("ordinary lookup unexpectedly exposed hidden target")
+	}
+	if listed, err := store.ListContainersForPlacement(); err != nil || len(listed) != 0 {
+		t.Fatalf("prepared target placement inventory=(%+v, %v), want empty", listed, err)
+	}
+	if runtime, err := store.LoadRuntimeContainer(info.ID); err != nil || runtime.ID != info.ID {
+		t.Fatalf("exact runtime lookup=(%q, %v), want hidden target", runtime.ID, err)
+	}
+	if _, err := store.LoadSpec(info.ID); err != nil {
+		t.Fatalf("loading hidden target runtime spec: %v", err)
+	}
+	if paths, err := store.BranchConsolePaths(info.ID, "main"); err != nil || paths.Log == "" {
+		t.Fatalf("preparing hidden target branch console paths: %+v, %v", paths, err)
+	}
+	if paths, err := store.ExecConsolePaths(info.ID, "main", "build"); err != nil || paths.Log == "" {
+		t.Fatalf("preparing hidden target exec console paths: %+v, %v", paths, err)
+	}
+	targetBundle, cleanup, err := store.PrepareDistributedTargetBundle(info.ID, "remote-filesystem")
+	if err != nil {
+		t.Fatalf("preparing hidden target runtime bundle: %v", err)
+	}
+	defer cleanup()
+	var targetSpec specs.Spec
+	encoded, err := os.ReadFile(filepath.Join(targetBundle, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &targetSpec); err != nil {
+		t.Fatal(err)
+	}
+	if !specutils.TTCDistributedTarget(&targetSpec) {
+		t.Fatal("hidden target runtime bundle is not marked as a distributed target")
+	}
+	if err := store.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		current.State = "paused"
+		return true, nil
+	}); err != nil {
+		t.Fatalf("mutating hidden target by exact ID: %v", err)
+	}
+	refreshed, err := store.RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.ID != info.ID || !refreshed.DistributedForkHidden {
+		t.Fatalf("refreshed target=%+v", refreshed)
+	}
+	if refreshed.State != "paused" {
+		t.Fatalf("refreshed target state=%q, want paused", refreshed.State)
+	}
+	published, err := store.PublishDistributedForkTarget("tx-hidden")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.DistributedForkHidden {
+		t.Fatal("target was not temporarily exposed for activation sidecars")
+	}
+	if exact, err := store.LoadContainer(info.ID); err != nil || exact.ID != info.ID {
+		t.Fatalf("published physical runtime exact lookup=(%q, %v)", exact.ID, err)
+	}
+	listed, err := store.ListContainers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("ordinary inventory exposed physical runtime: %+v", listed)
+	}
+	placementInventory, err := store.ListContainersForPlacement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placementInventory) != 1 || placementInventory[0].ID != info.ID {
+		t.Fatalf("placement inventory = %+v, want published physical runtime %q", placementInventory, info.ID)
+	}
+}
+
+func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created := time.Now().UTC().Add(-time.Hour)
+	source := ContainerInfo{ID: "source-runtime", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a",
+		Branches: []BranchInfo{{ID: "old-incarnation", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created, Quarantined: true}}}
+	target := ContainerInfo{ID: "target-runtime", Name: "target-runtime", DistributedFamilyID: "family-id", NodeID: "node-b",
+		BundleDir: filepath.Join(root, "containers", "target-runtime", "bundle"),
+		Branches:  []BranchInfo{{ID: "sibling", NodeID: "node-b", State: "running", CreatedAt: created}}}
+	if err := os.MkdirAll(target.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", target.ID, "container.json"), &target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+		SourceContainer: "family-id", SourcePhysicalBranch: "old-incarnation", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
+		ParentBranch: "moving", TransactionID: "tx-move", NodeID: "node-b", SourceNode: "node-a", Migration: true, Source: &source,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.LoadContainer(target.ID)
+	if err != nil || len(pending.Branches) != 1 {
+		t.Fatalf("reservation exposed migrating branch: %+v, %v", pending.Branches, err)
+	}
+	if _, branch, _, err := store.DistributedForkTargetBranch("tx-move"); err != nil || !branch.Quarantined {
+		t.Fatalf("pending migration lost quarantine: %+v, %v", branch, err)
+	}
+	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		published, err := store.PublishDistributedForkTarget("tx-move")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(published.Branches) != 2 {
+			t.Fatalf("publication lost sibling or duplicated migration: %+v", published.Branches)
+		}
+		branch := published.Branches[1]
+		if branch.ID != "tx-move" || branch.ParentID != "ancestor" || branch.NodeID != "node-b" ||
+			!branch.CreatedAt.Equal(created) || !branch.Quarantined || !branch.DistributedMigration || branch.State != "paused" {
+			t.Fatalf("migration lost branch metadata: %+v", branch)
+		}
+	}
+}
+
+func TestAuthoritativeMigrationReplacesStalePhysicalOwner(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	created := time.Now().UTC().Add(-time.Hour)
+	source := ContainerInfo{ID: "source-runtime", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-b",
+		Branches: []BranchInfo{{ID: "moving", ParentID: "ancestor", NodeID: "node-b", State: "running", CreatedAt: created}}}
+	target := ContainerInfo{ID: "target-runtime", Name: "target-runtime", DistributedFamilyID: "family-id", NodeID: "node-a",
+		BundleDir: filepath.Join(root, "containers", "target-runtime", "bundle"),
+		Branches: []BranchInfo{
+			{ID: "sibling", NodeID: "node-a", State: "running", CreatedAt: created},
+			// Model a branch that migrated away earlier. The physical family kept
+			// derived metadata for its former local branch, while Raft now
+			// authorizes importing that branch back from node-b.
+			{ID: "moving", ParentID: "ancestor", NodeID: "node-a", State: "running", CreatedAt: created},
+		}}
+	if err := os.MkdirAll(target.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", target.ID, "container.json"), &target); err != nil {
+		t.Fatal(err)
+	}
+	base := DistributedForkOptions{
+		SourceContainer: "family-id", TargetName: target.ID, TargetBranch: "tx-move", VisibleBranch: "moving",
+		ParentBranch: "moving", TransactionID: "tx-move", NodeID: "node-a", SourceNode: "node-b", Migration: true, Source: &source,
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), base); err == nil {
+		t.Fatal("non-authoritative migration ignored stale physical owner")
+	}
+	base.AuthoritativeMigration = true
+	if _, err := store.PrepareDistributedFork(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	published, err := store.PublishDistributedForkTarget("tx-move")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(published.Branches) != 3 {
+		t.Fatalf("publication lost stale provider or new incarnation: %+v", published.Branches)
+	}
+	for _, branch := range published.Branches {
+		if branch.ID == "tx-move" {
+			if branch.NodeID != "node-a" || branch.FilesystemBranch != ttcvolume.ScopedBranchID(source.ID, "tx-move") || !branch.DistributedMigration {
+				t.Fatalf("authoritative migration did not replace stale metadata: %+v", branch)
+			}
+			return
+		}
+	}
+	t.Fatal("published family lost moving branch")
+}
+
+func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	info := ContainerInfo{
+		ID: "physical", Name: "physical", State: "running",
+		BundleDir:                    filepath.Join(root, "containers", "physical", "bundle"),
+		DistributedForkTransactionID: "fork-original",
+		Branches: []BranchInfo{
+			{ID: "original", State: "running", DistributedForkTransactionID: "fork-original"},
+			{ID: "sibling", State: "running", DistributedForkTransactionID: "fork-sibling", DistributedMigration: true},
+		},
+	}
+	if err := os.MkdirAll(info.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	resolved, branch, peer, err := store.DistributedForkTargetBranch("fork-original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ID != info.ID || branch.ID != "original" || !peer {
+		t.Fatalf("resolved=%q branch=%+v peer=%t", resolved.ID, branch, peer)
+	}
+	if err := store.UpdateDistributedForkDependencies("fork-original", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkTargetState("fork-original", "paused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkMemoryGraph("fork-original", 9, []string{"0000000000000009-03-0000000000000001"}, "fork-original"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Branches[0].State != "paused" || updated.Branches[0].SnapshotID != 9 || updated.Branches[1].State != "running" || updated.Branches[1].SnapshotID != 0 {
+		t.Fatalf("branch states changed incorrectly: %+v", updated.Branches)
+	}
+}
+
 func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
 	now := time.Now().UTC()
 	for _, info := range []ContainerInfo{
 		{ID: "source-id", Name: "source", BundleDir: filepath.Join(root, "containers", "source-id", "bundle"), DistributedFamilyID: "global-family", State: "running", CreatedAt: now, Branches: []BranchInfo{{ID: "main", State: "running", CreatedAt: now}}},
-		{ID: "target-id", Name: "target", DistributedFamilyID: "global-family", DistributedForkNodeID: "node-b", NodeID: "node-b", State: "running", CreatedAt: now, BundleDir: filepath.Join(root, "containers", "target-id", "bundle"), Branches: []BranchInfo{{ID: "main", FilesystemBranch: "volume-main", State: "running", CreatedAt: now}}},
+		{ID: "target-id", Name: "target", DistributedFamilyID: "global-family", DistributedForkNodeID: "node-b", NodeID: "node-a", State: "running", CreatedAt: now, BundleDir: filepath.Join(root, "containers", "target-id", "bundle"), Branches: []BranchInfo{{ID: "main", FilesystemBranch: "volume-main", State: "running", CreatedAt: now}}},
 	} {
 		dir := filepath.Join(root, "containers", info.ID)
 		if err := os.MkdirAll(dir, 0700); err != nil {
@@ -86,13 +504,13 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+		if err := writeCurrentContainerFixture(filepath.Join(dir, "container.json"), &info); err != nil {
 			t.Fatal(err)
 		}
 	}
 	prepared, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
 		SourceContainer: "source", TargetName: "target", TargetBranch: "tx-physical",
-		VisibleBranch: "second", TransactionID: "tx-import", NodeID: "node-b",
+		VisibleBranch: "second", ParentBranch: "main", TransactionID: "tx-import", NodeID: "node-b",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,10 +522,30 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !peer || branch.ID != "second" || branch.FilesystemBranch != ttcvolume.ScopedBranchID("source-id", "tx-physical") {
+	if !peer || branch.ID != "second" || branch.ParentID != "main" || branch.FilesystemBranch != ttcvolume.ScopedBranchID("source-id", "tx-physical") {
 		t.Fatalf("pending peer=%t branch=%+v", peer, branch)
 	}
-	if err := store.UpdateDistributedForkSparseRoot("tx-import", "cluster/memory-chunks", "memory-root"); err != nil {
+	bundleDir, cleanup, err := store.PrepareDistributedBranchRestoreBundle("target", branch.ID, branch.FilesystemBranch)
+	if err != nil {
+		t.Fatalf("preparing first physical peer bundle: %v", err)
+	}
+	defer cleanup()
+	var bootstrap specs.Spec
+	encoded, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	if got := bootstrap.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "second" {
+		t.Fatalf("peer bootstrap branch annotation=%q, want second", got)
+	}
+	if got := bootstrap.Annotations[specutils.AnnotationTTCInitialFilesystemBranch]; got != branch.FilesystemBranch {
+		t.Fatalf("peer bootstrap filesystem annotation=%q, want %q", got, branch.FilesystemBranch)
+	}
+	graphObjects := []string{"0000000000000007-03-0000000000000001", "0000000000000006-03-0000000000000002"}
+	if err := store.UpdateDistributedForkMemoryGraph("tx-import", 7, graphObjects, "tx-import"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpdateDistributedForkTargetState("tx-import", "paused"); err != nil {
@@ -120,7 +558,10 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !peer || branch.State != "paused" || branch.DistributedSparseBranch != "memory-root" || len(info.Branches) != 2 {
+	if !peer || branch.State != "paused" || branch.NodeID != "node-b" || len(info.Branches) != 2 ||
+		branch.SnapshotID != 7 || !slices.Equal(branch.MemoryRootObjects, graphObjects) || len(branch.MemoryRoots) != 2 ||
+		branch.DistributedGraphReferenceOperation != "tx-import" ||
+		branch.MemoryRoots[0] != fmt.Sprintf("memory/branch/%s/resource-0000", branch.FilesystemBranch) {
 		t.Fatalf("published peer=%t branch=%+v family=%+v", peer, branch, info.Branches)
 	}
 	if err := store.RemoveDistributedForkTarget("tx-import"); err != nil {
@@ -155,7 +596,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(info.BundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(dir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(dir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 
@@ -179,7 +620,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	}
 
 	pending := prepare("tx-cancel")
-	bundleDir, cleanup, err := store.PrepareDistributedMigrationRestoreBundle("family", pending.ID, pending.FilesystemBranch)
+	bundleDir, cleanup, err := store.PrepareDistributedBranchRestoreBundle("family", pending.ID, pending.FilesystemBranch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +633,8 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err := json.Unmarshal(encoded, &spec); err != nil {
 		t.Fatal(err)
 	}
-	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "child" {
-		t.Fatalf("cold migration branch annotation=%q, want child", got)
+	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchID]; got != "tx-cancel" {
+		t.Fatalf("cold migration branch annotation=%q, want tx-cancel", got)
 	}
 	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]; got != "main" {
 		t.Fatalf("cold migration parent annotation=%q, want main", got)
@@ -217,18 +658,110 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(published.Branches) != 2 {
-		t.Fatalf("migration added a branch instead of replacing it: %+v", published.Branches)
+	if len(published.Branches) != 3 {
+		t.Fatalf("migration did not retain its sparse source incarnation: %+v", published.Branches)
 	}
 	for _, branch := range published.Branches {
-		if branch.ID == "child" {
+		if branch.ID == "tx-publish" {
 			if branch.ParentID != "main" || !branch.CreatedAt.Equal(created.Add(time.Second)) || branch.NodeID != "node-b" || branch.FilesystemBranch == "fs-child-old" || !branch.DistributedMigration {
 				t.Fatalf("published migration branch=%+v", branch)
 			}
 			return
 		}
 	}
-	t.Fatal("published migration lost child branch")
+	t.Fatal("published migration lost physical target branch")
+}
+
+func TestConcurrentDistributedMigrationReservationsPreserveImports(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	bundleDir := filepath.Join(root, "containers", "family-id", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const imports = 32
+	branches := make([]BranchInfo, 0, imports)
+	for i := 0; i < imports; i++ {
+		branches = append(branches, BranchInfo{
+			ID: fmt.Sprintf("branch-%02d", i), NodeID: "node-a",
+			FilesystemBranch: fmt.Sprintf("fs-%02d", i), State: "running",
+		})
+	}
+	info := ContainerInfo{
+		ID: "family-id", Name: "family", DistributedFamilyID: "family-id",
+		NodeID: "node-a", BundleDir: bundleDir, State: "running", Branches: branches,
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errorsByImport := make([]error, imports)
+	var wg sync.WaitGroup
+	for i := 0; i < imports; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			_, errorsByImport[index] = store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+				SourceContainer: "family", TargetName: "family",
+				TargetBranch:  fmt.Sprintf("transaction-branch-%02d", index),
+				VisibleBranch: fmt.Sprintf("branch-%02d", index),
+				TransactionID: fmt.Sprintf("transaction-%02d", index),
+				NodeID:        "node-b", SourceNode: "node-a", Migration: true,
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errorsByImport {
+		if err != nil {
+			t.Fatalf("reservation %d: %v", i, err)
+		}
+	}
+	got, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DistributedForkImports) != imports {
+		t.Fatalf("retained %d/%d concurrent imports: %+v", len(got.DistributedForkImports), imports, got.DistributedForkImports)
+	}
+}
+
+func TestDistributedForkAddsRemoteBranchToExistingFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	bundleDir := filepath.Join(root, "containers", "family-id", "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: "family-id", Name: "family", DistributedFamilyID: "family-id", NodeID: "node-a", BundleDir: bundleDir,
+		State: "running", Branches: []BranchInfo{{ID: "main", NodeID: "node-a", FilesystemBranch: "main", State: "running"}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareDistributedFork(context.Background(), DistributedForkOptions{
+		SourceContainer: "family", TargetName: "family", TargetBranch: "physical-child", VisibleBranch: "child",
+		TransactionID: "transaction-child", NodeID: "node-b", SourceNode: "node-a",
+	}); err != nil {
+		t.Fatalf("remote branch reservation: %v", err)
+	}
+	updated, err := store.LoadContainer("family")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, ok := updated.DistributedForkImports["transaction-child"]
+	if !ok || pending.BranchID != "child" || pending.TargetNode != "node-b" || pending.Migration {
+		t.Fatalf("remote family import=%+v present=%t", pending, ok)
+	}
 }
 
 func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
@@ -260,7 +793,7 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 	manifest.Xattrs["var/lib/app/nested/payload"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
 	manifest.Xattrs["var/lib/app/hardlink"] = map[string][]byte{"security.capability": []byte("virtual-capability")}
 
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +862,7 @@ func TestSeedManagedVolumeCopiesImageTreeDirectly(t *testing.T) {
 }
 
 func TestSeedCopiedHostMountDirectoryAndFile(t *testing.T) {
-	manager, err := ttcvolume.OpenManager(t.TempDir(), true)
+	manager, err := ttcvolume.OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +949,8 @@ func TestSeedCopiedHostMountDirectoryAndFile(t *testing.T) {
 }
 
 func TestBuildSpecDonatesPersistentRootfsUpper(t *testing.T) {
-	rootfs := t.TempDir()
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
 	repository := filepath.Join(t.TempDir(), "rootfs-upper")
 	spec, err := BuildSpec(
 		ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}},
@@ -474,7 +1008,7 @@ func TestBuildSpecRecordsImmutableLiveForkEligibility(t *testing.T) {
 	}
 }
 
-func TestLoadLegacyHostNetworkFamilyIsSystematicallyIneligible(t *testing.T) {
+func TestLoadRejectsLegacyHostNetworkMetadata(t *testing.T) {
 	root := t.TempDir()
 	containerDir := filepath.Join(root, "containers", "legacy-host")
 	bundleDir := filepath.Join(containerDir, "bundle")
@@ -490,12 +1024,8 @@ func TestLoadLegacyHostNetworkFamilyIsSystematicallyIneligible(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := (Store{Root: root}).LoadContainer("legacy-host")
-	if err != nil {
-		t.Fatalf("LoadContainer: %v", err)
-	}
-	if info.LiveForkEligible || info.LiveForkWaiver != "legacy host network configuration" {
-		t.Fatalf("legacy host family eligibility=(%t, %q), want systematic legacy waiver", info.LiveForkEligible, info.LiveForkWaiver)
+	if _, err := (Store{Root: root}).LoadContainer("legacy-host"); err == nil {
+		t.Fatal("legacy host family metadata was accepted")
 	}
 }
 
@@ -1174,6 +1704,50 @@ func TestPullPolicyAndStoredImageSelection(t *testing.T) {
 	}
 }
 
+// An image is ready to prepare a container from when it is stored and its root
+// is unpacked on this node; only then does preparing neither pull nor unpack.
+func TestImageReadyNeedsTheImageAndItsRoot(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	digest := "sha256:" + strings.Repeat("a", 64)
+	stored := []ttcimages.Info{{Reference: "docker.io/library/alpine:3.20", Digest: digest, Platform: "linux/amd64"}}
+	ready := func(reference, platform string) bool {
+		t.Helper()
+		got, err := store.imageReadyAmong(stored, reference, platform)
+		if err != nil {
+			t.Fatalf("imageReadyAmong(%q, %q): %v", reference, platform, err)
+		}
+		return got
+	}
+	if ready("alpine:3.20", "") {
+		t.Error("an image whose root is not unpacked is ready")
+	}
+	dir := filepath.Join(root, "images", imageRootKey(digest, "linux/amd64"))
+	if err := os.MkdirAll(filepath.Join(dir, "rootfs"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "image.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(filepath.Join(dir, "rootfs")), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !ready("alpine:3.20", "") || !ready("alpine:3.20", "linux/amd64") {
+		t.Error("a stored image with its root unpacked is not ready")
+	}
+	if ready("alpine:3.20", "linux/arm64") {
+		t.Error("an image is ready for a platform it was not stored for")
+	}
+	if ready("busybox:latest", "") {
+		t.Error("an image that is not stored is ready")
+	}
+	if got, err := store.ImageReady(context.Background(), "alpine:3.20", "", "always"); err != nil || got {
+		t.Errorf("ImageReady under the pull policy always=(%t, %v), want a pull", got, err)
+	}
+}
+
 func TestValidateName(t *testing.T) {
 	for _, name := range []string{"web", "web-1", "Web_1.test"} {
 		if err := validateName(name); err != nil {
@@ -1251,7 +1825,7 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(`{"process":{"args":["true"]}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{Name: "demo", BundleDir: bundleDir, ConsoleLogMaxBytes: 8 << 20, ConsoleLogMaxFiles: 5, State: "created", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	status := 17
@@ -1276,10 +1850,10 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 		t.Errorf("legacy branch history=%+v, want exited main", containers[0].Branches)
 	}
 	childCreated := time.Now().UTC()
-	child := BranchInfo{ID: "child", ParentID: "main", State: "running", CreatedAt: childCreated, ForkTotalNS: 123}
+	child := BranchInfo{ID: "child", ParentID: "main", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "child"), State: "running", StorageState: "local", CreatedAt: childCreated, ForkTotalNS: 123}
 	if err := store.RecordBranches("demo", []BranchInfo{
 		child,
-		{ID: "grandchild", ParentID: "child", State: "paused", CreatedAt: childCreated.Add(time.Second)},
+		{ID: "grandchild", ParentID: "child", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "grandchild"), State: "paused", StorageState: "local", DistributedGraphReferenceOperation: "branch-operation", CreatedAt: childCreated.Add(time.Second)},
 	}); err != nil {
 		t.Fatalf("RecordBranches: %v", err)
 	}
@@ -1290,10 +1864,10 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContainer with lineage: %v", err)
 	}
-	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" {
+	if len(withHistory.Branches) != 2 || withHistory.Branches[1].ID != "grandchild" || withHistory.Branches[1].ParentID != "main" || withHistory.Branches[1].DistributedGraphReferenceOperation != "branch-operation" {
 		t.Fatalf("persisted lineage=%+v", withHistory.Branches)
 	}
-	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", State: "running", CreatedAt: time.Now().UTC()}); err != nil {
+	if err := store.RecordBranch("demo", BranchInfo{ID: "child", ParentID: "grandchild", FilesystemBranch: ttcvolume.ScopedBranchID("demo", "child-reused"), State: "running", StorageState: "local", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("RecordBranch did not allow reuse: %v", err)
 	}
 	if err := store.UpdateState("demo", "exited", &status); err != nil {
@@ -1377,6 +1951,271 @@ func TestStoreLifecycleMetadata(t *testing.T) {
 	}
 }
 
+func TestListContainersSkipsUnreadableDirectory(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	goodDir := filepath.Join(root, "containers", "good")
+	if err := os.MkdirAll(filepath.Join(goodDir, "bundle"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goodDir, "bundle", "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(goodDir, "container.json"), &ContainerInfo{
+		ID: "good", Name: "good", BundleDir: filepath.Join(goodDir, "bundle"),
+		State: "created", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "containers", "incomplete"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err := store.ListContainers()
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(containers) != 1 || containers[0].ID != "good" {
+		t.Fatalf("containers=%+v, want only good", containers)
+	}
+	if _, err := store.listContainers(true); err == nil {
+		t.Fatal("strict container scan ignored incomplete metadata")
+	}
+
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatalf("RecoverContainerRemovals: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "containers", "incomplete")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("incomplete active directory remains: %v", err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 1 {
+		t.Fatalf("strict containers after recovery=%+v, err=%v", containers, err)
+	}
+	creatingDir := filepath.Join(root, "containers", "being-created")
+	if err := os.Mkdir(creatingDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(creatingDir, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 1 {
+		t.Fatalf("strict containers during marked creation=%+v, err=%v", containers, err)
+	}
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatalf("recovery during marked creation: %v", err)
+	}
+	if _, err := os.Stat(creatingDir); err != nil {
+		t.Fatalf("recovery moved an in-progress cluster-node creation: %v", err)
+	}
+}
+
+func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	staging, err := store.createContainerStagingDir("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(staging, "bundle")
+	if err := os.Mkdir(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	finalBundle := filepath.Join(root, "containers", "target", "bundle")
+	info := ContainerInfo{ID: "target", Name: "target", BundleDir: finalBundle, State: "created", CreatedAt: time.Now()}
+	if err := writeCurrentContainerFixture(filepath.Join(staging, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	// A maintenance pass from another daemon must neither expose nor reclaim a
+	// container before the single directory-rename publication boundary.
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("recovery reclaimed unpublished staging directory: %v", err)
+	}
+	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
+		t.Fatalf("unpublished containers=%+v, err=%v", containers, err)
+	}
+
+	if err := store.publishContainerDir(info.ID, staging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverContainerRemovals(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadContainer(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BundleDir != finalBundle {
+		t.Fatalf("published bundle=%q, want %q", loaded.BundleDir, finalBundle)
+	}
+}
+
+func TestContainerPublicationWithUnifiedActiveRoot(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root, ActiveRoot: root}
+	id, building, err := store.createContainerDir(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalDir := filepath.Join(root, "containers", id)
+	if building != finalDir {
+		t.Fatalf("building directory=%q, want in-place %q", building, finalDir)
+	}
+	if _, err := os.Stat(filepath.Join(building, containerCreationMarker)); err != nil {
+		t.Fatalf("in-place construction has no marker: %v", err)
+	}
+	if containers, err := store.listContainers(true); err != nil || len(containers) != 0 {
+		t.Fatalf("marked construction is visible: containers=%+v err=%v", containers, err)
+	}
+	bundle := filepath.Join(building, "bundle")
+	if err := os.Mkdir(bundle, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(building, "container.json"), &ContainerInfo{
+		ID: id, Name: "unified", BundleDir: bundle, State: "created", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.publishContainerDir(id, building); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(finalDir, containerCreationMarker)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("publication marker remains: %v", err)
+	}
+	loaded, err := store.LoadContainer(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Name != "unified" {
+		t.Fatalf("published container=%+v, want unified", loaded)
+	}
+}
+
+func TestRemoveContainerCommitsBeforePhysicalCleanup(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	allowCleanup := false
+	store := Store{Root: root}
+	store.removeAllPath = func(path string) error {
+		if filepath.Dir(path) == store.removedContainersRoot() && !allowCleanup {
+			// Model RemoveAll having already unlinked metadata before NFS rejects
+			// the final rmdir because another descriptor is still open.
+			if err := os.Remove(filepath.Join(path, "container.json")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			return unix.ENOTEMPTY
+		}
+		return os.RemoveAll(path)
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatalf("RemoveContainer: %v", err)
+	}
+	if _, err := os.Stat(containerDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("container remained visible after committed delete: %v", err)
+	}
+	tombstone := filepath.Join(store.removedContainersRoot(), "demo")
+	if _, err := os.Stat(tombstone); err != nil {
+		t.Fatalf("failed cleanup did not retain tombstone: %v", err)
+	}
+	if containers, err := store.ListContainers(); err != nil || len(containers) != 0 {
+		t.Fatalf("listing after deferred delete=%+v, err=%v", containers, err)
+	}
+	allowCleanup = true
+	removed, err := store.SweepRemovedContainers()
+	if err != nil || removed != 1 {
+		t.Fatalf("SweepRemovedContainers=(%d, %v), want (1, nil)", removed, err)
+	}
+	if _, err := os.Stat(tombstone); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("retried tombstone remains: %v", err)
+	}
+}
+
+func TestRemoveContainerRetriesTransientNetworkFilesystemCleanup(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "demo")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	store := Store{Root: root}
+	store.removeAllPath = func(path string) error {
+		if filepath.Dir(path) == store.removedContainersRoot() {
+			attempts++
+			if attempts == 1 {
+				return unix.ENOTEMPTY
+			}
+		}
+		return os.RemoveAll(path)
+	}
+	if err := store.RemoveContainer("demo"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("cleanup attempts=%d, want 2", attempts)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "demo")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("transient tombstone remains: %v", err)
+	}
+}
+
+func TestSweepRemovedContainersIsolatesFailures(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	for _, name := range []string{"busy", "free"} {
+		path := filepath.Join(store.removedContainersRoot(), name)
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.removeAllPath = func(path string) error {
+		if filepath.Base(path) == "busy" {
+			return unix.ENOTEMPTY
+		}
+		return os.RemoveAll(path)
+	}
+	removed, err := store.SweepRemovedContainers()
+	if err == nil || removed != 1 {
+		t.Fatalf("SweepRemovedContainers=(%d, %v), want one removal and one isolated error", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "busy")); err != nil {
+		t.Fatalf("busy tombstone disappeared: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store.removedContainersRoot(), "free")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("free tombstone was blocked by peer failure: %v", err)
+	}
+}
+
 func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	root := t.TempDir()
 	transientRoot := t.TempDir()
@@ -1406,7 +2245,7 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "exited", CreatedAt: time.Now(),
 		Branches: []BranchInfo{{ID: "child", ParentID: "main", State: "exited", FilesystemBranch: "fs-child"}},
 	}); err != nil {
@@ -1469,84 +2308,44 @@ func TestPrepareBranchStartBundlePreservesBranchIdentity(t *testing.T) {
 	}
 }
 
-func TestPrepareDehydrationRestoreBundleUsesCurrentRepositoryIdentity(t *testing.T) {
+func TestRemoveFinalCanonicalBranchLeavesReloadableCatalogIdentity(t *testing.T) {
 	root := t.TempDir()
-	transientRoot := t.TempDir()
-	store := Store{Root: root, TransientRoot: transientRoot}
-	containerDir := filepath.Join(root, "containers", "demo")
+	store := Store{Root: root}
+	containerDir := filepath.Join(root, "containers", "family")
 	bundleDir := filepath.Join(containerDir, "bundle")
-	repositoryPath := filepath.Join(containerDir, "repository")
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := ttcvolume.OpenManager(root, true)
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	info := ContainerInfo{
+		ID: "family", Name: "web", BundleDir: bundleDir, State: "dehydrated", CreatedAt: now,
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: "root-main", State: "dehydrated", StorageState: "shared", CreatedAt: now}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveBranchRecord("family", "main"); err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := store.LoadContainer("web")
+	if err != nil {
+		t.Fatalf("loading catalog-only family: %v", err)
+	}
+	if !anchor.DistributedCatalogOnly || len(anchor.Branches) != 0 || anchor.State != "exited" {
+		t.Fatalf("catalog-only family = %+v", anchor)
+	}
+	if err := store.RecordBranch("family", BranchInfo{ID: "next", FilesystemBranch: "root-next", State: "running", StorageState: "local", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	revived, err := store.LoadContainer("family")
 	if err != nil {
 		t.Fatal(err)
 	}
-	repository, err := manager.CreatePrivate(repositoryPath, "rootfs")
-	if err != nil {
-		t.Fatal(err)
-	}
-	currentID := repository.Info().ID
-	if err := repository.Fork(ttcvolume.MainBranch, "fs-child"); err != nil {
-		t.Fatal(err)
-	}
-	if err := repository.Close(); err != nil {
-		t.Fatal(err)
-	}
-	repositories := []specutils.TTCVolumeRepository{{
-		Source:    specutils.TTCRootfsUpperSource,
-		Path:      repositoryPath,
-		Branch:    ttcvolume.MainBranch,
-		CopyMode:  string(ttcvolume.CopyModeFull),
-		RestoreID: strings.Repeat("a", 32),
-	}}
-	encoded, err := json.Marshal(repositories)
-	if err != nil {
-		t.Fatal(err)
-	}
-	spec := specs.Spec{
-		Root:    &specs.Root{Path: "rootfs"},
-		Process: &specs.Process{Args: []string{"true"}},
-		Annotations: map[string]string{
-			specutils.AnnotationTTCVolumeRepositories: string(encoded),
-		},
-	}
-	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-		ID: "demo", Name: "demo", BundleDir: bundleDir, State: "dehydrated", CreatedAt: time.Now(),
-		Branches: []BranchInfo{{ID: "child", ParentID: "main", State: "dehydrated", FilesystemBranch: "fs-child"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	temp, cleanup, err := store.PrepareDehydrationRestoreBundle("demo", "fs-child")
-	if err != nil {
-		t.Fatalf("PrepareDehydrationRestoreBundle: %v", err)
-	}
-	defer cleanup()
-	data, err := os.ReadFile(filepath.Join(temp, "config.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got specs.Spec
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatal(err)
-	}
-	gotRepositories, err := specutils.TTCVolumeRepositories(&got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(gotRepositories) != 1 {
-		t.Fatalf("repositories=%+v", gotRepositories)
-	}
-	if gotRepositories[0].RestoreID != currentID {
-		t.Fatalf("restore identity=%q, want current repository %q", gotRepositories[0].RestoreID, currentID)
-	}
-	if gotRepositories[0].Branch != "fs-child" {
-		t.Fatalf("restore branch=%q, want fs-child", gotRepositories[0].Branch)
+	if revived.DistributedCatalogOnly || len(revived.Branches) != 1 || revived.Branches[0].ID != "next" {
+		t.Fatalf("revived family = %+v", revived)
 	}
 }
 
@@ -1569,7 +2368,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 			{ID: "child", ParentID: "main", State: "running", CreatedAt: now},
 		},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RemoveBranchRecord("demo", "main"); err != nil {
@@ -1585,8 +2384,7 @@ func TestStoreBranchLifecycleDoesNotDependOnMain(t *testing.T) {
 	if got.State != "dehydrated" || len(got.Branches) != 1 || got.Branches[0].ID != "child" || got.Branches[0].ParentID != "" || got.Branches[0].State != "dehydrated" {
 		t.Fatalf("after deleting main and dehydrating child: %+v", got)
 	}
-	status := 137
-	if err := store.ReconcileRuntimeUnavailable("demo", &status); err != nil {
+	if err := store.ReconcileRuntimeUnavailable("demo", RuntimeLoss{}); err != nil {
 		t.Fatalf("ReconcileRuntimeUnavailable: %v", err)
 	}
 	got, err = store.LoadContainer("demo")
@@ -1624,10 +2422,13 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	info := ContainerInfo{
 		ID: "demo", Name: "demo", BundleDir: bundleDir, NetworkMode: "ttc", State: "running", CreatedAt: time.Now(),
-		Branches:       []BranchInfo{{ID: "main", State: "running"}, {ID: "child", ParentID: "main", State: "running"}},
-		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+		Branches: []BranchInfo{{ID: "main", State: "running"}, {
+			ID: "child", ParentID: "main", State: "running", StorageState: "publishing",
+			PublicationID: "publication-inflight", StorageManifest: "/shared/base-manifest",
+		}},
+		PublishedPorts: []PortBinding{{HostIP: "127.0.0.1", HostPort: 8080, ContainerPort: 80, Protocol: "tcp", BranchID: "main"}},
 	}
-	if err := writeJSON(filepath.Join(containerDir, "container.json"), &info); err != nil {
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadContainer("demo")
@@ -1635,7 +2436,7 @@ func TestStoreBranchPortBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := loaded.PublishedPorts[0].BranchID; got != "main" {
-		t.Fatalf("legacy binding branch=%q, want main", got)
+		t.Fatalf("binding branch=%q, want main", got)
 	}
 	child := PortBinding{HostIP: "127.0.0.1", HostPort: 8081, ContainerPort: 80, Protocol: "tcp", BranchID: "child"}
 	if err := store.AddPortBinding("demo", child); err != nil {
@@ -1653,6 +2454,21 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if err := store.StopBranch("demo", "child", 137); err != nil {
 		t.Fatalf("StopBranch: %v", err)
 	}
+	stopped, err := store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stopped.Branches[1]; got.PublicationID != "" || got.StorageManifest != "/shared/base-manifest" {
+		t.Fatalf("StopBranch did not fence the publisher while retaining the filesystem ancestor: %+v", got)
+	}
+	if err := store.mutateContainer("demo", func(info *ContainerInfo) (bool, error) {
+		info.Branches[1].PublicationID = "publication-prior-incarnation"
+		info.Branches[1].StorageState = "shared"
+		info.Branches[1].StorageManifest = "/shared/prior-manifest"
+		return true, nil
+	}); err != nil {
+		t.Fatalf("recording prior publication: %v", err)
+	}
 	loaded, err = store.LoadContainer("demo")
 	if err != nil {
 		t.Fatal(err)
@@ -1660,7 +2476,10 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "exited" {
 		t.Fatalf("branch stop rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
 	}
-	if err := store.RecordBranchStart("demo", "child"); err != nil {
+	if loaded.Branches[1].ExitStatus == nil || *loaded.Branches[1].ExitStatus != 137 || loaded.Branches[1].ExitedAt == nil {
+		t.Fatalf("branch stop did not persist branch-local wait status: %+v", loaded.Branches[1])
+	}
+	if err := store.RecordBranchStart("demo", "child", "node-a"); err != nil {
 		t.Fatalf("RecordBranchStart: %v", err)
 	}
 	loaded, err = store.LoadContainer("demo")
@@ -1669,6 +2488,28 @@ func TestStoreBranchPortBindings(t *testing.T) {
 	}
 	if len(loaded.PublishedPorts) != 2 || loaded.Branches[0].State != "running" || loaded.Branches[1].State != "running" {
 		t.Fatalf("branch start rewrote peers or bindings: branches=%+v bindings=%+v", loaded.Branches, loaded.PublishedPorts)
+	}
+	if loaded.Branches[1].ExitStatus != nil || loaded.Branches[1].ExitedAt != nil {
+		t.Fatalf("branch start retained the previous incarnation's wait status: %+v", loaded.Branches[1])
+	}
+	if loaded.Branches[1].PublicationID != "" || loaded.Branches[1].StorageState != "local" || loaded.Branches[1].StorageManifest != "/shared/prior-manifest" {
+		t.Fatalf("branch start retained a stale publication fence or lost its immutable ancestor: %+v", loaded.Branches[1])
+	}
+	if loaded.Branches[1].NodeID != "node-a" || loaded.Branches[1].Unplaced {
+		t.Fatalf("branch start did not atomically record its execution owner: %+v", loaded.Branches[1])
+	}
+	if err := store.RecordBranchActivation("demo", "child", "paused", "node-a"); err != nil {
+		t.Fatalf("RecordBranchActivation(paused): %v", err)
+	}
+	loaded, err = store.LoadContainer("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Branches[1].State != "paused" {
+		t.Fatalf("branch activation state=%q, want paused", loaded.Branches[1].State)
+	}
+	if err := store.RecordBranchActivation("demo", "child", "exited", "node-a"); err == nil {
+		t.Fatal("RecordBranchActivation accepted exited state")
 	}
 	if err := store.RemoveBranchRecord("demo", "child"); err != nil {
 		t.Fatalf("RemoveBranchRecord: %v", err)
@@ -1712,7 +2553,7 @@ func TestContainerIdentityResolution(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
+		if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &ContainerInfo{
 			ID: id, Name: name, BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
@@ -1725,11 +2566,11 @@ func TestContainerIdentityResolution(t *testing.T) {
 	alphaDir := writeRecord(idAlpha, idAlpha, "alpha")
 	betaDir := writeRecord(idBeta, idBeta, "beta")
 	writeRecord(idNamedPrefix, idNamedPrefix, "abc")
-	legacyDir := writeRecord("legacy", "", "legacy")
+	nameKeyDir := writeRecord("name-key", "", "name-key")
 
 	for identifier, wantID := range map[string]string{
 		"alpha": idAlpha, idAlpha: idAlpha, idAlpha[:4]: idAlpha,
-		"abc": idNamedPrefix, "legacy": "legacy", idNamedPrefix: idNamedPrefix, idNamedPrefix[:8]: idNamedPrefix,
+		"abc": idNamedPrefix, "name-key": "name-key", idNamedPrefix: idNamedPrefix, idNamedPrefix[:8]: idNamedPrefix,
 	} {
 		info, err := store.LoadContainer(identifier)
 		if err != nil {
@@ -1740,6 +2581,9 @@ func TestContainerIdentityResolution(t *testing.T) {
 	}
 	if _, err := store.LoadContainer("ab"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("ambiguous ID prefix error=%v", err)
+	}
+	if _, err := store.LoadContainer("missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing container error=%v, want os.ErrNotExist", err)
 	}
 	paths, err := store.BranchConsolePaths("alpha", "main")
 	if err != nil {
@@ -1761,96 +2605,11 @@ func TestContainerIdentityResolution(t *testing.T) {
 	if _, err := os.Stat(betaDir); !os.IsNotExist(err) {
 		t.Errorf("removed ID directory still exists: %v", err)
 	}
-	if info, err := store.LoadContainer("legacy"); err != nil || info.ID != "legacy" {
-		t.Fatalf("legacy record=%+v, err=%v", info, err)
+	if info, err := store.LoadContainer("name-key"); err != nil || info.ID != "name-key" {
+		t.Fatalf("name-key record=%+v, err=%v", info, err)
 	}
-	if _, err := os.Stat(legacyDir); err != nil {
-		t.Errorf("legacy directory changed: %v", err)
-	}
-}
-
-func TestPromotedRepositoriesOutliveSourceAndFollowLastReference(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	writeContainer := func(id, name string, repositories []specutils.TTCVolumeRepository) {
-		t.Helper()
-		containerDir := filepath.Join(root, "containers", id)
-		bundleDir := filepath.Join(containerDir, "bundle")
-		if err := os.MkdirAll(bundleDir, 0700); err != nil {
-			t.Fatal(err)
-		}
-		encoded, err := json.Marshal(repositories)
-		if err != nil {
-			t.Fatal(err)
-		}
-		spec := specs.Spec{Process: &specs.Process{Args: []string{"true"}}}
-		if len(repositories) != 0 {
-			spec.Annotations = map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)}
-		}
-		if err := writeJSON(filepath.Join(bundleDir, "config.json"), &spec); err != nil {
-			t.Fatal(err)
-		}
-		if err := writeJSON(filepath.Join(containerDir, "container.json"), &ContainerInfo{
-			ID: id, Name: name, BundleDir: bundleDir, State: "created", CreatedAt: time.Now(),
-			Branches: []BranchInfo{{ID: "main", State: "created"}},
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	sourceID := strings.Repeat("a", 64)
-	sourceRepository := filepath.Join(root, "containers", sourceID, rootfsUpperRepositoryDir)
-	if err := os.MkdirAll(sourceRepository, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sourceRepository, "sentinel"), []byte("filesystem state"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	repositories := []specutils.TTCVolumeRepository{{
-		Source: specutils.TTCRootfsUpperSource, Path: sourceRepository, Branch: ttcvolume.MainBranch,
-		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
-	}}
-	writeContainer(sourceID, "source", repositories)
-
-	if err := store.PromoteContainerRepositories("source"); err != nil {
-		t.Fatalf("PromoteContainerRepositories: %v", err)
-	}
-	sourceSpec, err := store.LoadSpec("source")
-	if err != nil {
-		t.Fatal(err)
-	}
-	promoted, err := specutils.TTCVolumeRepositories(sourceSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(promoted) != 1 || promoted[0].Path == sourceRepository || !promoted[0].Private {
-		t.Fatalf("promoted repositories=%+v", promoted)
-	}
-	if inside, err := pathWithin(store.promotedRepositoryRoot(), promoted[0].Path); err != nil || !inside {
-		t.Fatalf("promoted path %q is outside cluster repository root: inside=%t err=%v", promoted[0].Path, inside, err)
-	}
-	if data, err := os.ReadFile(filepath.Join(promoted[0].Path, "sentinel")); err != nil || string(data) != "filesystem state" {
-		t.Fatalf("promoted contents=%q err=%v", data, err)
-	}
-	if err := store.PromoteContainerRepositories("source"); err != nil {
-		t.Fatalf("idempotent PromoteContainerRepositories: %v", err)
-	}
-
-	targetID := strings.Repeat("b", 64)
-	targetRepositories := append([]specutils.TTCVolumeRepository(nil), promoted...)
-	targetRepositories[0].Branch = "remote"
-	writeContainer(targetID, "target", targetRepositories)
-	if err := store.RemoveContainer("source"); err != nil {
-		t.Fatalf("RemoveContainer(source): %v", err)
-	}
-	if _, err := os.Stat(promoted[0].Path); err != nil {
-		t.Fatalf("repository disappeared while target still referenced it: %v", err)
-	}
-	if err := store.RemoveContainer("target"); err != nil {
-		t.Fatalf("RemoveContainer(target): %v", err)
-	}
-	if _, err := os.Stat(promoted[0].Path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("unreferenced promoted repository remains: %v", err)
+	if _, err := os.Stat(nameKeyDir); err != nil {
+		t.Errorf("name-key directory changed: %v", err)
 	}
 }
 
@@ -1878,19 +2637,7 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	amd64 := makeRoot(digest, "linux/amd64")
 	arm64 := makeRoot(digest, "linux/arm64/v8")
 	other := makeRoot(otherDigest, "linux/amd64")
-	legacy := filepath.Join(root, "images", safeComponent("v2-"+digest+"-linux/386"))
-	if err := os.MkdirAll(filepath.Join(legacy, "rootfs"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "image.json"), []byte("{}\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	legacyManifest := ownership.NewManifest()
-	legacyManifest.Entries["."] = ownership.Owner{}
-	if err := ownership.Write(ownership.ManifestPath(filepath.Join(legacy, "rootfs")), legacyManifest); err != nil {
-		t.Fatal(err)
-	}
-	for _, dir := range []string{amd64, arm64, legacy} {
+	for _, dir := range []string{amd64, arm64} {
 		restricted := filepath.Join(dir, "rootfs", "restricted")
 		if err := os.Mkdir(restricted, 0750); err != nil {
 			t.Fatal(err)
@@ -1933,10 +2680,10 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RemoveImageRoots: %v", err)
 	}
-	if removed != 3 {
-		t.Errorf("RemoveImageRoots removed %d roots, want 3", removed)
+	if removed != 2 {
+		t.Errorf("RemoveImageRoots removed %d roots, want 2", removed)
 	}
-	for _, dir := range []string{amd64, arm64, legacy} {
+	for _, dir := range []string{amd64, arm64} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Errorf("removed image root %q still exists: %v", dir, err)
 		}
@@ -1949,14 +2696,175 @@ func TestImageRootInventoryAndRemoval(t *testing.T) {
 	}
 }
 
+func TestSharedImagePackRoundTrip(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.MkdirAll(filepath.Join(rootfs, "usr", "bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := strings.Repeat("image payload\n", 100000)
+	if err := os.WriteFile(filepath.Join(rootfs, "usr", "bin", "tool"), []byte(payload), 0555); err != nil {
+		t.Fatal(err)
+	}
+	manifest := ownership.NewManifest()
+	manifest.Entries["."] = ownership.Owner{}
+	manifest.Entries["usr/bin/tool"] = ownership.Owner{UID: 123, GID: 456}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), manifest); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{
+		Reference: "docker.io/library/test:latest", ConfigDigest: "sha256:" + strings.Repeat("a", 64),
+		Platform: "linux/amd64", LayerCount: 2,
+	}
+	key := imageRootKey("sha256:"+strings.Repeat("b", 64), info.Platform)
+	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+		t.Fatalf("publishSharedImagePack: %v", err)
+	}
+	destination := filepath.Join(local, "images", key)
+	if err := os.MkdirAll(destination, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gotInfo, found, err := store.materializeSharedImagePack(key, destination)
+	if err != nil || !found {
+		t.Fatalf("materializeSharedImagePack = (%+v, %t, %v), want found", gotInfo, found, err)
+	}
+	if !reflect.DeepEqual(gotInfo, info) {
+		t.Fatalf("materialized info = %+v, want %+v", gotInfo, info)
+	}
+	target := filepath.Join(destination, "rootfs", "usr", "bin", "tool")
+	if stat, err := os.Stat(target); err != nil || stat.Size() != 0 {
+		t.Fatalf("lazy placeholder size = %v, %v; want zero", stat, err)
+	}
+	if usage, present, err := store.ImageCacheUsage("sha256:"+strings.Repeat("b", 64), info.Platform); err != nil || !present || usage.CompleteBytes != 0 || usage.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("initial image cache usage = (%+v, %t, %v)", usage, present, err)
+	}
+	descriptor, err := ttcpack.ReadLazyDescriptor(filepath.Join(destination, "rootfs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lazy, err := ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size, mode, ok := lazy.Metadata("usr/bin/tool"); !ok || size != int64(len(payload)) || mode&0777 != 0555 {
+		t.Fatalf("lazy metadata = (%d, %#o, %t)", size, mode, ok)
+	}
+	if err := lazy.Ensure("usr/bin/tool"); err != nil {
+		t.Fatalf("populating lazy file: %v", err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if usage, present, err := store.ImageCacheUsage("sha256:"+strings.Repeat("b", 64), info.Platform); err != nil || !present || usage.CompleteBytes != uint64(len(payload)) || usage.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("populated image cache usage = (%+v, %t, %v)", usage, present, err)
+	}
+	// A live gofer pins the whole immutable root. Capacity enforcement must
+	// skip it rather than invalidating an already-donated host descriptor.
+	lazy, err = ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := store.PruneImageCache(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned.EvictedBytes != 0 || pruned.BusyBytes != uint64(len(payload)) || pruned.AfterBytes != uint64(len(payload)) {
+		t.Fatalf("active capacity pass = %+v", pruned)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err = store.PruneImageCache(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned.EvictedFiles != 1 || pruned.EvictedBytes != uint64(len(payload)) || pruned.AfterBytes != 0 {
+		t.Fatalf("inactive capacity pass = %+v", pruned)
+	}
+	if stat, err := os.Stat(target); err != nil || stat.Size() != 0 {
+		t.Fatalf("evicted image file = %v, %v", stat, err)
+	}
+	lazy, err = ttcpack.OpenLazyDirectory(filepath.Join(destination, "rootfs"), descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Ensure("usr/bin/tool"); err != nil {
+		t.Fatal(err)
+	}
+	if err := lazy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != payload {
+		t.Fatalf("materialized payload length=%d err=%v", len(got), err)
+	}
+	owners, err := ownership.Read(ownership.ManifestPath(filepath.Join(destination, "rootfs")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := owners.Entries["usr/bin/tool"]; owner.UID != 123 || owner.GID != 456 {
+		t.Fatalf("materialized owner = %+v", owner)
+	}
+	entries, err := os.ReadDir(filepath.Join(store.sharedImagePackRoot(), "packs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("shared packs = %d, %v, want one", len(entries), err)
+	}
+}
+
+func TestSharedImagePackPublicationIsIdempotent(t *testing.T) {
+	shared := t.TempDir()
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.Mkdir(rootfs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "payload"), []byte("same immutable bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), owners); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{ConfigDigest: "sha256:" + strings.Repeat("c", 64), Platform: "linux/amd64"}
+	key := imageRootKey("sha256:"+strings.Repeat("d", 64), info.Platform)
+	for i := 0; i < 2; i++ {
+		store := Store{Root: shared, ActiveRoot: t.TempDir()}
+		if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+			t.Fatalf("publication %d: %v", i, err)
+		}
+	}
+	loaded, err := loadSharedImagePackManifest(Store{Root: shared}.sharedImagePackManifestPath(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := ttcpack.ParseID(loaded.Pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := ttcpack.Open(sharedImagePackRootForTest(shared), id)
+	if err != nil {
+		t.Fatalf("opening published pack: %v", err)
+	}
+	file.Close()
+}
+
+func sharedImagePackRootForTest(root string) string {
+	return Store{Root: root}.sharedImagePackRoot()
+}
+
 func TestPruneImageRoots(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	oldDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	staleDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	currentName := imageRootKey(digest, "linux/amd64")
-	referencedOldName := safeComponent("v3-" + oldDigest + "-linux/amd64")
-	staleOldName := safeComponent("v3-" + digest + "-linux/amd64")
+	referencedName := imageRootKey(oldDigest, "linux/amd64")
+	staleName := imageRootKey(staleDigest, "linux/amd64")
 	tempName := currentName + ".tmp-interrupted"
 
 	makeRoot := func(name string) string {
@@ -1978,12 +2886,12 @@ func TestPruneImageRoots(t *testing.T) {
 		return rootfs
 	}
 	currentRoot := makeRoot(currentName)
-	referencedOldRoot := makeRoot(referencedOldName)
-	staleOldRoot := makeRoot(staleOldName)
+	referencedRoot := makeRoot(referencedName)
+	staleRoot := makeRoot(staleName)
 	tempRoot := makeRoot(tempName)
 	t.Cleanup(func() {
 		_ = removeImageRoot(filepath.Join(root, "images", currentName))
-		_ = removeImageRoot(filepath.Join(root, "images", referencedOldName))
+		_ = removeImageRoot(filepath.Join(root, "images", referencedName))
 	})
 	unrelated := filepath.Join(root, "images", "operator-notes")
 	if err := os.MkdirAll(unrelated, 0700); err != nil {
@@ -1992,7 +2900,7 @@ func TestPruneImageRoots(t *testing.T) {
 
 	removed, err := store.pruneImageRoots(
 		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
-		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+		[]ContainerInfo{{Name: "referenced", Digest: oldDigest, Platform: "linux/amd64"}},
 	)
 	if err != nil {
 		t.Fatalf("pruneImageRoots: %v", err)
@@ -2000,62 +2908,110 @@ func TestPruneImageRoots(t *testing.T) {
 	if removed != 2 {
 		t.Fatalf("pruneImageRoots removed %d roots, want 2", removed)
 	}
-	for _, path := range []string{currentRoot, referencedOldRoot, unrelated} {
+	for _, path := range []string{currentRoot, referencedRoot, unrelated} {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("preserved path %q is unavailable: %v", path, err)
 		}
 	}
-	for _, path := range []string{staleOldRoot, tempRoot} {
+	for _, path := range []string{staleRoot, tempRoot} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("stale path %q remains: %v", path, err)
 		}
 	}
 	if removed, err := store.pruneImageRoots(
 		[]ttcimages.Info{{Digest: digest, Platform: "linux/amd64"}},
-		[]ContainerInfo{{Name: "legacy", RootFS: referencedOldRoot}},
+		[]ContainerInfo{{Name: "referenced", Digest: oldDigest, Platform: "linux/amd64"}},
 	); err != nil || removed != 0 {
 		t.Errorf("second pruneImageRoots = (%d, %v), want (0, nil)", removed, err)
 	}
 }
 
-func TestRemoveObsoleteApplicationMemoryFiles(t *testing.T) {
-	root := t.TempDir()
-	store := Store{Root: root}
-	legacy := filepath.Join(root, "containers", "legacy", "memory", "application.mem")
-	keep := filepath.Join(root, "containers", "legacy", "memory", "chunks", "keep")
-	if err := os.MkdirAll(filepath.Dir(legacy), 0700); err != nil {
+func TestClusterImageCacheKeepsOnlyNodeLocalContainers(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	digest := "sha256:" + strings.Repeat("e", 64)
+	platform := "linux/amd64"
+	key := imageRootKey(digest, platform)
+	root := filepath.Join(local, "images", key, "rootfs")
+	if err := os.MkdirAll(root, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(keep), 0700); err != nil {
+	if err := writeJSON(filepath.Join(filepath.Dir(root), "image.json"), &ttcimages.RootFSInfo{ConfigDigest: digest, Platform: platform}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(legacy, []byte("obsolete live memory"), 0600); err != nil {
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(root), owners); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(keep, []byte("durable chunk"), 0600); err != nil {
+	containers := []ContainerInfo{{ID: "remote", Digest: digest, Platform: platform}}
+	if removed, err := store.pruneImageRoots([]ttcimages.Info{{Digest: digest, Platform: platform}}, containers); err != nil || removed != 0 {
+		t.Fatalf("prune newly-created remote-only cache = (%d, %v), want (0, nil)", removed, err)
+	}
+	old := time.Now().Add(-2 * nodeLocalImageCacheGrace)
+	if err := os.Chtimes(filepath.Dir(root), old, old); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := store.RemoveObsoleteApplicationMemoryFiles()
+	if removed, err := store.pruneImageRoots([]ttcimages.Info{{Digest: digest, Platform: platform}}, containers); err != nil || removed != 1 {
+		t.Fatalf("prune remote-only cache = (%d, %v), want (1, nil)", removed, err)
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(filepath.Dir(root), "image.json"), &ttcimages.RootFSInfo{ConfigDigest: digest, Platform: platform}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ownership.Write(ownership.ManifestPath(root), owners); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.activeContainerDir("local"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	containers = []ContainerInfo{{ID: "local", Digest: digest, Platform: platform}}
+	if removed, err := store.pruneImageRoots(nil, containers); err != nil || removed != 0 {
+		t.Fatalf("prune locally-used cache = (%d, %v), want (0, nil)", removed, err)
+	}
+}
+
+func TestPruneUnreferencedSharedImagePack(t *testing.T) {
+	shared := t.TempDir()
+	store := Store{Root: shared, ActiveRoot: t.TempDir()}
+	imageDir := t.TempDir()
+	rootfs := filepath.Join(imageDir, "rootfs")
+	if err := os.Mkdir(rootfs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "payload"), []byte("unused image"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownership.NewManifest()
+	owners.Entries["."] = ownership.Owner{}
+	if err := ownership.Write(ownership.ManifestPath(rootfs), owners); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcimages.RootFSInfo{ConfigDigest: "sha256:" + strings.Repeat("f", 64), Platform: "linux/amd64"}
+	key := imageRootKey("sha256:"+strings.Repeat("1", 64), info.Platform)
+	if err := store.publishSharedImagePack(key, imageDir, info); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := loadSharedImagePackManifest(store.sharedImagePackManifestPath(key))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 1 {
-		t.Fatalf("removed %d obsolete files, want 1", removed)
+	id, _ := ttcpack.ParseID(manifest.Pack)
+	manifests, packs, err := store.PruneSharedImagePacks(context.Background())
+	if err != nil || manifests != 1 || packs != 1 {
+		t.Fatalf("PruneSharedImagePacks = (%d, %d, %v), want (1, 1, nil)", manifests, packs, err)
 	}
-	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("obsolete application memory remains: %v", err)
-	}
-	if data, err := os.ReadFile(keep); err != nil || string(data) != "durable chunk" {
-		t.Fatalf("durable chunk changed: data=%q err=%v", data, err)
-	}
-	if removed, err := store.RemoveObsoleteApplicationMemoryFiles(); err != nil || removed != 0 {
-		t.Fatalf("second cleanup=(%d, %v), want (0, nil)", removed, err)
+	if _, err := os.Stat(ttcpack.Path(store.sharedImagePackRoot(), id)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreferenced pack remains after immediate prune: %v", err)
 	}
 }
 
 func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	root := t.TempDir()
-	manager, err := ttcvolume.OpenManager(root, true)
+	manager, err := ttcvolume.OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2084,9 +3040,9 @@ func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	}
 	countObjects := func() int {
 		count := 0
-		objects := filepath.Join(root, "volumes-v2")
-		if err := filepath.WalkDir(objects, func(path string, entry fs.DirEntry, err error) error {
-			if err == nil && !entry.IsDir() && strings.Contains(path, string(filepath.Separator)+"objects"+string(filepath.Separator)) {
+		volumes := filepath.Join(root, "filesystems", "volumes")
+		if err := filepath.WalkDir(volumes, func(path string, entry fs.DirEntry, err error) error {
+			if err == nil && !entry.IsDir() && strings.Contains(path, string(filepath.Separator)+"data"+string(filepath.Separator)+"files"+string(filepath.Separator)) && strings.HasSuffix(path, ".data") {
 				count++
 			}
 			return err
@@ -2103,6 +3059,261 @@ func TestGarbageCollectRepositoriesIncludesNamedVolumes(t *testing.T) {
 	after := countObjects()
 	if collected != 1 || before < 2 || after >= before {
 		t.Fatalf("collected=%d objects before=%d after=%d", collected, before, after)
+	}
+}
+
+func TestGarbageCollectRepositoriesSkipsUnmaterializedPrivateRepository(t *testing.T) {
+	sharedRoot := t.TempDir()
+	localRoot := t.TempDir()
+	containerID := strings.Repeat("a", 64)
+	bundleDir := filepath.Join(sharedRoot, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source:   specutils.TTCRootfsUpperSource,
+		Path:     filepath.Join(localRoot, "containers", containerID, "rootfs-upper"),
+		Branch:   ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull),
+		Private:  true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(repositories),
+	}}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{
+		ID: containerID, Name: "remote-only", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "running", NodeID: "other-node"}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := (Store{Root: sharedRoot, ActiveRoot: localRoot}).GarbageCollectRepositories()
+	if err != nil {
+		t.Fatalf("GarbageCollectRepositories: %v", err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected=%d, want 0 for an unmaterialized remote repository", collected)
+	}
+}
+
+func TestFilesystemSnapshotOriginsIncludesNamedAndPrivateRepositories(t *testing.T) {
+	sharedRoot := t.TempDir()
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := manager.CreateWithOrigin("data", 41)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := named.Close(); err != nil {
+		t.Fatal(err)
+	}
+	containerID := strings.Repeat("b", 64)
+	privatePath := filepath.Join(localRoot, "containers", containerID, "rootfs-upper")
+	if err := os.MkdirAll(filepath.Dir(privatePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	private, err := manager.CreatePrivateWithOrigin(privatePath, "rootfs", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := private.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(sharedRoot, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: privatePath, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(repositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: containerID, Name: "inventory", BundleDir: bundleDir, Branches: []BranchInfo{{ID: "main"}}}
+	if err := writeCurrentContainerFixture(filepath.Join(sharedRoot, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: sharedRoot, ActiveRoot: localRoot}
+	origins, err := store.FilesystemSnapshotOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range []ttcsnapshot.SnapshotID{41, 42} {
+		if _, ok := origins[origin]; !ok {
+			t.Errorf("origin inventory does not contain %d: %v", origin, origins)
+		}
+	}
+	if err := manager.RemovePrivate(privatePath); err != nil {
+		t.Fatal(err)
+	}
+	origins, err = store.FilesystemSnapshotOrigins()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := origins[42]; ok {
+		t.Errorf("removed private repository origin remains in inventory: %v", origins)
+	}
+	if _, ok := origins[41]; !ok {
+		t.Errorf("named-volume origin disappeared with private repository: %v", origins)
+	}
+}
+
+func TestWithFilesystemSnapshotOriginFindsUniqueRepository(t *testing.T) {
+	localRoot := t.TempDir()
+	manager, err := ttcvolume.OpenManager(localRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.CreateWithOrigin("first", 71)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.CreateWithOrigin("second", 72)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := Store{Root: t.TempDir(), ActiveRoot: localRoot}
+	visited := 0
+	found, err := store.WithFilesystemSnapshotOrigin(72, func(repository *ttcvolume.Repository) error {
+		visited++
+		origins := repository.SnapshotOrigins()
+		if !slices.Contains(origins, ttcsnapshot.SnapshotID(72)) || slices.Contains(origins, ttcsnapshot.SnapshotID(71)) {
+			t.Fatalf("visited wrong repository origins: %v", origins)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || visited != 1 {
+		t.Fatalf("found=%t visited=%d, want true/1", found, visited)
+	}
+	found, err = store.WithFilesystemSnapshotOrigin(73, func(*ttcvolume.Repository) error {
+		t.Fatal("visited repository for absent origin")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("reported absent origin as found")
+	}
+}
+
+func TestRemoveBranchFilesystemsDeletesFinalDistributedVolumeMaterialization(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	manager, err := ttcvolume.OpenManager(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumes, err := manager.List()
+	if err != nil || len(volumes) != 1 {
+		t.Fatalf("listing volume: entries=%+v err=%v", volumes, err)
+	}
+	physicalBranch := ttcvolume.ScopedBranchID("logical-family", "migration")
+	if err := repository.Fork(ttcvolume.MainBranch, physicalBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch(ttcvolume.MainBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(local, "filesystems", "volumes", volumes[0].ID)
+	containerID := "fork-physical"
+	bundleDir := filepath.Join(shared, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	encodedRepositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: "/run/ttc/volumes/" + volumes[0].ID, Path: repositoryPath,
+		Branch: physicalBranch, CopyMode: string(ttcvolume.CopyModeFull),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(encodedRepositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{ID: "migration", FilesystemBranch: physicalBranch, State: "running"}
+	info := ContainerInfo{
+		ID: containerID, Name: containerID, BundleDir: bundleDir,
+		// Completed migrations clear their transaction ID while retaining the
+		// physical-to-logical family identity. Final-local-branch cleanup must
+		// continue treating this repository as a disposable materialization.
+		DistributedFamilyID: "logical-family",
+		Branches:            []BranchInfo{branch},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Root: shared, ActiveRoot: local}).RemoveBranchFilesystems(containerID, branch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(repositoryPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete distributed volume repository still exists: %v", err)
+	}
+}
+
+func TestRemoveBranchFilesystemsAcceptsAlreadyReclaimedActiveRepository(t *testing.T) {
+	shared := t.TempDir()
+	local := t.TempDir()
+	containerID := "retired-physical"
+	bundleDir := filepath.Join(shared, "containers", containerID, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(local, "containers", containerID, "rootfs-upper")
+	encodedRepositories, err := json.Marshal([]specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: missing, Branch: ttcvolume.MainBranch,
+		CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{Annotations: map[string]string{
+		specutils.AnnotationTTCVolumeRepositories: string(encodedRepositories),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	branch := BranchInfo{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "exited"}
+	info := ContainerInfo{ID: containerID, Name: containerID, BundleDir: bundleDir, Branches: []BranchInfo{branch}}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", containerID, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := (Store{Root: shared, ActiveRoot: local}).RemoveBranchFilesystems(containerID, branch); err != nil {
+		t.Fatalf("already reclaimed active repository: %v", err)
 	}
 }
 
@@ -2232,5 +3443,212 @@ func TestRepositoryCanonicalBranchBelongsToFamily(t *testing.T) {
 				t.Fatalf("repositoryCanonicalBranchBelongsToFamily(%+v)=%t, want %t", test.config, got, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadSpecResolvesNodeLocalImageAndRepositoryPaths(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	id := strings.Repeat("a", 64)
+	bundleDir := filepath.Join(shared, "containers", id, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: filepath.Join(shared, "old-upper"),
+		Branch: ttcvolume.MainBranch, CopyMode: string(ttcvolume.CopyModeFull), Private: true,
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := &specs.Spec{
+		Root: &specs.Root{Path: filepath.Join(shared, "images", "source", "rootfs")},
+		Annotations: map[string]string{
+			specutils.AnnotationTTCVolumeRepositories: string(encoded),
+			ttcpack.LazyAnnotation:                    filepath.Join(shared, "images", "source", ttcpack.LazyDescriptorName),
+			ownership.Annotation:                      filepath.Join(shared, "images", "source", ownership.ManifestName),
+			"dev.gvisor.spec.rootfs.source":           filepath.Join(shared, "images", "source", "rootfs"),
+		},
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), spec); err != nil {
+		t.Fatal(err)
+	}
+	// The old node's path may still be visible to this process. It must not be
+	// selected in preference to the current node's local active root.
+	if err := os.MkdirAll(repositories[0].Path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:" + strings.Repeat("b", 64)
+	info := ContainerInfo{
+		ID: id, Name: "demo", BundleDir: bundleDir, RootFS: spec.Root.Path, Digest: digest, Platform: "linux/amd64",
+		State: "created", LiveForkEligible: true, Branches: []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: "created"}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Annotations[ttcpack.LazyAnnotation]; got != "" {
+		t.Fatalf("stale lazy image annotation = %q, want empty", got)
+	}
+	wantRoot := filepath.Join(local, "images", imageRootKey(digest, "linux/amd64"), "rootfs")
+	if err := os.MkdirAll(wantRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	packID, err := ttcpack.ParseID(strings.Repeat("c", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ttcpack.WriteLazyDescriptor(wantRoot, filepath.Join(shared, "image-packs"), packID, "rootfs"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Root == nil || loaded.Root.Path != wantRoot {
+		t.Fatalf("root path = %+v, want %q", loaded.Root, wantRoot)
+	}
+	if got, want := loaded.Annotations["dev.gvisor.spec.rootfs.source"], wantRoot; got != want {
+		t.Fatalf("rootfs source annotation = %q, want %q", got, want)
+	}
+	if got, want := loaded.Annotations[ownership.Annotation], ownership.ManifestPath(wantRoot); got != want {
+		t.Fatalf("ownership annotation = %q, want %q", got, want)
+	}
+	if got, want := loaded.Annotations[ttcpack.LazyAnnotation], ttcpack.LazyDescriptorPath(wantRoot); got != want {
+		t.Fatalf("lazy image annotation = %q, want %q", got, want)
+	}
+	resolved, err := specutils.TTCVolumeRepositories(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRepository := filepath.Join(local, "containers", id, rootfsUpperRepositoryDir)
+	if len(resolved) != 1 || resolved[0].Path != wantRepository {
+		t.Fatalf("repositories = %+v, want path %q", resolved, wantRepository)
+	}
+}
+
+func TestCommitActiveRepositoryRestoreIDsAdvancesOneShotAlias(t *testing.T) {
+	shared, local := t.TempDir(), t.TempDir()
+	store := Store{Root: shared, ActiveRoot: local}
+	id := strings.Repeat("c", 64)
+	bundleDir := filepath.Join(shared, "containers", id, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := ttcvolume.OpenManager(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryPath := filepath.Join(local, "containers", id, rootfsUpperRepositoryDir)
+	if err := os.MkdirAll(filepath.Dir(repositoryPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(repositoryPath, "target-rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localID := repository.Info().ID
+	copyMode := string(manager.Capability().Mode)
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repositories := []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: "/old-node/rootfs-upper",
+		Branch: ttcvolume.MainBranch, CopyMode: copyMode, RestoreID: strings.Repeat("d", 32), Private: true,
+	}}
+	encoded, err := json.Marshal(repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(filepath.Join(bundleDir, "config.json"), &specs.Spec{
+		Annotations: map[string]string{specutils.AnnotationTTCVolumeRepositories: string(encoded)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info := ContainerInfo{ID: id, Name: "demo", BundleDir: bundleDir, State: "paused"}
+	if err := writeCurrentContainerFixture(filepath.Join(shared, "containers", id, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteActiveRepositoryMap(id, []specutils.TTCVolumeRepository{{
+		Source: specutils.TTCRootfsUpperSource, Path: repositoryPath, CopyMode: copyMode,
+		RestoreID: strings.Repeat("d", 32),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitActiveRepositoryRestoreIDs(id); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadSpec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := specutils.TTCVolumeRepositories(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Path != repositoryPath || got[0].RestoreID != localID {
+		t.Fatalf("repositories=%+v, want path %q and restore ID %q", got, repositoryPath, localID)
+	}
+}
+
+// A memory limit brings Docker's swap limit with it: twice the memory unless
+// --memory-swap says otherwise, -1 for unlimited swap, never less than the
+// memory, and never without a memory limit.
+func TestMemorySwapFollowsDocker(t *testing.T) {
+	const mib = int64(1) << 20
+	for value, want := range map[string]int64{"-1": -1, "0": 0, "256m": 256 * mib} {
+		if got, err := ParseMemorySwap(value); err != nil || got != want {
+			t.Errorf("ParseMemorySwap(%q) = %d, %v; want %d", value, got, err, want)
+		}
+	}
+	for _, value := range []string{"-2", "lots"} {
+		if _, err := ParseMemorySwap(value); err == nil {
+			t.Errorf("ParseMemorySwap(%q) succeeded", value)
+		}
+	}
+	for _, test := range []struct{ memory, swap, want int64 }{
+		{64 * mib, 0, 128 * mib}, {64 * mib, -1, -1}, {64 * mib, 100 * mib, 100 * mib}, {0, 0, 0},
+	} {
+		if got := EffectiveMemorySwap(test.memory, test.swap); got != test.want {
+			t.Errorf("EffectiveMemorySwap(%d, %d) = %d, want %d", test.memory, test.swap, got, test.want)
+		}
+	}
+	image := ocispec.Image{Config: ocispec.ImageConfig{Cmd: []string{"true"}}}
+	memory := 64 * mib
+	for _, swap := range []int64{128 * mib, 64 * mib} {
+		spec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), MemoryLimit: &memory, MemorySwap: &swap})
+		if err != nil {
+			t.Fatalf("BuildSpec with swap %d: %v", swap, err)
+		}
+		if got := spec.Linux.Resources.Memory.Swap; got == nil || *got != swap {
+			t.Errorf("spec swap = %v, want %d", got, swap)
+		}
+	}
+	// Unlimited swap, asked for or recorded before swap limits, sets none.
+	unlimited := int64(-1)
+	for _, swap := range []*int64{&unlimited, nil} {
+		spec, err := BuildSpec(image, SpecOptions{RootFS: t.TempDir(), MemoryLimit: &memory, MemorySwap: swap})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := spec.Linux.Resources.Memory.Swap; got != nil {
+			t.Errorf("unlimited swap set a limit: %d", *got)
+		}
+	}
+	short, zero := 32*mib, int64(0)
+	for name, opts := range map[string]SpecOptions{
+		"less than memory": {MemoryLimit: &memory, MemorySwap: &short},
+		"without memory":   {MemorySwap: &short},
+		"zero memory":      {MemoryLimit: &zero, MemorySwap: &short},
+		"below unlimited":  {MemoryLimit: &memory, MemorySwap: func() *int64 { v := int64(-2); return &v }()},
+	} {
+		opts.RootFS = t.TempDir()
+		if _, err := BuildSpec(image, opts); err == nil {
+			t.Errorf("BuildSpec accepted a memory-swap limit %s", name)
+		}
 	}
 }

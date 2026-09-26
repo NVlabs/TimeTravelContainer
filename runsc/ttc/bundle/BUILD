@@ -16,6 +16,9 @@ go_library(
     visibility = ["//runsc/ttc:__subpackages__"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/log",
+        "//pkg/ttcpack",
+        "//pkg/ttcsnapshot",
         "//pkg/ttcvolume",
         "//runsc/specutils",
         "//runsc/ttc/console",
@@ -40,6 +43,7 @@ go_test(
     ],
     library = ":bundle",
     deps = [
+        "//pkg/ttcpack",
         "//pkg/ttcvolume",
         "//runsc/specutils",
         "@org_golang_x_sys//unix:go_default_library",

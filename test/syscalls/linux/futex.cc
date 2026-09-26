@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstddef>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -457,6 +458,27 @@ TEST_P(PrivateAndSharedFutexTest, WakeOpCondFailure) {
                                      (kInitialValue - 1))),
               SyscallSucceedsWithValue(1));
   EXPECT_EQ(b, kInitialValue + 2);
+}
+
+TEST_P(PrivateAndSharedFutexTest, WakeOpSignedComparison) {
+  constexpr int kInitialValue = std::numeric_limits<int>::min() + 22;
+  std::atomic<int> a(0);
+  std::atomic<int> b(kInitialValue);
+
+  DisableSave ds;
+  ScopedThread thread_b([&] {
+    EXPECT_THAT(futex_wait(IsPrivate(), &b, kInitialValue), SyscallSucceeds());
+  });
+  absl::SleepFor(kWaiterStartupDelay);
+
+  // Clear b's sign bit, and wake its waiter if the original signed value was
+  // less than zero.
+  EXPECT_THAT(
+      futex_wake_op(IsPrivate(), &a, &b, 0, 1,
+                    FUTEX_OP(FUTEX_OP_ANDN | FUTEX_OP_OPARG_SHIFT, 31,
+                             FUTEX_OP_CMP_LT, 0)),
+      SyscallSucceedsWithValue(1));
+  EXPECT_EQ(b, 22);
 }
 
 TEST_P(PrivateAndSharedFutexTest, NoWakeInterprocessPrivateAnon) {

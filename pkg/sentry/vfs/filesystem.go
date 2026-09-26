@@ -552,6 +552,14 @@ type FilesystemImpl interface {
 	MountOptions() string
 }
 
+// FilesystemMetadataPublisher is implemented by filesystems that buffer
+// namespace or inode metadata outside their shared backing store. Publishing
+// makes completed mutations observable to another opener, but unlike Sync it
+// does not promise data durability.
+type FilesystemMetadataPublisher interface {
+	PublishFilesystemMetadata(ctx context.Context) error
+}
+
 // TarSerializer is an interface for serializing a filesystem to a tar archive.
 // It is an extension of FilesystemImpl.
 type TarSerializer interface {

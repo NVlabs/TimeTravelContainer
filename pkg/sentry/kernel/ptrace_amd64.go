@@ -21,8 +21,31 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// ptracePrepareGuestGS retires any platform mechanism that privately owns GS
+// before ptrace changes the tracee's guest-visible GS base. This is required
+// for nested systrap: the inner Sentry installs GS on its syscall threads with
+// PTRACE_SETREGSET, so the outer Sentry never observes an ARCH_SET_GS syscall
+// from those threads.
+func (t *Task) ptracePrepareGuestGS(target *Task, data hostarch.Addr, length int) error {
+	regsSize := (*linux.PtraceRegs)(nil).SizeBytes()
+	if length < regsSize {
+		return nil // The subsequent register setter reports the short input.
+	}
+	buf := make([]byte, regsSize)
+	if _, err := t.CopyInBytes(data, buf); err != nil {
+		return err
+	}
+	var regs linux.PtraceRegs
+	regs.UnmarshalUnsafe(buf)
+	if uint64(target.Arch().GSBase()) == regs.Gs_base {
+		return nil
+	}
+	return platform.PrepareGuestGSBase(target, target.Kernel().Platform, target.MemoryManager())
+}
 
 // ptraceArch implements arch-specific ptrace commands.
 func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) error {
@@ -59,6 +82,9 @@ func (t *Task) ptraceArch(target *Task, req int64, addr, data hostarch.Addr) err
 		return err
 
 	case linux.PTRACE_SETREGS:
+		if err := t.ptracePrepareGuestGS(target, data, (*linux.PtraceRegs)(nil).SizeBytes()); err != nil {
+			return err
+		}
 		_, err := target.Arch().PtraceSetRegs(&usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),

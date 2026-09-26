@@ -159,6 +159,15 @@ type dentryCache struct {
 	dentries dentryList `state:"nosave"`
 	// dentriesLen is the number of dentries in dentries.
 	dentriesLen uint64 `state:"nosave"`
+	// starved records that a gofer has said it has no file descriptors left.
+	//
+	// Beside the cache rather than on the connection that was refused, because
+	// one gofer process serves every mount of a sandbox out of one descriptor
+	// table while each mount has its own connection. Whoever is refused may be
+	// wedged — every path it touches fails, so nothing on it releases a dentry
+	// and nothing on it would ever reclaim. Anything sharing this cache can
+	// answer instead, and what it gives back is the same descriptors.
+	starved atomicbitops.Bool `state:"nosave"`
 }
 
 // SetDentryCacheSize sets the size of the global gofer dentry cache.
@@ -659,6 +668,10 @@ func (fs *filesystem) initClientAndGetRoot(ctx context.Context) (lisafs.Inode, i
 	if err != nil {
 		return lisafs.Inode{}, -1, err
 	}
+	// What this gofer says about descriptors is recorded where the descriptors
+	// can be given back from.
+	cache := fs.dentryCache
+	fs.client.OnStarved = func() { cache.starved.Store(true) }
 
 	cu := cleanup.Make(func() {
 		if rootHostFD >= 0 {
@@ -1679,6 +1692,7 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 // Preconditions: d.inode.fs.renameMu must be locked for writing if
 // renameMuWriteLocked is true; it may be temporarily unlocked.
 func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked bool) {
+	d.inode.fs.reclaimIfStarved(ctx, renameMuWriteLocked)
 	d.cachingMu.Lock()
 	refs := d.refs.Load()
 	if refs == -1 {
@@ -1785,6 +1799,83 @@ func (d *dentry) checkCachingLocked(ctx context.Context, renameMuWriteLocked boo
 			defer d.inode.fs.renameMu.Unlock()
 		}
 		d.inode.fs.evictCachedDentryLocked(ctx) // +checklocksforce: see above.
+	}
+}
+
+// reclaimForStarvedGofer gives descriptors back when the gofer has said it has
+// none left.
+//
+// The gofer keeps a host descriptor for every dentry cached on this side and
+// has a limit this side was never told; it cannot close what its client still
+// refers to, so this is the only place the descriptors can come from. Evicting
+// only when the cache passed its own count left a gofer at EMFILE sitting on
+// thousands of dentries nobody was using, and the sandbox failed every path it
+// touched from then until it was restarted.
+//
+// Preconditions:
+//   - fs.renameMu must be locked for writing if renameMuWriteLocked is true,
+//     and must not be held at all otherwise.
+func (fs *filesystem) reclaimIfStarved(ctx context.Context, renameMuWriteLocked bool) {
+	if !fs.goferStarved() {
+		return
+	}
+	if !renameMuWriteLocked {
+		fs.renameMu.Lock()
+		defer fs.renameMu.Unlock()
+	}
+	// Half of what is actually held, not half of what the cache is allowed.
+	//
+	// Those are not the same number and the difference is the whole of it: a
+	// cache configured larger than the descriptors can pay for is exactly the
+	// case this exists to survive, and there a fraction of the configured
+	// maximum is above everything in the cache, so the loop below would find
+	// itself already under target and give nothing back. Measured against what
+	// is there, it always makes progress while there is anything to make it
+	// with.
+	fs.dentryCache.mu.Lock()
+	held := fs.dentryCache.dentriesLen
+	fs.dentryCache.mu.Unlock()
+	fs.reclaimCachedDentriesLocked(ctx, held/2) // +checklocksforce: see above.
+}
+
+// goferStarved reports whether the gofer has said it has no file descriptors
+// left since this was last asked.
+//
+// Only the LISAFS case: with directfs the Sentry makes the host calls itself,
+// so a shortage arrives as its own errno rather than as the server's, and this
+// is not where it would be noticed.
+func (fs *filesystem) goferStarved() bool {
+	// Load first so the common case is a read of an uncontended line rather
+	// than a write every time a dentry goes idle. Taking rather than reading:
+	// one report should provoke one reclaim, and a flag that stayed set would
+	// have everything that went idle afterwards draining the cache again.
+	return fs.dentryCache.starved.Load() && fs.dentryCache.starved.Swap(false)
+}
+
+// reclaimCachedDentriesLocked evicts until the cache holds no more than keep.
+//
+// Preconditions:
+//   - fs.renameMu must be locked for writing; it may be temporarily unlocked.
+//
+// +checklocks:fs.renameMu
+func (fs *filesystem) reclaimCachedDentriesLocked(ctx context.Context, keep uint64) {
+	for {
+		fs.dentryCache.mu.Lock()
+		held := fs.dentryCache.dentriesLen
+		fs.dentryCache.mu.Unlock()
+		if held <= keep {
+			return
+		}
+		fs.evictCachedDentryLocked(ctx)
+		fs.dentryCache.mu.Lock()
+		stillHeld := fs.dentryCache.dentriesLen
+		fs.dentryCache.mu.Unlock()
+		if stillHeld >= held {
+			// The LRU had nothing this filesystem could take. Stopping rather
+			// than spinning: the cache is shared, and another filesystem's
+			// dentries are its own to release.
+			return
+		}
 	}
 }
 

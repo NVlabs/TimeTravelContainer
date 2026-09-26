@@ -60,9 +60,8 @@ non-forkable for its entire lifetime.
   upper; use `:copy` for a view detached from later host changes.
 - A managed volume cannot be attached writable to unrelated container
   families at the same time.
-- Efficient persistent file CoW requires filesystem reflinks. The
-  `--allow-slow-volume-copy` fallback can copy a complete shared file on its
-  first write.
+- Efficient persistent file CoW requires filesystem reflinks. Without them,
+  TTC automatically copies a complete shared file on its first write.
 - Virtual networking and published ports are currently IPv4-only, and
   published ports currently support TCP.
 - Linux 3.17 through 4.14.76 is supported with host GSO disabled
@@ -76,17 +75,22 @@ non-forkable for its entire lifetime.
   are not currently implemented.
 - Image signature, attestation, and content-trust policy are not yet
   implemented.
-- Cross-node fork requires mutually authenticated TTC peers, common image
-  content, a shared TTC data root, and a reachable page-transfer network. Use
-  a checkpoint for offline transfer or unrelated TTC installations.
-- Elastic migration currently uses a conservative dehydrate/ownership-CAS/
-  rehydrate cutover rather than the live sparse handoff planned for later.
-  Automatic rebalancing uses exact resident-memory sharing edges, coalesced by
-  branch membership and bounded at 4,096 distinct sets per family. TTC rejects
-  a plan if this bound is exceeded rather than using incomplete accounting.
-  Capacity acquisition uses a durable shared-filesystem JSON outbox; native
-  executable and HTTP provider adapters are not yet included. An unsuccessful
-  drain or rebalance remains safely retryable after a requested node joins.
+- Cross-node fork assumes a trusted private network, a common shared TTC data
+  root, and reachable peer-transfer ports. `TTC_CLUSTER_TOKEN` adds a shared
+  admission/request token when desired; TTC does not currently add TLS. Use a
+  checkpoint for offline transfer or unrelated TTC installations.
+- Elastic migration uses live sparse handoff. A newly running target may
+  temporarily depend on transaction-fenced memory chunks or whole files served
+  by the source. Graceful drain resolves these dependencies; unexpected source
+  loss before they are cached or published is reported as unrecoverable
+  volatile-state loss.
+  Automatic rebalancing uses exact resident-page identities represented as
+  fixed-size bitmaps. The 4,096-edge bound applies only to the optional
+  human-readable sharing-edge diagnostic; truncating that diagnostic does not
+  truncate planner input or reject a placement plan.
+  Capacity acquisition uses a durable shared-filesystem JSON outbox with
+  executable and HTTP webhook adapters. An unsuccessful drain or rebalance
+  remains safely retryable after a requested node joins.
 
 For the detailed resource matrix, measurements, and audit evidence, see the
 [security, performance, and compatibility audit](../proposals/timetravel_ttc_audit.md).

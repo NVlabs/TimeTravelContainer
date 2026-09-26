@@ -18,10 +18,9 @@
 set -eu
 
 TTC=${TTC:-}
-RUNSC=${RUNSC:-}
+TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
-TTC_ALLOW_SLOW_VOLUME_COPY=${TTC_ALLOW_SLOW_VOLUME_COPY:-0}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 
 fail() {
@@ -31,8 +30,8 @@ fail() {
 
 [ -n "$TTC" ] || fail "set TTC to the ttc binary"
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
-[ -n "$RUNSC" ] || fail "set RUNSC to the TimeTravel-enabled runsc binary"
-[ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
+[ -n "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
+[ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
 command -v script >/dev/null 2>&1 || fail "script is required"
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required"
@@ -47,25 +46,32 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-RUNSC_ROOT="$TTC_E2E_ROOT/runsc"
 DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
+BIN_DIR="$TTC_E2E_ROOT/bin"
+mkdir -p "$BIN_DIR"
+install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
+install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
+TTC="$BIN_DIR/ttc"
+export TTC_ROOT="$DATA_ROOT"
 NAME="terminal-e2e-$$"
 CLIENT_TERM=${TERM:-xterm}
-for value in "$TTC" "$RUNSC" "$TTC_E2E_ROOT"; do
+for value in "$TTC" "$TTCD" "$TTC_E2E_ROOT"; do
   case "$value" in
     *[[:space:]]*) fail "PTY test paths must not contain whitespace: $value" ;;
   esac
 done
 
-TTC_COMMAND="$TTC --data-root $DATA_ROOT --daemon-socket $DAEMON_SOCKET --root $RUNSC_ROOT --runsc $RUNSC"
+TTC_COMMAND="$TTC --daemon-socket $DAEMON_SOCKET"
 
 ttc() {
-  "$TTC" \
-    --data-root "$DATA_ROOT" \
-    --daemon-socket "$DAEMON_SOCKET" \
-    --root "$RUNSC_ROOT" \
-    --runsc "$RUNSC" \
-    "$@"
+  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
 }
 
 run_with_timeout() {
@@ -128,9 +134,6 @@ trap cleanup EXIT HUP INT TERM
 set -- daemon start
 if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" = 1 ]; then
   set -- "$@" --unsafe-no-host-isolation
-fi
-if [ "$TTC_ALLOW_SLOW_VOLUME_COPY" = 1 ]; then
-  set -- "$@" --allow-slow-volume-copy
 fi
 ttc "$@"
 

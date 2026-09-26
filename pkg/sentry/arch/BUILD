@@ -51,6 +51,13 @@ go_test(
     library = ":arch",
 )
 
+go_test(
+    name = "arch_test",
+    size = "small",
+    srcs = ["signal_fault_amd64_test.go"],
+    library = ":arch",
+)
+
 proto_library(
     name = "registers",
     srcs = ["registers.proto"],

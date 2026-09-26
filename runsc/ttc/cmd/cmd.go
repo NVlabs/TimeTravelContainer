@@ -35,6 +35,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,12 +46,15 @@ import (
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 
 	"gvisor.dev/gvisor/runsc/boot"
@@ -62,6 +66,7 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 	ttcimages "gvisor.dev/gvisor/runsc/ttc/images"
+	ttcstorage "gvisor.dev/gvisor/runsc/ttc/storage"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -80,23 +85,17 @@ type options struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	localRoot             string
 	runtimePlatform       string
+	cpuFeatures           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
-	allowSlowVolumeCopy   bool
 	daemonSocket          string
 	direct                bool
-	clientExecutable      string
 }
 
 // Run executes ttc with args and returns a process exit status.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) != 0 && args[0] == "_cp-helper" {
-		return runCopyHelper(args[1:], stdin, stdout, stderr)
-	}
-	if len(args) == 1 && args[0] == daemonRootlessProbeArg {
-		return 0
-	}
 	opts, args, done, err := parseGlobalOptions(args, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
@@ -109,6 +108,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+	if opts.unsafeNoHostIsolation && args[0] != "daemon" {
+		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' only; ordinary commands inherit the running daemon's mode")
+		return 2
+	}
 	if printCustomCommandHelp(args, stdout) {
 		return 0
 	}
@@ -117,6 +120,13 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if len(args) == 3 && args[2] == "--help" && (args[0] == "container" || args[0] == "image" || args[0] == "volume" || args[0] == "exec") {
 		return runCommand(args, stdout, stdout, nil)
+	}
+	if args[0] == "help" {
+		printUsage(stdout)
+		return 0
+	}
+	if args[0] == "completion" {
+		return runCommand(args, stdout, stderr, nil)
 	}
 	if args[0] == "daemon" {
 		return runDaemonControl(opts, args[1:], stdout, stderr)
@@ -129,25 +139,36 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 	if args[0] == "checkpoint" || args[0] == "restore" {
-		args, err = normalizeCheckpointCommandArgs(args)
+		var finish func(bool) error
+		args, stdin, stdout, finish, err = prepareCheckpointClientIO(args, stdin, stdout)
 		if err != nil {
 			fmt.Fprintf(stderr, "ttc: %v\n", err)
 			return 2
 		}
-	}
-	if opts.unsafeNoHostIsolation && !opts.direct {
-		fmt.Fprintln(stderr, "ttc: --unsafe-no-host-isolation configures 'daemon start' or '--direct' only; ordinary commands inherit the running daemon's mode")
-		return 2
-	}
-	if opts.direct {
-		if opts.unsafeNoHostIsolation {
-			fmt.Fprintln(stderr, "ttc: warning: --unsafe-no-host-isolation disables host namespaces and chroots; run trusted workloads only")
+		if finish != nil {
+			cleanup := finish
+			completed := false
+			defer func() {
+				// The actual result is finalized immediately below. This fallback
+				// only closes/removes a temporary file if a future early return is
+				// added between preparation and transport.
+				if !completed {
+					_ = cleanup(false)
+				}
+			}()
+			status, runErr := runViaDaemon(opts, args, stdin, stdout, stderr)
+			finishErr := cleanup(runErr == nil && status == 0)
+			completed = true
+			if runErr != nil {
+				fmt.Fprintf(stderr, "ttc: daemon transport: %v\n", runErr)
+				return 1
+			}
+			if finishErr != nil {
+				fmt.Fprintf(stderr, "ttc: finalizing checkpoint archive: %v\n", finishErr)
+				return 1
+			}
+			return status
 		}
-		if args[0] == "events" {
-			fmt.Fprintln(stderr, "ttc: events require ttcd; remove --direct")
-			return 1
-		}
-		return runCommand(args, stdout, stderr, directBackend(opts, stdin, stdout, stderr))
 	}
 	status, err := runViaDaemon(opts, args, stdin, stdout, stderr)
 	if err != nil {
@@ -159,12 +180,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
 	opts := options{
-		root:             runtimeRoot(),
-		runsc:            runscPath(),
-		dataRoot:         dataRoot(),
-		runtimePlatform:  runtimePlatformFromEnvironment(),
-		daemonSocket:     defaultDaemonSocket(),
-		clientExecutable: currentExecutable(),
+		runtimePlatform: runtimePlatformFromEnvironment(),
+		daemonSocket:    defaultDaemonSocket(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -175,42 +192,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 		case arg == "--version":
 			fmt.Fprintf(stdout, "ttc version %s\n", version.Version())
 			return opts, nil, true, nil
-		case arg == "--root":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--root requires a path")
-			}
-			opts.root = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--root="):
-			opts.root = strings.TrimPrefix(arg, "--root=")
-			if opts.root == "" {
-				return opts, nil, false, errors.New("--root requires a path")
-			}
-			args = args[1:]
-		case arg == "--runsc":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--runsc requires a path")
-			}
-			opts.runsc = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--runsc="):
-			opts.runsc = strings.TrimPrefix(arg, "--runsc=")
-			if opts.runsc == "" {
-				return opts, nil, false, errors.New("--runsc requires a path")
-			}
-			args = args[1:]
-		case arg == "--data-root":
-			if len(args) < 2 || args[1] == "" {
-				return opts, nil, false, errors.New("--data-root requires a path")
-			}
-			opts.dataRoot = args[1]
-			args = args[2:]
-		case strings.HasPrefix(arg, "--data-root="):
-			opts.dataRoot = strings.TrimPrefix(arg, "--data-root=")
-			if opts.dataRoot == "" {
-				return opts, nil, false, errors.New("--data-root requires a path")
-			}
-			args = args[1:]
 		case arg == "--daemon-socket":
 			if len(args) < 2 || args[1] == "" {
 				return opts, nil, false, errors.New("--daemon-socket requires a path")
@@ -222,9 +203,6 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 			if opts.daemonSocket == "" {
 				return opts, nil, false, errors.New("--daemon-socket requires a path")
 			}
-			args = args[1:]
-		case arg == "--direct":
-			opts.direct = true
 			args = args[1:]
 		case arg == "--unsafe-no-host-isolation":
 			opts.unsafeNoHostIsolation = true
@@ -238,45 +216,9 @@ func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, boo
 	return opts, args, false, nil
 }
 
-func runtimeRoot() string {
-	if dir := os.Getenv("TTC_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "runsc")
-	}
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "runsc")
-	}
-	return filepath.Join(os.TempDir(), "ttc-"+strconv.Itoa(os.Geteuid()), "runsc")
-}
-
-func runscPath() string {
-	if path := os.Getenv("TTC_RUNSC"); path != "" {
-		return path
-	}
-	if executable, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(executable), "ttcd")
-		if info, err := os.Stat(sibling); err == nil && !info.IsDir() {
-			return sibling
-		}
-	}
-	return "ttcd"
-}
-
 func currentExecutable() string {
 	executable, _ := os.Executable()
 	return executable
-}
-
-func dataRoot() string {
-	if root := os.Getenv("TTC_DATA_ROOT"); root != "" {
-		return root
-	}
-	if root := os.Getenv("XDG_DATA_HOME"); root != "" {
-		return filepath.Join(root, "ttc")
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".local", "share", "ttc")
-	}
-	return filepath.Join(os.TempDir(), "ttc")
 }
 
 func printUsage(w io.Writer) {
@@ -285,12 +227,8 @@ func printUsage(w io.Writer) {
 Manage TimeTravelContainer container families and live branches.
 
 Global options:
-  --root PATH                    runsc state root
-  --runsc PATH                   TimeTravel-enabled runsc executable
-  --data-root PATH               native images, bundles, and metadata
   --daemon-socket PATH           per-user ttcd Unix socket
-  --direct                       bypass ttcd for recovery/debugging
-  --unsafe-no-host-isolation     disable host isolation for daemon start/--direct
+  --unsafe-no-host-isolation     disable host isolation for daemon start
 
 Commands:
   images [OPTIONS]               List local images
@@ -301,9 +239,10 @@ Commands:
   load [OPTIONS]                 Load images from a tar archive or standard input
   save [OPTIONS] IMAGE...        Save images to a tar archive or standard output
   commit [OPTIONS] TARGET IMAGE  Commit a branch rootfs as a new OCI image
-  run [OPTIONS] IMAGE [COMMAND]  Pull, create, and run a container
-  create [OPTIONS] IMAGE [CMD]   Prepare a container without starting it
-  start [OPTIONS] TARGET         Start a prepared or exited branch
+  run [--node NODE] [OPTIONS] IMAGE [COMMAND] Pull, create, and run a container
+  create [--node NODE] [OPTIONS] IMAGE [CMD]
+                                 Prepare a container without starting it
+  start [--node NODE] [OPTIONS] TARGET Start a prepared or exited branch
   attach [OPTIONS] TARGET        Attach to a branch init or managed exec console
   logs [OPTIONS] TARGET          Print or follow init or managed exec logs
   exec [OPTIONS] TARGET COMMAND  Execute a command in a running branch
@@ -320,16 +259,19 @@ Commands:
   top [--json] TARGET [PS OPTS]   Show processes in one live branch
   stats [--json] TARGET           Show branch/family CoW resource accounting
   tty stat|watch TARGET --session NAME Observe or stream a named terminal
-  fork [--paused] [--quarantine] SOURCE [DEST...] Fork SOURCE into live branches
-  migrate --target NODE TARGET    Move a running branch to another cluster node
+  fork [--node NODE] [--paused] SOURCE [DEST...] Fork SOURCE into live branches
+  migrate --node NODE TARGET     Move a running branch to another cluster node
   node ls [--json]                 List elastic cluster nodes and memory load
-  node drain [--target NODE] NODE  Evacuate a node and reject new placement
-  node rebalance [--target NODE] NODE Relieve a node's configured memory pressure
+  node rm NODE                    Forget an offline, expired node identity
+  node stop [POLICY] NODE         Evacuate a node and stop its daemon
+  node rebalance [--node NODE] NODE Relieve a node's configured memory pressure
   checkpoint TARGET FILE          Save one branch as a standalone checkpoint
   restore [--name NAME] FILE      Restore a checkpoint as a new container
   rename CONTAINER@BRANCH NAME    Give a branch another name
   pause TARGET...                 Pause one or more branches
   resume TARGET...                Resume one or more branches
+  quarantine TARGET...            Disconnect branches from external networking
+  unquarantine TARGET...          Reconnect branches to external networking
   dehydrate TARGET...             Dehydrate branches or whole container families
   rehydrate TARGET...             Reconstruct one or more dehydrated branches
   unpause TARGET...               Resume branches (Docker alias)
@@ -338,14 +280,12 @@ Commands:
   port COMMAND                    Publish, list, or unpublish branch TCP ports
   volume COMMAND                  Manage persistent volumes (create, ls, inspect, rm)
   completion SHELL                 Generate Bash, Zsh, or Fish completion
-  daemon start [--platform systrap|kvm] [--unsafe-no-host-isolation]
-               [--allow-slow-volume-copy]
-               [--cluster-listen ADDR --cluster-node-id ID
-                --cluster-repository-id ID --cluster-cert FILE
-                --cluster-key FILE --cluster-ca FILE]
-		       [--cluster-advertise https://HOST:PORT,SERVER_NAME]
-		       [--cluster-memory-target SIZE --cluster-auto-rebalance]
-		       [--cluster-capacity-command PATH | --cluster-capacity-webhook URL]
+  daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
+               [--cpu-features FEATURE,...] [--unsafe-no-host-isolation]
+               [--cluster-init | --cluster-join HOST:PORT]
+               [--control-only --cluster-join HOST:PORT]
+               [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
+               [--memory-target SIZE]
                                   Start the per-user service in one fixed mode
   daemon status|stop              Inspect or stop the per-user service
   daemon requests [OPTIONS]        List durable mutation requests
@@ -369,22 +309,32 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"volume":     "Usage: ttc volume create|ls|inspect|rm [OPTIONS]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon":     fmt.Sprintf("Usage: ttc daemon start [--platform %s] [isolation/volume/cluster options]|status|stop|requests|request", runtimePlatformFlagUsage()),
-			"events":     "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
-			"pause":      "Usage: ttc pause TARGET [TARGET...]",
-			"rename":     "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
-			"resume":     "Usage: ttc resume TARGET [TARGET...]",
-			"dehydrate":  "Usage: ttc dehydrate TARGET [TARGET...]",
-			"rehydrate":  "Usage: ttc rehydrate TARGET [TARGET...]",
-			"unpause":    "Usage: ttc unpause TARGET [TARGET...]",
-			"top":        "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
-			"stats":      "Usage: ttc stats [--json] CONTAINER@BRANCH",
-			"tty":        "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
-			"cp":         "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
-			"checkpoint": "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
-			"migrate":    "Usage: ttc migrate --target NODE CONTAINER@BRANCH",
-			"node":       "Usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE",
-			"restore":    "Usage: ttc restore [--name NAME] FILE",
+			"daemon": `Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [OPTIONS]
+       ttc daemon start --control-only --cluster-join HOST:PORT [--cluster-join HOST:PORT...]
+       ttc daemon status
+       ttc daemon stop [--migrate-all|--dehydrate-all|--stop-all]
+
+--control-only starts an outbound-only login-node gateway. It accepts commands
+on TTC_SOCKET but advertises no TCP endpoint, joins no Raft group, and accepts
+no container placement. TTC_ROOT must identify the cluster shared root;
+TTC_LOCAL_ROOT is not required.`,
+			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
+			"pause":        "Usage: ttc pause TARGET [TARGET...]",
+			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
+			"resume":       "Usage: ttc resume TARGET [TARGET...]",
+			"quarantine":   "Usage: ttc quarantine CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"unquarantine": "Usage: ttc unquarantine CONTAINER@BRANCH [CONTAINER@BRANCH...]",
+			"dehydrate":    "Usage: ttc dehydrate TARGET [TARGET...]",
+			"rehydrate":    "Usage: ttc rehydrate TARGET [TARGET...]",
+			"unpause":      "Usage: ttc unpause TARGET [TARGET...]",
+			"top":          "Usage: ttc top [--json] CONTAINER@BRANCH [PS OPTIONS]",
+			"stats":        "Usage: ttc stats [--json] [--no-stream] CONTAINER@BRANCH\n\nTTC stats is one-shot by default; --no-stream is accepted for Docker CLI compatibility.",
+			"tty":          "Usage: ttc tty stat|watch CONTAINER@BRANCH --session NAME [--json]",
+			"cp":           "Usage: ttc cp [-a|--archive] [-L|--follow-link] SRC_PATH DEST_PATH",
+			"checkpoint":   "Usage: ttc checkpoint [--compression none|flate-best-speed] CONTAINER@BRANCH FILE",
+			"migrate":      "Usage: ttc migrate --node NODE CONTAINER@BRANCH",
+			"node":         "Usage: ttc node ls [--json] | ttc node rm NODE | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE",
+			"restore":      "Usage: ttc restore [--node NODE] [--name NAME] FILE",
 		}
 		if text, ok := usage[args[0]]; ok {
 			fmt.Fprintln(stdout, text)
@@ -396,7 +346,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"container pause":   "Usage: ttc container pause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container unpause": "Usage: ttc container unpause CONTAINER@BRANCH [CONTAINER@BRANCH...]",
 			"container top":     "Usage: ttc container top CONTAINER@BRANCH [PS OPTIONS]",
-			"image inspect":     "Usage: ttc image inspect IMAGE [IMAGE...]",
+			"image inspect":     "Usage: ttc image inspect [--format TEMPLATE] IMAGE [IMAGE...]",
 			"image load":        "Usage: ttc image load [--input FILE] [--platform PLATFORM] [--quiet]",
 			"image save":        "Usage: ttc image save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
@@ -455,12 +405,14 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runDiff(args[1:], stdout, stderr, backend)
 	case "stats":
 		err = runStats(args[1:], stdout, stderr, backend)
+	case "_stats-local":
+		err = runStats(args[1:], stdout, stderr, backend)
 	case "inspect":
 		err = runInspect(args[1:], stdout, stderr, backend)
 	case "rm":
 		err = runRemove(args[1:], stdout, stderr, backend)
-	case "_auto-remove":
-		err = runAutoRemove(args[1:], backend)
+	case "_auto-remove-now":
+		err = runAutoRemoveNow(args[1:], backend)
 	case "_purge-runtime":
 		if len(args) != 2 {
 			err = errors.New("internal runtime purge requires one family ID")
@@ -472,6 +424,114 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 			break
 		}
 		err = purger.purgeRuntime(args[1])
+	case "_remove-family-record":
+		removeVolumes := false
+		operands := args[1:]
+		if len(operands) != 0 && operands[0] == "--volumes" {
+			removeVolumes = true
+			operands = operands[1:]
+		}
+		if len(operands) != 1 {
+			err = errors.New("internal family-record removal requires one family ID")
+			break
+		}
+		remover, ok := backend.(interface {
+			removeDistributedFamilyRecord(string, bool) error
+		})
+		if !ok {
+			err = errors.New("this backend does not support distributed family-record removal")
+			break
+		}
+		err = remover.removeDistributedFamilyRecord(operands[0], removeVolumes)
+	case "_remove-corrupted-branch":
+		if len(args) != 2 {
+			err = errors.New("internal corrupted-branch removal requires one CONTAINER@BRANCH selector")
+			break
+		}
+		target, parseErr := parseSelector(args[1])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		remover, ok := backend.(interface{ removeCorruptedBranch(selector) error })
+		if !ok {
+			err = errors.New("this backend does not support corrupted-branch removal")
+			break
+		}
+		err = remover.removeCorruptedBranch(target)
+	case "_reclaim-removed-family-local":
+		if len(args) < 3 {
+			err = errors.New("internal removed-family cleanup requires a family ID and at least one physical container ID")
+			break
+		}
+		reclaimer, ok := backend.(interface{ reclaimRemovedFamilyLocal(string, []string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-family local cleanup")
+			break
+		}
+		err = reclaimer.reclaimRemovedFamilyLocal(args[1], args[2:])
+	case "_settle-source-transactions":
+		if len(args) < 2 {
+			err = errors.New("internal source-dependency settlement requires at least one transaction ID")
+			break
+		}
+		settler, ok := backend.(interface{ settleDistributedSourceTransactions([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support distributed source-dependency settlement")
+			break
+		}
+		err = settler.settleDistributedSourceTransactions(args[1:])
+	case "_cancel-source-transactions":
+		if len(args) < 2 {
+			err = errors.New("internal source-dependency cancellation requires at least one transaction ID")
+			break
+		}
+		canceler, ok := backend.(interface{ cancelDistributedForkTargets([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support distributed source-dependency cancellation")
+			break
+		}
+		err = canceler.cancelDistributedForkTargets(args[1:])
+	case "_remove-canceled-fork-placement":
+		if len(args) != 3 {
+			err = errors.New("internal canceled-fork placement removal requires a branch selector and transaction ID")
+			break
+		}
+		target, parseErr := parseSelector(args[1])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		remover, ok := backend.(interface {
+			removeCanceledForkPlacement(selector, string) error
+		})
+		if !ok {
+			err = errors.New("this backend does not support canceled-fork placement removal")
+			break
+		}
+		err = remover.removeCanceledForkPlacement(target, args[2])
+	case "_discard-removed-migration-sources":
+		if len(args) < 2 {
+			err = errors.New("internal removed-migration cleanup requires at least one transaction ID")
+			break
+		}
+		discarder, ok := backend.(interface{ discardRemovedMigrationSources([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-migration cleanup")
+			break
+		}
+		err = discarder.discardRemovedMigrationSources(args[1:])
+	case "_prepare-removed-migration-sources":
+		if len(args) < 2 {
+			err = errors.New("internal removed-migration preparation requires at least one transaction ID")
+			break
+		}
+		preparer, ok := backend.(interface{ prepareRemovedMigrationSources([]string) error })
+		if !ok {
+			err = errors.New("this backend does not support removed-migration preparation")
+			break
+		}
+		err = preparer.prepareRemovedMigrationSources(args[1:])
 	case "ls":
 		err = runList(args[1:], stdout, stderr, backend)
 	case "ps":
@@ -496,6 +556,10 @@ func runCommand(args []string, stdout, stderr io.Writer, backend backend) int {
 		err = runPauseResume(args[1:], stdout, backend, true)
 	case "resume", "unpause":
 		err = runPauseResume(args[1:], stdout, backend, false)
+	case "quarantine":
+		err = runQuarantine(args[1:], stdout, backend, true)
+	case "unquarantine":
+		err = runQuarantine(args[1:], stdout, backend, false)
 	case "dehydrate":
 		err = runDehydrateRehydrate(args[1:], stdout, backend, true)
 	case "rehydrate":
@@ -544,14 +608,15 @@ type elasticMigrationBackend interface {
 
 type elasticNodeBackend interface {
 	clusterNodes() ([]cluster.NodeRecord, error)
-	drainNode(sourceNode, targetNode string, local bool) ([]selector, error)
+	removeNode(node string) error
+	stopNode(sourceNode, mode string, local bool) ([]selector, error)
 	rebalanceNode(sourceNode, targetNode string, local bool) (cluster.FixedTerminalPlan, error)
 	plannerSnapshot(node string, local bool) (cluster.PlannerSnapshot, error)
 }
 
 func runNode(args []string, stdout io.Writer, backend backend) error {
 	if len(args) == 0 {
-		return errors.New("usage: ttc node ls [--json] | ttc node drain|rebalance [--target NODE] NODE")
+		return errors.New("usage: ttc node ls [--json] | ttc node rm NODE | ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE | ttc node rebalance NODE")
 	}
 	nodes, ok := backend.(elasticNodeBackend)
 	if !ok {
@@ -578,30 +643,73 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 			return encoder.Encode(records)
 		}
 		writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(writer, "NODE\tSTATE\tMEMORY\tTARGET\tRESERVED\tLEASE")
+		fmt.Fprintln(writer, "NODE\tADDRESS\tSTATE\tMEMORY\tTARGET\tRESERVED\tLEASE")
 		now := time.Now()
 		for _, record := range records {
 			lease := "expired"
 			if remaining := record.LeaseExpiresAt.Sub(now); remaining > 0 {
 				lease = remaining.Round(time.Second).String()
 			}
-			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n", record.NodeID, record.State,
+			address := strings.TrimPrefix(strings.TrimPrefix(record.ControlURL, "http://"), "https://")
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", record.NodeID, address, record.State,
 				formatImageSize(int64(record.MemoryCurrentBytes)), formatImageSize(int64(record.MemoryTargetBytes)),
 				formatImageSize(int64(record.IncomingReservedBytes)), lease)
 		}
 		return writer.Flush()
-	case "drain":
-		fs := flag.NewFlagSet("node drain", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		target := fs.String("target", "", "force all branches to one destination node")
-		local := fs.Bool("_local", false, "execute only on the addressed daemon")
-		if err := fs.Parse(args[1:]); err != nil {
+	case "rm":
+		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
+			return errors.New("usage: ttc node rm NODE")
+		}
+		if err := nodes.removeNode(args[1]); err != nil {
 			return err
 		}
-		if fs.NArg() != 1 {
-			return errors.New("usage: ttc node drain [--target NODE] NODE")
+		fmt.Fprintln(stdout, args[1])
+		return nil
+	case "stop":
+		var sourceNode string
+		var stopAll, dehydrateAll, migrateAll, local bool
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--stop-all":
+				stopAll = true
+			case "--dehydrate-all":
+				dehydrateAll = true
+			case "--migrate-all":
+				migrateAll = true
+			case "--_local":
+				local = true
+			default:
+				if strings.HasPrefix(arg, "-") {
+					return fmt.Errorf("unknown node stop option %q", arg)
+				}
+				if sourceNode != "" {
+					return errors.New("usage: ttc node stop NODE [--stop-all|--dehydrate-all|--migrate-all]")
+				}
+				sourceNode = arg
+			}
 		}
-		moved, err := nodes.drainNode(fs.Arg(0), *target, *local)
+		if sourceNode == "" {
+			return errors.New("usage: ttc node stop [--stop-all|--dehydrate-all|--migrate-all] NODE")
+		}
+		selected := 0
+		for _, enabled := range []bool{stopAll, dehydrateAll, migrateAll} {
+			if enabled {
+				selected++
+			}
+		}
+		if selected > 1 {
+			return errors.New("--stop-all, --dehydrate-all, and --migrate-all are mutually exclusive")
+		}
+		mode := ""
+		switch {
+		case stopAll:
+			mode = "stop"
+		case dehydrateAll:
+			mode = "dehydrate"
+		case migrateAll:
+			mode = "migrate"
+		}
+		moved, err := nodes.stopNode(sourceNode, mode, local)
 		if err != nil {
 			return err
 		}
@@ -612,15 +720,14 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 	case "rebalance":
 		fs := flag.NewFlagSet("node rebalance", flag.ContinueOnError)
 		fs.SetOutput(io.Discard)
-		target := fs.String("target", "", "restrict the destination node")
 		local := fs.Bool("_local", false, "execute only on the addressed daemon")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if fs.NArg() != 1 {
-			return errors.New("usage: ttc node rebalance [--target NODE] NODE")
+			return errors.New("usage: ttc node rebalance NODE")
 		}
-		plan, err := nodes.rebalanceNode(fs.Arg(0), *target, *local)
+		plan, err := nodes.rebalanceNode(fs.Arg(0), "", *local)
 		if err != nil {
 			return err
 		}
@@ -650,12 +757,12 @@ func runNode(args []string, stdout io.Writer, backend backend) error {
 func runMigrate(args []string, stdout io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	targetNode := fs.String("target", "", "destination cluster node")
+	targetNode := fs.String("node", "", "destination cluster node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *targetNode == "" || fs.NArg() != 1 {
-		return errors.New("usage: ttc migrate --target NODE CONTAINER@BRANCH")
+		return errors.New("usage: ttc migrate --node NODE CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -1481,7 +1588,10 @@ func parsePublishedPorts(values []string) ([]ttcbundle.PortBinding, error) {
 			return nil, fmt.Errorf("published host endpoint %s is specified more than once", key)
 		}
 		seen[key] = true
-		bindings = append(bindings, ttcbundle.PortBinding{HostIP: address.String(), HostPort: hostPort, ContainerPort: containerPort, Protocol: protocol})
+		// Command-line publications belong to the initial branch. New-format
+		// roots reject an empty branch identity instead of interpreting it as a
+		// legacy spelling of main.
+		bindings = append(bindings, ttcbundle.PortBinding{HostIP: address.String(), HostPort: hostPort, ContainerPort: containerPort, Protocol: protocol, BranchID: "main"})
 	}
 	return bindings, nil
 }
@@ -1636,6 +1746,7 @@ type runRequest struct {
 	stopTimeout        int
 	pidsLimit          *int64
 	memoryLimit        *int64
+	memorySwap         *int64
 	nanoCPUs           *int64
 	cpuShares          *uint64
 	cpuPeriod          *uint64
@@ -1662,6 +1773,7 @@ type attachRequest struct {
 type execRequest struct {
 	detach         bool
 	execID         string
+	retain         bool
 	target         selector
 	args           []string
 	env            []string
@@ -1694,7 +1806,7 @@ func flagWasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func runContainer(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "dit", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1712,6 +1824,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	memoryValue := fs.String("memory", "0", "memory limit")
 	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	memorySwapValue := fs.String("memory-swap", "0", "memory plus swap limit; -1 is unlimited")
 	cpusValue := fs.String("cpus", "0", "number of CPUs")
 	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
 	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
@@ -1841,6 +1954,10 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if err != nil {
 		return err
 	}
+	parsedMemorySwap, err := ttcbundle.ParseMemorySwap(*memorySwapValue)
+	if err != nil {
+		return err
+	}
 	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
 	if err != nil {
 		return err
@@ -1883,6 +2000,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
 		effectiveMemoryLimit = &parsedMemoryLimit
 	}
+	memorySwap := effectiveMemorySwap(effectiveMemoryLimit, parsedMemorySwap, flagWasSet(fs, "memory-swap"), stderr)
 	if flagWasSet(fs, "cpus") {
 		effectiveNanoCPUs = &parsedNanoCPUs
 	}
@@ -1926,6 +2044,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
 		memoryLimit:        effectiveMemoryLimit,
+		memorySwap:         memorySwap,
 		nanoCPUs:           effectiveNanoCPUs,
 		cpuShares:          effectiveCPUShares,
 		cpuPeriod:          effectiveCPUPeriod,
@@ -1964,7 +2083,7 @@ func runContainer(args []string, stdout, stderr io.Writer, backend backend) erro
 }
 
 func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
-	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
+	args = expandCombinedShortBools(args, "it", "--name", "--pull", "--workdir", "-w", "--user", "-u", "--hostname", "-h", "--network", "--net", "--ip", "--mac-address", "--publish", "-p", "--add-host", "--dns", "--dns-search", "--dns-option", "--dns-opt", "--entrypoint", "--stop-signal", "--stop-timeout", "--pids-limit", "--memory", "-m", "--memory-swap", "--cpus", "--cpu-shares", "--cpu-period", "--cpu-quota", "--shm-size", "--group-add", "--cap-add", "--cap-drop", "--ulimit", "--env", "-e", "--env-file", "--label", "-l", "--label-file", "--volume", "-v", "--mount", "--tmpfs", "--log-driver", "--log-opt")
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "assign a container name")
@@ -1980,6 +2099,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	pidsLimit := fs.Int64("pids-limit", 0, "tune the container task limit; -1 or 0 means unlimited")
 	memoryValue := fs.String("memory", "0", "memory limit")
 	fs.StringVar(memoryValue, "m", "0", "memory limit")
+	memorySwapValue := fs.String("memory-swap", "0", "memory plus swap limit; -1 is unlimited")
 	cpusValue := fs.String("cpus", "0", "number of CPUs")
 	cpuShares := fs.Uint64("cpu-shares", 0, "CPU shares (relative weight)")
 	cpuPeriod := fs.Uint64("cpu-period", 0, "limit CPU CFS period")
@@ -2109,6 +2229,10 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if err != nil {
 		return err
 	}
+	parsedMemorySwap, err := ttcbundle.ParseMemorySwap(*memorySwapValue)
+	if err != nil {
+		return err
+	}
 	parsedNanoCPUs, err := parseNanoCPUs(*cpusValue)
 	if err != nil {
 		return err
@@ -2151,6 +2275,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 	if flagWasSet(fs, "memory") || flagWasSet(fs, "m") {
 		effectiveMemoryLimit = &parsedMemoryLimit
 	}
+	memorySwap := effectiveMemorySwap(effectiveMemoryLimit, parsedMemorySwap, flagWasSet(fs, "memory-swap"), stderr)
 	if flagWasSet(fs, "cpus") {
 		effectiveNanoCPUs = &parsedNanoCPUs
 	}
@@ -2194,6 +2319,7 @@ func runCreate(args []string, stdout, stderr io.Writer, backend backend) error {
 		stopTimeout:        *stopTimeout,
 		pidsLimit:          effectivePidsLimit,
 		memoryLimit:        effectiveMemoryLimit,
+		memorySwap:         memorySwap,
 		nanoCPUs:           effectiveNanoCPUs,
 		cpuShares:          effectiveCPUShares,
 		cpuPeriod:          effectiveCPUPeriod,
@@ -2396,7 +2522,7 @@ func runAttach(args []string, stderr io.Writer, backend backend) error {
 		return errors.New("--interactive and --no-stdin cannot be used together")
 	}
 	if *takeover {
-		return errors.New("--takeover requires ttcd; remove --direct")
+		return errors.New("--takeover is unavailable for this attachment")
 	}
 	request := attachRequest{
 		execID: *execID,
@@ -2586,6 +2712,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 	}
 	execID := *sessionID
+	retain := execID != "" || *detach
 	if execID == "" {
 		execID, err = newExecID()
 		if err != nil {
@@ -2597,6 +2724,7 @@ func runExec(args []string, stdout, stderr io.Writer, backend backend) error {
 	status, err := backend.exec(execRequest{
 		detach:         *detach,
 		execID:         execID,
+		retain:         retain,
 		target:         target,
 		args:           append([]string(nil), fs.Args()[1:]...),
 		env:            append([]string(nil), env...),
@@ -2792,6 +2920,7 @@ type InspectHostConfig struct {
 	StopTimeout    *int                            `json:"StopTimeout"`
 	PidsLimit      *int64                          `json:"PidsLimit"`
 	Memory         int64                           `json:"Memory"`
+	MemorySwap     int64                           `json:"MemorySwap"`
 	NanoCPUs       int64                           `json:"NanoCpus"`
 	CPUShares      uint64                          `json:"CpuShares"`
 	CPUPeriod      uint64                          `json:"CpuPeriod"`
@@ -3016,6 +3145,7 @@ func marshalInspectTemplateJSON(value any) ([]byte, error) {
 }
 
 func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "fv")
 	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	force := fs.Bool("force", false, "force removal of running branches")
@@ -3051,16 +3181,13 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-func runAutoRemove(args []string, backend backend) error {
+func runAutoRemoveNow(args []string, backend backend) error {
 	if len(args) != 1 {
-		return errors.New("internal auto-remove requires one branch selector")
+		return errors.New("internal auto-remove-now requires one branch selector")
 	}
 	target, err := parseSelector(args[0])
 	if err != nil {
 		return fmt.Errorf("internal auto-remove target: %w", err)
-	}
-	if _, err := backend.wait(target); err != nil {
-		return fmt.Errorf("waiting to auto-remove %s: %w", target, err)
 	}
 	if err := autoRemoveTarget(target, backend); err != nil {
 		return fmt.Errorf("auto-removing %s: %w", target, err)
@@ -3244,20 +3371,104 @@ func runImages(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runImageInspect(args []string, stdout io.Writer, backend backend) error {
-	if len(args) == 0 {
-		return errors.New("usage: ttc image inspect IMAGE [IMAGE...]")
+	format, identifiers, err := parseImageInspectArgs(args)
+	if err != nil {
+		return err
 	}
-	results := make([]ImageInspectInfo, 0, len(args))
-	for _, identifier := range args {
+	if len(identifiers) == 0 {
+		return errors.New("usage: ttc image inspect [--format TEMPLATE] IMAGE [IMAGE...]")
+	}
+	results := make([]ImageInspectInfo, 0, len(identifiers))
+	for _, identifier := range identifiers {
 		info, err := backend.inspectImage(identifier)
 		if err != nil {
 			return err
 		}
 		results = append(results, info)
 	}
-	encoder := json.NewEncoder(stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(results)
+	if format == "" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(results)
+	}
+	return writeImageInspectFormat(stdout, results, format)
+}
+
+func parseImageInspectArgs(args []string) (string, []string, error) {
+	format := ""
+	identifiers := make([]string, 0, len(args))
+	options := true
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if options && arg == "--" {
+			options = false
+			continue
+		}
+		if options {
+			switch {
+			case arg == "--format" || arg == "-f":
+				if i+1 >= len(args) {
+					return "", nil, fmt.Errorf("%s requires a template", arg)
+				}
+				i++
+				format = args[i]
+				continue
+			case strings.HasPrefix(arg, "--format="):
+				format = strings.TrimPrefix(arg, "--format=")
+				continue
+			case strings.HasPrefix(arg, "-f="):
+				format = strings.TrimPrefix(arg, "-f=")
+				continue
+			case strings.HasPrefix(arg, "-"):
+				return "", nil, fmt.Errorf("unknown image inspect option %q", arg)
+			}
+		}
+		identifiers = append(identifiers, arg)
+	}
+	return format, identifiers, nil
+}
+
+func writeImageInspectFormat(w io.Writer, results []ImageInspectInfo, format string) error {
+	if format == "json" {
+		encoder := json.NewEncoder(w)
+		for _, result := range results {
+			if err := encoder.Encode(result); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	tmpl, err := template.New("image-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			data, err := marshalInspectTemplateJSON(value)
+			return string(data), err
+		},
+		"join": strings.Join, "lower": strings.ToLower, "split": strings.Split, "upper": strings.ToUpper,
+	}).Parse(format)
+	if err != nil {
+		return fmt.Errorf("parsing image inspect format: %w", err)
+	}
+	for _, result := range results {
+		data, err := json.Marshal(result)
+		if err != nil {
+			return err
+		}
+		var values map[string]any
+		if err := json.Unmarshal(data, &values); err != nil {
+			return err
+		}
+		var output bytes.Buffer
+		if err := tmpl.Execute(&output, values); err != nil {
+			return fmt.Errorf("executing image inspect format: %w", err)
+		}
+		if output.Len() == 0 || output.Bytes()[output.Len()-1] != '\n' {
+			output.WriteByte('\n')
+		}
+		if _, err := io.Copy(w, &output); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runImageRemove(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -3643,6 +3854,7 @@ func runList(args []string, stdout, stderr io.Writer, backend backend) error {
 }
 
 func runPs(args []string, stdout, stderr io.Writer, backend backend) error {
+	args = expandCombinedShortBools(args, "aqls", "--filter", "-f", "--format", "--last", "-n")
 	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	all := fs.Bool("all", false, "show created and exited branches")
@@ -3835,6 +4047,9 @@ func psRows(families []Family, now time.Time, noTrunc bool) []psRow {
 				status = "Created"
 			case "exited", "stopped":
 				status = "Exited"
+				if branch.ExitStatus != nil {
+					status = fmt.Sprintf("Exited (%d)", *branch.ExitStatus)
+				}
 			}
 			createdAt := ""
 			if !created.IsZero() {
@@ -4254,12 +4469,12 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs.SetOutput(stderr)
 	paused := fs.Bool("paused", false, "leave the child branch paused")
 	quarantine := fs.Bool("quarantine", false, "cut the child off from outside the sandbox: its connections stay up and lead nowhere, and nothing outside can tell it exists")
-	targetNode := fs.String("target", "", "fork into a container on another configured ttcd node")
+	targetNode := fs.String("node", "", "fork into a container on another configured ttcd node")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: ttc fork [--paused] [--quarantine] [--target NODE] SOURCE [DEST...]")
+		return errors.New("usage: ttc fork [--paused] [--quarantine] [--node NODE] SOURCE [DEST...]")
 	}
 	source, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -4268,28 +4483,38 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 	destinationValues := fs.Args()[1:]
 	if len(destinationValues) == 0 {
 		generated := "fork-" + time.Now().UTC().Format("20060102T150405.000000000Z")
-		if *targetNode != "" {
-			destinationValues = []string{generated + "@" + defaultBranchID}
-		} else {
-			destinationValues = []string{generated}
+		destinationValues = []string{generated}
+	}
+	selectedNode := *targetNode
+	remote := selectedNode != ""
+	if placer, ok := backend.(distributedForkPlacementBackend); ok && !*quarantine {
+		selectedNode, remote, err = placer.selectForkNode(selectedNode)
+		if err != nil {
+			return fmt.Errorf("selecting a node for fork: %w", err)
 		}
 	}
-	if *targetNode != "" {
+	if selectedNode != "" && *quarantine {
+		return errors.New("a quarantined fork stays on this node: omit --node")
+	}
+	if remote {
+		if *quarantine {
+			return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
+		}
 		distributed, ok := backend.(distributedForkBackend)
 		if !ok {
 			return errors.New("this backend does not support distributed forks")
 		}
 		targetContainers := make([]string, len(destinationValues))
 		for i, value := range destinationValues {
-			target, err := parseSelector(value)
+			target, err := parseDestination(source.container, value)
 			if err != nil {
 				return fmt.Errorf("invalid destination %q: %w", value, err)
 			}
 			targetContainers[i] = target.String()
 		}
-		targets, err := distributed.forkRemoteMany(source, *targetNode, targetContainers, *paused)
+		targets, err := distributed.forkRemoteMany(source, selectedNode, targetContainers, *paused)
 		if err != nil {
-			return fmt.Errorf("forking %s to node %s as %s: %w", source, *targetNode, strings.Join(destinationValues, ", "), err)
+			return fmt.Errorf("forking %s to node %s as %s: %w", source, selectedNode, strings.Join(destinationValues, ", "), err)
 		}
 		for _, target := range targets {
 			fmt.Fprintln(stdout, target)
@@ -4305,9 +4530,6 @@ func runFork(args []string, stdout, stderr io.Writer, backend backend) error {
 		}
 		destinations[i] = destination
 		destinationBranches[i] = destination.branch
-	}
-	if *quarantine && *targetNode != "" {
-		return errors.New("a quarantined fork stays on this node: it exists to be asked something and thrown away")
 	}
 	branches, err := backend.forkMany(source, destinationBranches, *paused, *quarantine)
 	if err != nil {
@@ -4368,6 +4590,29 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 		return errors.New("usage: ttc resume TARGET [TARGET...]")
 	}
 	for _, arg := range args {
+		if !strings.Contains(arg, "@") {
+			// A family pauses its running branches and resumes its paused
+			// ones, and leaves the rest as they are.
+			targets, err := branchOperationTargets(arg, backend, true)
+			if err != nil {
+				return fmt.Errorf("invalid target %q: %w", arg, err)
+			}
+			for _, target := range targets {
+				switch {
+				case pause && target.state == "running":
+					err = backend.pause(target.selector)
+				case !pause && target.state == "paused":
+					err = backend.resume(target.selector)
+				default:
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("updating %s: %w", target.selector, err)
+				}
+			}
+			fmt.Fprintln(stdout, arg)
+			continue
+		}
 		target, err := parseSelector(arg)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", arg, err)
@@ -4379,6 +4624,31 @@ func runPauseResume(args []string, stdout io.Writer, backend backend, pause bool
 		}
 		if err != nil {
 			return fmt.Errorf("updating %s: %w", target, err)
+		}
+		fmt.Fprintln(stdout, target)
+	}
+	return nil
+}
+
+func runQuarantine(args []string, stdout io.Writer, backend backend, enabled bool) error {
+	if len(args) == 0 {
+		command := "quarantine"
+		if !enabled {
+			command = "unquarantine"
+		}
+		return fmt.Errorf("usage: ttc %s CONTAINER@BRANCH [CONTAINER@BRANCH...]", command)
+	}
+	qb, ok := backend.(quarantineBackend)
+	if !ok {
+		return errors.New("this backend does not support quarantine")
+	}
+	for _, value := range args {
+		target, err := parseSelector(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
+		}
+		if err := qb.setQuarantine(target, enabled); err != nil {
+			return fmt.Errorf("updating %s quarantine: %w", target, err)
 		}
 		fmt.Fprintln(stdout, target)
 	}
@@ -4427,7 +4697,7 @@ func runDehydrateRehydrate(args []string, stdout io.Writer, backend backend, deh
 					return fmt.Errorf("cannot dehydrate %s in state %q", target.selector, target.state)
 				}
 			} else {
-				if target.state != "dehydrated" {
+				if target.state != "dehydrated" && target.state != "dehydrating" && target.state != "materializing" {
 					return fmt.Errorf("cannot rehydrate %s in state %q", target.selector, target.state)
 				}
 				err = db.rehydrate(target.selector)
@@ -4515,7 +4785,7 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 			stopTimeout = timeout
 		}
 		for _, target := range targets {
-			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend, true); err != nil {
 				return err
 			}
 		}
@@ -4524,61 +4794,137 @@ func runStop(args []string, stdout, stderr io.Writer, backend backend) error {
 	return nil
 }
 
-func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend) error {
+func stopBranchLifecycle(target branchOperationTarget, stopSignal, timeoutSeconds int, backend backend, publish bool) error {
+	queueExit := func() error {
+		if !publish {
+			return nil
+		}
+		if publisher, ok := backend.(interface{ queueBranchPublication(selector, string) error }); ok {
+			if err := publisher.queueBranchPublication(target.selector, "stop"); err != nil {
+				return fmt.Errorf("queueing durable filesystem publication for %s: %w", target.selector, err)
+			}
+		}
+		return nil
+	}
 	switch target.state {
 	case "running", "restarting":
+		finishExplicitStop := func(bool) {}
+		if coordinator, ok := backend.(interface {
+			beginExplicitInitStop(selector) (func(bool), error)
+		}); ok {
+			var err error
+			finishExplicitStop, err = coordinator.beginExplicitInitStop(target.selector)
+			if err != nil {
+				return fmt.Errorf("coordinating explicit stop of %s: %w", target.selector, err)
+			}
+		}
+		initTerminated := false
+		defer func() { finishExplicitStop(initTerminated) }()
 		if err := backend.prepareStop(target.selector); err != nil {
 			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
 			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				initTerminated = true
 				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return nil
+					return queueExit()
 				}
 			}
 			return fmt.Errorf("preparing %s for independent stop: %w", target.selector, err)
 		}
-		if err := stopBranch(target.selector, stopSignal, timeoutSeconds, backend); err != nil {
+		// The grace period lasts as long as the stop policy allows, and
+		// other commands go on meanwhile; a kill of this branch too.
+		if err := withoutLifecycleLock(backend, target.selector, longOperation{branch: target.selector.branch, state: "stopping"}, func() error {
+			return stopBranch(target.selector, stopSignal, timeoutSeconds, backend)
+		}); err != nil {
 			// The final physical branch on an elastic node tears down its control
 			// socket as the init exits. If reconciliation confirms the requested
 			// terminal state, treat the lost wait reply as a committed stop.
 			refreshed, refreshErr := branchOperationTargets(target.selector.String(), backend, false)
 			if refreshErr == nil && len(refreshed) == 1 && refreshed[0].state == "exited" {
+				initTerminated = true
 				if discardErr := backend.discard(target.selector); discardErr == nil {
-					return nil
+					return queueExit()
 				}
 			}
 			return err
 		}
+		initTerminated = true
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing stopped execution state for %s: %w", target.selector, err)
 		}
-	case "paused", "dehydrated":
+		return queueExit()
+	case "paused":
+		if err := backend.preparePausedStop(target.selector); err != nil {
+			return fmt.Errorf("persisting paused filesystem state for %s: %w", target.selector, err)
+		}
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
 		}
+		return queueExit()
+	case "dehydrating":
+		// The in-flight dehydration publication owns the newest sealed filesystem
+		// generation. Canceling it would remove that hidden branch and make stop
+		// publish an older working generation. Let the immutable capture reach its
+		// durability boundary first, then discard only its memory roots through the
+		// ordinary dehydrated-stop path.
+		result := waitForDurableBranch(target.selector, backend)
+		if result.err != nil {
+			return fmt.Errorf("waiting for dehydration of %s: %w", target.selector, result.err)
+		}
+		target.state = "dehydrated"
+		return stopBranchLifecycle(target, stopSignal, timeoutSeconds, backend, publish)
+	case "dehydrated":
+		if err := backend.discard(target.selector); err != nil {
+			return fmt.Errorf("discarding execution state for %s: %w", target.selector, err)
+		}
+		if authority, ok := backend.(coldStopAuthorityBackend); ok {
+			handled, err := authority.finalizeColdStopAuthority(target.selector, target.state)
+			if err != nil {
+				return err
+			}
+			if handled {
+				return nil
+			}
+		}
+		return queueExit()
 	case "exited":
 		if err := backend.discard(target.selector); err != nil {
 			return fmt.Errorf("releasing exited execution state for %s: %w", target.selector, err)
 		}
-	case "created", "failed", "dead":
+		if authority, ok := backend.(coldStopAuthorityBackend); ok {
+			handled, err := authority.finalizeColdStopAuthority(target.selector, target.state)
+			if err != nil {
+				return err
+			}
+			if handled {
+				return nil
+			}
+		}
+		return queueExit()
+	case "created":
+		// A prepared branch has no runtime to terminate, but its writable
+		// repository is still authoritative on this node. Publishing it makes a
+		// later start independent of this node and lets graceful retirement
+		// discard node-local scratch safely.
+		return queueExit()
+	case "failed", "dead":
 		return nil
 	default:
 		return fmt.Errorf("cannot stop %s in state %q", target.selector, target.state)
 	}
-	return nil
 }
 
 func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	condition := fs.String("condition", "not-running", "wait condition (not-running only)")
+	condition := fs.String("condition", "not-running", "wait condition (not-running or durable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc wait [--condition not-running] TARGET [TARGET...]")
+		return errors.New("usage: ttc wait [--condition not-running|durable] TARGET [TARGET...]")
 	}
-	if *condition != "not-running" {
-		return fmt.Errorf("wait condition %q is not implemented; use 'not-running'", *condition)
+	if *condition != "not-running" && *condition != "durable" {
+		return fmt.Errorf("wait condition %q is not implemented; use 'not-running' or 'durable'", *condition)
 	}
 	targets := make([]selector, 0, fs.NArg())
 	for _, arg := range fs.Args() {
@@ -4593,6 +4939,10 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 		waited := make(chan waitResult, 1)
 		waiters[i] = waited
 		go func(target selector, waited chan<- waitResult) {
+			if *condition == "durable" {
+				waited <- waitForDurableBranch(target, backend)
+				return
+			}
 			status, err := backend.wait(target)
 			waited <- waitResult{status: status, err: err}
 		}(target, waited)
@@ -4602,9 +4952,100 @@ func runWait(args []string, stdout, stderr io.Writer, backend backend) error {
 		if result.err != nil {
 			return fmt.Errorf("waiting for %s: %w", targets[i], result.err)
 		}
-		fmt.Fprintln(stdout, waitStatusExitCode(result.status))
+		if *condition == "durable" {
+			fmt.Fprintln(stdout, targets[i])
+		} else {
+			fmt.Fprintln(stdout, waitStatusExitCode(result.status))
+		}
 	}
 	return nil
+}
+
+type residentDehydrationBackend interface {
+	persistResidentDehydration(selector) error
+}
+
+func waitForDurableBranch(target selector, backend backend) waitResult {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		// runtimeBackend implements both interfaces in every mode. Select Raft
+		// authority only for clustered storage; in standalone mode TTC_ROOT is
+		// the authoritative store and a local capture is already durable. Merely
+		// testing the authority interface here made standalone waits poll a
+		// deliberately inapplicable method forever.
+		localAuthoritative := false
+		if durability, ok := backend.(localDurabilityBackend); ok {
+			localAuthoritative = durability.localStorageIsDurable()
+		}
+		if authority, ok := backend.(authoritativeDurabilityBackend); ok && !localAuthoritative {
+			durable, err := authority.authoritativeBranchDurable(target)
+			if err != nil {
+				return waitResult{err: err}
+			}
+			if durable {
+				return waitResult{}
+			}
+			// A clustered backend's Raft catalog is the complete lifecycle and
+			// publication authority. Its persistent family view may deliberately
+			// omit a transaction-scoped physical branch while publication is in
+			// progress, so consulting inspect here can turn a normal pending state
+			// into a spurious "branch does not exist" failure.
+			<-ticker.C
+			continue
+		}
+		family, err := backend.inspect(target.container)
+		if err != nil {
+			return waitResult{err: err}
+		}
+		found := false
+		for _, inspected := range family.TTC.Branches {
+			branch := inspected.Metadata
+			if branch.ID != target.branch {
+				continue
+			}
+			found = true
+			// A live branch has no captured state for durability to describe,
+			// so waiting for it would wait for ever.
+			switch state := normalizeLifecycleState(branch.State); state {
+			case "running", "paused":
+				return waitResult{err: fmt.Errorf("%s is %s: only a stopped or dehydrated branch has durable state to wait for", target, state)}
+			}
+			switch branch.StorageState {
+			case ttcbundle.StorageResident:
+				// Nothing makes a resident capture durable until its family's
+				// last live branch goes, so asking for durability does.
+				if persister, ok := backend.(residentDehydrationBackend); ok {
+					if err := persister.persistResidentDehydration(target); err != nil {
+						return waitResult{err: err}
+					}
+				}
+			case "shared":
+				return waitResult{}
+			case "local":
+				// Standalone TTC has no cache tier: TTC_ROOT is authoritative,
+				// so a local stopped/dehydrated capture is already durable.
+				// Clustered local state remains node-authoritative and must wait
+				// for publication to the shared root.
+				if localAuthoritative {
+					return waitResult{}
+				}
+			case "materializing":
+				if branch.StorageManifest != "" {
+					return waitResult{}
+				}
+			case "error":
+				if branch.StorageRetryAt.IsZero() {
+					return waitResult{err: fmt.Errorf("storage publication failed: %s", branch.StorageError)}
+				}
+			}
+			break
+		}
+		if !found {
+			return waitResult{err: fmt.Errorf("branch %s does not exist", target)}
+		}
+		<-ticker.C
+	}
 }
 
 func runRestart(args []string, stdout, stderr io.Writer, backend backend) error {
@@ -4651,10 +5092,17 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		}
 		switch target.state {
 		case "running", "restarting", "paused", "dehydrated":
-			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend); err != nil {
+			// Restart consumes the stopped state immediately on the same node.
+			// Publishing that transient state introduces an unnecessary race in
+			// which the asynchronous publication can unplace the branch between
+			// stop and the fresh start.
+			if err := stopBranchLifecycle(target, stopSignal, stopTimeout, backend, false); err != nil {
 				return err
 			}
-		case "created", "exited", "failed", "dead":
+		case "created", "exited", "failed", "dead", "materializing":
+			// Cluster admission claims an unplaced dehydrated branch as
+			// materializing after converting it to an exited filesystem-only
+			// snapshot. The node-local record is ready for the fresh start below.
 		default:
 			return fmt.Errorf("cannot restart %s in state %q", target.selector, target.state)
 		}
@@ -4878,6 +5326,20 @@ type selector struct {
 	branch    string
 }
 
+// remoteBranchOwnershipError is the expected result of observing a stale
+// local physical runtime after clustered placement has moved elsewhere. User
+// commands still receive the ordinary diagnostic text, while asynchronous
+// console-exit reconciliation can distinguish this benign cutover from a real
+// finalization failure without parsing strings.
+type remoteBranchOwnershipError struct {
+	target selector
+	owner  string
+}
+
+func (e *remoteBranchOwnershipError) Error() string {
+	return fmt.Sprintf("branch %s belongs to cluster node %q", e.target, e.owner)
+}
+
 func parseSelector(value string) (selector, error) {
 	if value == "" {
 		return selector{}, errors.New("selector must not be empty")
@@ -4945,7 +5407,7 @@ func parseDestination(containerID, value string) (selector, error) {
 		return selector{}, errors.New("branch name must not be empty")
 	}
 	if strings.Contains(value, "@") {
-		return selector{}, errors.New("local fork destination must be a branch name, not CONTAINER@BRANCH")
+		return selector{}, errors.New("fork destination must be a branch name, not CONTAINER@BRANCH")
 	}
 	return selector{container: containerID, branch: value}, nil
 }
@@ -4956,17 +5418,40 @@ func (s selector) String() string {
 
 // Branch is stable branch metadata returned by ttc ls --json.
 type Branch struct {
-	ID               string    `json:"id"`
-	NodeID           string    `json:"node_id,omitempty"`
-	ParentID         string    `json:"parent,omitempty"`
-	State            string    `json:"state"`
-	ForkTotalNS      int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS     int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	InitPID          int32     `json:"init_pid,omitempty"`
-	InitState        string    `json:"init_state,omitempty"`
-	MemorySharing    string    `json:"memory_sharing,omitempty"`
+	ID                        string    `json:"id"`
+	Quarantined               bool      `json:"quarantined,omitempty"`
+	NodeID                    string    `json:"node_id,omitempty"`
+	ParentID                  string    `json:"parent,omitempty"`
+	State                     string    `json:"state"`
+	ExitStatus                *int      `json:"exit_status,omitempty"`
+	StorageState              string    `json:"storage_state"`
+	PublicationID             string    `json:"publication_id,omitempty"`
+	StorageError              string    `json:"storage_error,omitempty"`
+	StorageManifest           string    `json:"storage_manifest,omitempty"`
+	StorageRetryAt            time.Time `json:"storage_retry_at,omitempty"`
+	SnapshotID                uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots               []string  `json:"memory_roots,omitempty"`
+	MemoryRootObjects         []string  `json:"memory_root_objects,omitempty"`
+	ControlRoot               string    `json:"control_root,omitempty"`
+	ControlRootObject         string    `json:"control_root_object,omitempty"`
+	SourceNode                string    `json:"source_node,omitempty"`
+	DependentMemoryBytes      uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes  uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
+	InitPID                   int32     `json:"init_pid,omitempty"`
+	InitState                 string    `json:"init_state,omitempty"`
+	MemorySharing             string    `json:"memory_sharing,omitempty"`
 }
 
 // Family is stable family metadata returned by ttc ls --json.
@@ -5008,10 +5493,21 @@ type ImageInfo struct {
 	Size         int64             `json:"size"`
 	Platform     string            `json:"platform"`
 	Materialized bool              `json:"materialized"`
+	LocalCache   *ImageCacheInfo   `json:"local_cache,omitempty"`
 	Containers   []string          `json:"containers,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
+}
+
+// ImageCacheInfo describes a clustered node's disposable, whole-file image
+// cache. Total is the logical fully-populated size; Complete is immediately
+// readable without another shared-pack range fetch.
+type ImageCacheInfo struct {
+	CompleteFiles uint64 `json:"complete_files"`
+	TotalFiles    uint64 `json:"total_files"`
+	CompleteBytes uint64 `json:"complete_bytes"`
+	TotalBytes    uint64 `json:"total_bytes"`
 }
 
 // ImageInspectInfo follows Docker's top-level image inspection naming while
@@ -5027,6 +5523,7 @@ type ImageInspectInfo struct {
 	Variant      string             `json:"Variant,omitempty"`
 	MediaType    string             `json:"MediaType"`
 	Materialized bool               `json:"Materialized"`
+	LocalCache   *ImageCacheInfo    `json:"LocalCache,omitempty"`
 	Containers   []string           `json:"Containers,omitempty"`
 	Config       ImageInspectConfig `json:"Config"`
 }
@@ -5100,21 +5597,56 @@ type ResourceBytes struct {
 
 // BranchResourceStats is one branch's resource-accounting snapshot.
 type BranchResourceStats struct {
-	Target           string        `json:"target"`
-	State            string        `json:"state"`
-	ResidentMemory   ResourceBytes `json:"resident_memory"`
-	MemoryBacking    ResourceBytes `json:"memory_backing"`
-	Filesystem       ResourceBytes `json:"filesystem"`
-	FilesystemInodes uint64        `json:"filesystem_inodes"`
+	Target                   string        `json:"target"`
+	State                    string        `json:"state"`
+	NodeID                   string        `json:"node_id,omitempty"`
+	Quarantined              bool          `json:"quarantined,omitempty"`
+	StorageState             string        `json:"storage_state"`
+	PublicationID            string        `json:"publication_id,omitempty"`
+	StorageError             string        `json:"storage_error,omitempty"`
+	StorageRetryAt           time.Time     `json:"storage_retry_at,omitempty"`
+	SnapshotID               uint64        `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string      `json:"memory_roots,omitempty"`
+	MemoryRootObjects        []string      `json:"memory_root_objects,omitempty"`
+	ControlRoot              string        `json:"control_root,omitempty"`
+	ControlRootObject        string        `json:"control_root_object,omitempty"`
+	FilesystemRoot           string        `json:"filesystem_root,omitempty"`
+	SourceNode               string        `json:"source_node,omitempty"`
+	DependentMemoryBytes     uint64        `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes uint64        `json:"dependent_filesystem_bytes,omitempty"`
+	ResidentMemory           ResourceBytes `json:"resident_memory"`
+	MemoryBacking            ResourceBytes `json:"memory_backing"`
+	Filesystem               ResourceBytes `json:"filesystem"`
+	FilesystemInodes         uint64        `json:"filesystem_inodes"`
+}
+
+// SnapshotGraphResourceStats is a physical-path-free node-local diagnostic.
+// FamilyReachableObjects and PendingReferenceOperations are scoped to the
+// reported family; the remaining counts describe the serving node's graph.
+type SnapshotGraphResourceStats struct {
+	Sequence                   uint64 `json:"sequence"`
+	Snapshots                  int    `json:"snapshots"`
+	Objects                    int    `json:"objects"`
+	Roots                      int    `json:"roots"`
+	Pins                       int    `json:"pins"`
+	Reclaiming                 int    `json:"reclaiming"`
+	JournalBytes               int64  `json:"journal_bytes"`
+	FamilyReachableObjects     int    `json:"family_reachable_objects"`
+	PendingReferenceOperations int    `json:"pending_reference_operations"`
 }
 
 // FamilyResourceStats includes branch attribution and non-double-counted totals.
 type FamilyResourceStats struct {
-	Container                 string                `json:"container"`
-	Branches                  []BranchResourceStats `json:"branches"`
-	ResidentMemoryUniqueBytes uint64                `json:"resident_memory_unique_bytes"`
-	MemoryBackingUniqueBytes  uint64                `json:"memory_backing_unique_bytes"`
-	FilesystemUniqueBytes     uint64                `json:"filesystem_unique_bytes"`
+	Container                 string                      `json:"container"`
+	Branches                  []BranchResourceStats       `json:"branches"`
+	ResidentMemoryUniqueBytes uint64                      `json:"resident_memory_unique_bytes"`
+	MemoryBackingUniqueBytes  uint64                      `json:"memory_backing_unique_bytes"`
+	FilesystemUniqueBytes     uint64                      `json:"filesystem_unique_bytes"`
+	DependentMemoryBytes      uint64                      `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes  uint64                      `json:"dependent_filesystem_bytes,omitempty"`
+	ImageCacheBytes           uint64                      `json:"image_cache_bytes,omitempty"`
+	ImageCacheTotalBytes      uint64                      `json:"image_cache_total_bytes,omitempty"`
+	SnapshotGraph             *SnapshotGraphResourceStats `json:"snapshot_graph,omitempty"`
 }
 
 type resourceStatsBackend interface {
@@ -5125,11 +5657,12 @@ func runStats(args []string, stdout, stderr io.Writer, b backend) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	jsonOutput := fs.Bool("json", false, "emit stable machine-readable JSON")
+	fs.Bool("no-stream", false, "one-shot output (accepted for Docker CLI compatibility; this is the default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ttc stats [--json] CONTAINER@BRANCH")
+		return errors.New("usage: ttc stats [--json] [--no-stream] CONTAINER@BRANCH")
 	}
 	target, err := parseSelector(fs.Arg(0))
 	if err != nil {
@@ -5144,16 +5677,28 @@ func runStats(args []string, stdout, stderr io.Writer, b backend) error {
 		return fmt.Errorf("accounting %s: %w", target, err)
 	}
 	if *jsonOutput {
+		return writeResourceStats(stdout, stats, true)
+	}
+	return writeResourceStats(stdout, stats, false)
+}
+
+func writeResourceStats(stdout io.Writer, stats FamilyResourceStats, jsonOutput bool) error {
+	if jsonOutput {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
 		return encoder.Encode(stats)
 	}
-	table := tabwriter.NewWriter(stdout, 0, 4, 2, 24, 0)
-	fmt.Fprintln(table, "TARGET\tSTATE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED")
+	table := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(table, "TARGET\tSTATE\tSTORAGE\tMEM PRIVATE\tMEM SHARED\tMEM BACKING\tDISK PRIVATE\tDISK SHARED\tREMOTE DEPENDENT\tIMAGE CACHE")
 	for _, branch := range stats.Branches {
-		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", branch.Target, branch.State,
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\n", branch.Target, branch.State, branch.StorageState,
 			formatImageSize(int64(branch.ResidentMemory.PrivateBytes)), formatImageSize(int64(branch.ResidentMemory.SharedBytes)),
-			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)))
+			formatImageSize(int64(branch.MemoryBacking.TotalBytes)), formatImageSize(int64(branch.Filesystem.PrivateBytes)), formatImageSize(int64(branch.Filesystem.SharedBytes)),
+			formatImageSize(int64(branch.DependentMemoryBytes+branch.DependentFilesystemBytes)))
+	}
+	if stats.ImageCacheTotalBytes != 0 {
+		fmt.Fprintf(table, "image cache\t-\t-\t-\t-\t-\t-\t-\t-\t%s / %s\n",
+			formatImageSize(int64(stats.ImageCacheBytes)), formatImageSize(int64(stats.ImageCacheTotalBytes)))
 	}
 	return table.Flush()
 }
@@ -5195,6 +5740,28 @@ type volumeCommandBackend interface {
 	volumeDriver() (string, error)
 }
 
+// volumeInspectTTC is TTC's own part of a volume's inspect output. A cluster
+// node names itself: its volume is not another node's of the same name.
+func volumeInspectTTC(info ttcvolume.VolumeInfo, b volumeCommandBackend) map[string]any {
+	result := map[string]any{"ID": info.ID, "NextInode": info.NextInode}
+	if runtime, ok := b.(*runtimeBackend); ok && runtime.nodeID != "" {
+		result["Node"] = runtime.nodeID
+	}
+	return result
+}
+
+// clusterVolumeBackend lists the named volumes of every node of a cluster.
+type clusterVolumeBackend interface {
+	clusterVolumes() ([]clusterVolume, bool, error)
+}
+
+// clusterVolume is a named volume and the node whose local root holds it.
+type clusterVolume struct {
+	Name   string `json:"name"`
+	Driver string `json:"driver"`
+	Node   string `json:"node,omitempty"`
+}
+
 func runVolume(args []string, stdout io.Writer, b backend) error {
 	volumes, ok := b.(volumeCommandBackend)
 	if !ok {
@@ -5215,8 +5782,28 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 		fmt.Fprintln(stdout, info.Name)
 		return nil
 	case "ls", "list":
-		if len(args) != 1 {
+		local := len(args) == 2 && args[1] == "--_local"
+		if len(args) != 1 && !local {
 			return errors.New("usage: ttc volume ls")
+		}
+		if !local {
+			if clustered, ok := volumes.(clusterVolumeBackend); ok {
+				list, inCluster, err := clustered.clusterVolumes()
+				if err != nil {
+					return err
+				}
+				if inCluster {
+					sort.Slice(list, func(i, j int) bool {
+						return list[i].Name < list[j].Name || list[i].Name == list[j].Name && list[i].Node < list[j].Node
+					})
+					tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+					fmt.Fprintln(tw, "DRIVER\tVOLUME NAME\tNODE")
+					for _, volume := range list {
+						fmt.Fprintf(tw, "%s\t%s\t%s\n", volume.Driver, volume.Name, volume.Node)
+					}
+					return tw.Flush()
+				}
+			}
 		}
 		list, err := volumes.listVolumes()
 		if err != nil {
@@ -5227,6 +5814,13 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 			return err
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		if local {
+			listing := make([]clusterVolume, 0, len(list))
+			for _, info := range list {
+				listing = append(listing, clusterVolume{Name: info.Name, Driver: driver})
+			}
+			return json.NewEncoder(stdout).Encode(listing)
+		}
 		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "DRIVER\tVOLUME NAME")
 		for _, info := range list {
@@ -5260,7 +5854,7 @@ func runVolume(args []string, stdout io.Writer, b backend) error {
 				"Name": info.Name, "Driver": driver,
 				"CreatedAt": info.CreatedAt, "Scope": "local",
 				"Labels": map[string]string{}, "Options": map[string]string{},
-				"TTC": map[string]any{"ID": info.ID, "NextInode": info.NextInode},
+				"TTC": volumeInspectTTC(info, volumes),
 			})
 		}
 		encoder := json.NewEncoder(stdout)
@@ -5323,6 +5917,7 @@ type backend interface {
 	resume(target selector) error
 	renameBranch(target selector, name string) error
 	prepareStop(target selector) error
+	preparePausedStop(target selector) error
 	discard(target selector) error
 	destroy(target selector, force bool) error
 	signal(target selector, signal int, all bool) error
@@ -5334,16 +5929,207 @@ type dehydrationBackend interface {
 	rehydrate(target selector) error
 }
 
+type quarantineBackend interface {
+	setQuarantine(target selector, enabled bool) error
+}
+
+type localDurabilityBackend interface {
+	localStorageIsDurable() bool
+}
+
+type authoritativeDurabilityBackend interface {
+	authoritativeBranchDurable(selector) (bool, error)
+}
+
+type coldStopAuthorityBackend interface {
+	finalizeColdStopAuthority(selector, string) (bool, error)
+}
+
+func (b *runtimeBackend) localStorageIsDurable() bool {
+	return b != nil && b.distributedSource == nil
+}
+
+// finalizeColdStopAuthority avoids recapturing an already durable, unplaced
+// branch. In particular, stopping a dehydrated branch only drops its memory
+// root; its immutable filesystem root is already authoritative in shared
+// storage and needs no physical placement or second publication.
+func (b *runtimeBackend) finalizeColdStopAuthority(target selector, previousState string) (bool, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false, nil
+	}
+	// Resolve through Raft as well as the shared store. A publication may be
+	// authoritative before NFS directory and negative-entry caches on this
+	// control node expose the family by name.
+	info, err := b.resolveContainer(target.container)
+	if err != nil {
+		return false, err
+	}
+	family := logicalFamilyID(info)
+	branch, err := b.distributedSource.authority.Branch(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	placement, err := b.distributedSource.authority.LookupPlacement(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	if previousState == "dehydrated" {
+		if placement.State != cluster.PlacementUnplaced {
+			return false, errors.New("dehydrated branch is no longer unplaced")
+		}
+		if _, err := b.distributedSource.authority.DiscardDehydratedMemory(family, target.branch); err != nil {
+			return false, fmt.Errorf("discarding durable memory authority for %s: %w", target, err)
+		}
+		return true, nil
+	}
+	if previousState == "exited" && placement.State == cluster.PlacementUnplaced && branch.Lifecycle == "exited" && branch.Roots.FilesystemRoot != "" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (b *runtimeBackend) authoritativeBranchDurable(target selector) (bool, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return false, nil
+	}
+	// Resolve through Raft as well as the shared store. A publication may be
+	// authoritative before NFS directory and negative-entry caches on this
+	// control node expose the family by name.
+	info, err := b.resolveContainer(target.container)
+	if err != nil {
+		return false, err
+	}
+	family := logicalFamilyID(info)
+	branch, err := b.distributedSource.authority.Branch(family, target.branch)
+	if err != nil {
+		return false, err
+	}
+	if branch.Corrupted {
+		return false, fmt.Errorf("branch %s is corrupted: %s", target, branch.CorruptionReason)
+	}
+	if branch.Lifecycle == "running" || branch.Lifecycle == "paused" {
+		return false, fmt.Errorf("%s is %s: only a stopped or dehydrated branch has durable state to wait for", target, branch.Lifecycle)
+	}
+	if branch.Lifecycle != "exited" && branch.Lifecycle != "dehydrated" {
+		return false, nil
+	}
+	if branch.PublicationID == "" {
+		// A stopped dehydrated branch deliberately drops its memory root and
+		// terminal publication history in one Raft transition. Its filesystem
+		// root remains authoritative, and an unplaced generation proves that no
+		// mutable runtime can still supersede it. Do not require dead transaction
+		// metadata merely to report this stable state as durable.
+		placement, placementErr := b.distributedSource.authority.LookupPlacement(family, target.branch)
+		if placementErr != nil {
+			return false, placementErr
+		}
+		return branch.Lifecycle == "exited" && branch.Roots.FilesystemRoot != "" &&
+			branch.Roots.MemoryRoot == "" && branch.Roots.MemorySnapshot == 0 && placement.State == cluster.PlacementUnplaced, nil
+	}
+	publication, ok, err := b.distributedSource.authority.Publication(family, target.branch, branch.PublicationID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	switch publication.State {
+	case cluster.PublicationCommitted:
+		// CommitPublication is the cluster durability boundary, but the
+		// provider still has a short local completion tail: it changes local
+		// snapshot origins to shared authority, removes their handoff freeze,
+		// and finally publishes the matching container metadata. A command that
+		// immediately forks the cold branch may execute on that same provider;
+		// returning before the tail completes would expose the internal frozen
+		// ledger as a dynamic fork failure. CompleteBranchPublication is ordered
+		// after all local handoffs, so require the exact derived identity too.
+		physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, branch.PublicationID)
+		if errors.Is(resolveErr, os.ErrNotExist) {
+			return false, nil
+		}
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		persistent, persistentErr := persistentBranchInfo(physical, physicalBranch)
+		if persistentErr != nil {
+			return false, persistentErr
+		}
+		return persistent.PublicationID == branch.PublicationID &&
+			persistent.StorageState == "shared" && persistent.StorageManifest != "", nil
+	case cluster.PublicationFailed:
+		return false, fmt.Errorf("storage publication failed: %s", publication.Failure)
+	default:
+		return false, nil
+	}
+}
+
 type consoleSidecarOwner interface {
-	OwnConsoleSidecar(key string, command *exec.Cmd) error
+	FollowFamilyConsole(dir string, start func() error, follow ttcconsole.Follow, lock *os.File, target selector, observeInitExit bool) error
+	ObserveFamilyConsole(dir, key string, target selector, observeInitExit bool) bool
+	StopFamilyConsole(dir, key string) (bool, error)
+	OwnConsoleSidecar(key string, command *exec.Cmd, target selector, observeInitExit bool) error
+	ObserveInheritedConsoleSidecar(key string, target selector, observeInitExit bool)
+	SuppressConsoleExitOnce(key string) func(bool)
 	StopConsoleSidecar(key string) (bool, error)
 	OwnPortSidecar(key string, command *exec.Cmd) error
 	StopPortSidecar(key string) (bool, error)
+	RegisterConsoleClient(target selector, cancel func()) (func(), error)
+	QuiesceConsoleClients(target selector) (func(), error)
+}
+
+// beginExplicitInitStop transfers exit-finalization ownership from the console
+// follower to stopBranchLifecycle. The returned function must be called with
+// true once the old init is known to have terminated, or false when the stop
+// was abandoned while it could still exit naturally later.
+func (b *runtimeBackend) beginExplicitInitStop(target selector) (func(bool), error) {
+	if b.explicitInitStop {
+		return nil, errors.New("explicit init stop is already active")
+	}
+	if b.consoleSidecars == nil {
+		b.explicitInitStop = true
+		return func(bool) { b.explicitInitStop = false }, nil
+	}
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, resolved.branch)
+	if err != nil {
+		return nil, err
+	}
+	finishConsole := b.consoleSidecars.SuppressConsoleExitOnce(paths.Lock)
+	b.explicitInitStop = true
+	return func(commit bool) {
+		b.explicitInitStop = false
+		finishConsole(commit)
+	}, nil
 }
 
 func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	if paths.Lock == "" {
 		return nil
+	}
+	// A console no one follows any more keeps its wait status: its process
+	// has ended.
+	if active, err := consoleDrainActive(paths.Lock); err != nil {
+		return err
+	} else if active && paths.FamilyDir != "" {
+		var err error
+		if b.consoleSidecars != nil {
+			_, err = b.consoleSidecars.StopFamilyConsole(paths.FamilyDir, paths.Lock)
+		} else {
+			err = stopFamilyConsoleOnce(paths.FamilyDir, paths.Lock)
+		}
+		if err != nil {
+			return err
+		}
+		// Unless a follower of its own that an older ttcd started follows
+		// it, it is stopped.
+		if active, err := consoleDrainActive(paths.Lock); err == nil && !active {
+			_ = os.Remove(paths.PID)
+			_ = os.Remove(paths.WaitStatus)
+			return nil
+		}
 	}
 	if b.consoleSidecars != nil {
 		stopped, err := b.consoleSidecars.StopConsoleSidecar(paths.Lock)
@@ -5392,9 +6178,31 @@ func (b *runtimeBackend) stopConsoleDrain(paths ttcbundle.ConsolePaths) error {
 	return nil
 }
 
-func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
-	consoleDir := filepath.Join(b.dataRoot, "containers", containerID, "console")
+// clearConsoleIncarnationStatus removes only the terminal markers owned by a
+// previous init incarnation. Logs and retention metadata intentionally remain:
+// Docker-style restart appends to the same branch log, but a stale wait status
+// must never be mistaken for the freshly imported init's exit.
+func clearConsoleIncarnationStatus(paths ttcbundle.ConsolePaths) error {
 	var result error
+	for _, path := range []string{paths.PID, paths.WaitStatus} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+func (b *runtimeBackend) stopContainerConsoleDrains(containerID string) error {
+	consoleDir := filepath.Join(b.activeDataRoot(), "containers", containerID, "console")
+	var result error
+	if b.consoleSidecars != nil {
+		_, result = b.consoleSidecars.StopFamilyConsole(consoleDir, "")
+	} else {
+		result = stopFamilyConsoleOnce(consoleDir, "")
+	}
 	err := filepath.WalkDir(consoleDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -5422,12 +6230,13 @@ type runtimeBackend struct {
 	root                  string
 	runsc                 string
 	dataRoot              string
+	localRoot             string
+	daemonSocket          string
 	runtimePlatform       string
+	cpuFeatures           string
 	unsafeNoHostIsolation bool
 	disableHostGSO        bool
-	allowSlowVolumeCopy   bool
 	volumeCopyMode        ttcvolume.CopyMode
-	clientExecutable      string
 	clientTERM            string
 	progressTerminal      bool
 	progressWidth         int
@@ -5436,7 +6245,108 @@ type runtimeBackend struct {
 	stderr                io.Writer
 	consoleSidecars       consoleSidecarOwner
 	distributedSource     *distributedSourceRuntime
+	portIngress           *portIngressManager
 	nodeID                string
+	cancelClient          func()
+	clientCanceled        <-chan struct{}
+	// clientGone is closed once the client's connection breaks.
+	clientGone <-chan struct{}
+	// lockLifecycle serializes background lifecycle completion with foreground
+	// commands and periodic repository maintenance. Long-running transfer and
+	// peer polling stay outside this lock; only the terminal mutation that
+	// releases runtimes, graph roots, and private repositories enters it.
+	lockLifecycle func() func()
+	// lifecycleLockHeld is true for the synchronous portion of a daemon
+	// request that already owns lockLifecycle. Helpers shared with background
+	// completion paths use it to avoid recursively acquiring the non-reentrant
+	// family lifecycle lock.
+	lifecycleLockHeld bool
+	// explicitInitStop distinguishes the internal wait performed by stop and
+	// restart from a user-facing `ttc wait`. The foreground lifecycle operation
+	// owns discard/publication ordering and must not recursively invoke the
+	// spontaneous-exit finalizer from its wait path.
+	explicitInitStop bool
+	// lifecycleReady releases the daemon lifecycle lock after an attached
+	// run/start has finished creating its runtime but before it waits for the
+	// guest. Detached commands release the lock when the command returns.
+	lifecycleReady func()
+	// inventoryReadOnly is set for a listing that runs without the lifecycle
+	// lock. It lists what it finds and repairs nothing: a runtime missing now
+	// may be one that a mutation holding the lock is rebuilding.
+	inventoryReadOnly bool
+	// inventoryRepairWanted is set by such a listing when it passes over a
+	// family whose runtime is gone, which a listing holding the lock would
+	// record.
+	inventoryRepairWanted bool
+	// mutating is set for a daemon request that changes lifecycle state; it
+	// waits for a long operation of another request on its family to finish.
+	// commandName is the request's command.
+	mutating    bool
+	commandName string
+	// operations records the long operations in progress, and
+	// suspendLifecycle lets this request's long operation give up the
+	// lifecycle lock; see withoutLifecycleLock.
+	operations       *familyOperations
+	suspendLifecycle func(*familyOperation) (func(), error)
+	// lifecycleHold is the request's hold on the lifecycle lock, which it
+	// gives up while it waits for another request's long operation.
+	lifecycleHold *lifecycleHold
+	// heldFamilies are the IDs of the families whose locks the request
+	// holds. On a standalone daemon, lockFamily takes a family's lock, and
+	// lockSharedLifecycle the lifecycle lock shared, for background work on
+	// one family; see family_locks.go.
+	heldFamilies        []string
+	lockFamily          func(id string) func()
+	lockSharedLifecycle func() func()
+	publicationQueue    *ttcstorage.Queue
+	snapshotGraph       *ttcsnapshot.Store
+	snapshotData        *ttcsnapshot.LocalDataStore
+	snapshotResolver    *ttcsnapshot.Resolver
+	snapshotShared      *ttcsnapshot.SharedPackStore
+	sharedReferences    *sharedReferenceService
+	// daemonStopRequested is set only after a node-stop policy has completed.
+	// The daemon sends the command result before closing its listener.
+	daemonStopRequested bool
+}
+
+func (b *runtimeBackend) lockBackgroundLifecycle() func() {
+	if b == nil || b.lockLifecycle == nil {
+		return func() {}
+	}
+	return b.lockLifecycle()
+}
+
+func (b *runtimeBackend) signalLifecycleReady() {
+	if b.lifecycleReady != nil {
+		b.lifecycleReady()
+		b.lifecycleReady = nil
+	}
+}
+
+func (b *runtimeBackend) registerConsoleClient(target selector) (func(), error) {
+	if b.consoleSidecars == nil || b.cancelClient == nil {
+		return func() {}, nil
+	}
+	return b.consoleSidecars.RegisterConsoleClient(target, b.cancelClient)
+}
+
+func (b *runtimeBackend) quiesceConsoleClients(target selector) (func(), error) {
+	if b.consoleSidecars == nil {
+		return func() {}, nil
+	}
+	return b.consoleSidecars.QuiesceConsoleClients(target)
+}
+
+func (b *runtimeBackend) consoleClientCanceled() bool {
+	if b.clientCanceled == nil {
+		return false
+	}
+	select {
+	case <-b.clientCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 func terminalType(value string) string {
@@ -5457,11 +6367,211 @@ func environmentHasKey(env []string, key string) bool {
 }
 
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot(), CPUFeatures: b.cpuFeatures}
 	if b.root != "" {
 		store.TransientRoot = filepath.Join(b.root, "ttc-transient-bundles")
 	}
 	return store
+}
+
+func (b *runtimeBackend) activeDataRoot() string {
+	if b.localRoot != "" {
+		return b.localRoot
+	}
+	return b.dataRoot
+}
+
+func (b *runtimeBackend) queueBranchPublication(target selector, kind string) error {
+	if b.publicationQueue == nil {
+		if kind == "dehydrate" && b.dataRoot != "" {
+			return b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated")
+		}
+		return nil
+	}
+	store := b.containerStore()
+	// Publication intents are durable and may outlive the user-facing name or
+	// the daemon process that created them. Key them by the immutable container
+	// ID so publish completion, branch removal fencing, and restart recovery all
+	// address the same immutable publication even when the lifecycle command used a name
+	// or ID prefix.
+	resolved, container, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	previous, err := persistentBranchInfo(container, target.branch)
+	if err != nil {
+		return err
+	}
+	authorityContainer, authorityBranch := logicalFamilyID(container), target.branch
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		state, err := b.distributedSource.authority.AuthorityState()
+		if err != nil {
+			return fmt.Errorf("resolving publication authority: %w", err)
+		}
+		var found bool
+		authorityContainer, authorityBranch, found = logicalPlacementForPhysicalRuntime(state, container.ID, target.branch)
+		if !found {
+			return fmt.Errorf("physical branch %s has no unique logical Raft placement", target)
+		}
+	}
+	publicationID, err := store.NewBranchPublicationID()
+	if err != nil {
+		return err
+	}
+	captureBranch := "ttc-publish-" + strings.TrimPrefix(publicationID, "publication-")
+	intent := ttcstorage.Intent{
+		Container: target.container, Branch: target.branch, PublicationID: publicationID, Kind: kind,
+		AuthorityContainer: authorityContainer, AuthorityBranch: authorityBranch, FilesystemBranch: captureBranch,
+		SupersedesPublicationID: previous.PublicationID,
+	}
+	if err := b.publicationQueue.Enqueue(intent); err != nil {
+		return err
+	}
+	captureComplete := false
+	publicationInstalled := false
+	originsCommitted := false
+	finishFilesystemOrigins := func(bool) error { return nil }
+	var forks []*ttcvolume.ForkTransaction
+	var repositories []*ttcvolume.Repository
+	defer func() {
+		for _, repository := range repositories {
+			_ = repository.Close()
+		}
+	}()
+	rollback := func(cause error) error {
+		if !captureComplete {
+			for i := len(forks) - 1; i >= 0; i-- {
+				cause = errors.Join(cause, forks[i].Abort())
+			}
+		}
+		if !originsCommitted {
+			cause = errors.Join(cause, finishFilesystemOrigins(false))
+		}
+		if !publicationInstalled {
+			cause = errors.Join(cause, b.publicationQueue.Cancel(target.container, target.branch, publicationID))
+		}
+		return cause
+	}
+	info, err := store.LoadContainer(target.container)
+	if err != nil {
+		return rollback(err)
+	}
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return rollback(err)
+	}
+	filesystemBranch := branch.FilesystemBranch
+	if filesystemBranch == "" {
+		filesystemBranch = offlineCopyBranch(info, branch.ID)
+	}
+	spec, err := store.LoadSpec(info.ID)
+	if err != nil {
+		return rollback(err)
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return rollback(err)
+	}
+	assignments, finishOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
+	finishFilesystemOrigins = finishOrigins
+	if err != nil {
+		return rollback(err)
+	}
+	originsByRepository := make(map[string][]uint64, len(assignments))
+	for _, assignment := range assignments {
+		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
+	}
+	seen := make(map[string]struct{})
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return rollback(err)
+		}
+		repositories = append(repositories, repository)
+		var fork *ttcvolume.ForkTransaction
+		if origins := originsByRepository[repository.Info().ID]; len(origins) != 0 {
+			fork, err = repository.BeginForkWithOrigins(repositoryPhysicalBranch(config, filesystemBranch), captureBranch,
+				ttcsnapshot.SnapshotID(origins[0]), ttcsnapshot.SnapshotID(origins[1]))
+		} else {
+			fork, err = repository.BeginFork(repositoryPhysicalBranch(config, filesystemBranch), captureBranch)
+		}
+		if err != nil {
+			return rollback(fmt.Errorf("sealing repository %q: %w", config.Source, err))
+		}
+		forks = append(forks, fork)
+	}
+	if kind == "dehydrate" {
+		if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+			return rollback(errors.New("new-format dehydrated branch has no graph memory roots"))
+		}
+		if err := validateGraphControlRoot(branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject); err != nil {
+			return rollback(fmt.Errorf("new-format dehydrated branch has no graph control root: %w", err))
+		}
+		record, ok := b.snapshotGraph.Snapshot(ttcsnapshot.SnapshotID(branch.SnapshotID))
+		if !ok || (record.State != ttcsnapshot.SnapshotSealedLocal && record.State != ttcsnapshot.SnapshotSealedVolatile) {
+			return rollback(fmt.Errorf("graph memory snapshot %d is not sealed", branch.SnapshotID))
+		}
+	}
+	committedForks := 0
+	for _, fork := range forks {
+		if err := fork.Commit(); err != nil {
+			if committedForks != 0 {
+				originsCommitted = true
+				_ = finishFilesystemOrigins(true)
+			}
+			return rollback(err)
+		}
+		committedForks++
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return rollback(err)
+	}
+	originsCommitted = true
+	captureComplete = true
+	if _, err := store.BeginBranchPublicationIf(target.container, target.branch, previous.PublicationID, publicationID); err != nil {
+		return rollback(fmt.Errorf("installing captured publication: %w", err))
+	}
+	publicationInstalled = true
+	// The replacement is visible only after its complete hidden capture exists.
+	// Promptly cancel a same-node predecessor; a predecessor owned by another
+	// node observes the identity fence and terminates through the ordinary queue
+	// supersession path. CaptureAvailable also fences its Raft authority before
+	// authorizing this publication.
+	if previous.PublicationID != "" {
+		_ = b.publicationQueue.CancelPending(target.container, target.branch, previous.PublicationID)
+	}
+	if err := b.publicationQueue.Activate(target.container, target.branch, publicationID); err != nil {
+		// The committed hidden roots are immutable and safe for retry. Keep the
+		// pending intent so daemon restart can validate and activate it.
+		_ = store.UpdateBranchStorage(target.container, target.branch, publicationID, "error", err.Error(), time.Time{})
+		return err
+	}
+	return nil
+}
+
+func persistentBranchInfoFromStore(store ttcbundle.Store, target selector) (ttcbundle.BranchInfo, error) {
+	info, err := store.LoadContainer(target.container)
+	if err != nil {
+		return ttcbundle.BranchInfo{}, err
+	}
+	return persistentBranchInfo(info, target.branch)
+}
+
+// logicalFamilyID returns the cluster identity used by Raft. A branch that
+// has migrated may be materialized in a node-local container whose physical
+// ID differs from the family ID; physical IDs must never escape into the
+// control-plane state machine.
+func logicalFamilyID(info ttcbundle.ContainerInfo) string {
+	if info.DistributedFamilyID != "" {
+		return info.DistributedFamilyID
+	}
+	return info.ID
 }
 
 func (b *runtimeBackend) imageProgress() ttcimages.ProgressFunc {
@@ -5472,11 +6582,105 @@ func (b *runtimeBackend) resolveContainer(identifier string) (ttcbundle.Containe
 	if b.dataRoot == "" {
 		return ttcbundle.ContainerInfo{ID: identifier, Name: identifier}, nil
 	}
-	info, err := b.containerStore().LoadContainer(identifier)
+	store := b.containerStore()
+	info, err := store.LoadContainer(identifier)
 	if err != nil {
+		if placements, placementErr := b.placementCatalog(); placementErr == nil {
+			// Branch-scoped operations need the Raft family identity before they
+			// resolve the exact physical runtime below; they do not need the
+			// canonical shared catalog record. A multi-node family removal may
+			// legitimately delete that record with its final canonical physical
+			// branch while transaction-scoped siblings are still being removed.
+			// Keep those siblings operable from placement authority instead of
+			// waiting for metadata that is intentionally gone.
+			return loadDistributedFamilyIdentity(store, placements, identifier)
+		}
 		return ttcbundle.ContainerInfo{}, err
 	}
 	return info, nil
+}
+
+// resolveDistributedPersistentBranch maps one logical family branch to the
+// shared catalog record that contains its durable node-local/cold metadata.
+//
+// A distributed fork may place a branch in a physical container whose ID is
+// deliberately hidden from the user. While the branch is live, Raft placement
+// names that physical container. Durable publication makes the branch
+// unplaced and clears execution identity, but commands such as cp, rehydrate,
+// and fork-from-dehydrated must still find its immutable publication record.
+// The physical records are in TTC_ROOT, so every node can resolve them without
+// assigning execution ownership first.
+func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.ContainerInfo, branchID, publicationID string) (ttcbundle.ContainerInfo, string, error) {
+	// The caller may have obtained logical through Store.LoadContainer(name),
+	// whose user-facing family view merges branches from hidden physical
+	// runtimes. Such a synthesized branch is useful for ls/inspect, but its
+	// containing bundle and repository paths still belong to the logical
+	// family's original runtime. Reload the exact immutable family ID so only a
+	// branch genuinely stored in that bundle can satisfy the fast path.
+	logicalID := logicalFamilyID(logical)
+	if exact, err := b.containerStore().LoadRuntimeContainer(logicalID); err == nil {
+		logical = exact
+	}
+	if branch, err := persistentBranchInfo(logical, branchID); err == nil {
+		if publicationID == "" || (branch.PublicationID == publicationID && (branch.StorageManifest != "" ||
+			(branch.NodeID == b.nodeID && (branch.StorageState == "local" || branch.StorageState == "publishing")))) {
+			return logical, branchID, nil
+		}
+	}
+	// Once Raft commits publication, its filesystem root is the canonical
+	// ancestry-independent locator. Following the manifest avoids an NFS
+	// directory scan and disambiguates stale physical incarnations left by
+	// repeated migrations. It also closes the cutover race where placement is
+	// already unplaced but the derived container record is still being updated.
+	if publicationID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
+		if authority, err := b.distributedSource.authority.Branch(logicalID, branchID); err == nil &&
+			authority.PublicationID == publicationID && authority.Roots.FilesystemRoot != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			physical, physicalBranch, waitErr := waitForCommittedColdBranchMetadata(ctx, b.containerStore(), logicalID, branchID, *authority)
+			cancel()
+			if waitErr != nil {
+				return ttcbundle.ContainerInfo{}, "", waitErr
+			}
+			return physical, physicalBranch.ID, nil
+		}
+	}
+	containers, err := b.containerStore().ListContainersForPlacement()
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, "", err
+	}
+	type candidate struct {
+		info   ttcbundle.ContainerInfo
+		branch string
+	}
+	var candidates []candidate
+	for _, container := range containers {
+		if logicalFamilyID(container) != logicalID {
+			continue
+		}
+		for _, branch := range container.Branches {
+			// A migrated runtime's physical branch is a transaction ID. Once
+			// publication commits, Raft deliberately clears physical placement,
+			// so the immutable publication ID is the only ancestry-independent
+			// locator for its cold record. Match the logical name only when no
+			// authoritative publication identity is available.
+			if publicationID != "" {
+				if branch.PublicationID != publicationID || branch.StorageManifest == "" {
+					continue
+				}
+			} else if branch.ID != branchID {
+				continue
+			}
+			candidates = append(candidates, candidate{info: container, branch: branch.ID})
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q does not exist in distributed family %q: %w", branchID, logical.Name, os.ErrNotExist)
+	case 1:
+		return candidates[0].info, candidates[0].branch, nil
+	default:
+		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q has %d durable physical records in distributed family %q", branchID, len(candidates), logical.Name)
+	}
 }
 
 func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.ContainerInfo, error) {
@@ -5484,10 +6688,111 @@ func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.C
 	if err != nil {
 		return selector{}, ttcbundle.ContainerInfo{}, err
 	}
+	if waited, err := b.waitBusy(info.ID); err != nil {
+		return selector{}, ttcbundle.ContainerInfo{}, err
+	} else if waited {
+		if info, err = b.resolveContainer(target.container); err != nil {
+			return selector{}, ttcbundle.ContainerInfo{}, err
+		}
+	}
 	if b.nodeID != "" {
+		var publicationID string
+		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			if authority, authorityErr := b.distributedSource.authority.Branch(info.ID, target.branch); authorityErr == nil && authority.Corrupted {
+				// Corruption clears physical placement because no node may execute
+				// the branch, but its last materialization may still contain graph,
+				// filesystem, and console objects that rm must reclaim. Resolve that
+				// durable record without treating it as execution authority.
+				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")
+					if resolveErr == nil {
+						target.container = physical.ID
+						target.branch = physicalBranch
+						return target, physical, nil
+					}
+					if !errors.Is(resolveErr, os.ErrNotExist) {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving corrupted branch storage for %s: %w", target, resolveErr)
+					}
+				}
+				target.container = info.ID
+				return target, info, nil
+			} else if authorityErr == nil {
+				publicationID = authority.PublicationID
+			} else if !errors.Is(authorityErr, os.ErrNotExist) {
+				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving authority for %s: %w", target, authorityErr)
+			}
+		}
+		if placements, placementErr := b.placementCatalog(); placementErr == nil {
+			logicalFamily := info.ID
+			if info.DistributedFamilyID != "" {
+				logicalFamily = info.DistributedFamilyID
+			}
+			if placement, lookupErr := placements.Lookup(logicalFamily, target.branch); lookupErr == nil {
+				if placement.OwnerNode != "" && placement.OwnerNode != b.nodeID {
+					return selector{}, ttcbundle.ContainerInfo{}, &remoteBranchOwnershipError{target: target, owner: placement.OwnerNode}
+				}
+				physicalContainer := placement.PhysicalContainer
+				if physicalContainer == "" {
+					physicalContainer = info.ID
+				}
+				physicalBranch := placement.PhysicalBranch
+				if physicalBranch == "" {
+					physicalBranch = target.branch
+				}
+				// Migration keeps the stable logical selector in Raft, but the
+				// target Sentry uses the transaction ID as its physical branch.
+				// This distinction also exists when the target Sentry already hosts
+				// another branch of the family, so comparing only container IDs
+				// incorrectly routed commands to the nonexistent logical name.
+				if physicalContainer != info.ID || physicalBranch != target.branch {
+					physical := info
+					if physicalContainer != info.ID {
+						var loadErr error
+						physical, loadErr = b.containerStore().LoadRuntimeContainer(physicalContainer)
+						if loadErr != nil {
+							return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime for %s: %w", target, loadErr)
+						}
+					}
+					if _, branchErr := persistentBranchInfo(physical, physicalBranch); branchErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading physical runtime branch for %s: %w", target, branchErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				// Publication commit deliberately removes physical placement from
+				// Raft: a cold branch has no execution owner. Its immutable
+				// publication identity is then the only authoritative way to select
+				// among the physical records retained by repeated migrations. Never
+				// let an older family record win merely because it also contains a
+				// stale branch with the same user-visible name.
+				if placement.State == cluster.PlacementUnplaced && publicationID != "" {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, publicationID)
+					if resolveErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				if _, branchErr := persistentBranchInfo(info, target.branch); branchErr != nil && placement.State == cluster.PlacementUnplaced {
+					physical, physicalBranch, resolveErr := b.resolveDistributedPersistentBranch(info, target.branch, "")
+					if resolveErr != nil {
+						return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("loading durable physical branch for %s: %w", target, resolveErr)
+					}
+					target.container = physical.ID
+					target.branch = physicalBranch
+					return target, physical, nil
+				}
+				target.container = info.ID
+				return target, info, nil
+			} else if !errors.Is(lookupErr, os.ErrNotExist) {
+				return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("resolving placement for %s: %w", target, lookupErr)
+			}
+		}
 		owner := info.BranchNodeID(target.branch)
 		if owner != "" && owner != b.nodeID {
-			return selector{}, ttcbundle.ContainerInfo{}, fmt.Errorf("branch %s belongs to cluster node %q", target, owner)
+			return selector{}, ttcbundle.ContainerInfo{}, &remoteBranchOwnershipError{target: target, owner: owner}
 		}
 	}
 	target.container = info.ID
@@ -5505,7 +6810,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	containers, err := store.ListContainers()
 	if err != nil {
 		return nil, err
@@ -5520,6 +6825,15 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 		if err != nil {
 			return nil, err
 		}
+		var cache *ImageCacheInfo
+		if usage, present, err := store.ImageCacheUsage(record.Digest, record.Platform); err != nil {
+			return nil, err
+		} else if present {
+			cache = &ImageCacheInfo{
+				CompleteFiles: usage.CompleteFiles, TotalFiles: usage.TotalFiles,
+				CompleteBytes: usage.CompleteBytes, TotalBytes: usage.TotalBytes,
+			}
+		}
 		containerNames := append([]string(nil), users[record.Digest]...)
 		sort.Strings(containerNames)
 		infos = append(infos, ImageInfo{
@@ -5529,6 +6843,7 @@ func (b *runtimeBackend) listImages() ([]ImageInfo, error) {
 			Size:         record.Size,
 			Platform:     record.Platform,
 			Materialized: materialized,
+			LocalCache:   cache,
 			Containers:   containerNames,
 			Labels:       cloneStringMap(record.Labels),
 			CreatedAt:    record.CreatedAt,
@@ -5611,7 +6926,34 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			return ttcimages.Info{}, err
 		}
 		temporaryBranch = "commit-" + hex.EncodeToString(random[:])
-		if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
+		state := normalizeLifecycleState(branch.State)
+		if state == "running" || state == "paused" {
+			// The Sentry may still have a bounded metadata batch for this
+			// repository. Snapshot through the mounted filesystem so the guest is
+			// paused across metadata flush, mmap invalidation, and graph-root
+			// publication. Forking from this manager-side Repository directly can
+			// otherwise capture only the last durable batch and silently omit the
+			// most recent creates and writes.
+			cont, loadErr := container.Load(b.root, container.FullID{
+				SandboxID:   resolved.container,
+				ContainerID: resolved.container,
+			}, container.LoadOpts{Exact: true, SkipCheck: true})
+			if loadErr != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, fmt.Errorf("loading live branch for commit: %w", loadErr)
+			}
+			resource := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repository.Info().ID}
+			if snapshotErr := cont.Sandbox.SnapshotFilesystemBranch(&boot.FilesystemBranchSnapshotArgs{
+				BranchID: resolved.branch, ResourceID: resource, Child: temporaryBranch,
+			}); snapshotErr != nil {
+				repository.Close()
+				reader.Close()
+				writer.Close()
+				return ttcimages.Info{}, fmt.Errorf("snapshotting live rootfs upper: %w", snapshotErr)
+			}
+		} else if err := repository.Fork(filesystemBranch, temporaryBranch); err != nil {
 			repository.Close()
 			reader.Close()
 			writer.Close()
@@ -5633,12 +6975,22 @@ func (b *runtimeBackend) commit(target selector, reference string, options image
 			exportDone <- err
 		}()
 	}
-	result, commitErr := ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
-		Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader,
-		Author: options.Author, Message: options.Message, Changes: options.Changes,
-	})
-	_ = reader.Close()
-	exportErr := <-exportDone
+	var commitErr, exportErr error
+	// Writing the layer takes time in proportion to the files; other
+	// commands go on meanwhile, and the image store has its own lock.
+	if err := b.withoutLifecycleLock(info, longOperation{branch: resolved.branch, state: "committing"}, func() error {
+		result, commitErr = ttcimages.Commit(context.Background(), ttcimages.CommitOptions{
+			Root: b.dataRoot, BaseDigest: info.Digest, Reference: reference, Layer: reader,
+			Author: options.Author, Message: options.Message, Changes: options.Changes,
+		})
+		_ = reader.Close()
+		exportErr = <-exportDone
+		return nil
+	}); err != nil {
+		_ = reader.Close()
+		<-exportDone
+		return ttcimages.Info{}, err
+	}
 	if commitErr != nil || exportErr != nil {
 		return ttcimages.Info{}, errors.Join(commitErr, exportErr)
 	}
@@ -5663,6 +7015,7 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 	seenRepoDigest := make(map[string]bool)
 	seenContainer := make(map[string]bool)
 	materialized := false
+	var localCache *ImageCacheInfo
 	for i := range infos {
 		info := &infos[i]
 		if info.Digest != digest {
@@ -5687,6 +7040,10 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 			}
 		}
 		materialized = materialized || info.Materialized
+		if info.LocalCache != nil && (localCache == nil || info.LocalCache.CompleteBytes > localCache.CompleteBytes) {
+			copy := *info.LocalCache
+			localCache = &copy
+		}
 		for _, container := range info.Containers {
 			if !seenContainer[container] {
 				containers = append(containers, container)
@@ -5722,6 +7079,7 @@ func inspectImageFromInventory(infos []ImageInfo, identifier string) (ImageInspe
 		Variant:      variant,
 		MediaType:    selected.MediaType,
 		Materialized: materialized,
+		LocalCache:   localCache,
 		Containers:   containers,
 		Config:       ImageInspectConfig{Labels: cloneStringMap(selected.Labels)},
 	}, nil
@@ -5737,7 +7095,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 		return ImageRemoveResult{}, err
 	}
 	digest := matches[0].Digest
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	containers, err := store.ListContainers()
 	if err != nil {
 		return ImageRemoveResult{}, err
@@ -5774,7 +7132,17 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 	}
 	result.Deleted = digest
 	if len(users) == 0 {
-		if _, err := store.RemoveImageRoots(digest); err != nil {
+		// Removing the image's roots and packs takes time in proportion to
+		// its files; the image roots have a lock of their own.
+		if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "removing"}, func() error {
+			if _, err := store.RemoveImageRoots(digest); err != nil {
+				return err
+			}
+			if _, _, err := store.PruneSharedImagePacks(context.Background()); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: pruning shared image packs: %v\n", err)
+			}
+			return nil
+		}); err != nil {
 			return result, err
 		}
 	}
@@ -5782,7 +7150,7 @@ func (b *runtimeBackend) removeImage(identifier string, force bool) (ImageRemove
 }
 
 func (b *runtimeBackend) volumeManager() (*ttcvolume.Manager, error) {
-	manager, err := ttcvolume.OpenManager(b.dataRoot, b.allowSlowVolumeCopy)
+	manager, err := ttcvolume.OpenManager(b.activeDataRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -5797,7 +7165,24 @@ func (b *runtimeBackend) createVolume(name string) (ttcvolume.VolumeInfo, error)
 	if err != nil {
 		return ttcvolume.VolumeInfo{}, err
 	}
-	repository, err := manager.Create(name)
+	allocate, finish := b.newFilesystemOriginScope()
+	var repository *ttcvolume.Repository
+	if allocate == nil {
+		repository, err = manager.Create(name)
+	} else {
+		origins, allocateErr := allocate(1)
+		if allocateErr != nil {
+			return ttcvolume.VolumeInfo{}, errors.Join(allocateErr, finish(false))
+		}
+		repository, err = manager.CreateWithOrigin(name, origins[0])
+		if err != nil {
+			return ttcvolume.VolumeInfo{}, errors.Join(err, finish(false))
+		}
+		if err := finish(true); err != nil {
+			repository.Close()
+			return ttcvolume.VolumeInfo{}, err
+		}
+	}
 	if err != nil {
 		return ttcvolume.VolumeInfo{}, err
 	}
@@ -5811,6 +7196,85 @@ func (b *runtimeBackend) listVolumes() ([]ttcvolume.VolumeInfo, error) {
 		return nil, err
 	}
 	return manager.List()
+}
+
+// clusterVolumes lists the named volumes of every node of the cluster this
+// daemon belongs to, with the node each is on, and reports false for a
+// standalone daemon. As a Docker Swarm node's local volumes do, a volume
+// belongs to one node: its branches there use it, and the same name on
+// another node is another volume. A node that does not answer is passed over
+// with a warning.
+func (b *runtimeBackend) clusterVolumes() ([]clusterVolume, bool, error) {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.directory == nil {
+		return nil, false, nil
+	}
+	nodes, err := b.clusterNodes()
+	if err != nil {
+		return nil, true, err
+	}
+	var result []clusterVolume
+	now := time.Now()
+	for _, node := range nodes {
+		if !node.LeaseActive(now) {
+			continue
+		}
+		var listing []clusterVolume
+		if node.NodeID == b.nodeID {
+			listing, err = b.localVolumes()
+		} else {
+			listing, err = b.remoteVolumes(node.NodeID)
+		}
+		if err != nil {
+			if b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: listing the volumes of node %s: %v\n", node.NodeID, err)
+			}
+			continue
+		}
+		for _, volume := range listing {
+			volume.Node = node.NodeID
+			result = append(result, volume)
+		}
+	}
+	return result, true, nil
+}
+
+func (b *runtimeBackend) localVolumes() ([]clusterVolume, error) {
+	list, err := b.listVolumes()
+	if err != nil {
+		return nil, err
+	}
+	driver, err := b.volumeDriver()
+	if err != nil {
+		return nil, err
+	}
+	listing := make([]clusterVolume, 0, len(list))
+	for _, info := range list {
+		listing = append(listing, clusterVolume{Name: info.Name, Driver: driver})
+	}
+	return listing, nil
+}
+
+func (b *runtimeBackend) remoteVolumes(node string) ([]clusterVolume, error) {
+	peer, err := b.distributedSource.peer(node, false)
+	if err != nil {
+		return nil, err
+	}
+	requestID, err := newDaemonRequestID()
+	if err != nil {
+		return nil, err
+	}
+	status, output, diagnostic, err := executeRemoteDaemonCommand(context.Background(), peer, requestID, []string{"volume", "ls", "--_local"})
+	if err != nil {
+		return nil, err
+	}
+	if status != 0 {
+		return nil, errors.New(strings.TrimSpace(diagnostic))
+	}
+	var listing []clusterVolume
+	if err := json.Unmarshal([]byte(output), &listing); err != nil {
+		return nil, fmt.Errorf("decoding its volumes: %w", err)
+	}
+	return listing, nil
 }
 
 func (b *runtimeBackend) volumeDriver() (string, error) {
@@ -5874,12 +7338,51 @@ func (b *runtimeBackend) initialConsoleSize(enabled bool) (*specs.Box, error) {
 	return &specs.Box{Height: uint(rows), Width: uint(cols)}, nil
 }
 
+func (b *runtimeBackend) snapshotManagedVolume(ownerContainer, ownerBranch, volumeID, childBranch string, sourceWorking, childWorking ttcsnapshot.SnapshotID) error {
+	args := []string{"timetravel", ownerContainer, "filesystem-snapshot", ownerBranch, volumeID, childBranch}
+	if sourceWorking != 0 || childWorking != 0 {
+		args = append(args, strconv.FormatUint(uint64(sourceWorking), 10), strconv.FormatUint(uint64(childWorking), 10))
+	}
+	_, err := b.command(args...)
+	return err
+}
+
+// prepareImageForFamily pulls the image a new family is created from, if its
+// pull policy asks for that, and unpacks its root on this node, without the
+// lifecycle lock: both take time in proportion to the image, and other
+// commands go on meanwhile. It returns the pull policy that preparing the
+// family should then apply.
+func (b *runtimeBackend) prepareImageForFamily(reference, pullPolicy string) (string, error) {
+	store := b.containerStore()
+	if ready, err := store.ImageReady(context.Background(), reference, "", pullPolicy); err != nil || ready {
+		return pullPolicy, err
+	}
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "pulling"}, func() error {
+		return store.PrepareImage(context.Background(), reference, "", pullPolicy, b.imageProgress())
+	}); err != nil {
+		return "", err
+	}
+	// The image is here now, and preparing the family must not pull it again.
+	return "missing", nil
+}
+
 func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 	consoleSize, err := b.initialConsoleSize(request.terminal)
 	if err != nil {
 		return containerRunResult{}, err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
+	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	if err != nil {
+		return containerRunResult{}, err
+	}
+	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
+	persistedPorts := request.publishedPorts
+	if b.portIngress.Clustered() {
+		// Cluster ingress is deliberately local to the daemon that receives the
+		// run request and does not survive its restart.
+		persistedPorts = nil
+	}
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -5901,6 +7404,7 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			MemoryLimit:      request.memoryLimit,
+			MemorySwap:       request.memorySwap,
 			NanoCPUs:         request.nanoCPUs,
 			CPUShares:        request.cpuShares,
 			CPUPeriod:        request.cpuPeriod,
@@ -5915,36 +7419,93 @@ func (b *runtimeBackend) run(request runRequest) (containerRunResult, error) {
 			FilesystemMounts: request.filesystemMounts,
 			ManagedVolumes:   request.managedVolumes,
 		},
-		Reference:          request.reference,
-		PullPolicy:         request.pullPolicy,
-		LogDriver:          request.logDriver,
-		LogOptions:         request.logOptions,
-		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
-		ConsoleLogMaxFiles: request.consoleLogMaxFiles,
-		OpenStdin:          request.interactive,
-		AutoRemove:         request.autoRemove,
-		StopTimeout:        &request.stopTimeout,
-		NetworkNAT:         request.networkNAT,
-		NetworkIP:          request.networkIP,
-		NetworkMAC:         request.networkMAC,
-		PublishedPorts:     request.publishedPorts,
-		WaiveLiveFork:      !request.liveForkEligible,
-		LiveForkWaiver:     request.liveForkWaiver,
-		Progress:           b.imageProgress(),
-		VolumeCopyMode:     b.volumeCopyMode,
-		NodeID:             b.nodeID,
+		Reference:               request.reference,
+		PullPolicy:              pullPolicy,
+		LogDriver:               request.logDriver,
+		LogOptions:              request.logOptions,
+		ConsoleLogMaxBytes:      request.consoleLogMaxBytes,
+		ConsoleLogMaxFiles:      request.consoleLogMaxFiles,
+		OpenStdin:               request.interactive,
+		AutoRemove:              request.autoRemove,
+		StopTimeout:             &request.stopTimeout,
+		NetworkNAT:              request.networkNAT,
+		NetworkIP:               request.networkIP,
+		NetworkMAC:              request.networkMAC,
+		PublishedPorts:          persistedPorts,
+		WaiveLiveFork:           !request.liveForkEligible,
+		LiveForkWaiver:          request.liveForkWaiver,
+		Progress:                b.imageProgress(),
+		VolumeCopyMode:          b.volumeCopyMode,
+		NodeID:                  b.nodeID,
+		AllocateSnapshotOrigins: filesystemOrigins,
+		SnapshotManagedVolume:   b.snapshotManagedVolume,
 	})
 	if err != nil {
-		return containerRunResult{}, err
+		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false))
 	}
 	id := prepared.Container.ID
 	target := selector{container: id, branch: defaultBranchID}
-	status, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
-	if err == nil {
-		b.recordLaunchState(target, request.detach, status)
+	reservation, err := b.reserveNewContainerPlacement(prepared.Container)
+	if err != nil {
+		return containerRunResult{}, errors.Join(err, finishFilesystemOrigins(false), store.RemoveContainer(id))
+	}
+	placementActive := false
+	cleanupPrepared := func(cause error) error {
+		if placementActive {
+			return cause
+		}
+		return errors.Join(cause, b.cancelNewContainerPlacement(reservation), store.RemoveContainer(id))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return containerRunResult{}, cleanupPrepared(err)
+	}
+	var ingressBindings []ttcbundle.PortBinding
+	if b.portIngress.Clustered() {
+		for _, binding := range request.publishedPorts {
+			if err := b.portIngress.PublishPrepared(prepared.Container, defaultBranchID, binding); err != nil {
+				for _, installed := range ingressBindings {
+					_ = b.portIngress.Unpublish(target, installed)
+				}
+				return containerRunResult{}, cleanupPrepared(fmt.Errorf("publishing ingress port: %w", err))
+			}
+			ingressBindings = append(ingressBindings, binding)
+		}
+	}
+	status, running, err := b.launch(prepared.Container, target, prepared.Container.BundleDir, request.detach, request.interactive)
+	if err != nil {
+		for _, binding := range ingressBindings {
+			_ = b.portIngress.Unpublish(target, binding)
+		}
+		return containerRunResult{ID: id, Status: status}, cleanupPrepared(err)
+	}
+	// Guest execution has started, so the materializing placement is now an
+	// authoritative recovery record. From this point onward cleanup must use the
+	// normal branch lifecycle; deleting the reservation on a later bookkeeping
+	// failure would strand an existing runtime outside the cluster catalog.
+	placementActive = true
+	b.recordLaunchState(target, running, status)
+	if running {
+		if err := b.activateNewContainerPlacement(reservation); err != nil {
+			// A materializing record is authoritative and recovery can still find
+			// this runtime, but the initiating command must not report success
+			// until the branch is normally routable.
+			return containerRunResult{ID: id, Status: 1}, err
+		}
+	} else if !request.autoRemove {
+		// A foreground exit has the same durable-storage obligations as `ttc
+		// stop`: release its process state, seal the filesystem, and let
+		// publication atomically replace the materializing placement with an
+		// unplaced durable branch. This remains correct if publication finishes
+		// after the client disconnects or the daemon restarts.
+		if err := b.discard(target); err != nil {
+			return containerRunResult{ID: id, Status: status}, fmt.Errorf("releasing foreground execution state for %s: %w", target, err)
+		}
+		if err := b.queueBranchPublication(target, "stop"); err != nil {
+			return containerRunResult{ID: id, Status: status}, fmt.Errorf("queueing foreground filesystem publication for %s: %w", target, err)
+		}
 	}
 	if request.autoRemove {
-		status, err = b.applyAutoRemove(target, request.detach, status, err)
+		status, err = b.applyAutoRemove(target, running, status, err)
 	}
 	return containerRunResult{ID: id, Status: status}, err
 }
@@ -5954,7 +7515,13 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
+	pullPolicy, err := b.prepareImageForFamily(request.reference, request.pullPolicy)
+	if err != nil {
+		return "", err
+	}
+	filesystemOrigins, finishFilesystemOrigins := b.newFilesystemOriginScope()
+	createdNodeID := b.nodeID
 	prepared, err := store.Prepare(context.Background(), ttcbundle.PrepareOptions{
 		SpecOptions: ttcbundle.SpecOptions{
 			Name:             request.name,
@@ -5976,6 +7543,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			StopSignal:       request.stopSignal,
 			PidsLimit:        request.pidsLimit,
 			MemoryLimit:      request.memoryLimit,
+			MemorySwap:       request.memorySwap,
 			NanoCPUs:         request.nanoCPUs,
 			CPUShares:        request.cpuShares,
 			CPUPeriod:        request.cpuPeriod,
@@ -5991,7 +7559,7 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 			ManagedVolumes:   request.managedVolumes,
 		},
 		Reference:          request.reference,
-		PullPolicy:         request.pullPolicy,
+		PullPolicy:         pullPolicy,
 		LogDriver:          request.logDriver,
 		LogOptions:         request.logOptions,
 		ConsoleLogMaxBytes: request.consoleLogMaxBytes,
@@ -6007,10 +7575,21 @@ func (b *runtimeBackend) create(request runRequest) (string, error) {
 		LiveForkWaiver:     request.liveForkWaiver,
 		Progress:           b.imageProgress(),
 		VolumeCopyMode:     b.volumeCopyMode,
-		NodeID:             b.nodeID,
+		// A created branch owns mutable local filesystem state even though it has
+		// no runtime yet. Keep that state assigned to this node until an explicit
+		// publication or migration transfers authority.
+		NodeID:                  createdNodeID,
+		AllocateSnapshotOrigins: filesystemOrigins,
+		SnapshotManagedVolume:   b.snapshotManagedVolume,
 	})
 	if err != nil {
-		return "", err
+		return "", errors.Join(err, finishFilesystemOrigins(false))
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
+		return "", errors.Join(err, store.RemoveContainer(prepared.Container.ID))
+	}
+	if err := b.registerCreatedContainerPlacement(prepared.Container); err != nil {
+		return "", errors.Join(err, store.RemoveContainer(prepared.Container.ID))
 	}
 	return prepared.Container.ID, nil
 }
@@ -6032,19 +7611,52 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	default:
 		return 1, fmt.Errorf("branch %s is %s", target, normalizeLifecycleState(branch.State))
 	}
-	preservedPeers, err := freshStartPeers(info, target)
+	// A stopped branch becomes locally restartable before its immutable capture
+	// is necessarily shared. Fence that exact capture before executing a fresh
+	// process incarnation. Otherwise its late completion could still release the
+	// placement or overwrite storage metadata belonging to the new runtime.
+	// A committed capture has a manifest and no active worker; materialize it
+	// below before changing the local storage view.
+	if branch.PublicationID != "" && branch.StorageManifest == "" {
+		if b.publicationQueue == nil {
+			return 1, fmt.Errorf("branch %s has publication %q but no publication queue", target, branch.PublicationID)
+		}
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, branch.PublicationID); err != nil {
+			return 1, fmt.Errorf("fencing stopped snapshot publication for %s: %w", target, err)
+		}
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, branch.PublicationID); err != nil {
+			return 1, fmt.Errorf("retiring stopped snapshot publication for %s: %w", target, err)
+		}
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return 1, err
+		}
+		branch, err = persistentBranchInfo(info, target.branch)
+		if err != nil {
+			return 1, err
+		}
+	}
+	preservedPeers, err := freshStartPeers(info, target, b.nodeID)
 	if err != nil {
 		return 1, err
 	}
 	if len(preservedPeers) != 0 {
+		info, branch, err = b.prepareFreshStartStorage(info, target)
+		if err != nil {
+			return 1, err
+		}
 		if err := b.startFreshBranchBesidePeers(info, target, branch); err != nil {
 			return 1, err
 		}
-		if err := b.containerStore().RecordBranchStart(target.container, target.branch); err != nil {
+		if err := b.containerStore().RecordBranchStart(target.container, target.branch, b.nodeID); err != nil {
 			_, _ = b.command("timetravel", target.container, "destroy", target.branch)
 			return 1, fmt.Errorf("recording fresh start for %s: %w", target, err)
 		}
 		return b.finishPreservedPeerStart(info, target, detach, interactive)
+	}
+	// Replacing the runtime would take every capture only its Sentry holds.
+	if err := b.persistResidentDehydrations(info, nil); err != nil {
+		return 1, err
 	}
 	// Waiting for the branch init process and tearing down its sandbox are
 	// separate events. In particular, a multi-process container may report its
@@ -6056,19 +7668,9 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 	if err := b.removeStoppedRuntime(info.ID, waitForTeardown); err != nil {
 		return 1, fmt.Errorf("preparing a fresh runtime for %s: %w", target, err)
 	}
-	if b.dataRoot != "" {
-		store := b.containerStore()
-		info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
-		if err != nil {
-			return 1, err
-		}
-		if _, err := store.PruneImageRoots(context.Background()); err != nil {
-			return 1, fmt.Errorf("pruning superseded image roots: %w", err)
-		}
-		branch, err = persistentBranchInfo(info, target.branch)
-		if err != nil {
-			return 1, err
-		}
+	info, branch, err = b.prepareFreshStartStorage(info, target)
+	if err != nil {
+		return 1, err
 	}
 	filesystemBranch := branch.FilesystemBranch
 	if filesystemBranch == "" {
@@ -6083,24 +7685,88 @@ func (b *runtimeBackend) start(target selector, detach, interactive bool) (int, 
 		return 1, err
 	}
 	defer cleanupBundle()
-	status, err := b.launch(info, target, bundleDir, detach, interactive)
+	status, running, err := b.launch(info, target, bundleDir, detach, interactive)
 	if err == nil {
-		b.recordLaunchState(target, detach, status)
+		b.recordLaunchState(target, running, status)
 	}
 	if info.AutoRemove {
-		return b.applyAutoRemove(target, detach, status, err)
+		return b.applyAutoRemove(target, running, status, err)
 	}
 	return status, err
+}
+
+// prepareFreshStartStorage makes the target branch's immutable image and
+// filesystem roots usable from this node's active repository. It is shared by
+// full-sandbox replacement and bootstrap-beside-peers: a cold branch may be
+// admitted on a node that has neither its image extraction nor its writable
+// repository yet.
+func (b *runtimeBackend) prepareFreshStartStorage(info ttcbundle.ContainerInfo, target selector) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if b.dataRoot == "" {
+		return info, branch, nil
+	}
+	store := b.containerStore()
+	if ready, err := store.ContainerImageRootReady(info.ID); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	} else if !ready {
+		// Unpacking the image on a node that has not run it yet takes time
+		// in proportion to the image; other commands go on meanwhile.
+		if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "starting"}, func() error {
+			return store.PrepareContainerImageRoot(context.Background(), info.ID)
+		}); err != nil {
+			return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+		}
+	}
+	info, err = store.RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("pruning superseded image roots: %w", err)
+	}
+	branch, err = persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, err
+	}
+	if branch.StorageManifest == "" {
+		return info, branch, nil
+	}
+	if err := b.ensureLocalColdFilesystem(info, branch); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("materializing durable filesystem for %s: %w", target, err)
+	}
+	if err := b.ensureClusterFilesystemWorkingOrigins(info, branch.FilesystemBranch); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("activating durable filesystem for %s: %w", target, err)
+	}
+	// A fresh start does not restore serialized Sentry state: its VFS is
+	// constructed directly from the newly materialized local repository. Retire
+	// the one-shot source alias before this runtime can become a later migration
+	// source.
+	if err := store.CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return ttcbundle.ContainerInfo{}, ttcbundle.BranchInfo{}, fmt.Errorf("canonicalizing fresh filesystem identities for %s: %w", target, err)
+	}
+	return info, branch, nil
 }
 
 // freshStartPeers returns active branches that must survive replacement of the
 // family's Sentry. Process-free peers need no work. Transient states are
 // rejected because daemon mutation serialization should never expose one here
 // unless an earlier operation was interrupted.
-func freshStartPeers(info ttcbundle.ContainerInfo, target selector) ([]selector, error) {
+func freshStartPeers(info ttcbundle.ContainerInfo, target selector, localNodeID string) ([]selector, error) {
 	peers := make([]selector, 0, len(info.Branches))
 	for _, branch := range info.Branches {
 		if branch.ID == target.branch {
+			continue
+		}
+		// A distributed physical family may have live branches on several
+		// nodes, each in a different Sentry. Only branches owned by this node
+		// can be peers of the runtime that we are about to create here. Treating
+		// a remote branch as a local peer makes start try to import into a
+		// nonexistent local Sentry with the same physical container ID.
+		// Standalone branches have no owner and continue to share one Sentry.
+		if localNodeID != "" && branch.NodeID != localNodeID {
 			continue
 		}
 		switch normalizeLifecycleState(branch.State) {
@@ -6130,7 +7796,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 			filesystemBranch = ttcvolume.ScopedBranchID(info.ID, target.branch)
 		}
 	}
-	memoryRoot := filepath.Join(b.dataRoot, "containers", info.ID, "memory")
+	memoryRoot := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory")
 	if err := os.MkdirAll(memoryRoot, 0700); err != nil {
 		return fmt.Errorf("creating branch bootstrap memory root: %w", err)
 	}
@@ -6149,7 +7815,7 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 		return fmt.Errorf("creating branch bootstrap runtime ID: %w", err)
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
-	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured := b.configuredRunscArgsForBranch(info, branch)
 	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
 	if err != nil {
 		return err
@@ -6177,14 +7843,25 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	if err := b.waitForPausedBootstrap(runtimeID, target.branch, 5*time.Second); err != nil {
 		return fmt.Errorf("waiting for paused bootstrap for %s: %w", target, err)
 	}
-	capture, metadata, snapshots, err := b.captureTransientBranch(runtimeID, target.branch, stagingDir)
+	capture, metadata, err := b.captureTransientBranch(runtimeID, target.branch, stagingDir)
 	if err != nil {
 		return fmt.Errorf("capturing paused bootstrap for %s: %w", target, err)
 	}
 	defer metadata.Close()
+	graphRoots := make([]string, len(capture.MemoryRoots))
+	graphObjects := make([]string, len(capture.MemoryRoots))
+	for i, root := range capture.MemoryRoots {
+		graphRoots[i] = root.Name
+		graphObjects[i] = root.Root
+	}
+	graphRecorded := false
 	defer func() {
-		for _, snapshot := range snapshots {
-			_ = snapshot.Close()
+		if graphRecorded {
+			return
+		}
+		_ = b.releaseGraphMemoryRoots(graphRoots)
+		if b.distributedSource != nil {
+			_ = b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(capture.SnapshotID))
 		}
 	}()
 	if _, err := b.command("delete", "--force", runtimeID); err != nil {
@@ -6211,10 +7888,29 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	} else {
 		return fmt.Errorf("querying active peers before starting %s: %w", target, err)
 	}
+	if branch.SnapshotID != 0 || len(branch.MemoryRoots) != 0 || len(branch.MemoryRootObjects) != 0 || branch.ControlRoot != "" || branch.ControlRootObject != "" || branch.DistributedGraphReferenceOperation != "" {
+		return fmt.Errorf("fresh branch %s unexpectedly retains an older memory snapshot", target)
+	}
+	if err := b.containerStore().UpdateBranchMemoryGraph(info.ID, target.branch, capture.SnapshotID, graphRoots, graphObjects, ""); err != nil {
+		return fmt.Errorf("recording bootstrap memory graph for %s: %w", target, err)
+	}
+	defer func() {
+		if !graphRecorded {
+			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", "")
+		}
+	}()
+	consolePaths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return fmt.Errorf("resolving console state for fresh branch %s: %w", target, err)
+	}
+	if err := clearConsoleIncarnationStatus(consolePaths); err != nil {
+		return fmt.Errorf("clearing prior console state for fresh branch %s: %w", target, err)
+	}
 	capture.Resume = true
-	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, snapshots); err != nil {
+	if err := b.rehydrateColdPeer(target, info, branch, capture, stagingDir, metadata, nil); err != nil {
 		return fmt.Errorf("installing fresh branch %s beside active peers: %w", target, err)
 	}
+	graphRecorded = true
 	return nil
 }
 
@@ -6250,71 +7946,86 @@ func (b *runtimeBackend) waitForPausedBootstrap(runtimeID, branchID string, time
 // captureTransientBranch exports one already-paused bootstrap branch into
 // short-lived files suitable for peer import. The caller owns the returned
 // open files and directory.
-func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir string) (boot.BranchDehydrateInfo, *os.File, []*os.File, error) {
+func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir string) (_ boot.BranchDehydrateInfo, _ *os.File, retErr error) {
 	metadataPath := filepath.Join(stagingDir, "metadata.state")
 	metadata, err := os.OpenFile(metadataPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
 	output, err := b.commandWithFiles([]*os.File{metadata}, "timetravel", "--dehydration-fd=3", runtimeID, "dehydrate", branchID)
 	if closeErr := metadata.Close(); err == nil && closeErr != nil {
 		err = closeErr
 	}
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
 	var capture boot.BranchDehydrateInfo
 	if err := json.Unmarshal(output, &capture); err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, fmt.Errorf("decoding bootstrap capture: %w", err)
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("decoding bootstrap capture: %w", err)
 	}
 	if len(capture.Memories) == 0 {
-		return boot.BranchDehydrateInfo{}, nil, nil, errors.New("bootstrap capture contains no memory images")
+		return boot.BranchDehydrateInfo{}, nil, errors.New("bootstrap capture contains no memory images")
 	}
-	exportFiles := make([]*os.File, 0, len(capture.Memories))
-	for i := range capture.Memories {
-		file, err := os.OpenFile(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		if err != nil {
-			for _, opened := range exportFiles {
-				_ = opened.Close()
-			}
-			return boot.BranchDehydrateInfo{}, nil, nil, err
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("allocating bootstrap snapshot origin: %w", err)
+	}
+	var roots []string
+	defer func() {
+		if retErr == nil {
+			return
 		}
-		exportFiles = append(exportFiles, file)
-	}
-	exportArgs := []string{"timetravel", "--dehydration-snapshots-start-fd=3", fmt.Sprintf("--dehydration-snapshots-count=%d", len(exportFiles))}
-	if b.allowSlowVolumeCopy {
-		exportArgs = append(exportArgs, "--dehydration-snapshot-allow-copy")
-	}
-	exportArgs = append(exportArgs, runtimeID, "dehydrate-export", branchID)
-	_, exportErr := b.commandWithFiles(exportFiles, exportArgs...)
-	for _, file := range exportFiles {
-		if closeErr := file.Close(); exportErr == nil && closeErr != nil {
-			exportErr = closeErr
+		if len(roots) != 0 {
+			_ = b.releaseGraphMemoryRoots(roots)
 		}
+		if b.distributedSource != nil {
+			_ = b.discardFailedGraphSnapshot(origin)
+		}
+	}()
+	reader, writer, err := graphCaptureStream()
+	if err != nil {
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
+	type graphImportOutcome struct {
+		result ttcchunk.GraphImportResult
+		err    error
+	}
+	imported := make(chan graphImportOutcome, 1)
+	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+	go func() {
+		result, importErr := b.importGraphCapture(reader, origin, prefix)
+		_ = reader.Close()
+		imported <- graphImportOutcome{result: result, err: importErr}
+	}()
+	_, exportErr := b.commandWithFiles([]*os.File{writer}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", runtimeID, "dehydrate-export", branchID)
+	_ = writer.Close()
+	outcome := <-imported
 	if exportErr != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, exportErr
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("streaming graph-native bootstrap memory: %w", exportErr)
 	}
+	if outcome.err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("importing graph-native bootstrap memory: %w", outcome.err)
+	}
+	for _, root := range outcome.result.Roots {
+		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+			ResourceID: root.ResourceID,
+			Name:       root.Name,
+			Root:       root.Root.String(),
+		})
+		roots = append(roots, root.Name)
+	}
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("sealing bootstrap snapshot origin %d: %w", origin, err)
+	}
+	capture.SnapshotID = uint64(origin)
 	metadata, err = os.Open(metadataPath)
 	if err != nil {
-		return boot.BranchDehydrateInfo{}, nil, nil, err
+		return boot.BranchDehydrateInfo{}, nil, err
 	}
-	snapshots := make([]*os.File, 0, len(capture.Memories))
-	for i := range capture.Memories {
-		file, err := os.Open(filepath.Join(stagingDir, fmt.Sprintf("memory-%04d.snapshot", i)))
-		if err != nil {
-			metadata.Close()
-			for _, opened := range snapshots {
-				_ = opened.Close()
-			}
-			return boot.BranchDehydrateInfo{}, nil, nil, err
-		}
-		snapshots = append(snapshots, file)
-	}
-	return capture, metadata, snapshots, nil
+	return capture, metadata, nil
 }
-
 func (b *runtimeBackend) finishPreservedPeerStart(info ttcbundle.ContainerInfo, target selector, detach, interactive bool) (int, error) {
+	b.signalLifecycleReady()
 	if detach {
 		if info.AutoRemove {
 			return b.applyAutoRemove(target, true, 0, nil)
@@ -6362,44 +8073,28 @@ func (b *runtimeBackend) applyAutoRemove(target selector, detach bool, status in
 }
 
 func (b *runtimeBackend) scheduleAutoRemove(target selector) error {
-	executable := b.clientExecutable
+	executable := b.runsc
 	if executable == "" {
 		executable = currentExecutable()
 	}
-	if executable == "" {
-		return errors.New("locating ttc executable")
+	if executable == "" || b.daemonSocket == "" {
+		return errors.New("locating ttcd auto-remove helper")
 	}
-	args := []string{
-		"--direct",
-		"--root", b.root,
-		"--runsc", b.runsc,
-		"--data-root", b.dataRoot,
-	}
-	if b.unsafeNoHostIsolation {
-		args = append(args, "--unsafe-no-host-isolation")
-	}
-	args = append(args, "_auto-remove", target.String())
+	args := []string{"_auto-remove-client", "--socket", b.daemonSocket, target.String()}
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("opening auto-remove stdio: %w", err)
 	}
 	defer devNull.Close()
-	errorPath := filepath.Join(b.dataRoot, "containers", target.container, "auto-remove.error.log")
-	errorLog, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("opening auto-remove error log: %w", err)
-	}
-	defer errorLog.Close()
 	command := exec.Command(executable, args...)
-	for _, value := range os.Environ() {
-		if !strings.HasPrefix(value, "TTC_RUNTIME_PLATFORM=") {
-			command.Env = append(command.Env, value)
-		}
-	}
-	command.Env = append(command.Env, "TTC_RUNTIME_PLATFORM="+b.runtimePlatform)
 	command.Stdin = devNull
 	command.Stdout = devNull
-	command.Stderr = errorLog
+	// The helper is the process that ultimately unlinks the container tree. Its
+	// own stderr must therefore not be a file inside that tree: on NFS this
+	// deterministically silly-renames the open log to .nfs* and makes every
+	// successful --rm require deferred cleanup. Helper failures leave the
+	// container record intact and are visible through normal lifecycle state.
+	command.Stderr = devNull
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("starting auto-remove helper: %w", err)
@@ -6417,7 +8112,7 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 	)
 	deadline := time.Now().Add(teardownTimeout)
 	for {
-		families, err := b.listRuntimeFamilies()
+		families, err := b.listRuntimeFamiliesOf(name)
 		if err != nil {
 			return fmt.Errorf("checking runtime state before starting %q: %w", name, err)
 		}
@@ -6446,11 +8141,20 @@ func (b *runtimeBackend) removeStoppedRuntime(name string, waitForTeardown bool)
 }
 
 func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error) {
-	resolved, _, err := b.resolveSelector(request.target)
+	resolved, info, err := b.resolveSelector(request.target)
 	if err != nil {
 		return 1, err
 	}
 	request.target = resolved
+	if b.dataRoot != "" {
+		branch, err := persistentBranchInfo(info, request.target.branch)
+		if err != nil {
+			return 1, err
+		}
+		if state := normalizeLifecycleState(branch.State); state != "running" {
+			return 1, fmt.Errorf("cannot exec in branch %s: branch is %s", request.target, state)
+		}
+	}
 	if request.terminal && request.processPath == "" && !environmentHasKey(request.env, "TERM") {
 		request.env = append(request.env, "TERM="+terminalType(b.clientTERM))
 	}
@@ -6472,6 +8176,9 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 		}
 	}
 	args = append(args, "--exec-id", execID)
+	if request.retain {
+		args = append(args, "--retain-exec-session")
+	}
 	consoleID = "ttc-" + execID
 	args = append(args, "--internal-console", consoleID)
 	if request.detach {
@@ -6827,19 +8534,7 @@ func acquireConsoleStdin(lockPath string, target selector) (*os.File, error) {
 }
 
 func readConsoleWaitStatus(path string) (uint32, bool, error) {
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("reading console wait status: %w", err)
-	}
-	value := strings.TrimSpace(string(data))
-	status, err := strconv.ParseUint(value, 10, 32)
-	if err != nil {
-		return 0, false, fmt.Errorf("parsing console wait status %q: %w", value, err)
-	}
-	return uint32(status), true, nil
+	return ttcconsole.ReadWaitStatus(path)
 }
 
 func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr error) {
@@ -6847,6 +8542,11 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 	if err != nil {
 		return 0, err
 	}
+	releaseClient, err := b.registerConsoleClient(target)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseClient()
 	execID := request.execID
 	var paths ttcbundle.ConsolePaths
 	consoleID := "init"
@@ -6856,7 +8556,7 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 		if err != nil {
 			return 0, err
 		}
-		store := ttcbundle.Store{Root: b.dataRoot}
+		store := b.containerStore()
 		containerInfo, err := store.LoadContainer(target.container)
 		if err != nil {
 			return 0, err
@@ -6949,6 +8649,9 @@ func (b *runtimeBackend) attach(request attachRequest) (status uint32, retErr er
 	}
 	var waitErr error
 	for {
+		if b.consoleClientCanceled() {
+			return 0, errDetached
+		}
 		progress, err := follower.drain(stdout, stderr)
 		if err != nil {
 			return 0, err
@@ -7223,7 +8926,12 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 		return err
 	}
 	target = resolved
-	container, err := (ttcbundle.Store{Root: b.dataRoot}).LoadContainer(target.container)
+	releaseClient, err := b.registerConsoleClient(target)
+	if err != nil {
+		return err
+	}
+	defer releaseClient()
+	container, err := b.containerStore().LoadContainer(target.container)
 	if err != nil {
 		return err
 	}
@@ -7255,6 +8963,9 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 	output := newConsoleLogOutput(options, container.LogAttributes)
 	initial := true
 	for {
+		if b.consoleClientCanceled() {
+			return nil
+		}
 		var progress bool
 		if initial && options.Tail >= 0 {
 			collector := &consoleLogTail{limit: options.Tail}
@@ -7293,7 +9004,7 @@ func (b *runtimeBackend) logs(target selector, options logsOptions) error {
 }
 
 func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	info, err := store.LoadContainer(container)
 	if err != nil {
 		return 0, 0, fmt.Errorf("loading console retention for %s: %w", container, err)
@@ -7310,21 +9021,93 @@ func (b *runtimeBackend) consoleRetention(container string) (int64, int, error) 
 }
 
 func (b *runtimeBackend) ensureConsoleDrain(target selector, reset bool) (ttcbundle.ConsolePaths, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.BranchConsolePaths(target.container, target.branch)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
+	}
+	// A short-lived detached init may exit between runsc start and console
+	// follower registration. Its retained log is already authoritative and its
+	// durable exit status is sufficient to complete log/attach readers; trying
+	// to start another follower can only fail because runsc has removed the
+	// exited container state. This mirrors completed named-exec handling below.
+	if !reset {
+		info, infoErr := store.LoadContainer(target.container)
+		if infoErr == nil {
+			branch, branchErr := persistentBranchInfo(info, target.branch)
+			if branchErr == nil && branch.State == "exited" && branch.ExitStatus != nil {
+				if err := installRetainedConsoleExitCode(paths, *branch.ExitStatus); err != nil {
+					return ttcbundle.ConsolePaths{}, err
+				}
+				return paths, nil
+			}
+		}
 	}
 	return b.ensureConsoleDrainPaths(target, "", "init", paths, reset)
 }
 
 func (b *runtimeBackend) ensureExecConsoleDrain(target selector, execID, consoleID string, reset bool) (ttcbundle.ConsolePaths, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.ExecConsolePaths(target.container, target.branch, execID)
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, err
 	}
+	// A restored completed session has no live ThreadGroup to follow. Its
+	// retained ring and status are already authoritative, so materialize the
+	// ordinary host-side completion marker and let attach/log readers consume
+	// them without spawning a doomed console follower. This also repairs old
+	// node-local caches after rehydration on demand.
+	if !reset {
+		session, sessionErr := b.execSession(target, execID)
+		if sessionErr == nil && session.State == string(boot.ExecSessionExited) && session.ExitStatus != nil {
+			if err := installRetainedConsoleWaitStatus(paths, *session.ExitStatus); err != nil {
+				return ttcbundle.ConsolePaths{}, err
+			}
+			return paths, nil
+		}
+	}
 	return b.ensureConsoleDrainPaths(target, execID, consoleID, paths, reset)
+}
+
+// installRetainedConsoleExitCode is installRetainedConsoleWaitStatus for a
+// process known by its exit code, as a branch's record keeps it: the wait
+// status recorded must give that code.
+func installRetainedConsoleExitCode(paths ttcbundle.ConsolePaths, code int) error {
+	current, found, err := readConsoleWaitStatus(paths.WaitStatus)
+	if err != nil {
+		return err
+	}
+	if found {
+		if waitStatusExitCode(current) != code {
+			return fmt.Errorf("retained wait status %d is not of exit code %d", current, code)
+		}
+		return nil
+	}
+	status := uint32(code&0xff) << 8
+	if code > 128 && code < 128+65 {
+		// Killed by the signal.
+		status = uint32(code - 128)
+	}
+	return installRetainedConsoleWaitStatus(paths, status)
+}
+
+func installRetainedConsoleWaitStatus(paths ttcbundle.ConsolePaths, status uint32) error {
+	if current, found, err := readConsoleWaitStatus(paths.WaitStatus); err != nil {
+		return err
+	} else if found {
+		if current != status {
+			return fmt.Errorf("retained exec wait status is %d, want %d", current, status)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(paths.WaitStatus), 0700); err != nil {
+		return err
+	}
+	data := []byte(strconv.FormatUint(uint64(status), 10) + "\n")
+	if err := os.WriteFile(paths.WaitStatus, data, 0600); err != nil {
+		return fmt.Errorf("restoring retained exec wait status: %w", err)
+	}
+	return nil
 }
 
 func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consoleID string, paths ttcbundle.ConsolePaths, reset bool) (ttcbundle.ConsolePaths, error) {
@@ -7337,6 +9120,11 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			if reset {
 				return ttcbundle.ConsolePaths{}, fmt.Errorf("console drain for %s is still active", target)
+			}
+			// The console is followed: by its family's follower, or by a
+			// follower of its own an older ttcd started.
+			if b.consoleSidecars != nil && !b.consoleSidecars.ObserveFamilyConsole(paths.FamilyDir, paths.Lock, target, execID == "") {
+				b.consoleSidecars.ObserveInheritedConsoleSidecar(paths.Lock, target, execID == "")
 			}
 			return paths, nil
 		}
@@ -7392,62 +9180,110 @@ func (b *runtimeBackend) ensureConsoleDrainPaths(target selector, execID, consol
 	if err != nil {
 		return ttcbundle.ConsolePaths{}, fmt.Errorf("opening console error log: %w", err)
 	}
-	defer errorFile.Close()
+	if err := errorFile.Close(); err != nil {
+		return ttcbundle.ConsolePaths{}, fmt.Errorf("closing prepared console error log: %w", err)
+	}
+	follow := ttcconsole.Follow{
+		Branch: target.branch, ExecID: execID, ConsoleID: consoleID, Lock: paths.Lock,
+		Log: paths.Log, LogMaxBytes: maxBytes, LogMaxFiles: maxFiles, RetentionStats: paths.RetentionStats,
+		WaitStatus: paths.WaitStatus, Error: paths.Error,
+	}
+	start := func() error { return b.startFamilyConsoleFollower(target.container, paths.FamilyDir) }
+	if b.consoleSidecars != nil {
+		err = b.consoleSidecars.FollowFamilyConsole(paths.FamilyDir, start, follow, lockFile, target, execID == "")
+	} else {
+		err = followFamilyConsoleOnce(paths.FamilyDir, start, follow, lockFile)
+	}
+	if err != nil {
+		return ttcbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
+	}
+	return paths, nil
+}
 
+// startFamilyConsoleFollower starts the console follower of container, whose
+// console directory is dir, and waits until it listens: after the follower an
+// older one was, if it is exiting.
+func (b *runtimeBackend) startFamilyConsoleFollower(container, dir string) error {
+	errorPath := filepath.Join(dir, ".follower.error.log")
+	errorFile, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("opening console follower error log: %w", err)
+	}
+	defer errorFile.Close()
 	readyReader, readyWriter, err := os.Pipe()
 	if err != nil {
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("creating console readiness pipe: %w", err)
+		return fmt.Errorf("creating console follower readiness pipe: %w", err)
 	}
 	defer readyReader.Close()
-	commandArgs := append(b.runtimeControlArgs(),
-		"timetravel", "--console", consoleID,
-		"--console-log", paths.Log,
-		"--console-log-max-bytes", strconv.FormatInt(maxBytes, 10),
-		"--console-log-max-files", strconv.Itoa(maxFiles),
-		"--console-wait-status", paths.WaitStatus,
-		"--console-retention-stats", paths.RetentionStats,
-		"--console-pid-file", paths.PID,
-		"--console-ready-fd", "4")
-	if execID != "" {
-		commandArgs = append(commandArgs, "--exec-id", execID)
-	}
-	commandArgs = append(commandArgs, target.container, "console-follow", target.branch)
-	command := runscCommand(b.runsc, commandArgs...)
+	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), "timetravel",
+		"--console-socket", filepath.Join(dir, ttcconsole.FollowerSocketName), "--console-ready-fd", "3",
+		container, "console-follow-family")...)
 	command.Stderr = errorFile
-	// The inherited duplicate keeps the advisory lock held for exactly the
-	// lifetime of the drainer, preventing multiple consumers of one pipe.
-	command.ExtraFiles = []*os.File{lockFile, readyWriter}
+	// A follower mostly waits, polling pipes: one processor serves it.
+	command.Env = append(os.Environ(), "GOMAXPROCS=1")
+	command.ExtraFiles = []*os.File{readyWriter}
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		readyWriter.Close()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("starting console drain for %s: %w", target, err)
+		return fmt.Errorf("starting the console follower of %s: %w", container, err)
 	}
-	if err := readyWriter.Close(); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("closing console readiness writer for %s: %w", target, err)
+	readyWriter.Close()
+	fail := func(err error) error {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return fmt.Errorf("starting the console follower of %s: %w: %v", container, err, consoleDrainStoppedError(errorPath))
 	}
-	if err := readyReader.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("setting console readiness deadline for %s: %w", target, err)
+	if err := readyReader.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		return fail(err)
 	}
 	var ready [1]byte
 	if _, err := io.ReadFull(readyReader, ready[:]); err != nil {
-		command.Process.Kill()
-		command.Wait()
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("waiting for console drain readiness for %s: %w: %v", target, err, consoleDrainStoppedError(paths.Error))
+		return fail(err)
 	}
 	if b.consoleSidecars != nil {
-		if err := b.consoleSidecars.OwnConsoleSidecar(paths.Lock, command); err != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-			return ttcbundle.ConsolePaths{}, fmt.Errorf("transferring console drain ownership for %s: %w", target, err)
-		}
-	} else if err := command.Process.Release(); err != nil {
-		return ttcbundle.ConsolePaths{}, fmt.Errorf("releasing console drain process for %s: %w", target, err)
+		// The daemon reaps it; it outlives the daemon otherwise.
+		go func() { _ = command.Wait() }()
+		return nil
 	}
-	return paths, nil
+	return command.Process.Release()
+}
+
+// followFamilyConsoleOnce is FollowFamilyConsole for a backend outside a
+// daemon, which observes no console's end.
+func followFamilyConsoleOnce(dir string, start func() error, follow ttcconsole.Follow, lock *os.File) error {
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		var client *familyFollowerClient
+		client, err = dialFamilyFollower(dir, nil, nil)
+		if err != nil {
+			if err = start(); err != nil {
+				return err
+			}
+			if client, err = dialFamilyFollower(dir, nil, nil); err != nil {
+				return err
+			}
+		}
+		err = client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerFollow, Follow: &follow}, lock)
+		_ = client.conn.Close()
+		if err == nil || (!errors.Is(err, errFollowerGone) && err.Error() != errFollowerExiting) {
+			return err
+		}
+		<-client.gone
+	}
+	return err
+}
+
+// stopFamilyConsoleOnce is StopFamilyConsole for a backend outside a daemon.
+func stopFamilyConsoleOnce(dir, key string) error {
+	client, err := dialFamilyFollower(dir, nil, nil)
+	if err != nil {
+		return nil
+	}
+	defer client.conn.Close()
+	if err := client.call(ttcconsole.FollowerMessage{Op: ttcconsole.FollowerStop, Lock: key}); err != nil && !errors.Is(err, errFollowerGone) {
+		return err
+	}
+	return nil
 }
 
 func consoleDrainActive(lockPath string) (bool, error) {
@@ -7615,7 +9451,7 @@ func waitStatusExitCode(status uint32) int {
 func (b *runtimeBackend) recordLaunchState(target selector, detach bool, status int) {
 	store := ttcbundle.Store{Root: b.dataRoot}
 	if detach && status == 0 {
-		if err := store.RecordBranchStart(target.container, target.branch); err != nil && b.stderr != nil {
+		if err := store.RecordBranchStart(target.container, target.branch, b.nodeID); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: recording start state for %s: %v\n", target, err)
 		}
 	} else {
@@ -7795,6 +9631,9 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			stateError = family.Error
 		}
 	}
+	if stateError == "" && state == "exited" {
+		stateError = container.ExitError
+	}
 	process := &specs.Process{}
 	if spec != nil && spec.Process != nil {
 		process = spec.Process
@@ -7891,6 +9730,10 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 	if container.MemoryLimit != nil {
 		memory = *container.MemoryLimit
 	}
+	memorySwap := int64(0)
+	if container.MemorySwap != nil {
+		memorySwap = *container.MemorySwap
+	}
 	if container.NanoCPUs != nil {
 		nanoCPUs = *container.NanoCPUs
 	}
@@ -7945,7 +9788,7 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 		ID: container.ID, Created: created, Path: path, Args: args,
 		State: InspectState{
 			Status: state, Running: state == "running" || state == "paused", Paused: state == "paused",
-			Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
+			OOMKilled: state == "exited" && container.OOMKilled, Dead: state == "failed" || state == "destroying", Pid: sandboxPID, ExitCode: exitCode,
 			Error: stateError, StartedAt: inspectTimestamp(container.StartedAt), FinishedAt: inspectTimestamp(container.ExitedAt),
 		},
 		Image: container.Digest, Name: "/" + container.Name, Driver: driver,
@@ -7960,7 +9803,7 @@ func buildInspectInfo(container ttcbundle.ContainerInfo, spec *specs.Spec, famil
 			Image: container.Reference, Volumes: volumes, WorkingDir: process.Cwd, Entrypoint: entrypoint, Labels: labels, StopSignal: stopSignal,
 		},
 		HostConfig: InspectHostConfig{
-			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, PortBindings: portBindings, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
+			Binds: binds, AutoRemove: container.AutoRemove, NetworkMode: container.NetworkMode, PortBindings: portBindings, LogConfig: logConfig, ExtraHosts: container.ExtraHosts, DNS: container.DNS, DNSSearch: container.DNSSearch, DNSOptions: container.DNSOptions, ReadonlyRootfs: readonlyRootfs, StopTimeout: stopTimeout, Runtime: "runsc", PidsLimit: container.PidsLimit, Memory: memory, MemorySwap: memorySwap, NanoCPUs: nanoCPUs, CPUShares: cpuShares, CPUPeriod: cpuPeriod, CPUQuota: cpuQuota, ShmSize: shmSize, GroupAdd: container.GroupAdd, CapAdd: container.CapAdd, CapDrop: container.CapDrop, Ulimits: container.Ulimits, Tmpfs: tmpfs,
 		},
 		Mounts: mounts,
 		TTC: TTCInspectInfo{
@@ -7975,11 +9818,14 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if err != nil {
 		return InspectInfo{}, err
 	}
+	if containerInfo.IsDistributedPhysicalRuntime() {
+		return InspectInfo{}, fmt.Errorf("container %q does not exist: %w", name, os.ErrNotExist)
+	}
 	spec, err := store.LoadSpec(containerInfo.ID)
 	if err != nil {
 		return InspectInfo{}, err
 	}
-	families, err := b.listFamilies()
+	families, err := b.listFamiliesOf(containerInfo.ID)
 	if err != nil {
 		return buildInspectInfo(containerInfo, spec, nil, err.Error()), nil
 	}
@@ -7988,6 +9834,13 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	if refreshed, err := store.LoadContainer(containerInfo.ID); err == nil {
 		containerInfo = refreshed
 	}
+	if b.nodeID != "" {
+		if placements, openErr := b.placementCatalog(); openErr == nil {
+			if records, offlineOwners, listErr := placementsWithOfflineOwners(placements); listErr == nil {
+				containerInfo.Branches = logicalPersistentBranchInfos(containerInfo.Branches, records, offlineOwners, containerInfo.ID)
+			}
+		}
+	}
 	var runtimeFamily *Family
 	for i := range families {
 		if families[i].ID == containerInfo.ID {
@@ -7995,9 +9848,10 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 			break
 		}
 	}
+	projectContainerAuthority(&containerInfo, runtimeFamily)
 	result := buildInspectInfo(containerInfo, spec, runtimeFamily, "")
 	if transactionID := containerInfo.DistributedForkTransactionID; transactionID != "" {
-		if store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions")); err == nil {
+		if store, err := b.transactionCatalog(); err == nil {
 			if transaction, err := store.Load(transactionID); err == nil {
 				result.TTC.DistributedFork = transaction
 			}
@@ -8005,7 +9859,11 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	}
 	for i := range result.TTC.Branches {
 		branch := &result.TTC.Branches[i]
-		paths, retentionErr := store.BranchConsolePaths(containerInfo.ID, branch.Metadata.ID)
+		physicalContainer, physicalBranch := containerInfo.ID, branch.Metadata.ID
+		if resolved, physical, resolveErr := b.resolveSelector(selector{container: containerInfo.ID, branch: branch.Metadata.ID}); resolveErr == nil {
+			physicalContainer, physicalBranch = physical.ID, resolved.branch
+		}
+		paths, retentionErr := b.containerStore().BranchConsolePaths(physicalContainer, physicalBranch)
 		if retentionErr == nil {
 			stats, statsErr := ttcconsole.ReadRetentionStats(paths.RetentionStats)
 			if statsErr != nil {
@@ -8017,7 +9875,7 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 		if retentionErr != nil {
 			branch.OutputRetentionError = retentionErr.Error()
 		}
-		execStats, execRetentionErr := store.ListExecConsoleRetentionStats(containerInfo.ID, branch.Metadata.ID)
+		execStats, execRetentionErr := b.containerStore().ListExecConsoleRetentionStats(physicalContainer, physicalBranch)
 		if execRetentionErr != nil {
 			branch.ExecOutputRetentionError = execRetentionErr.Error()
 		} else {
@@ -8036,11 +9894,37 @@ func (b *runtimeBackend) inspect(name string) (InspectInfo, error) {
 	return result, nil
 }
 
+// projectContainerAuthority removes stale ownership and lifecycle fields from
+// the shared physical materialization before it is exposed by inspect. A
+// clustered container.json is deliberately not rewritten on every migration;
+// listFamilies has already merged Raft placement and branch authority into
+// family, so it is the single public source for these duplicated summary
+// fields. Branch details were projected above by logicalPersistentBranchInfos.
+func projectContainerAuthority(container *ttcbundle.ContainerInfo, family *Family) {
+	if container == nil || family == nil {
+		return
+	}
+	container.NodeID = family.NodeID
+	container.State = family.State
+}
+
 func (b *runtimeBackend) remove(name string, force, volumes bool) error {
+	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+			return fmt.Errorf("renewing removal execution authority: %w", err)
+		}
+	}
 	store := b.containerStore()
 	info, err := store.LoadContainer(name)
 	if err != nil {
 		return err
+	}
+	if waited, err := b.waitBusy(info.ID); err != nil {
+		return err
+	} else if waited {
+		if info, err = store.LoadContainer(name); err != nil {
+			return err
+		}
 	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, ""); err != nil {
 		return fmt.Errorf("settling remote branches before removing %q: %w", name, err)
@@ -8053,11 +9937,33 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 			}
 		}
 	}
+	// Fence asynchronous publication while the runtime and its local graph are
+	// still intact. Raft atomically chooses cancellation or completed durable
+	// publication; either outcome is safe to remove after the queue drains.
+	if b.publicationQueue != nil {
+		for _, branch := range info.Branches {
+			if err := b.publicationQueue.CancelBranch(info.ID, branch.ID); err != nil {
+				return fmt.Errorf("canceling publications for %s@%s: %w", info.Name, branch.ID, err)
+			}
+		}
+		info, err = store.LoadContainer(info.ID)
+		if err != nil {
+			return err
+		}
+	}
+	releaseClients, err := b.quiesceConsoleClients(selector{container: info.ID})
+	if err != nil {
+		return fmt.Errorf("detaching console clients for %q: %w", name, err)
+	}
+	defer releaseClients()
 	if err := b.stopContainerConsoleDrains(info.ID); err != nil {
 		return fmt.Errorf("stopping console followers for %q: %w", name, err)
 	}
+	if err := b.stopPublishedPorts(info); err != nil {
+		return fmt.Errorf("stopping published ports for %q: %w", name, err)
+	}
 	runtimeID := info.ID
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(runtimeID)
 	if err != nil {
 		return fmt.Errorf("checking runtime state before removing %q: %w", name, err)
 	}
@@ -8075,10 +9981,309 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 		}
 		break
 	}
-	if err := b.releaseDistributedSparseRoot(info); err != nil {
-		return fmt.Errorf("releasing distributed sparse memory: %w", err)
+	graphRoots := make([]string, 0)
+	seenGraphRoots := make(map[string]struct{})
+	for _, branch := range info.Branches {
+		for _, root := range branchGraphRootNames(branch) {
+			if _, exists := seenGraphRoots[root]; exists {
+				continue
+			}
+			seenGraphRoots[root] = struct{}{}
+			graphRoots = append(graphRoots, root)
+		}
 	}
-	if err := store.RemoveContainer(runtimeID); err != nil {
+	for _, backing := range info.RuntimeMemoryBackings {
+		for _, root := range branchGraphRootNames(runtimeBackingAsBranch(backing)) {
+			if _, exists := seenGraphRoots[root]; exists {
+				continue
+			}
+			seenGraphRoots[root] = struct{}{}
+			graphRoots = append(graphRoots, root)
+		}
+	}
+	for _, branch := range info.Branches {
+		if graphReferenceOperationForBranch(info, branch) == "" {
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+				return fmt.Errorf("releasing shared graph roots for %s@%s: %w", info.Name, branch.ID, err)
+			}
+		}
+		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
+			return fmt.Errorf("releasing distributed graph origins for %s@%s: %w", info.Name, branch.ID, err)
+		}
+	}
+	for _, backing := range info.RuntimeMemoryBackings {
+		branch := runtimeBackingAsBranch(backing)
+		if graphReferenceOperationForBranch(info, branch) == "" {
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+				return fmt.Errorf("releasing shared runtime memory backing %s for %s: %w", backing.ID, info.Name, err)
+			}
+		}
+		if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
+			return fmt.Errorf("releasing distributed runtime memory backing %s for %s: %w", backing.ID, info.Name, err)
+		}
+	}
+	// Resolve shared-ledger references while Raft still identifies local
+	// provider origins. Local collection may abandon an empty volatile origin;
+	// after that absence deliberately means "read from shared" to consumers.
+	// Both steps take time in proportion to the family's memory and storage,
+	// and the family has no runtime left to change, so other commands go on
+	// meanwhile.
+	if err := b.withoutLifecycleLock(info, longOperation{state: "removing", shown: true}, func() error {
+		if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
+			return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
+		}
+		return store.RemoveContainer(runtimeID)
+	}); err != nil {
+		return err
+	}
+	if err := b.removeContainerPlacements(info); err != nil {
+		return fmt.Errorf("removing cluster placement for %q: %w", name, err)
+	}
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return fmt.Errorf("reconciling filesystem origins after removing %q: %w", name, err)
+	}
+	if volumes {
+		manager, err := b.volumeManager()
+		if err != nil {
+			return err
+		}
+		for _, volume := range info.Volumes {
+			if volume.Anonymous {
+				if err := manager.Remove(volume.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("removing anonymous volume %q: %w", volume.Name, err)
+				}
+			}
+		}
+	}
+	if _, err := store.PruneImageRoots(context.Background()); err != nil {
+		return fmt.Errorf("pruning unreferenced image roots: %w", err)
+	}
+	return nil
+}
+
+// removeContainerPlacements commits logical deletion after physical cleanup.
+// A migrated runtime may store transaction-scoped physical branch names, so
+// candidates are matched by both logical branch and exact physical identity.
+// Removal must never depend on a later reconciliation pass: daemon shutdown
+// can immediately follow rm, and stale authority would then resurrect work in
+// the drain planner.
+func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo) error {
+	if b.nodeID == "" {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return err
+	}
+	logicalFamily := logicalFamilyID(info)
+	physicalBranches := make(map[string]struct{}, len(info.Branches))
+	for _, branch := range info.Branches {
+		physicalBranches[branch.ID] = struct{}{}
+	}
+	for _, record := range records {
+		if record.FamilyID != logicalFamily {
+			continue
+		}
+		_, logicalMatch := physicalBranches[record.BranchID]
+		_, physicalMatch := physicalBranches[record.PhysicalBranch]
+		exactPhysicalMatch := record.PhysicalContainer == info.ID && physicalMatch
+		physicalRuntime := info.IsDistributedPhysicalRuntime()
+		if physicalRuntime && !exactPhysicalMatch {
+			continue
+		}
+		if !physicalRuntime && !logicalMatch && !exactPhysicalMatch {
+			continue
+		}
+		if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+			return fmt.Errorf("branch %s@%s is still owned by node %q", record.FamilyID, record.BranchID, record.OwnerNode)
+		}
+		if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
+			if err := b.distributedSource.authority.RemoveCorruptedBranch(record.FamilyID, record.BranchID); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		} else if err := placements.Remove(record.FamilyID, record.BranchID, record.Generation); err != nil {
+			return err
+		}
+		if err := b.retireTransactionsForRemovedPlacement(record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeLogicalBranchPlacement commits deletion of one user-visible branch.
+//
+// Most placement cleanup can recover the logical identity from the physical
+// container and branch recorded in Raft. A durable publication deliberately
+// clears that physical identity when it makes a branch unplaced, however. At
+// that point the lifecycle command's original selector is the only exact
+// logical identity available. Treating the published physical container as
+// authoritative made removal appear to succeed while leaving its unplaced
+// Raft record behind.
+func (b *runtimeBackend) removeLogicalBranchPlacement(familyID, branchID string) error {
+	if b.nodeID == "" {
+		return nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	record, err := placements.Lookup(familyID, branchID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if record.OwnerNode != "" && record.OwnerNode != b.nodeID {
+		return fmt.Errorf("branch %s@%s is still owned by node %q", familyID, branchID, record.OwnerNode)
+	}
+	if record.State == cluster.PlacementCorrupted && b.distributedSource != nil && b.distributedSource.authority != nil {
+		if err := b.distributedSource.authority.RemoveCorruptedBranch(familyID, branchID); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if err := placements.Remove(familyID, branchID, record.Generation); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return b.retireTransactionsForRemovedPlacement(*record)
+}
+
+// distributedFamilyHasPeerPlacement reports whether a physical runtime's
+// final branch is only locally final, while another logical branch in the same
+// family still exists elsewhere in the cluster. Physical containers are an
+// implementation detail of migration and remote fork: deleting a one-branch
+// physical container must not delete the canonical family record while a
+// sibling placement survives on another node.
+func (b *runtimeBackend) distributedFamilyHasPeerPlacement(familyID, branchID string) (bool, error) {
+	if b.nodeID == "" {
+		return false, nil
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return false, err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		if record.FamilyID == familyID && record.BranchID != branchID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// removeCorruptedBranch removes a branch whose execution authority has
+// already been permanently fenced by Raft. Corruption intentionally clears
+// OwnerNode and every physical runtime identity: contacting the former owner
+// would both violate that fence and make rm wait for a process that is known
+// to be gone.
+//
+// The operation is idempotent across crashes. Raft is changed first; a retry
+// can reconstruct the transaction match from the logical selector and finish
+// pruning the shared family catalog even though the placement no longer
+// exists. The family record itself remains until the coordinator has removed
+// the final logical placement.
+func (b *runtimeBackend) removeCorruptedBranch(target selector) error {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return errors.New("corrupted-branch removal requires clustered authority")
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	removed := cluster.PlacementRecord{FamilyID: target.container, BranchID: target.branch}
+	if record, lookupErr := placements.Lookup(target.container, target.branch); lookupErr == nil {
+		if record.State != cluster.PlacementCorrupted {
+			return fmt.Errorf("branch %s is %s, not corrupted", target, record.State)
+		}
+		removed = *record
+	} else if !errors.Is(lookupErr, os.ErrNotExist) {
+		return lookupErr
+	}
+	if err := b.distributedSource.authority.RemoveCorruptedBranch(target.container, target.branch); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := b.retireTransactionsForRemovedPlacement(removed); err != nil {
+		return fmt.Errorf("retiring transactions for %s: %w", target, err)
+	}
+
+	// The shared catalog is display and restart metadata, not execution
+	// authority. Bound it to the live branch set without deleting the family
+	// record that a later child in the same family rm still needs to resolve.
+	shared := ttcbundle.Store{Root: b.dataRoot}
+	if info, loadErr := shared.LoadRuntimeContainer(target.container); loadErr == nil {
+		found := false
+		for _, branch := range info.Branches {
+			if branch.ID == target.branch {
+				found = true
+				break
+			}
+		}
+		if found && len(info.Branches) > 1 {
+			if err := shared.RemoveBranchRecord(info.ID, target.branch); err != nil {
+				return fmt.Errorf("removing shared branch metadata for %s: %w", target, err)
+			}
+		}
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		return loadErr
+	}
+	_, err = b.reconcileVolatileSnapshotOrigins()
+	return err
+}
+
+// removeDistributedFamilyRecord deletes the canonical, non-executing family
+// record after every Raft placement has been removed through its exact
+// physical branch. A family whose canonical container hosted the final branch
+// is already absent, making this operation naturally idempotent.
+func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volumes bool) error {
+	store := b.containerStore()
+	info, err := store.LoadRuntimeContainer(containerID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDistributedPhysicalRuntime() {
+		return fmt.Errorf("container %q is a physical distributed runtime, not a canonical family record", containerID)
+	}
+	if b.nodeID != "" {
+		placements, err := b.placementCatalog()
+		if err != nil {
+			return err
+		}
+		records, err := placements.List()
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if record.FamilyID == info.ID {
+				return fmt.Errorf("cannot remove family record %q while branch %q still has placement state %s", info.Name, record.BranchID, record.State)
+			}
+		}
+		containers, err := store.ListContainersForPlacement()
+		if err != nil {
+			return err
+		}
+		for _, candidate := range containers {
+			if candidate.ID != info.ID && logicalFamilyID(candidate) == info.ID {
+				// With no remaining Raft placement, this is an inert physical
+				// catalog left by a completed migration, canceled fork, or lost
+				// runtime. Per-node cleanup has already fenced and removed any
+				// corresponding local shell; prune the shared identity now.
+				if err := store.RemoveContainer(candidate.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("removing stale physical runtime record %q: %w", candidate.ID, err)
+				}
+			}
+		}
+	}
+	if err := store.RemoveContainer(info.ID); err != nil {
 		return err
 	}
 	if volumes {
@@ -8100,16 +10305,70 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	return nil
 }
 
+// reclaimRemovedFamilyLocal drops node-local runtime shells and cache entries
+// only after Raft proves that the logical family has no placements anywhere.
+// physicalIDs are captured before the shared family catalog is removed, so a
+// remote node never has to infer ownership from an already-deleted record.
+func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs []string) error {
+	if b.nodeID == "" || b.localRoot == "" {
+		return errors.New("removed-family local cleanup requires a clustered node-local root")
+	}
+	placements, err := b.placementCatalog()
+	if err != nil {
+		return err
+	}
+	records, err := placements.List()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.FamilyID == familyID {
+			return fmt.Errorf("family %q still has placement for branch %q", familyID, record.BranchID)
+		}
+	}
+	runtimes, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return fmt.Errorf("listing runtimes before local family cleanup: %w", err)
+	}
+	live := make(map[string]struct{}, len(runtimes))
+	for _, runtime := range runtimes {
+		live[runtime.ID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(physicalIDs))
+	for _, physicalID := range physicalIDs {
+		if physicalID == "" {
+			continue
+		}
+		if _, ok := seen[physicalID]; ok {
+			continue
+		}
+		seen[physicalID] = struct{}{}
+		if _, ok := live[physicalID]; ok {
+			if err := b.removeOrphanRuntime(physicalID); err != nil {
+				return fmt.Errorf("removing unplaced runtime %q: %w", physicalID, err)
+			}
+			continue
+		}
+		if err := b.stopContainerConsoleDrains(physicalID); err != nil {
+			return fmt.Errorf("stopping console followers for unplaced runtime %q: %w", physicalID, err)
+		}
+		if err := os.RemoveAll(filepath.Join(b.localRoot, "containers", physicalID)); err != nil {
+			return fmt.Errorf("removing local cache for unplaced runtime %q: %w", physicalID, err)
+		}
+	}
+	return nil
+}
+
 // purgeRuntime removes only this node's physical Sentry/gofer shell. Shared
 // family metadata and branch filesystems are intentionally untouched; elastic
 // migration and family-removal coordinators use this after ownership moved.
 func (b *runtimeBackend) purgeRuntime(containerID string) error {
-	families, err := b.listRuntimeFamilies()
+	sandboxes, err := b.listRuntimeSandboxes()
 	if err != nil {
 		return fmt.Errorf("listing runtimes before purging %q: %w", containerID, err)
 	}
-	for _, family := range families {
-		if family.ID != containerID {
+	for _, sandbox := range sandboxes {
+		if sandbox.ID != containerID {
 			continue
 		}
 		if _, err := b.command("delete", "--force", containerID); err != nil {
@@ -8118,6 +10377,72 @@ func (b *runtimeBackend) purgeRuntime(containerID string) error {
 		break
 	}
 	return nil
+}
+
+// removeOrphanRuntime force-removes a local physical runtime after its shared
+// family metadata has disappeared. This is a last-resort daemon-shutdown path:
+// without metadata there is no durable branch state left to preserve or
+// publish, but the Sentry and its console followers must not survive forever.
+func (b *runtimeBackend) removeOrphanRuntime(containerID string) error {
+	consoleErr := b.stopContainerConsoleDrains(containerID)
+	_, deleteErr := b.command("delete", "--force", containerID)
+	if deleteErr != nil {
+		deleteErr = fmt.Errorf("deleting physical runtime: %w", deleteErr)
+	}
+	var localErr error
+	if deleteErr == nil {
+		localErr = os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
+	}
+	return errors.Join(consoleErr, deleteErr, localErr)
+}
+
+// The gofer holds host descriptors for the dentries the sentry is holding —
+// close to two apiece — and it inherits this process's descriptor limit.
+//
+// Left alone the sentry caches a thousand dentries per mount, which is a budget
+// with no relationship to that limit. A sandbox with seven mounts may cache
+// seven thousand dentries and so ask its gofer for some twelve thousand
+// descriptors; on a login node whose hard limit is 8192 the gofer reaches
+// EMFILE long before the caches are full. There is no way back from that.
+// Nothing evicts on a descriptor shortage, so from then until the sandbox is
+// restarted every path in it fails — and fails as a missing file rather than as
+// a shortage, because a lookup that cannot reach the gofer is indistinguishable
+// from one that found nothing.
+//
+// So the cache is sized from the budget rather than from the number of mounts:
+// half the descriptors for cached dentries, the other half left for the files
+// the workload is actually holding open.
+const (
+	goferFDsPerDentry = 2
+	// Room for the workload, in the same units: the cache may have one of
+	// every dentryCacheShare descriptors.
+	dentryCacheShare = 2
+	// Below this a cache is not worth having, and above it the sandbox is
+	// bounded by something other than descriptors. Both ends only bite on
+	// hosts far away from the one this exists for.
+	minDentryCache = 256
+	maxDentryCache = 8000
+)
+
+// dentryCacheSize is how many dentries a sandbox may cache, in descriptors it
+// can actually have.
+//
+// The second result is whether the budget could be read at all. When it cannot
+// be, nothing is passed and the per-mount default stands: a number invented
+// here would be worse than the one that is already there.
+func dentryCacheSize() (int, bool) {
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		return 0, false
+	}
+	size := int(limit.Cur) / (goferFDsPerDentry * dentryCacheShare)
+	if size < minDentryCache {
+		size = minDentryCache
+	}
+	if size > maxDentryCache {
+		size = maxDentryCache
+	}
+	return size, true
 }
 
 func (b *runtimeBackend) configuredRunscArgs() []string {
@@ -8152,6 +10477,10 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	args := []string{
 		"--root", b.root,
 		"--platform=" + runtimePlatform,
+		// Preserve Sentry runtime failures even when the OCI console and control
+		// channel both disappear. Multiple sandboxes append complete Go runtime
+		// reports to this daemon-local diagnostic file.
+		"--panic-log=" + filepath.Join(b.root, "sentry-panic.log"),
 	}
 	if b.unsafeNoHostIsolation {
 		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
@@ -8165,6 +10494,11 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 		// compatibility with Docker images that use helpers such as sudo.
 		"--allow-suid=true",
 		"--overlay2=all:memory")
+	if size, known := dentryCacheSize(); known {
+		// One cache for the sandbox rather than one per mount, so that what it
+		// costs the gofer does not grow with the number of things mounted.
+		args = append(args, "--dcache="+strconv.Itoa(size))
+	}
 	if b.disableHostGSO {
 		args = append(args, "--gso=false")
 	}
@@ -8226,6 +10560,14 @@ func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.T
 		}
 	}
 	return ""
+}
+
+func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) []string {
+	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	if branch.Quarantined {
+		args = append(args, "--ttc-network-quarantine=true")
+	}
+	return args
 }
 
 func (b *runtimeBackend) runConfiguredCommand(args ...string) (int, error) {
@@ -8420,24 +10762,164 @@ func (b *runtimeBackend) verifyHostResourceLimits(name, bundleDir string) error 
 	return nil
 }
 
-func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (int, error) {
+// preflightHostResourceLimits reports missing host cgroup delegation before
+// runsc starts a sandbox. Hard memory and CPU limits are host-enforced; the
+// Sentry cannot safely pretend that they are active when the daemon's cgroup
+// does not permit child creation. runsc also fails closed, but its first
+// failing ancestor otherwise leaks a low-level cgroup.subtree_control error to
+// the user after doing most of container creation.
+func preflightHostResourceLimits(bundleDir string) error {
+	data, err := os.ReadFile(filepath.Join(bundleDir, "config.json"))
+	if err != nil {
+		return fmt.Errorf("reading OCI config for resource preflight: %w", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return fmt.Errorf("decoding OCI config for resource preflight: %w", err)
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil || spec.Linux.CgroupsPath == "" {
+		return nil
+	}
+	resources := spec.Linux.Resources
+	required := make([]string, 0, 2)
+	if resources.Memory != nil && resources.Memory.Limit != nil && *resources.Memory.Limit > 0 {
+		required = append(required, "memory")
+	}
+	if resources.CPU != nil {
+		required = append(required, "cpu")
+	}
+	if len(required) == 0 {
+		return nil
+	}
+	return preflightCgroupV2Delegation("/proc/self/cgroup", "/sys/fs/cgroup", required)
+}
+
+// delegatedCgroupParent returns the cgroup v2 directory in which runsc creates
+// a sandbox's relative cgroup: the parent of the daemon's own leaf cgroup.
+func delegatedCgroupParent(procCgroupPath, mountRoot string) (string, error) {
+	data, err := os.ReadFile(procCgroupPath)
+	if err != nil {
+		return "", fmt.Errorf("reading daemon cgroup membership: %w", err)
+	}
+	membership := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			membership = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+	if membership == "" {
+		return "", errors.New("hard host resource limits require unified cgroup v2 delegation, but ttcd has no unified cgroup membership")
+	}
+	// Relative runsc cgroups are siblings of the daemon's leaf cgroup. In a
+	// cgroup namespace the host membership may not exist below the visible
+	// mount; in that case the mount root itself is the delegated parent.
+	visibleMembership := filepath.Join(mountRoot, filepath.Clean("/"+membership))
+	if _, err := os.Stat(visibleMembership); err == nil {
+		return filepath.Dir(visibleMembership), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("checking daemon cgroup %q: %w", visibleMembership, err)
+	}
+	return mountRoot, nil
+}
+
+// effectiveMemorySwap is the memory-swap limit a new family gets, as Docker
+// gives it: the one asked for, or twice its memory limit. A kernel that does
+// not account swap to cgroups cannot hold a family to one, and, as Docker
+// does, TTC then says so and limits only memory.
+func effectiveMemorySwap(memoryLimit *int64, swap int64, swapSet bool, stderr io.Writer) *int64 {
+	memory := int64(0)
+	if memoryLimit != nil {
+		memory = *memoryLimit
+	}
+	if memory == 0 && !swapSet {
+		return nil
+	}
+	effective := ttcbundle.EffectiveMemorySwap(memory, swap)
+	if memory > 0 && effective > 0 && !cgroupSwapAccounted("/proc/self/cgroup", "/sys/fs/cgroup") {
+		fmt.Fprintln(stderr, "ttc: warning: this kernel does not account swap to cgroups, so memory is limited without limiting swap")
+		effective = -1
+	}
+	return &effective
+}
+
+// cgroupSwapAccounted reports whether the kernel accounts swap to the cgroups
+// runsc creates for sandboxes, as their parent's memory.swap.max shows. With
+// no memory interface to judge by, as on cgroup v1, it lets runsc decide.
+func cgroupSwapAccounted(procCgroupPath, mountRoot string) bool {
+	parent, err := delegatedCgroupParent(procCgroupPath, mountRoot)
+	if err != nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(parent, "memory.max")); err != nil {
+		return true
+	}
+	_, err = os.Stat(filepath.Join(parent, "memory.swap.max"))
+	return err == nil
+}
+
+func preflightCgroupV2Delegation(procCgroupPath, mountRoot string, required []string) error {
+	if _, err := os.Stat(filepath.Join(mountRoot, "cgroup.controllers")); errors.Is(err, os.ErrNotExist) {
+		// The host may use cgroup v1. Let runsc's native implementation decide
+		// whether the requested controllers are available there.
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("checking unified cgroup v2: %w", err)
+	}
+	parent, err := delegatedCgroupParent(procCgroupPath, mountRoot)
+	if err != nil {
+		return err
+	}
+	controllersData, err := os.ReadFile(filepath.Join(parent, "cgroup.controllers"))
+	if err != nil {
+		return fmt.Errorf("reading delegated cgroup controllers from %q: %w", parent, err)
+	}
+	available := make(map[string]struct{})
+	for _, controller := range strings.Fields(string(controllersData)) {
+		available[controller] = struct{}{}
+	}
+	for _, controller := range required {
+		if _, ok := available[controller]; !ok {
+			return fmt.Errorf("hard host resource limits require delegated cgroup v2 controller %q, but %q exposes %q", controller, parent, strings.TrimSpace(string(controllersData)))
+		}
+	}
+	control := filepath.Join(parent, "cgroup.subtree_control")
+	if err := unix.Access(control, unix.W_OK); err != nil {
+		return fmt.Errorf("hard host resource limits require a writable delegated cgroup v2 subtree: ttcd cannot write %q: %w; start ttcd in a delegated cgroup (for example, a systemd unit with Delegate=yes) or omit --memory and CPU limit options", control, err)
+	}
+	if err := unix.Access(parent, unix.W_OK); err != nil {
+		return fmt.Errorf("hard host resource limits require a writable delegated cgroup v2 subtree: ttcd cannot create child cgroups in %q: %w; start ttcd in a delegated cgroup (for example, a systemd unit with Delegate=yes) or omit --memory and CPU limit options", parent, err)
+	}
+	return nil
+}
+
+// launch starts target and reports whether it remains running when this call
+// returns. The latter is intentionally distinct from the requested detach
+// flag: an attached terminal may detach through its detach key sequence.
+func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, bundleDir string, detach, interactive bool) (status int, running bool, err error) {
 	name := info.ID
-	configuredArgs := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
-	var err error
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return 1, false, err
+	}
+	if err := preflightHostResourceLimits(bundleDir); err != nil {
+		return 1, false, err
+	}
+	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
 	configuredArgs, err = b.withRuntimeDiagnostics(configuredArgs, info.ID)
 	if err != nil {
-		return 1, err
+		return 1, false, err
 	}
-	status, err := b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
+	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
-		return status, err
+		return status, false, err
 	}
 	if err := b.verifyHostResourceLimits(name, bundleDir); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, err
+		return 1, false, err
 	}
 	startDrain := func(phase string) error {
 		if _, err := b.ensureConsoleDrain(target, true); err != nil {
@@ -8448,9 +10930,9 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 	if err := startDrain("before"); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("%w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, err
+		return 1, false, err
 	}
 	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "start", name)
 	if err != nil || status != 0 {
@@ -8459,28 +10941,29 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 		}
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return status, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return status, false, fmt.Errorf("starting container: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return status, err
+		return status, false, err
 	}
 	if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
 		_, cleanupErr := b.command("delete", "--force", name)
 		if cleanupErr != nil {
-			return 1, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
+			return 1, false, fmt.Errorf("publishing ports: %w (runtime cleanup also failed: %v)", err, cleanupErr)
 		}
-		return 1, fmt.Errorf("publishing ports: %w", err)
+		return 1, false, fmt.Errorf("publishing ports: %w", err)
 	}
+	b.signalLifecycleReady()
 	if detach {
-		return 0, nil
+		return 0, true, nil
 	}
 	waitStatus, err := b.attach(attachRequest{target: target, stdin: interactive, stdout: true, stderr: true, detachKeys: defaultDetachKeys})
 	if err != nil {
 		if errors.Is(err, errDetached) {
-			return 0, nil
+			return 0, true, nil
 		}
-		return 1, err
+		return 1, false, err
 	}
-	return waitStatusExitCode(waitStatus), nil
+	return waitStatusExitCode(waitStatus), false, nil
 }
 
 func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding) (lockPath, errorPath string) {
@@ -8494,6 +10977,19 @@ func portSidecarPaths(dataRoot, container string, binding ttcbundle.PortBinding)
 }
 
 func (b *runtimeBackend) ensurePublishedPortsForBranch(info ttcbundle.ContainerInfo, branch string) error {
+	if b.portIngress.Clustered() {
+		// Cluster ingress listeners are explicit node-local ephemeral objects.
+		// They are created by run -p or `ttc port publish`, not reconstructed
+		// from shared container metadata on a target or daemon restart.
+		return nil
+	}
+	record, err := persistentBranchInfo(info, branch)
+	if err != nil {
+		return err
+	}
+	if record.Quarantined {
+		return nil
+	}
 	for _, binding := range info.PublishedPorts {
 		if binding.Branch() != branch {
 			continue
@@ -8509,7 +11005,10 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 	if info.NetworkMode != "ttc" {
 		return fmt.Errorf("container %s publishes ports with network mode %q", info.ID, info.NetworkMode)
 	}
-	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	// Listener locks and logs are live node-local state. Publishing them in the
+	// shared catalog both creates unnecessary small-file traffic and exposes
+	// removal to NFS open-unlink semantics.
+	lockPath, errorPath := portSidecarPaths(b.activeDataRoot(), info.ID, binding)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
 		return fmt.Errorf("creating published-port state: %w", err)
 	}
@@ -8582,7 +11081,7 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 }
 
 func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(target.container)
 	if err != nil {
 		return "", err
 	}
@@ -8601,6 +11100,9 @@ func (b *runtimeBackend) branchRuntimeState(target selector) (string, error) {
 }
 
 func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBinding) error {
+	if b.usesEphemeralPortIngress() {
+		return b.portIngress.Publish(target, binding)
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -8619,6 +11121,16 @@ func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBind
 		return err
 	}
 	info.PublishedPorts = append(info.PublishedPorts, binding)
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		_ = store.RemovePortBinding(target.container, binding)
+		return err
+	}
+	if branch.Quarantined {
+		// Keep the desired binding in branch metadata. Unquarantine activates
+		// it, without opening an external listener while the flag is set.
+		return nil
+	}
 	if err := b.ensurePublishedPort(info, binding); err != nil {
 		rollbackErr := store.RemovePortBinding(target.container, binding)
 		if rollbackErr != nil {
@@ -8630,6 +11142,16 @@ func (b *runtimeBackend) publishPort(target selector, binding ttcbundle.PortBind
 }
 
 func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, error) {
+	if b.usesEphemeralPortIngress() {
+		ephemeral, err := b.portIngress.List(container)
+		if err != nil {
+			return nil, err
+		}
+		// Cluster ingress bindings are intentionally node-local and
+		// ephemeral. A remote branch's physical bundle is not present on
+		// this ingress node and must not be consulted for display.
+		return ephemeral, nil
+	}
 	info, err := b.resolveContainer(container)
 	if err != nil {
 		return nil, err
@@ -8685,7 +11207,7 @@ func cleanupPortSidecarFiles(lockPath, errorPath string) error {
 }
 
 func (b *runtimeBackend) stopPublishedPort(info ttcbundle.ContainerInfo, binding ttcbundle.PortBinding) error {
-	lockPath, errorPath := portSidecarPaths(b.dataRoot, info.ID, binding)
+	lockPath, errorPath := portSidecarPaths(b.activeDataRoot(), info.ID, binding)
 	if b.consoleSidecars != nil {
 		stopped, err := b.consoleSidecars.StopPortSidecar(lockPath)
 		if err != nil {
@@ -8739,7 +11261,24 @@ func (b *runtimeBackend) stopPublishedPortsForBranch(info ttcbundle.ContainerInf
 	return errors.Join(errs...)
 }
 
+func (b *runtimeBackend) stopPublishedPorts(info ttcbundle.ContainerInfo) error {
+	var errs []error
+	for _, binding := range info.PublishedPorts {
+		if err := b.stopPublishedPort(info, binding); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", portBindingSpec(binding), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBinding) error {
+	if b.usesEphemeralPortIngress() {
+		if err := b.portIngress.Unpublish(target, binding); err == nil {
+			return nil
+		} else if !errors.Is(err, errIngressPortNotFound) {
+			return err
+		}
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -8769,23 +11308,42 @@ func (b *runtimeBackend) unpublishPort(target selector, binding ttcbundle.PortBi
 	return nil
 }
 
+// usesEphemeralPortIngress reports whether published ports belong only to the
+// daemon process that accepted the request. Cluster ingress is deliberately
+// node-local: each accepted connection resolves the branch's current Raft
+// placement, so it follows migration without rewriting container metadata.
+// Standalone TTC has no placement catalog and therefore persists bindings in
+// the container record so daemon reconciliation can restore their listeners.
+func (b *runtimeBackend) usesEphemeralPortIngress() bool {
+	return b.portIngress.Clustered()
+}
+
 func (b *runtimeBackend) pull(reference, platform string, progress bool) (ttcimages.Info, error) {
 	var progressFunc ttcimages.ProgressFunc
 	if progress {
 		progressFunc = b.imageProgress()
 	}
 	ctx := context.Background()
-	info, err := ttcimages.Pull(ctx, ttcimages.PullOptions{
-		Root:      b.dataRoot,
-		Reference: reference,
-		Platform:  platform,
-		Progress:  progressFunc,
-	})
-	if err != nil {
+	var info ttcimages.Info
+	// Downloading and unpacking take time in proportion to the image; the
+	// image store and its roots have locks of their own.
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "pulling"}, func() error {
+		var err error
+		info, err = ttcimages.Pull(ctx, ttcimages.PullOptions{
+			Root:      b.dataRoot,
+			Reference: reference,
+			Platform:  platform,
+			Progress:  progressFunc,
+		})
+		if err != nil {
+			return err
+		}
+		if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
+			return fmt.Errorf("preparing pulled image root: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return ttcimages.Info{}, err
-	}
-	if _, _, err := b.containerStore().EnsureImageRoot(ctx, info, platform, progressFunc); err != nil {
-		return ttcimages.Info{}, fmt.Errorf("preparing pulled image root: %w", err)
 	}
 	if _, err := b.containerStore().PruneImageRoots(ctx); err != nil {
 		return ttcimages.Info{}, fmt.Errorf("pruning superseded image roots: %w", err)
@@ -8801,12 +11359,7 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 		return nil, errors.New("no image archive on standard input")
 	}
 	ctx := context.Background()
-	imported, err := ttcimages.Load(ctx, ttcimages.LoadOptions{
-		Root: b.dataRoot, Archive: archive, Platform: platform,
-	})
-	if err != nil {
-		return nil, err
-	}
+	var imported []ttcimages.ImportedImage
 	published := false
 	defer func() {
 		if !published {
@@ -8814,12 +11367,25 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 			_, _ = b.containerStore().PruneImageRoots(context.Background())
 		}
 	}()
-	infos := make([]ttcimages.Info, 0, len(imported))
-	for _, image := range imported {
-		if _, _, err := b.containerStore().EnsureImportedImageRoot(ctx, image, image.Info.Platform, nil); err != nil {
-			return nil, fmt.Errorf("preparing loaded image %q root: %w", image.Info.Reference, err)
+	infos := make([]ttcimages.Info, 0)
+	// Importing and unpacking take time in proportion to the archive.
+	if err := b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "loading"}, func() error {
+		var err error
+		imported, err = ttcimages.Load(ctx, ttcimages.LoadOptions{
+			Root: b.dataRoot, Archive: archive, Platform: platform,
+		})
+		if err != nil {
+			return err
 		}
-		infos = append(infos, image.Info)
+		for _, image := range imported {
+			if _, _, err := b.containerStore().EnsureImportedImageRoot(ctx, image, image.Info.Platform, nil); err != nil {
+				return fmt.Errorf("preparing loaded image %q root: %w", image.Info.Reference, err)
+			}
+			infos = append(infos, image.Info)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	if err := ttcimages.PublishLoaded(ctx, b.dataRoot, imported); err != nil {
 		return nil, fmt.Errorf("publishing loaded images: %w", err)
@@ -8835,8 +11401,11 @@ func (b *runtimeBackend) loadImages(archive io.Reader, platform string) ([]ttcim
 }
 
 func (b *runtimeBackend) saveImages(archive io.Writer, identifiers []string, platform string) error {
-	return ttcimages.Save(context.Background(), ttcimages.SaveOptions{
-		Root: b.dataRoot, Archive: archive, Images: identifiers, Platform: platform,
+	// Exporting takes time in proportion to the images.
+	return b.withoutLifecycleLock(b.imageOperation(), longOperation{state: "saving"}, func() error {
+		return ttcimages.Save(context.Background(), ttcimages.SaveOptions{
+			Root: b.dataRoot, Archive: archive, Images: identifiers, Platform: platform,
+		})
 	})
 }
 
@@ -8845,6 +11414,11 @@ func (b *runtimeBackend) command(args ...string) ([]byte, error) {
 }
 
 func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]byte, error) {
+	if len(files) == 0 && embeddedRuntime(b.runsc) {
+		if output, answered, err := embeddedRuntimeCommand(b.root, args); answered {
+			return output, err
+		}
+	}
 	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), args...)...)
 	command.ExtraFiles = files
 	var stderr strings.Builder
@@ -8860,38 +11434,6 @@ func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]b
 	return output, nil
 }
 
-// pipeReaderForBytes returns a file descriptor that yields data and a
-// completion function that closes the reader and reports the asynchronous
-// writer's result. Writing must be concurrent with the command that consumes
-// the descriptor: configuration payloads can exceed the kernel pipe buffer.
-// The completion function is idempotent and must always be called.
-func pipeReaderForBytes(data []byte) (*os.File, func() error, error) {
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, writeErr := writer.Write(data)
-		if closeErr := writer.Close(); writeErr == nil {
-			writeErr = closeErr
-		}
-		done <- writeErr
-	}()
-	var (
-		once      sync.Once
-		finishErr error
-	)
-	finish := func() error {
-		once.Do(func() {
-			_ = reader.Close()
-			finishErr = <-done
-		})
-		return finishErr
-	}
-	return reader, finish, nil
-}
-
 func familyNodeID(info ttcbundle.ContainerInfo) string {
 	owner := ""
 	for _, branch := range info.Branches {
@@ -8904,9 +11446,6 @@ func familyNodeID(info ttcbundle.ContainerInfo) string {
 		}
 		owner = branchOwner
 	}
-	if owner == "" {
-		return info.NodeID
-	}
 	return owner
 }
 
@@ -8916,7 +11455,7 @@ func containerHasBranchOnNode(info ttcbundle.ContainerInfo, nodeID string) bool 
 	}
 	for _, branch := range info.Branches {
 		owner := info.BranchNodeID(branch.ID)
-		if owner == "" || owner == nodeID {
+		if owner == nodeID {
 			return true
 		}
 	}
@@ -8931,7 +11470,7 @@ func allBranchesColdOnNode(info ttcbundle.ContainerInfo, nodeID string) (allCold
 		}
 		count++
 		switch normalizeLifecycleState(branch.State) {
-		case "created", "dehydrated", "exited", "failed", "dead":
+		case "created", "dehydrating", "dehydrated", "exited", "failed", "dead":
 		default:
 			allCold = false
 		}
@@ -8939,18 +11478,98 @@ func allBranchesColdOnNode(info ttcbundle.ContainerInfo, nodeID string) (allCold
 	return allCold, count
 }
 
+// placementOwnersLister is a placement catalog that also reports, from the
+// same snapshot, which nodes are offline.
+type placementOwnersLister interface {
+	ListWithOfflineOwners() ([]cluster.PlacementRecord, map[string]bool, error)
+}
+
+// placementsWithOfflineOwners lists placements and, where the catalog can say
+// so from the same snapshot, which nodes are offline.
+func placementsWithOfflineOwners(placements cluster.PlacementCatalog) ([]cluster.PlacementRecord, map[string]bool, error) {
+	if withOwners, ok := placements.(placementOwnersLister); ok {
+		return withOwners.ListWithOfflineOwners()
+	}
+	records, err := placements.List()
+	return records, nil, err
+}
+
+// placementDisplayState is the state a listing shows for record: a running or
+// paused branch of an offline node is unavailable until the node returns, or
+// its removal gives the branch up.
+func placementDisplayState(record cluster.PlacementRecord, offlineOwners map[string]bool) string {
+	if offlineOwners[record.OwnerNode] && (record.State == cluster.PlacementRunning || record.State == cluster.PlacementPaused) {
+		return "unavailable"
+	}
+	return string(record.State)
+}
+
 func (b *runtimeBackend) listFamilies() ([]Family, error) {
-	runtimeFamilies, runtimeErr := b.listRuntimeFamilies()
+	return b.listFamiliesOf("")
+}
+
+// listFamiliesOf is listFamilies, but on a standalone daemon it lists only
+// the family with the given ID, if it is not empty: it reads no other
+// family's record and asks no other family's Sentry for its branches. A
+// cluster node lists every family, whose physical runtimes it can know only
+// from placements read after its runtimes.
+func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
+	if b.nodeID != "" {
+		familyID = ""
+	}
+	var runtimeFamilies []Family
+	var runtimeErr error
+	if familyID != "" {
+		runtimeFamilies, runtimeErr = b.listRuntimeFamiliesOf(familyID)
+	} else {
+		runtimeFamilies, runtimeErr = b.listRuntimeFamilies()
+	}
 	if b.dataRoot == "" {
 		return runtimeFamilies, runtimeErr
 	}
 	store := ttcbundle.Store{Root: b.dataRoot}
-	containers, storeErr := store.ListContainers()
-	if storeErr != nil {
-		return nil, storeErr
+	var containers []ttcbundle.ContainerInfo
+	if familyID == "" {
+		var storeErr error
+		if containers, storeErr = store.ListContainers(); storeErr != nil {
+			return nil, storeErr
+		}
+	} else if info, err := store.LoadContainer(familyID); err == nil {
+		if !info.IsDistributedPhysicalRuntime() {
+			containers = []ttcbundle.ContainerInfo{info}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	// Resolve physical migration identities before constructing the persistent
+	// view. A target imported into an existing Sentry is stored under a private
+	// transaction branch name, even though Raft exposes only the stable logical
+	// name. The private name must never enter user-facing inventory.
+	physicalPlacements := make(map[string][]cluster.PlacementRecord)
+	logicalPlacements := make(map[string][]cluster.PlacementRecord)
+	var placementRecords []cluster.PlacementRecord
+	var offlineOwners map[string]bool
+	if b.nodeID != "" {
+		if placements, err := b.placementCatalog(); err == nil {
+			var records []cluster.PlacementRecord
+			if records, offlineOwners, err = placementsWithOfflineOwners(placements); err == nil {
+				placementRecords = records
+				for _, record := range records {
+					logicalPlacements[record.FamilyID] = append(logicalPlacements[record.FamilyID], record)
+					if record.PhysicalContainer != "" {
+						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
+					}
+				}
+			}
+		}
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
 	for _, container := range containers {
+		if container.IsDistributedPhysicalRuntime() {
+			// Per-node target records are addressed through Raft placement. They
+			// must not appear as additional user-visible families.
+			continue
+		}
 		state := normalizeLifecycleState(container.State)
 		if state == "" {
 			state = "created"
@@ -8966,47 +11585,101 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			LiveForkWaiver:   container.LiveForkWaiver,
 			State:            state,
 			CreatedAt:        container.CreatedAt,
-			Branches:         persistentBranches(container.Branches, container.NodeID),
+			Branches:         persistentBranches(logicalPersistentBranchInfos(container.Branches, physicalPlacements[container.ID], offlineOwners, container.ID)),
 		}
 	}
-	// A single catalog snapshot is authoritative for branches that have entered
-	// elastic placement. Persistent container metadata remains the compatibility
-	// source for older/cold branches, but must not expose a half-published target
-	// during ownership cutover.
+	// A single catalog snapshot is authoritative for elastically placed branches.
+	// Persistent container metadata describes cold branches, but must not expose
+	// a half-published target during ownership cutover.
 	if b.nodeID != "" {
-		if placements, err := cluster.OpenPlacementStore(filepath.Join(b.dataRoot, "cluster", "placements")); err == nil {
-			if records, err := placements.List(); err == nil {
-				for _, record := range records {
-					family, ok := byID[record.FamilyID]
-					if !ok || record.State == cluster.PlacementUnplaced {
-						continue
-					}
-					for i := range family.Branches {
-						if family.Branches[i].ID == record.BranchID {
-							family.Branches[i].NodeID = record.OwnerNode
-							break
-						}
-					}
-					owner := ""
-					for _, branch := range family.Branches {
-						if branch.NodeID == "" {
-							continue
-						}
-						if owner != "" && owner != branch.NodeID {
-							owner = ""
-							break
-						}
-						owner = branch.NodeID
-					}
-					family.NodeID = owner
-					byID[record.FamilyID] = family
+		for _, record := range placementRecords {
+			family, ok := byID[record.FamilyID]
+			if !ok && record.FamilyName != "" {
+				family = Family{
+					ID: record.FamilyID, Name: record.FamilyName, Image: record.ImageReference,
+					Digest: record.ImageDigest, ImageSize: record.ImageSize,
+					LiveForkEligible: record.LiveForkEligible, LiveForkWaiver: record.LiveForkWaiver,
+					CreatedAt: record.FamilyCreatedAt,
+				}
+				ok = true
+			}
+			if !ok {
+				continue
+			}
+			foundBranch := false
+			for i := range family.Branches {
+				if family.Branches[i].ID == record.BranchID {
+					family.Branches[i].NodeID = record.OwnerNode
+					family.Branches[i].State = placementDisplayState(record, offlineOwners)
+					family.Branches[i].Quarantined = record.Quarantined
+					foundBranch = true
+					break
 				}
 			}
+			if !foundBranch {
+				storageState := "local"
+				if record.State == cluster.PlacementUnplaced {
+					storageState = "shared"
+				}
+				family.Branches = append(family.Branches, Branch{
+					ID: record.BranchID, NodeID: record.OwnerNode, ParentID: record.ParentBranch,
+					Quarantined: record.Quarantined, State: placementDisplayState(record, offlineOwners), StorageState: storageState, CreatedAt: record.BranchCreatedAt,
+				})
+			}
+			owner := ""
+			for _, branch := range family.Branches {
+				if branch.NodeID == "" {
+					continue
+				}
+				if owner != "" && owner != branch.NodeID {
+					owner = ""
+					break
+				}
+				owner = branch.NodeID
+			}
+			family.NodeID = owner
+			family.State = familyStateFromBranches(family.Branches)
+			byID[record.FamilyID] = family
+		}
+	}
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		// In clustered TTC, Raft is the existence authority for every logical
+		// branch, including cold/unplaced ones. container.json is a physical
+		// materialization record and can lag a rename or removal on another node;
+		// retaining names absent from the placement snapshot manufactures zombie
+		// branches in ps/ls and can make later commands appear routable.
+		for familyID, family := range byID {
+			records := logicalPlacements[familyID]
+			if len(records) == 0 {
+				delete(byID, familyID)
+				continue
+			}
+			family.Branches = branchesInPlacementSnapshot(family.Branches, records)
+			family.State = familyStateFromBranches(family.Branches)
+			byID[familyID] = family
 		}
 	}
 	if runtimeErr == nil {
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
+			runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
+			physicalRuntime := runtimeInfoErr == nil && runtimeInfo.IsDistributedPhysicalRuntime()
+			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
+				physicalID := family.ID
+				family.ID = placements[0].FamilyID
+				// Unmapped runtime branches are paused sparse providers from an
+				// older migration incarnation or provisional targets whose Raft
+				// placement has not committed. They are implementation state, not
+				// additional user-visible branches.
+				family.Branches = visiblePhysicalRuntimeBranches(family.Branches, placements, physicalID)
+			} else if physicalRuntime {
+				// Raft only retains the current physical placement for a logical
+				// branch. A completed migration's source runtime can therefore
+				// remain visible to runsc briefly while its asynchronous cleanup
+				// is retrying. It is internal implementation state, never a new
+				// user-visible family.
+				continue
+			}
 			// A runsc state directory can outlive its Sentry after SIGKILL, which
 			// is common when a batch scheduler terminates a whole job. Merely
 			// appearing in `runsc list` does not make that runtime available.
@@ -9032,7 +11705,7 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 				}
 				for _, branch := range family.Branches {
 					owner := persistentByID[branch.ID].NodeID
-					if b.nodeID == "" || owner == "" || owner == b.nodeID {
+					if b.nodeID == "" || owner == b.nodeID {
 						liveLocal = append(liveLocal, branch)
 					}
 				}
@@ -9061,47 +11734,43 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 			if b.nodeID != "" && !containerHasBranchOnNode(container, b.nodeID) {
 				continue
 			}
-			if _, ok := runtimeIDs[container.ID]; ok {
+			displayID := container.ID
+			if container.DistributedFamilyID != "" {
+				displayID = container.DistributedFamilyID
+			}
+			if _, ok := runtimeIDs[displayID]; ok {
 				continue
 			}
-			var exitStatus *int
-			// A wait-status file belongs to one incarnation of main. Do not
-			// attribute an old main exit to a different live branch that was
-			// killed with the sandbox.
-			if persistentBranchRequiredRuntime(container, defaultBranchID) {
-				if paths, err := store.BranchConsolePaths(container.ID, defaultBranchID); err == nil {
-					if status, found, err := readConsoleWaitStatus(paths.WaitStatus); err == nil && found {
-						code := waitStatusExitCode(status)
-						exitStatus = &code
-					}
-				}
+			// Process-free states intentionally have no live Sentry. This also
+			// covers the publication window for `runsc create` and the short
+			// interval after a foreground init exits but before its waiter records
+			// the result: persistent state is still "created" in both cases.
+			// Inventory must not force-delete runtime metadata in either window.
+			if !persistentFamilyRequiredRuntime(container, b.nodeID) {
+				continue
 			}
-			// Once the Sentry is known to be gone, no console follower or gofer
-			// may retain files from the persistent container directory. Reap the
-			// sidecars before recording process-free state so later removal is
-			// also safe on NFS, where unlinking an open file creates .nfs files.
-			_ = b.stopContainerConsoleDrains(container.ID)
-			_, _ = b.command("delete", "--force", container.ID)
-			if err := store.ReconcileNodeRuntimeUnavailable(container.ID, b.nodeID, exitStatus); err != nil {
+			if _, busy := b.operations.lookup(container.ID); busy {
+				continue
+			}
+			if b.inventoryReadOnly {
+				b.inventoryRepairWanted = true
+				continue
+			}
+			if err := b.recordLostRuntime(container); err != nil {
 				continue
 			}
 			if reconciled, err := store.LoadContainer(container.ID); err == nil {
-				// No process can fault the imported backing after the family
-				// runtime is gone. Persist the exited state first, then release
-				// the cluster root; a failure remains conservative and a later
-				// listing retries the idempotent cleanup.
-				if persistentFamilyProcessFree(reconciled) {
-					if err := b.releaseDistributedSparseRoot(reconciled); err == nil {
-						if latest, err := store.LoadContainer(container.ID); err == nil {
-							reconciled = latest
-						}
-					}
+				family := byID[displayID]
+				if family.ID == "" {
+					// A per-node physical runtime record is not itself a
+					// user-visible family. If the logical catalog is temporarily
+					// unavailable, do not manufacture an empty zombie row for it.
+					continue
 				}
-				family := byID[container.ID]
 				family.State = normalizeLifecycleState(reconciled.State)
-				family.Branches = persistentBranches(reconciled.Branches, reconciled.NodeID)
+				family.Branches = persistentBranches(logicalPersistentBranchInfos(reconciled.Branches, physicalPlacements[reconciled.ID], offlineOwners, reconciled.ID))
 				family.SandboxPID = 0
-				byID[container.ID] = family
+				byID[displayID] = family
 			}
 		}
 	} else {
@@ -9111,6 +11780,33 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		for id, family := range byID {
 			family.Error = runtimeErr.Error()
 			byID[id] = family
+		}
+	}
+	// In clustered TTC, Raft is the lifecycle authority. Shared container JSON
+	// is a materialization catalog and may lag a lease-expiry or migration
+	// decision; never let it make a fenced/corrupted branch appear runnable.
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		authorities, err := b.distributedSource.authority.Branches()
+		if err != nil {
+			return nil, fmt.Errorf("reading cluster branch authority: %w", err)
+		}
+		placementByBranch := make(map[string]cluster.PlacementRecord)
+		if placements, err := b.placementCatalog(); err == nil {
+			if records, err := placements.List(); err == nil {
+				for _, record := range records {
+					placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
+				}
+			}
+		}
+		for _, authority := range authorities {
+			family, ok := byID[authority.FamilyID]
+			if !ok {
+				continue
+			}
+			placement, placed := placementByBranch[authority.FamilyID+"\x00"+authority.BranchID]
+			family = mergeAuthoritativeBranch(family, authority, placement, placed, b.dataRoot)
+			family.State = familyStateFromBranches(family.Branches)
+			byID[authority.FamilyID] = family
 		}
 	}
 	families := make([]Family, 0, len(byID))
@@ -9129,7 +11825,86 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 		}
 		return families[i].ID < families[j].ID
 	})
+	b.showLongOperations(families)
 	return families, nil
+}
+
+func branchesInPlacementSnapshot(branches []Branch, placements []cluster.PlacementRecord) []Branch {
+	visible := make(map[string]struct{}, len(placements))
+	for _, placement := range placements {
+		visible[placement.BranchID] = struct{}{}
+	}
+	filtered := make([]Branch, 0, min(len(branches), len(visible)))
+	for _, branch := range branches {
+		if _, ok := visible[branch.ID]; ok {
+			filtered = append(filtered, branch)
+		}
+	}
+	return filtered
+}
+
+// mergeAuthoritativeBranch projects one Raft branch record into the public
+// family view. Raft is the existence and lifecycle authority in a cluster, so
+// an unplaced migrated branch must be synthesized even when its durable bytes
+// live in a hidden transaction-scoped container. Requiring a matching entry in
+// the logical family's container.json made cold migrated branches disappear
+// from ls/inspect and consequently made rehydrate impossible.
+func mergeAuthoritativeBranch(family Family, authority cluster.BranchAuthority, placement cluster.PlacementRecord, placed bool, dataRoot string) Family {
+	index := -1
+	for i := range family.Branches {
+		if family.Branches[i].ID == authority.BranchID {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		family.Branches = append(family.Branches, Branch{ID: authority.BranchID})
+		index = len(family.Branches) - 1
+	}
+	branch := &family.Branches[index]
+	branch.State = authority.Lifecycle
+	branch.PublicationID = authority.PublicationID
+	if authority.Roots.FilesystemRoot != "" {
+		branch.StorageManifest = filepath.Join(dataRoot, authority.Roots.FilesystemRoot)
+	}
+	if placed {
+		branch.ParentID = placement.ParentBranch
+		branch.Quarantined = placement.Quarantined
+		if !placement.BranchCreatedAt.IsZero() {
+			branch.CreatedAt = placement.BranchCreatedAt
+		}
+	}
+	if !placed || placement.State == cluster.PlacementUnplaced || placement.State == cluster.PlacementCorrupted {
+		branch.NodeID = ""
+		if authority.Roots.FilesystemRoot != "" {
+			branch.StorageState = "shared"
+		}
+	} else {
+		branch.NodeID = placement.OwnerNode
+		if branch.StorageState == "" {
+			branch.StorageState = "local"
+		}
+	}
+	if authority.Corrupted {
+		family.Error = fmt.Sprintf("branch %s is corrupted: %s", authority.BranchID, authority.CorruptionReason)
+	}
+	sort.Slice(family.Branches, func(i, j int) bool { return family.Branches[i].ID < family.Branches[j].ID })
+	return family
+}
+
+func visiblePhysicalRuntimeBranches(branches []Branch, placements []cluster.PlacementRecord, physicalContainer string) []Branch {
+	visible := make([]Branch, 0, len(branches))
+	for _, branch := range branches {
+		for _, placement := range placements {
+			if placement.PhysicalContainer != physicalContainer || placement.PhysicalBranch != branch.ID {
+				continue
+			}
+			branch.ID = placement.BranchID
+			visible = append(visible, branch)
+			break
+		}
+	}
+	return visible
 }
 
 // runtimeFamilyUnavailable reports whether a runsc list entry is only stale
@@ -9159,25 +11934,62 @@ func persistentBranchRequiredRuntime(container ttcbundle.ContainerInfo, branchID
 	}
 }
 
+func persistentFamilyRequiredRuntime(container ttcbundle.ContainerInfo, nodeID string) bool {
+	for _, branch := range container.Branches {
+		owner := container.BranchNodeID(branch.ID)
+		if nodeID != "" && owner != "" && owner != nodeID {
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "creating", "running", "paused", "dehydrating", "rehydrating", "restarting":
+			return true
+		}
+		if ttcbundle.ResidentDehydration(branch) {
+			return true
+		}
+	}
+	return false
+}
+
 func enrichPersistentBranchDiagnostics(family *Family) {
+	liveKernelsByNode := make(map[string]int)
+	for i := range family.Branches {
+		branch := &family.Branches[i]
+		switch normalizeLifecycleState(branch.State) {
+		case "running", "paused":
+			liveKernelsByNode[branch.NodeID]++
+		}
+	}
 	for i := range family.Branches {
 		branch := &family.Branches[i]
 		if branch.InitState == "" {
-			switch branch.State {
+			switch normalizeLifecycleState(branch.State) {
 			case "created", "creating":
 				branch.InitState = "not-started"
 			case "exited", "stopped", "failed":
 				branch.InitState = "exited"
+			case "running", "paused":
+				// Raft lifecycle and placement are authoritative after a remote
+				// fork or migration. A control-only node may not have a local
+				// Sentry from which to enrich these fields, but a branch cannot
+				// commit either state without a live PID 1 on its owner.
+				branch.InitState = normalizeLifecycleState(branch.State)
+				branch.InitPID = 1
 			default:
 				branch.InitState = "unknown"
 			}
 		}
 		if branch.MemorySharing == "" {
-			switch branch.State {
+			switch normalizeLifecycleState(branch.State) {
 			case "created", "creating":
 				branch.MemorySharing = "unallocated"
 			case "exited", "stopped", "failed":
 				branch.MemorySharing = "released"
+			case "running", "paused":
+				branch.MemorySharing = "private"
+				if liveKernelsByNode[branch.NodeID] > 1 {
+					branch.MemorySharing = "cow"
+				}
 			default:
 				branch.MemorySharing = "unknown"
 			}
@@ -9185,20 +11997,77 @@ func enrichPersistentBranchDiagnostics(family *Family) {
 	}
 }
 
-func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
+type runtimeSandboxState struct {
+	ID     string `json:"id"`
+	PID    int    `json:"pid"`
+	Status string `json:"status"`
+}
+
+// listRuntimeSandboxes reads only runsc's host-side state. It deliberately
+// does not contact a Sentry control server, so teardown can still discover and
+// force-delete a sandbox whose branch RPC endpoint is unavailable.
+func (b *runtimeBackend) listRuntimeSandboxes() ([]runtimeSandboxState, error) {
 	output, err := b.command("list", "--format=json", "--sandbox")
 	if err != nil {
 		return nil, err
 	}
-	var states []struct {
-		ID     string `json:"id"`
-		PID    int    `json:"pid"`
-		Status string `json:"status"`
-	}
+	var states []runtimeSandboxState
 	if err := json.Unmarshal(output, &states); err != nil {
 		return nil, fmt.Errorf("decoding runsc container list: %w", err)
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
+	return states, nil
+}
+
+// listRuntimeSandboxesOf is listRuntimeSandboxes of only the sandboxes with the
+// given IDs. With the runtime embedded in ttcd, it reads only their state.
+func (b *runtimeBackend) listRuntimeSandboxesOf(ids []string) ([]runtimeSandboxState, error) {
+	if !embeddedRuntime(b.runsc) {
+		states, err := b.listRuntimeSandboxes()
+		if err != nil {
+			return nil, err
+		}
+		kept := states[:0]
+		for _, state := range states {
+			if slices.Contains(ids, state.ID) {
+				kept = append(kept, state)
+			}
+		}
+		return kept, nil
+	}
+	var states []runtimeSandboxState
+	for _, id := range ids {
+		// Like runsc list, pass over a sandbox that cannot be loaded, as one
+		// being deleted.
+		c, err := container.Load(b.root, container.FullID{SandboxID: id, ContainerID: id}, container.LoadOpts{Exact: true})
+		if err != nil {
+			continue
+		}
+		state := c.State()
+		states = append(states, runtimeSandboxState{ID: state.ID, PID: state.Pid, Status: string(state.Status)})
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].ID < states[j].ID })
+	return states, nil
+}
+
+func (b *runtimeBackend) listRuntimeFamilies() ([]Family, error) {
+	return b.listRuntimeFamiliesOf()
+}
+
+// listRuntimeFamiliesOf is listRuntimeFamilies of only the sandboxes with the
+// given IDs, or of every sandbox if none is given. It asks no other sandbox
+// about itself.
+func (b *runtimeBackend) listRuntimeFamiliesOf(ids ...string) ([]Family, error) {
+	var states []runtimeSandboxState
+	var err error
+	if len(ids) != 0 {
+		states, err = b.listRuntimeSandboxesOf(ids)
+	} else {
+		states, err = b.listRuntimeSandboxes()
+	}
+	if err != nil {
+		return nil, err
+	}
 	families := make([]Family, 0, len(states))
 	for _, state := range states {
 		if state.ID == "" {
@@ -9372,10 +12241,19 @@ type runscBranchInfo struct {
 	InitPID          int32     `json:"InitPID"`
 	InitState        string    `json:"InitState"`
 	SharesMemory     bool      `json:"SharesMemory"`
+	Quarantined      bool      `json:"Quarantined"`
 	ForkMetrics      struct {
 		SourceDowntime time.Duration `json:"SourceDowntime"`
 		Kernel         struct {
-			Total time.Duration `json:"Total"`
+			Validation              time.Duration `json:"Validation"`
+			SharedMemoryPreparation time.Duration `json:"SharedMemoryPreparation"`
+			MappingInvalidation     time.Duration `json:"MappingInvalidation"`
+			VFSPreparation          time.Duration `json:"VFSPreparation"`
+			MemoryPreparation       time.Duration `json:"MemoryPreparation"`
+			MetadataStream          time.Duration `json:"MetadataStream"`
+			MetadataBytes           int64         `json:"MetadataBytes"`
+			ChildRestore            time.Duration `json:"ChildRestore"`
+			Total                   time.Duration `json:"Total"`
 		} `json:"Kernel"`
 		Total time.Duration `json:"Total"`
 	} `json:"ForkMetrics"`
@@ -9391,23 +12269,114 @@ func normalizeLifecycleState(state string) string {
 	return state
 }
 
-func persistentBranchView(info ttcbundle.BranchInfo, fallbackNode string) Branch {
-	nodeID := info.NodeID
-	if nodeID == "" {
-		nodeID = fallbackNode
-	}
+func persistentBranchView(info ttcbundle.BranchInfo) Branch {
 	return Branch{
-		ID: info.ID, NodeID: nodeID, ParentID: info.ParentID, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
-		ForkTotalNS: info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
+		ID: info.ID, NodeID: info.NodeID, ParentID: info.ParentID, Quarantined: info.Quarantined, State: normalizeLifecycleState(info.State), CreatedAt: info.CreatedAt,
+		ExitStatus: info.ExitStatus, StorageState: info.StorageState, PublicationID: info.PublicationID, StorageError: info.StorageError,
+		StorageManifest: info.StorageManifest, SnapshotID: info.SnapshotID, MemoryRoots: append([]string(nil), info.MemoryRoots...),
+		MemoryRootObjects: append([]string(nil), info.MemoryRootObjects...),
+		ControlRoot:       info.ControlRoot, ControlRootObject: info.ControlRootObject,
+		StorageRetryAt: info.StorageRetryAt, SourceNode: info.SourceNode, DependentMemoryBytes: info.DependentMemoryBytes,
+		DependentFilesystemBytes: info.DependentFilesystemBytes,
+		ForkTotalNS:              info.ForkTotalNS, SourceDowntimeNS: info.SourceDowntimeNS, KernelForkNS: info.KernelForkNS,
+		ForkValidationNS: info.ForkValidationNS, ForkSharedMemoryNS: info.ForkSharedMemoryNS,
+		ForkMappingInvalidationNS: info.ForkMappingInvalidationNS, ForkVFSPreparationNS: info.ForkVFSPreparationNS,
+		ForkMemoryPreparationNS: info.ForkMemoryPreparationNS, ForkMetadataStreamNS: info.ForkMetadataStreamNS,
+		ForkMetadataBytes: info.ForkMetadataBytes, ForkChildRestoreNS: info.ForkChildRestoreNS,
 	}
 }
 
-func persistentBranches(infos []ttcbundle.BranchInfo, fallbackNode string) []Branch {
+func persistentBranches(infos []ttcbundle.BranchInfo) []Branch {
 	branches := make([]Branch, 0, len(infos))
 	for _, info := range infos {
-		branches = append(branches, persistentBranchView(info, fallbackNode))
+		branches = append(branches, persistentBranchView(info))
 	}
 	return branches
+}
+
+// logicalPersistentBranchInfos removes transaction-scoped migration branch
+// names from a user-facing persistent view. A physical migration branch is
+// visible only through the Raft placement that currently maps it to a stable
+// logical identity. Superseded physical branches are provider/cleanup state and
+// remain hidden even while their local metadata genuinely still exists.
+func logicalPersistentBranchInfos(infos []ttcbundle.BranchInfo, placements []cluster.PlacementRecord, offlineOwners map[string]bool, physicalContainer string) []ttcbundle.BranchInfo {
+	byPhysical := make(map[string]cluster.PlacementRecord, len(placements))
+	byLogical := make(map[string]cluster.PlacementRecord, len(placements))
+	authoritativeFamily := false
+	for _, placement := range placements {
+		if placement.PhysicalContainer == physicalContainer && placement.PhysicalBranch != "" {
+			byPhysical[placement.PhysicalBranch] = placement
+		}
+		if placement.FamilyID == physicalContainer {
+			authoritativeFamily = true
+			byLogical[placement.BranchID] = placement
+		}
+	}
+	result := make([]ttcbundle.BranchInfo, 0, len(infos))
+	resultByLogical := make(map[string]int, len(infos))
+	for _, info := range infos {
+		logical := info
+		if info.DistributedMigration {
+			placement, ok := byPhysical[info.ID]
+			if !ok {
+				continue
+			}
+			logical.ID = placement.BranchID
+			logical.NodeID = placement.OwnerNode
+			logical.Quarantined = placement.Quarantined
+			logical.Unplaced = placement.State == cluster.PlacementUnplaced
+			if placement.ParentBranch != "" || logical.ParentID == "" {
+				logical.ParentID = placement.ParentBranch
+			}
+			if !placement.BranchCreatedAt.IsZero() {
+				logical.CreatedAt = placement.BranchCreatedAt
+			}
+			logical.DistributedForkTransactionID = ""
+			logical.DistributedGraphReferenceOperation = ""
+			logical.DistributedMigration = false
+		} else if authoritativeFamily {
+			placement, ok := byLogical[info.ID]
+			if !ok {
+				// A rename/removal committed on another node may leave this
+				// physical materialization record behind until asynchronous
+				// cleanup. It is no longer a logical branch.
+				continue
+			}
+			logical.NodeID = placement.OwnerNode
+			logical.Quarantined = placement.Quarantined
+			logical.Unplaced = placement.State == cluster.PlacementUnplaced
+			logical.State = placementDisplayState(placement, offlineOwners)
+			logical.ParentID = placement.ParentBranch
+			if !placement.BranchCreatedAt.IsZero() {
+				logical.CreatedAt = placement.BranchCreatedAt
+			}
+		}
+		if index, exists := resultByLogical[logical.ID]; exists {
+			// The currently placed physical incarnation is authoritative over a
+			// stale persistent record carrying the same logical name.
+			if info.DistributedMigration {
+				result[index] = logical
+			}
+			continue
+		}
+		resultByLogical[logical.ID] = len(result)
+		result = append(result, logical)
+	}
+	if authoritativeFamily {
+		for _, placement := range byLogical {
+			if _, ok := resultByLogical[placement.BranchID]; ok {
+				continue
+			}
+			result = append(result, ttcbundle.BranchInfo{
+				ID: placement.BranchID, ParentID: placement.ParentBranch,
+				NodeID: placement.OwnerNode, State: string(placement.State),
+				Quarantined: placement.Quarantined, Unplaced: placement.State == cluster.PlacementUnplaced,
+				CreatedAt: placement.BranchCreatedAt,
+			})
+		}
+		sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	}
+	return result
 }
 
 func persistentBranchInfo(info ttcbundle.ContainerInfo, branchID string) (ttcbundle.BranchInfo, error) {
@@ -9423,19 +12392,11 @@ func memoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.Branch
 	return filepath.Join(dataRoot, "containers", containerID, "memory", kind, ttcbundle.MemoryBranchKey(branch))
 }
 
-// existingMemoryBranchDir accepts the visible-name layout written by older
-// TTC versions. New writes and any branch rename use the stable filesystem
-// identity instead.
+// existingMemoryBranchDir returns the only memory layout accepted by the
+// current root format. Older visible-name layouts are rejected at the root
+// boundary and must never be consulted from a new-format root.
 func existingMemoryBranchDir(dataRoot, containerID, kind string, branch ttcbundle.BranchInfo) string {
-	stable := memoryBranchDir(dataRoot, containerID, kind, branch)
-	if _, err := os.Lstat(stable); err == nil || !os.IsNotExist(err) {
-		return stable
-	}
-	legacy := filepath.Join(dataRoot, "containers", containerID, "memory", kind, hex.EncodeToString([]byte(branch.ID)))
-	if _, err := os.Lstat(legacy); err == nil || !os.IsNotExist(err) {
-		return legacy
-	}
-	return stable
+	return memoryBranchDir(dataRoot, containerID, kind, branch)
 }
 
 func mergeBranchHistory(history, live []Branch) []Branch {
@@ -9450,7 +12411,24 @@ func mergeBranchHistory(history, live []Branch) []Branch {
 			// parent itself was already process-free, so it is not authoritative
 			// for lineage reconciliation.
 			branch.ParentID = recorded.ParentID
+			// Quarantine is user-controlled durable policy. In particular, it can
+			// change while a process-free branch remains listed by a live peer's
+			// Sentry, whose cached BranchInfo is not authoritative.
+			branch.Quarantined = recorded.Quarantined
 			branch.NodeID = recorded.NodeID
+			branch.StorageState = recorded.StorageState
+			branch.PublicationID = recorded.PublicationID
+			branch.StorageError = recorded.StorageError
+			branch.StorageManifest = recorded.StorageManifest
+			branch.StorageRetryAt = recorded.StorageRetryAt
+			branch.SnapshotID = recorded.SnapshotID
+			branch.MemoryRoots = append([]string(nil), recorded.MemoryRoots...)
+			branch.MemoryRootObjects = append([]string(nil), recorded.MemoryRootObjects...)
+			branch.ControlRoot = recorded.ControlRoot
+			branch.ControlRootObject = recorded.ControlRootObject
+			branch.SourceNode = recorded.SourceNode
+			branch.DependentMemoryBytes = recorded.DependentMemoryBytes
+			branch.DependentFilesystemBytes = recorded.DependentFilesystemBytes
 		}
 		byID[branch.ID] = branch
 	}
@@ -9466,7 +12444,7 @@ func familyStateFromBranches(branches []Branch) string {
 	priority := map[string]int{
 		"exited": 1, "failed": 2, "dead": 2, "dehydrated": 3, "created": 4,
 		"paused": 5, "dehydrating": 6, "rehydrating": 7, "creating": 8,
-		"restarting": 9, "running": 10,
+		"restarting": 9, "running": 10, "removing": 11,
 	}
 	state, best := "exited", 0
 	for _, branch := range branches {
@@ -9486,16 +12464,25 @@ func memorySharingMode(shared bool) string {
 
 func branchView(info runscBranchInfo) Branch {
 	return Branch{
-		ID:               info.ID,
-		ParentID:         info.ParentID,
-		State:            normalizeLifecycleState(info.State),
-		CreatedAt:        info.CreatedAt,
-		InitPID:          info.InitPID,
-		InitState:        info.InitState,
-		MemorySharing:    memorySharingMode(info.SharesMemory),
-		ForkTotalNS:      info.ForkMetrics.Total.Nanoseconds(),
-		SourceDowntimeNS: info.ForkMetrics.SourceDowntime.Nanoseconds(),
-		KernelForkNS:     info.ForkMetrics.Kernel.Total.Nanoseconds(),
+		ID:                        info.ID,
+		ParentID:                  info.ParentID,
+		Quarantined:               info.Quarantined,
+		State:                     normalizeLifecycleState(info.State),
+		CreatedAt:                 info.CreatedAt,
+		InitPID:                   info.InitPID,
+		InitState:                 info.InitState,
+		MemorySharing:             memorySharingMode(info.SharesMemory),
+		ForkTotalNS:               info.ForkMetrics.Total.Nanoseconds(),
+		SourceDowntimeNS:          info.ForkMetrics.SourceDowntime.Nanoseconds(),
+		KernelForkNS:              info.ForkMetrics.Kernel.Total.Nanoseconds(),
+		ForkValidationNS:          info.ForkMetrics.Kernel.Validation.Nanoseconds(),
+		ForkSharedMemoryNS:        info.ForkMetrics.Kernel.SharedMemoryPreparation.Nanoseconds(),
+		ForkMappingInvalidationNS: info.ForkMetrics.Kernel.MappingInvalidation.Nanoseconds(),
+		ForkVFSPreparationNS:      info.ForkMetrics.Kernel.VFSPreparation.Nanoseconds(),
+		ForkMemoryPreparationNS:   info.ForkMetrics.Kernel.MemoryPreparation.Nanoseconds(),
+		ForkMetadataStreamNS:      info.ForkMetrics.Kernel.MetadataStream.Nanoseconds(),
+		ForkMetadataBytes:         info.ForkMetrics.Kernel.MetadataBytes,
+		ForkChildRestoreNS:        info.ForkMetrics.Kernel.ChildRestore.Nanoseconds(),
 	}
 }
 
@@ -9511,6 +12498,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if len(destinations) == 0 {
 		return nil, errors.New("at least one fork destination is required")
 	}
+	logicalSource := source
 	resolved, containerInfo, err := b.resolveSelector(source)
 	if err != nil {
 		return nil, err
@@ -9531,15 +12519,55 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			}
 		}
 	}
+	if err := b.ensureForkPlacementDestinationsAvailable(containerInfo, destinations); err != nil {
+		return nil, err
+	}
 	sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
 	if err != nil {
 		return nil, err
 	}
-	if normalizeLifecycleState(sourceRecord.State) == "dehydrated" {
-		if quarantine {
-			return nil, errors.New("a dehydrated branch cannot be forked into quarantine: it has no connections to keep and nothing to ask")
+	if state := normalizeLifecycleState(sourceRecord.State); state == "dehydrated" || state == "dehydrating" {
+		// A dehydrated branch is forked from its durable image, which a
+		// resident dehydration does not have yet.
+		if ttcbundle.ResidentDehydration(sourceRecord) {
+			if err := b.persistDehydration(source, containerInfo, sourceRecord, nil); err != nil {
+				return nil, fmt.Errorf("making the dehydration of %s durable to fork it: %w", source, err)
+			}
+			if containerInfo, err = b.containerStore().LoadContainer(containerInfo.ID); err != nil {
+				return nil, err
+			}
+			if sourceRecord, err = persistentBranchInfo(containerInfo, source.branch); err != nil {
+				return nil, err
+			}
 		}
-		return b.forkDehydratedMany(source, containerInfo, sourceRecord, destinations, paused)
+		return b.forkDehydratedMany(source, logicalSource.branch, containerInfo, sourceRecord, destinations, paused, sourceRecord.Quarantined || quarantine)
+	}
+	referenceTransaction := transactionIDForBranch(containerInfo, sourceRecord)
+	referenceOperations := make([]string, len(destinations))
+	referenceTransactions := make([]string, len(destinations))
+	referenceRequired := referenceTransaction != ""
+	if len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		localRoots, err := b.graphMemoryRootsLocal(sourceRecord.MemoryRoots)
+		if err != nil {
+			return nil, err
+		}
+		referenceRequired = referenceRequired || !localRoots
+	}
+	if referenceRequired && len(sourceRecord.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		for index := range referenceOperations {
+			operation, err := newGraphReferenceOperation()
+			if err != nil {
+				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destinations[index], err)
+			}
+			referenceOperations[index] = operation
+			referenceTransactions[index] = referenceTransaction
+			if referenceTransactions[index] == "" {
+				// Shared-only roots have no fork transaction to authorize. The
+				// unique operation is a durable local ownership fence and also
+				// satisfies the intent format's non-empty transaction identity.
+				referenceTransactions[index] = operation
+			}
+		}
 	}
 	args := []string{"timetravel", "--source", source.branch}
 	if paused {
@@ -9550,8 +12578,36 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	}
 	args = append(args, source.container, "fork")
 	args = append(args, destinations...)
-	output, err := b.command(args...)
+	fork := func() ([]byte, func(bool) error, error) {
+		filesystemOrigins, finishFilesystemOrigins, err := b.allocateFilesystemForkOrigins(containerInfo.ID, len(destinations))
+		if err != nil {
+			return nil, nil, err
+		}
+		var output []byte
+		if len(filesystemOrigins) == 0 {
+			output, err = b.command(args...)
+		} else {
+			originsReader, pipeErr := filesystemOriginAssignmentsPipe(filesystemOrigins)
+			if pipeErr != nil {
+				return nil, nil, errors.Join(pipeErr, finishFilesystemOrigins(false))
+			}
+			withOrigins := append([]string{"timetravel", "--filesystem-origins-fd=3"}, args[1:]...)
+			output, err = b.commandWithFiles([]*os.File{originsReader}, withOrigins...)
+			closeErr := originsReader.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			return nil, nil, errors.Join(err, finishFilesystemOrigins(false))
+		}
+		return output, finishFilesystemOrigins, nil
+	}
+	output, finishFilesystemOrigins, err := b.forkThroughHandoffs(containerInfo, source.branch, fork)
 	if err != nil {
+		return nil, err
+	}
+	if err := finishFilesystemOrigins(true); err != nil {
 		return nil, err
 	}
 	infos := make([]runscBranchInfo, 0, len(destinations))
@@ -9567,21 +12623,60 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	branches := make([]Branch, len(infos))
 	for i, info := range infos {
 		branches[i] = branchView(info)
+		branches[i].ParentID = logicalSource.branch
 	}
 	if b.dataRoot != "" {
 		records := make([]ttcbundle.BranchInfo, len(branches))
 		for i, branch := range branches {
 			records[i] = ttcbundle.BranchInfo{
 				ID: branch.ID, ParentID: branch.ParentID, FilesystemBranch: infos[i].FilesystemBranch,
-				State: branch.State, CreatedAt: branch.CreatedAt,
+				Quarantined: branch.Quarantined,
+				NodeID:      b.nodeID,
+				State:       branch.State, StorageState: "local", StorageManifest: sourceRecord.StorageManifest, CreatedAt: branch.CreatedAt,
 				ForkTotalNS: branch.ForkTotalNS, SourceDowntimeNS: branch.SourceDowntimeNS, KernelForkNS: branch.KernelForkNS,
+				ForkValidationNS: branch.ForkValidationNS, ForkSharedMemoryNS: branch.ForkSharedMemoryNS,
+				ForkMappingInvalidationNS: branch.ForkMappingInvalidationNS, ForkVFSPreparationNS: branch.ForkVFSPreparationNS,
+				ForkMemoryPreparationNS: branch.ForkMemoryPreparationNS, ForkMetadataStreamNS: branch.ForkMetadataStreamNS,
+				ForkMetadataBytes: branch.ForkMetadataBytes, ForkChildRestoreNS: branch.ForkChildRestoreNS,
 			}
+			if referenceOperations[i] != "" {
+				if referenceTransaction != "" {
+					records[i].DistributedForkTransactionID = referenceTransaction
+				}
+				records[i].DistributedGraphReferenceOperation = referenceOperations[i]
+			}
+		}
+		graphRoots, err := b.cloneGraphMemoryRootsMany(sourceRecord.MemoryRoots, sourceRecord.MemoryRootObjects, sourceRecord.SnapshotID, records)
+		if err != nil {
+			var cleanupErr error
+			store := b.containerStore()
+			for i, cleanupDestination := range destinations {
+				if _, destroyErr := b.command("timetravel", source.container, "destroy-reclaim", cleanupDestination); destroyErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
+					continue
+				}
+				record := ttcbundle.BranchInfo{ID: cleanupDestination, FilesystemBranch: infos[i].FilesystemBranch}
+				cleanupErr = errors.Join(cleanupErr, store.RemoveBranchFilesystems(source.container, record))
+				cleanupErr = errors.Join(cleanupErr, store.RemoveBranchArtifacts(source.container, record))
+			}
+			if cleanupErr != nil {
+				return nil, fmt.Errorf("rooting graph memory for batch fork: %w; cleanup: %v", err, cleanupErr)
+			}
+			return nil, fmt.Errorf("rooting graph memory for batch fork: %w", err)
+		}
+		for i := range records {
+			records[i].SnapshotID = sourceRecord.SnapshotID
+			records[i].MemoryRoots = graphRoots[records[i].FilesystemBranch]
+			records[i].MemoryRootObjects = append([]string(nil), sourceRecord.MemoryRootObjects...)
 		}
 		if err := b.containerStore().RecordBranches(source.container, records); err != nil {
 			var cleanupErr error
 			store := b.containerStore()
+			for _, roots := range graphRoots {
+				cleanupErr = errors.Join(cleanupErr, b.releaseGraphMemoryRoots(roots))
+			}
 			for i, cleanupDestination := range destinations {
-				if _, destroyErr := b.command("timetravel", source.container, "destroy", cleanupDestination); destroyErr != nil {
+				if _, destroyErr := b.command("timetravel", source.container, "destroy-reclaim", cleanupDestination); destroyErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("destroying %q: %w", cleanupDestination, destroyErr))
 					continue
 				}
@@ -9589,7 +12684,7 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 				if filesystemErr := store.RemoveBranchFilesystems(source.container, record); filesystemErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reclaiming %q filesystems: %w", cleanupDestination, filesystemErr))
 				}
-				if artifactErr := store.RemoveBranchArtifacts(source.container, cleanupDestination); artifactErr != nil {
+				if artifactErr := store.RemoveBranchArtifacts(source.container, record); artifactErr != nil {
 					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("removing %q artifacts: %w", cleanupDestination, artifactErr))
 				}
 			}
@@ -9599,16 +12694,29 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 			return nil, fmt.Errorf("persisting batch fork lineage: %w; batch branches were destroyed", err)
 		}
 		for i := range records {
-			if err := b.cloneSparseMemoryRoot(containerInfo.ID, sourceRecord.FilesystemBranch, records[i].FilesystemBranch); err != nil {
+			if records[i].DistributedGraphReferenceOperation == "" {
+				continue
+			}
+			if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, containerInfo.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
 				var cleanupErr error
 				for _, cleanupDestination := range destinations {
 					cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
 				}
 				if cleanupErr != nil {
-					return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; cleaning batch branches: %v", records[i].ID, err, cleanupErr)
+					return nil, fmt.Errorf("retaining graph origins for branch %q: %w; cleaning batch branches: %v", records[i].ID, err, cleanupErr)
 				}
-				return nil, fmt.Errorf("rooting sparse memory for branch %q: %w; batch branches were destroyed", records[i].ID, err)
+				return nil, fmt.Errorf("retaining graph origins for branch %q: %w; batch branches were destroyed", records[i].ID, err)
 			}
+		}
+		if err := b.registerLocalForkPlacements(containerInfo, records); err != nil {
+			var cleanupErr error
+			for _, cleanupDestination := range destinations {
+				cleanupErr = errors.Join(cleanupErr, b.destroy(selector{container: source.container, branch: cleanupDestination}, true))
+			}
+			if cleanupErr != nil {
+				return nil, fmt.Errorf("registering batch fork placements: %w; cleaning batch branches: %v", err, cleanupErr)
+			}
+			return nil, fmt.Errorf("registering batch fork placements: %w; batch branches were destroyed", err)
 		}
 	}
 	for _, destination := range destinations {
@@ -9644,13 +12752,25 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 
 // forkDehydratedMany creates local children directly from durable branch
 // state. The source remains process-free and its dehydration image is never
-// consumed. Filesystem metadata and sparse-memory manifests are immutable, so
-// preparing any number of siblings does not copy file or memory data.
-func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused bool) (_ []Branch, retErr error) {
+// consumed. Filesystem metadata and graph roots are immutable, so preparing
+// any number of siblings does not copy file or memory data.
+func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent string, info ttcbundle.ContainerInfo, sourceBranch ttcbundle.BranchInfo, destinations []string, paused, quarantined bool) (_ []Branch, retErr error) {
 	if b.dataRoot == "" {
 		return nil, errors.New("forking a dehydrated branch requires a persistent TTC data root")
 	}
-	sourceDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", sourceBranch)
+	// Cold forks install new graph roots and filesystem edges. Keep the whole
+	// path on the foreground side of the snapshot handoff gate so each edge is
+	// accounted either by the provider ledger or by the shared ledger, never in
+	// the frozen interval between them. The gate is a no-op in standalone mode.
+	finishForegroundCapture := func() {}
+	if b.distributedSource != nil {
+		finishForegroundCapture = b.distributedSource.beginForegroundCapture()
+	}
+	defer finishForegroundCapture()
+	if err := b.ensureLocalColdBranch(info, sourceBranch); err != nil {
+		return nil, fmt.Errorf("materializing dehydrated source: %w", err)
+	}
+	sourceDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", sourceBranch)
 	controlData, err := os.ReadFile(filepath.Join(sourceDir, "control.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading dehydrated source control state: %w", err)
@@ -9689,7 +12809,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				}
 			}
 			result = errors.Join(result, os.RemoveAll(child.dir))
-			result = errors.Join(result, b.releaseSparseMemoryRoot(info.ID, child.branch.FilesystemBranch))
+			result = errors.Join(result, b.releaseBranchGraphRoots(child.branch))
 			result = errors.Join(result, b.containerStore().RemoveBranchFilesystems(info.ID, child.branch))
 		}
 		return result
@@ -9702,12 +12822,52 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 
 	createdAt := time.Now().UTC()
 	records := make([]ttcbundle.BranchInfo, 0, len(destinations))
-	for _, destination := range destinations {
-		filesystemBranch := ttcvolume.ScopedBranchID(info.ID, destination)
-		childDir := filepath.Join(filepath.Dir(sourceDir), hex.EncodeToString([]byte(destination)))
-		branch := ttcbundle.BranchInfo{ID: destination, ParentID: source.branch, FilesystemBranch: filesystemBranch, State: "dehydrated", CreatedAt: createdAt}
+	referenceTransaction := transactionIDForBranch(info, sourceBranch)
+	referenceTransactions := make([]string, len(destinations))
+	externalMemoryRoots := false
+	if len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
+		localRoots, err := b.graphMemoryRootsLocal(sourceBranch.MemoryRoots)
+		if err != nil {
+			return nil, err
+		}
+		externalMemoryRoots = !localRoots
+	}
+	for destinationIndex, destination := range destinations {
+		filesystemBranch, err := ttcvolume.NewScopedBranchID(info.ID, destination)
+		if err != nil {
+			return nil, fmt.Errorf("allocating filesystem identity for %s@%s: %w", source.container, destination, err)
+		}
+		branch := ttcbundle.BranchInfo{ID: destination, ParentID: logicalParent, FilesystemBranch: filesystemBranch, Quarantined: quarantined, State: "dehydrated", StorageState: "local", SnapshotID: sourceBranch.SnapshotID, NodeID: b.nodeID, CreatedAt: createdAt}
+		if (referenceTransaction != "" || externalMemoryRoots) && len(sourceBranch.MemoryRootObjects) != 0 && b.distributedSource != nil {
+			operation, err := newGraphReferenceOperation()
+			if err != nil {
+				return nil, fmt.Errorf("allocating graph reference identity for %q: %w", destination, err)
+			}
+			if referenceTransaction != "" {
+				branch.DistributedForkTransactionID = referenceTransaction
+			}
+			branch.DistributedGraphReferenceOperation = operation
+			referenceTransactions[destinationIndex] = referenceTransaction
+			if referenceTransactions[destinationIndex] == "" {
+				referenceTransactions[destinationIndex] = operation
+			}
+		}
+		childDir := memoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 		children = append(children, preparedChild{target: selector{container: source.container, branch: destination}, branch: branch, dir: childDir})
-		transactions, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
+		graphRoots, err := b.cloneGraphMemoryRoots(sourceBranch.MemoryRoots, sourceBranch.MemoryRootObjects, sourceBranch.SnapshotID, filesystemBranch)
+		if err != nil {
+			return nil, fmt.Errorf("rooting graph memory for %s@%s: %w", source.container, destination, err)
+		}
+		branch.MemoryRoots = graphRoots
+		branch.MemoryRootObjects = append([]string(nil), sourceBranch.MemoryRootObjects...)
+		controlRoot, err := b.cloneGraphControlRoot(sourceBranch.ControlRoot, sourceBranch.ControlRootObject, sourceBranch.SnapshotID, filesystemBranch)
+		if err != nil {
+			return nil, fmt.Errorf("rooting graph control state for %s@%s: %w", source.container, destination, err)
+		}
+		branch.ControlRoot = controlRoot
+		branch.ControlRootObject = sourceBranch.ControlRootObject
+		children[len(children)-1].branch = branch
+		transactions, finishFilesystemOrigins, err := b.forkDehydratedDistributedFilesystems(info.ID, capture.FilesystemBranch, filesystemBranch)
 		if err != nil {
 			return nil, fmt.Errorf("forking filesystems for %s@%s: %w", source.container, destination, err)
 		}
@@ -9716,27 +12876,24 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 				for abortIndex := len(transactions) - 1; abortIndex > index; abortIndex-- {
 					_ = transactions[abortIndex].abort()
 				}
-				return nil, fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err)
+				return nil, errors.Join(fmt.Errorf("committing filesystem fork for %s@%s: %w", source.container, destination, err), finishFilesystemOrigins(false))
 			}
 		}
-		if capture.SparseManifest != (ttcchunk.ManifestID{}) {
-			repository, err := ttcchunk.OpenMemoryRepository(filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks"))
-			if err != nil {
-				return nil, err
-			}
-			err = repository.SetBranch(filesystemBranch, capture.SparseManifest)
-			closeErr := repository.Close()
-			if err != nil {
-				return nil, fmt.Errorf("rooting sparse memory for %s@%s: %w", source.container, destination, err)
-			}
-			if closeErr != nil {
-				return nil, closeErr
-			}
+		if err := finishFilesystemOrigins(true); err != nil {
+			return nil, fmt.Errorf("committing filesystem origins for %s@%s: %w", source.container, destination, err)
 		}
-
 		childCapture := capture
 		childCapture.FilesystemBranch = filesystemBranch
 		childCapture.Resume = capture.Resume && !paused
+		if len(graphRoots) != 0 {
+			if len(childCapture.MemoryRoots) != len(graphRoots) {
+				return nil, fmt.Errorf("dehydrated source has %d graph control roots and %d branch roots", len(childCapture.MemoryRoots), len(graphRoots))
+			}
+			childCapture.MemoryRoots = append([]boot.BranchMemoryRoot(nil), childCapture.MemoryRoots...)
+			for index := range childCapture.MemoryRoots {
+				childCapture.MemoryRoots[index].Name = graphRoots[index]
+			}
+		}
 		if _, err := os.Stat(childDir); err == nil {
 			return nil, fmt.Errorf("dehydration image already exists for branch %q", destination)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -9754,14 +12911,9 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 			_ = os.RemoveAll(staging)
 			return nil, err
 		}
-		if capture.SparseManifest == (ttcchunk.ManifestID{}) {
-			for index := range capture.Memories {
-				name := fmt.Sprintf("memory-%04d.snapshot", index)
-				if err := copyCheckpointHostFile(filepath.Join(sourceDir, name), filepath.Join(staging, name), 0600); err != nil {
-					_ = os.RemoveAll(staging)
-					return nil, err
-				}
-			}
+		if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
+			_ = os.RemoveAll(staging)
+			return nil, errors.New("new-format dehydrated source is not graph-native")
 		}
 		if err := os.Rename(staging, childDir); err != nil {
 			_ = os.RemoveAll(staging)
@@ -9771,6 +12923,14 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	}
 	if err := b.containerStore().RecordBranches(info.ID, records); err != nil {
 		return nil, fmt.Errorf("recording dehydrated fork children: %w", err)
+	}
+	for i := range records {
+		if records[i].DistributedGraphReferenceOperation == "" {
+			continue
+		}
+		if err := b.retainDistributedGraphReferences(referenceTransactions[i], records[i].DistributedGraphReferenceOperation, info.ID, records[i].ID, branchGraphRootObjects(records[i])); err != nil {
+			return nil, fmt.Errorf("retaining graph origins for dehydrated branch %q: %w", records[i].ID, err)
+		}
 	}
 
 	peer := false
@@ -9784,7 +12944,11 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 	}
 	result := make([]Branch, 0, len(children))
 	for _, child := range children {
-		if err := b.rehydrateCold(child.target, info, child.branch, peer); err != nil {
+		// Building the child from the durable image takes time in proportion
+		// to its memory; other commands go on meanwhile.
+		if err := b.withoutLifecycleLock(info, longOperation{branch: child.branch.ID, state: "rehydrating", shown: true}, func() error {
+			return b.rehydrateCold(child.target, info, child.branch, peer, sourceBranch)
+		}); err != nil {
 			return nil, fmt.Errorf("starting dehydrated fork child %s: %w", child.target, err)
 		}
 		peer = true
@@ -9792,7 +12956,7 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, info ttcbundle.Cont
 		if capture.Resume && !paused {
 			state = "running"
 		}
-		result = append(result, Branch{ID: child.branch.ID, ParentID: source.branch, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
+		result = append(result, Branch{ID: child.branch.ID, ParentID: logicalParent, Quarantined: child.branch.Quarantined, State: state, CreatedAt: createdAt, MemorySharing: "cow"})
 	}
 	return result, nil
 }
@@ -9823,6 +12987,160 @@ func (b *runtimeBackend) resume(target selector) error {
 	return err
 }
 
+func (b *runtimeBackend) setQuarantine(target selector, enabled bool) error {
+	logicalBranch := target.branch
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	target = resolved
+	branch, err := persistentBranchInfo(info, target.branch)
+	if err != nil {
+		return err
+	}
+	if enabled && info.NetworkMode == "host" {
+		return fmt.Errorf("container %q uses host networking, which cannot be quarantined", info.Name)
+	}
+	if branch.Quarantined == enabled {
+		return nil
+	}
+	logicalFamily := info.DistributedFamilyID
+	if logicalFamily == "" {
+		logicalFamily = info.ID
+	}
+	var placement *cluster.PlacementRecord
+	var placements cluster.PlacementCatalog
+	var ownerIncarnation string
+	if b.nodeID != "" {
+		owner, renewErr := b.renewDistributedExecutionAuthority()
+		if renewErr != nil {
+			return fmt.Errorf("renewing quarantine execution authority: %w", renewErr)
+		}
+		ownerIncarnation = owner.Incarnation
+		placements, err = b.placementCatalog()
+		if err != nil {
+			return fmt.Errorf("opening quarantine placement authority: %w", err)
+		}
+		placement, err = placements.Lookup(logicalFamily, logicalBranch)
+		if err != nil {
+			return fmt.Errorf("resolving quarantine placement: %w", err)
+		}
+		if placement.OwnerNode != b.nodeID || placement.OwnerIncarnation != ownerIncarnation || placement.PhysicalContainer != target.container || placement.PhysicalBranch != target.branch {
+			return errors.New("quarantine placement no longer names the resolved physical branch")
+		}
+	}
+	state := normalizeLifecycleState(branch.State)
+	live := state == "running" || state == "paused"
+	runtimeMutable := live
+	if state == "dehydrated" {
+		// A dehydrated branch may still have a process-free record in a Sentry
+		// that owns live siblings. Keep that cache coherent when it exists; an
+		// entirely cold family has no control server and needs only the durable
+		// update below.
+		if output, listErr := b.command("timetravel", info.ID, "branches"); listErr == nil {
+			var runtimeBranches []runscBranchInfo
+			if err := json.Unmarshal(output, &runtimeBranches); err != nil {
+				return fmt.Errorf("decoding runtime branches before changing quarantine: %w", err)
+			}
+			for _, runtimeBranch := range runtimeBranches {
+				if runtimeBranch.ID == target.branch {
+					runtimeMutable = true
+					break
+				}
+			}
+		} else {
+			for _, sibling := range info.Branches {
+				state := normalizeLifecycleState(sibling.State)
+				if state == "running" || state == "paused" {
+					return fmt.Errorf("checking the live family before changing dehydrated branch quarantine: %w", listErr)
+				}
+			}
+		}
+	}
+	for i := range info.Branches {
+		if info.Branches[i].ID == target.branch {
+			info.Branches[i].Quarantined = enabled
+			break
+		}
+	}
+	if enabled && live {
+		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
+			return fmt.Errorf("closing published ports before quarantining %s: %w", target, err)
+		}
+	}
+	transitionRuntime := func(value bool) error {
+		if !runtimeMutable {
+			return nil
+		}
+		action := "quarantine"
+		if !value {
+			action = "unquarantine"
+		}
+		_, err := b.command("timetravel", target.container, action, target.branch)
+		return err
+	}
+	if runtimeMutable {
+		if err := transitionRuntime(enabled); err != nil {
+			if enabled {
+				_ = b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch)
+			}
+			return err
+		}
+	}
+	if !enabled && live {
+		if err := b.ensurePublishedPortsForBranch(info, target.branch); err != nil {
+			_ = b.stopPublishedPortsForBranch(info, target.branch)
+			_ = transitionRuntime(true)
+			return fmt.Errorf("opening published ports after unquarantining %s: %w", target, err)
+		}
+	}
+	if b.dataRoot == "" {
+		return nil
+	}
+	if err := b.containerStore().UpdateBranchQuarantine(target.container, target.branch, enabled); err != nil {
+		var rollbackErr error
+		if !enabled && live {
+			rollbackErr = errors.Join(rollbackErr, b.stopPublishedPortsForBranch(info, target.branch))
+		}
+		rollbackErr = errors.Join(rollbackErr, transitionRuntime(branch.Quarantined))
+		if enabled && live {
+			rollbackErr = errors.Join(rollbackErr, b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch))
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("persisting quarantine: %w; restoring runtime state: %v", err, rollbackErr)
+		}
+		return err
+	}
+	if placement != nil {
+		if _, err := placements.SetQuarantine(logicalFamily, logicalBranch, b.nodeID, ownerIncarnation, placement.Generation, enabled, time.Now().UTC()); err != nil {
+			rollbackErr := b.containerStore().UpdateBranchQuarantine(target.container, target.branch, branch.Quarantined)
+			if !enabled && live {
+				rollbackErr = errors.Join(rollbackErr, b.stopPublishedPortsForBranch(info, target.branch))
+			}
+			rollbackErr = errors.Join(rollbackErr, transitionRuntime(branch.Quarantined))
+			if enabled && live {
+				rollbackErr = errors.Join(rollbackErr, b.ensurePublishedPortsForBranch(infoWithBranchQuarantine(info, target.branch, false), target.branch))
+			}
+			if rollbackErr != nil {
+				return fmt.Errorf("persisting cluster quarantine policy: %w; restoring local state: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("persisting cluster quarantine policy: %w", err)
+		}
+	}
+	return nil
+}
+
+func infoWithBranchQuarantine(info ttcbundle.ContainerInfo, branchID string, quarantined bool) ttcbundle.ContainerInfo {
+	info.Branches = append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	for i := range info.Branches {
+		if info.Branches[i].ID == branchID {
+			info.Branches[i].Quarantined = quarantined
+			break
+		}
+	}
+	return info
+}
+
 // renameBranch gives a live branch another name.
 //
 // The name is how a branch is asked for and nothing else: the memory, the
@@ -9832,6 +13150,7 @@ func (b *runtimeBackend) resume(target selector) error {
 // written the sandbox is told to change back, because a family whose two halves
 // disagree about a branch's name is worse than one that never renamed it.
 func (b *runtimeBackend) renameBranch(target selector, name string) error {
+	logicalBranch := target.branch
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
@@ -9904,6 +13223,34 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 			return fmt.Errorf("checking dehydrated branch runtime before rename: %w", branchesErr)
 		}
 	}
+	logicalFamily := info.DistributedFamilyID
+	if logicalFamily == "" {
+		logicalFamily = info.ID
+	}
+	var placement *cluster.PlacementRecord
+	var placements cluster.PlacementCatalog
+	var ownerIncarnation string
+	if b.nodeID != "" {
+		placements, err = b.placementCatalog()
+		if err != nil {
+			return fmt.Errorf("opening rename placement authority: %w", err)
+		}
+		placement, err = placements.Lookup(logicalFamily, logicalBranch)
+		if err != nil {
+			return fmt.Errorf("resolving rename placement: %w", err)
+		}
+		if placement.State != cluster.PlacementUnplaced {
+			owner, renewErr := b.renewDistributedExecutionAuthority()
+			if renewErr != nil {
+				return fmt.Errorf("renewing rename execution authority: %w", renewErr)
+			}
+			ownerIncarnation = owner.Incarnation
+			if placement.OwnerNode != b.nodeID || placement.OwnerIncarnation != ownerIncarnation ||
+				placement.PhysicalContainer != target.container || placement.PhysicalBranch != target.branch {
+				return errors.New("rename placement no longer names the resolved physical branch")
+			}
+		}
+	}
 	if live {
 		if _, err := b.command("timetravel", target.container, "rename", target.branch, name); err != nil {
 			return err
@@ -9918,71 +13265,833 @@ func (b *runtimeBackend) renameBranch(target selector, name string) error {
 		}
 		return err
 	}
+	if placement != nil {
+		physicalBranch := ""
+		if placement.State != cluster.PlacementUnplaced {
+			physicalBranch = name
+		}
+		if _, err := placements.Rename(logicalFamily, logicalBranch, name, b.nodeID, ownerIncarnation, physicalBranch, placement.Generation, time.Now().UTC()); err != nil {
+			rollbackErr := b.containerStore().RenameBranch(target.container, name, target.branch)
+			if live {
+				_, runtimeErr := b.command("timetravel", target.container, "rename", name, target.branch)
+				rollbackErr = errors.Join(rollbackErr, runtimeErr)
+			}
+			if rollbackErr != nil {
+				return fmt.Errorf("renaming cluster authority: %w; restoring local branch: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("renaming cluster authority: %w", err)
+		}
+	}
 	return nil
 }
 
 func (b *runtimeBackend) prepareStop(target selector) error {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	// A migrated branch may still read unchanged files from its source node.
+	// Stop destroys the only live resolver before asynchronous cold publication,
+	// so establish filesystem and memory independence while the Sentry can
+	// still service the drain. Dehydration already uses the same fence.
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before stopping %s: %w", resolved, err)
 	}
 	_, err = b.command("timetravel", resolved.container, "prepare-stop", resolved.branch)
 	return err
 }
 
-// cloneSparseMemoryRoot gives a newly forked branch an independent durable
-// root for any chunks that its source still faults on demand. A branch that
-// has never been restored from sparse storage has no root to clone.
-func (b *runtimeBackend) cloneSparseMemoryRoot(containerID, sourceFilesystemBranch, targetFilesystemBranch string) error {
-	if b.dataRoot == "" || sourceFilesystemBranch == "" || targetFilesystemBranch == "" {
+// preparePausedStop commits the Sentry's bounded filesystem metadata batches
+// into each TTC repository before the paused Kernel is discarded. A manager-
+// side repository fork is insufficient here: the mounted VFS may still own
+// creates, writes, and mmap invalidations that are visible to the guest but
+// have not reached the repository branch pointer. Running stop obtains this
+// fence through orderly task/VFS teardown; paused stop deliberately executes
+// no guest instruction and therefore needs an explicit filesystem snapshot.
+//
+// The temporary child is removed immediately. Its purpose is to drive the
+// existing atomic live-filesystem snapshot protocol, which both flushes the
+// mounted branch and installs a fresh working generation for the source.
+func (b *runtimeBackend) preparePausedStop(target selector) (retErr error) {
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if normalizeLifecycleState(branch.State) != "paused" {
+		return fmt.Errorf("branch %s is %s, not paused", resolved, normalizeLifecycleState(branch.State))
+	}
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before stopping %s: %w", resolved, err)
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	if len(configs) == 0 {
 		return nil
 	}
-	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
-	if _, err := os.Stat(repositoryPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
+	cont, err := container.Load(b.root, container.FullID{
+		SandboxID: info.ID, ContainerID: info.ID,
+	}, container.LoadOpts{Exact: true, SkipCheck: true})
+	if err != nil {
+		return fmt.Errorf("loading paused runtime: %w", err)
 	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+	assignments, finishOrigins, err := b.allocateFilesystemForkOrigins(info.ID, 1)
 	if err != nil {
 		return err
 	}
-	defer repository.Close()
-	manifest, err := repository.Branch(sourceFilesystemBranch)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
+	originsByRepository := make(map[string][]uint64, len(assignments))
+	for _, assignment := range assignments {
+		originsByRepository[assignment.ResourceID.Path] = assignment.Origins
+	}
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return errors.Join(err, finishOrigins(false))
+	}
+	temporaryBranch := "paused-stop-" + hex.EncodeToString(random[:])
+	type capturedRepository struct {
+		repository *ttcvolume.Repository
+		captured   bool
+	}
+	opened := make([]capturedRepository, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
+	committedAny := false
+	originsAdopted := false
+	finish := func(adopt bool) error {
+		err := finishOrigins(adopt)
+		originsAdopted = adopt && err == nil
 		return err
 	}
-	return repository.SetBranch(targetFilesystemBranch, manifest)
+	cleanup := func() error {
+		var cleanupErr error
+		for i := len(opened) - 1; i >= 0; i-- {
+			entry := opened[i]
+			if entry.captured {
+				if err := entry.repository.RemoveBranch(temporaryBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
+					cleanupErr = errors.Join(cleanupErr, err)
+				} else if err == nil {
+					cleanupErr = errors.Join(cleanupErr, entry.repository.GarbageCollect())
+				}
+			}
+			cleanupErr = errors.Join(cleanupErr, entry.repository.Close())
+		}
+		return cleanupErr
+	}
+	defer func() {
+		if len(opened) != 0 {
+			retErr = errors.Join(retErr, cleanup())
+		}
+		if originsAdopted {
+			if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("reconciling paused filesystem snapshot origins: %w", err))
+			}
+		}
+	}()
+	for _, config := range configs {
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			if committedAny {
+				retErr = errors.Join(err, finish(true))
+			} else {
+				retErr = errors.Join(err, finish(false))
+			}
+			return retErr
+		}
+		repositoryID := repository.Info().ID
+		if _, duplicate := seen[repositoryID]; duplicate {
+			retErr = errors.Join(retErr, repository.Close())
+			continue
+		}
+		seen[repositoryID] = struct{}{}
+		opened = append(opened, capturedRepository{repository: repository})
+		args := &boot.FilesystemBranchSnapshotArgs{
+			BranchID:   resolved.branch,
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repositoryID},
+			Child:      temporaryBranch,
+		}
+		if origins := originsByRepository[repositoryID]; len(origins) != 0 {
+			args.SourceWorking, args.ChildWorking = origins[0], origins[1]
+		}
+		if err := cont.Sandbox.SnapshotFilesystemBranch(args); err != nil {
+			if committedAny {
+				retErr = errors.Join(err, finish(true))
+			} else {
+				retErr = errors.Join(err, finish(false))
+			}
+			return retErr
+		}
+		opened[len(opened)-1].captured = true
+		committedAny = true
+	}
+	if err := finish(true); err != nil {
+		return err
+	}
+	return retErr
 }
 
-// releaseSparseMemoryRoot removes one branch's durable chunk reachability
-// only after its runtime has stopped using the on-demand loader, then reclaims
-// objects no surviving branch, lease, or publication transaction references.
-func (b *runtimeBackend) releaseSparseMemoryRoot(containerID, filesystemBranch string) error {
-	if b.dataRoot == "" || filesystemBranch == "" {
+func graphMemoryRootNames(filesystemBranch string, count int) []string {
+	result := make([]string, count)
+	for index := range result {
+		result[index] = fmt.Sprintf("memory/branch/%s/resource-%04x", filesystemBranch, index)
+	}
+	return result
+}
+
+func graphControlRootName(filesystemBranch string) string {
+	return "control/branch/" + filesystemBranch
+}
+
+func graphCaptureControlRootName(snapshotID uint64) string {
+	return fmt.Sprintf("control/capture/%016x", snapshotID)
+}
+
+func branchGraphRootObjects(branch ttcbundle.BranchInfo) []string {
+	objects := append([]string(nil), branch.MemoryRootObjects...)
+	if branch.ControlRootObject != "" {
+		objects = append(objects, branch.ControlRootObject)
+	}
+	return objects
+}
+
+func branchGraphRootNames(branch ttcbundle.BranchInfo) []string {
+	roots := append([]string(nil), branch.MemoryRoots...)
+	if branch.ControlRoot != "" {
+		roots = append(roots, branch.ControlRoot)
+	}
+	return roots
+}
+
+func runtimeBackingAsBranch(backing ttcbundle.RuntimeMemoryBacking) ttcbundle.BranchInfo {
+	return ttcbundle.BranchInfo{
+		SnapshotID:                         backing.SnapshotID,
+		MemoryRoots:                        append([]string(nil), backing.MemoryRoots...),
+		MemoryRootObjects:                  append([]string(nil), backing.MemoryRootObjects...),
+		ControlRoot:                        backing.ControlRoot,
+		ControlRootObject:                  backing.ControlRootObject,
+		DistributedGraphReferenceOperation: backing.DistributedGraphReferenceOperation,
+	}
+}
+
+func appendGraphRoot(roots []string, root string) []string {
+	if root == "" {
+		return roots
+	}
+	return append(roots, root)
+}
+
+func validateGraphControlRoot(snapshotID uint64, root, object string) error {
+	if root == "" && object == "" {
 		return nil
 	}
-	repositoryPath := filepath.Join(b.dataRoot, "containers", containerID, "memory", "chunks")
-	if _, err := os.Stat(repositoryPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+	if snapshotID == 0 || root == "" || object == "" {
+		return errors.New("control root requires a snapshot, logical name, and immutable object")
+	}
+	id, err := ttcsnapshot.ParseObjectID(object)
+	if err != nil {
+		return fmt.Errorf("parsing control root object: %w", err)
+	}
+	if id.Snapshot == 0 || uint64(id.Snapshot) != snapshotID || id.Kind != ttcsnapshot.ObjectKindMetadata {
+		return fmt.Errorf("control root object %s is not a filesystem root", id)
+	}
+	return nil
+}
+
+// cloneGraphMemoryRoots gives a branch O(1)-with-respect-to-memory references
+// to the same immutable radix roots as its source. No page or radix node is
+// walked or copied.
+func validateGraphRootObjects(snapshotID uint64, roots, objects []string) error {
+	if snapshotID == 0 || len(roots) == 0 || len(roots) != len(objects) {
+		return fmt.Errorf("memory snapshot %d has %d root names and %d root objects", snapshotID, len(roots), len(objects))
+	}
+	for index, encoded := range objects {
+		id, err := ttcsnapshot.ParseObjectID(encoded)
+		if err != nil {
+			return fmt.Errorf("parsing memory root object %d: %w", index, err)
 		}
+		if id.Snapshot == 0 || id.Kind != ttcsnapshot.ObjectKindMemoryNode {
+			return fmt.Errorf("memory root object %s for snapshot %d is not a memory radix root", id, snapshotID)
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) validateExternalGraphRoots(snapshotID uint64, roots, objects []string) error {
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return errors.New("memory roots are absent from the authoritative local graph")
+	}
+	if err := validateGraphRootObjects(snapshotID, roots, objects); err != nil {
 		return err
 	}
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryPath)
+	origins := make(map[ttcsnapshot.SnapshotID]struct{}, len(objects))
+	for _, encoded := range objects {
+		id, _ := ttcsnapshot.ParseObjectID(encoded)
+		origins[id.Snapshot] = struct{}{}
+	}
+	for origin := range origins {
+		_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+		if err != nil {
+			return fmt.Errorf("resolving memory origin %d authority: %w", origin, err)
+		}
+		if !volatile {
+			if b.snapshotShared == nil {
+				return errors.New("shared snapshot repository is unavailable")
+			}
+			if _, err := b.snapshotShared.Manifest(origin); err != nil {
+				return fmt.Errorf("opening shared memory origin %d: %w", origin, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (b *runtimeBackend) cloneGraphMemoryRoots(sourceRoots, sourceObjects []string, snapshotID uint64, targetFilesystemBranch string) ([]string, error) {
+	if len(sourceRoots) == 0 {
+		if len(sourceObjects) != 0 || snapshotID != 0 {
+			return nil, errors.New("memory snapshot metadata has no logical roots")
+		}
+		return nil, nil
+	}
+	if b.snapshotGraph == nil || targetFilesystemBranch == "" {
+		return nil, errors.New("snapshot graph is unavailable for memory-root fork")
+	}
+	if err := validateGraphRootObjects(snapshotID, sourceRoots, sourceObjects); err != nil {
+		return nil, err
+	}
+	destinations := graphMemoryRootNames(targetFilesystemBranch, len(sourceRoots))
+	copies := make(map[string]string, len(sourceRoots))
+	for index, source := range sourceRoots {
+		copies[destinations[index]] = source
+	}
+	local, err := b.graphMemoryRootsLocal(sourceRoots)
+	if err != nil {
+		return nil, err
+	}
+	if local {
+		if err := b.snapshotGraph.CloneRoots(copies); err != nil {
+			return nil, err
+		}
+		return destinations, nil
+	}
+	// Cache materialization never imports shared or peer reference authority
+	// into the local graph. The branch-level object IDs are sufficient to add
+	// another logical reference; the origin ledger milestone accounts for that
+	// reference at its unique provider.
+	if err := b.validateExternalGraphRoots(snapshotID, sourceRoots, sourceObjects); err != nil {
+		return nil, err
+	}
+	return destinations, nil
+}
+
+// graphMemoryRootsLocal determines whether one logical root set is wholly
+// represented in the node-local graph. A root set may instead be wholly
+// external (peer- or shared-pack authoritative), but a mixed set is invalid:
+// no single reference operation could then preserve it atomically.
+func (b *runtimeBackend) graphMemoryRootsLocal(roots []string) (bool, error) {
+	if len(roots) == 0 {
+		return true, nil
+	}
+	if b.snapshotGraph == nil {
+		return false, errors.New("snapshot graph is unavailable")
+	}
+	existing := 0
+	for _, root := range roots {
+		if _, ok := b.snapshotGraph.Root(root); ok {
+			existing++
+		}
+	}
+	if existing != 0 && existing != len(roots) {
+		return false, errors.New("memory roots are split between local and external authority")
+	}
+	return existing == len(roots), nil
+}
+
+// cloneGraphMemoryRootsMany commits all roots for a batch fork in one graph
+// transaction, so no sibling can be left partially rooted after a crash.
+func (b *runtimeBackend) cloneGraphMemoryRootsMany(sourceRoots, sourceObjects []string, snapshotID uint64, branches []ttcbundle.BranchInfo) (map[string][]string, error) {
+	result := make(map[string][]string, len(branches))
+	if len(sourceRoots) == 0 {
+		return result, nil
+	}
+	if b.snapshotGraph == nil {
+		return nil, errors.New("snapshot graph is unavailable for batch memory-root fork")
+	}
+	if err := validateGraphRootObjects(snapshotID, sourceRoots, sourceObjects); err != nil {
+		return nil, err
+	}
+	copies := make(map[string]string, len(sourceRoots)*len(branches))
+	for _, branch := range branches {
+		destinations := graphMemoryRootNames(branch.FilesystemBranch, len(sourceRoots))
+		result[branch.FilesystemBranch] = destinations
+		for index, source := range sourceRoots {
+			copies[destinations[index]] = source
+		}
+	}
+	local, err := b.graphMemoryRootsLocal(sourceRoots)
+	if err != nil {
+		return nil, err
+	}
+	if local {
+		if err := b.snapshotGraph.CloneRoots(copies); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+	if err := b.validateExternalGraphRoots(snapshotID, sourceRoots, sourceObjects); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (b *runtimeBackend) cloneGraphControlRoot(sourceRoot, sourceObject string, snapshotID uint64, targetFilesystemBranch string) (string, error) {
+	if sourceRoot == "" && sourceObject == "" {
+		return "", nil
+	}
+	if b.snapshotGraph == nil || targetFilesystemBranch == "" {
+		return "", errors.New("snapshot graph is unavailable for control-root fork")
+	}
+	if err := validateGraphControlRoot(snapshotID, sourceRoot, sourceObject); err != nil {
+		return "", err
+	}
+	destination := graphControlRootName(targetFilesystemBranch)
+	if _, ok := b.snapshotGraph.Root(sourceRoot); ok {
+		if err := b.snapshotGraph.CloneRoots(map[string]string{destination: sourceRoot}); err != nil {
+			return "", err
+		}
+		return destination, nil
+	}
+	if b.nodeID == "" || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return "", errors.New("control root is absent from the authoritative local graph")
+	}
+	id, _ := ttcsnapshot.ParseObjectID(sourceObject)
+	_, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(id.Snapshot))
+	if err != nil {
+		return "", fmt.Errorf("resolving control origin %d authority: %w", id.Snapshot, err)
+	}
+	if !volatile {
+		if b.snapshotShared == nil {
+			return "", errors.New("shared snapshot repository is unavailable")
+		}
+		if _, err := b.snapshotShared.Manifest(id.Snapshot); err != nil {
+			return "", fmt.Errorf("opening shared control origin %d: %w", id.Snapshot, err)
+		}
+	}
+	return destination, nil
+}
+
+func (b *runtimeBackend) releaseBranchGraphRoots(branch ttcbundle.BranchInfo) error {
+	return b.releaseGraphMemoryRoots(branchGraphRootNames(branch))
+}
+
+// parkBranchMemoryGraph detaches immutable page backing from a branch before
+// the Sentry transfers that branch's unresolved loader to a sibling. The
+// returned branch is reloaded after the atomic metadata mutation and therefore
+// no longer owns the parked roots.
+func (b *runtimeBackend) parkBranchMemoryGraph(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) (ttcbundle.ContainerInfo, ttcbundle.BranchInfo, error) {
+	if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+		return info, branch, nil
+	}
+	if _, _, err := b.containerStore().ParkBranchMemoryGraph(info.ID, branch.ID); err != nil {
+		return info, branch, fmt.Errorf("parking runtime memory backing for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	refreshed, err := b.containerStore().LoadContainer(info.ID)
+	if err != nil {
+		return info, branch, fmt.Errorf("reloading parked runtime memory backing for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	updated, err := persistentBranchInfo(refreshed, branch.ID)
+	if err != nil {
+		return info, branch, err
+	}
+	return refreshed, updated, nil
+}
+
+// reclaimBranchBacking releases every immutable graph reference and writable
+// filesystem generation owned by one physical branch. Lifecycle callers keep
+// the branch record until this method succeeds, which makes retries able to
+// recover the exact reference-operation identity after a crash.
+//
+// Physical branches created for a distributed fork or migration use the same
+// backing primitives as ordinary branches. Keeping their cleanup here avoids
+// letting a migration-specific path forget one of the local graph, remote
+// ledger, or filesystem references when the physical runtime is retired.
+func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	operation := graphReferenceOperationForBranch(info, branch)
+	if operation == "" {
+		if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+			return fmt.Errorf("releasing producer shared-memory roots: %w", err)
+		}
+	}
+	// A remote-origin branch may have both ordinary logical roots and retained
+	// roots installed by its durable reference intent. Drop the retained roots
+	// first so the subsequent local collection sees the true zero-reference
+	// state and can retire the provider origin in the same operation.
+	if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
+		return fmt.Errorf("releasing distributed memory references: %w", err)
+	}
+	if err := b.releaseBranchGraphRoots(branch); err != nil {
+		return fmt.Errorf("releasing local memory roots: %w", err)
+	}
+	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
+		return fmt.Errorf("removing branch filesystems: %w", err)
+	}
+	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
+		return fmt.Errorf("reconciling snapshot providers: %w", err)
+	}
+	return nil
+}
+
+// releaseGraphMemoryRoots drops logical branch reachability, cascades exact
+// reference counts, and then removes only bulk objects absent from the graph.
+func (b *runtimeBackend) releaseGraphMemoryRoots(roots []string) error {
+	if len(roots) == 0 || b.snapshotGraph == nil || b.snapshotData == nil {
+		return nil
+	}
+	if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
+		return err
+	}
+	for {
+		collected, err := b.snapshotGraph.Collect(4096)
+		if err != nil {
+			return err
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	_, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
 	if err != nil {
 		return err
 	}
-	defer repository.Close()
-	if err := repository.DeleteBranch(filesystemBranch); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if _, err := b.abandonEmptyVolatileMemoryOrigins(); err != nil {
 		return err
 	}
-	_, err = repository.CollectGarbage(ttcchunk.GCOptions{})
-	return err
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting reclaimed snapshot graph: %w", err)
+		}
+	}
+	return nil
+}
+
+// abandonEmptyVolatileMemoryOrigins removes cluster provider records for
+// node-local memory origins that own no objects. Both sealed and working
+// origins are eligible: a working origin with no objects is allocation residue
+// from a canceled or fully reclaimed mutation, not mutable guest state. The
+// daemon mutation lock excludes a concurrent graph builder while this runs.
+//
+// Keeping this rule in one place is important. Branch cleanup, crash
+// reconciliation, and node retirement previously used subtly different state
+// filters, which allowed an empty working origin to outlive its final branch
+// and then make clean retirement impossible.
+func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
+	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return 0, nil
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, errors.New("cluster memory-origin cleanup lacks node incarnation")
+	}
+	inspection := b.snapshotGraph.Inspect()
+	abandoned := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.State != ttcsnapshot.SnapshotWorking && snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
+			continue
+		}
+		unlockOrigin := b.distributedSource.lockSnapshotOrigin(snapshot.ID)
+		objects, err := b.snapshotGraph.SnapshotObjects(snapshot.ID)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			unlockOrigin()
+			return len(abandoned), fmt.Errorf("inspecting memory origin %d: %w", snapshot.ID, err)
+		}
+		if len(objects) != 0 {
+			unlockOrigin()
+			continue
+		}
+		provider, found, err := b.distributedSource.authority.SnapshotProvider(uint64(snapshot.ID))
+		if errors.Is(err, os.ErrNotExist) {
+			// Empty-origin cleanup is global to the node, while migration
+			// completion is deliberately concurrent across families. Another
+			// cleanup may therefore have installed the permanent abandoned or
+			// retired tombstone after this pass inspected the local graph. The
+			// tombstone proves that no provider authority remains; finish the
+			// idempotent local collection instead of failing branch removal.
+			abandoned[snapshot.ID] = struct{}{}
+			unlockOrigin()
+			continue
+		}
+		if err != nil {
+			unlockOrigin()
+			return len(abandoned), fmt.Errorf("resolving empty memory origin %d: %w", snapshot.ID, err)
+		}
+		if !found {
+			// Shared authority makes an empty provider-side graph disposable.
+			abandoned[snapshot.ID] = struct{}{}
+			unlockOrigin()
+			continue
+		}
+		if provider.NodeID != node {
+			unlockOrigin()
+			continue
+		}
+		if b.snapshotShared != nil {
+			busy, err := b.snapshotShared.DiscardHandoff(snapshot.ID)
+			if err != nil {
+				unlockOrigin()
+				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: %w", snapshot.ID, err)
+			}
+			if busy {
+				unlockOrigin()
+				return len(abandoned), fmt.Errorf("discarding uncommitted memory origin %d: pack is busy", snapshot.ID)
+			}
+		}
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(snapshot.ID)); err != nil {
+			unlockOrigin()
+			return len(abandoned), fmt.Errorf("abandoning empty memory origin %d: %w", snapshot.ID, err)
+		}
+		abandoned[snapshot.ID] = struct{}{}
+		unlockOrigin()
+	}
+	if len(abandoned) == 0 {
+		return 0, nil
+	}
+	retain := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots)-len(abandoned))
+	for _, snapshot := range inspection.Snapshots {
+		if _, remove := abandoned[snapshot.ID]; !remove {
+			retain = append(retain, snapshot.ID)
+		}
+	}
+	if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
+		return len(abandoned), err
+	}
+	return len(abandoned), nil
+}
+
+// reconcileVolatileSnapshotOrigins removes provider-directory entries whose
+// authoritative local graph no longer exists. Snapshot IDs are cluster-wide,
+// so a single union of the memory graph and filesystem repository graphs is
+// sufficient; Raft deliberately does not need page- or file-level state.
+//
+// Lifecycle mutations and this reconciliation share the daemon data-root
+// lock. Thus an origin allocated for an in-progress mutation cannot be
+// mistaken for crash residue between allocation and graph adoption. Any
+// uncommitted shared handoff is discarded before Raft forgets its provider, so
+// absence from the provider directory never exposes canceled bytes as shared
+// authority.
+func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
+	if b == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return 0, nil
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, errors.New("cluster snapshot reconciliation lacks node incarnation")
+	}
+	// Snapshot-provider mutations are fenced to the current Raft leader term.
+	// A node may remain healthy across a leadership change while its periodic
+	// heartbeat has not yet renewed that term. Reconcile synchronously so an
+	// otherwise successful branch removal cannot fail in this transient window.
+	if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+		return 0, fmt.Errorf("renewing snapshot reconciliation authority: %w", err)
+	}
+	abandoned, err := b.abandonEmptyVolatileMemoryOrigins()
+	if err != nil {
+		return 0, fmt.Errorf("reclaiming empty memory origins: %w", err)
+	}
+	live := make(map[ttcsnapshot.SnapshotID]struct{})
+	if b.snapshotGraph != nil {
+		for _, snapshot := range b.snapshotGraph.Inspect().Snapshots {
+			live[snapshot.ID] = struct{}{}
+		}
+	}
+	filesystem, err := b.containerStore().FilesystemSnapshotOrigins()
+	if err != nil {
+		return 0, fmt.Errorf("inventorying filesystem snapshot origins: %w", err)
+	}
+	for origin := range filesystem {
+		live[origin] = struct{}{}
+	}
+	state, err := b.distributedSource.authority.AuthorityState()
+	if err != nil {
+		return 0, err
+	}
+	var stale []uint64
+	for id, provider := range state.VolatileOrigins {
+		if provider.NodeID != node {
+			continue
+		}
+		if _, ok := live[ttcsnapshot.SnapshotID(id)]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
+	for _, encoded := range stale {
+		origin := ttcsnapshot.SnapshotID(encoded)
+		unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+		// The inventory above is only a candidate list. A concurrent publisher or
+		// branch mutation may have made the origin live before this origin fence
+		// was acquired, so repeat both data-plane and authority observations.
+		if b.snapshotGraph != nil {
+			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
+				unlockOrigin()
+				continue
+			}
+		}
+		filesystemLive, liveErr := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
+		if liveErr != nil {
+			unlockOrigin()
+			return 0, fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, liveErr)
+		}
+		if filesystemLive {
+			unlockOrigin()
+			continue
+		}
+		provider, volatile, providerErr := b.distributedSource.authority.SnapshotProvider(encoded)
+		if errors.Is(providerErr, os.ErrNotExist) || (!volatile && providerErr == nil) {
+			unlockOrigin()
+			continue
+		}
+		if providerErr != nil {
+			unlockOrigin()
+			return 0, fmt.Errorf("rechecking orphan snapshot origin %d authority: %w", origin, providerErr)
+		}
+		if provider.NodeID != node {
+			unlockOrigin()
+			continue
+		}
+		if b.snapshotShared != nil {
+			busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
+			if discardErr != nil {
+				unlockOrigin()
+				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: %w", origin, discardErr)
+			}
+			if busy {
+				unlockOrigin()
+				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: pack is busy", origin)
+			}
+		}
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, encoded); err != nil {
+			// Another serialized cleanup may have completed between the state
+			// read and this proposal. Treat an already-retired origin as success.
+			if _, found, lookupErr := b.distributedSource.authority.SnapshotProvider(encoded); lookupErr != nil || found {
+				unlockOrigin()
+				return 0, fmt.Errorf("abandoning orphan snapshot origin %d: %w", origin, errors.Join(err, lookupErr))
+			}
+		}
+		unlockOrigin()
+	}
+	return abandoned + len(stale), nil
+}
+
+const snapshotGraphJournalCompactBytes = 8 << 20
+
+// reconcileStandaloneMemoryGraph makes durable branch records the sole root
+// directory for standalone memory. It runs only while the daemon's mutation
+// lock excludes capture/fork/removal, so every construction pin is necessarily
+// crash residue. Cluster graphs require their origin-owned ledger instead.
+func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
+	if b == nil || b.nodeID != "" || b.snapshotGraph == nil || b.snapshotData == nil {
+		return nil
+	}
+	containers, err := b.containerStore().ListContainersForGC()
+	if err != nil {
+		return fmt.Errorf("listing authoritative memory roots: %w", err)
+	}
+	liveRoots := make(map[string]struct{})
+	retainedSnapshots := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, container := range containers {
+		for _, branch := range container.Branches {
+			if branch.SnapshotID != 0 {
+				retainedSnapshots[ttcsnapshot.SnapshotID(branch.SnapshotID)] = struct{}{}
+			}
+			for _, name := range branchGraphRootNames(branch) {
+				liveRoots[name] = struct{}{}
+				if _, ok := b.snapshotGraph.Root(name); !ok {
+					return fmt.Errorf("branch %s@%s references missing snapshot root %q", container.Name, branch.ID, name)
+				}
+			}
+		}
+		for _, backing := range container.RuntimeMemoryBackings {
+			if backing.SnapshotID != 0 {
+				retainedSnapshots[ttcsnapshot.SnapshotID(backing.SnapshotID)] = struct{}{}
+			}
+			for _, name := range branchGraphRootNames(runtimeBackingAsBranch(backing)) {
+				liveRoots[name] = struct{}{}
+				if _, ok := b.snapshotGraph.Root(name); !ok {
+					return fmt.Errorf("container %s runtime backing %s references missing snapshot root %q", container.Name, backing.ID, name)
+				}
+			}
+		}
+	}
+	inspection := b.snapshotGraph.Inspect()
+	var orphanRoots []string
+	for name := range inspection.Roots {
+		if strings.HasPrefix(name, "memory/") || strings.HasPrefix(name, "control/") {
+			if _, live := liveRoots[name]; !live {
+				orphanRoots = append(orphanRoots, name)
+			}
+		}
+	}
+	sort.Strings(orphanRoots)
+	if err := b.snapshotGraph.ReleaseRoots(orphanRoots); err != nil {
+		return fmt.Errorf("releasing orphan memory roots: %w", err)
+	}
+	var orphanPins []string
+	for name := range inspection.Pins {
+		if strings.HasPrefix(name, "memory/") || strings.HasPrefix(name, "control/") || strings.HasPrefix(name, "import/") {
+			orphanPins = append(orphanPins, name)
+		}
+	}
+	sort.Strings(orphanPins)
+	if err := b.snapshotGraph.DeletePins(orphanPins); err != nil {
+		return fmt.Errorf("releasing orphan memory construction pins: %w", err)
+	}
+	collectedTotal := 0
+	for {
+		collected, err := b.snapshotGraph.Collect(4096)
+		if err != nil {
+			return err
+		}
+		collectedTotal += collected
+		if collected == 0 {
+			break
+		}
+	}
+	retained := make([]ttcsnapshot.SnapshotID, 0, len(retainedSnapshots))
+	for id := range retainedSnapshots {
+		retained = append(retained, id)
+	}
+	sort.Slice(retained, func(i, j int) bool { return retained[i] < retained[j] })
+	emptySnapshots, err := b.snapshotGraph.CollectEmptySnapshots(retained)
+	if err != nil {
+		return err
+	}
+	reclaimedObjects, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph)
+	if err != nil {
+		return err
+	}
+	changed := len(orphanRoots) != 0 || len(orphanPins) != 0 || collectedTotal != 0 || emptySnapshots != 0 || reclaimedObjects != 0
+	if changed || b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting standalone memory graph: %w", err)
+		}
+	}
+	return b.snapshotGraph.Verify()
 }
 
 // discard releases one branch's process/kernel/dehydration state while
@@ -9999,6 +14108,22 @@ func (b *runtimeBackend) discard(target selector) error {
 	branch, err := persistentBranchInfo(info, target.branch)
 	if err != nil {
 		return err
+	}
+	// Retiring PublicationID below is the physical CAS that prevents a stale
+	// worker from replaying this branch's preceding lifecycle. First wait out an
+	// exact in-flight queue worker so its committed Raft roots and data-plane
+	// cleanup reach a terminal boundary. Otherwise daemon drain would retain an
+	// intent whose next retry can only report "publication identity changed".
+	if branch.PublicationID != "" && b.publicationQueue != nil {
+		if err := b.publicationQueue.CancelPending(info.ID, target.branch, branch.PublicationID); err != nil {
+			return fmt.Errorf("fencing branch publication before discarding %s: %w", target, err)
+		}
+	}
+	// Natural init exit can reach discard without prepareStop. The Sentry still
+	// exists until the runtime deletion below, so use that last opportunity to
+	// resolve sparse migration backing before the branch becomes process-free.
+	if err := b.ensureDistributedTargetMemoryIndependent(info, branch); err != nil {
+		return fmt.Errorf("materializing remote state before discarding %s: %w", target, err)
 	}
 	store := b.containerStore()
 	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
@@ -10032,7 +14157,7 @@ func (b *runtimeBackend) discard(target selector) error {
 		return err
 	}
 
-	runtimeFamilies, listErr := b.listRuntimeFamilies()
+	runtimeFamilies, listErr := b.listRuntimeFamiliesOf(info.ID)
 	if listErr != nil {
 		return fmt.Errorf("checking runtime state while discarding %s: %w", target, listErr)
 	}
@@ -10040,22 +14165,24 @@ func (b *runtimeBackend) discard(target selector) error {
 		if family.ID != info.ID {
 			continue
 		}
-		present := false
-		for _, branch := range family.Branches {
-			if branch.ID == target.branch {
-				present = true
-				break
-			}
-		}
+		present, onlyBranch := runtimeFamilyBranchDisposition(family, target.branch)
 		if !present {
 			break
 		}
-		if len(family.Branches) == 1 || runtimeFamilyUnavailable(family) {
+		if onlyBranch {
 			if _, err := b.command("delete", "--force", info.ID); err != nil {
 				return fmt.Errorf("releasing final runtime branch %s: %w", target, err)
 			}
-		} else if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
-			return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
+		} else {
+			var updated ttcbundle.BranchInfo
+			info, updated, err = b.parkBranchMemoryGraph(info, branch)
+			if err != nil {
+				return err
+			}
+			branch = updated
+			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
+				return fmt.Errorf("discarding live runtime state for %s: %w", target, err)
+			}
 		}
 		break
 	}
@@ -10070,19 +14197,45 @@ func (b *runtimeBackend) discard(target selector) error {
 	}
 
 	for _, kind := range []string{"active", "dehydrated"} {
-		path := existingMemoryBranchDir(b.dataRoot, info.ID, kind, branch)
+		path := existingMemoryBranchDir(b.activeDataRoot(), info.ID, kind, branch)
 		if err := os.RemoveAll(path); err != nil {
 			return fmt.Errorf("removing %s memory for %s: %w", kind, target, err)
 		}
 	}
-	if err := b.releaseSparseMemoryRoot(info.ID, branch.FilesystemBranch); err != nil {
-		return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
+	if graphReferenceOperationForBranch(info, branch) == "" {
+		if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+			return fmt.Errorf("releasing shared graph roots for %s: %w", target, err)
+		}
+	}
+	if err := b.releaseBranchGraphRoots(branch); err != nil {
+		return fmt.Errorf("reclaiming graph memory for %s: %w", target, err)
+	}
+	if err := b.releaseDistributedGraphReferencesEventually(graphReferenceOperationForBranch(info, branch)); err != nil {
+		return fmt.Errorf("releasing distributed graph origins for %s: %w", target, err)
+	}
+	if len(branch.MemoryRoots) != 0 {
+		if err := store.UpdateBranchSnapshotGraph(info.ID, target.branch, 0, nil, nil, "", "", ""); err != nil {
+			return err
+		}
 	}
 	latest, err := store.LoadContainer(info.ID)
 	if err != nil {
 		return err
 	}
 	return b.deleteRuntimeIfProcessFree(latest)
+}
+
+// runtimeFamilyBranchDisposition decides whether discarding branch may delete
+// its whole host sandbox. A sandbox's aggregate OCI status follows its loader
+// branch and may be "exited" while another TTC branch is still running; that
+// aggregate status must never authorize deletion of the peers.
+func runtimeFamilyBranchDisposition(family Family, branchID string) (present, onlyBranch bool) {
+	for _, branch := range family.Branches {
+		if branch.ID == branchID {
+			return true, len(family.Branches) == 1
+		}
+	}
+	return false, false
 }
 
 func persistentFamilyProcessFree(info ttcbundle.ContainerInfo) bool {
@@ -10100,7 +14253,7 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 	if !persistentFamilyProcessFree(info) {
 		return nil
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(info.ID)
 	if err != nil {
 		return fmt.Errorf("checking process-free runtime %q: %w", info.Name, err)
 	}
@@ -10108,10 +14261,486 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 		if family.ID != info.ID {
 			continue
 		}
+		// The last live branch is gone, and with the runtime would go every
+		// capture only its Sentry holds.
+		if err := b.persistResidentDehydrations(info, nil); err != nil {
+			return err
+		}
 		if _, err := b.command("delete", "--force", info.ID); err != nil {
 			return fmt.Errorf("deleting process-free runtime %q: %w", info.Name, err)
 		}
 		break
+	}
+	return nil
+}
+
+// allocateGraphSnapshotOrigin keeps the core graph independent of its ID
+// allocator. Standalone roots allocate locally; clustered roots first commit
+// the globally unique origin and exact volatile provider through Raft.
+func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, ttcsnapshot.SnapshotState, error) {
+	if b.snapshotGraph == nil {
+		return 0, "", errors.New("snapshot graph is unavailable")
+	}
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		origin, err := b.snapshotGraph.AllocateWorking()
+		return origin, ttcsnapshot.SnapshotSealedLocal, err
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	if node == "" || b.distributedSource.incarnation == "" {
+		return 0, "", errors.New("cluster snapshot allocation lacks node incarnation")
+	}
+	allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, b.distributedSource.incarnation, 1)
+	if err != nil {
+		return 0, "", fmt.Errorf("allocating Raft snapshot origin: %w", err)
+	}
+	origin := ttcsnapshot.SnapshotID(allocation.First)
+	if allocation.Count != 1 || origin == 0 {
+		return 0, "", fmt.Errorf("raft returned invalid snapshot allocation %+v", allocation)
+	}
+	if err := b.snapshotGraph.AdoptWorking(origin); err != nil {
+		return 0, "", fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
+	}
+	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
+}
+
+// graphCaptureStream returns the two ends of a stream a Sentry writes a
+// memory capture to: the daemon's, which is read and answered by
+// importGraphCapture, and the one handed to the Sentry. It is two-way so that
+// the daemon can answer the capture's manifest with the pages its graph
+// lacks, and a fork still sharing most of its memory sends little.
+func graphCaptureStream() (daemon, sentry *os.File, err error) {
+	fds, err := cloexecStreamSocketpair()
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating memory capture stream: %w", err)
+	}
+	// The daemon's end, alone, is nonblocking, so that Go polls it.
+	if err := unix.SetNonblock(fds[0], true); err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		return nil, nil, fmt.Errorf("creating memory capture stream: %w", err)
+	}
+	return os.NewFile(uintptr(fds[0]), "memory-capture"), os.NewFile(uintptr(fds[1]), "memory-capture-sentry"), nil
+}
+
+// importGraphCapture keeps the sharing of pages the graph already holds inside
+// one reference-authority domain. Standalone origins may share other locally
+// sealed objects. Clustered origins may share only sealed volatile objects
+// owned by this daemon; SnapshotShared objects are caches whose references are
+// owned by the shared ledger and must not acquire unreported local child
+// edges.
+//
+// stream is read, and for a filtered capture also answered; see
+// graphCaptureStream.
+func (b *runtimeBackend) importGraphCapture(stream io.ReadWriter, origin ttcsnapshot.SnapshotID, prefix string) (ttcchunk.GraphImportResult, error) {
+	states := []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotWorking, ttcsnapshot.SnapshotSealedLocal}
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		// Concurrent and crash-interrupted cluster captures may leave committed
+		// objects in a working origin. Reusing them would let a completed capture
+		// depend on an origin that is still mutable or was never sealed. Reuse only
+		// origins whose immutability is already established. Standalone captures
+		// are serialized by the foreground gate and retain their local behavior.
+		states = []ttcsnapshot.SnapshotState{ttcsnapshot.SnapshotSealedVolatile}
+	}
+	result, err := ttcchunk.ImportGraphCaptureWithReusableStates(stream, b.snapshotGraph, b.snapshotData, origin, prefix, states)
+	if err != nil {
+		return ttcchunk.GraphImportResult{}, err
+	}
+	// A capture can append hundreds of megabytes of bounded page/radix
+	// transactions. It is already a foreground durability operation, so publish
+	// one compact generation before returning once the journal has outgrown
+	// the checkpoint, rather than leave every later daemon restart to replay
+	// more capture history than it loads.
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return ttcchunk.GraphImportResult{}, fmt.Errorf("compacting imported memory graph: %w", err)
+		}
+	}
+	return result, nil
+}
+
+// reconcileInterruptedClusterMemoryGraph converts crash residue into one of
+// two unambiguous states before the node resumes execution: unreachable
+// working origins are reclaimed and abandoned, while objects already reached
+// from a later sealed root are themselves sealed. A graph import commits
+// immutable objects and bounded radix updates transactionally, so removing its
+// construction roots/pins leaves only references created by a completed
+// capture. No new cluster import is admitted while startup reconciliation runs.
+func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
+	if b == nil || b.snapshotGraph == nil || b.snapshotData == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	if err := reconcileInterruptedMemoryGraph(b.snapshotGraph, b.snapshotData, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		return err
+	}
+	if b.snapshotGraph.CheckpointDue(snapshotGraphJournalCompactBytes) {
+		if err := b.snapshotGraph.Checkpoint(); err != nil {
+			return fmt.Errorf("compacting recovered cluster memory graph: %w", err)
+		}
+	}
+	// Empty provider origins are abandoned by the ordinary volatile-origin
+	// reconciliation after this node transitions from joining to ready. Raft
+	// intentionally rejects execution-authority mutations while joining.
+	return nil
+}
+
+func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, sealState ttcsnapshot.SnapshotState) error {
+	inspection := graph.Inspect()
+	working := make(map[ttcsnapshot.SnapshotID]struct{})
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.State == ttcsnapshot.SnapshotWorking {
+			working[snapshot.ID] = struct{}{}
+		}
+	}
+	if len(working) == 0 {
+		return nil
+	}
+	var roots, pins []string
+	for name, object := range inspection.Roots {
+		if _, ok := working[object.Snapshot]; ok {
+			roots = append(roots, name)
+		}
+	}
+	for name, object := range inspection.Pins {
+		if _, ok := working[object.Snapshot]; ok {
+			pins = append(pins, name)
+		}
+	}
+	sort.Strings(roots)
+	sort.Strings(pins)
+	if len(pins) != 0 {
+		if err := graph.DeletePins(pins); err != nil {
+			return fmt.Errorf("releasing interrupted memory construction pins: %w", err)
+		}
+	}
+	if len(roots) != 0 {
+		if err := graph.ReleaseRoots(roots); err != nil {
+			return fmt.Errorf("releasing interrupted memory construction roots: %w", err)
+		}
+	}
+	for {
+		collected, err := graph.Collect(4096)
+		if err != nil {
+			return fmt.Errorf("collecting interrupted memory graph: %w", err)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if _, _, err := data.ReclaimUnreferenced(graph); err != nil {
+		return fmt.Errorf("reclaiming interrupted memory data: %w", err)
+	}
+	ordered := make([]ttcsnapshot.SnapshotID, 0, len(working))
+	for origin := range working {
+		ordered = append(ordered, origin)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, origin := range ordered {
+		objects, err := graph.SnapshotObjects(origin)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspecting interrupted memory origin %d: %w", origin, err)
+		}
+		if len(objects) == 0 {
+			continue
+		}
+		if err := graph.Seal(origin, sealState); err != nil {
+			return fmt.Errorf("sealing referenced interrupted memory origin %d: %w", origin, err)
+		}
+	}
+	return nil
+}
+
+// newFilesystemOriginScope returns a bundle allocator and a completion
+// function. A failed bundle preparation abandons every otherwise-unreachable
+// Raft allocation without reusing its ID; success transfers those origins to
+// the created repositories.
+func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot.SnapshotID, error), func(bool) error) {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil, func(bool) error { return nil }
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	incarnation := b.distributedSource.incarnation
+	var allocated []ttcsnapshot.SnapshotID
+	allocate := func(count uint32) ([]ttcsnapshot.SnapshotID, error) {
+		if node == "" || incarnation == "" {
+			return nil, errors.New("cluster filesystem snapshot allocation lacks node incarnation")
+		}
+		allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, incarnation, count)
+		if err != nil {
+			return nil, fmt.Errorf("allocating Raft filesystem origins: %w", err)
+		}
+		if allocation.Count != count || allocation.First == 0 {
+			return nil, fmt.Errorf("raft returned invalid filesystem snapshot allocation %+v", allocation)
+		}
+		origins := make([]ttcsnapshot.SnapshotID, count)
+		for index := range origins {
+			origins[index] = ttcsnapshot.SnapshotID(allocation.First + uint64(index))
+		}
+		allocated = append(allocated, origins...)
+		return origins, nil
+	}
+	finish := func(committed bool) error {
+		if committed {
+			allocated = nil
+			return nil
+		}
+		var result error
+		for _, origin := range allocated {
+			if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, incarnation, uint64(origin)); err != nil {
+				result = errors.Join(result, fmt.Errorf("abandoning filesystem origin %d: %w", origin, err))
+			}
+		}
+		allocated = nil
+		return result
+	}
+	return allocate, finish
+}
+
+// ensureClusterFilesystemWorkingOrigins upgrades immutable cold repository
+// branches to fresh Raft-owned working origins immediately before a runtime is
+// admitted to mutate them. Repository open and offline inspection deliberately
+// do not perform this transition.
+func (b *runtimeBackend) ensureClusterFilesystemWorkingOrigins(info ttcbundle.ContainerInfo, filesystemBranch string) error {
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	if filesystemBranch == "" {
+		return errors.New("cluster filesystem branch is empty")
+	}
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		path := filepath.Clean(config.Path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return fmt.Errorf("opening clustered repository %q: %w", config.Source, err)
+		}
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		if !repository.Info().Clustered {
+			repository.Close()
+			return fmt.Errorf("repository %q was created without cluster snapshot authority", config.Source)
+		}
+		needs, err := repository.BranchNeedsWorkingOrigin(physicalBranch)
+		if err != nil {
+			repository.Close()
+			return fmt.Errorf("checking clustered repository %q branch %q: %w", config.Source, physicalBranch, err)
+		}
+		if !needs {
+			if err := repository.Close(); err != nil {
+				return err
+			}
+			continue
+		}
+		allocate, finish := b.newFilesystemOriginScope()
+		origins, err := allocate(1)
+		if err != nil {
+			repository.Close()
+			return errors.Join(err, finish(false))
+		}
+		adopted, installErr := repository.InstallBranchWorkingOrigin(physicalBranch, origins[0])
+		closeErr := repository.Close()
+		finishErr := finish(adopted)
+		if installErr != nil || closeErr != nil || finishErr != nil {
+			if installErr != nil {
+				installErr = fmt.Errorf("installing clustered repository %q working origin: %w", config.Source, installErr)
+			}
+			return errors.Join(installErr, closeErr, finishErr)
+		}
+	}
+	return nil
+}
+
+// allocateFilesystemForkOrigins reserves the exact working origins consumed
+// by one Sentry filesystem fork. Each repository consumes a source/child pair
+// for every destination; the assignment is keyed by the repository identity
+// embedded in the guest mount, never by a host path.
+func (b *runtimeBackend) allocateFilesystemForkOrigins(containerID string, childCount int) ([]boot.FilesystemOriginAssignment, func(bool) error, error) {
+	finishNoop := func(bool) error { return nil }
+	if b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil, finishNoop, nil
+	}
+	if childCount <= 0 || childCount > 2048 {
+		return nil, finishNoop, fmt.Errorf("invalid filesystem fork fanout %d", childCount)
+	}
+	spec, err := b.containerStore().LoadSpec(containerID)
+	if err != nil {
+		return nil, finishNoop, err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return nil, finishNoop, err
+	}
+	allocate, finish := b.newFilesystemOriginScope()
+	assignments := make([]boot.FilesystemOriginAssignment, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		repository, err := ttcvolume.OpenRepository(config.Path, ttcvolume.CopyMode(config.CopyMode))
+		if err != nil {
+			return nil, finish, errors.Join(err, finish(false))
+		}
+		repositoryID := repository.Info().ID
+		closeErr := repository.Close()
+		if closeErr != nil {
+			return nil, finish, errors.Join(closeErr, finish(false))
+		}
+		if _, ok := seen[repositoryID]; ok {
+			continue
+		}
+		seen[repositoryID] = struct{}{}
+		origins, err := allocate(uint32(2 * childCount))
+		if err != nil {
+			return nil, finish, errors.Join(err, finish(false))
+		}
+		encoded := make([]uint64, len(origins))
+		for i, origin := range origins {
+			encoded[i] = uint64(origin)
+		}
+		assignments = append(assignments, boot.FilesystemOriginAssignment{
+			ResourceID: checkpoint.ResourceID{ContainerName: "ttc-volume", Path: repositoryID},
+			Origins:    encoded,
+		})
+	}
+	sort.Slice(assignments, func(i, j int) bool {
+		return assignments[i].ResourceID.Path < assignments[j].ResourceID.Path
+	})
+	return assignments, finish, nil
+}
+
+func filesystemOriginAssignmentsPipe(assignments []boot.FilesystemOriginAssignment) (*os.File, error) {
+	encoded, err := json.Marshal(assignments)
+	if err != nil {
+		return nil, err
+	}
+	return newConfigMemFD("ttc-filesystem-origin-assignments", encoded)
+}
+
+// discardFailedGraphSnapshot rolls back an origin that never became
+// authoritative. Failed captures must not be published as empty snapshots:
+// doing so bypasses the shared reference ledger and leaves a pack that no
+// collector owns. Callers release every construction root before entering
+// this method.
+//
+// If authority already switched to shared, publication passed the reference
+// ledger fence and normal shared GC owns the origin. The only local repair
+// needed in that case is finishing a possibly interrupted MarkShared step.
+func (b *runtimeBackend) discardFailedGraphSnapshot(origin ttcsnapshot.SnapshotID) error {
+	if origin == 0 || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return nil
+	}
+	node := b.nodeID
+	if node == "" {
+		node = b.distributedSource.capabilities.NodeID
+	}
+	provider, volatile, err := b.distributedSource.authority.SnapshotProvider(uint64(origin))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("resolving failed snapshot origin %d: %w", origin, err)
+	}
+	abandoned := errors.Is(err, os.ErrNotExist)
+	if volatile && provider.NodeID != node {
+		return fmt.Errorf("failed snapshot origin %d is owned by node %q, not %q", origin, provider.NodeID, node)
+	}
+	if !volatile && !abandoned && b.snapshotShared != nil {
+		if _, manifestErr := b.snapshotShared.Manifest(origin); manifestErr == nil {
+			if record, ok := b.snapshotGraph.Snapshot(origin); ok && record.State != ttcsnapshot.SnapshotShared {
+				if err := b.snapshotGraph.MarkShared(origin); err != nil {
+					return fmt.Errorf("finishing shared state for snapshot origin %d: %w", origin, err)
+				}
+			}
+			return nil
+		} else if !errors.Is(manifestErr, os.ErrNotExist) {
+			return fmt.Errorf("checking failed snapshot origin %d publication: %w", origin, manifestErr)
+		}
+	}
+	if b.snapshotGraph == nil || b.snapshotData == nil {
+		return errors.New("local graph snapshot repository is unavailable")
+	}
+	// A failed origin was never made visible to another branch. Reclaim every
+	// construction reference rooted in that origin rather than relying on each
+	// streaming caller to have observed the importer's final result. In
+	// particular, a command may report failure after its stream was committed.
+	inspection := b.snapshotGraph.Inspect()
+	var roots, pins []string
+	for name, object := range inspection.Roots {
+		if object.Snapshot == origin {
+			roots = append(roots, name)
+		}
+	}
+	for name, object := range inspection.Pins {
+		if object.Snapshot == origin {
+			pins = append(pins, name)
+		}
+	}
+	if len(pins) != 0 {
+		if err := b.snapshotGraph.DeletePins(pins); err != nil {
+			return fmt.Errorf("releasing failed snapshot origin %d pins: %w", origin, err)
+		}
+	}
+	if len(roots) != 0 {
+		if err := b.snapshotGraph.ReleaseRoots(roots); err != nil {
+			return fmt.Errorf("releasing failed snapshot origin %d roots: %w", origin, err)
+		}
+	}
+	for {
+		collected, collectErr := b.snapshotGraph.Collect(4096)
+		if collectErr != nil {
+			return fmt.Errorf("collecting failed snapshot origin %d: %w", origin, collectErr)
+		}
+		if collected == 0 {
+			break
+		}
+	}
+	if _, _, err := b.snapshotData.ReclaimUnreferenced(b.snapshotGraph); err != nil {
+		return fmt.Errorf("reclaiming failed snapshot origin %d data: %w", origin, err)
+	}
+	objects, err := b.snapshotGraph.SnapshotObjects(origin)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspecting failed snapshot origin %d: %w", origin, err)
+	}
+	if len(objects) != 0 {
+		return fmt.Errorf("failed snapshot origin %d still owns %d reachable objects", origin, len(objects))
+	}
+	if b.snapshotShared != nil {
+		busy, err := b.snapshotShared.DiscardHandoff(origin)
+		if err != nil {
+			return fmt.Errorf("discarding failed snapshot origin %d pack: %w", origin, err)
+		}
+		if busy {
+			return fmt.Errorf("discarding failed snapshot origin %d pack: pack is busy", origin)
+		}
+	}
+	if volatile {
+		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, uint64(origin)); err != nil {
+			return fmt.Errorf("abandoning failed snapshot origin %d: %w", origin, err)
+		}
+	}
+	if _, ok := b.snapshotGraph.Snapshot(origin); !ok {
+		return nil
+	}
+	inspection = b.snapshotGraph.Inspect()
+	retain := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots)-1)
+	for _, snapshot := range inspection.Snapshots {
+		if snapshot.ID != origin {
+			retain = append(retain, snapshot.ID)
+		}
+	}
+	if _, err := b.snapshotGraph.CollectEmptySnapshots(retain); err != nil {
+		return fmt.Errorf("forgetting failed snapshot origin %d: %w", origin, err)
 	}
 	return nil
 }
@@ -10126,8 +14755,14 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err != nil {
 		return err
 	}
+	if b.snapshotGraph == nil || b.snapshotData == nil {
+		return errors.New("new-format daemon has no graph-native memory store")
+	}
 	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
 		return fmt.Errorf("settling remote branches before dehydrating %s: %w", target, err)
+	}
+	if err := b.ensureDistributedTargetMemoryIndependent(info, persistentBranch); err != nil {
+		return fmt.Errorf("materializing remote memory before dehydrating %s: %w", target, err)
 	}
 	store := b.containerStore()
 	initConsolePaths, _ := store.BranchConsolePaths(info.ID, target.branch)
@@ -10136,13 +14771,6 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	originalState := normalizeLifecycleState(persistentBranch.State)
 	transitionPublished := false
 	captured := false
-	var stagingDir, finalDir string
-	finalPublished := false
-	sparseRootChanged := false
-	hadPreviousSparseRoot := false
-	var previousSparseRoot ttcchunk.ManifestID
-	var sparseRepositoryPath string
-	var sparseFilesystemBranch string
 	defer func() {
 		if dehydrated {
 			return
@@ -10150,34 +14778,11 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		if transitionPublished {
 			_ = b.containerStore().UpdateBranchState(info.ID, target.branch, originalState)
 		}
-		if sparseRootChanged {
-			if repository, openErr := ttcchunk.OpenMemoryRepository(sparseRepositoryPath); openErr == nil {
-				if hadPreviousSparseRoot {
-					openErr = repository.SetBranch(sparseFilesystemBranch, previousSparseRoot)
-				} else {
-					openErr = repository.DeleteBranch(sparseFilesystemBranch)
-					if errors.Is(openErr, os.ErrNotExist) {
-						openErr = nil
-					}
-				}
-				if openErr == nil {
-					_, openErr = repository.CollectGarbage(ttcchunk.GCOptions{})
-				}
-				_ = repository.Close()
-				if openErr != nil && b.stderr != nil {
-					fmt.Fprintf(b.stderr, "ttc: warning: rolling back sparse memory root for %s: %v\n", target, openErr)
-				}
-			} else if b.stderr != nil {
-				fmt.Fprintf(b.stderr, "ttc: warning: opening sparse memory repository to roll back %s: %v\n", target, openErr)
-			}
-		}
-		if finalPublished {
-			_ = os.RemoveAll(finalDir)
-		}
 		if captured {
-			// Dehydration has already replaced the live Kernel. If durable export
-			// fails, reconstruct it while the Sentry still owns the capture so the
-			// operation remains atomic from the user's point of view.
+			// Dehydration has already replaced the live Kernel. If making it
+			// durable fails, reconstruct it while the Sentry still owns the
+			// capture so the operation remains atomic from the user's point of
+			// view.
 			_, _ = b.command("timetravel", target.container, "rehydrate", target.branch)
 		}
 		// Capture failure leaves the branch in its original running or paused
@@ -10203,120 +14808,16 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil {
 		return fmt.Errorf("stopping published ports before dehydration: %w", err)
 	}
-	var metadataFile *os.File
-	if b.dataRoot != "" {
-		metadataDir := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "dehydrated")
-		if err := os.MkdirAll(metadataDir, 0700); err != nil {
-			return fmt.Errorf("creating dehydration metadata directory: %w", err)
-		}
-		encodedBranch := ttcbundle.MemoryBranchKey(persistentBranch)
-		finalDir = filepath.Join(metadataDir, encodedBranch)
-		stagingDir, err = os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
-		if err != nil {
-			return fmt.Errorf("creating dehydration staging directory: %w", err)
-		}
-		defer os.RemoveAll(stagingDir)
-		metadataFile, err = os.OpenFile(filepath.Join(stagingDir, "metadata.state"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-		if err != nil {
-			return fmt.Errorf("creating dehydration metadata: %w", err)
-		}
-		defer metadataFile.Close()
-	}
-	var output []byte
 	if b.dataRoot != "" {
 		if err := b.containerStore().UpdateBranchState(info.ID, target.branch, "dehydrating"); err != nil {
 			return fmt.Errorf("publishing dehydration transition for %s: %w", target, err)
 		}
 		transitionPublished = true
 	}
-	if metadataFile != nil {
-		output, err = b.commandWithFiles([]*os.File{metadataFile}, "timetravel", "--dehydration-fd=3", target.container, "dehydrate", target.branch)
-	} else {
-		output, err = b.command("timetravel", target.container, "dehydrate", target.branch)
-	}
-	if err != nil {
+	if _, err := b.command("timetravel", target.container, "dehydrate", target.branch); err != nil {
 		return err
 	}
 	captured = true
-	if metadataFile != nil {
-		var capture boot.BranchDehydrateInfo
-		if err := json.Unmarshal(output, &capture); err != nil {
-			return fmt.Errorf("decoding dehydration capture description: %w", err)
-		}
-		sparseRepositoryPath = filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
-		memoryRepository, err := ttcchunk.OpenMemoryRepository(sparseRepositoryPath)
-		if err != nil {
-			return fmt.Errorf("opening sparse dehydration memory repository: %w", err)
-		}
-		defer memoryRepository.Close()
-		previousSparseRoot, err = memoryRepository.Branch(capture.FilesystemBranch)
-		if err == nil {
-			hadPreviousSparseRoot = true
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("reading previous sparse dehydration branch root: %w", err)
-		}
-		repositoryDir, err := os.Open(sparseRepositoryPath)
-		if err != nil {
-			return err
-		}
-		exportArgs := []string{"timetravel", "--dehydration-memory-repository-fd=3", target.container, "dehydrate-export", target.branch}
-		exportOutput, exportErr := b.commandWithFiles([]*os.File{repositoryDir}, exportArgs...)
-		_ = repositoryDir.Close()
-		if exportErr != nil {
-			return fmt.Errorf("persisting dehydration memory: %w", exportErr)
-		}
-		var exportInfo boot.BranchDehydrationExportInfo
-		if err := json.Unmarshal(exportOutput, &exportInfo); err != nil {
-			return fmt.Errorf("decoding sparse dehydration root: %w", err)
-		}
-		if exportInfo.Manifest == (ttcchunk.ManifestID{}) {
-			return errors.New("sparse dehydration export returned an empty manifest ID")
-		}
-		sparseFilesystemBranch = capture.FilesystemBranch
-		capture.SparseManifest = exportInfo.Manifest
-		if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
-			return fmt.Errorf("persisting dehydration control state: %w", err)
-		}
-		if err := metadataFile.Sync(); err != nil {
-			return fmt.Errorf("syncing dehydration metadata: %w", err)
-		}
-		if err := metadataFile.Close(); err != nil {
-			return fmt.Errorf("closing dehydration metadata: %w", err)
-		}
-		metadataFile = nil
-		if _, err := os.Stat(finalDir); err == nil {
-			return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.Rename(stagingDir, finalDir); err != nil {
-			return fmt.Errorf("publishing dehydration image: %w", err)
-		}
-		stagingDir = ""
-		finalPublished = true
-		if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
-			_ = dir.Sync()
-			_ = dir.Close()
-		}
-		sparseRootChanged = true
-		if err := memoryRepository.SetBranch(capture.FilesystemBranch, exportInfo.Manifest); err != nil {
-			return fmt.Errorf("publishing sparse dehydration branch root: %w", err)
-		}
-		// A durable dehydration image contains every page needed by this
-		// branch, including pages formerly fetched from a remote fork source.
-		// Publish that fact before the process-free runtime disappears so the
-		// source may release its live snapshot without waiting for rehydration.
-		if err := b.completeDistributedTargetDehydration(info, persistentBranch); err != nil {
-			return fmt.Errorf("completing remote dependency for dehydrated %s: %w", target, err)
-		}
-		if transactionID := transactionIDForBranch(info, persistentBranch); transactionID != "" {
-			if err := b.releaseDistributedSparseRootTransaction(transactionID); err != nil && b.stderr != nil {
-				// The durable target image is already independent. Retaining the old
-				// immutable root is safe; repository maintenance may retry cleanup.
-				fmt.Fprintf(b.stderr, "ttc: warning: retaining superseded remote memory root for %s: %v\n", target, err)
-			}
-		}
-	}
 	// The old console followers observe the intentionally released Kernel as an
 	// exit and record SIGKILL. That is not a container exit: discard those
 	// transient statuses so rehydration can attach fresh followers.
@@ -10332,17 +14833,30 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 	}
 	if b.dataRoot != "" {
-		if err := b.containerStore().UpdateBranchState(target.container, target.branch, "dehydrated"); err != nil {
+		latest, err := store.LoadContainer(info.ID)
+		if err != nil {
 			return err
 		}
-	}
-	dehydrated = true
-	if b.dataRoot != "" {
-		activeDir := existingMemoryBranchDir(b.dataRoot, info.ID, "active", persistentBranch)
-		if removeErr := os.RemoveAll(activeDir); removeErr != nil {
-			return fmt.Errorf("removing superseded active memory: %w", removeErr)
+		if b.dehydrationMayStayResident(latest, target.branch) {
+			if err := store.MarkBranchDehydratedResident(info.ID, target.branch); err != nil {
+				return fmt.Errorf("recording resident dehydration of %s: %w", target, err)
+			}
+			dehydrated = true
+			return nil
 		}
 	}
+	// The family's resident dehydrations below share pages with the image
+	// this one supersedes; see persistResidentDehydrations.
+	var superseded []func()
+	defer func() {
+		for _, release := range superseded {
+			release()
+		}
+	}()
+	if err := b.persistDehydration(target, info, persistentBranch, &superseded); err != nil {
+		return err
+	}
+	dehydrated = true
 	if b.dataRoot != "" {
 		latest, loadErr := b.containerStore().LoadContainer(target.container)
 		if loadErr != nil {
@@ -10350,6 +14864,9 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 		}
 		allCold, localBranches := allBranchesColdOnNode(latest, b.nodeID)
 		if allCold && localBranches != 0 {
+			if err := b.persistResidentDehydrations(latest, &superseded); err != nil {
+				return err
+			}
 			if _, deleteErr := b.command("delete", "--force", info.ID); deleteErr != nil {
 				return fmt.Errorf("releasing fully dehydrated runtime: %w", deleteErr)
 			}
@@ -10358,12 +14875,411 @@ func (b *runtimeBackend) dehydrate(target selector) error {
 	return nil
 }
 
+// dehydrationMayStayResident reports whether branchID's dehydration may leave
+// its capture in the family's Sentry rather than making it durable: in a
+// standalone daemon, while another branch of the family on this node is live.
+//
+// The Sentry must stay up for that branch anyway, and a capture shares every
+// page that neither branch has written since, so a durable copy bought little
+// and cost a write of the branch's whole memory: a fork dehydrated at once was
+// the most expensive case, when it should have been the cheapest. A clustered
+// daemon still publishes at once, because other nodes rehydrate and fork
+// dehydrated branches only from what was published.
+func (b *runtimeBackend) dehydrationMayStayResident(info ttcbundle.ContainerInfo, branchID string) bool {
+	if b.dataRoot == "" || b.distributedSource != nil || b.publicationQueue != nil {
+		return false
+	}
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			continue
+		}
+		if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+			continue
+		}
+		switch normalizeLifecycleState(branch.State) {
+		case "created", "dehydrating", "dehydrated", "exited", "failed", "dead":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// persistResidentDehydrations makes durable every resident dehydration of
+// info's family on this node. It must run while the family's Sentry is still
+// up, before anything deletes the runtime that holds those captures.
+//
+// The images a branch's dehydration supersedes are released only once every
+// branch is durable, or, if superseded is not nil, appended to it for the
+// caller to release: a sibling forked from or rehydrated beside the branch
+// holds pages of those images, and the graph recognizes a page it holds only
+// while an image names it. Released as each branch was done, a family whose
+// first branch had rewritten much of its memory made its siblings send all of
+// those pages again.
+func (b *runtimeBackend) persistResidentDehydrations(info ttcbundle.ContainerInfo, superseded *[]func()) error {
+	if superseded == nil {
+		var releases []func()
+		defer func() {
+			for _, release := range releases {
+				release()
+			}
+		}()
+		superseded = &releases
+	}
+	for _, branch := range info.Branches {
+		if !ttcbundle.ResidentDehydration(branch) {
+			continue
+		}
+		if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+			continue
+		}
+		if err := b.persistDehydration(selector{container: info.ID, branch: branch.ID}, info, branch, superseded); err != nil {
+			return fmt.Errorf("making the dehydration of %s@%s durable: %w", info.Name, branch.ID, err)
+		}
+	}
+	return nil
+}
+
+// persistResidentDehydration makes one resident dehydration durable on
+// request, as waiting for a dehydrated branch to be durable asks.
+func (b *runtimeBackend) persistResidentDehydration(target selector) error {
+	// Exporting a capture must not race a lifecycle command consuming it.
+	unlock := func() {}
+	if !b.lifecycleLockHeld {
+		unlock = b.holdFamilyLifecycle(b.familyID(target.container))
+	}
+	defer unlock()
+	resolved, info, err := b.resolveSelector(target)
+	if err != nil {
+		return err
+	}
+	branch, err := persistentBranchInfo(info, resolved.branch)
+	if err != nil {
+		return err
+	}
+	if !ttcbundle.ResidentDehydration(branch) {
+		return nil
+	}
+	return b.persistDehydration(resolved, info, branch, nil)
+}
+
+// persistDehydration makes a captured dehydration durable: it exports the
+// capture held by the family's Sentry into the snapshot graph with its control
+// state, records the roots, and publishes the branch as durably dehydrated.
+// The Sentry keeps the capture, so the branch can still be rehydrated from
+// memory, and a failed attempt can be repeated.
+//
+// The roots the branch's new image supersedes are released at once, or, if
+// superseded is not nil, appended to it to be released later.
+func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.ContainerInfo, persistentBranch ttcbundle.BranchInfo, superseded *[]func()) error {
+	if b.dataRoot == "" {
+		return b.queueBranchPublication(target, "dehydrate")
+	}
+	// A graph capture installs roots and parent edges to immutable origins.
+	// Exclude the short provider-to-shared ledger freeze so every new reference
+	// is included on exactly one side of the authority handoff.
+	finishGraphCapture := func() {}
+	graphCaptureActive := false
+	if b.distributedSource != nil {
+		finishGraphCapture = b.distributedSource.beginForegroundCapture()
+		graphCaptureActive = true
+	}
+	defer func() {
+		if graphCaptureActive {
+			finishGraphCapture()
+		}
+	}()
+	persisted := false
+	finalPublished := false
+	var graphMemoryRoots []string
+	var graphMemoryRootObjects []string
+	var graphControlRoot string
+	var graphControlRootObject string
+	var graphMemorySnapshot uint64
+	graphMemoryRecorded := false
+	previousGraphMemorySnapshot := persistentBranch.SnapshotID
+	previousGraphMemoryRoots := append([]string(nil), persistentBranch.MemoryRoots...)
+	previousGraphMemoryRootObjects := append([]string(nil), persistentBranch.MemoryRootObjects...)
+	previousGraphControlRoot := persistentBranch.ControlRoot
+	previousGraphControlRootObject := persistentBranch.ControlRootObject
+	previousGraphReferenceOperation := persistentBranch.DistributedGraphReferenceOperation
+	metadataDir := filepath.Join(b.activeDataRoot(), "containers", info.ID, "memory", "dehydrated")
+	encodedBranch := ttcbundle.MemoryBranchKey(persistentBranch)
+	finalDir := filepath.Join(metadataDir, encodedBranch)
+	defer func() {
+		if persisted {
+			return
+		}
+		if graphMemoryRecorded {
+			_ = b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, previousGraphMemorySnapshot, previousGraphMemoryRoots, previousGraphMemoryRootObjects, previousGraphControlRoot, previousGraphControlRootObject, previousGraphReferenceOperation)
+		}
+		if len(graphMemoryRoots) != 0 || graphControlRoot != "" {
+			if graphErr := b.releaseGraphMemoryRoots(appendGraphRoot(append([]string(nil), graphMemoryRoots...), graphControlRoot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: rolling back graph memory roots for %s: %v\n", target, graphErr)
+			}
+		}
+		if graphMemorySnapshot != 0 && b.distributedSource != nil {
+			if graphErr := b.discardFailedGraphSnapshot(ttcsnapshot.SnapshotID(graphMemorySnapshot)); graphErr != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: discarding failed graph snapshot %d for %s: %v\n", graphMemorySnapshot, target, graphErr)
+			}
+		}
+		if finalPublished {
+			_ = os.RemoveAll(finalDir)
+		}
+	}()
+	if ttcbundle.ResidentDehydration(persistentBranch) {
+		// The record names no image, so any here is what an interrupted
+		// attempt left, and nothing refers to it.
+		if err := b.removeInterruptedDehydrationImages(info.ID, persistentBranch); err != nil {
+			return fmt.Errorf("removing an interrupted dehydration image: %w", err)
+		}
+	}
+	if err := os.MkdirAll(metadataDir, 0700); err != nil {
+		return fmt.Errorf("creating dehydration metadata directory: %w", err)
+	}
+	stagingDir, err := os.MkdirTemp(metadataDir, "."+encodedBranch+"-*")
+	if err != nil {
+		return fmt.Errorf("creating dehydration staging directory: %w", err)
+	}
+	defer func() {
+		if stagingDir != "" {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+	metadataFile, err := os.OpenFile(filepath.Join(stagingDir, "metadata.state"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("creating dehydration metadata: %w", err)
+	}
+	defer func() {
+		if metadataFile != nil {
+			_ = metadataFile.Close()
+		}
+	}()
+	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	if err != nil {
+		return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
+	}
+	graphMemorySnapshot = uint64(origin)
+	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
+	reader, writer, err := graphCaptureStream()
+	if err != nil {
+		return fmt.Errorf("creating graph dehydration stream: %w", err)
+	}
+	type graphImportOutcome struct {
+		result ttcchunk.GraphImportResult
+		err    error
+	}
+	imported := make(chan graphImportOutcome, 1)
+	var output []byte
+	var exportErr error
+	var outcome graphImportOutcome
+	// Streaming the branch's memory into the graph takes time in
+	// proportion to it; other commands go on meanwhile.
+	if err := b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "dehydrating", shown: true}, func() error {
+		go func() {
+			result, importErr := b.importGraphCapture(reader, origin, prefix)
+			_ = reader.Close()
+			imported <- graphImportOutcome{result: result, err: importErr}
+		}()
+		output, exportErr = b.commandWithFiles([]*os.File{writer, metadataFile}, "timetravel", "--dehydration-graph-stream-fd=3", "--dehydration-graph-stream-filtered", "--dehydration-fd=4", target.container, "dehydrate-export", target.branch)
+		_ = writer.Close()
+		outcome = <-imported
+		return nil
+	}); err != nil {
+		_ = writer.Close()
+		_ = reader.Close()
+		return err
+	}
+	if exportErr != nil {
+		return fmt.Errorf("streaming graph-native dehydration memory: %w", exportErr)
+	}
+	if outcome.err != nil {
+		return fmt.Errorf("importing graph-native dehydration memory: %w", outcome.err)
+	}
+	var exported boot.BranchDehydrationExportInfo
+	if err := json.Unmarshal(output, &exported); err != nil {
+		return fmt.Errorf("decoding dehydration capture description: %w", err)
+	}
+	capture := exported.Capture
+	for _, root := range outcome.result.Roots {
+		capture.MemoryRoots = append(capture.MemoryRoots, boot.BranchMemoryRoot{
+			ResourceID: root.ResourceID,
+			Name:       root.Name,
+			Root:       root.Root.String(),
+		})
+		graphMemoryRoots = append(graphMemoryRoots, root.Name)
+		graphMemoryRootObjects = append(graphMemoryRootObjects, root.Root.String())
+	}
+	capture.SnapshotID = uint64(origin)
+	if err := writeDurableJSON(filepath.Join(stagingDir, "control.json"), &capture); err != nil {
+		return fmt.Errorf("persisting dehydration control state: %w", err)
+	}
+	if err := metadataFile.Sync(); err != nil {
+		return fmt.Errorf("syncing dehydration metadata: %w", err)
+	}
+	if err := metadataFile.Close(); err != nil {
+		metadataFile = nil
+		return fmt.Errorf("closing dehydration metadata: %w", err)
+	}
+	metadataFile = nil
+	graphControlRoot = graphCaptureControlRootName(uint64(origin))
+	controlObject, err := ttcsnapshot.ImportDirectory(context.Background(), b.snapshotGraph, b.snapshotData, origin, graphControlRoot, stagingDir)
+	if err != nil {
+		return fmt.Errorf("importing graph-native dehydration control state: %w", err)
+	}
+	graphControlRootObject = controlObject.String()
+	if err := b.snapshotGraph.Seal(origin, sealState); err != nil {
+		return fmt.Errorf("sealing dehydration snapshot origin %d: %w", origin, err)
+	}
+	if graphCaptureActive {
+		finishGraphCapture()
+		graphCaptureActive = false
+	}
+	if _, err := os.Stat(finalDir); err == nil {
+		return fmt.Errorf("dehydration image already exists for branch %q", target.branch)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(stagingDir, finalDir); err != nil {
+		return fmt.Errorf("publishing dehydration image: %w", err)
+	}
+	stagingDir = ""
+	finalPublished = true
+	if dir, err := os.Open(filepath.Dir(finalDir)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	if err := b.containerStore().UpdateBranchSnapshotGraph(info.ID, target.branch, graphMemorySnapshot, graphMemoryRoots, graphMemoryRootObjects, graphControlRoot, graphControlRootObject, ""); err != nil {
+		return fmt.Errorf("recording graph-native dehydration roots: %w", err)
+	}
+	graphMemoryRecorded = true
+	// Remote dependencies remain live until the asynchronous shared
+	// publication commits. The publisher advances the transaction only after
+	// its manifest is authoritative.
+	if err := b.queueBranchPublication(target, "dehydrate"); err != nil {
+		return fmt.Errorf("queueing durable dehydration publication: %w", err)
+	}
+	if err := b.containerStore().MarkBranchDehydrationDurable(info.ID, target.branch); err != nil {
+		return fmt.Errorf("recording durable dehydration of %s: %w", target, err)
+	}
+	persisted = true
+	release := func() {
+		if len(previousGraphMemoryRoots) == 0 {
+			return
+		}
+		if graphReferenceOperationForBranch(info, persistentBranch) == "" {
+			previousBranch := persistentBranch
+			previousBranch.MemoryRoots = previousGraphMemoryRoots
+			previousBranch.MemoryRootObjects = previousGraphMemoryRootObjects
+			previousBranch.ControlRoot = previousGraphControlRoot
+			previousBranch.ControlRootObject = previousGraphControlRootObject
+			if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(previousBranch), branchGraphRootObjects(previousBranch)); err != nil && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded shared memory roots for %s: %v\n", target, err)
+			}
+		}
+		previousRoots := appendGraphRoot(append([]string(nil), previousGraphMemoryRoots...), previousGraphControlRoot)
+		if err := b.releaseGraphMemoryRoots(previousRoots); err != nil && b.stderr != nil {
+			// The new roots are already authoritative. Retaining the superseded
+			// roots is a safe leak that standalone graph reconciliation retries;
+			// it must not turn a successful dehydration into an ambiguous failure.
+			fmt.Fprintf(b.stderr, "ttc: warning: reclaiming superseded memory roots for %s: %v\n", target, err)
+		}
+		if err := b.releaseDistributedGraphReferences(graphReferenceOperationForBranch(info, persistentBranch)); err != nil && b.stderr != nil {
+			fmt.Fprintf(b.stderr, "ttc: warning: releasing superseded distributed memory origins for %s: %v\n", target, err)
+		}
+	}
+	if superseded != nil {
+		*superseded = append(*superseded, release)
+	} else {
+		release()
+	}
+	activeDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "active", persistentBranch)
+	if removeErr := os.RemoveAll(activeDir); removeErr != nil {
+		return fmt.Errorf("removing superseded active memory: %w", removeErr)
+	}
+	return nil
+}
+
+// ensureDistributedTargetMemoryIndependent drains a live target's original
+// peer-backed memory and filesystem readers before capturing a process-free
+// image. A sparse dehydration export can read outstanding memory through its
+// loader, but filesystem object holes have no process-free network reader.
+// Declaring the transaction independent while either remained would turn a
+// later source loss into EPIPE from an otherwise healthy rehydrated branch.
+func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
+	transactionID := transactionIDForBranch(info, branch)
+	if transactionID == "" || (branch.DependentMemoryBytes == 0 && branch.DependentFilesystemBytes == 0) {
+		return nil
+	}
+	action := "distributed-filesystem-drain"
+	if branch.DependentMemoryBytes != 0 {
+		action = "distributed-drain"
+	}
+	if _, err := b.command("timetravel", info.ID, action, branch.ID); err != nil {
+		return err
+	}
+	if branch.DependentMemoryBytes != 0 {
+		if err := b.waitDistributedBranchMemory(info.ID, branch.ID, 5*time.Minute); err != nil {
+			return err
+		}
+	}
+	if err := b.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0); err != nil {
+		return err
+	}
+	transactions, err := b.transactionCatalog()
+	if err != nil {
+		return err
+	}
+	tx, err := transactions.Load(transactionID)
+	if err != nil {
+		return err
+	}
+	switch tx.State {
+	case cluster.TransactionPublished, cluster.TransactionDraining:
+		_, err = transactions.Advance(transactionID, tx.Revision, cluster.TransactionIndependent, "", time.Now())
+		return err
+	case cluster.TransactionIndependent:
+		return nil
+	case cluster.TransactionCanceled, cluster.TransactionFailed:
+		return fmt.Errorf("distributed fork transaction %q is %s: %s", transactionID, tx.State, tx.Failure)
+	default:
+		return fmt.Errorf("distributed fork transaction %q is unexpectedly %s", transactionID, tx.State)
+	}
+}
+
+// waitDistributedBranchMemory waits until all volatile readers owned by one
+// live branch have either materialized their pages or failed. Durable graph
+// readers intentionally report no source dependency and do not get drained.
+func (b *runtimeBackend) waitDistributedBranchMemory(containerID, branchID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		output, err := b.command("timetravel", containerID, "distributed-dependency", branchID)
+		if err != nil {
+			return err
+		}
+		var status pgalloc.AsyncPagesFileLoadStats
+		if err := json.Unmarshal(output, &status); err != nil {
+			return fmt.Errorf("decoding remote-memory dependency: %w", err)
+		}
+		if status.Done {
+			if status.Error != "" {
+				return errors.New(status.Error)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out with %d remote bytes outstanding", status.BytesOutstanding)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (b *runtimeBackend) completeDistributedTargetDehydration(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) error {
 	transactionID := transactionIDForBranch(info, branch)
 	if transactionID == "" || b.dataRoot == "" {
 		return nil
 	}
-	store, err := cluster.OpenStore(filepath.Join(b.dataRoot, "cluster", "transactions"))
+	store, err := b.transactionCatalog()
 	if err != nil {
 		return err
 	}
@@ -10393,6 +15309,16 @@ func transactionIDForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.Branc
 	return info.DistributedForkTransactionID
 }
 
+// lostResidentDehydration records that target's resident capture went with
+// its runtime, as a running branch's memory does, and says so.
+func (b *runtimeBackend) lostResidentDehydration(target selector, info ttcbundle.ContainerInfo) error {
+	exitStatus := 128 + int(linux.SIGKILL)
+	if err := b.containerStore().StopBranch(info.ID, target.branch, exitStatus); err != nil {
+		return fmt.Errorf("recording the loss of %s: %w", target, err)
+	}
+	return fmt.Errorf("branch %s was dehydrated in the runtime it shared with a live branch, and that runtime is gone; start it to boot it from its filesystem", target)
+}
+
 func (b *runtimeBackend) rehydrate(target selector) error {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -10409,12 +15335,54 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	if persistentBranch == nil {
 		return fmt.Errorf("branch %q is not recorded", target.branch)
 	}
+	if persistentBranch.State == "dehydrating" {
+		if b.publicationQueue == nil || persistentBranch.PublicationID == "" {
+			return fmt.Errorf("branch %s has not completed its local dehydration capture", target)
+		}
+		publicationID := persistentBranch.PublicationID
+		if err := b.publicationQueue.Cancel(info.ID, target.branch, publicationID); err != nil {
+			return fmt.Errorf("fencing dehydration publication for %s: %w", target, err)
+		}
+		if err := b.containerStore().AbandonBranchPublication(info.ID, target.branch, publicationID); err != nil {
+			return fmt.Errorf("retiring dehydration publication for %s: %w", target, err)
+		}
+		// AbandonBranchPublication clears the immutable publication fence. Reload
+		// so the cold restore cannot accidentally reuse the canceled identity.
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return fmt.Errorf("reloading canceled dehydration for %s: %w", target, err)
+		}
+		persistentBranch = nil
+		for i := range info.Branches {
+			if info.Branches[i].ID == target.branch {
+				persistentBranch = &info.Branches[i]
+				break
+			}
+		}
+		if persistentBranch == nil {
+			return fmt.Errorf("branch %q disappeared while canceling dehydration", target.branch)
+		}
+		persistentBranch.State = "dehydrated"
+	}
+	// Rebuilding a branch from its durable image takes time in proportion to
+	// its memory; other commands go on meanwhile.
+	rehydrateCold := func(peer bool) error {
+		return b.withoutLifecycleLock(info, longOperation{branch: target.branch, state: "rehydrating", shown: true}, func() error {
+			return b.rehydrateCold(target, info, *persistentBranch, peer)
+		})
+	}
 	if persistentBranch.State == "dehydrated" {
 		if _, stateErr := b.command("state", info.ID); stateErr != nil {
-			return b.rehydrateCold(target, info, *persistentBranch, false)
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
+			return rehydrateCold(false)
 		}
 		output, branchesErr := b.command("timetravel", info.ID, "branches")
 		if branchesErr != nil {
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
 			// A fully dehydrated family has no live Sentry. runsc may briefly
 			// retain a stopped OCI record after the last branch releases it;
 			// state then succeeds even though its control server is gone. Remove
@@ -10430,7 +15398,7 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 				return branchesErr
 			}
 			_, _ = b.command("delete", "--force", info.ID)
-			return b.rehydrateCold(target, info, *persistentBranch, false)
+			return rehydrateCold(false)
 		}
 		var runtimeBranches []runscBranchInfo
 		if err := json.Unmarshal(output, &runtimeBranches); err != nil {
@@ -10444,14 +15412,26 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			}
 		}
 		if !present {
-			return b.rehydrateCold(target, info, *persistentBranch, true)
+			if ttcbundle.ResidentDehydration(*persistentBranch) {
+				return b.lostResidentDehydration(target, info)
+			}
+			return rehydrateCold(true)
+		}
+		// The durable record is authoritative across daemon crashes. Reconcile
+		// the process-free runtime record before it recreates the Kernel.
+		action := "unquarantine"
+		if persistentBranch.Quarantined {
+			action = "quarantine"
+		}
+		if _, err := b.command("timetravel", info.ID, action, target.branch); err != nil {
+			return fmt.Errorf("reconciling dehydration-time quarantine for %s: %w", target, err)
 		}
 	}
 	_, err = b.command("timetravel", target.container, "rehydrate", target.branch)
 	if err != nil || b.dataRoot == "" {
 		return err
 	}
-	families, err := b.listRuntimeFamilies()
+	families, err := b.listRuntimeFamiliesOf(target.container)
 	if err != nil {
 		return err
 	}
@@ -10461,9 +15441,10 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		}
 		for _, branch := range family.Branches {
 			if branch.ID == target.branch {
-				if err := b.containerStore().UpdateBranchState(target.container, target.branch, branch.State); err != nil {
+				if err := b.containerStore().RecordBranchActivation(target.container, target.branch, branch.State, b.nodeID); err != nil {
 					return err
 				}
+				b.releaseConsumedStandaloneMemoryBacking(target, *persistentBranch)
 				b.retainRehydrationPageSource(info.ID, *persistentBranch, "")
 				if _, err := b.ensureConsoleDrain(target, false); err != nil {
 					return fmt.Errorf("reattaching init console: %w", err)
@@ -10489,18 +15470,125 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 	return fmt.Errorf("rehydrated branch %s disappeared from runtime state", target)
 }
 
-// retainRehydrationPageSource finalizes a consumed dehydration image after the
-// restored branch is committed. Sparse restores read immutable objects from
-// the family repository, so their per-branch control directory is removed.
-// Legacy packed restores retain their snapshot files under the active branch
-// because the on-demand readers may still have those files open.
+// releaseConsumedStandaloneMemoryBacking drops a rehydrated branch's control
+// root once the restored Kernel has no outstanding reads from its image. The
+// branch keeps its memory roots: its next dehydration finds in them the pages
+// it has not changed since, and writes only the others, and that dehydration,
+// or the branch's end, releases them. The durable branch CAS is the commit
+// point: if graph collection then fails or the daemon crashes, standalone
+// startup reconciliation finds and releases the orphan root. A clustered
+// branch instead uses its origin ledger and publication protocol; it must
+// never take this local-only shortcut.
+func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector, branch ttcbundle.BranchInfo) {
+	if b.nodeID != "" || branch.SnapshotID == 0 || branch.ControlRoot == "" {
+		return
+	}
+	output, err := b.command("timetravel", target.container, "page-load-status", target.branch)
+	if err != nil {
+		return
+	}
+	var status pgalloc.AsyncPagesFileLoadStats
+	if err := json.Unmarshal(output, &status); err != nil || !status.Done || status.Error != "" {
+		return
+	}
+	cleared, err := b.containerStore().ClearBranchControlGraphIf(
+		target.container, target.branch, branch.SnapshotID, branch.ControlRoot, branch.ControlRootObject)
+	if err == nil && cleared {
+		err = b.releaseGraphMemoryRoots([]string{branch.ControlRoot})
+	}
+	if err != nil && b.stderr != nil {
+		fmt.Fprintf(b.stderr, "ttc: warning: releasing consumed control state for %s: %v\n", target, err)
+	}
+}
+
+// reconcileConsumedMemoryBacking eventually releases roots whose
+// demand loader completed after rehydrate returned. Polling is daemon-side and
+// infrequent; ordinary guest faults never mutate the graph or storage catalog.
+func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
+	containers, err := b.containerStore().ListContainersForGC()
+	if err != nil {
+		return err
+	}
+	runtimeFamilies, err := b.listRuntimeFamilies()
+	if err != nil {
+		return err
+	}
+	runtimeByID := make(map[string]Family, len(runtimeFamilies))
+	for _, family := range runtimeFamilies {
+		runtimeByID[family.ID] = family
+	}
+	for _, container := range containers {
+		if b.nodeID == "" {
+			for _, branch := range container.Branches {
+				if len(branch.MemoryRoots) == 0 {
+					continue
+				}
+				switch normalizeLifecycleState(branch.State) {
+				case "running", "paused":
+					if branch.ControlRoot != "" {
+						b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
+					}
+				}
+			}
+		}
+		if len(container.RuntimeMemoryBackings) == 0 {
+			continue
+		}
+		allDone := true
+		if family, ok := runtimeByID[container.ID]; ok {
+			for _, branch := range family.Branches {
+				switch normalizeLifecycleState(branch.State) {
+				case "running", "paused", "restarting":
+				default:
+					continue
+				}
+				output, statusErr := b.command("timetravel", container.ID, "page-load-status", branch.ID)
+				if statusErr != nil {
+					allDone = false
+					break
+				}
+				var status pgalloc.AsyncPagesFileLoadStats
+				if json.Unmarshal(output, &status) != nil || !status.Done || status.Error != "" {
+					allDone = false
+					break
+				}
+			}
+		}
+		if !allDone {
+			continue
+		}
+		for _, backing := range container.RuntimeMemoryBackings {
+			branch := runtimeBackingAsBranch(backing)
+			operation := graphReferenceOperationForBranch(container, branch)
+			if operation == "" {
+				if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
+					return fmt.Errorf("releasing shared runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+				}
+			}
+			if err := b.releaseDistributedGraphReferencesEventually(operation); err != nil {
+				return fmt.Errorf("releasing distributed runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+			}
+			if err := b.releaseBranchGraphRoots(branch); err != nil {
+				return fmt.Errorf("releasing local runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+			}
+			if err := b.containerStore().RemoveRuntimeMemoryBacking(container.ID, backing.ID); err != nil {
+				return fmt.Errorf("retiring runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// retainRehydrationPageSource removes a consumed per-branch control image
+// after the graph-backed runtime is committed. All demand-loaded bulk memory
+// lives in the central graph object store, so no branch-local page source must
+// remain open or be moved beneath the active branch.
 //
-// Failure is a post-commit cleanup warning and must never roll back a live
-// branch or change its persistent state.
+// Failure is post-commit cleanup: report it without rolling back a live branch.
 func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch ttcbundle.BranchInfo, sourceDir string) {
 	branchID := branch.ID
 	if sourceDir == "" {
-		sourceDir = existingMemoryBranchDir(b.dataRoot, containerID, "dehydrated", branch)
+		sourceDir = existingMemoryBranchDir(b.activeDataRoot(), containerID, "dehydrated", branch)
 	}
 	if _, err := os.Lstat(sourceDir); os.IsNotExist(err) {
 		return
@@ -10510,46 +15598,49 @@ func (b *runtimeBackend) retainRehydrationPageSource(containerID string, branch 
 		}
 		return
 	}
-	if control, err := os.ReadFile(filepath.Join(sourceDir, "control.json")); err == nil {
-		var capture boot.BranchDehydrateInfo
-		if json.Unmarshal(control, &capture) == nil && capture.SparseManifest != (ttcchunk.ManifestID{}) {
-			if err := os.RemoveAll(sourceDir); err != nil {
-				if b.stderr != nil {
-					fmt.Fprintf(b.stderr, "ttc: warning: removing consumed sparse dehydration image for %s@%s: %v\n", containerID, branchID, err)
-				}
-				return
-			}
-			if dir, err := os.Open(filepath.Dir(sourceDir)); err == nil {
-				_ = dir.Sync()
-				_ = dir.Close()
-			}
-			return
-		}
-	}
-	activeDir := memoryBranchDir(b.dataRoot, containerID, "active", branch)
-	if err := os.MkdirAll(activeDir, 0700); err != nil {
+	if err := os.RemoveAll(sourceDir); err != nil {
 		if b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
+			fmt.Fprintf(b.stderr, "ttc: warning: removing consumed dehydration image for %s@%s: %v\n", containerID, branchID, err)
 		}
 		return
 	}
-	destination := filepath.Join(activeDir, "dehydration-source")
-	if err := os.Rename(sourceDir, destination); err != nil {
-		if b.stderr != nil {
-			fmt.Fprintf(b.stderr, "ttc: warning: retaining dehydration page source for %s@%s: %v\n", containerID, branchID, err)
-		}
-		return
-	}
-	for _, directory := range []string{filepath.Dir(sourceDir), activeDir} {
-		if dir, err := os.Open(directory); err == nil {
-			_ = dir.Sync()
-			_ = dir.Close()
-		}
+	if dir, err := os.Open(filepath.Dir(sourceDir)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 }
-
-func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool) (retErr error) {
-	imageDir := existingMemoryBranchDir(b.dataRoot, info.ID, "dehydrated", branch)
+func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, peer bool, filesystemSource ...ttcbundle.BranchInfo) (retErr error) {
+	refreshed, err := b.containerStore().RefreshContainerImageRoot(context.Background(), info.ID)
+	if err != nil {
+		return fmt.Errorf("materializing immutable image cache: %w", err)
+	}
+	info = refreshed
+	// RefreshContainerImageRoot reloads the authoritative container record.
+	// Do not keep using the BranchInfo snapshot supplied by a merged runtime
+	// view: quarantine may have changed while this branch was process-free.
+	foundBranch := false
+	for _, current := range info.Branches {
+		if current.ID == branch.ID {
+			branch = current
+			foundBranch = true
+			break
+		}
+	}
+	if !foundBranch {
+		return fmt.Errorf("branch %q disappeared before cold rehydration", branch.ID)
+	}
+	localImageBefore := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
+	_, localImageErr := os.Stat(localImageBefore)
+	if localImageErr != nil && !errors.Is(localImageErr, os.ErrNotExist) {
+		return localImageErr
+	}
+	if err := b.ensureLocalColdBranch(info, branch); err != nil {
+		return fmt.Errorf("materializing cold branch: %w", err)
+	}
+	if err := b.ensureClusterFilesystemWorkingOrigins(info, branch.FilesystemBranch); err != nil {
+		return fmt.Errorf("activating cold branch filesystem: %w", err)
+	}
+	imageDir := existingMemoryBranchDir(b.activeDataRoot(), info.ID, "dehydrated", branch)
 	controlData, err := os.ReadFile(filepath.Join(imageDir, "control.json"))
 	if err != nil {
 		return fmt.Errorf("reading dehydration control state: %w", err)
@@ -10561,37 +15652,36 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if capture.FilesystemBranch == "" || len(capture.Memories) == 0 {
 		return errors.New("dehydration control state is incomplete")
 	}
-	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
+	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
+		return errors.New("new-format dehydration control state is not graph-native")
+	}
 	metadata, err := os.Open(filepath.Join(imageDir, "metadata.state"))
 	if err != nil {
 		return fmt.Errorf("opening dehydration metadata: %w", err)
 	}
 	defer metadata.Close()
-	snapshots := make([]*os.File, 0, len(capture.Memories))
-	defer func() {
-		for _, file := range snapshots {
-			_ = file.Close()
-		}
-	}()
-	for i := range capture.Memories {
-		if sparse {
-			break
-		}
-		file, err := os.Open(filepath.Join(imageDir, fmt.Sprintf("memory-%04d.snapshot", i)))
+	relaySource := branch
+	if len(filesystemSource) != 0 {
+		relaySource = filesystemSource[0]
+	}
+	var relays *coldFilesystemRelays
+	// A local control image says nothing about whether the imported filesystem
+	// repository still contains lazy whole-file placeholders. This is common
+	// after a cold branch was materialized once, and is guaranteed for a child
+	// forked from that branch. Donate shared-pack relays whenever a durable
+	// backing manifest exists; AttachRemoteObjectSource closes an unused relay
+	// immediately when all files are already local.
+	if relaySource.StorageManifest != "" {
+		relays, err = b.prepareColdFilesystemRelays(info, relaySource)
 		if err != nil {
-			return fmt.Errorf("opening dehydration memory image %d: %w", i, err)
+			return fmt.Errorf("preparing lazy cold filesystem: %w", err)
 		}
-		if stat, err := file.Stat(); err != nil {
-			file.Close()
-			return err
-		} else if uint64(stat.Size()) != capture.Memories[i].StreamBytes {
-			file.Close()
-			return fmt.Errorf("dehydration memory image %d is %d bytes, want %d", i, stat.Size(), capture.Memories[i].StreamBytes)
-		}
-		snapshots = append(snapshots, file)
+	}
+	if relays != nil {
+		defer relays.close()
 	}
 	if peer {
-		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, snapshots)
+		return b.rehydrateColdPeer(target, info, branch, capture, imageDir, metadata, relays)
 	}
 	bundleDir, cleanupBundle, err := b.containerStore().PrepareDehydrationRestoreBundle(info.ID, capture.FilesystemBranch)
 	if err != nil {
@@ -10618,45 +15708,59 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}()
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Sparse: sparse,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, Quarantined: branch.Quarantined,
+	}
+	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return err
+	}
+	if relays != nil {
+		restoreArgs.FilesystemConnections = len(relays.clients)
+		restoreArgs.FilesystemToken = relays.token
 	}
 	restoreArgs.NetworkArgs, err = dehydrationNetworkArgs(info)
 	if err != nil {
 		return err
 	}
+	graphRestore, err := b.openGraphMemoryRestore(capture)
+	if err != nil {
+		return err
+	}
+	defer graphRestore.close()
+	if graphRestore.remote != nil {
+		restoreArgs.GraphRemote = true
+		restoreArgs.GraphRemoteToken = graphRestore.token
+	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
 		return err
 	}
-	configReader, finishConfig, err := pipeReaderForBytes(encoded)
+	configReader, err := newConfigMemFD("ttc-dehydration-restore-config", encoded)
 	if err != nil {
 		return err
 	}
-	defer finishConfig()
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
-	if sparse {
-		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
-		repository, err := os.Open(repositoryPath)
-		if err != nil {
-			configReader.Close()
-			return fmt.Errorf("opening sparse dehydration repository: %w", err)
-		}
-		defer repository.Close()
-		files = append(files, repository)
-		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
-	} else {
-		files = append(files, snapshots...)
-		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
+	manifestFD := 3 + len(files)
+	files = append(files, graphRestore.manifest)
+	objectsFD := 3 + len(files)
+	files = append(files, graphRestore.objects)
+	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
+	if graphRestore.remote != nil {
+		remoteFD := 3 + len(files)
+		files = append(files, graphRestore.remote)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
+	}
+	if relays != nil {
+		filesystemStartFD := 3 + len(files)
+		files = append(files, relays.clients...)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-filesystems-start-fd=%d", filesystemStartFD), fmt.Sprintf("--dehydration-filesystems-count=%d", len(relays.clients)))
 	}
 	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
-	configErr := finishConfig()
+	configReader.Close()
 	if err != nil {
 		return fmt.Errorf("installing dehydration image: %w", err)
-	}
-	if configErr != nil {
-		return fmt.Errorf("supplying dehydration configuration: %w", configErr)
 	}
 	// commandWithFiles has transferred the metadata to the Sentry. Close our
 	// source descriptor before sparse cleanup; otherwise NFS must silly-rename
@@ -10669,6 +15773,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	if status != 0 {
 		return fmt.Errorf("starting dehydration runtime exited with status %d", status)
 	}
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return fmt.Errorf("committing rehydrated filesystem identities: %w", err)
+	}
 	state := "paused"
 	if capture.Resume {
 		if _, err := b.command("timetravel", info.ID, "resume", target.branch); err != nil {
@@ -10676,12 +15783,13 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 		}
 		state = "running"
 	}
-	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state, b.nodeID); err != nil {
 		return err
 	}
 	// The live runtime and its persistent state are now committed. Failures in
 	// sidecar attachment or page-source bookkeeping must not delete it.
 	runtimeCreated = false
+	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, imageDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
@@ -10703,21 +15811,188 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	return nil
 }
 
-func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, snapshots []*os.File) error {
-	sparse := capture.SparseManifest != (ttcchunk.ManifestID{})
+type graphMemoryRestore struct {
+	manifest *os.File
+	objects  *os.File
+	remote   *os.File
+	token    ttcsnapshot.ObjectRelayToken
+}
+
+func (restore *graphMemoryRestore) close() {
+	if restore == nil {
+		return
+	}
+	for _, file := range []*os.File{restore.manifest, restore.objects, restore.remote} {
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+}
+
+type graphRestoreObjectSource struct {
+	resolver *ttcsnapshot.Resolver
+	objects  map[ttcsnapshot.ObjectID]ttcsnapshot.Object
+}
+
+func (source graphRestoreObjectSource) Fetch(ctx context.Context, id ttcsnapshot.ObjectID) (io.ReadCloser, uint64, error) {
+	object, ok := source.objects[id]
+	if !ok {
+		return nil, 0, os.ErrNotExist
+	}
+	file, err := source.resolver.ResolveKnown(ctx, object)
+	if err != nil {
+		return nil, 0, err
+	}
+	return file, object.BulkLength, nil
+}
+
+func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*graphMemoryRestore, error) {
+	if b.snapshotData == nil || len(capture.MemoryRoots) == 0 || capture.SnapshotID == 0 {
+		return nil, errors.New("graph-native dehydration roots are unavailable")
+	}
+	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
+	rootObjects := make([]ttcsnapshot.ObjectID, len(capture.MemoryRoots))
+	localRoots := b.snapshotGraph != nil
+	for index, recorded := range capture.MemoryRoots {
+		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
+		if err != nil {
+			return nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
+		}
+		if localRoots {
+			current, ok := b.snapshotGraph.Root(recorded.Name)
+			if !ok || current != id {
+				localRoots = false
+			}
+		}
+		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
+		rootObjects[index] = id
+	}
+	var catalog ttcsnapshot.MemoryCatalog
+	if localRoots {
+		catalog = b.snapshotGraph
+	} else {
+		immutable, err := b.immutableSnapshotCatalog(context.Background(), rootObjects, "")
+		if err != nil {
+			return nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
+		}
+		catalog = immutable
+	}
+	adapted, err := ttcchunk.BuildGraphManifest(catalog, roots)
+	if err != nil {
+		return nil, err
+	}
+	objectCatalog, ok := catalog.(interface {
+		Object(ttcsnapshot.ObjectID) (ttcsnapshot.Object, bool)
+	})
+	if !ok {
+		return nil, errors.New("graph memory catalog cannot describe bulk objects")
+	}
+	missing := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
+	for _, objectID := range adapted.Chunks {
+		if file, err := b.snapshotData.Open(objectID, ttcsnapshot.MemoryChunkBytes); err == nil {
+			file.Close()
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("opening local memory chunk %s: %w", objectID, err)
+		}
+		object, ok := objectCatalog.Object(objectID)
+		if !ok {
+			return nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
+		}
+		if object.BulkLength != ttcsnapshot.MemoryChunkBytes {
+			return nil, fmt.Errorf("memory chunk %s has length %d, want %d", objectID, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
+		}
+		missing[objectID] = object
+	}
+	encoded, err := ttcchunk.EncodeManifest(adapted.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	manifestFD, err := memutil.CreateMemFD("ttc-graph-memory-manifest", 0)
+	if err != nil {
+		return nil, err
+	}
+	manifest := os.NewFile(uintptr(manifestFD), "ttc-graph-memory-manifest")
+	if _, err := manifest.Write(encoded); err != nil {
+		manifest.Close()
+		return nil, err
+	}
+	if _, err := manifest.Seek(0, io.SeekStart); err != nil {
+		manifest.Close()
+		return nil, err
+	}
+	objects, err := os.Open(filepath.Join(b.activeDataRoot(), "objects"))
+	if err != nil {
+		manifest.Close()
+		return nil, err
+	}
+	restore := &graphMemoryRestore{manifest: manifest, objects: objects}
+	if len(missing) == 0 {
+		return restore, nil
+	}
+	if _, err := rand.Read(restore.token[:]); err != nil {
+		restore.close()
+		return nil, err
+	}
+	// Cold graph objects that are already authoritative in shared storage are
+	// served by a detached helper. Do not make a live Sentry's future page
+	// faults depend on the lifetime of the control daemon that rehydrated it.
+	shared := b.snapshotShared != nil
+	if shared {
+		for id, object := range missing {
+			stored, err := b.snapshotShared.Object(id)
+			if err != nil || stored.BulkLength != object.BulkLength {
+				shared = false
+				break
+			}
+		}
+	}
+	if shared {
+		client, _, err := startSharedMemoryRelay(b.dataRoot, missing, restore.token)
+		if err != nil {
+			restore.close()
+			return nil, fmt.Errorf("starting shared graph memory relay: %w", err)
+		}
+		restore.remote = client
+		return restore, nil
+	}
+	if b.snapshotResolver == nil {
+		restore.close()
+		return nil, errors.New("graph memory has non-local chunks and no distributed resolver")
+	}
+	fds, err := cloexecStreamSocketpair()
+	if err != nil {
+		restore.close()
+		return nil, err
+	}
+	server := os.NewFile(uintptr(fds[0]), "ttc-graph-memory-server")
+	restore.remote = os.NewFile(uintptr(fds[1]), "ttc-graph-memory-client")
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(missing))
+	for id, object := range missing {
+		allowed[id] = object.BulkLength
+	}
+	go func() {
+		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: b.snapshotResolver, objects: missing}, allowed)
+		b.reportColdRelayError("graph memory", err)
+	}()
+	return restore, nil
+}
+
+func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, capture boot.BranchDehydrateInfo, sourceDir string, metadata *os.File, relays *coldFilesystemRelays) error {
+	var err error
 	targets := make([]*os.File, 0, len(capture.Memories))
 	defer func() {
 		for _, file := range targets {
 			_ = file.Close()
 		}
 	}()
-	firstTarget := 0
-	if sparse {
-		// Sparse peer restores install application chunks into the family's
-		// existing MemoryFile. Only private filesystem MemoryFiles need new
-		// donated backing files.
-		firstTarget = 1
+	if capture.SnapshotID == 0 || len(capture.MemoryRoots) == 0 {
+		return errors.New("new-format peer restore is not graph-native")
 	}
+	// Graph restores install application chunks into the family's existing
+	// MemoryFile. Only private filesystem MemoryFiles need new donated backing
+	// files.
+	firstTarget := 1
 	for i := firstTarget; i < len(capture.Memories); i++ {
 		fd, err := memutil.CreateMemFD(fmt.Sprintf("ttc-rehydration-memory-%04d", i), 0)
 		if err != nil {
@@ -10732,59 +16007,76 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	restoreArgs := boot.DurableDehydrationRestoreArgs{
 		ID: target.branch, ParentID: branch.ParentID, FilesystemBranch: capture.FilesystemBranch,
-		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true, Sparse: sparse,
-		ReusePeerApplicationMemoryFile: sparse,
+		Resume: capture.Resume, ExecSessions: capture.ExecSessions, UseDonatedMemoryFiles: true,
+		ReusePeerApplicationMemoryFile: true, Quarantined: branch.Quarantined,
+	}
+	restoreArgs.FilesystemRestoreIDs, err = b.filesystemRestoreIDs(info.ID)
+	if err != nil {
+		return err
+	}
+	if relays != nil {
+		restoreArgs.FilesystemConnections = len(relays.clients)
+		restoreArgs.FilesystemToken = relays.token
 	}
 	networkArgs, err := dehydrationNetworkArgs(info)
 	if err != nil {
 		return err
 	}
 	restoreArgs.NetworkArgs = networkArgs
+	graphRestore, err := b.openGraphMemoryRestore(capture)
+	if err != nil {
+		return err
+	}
+	defer graphRestore.close()
+	if graphRestore.remote != nil {
+		restoreArgs.GraphRemote = true
+		restoreArgs.GraphRemoteToken = graphRestore.token
+	}
 	encoded, err := json.Marshal(&restoreArgs)
 	if err != nil {
 		return err
 	}
-	configReader, finishConfig, err := pipeReaderForBytes(encoded)
+	configReader, err := newConfigMemFD("ttc-dehydration-restore-config", encoded)
 	if err != nil {
 		return err
 	}
-	defer finishConfig()
 	files := []*os.File{configReader, metadata}
 	commandArgs := []string{"timetravel", "--dehydration-config-fd=3", "--dehydration-fd=4"}
-	targetStartFD := 5 + len(snapshots)
-	if sparse {
-		repositoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
-		repository, err := os.Open(repositoryPath)
-		if err != nil {
-			configReader.Close()
-			return err
-		}
-		defer repository.Close()
-		files = append(files, repository)
-		targetStartFD = 6
-		commandArgs = append(commandArgs, "--dehydration-memory-repository-fd=5")
-	} else {
-		files = append(files, snapshots...)
-		commandArgs = append(commandArgs, "--dehydration-snapshots-start-fd=5", fmt.Sprintf("--dehydration-snapshots-count=%d", len(snapshots)))
+	manifestFD := 3 + len(files)
+	files = append(files, graphRestore.manifest)
+	objectsFD := 3 + len(files)
+	files = append(files, graphRestore.objects)
+	commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-graph-manifest-fd=%d", manifestFD), fmt.Sprintf("--dehydration-graph-objects-fd=%d", objectsFD))
+	if graphRestore.remote != nil {
+		remoteFD := 3 + len(files)
+		files = append(files, graphRestore.remote)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-memory-remote-fd=%d", remoteFD))
 	}
+	targetStartFD := 3 + len(files)
 	files = append(files, targets...)
 	commandArgs = append(commandArgs,
 		fmt.Sprintf("--dehydration-targets-start-fd=%d", targetStartFD), fmt.Sprintf("--dehydration-targets-count=%d", len(targets)),
-		info.ID, "dehydrate-restore", target.branch)
+	)
+	if relays != nil {
+		filesystemStartFD := 3 + len(files)
+		files = append(files, relays.clients...)
+		commandArgs = append(commandArgs, fmt.Sprintf("--dehydration-filesystems-start-fd=%d", filesystemStartFD), fmt.Sprintf("--dehydration-filesystems-count=%d", len(relays.clients)))
+	}
+	commandArgs = append(commandArgs, info.ID, "dehydrate-restore", target.branch)
 	_, err = b.commandWithFiles(files, commandArgs...)
-	configErr := finishConfig()
+	configReader.Close()
 	if err != nil {
 		return fmt.Errorf("installing dehydrated peer: %w", err)
 	}
-	if configErr != nil {
-		return fmt.Errorf("supplying dehydrated-peer configuration: %w", configErr)
+	if err := b.containerStore().CommitActiveRepositoryRestoreIDs(info.ID); err != nil {
+		return fmt.Errorf("committing rehydrated peer filesystem identities: %w", err)
 	}
 	_ = metadata.Close()
 	state := "paused"
 	if capture.Resume {
 		state = "running"
 	}
-	if err := b.containerStore().UpdateBranchState(info.ID, target.branch, state); err != nil {
+	if err := b.containerStore().RecordBranchActivation(info.ID, target.branch, state, b.nodeID); err != nil {
 		if _, destroyErr := b.command("timetravel", info.ID, "destroy", target.branch); destroyErr != nil {
 			return fmt.Errorf("recording rehydrated peer: %w (rolling it back also failed: %v)", err, destroyErr)
 		}
@@ -10792,6 +16084,7 @@ func (b *runtimeBackend) rehydrateColdPeer(target selector, info ttcbundle.Conta
 	}
 	// Persistent state now names the live peer. Keep its on-demand snapshot
 	// readers reachable and do not roll the peer back for artifact bookkeeping.
+	b.releaseConsumedStandaloneMemoryBacking(target, branch)
 	b.retainRehydrationPageSource(info.ID, branch, sourceDir)
 	if _, err := b.ensureConsoleDrain(target, false); err != nil {
 		return fmt.Errorf("reattaching init console: %w", err)
@@ -10839,13 +16132,34 @@ func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndR
 }
 
 func (b *runtimeBackend) destroy(target selector, force bool) error {
+	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
+			return fmt.Errorf("renewing branch removal execution authority: %w", err)
+		}
+	}
+	requested := target
+	logicalInfo, err := b.resolveContainer(requested.container)
+	if err != nil {
+		return err
+	}
+	logicalFamily := logicalFamilyID(logicalInfo)
+	corrupted := false
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		if authority, authorityErr := b.distributedSource.authority.Branch(logicalFamily, requested.branch); authorityErr == nil {
+			corrupted = authority.Corrupted
+		} else if !errors.Is(authorityErr, os.ErrNotExist) {
+			return fmt.Errorf("loading branch authority for %s: %w", requested, authorityErr)
+		}
+	}
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
 	target = resolved
-	if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
-		return fmt.Errorf("settling remote branches before removing %s: %w", target, err)
+	if !corrupted {
+		if err := b.ensureDistributedSourceIndependent(info.ID, target.branch); err != nil {
+			return fmt.Errorf("settling remote branches before removing %s: %w", target, err)
+		}
 	}
 	var recorded *ttcbundle.BranchInfo
 	for i := range info.Branches {
@@ -10855,21 +16169,59 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	if recorded == nil {
+		// A failed node may lose its only physical catalog before Raft can mark
+		// the branch corrupted. The control-plane tombstone is then the only
+		// remaining object, and removing it is both necessary and sufficient.
+		if corrupted {
+			return b.distributedSource.authority.RemoveCorruptedBranch(logicalFamily, requested.branch)
+		}
 		return fmt.Errorf("branch %q does not exist", target.branch)
 	}
-	switch normalizeLifecycleState(recorded.State) {
-	case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
-		if !force {
-			return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
+	if !force && branchRemovalRequiresForce(recorded.State, corrupted) {
+		return fmt.Errorf("branch %s is %s; use -f to force removal", target, normalizeLifecycleState(recorded.State))
+	}
+	if b.publicationQueue != nil {
+		if err := b.publicationQueue.CancelBranch(info.ID, recorded.ID); err != nil {
+			return fmt.Errorf("canceling pending publications for %s: %w", target, err)
+		}
+		info, err = b.containerStore().LoadContainer(info.ID)
+		if err != nil {
+			return err
+		}
+		recorded = nil
+		for i := range info.Branches {
+			if info.Branches[i].ID == target.branch {
+				recorded = &info.Branches[i]
+				break
+			}
+		}
+		if recorded == nil {
+			return fmt.Errorf("branch %q disappeared while fencing publication", target.branch)
 		}
 	}
 	remaining := len(info.Branches)
-	if remaining == 1 {
+	logicalPeers, err := b.distributedFamilyHasPeerPlacement(logicalFamily, requested.branch)
+	if err != nil {
+		return fmt.Errorf("checking logical peers before removing %s: %w", requested, err)
+	}
+	// A transaction-scoped physical container may always disappear with its
+	// final local branch: the canonical family record is a different object.
+	// The canonical physical container, however, also carries the logical
+	// family identity and must survive while a peer placement exists remotely.
+	if remaining == 1 && (!logicalPeers || info.ID != logicalFamily) {
 		// Removing the family's final branch also removes the now-empty family.
 		// Named volumes remain independently managed, matching a normal rm
 		// without --volumes.
-		return b.remove(target.container, true, false)
+		if err := b.remove(target.container, true, false); err != nil {
+			return err
+		}
+		return b.removeLogicalBranchPlacement(logicalFamily, requested.branch)
 	}
+	releaseClients, err := b.quiesceConsoleClients(target)
+	if err != nil {
+		return fmt.Errorf("detaching console clients for %s: %w", target, err)
+	}
+	defer releaseClients()
 	store := b.containerStore()
 	if paths, pathErr := store.BranchConsolePaths(info.ID, target.branch); pathErr == nil {
 		if err := b.stopConsoleDrain(paths); err != nil {
@@ -10899,13 +16251,31 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("preparing %s for removal: %w", target, err)
 		}
 	}
+	// Branch destruction transfers unresolved page loaders to an in-process
+	// sibling. Move immutable graph authority to the family before that
+	// transfer; otherwise reclaiming the removed branch can unlink chunks that
+	// the sibling will demand later.
+	if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
+		for _, family := range families {
+			if family.ID != target.container || len(family.Branches) < 2 {
+				continue
+			}
+			var updated ttcbundle.BranchInfo
+			info, updated, err = b.parkBranchMemoryGraph(info, *recorded)
+			if err != nil {
+				return err
+			}
+			recorded = &updated
+			break
+		}
+	}
 	destroyRuntime := func() error {
 		// Elastic placement can leave this as the last physical branch on this
 		// node while persistent siblings run elsewhere. runsc's branch destroy
 		// correctly refuses to remove a runtime's final branch, so delete this
 		// node-local runtime shell instead; shared family metadata is removed
 		// separately below only for the selected branch.
-		if families, listErr := b.listRuntimeFamilies(); listErr == nil {
+		if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
 			for _, family := range families {
 				if family.ID != target.container || len(family.Branches) != 1 || family.Branches[0].ID != target.branch {
 					continue
@@ -10916,11 +16286,11 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return nil
 			}
 		}
-		if _, err := b.command("timetravel", target.container, "destroy", target.branch); err == nil {
+		if _, err := b.command("timetravel", target.container, "destroy-reclaim", target.branch); err == nil {
 			return nil
 		} else {
 			destroyErr := err
-			families, listErr := b.listRuntimeFamilies()
+			families, listErr := b.listRuntimeFamiliesOf(target.container)
 			if listErr != nil {
 				return destroyErr
 			}
@@ -10961,24 +16331,13 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	portErr := b.stopPublishedPortsForBranch(info, target.branch)
 	if b.dataRoot != "" {
-		if recorded.DistributedSparseRepository != "" || recorded.DistributedSparseBranch != "" {
-			if err := b.releaseSparseRoot(recorded.DistributedSparseRepository, recorded.DistributedSparseBranch); err != nil {
-				return fmt.Errorf("releasing distributed sparse memory for %s: %w", target, err)
-			}
-		}
-		if err := b.releaseSparseMemoryRoot(info.ID, recorded.FilesystemBranch); err != nil {
-			if portErr != nil {
-				return fmt.Errorf("reclaiming sparse memory for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
-			}
-			return fmt.Errorf("reclaiming sparse memory for %s: %w", target, err)
-		}
-		if err := store.RemoveBranchFilesystems(target.container, *recorded); err != nil {
+		if err := b.reclaimBranchBacking(info, *recorded); err != nil {
 			if portErr != nil {
 				return fmt.Errorf("reclaiming filesystems for %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
-			return fmt.Errorf("reclaiming filesystems for %s: %w", target, err)
+			return fmt.Errorf("reclaiming branch backing for %s: %w", target, err)
 		}
-		if err := store.RemoveBranchArtifacts(target.container, target.branch); err != nil {
+		if err := store.RemoveBranchArtifacts(target.container, *recorded); err != nil {
 			return fmt.Errorf("removing persistent artifacts for %s: %w", target, err)
 		}
 		if err := store.RemoveBranchRecord(target.container, target.branch); err != nil {
@@ -10986,6 +16345,12 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 				return fmt.Errorf("persisting deletion of %s: %w (stopping published ports also failed: %v)", target, err, portErr)
 			}
 			return fmt.Errorf("persisting deletion of %s: %w", target, err)
+		}
+		if err := b.removeLogicalBranchPlacement(logicalFamily, requested.branch); err != nil {
+			return fmt.Errorf("removing cluster placement for %s: %w", requested, err)
+		}
+		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {
+			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
 		}
 		latest, err := store.LoadContainer(target.container)
 		if err != nil {
@@ -10996,6 +16361,21 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		}
 	}
 	return portErr
+}
+
+func branchRemovalRequiresForce(state string, corrupted bool) bool {
+	if corrupted {
+		// Corruption fences execution authority and clears physical placement.
+		// Node-local metadata from the lost incarnation may still say running,
+		// but no live runtime remains for -f to protect against.
+		return false
+	}
+	switch normalizeLifecycleState(state) {
+	case "running", "paused", "creating", "dehydrating", "rehydrating", "restarting":
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *runtimeBackend) processes(target selector) ([]ProcessInfo, error) {
@@ -11039,6 +16419,23 @@ func (b *runtimeBackend) rootfsSize(target selector) (uint64, error) {
 	return size.WritableBytes, nil
 }
 
+// publishLiveFilesystemMetadata establishes a manager-observation boundary
+// for branch filesystems that keep a bounded metadata tail inside the Sentry.
+// This deliberately does not fsync file payloads: diff and accounting require
+// a current coherent graph view, not a guest-visible durability operation.
+func (b *runtimeBackend) publishLiveFilesystemMetadata(container string, branches ...ttcbundle.BranchInfo) error {
+	for _, branch := range branches {
+		state := normalizeLifecycleState(branch.State)
+		if state != "running" && state != "paused" {
+			continue
+		}
+		if _, err := b.command("timetravel", container, "filesystem-publish", branch.ID); err != nil {
+			return fmt.Errorf("publishing live filesystem metadata for %s@%s: %w", container, branch.ID, err)
+		}
+	}
+	return nil
+}
+
 func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
@@ -11046,6 +16443,9 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 	}
 	branch, err := persistentBranchInfo(info, resolved.branch)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.publishLiveFilesystemMetadata(resolved.container, branch); err != nil {
 		return nil, err
 	}
 	filesystemBranch := branch.FilesystemBranch
@@ -11075,7 +16475,14 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		if err != nil {
 			return nil, fmt.Errorf("opening repository for %s: %w", mount, err)
 		}
-		diff, diffErr := repository.BranchDiff(filesystemBranch)
+		physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+		if b.snapshotShared != nil {
+			if err := repository.AttachImmutableMetadataSource(physicalBranch, b.snapshotShared.Object); err != nil {
+				repository.Close()
+				return nil, fmt.Errorf("attaching shared metadata for %s: %w", mount, err)
+			}
+		}
+		diff, diffErr := repository.BranchDiff(physicalBranch)
 		closeErr := repository.Close()
 		if diffErr != nil {
 			return nil, fmt.Errorf("reading repository diff for %s: %w", mount, diffErr)
@@ -11084,6 +16491,9 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 			return nil, closeErr
 		}
 		for _, change := range diff {
+			if syntheticRootfsMountChange(spec, mount, change.Path) {
+				continue
+			}
 			path := mount
 			if change.Path != "/" {
 				path = filepath.Join(mount, strings.TrimPrefix(change.Path, "/"))
@@ -11100,6 +16510,26 @@ func (b *runtimeBackend) diff(target selector) ([]BranchPathChange, error) {
 		return changes[i].Path < changes[j].Path
 	})
 	return changes, nil
+}
+
+// syntheticRootfsMountChange hides rootfs entries created solely to host OCI
+// mounts. The mounted repository reports its own guest-visible changes; also
+// returning the covered rootfs directory produces duplicate paths such as
+// /data and leaks runtime scaffolding such as /proc and /sys into ttc diff.
+func syntheticRootfsMountChange(spec *specs.Spec, repositoryMount, repositoryPath string) bool {
+	if repositoryMount != "/" {
+		return false
+	}
+	path := filepath.Clean(repositoryPath)
+	if path == "/" {
+		return true
+	}
+	for _, mount := range spec.Mounts {
+		if filepath.Clean(mount.Destination) == path {
+			return true
+		}
+	}
+	return false
 }
 
 func addResourceBytes(target *ResourceBytes, privateBytes, sharedBytes uint64) {
@@ -11121,19 +16551,109 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		result.Container = target.container
 	}
 	branches := append([]ttcbundle.BranchInfo(nil), info.Branches...)
+	physicalToLogical := make(map[string]string)
+	if b.nodeID != "" {
+		placements, placementErr := b.placementCatalog()
+		var records []cluster.PlacementRecord
+		if placementErr == nil {
+			records, placementErr = placements.List()
+		}
+		filtered := branches[:0]
+		for _, branch := range branches {
+			if placementErr != nil {
+				if info.BranchNodeID(branch.ID) == b.nodeID {
+					physicalToLogical[branch.ID] = branch.ID
+					filtered = append(filtered, branch)
+				}
+				continue
+			}
+			for _, record := range records {
+				if record.PhysicalContainer != info.ID || record.PhysicalBranch != branch.ID || record.OwnerNode != b.nodeID ||
+					(record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused) {
+					continue
+				}
+				physicalToLogical[branch.ID] = record.BranchID
+				branch.NodeID = record.OwnerNode
+				branch.Quarantined = record.Quarantined
+				filtered = append(filtered, branch)
+				break
+			}
+		}
+		branches = filtered
+	}
+	logicalBranchID := func(physical string) string {
+		if logical := physicalToLogical[physical]; logical != "" {
+			return logical
+		}
+		return physical
+	}
+	if err := b.publishLiveFilesystemMetadata(info.ID, branches...); err != nil {
+		return FamilyResourceStats{}, err
+	}
 	sort.Slice(branches, func(i, j int) bool { return branches[i].ID < branches[j].ID })
 	result.Branches = make([]BranchResourceStats, 0, len(branches))
 	byID := make(map[string]*BranchResourceStats, len(branches))
 	filesystemBranches := make(map[string]string, len(branches))
+	volatileTransactions := make(map[string]bool)
+	if b.nodeID != "" {
+		if transactions, txErr := b.transactionCatalog(); txErr == nil {
+			if records, listErr := transactions.List(); listErr == nil {
+				for _, transaction := range records {
+					volatileTransactions[transaction.Identity.TransactionID] = transaction.SourceNeeded
+				}
+			}
+		}
+	}
 	for _, branch := range branches {
-		account := BranchResourceStats{Target: result.Container + "@" + branch.ID, State: normalizeLifecycleState(branch.State)}
+		logicalID := logicalBranchID(branch.ID)
+		account := BranchResourceStats{
+			Target: result.Container + "@" + logicalID, State: normalizeLifecycleState(branch.State),
+			NodeID: info.BranchNodeID(branch.ID), Quarantined: branch.Quarantined,
+			StorageState: branch.StorageState, PublicationID: branch.PublicationID,
+			StorageError: branch.StorageError, StorageRetryAt: branch.StorageRetryAt,
+			SnapshotID: branch.SnapshotID, MemoryRoots: append([]string(nil), branch.MemoryRoots...),
+			MemoryRootObjects: append([]string(nil), branch.MemoryRootObjects...), FilesystemRoot: branch.StorageManifest,
+			ControlRoot: branch.ControlRoot, ControlRootObject: branch.ControlRootObject,
+			SourceNode:           branch.SourceNode,
+			DependentMemoryBytes: branch.DependentMemoryBytes, DependentFilesystemBytes: branch.DependentFilesystemBytes,
+		}
+		result.DependentMemoryBytes += branch.DependentMemoryBytes
+		result.DependentFilesystemBytes += branch.DependentFilesystemBytes
 		result.Branches = append(result.Branches, account)
-		byID[branch.ID] = &result.Branches[len(result.Branches)-1]
+		byID[logicalID] = &result.Branches[len(result.Branches)-1]
+		// A remotely backed filesystem deliberately keeps its deferred catalog
+		// and provider connection inside the live Sentry. The manager-side
+		// repository handle has neither, and traversing it would either fail or
+		// turn an observation into an eager independence barrier. Report the
+		// already persisted dependent byte count until the Sentry completes the
+		// drain; the next snapshot can then account exact private/shared local
+		// object identity without touching the provider.
+		// A dependency can consist entirely of filesystem metadata and
+		// therefore account for zero payload bytes. SourceNeeded is the
+		// authoritative lifetime fence; using the byte counter as a boolean
+		// briefly traversed an incompletely attached deferred catalog directly
+		// after remote fork.
+		if deferFilesystemAccounting(branch, volatileTransactions) {
+			continue
+		}
 		filesystemBranch := branch.FilesystemBranch
 		if filesystemBranch == "" {
 			filesystemBranch = offlineCopyBranch(info, branch.ID)
 		}
-		filesystemBranches[branch.ID] = filesystemBranch
+		filesystemBranches[logicalID] = filesystemBranch
+	}
+	if b.snapshotGraph != nil {
+		graph := b.snapshotGraph.Stats()
+		result.SnapshotGraph = &SnapshotGraphResourceStats{
+			Sequence: graph.Sequence, Snapshots: graph.Snapshots, Objects: graph.Objects,
+			Roots: graph.Roots, Pins: graph.Pins, Reclaiming: graph.Reclaiming,
+			JournalBytes: b.snapshotGraph.JournalBytes(),
+		}
+		for _, branch := range branches {
+			if branch.DistributedGraphReferenceOperation != "" {
+				result.SnapshotGraph.PendingReferenceOperations++
+			}
+		}
 	}
 
 	spec, err := b.containerStore().LoadSpec(info.ID)
@@ -11145,6 +16665,9 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		return FamilyResourceStats{}, err
 	}
 	for _, config := range repositories {
+		if len(filesystemBranches) == 0 {
+			break
+		}
 		dir, err := os.Open(config.Path)
 		if err != nil {
 			return FamilyResourceStats{}, err
@@ -11156,12 +16679,23 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 		filesystemIDs := make([]string, 0, len(filesystemBranches))
 		seenFilesystemIDs := make(map[string]struct{}, len(filesystemBranches))
-		for _, filesystemBranch := range filesystemBranches {
-			if _, ok := seenFilesystemIDs[filesystemBranch]; ok {
+		visibleByFilesystem := make(map[string][]string)
+		for visible, filesystemBranch := range filesystemBranches {
+			physicalBranch := repositoryPhysicalBranch(config, filesystemBranch)
+			visibleByFilesystem[physicalBranch] = append(visibleByFilesystem[physicalBranch], visible)
+			if _, ok := seenFilesystemIDs[physicalBranch]; ok {
 				continue
 			}
-			seenFilesystemIDs[filesystemBranch] = struct{}{}
-			filesystemIDs = append(filesystemIDs, filesystemBranch)
+			seenFilesystemIDs[physicalBranch] = struct{}{}
+			filesystemIDs = append(filesystemIDs, physicalBranch)
+		}
+		if b.snapshotShared != nil {
+			for _, physicalBranch := range filesystemIDs {
+				if err := repository.AttachImmutableMetadataSource(physicalBranch, b.snapshotShared.Object); err != nil {
+					repository.Close()
+					return FamilyResourceStats{}, fmt.Errorf("attaching shared filesystem metadata for %s: %w", physicalBranch, err)
+				}
+			}
 		}
 		usage, usageErr := repository.BranchSetUsage(filesystemIDs)
 		closeErr := repository.Close()
@@ -11172,10 +16706,6 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			return FamilyResourceStats{}, closeErr
 		}
 		result.FilesystemUniqueBytes += usage.UniqueBytes
-		visibleByFilesystem := make(map[string][]string)
-		for visible, filesystem := range filesystemBranches {
-			visibleByFilesystem[filesystem] = append(visibleByFilesystem[filesystem], visible)
-		}
 		for _, branchUsage := range usage.Branches {
 			for _, visible := range visibleByFilesystem[branchUsage.ID] {
 				account := byID[visible]
@@ -11185,39 +16715,82 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 	}
 
-	memoryPath := filepath.Join(b.dataRoot, "containers", info.ID, "memory", "chunks")
-	if _, statErr := os.Stat(memoryPath); statErr == nil {
-		memoryRepository, openErr := ttcchunk.OpenMemoryRepository(memoryPath)
-		if openErr != nil {
-			return FamilyResourceStats{}, openErr
+	graphMemory := make(map[string]map[ttcsnapshot.ObjectID]uint64)
+	objectBranches := make(map[ttcsnapshot.ObjectID]uint64)
+	objectSizes := make(map[ttcsnapshot.ObjectID]uint64)
+	familyReachableObjects := make(map[ttcsnapshot.ObjectID]struct{})
+	for _, branch := range branches {
+		logicalID := logicalBranchID(branch.ID)
+		if len(branch.MemoryRootObjects) == 0 {
+			continue
 		}
-		roots, rootsErr := memoryRepository.ListBranches()
-		if rootsErr != nil {
-			memoryRepository.Close()
-			return FamilyResourceStats{}, rootsErr
+		if err := validateGraphRootObjects(branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects); err != nil {
+			return FamilyResourceStats{}, fmt.Errorf("accounting %s@%s memory roots: %w", result.Container, branch.ID, err)
 		}
-		memoryBranches := make(map[string]string)
-		for visible, filesystem := range filesystemBranches {
-			if _, ok := roots[filesystem]; ok {
-				memoryBranches[visible] = filesystem
+		roots := make([]ttcsnapshot.ObjectID, len(branch.MemoryRootObjects))
+		allLocal := b.snapshotGraph != nil
+		for index, encoded := range branch.MemoryRootObjects {
+			id, err := ttcsnapshot.ParseObjectID(encoded)
+			if err != nil {
+				return FamilyResourceStats{}, err
+			}
+			roots[index] = id
+			if allLocal {
+				_, allLocal = b.snapshotGraph.Object(id)
 			}
 		}
-		usage, usageErr := memoryRepository.BranchSetUsage(memoryBranches)
-		closeErr := memoryRepository.Close()
-		if usageErr != nil {
-			return FamilyResourceStats{}, usageErr
+		var catalog ttcsnapshot.ObjectCatalog
+		if allLocal {
+			catalog = b.snapshotGraph
+		} else {
+			immutable, err := b.immutableSnapshotCatalog(context.Background(), roots, "")
+			if err != nil {
+				return FamilyResourceStats{}, fmt.Errorf("resolving immutable memory catalog for %s@%s: %w", result.Container, branch.ID, err)
+			}
+			catalog = immutable
 		}
-		if closeErr != nil {
-			return FamilyResourceStats{}, closeErr
+		objects, err := ttcsnapshot.ReachableBulkObjects(catalog, roots)
+		if err != nil {
+			return FamilyResourceStats{}, fmt.Errorf("traversing memory roots for %s@%s: %w", result.Container, branch.ID, err)
 		}
-		result.MemoryBackingUniqueBytes = usage.UniqueBytes
-		for _, branchUsage := range usage.Branches {
-			if account := byID[branchUsage.ID]; account != nil {
-				addResourceBytes(&account.MemoryBacking, branchUsage.PrivateBytes, branchUsage.SharedBytes)
+		memoryObjects := make(map[ttcsnapshot.ObjectID]uint64)
+		for id, size := range objects {
+			if id.Kind != ttcsnapshot.ObjectKindMemoryChunk {
+				return FamilyResourceStats{}, fmt.Errorf("memory root for %s@%s reaches non-memory bulk object %s", result.Container, branch.ID, id)
+			}
+			memoryObjects[id] = size
+			objectBranches[id]++
+			objectSizes[id] = size
+		}
+		graphMemory[logicalID] = memoryObjects
+		if result.SnapshotGraph != nil {
+			reachable, err := ttcsnapshot.ReachableObjects(catalog, roots)
+			if err != nil {
+				return FamilyResourceStats{}, fmt.Errorf("traversing graph roots for %s@%s: %w", result.Container, branch.ID, err)
+			}
+			for _, object := range reachable {
+				familyReachableObjects[object.ID] = struct{}{}
 			}
 		}
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return FamilyResourceStats{}, statErr
+	}
+	if result.SnapshotGraph != nil {
+		result.SnapshotGraph.FamilyReachableObjects = len(familyReachableObjects)
+	}
+	if len(graphMemory) != 0 {
+		for branch, objects := range graphMemory {
+			account := byID[branch]
+			for id, size := range objects {
+				if objectBranches[id] > 1 {
+					account.MemoryBacking.SharedBytes += size
+				} else {
+					account.MemoryBacking.PrivateBytes += size
+				}
+			}
+			account.MemoryBacking.TotalBytes = account.MemoryBacking.PrivateBytes + account.MemoryBacking.SharedBytes
+		}
+		for _, size := range objectSizes {
+			result.MemoryBackingUniqueBytes += size
+		}
 	}
 
 	output, residentErr := b.command("timetravel", resolved.container, "stats", resolved.branch)
@@ -11228,7 +16801,11 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 		}
 		result.ResidentMemoryUniqueBytes = resident.UniqueBytes
 		for _, branchMemory := range resident.Branches {
-			if account := byID[branchMemory.ID]; account != nil {
+			branchID := branchMemory.ID
+			if logical := physicalToLogical[branchID]; logical != "" {
+				branchID = logical
+			}
+			if account := byID[branchID]; account != nil {
 				addResourceBytes(&account.ResidentMemory, branchMemory.PrivateBytes, branchMemory.SharedBytes)
 			}
 		}
@@ -11240,7 +16817,17 @@ func (b *runtimeBackend) resourceStats(target selector) (FamilyResourceStats, er
 			}
 		}
 	}
+	if usage, present, cacheErr := b.containerStore().ImageCacheUsage(info.Digest, info.Platform); cacheErr != nil {
+		return FamilyResourceStats{}, cacheErr
+	} else if present {
+		result.ImageCacheBytes = usage.CompleteBytes
+		result.ImageCacheTotalBytes = usage.TotalBytes
+	}
 	return result, nil
+}
+
+func deferFilesystemAccounting(branch ttcbundle.BranchInfo, volatileTransactions map[string]bool) bool {
+	return branch.DependentFilesystemBytes != 0 || volatileTransactions[branch.DistributedForkTransactionID]
 }
 
 func repositoryGuestMount(spec *specs.Spec, repository specutils.TTCVolumeRepository) (string, error) {
@@ -11274,11 +16861,32 @@ func (b *runtimeBackend) signal(target selector, signal int, all bool) error {
 }
 
 func (b *runtimeBackend) wait(target selector) (uint32, error) {
-	resolved, _, err := b.resolveSelector(target)
+	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return 0, err
 	}
 	target = resolved
+	// A completed branch remains waitable after its runtime and console helper
+	// are discarded. Avoid invoking runsc for a process-free cold branch: doing
+	// so both obscures the real status and produces a misleading FetchSpec error.
+	if branch, branchErr := persistentBranchInfo(info, target.branch); branchErr == nil && normalizeLifecycleState(branch.State) == "exited" {
+		var status uint32
+		if branch.ExitStatus != nil {
+			status = uint32(*branch.ExitStatus) << 8
+			if b.publicationQueue != nil && branch.PublicationID == "" && branch.StorageState != "shared" {
+				if err := b.completeWaitedInitExit(target, status); err != nil {
+					return status, err
+				}
+			}
+			return status, nil
+		}
+		// Compatibility for records written earlier in the same root format,
+		// before exits became branch-local. This is sound only when the whole
+		// family is terminal.
+		if normalizeLifecycleState(info.State) == "exited" && info.ExitStatus != nil {
+			return uint32(*info.ExitStatus) << 8, nil
+		}
+	}
 	output, commandErr := b.command("timetravel", target.container, "wait", target.branch)
 	if commandErr == nil {
 		var result struct {
@@ -11287,7 +16895,9 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		if err := json.Unmarshal(output, &result); err != nil {
 			return 0, fmt.Errorf("decoding runsc wait result: %w", err)
 		}
-		b.recordWaitState(target, result.Status)
+		if err := b.completeWaitedInitExit(target, result.Status); err != nil {
+			return result.Status, err
+		}
 		return result.Status, nil
 	}
 
@@ -11296,14 +16906,60 @@ func (b *runtimeBackend) wait(target selector) (uint32, error) {
 		return 0, fmt.Errorf("%w; checking persistent wait status: %v", commandErr, err)
 	}
 	if found {
-		b.recordWaitState(target, status)
+		if err := b.completeWaitedInitExit(target, status); err != nil {
+			return status, err
+		}
+		return status, nil
+	}
+	if status, lost := b.lostRuntimeWaitStatus(target); lost {
 		return status, nil
 	}
 	return 0, commandErr
 }
 
+// completeWaitedInitExit closes the ordering gap between wait observing PID 1
+// and the asynchronous console follower finalizing the branch. Once wait
+// returns, a subsequent start must see a process-free lifecycle rather than a
+// stale running placement. The wait status is immutable, so racing atomic
+// installations by the follower and this synchronous path are equivalent.
+func (b *runtimeBackend) completeWaitedInitExit(target selector, status uint32) error {
+	b.recordWaitState(target, status)
+	if b.explicitInitStop {
+		return nil
+	}
+	// Standalone start already consumes the durable exited state directly and
+	// has no asynchronous placement release to race. Preserve its lightweight
+	// wait path; publicationQueue is present only on clustered compute daemons.
+	if b.publicationQueue == nil {
+		return nil
+	}
+	// Waiting for PID 1 itself must not hold the lifecycle lock, but the small
+	// terminal transition after it exits must serialize with the console
+	// follower and foreground lifecycle commands. In particular, the follower
+	// may record the exited status just before wait enters its fast path; only
+	// one of them should seal and publish the process-free branch.
+	unlock := func() {}
+	if !b.lifecycleLockHeld {
+		unlock = b.holdFamilyLifecycle(b.familyID(target.container))
+	}
+	defer unlock()
+	info, err := b.containerStore().LoadContainer(target.container)
+	if err != nil {
+		return err
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return err
+	}
+	if err := ttcconsole.WriteWaitStatus(paths.WaitStatus, status); err != nil {
+		return err
+	}
+	_, err = b.finalizeObservedInitExit(target)
+	return err
+}
+
 func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	if info, err := store.LoadContainer(target.container); err == nil {
 		if err := b.stopPublishedPortsForBranch(info, target.branch); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: stopping published ports for exited %s: %v\n", target, err)
@@ -11315,8 +16971,107 @@ func (b *runtimeBackend) recordWaitState(target selector, status uint32) {
 	}
 }
 
+// finalizeObservedInitExit converts a detached init's completed wait status
+// into the same process-free, persistable state as a foreground exit. The
+// console follower writes WaitStatus only after runsc has observed init
+// termination and drained its output, so its presence is the durable local
+// proof that this is a normal branch exit rather than unexplained runtime
+// loss.
+func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error) {
+	// Console followers are attached to an exact physical runtime. Prefer that
+	// record over logical placement resolution: a daemon recovery scan sees
+	// every shared physical record, including committed cold publications whose
+	// derived metadata may still be settling. Resolving such a record as a
+	// logical selector can wait for the publication fence while holding the
+	// daemon-wide reconciliation lock, blocking every client request.
+	info, err := b.containerStore().LoadRuntimeContainer(target.container)
+	branch, branchErr := persistentBranchInfo(info, target.branch)
+	if err != nil || branchErr != nil {
+		resolved, resolvedInfo, resolveErr := b.resolveSelector(target)
+		if resolveErr != nil {
+			return false, resolveErr
+		}
+		target, info = resolved, resolvedInfo
+		branch, err = persistentBranchInfo(info, target.branch)
+	} else {
+		err = nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch normalizeLifecycleState(branch.State) {
+	case "running", "paused", "restarting", "rehydrating", "exited":
+	default:
+		return false, nil
+	}
+	if branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared" {
+		return false, nil
+	}
+	paths, err := b.containerStore().BranchConsolePaths(info.ID, target.branch)
+	if err != nil {
+		return false, err
+	}
+	status, found, err := readConsoleWaitStatus(paths.WaitStatus)
+	if err != nil || !found {
+		return false, err
+	}
+	// Detached --rm has its own durable daemon request, which waits for this
+	// same status before removing the branch. Do not race it by publishing a
+	// filesystem generation that is intended to be discarded.
+	if info.AutoRemove {
+		return false, nil
+	}
+	b.recordWaitState(target, status)
+	if err := b.discard(target); err != nil {
+		return false, fmt.Errorf("releasing naturally exited branch %s: %w", target, err)
+	}
+	if err := b.queueBranchPublication(target, "stop"); err != nil {
+		return false, fmt.Errorf("queueing naturally exited branch %s for publication: %w", target, err)
+	}
+	return true, nil
+}
+
+// reconcileObservedInitExits retries exit finalization after daemon restart or
+// a failure between the console follower's durable wait-status write and the
+// asynchronous publication intent. It intentionally scans physical records:
+// remote forks and migrations may be materialized under hidden IDs even though
+// their user-facing identity is a logical Raft branch.
+func (b *runtimeBackend) reconcileObservedInitExits() error {
+	if b == nil || b.dataRoot == "" {
+		return nil
+	}
+	containers, err := b.containerStore().ListContainersForPlacement()
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, info := range containers {
+		// A long operation working on the family finishes what it changes.
+		if _, busy := b.operations.lookup(info.ID); busy {
+			continue
+		}
+		for _, branch := range info.Branches {
+			// Recovery is node-local. Foreign runtimes and process-free cold
+			// publications are visible in the shared catalog but cannot have a
+			// console follower owned by this daemon. Filtering them before selector
+			// resolution prevents an unrelated incomplete publication from stalling
+			// local command admission.
+			if owner := info.BranchNodeID(branch.ID); b.nodeID != "" && owner != "" && owner != b.nodeID {
+				continue
+			}
+			if branch.PublicationID != "" || branch.StorageState == "publishing" || branch.StorageState == "shared" {
+				continue
+			}
+			if _, err := b.finalizeObservedInitExit(selector{container: info.ID, branch: branch.ID}); err != nil {
+				result = errors.Join(result, err)
+			}
+		}
+	}
+	return result
+}
+
 func (b *runtimeBackend) waitForConsoleStatus(target selector) (uint32, bool, error) {
-	store := ttcbundle.Store{Root: b.dataRoot}
+	store := b.containerStore()
 	paths, err := store.BranchConsolePaths(target.container, target.branch)
 	if err != nil {
 		return 0, false, err

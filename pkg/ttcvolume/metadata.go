@@ -15,13 +15,8 @@
 package ttcvolume
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -31,6 +26,7 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 const (
@@ -39,12 +35,8 @@ const (
 	metadataSetEntry    = "set-entry"
 	metadataDeleteEntry = "delete-entry"
 
-	metadataJournalHeaderSize = 16
-	maxMetadataRecordSize     = 4 << 20
-	inodeReservationSize      = 4096
+	inodeReservationSize = 4096
 )
-
-var metadataJournalMagic = [4]byte{'T', 'T', 'C', 'J'}
 
 type metadataEntryKey struct {
 	Parent uint64
@@ -60,101 +52,149 @@ type metadataOp struct {
 	Name   string          `json:"name,omitempty"`
 }
 
-type metadataTransaction struct {
-	Sequence uint64       `json:"sequence"`
-	Ops      []metadataOp `json:"ops"`
+const metadataBatchOperations = 256
+
+type metadataBatch struct {
+	state       *branchMetadata
+	branch      Branch
+	inodes      map[uint64]ttcsnapshot.FilesystemOperation
+	entries     map[metadataEntryKey]ttcsnapshot.FilesystemOperation
+	releasePins map[string]struct{}
+}
+
+func (batch *metadataBatch) add(operations []ttcsnapshot.FilesystemOperation) {
+	for _, operation := range operations {
+		switch {
+		case operation.PutInode != nil:
+			batch.inodes[operation.PutInode.Number] = operation
+		case operation.DeleteInode != 0:
+			batch.inodes[operation.DeleteInode] = operation
+		case operation.PutEntry != nil:
+			batch.entries[metadataEntryKey{Parent: operation.PutEntry.Parent, Name: operation.PutEntry.Name}] = operation
+		case operation.DeleteEntry != nil:
+			batch.entries[metadataEntryKey{Parent: operation.DeleteEntry.Parent, Name: operation.DeleteEntry.Name}] = operation
+		}
+	}
+}
+
+func (batch *metadataBatch) len() int {
+	return len(batch.inodes) + len(batch.entries)
+}
+
+// operations returns the final metadata delta in dependency-safe canonical
+// order. Repeated chmod/chown/utimens/write-size updates to one inode and
+// repeated changes to one name collapse to their final values before any
+// immutable B-tree path is copied.
+func (batch *metadataBatch) operations() []ttcsnapshot.FilesystemOperation {
+	inodeNumbers := make([]uint64, 0, len(batch.inodes))
+	for number := range batch.inodes {
+		inodeNumbers = append(inodeNumbers, number)
+	}
+	sort.Slice(inodeNumbers, func(i, j int) bool { return inodeNumbers[i] < inodeNumbers[j] })
+	entryKeys := make([]metadataEntryKey, 0, len(batch.entries))
+	for key := range batch.entries {
+		if parent, ok := batch.inodes[key.Parent]; ok && parent.DeleteInode != 0 {
+			// The complete directory subtree disappears with its inode; child
+			// entry deltas are neither reachable nor valid graph operations.
+			continue
+		}
+		entryKeys = append(entryKeys, key)
+	}
+	sort.Slice(entryKeys, func(i, j int) bool {
+		if entryKeys[i].Parent != entryKeys[j].Parent {
+			return entryKeys[i].Parent < entryKeys[j].Parent
+		}
+		return entryKeys[i].Name < entryKeys[j].Name
+	})
+	operations := make([]ttcsnapshot.FilesystemOperation, 0, batch.len())
+	// Materialize final inode records before names reference them.
+	for _, number := range inodeNumbers {
+		operation := batch.inodes[number]
+		if operation.PutInode != nil {
+			operations = append(operations, operation)
+		}
+	}
+	// Remove old names before publishing final names, then remove unreachable
+	// inode records last.
+	for _, key := range entryKeys {
+		operation := batch.entries[key]
+		if operation.DeleteEntry != nil {
+			operations = append(operations, operation)
+		}
+	}
+	for _, key := range entryKeys {
+		operation := batch.entries[key]
+		if operation.PutEntry != nil {
+			operations = append(operations, operation)
+		}
+	}
+	for _, number := range inodeNumbers {
+		operation := batch.inodes[number]
+		if operation.DeleteInode != 0 {
+			operations = append(operations, operation)
+		}
+	}
+	return operations
 }
 
 type branchMetadata struct {
-	mu           sync.RWMutex
-	branch       Branch
-	layers       []string
-	inodes       map[uint64]Inode
-	entries      map[metadataEntryKey]DirectoryEntry
-	directories  map[uint64]map[string]DirectoryEntry
-	nextSequence uint64
-	layerSizes   map[string]int64
+	mu                sync.RWMutex
+	branch            Branch
+	inodes            map[uint64]Inode
+	entries           map[metadataEntryKey]DirectoryEntry
+	directories       map[uint64]map[string]DirectoryEntry
+	loadedDirectories map[uint64]bool
+	deletedInodes     map[uint64]bool
+	deletedEntries    map[metadataEntryKey]bool
+	complete          bool
 }
 
 func newBranchMetadata(branch Branch) *branchMetadata {
 	return &branchMetadata{
 		branch: branch, inodes: make(map[uint64]Inode),
 		entries: make(map[metadataEntryKey]DirectoryEntry), directories: make(map[uint64]map[string]DirectoryEntry),
-		// Sequence numbers are local to a layer and start at one.
-		nextSequence: 1, layerSizes: make(map[string]int64),
+		loadedDirectories: make(map[uint64]bool), deletedInodes: make(map[uint64]bool),
+		deletedEntries: make(map[metadataEntryKey]bool),
 	}
-}
-
-type metadataLayer struct {
-	// Parent links immutable metadata layers into a persistent sharing DAG. It
-	// is not a container-branch parent: every branch independently names one
-	// Root, and deleting or rehydrating any branch never traverses UI lineage.
-	Parent string `json:"parent,omitempty"`
-}
-
-func (r *Repository) createMetadataLayer(parent string) (string, error) {
-	if parent != "" && !validID(parent) {
-		return "", fmt.Errorf("invalid parent metadata layer %q", parent)
-	}
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	name := filepath.Join("layers", id)
-	if err := r.mkdir(name, 0700); err != nil {
-		return "", err
-	}
-	if err := r.writeJSONAtomic(filepath.Join(name, "layer.json"), metadataLayer{Parent: parent}); err != nil {
-		return "", err
-	}
-	journal, err := r.openFile(filepath.Join(name, "journal"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return "", err
-	}
-	if err := journal.Close(); err != nil {
-		return "", err
-	}
-	r.markDirtyDirectory(name)
-	r.markDirtyDirectory("layers")
-	return id, nil
 }
 
 func normalizeBranchLayers(branch *Branch) error {
-	if !validID(branch.Root) {
-		return fmt.Errorf("branch %q has invalid metadata root %q", branch.ID, branch.Root)
+	if _, err := ttcsnapshot.ParseObjectID(branch.Root); err != nil {
+		return fmt.Errorf("branch %q has invalid snapshot graph root %q: %w", branch.ID, branch.Root, err)
+	}
+	if branch.WorkingSnapshot == 0 {
+		return fmt.Errorf("branch %q has no working snapshot", branch.ID)
 	}
 	return nil
 }
 
-func (r *Repository) metadataLayers(root string) ([]string, error) {
-	seen := make(map[string]struct{})
-	var reversed []string
-	for root != "" {
-		if !validID(root) {
-			return nil, fmt.Errorf("invalid metadata layer %q", root)
-		}
-		if _, ok := seen[root]; ok {
-			return nil, fmt.Errorf("metadata layer cycle at %q", root)
-		}
-		seen[root] = struct{}{}
-		reversed = append(reversed, root)
-		var layer metadataLayer
-		if err := r.readJSON(filepath.Join("layers", root, "layer.json"), &layer); err != nil {
-			return nil, err
-		}
-		root = layer.Parent
-	}
-	layers := make([]string, len(reversed))
-	for i := range reversed {
-		layers[len(reversed)-1-i] = reversed[i]
-	}
-	return layers, nil
+func graphRootName(branchID string) string {
+	return "filesystem/" + branchID
+}
+
+func graphBaseRootName(branchID string) string {
+	return "filesystem-base/" + branchID
+}
+
+func graphConstructionPin(id ttcsnapshot.ObjectID) string {
+	return "construct/" + id.String()
 }
 
 func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 	if err := normalizeBranchLayers(&branch); err != nil {
 		return nil, err
 	}
+	if err := r.graph.Reload(); err != nil {
+		return nil, err
+	}
+	root, ok := r.graph.Root(graphRootName(branch.ID))
+	if !ok {
+		return nil, fmt.Errorf("branch %q has no snapshot graph root", branch.ID)
+	}
+	// The graph transaction precedes the branch pointer rename. Reading the
+	// graph root here makes the two-file publication appear atomically at the
+	// graph commit point, including to a reader in the small rename window.
+	branch.Root = root.String()
 	r.metadataMu.Lock()
 	defer r.metadataMu.Unlock()
 	if r.metadata == nil {
@@ -163,272 +203,333 @@ func (r *Repository) metadataForBranch(branch Branch) (*branchMetadata, error) {
 	if state := r.metadata[branch.ID]; state != nil {
 		state.mu.RLock()
 		sameRoot := state.branch.Root == branch.Root
-		knownSize := state.layerSizes[branch.Root]
-		layers := append([]string(nil), state.layers...)
 		state.mu.RUnlock()
 		if sameRoot {
-			current, err := r.metadataLayerSizes([]string{branch.Root})
-			if err != nil {
-				return nil, err
-			}
-			if current[branch.Root] == knownSize {
-				state.mu.Lock()
-				state.branch = branch
-				state.mu.Unlock()
-				return state, nil
-			}
-			return r.reloadBranchMetadata(branch, layers)
+			state.mu.Lock()
+			state.branch = branch
+			state.mu.Unlock()
+			return state, nil
 		}
-	}
-	layers, err := r.metadataLayers(branch.Root)
-	if err != nil {
-		return nil, err
-	}
-	return r.reloadBranchMetadata(branch, layers)
-}
-
-func (r *Repository) reloadBranchMetadata(branch Branch, layers []string) (*branchMetadata, error) {
-	var replacedLayers []string
-	if previous := r.metadata[branch.ID]; previous != nil {
-		previous.mu.RLock()
-		replacedLayers = append(replacedLayers, previous.layers...)
-		previous.mu.RUnlock()
 	}
 	state := newBranchMetadata(branch)
-	state.layers = layers
-	for _, layer := range layers {
-		size, sequence, err := r.replayMetadataLayer(layer, state)
-		if err != nil {
-			return nil, fmt.Errorf("replaying metadata layer %q: %w", layer, err)
-		}
-		state.layerSizes[layer] = size
-		if sequence >= state.nextSequence {
-			state.nextSequence = sequence + 1
-		}
-	}
-	if state.nextSequence == 0 {
-		state.nextSequence = 1
-	}
 	r.metadata[branch.ID] = state
-	r.pruneUnreferencedLayerCachesLocked(replacedLayers)
 	return state, nil
 }
 
-// pruneUnreferencedLayerCachesLocked drops process-local state for metadata
-// layers that no decoded branch still uses. r.metadataMu must be held. Closing
-// a journal for a layer used only by an uncached branch is harmless: a later
-// mutation reopens it after reconstructing that branch from its pointer.
-func (r *Repository) pruneUnreferencedLayerCachesLocked(candidates []string) {
-	if len(candidates) == 0 {
-		return
-	}
-	live := make(map[string]struct{})
-	for _, state := range r.metadata {
-		state.mu.RLock()
-		for _, layer := range state.layers {
-			live[layer] = struct{}{}
-		}
+func (r *Repository) completeMetadata(state *branchMetadata) error {
+	state.mu.RLock()
+	if state.complete {
 		state.mu.RUnlock()
+		return nil
 	}
-	stale := make(map[string]struct{})
-	for _, layer := range candidates {
-		if _, ok := live[layer]; !ok {
-			stale[layer] = struct{}{}
-		}
-	}
-	if len(stale) == 0 {
-		return
-	}
-	r.journalMu.Lock()
-	for layer := range stale {
-		if journal := r.journals[layer]; journal != nil {
-			_ = journal.Close()
-			delete(r.journals, layer)
-		}
-	}
-	r.journalMu.Unlock()
-	r.dirtyMu.Lock()
-	for name := range r.dirtyFiles {
-		if pathUsesMetadataLayer(name, stale) {
-			delete(r.dirtyFiles, name)
-		}
-	}
-	for name := range r.dirtyDirs {
-		if pathUsesMetadataLayer(name, stale) {
-			delete(r.dirtyDirs, name)
-		}
-	}
-	for name := range r.knownDirs {
-		if pathUsesMetadataLayer(name, stale) {
-			delete(r.knownDirs, name)
-		}
-	}
-	r.dirtyMu.Unlock()
-}
-
-func pathUsesMetadataLayer(name string, layers map[string]struct{}) bool {
-	const prefix = "layers/"
-	if !strings.HasPrefix(name, prefix) {
-		return false
-	}
-	rest := strings.TrimPrefix(name, prefix)
-	layer, _, _ := strings.Cut(rest, "/")
-	_, ok := layers[layer]
-	return ok
-}
-
-func (r *Repository) metadataLayerSizes(layers []string) (map[string]int64, error) {
-	sizes := make(map[string]int64, len(layers))
-	for _, layer := range layers {
-		file, err := r.metadataJournal(layer)
-		if err != nil {
-			return nil, err
-		}
-		info, err := file.Stat()
-		if err != nil {
-			return nil, err
-		}
-		sizes[layer] = info.Size()
-	}
-	return sizes, nil
-}
-
-func (r *Repository) replayMetadataLayer(layer string, state *branchMetadata) (int64, uint64, error) {
-	file, err := r.metadataJournal(layer)
+	branch := state.branch
+	state.mu.RUnlock()
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
-	var offset int64
-	var sequence uint64
-	for {
-		transaction, next, err := readMetadataTransaction(file, offset)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return offset, sequence, nil
-		}
-		if err != nil {
-			return 0, 0, err
-		}
-		if transaction.Sequence <= sequence {
-			return 0, 0, fmt.Errorf("non-increasing transaction sequence %d", transaction.Sequence)
-		}
-		if err := applyMetadataOps(state, transaction.Ops); err != nil {
-			return 0, 0, err
-		}
-		sequence = transaction.Sequence
-		offset = next
-	}
-}
-
-func (r *Repository) metadataJournal(layer string) (*os.File, error) {
-	if !validID(layer) {
-		return nil, fmt.Errorf("invalid metadata layer %q", layer)
-	}
-	r.journalMu.Lock()
-	defer r.journalMu.Unlock()
-	if journal := r.journals[layer]; journal != nil {
-		return journal, nil
-	}
-	journal, err := r.openFile(filepath.Join("layers", layer, "journal"), os.O_RDWR, 0)
+	inodes, entries, err := r.graph.FilesystemRecords(root)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if r.journals == nil {
-		r.journals = make(map[string]*os.File)
+	resolvedInodes := make([]Inode, 0, len(inodes))
+	for _, record := range inodes {
+		inode := inodeFromGraph(record)
+		if err := r.prepareDeferredInode(&inode); err != nil {
+			return err
+		}
+		resolvedInodes = append(resolvedInodes, inode)
 	}
-	r.journals[layer] = journal
-	return journal, nil
-}
-
-func readMetadataTransaction(file *os.File, offset int64) (metadataTransaction, int64, error) {
-	var header [metadataJournalHeaderSize]byte
-	if _, err := file.ReadAt(header[:], offset); err != nil {
-		return metadataTransaction{}, offset, err
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.branch.Root != branch.Root {
+		return errors.New("filesystem root changed while materializing metadata")
 	}
-	if !bytes.Equal(header[:4], metadataJournalMagic[:]) {
-		return metadataTransaction{}, offset, fmt.Errorf("invalid metadata journal magic at offset %d", offset)
+	state.inodes = make(map[uint64]Inode, len(inodes))
+	state.entries = make(map[metadataEntryKey]DirectoryEntry, len(entries))
+	state.directories = make(map[uint64]map[string]DirectoryEntry)
+	state.loadedDirectories = make(map[uint64]bool)
+	state.deletedInodes = make(map[uint64]bool)
+	state.deletedEntries = make(map[metadataEntryKey]bool)
+	for _, inode := range resolvedInodes {
+		state.inodes[inode.Number] = inode
 	}
-	length := binary.LittleEndian.Uint32(header[4:8])
-	if length == 0 || length > maxMetadataRecordSize {
-		return metadataTransaction{}, offset, fmt.Errorf("invalid metadata transaction length %d at offset %d", length, offset)
+	for _, record := range entries {
+		entry := DirectoryEntry{Name: record.Name, Inode: record.Inode}
+		key := metadataEntryKey{Parent: record.Parent, Name: record.Name}
+		state.entries[key] = entry
+		directory := state.directories[record.Parent]
+		if directory == nil {
+			directory = make(map[string]DirectoryEntry)
+			state.directories[record.Parent] = directory
+		}
+		directory[record.Name] = entry
+		state.loadedDirectories[record.Parent] = true
 	}
-	payload := make([]byte, length)
-	if _, err := file.ReadAt(payload, offset+metadataJournalHeaderSize); err != nil {
-		return metadataTransaction{}, offset, err
+	for _, inode := range state.inodes {
+		if inode.Type == "directory" {
+			state.loadedDirectories[inode.Number] = true
+		}
 	}
-	if got, want := crc32.ChecksumIEEE(payload), binary.LittleEndian.Uint32(header[8:12]); got != want {
-		return metadataTransaction{}, offset, fmt.Errorf("metadata transaction checksum mismatch at offset %d", offset)
-	}
-	var transaction metadataTransaction
-	if err := json.Unmarshal(payload, &transaction); err != nil {
-		return metadataTransaction{}, offset, err
-	}
-	if transaction.Sequence == 0 || len(transaction.Ops) == 0 {
-		return metadataTransaction{}, offset, errors.New("empty metadata transaction")
-	}
-	return transaction, offset + metadataJournalHeaderSize + int64(length), nil
+	state.complete = true
+	return nil
 }
 
 func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops []metadataOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
+	// metadataForBranch receives Branch by value, so its authoritative graph
+	// root correction is stored in state rather than the caller's stale branch
+	// summary. Carry that state forward while a bounded batch is pending.
 	state.mu.RLock()
-	sequence := state.nextSequence
-	durableEnd := state.layerSizes[branch.Root]
+	currentBranch := state.branch
 	state.mu.RUnlock()
-	transaction := metadataTransaction{Sequence: sequence, Ops: ops}
-	payload, err := json.Marshal(transaction)
-	if err != nil {
-		return err
+	if currentBranch.ID != branch.ID || currentBranch.WorkingSnapshot != branch.WorkingSnapshot {
+		return fmt.Errorf("branch %q metadata generation changed during mutation", branch.ID)
 	}
-	if len(payload) > maxMetadataRecordSize {
-		return syscall.E2BIG
-	}
-	record := make([]byte, metadataJournalHeaderSize+len(payload))
-	copy(record[:4], metadataJournalMagic[:])
-	binary.LittleEndian.PutUint32(record[4:8], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(record[8:12], crc32.ChecksumIEEE(payload))
-	copy(record[metadataJournalHeaderSize:], payload)
-	journalName := filepath.Join("layers", branch.Root, "journal")
-	journal, err := r.metadataJournal(branch.Root)
-	if err != nil {
-		return err
-	}
-	info, err := journal.Stat()
-	if err != nil {
-		return err
-	}
-	if info.Size() != durableEnd {
-		// Recovery deliberately ignores a torn final record. Remove that tail
-		// before appending so it cannot hide all subsequent transactions.
-		if info.Size() < durableEnd {
-			return fmt.Errorf("metadata journal shrank from %d to %d", durableEnd, info.Size())
+	*branch = currentBranch
+	graphOps := make([]ttcsnapshot.FilesystemOperation, 0, len(ops))
+	for _, op := range ops {
+		switch op.Kind {
+		case metadataSetInode:
+			if op.Inode == nil {
+				return errors.New("invalid set-inode operation")
+			}
+			record, err := inodeToGraph(*op.Inode)
+			if err != nil {
+				return err
+			}
+			if !record.File.IsZero() {
+				r.dirtyMu.Lock()
+				if pending, ok := r.pendingBulk[record.File.String()]; ok {
+					pending.BulkLength = uint64(max(op.Inode.Size, 0))
+					r.pendingBulk[record.File.String()] = pending
+				}
+				r.dirtyMu.Unlock()
+			}
+			graphOps = append(graphOps, ttcsnapshot.FilesystemOperation{PutInode: &record})
+		case metadataDeleteInode:
+			graphOps = append(graphOps, ttcsnapshot.FilesystemOperation{DeleteInode: op.Number})
+		case metadataSetEntry:
+			if op.Entry == nil {
+				return errors.New("invalid set-entry operation")
+			}
+			record := ttcsnapshot.DirectoryEntryRecord{Parent: op.Parent, Name: op.Entry.Name, Inode: op.Entry.Inode}
+			graphOps = append(graphOps, ttcsnapshot.FilesystemOperation{PutEntry: &record})
+		case metadataDeleteEntry:
+			record := ttcsnapshot.DirectoryEntryRecord{Parent: op.Parent, Name: op.Name}
+			graphOps = append(graphOps, ttcsnapshot.FilesystemOperation{DeleteEntry: &record})
+		default:
+			return fmt.Errorf("unknown metadata operation %q", op.Kind)
 		}
-		if err := journal.Truncate(durableEnd); err != nil {
-			return err
+	}
+	releasePins := make(map[string]struct{})
+	for _, op := range ops {
+		if op.Inode != nil && op.Inode.Object != "" {
+			if id, err := ttcsnapshot.ParseObjectID(op.Inode.Object); err == nil {
+				pin := graphConstructionPin(id)
+				r.dirtyMu.Lock()
+				_, pending := r.pendingBulk[id.String()]
+				r.dirtyMu.Unlock()
+				if pending || r.graph.HasPin(pin) {
+					releasePins[pin] = struct{}{}
+				}
+			}
 		}
-	}
-	if _, err := journal.Seek(0, io.SeekEnd); err != nil {
-		return err
-	}
-	written, err := journal.Write(record)
-	if err != nil {
-		return err
-	}
-	if written != len(record) {
-		return io.ErrShortWrite
 	}
 	state.mu.Lock()
 	if err := applyMetadataOps(state, ops); err != nil {
 		state.mu.Unlock()
 		return err
 	}
-	state.nextSequence++
-	state.layerSizes[branch.Root] += int64(len(record))
 	state.branch = *branch
 	state.mu.Unlock()
-	r.markDirtyFile(journalName)
+	r.dirtyMu.Lock()
+	if r.pendingMetadata == nil {
+		r.pendingMetadata = make(map[string]*metadataBatch)
+	}
+	batch := r.pendingMetadata[branch.ID]
+	if batch == nil {
+		batch = &metadataBatch{
+			state: state, branch: *branch, inodes: make(map[uint64]ttcsnapshot.FilesystemOperation),
+			entries: make(map[metadataEntryKey]ttcsnapshot.FilesystemOperation), releasePins: make(map[string]struct{}),
+		}
+		r.pendingMetadata[branch.ID] = batch
+	}
+	batch.add(graphOps)
+	for pin := range releasePins {
+		batch.releasePins[pin] = struct{}{}
+	}
+	// Construction pins are also bounded tail work even when create+unlink
+	// pairs collapse to no final namespace entry.
+	flush := batch.len()+len(batch.releasePins) >= metadataBatchOperations ||
+		len(r.pendingReclaims)+len(batch.releasePins) >= reclaimBatchObjects
+	r.dirtyMu.Unlock()
+	if flush {
+		if err := r.flushMetadataBatchLocked(branch.ID); err != nil {
+			return fmt.Errorf("flushing bounded filesystem metadata batch: %w", err)
+		}
+		r.dirtyMu.Lock()
+		durabilityFence := len(r.pendingReclaims) >= reclaimBatchObjects || r.graph.JournalBytes() >= reclaimJournalBytes
+		r.dirtyMu.Unlock()
+		if durabilityFence {
+			if err := r.syncMetadataLocked(); err != nil {
+				return fmt.Errorf("flushing bounded filesystem garbage: %w", err)
+			}
+		}
+	}
 	return nil
+}
+
+// flushMetadataBatchLocked publishes one branch's bounded live metadata tail
+// into the immutable snapshot graph. Repository.operationMu and the repository
+// flock must be held by the caller.
+func (r *Repository) flushMetadataBatchLocked(branchID string) error {
+	r.dirtyMu.Lock()
+	batch := r.pendingMetadata[branchID]
+	r.dirtyMu.Unlock()
+	if batch == nil || batch.len() == 0 {
+		return nil
+	}
+	// A filesystem transaction path-copies the branch's tree, and so changes
+	// the references of the snapshots it shares with other branches; while
+	// one of them is frozen for an authority handoff, the graph refuses it.
+	// Refuse it before publishing any bulk object below. Refused after, the
+	// objects were left held only by construction pins, and the next process
+	// to open the repository released them as a crashed transaction's.
+	if snapshot, frozen := r.graph.FrozenSnapshotLedger(); frozen {
+		return fmt.Errorf("snapshot %d references are frozen for authority handoff: %w", snapshot, ttcsnapshot.ErrSnapshotLedgerFrozen)
+	}
+	pins := make([]string, 0, len(batch.releasePins))
+	for pin := range batch.releasePins {
+		pins = append(pins, pin)
+	}
+	sort.Strings(pins)
+	// Publish complete bulk payload metadata in one graph transaction before
+	// the filesystem transaction converts their construction pins into inode
+	// edges. A retry after an uncertain later step recognizes already-published
+	// objects and proceeds idempotently.
+	r.dirtyMu.Lock()
+	pending := make([]ttcsnapshot.ReservedObject, 0, len(pins))
+	for _, pin := range pins {
+		for _, object := range r.pendingBulk {
+			if object.Pin == pin {
+				pending = append(pending, object)
+				break
+			}
+		}
+	}
+	r.dirtyMu.Unlock()
+	sort.Slice(pending, func(i, j int) bool { return pending[i].ID.String() < pending[j].ID.String() })
+	var unpublished []ttcsnapshot.ReservedObject
+	for _, object := range pending {
+		if _, exists := r.graph.Object(object.ID); exists && r.graph.HasPin(object.Pin) {
+			continue
+		}
+		unpublished = append(unpublished, object)
+	}
+	if len(unpublished) != 0 {
+		if err := r.graph.CommitReservedObjects(unpublished); err != nil {
+			return fmt.Errorf("publishing filesystem bulk objects: %w", err)
+		}
+	}
+	root, reclaimed, err := r.graph.ApplyFilesystemAndReleasePinsReclaimed(
+		ttcsnapshot.SnapshotID(batch.branch.WorkingSnapshot), graphRootName(branchID), batch.operations(), pins)
+	if err != nil {
+		return err
+	}
+	// Until the inodes name them, a retry must still find the objects above.
+	if len(pending) != 0 {
+		r.dirtyMu.Lock()
+		for _, object := range pending {
+			delete(r.pendingBulk, object.ID.String())
+		}
+		r.dirtyMu.Unlock()
+	}
+	batch.branch.Root = root.String()
+	batch.state.mu.Lock()
+	batch.state.branch.Root = root.String()
+	batch.state.mu.Unlock()
+	r.dirtyMu.Lock()
+	// The operation lock ensures nobody can replace this batch while it is
+	// being published. Keep the identity check to make that invariant explicit.
+	if r.pendingMetadata[branchID] != batch {
+		r.dirtyMu.Unlock()
+		return errors.New("TTC filesystem metadata batch changed during publication")
+	}
+	delete(r.pendingMetadata, branchID)
+	if r.dirtyBranches == nil {
+		r.dirtyBranches = make(map[string]*branchMetadata)
+	}
+	r.dirtyBranches[branchID] = batch.state
+	if r.pendingReclaims == nil {
+		r.pendingReclaims = make(map[string]ttcsnapshot.ObjectID)
+	}
+	for _, id := range reclaimed {
+		r.pendingReclaims[id.String()] = id
+	}
+	r.dirtyMu.Unlock()
+	return nil
+}
+
+func (r *Repository) flushAllMetadataBatchesLocked() error {
+	r.dirtyMu.Lock()
+	branches := make([]string, 0, len(r.pendingMetadata))
+	for branch := range r.pendingMetadata {
+		branches = append(branches, branch)
+	}
+	r.dirtyMu.Unlock()
+	sort.Strings(branches)
+	for _, branch := range branches {
+		if err := r.flushMetadataBatchLocked(branch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func inodeToGraph(inode Inode) (ttcsnapshot.InodeRecord, error) {
+	record := ttcsnapshot.InodeRecord{
+		Number: inode.Number, Type: inode.Type, Mode: inode.Mode, UID: inode.UID, GID: inode.GID,
+		Nlink: inode.Nlink, Size: inode.Size, Target: inode.Target, DeviceMajor: inode.DevMajor,
+		DeviceMinor: inode.DevMinor, AtimeNsec: inode.AtimeNsec, BtimeNsec: inode.BtimeNsec,
+		CtimeNsec: inode.CtimeNsec, MtimeNsec: inode.MtimeNsec,
+	}
+	if inode.Object != "" {
+		id, err := ttcsnapshot.ParseObjectID(inode.Object)
+		if err != nil || id.Kind != ttcsnapshot.ObjectKindFile {
+			return record, fmt.Errorf("inode %d has invalid whole-file object %q", inode.Number, inode.Object)
+		}
+		record.File = id
+	}
+	if len(inode.Xattrs) != 0 {
+		record.Xattrs = make(map[string][]byte, len(inode.Xattrs))
+		for name, value := range inode.Xattrs {
+			record.Xattrs[name] = []byte(value)
+		}
+	}
+	return record, nil
+}
+
+func inodeFromGraph(record ttcsnapshot.InodeRecord) Inode {
+	inode := Inode{
+		Number: record.Number, Type: record.Type, Mode: record.Mode, UID: record.UID, GID: record.GID,
+		Nlink: record.Nlink, Size: record.Size, Target: record.Target, DevMajor: record.DeviceMajor,
+		DevMinor: record.DeviceMinor, AtimeNsec: record.AtimeNsec, BtimeNsec: record.BtimeNsec,
+		CtimeNsec: record.CtimeNsec, MtimeNsec: record.MtimeNsec,
+	}
+	if !record.File.IsZero() {
+		inode.Object = record.File.String()
+		inode.DataGeneration = uint64(record.File.Snapshot)
+	}
+	if len(record.Xattrs) != 0 {
+		inode.Xattrs = make(map[string]string, len(record.Xattrs))
+		for name, value := range record.Xattrs {
+			inode.Xattrs[name] = string(value)
+		}
+	}
+	return inode
 }
 
 func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
@@ -439,28 +540,49 @@ func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
 				return errors.New("invalid set-inode operation")
 			}
 			state.inodes[op.Inode.Number] = *op.Inode
+			delete(state.deletedInodes, op.Inode.Number)
+			if state.complete && op.Inode.Type == "directory" {
+				state.loadedDirectories[op.Inode.Number] = true
+				if state.directories[op.Inode.Number] == nil {
+					state.directories[op.Inode.Number] = make(map[string]DirectoryEntry)
+				}
+			}
 		case metadataDeleteInode:
 			if op.Number == 0 {
 				return errors.New("invalid delete-inode operation")
 			}
 			delete(state.inodes, op.Number)
+			state.deletedInodes[op.Number] = true
+			delete(state.directories, op.Number)
+			delete(state.loadedDirectories, op.Number)
+			for key := range state.entries {
+				if key.Parent == op.Number {
+					delete(state.entries, key)
+					state.deletedEntries[key] = true
+				}
+			}
 		case metadataSetEntry:
 			if op.Entry == nil || op.Parent == 0 || validateEntryName(op.Entry.Name) != nil || op.Entry.Inode == 0 {
 				return errors.New("invalid set-entry operation")
 			}
 			key := metadataEntryKey{Parent: op.Parent, Name: op.Entry.Name}
 			state.entries[key] = *op.Entry
-			directory := state.directories[op.Parent]
-			if directory == nil {
-				directory = make(map[string]DirectoryEntry)
-				state.directories[op.Parent] = directory
+			delete(state.deletedEntries, key)
+			if state.loadedDirectories[op.Parent] {
+				directory := state.directories[op.Parent]
+				if directory == nil {
+					directory = make(map[string]DirectoryEntry)
+					state.directories[op.Parent] = directory
+				}
+				directory[op.Entry.Name] = *op.Entry
 			}
-			directory[op.Entry.Name] = *op.Entry
 		case metadataDeleteEntry:
 			if op.Parent == 0 || validateEntryName(op.Name) != nil {
 				return errors.New("invalid delete-entry operation")
 			}
-			delete(state.entries, metadataEntryKey{Parent: op.Parent, Name: op.Name})
+			key := metadataEntryKey{Parent: op.Parent, Name: op.Name}
+			delete(state.entries, key)
+			state.deletedEntries[key] = true
 			if directory := state.directories[op.Parent]; directory != nil {
 				delete(directory, op.Name)
 				if len(directory) == 0 {
@@ -476,34 +598,133 @@ func applyMetadataOps(state *branchMetadata, ops []metadataOp) error {
 
 func (r *Repository) metadataInode(state *branchMetadata, ino uint64) (Inode, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
 	inode, ok := state.inodes[ino]
+	deleted := state.deletedInodes[ino]
+	branch := state.branch
+	state.mu.RUnlock()
+	if ok {
+		if err := r.prepareDeferredInode(&inode); err != nil {
+			return Inode{}, err
+		}
+		return inode, nil
+	}
+	if deleted {
+		return Inode{}, fs.ErrNotExist
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return Inode{}, err
+	}
+	record, ok, err := r.graph.FilesystemInode(root, ino)
+	if err != nil {
+		return Inode{}, err
+	}
 	if !ok {
 		return Inode{}, fs.ErrNotExist
 	}
+	inode = inodeFromGraph(record)
+	if err := r.prepareDeferredInode(&inode); err != nil {
+		return Inode{}, err
+	}
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		state.inodes[ino] = inode
+	}
+	state.mu.Unlock()
 	return inode, nil
 }
 
 func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name string) (uint64, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
-	entry, ok := state.entries[metadataEntryKey{Parent: parent, Name: name}]
+	key := metadataEntryKey{Parent: parent, Name: name}
+	entry, ok := state.entries[key]
+	deleted := state.deletedEntries[key]
+	branch := state.branch
+	state.mu.RUnlock()
+	if ok {
+		return entry.Inode, nil
+	}
+	if deleted {
+		return 0, fs.ErrNotExist
+	}
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return 0, err
+	}
+	record, ok, err := r.graph.FilesystemLookup(root, parent, name)
+	if err != nil {
+		return 0, err
+	}
 	if !ok {
 		return 0, fs.ErrNotExist
 	}
+	entry = DirectoryEntry{Name: record.Name, Inode: record.Inode}
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		state.entries[metadataEntryKey{Parent: parent, Name: name}] = entry
+	}
+	state.mu.Unlock()
 	return entry.Inode, nil
 }
 
-func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) []DirectoryEntry {
+func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) ([]DirectoryEntry, error) {
 	state.mu.RLock()
-	defer state.mu.RUnlock()
-	directory := state.directories[parent]
-	entries := make([]DirectoryEntry, 0, len(directory))
-	for _, entry := range directory {
+	loaded := state.loadedDirectories[parent]
+	branch := state.branch
+	if loaded {
+		directory := state.directories[parent]
+		entries := make([]DirectoryEntry, 0, len(directory))
+		for _, entry := range directory {
+			entries = append(entries, entry)
+		}
+		state.mu.RUnlock()
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		return entries, nil
+	}
+	state.mu.RUnlock()
+	root, err := ttcsnapshot.ParseObjectID(branch.Root)
+	if err != nil {
+		return nil, err
+	}
+	records, err := r.graph.FilesystemDirectory(root, parent)
+	if err != nil {
+		return nil, err
+	}
+	directory := make(map[string]DirectoryEntry, len(records))
+	entries := make([]DirectoryEntry, 0, len(records))
+	for _, record := range records {
+		entry := DirectoryEntry{Name: record.Name, Inode: record.Inode}
+		directory[entry.Name] = entry
 		entries = append(entries, entry)
 	}
+	state.mu.Lock()
+	if state.branch.Root == branch.Root {
+		// Overlay process-local batched mutations on the immutable graph view.
+		// Negative entries are explicit so a pending unlink cannot fall back to
+		// the still-current graph root and resurrect a name.
+		for key := range state.deletedEntries {
+			if key.Parent == parent {
+				delete(directory, key.Name)
+			}
+		}
+		for key, entry := range state.entries {
+			if key.Parent == parent {
+				directory[key.Name] = entry
+			}
+		}
+		entries = entries[:0]
+		for _, entry := range directory {
+			entries = append(entries, entry)
+		}
+		state.directories[parent] = directory
+		state.loadedDirectories[parent] = true
+		for _, entry := range entries {
+			state.entries[metadataEntryKey{Parent: parent, Name: entry.Name}] = entry
+		}
+	}
+	state.mu.Unlock()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
-	return entries
+	return entries, nil
 }
 
 func (r *Repository) allocateInodeLocked() (uint64, error) {
@@ -599,17 +820,26 @@ func (r *Repository) mkdirAll(name string, mode fs.FileMode) error {
 }
 
 func (r *Repository) objectPath(id string) string {
-	return filepath.Join("objects", id[:2], id[2:4], id)
+	parsed, err := ttcsnapshot.ParseObjectID(id)
+	if err != nil || r.data == nil {
+		return filepath.Join("data", "invalid")
+	}
+	path, err := r.data.Path(parsed)
+	if err != nil {
+		return filepath.Join("data", "invalid")
+	}
+	if r.path != "" {
+		if relative, err := filepath.Rel(r.path, path); err == nil {
+			return relative
+		}
+	}
+	return path
 }
 
 func (r *Repository) openObject(id string, flags int) (*os.File, error) {
-	if !validID(id) {
-		return nil, fmt.Errorf("invalid object ID %q", id)
+	parsed, err := ttcsnapshot.ParseObjectID(id)
+	if err != nil || parsed.Kind != ttcsnapshot.ObjectKindFile {
+		return nil, fmt.Errorf("invalid whole-file object ID %q", id)
 	}
-	file, err := r.openFile(r.objectPath(id), flags, 0)
-	if errors.Is(err, os.ErrNotExist) {
-		// Version-1 repositories and snapshots used a flat object directory.
-		return r.openFile(filepath.Join("objects", id), flags, 0)
-	}
-	return file, err
+	return r.data.OpenFile(parsed, flags, -1)
 }

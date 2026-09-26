@@ -12,8 +12,5 @@ go_binary(
     tags = ["staging"],
     visibility = ["//visibility:public"],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
-    deps = [
-        "//runsc/ttc/cmd",
-        "//runsc/ttc/copyguest",
-    ],
+    deps = ["//runsc/ttc/client"],
 )

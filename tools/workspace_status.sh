@@ -14,5 +14,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The STABLE_ prefix will trigger a re-link if it changes.
-echo STABLE_VERSION "$(git describe --always --tags --abbrev=12 --dirty 2>/dev/null || echo 0.0.0)"
+# The STABLE_ prefix will trigger a re-link if it changes. `git describe
+# --dirty` only distinguishes clean from dirty: two binaries built from
+# different uncommitted source trees would both report the same `<commit>-dirty`
+# identity and TTC's exact client/daemon and daemon/daemon compatibility fence
+# could accept them. Include a deterministic digest of every tracked change
+# and every non-ignored untracked file instead.
+if base=$(git describe --always --tags --abbrev=12 2>/dev/null); then
+  changed=false
+  if ! git diff --quiet HEAD -- || ! git diff --cached --quiet HEAD --; then
+    changed=true
+  elif test -n "$(git ls-files --others --exclude-standard | head -n 1)"; then
+    changed=true
+  fi
+  if "$changed"; then
+    digest=$(
+      {
+        git diff --binary HEAD --
+        while IFS= read -r -d '' path; do
+          printf '\0%s\0' "$path"
+          sha256sum -- "$path"
+        done < <(git ls-files --others --exclude-standard -z)
+      } | sha256sum | cut -c1-16
+    )
+    base="${base}-dirty.${digest}"
+  fi
+else
+  base=0.0.0
+fi
+echo STABLE_VERSION "$base"

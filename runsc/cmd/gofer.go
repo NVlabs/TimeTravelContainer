@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/ttcpack"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -119,6 +121,10 @@ type Gofer struct {
 
 	specFD            int
 	rootfsOwnershipFD int
+	lazyPackFD        int
+	lazyRootFD        int
+	lazyStateFD       int
+	lazyPrefix        string
 	mountsFD          int
 	goferToHostRPCFD  int
 	profileFDs        profile.FDArgs
@@ -153,6 +159,10 @@ func (g *Gofer) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&g.devIoFD, "dev-io-fd", -1, "optional FD to connect /dev gofer server")
 	f.IntVar(&g.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&g.rootfsOwnershipFD, "rootfs-ownership-fd", -1, "optional open TTC rootfs ownership manifest preserved across gofer re-exec")
+	f.IntVar(&g.lazyPackFD, "ttc-lazy-pack-fd", -1, "optional TTC image pack preserved across gofer re-exec")
+	f.IntVar(&g.lazyRootFD, "ttc-lazy-root-fd", -1, "optional TTC lazy image root preserved across gofer re-exec")
+	f.IntVar(&g.lazyStateFD, "ttc-lazy-state-fd", -1, "optional TTC lazy image state directory preserved across gofer re-exec")
+	f.StringVar(&g.lazyPrefix, "ttc-lazy-prefix", "", "optional TTC image pack path prefix preserved across gofer re-exec")
 	f.IntVar(&g.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to write list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&g.goferToHostRPCFD, "rpc-fd", -1, "gofer-to-host RPC file descriptor.")
 
@@ -216,6 +226,13 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	if rootfsOwnershipFile != nil {
 		defer rootfsOwnershipFile.Close()
 	}
+	lazyFiles, err := loadRootfsLazyFiles(spec, g.lazyPackFD, g.lazyRootFD, g.lazyStateFD, g.lazyPrefix)
+	if err != nil {
+		util.Fatalf("loading lazy rootfs image: %v", err)
+	}
+	if lazyFiles != nil {
+		defer lazyFiles.Close()
+	}
 	lisafsNeeded := lisafsNeededForDirectFSSuppression(spec, mountHints, rootfsHint, g.mountConfs)
 
 	g.syncFDs.syncChroot()
@@ -267,6 +284,18 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 					util.Fatalf("clearing CLOEXEC on rootfs ownership manifest: %v", errno)
 				}
 				overrides["rootfs-ownership-fd"] = strconv.Itoa(int(rootfsOwnershipFile.Fd()))
+			}
+			if lazyFiles != nil {
+				packFD, rootFD, stateFD, prefix := lazyFiles.InheritedFDs()
+				for _, inheritedFD := range []int{packFD, rootFD, stateFD} {
+					if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(inheritedFD), unix.F_SETFD, 0); errno != 0 {
+						util.Fatalf("clearing CLOEXEC on lazy image fd %d: %v", inheritedFD, errno)
+					}
+				}
+				overrides["ttc-lazy-pack-fd"] = strconv.Itoa(packFD)
+				overrides["ttc-lazy-root-fd"] = strconv.Itoa(rootFD)
+				overrides["ttc-lazy-state-fd"] = strconv.Itoa(stateFD)
+				overrides["ttc-lazy-prefix"] = prefix
 			}
 			for key, value := range extensionPrepare.FlagOverrides {
 				overrides[key] = value
@@ -340,7 +369,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 	}()
 
 	specutils.LogSpecDebug(spec, conf.OCISeccomp)
-
 	// fsgofer should run with a umask of 0, because we want to preserve file
 	// modes exactly as sent by the sandbox, which will have applied its own umask.
 	unix.Umask(0)
@@ -367,7 +395,6 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		}
 		log.Infof("Process chroot'd to %q", root)
 	}
-
 	ruid := unix.Getuid()
 	euid := unix.Geteuid()
 	rgid := unix.Getgid()
@@ -390,7 +417,32 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomm
 		util.Fatalf("installing seccomp filters: %v", err)
 	}
 
-	return g.serve(spec, conf, root, ruid, euid, rgid, egid, virtualOwners)
+	return g.serve(spec, conf, root, ruid, euid, rgid, egid, virtualOwners, lazyFiles)
+}
+
+func loadRootfsLazyFiles(spec *specs.Spec, packFD, rootFD, stateFD int, prefix string) (*ttcpack.LazyDirectory, error) {
+	name := spec.Annotations[ttcpack.LazyAnnotation]
+	if name == "" {
+		if packFD >= 0 || rootFD >= 0 || stateFD >= 0 || prefix != "" {
+			return nil, errors.New("lazy image descriptors supplied without rootfs annotation")
+		}
+		return nil, nil
+	}
+	if packFD >= 0 || rootFD >= 0 || stateFD >= 0 {
+		if packFD < 0 || rootFD < 0 || stateFD < 0 {
+			return nil, errors.New("incomplete inherited lazy image descriptors")
+		}
+		return ttcpack.OpenLazyDirectoryFromFDs(packFD, rootFD, stateFD, prefix)
+	}
+	want := ttcpack.LazyDescriptorPath(spec.Root.Path)
+	if !filepath.IsAbs(name) || filepath.Clean(name) != filepath.Clean(want) {
+		return nil, fmt.Errorf("lazy image descriptor path %q does not match rootfs %q", name, spec.Root.Path)
+	}
+	descriptor, err := ttcpack.ReadLazyDescriptor(spec.Root.Path)
+	if err != nil {
+		return nil, err
+	}
+	return ttcpack.OpenLazyDirectory(spec.Root.Path, descriptor)
 }
 
 func loadRootfsOwnership(spec *specs.Spec, inheritedFD int) (_ *ownership.Manifest, manifestFile *os.File, retErr error) {
@@ -439,13 +491,14 @@ func goferMountPath(conf *config.Config, source, destination string) string {
 	}
 	return destination
 }
-func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, virtualOwners *ownership.Manifest) subcommands.ExitStatus {
+func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid int, euid int, rgid int, egid int, virtualOwners *ownership.Manifest, lazyFiles *ttcpack.LazyDirectory) subcommands.ExitStatus {
 	type connectionConfig struct {
 		sock          *unet.Socket
 		mountPath     string
 		readonly      bool
 		mount         *specs.Mount
 		virtualOwners *ownership.Manifest
+		lazyFiles     fsgofer.LazyFileProvider
 	}
 	cfgs := make([]connectionConfig, 0, len(spec.Mounts)+1)
 
@@ -459,6 +512,7 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 			mountPath:     mountPath,
 			readonly:      spec.Root.Readonly || rootfsConf.ShouldUseOverlayfs(),
 			virtualOwners: virtualOwners,
+			lazyFiles:     lazyFiles,
 		})
 		log.Infof("Serving %q mapped to %q on FD %d (ro: %t)", mountPath, root, ioFDs[0], cfgs[0].readonly)
 		ioFDs = ioFDs[1:]
@@ -542,6 +596,7 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 		if connImpl == nil {
 			connectionConf := *fsgoferConf
 			connectionConf.VirtualOwners = cfg.virtualOwners
+			connectionConf.LazyFiles = cfg.lazyFiles
 			connImpl = fsgofer.NewConnectionImpl(&connectionConf)
 			connOpts = fsgofer.ConnectionOpts(cfg.readonly)
 		}
@@ -550,6 +605,9 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 			util.Fatalf("starting connection on FD %d for gofer mount failed: %v", cfg.sock.FD(), err)
 		}
 		server.StartConnection(conn)
+	}
+	if lazyFiles != nil {
+		lazyFiles.StartPrefetch()
 	}
 	server.Wait()
 	server.Destroy()

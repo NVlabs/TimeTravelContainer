@@ -166,14 +166,24 @@ func TestNodeDirectoryLifecycleAndFencing(t *testing.T) {
 	if draining.AcceptsPlacement(now.Add(5 * time.Second)) {
 		t.Fatal("draining node accepts placement")
 	}
-	offline, err := directory.Transition("node-a", "boot-a", NodeOffline, now.Add(5*time.Second), 30*time.Second)
+	readyAgain, err := directory.Transition("node-a", "boot-a", NodeReady, now.Add(5*time.Second), 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if offline.LeaseActive(now.Add(5 * time.Second)) {
+	if !readyAgain.AcceptsPlacement(now.Add(5 * time.Second)) {
+		t.Fatal("node does not accept placement after canceling drain")
+	}
+	if _, err := directory.Transition("node-a", "boot-a", NodeDraining, now.Add(6*time.Second), 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	offline, err := directory.Transition("node-a", "boot-a", NodeOffline, now.Add(7*time.Second), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offline.LeaseActive(now.Add(7 * time.Second)) {
 		t.Fatal("offline node has an active lease")
 	}
-	if _, err := directory.Register(testNodeRecord("node-a", "boot-b"), now.Add(6*time.Second), 30*time.Second); err != nil {
+	if _, err := directory.Register(testNodeRecord("node-a", "boot-b"), now.Add(8*time.Second), 30*time.Second); err != nil {
 		t.Fatalf("replacing offline incarnation: %v", err)
 	}
 }

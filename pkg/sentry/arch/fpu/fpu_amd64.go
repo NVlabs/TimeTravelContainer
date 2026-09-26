@@ -30,6 +30,44 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
+// XstateComponent describes one standard-format XSAVE component.
+//
+// +stateify savable
+type XstateComponent struct {
+	Offset uint32
+	Size   uint32
+}
+
+// XstateLayout records the physical XSAVE layout used to encode State. CPUID
+// leaf 0xd component offsets are not identical across all x86 CPUs, so raw
+// byte copying is insufficient for cross-host restore.
+//
+// +stateify savable
+type XstateLayout struct {
+	UseXsave   bool
+	Size       uint32
+	Components [64]XstateComponent
+}
+
+// HostXstateLayout returns the standard XSAVE layout used by this process.
+func HostXstateLayout() XstateLayout {
+	fs := cpuid.HostFeatureSet()
+	size, _ := fs.ExtendedStateSize()
+	layout := XstateLayout{UseXsave: fs.UseXsave(), Size: uint32(size)}
+	if !layout.UseXsave {
+		return layout
+	}
+	layout.Components[0] = XstateComponent{Offset: 0, Size: 160}
+	layout.Components[1] = XstateComponent{Offset: 160, Size: 352}
+	for bit := uint32(2); bit < 64; bit++ {
+		out := fs.Query(cpuid.In{Eax: 0xd, Ecx: bit})
+		if out.Eax != 0 {
+			layout.Components[bit] = XstateComponent{Offset: out.Ebx, Size: out.Eax}
+		}
+	}
+	return layout
+}
+
 // FPSoftwareFrame is equivalent to struct _fpx_sw_bytes, the data stored by
 // Linux in bytes 464:511 of the fxsave/xsave frame.
 //
@@ -377,9 +415,19 @@ func (s *State) BytePointer() *byte {
 // and SSE state, so this is the equivalent XSTATE_BV value.
 const fxsaveBV uint64 = cpuid.XSAVEFeatureX87 | cpuid.XSAVEFeatureSSE
 
-// AfterLoad converts the loaded state to the format that compatible with the
-// current processor.
+// AfterLoad converts legacy loaded state for which no source layout was
+// serialized.
 func (s *State) AfterLoad() {
+	s.afterLoadFrom(XstateLayout{})
+}
+
+// AfterLoadFrom converts loaded state from sourceLayout to the current CPU's
+// layout.
+func (s *State) AfterLoadFrom(sourceLayout XstateLayout) {
+	s.afterLoadFrom(sourceLayout)
+}
+
+func (s *State) afterLoadFrom(sourceLayout XstateLayout) {
 	old := s.Slice()
 
 	// Recreate the slice. This is done to ensure that it is aligned
@@ -390,6 +438,7 @@ func (s *State) AfterLoad() {
 	// smaller state component bitmap. Intel SDM Volume 1 Chapter 13 has
 	// more info.
 	*s = NewState()
+	targetLayout := HostXstateLayout()
 
 	// x86FPState always contains all the FP state supported by the host.
 	// We may have come from a newer machine that supports additional state
@@ -428,8 +477,12 @@ func (s *State) AfterLoad() {
 		hostarch.ByteOrder.PutUint64((old)[xstateBVOffset:], savedBV)
 	}
 
-	// Copy to the new, aligned location.
-	copy(*s, old)
+	if sourceLayout.Size == 0 {
+		// Compatibility for state written before layouts were serialized.
+		copy(*s, old)
+	} else {
+		convertXstateLayout(*s, old, sourceLayout, targetLayout, savedBV)
+	}
 
 	mxcsrBefore := s.GetMXCSR()
 	sanitizeMXCSR(*s)
@@ -445,5 +498,34 @@ func (s *State) AfterLoad() {
 			}
 			panic(fmt.Sprintf("incompatible state: %s\nlen(old)=%d len(new)=%d supportedBV=%#x XSTATE_BV=%#x XCOMP_BV=%#x", err, len(old), len(*s), supportedBV, savedBV, xcompBV))
 		}
+	}
+}
+
+func convertXstateLayout(dst, src []byte, source, target XstateLayout, savedBV uint64) {
+	const legacyBytes = 512
+	if len(src) < legacyBytes || len(dst) < legacyBytes {
+		panic(fmt.Sprintf("incompatible x86 floating-point state: source=%d target=%d", len(src), len(dst)))
+	}
+	copy(dst[:legacyBytes], src[:legacyBytes])
+	if !target.UseXsave {
+		return
+	}
+	hostarch.ByteOrder.PutUint64(dst[xstateBVOffset:], savedBV)
+	clear(dst[xsaveHeaderZeroedOffset : xsaveHeaderZeroedOffset+xsaveHeaderZeroedBytes])
+	if !source.UseXsave {
+		return
+	}
+	for bit := uint(2); bit < 64; bit++ {
+		if savedBV&(uint64(1)<<bit) == 0 {
+			continue
+		}
+		from := source.Components[bit]
+		to := target.Components[bit]
+		if from.Size == 0 || to.Size == 0 || from.Size != to.Size ||
+			uint64(from.Offset)+uint64(from.Size) > uint64(len(src)) ||
+			uint64(to.Offset)+uint64(to.Size) > uint64(len(dst)) {
+			panic(fmt.Sprintf("incompatible xstate component %d: source=%+v target=%+v source-bytes=%d target-bytes=%d", bit, from, to, len(src), len(dst)))
+		}
+		copy(dst[to.Offset:to.Offset+to.Size], src[from.Offset:from.Offset+from.Size])
 	}
 }

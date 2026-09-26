@@ -275,9 +275,25 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		go func() {
 			e.protocol.restore.connected.Wait()
 			e.LockUser()
-			// All endpoints will be moved to initial state after
-			// restore. Set endpoint to its originial listen state.
+			// A restored stack may initially contain the serialized demuxer
+			// registration, but replacing a runtime-owned NIC can remove it
+			// while leaving the socket object in StateListen. Reinstall the
+			// listener unconditionally so /proc/net cannot report a socket
+			// that resets every incoming connection.
+			e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, e.TransportEndpointInfo.ID, e, e.boundPortFlags, e.boundBindToDevice)
+			// All endpoints are moved to initial state after restore. Set the
+			// endpoint to its original listen state before making it reachable
+			// through the demuxer.
 			e.setEndpointState(StateListen)
+			if err := e.stack.RegisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, e.TransportEndpointInfo.ID, e, e.boundPortFlags, e.boundBindToDevice); err != nil {
+				log.Warningf("TCP listener registration failed during restore for ID %+v: %v", e.TransportEndpointInfo.ID, err)
+				e.setEndpointState(StateError)
+				e.UnlockUser()
+				e.protocol.restore.listening.Done()
+				e.protocol.restore.async.Done()
+				return
+			}
+			e.isRegistered = true
 			// Initialize the listening context.
 			rcvWnd := seqnum.Size(e.receiveBufferAvailable())
 			e.listenCtx = newListenContext(e.stack, e.protocol, e, rcvWnd, e.ops.GetV6Only(), e.NetProto)

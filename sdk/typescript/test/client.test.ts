@@ -70,7 +70,7 @@ test("ping uses the direct protocol", async () => {
   await withServer(
     (socket, request) => {
       assert.deepEqual(request, { version: API_VERSION, action: "ping" });
-      socket.write(frame("O", Buffer.from('{"version":4}\n')));
+      socket.write(frame("O", Buffer.from('{"version":9}\n')));
       socket.end(frame("X", Buffer.from([0, 0, 0, 0])));
     },
     async (path) => {
@@ -125,8 +125,8 @@ test("command streams flow-controlled stdin and preserves status", async () => {
 
 test("default socket environment precedence", () => {
   assert.equal(
-    defaultSocketPath({ TTC_RUNTIME_DIR: "/run/a", XDG_RUNTIME_DIR: "/run/b" }),
-    "/run/a/ttcd.sock",
+    defaultSocketPath({ TTC_SOCKET: "/run/a/custom.sock", XDG_RUNTIME_DIR: "/run/b" }),
+    "/run/a/custom.sock",
   );
   assert.equal(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/b" }), "/run/b/ttc/ttcd.sock");
 });
@@ -156,7 +156,7 @@ test("batch remote fork uses the current CLI shape", async () => {
       assert.deepEqual(request.args, [
         "fork",
         "--paused",
-        "--target",
+        "--node",
         "node-b",
         "demo@main",
         "remote@one",
@@ -168,7 +168,7 @@ test("batch remote fork uses the current CLI shape", async () => {
       const result = await new Client(path).forkMany(
         "demo@main",
         ["remote@one", "remote@two"],
-        { paused: true, targetNode: "node-b" },
+        { paused: true, node: "node-b" },
       );
       assert.equal(result.ok, true);
     },
@@ -178,7 +178,7 @@ test("batch remote fork uses the current CLI shape", async () => {
 test("elastic cluster helpers use the current CLI shape", async () => {
   await withServer(
     (socket, request) => {
-      assert.deepEqual(request.args, ["migrate", "--target", "node-b", "demo@main"]);
+      assert.deepEqual(request.args, ["migrate", "--node", "node-b", "demo@main"]);
       socket.end(frame("X", Buffer.alloc(4)));
     },
     async (path) => {
@@ -194,6 +194,33 @@ test("elastic cluster helpers use the current CLI shape", async () => {
     async (path) => {
       const nodes = await new Client(path).nodes<Array<{ node_id: string }>>();
       assert.equal(nodes[0]?.node_id, "node-a");
+    },
+  );
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "node", "stop", "--migrate-all", "node-a",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      assert.equal((await new Client(path).stopNode("node-a", "migrate")).ok, true);
+    },
+  );
+});
+
+test("durable wait uses the current CLI shape", async () => {
+  await withServer(
+    (socket, request) => {
+      assert.deepEqual(request.args, [
+        "wait", "--condition", "durable", "demo@main",
+      ]);
+      socket.end(frame("X", Buffer.alloc(4)));
+    },
+    async (path) => {
+      assert.equal((await new Client(path).wait(
+        "demo@main", { condition: "durable" },
+      )).ok, true);
     },
   );
 });

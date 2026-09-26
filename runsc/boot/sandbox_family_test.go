@@ -19,10 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -34,6 +36,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -92,6 +96,49 @@ func TestResidentMemorySharingEdgesExactAndBounded(t *testing.T) {
 	}
 }
 
+func TestWaitExecSessionConsumesAlreadyExitedTransientSession(t *testing.T) {
+	status := uint32(linux.WaitStatusExit(7))
+	transient := &execSession{info: ExecSessionInfo{
+		ID: "ttc-cp-helper", State: ExecSessionExited, ExitStatus: &status,
+	}}
+	retained := &execSession{info: ExecSessionInfo{
+		ID: "named", State: ExecSessionExited, ExitStatus: &status,
+	}, retain: true}
+	family := &SandboxFamily{
+		loaderBranchID: "main",
+		branches: map[string]*sandboxBranch{"main": {
+			id: "main", state: BranchRunning,
+			execSessions: map[string]*execSession{
+				"ttc-cp-helper": transient,
+				"named":         retained,
+			},
+		}},
+	}
+	got, err := family.WaitExecSession(&ExecSessionArgs{BranchID: "main", ExecID: "ttc-cp-helper"}, nil)
+	if err != nil || got != status {
+		t.Fatalf("WaitExecSession()=(%d, %v), want (%d, nil)", got, err, status)
+	}
+	family.mu.Lock()
+	_, transientExists := family.branches["main"].execSessions["ttc-cp-helper"]
+	_, retainedExists := family.branches["main"].execSessions["named"]
+	family.mu.Unlock()
+	if transientExists {
+		t.Fatal("already-exited transient exec session was retained")
+	}
+	if !retainedExists {
+		t.Fatal("unrelated named exec session was removed")
+	}
+	if got, err := family.WaitExecSession(&ExecSessionArgs{BranchID: "main", ExecID: "named"}, nil); err != nil || got != status {
+		t.Fatalf("retained WaitExecSession()=(%d, %v), want (%d, nil)", got, err, status)
+	}
+	family.mu.Lock()
+	_, retainedExists = family.branches["main"].execSessions["named"]
+	family.mu.Unlock()
+	if !retainedExists {
+		t.Fatal("retained named exec session was consumed")
+	}
+}
+
 func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
 	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
 	file1 := &pgalloc.MemoryFile{}
@@ -105,6 +152,25 @@ func TestResidentMemoryVersionRunsCompressAndDeduplicate(t *testing.T) {
 	runs := residentMemoryVersionRuns([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
 	if len(runs) != 2 || runs[0].Branch != "main" || runs[0].FirstSequence != 7 || runs[0].Pages != 2 || runs[1].FirstSequence != 10 || runs[1].Pages != 1 {
 		t.Fatalf("runs=%+v", runs)
+	}
+}
+
+func TestResidentMemoryVersionChunksBoundFragmentation(t *testing.T) {
+	allocator := pgalloc.LogicalAllocatorID{1, 2, 3}
+	file1 := &pgalloc.MemoryFile{}
+	file2 := &pgalloc.MemoryFile{}
+	pages := make(map[mm.ResidentPageVersion]struct{})
+	for sequence := uint64(0); sequence < 256; sequence += 2 {
+		pages[mm.ResidentPageVersion{File: file1, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: sequence}}] = struct{}{}
+	}
+	// A physical alias of the same stable version must not create another bit.
+	pages[mm.ResidentPageVersion{File: file2, Version: pgalloc.PageVersionID{Allocator: allocator, Sequence: 10}}] = struct{}{}
+	chunks := residentMemoryVersionChunks([]string{"main"}, []map[mm.ResidentPageVersion]struct{}{pages})
+	if len(chunks) != 1 {
+		t.Fatalf("chunks=%+v, want one bounded record", chunks)
+	}
+	if got := chunks[0]; got.Branch != "main" || got.Chunk != 0 || got.Bitmap != strings.Repeat("55", 32) {
+		t.Fatalf("chunk=%+v, want even-slot bitmap", got)
 	}
 }
 
@@ -219,16 +285,7 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
-	family.mu.Lock()
-	family.branches[DefaultBranchID].execSessions["remote-exec"] = &execSession{
-		info: ExecSessionInfo{
-			ID: "remote-exec", ContainerID: "source-container", PID: parent.GlobalInit().ID(),
-			ConsoleID: "remote-console", State: ExecSessionRunning, CreatedAt: time.Unix(1, 0).UTC(),
-		},
-		tg: parent.GlobalInit(),
-	}
-	family.mu.Unlock()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	info, err := family.CaptureDistributedFork(&DistributedForkCaptureArgs{
 		SessionID: "tx-1", FamilyID: "family-1", TargetBranchID: "remote-1",
 		ListenAddress: "127.0.0.1:0", MaxTransferBytes: 64 << 10,
@@ -248,20 +305,13 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	}
 	metadata, err := ttcremote.UnmarshalSessionMetadata(encoded, ttcremote.SessionMetadataLimits{
 		MaxTotalBytes: 64 << 20, MaxKernelBytes: 60 << 20,
-		MaxAllocatorBytes: 4 << 20, MaxExecBytes: 1 << 20, MaxLoadRanges: 1 << 20,
+		MaxAllocatorBytes: 4 << 20, MaxLoadRanges: 1 << 20,
 	})
 	if err != nil {
 		t.Fatalf("UnmarshalSessionMetadata: %v", err)
 	}
 	if metadata.FamilyID != "family-1" || metadata.SourceBranchID != DefaultBranchID || metadata.TargetBranchID != "remote-1" {
 		t.Fatalf("metadata identity: %+v", metadata)
-	}
-	execSessions, err := decodeDistributedExecSessions(metadata.ExecSessions, "target-container")
-	if err != nil {
-		t.Fatalf("decodeDistributedExecSessions: %v", err)
-	}
-	if len(execSessions) != 1 || execSessions[0].ID != "remote-exec" || execSessions[0].ContainerID != "target-container" || execSessions[0].PID != parent.GlobalInit().ID() {
-		t.Fatalf("distributed exec sessions: %+v", execSessions)
 	}
 	status, err := family.DistributedForkSessionStatus("tx-1")
 	if err != nil {
@@ -270,28 +320,66 @@ func TestSandboxFamilyDistributedForkSessionLifecycle(t *testing.T) {
 	if status.Snapshot.PagesOutstanding == 0 || status.Transport.MetadataBytesSent != uint64(len(encoded)) {
 		t.Fatalf("unexpected session status: %+v", status)
 	}
-	repositoryRoot := t.TempDir()
-	repository, err := ttcchunk.OpenMemoryRepository(repositoryRoot)
+	streamFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	stream := os.NewFile(uintptr(streamFDs[0]), "distributed-page-stream")
+	peerStream := os.NewFile(uintptr(streamFDs[1]), "distributed-page-peer")
+	defer stream.Close()
+	defer peerStream.Close()
+	served := make(chan error, 1)
+	go func() {
+		served <- family.ServeDistributedForkConnection(&DistributedForkServeArgs{
+			FilePayload: urpc.FilePayload{Files: []*os.File{stream}}, SessionID: "tx-1",
+		})
+	}()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("ServeDistributedForkConnection: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeDistributedForkConnection occupied its control caller")
+	}
+	graphStream, err := os.CreateTemp(t.TempDir(), "graph-capture-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	repositoryDir, err := os.Open(repositoryRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exported, err := family.ExportDistributedForkSnapshot(&DistributedForkExportArgs{
-		FilePayload: urpc.FilePayload{Files: []*os.File{repositoryDir}}, SessionID: "tx-1", Sparse: true,
+	graphExport, err := family.ExportDistributedForkSnapshot(&DistributedForkExportArgs{
+		FilePayload: urpc.FilePayload{Files: []*os.File{graphStream}}, SessionID: "tx-1",
 	})
-	repositoryDir.Close()
 	if err != nil {
-		t.Fatalf("ExportDistributedForkSnapshot sparse: %v", err)
+		t.Fatalf("ExportDistributedForkSnapshot graph: %v", err)
 	}
-	if exported.Manifest == (ttcchunk.ManifestID{}) || exported.FilesystemBranch != "remote-1" {
-		t.Fatalf("incomplete sparse export: %+v", exported)
+	if graphExport.FilesystemBranch != "remote-1" {
+		t.Fatalf("graph export filesystem branch=%q, want remote-1", graphExport.FilesystemBranch)
 	}
-	if _, err := repository.LoadManifest(exported.Manifest); err != nil {
-		t.Fatalf("loading exported sparse manifest: %v", err)
+	if _, err := graphStream.Seek(0, 0); err != nil {
+		t.Fatal(err)
 	}
+	graphRoot := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(graphRoot, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(graphRoot, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphImported, err := ttcchunk.ImportGraphCapture(graphStream, graph, data, origin, "remote/1/tx-1")
+	if err != nil {
+		t.Fatalf("ImportGraphCapture: %v", err)
+	}
+	if len(graphImported.Roots) == 0 || graphImported.Pages == 0 {
+		t.Fatalf("empty graph export: %+v", graphImported)
+	}
+	graphStream.Close()
 	if err := family.CancelDistributedForkSession("tx-1"); err != nil {
 		t.Fatalf("CancelDistributedForkSession: %v", err)
 	}
@@ -336,7 +424,7 @@ func TestSandboxFamilyDistributedForkCaptureMany(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	infos, err := family.CaptureDistributedForkMany(&DistributedForkCaptureManyArgs{
 		FamilyID: "family-many", MaxTransferBytes: 64 << 10,
 		Children: []DistributedForkCaptureChildArgs{
@@ -389,7 +477,7 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	defer func() {
 		family.DestroyNonLoaderBranches()
 		parent.Pause()
@@ -419,6 +507,11 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}()
 	family.mu.Lock()
 	original := family.branches["sleeping"].k
+	exitStatus := uint32(linux.WaitStatusExit(7))
+	family.branches["sleeping"].execSessions["completed"] = &execSession{info: ExecSessionInfo{
+		ID: "completed", ContainerID: "container", PID: 4242, ConsoleID: "console-completed",
+		State: ExecSessionExited, ExitStatus: &exitStatus,
+	}, retain: true}
 	family.mu.Unlock()
 	metadata, err := os.CreateTemp(t.TempDir(), "dehydration-*.state")
 	if err != nil {
@@ -450,12 +543,16 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 	family.mu.Lock()
 	restored := family.branches["sleeping"].k
+	completed := family.branches["sleeping"].execSessions["completed"]
 	family.mu.Unlock()
 	if restored == nil || restored == original {
 		t.Fatalf("rehydrated Kernel=%p, original=%p", restored, original)
 	}
 	if !restored.IsPaused() {
 		t.Fatal("previously paused branch resumed during rehydration")
+	}
+	if completed == nil || completed.tg != nil || completed.info.State != ExecSessionExited || completed.info.ExitStatus == nil || *completed.info.ExitStatus != exitStatus {
+		t.Fatalf("rehydrated completed exec session=%+v", completed)
 	}
 	if got := branchStateForTest(family.List(), "sleeping"); got != BranchPaused {
 		t.Fatalf("state after rehydration=%q, want %q", got, BranchPaused)
@@ -490,6 +587,189 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 	if got := branchStateForTest(family.List(), "sleeping"); got != BranchRunning {
 		t.Fatalf("running state after second rehydration=%q, want %q", got, BranchRunning)
+	}
+}
+
+func TestSandboxFamilyDehydrateLoaderTransfersRole(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	var loaderChanges []*kernel.Kernel
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		LiveForkEligible: true,
+		OnLoaderKernelChanged: func(k *kernel.Kernel, _ *watchdog.Watchdog) {
+			loaderChanges = append(loaderChanges, k)
+		},
+	})
+	if _, err := family.Fork(&ForkBranchArgs{ID: "survivor", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	family.mu.Lock()
+	survivor := family.branches["survivor"].k
+	family.mu.Unlock()
+	metadata, err := os.CreateTemp(t.TempDir(), "loader-dehydration-*.state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := family.Dehydrate(DefaultBranchID, metadata); err != nil {
+		t.Fatalf("Dehydrate loader: %v", err)
+	}
+	if got := family.LoaderBranchID(); got != "survivor" {
+		t.Fatalf("loader branch after dehydration=%q, want survivor", got)
+	}
+	if len(loaderChanges) != 1 || loaderChanges[0] != survivor {
+		t.Fatalf("loader callbacks=%p, want [%p]", loaderChanges, survivor)
+	}
+	if got := branchStateForTest(family.List(), DefaultBranchID); got != BranchDehydrated {
+		t.Fatalf("dehydrated loader state=%q, want %q", got, BranchDehydrated)
+	}
+	if got := branchStateForTest(family.List(), "survivor"); got != BranchPaused {
+		t.Fatalf("survivor state=%q, want %q", got, BranchPaused)
+	}
+	if err := family.Destroy(DefaultBranchID); err != nil {
+		t.Fatalf("Destroy dehydrated branch: %v", err)
+	}
+	survivor.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+	survivor.Unpause()
+	survivor.WaitExited()
+	survivor.Release()
+}
+
+// A capture taken without a metadata file can be exported later, more than
+// once, and still rehydrated: ttcd exports a resident dehydration only when the
+// family's last live branch goes, and repeats an export whose recording failed.
+func TestSandboxFamilyExportsAResidentCaptureRepeatedly(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		family.DestroyNonLoaderBranches()
+		parent.Pause()
+		parent.Release()
+	}()
+	if _, err := family.Fork(&ForkBranchArgs{ID: "resident", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := family.Dehydrate("resident", nil); err != nil {
+		t.Fatalf("Dehydrate: %v", err)
+	}
+	export := func(withMetadata bool) ([]byte, *BranchDehydrationExportInfo, *os.File) {
+		t.Helper()
+		stream, err := os.CreateTemp(t.TempDir(), "stream-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		files := []*os.File{stream}
+		var metadata *os.File
+		if withMetadata {
+			if metadata, err = os.CreateTemp(t.TempDir(), "metadata-*"); err != nil {
+				t.Fatal(err)
+			}
+			files = append(files, metadata)
+		}
+		info, err := family.ExportDehydration(&BranchDehydrationExportArgs{
+			FilePayload: urpc.FilePayload{Files: files}, ID: "resident",
+		})
+		if err != nil {
+			t.Fatalf("ExportDehydration: %v", err)
+		}
+		data, err := os.ReadFile(stream.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data, info, metadata
+	}
+	first, info, _ := export(false)
+	if len(first) == 0 || len(info.Capture.Memories) == 0 || info.Capture.FilesystemBranch == "" {
+		t.Fatalf("first export: %d stream bytes, capture %+v", len(first), info.Capture)
+	}
+	second, _, metadata := export(true)
+	defer metadata.Close()
+	if string(first) != string(second) {
+		t.Fatalf("a repeated export wrote %d bytes that differ from the first export's %d", len(second), len(first))
+	}
+	if stat, err := metadata.Stat(); err != nil || stat.Size() <= 48 {
+		t.Fatalf("metadata written with the export: stat=%v err=%v", stat, err)
+	}
+	if err := family.Rehydrate("resident"); err != nil {
+		t.Fatalf("Rehydrate after exports: %v", err)
+	}
+	if got := branchStateForTest(family.List(), "resident"); got != BranchPaused {
+		t.Fatalf("state after rehydration=%q, want %q", got, BranchPaused)
+	}
+}
+
+// WaitDefaultExit keeps the Sentry up after its last live branch exits for as
+// long as a branch is dehydrated, because the capture may exist nowhere else.
+// (Its final status comes from a loader init that this test kernel lacks; the
+// daemon-level tests exercise that exit.)
+func TestSandboxFamilyHoldsWhileABranchIsDehydrated(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		family.DestroyNonLoaderBranches()
+		parent.Pause()
+		parent.Release()
+	}()
+	holds := func() bool {
+		family.mu.Lock()
+		defer family.mu.Unlock()
+		return family.holdsDehydrationLocked()
+	}
+	if _, err := family.Fork(&ForkBranchArgs{ID: "held", Paused: true}); err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if holds() {
+		t.Fatal("a family with only live branches held its exit")
+	}
+	if err := family.Dehydrate("held", nil); err != nil {
+		t.Fatalf("Dehydrate: %v", err)
+	}
+	if !holds() {
+		t.Fatal("a family holding a dehydrated branch would exit")
+	}
+	if err := family.Rehydrate("held"); err != nil {
+		t.Fatalf("Rehydrate: %v", err)
+	}
+	if holds() {
+		t.Fatal("a rehydrated branch still held the family's exit")
+	}
+	if err := family.Dehydrate("held", nil); err != nil {
+		t.Fatalf("Dehydrate again: %v", err)
+	}
+	if err := family.Destroy("held"); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if holds() {
+		t.Fatal("a destroyed dehydrated branch still held the family's exit")
 	}
 }
 
@@ -538,6 +818,53 @@ func TestSandboxFamilyInitialBranchIdentity(t *testing.T) {
 	}
 }
 
+func TestSandboxFamilyDestroyReclaimsReleasedFilesystemBranch(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	defer func() {
+		parent.Pause()
+		parent.Release()
+	}()
+
+	var reclaimed []string
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{
+		LiveForkEligible: true,
+		ReclaimFilesystemBranch: func(branch string) error {
+			reclaimed = append(reclaimed, branch)
+			return nil
+		},
+	})
+	child, err := family.Fork(&ForkBranchArgs{ID: "short-lived", Paused: true})
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if err := family.Destroy(child.ID); err != nil {
+		t.Fatalf("Destroy without reclaim: %v", err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("runtime-only destroy reclaimed filesystem branches=%q", reclaimed)
+	}
+	child, err = family.Fork(&ForkBranchArgs{ID: "reclaimed", Paused: true})
+	if err != nil {
+		t.Fatalf("second Fork: %v", err)
+	}
+	if err := family.DestroyAndReclaim(child.ID); err != nil {
+		t.Fatalf("DestroyAndReclaim: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0] != child.FilesystemBranch {
+		t.Fatalf("reclaimed filesystem branches=%q, want [%q]", reclaimed, child.FilesystemBranch)
+	}
+}
+
 func TestDestroyLoaderPrefersLivePeerOverExitedPeer(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -550,7 +877,7 @@ func TestDestroyLoaderPrefersLivePeerOverExitedPeer(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	if _, err := family.Fork(&ForkBranchArgs{ID: "a-exited", Paused: true}); err != nil {
 		t.Fatalf("Fork exited candidate: %v", err)
 	}
@@ -583,7 +910,7 @@ func TestReplaceDefaultKernelBeforeRestoreLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	replacement := &kernel.Kernel{}
 	if err := family.ReplaceDefaultKernel(replacement); err != nil {
 		t.Fatal(err)
@@ -659,6 +986,7 @@ func TestSandboxFamilyForkFailureCleanup(t *testing.T) {
 			injected := errors.New("injected sandbox-family fork failure")
 			failOnce := true
 			family := NewSandboxFamily(parent, SandboxFamilyOptions{
+				LiveForkEligible: true,
 				TestOnlyForkFailureInjector: func(completed SandboxForkStage) error {
 					if failOnce && completed == stage {
 						failOnce = false
@@ -718,7 +1046,7 @@ func TestSandboxFamilyConsoleWaitReadinessAndLifecycleIndependence(t *testing.T)
 		}
 		_ = parent.RemoveInternalConsole(parent.SupervisorContext(), consoleID)
 	}()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	var timeoutResult ConsoleWaitResult
 	if err := family.ConsoleWait(&ConsoleWaitArgs{
@@ -847,7 +1175,7 @@ func TestSandboxFamilyExecLeaseSerializesLifecycle(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	child, err := family.Fork(&ForkBranchArgs{ID: "exec-target"})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)
@@ -947,7 +1275,7 @@ func TestSandboxFamilyPausedManagementControlPreservesPause(t *testing.T) {
 		parent.Release()
 	}()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	childInfo, err := family.Fork(&ForkBranchArgs{ID: "paused-copy", Paused: true})
 	if err != nil {
 		t.Fatalf("Fork: %v", err)
@@ -1003,7 +1331,7 @@ func TestSandboxFamilyBranchLifecycle(t *testing.T) {
 	}
 	parent.Unpause()
 
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	initialBranches := family.List()
 	if len(initialBranches) != 1 || initialBranches[0].State != BranchRunning || parent.IsPaused() {
 		branches := initialBranches
@@ -1143,7 +1471,7 @@ func TestSandboxFamilyForkMany(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	infos, err := family.ForkMany(&ForkBranchesArgs{
 		IDs:    []string{"sibling-a", "sibling-b", "sibling-c"},
@@ -1197,7 +1525,7 @@ func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 		t.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 	// Exclude one-time source-side lazy initialization from the leak baseline.
 	// A retained branch reference would continue growing after this warm-up.
 	if _, err := family.Fork(&ForkBranchArgs{ID: "warm-up", Paused: true}); err != nil {
@@ -1263,6 +1591,66 @@ func TestSandboxFamilyRepeatedBranchTreesDoNotLeakPages(t *testing.T) {
 	parent.Release()
 }
 
+func TestSandboxFamilyQuarantineIsIndependentInheritedBranchState(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	parent.Pause()
+	if err := parent.StartPaused(); err != nil {
+		parent.Release()
+		t.Fatalf("StartPaused: %v", err)
+	}
+	parent.Unpause()
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
+	defer func() {
+		for _, info := range family.List() {
+			if info.ID != DefaultBranchID {
+				_ = family.Destroy(info.ID)
+			}
+		}
+		parent.Pause()
+		parent.Release()
+	}()
+
+	if err := family.SetQuarantine(DefaultBranchID, true); err != nil {
+		t.Fatalf("quarantine source: %v", err)
+	}
+	child, err := family.Fork(&ForkBranchArgs{ID: "child", Paused: true})
+	if err != nil {
+		t.Fatalf("fork quarantined source: %v", err)
+	}
+	if !child.Quarantined {
+		t.Fatalf("child did not inherit quarantine: %+v", child)
+	}
+	if err := family.SetQuarantine("child", false); err != nil {
+		t.Fatalf("unquarantine child: %v", err)
+	}
+	var sourceSeen, childSeen bool
+	for _, info := range family.List() {
+		switch info.ID {
+		case DefaultBranchID:
+			sourceSeen = true
+			if !info.Quarantined {
+				t.Fatal("unquarantining child changed source")
+			}
+		case "child":
+			childSeen = true
+			if info.Quarantined {
+				t.Fatal("child remained quarantined")
+			}
+			if info.State != BranchPaused {
+				t.Fatalf("changing quarantine changed child lifecycle to %s", info.State)
+			}
+		}
+	}
+	if !sourceSeen || !childSeen {
+		t.Fatalf("family branches after quarantine transitions: %+v", family.List())
+	}
+}
+
 func BenchmarkSandboxFamilyFork(b *testing.B) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -1275,7 +1663,7 @@ func BenchmarkSandboxFamilyFork(b *testing.B) {
 		b.Fatalf("StartPaused: %v", err)
 	}
 	parent.Unpause()
-	family := NewSandboxFamily(parent, SandboxFamilyOptions{})
+	family := NewSandboxFamily(parent, SandboxFamilyOptions{LiveForkEligible: true})
 
 	var totals SandboxForkMetrics
 	b.ResetTimer()

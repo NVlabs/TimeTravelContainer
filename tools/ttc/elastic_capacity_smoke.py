@@ -6,6 +6,7 @@ the TTC_CAPACITY_REQUEST_ID environment variable selects provider mode.
 """
 
 import argparse
+import errno
 import json
 import os
 import pathlib
@@ -50,31 +51,6 @@ def provider_main():
     return 75
 
 
-def make_certificates(root):
-    run([
-        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-days", "2", "-subj", "/CN=ttc-capacity-smoke-ca",
-        "-keyout", root / "ca.key", "-out", root / "ca.pem",
-    ])
-    for node in ("node-a", "node-b"):
-        run([
-            "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-            "-subj", f"/CN={node}", "-keyout", root / f"{node}.key",
-            "-out", root / f"{node}.csr",
-        ])
-        extension = root / f"{node}.ext"
-        extension.write_text(
-            f"subjectAltName=DNS:{node},IP:127.0.0.1\n"
-            "extendedKeyUsage=serverAuth,clientAuth\n", encoding="utf-8",
-        )
-        run([
-            "openssl", "x509", "-req", "-days", "2",
-            "-in", root / f"{node}.csr", "-CA", root / "ca.pem",
-            "-CAkey", root / "ca.key", "-CAcreateserial",
-            "-extfile", extension, "-out", root / f"{node}.pem",
-        ])
-
-
 def wait_for(description, predicate, timeout=180):
     deadline = time.monotonic() + timeout
     last = None
@@ -92,14 +68,26 @@ def wait_for(description, predicate, timeout=180):
 def remove_tree(path):
     # Images legitimately contain mode-000 files and non-writable directories.
     # Deletion depends on each parent directory's write bit, not the child's.
-    for current, directories, _files in os.walk(path, topdown=True):
-        if not os.path.islink(current):
-            os.chmod(current, 0o700)
-        for directory in directories:
-            child = os.path.join(current, directory)
-            if not os.path.islink(child):
-                os.chmod(child, 0o700)
-    shutil.rmtree(path)
+    # Network filesystems and asynchronous daemon teardown may report a short
+    # EBUSY/ENOTEMPTY window after the last TTC process exits. Retry removal of
+    # this dedicated test tree, but keep every unexpected or persistent error
+    # visible to the test.
+    deadline = time.monotonic() + 30
+    while path.exists():
+        for current, directories, _files in os.walk(path, topdown=True):
+            if not os.path.islink(current):
+                os.chmod(current, 0o700)
+            for directory in directories:
+                child = os.path.join(current, directory)
+                if not os.path.islink(child):
+                    os.chmod(child, 0o700)
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as error:
+            if error.errno not in (errno.EBUSY, errno.ENOTEMPTY) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
 
 
 def main():
@@ -118,10 +106,18 @@ def main():
         help="shell command to run in the source before forking",
     )
     parser.add_argument(
+        "--workload-command",
+        help="override the long-running source command (default: counter loop)",
+    )
+    parser.add_argument(
         "--verify-command",
         help="shell command to run independently in every migrated branch",
     )
     parser.add_argument("--command-timeout", type=int, default=600)
+    parser.add_argument(
+        "--cluster-lease", default="3s",
+        help="cluster membership lease (increase when throttling shared storage)",
+    )
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--preserve-on-failure", action="store_true",
@@ -142,41 +138,34 @@ def main():
     runtime_b = root / "runtime-b"
     for path in (data, runtime_a, runtime_b):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    make_certificates(root)
     provider = pathlib.Path(__file__).resolve()
     provider.chmod(0o755)
 
     def env(runtime):
         result = os.environ.copy()
         result.update({
-            "TTC_DATA_ROOT": str(data),
-            "TTC_RUNTIME_DIR": str(runtime),
+            "TTC_ROOT": str(data),
+            "TTC_LOCAL_ROOT": str(runtime / "data"),
+            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
             "TTC_CAPACITY_TEST_ROOT": str(root),
         })
+        result.pop("TTC_DATA_ROOT", None)
+        result.pop("TTC_RUNTIME_DIR", None)
         return result
 
     def ttc(runtime, *argv, check=True, timeout=180):
         return run([args.ttc, *argv], env=env(runtime), check=check, timeout=timeout)
 
-    common = [
-        "--unsafe-no-host-isolation", "--allow-slow-volume-copy",
-        "--cluster-repository-id", "capacity-smoke",
-        "--cluster-ca", root / "ca.pem",
-        "--cluster-page-listen", "127.0.0.1:0",
-        "--cluster-page-advertise", "127.0.0.1:0",
-        "--cluster-lease", "3s",
-    ]
+    common = ["--unsafe-no-host-isolation", "--cluster-lease", args.cluster_lease]
     started_a = False
     started_b = False
     succeeded = False
     began = time.monotonic()
     try:
-        ttc(runtime_a, "daemon", "start", *common,
-            "--cluster-listen", "127.0.0.1:28443",
-            "--cluster-advertise", "https://127.0.0.1:28443,node-a",
-            "--cluster-node-id", "node-a",
-            "--cluster-cert", root / "node-a.pem", "--cluster-key", root / "node-a.key",
-            "--cluster-memory-target", "512GiB",
+        ttc(runtime_a, "daemon", "start", "--cluster-init", *common,
+            "--listen", "127.0.0.1:28443",
+            "--advertise", "127.0.0.1:28443", "--node", "node-a",
+            "--memory-target", "512GiB",
             "--cluster-capacity-command", provider)
         started_a = True
         run_args = ["run", "-d", "--name", "capacity-smoke"]
@@ -184,10 +173,10 @@ def main():
             run_args.append("--network=ttc")
         if args.nat:
             run_args.append("--nat")
-        run_args.extend([
-            args.image, "sh", "-c",
-            "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done",
-        ])
+        workload = args.workload_command or (
+            "i=0; while :; do i=$((i+1)); echo $i > /tmp/counter; sleep 0.05; done"
+        )
+        run_args.extend([args.image, "sh", "-c", workload])
         ttc(runtime_a, *run_args, timeout=args.command_timeout)
         prepare_seconds = None
         if args.prepare_command:
@@ -197,7 +186,7 @@ def main():
             prepare_seconds = round(time.monotonic() - prepare_began, 3)
         ttc(runtime_a, "fork", "capacity-smoke@main", "child")
 
-        drain = ttc(runtime_a, "node", "drain", "node-a", check=False)
+        drain = ttc(runtime_a, "node", "stop", "node-a", "--migrate-all", check=False)
         if drain.returncode == 0 or "capacity request" not in drain.stderr:
             raise RuntimeError(f"initial drain did not request capacity: {drain}")
 
@@ -206,34 +195,31 @@ def main():
             lambda: json.loads((root / "provider-accepted.json").read_text(encoding="utf-8")),
             timeout=30,
         )
-        ttc(runtime_b, "daemon", "start", *common,
-            "--cluster-listen", "127.0.0.1:38443",
-            "--cluster-advertise", "https://127.0.0.1:38443,node-b",
-            "--cluster-node-id", "node-b",
-            "--cluster-cert", root / "node-b.pem", "--cluster-key", root / "node-b.key",
-            "--cluster-memory-target", "2TiB",
+        ttc(runtime_b, "daemon", "start", "--cluster-join", "127.0.0.1:28443", *common,
+            "--listen", "127.0.0.1:38443",
+            "--advertise", "127.0.0.1:38443", "--node", "node-b",
+            "--memory-target", "2TiB",
             "--cluster-capacity-command", provider)
         started_b = True
 
         request_path = data / "cluster" / "capacity-requests" / "node-a.json"
         wait_for("membership-confirmed outbox consumption", lambda: not request_path.exists())
-        intent_path = data / "cluster" / "drains" / "node-a.json"
-        wait_for(
-            "automatic drain completion",
-            lambda: json.loads(intent_path.read_text(encoding="utf-8")).get("state") == "complete",
-        )
-        inspected = json.loads(ttc(runtime_a, "inspect", "capacity-smoke").stdout)[0]
+        wait_for("automatic drain and daemon stop",
+                 lambda: not (runtime_a / "run" / "ttcd.sock").exists(),
+                 timeout=args.command_timeout)
+        started_a = False
+        inspected = json.loads(ttc(runtime_b, "inspect", "capacity-smoke").stdout)[0]
         branches = inspected["TTC"]["container"]["branches"]
         if {branch["id"]: branch.get("node_id") for branch in branches} != {"main": "node-b", "child": "node-b"}:
             raise RuntimeError(f"unexpected placements after drain: {branches!r}")
         verification_seconds = {}
         for branch in ("main", "child"):
-            counter = ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "cat", "/tmp/counter").stdout.strip()
+            counter = ttc(runtime_b, "exec", f"capacity-smoke@{branch}", "cat", "/tmp/counter").stdout.strip()
             if not counter.isdigit() or int(counter) <= 0:
                 raise RuntimeError(f"branch {branch} counter did not survive: {counter!r}")
             if args.verify_command:
                 verify_began = time.monotonic()
-                ttc(runtime_a, "exec", f"capacity-smoke@{branch}", "sh", "-lc",
+                ttc(runtime_b, "exec", f"capacity-smoke@{branch}", "sh", "-lc",
                     args.verify_command, timeout=args.command_timeout)
                 verification_seconds[branch] = round(time.monotonic() - verify_began, 3)
         calls = [json.loads(line) for line in (root / "provider-calls.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -252,35 +238,45 @@ def main():
         if verification_seconds:
             result["verification_seconds"] = verification_seconds
         print(json.dumps(result, indent=2, sort_keys=True))
-        ttc(runtime_a, "rm", "-f", "capacity-smoke")
+        ttc(runtime_b, "rm", "-f", "capacity-smoke", timeout=args.command_timeout)
         succeeded = True
     finally:
         if args.preserve_on_failure and not succeeded:
             print(f"preserved failed qualification at {root}", file=sys.stderr)
-        else:
-            if started_a:
-                # Remove image-owned mapped-UID trees while the daemon can still
-                # enter its extraction namespace. A plain host rmtree may not own
-                # those inodes, even in unsafe-no-host-isolation test mode.
-                ttc(runtime_a, "rm", "-f", "capacity-smoke", check=False, timeout=30)
-                ttc(runtime_a, "rmi", "--force", args.image, check=False, timeout=30)
-            if started_b:
-                ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=30)
-            if started_a:
-                ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=30)
-            if not args.keep:
-                # The stop response precedes the serving goroutine's final durable
-                # intent cleanup by a small interval. Wait for both sockets to
-                # disappear so that cleanup cannot recreate the test root.
-                wait_for(
-                    "daemon shutdown",
-                    lambda: not (runtime_a / "ttcd.sock").exists() and not (runtime_b / "ttcd.sock").exists(),
-                    timeout=30,
-                )
-                time.sleep(1)
-                remove_tree(root)
-                if args.data_dir is not None and data.exists():
-                    remove_tree(data)
+            # Preserve the environment without suppressing the exception that
+            # explains why qualification failed.
+            started_a = False
+            started_b = False
+            args.keep = True
+        # On failure, retain shared family metadata until both physical owners
+        # have stopped their local branches. Removing it first strands
+        # unaddressable Sentries and turns cleanup failure into misleading
+        # migration failure. Source shutdown runs first so it can settle any
+        # dependency still served to B.
+        if started_b and succeeded:
+            # Remove image-owned mapped-UID trees while a daemon can still
+            # enter its extraction namespace. A plain host rmtree may not own
+            # those inodes, even in unsafe-no-host-isolation test mode.
+            # The family itself was already removed by its owner above.
+            ttc(runtime_b, "rmi", "--force", args.image, check=False, timeout=args.command_timeout)
+        if started_a:
+            ttc(runtime_a, "daemon", "stop", "--stop-all", check=False, timeout=args.command_timeout)
+        if started_b:
+            ttc(runtime_b, "daemon", "stop", "--stop-all", check=False, timeout=args.command_timeout)
+        if not args.keep:
+            # The stop response precedes the serving goroutine's final durable
+            # intent cleanup by a small interval. Wait for both sockets to
+            # disappear so that cleanup cannot recreate the test root.
+            wait_for(
+                "daemon shutdown",
+                lambda: not (runtime_a / "run" / "ttcd.sock").exists()
+                and not (runtime_b / "run" / "ttcd.sock").exists(),
+                timeout=args.command_timeout,
+            )
+            time.sleep(1)
+            remove_tree(root)
+            if args.data_dir is not None and data.exists():
+                remove_tree(data)
 
 
 if __name__ == "__main__":

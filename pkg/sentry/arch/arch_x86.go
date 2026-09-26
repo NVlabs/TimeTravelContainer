@@ -147,8 +147,9 @@ func (s State) Proto() *rpb.Registers {
 // Fork creates and returns an identical copy of the state.
 func (s *State) Fork() State {
 	return State{
-		Regs:    s.Regs,
-		fpState: s.fpState.Fork(),
+		Regs:          s.Regs,
+		fpState:       s.fpState.Fork(),
+		fpStateLayout: s.fpStateLayout,
 	}
 }
 
@@ -215,33 +216,12 @@ func (s *State) PtraceGetRegs(dst io.Writer) (int, error) {
 }
 
 func (s *State) ptraceGetRegs() Registers {
-	regs := s.Regs
-	// As an optimization, Linux <4.7 implements 32-bit fs_base/gs_base
-	// addresses using reserved descriptors in the GDT instead of the MSRs,
-	// with selector values FS_TLS_SEL and GS_TLS_SEL respectively. These
-	// values are actually visible in struct user_regs_struct::fs/gs;
-	// arch/x86/kernel/ptrace.c:getreg() doesn't attempt to sanitize struct
-	// thread_struct::fsindex/gsindex.
-	//
-	// We always use fs == gs == 0 when fs_base/gs_base is in use, for
-	// simplicity.
-	//
-	// Luckily, Linux <4.7 silently ignores setting fs/gs to 0 via
-	// arch/x86/kernel/ptrace.c:set_segment_reg() when fs_base/gs_base is a
-	// 32-bit value and fsindex/gsindex indicates that this optimization is
-	// in use, as well as the reverse case of setting fs/gs to
-	// FS/GS_TLS_SEL when fs_base/gs_base is a 64-bit value. (We do the
-	// same in PtraceSetRegs.)
-	//
-	// TODO(gvisor.dev/issue/168): Remove this fixup since newer Linux
-	// doesn't have this behavior anymore.
-	if regs.Fs == 0 && regs.Fs_base <= 0xffffffff {
-		regs.Fs = _FS_TLS_SEL
-	}
-	if regs.Gs == 0 && regs.Gs_base <= 0xffffffff {
-		regs.Gs = _GS_TLS_SEL
-	}
-	return regs
+	// Modern Linux exposes the actual segment selectors. In particular, it
+	// does not synthesize the reserved TLS selectors used by Linux before 4.7
+	// for a zero selector and a 32-bit base. Synthesizing such a selector is
+	// also unsafe for nested runtimes: the returned selector may not name a
+	// descriptor installed for the traced thread, so restoring it faults.
+	return s.Regs
 }
 
 var ptraceRegistersSize = (*linux.PtraceRegs)(nil).SizeBytes()
@@ -397,8 +377,9 @@ func New(arch Arch) *Context64 {
 	switch arch {
 	case AMD64:
 		return &Context64{
-			State{
-				fpState: fpu.NewState(),
+			State: State{
+				fpState:       fpu.NewState(),
+				fpStateLayout: fpu.HostXstateLayout(),
 				// Set initial registers for compatibility with Linux
 				// (as done in arch/x86/kernel/process_64.c:start_thread()).
 				Regs: Registers{

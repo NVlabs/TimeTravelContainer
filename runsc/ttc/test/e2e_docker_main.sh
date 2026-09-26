@@ -33,7 +33,9 @@ fail() {
 [ -x "$RUNSC" ] || fail "RUNSC is not executable: $RUNSC"
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 
-RUNTIME_COPY=$(mktemp "${TMPDIR:-/tmp}/ttc-runsc.XXXXXX")
+# ttcd selects its embedded runsc entry point from argv[0]. Preserve a
+# runsc-prefixed basename when the release ttcd binary is supplied here.
+RUNTIME_COPY=$(mktemp "${TMPDIR:-/tmp}/runsc-ttc.XXXXXX")
 cleanup() {
   docker rm --force "$TEST_NAME" >/dev/null 2>&1 || true
   rm -f "$RUNTIME_COPY"

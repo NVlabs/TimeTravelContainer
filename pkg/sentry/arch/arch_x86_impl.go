@@ -34,6 +34,9 @@ type State struct {
 
 	// Our floating point state.
 	fpState fpu.State `state:"wait"`
+
+	// The physical XSAVE layout used by fpState.
+	fpStateLayout fpu.XstateLayout
 }
 
 // afterLoad is invoked by stateify.

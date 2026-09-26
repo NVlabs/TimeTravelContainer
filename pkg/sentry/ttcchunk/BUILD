@@ -7,32 +7,23 @@ package(
 
 go_library(
     name = "ttcchunk",
-     srcs = [
-        "consumption.go",
-        "consumption_tracker.go",
-        "assemble.go",
+    srcs = [
         "chunk.go",
-        "donated.go",
-        "host_ops_darwin.go",
-        "host_ops_linux.go",
+        "graph.go",
+        "graph_stream.go",
         "install.go",
-        "lifecycle.go",
         "manifest.go",
         "packed_reader.go",
-        "repository.go",
-        "store.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "@org_golang_x_sys//unix",
         "//pkg/hostarch",
-        "//pkg/log",
         "//pkg/sentry/checkpoint",
-        "//pkg/safemem",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/usage",
+        "//pkg/ttcsnapshot",
     ],
 )
 
@@ -43,8 +34,8 @@ go_test(
     library = ":ttcchunk",
     deps = [
         "//pkg/hostarch",
-        "//pkg/sentry/checkpoint",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
+        "//pkg/ttcsnapshot",
     ],
 )

@@ -2195,6 +2195,16 @@ func (s *Sandbox) ServeDistributedForkConnection(args *boot.DistributedForkServe
 	return nil
 }
 
+// ServeDistributedFilesystemConnection donates one accepted TTC filesystem
+// stream to the Sentry that owns the source repository and any upstream
+// resolvers needed for multihop service.
+func (s *Sandbox) ServeDistributedFilesystemConnection(args *boot.DistributedForkServeArgs) error {
+	if err := s.call(boot.ContMgrServeDistributedFilesystemConnection, args, nil); err != nil {
+		return fmt.Errorf("serving distributed filesystem session %q: %w", args.SessionID, err)
+	}
+	return nil
+}
+
 // ExportDistributedForkSnapshot persists a distributed session's page stream.
 func (s *Sandbox) ExportDistributedForkSnapshot(args *boot.DistributedForkExportArgs) (*boot.DistributedForkExportInfo, error) {
 	var info boot.DistributedForkExportInfo
@@ -2210,6 +2220,17 @@ func (s *Sandbox) DistributedForkDependencyStatus(branchID string) (pgalloc.Asyn
 	err := s.call(boot.ContMgrDistributedForkDependencyStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID}, &status)
 	if err != nil {
 		return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("reading distributed fork dependency for branch %q: %w", branchID, err)
+	}
+	return status, nil
+}
+
+// PageLoadStatus reports all target-side asynchronous page readers, including
+// readers whose backing is durable and has no source-node dependency.
+func (s *Sandbox) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	var status pgalloc.AsyncPagesFileLoadStats
+	err := s.call(boot.ContMgrDistributedForkDependencyStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID, IncludeDurable: true}, &status)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, fmt.Errorf("reading page-load status for branch %q: %w", branchID, err)
 	}
 	return status, nil
 }
@@ -2231,12 +2252,40 @@ func (s *Sandbox) DrainDistributedForkMemory(branchID string) error {
 	return nil
 }
 
+// DrainDistributedForkFilesystems eagerly loads remote filesystem objects
+// without changing sparse-memory residency.
+func (s *Sandbox) DrainDistributedForkFilesystems(branchID string) error {
+	if err := s.call(boot.ContMgrDrainDistributedForkFilesystems, &boot.DistributedForkDependencyArgs{BranchID: branchID}, nil); err != nil {
+		return fmt.Errorf("draining distributed fork filesystems for branch %q: %w", branchID, err)
+	}
+	return nil
+}
+
+// DistributedForkFilesystemDrainStatus reports asynchronous filesystem
+// materialization progress.
+func (s *Sandbox) DistributedForkFilesystemDrainStatus(branchID string) (boot.DistributedForkFilesystemDrainStatus, error) {
+	var status boot.DistributedForkFilesystemDrainStatus
+	if err := s.call(boot.ContMgrDistributedForkFilesystemDrainStatus, &boot.DistributedForkDependencyArgs{BranchID: branchID}, &status); err != nil {
+		return boot.DistributedForkFilesystemDrainStatus{}, fmt.Errorf("reading distributed filesystem drain status for branch %q: %w", branchID, err)
+	}
+	return status, nil
+}
+
 // HandoffDistributedForkMemory replaces a live source with a sparse manifest.
 func (s *Sandbox) HandoffDistributedForkMemory(args *boot.DistributedForkHandoffArgs) error {
 	if err := s.call(boot.ContMgrHandoffDistributedForkMemory, args, nil); err != nil {
 		return fmt.Errorf("handing off distributed fork memory for branch %q: %w", args.BranchID, err)
 	}
 	return nil
+}
+
+// DistributedForkMemoryHandoffStatus reports asynchronous reader-switch progress.
+func (s *Sandbox) DistributedForkMemoryHandoffStatus(branchID string) (boot.DistributedForkHandoffStatus, error) {
+	var status boot.DistributedForkHandoffStatus
+	if err := s.call(boot.ContMgrDistributedForkMemoryHandoffStatus, &boot.BranchArgs{ID: branchID}, &status); err != nil {
+		return boot.DistributedForkHandoffStatus{}, fmt.Errorf("reading distributed graph handoff for branch %q: %w", branchID, err)
+	}
+	return status, nil
 }
 
 // DistributedForkSessionStatus returns remote-memory transfer progress.
@@ -2315,6 +2364,32 @@ func (s *Sandbox) ResumeBranch(id string) error {
 	return nil
 }
 
+// SnapshotFilesystemBranch snapshots one persistent resource in a branch.
+func (s *Sandbox) SnapshotFilesystemBranch(args *boot.FilesystemBranchSnapshotArgs) error {
+	if err := s.call(boot.ContMgrSnapshotFilesystemBranch, args, nil); err != nil {
+		return fmt.Errorf("snapshotting filesystem resource %q from branch %q: %w", args.ResourceID, args.BranchID, err)
+	}
+	return nil
+}
+
+// PublishBranchFilesystemMetadata publishes completed TTC filesystem metadata
+// for manager-side observations such as diff and resource accounting.
+func (s *Sandbox) PublishBranchFilesystemMetadata(id string) error {
+	if err := s.call(boot.ContMgrPublishBranchFilesystemMetadata, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("publishing filesystem metadata for branch %q: %w", id, err)
+	}
+	return nil
+}
+
+// SetBranchQuarantine changes one branch's external-connectivity bit.
+func (s *Sandbox) SetBranchQuarantine(id string, enabled bool) error {
+	args := boot.BranchQuarantineArgs{ID: id, Enabled: enabled}
+	if err := s.call(boot.ContMgrSetBranchQuarantine, &args, nil); err != nil {
+		return fmt.Errorf("setting branch %q quarantine to %t: %w", id, enabled, err)
+	}
+	return nil
+}
+
 // DehydrateBranch hibernates one branch.
 func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.BranchDehydrateInfo, error) {
 	args := &boot.BranchDehydrateArgs{ID: id}
@@ -2328,7 +2403,7 @@ func (s *Sandbox) DehydrateBranch(id string, metadataFile *os.File) (*boot.Branc
 	return &info, nil
 }
 
-// ExportDehydratedBranch persists packed streams or a sparse memory root.
+// ExportDehydratedBranch streams one graph-native immutable memory capture.
 func (s *Sandbox) ExportDehydratedBranch(args *boot.BranchDehydrationExportArgs) (*boot.BranchDehydrationExportInfo, error) {
 	var info boot.BranchDehydrationExportInfo
 	if err := s.call(boot.ContMgrExportDehydratedBranch, args, &info); err != nil {
@@ -2353,8 +2428,17 @@ func (s *Sandbox) DestroyBranch(id string) error {
 	return nil
 }
 
-// PrepareStopBranch moves legacy loader bookkeeping away from a branch before
-// its init process is terminated.
+// DestroyBranchAndReclaim destroys one in-memory branch and releases its
+// persistent filesystem roots after its Kernel references are gone.
+func (s *Sandbox) DestroyBranchAndReclaim(id string) error {
+	if err := s.call(boot.ContMgrDestroyBranchAndReclaim, &boot.BranchArgs{ID: id}, nil); err != nil {
+		return fmt.Errorf("destroying and reclaiming live branch %q: %w", id, err)
+	}
+	return nil
+}
+
+// PrepareStopBranch moves process-local Loader bookkeeping away from a branch
+// before its init process is terminated.
 func (s *Sandbox) PrepareStopBranch(id string) error {
 	if err := s.call(boot.ContMgrPrepareStopBranch, &boot.BranchArgs{ID: id}, nil); err != nil {
 		return fmt.Errorf("preparing live branch %q for stop: %w", id, err)
@@ -2444,13 +2528,13 @@ func (s *Sandbox) SignalExecSession(args *boot.ExecSessionArgs) error {
 	return nil
 }
 
-// FollowConsole streams framed init output and waits for init to exit.
-func (s *Sandbox) FollowConsole(args *boot.ConsoleFollowArgs) (uint32, error) {
-	var waitStatus uint32
-	if err := s.call(boot.ContMgrConsoleFollow, args, &waitStatus); err != nil {
-		return 0, fmt.Errorf("following internal console %q in live branch %q: %w", args.ConsoleID, args.BranchID, err)
+// PushConsole has the Sentry push a process's console to the file args
+// carries, in the background, once it holds the Kernel's lifetime.
+func (s *Sandbox) PushConsole(args *boot.ConsolePushArgs) error {
+	if err := s.call(boot.ContMgrConsolePush, args, nil); err != nil {
+		return fmt.Errorf("pushing internal console %q of live branch %q: %w", args.ConsoleID, args.BranchID, err)
 	}
-	return waitStatus, nil
+	return nil
 }
 
 // ReadConsole performs one nonblocking branch-local internal-console read.

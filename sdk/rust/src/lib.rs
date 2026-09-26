@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
-pub const API_VERSION: u32 = 4;
+pub const API_VERSION: u32 = 9;
 const MAX_FRAME: usize = 1 << 20;
 const STDIN_WINDOW: usize = 1 << 20;
 
@@ -361,8 +361,8 @@ fn settle_stream(
 
 /// Returns ttcd's default per-user socket path.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = env::var_os("TTC_RUNTIME_DIR") {
-        return PathBuf::from(path).join("ttcd.sock");
+    if let Some(path) = env::var_os("TTC_SOCKET") {
+        return PathBuf::from(path);
     }
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("ttc").join("ttcd.sock");
@@ -461,8 +461,9 @@ impl Client {
         checked_json(self.command(["ls", "--json"])?)
     }
 
-    pub fn inspect(&self, target: &str) -> Result<Value, Error> {
-        checked_json(self.command(["inspect", target])?)
+    /// Inspects a container family; branch details are included in TTC.branches.
+    pub fn inspect(&self, container: &str) -> Result<Value, Error> {
+        checked_json(self.command(["inspect", container])?)
     }
 
     pub fn pull(&self, image: &str) -> Result<CommandResult, Error> {
@@ -475,15 +476,32 @@ impl Client {
         command: &[&str],
         options: &[&str],
     ) -> Result<CommandResult, Error> {
-        let mut args = vec!["run"];
-        args.extend_from_slice(options);
-        args.push(image);
-        args.extend_from_slice(command);
+        self.run_on(image, command, options, None)
+    }
+
+    pub fn run_on(
+        &self,
+        image: &str,
+        command: &[&str],
+        options: &[&str],
+        node: Option<&str>,
+    ) -> Result<CommandResult, Error> {
+        let mut args = vec!["run".to_owned()];
+        if let Some(node) = node {
+            args.extend(["--node".to_owned(), node.to_owned()]);
+        }
+        args.extend(options.iter().map(|value| (*value).to_owned()));
+        args.push(image.to_owned());
+        args.extend(command.iter().map(|value| (*value).to_owned()));
         self.command(args)
     }
 
     pub fn start(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["start", target])
+    }
+
+    pub fn start_on(&self, target: &str, node: &str) -> Result<CommandResult, Error> {
+        self.command(["start", "--node", node, target])
     }
 
     pub fn exec(&self, target: &str, command: &[&str]) -> Result<CommandResult, Error> {
@@ -594,11 +612,7 @@ impl Client {
         )
     }
 
-    pub fn save(
-        &self,
-        images: &[&str],
-        options: ImageSaveOptions,
-    ) -> Result<CommandResult, Error> {
+    pub fn save(&self, images: &[&str], options: ImageSaveOptions) -> Result<CommandResult, Error> {
         if images.is_empty() {
             return Err(Error::InvalidArguments(
                 "image save requires at least one image".to_owned(),
@@ -646,7 +660,7 @@ impl Client {
         source: &str,
         destinations: &[&str],
         paused: bool,
-        target_node: Option<&str>,
+        node: Option<&str>,
     ) -> Result<CommandResult, Error> {
         if destinations.is_empty() {
             return Err(Error::InvalidArguments(
@@ -657,9 +671,9 @@ impl Client {
         if paused {
             args.push("--paused".to_owned());
         }
-        if let Some(target_node) = target_node {
-            args.push("--target".to_owned());
-            args.push(target_node.to_owned());
+        if let Some(node) = node {
+            args.push("--node".to_owned());
+            args.push(node.to_owned());
         }
         args.push(source.to_owned());
         args.extend(
@@ -671,8 +685,8 @@ impl Client {
     }
 
     /// Moves a branch to another elastic-cluster node without changing its identity.
-    pub fn migrate(&self, target: &str, target_node: &str) -> Result<CommandResult, Error> {
-        self.command(["migrate", "--target", target_node, target])
+    pub fn migrate(&self, target: &str, node: &str) -> Result<CommandResult, Error> {
+        self.command(["migrate", "--node", node, target])
     }
 
     /// Returns the current dynamic cluster membership and memory accounting.
@@ -681,14 +695,15 @@ impl Client {
         checked_json(result)
     }
 
-    pub fn drain_node(
-        &self,
-        node: &str,
-        target_node: Option<&str>,
-    ) -> Result<CommandResult, Error> {
-        let mut args = vec!["node".to_owned(), "drain".to_owned()];
-        if let Some(target_node) = target_node {
-            args.extend(["--target".to_owned(), target_node.to_owned()]);
+    pub fn stop_node(&self, node: &str, policy: Option<&str>) -> Result<CommandResult, Error> {
+        let mut args = vec!["node".to_owned(), "stop".to_owned()];
+        if let Some(policy) = policy {
+            if policy != "stop" && policy != "dehydrate" && policy != "migrate" {
+                return Err(Error::InvalidArguments(
+                    "node stop policy must be stop, dehydrate, or migrate".to_owned(),
+                ));
+            }
+            args.push(format!("--{policy}-all"));
         }
         args.push(node.to_owned());
         self.command(args)
@@ -697,11 +712,11 @@ impl Client {
     pub fn rebalance_node(
         &self,
         node: &str,
-        target_node: Option<&str>,
+        destination_node: Option<&str>,
     ) -> Result<serde_json::Value, Error> {
         let mut args = vec!["node".to_owned(), "rebalance".to_owned()];
-        if let Some(target_node) = target_node {
-            args.extend(["--target".to_owned(), target_node.to_owned()]);
+        if let Some(destination_node) = destination_node {
+            args.extend(["--node".to_owned(), destination_node.to_owned()]);
         }
         args.push(node.to_owned());
         checked_json(self.command(args)?)
@@ -715,12 +730,24 @@ impl Client {
         self.command(["resume", target])
     }
 
+    pub fn quarantine(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["quarantine", target])
+    }
+
+    pub fn unquarantine(&self, target: &str) -> Result<CommandResult, Error> {
+        self.command(["unquarantine", target])
+    }
+
     pub fn dehydrate(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["dehydrate", target])
     }
 
     pub fn rehydrate(&self, target: &str) -> Result<CommandResult, Error> {
         self.command(["rehydrate", target])
+    }
+
+    pub fn rehydrate_on(&self, target: &str, node: &str) -> Result<CommandResult, Error> {
+        self.command(["rehydrate", "--node", node, target])
     }
 
     pub fn checkpoint(
@@ -746,6 +773,21 @@ impl Client {
     ) -> Result<CommandResult, Error> {
         let file = absolute_path(file.as_ref())?;
         let mut args = vec!["restore".to_owned()];
+        if let Some(name) = name {
+            args.extend(["--name".to_owned(), name.to_owned()]);
+        }
+        args.push(file.to_string_lossy().into_owned());
+        self.command(args)
+    }
+
+    pub fn restore_on(
+        &self,
+        file: impl AsRef<Path>,
+        name: Option<&str>,
+        node: &str,
+    ) -> Result<CommandResult, Error> {
+        let file = absolute_path(file.as_ref())?;
+        let mut args = vec!["restore".to_owned(), "--node".to_owned(), node.to_owned()];
         if let Some(name) = name {
             args.extend(["--name".to_owned(), name.to_owned()]);
         }
@@ -783,7 +825,16 @@ impl Client {
     }
 
     pub fn wait(&self, target: &str) -> Result<CommandResult, Error> {
-        self.command(["wait", target])
+        self.wait_for(target, "not-running")
+    }
+
+    pub fn wait_for(&self, target: &str, condition: &str) -> Result<CommandResult, Error> {
+        if condition != "not-running" && condition != "durable" {
+            return Err(Error::InvalidArguments(
+                "condition must be 'not-running' or 'durable'".to_owned(),
+            ));
+        }
+        self.command(["wait", "--condition", condition, target])
     }
 
     pub fn remove(&self, target: &str, force: bool) -> Result<CommandResult, Error> {
@@ -1193,7 +1244,7 @@ mod tests {
         let path = temporary_socket("ping");
         let server = mock_server(&path, |mut stream, request| {
             assert_eq!(request, json!({"version": API_VERSION, "action": "ping"}));
-            write_frame(&mut stream, b'O', br#"{"version":4}"#).unwrap();
+            write_frame(&mut stream, b'O', br#"{"version":9}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
         assert_eq!(Client::new(&path).ping().unwrap()["version"], API_VERSION);
@@ -1216,6 +1267,24 @@ mod tests {
             result.stdout,
             b"{\"version\":1,\"output_bytes\":4}\n{\"version\":1,\"output_bytes\":9}\n"
         );
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn durable_wait_uses_current_cli_shape() {
+        let path = temporary_socket("durable-wait");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["wait", "--condition", "durable", "demo@main"])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        assert!(Client::new(&path)
+            .wait_for("demo@main", "durable")
+            .unwrap()
+            .ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1384,7 +1453,7 @@ mod tests {
                 json!([
                     "fork",
                     "--paused",
-                    "--target",
+                    "--node",
                     "node-b",
                     "demo@main",
                     "remote@one",
@@ -1412,11 +1481,29 @@ mod tests {
         let server = mock_server(&path, |mut stream, request| {
             assert_eq!(
                 request["args"],
-                json!(["migrate", "--target", "node-b", "demo@main"])
+                json!(["migrate", "--node", "node-b", "demo@main"])
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
         let result = Client::new(&path).migrate("demo@main", "node-b").unwrap();
+        assert!(result.ok());
+        server.join().unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn elastic_node_stop_uses_current_cli_shape() {
+        let path = temporary_socket("node-stop");
+        let server = mock_server(&path, |mut stream, request| {
+            assert_eq!(
+                request["args"],
+                json!(["node", "stop", "--migrate-all", "node-a"])
+            );
+            write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
+        });
+        let result = Client::new(&path)
+            .stop_node("node-a", Some("migrate"))
+            .unwrap();
         assert!(result.ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -1500,7 +1587,13 @@ mod tests {
         let server = mock_server(&path, |mut stream, request| {
             assert_eq!(
                 request["args"],
-                json!(["save", "--output", "/srv/images.tar", "one:latest", "two:test"])
+                json!([
+                    "save",
+                    "--output",
+                    "/srv/images.tar",
+                    "one:latest",
+                    "two:test"
+                ])
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });

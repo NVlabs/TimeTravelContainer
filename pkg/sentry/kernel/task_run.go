@@ -303,6 +303,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 			if sig == linux.SIGSEGV && err == linuxerr.EPERM {
 				info.Code = 2 // SEGV_ACCERR
 			}
+			t.Arch().SetSignalFault(addr, at)
 
 			if sig == linux.SIGSEGV && t.tg.sigsegvLockCount.Load() != 0 {
 				t.tg.signalHandlers.mu.Lock()

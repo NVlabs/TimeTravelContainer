@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -48,7 +49,9 @@ var nodeTransitions = map[NodeState]map[NodeState]bool{
 	NodeJoining:   {NodeReady: true, NodeDraining: true, NodeOffline: true},
 	NodeReady:     {NodePressured: true, NodeDraining: true, NodeOffline: true},
 	NodePressured: {NodeReady: true, NodeDraining: true, NodeOffline: true},
-	NodeDraining:  {NodeOffline: true},
+	// A drain may be canceled before it creates a durable evacuation intent,
+	// for example when daemon stop discovers active branches without a policy.
+	NodeDraining: {NodeReady: true, NodePressured: true, NodeOffline: true},
 }
 
 // NodeRecord is the shared discovery record for one ttcd incarnation.
@@ -59,6 +62,7 @@ type NodeRecord struct {
 	State                 NodeState                      `json:"state"`
 	ControlURL            string                         `json:"control_url"`
 	ControlServerName     string                         `json:"control_server_name"`
+	RaftAddress           string                         `json:"raft_address,omitempty"`
 	Capabilities          Capabilities                   `json:"capabilities"`
 	MemoryTargetBytes     uint64                         `json:"memory_target_bytes,omitempty"`
 	MemoryCurrentBytes    uint64                         `json:"memory_current_bytes,omitempty"`
@@ -69,6 +73,10 @@ type NodeRecord struct {
 	StartedAt             time.Time                      `json:"started_at"`
 	UpdatedAt             time.Time                      `json:"updated_at"`
 	LeaseExpiresAt        time.Time                      `json:"lease_expires_at"`
+	LeaseDuration         time.Duration                  `json:"lease_duration,omitempty"`
+	// LeaseTerm proves that this incarnation renewed with the current Raft
+	// leader. A prior-term wall-clock deadline alone never authorizes work.
+	LeaseTerm uint64 `json:"lease_term,omitempty"`
 }
 
 // IncomingReservation fences capacity promised to one placement operation.
@@ -119,13 +127,22 @@ func (r NodeRecord) Validate() error {
 		return fmt.Errorf("capability node %q does not match record node %q", r.Capabilities.NodeID, r.NodeID)
 	}
 	parsed, err := url.Parse(r.ControlURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("invalid node control URL %q", r.ControlURL)
 	}
-	if strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName {
+	if parsed.Scheme == "https" && (strings.TrimSpace(r.ControlServerName) == "" || strings.TrimSpace(r.ControlServerName) != r.ControlServerName) {
 		return fmt.Errorf("invalid control TLS server name %q", r.ControlServerName)
 	}
-	if r.Revision == 0 || r.StartedAt.IsZero() || r.UpdatedAt.Before(r.StartedAt) || r.LeaseExpiresAt.Before(r.UpdatedAt) {
+	if r.RaftAddress != "" {
+		if strings.Contains(r.RaftAddress, "@") {
+			if _, _, err := parseRaftAddress(r.RaftAddress); err != nil {
+				return fmt.Errorf("invalid node Raft address: %w", err)
+			}
+		} else if _, _, err := net.SplitHostPort(r.RaftAddress); err != nil {
+			return fmt.Errorf("invalid node Raft address: %w", err)
+		}
+	}
+	if r.Revision == 0 || r.LeaseDuration <= 0 || r.StartedAt.IsZero() || r.UpdatedAt.Before(r.StartedAt) || r.LeaseExpiresAt.Before(r.UpdatedAt) {
 		return errors.New("invalid node revision or lease timestamps")
 	}
 	if len(r.Labels) > 64 {
@@ -160,6 +177,29 @@ func (r NodeRecord) Validate() error {
 type NodeDirectory struct {
 	dir string
 }
+
+// NodeCatalog is the linearizable membership and capacity authority consumed
+// by elastic placement. Clustered TTC uses the Raft implementation;
+// NodeDirectory is a filesystem-backed test implementation.
+type NodeCatalog interface {
+	Register(NodeRecord, time.Time, time.Duration) (*NodeRecord, error)
+	Heartbeat(nodeID, incarnation string, current uint64, now time.Time, lease time.Duration) (*NodeRecord, error)
+	ReserveIncoming(nodeID, incarnation, operation, sourceNode string, bytes uint64, now time.Time, ttl time.Duration) (*NodeRecord, error)
+	ReleaseIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error)
+	CompleteIncoming(nodeID, incarnation, operation string, now time.Time) (*NodeRecord, error)
+	Transition(nodeID, incarnation string, next NodeState, now time.Time, lease time.Duration) (*NodeRecord, error)
+	Lookup(nodeID string) (*NodeRecord, error)
+	List() ([]NodeRecord, error)
+}
+
+// NodeExpiryCatalog commits the consequences of one exact expired execution
+// lease. It is separate from NodeCatalog because not every test catalog is a
+// distributed fencing authority.
+type NodeExpiryCatalog interface {
+	ExpireNode(nodeID, incarnation string, revision uint64) (*NodeRecord, error)
+}
+
+var _ NodeCatalog = (*NodeDirectory)(nil)
 
 // OpenNodeDirectory opens or creates a private shared discovery directory.
 func OpenNodeDirectory(dir string) (*NodeDirectory, error) {
@@ -220,6 +260,7 @@ func (d *NodeDirectory) Register(record NodeRecord, now time.Time, lease time.Du
 	record.StartedAt = now
 	record.UpdatedAt = now
 	record.LeaseExpiresAt = now.Add(lease)
+	record.LeaseDuration = lease
 	if err := record.Validate(); err != nil {
 		return nil, err
 	}
@@ -272,9 +313,11 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 		}
 		record.MemoryCurrentBytes = current
 		pruneIncomingReservations(&record, now)
+		updateNodePressureState(&record)
 		record.Revision++
 		record.UpdatedAt = now
 		record.LeaseExpiresAt = now.Add(lease)
+		record.LeaseDuration = lease
 		if err := d.store(record); err != nil {
 			return err
 		}
@@ -285,6 +328,23 @@ func (d *NodeDirectory) Heartbeat(nodeID, incarnation string, current uint64, no
 		return nil, err
 	}
 	return &result, nil
+}
+
+// updateNodePressureState derives the ordinary ready/pressured load state from
+// the committed memory sample. Keep this in the catalog mutation rather than
+// in a caller-side follow-up transition: Raft renewals must publish the load
+// and the state it implies atomically, and must not bypass pressure detection.
+func updateNodePressureState(record *NodeRecord) {
+	switch record.State {
+	case NodeReady:
+		if record.MemoryTargetBytes != 0 && record.MemoryCurrentBytes > record.MemoryTargetBytes {
+			record.State = NodePressured
+		}
+	case NodePressured:
+		if record.MemoryTargetBytes == 0 || record.MemoryCurrentBytes < record.MemoryTargetBytes-record.MemoryTargetBytes/10 {
+			record.State = NodeReady
+		}
+	}
 }
 
 func pruneIncomingReservations(record *NodeRecord, now time.Time) {
@@ -466,6 +526,7 @@ func (d *NodeDirectory) Transition(nodeID, incarnation string, next NodeState, n
 			record.LeaseExpiresAt = now
 		} else {
 			record.LeaseExpiresAt = now.Add(lease)
+			record.LeaseDuration = lease
 		}
 		if err := d.store(record); err != nil {
 			return err

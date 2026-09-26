@@ -85,12 +85,48 @@ moves. All 13 placements finished stable on one node and routed `exec true`
 succeeded for every branch.
 
 This test also exposed a distributed lifecycle-lock inversion: a client entry
-daemon proxied `node drain` while holding its own mutation lock, and the source
+daemon proxied `node stop --migrate-all` while holding its own mutation lock, and the source
 called that daemon back to rehydrate a target. Node-wide mutations are now
 routed to their source before any local mutation lock is taken. A final
 13-branch reverse drain invoked through the destination completed in 25.932
 seconds. Cleanup removed the family, both daemons, Sentries, gofers, console
 followers, durable intents, and the test root.
+
+### Plaintext cluster interface and two-node retirement
+
+On 2026-09-08, a fresh two-node cluster was bootstrapped through the simplified
+`--cluster-init` / `--cluster-join` interface with one shared root, independent
+local roots, and `TTC_CLUSTER_TOKEN`. A join using the wrong token was rejected.
+BusyBox was then placed explicitly on node B, forked locally through automatic
+placement, and both live branches were evacuated by running `ttc node stop
+node-b --migrate-all` through node A. Both branches retained a guest-written
+file, node B became offline, its socket disappeared, and node A retained Raft
+quorum and served both branches.
+
+This run exposed and fixed three shutdown-path defects: plaintext Raft join
+still required the old TLS address encoding; closing the local daemon listener
+could race the final proxied response and return EOF; and a completed capacity
+reservation incorrectly prevented the source voter from retiring. The test
+was repeated from a fresh root after all three fixes. The surviving daemon was
+then stopped with `ttc node stop node-a --stop-all`, and all temporary runtimes
+and storage were removed.
+
+### Single-port control/Raft multiplexing and member reuse
+
+On 2026-09-08, the same qualification was repeated after HTTP control and Raft
+were collapsed onto one TCP listener. Node A advertised and listened only on
+port 17643 and node B only on port 17653; `node ls --json` reported each exact
+port as both `control_url` and `raft_address`, and no adjacent listener existed.
+A join with the wrong `TTC_CLUSTER_TOKEN` failed before admission.
+
+A continuously updating BusyBox branch was migrated away while retiring the
+Raft leader. Its counter continued advancing on the survivor, the retired
+listener disappeared, and the retired node's local Raft database was removed.
+That node then rejoined through the survivor on its original single port, took
+the branch back during a second node retirement, and preserved the advancing
+counter. The test exposed and fixed a lifecycle defect in which a cleanly
+removed member retained obsolete local Raft state and could not later rejoin.
+Both retirement directions and all test storage and processes were cleaned up.
 
 ## Pressure placement and cleanup
 
@@ -208,7 +244,61 @@ Putting the daemon sockets and runsc runtime roots on the NFS mount is an
 invalid layout: a later sibling import can observe unsafe live-runtime
 semantics rather than shared-repository semantics. TTC now detects NFS at
 daemon startup and rejects that layout with instructions to keep only
-`TTC_DATA_ROOT` shared.
+`TTC_ROOT` shared and use a distinct node-local `TTC_LOCAL_ROOT`.
+
+### Explicit-root and tiered-storage regression
+
+After separating the root-unaware client from daemon storage configuration,
+the capacity smoke was rerun with one shared `TTC_ROOT`, two distinct
+node-local `TTC_LOCAL_ROOT` values, and independent `TTC_SOCKET` paths. A
+two-branch BusyBox drain completed in 7.501 seconds, including one injected
+capacity-provider failure and retry. A nontrivial Ubuntu 24.04 run created
+1,000 files and a tar archive before migration, then verified every file and
+wrote and synchronized 8 MiB independently in both branches; it completed in
+10.044 seconds (0.261 seconds preparation, 0.082 and 0.169 seconds branch
+verification).
+
+The BusyBox case also passed with the shared root on a loopback NFSv3 mount in
+9.01 seconds. A heavier NFS attempt exposed a race between eager dependency
+drain and sparse target handoff: the eager drain could make the transaction
+source-independent before the target registered a sparse descriptor, causing
+the target to retry forever. The target now recognizes that fenced state as a
+completed handoff. The heavy Ubuntu case passed locally after the fix; the
+follow-up loopback-NFS run was not used as evidence because the local kernel
+NFS server itself stalled during remount. Earlier Rocky Linux and repeated
+crash/rejoin NFS results above continue to cover the full NFS workload path.
+
+Later qualification replaced the host-kernel server with NFS-Ganesha and
+covered both NFSv3 and NFSv4.2. An unshaped NFSv4.2 matrix forked four 128 MiB
+siblings in 1.991 seconds and completed in 24.287 seconds; a random sparse
+two-sibling variant forked in 1.702 seconds and completed in 14.672 seconds.
+A 15±3 ms, 100 Mbit/s run completed in 101.280 seconds, including 20.850
+seconds for remote fork, 15.973 seconds for dehydration, 13.555 seconds for
+rehydration, and 62.562 seconds to make every remote dependency independent.
+
+The final shaped regression used hard NFSv3 with 1 MiB reads/writes and
+20±5 ms, 50 Mbit/s loopback shaping. The source kept 128 MiB resident in
+`/dev/shm`, created a 64 MiB rootfs object and 2,000 small files, forked two
+branches, and drained to a dynamically joined node. Each target then verified
+the inherited files and independently wrote 32 MiB to rootfs and 32 MiB to
+`/dev/shm`. It passed in 236.705 seconds; preparation took 17.336 seconds and
+target verification took 2.370 and 2.948 seconds. The traffic shaper, family,
+daemons, NFS test tree, and local roots were all removed afterward.
+
+A controlled shared-storage outage then suspended NFS-Ganesha for eight
+seconds during migration while node leases remained valid. Both branches
+completed migration and verification in 20.805 seconds. This distinguished a
+recoverable repository stall from source loss; a separate trial that exceeded
+the deliberately short lease correctly fenced the expired source instead of
+allowing two owners.
+
+An earlier shaped run also caught a target-cleanup race: the background
+reconciler could observe a prepared target before placement cutover, conclude
+that its local runtime was unowned, and terminate it. Provisional distributed
+targets are now protected by their fenced import transaction until cutover or
+explicit cancellation. The full 128 MiB/4,000-file, 20±5 ms, 50 Mbit/s rerun
+then passed in 596.508 seconds, including independent 64 MiB writes in both
+target branches.
 
 A follow-up cutover-hardening run completed locally in 7.306 seconds. It
 verified that a prepared migration remains physically paused and hidden while
@@ -268,6 +358,24 @@ and the target Sentry reported the same three edges and byte totals, proving
 that migration preserved the CoW topology. Removing the family and stopping
 both daemons left no workload, Sentry, gofer, or test directory.
 
+### High-fanout tmpfs pressure
+
+The pressure regression was extended to eight running sibling branches. Each
+branch independently dirtied a 48 MiB `/dev/shm` file, so accounting had to
+include linked tmpfs pages that were no longer mapped by a task and deduplicate
+them against mapped pages by their stable physical page-version identity. The
+source reported at least 384 MiB resident, crossed its configured target, and
+the scheduler moved a CoW-aware group across the two accepting peers. Every
+branch and every independently written tmpfs payload remained readable after
+migration.
+
+The original exact representation expanded to roughly 2.6 MiB when sibling
+writes interleaved allocator sequence numbers. TTC now sends one 256-version,
+32-byte bitmap per allocator window. The same run kept the complete planner
+payload below 512 KiB and completed with one migration. The 4,096-entry
+sharing-edge cap remains only on the diagnostic summary; planner correctness
+does not depend on that summary.
+
 ## NFS remote-fork matrix
 
 The test data root was exported by the host kernel NFS server and mounted over
@@ -295,6 +403,33 @@ found a monitor race where intentional process-free dehydration was mistaken
 for a crashed target; `dehydrating` is now published before teardown and a
 durable dehydration image completes the remote dependency.
 
+### Branch churn and deletion
+
+A separate NFSv3 lifecycle test repeatedly reused one visible branch name for
+50 local forks. Every branch created 128 files plus hardlinks and symlinks and
+a 2 MiB regular file; every third iteration held an open file descriptor in a
+named detached exec session; every fifth iteration dehydrated, waited for
+shared durability, and copied the 2 MiB file directly from the process-free
+branch. Every iteration then force-removed the branch and immediately reused
+its name.
+
+The first run exposed a stable-key cleanup bug: memory control images are keyed
+by the internal filesystem-branch identity so renames do not move them, but
+branch removal deleted only the legacy visible-name path. Name reuse therefore
+collided with the retained dehydration image. Removal now deletes both the
+stable key and legacy key after fencing publications and releasing the sparse
+memory root. The same failure also showed that a sparse publication transaction
+could remain rooted if a later control-image step failed; manifest reachability
+is now committed before those steps and restored by the existing rollback.
+
+The complete rerun passed. It left zero dehydration directories, zero memory
+branch pointers, zero pending publications, zero exec followers, zero NFS
+`.nfs*` files, and one rootfs branch. Rootfs metadata compacted to eight layers
+after the run. A non-owning cluster node also attempted to collect another
+node's intentionally unmaterialized private repository; maintenance now skips
+only an absent repository path while continuing to report a present but
+malformed repository.
+
 Run the same matrix with:
 
 ```shell
@@ -307,9 +442,13 @@ python3 tools/ttc/distributed_benchmark/benchmark.py \
 
 ## Remaining qualification
 
-The configured `kvm-node` was unreachable (`No route to host`) during this
-iteration, and the development host has no `/dev/kvm`; therefore the latest
-elastic changes have not yet been rerun on the KVM platform. Physical
-multi-host network-delay/loss, exhaustive node-loss injection at every
-instruction-level migration boundary, and long-running automatic
-rebalance/anti-oscillation tests also remain required before production use.
+Lustre was not available on this qualification host: its
+`6.17.0-1017-aws` kernel exposes neither Lustre nor LNet in `/proc/filesystems`,
+has no corresponding kernel modules, and provides neither `mount.lustre` nor
+`lctl`. NFS latency/bandwidth shaping exercises TTC's slow-shared-storage
+behavior but is not presented as Lustre qualification. A real Lustre client
+and server must be provisioned before that result can be recorded.
+
+Physical multi-host loss/reordering, exhaustive node-loss injection at every
+migration boundary, a real Lustre deployment, and long-running automatic
+rebalance/anti-oscillation tests remain required before production use.

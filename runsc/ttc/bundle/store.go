@@ -15,9 +15,9 @@
 package bundle
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,9 +28,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -38,6 +40,9 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/ttcpack"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
@@ -54,54 +59,153 @@ const (
 	DefaultLogDriver = "local"
 )
 
-const promotedRepositoryDir = "repositories"
+// removedContainerDir is outside the active container namespace so that a
+// failed physical deletion cannot make container discovery fail. It remains
+// under Store.Root to keep the rename that commits a deletion on one
+// filesystem, including when Store.Root is an NFS mount.
+const removedContainerDir = "removed-containers"
+
+const containerCreationMarker = ".creating"
+
+// containerStagingDir holds unpublished container directories. Container
+// metadata is assembled here and atomically renamed into containers/ only
+// after the bundle and container record are complete. In particular, this
+// prevents a second NFS client from observing a creation-marker unlink before
+// it observes the preceding container.json rename and reclaiming a live
+// distributed target as an incomplete directory.
+const containerStagingDir = "container-staging"
+
+const stalePathReadAttempts = 6
+
+// retryStalePathRead reopens pathname-based metadata after NFS reports
+// ESTALE. TTC publishes records with atomic rename; an NFS client may briefly
+// retain the replaced inode's file handle even though a fresh pathname lookup
+// is already valid. Retrying only ESTALE keeps real corruption and permission
+// failures visible while preventing a transient cache entry from aborting a
+// fork or making the cluster inventory disappear.
+func retryStalePathRead[T any](operation func() (T, error)) (T, error) {
+	delay := time.Millisecond
+	for attempt := 0; ; attempt++ {
+		value, err := operation()
+		if err == nil || !errors.Is(err, unix.ESTALE) || attempt+1 == stalePathReadAttempts {
+			return value, err
+		}
+		time.Sleep(delay)
+		if delay < 16*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
+func readFileWithStaleRetry(path string) ([]byte, error) {
+	return retryStalePathRead(func() ([]byte, error) {
+		return os.ReadFile(path)
+	})
+}
+
+func readDirWithStaleRetry(path string) ([]fs.DirEntry, error) {
+	return retryStalePathRead(func() ([]fs.DirEntry, error) {
+		return os.ReadDir(path)
+	})
+}
 
 // Store owns persistent image roots and generated container bundles.
 type Store struct {
 	Root string
+	// CPUFeatures is the daemon-owned, comma-separated guest CPU feature
+	// profile installed into every newly created or restored OCI spec.
+	CPUFeatures string
+	// ActiveRoot holds node-local mutable data for running workloads. Root is
+	// the durable catalog and immutable image store and may be a shared
+	// filesystem in cluster mode. Empty preserves the standalone layout.
+	ActiveRoot string
 	// TransientRoot, when non-empty, holds short-lived OCI bundles. Keeping
 	// these outside Root matters when Root is NFS: runsc's gofer retains the
 	// bundle config descriptor for its lifetime, so unlinking an NFS-backed
 	// bundle would leave a .nfs placeholder until the container exits.
 	TransientRoot string
+
+	// These hooks are used only by tests that emulate failures such as NFS
+	// silly-renamed files. Production stores leave them nil.
+	renamePath    func(string, string) error
+	removeAllPath func(string) error
 }
 
-// RemoveObsoleteApplicationMemoryFiles removes pathname-backed live memory
-// allocators created by TTC versions predating sparse dehydration. Current
-// runtimes use anonymous memfds; durable page contents live exclusively in the
-// family memory-chunk repository. Unlinking is safe even if an older Sentry
-// still has the file open, since its descriptor remains valid until it exits.
-func (s Store) RemoveObsoleteApplicationMemoryFiles() (int, error) {
-	containersRoot := filepath.Join(s.Root, "containers")
-	entries, err := os.ReadDir(containersRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+// ImageCachePruneResult summarizes a node-local capacity pass. BusyBytes are
+// complete immutable bytes pinned by an active gofer and therefore never
+// eligible for eviction during the pass.
+type ImageCachePruneResult struct {
+	BeforeBytes  uint64 `json:"before_bytes"`
+	AfterBytes   uint64 `json:"after_bytes"`
+	EvictedFiles uint64 `json:"evicted_files"`
+	EvictedBytes uint64 `json:"evicted_bytes"`
+	BusyBytes    uint64 `json:"busy_bytes"`
+}
+
+type activeRepositoryMapping struct {
+	Path      string `json:"path"`
+	RestoreID string `json:"restore_id,omitempty"`
+	CopyMode  string `json:"copy_mode,omitempty"`
+}
+
+func (s Store) activeRoot() string {
+	if s.ActiveRoot != "" {
+		return s.ActiveRoot
 	}
-	if err != nil {
-		return 0, err
+	return s.Root
+}
+
+// hasUnifiedActiveRoot reports whether durable metadata and mutable runtime
+// data intentionally share one hierarchy. Standalone TTC uses this layout;
+// clustered TTC keeps active data in TTC_LOCAL_ROOT and metadata in TTC_ROOT.
+//
+// A unified store cannot build a container in container-staging and also put
+// its rootfs repository in containers/<id>: creating the repository would
+// create the destination of the final directory rename. Such stores therefore
+// construct the complete record in place behind containerCreationMarker and
+// publish container.json last.
+func (s Store) hasUnifiedActiveRoot() bool {
+	return s.ActiveRoot != "" && filepath.Clean(s.ActiveRoot) == filepath.Clean(s.Root)
+}
+
+func (s Store) activeContainerDir(id string) string {
+	return filepath.Join(s.activeRoot(), "containers", id)
+}
+
+func (s Store) imageRootDir() string {
+	return filepath.Join(s.activeRoot(), "images")
+}
+
+var warnedUnreadableContainers sync.Map
+
+// containerNameHints maps a data root and a container name to the ID the name
+// last resolved to, so that LoadContainer need not read every container's
+// record to find one by name. A hint is used only if the record it names
+// still has that name and is listed; otherwise the name is looked up as
+// before. Names are unique, which creation checks, so a hint resolves a name
+// as the full lookup would. The hints are forgotten whenever there are
+// maxContainerNameHints of them.
+var containerNameHints struct {
+	mu  sync.Mutex
+	ids map[string]string
+}
+
+const maxContainerNameHints = 1 << 16
+
+func containerNameHint(key string) (string, bool) {
+	containerNameHints.mu.Lock()
+	defer containerNameHints.mu.Unlock()
+	id, ok := containerNameHints.ids[key]
+	return id, ok
+}
+
+func setContainerNameHint(key, id string) {
+	containerNameHints.mu.Lock()
+	defer containerNameHints.mu.Unlock()
+	if containerNameHints.ids == nil || len(containerNameHints.ids) >= maxContainerNameHints {
+		containerNameHints.ids = make(map[string]string)
 	}
-	removed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(containersRoot, entry.Name(), "memory", "application.mem")
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return removed, fmt.Errorf("checking obsolete application memory for %s: %w", entry.Name(), err)
-		}
-		if !info.Mode().IsRegular() {
-			return removed, fmt.Errorf("obsolete application memory path for %s is not a regular file", entry.Name())
-		}
-		if err := os.Remove(path); err != nil {
-			return removed, fmt.Errorf("removing obsolete application memory for %s: %w", entry.Name(), err)
-		}
-		removed++
-	}
-	return removed, nil
+	containerNameHints.ids[key] = id
 }
 
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
@@ -135,19 +239,31 @@ func (s Store) PrepareDehydrationRestoreBundle(name, filesystemBranch string) (s
 	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
 }
 
-// PrepareDistributedMigrationRestoreBundle creates a cold target bundle whose
-// bootstrap SandboxFamily already uses the migrated branch's visible identity.
+// PrepareDistributedTargetBundle creates the node-local OCI view used to boot
+// a new hidden remote-fork target. The canonical bundle is shared metadata and
+// may still contain another node's image-cache and repository paths.
+func (s Store) PrepareDistributedTargetBundle(name, filesystemBranch string) (string, func(), error) {
+	if filesystemBranch == "" {
+		return "", nil, errors.New("distributed target filesystem identity is empty")
+	}
+	return s.prepareBranchBundle(name, "", filesystemBranch, true, false)
+}
+
+// PrepareDistributedBranchRestoreBundle creates a cold target bundle whose
+// bootstrap SandboxFamily already uses the imported branch's visible identity.
 // Distributed restore later replaces that placeholder Kernel in place; it
-// must not silently fall back to the ordinary "main" bootstrap identity.
-func (s Store) PrepareDistributedMigrationRestoreBundle(name, branchID, filesystemBranch string) (string, func(), error) {
+// must not silently fall back to the ordinary "main" bootstrap identity. This
+// applies both to migration and to the first physical branch of an existing
+// logical family placed on a new node.
+func (s Store) PrepareDistributedBranchRestoreBundle(name, branchID, filesystemBranch string) (string, func(), error) {
 	if branchID == "" || filesystemBranch == "" {
-		return "", nil, errors.New("distributed migration restore branch or filesystem identity is empty")
+		return "", nil, errors.New("distributed restore branch or filesystem identity is empty")
 	}
 	return s.prepareBranchBundle(name, branchID, filesystemBranch, true, false)
 }
 
 func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, distributedTarget, startPaused bool) (string, func(), error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return "", nil, err
 	}
@@ -163,32 +279,10 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 	if err != nil {
 		return "", nil, err
 	}
-	if distributedTarget && len(repositories) != 0 {
-		// Checkpoint import needs RestoreID to name the repository identity in
-		// the imported state. Once that state has been restored,
-		// CompleteRestore canonicalizes every filesystem to the new local
-		// repository identity. A later dehydration or migration captures that
-		// local identity, so a cold target bundle must donate its repositories
-		// under the current IDs rather than preserving the one-shot import IDs
-		// from the canonical OCI spec.
-		manager, err := ttcvolume.OpenManager(s.Root, true)
-		if err != nil {
-			return "", nil, err
-		}
-		for i := range repositories {
-			repository, err := manager.OpenPrivate(repositories[i].Path)
-			if err != nil {
-				return "", nil, fmt.Errorf("opening cold-restore repository %q: %w", repositories[i].Source, err)
-			}
-			info := repository.Info()
-			if err := repository.Close(); err != nil {
-				return "", nil, fmt.Errorf("closing cold-restore repository %q: %w", repositories[i].Source, err)
-			}
-			repositories[i].RestoreID = info.ID
-		}
-	}
 	for i := range repositories {
-		repositories[i].Branch = filesystemBranch
+		if filesystemBranch != ttcvolume.MainBranch || repositories[i].Branch == "" {
+			repositories[i].Branch = filesystemBranch
+		}
 	}
 	if len(repositories) != 0 {
 		encoded, err := json.Marshal(repositories)
@@ -205,6 +299,21 @@ func (s Store) prepareBranchBundle(name, branchID, filesystemBranch string, dist
 				if info.Branches[i].ID == branchID {
 					branch = &info.Branches[i]
 					break
+				}
+			}
+			if branch == nil {
+				// A distributed import is reserved before it becomes a stable
+				// BranchInfo. It must nevertheless be the bootstrap identity when
+				// this is the first physical Sentry for the family on this node.
+				for _, pending := range info.DistributedForkImports {
+					physicalBranch := pending.PhysicalBranchID
+					if physicalBranch == "" {
+						physicalBranch = pending.BranchID
+					}
+					if physicalBranch == branchID && pending.FilesystemBranch == filesystemBranch {
+						branch = &BranchInfo{ID: physicalBranch, ParentID: pending.ParentID, FilesystemBranch: pending.FilesystemBranch}
+						break
+					}
 				}
 			}
 			if branch == nil {
@@ -281,6 +390,32 @@ type PrepareOptions struct {
 	// Empty permits Store-only callers to probe either supported mode.
 	VolumeCopyMode ttcvolume.CopyMode
 	NodeID         string
+	// AllocateSnapshotOrigins returns globally monotonic working origins in
+	// cluster mode. Nil selects the standalone repository-local allocator.
+	AllocateSnapshotOrigins func(count uint32) ([]ttcsnapshot.SnapshotID, error)
+	// SnapshotManagedVolume snapshots a named volume through its live owning
+	// Sentry. This preserves bounded process-local metadata batching and mmap
+	// CoW correctness when a second family attaches read-only.
+	SnapshotManagedVolume func(ownerContainer, ownerBranch, volumeID, childBranch string, sourceWorking, childWorking ttcsnapshot.SnapshotID) error
+}
+
+func allocateRepositoryOrigins(opts *PrepareOptions, count uint32) ([]ttcsnapshot.SnapshotID, error) {
+	if opts == nil || opts.AllocateSnapshotOrigins == nil {
+		return nil, nil
+	}
+	origins, err := opts.AllocateSnapshotOrigins(count)
+	if err != nil {
+		return nil, err
+	}
+	if len(origins) != int(count) {
+		return nil, fmt.Errorf("snapshot allocator returned %d origins, want %d", len(origins), count)
+	}
+	for i, origin := range origins {
+		if origin == 0 {
+			return nil, fmt.Errorf("snapshot allocator returned zero origin at index %d", i)
+		}
+	}
+	return origins, nil
 }
 
 // Prepared is a generated OCI bundle ready for runsc.
@@ -318,6 +453,9 @@ type RestoreOptions struct {
 	RestorePaused    bool
 	CheckpointBranch string
 	NodeID           string
+	// AllocateSnapshotOrigins allocates the working origins of a clustered
+	// node's repositories, as PrepareOptions' does.
+	AllocateSnapshotOrigins func(uint32) ([]ttcsnapshot.SnapshotID, error)
 }
 
 // DistributedForkOptions materializes a hidden target bundle that refers to
@@ -325,77 +463,175 @@ type RestoreOptions struct {
 // target stores must name the same shared TTC repository.
 type DistributedForkOptions struct {
 	SourceContainer string
-	TargetName      string
-	TargetBranch    string
-	VisibleBranch   string
-	TransactionID   string
-	NodeID          string
-	SourceNode      string
-	Migration       bool
+	// SourcePhysicalBranch identifies the exact source Sentry branch for a
+	// migration whose logical branch has already crossed nodes before.
+	SourcePhysicalBranch string
+	TargetName           string
+	TargetBranch         string
+	VisibleBranch        string
+	ParentBranch         string
+	TransactionID        string
+	NodeID               string
+	SourceNode           string
+	Migration            bool
+	// AuthoritativeMigration means the target daemon has already validated the
+	// exact source, target, and operation against cluster authority. Physical
+	// family metadata may retain the branch's former local owner after an
+	// earlier migration and must not override that placement decision.
+	AuthoritativeMigration bool
+	TargetID               string
+	// Source and Spec are supplied by the source daemon over the authenticated
+	// cluster control connection. They avoid using shared-filesystem directory
+	// visibility as a target-reservation synchronization primitive.
+	Source *ContainerInfo
+	Spec   *specs.Spec
 }
 
 // BranchInfo is branch display lineage plus its last known lifecycle state.
 type BranchInfo struct {
 	ID string `json:"id"`
-	// NodeID overrides the legacy family-wide owner for elastic placements.
-	// Empty inherits ContainerInfo.NodeID.
+	// Quarantined disconnects the branch's runtime-managed external network
+	// edge while preserving its Sentry-owned network and socket state.
+	Quarantined bool `json:"quarantined,omitempty"`
+	// NodeID is the branch's physical owner in clustered mode. It is empty for
+	// standalone branches and for clustered branches marked Unplaced.
 	NodeID string `json:"node_id,omitempty"`
+	// Unplaced identifies a durable clustered branch with no physical owner.
+	Unplaced bool `json:"unplaced,omitempty"`
 	// ParentID is display provenance, not an ownership edge. Removing a branch
 	// reparents its direct children to this branch's parent.
-	ParentID                     string    `json:"parent_id,omitempty"`
-	FilesystemBranch             string    `json:"filesystem_branch,omitempty"`
-	DistributedForkTransactionID string    `json:"distributed_fork_transaction_id,omitempty"`
-	DistributedSparseRepository  string    `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch      string    `json:"distributed_sparse_branch,omitempty"`
-	DistributedMigration         bool      `json:"distributed_migration,omitempty"`
-	State                        string    `json:"state"`
-	ForkTotalNS                  int64     `json:"fork_total_ns,omitempty"`
-	SourceDowntimeNS             int64     `json:"source_downtime_ns,omitempty"`
-	KernelForkNS                 int64     `json:"kernel_fork_ns,omitempty"`
-	CreatedAt                    time.Time `json:"created_at"`
+	ParentID                     string `json:"parent_id,omitempty"`
+	FilesystemBranch             string `json:"filesystem_branch,omitempty"`
+	DistributedForkTransactionID string `json:"distributed_fork_transaction_id,omitempty"`
+	// DistributedGraphReferenceOperation names this branch's independent,
+	// idempotent provider-root batch. Multiple local descendants may share the
+	// same authorizing distributed transaction, but must never share this
+	// lifetime identity.
+	DistributedGraphReferenceOperation string     `json:"distributed_graph_reference_operation,omitempty"`
+	DistributedMigration               bool       `json:"distributed_migration,omitempty"`
+	State                              string     `json:"state"`
+	ExitStatus                         *int       `json:"exit_status,omitempty"`
+	ExitedAt                           *time.Time `json:"exited_at,omitempty"`
+	// StorageState describes where the authoritative captured snapshot is.
+	// It is independent of the process lifecycle in State. StorageResident
+	// marks a dehydrated branch whose capture only its family's Sentry holds.
+	StorageState             string    `json:"storage_state,omitempty"`
+	PublicationID            string    `json:"publication_id,omitempty"`
+	StorageError             string    `json:"storage_error,omitempty"`
+	StorageManifest          string    `json:"storage_manifest,omitempty"`
+	StorageRetryAt           time.Time `json:"storage_retry_at,omitempty"`
+	SourceNode               string    `json:"source_node,omitempty"`
+	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string  `json:"memory_roots,omitempty"`
+	// MemoryRootObjects records the immutable object selected by each logical
+	// root name. Names are branch-local handles; object IDs remain stable when
+	// authority moves from a node to shared storage.
+	MemoryRootObjects []string `json:"memory_root_objects,omitempty"`
+	// ControlRoot and ControlRootObject retain the immutable filesystem tree
+	// containing a process-free branch's kernel/process metadata. They are
+	// present only while a branch is dehydrated; live branches have already
+	// consumed this auxiliary snapshot root.
+	ControlRoot               string    `json:"control_root,omitempty"`
+	ControlRootObject         string    `json:"control_root_object,omitempty"`
+	ForkTotalNS               int64     `json:"fork_total_ns,omitempty"`
+	SourceDowntimeNS          int64     `json:"source_downtime_ns,omitempty"`
+	KernelForkNS              int64     `json:"kernel_fork_ns,omitempty"`
+	ForkValidationNS          int64     `json:"fork_validation_ns,omitempty"`
+	ForkSharedMemoryNS        int64     `json:"fork_shared_memory_ns,omitempty"`
+	ForkMappingInvalidationNS int64     `json:"fork_mapping_invalidation_ns,omitempty"`
+	ForkVFSPreparationNS      int64     `json:"fork_vfs_preparation_ns,omitempty"`
+	ForkMemoryPreparationNS   int64     `json:"fork_memory_preparation_ns,omitempty"`
+	ForkMetadataStreamNS      int64     `json:"fork_metadata_stream_ns,omitempty"`
+	ForkMetadataBytes         int64     `json:"fork_metadata_bytes,omitempty"`
+	ForkChildRestoreNS        int64     `json:"fork_child_restore_ns,omitempty"`
+	CreatedAt                 time.Time `json:"created_at"`
 }
 
-// BranchNodeID returns the effective cluster owner of branchID.
-func (c ContainerInfo) BranchNodeID(branchID string) string {
-	for _, branch := range c.Branches {
+// RuntimeMemoryBacking retains an immutable process-memory graph while a live
+// family MemoryFile may still demand pages from it. Unlike BranchInfo, this is
+// deliberately family-scoped: destroying a branch can transfer its page
+// loader to any surviving sibling, so the backing no longer belongs to the
+// branch that originally introduced it.
+type RuntimeMemoryBacking struct {
+	ID                                 string   `json:"id"`
+	SnapshotID                         uint64   `json:"snapshot_id"`
+	MemoryRoots                        []string `json:"memory_roots"`
+	MemoryRootObjects                  []string `json:"memory_root_objects"`
+	ControlRoot                        string   `json:"control_root,omitempty"`
+	ControlRootObject                  string   `json:"control_root_object,omitempty"`
+	DistributedGraphReferenceOperation string   `json:"distributed_graph_reference_operation,omitempty"`
+}
+
+// StorageResident is the StorageState of a dehydrated branch whose capture
+// exists only in its family's Sentry on its node.
+//
+// Dehydration used to make every capture durable at once: its memory went
+// into the snapshot graph and its control state into the data root. While
+// another branch of the family runs on the same node the Sentry stays up
+// anyway, and the capture shares nearly all of its pages with that branch, so
+// the copy bought little and cost as much as the branch's whole memory. The
+// capture is made durable when the family's last live branch on the node goes
+// instead, and until then a lost runtime loses it the way it loses a running
+// branch.
+const StorageResident = "resident"
+
+// ResidentDehydration reports whether branch is dehydrated and its capture
+// only its family's Sentry holds.
+func ResidentDehydration(branch BranchInfo) bool {
+	return branch.State == "dehydrated" && branch.StorageState == StorageResident
+}
+
+// BranchNodeID returns the explicit cluster owner of branchID.
+func (info ContainerInfo) BranchNodeID(branchID string) string {
+	for _, branch := range info.Branches {
 		if branch.ID == branchID {
-			if branch.NodeID != "" {
-				return branch.NodeID
+			if branch.Unplaced {
+				return ""
 			}
-			return c.NodeID
+			return branch.NodeID
 		}
 	}
 	return ""
 }
 
 // MemoryBranchKey returns the stable directory key used for a branch's
-// dehydration metadata and legacy active page sources. It deliberately uses
+// dehydration metadata and active page sources. It deliberately uses
 // the filesystem branch identity rather than the user-visible branch name so
 // renaming a branch never changes where its durable memory is stored.
 func MemoryBranchKey(branch BranchInfo) string {
-	identity := branch.FilesystemBranch
-	if identity == "" {
-		identity = branch.ID
-	}
-	return hex.EncodeToString([]byte(identity))
+	return hex.EncodeToString([]byte(branch.FilesystemBranch))
 }
 
 // DistributedForkImport is a reserved but not yet visible branch imported
 // into an already-running target family.
 type DistributedForkImport struct {
-	BranchID         string    `json:"branch_id"`
-	FilesystemBranch string    `json:"filesystem_branch"`
-	State            string    `json:"state"`
-	CreatedAt        time.Time `json:"created_at"`
-	SparseRepository string    `json:"sparse_repository,omitempty"`
-	SparseBranch     string    `json:"sparse_branch,omitempty"`
-	SourceNode       string    `json:"source_node,omitempty"`
-	TargetNode       string    `json:"target_node,omitempty"`
-	Migration        bool      `json:"migration,omitempty"`
+	BranchID string `json:"branch_id"`
+	// PhysicalBranchID is the transaction-scoped Sentry branch that implements
+	// BranchID. It differs for migrations so an older, paused source incarnation
+	// can continue serving sparse pages while a newer incarnation returns to the
+	// same Sentry. BranchID remains the stable user-visible Raft identity.
+	PhysicalBranchID         string    `json:"physical_branch_id,omitempty"`
+	Quarantined              bool      `json:"quarantined,omitempty"`
+	ParentID                 string    `json:"parent_id,omitempty"`
+	FilesystemBranch         string    `json:"filesystem_branch"`
+	State                    string    `json:"state"`
+	CreatedAt                time.Time `json:"created_at"`
+	SourceNode               string    `json:"source_node,omitempty"`
+	TargetNode               string    `json:"target_node,omitempty"`
+	Migration                bool      `json:"migration,omitempty"`
+	AuthoritativeMigration   bool      `json:"authoritative_migration,omitempty"`
+	DependentMemoryBytes     uint64    `json:"dependent_memory_bytes,omitempty"`
+	DependentFilesystemBytes uint64    `json:"dependent_filesystem_bytes,omitempty"`
+	SnapshotID               uint64    `json:"snapshot_id,omitempty"`
+	MemoryRoots              []string  `json:"memory_roots,omitempty"`
+	MemoryRootObjects        []string  `json:"memory_root_objects,omitempty"`
+	GraphReferenceOperation  string    `json:"graph_reference_operation,omitempty"`
 }
 
 // PortBinding describes a TCP listener managed by TTC for one live branch.
-// An empty BranchID is the legacy representation of the main branch.
+// BranchID is always explicit; no branch, including main, is implicit.
 type PortBinding struct {
 	HostIP        string `json:"host_ip"`
 	HostPort      uint16 `json:"host_port"`
@@ -404,11 +640,8 @@ type PortBinding struct {
 	BranchID      string `json:"branch_id,omitempty"`
 }
 
-// Branch returns the branch targeted by p, normalizing legacy main bindings.
+// Branch returns the branch targeted by p.
 func (p PortBinding) Branch() string {
-	if p.BranchID == "" {
-		return "main"
-	}
 	return p.BranchID
 }
 
@@ -424,6 +657,7 @@ type ContainerInfo struct {
 	BundleDir                    string                           `json:"bundle_dir"`
 	RootFS                       string                           `json:"rootfs"`
 	Branches                     []BranchInfo                     `json:"branches,omitempty"`
+	RuntimeMemoryBackings        []RuntimeMemoryBacking           `json:"runtime_memory_backings,omitempty"`
 	NetworkMode                  string                           `json:"network_mode,omitempty"`
 	LiveForkEligible             bool                             `json:"live_fork_eligible"`
 	LiveForkWaiver               string                           `json:"live_fork_waiver,omitempty"`
@@ -443,6 +677,7 @@ type ContainerInfo struct {
 	StopTimeout                  *int                             `json:"stop_timeout,omitempty"`
 	PidsLimit                    *int64                           `json:"pids_limit,omitempty"`
 	MemoryLimit                  *int64                           `json:"memory_limit,omitempty"`
+	MemorySwap                   *int64                           `json:"memory_swap,omitempty"`
 	NanoCPUs                     *int64                           `json:"nano_cpus,omitempty"`
 	CPUShares                    *uint64                          `json:"cpu_shares,omitempty"`
 	CPUPeriod                    *uint64                          `json:"cpu_period,omitempty"`
@@ -461,17 +696,34 @@ type ContainerInfo struct {
 	RootfsUpperCopyMode          string                           `json:"rootfs_upper_copy_mode,omitempty"`
 	State                        string                           `json:"state"`
 	ExitStatus                   *int                             `json:"exit_status,omitempty"`
+	OOMKilled                    bool                             `json:"oom_killed,omitempty"`
+	ExitError                    string                           `json:"exit_error,omitempty"`
 	CreatedAt                    time.Time                        `json:"created_at"`
 	StartedAt                    *time.Time                       `json:"started_at,omitempty"`
 	ExitedAt                     *time.Time                       `json:"exited_at,omitempty"`
 	DistributedForkTransactionID string                           `json:"distributed_fork_transaction_id,omitempty"`
 	DistributedForkNodeID        string                           `json:"distributed_fork_node_id,omitempty"`
 	DistributedForkHidden        bool                             `json:"distributed_fork_hidden,omitempty"`
-	DistributedSparseRepository  string                           `json:"distributed_sparse_repository,omitempty"`
-	DistributedSparseBranch      string                           `json:"distributed_sparse_branch,omitempty"`
+	DistributedPhysicalRuntime   bool                             `json:"distributed_physical_runtime,omitempty"`
 	DistributedFamilyID          string                           `json:"distributed_family_id,omitempty"`
 	DistributedForkImports       map[string]DistributedForkImport `json:"distributed_fork_imports,omitempty"`
 	NodeID                       string                           `json:"node_id,omitempty"`
+	// DistributedCatalogOnly marks the canonical identity record after its
+	// final physical branch has been removed while logical sibling placements
+	// still exist in Raft. Such a record intentionally has no local branches;
+	// user-visible branch inventory is synthesized from placement authority.
+	DistributedCatalogOnly bool `json:"distributed_catalog_only,omitempty"`
+}
+
+// IsDistributedPhysicalRuntime reports whether info is a node-local physical
+// materialization behind a cluster-wide logical family. Transaction identity
+// exists only while a fork or migration is in flight, so it cannot by itself
+// classify a runtime after publication or a later cold restart.
+func (info ContainerInfo) IsDistributedPhysicalRuntime() bool {
+	return info.DistributedPhysicalRuntime || info.DistributedForkTransactionID != "" || info.DistributedForkHidden ||
+		// Compatibility for physical records created before the explicit role
+		// bit: internal physical runtimes are named by their generated ID.
+		(info.DistributedFamilyID != "" && info.DistributedFamilyID != info.ID && info.Name == info.ID)
 }
 
 func cloneIntPointer(value *int) *int {
@@ -592,7 +844,7 @@ func materializeNetworkFiles(containerDir string, opts SpecOptions) ([]HostMount
 	if hostname == "" {
 		hostname = opts.Name
 	}
-	hostResolv, err := os.ReadFile("/etc/resolv.conf")
+	hostResolv, err := readFileWithStaleRetry("/etc/resolv.conf")
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading host resolver configuration: %w", err)
 	}
@@ -699,7 +951,7 @@ func rehomeInternalMounts(spec *specs.Spec, targetContainerDir string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("TTC internal mount %q is not a regular file", mount.Destination)
 		}
-		contents, err := os.ReadFile(mount.Source)
+		contents, err := readFileWithStaleRetry(mount.Source)
 		if err != nil {
 			return fmt.Errorf("copying TTC internal mount %q: %w", mount.Destination, err)
 		}
@@ -715,9 +967,195 @@ func rehomeInternalMounts(spec *specs.Spec, targetContainerDir string) error {
 	return nil
 }
 
+// PortableInternalMount is the content of a TTC-generated bind mount without
+// its node-local source pathname.
+type PortableInternalMount struct {
+	Destination string
+	Contents    []byte
+	Mode        os.FileMode
+}
+
+// PortableInternalMounts captures TTC-generated mounts from this store's
+// node-local OCI view. It never includes user-supplied host mounts.
+func (s Store) PortableInternalMounts(name string) ([]PortableInternalMount, error) {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return nil, err
+	}
+	if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+		return nil, nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+		return nil, fmt.Errorf("decoding TTC internal mounts: %w", err)
+	}
+	internal := make(map[string]struct{}, len(destinations))
+	for _, destination := range destinations {
+		internal[filepath.Clean(destination)] = struct{}{}
+	}
+	result := make([]PortableInternalMount, 0, len(destinations))
+	for _, mount := range spec.Mounts {
+		if _, ok := internal[filepath.Clean(mount.Destination)]; !ok {
+			continue
+		}
+		contents, err := readFileWithStaleRetry(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("reading TTC internal mount %q: %w", mount.Destination, err)
+		}
+		info, err := os.Stat(mount.Source)
+		if err != nil {
+			return nil, fmt.Errorf("stating TTC internal mount %q: %w", mount.Destination, err)
+		}
+		result = append(result, PortableInternalMount{
+			Destination: filepath.Clean(mount.Destination), Contents: contents, Mode: info.Mode().Perm(),
+		})
+	}
+	if len(result) != len(internal) {
+		return nil, fmt.Errorf("OCI spec describes %d TTC internal mounts but only %d sources", len(internal), len(result))
+	}
+	return result, nil
+}
+
+// InstallPortableInternalMounts replaces node-local sources in a container's
+// persistent OCI specification. The files themselves are kept in the active
+// node-local root. This is required for a migrated container to act as the
+// source of a later remote fork without referring back to the previous node's
+// private scratch filesystem.
+func (s Store) InstallPortableInternalMounts(name string, mounts []PortableInternalMount) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(info.BundleDir, "config.json")
+	data, err := readFileWithStaleRetry(configPath)
+	if err != nil {
+		return err
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return err
+	}
+	if err := installPortableInternalMounts(&spec, filepath.Join(s.activeContainerDir(info.ID), "internal-mounts"), mounts); err != nil {
+		return err
+	}
+	if s.activeRoot() != s.Root {
+		// The canonical OCI bundle is shared cluster metadata. Node-local mount
+		// paths must never be written into it: LoadSpec overlays the local paths
+		// whenever this node has materialized the portable files.
+		return nil
+	}
+	return writeJSON(configPath, &spec)
+}
+
+// MaterializePortableInternalMounts replaces node-local sources in a prepared
+// transient bundle with target-local files. The caller must supply exactly the
+// destinations declared by the bundle annotation.
+func MaterializePortableInternalMounts(bundleDir string, mounts []PortableInternalMount) error {
+	return materializePortableInternalMounts(bundleDir, filepath.Join(bundleDir, "internal-mounts"), mounts)
+}
+
+func materializePortableInternalMounts(bundleDir, directory string, mounts []PortableInternalMount) error {
+	configPath := filepath.Join(bundleDir, "config.json")
+	data, err := readFileWithStaleRetry(configPath)
+	if err != nil {
+		return err
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return err
+	}
+	if err := installPortableInternalMounts(&spec, directory, mounts); err != nil {
+		return err
+	}
+	return writeJSON(configPath, &spec)
+}
+
+func installPortableInternalMounts(spec *specs.Spec, directory string, mounts []PortableInternalMount) error {
+	if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+		if len(mounts) != 0 {
+			return errors.New("remote session supplied undeclared TTC internal mounts")
+		}
+		return nil
+	}
+	var destinations []string
+	if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+		return fmt.Errorf("decoding TTC internal mounts: %w", err)
+	}
+	provided := make(map[string]PortableInternalMount, len(mounts))
+	for _, mount := range mounts {
+		provided[filepath.Clean(mount.Destination)] = mount
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	rewritten := 0
+	for i := range spec.Mounts {
+		mount := &spec.Mounts[i]
+		portable, ok := provided[filepath.Clean(mount.Destination)]
+		if !ok {
+			continue
+		}
+		name := filepath.Join(directory, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
+		if err := replacePortableInternalMount(name, portable.Contents, portable.Mode.Perm()); err != nil {
+			return fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
+		}
+		mount.Source = name
+		rewritten++
+	}
+	if rewritten != len(destinations) || rewritten != len(provided) {
+		return fmt.Errorf("portable TTC internal mounts do not match OCI declarations: declared=%d supplied=%d matched=%d", len(destinations), len(provided), rewritten)
+	}
+	return nil
+}
+
+// replacePortableInternalMount atomically installs an immutable internal
+// mount. These files are commonly mode 0444, so a later remote fork imported
+// into the same physical family cannot update them with os.WriteFile: opening
+// the existing inode for truncation fails with EACCES. Replacing the directory
+// entry also avoids exposing a partially rewritten hostname/hosts/resolv.conf
+// to a concurrently starting branch.
+func replacePortableInternalMount(path string, contents []byte, mode os.FileMode) error {
+	if existing, err := readFileWithStaleRetry(path); err == nil {
+		if info, statErr := os.Stat(path); statErr == nil && info.Mode().Perm() == mode && bytes.Equal(existing, contents) {
+			return nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(mode); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(contents); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
+}
+
 // ConsolePaths are persistent host-side files for one branch-local console.
 // None of these files are donated into the sandbox.
 type ConsolePaths struct {
+	// FamilyDir is the console directory of the branch's family, where its
+	// console follower's socket is.
+	FamilyDir      string
 	Log            string
 	Lock           string
 	StdinLock      string
@@ -874,13 +1312,25 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err != nil {
 		return Prepared{}, err
 	}
-	opts.ManagedVolumes, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
+	var cleanupManagedVolumeSnapshots func()
+	opts.ManagedVolumes, cleanupManagedVolumeSnapshots, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
 	if err != nil {
 		return Prepared{}, err
 	}
+	keepManagedVolumeSnapshots := false
+	defer func() {
+		if !keepManagedVolumeSnapshots && cleanupManagedVolumeSnapshots != nil {
+			cleanupManagedVolumeSnapshots()
+		}
+	}()
 	id, containerDir, err := s.createContainerDir(containers)
 	if err != nil {
 		return Prepared{}, err
+	}
+	activeContainerDir := s.activeContainerDir(id)
+	if err := os.MkdirAll(activeContainerDir, 0700); err != nil {
+		s.discardIncompleteContainer(id)
+		return Prepared{}, fmt.Errorf("creating active container directory: %w", err)
 	}
 	keep := false
 	leaseID := ""
@@ -891,19 +1341,28 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 				_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 				cancel()
 			}
-			os.RemoveAll(containerDir)
+			s.discardIncompleteContainer(id)
 		}
 	}()
 	rootfsUpperID := ""
 	if !opts.ReadonlyRootfs {
-		manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+		manager, err := ttcvolume.OpenManager(s.activeRoot())
 		if err != nil {
 			return Prepared{}, fmt.Errorf("opening rootfs upper store: %w", err)
 		}
 		if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
 			return Prepared{}, fmt.Errorf("volume backing capability changed while preparing rootfs: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 		}
-		rootfsUpper, err := manager.CreatePrivate(filepath.Join(containerDir, rootfsUpperRepositoryDir), "rootfs")
+		origins, err := allocateRepositoryOrigins(&opts, 1)
+		if err != nil {
+			return Prepared{}, fmt.Errorf("allocating rootfs working snapshot: %w", err)
+		}
+		var rootfsUpper *ttcvolume.Repository
+		if len(origins) == 0 {
+			rootfsUpper, err = manager.CreatePrivate(filepath.Join(activeContainerDir, rootfsUpperRepositoryDir), "rootfs")
+		} else {
+			rootfsUpper, err = manager.CreatePrivateWithOrigin(filepath.Join(activeContainerDir, rootfsUpperRepositoryDir), "rootfs", origins[0])
+		}
 		if err != nil {
 			return Prepared{}, fmt.Errorf("creating persistent rootfs upper: %w", err)
 		}
@@ -914,10 +1373,14 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			return Prepared{}, fmt.Errorf("closing persistent rootfs upper: %w", err)
 		}
 	}
-	if err := s.resolveWritableHostMounts(containerDir, &opts); err != nil {
+	if err := s.resolveWritableHostMounts(activeContainerDir, &opts); err != nil {
 		return Prepared{}, err
 	}
-	internalMounts, err := materializeNetworkFiles(containerDir, opts.SpecOptions)
+	// These files are bind-mounted into the live sandbox and remain open for
+	// the lifetime of its gofer. Keep them with the node-local active state,
+	// not in the shared catalog. Apart from avoiding hot shared-filesystem I/O,
+	// this ensures removing shared metadata never unlinks an open NFS file.
+	internalMounts, err := materializeNetworkFiles(activeContainerDir, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -929,6 +1392,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	spec, err := BuildSpec(imageInfo.Image, opts.SpecOptions)
 	if err != nil {
 		return Prepared{}, err
+	}
+	if s.CPUFeatures != "" {
+		if spec.Annotations == nil {
+			spec.Annotations = make(map[string]string)
+		}
+		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
 	}
 	logAttributes, err := selectLogAttributes(opts.LogOptions, spec)
 	if err != nil {
@@ -957,7 +1426,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		ImageSize:           pulled.Size,
 		LeaseID:             leaseID,
 		Platform:            imageInfo.Platform,
-		BundleDir:           bundleDir,
+		BundleDir:           filepath.Join(s.Root, "containers", id, "bundle"),
 		RootFS:              rootfs,
 		NetworkMode:         networkMode,
 		LiveForkEligible:    liveForkEligible,
@@ -978,6 +1447,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		StopTimeout:         cloneIntPointer(opts.StopTimeout),
 		PidsLimit:           cloneInt64Pointer(opts.PidsLimit),
 		MemoryLimit:         cloneInt64Pointer(opts.MemoryLimit),
+		MemorySwap:          cloneInt64Pointer(opts.MemorySwap),
 		NanoCPUs:            cloneInt64Pointer(opts.NanoCPUs),
 		CPUShares:           cloneUint64Pointer(opts.CPUShares),
 		CPUPeriod:           cloneUint64Pointer(opts.CPUPeriod),
@@ -998,7 +1468,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		CreatedAt:           time.Now().UTC(),
 		NodeID:              opts.NodeID,
 	}
-	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: metadata.CreatedAt}}
+	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", StorageState: "local", CreatedAt: metadata.CreatedAt}}
 	if metadata.StopTimeout == nil {
 		value := DefaultStopTimeoutSeconds
 		metadata.StopTimeout = &value
@@ -1006,8 +1476,12 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, fmt.Errorf("writing container metadata: %w", err)
 	}
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing container metadata: %w", err)
+	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+	keepManagedVolumeSnapshots = true
+	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
 // PrepareRestore imports a standalone checkpoint's writable filesystems and
@@ -1043,6 +1517,11 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err != nil {
 		return Prepared{}, err
 	}
+	activeContainerDir := s.activeContainerDir(id)
+	if err := os.MkdirAll(activeContainerDir, 0700); err != nil {
+		s.discardIncompleteContainer(id)
+		return Prepared{}, fmt.Errorf("creating active restore directory: %w", err)
+	}
 	keep := false
 	leaseID := ""
 	var importedVolumeIDs []string
@@ -1050,7 +1529,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		if keep {
 			return
 		}
-		if manager, err := ttcvolume.OpenManager(s.Root, true); err == nil {
+		if manager, err := ttcvolume.OpenManager(s.activeRoot()); err == nil {
 			for _, volumeID := range importedVolumeIDs {
 				_ = manager.Remove(volumeID)
 			}
@@ -1060,7 +1539,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 			cancel()
 		}
-		_ = os.RemoveAll(containerDir)
+		s.discardIncompleteContainer(id)
 	}()
 
 	specData, err := json.Marshal(opts.Spec)
@@ -1085,7 +1564,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		}
 		snapshotBySource[snapshot.Source] = snapshot.SnapshotPath
 	}
-	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1093,6 +1572,41 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		return Prepared{}, fmt.Errorf("volume backing capability changed during restore: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 	}
 	copyMode := manager.Capability().Mode
+	// A cluster node's repositories have working origins the cluster
+	// authority allocates, as those of a family it creates do.
+	importOrigin := func() (ttcsnapshot.SnapshotID, error) {
+		if opts.AllocateSnapshotOrigins == nil {
+			return 0, nil
+		}
+		origins, err := opts.AllocateSnapshotOrigins(1)
+		if err != nil {
+			return 0, err
+		}
+		if len(origins) != 1 || origins[0] == 0 {
+			return 0, fmt.Errorf("snapshot allocator returned %v, want one origin", origins)
+		}
+		return origins[0], nil
+	}
+	importPrivate := func(path, name, source string) (*ttcvolume.Repository, ttcvolume.SnapshotInfo, error) {
+		origin, err := importOrigin()
+		if err != nil || origin == 0 {
+			if err != nil {
+				return nil, ttcvolume.SnapshotInfo{}, err
+			}
+			return manager.ImportPrivateSnapshot(path, name, source)
+		}
+		return manager.ImportPrivateSnapshotWithOrigin(path, name, source, origin)
+	}
+	importVolume := func(name, source string) (*ttcvolume.Repository, ttcvolume.SnapshotInfo, error) {
+		origin, err := importOrigin()
+		if err != nil || origin == 0 {
+			if err != nil {
+				return nil, ttcvolume.SnapshotInfo{}, err
+			}
+			return manager.ImportSnapshot(name, source)
+		}
+		return manager.ImportSnapshotWithOrigin(name, source, origin)
+	}
 	var rootfsUpperID string
 	volumeIDMap := make(map[string]ttcvolume.VolumeInfo)
 	for index := range repositories {
@@ -1102,8 +1616,8 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			return Prepared{}, fmt.Errorf("checkpoint omits repository source %q", repository.Source)
 		}
 		if repository.Source == specutils.TTCRootfsUpperSource {
-			path := filepath.Join(containerDir, rootfsUpperRepositoryDir)
-			imported, snapshot, err := manager.ImportPrivateSnapshot(path, "rootfs", snapshotPath)
+			path := filepath.Join(activeContainerDir, rootfsUpperRepositoryDir)
+			imported, snapshot, err := importPrivate(path, "rootfs", snapshotPath)
 			if err != nil {
 				return Prepared{}, fmt.Errorf("importing rootfs upper: %w", err)
 			}
@@ -1119,11 +1633,11 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			continue
 		}
 		if repository.Private {
-			path := filepath.Join(containerDir, hostMountRepositoryDir, strconv.Itoa(index))
+			path := filepath.Join(activeContainerDir, hostMountRepositoryDir, strconv.Itoa(index))
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				return Prepared{}, fmt.Errorf("creating restored private repository root: %w", err)
 			}
-			imported, snapshot, err := manager.ImportPrivateSnapshot(path, fmt.Sprintf("host-%d", index), snapshotPath)
+			imported, snapshot, err := importPrivate(path, fmt.Sprintf("host-%d", index), snapshotPath)
 			if err != nil {
 				return Prepared{}, fmt.Errorf("importing private host-mount repository %q: %w", repository.Source, err)
 			}
@@ -1137,7 +1651,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 			continue
 		}
 		name := fmt.Sprintf("restore-%s-%d", id[:12], index)
-		imported, snapshot, err := manager.ImportSnapshot(name, snapshotPath)
+		imported, snapshot, err := importVolume(name, snapshotPath)
 		if err != nil {
 			return Prepared{}, fmt.Errorf("importing managed volume %q: %w", repository.Source, err)
 		}
@@ -1162,17 +1676,18 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if spec.Annotations == nil {
 		spec.Annotations = make(map[string]string)
 	}
+	if s.CPUFeatures != "" {
+		spec.Annotations[specutils.AnnotationCPUFeatures] = s.CPUFeatures
+	}
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
-	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
 	if len(repositories) == 0 {
 		delete(spec.Annotations, specutils.AnnotationTTCVolumeRepositories)
 	} else {
 		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
 	}
-	if spec.Root == nil {
-		return Prepared{}, errors.New("checkpoint OCI spec has no root")
+	if err := rewriteImageRoot(&spec, rootfs); err != nil {
+		return Prepared{}, fmt.Errorf("rewriting checkpoint image root: %w", err)
 	}
-	spec.Root.Path = rootfs
 	hostMountByIndex := make(map[int]RestoreHostMount, len(opts.HostMounts))
 	for _, mount := range opts.HostMounts {
 		if mount.MountIndex < 0 || mount.Source == "" || mount.SnapshotPath == "" {
@@ -1192,7 +1707,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 		if mount.Type != "bind" || mount.Source != snapshot.Source {
 			return Prepared{}, fmt.Errorf("checkpoint host mount %d does not match OCI spec", index)
 		}
-		destination := filepath.Join(containerDir, "checkpoint-mounts", strconv.Itoa(index))
+		destination := filepath.Join(activeContainerDir, "checkpoint-mounts", strconv.Itoa(index))
 		if err := copyRestoreHostPath(snapshot.SnapshotPath, destination); err != nil {
 			return Prepared{}, fmt.Errorf("restoring host mount %q: %w", mount.Source, err)
 		}
@@ -1234,17 +1749,19 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	metadata.ImageSize = pulled.Size
 	metadata.LeaseID = leaseID
 	metadata.Platform = imageInfo.Platform
-	metadata.BundleDir = bundleDir
+	metadata.BundleDir = filepath.Join(s.Root, "containers", id, "bundle")
 	metadata.RootFS = rootfs
 	metadata.PublishedPorts = nil
 	metadata.RootfsUpperID = rootfsUpperID
 	metadata.RootfsUpperCopyMode = string(copyMode)
 	metadata.State = "created"
 	metadata.ExitStatus = nil
+	metadata.OOMKilled = false
+	metadata.ExitError = ""
 	metadata.CreatedAt = now
 	metadata.StartedAt = nil
 	metadata.ExitedAt = nil
-	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", CreatedAt: now}}
+	metadata.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: ttcvolume.MainBranch, State: "created", StorageState: "local", CreatedAt: now}}
 	metadata.NodeID = opts.NodeID
 	for index := range metadata.Volumes {
 		oldID := metadata.Volumes[index].ID
@@ -1257,8 +1774,11 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &metadata); err != nil {
 		return Prepared{}, err
 	}
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing restored container metadata: %w", err)
+	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
+	return Prepared{BundleDir: metadata.BundleDir, RootFS: rootfs, Image: imageInfo, Container: metadata}, nil
 }
 
 // PrepareDistributedFork creates target container metadata without copying
@@ -1298,9 +1818,47 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return Prepared{}, err
 	}
-	source, err := s.LoadContainer(opts.SourceContainer)
-	if err != nil {
-		return Prepared{}, err
+	var source ContainerInfo
+	if opts.Source != nil {
+		source = *opts.Source
+		portableFamily := source.DistributedFamilyID
+		if portableFamily == "" {
+			portableFamily = source.ID
+		}
+		if source.ID != opts.SourceContainer && portableFamily != opts.SourceContainer {
+			return Prepared{}, fmt.Errorf("portable source ID %q does not match transaction source %q", source.ID, opts.SourceContainer)
+		}
+	} else {
+		var err error
+		source, err = s.LoadContainer(opts.SourceContainer)
+		if err != nil {
+			return Prepared{}, err
+		}
+	}
+	sourceQuarantined := false
+	targetParent := opts.ParentBranch
+	targetCreated := time.Now().UTC()
+	var migrationSource *BranchInfo
+	sourcePhysicalBranch := opts.SourcePhysicalBranch
+	if sourcePhysicalBranch == "" {
+		sourcePhysicalBranch = opts.VisibleBranch
+	}
+	for _, branch := range source.Branches {
+		if opts.Migration && branch.ID == sourcePhysicalBranch {
+			copy := branch
+			migrationSource = &copy
+			targetParent = branch.ParentID
+			targetCreated = branch.CreatedAt
+			sourceQuarantined = branch.Quarantined
+			break
+		}
+		if branch.ID == opts.ParentBranch {
+			sourceQuarantined = branch.Quarantined
+			if opts.Migration {
+				targetParent = branch.ParentID
+			}
+			break
+		}
 	}
 	globalFamilyID := source.DistributedFamilyID
 	if globalFamilyID == "" {
@@ -1320,63 +1878,84 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		}
 	}
 	if existingTarget != nil {
-		existing := *existingTarget
-		if !opts.Migration && existing.NodeID != "" && existing.NodeID != opts.NodeID {
-			return Prepared{}, fmt.Errorf("container %q belongs to cluster node %q", opts.TargetName, existing.NodeID)
-		}
-		existingFamilyID := existing.DistributedFamilyID
-		if existingFamilyID == "" {
-			existingFamilyID = existing.ID
-		}
-		if existingFamilyID != globalFamilyID {
-			return Prepared{}, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
-		}
-		branchExists := false
-		for _, branch := range existing.Branches {
-			if branch.ID != opts.VisibleBranch {
-				continue
+		// A target family can simultaneously finish an earlier branch import
+		// while this one is being reserved. Keep the complete read/validate/write
+		// transaction under the same per-container lock as dependency and
+		// publication updates; otherwise either writer can silently erase the
+		// other's DistributedForkImports entry on a delayed shared filesystem.
+		var existing ContainerInfo
+		err := s.mutateContainer(existingTarget.ID, func(current *ContainerInfo) (bool, error) {
+			// A logical family spans nodes. An import into an existing family is a
+			// peer branch even when the target node does not yet have a physical
+			// Sentry for that family; the target runtime layer creates one lazily.
+			existingFamilyID := current.DistributedFamilyID
+			if existingFamilyID == "" {
+				existingFamilyID = current.ID
 			}
-			branchExists = true
-			if !opts.Migration {
-				return Prepared{}, fmt.Errorf("branch %s@%s already exists", existing.Name, opts.VisibleBranch)
+			if existingFamilyID != globalFamilyID {
+				return false, fmt.Errorf("container %q belongs to distributed family %q, not %q", opts.TargetName, existingFamilyID, globalFamilyID)
 			}
-			if existing.BranchNodeID(branch.ID) != opts.SourceNode {
-				return Prepared{}, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", existing.Name, branch.ID, existing.BranchNodeID(branch.ID), opts.SourceNode)
+			branchExists := false
+			for _, branch := range current.Branches {
+				if branch.ID != opts.VisibleBranch {
+					continue
+				}
+				branchExists = true
+				if !opts.Migration {
+					return false, fmt.Errorf("branch %s@%s already exists", current.Name, opts.VisibleBranch)
+				}
+				if !opts.AuthoritativeMigration && current.BranchNodeID(branch.ID) != opts.SourceNode {
+					return false, fmt.Errorf("migration source branch %s@%s belongs to node %q, not %q", current.Name, branch.ID, current.BranchNodeID(branch.ID), opts.SourceNode)
+				}
 			}
-		}
-		if opts.Migration && !branchExists {
-			return Prepared{}, fmt.Errorf("migration source branch %s@%s does not exist", existing.Name, opts.VisibleBranch)
-		}
-		if existing.DistributedForkImports == nil {
-			existing.DistributedForkImports = make(map[string]DistributedForkImport)
-		}
-		if _, ok := existing.DistributedForkImports[opts.TransactionID]; ok {
-			return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
-		}
-		for _, pending := range existing.DistributedForkImports {
-			if pending.BranchID == opts.VisibleBranch {
-				return Prepared{}, fmt.Errorf("branch %s@%s is already being imported", existing.Name, opts.VisibleBranch)
+			if opts.Migration && !opts.AuthoritativeMigration && !branchExists && (migrationSource == nil || source.BranchNodeID(sourcePhysicalBranch) != opts.SourceNode) {
+				return false, fmt.Errorf("migration source branch %s@%s is absent from the source-owned family metadata", current.Name, opts.VisibleBranch)
 			}
-		}
-		now := time.Now().UTC()
-		existing.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
-			BranchID: opts.VisibleBranch, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch),
-			State: "created", CreatedAt: now, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
-		}
-		if err := writeJSON(filepath.Join(s.Root, "containers", existing.ID, "container.json"), &existing); err != nil {
+			if current.DistributedForkImports == nil {
+				current.DistributedForkImports = make(map[string]DistributedForkImport)
+			}
+			if _, ok := current.DistributedForkImports[opts.TransactionID]; ok {
+				existing = *current
+				return false, nil
+			}
+			for _, pending := range current.DistributedForkImports {
+				if pending.BranchID == opts.VisibleBranch {
+					return false, fmt.Errorf("branch %s@%s is already being imported", current.Name, opts.VisibleBranch)
+				}
+			}
+			physicalBranch := ""
+			if opts.Migration {
+				physicalBranch = opts.TargetBranch
+			}
+			current.DistributedForkImports[opts.TransactionID] = DistributedForkImport{
+				BranchID: opts.VisibleBranch, PhysicalBranchID: physicalBranch, ParentID: targetParent, FilesystemBranch: ttcvolume.ScopedBranchID(source.ID, opts.TargetBranch), Quarantined: sourceQuarantined,
+				State: "created", CreatedAt: targetCreated, SourceNode: opts.SourceNode, TargetNode: opts.NodeID, Migration: opts.Migration,
+				AuthoritativeMigration: opts.AuthoritativeMigration,
+			}
+			existing = *current
+			return true, nil
+		})
+		if err != nil {
 			return Prepared{}, err
 		}
 		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
 	}
-	if opts.Migration {
-		return Prepared{}, fmt.Errorf("migration target family %q is unavailable", opts.TargetName)
-	}
-	if opts.VisibleBranch != "main" {
-		return Prepared{}, fmt.Errorf("new distributed target family %q must start with @main", opts.TargetName)
-	}
-	spec, err := s.LoadSpec(source.ID)
-	if err != nil {
-		return Prepared{}, err
+	var spec *specs.Spec
+	if opts.Spec != nil {
+		encoded, err := json.Marshal(opts.Spec)
+		if err != nil {
+			return Prepared{}, err
+		}
+		spec = &specs.Spec{}
+		if err := json.Unmarshal(encoded, spec); err != nil {
+			return Prepared{}, err
+		}
+	} else {
+		var err error
+		spec, err = s.LoadSpec(source.ID)
+		if err != nil {
+			return Prepared{}, err
+		}
 	}
 	repositories, err := specutils.TTCVolumeRepositories(spec)
 	if err != nil {
@@ -1402,14 +1981,29 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	} else {
 		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encodedRepositories)
 	}
-	id, containerDir, err := s.createContainerDir(containers)
+	var id, containerDir string
+	if opts.TargetID != "" {
+		if err := validateObjectName("distributed target container", opts.TargetID); err != nil {
+			return Prepared{}, err
+		}
+		id = opts.TargetID
+		containerDir, err = s.createContainerStagingDir(id)
+	} else {
+		id, containerDir, err = s.createContainerDir(containers)
+	}
 	if err != nil {
 		return Prepared{}, err
 	}
-	if err := rehomeInternalMounts(spec, containerDir); err != nil {
-		_ = os.RemoveAll(containerDir)
-		return Prepared{}, err
+	activeContainerDir := s.activeContainerDir(id)
+	if err := os.MkdirAll(activeContainerDir, 0700); err != nil {
+		s.discardIncompleteContainer(id)
+		return Prepared{}, fmt.Errorf("creating distributed target active directory: %w", err)
 	}
+	// TTC-generated bind mounts still name the source node here. Their small
+	// contents arrive with the authenticated remote session and are rewritten
+	// in the transient runtime bundle immediately before runsc create. Trying
+	// to read these paths during reservation breaks when nodes use private /tmp
+	// mounts, even if their TTC_LOCAL_ROOT strings happen to be identical.
 	delete(spec.Annotations, specutils.AnnotationTTCMemoryFile)
 	spec.Annotations[specutils.AnnotationTTCDistributedTarget] = "true"
 	keep := false
@@ -1423,7 +2017,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 			_ = images.DeleteContentLease(cleanupCtx, images.ContentLeaseOptions{Root: s.Root, LeaseID: leaseID})
 			cancel()
 		}
-		_ = os.RemoveAll(containerDir)
+		s.discardIncompleteContainer(id)
 	}()
 	if spec.Linux != nil && spec.Linux.Resources != nil && spec.Linux.CgroupsPath != "" {
 		spec.Linux.CgroupsPath = filepath.Join("ttc", id)
@@ -1449,25 +2043,35 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	}
 	now := time.Now().UTC()
 	target.ID = id
-	target.Name = opts.TargetName
+	// A remote runtime is a physical implementation detail of the logical
+	// distributed family. Give its persistent record an internal unique name;
+	// exposing the source family name here makes ordinary name lookup ambiguous
+	// after migration. Raft placement maps it back to the logical family.
+	target.Name = id
 	target.LeaseID = leaseID
-	target.BundleDir = bundleDir
+	target.BundleDir = filepath.Join(s.Root, "containers", id, "bundle")
 	target.PublishedPorts = nil
 	target.AutoRemove = false
 	target.State = "created"
 	target.ExitStatus = nil
+	target.OOMKilled = false
+	target.ExitError = ""
 	target.CreatedAt = now
 	target.StartedAt = nil
 	target.ExitedAt = nil
-	target.Branches = []BranchInfo{{ID: "main", NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch, State: "created", CreatedAt: now}}
+	physicalBranch := opts.VisibleBranch
+	if opts.Migration {
+		physicalBranch = opts.TargetBranch
+	}
+	target.Branches = []BranchInfo{{
+		ID: physicalBranch, NodeID: opts.NodeID, FilesystemBranch: childRepositoryBranch,
+		Quarantined: sourceQuarantined, State: "created", StorageState: "local", SourceNode: opts.SourceNode,
+		ParentID: targetParent, CreatedAt: now, DistributedForkTransactionID: opts.TransactionID,
+	}}
 	target.DistributedForkTransactionID = opts.TransactionID
 	target.DistributedForkNodeID = opts.NodeID
 	target.DistributedForkHidden = true
-	// Sparse roots describe this target runtime's own demand-page source. They
-	// must never be inherited when the source is itself a distributed child;
-	// Prepare will install a new root if this transaction uses sparse handoff.
-	target.DistributedSparseRepository = ""
-	target.DistributedSparseBranch = ""
+	target.DistributedPhysicalRuntime = true
 	target.DistributedFamilyID = globalFamilyID
 	target.DistributedForkImports = nil
 	target.NodeID = opts.NodeID
@@ -1477,8 +2081,11 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if err := writeJSON(filepath.Join(containerDir, "container.json"), &target); err != nil {
 		return Prepared{}, err
 	}
+	if err := s.publishContainerDir(id, containerDir); err != nil {
+		return Prepared{}, fmt.Errorf("publishing distributed target metadata: %w", err)
+	}
 	keep = true
-	return Prepared{BundleDir: bundleDir, RootFS: target.RootFS, Container: target}, nil
+	return Prepared{BundleDir: target.BundleDir, RootFS: target.RootFS, Container: target}, nil
 }
 
 func copyRestoreHostPath(source, destination string) error {
@@ -1571,7 +2178,7 @@ func copyRestoreHostFile(source, destination string, mode os.FileMode) error {
 	return output.Close()
 }
 
-func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, error) {
+func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, func(), error) {
 	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
 	mounted := make(map[string]bool)
 	for _, mount := range opts.HostMounts {
@@ -1583,7 +2190,7 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	for _, volume := range volumes {
 		destination := filepath.Clean(volume.Destination)
 		if mounted[destination] {
-			return nil, fmt.Errorf("duplicate mount destination %q", destination)
+			return nil, nil, fmt.Errorf("duplicate mount destination %q", destination)
 		}
 		mounted[destination] = true
 	}
@@ -1595,7 +2202,7 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 	for _, destination := range imageDestinations {
 		clean := filepath.Clean(destination)
 		if !filepath.IsAbs(clean) || clean == "/" {
-			return nil, fmt.Errorf("image declares invalid volume destination %q", destination)
+			return nil, nil, fmt.Errorf("image declares invalid volume destination %q", destination)
 		}
 		if mounted[clean] {
 			continue
@@ -1604,25 +2211,46 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 		mounted[clean] = true
 	}
 	if len(volumes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if opts.VolumeCopyMode != "" && manager.Capability().Mode != opts.VolumeCopyMode {
-		return nil, fmt.Errorf("volume backing capability changed while preparing managed volumes: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
+		return nil, nil, fmt.Errorf("volume backing capability changed while preparing managed volumes: daemon mode is %s, current mode is %s", opts.VolumeCopyMode, manager.Capability().Mode)
 	}
 	ownerManifest, err := ownership.Read(ownership.ManifestPath(rootfs))
 	if err != nil {
-		return nil, fmt.Errorf("loading image ownership for managed volumes: %w", err)
+		return nil, nil, fmt.Errorf("loading image ownership for managed volumes: %w", err)
 	}
+	type createdSnapshot struct {
+		volume string
+		branch string
+	}
+	var snapshots []createdSnapshot
+	cleanup := func() {
+		for i := len(snapshots) - 1; i >= 0; i-- {
+			repository, openErr := manager.Open(snapshots[i].volume)
+			if openErr != nil {
+				continue
+			}
+			_ = repository.RemoveBranch(snapshots[i].branch)
+			_ = repository.Close()
+		}
+	}
+	success := false
+	defer func() {
+		if !success {
+			cleanup()
+		}
+	}()
 	seenIDs := make(map[string]string)
 	for i := range volumes {
 		if volumes[i].Name == "" {
 			id, err := randomObjectID("anonymous volume", 16)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			volumes[i].Name = "anon-" + id
 			volumes[i].Anonymous = true
@@ -1630,41 +2258,120 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 		repository, err := manager.Open(volumes[i].Name)
 		created := false
 		if errors.Is(err, os.ErrNotExist) {
-			repository, err = manager.Create(volumes[i].Name)
+			origins, allocationErr := allocateRepositoryOrigins(&opts, 1)
+			if allocationErr != nil {
+				return nil, nil, fmt.Errorf("allocating managed-volume working snapshot: %w", allocationErr)
+			}
+			if len(origins) == 0 {
+				repository, err = manager.Create(volumes[i].Name)
+			} else {
+				repository, err = manager.CreateWithOrigin(volumes[i].Name, origins[0])
+			}
 			created = err == nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("resolving managed volume %q: %w", volumes[i].Name, err)
+			return nil, nil, fmt.Errorf("resolving managed volume %q: %w", volumes[i].Name, err)
 		}
 		if created && !volumes[i].NoCopy {
 			if err := seedManagedVolume(repository, rootfs, volumes[i].Destination, ownerManifest); err != nil {
 				repository.Close()
 				_ = manager.Remove(volumes[i].Name)
-				return nil, fmt.Errorf("initializing managed volume %q from image path %q: %w", volumes[i].Name, volumes[i].Destination, err)
+				return nil, nil, fmt.Errorf("initializing managed volume %q from image path %q: %w", volumes[i].Name, volumes[i].Destination, err)
 			}
 		}
 		info := repository.Info()
 		if err := validateManagedVolumeAttachment(info.ID, volumes[i], containers); err != nil {
 			repository.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		volumes[i].ID = info.ID
 		volumes[i].RepositoryPath = repository.HostPath()
+		volumes[i].RepositoryBranch = ttcvolume.MainBranch
 		volumes[i].CopyMode = string(manager.Capability().Mode)
-		repository.Close()
+		if err := repository.Close(); err != nil {
+			return nil, nil, err
+		}
+		if volumes[i].Readonly {
+			nonce, err := randomObjectID("managed volume attachment", 16)
+			if err != nil {
+				return nil, nil, err
+			}
+			child := "a-" + nonce
+			owner, ownerBranch := managedVolumeWritableOwner(info.ID, containers)
+			origins, allocationErr := allocateRepositoryOrigins(&opts, 2)
+			if allocationErr != nil {
+				return nil, nil, fmt.Errorf("allocating readonly volume snapshot origins: %w", allocationErr)
+			}
+			if owner != nil && (ownerBranch.State == "running" || ownerBranch.State == "paused") {
+				if opts.SnapshotManagedVolume == nil {
+					return nil, nil, fmt.Errorf("managed volume %q requires a live snapshot from container %q", volumes[i].Name, owner.Name)
+				}
+				var sourceWorking, childWorking ttcsnapshot.SnapshotID
+				if len(origins) != 0 {
+					sourceWorking, childWorking = origins[0], origins[1]
+				}
+				if err := opts.SnapshotManagedVolume(owner.ID, ownerBranch.ID, info.ID, child, sourceWorking, childWorking); err != nil {
+					return nil, nil, fmt.Errorf("snapshotting managed volume %q from %s@%s: %w", volumes[i].Name, owner.Name, ownerBranch.ID, err)
+				}
+			} else {
+				repository, err := manager.Open(info.ID)
+				if err != nil {
+					return nil, nil, err
+				}
+				var tx *ttcvolume.ForkTransaction
+				var forkErr error
+				if len(origins) == 0 {
+					tx, forkErr = repository.BeginFork(ttcvolume.MainBranch, child)
+				} else {
+					tx, forkErr = repository.BeginForkWithOrigins(ttcvolume.MainBranch, child, origins[0], origins[1])
+				}
+				if forkErr == nil {
+					forkErr = tx.Commit()
+				}
+				closeErr := repository.Close()
+				if forkErr != nil || closeErr != nil {
+					return nil, nil, errors.Join(forkErr, closeErr)
+				}
+			}
+			volumes[i].RepositoryBranch = child
+			snapshots = append(snapshots, createdSnapshot{volume: info.ID, branch: child})
+		}
 		if previous, ok := seenIDs[info.ID]; ok {
-			return nil, fmt.Errorf("managed volume %q is mounted more than once (%q and %q); aliases are not yet supported", volumes[i].Name, previous, volumes[i].Destination)
+			return nil, nil, fmt.Errorf("managed volume %q is mounted more than once (%q and %q); aliases are not yet supported", volumes[i].Name, previous, volumes[i].Destination)
 		}
 		seenIDs[info.ID] = volumes[i].Destination
 	}
-	return volumes, nil
+	success = true
+	return volumes, cleanup, nil
+}
+
+func managedVolumeWritableOwner(volumeID string, containers []ContainerInfo) (*ContainerInfo, BranchInfo) {
+	for i := range containers {
+		writable := false
+		for _, volume := range containers[i].Volumes {
+			if volume.ID == volumeID && !volume.Readonly {
+				writable = true
+				break
+			}
+		}
+		if !writable {
+			continue
+		}
+		for _, branch := range containers[i].Branches {
+			if branch.ID == "main" {
+				return &containers[i], branch
+			}
+		}
+		return &containers[i], BranchInfo{}
+	}
+	return nil, BranchInfo{}
 }
 
 func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptions) error {
 	if opts == nil {
 		return errors.New("missing host mount options")
 	}
-	manager, err := ttcvolume.OpenManager(s.Root, opts.VolumeCopyMode == "" || opts.VolumeCopyMode == ttcvolume.CopyModeFull)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return err
 	}
@@ -1698,7 +2405,16 @@ func (s Store) resolveWritableHostMounts(containerDir string, opts *PrepareOptio
 			hostMountRootCreated = true
 		}
 		repositoryPath := filepath.Join(containerDir, hostMountRepositoryDir, strconv.Itoa(index))
-		repository, err := manager.CreatePrivate(repositoryPath, fmt.Sprintf("host-%d", index))
+		origins, err := allocateRepositoryOrigins(opts, 1)
+		if err != nil {
+			return fmt.Errorf("allocating host-mount working snapshot: %w", err)
+		}
+		var repository *ttcvolume.Repository
+		if len(origins) == 0 {
+			repository, err = manager.CreatePrivate(repositoryPath, fmt.Sprintf("host-%d", index))
+		} else {
+			repository, err = manager.CreatePrivateWithOrigin(repositoryPath, fmt.Sprintf("host-%d", index), origins[0])
+		}
 		if err != nil {
 			return fmt.Errorf("creating persistent upper for host mount %q: %w", mount.Destination, err)
 		}
@@ -1840,8 +2556,7 @@ func copyHostRegularIntoRepository(repository *ttcvolume.Repository, ino uint64,
 	if err != nil {
 		return err
 	}
-	destinationPath := filepath.Join(repository.HostPath(), destination.Name())
-	destination, cloneErr := cloneOpenFile(destination, source, destinationPath)
+	destination, cloneErr := cloneOpenFile(destination, source)
 	if destination == nil {
 		return cloneErr
 	}
@@ -2095,10 +2810,6 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 	for _, info := range existing {
 		unavailable[info.Name] = true
 	}
-	containersDir := filepath.Join(s.Root, "containers")
-	if err := os.MkdirAll(containersDir, 0700); err != nil {
-		return "", "", fmt.Errorf("creating container state root: %w", err)
-	}
 	for attempt := 0; attempt < 100; attempt++ {
 		id, err := randomObjectID("container", containerIDBytes)
 		if err != nil {
@@ -2107,8 +2818,13 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 		if unavailable[id] {
 			continue
 		}
-		dir := filepath.Join(containersDir, id)
-		if err := os.Mkdir(dir, 0700); err == nil {
+		var dir string
+		if s.hasUnifiedActiveRoot() {
+			dir, err = s.createContainerInPlaceDir(id)
+		} else {
+			dir, err = s.createContainerStagingDir(id)
+		}
+		if err == nil {
 			return id, dir, nil
 		} else if !os.IsExist(err) {
 			return "", "", fmt.Errorf("creating state for container %s: %w", id, err)
@@ -2117,6 +2833,62 @@ func (s Store) createContainerDir(existing []ContainerInfo) (string, string, err
 	return "", "", errors.New("could not allocate a unique container ID")
 }
 
+func (s Store) createContainerInPlaceDir(id string) (string, error) {
+	root := filepath.Join(s.Root, "containers")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating container state root: %w", err)
+	}
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, containerCreationMarker), []byte("in progress\n"), 0600); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("marking in-place container construction: %w", err)
+	}
+	return dir, nil
+}
+
+func (s Store) createContainerStagingDir(id string) (string, error) {
+	if err := os.MkdirAll(filepath.Join(s.Root, "containers"), 0700); err != nil {
+		return "", fmt.Errorf("creating container state root: %w", err)
+	}
+	root := filepath.Join(s.Root, containerStagingDir)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating container staging root: %w", err)
+	}
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// publishContainerDir is the only boundary at which a newly constructed
+// container becomes visible. Renaming the complete directory is atomic to all
+// clients of a conforming shared filesystem; unlike a marker unlink, it does
+// not require cross-client cache ordering between independent pathnames.
+func (s Store) publishContainerDir(id, stagingDir string) error {
+	finalDir := filepath.Join(s.Root, "containers", id)
+	if filepath.Clean(stagingDir) == filepath.Clean(finalDir) {
+		// container.json was written atomically after every other required file,
+		// so it is the visibility boundary for a unified standalone store. The
+		// marker is retained only for startup recovery if TTC crashes between
+		// those two operations.
+		if err := os.Remove(filepath.Join(finalDir, containerCreationMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	} else {
+		if err := s.rename(stagingDir, finalDir); err != nil {
+			return err
+		}
+	}
+	directory, err := os.Open(filepath.Dir(finalDir))
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
+}
 func normalizePortBinding(binding PortBinding) (PortBinding, error) {
 	address, err := netip.ParseAddr(binding.HostIP)
 	if err != nil || !address.Is4() {
@@ -2146,7 +2918,6 @@ func samePortBinding(a, b PortBinding) bool {
 }
 
 // LoadContainer resolves an exact name, full ID, or unambiguous ID prefix.
-// Legacy name-keyed records are returned with ID set to their directory key.
 func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	if err := validateName(identifier); err != nil {
 		return ContainerInfo{}, err
@@ -2158,6 +2929,11 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ContainerInfo{}, err
 	}
+	if id, ok := containerNameHint(s.Root + "\x00" + identifier); ok {
+		if info, err := s.loadContainerKey(id); err == nil && info.Name == identifier && !info.DistributedForkHidden && !info.IsDistributedPhysicalRuntime() {
+			return info, nil
+		}
+	}
 	containers, err := s.ListContainers()
 	if err != nil {
 		return ContainerInfo{}, err
@@ -2165,6 +2941,7 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	var names []ContainerInfo
 	var ids []ContainerInfo
 	for _, info := range containers {
+		setContainerNameHint(s.Root+"\x00"+info.Name, info.ID)
 		if info.Name == identifier {
 			names = append(names, info)
 		}
@@ -2184,7 +2961,64 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 	if len(ids) > 1 {
 		return ContainerInfo{}, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
 	}
-	return ContainerInfo{}, fmt.Errorf("container %q does not exist", identifier)
+	return ContainerInfo{}, fmt.Errorf("container %q does not exist: %w", identifier, os.ErrNotExist)
+}
+
+// loadRuntimeContainer resolves ordinary containers and an exact hidden
+// distributed-target ID. Hidden targets remain absent from all name and prefix
+// lookups, but runtime preparation must be able to consume their private bundle
+// before the target is atomically published.
+func (s Store) loadRuntimeContainer(identifier string) (ContainerInfo, error) {
+	return s.LoadRuntimeContainer(identifier)
+}
+
+// LoadRuntimeContainer resolves ordinary containers and exact persistent
+// container IDs. Callers using an internal distributed identity must already
+// possess that ID from placement authority; this method deliberately does not
+// expose hidden targets through names or ID prefixes. The exact-ID fallback is
+// also important on NFS, where a newly committed Raft placement can become
+// visible before another client's directory cache sees the corresponding
+// shared family record.
+func (s Store) LoadRuntimeContainer(identifier string) (ContainerInfo, error) {
+	info, err := s.LoadContainer(identifier)
+	if err == nil {
+		return info, nil
+	}
+	exact, exactErr := s.loadContainerKey(identifier)
+	if exactErr == nil && exact.ID == identifier {
+		return exact, nil
+	}
+	return ContainerInfo{}, err
+}
+
+// mutateContainer serializes catalog read-modify-write transactions across
+// foreground commands, background publication workers, and clustered daemons
+// sharing TTC_ROOT. The lock is deliberately separate from the JSON file so
+// atomic replacement of container.json does not replace the lock inode.
+func (s Store) mutateContainer(identifier string, mutate func(*ContainerInfo) (bool, error)) error {
+	resolved, err := s.loadRuntimeContainer(identifier)
+	if err != nil {
+		return err
+	}
+	directory := filepath.Join(s.Root, "containers", resolved.ID)
+	lock, err := os.OpenFile(filepath.Join(directory, ".metadata.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return err
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	info, err := s.loadContainerKey(resolved.ID)
+	if err != nil {
+		return err
+	}
+	changed, err := mutate(&info)
+	if err != nil || !changed {
+		return err
+	}
+	return writeJSON(filepath.Join(directory, "container.json"), &info)
 }
 
 // LoadDistributedForkTarget resolves a hidden or published target by its
@@ -2225,16 +3059,13 @@ func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, e
 }
 
 func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
-	data, err := os.ReadFile(filepath.Join(s.Root, "containers", key, "container.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(s.Root, "containers", key, "container.json"))
 	if err != nil {
 		return ContainerInfo{}, fmt.Errorf("reading container %q: %w", key, err)
 	}
 	var info ContainerInfo
 	if err := json.Unmarshal(data, &info); err != nil {
 		return ContainerInfo{}, fmt.Errorf("decoding container %q: %w", key, err)
-	}
-	if info.ID == "" {
-		info.ID = key
 	}
 	if info.ID != key || info.Name == "" || info.BundleDir == "" {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata", key)
@@ -2243,10 +3074,13 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	if info.State == "" {
-		info.State = "created"
+		return ContainerInfo{}, fmt.Errorf("container %q has no lifecycle state", key)
 	}
-	if len(info.Branches) == 0 {
-		info.Branches = []BranchInfo{{ID: "main", FilesystemBranch: ttcvolume.MainBranch, State: info.State, CreatedAt: info.CreatedAt}}
+	if len(info.Branches) == 0 && !info.DistributedCatalogOnly {
+		return ContainerInfo{}, fmt.Errorf("container %q has no branch metadata", key)
+	}
+	if info.DistributedCatalogOnly && info.IsDistributedPhysicalRuntime() {
+		return ContainerInfo{}, fmt.Errorf("physical container %q cannot be a catalog-only family", key)
 	}
 	seenBranches := make(map[string]struct{}, len(info.Branches))
 	for i := range info.Branches {
@@ -2262,17 +3096,17 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		}
 		seenBranches[branch.ID] = struct{}{}
 		if branch.FilesystemBranch == "" {
-			if branch.ID == "main" {
-				branch.FilesystemBranch = ttcvolume.MainBranch
-			} else {
-				branch.FilesystemBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
-			}
+			return ContainerInfo{}, fmt.Errorf("container %q branch %q has no filesystem identity", key, branch.ID)
+		}
+		if branch.StorageState == "" {
+			return ContainerInfo{}, fmt.Errorf("container %q branch %q has no storage state", key, branch.ID)
 		}
 	}
 	seenPortEndpoints := make(map[string]struct{}, len(info.PublishedPorts))
 	bindings := info.PublishedPorts[:0]
 	for i := range info.PublishedPorts {
-		binding, err := normalizePortBinding(info.PublishedPorts[i])
+		candidate := info.PublishedPorts[i]
+		binding, err := normalizePortBinding(candidate)
 		if err != nil {
 			return ContainerInfo{}, fmt.Errorf("container %q has invalid published-port metadata: %w", key, err)
 		}
@@ -2293,17 +3127,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid metadata: %w", key, err)
 	}
 	info.NetworkMode = networkMode
-	// Metadata predating the immutable eligibility property omitted both fields.
-	// Existing contained-network families were created under TTC's forkable
-	// configuration, while legacy host-network families necessarily remain
-	// ineligible.
-	if !info.LiveForkEligible && info.LiveForkWaiver == "" {
-		if networkMode == "host" {
-			info.LiveForkWaiver = "legacy host network configuration"
-		} else {
-			info.LiveForkEligible = true
-		}
-	}
 	if info.LiveForkEligible && info.LiveForkWaiver != "" {
 		return ContainerInfo{}, fmt.Errorf("container %q is live-fork eligible but records waiver %q", key, info.LiveForkWaiver)
 	}
@@ -2341,7 +3164,7 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if *info.ShmSize < 0 {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid shared memory size %d", key, *info.ShmSize)
 	}
-	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
+	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, MemorySwap: info.MemorySwap, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid resource limits: %w", key, err)
 	}
 	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
@@ -2352,11 +3175,11 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 
 // LoadSpec returns the generated OCI runtime spec for a persistent container.
 func (s Store) LoadSpec(name string) (*specs.Spec, error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(filepath.Join(info.BundleDir, "config.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(info.BundleDir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading OCI config for container %q: %w", name, err)
 	}
@@ -2364,20 +3187,266 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	if err := json.Unmarshal(data, &spec); err != nil {
 		return nil, fmt.Errorf("decoding OCI config for container %q: %w", name, err)
 	}
+	if s.activeRoot() != s.Root {
+		if spec.Root != nil && info.Digest != "" && info.Platform != "" {
+			rootfs := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
+			if err := rewriteImageRoot(&spec, rootfs); err != nil {
+				return nil, err
+			}
+		}
+		// TTC-generated bind mounts are small node-private files (hostname,
+		// hosts, and resolv.conf). A cold publication stores their contents,
+		// and materialization installs them under the active root. Overlay those
+		// paths in memory just like the image root and volume repositories; the
+		// canonical shared OCI bundle must remain free of node-local paths.
+		internalDir := filepath.Join(s.activeContainerDir(info.ID), "internal-mounts")
+		if _, err := os.Stat(internalDir); err == nil {
+			if spec.Annotations == nil || spec.Annotations[InternalMountsAnnotation] == "" {
+				return nil, fmt.Errorf("container %q has node-local internal mounts but no declaration", info.Name)
+			}
+			var destinations []string
+			if err := json.Unmarshal([]byte(spec.Annotations[InternalMountsAnnotation]), &destinations); err != nil {
+				return nil, fmt.Errorf("decoding TTC internal mounts: %w", err)
+			}
+			declared := make(map[string]struct{}, len(destinations))
+			for _, destination := range destinations {
+				declared[filepath.Clean(destination)] = struct{}{}
+			}
+			rewritten := 0
+			for i := range spec.Mounts {
+				mount := &spec.Mounts[i]
+				if _, ok := declared[filepath.Clean(mount.Destination)]; !ok {
+					continue
+				}
+				path := filepath.Join(internalDir, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
+				if _, err := os.Stat(path); err != nil {
+					return nil, fmt.Errorf("opening node-local TTC internal mount %q: %w", mount.Destination, err)
+				}
+				mount.Source = path
+				rewritten++
+			}
+			if rewritten != len(declared) {
+				return nil, fmt.Errorf("OCI spec declares %d TTC internal mounts but matched %d", len(declared), rewritten)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("checking node-local TTC internal mounts: %w", err)
+		}
+		repositories, err := specutils.TTCVolumeRepositories(&spec)
+		if err != nil {
+			return nil, err
+		}
+		changed := false
+		activeMappings := make(map[string]activeRepositoryMapping)
+		if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
+			if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
+				return nil, fmt.Errorf("decoding active repository map: %w", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		for i := range repositories {
+			if mapping, ok := activeMappings[repositories[i].Source]; ok {
+				repositories[i].Path = mapping.Path
+				repositories[i].RestoreID = mapping.RestoreID
+				if mapping.CopyMode != "" {
+					repositories[i].CopyMode = mapping.CopyMode
+				}
+				changed = true
+				continue
+			}
+			// Canonical specs are shared by every node. Their repository paths
+			// may name the node that originally created the family and must
+			// never become authoritative merely because that path happens to be
+			// visible (for example two daemons running on one host, or a local
+			// scratch tree accidentally exported over NFS). Resolve every known
+			// TTC repository source into this node's active root.
+			switch {
+			case repositories[i].Source == specutils.TTCRootfsUpperSource:
+				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), rootfsUpperRepositoryDir)
+			case strings.HasPrefix(repositories[i].Source, "/run/ttc/volumes/"):
+				repositories[i].Path = filepath.Join(s.activeRoot(), "filesystems", "volumes", filepath.Base(repositories[i].Source))
+			case repositories[i].Private:
+				repositories[i].Path = filepath.Join(s.activeContainerDir(info.ID), hostMountRepositoryDir, filepath.Base(repositories[i].Path))
+			default:
+				continue
+			}
+			changed = true
+		}
+		if changed {
+			encoded, err := json.Marshal(repositories)
+			if err != nil {
+				return nil, err
+			}
+			if spec.Annotations == nil {
+				spec.Annotations = make(map[string]string)
+			}
+			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+		}
+	}
+	// Restore aliases are one-shot resource keys and are recorded separately
+	// from the canonical OCI spec. Consult the map even in standalone mode so
+	// checkpoint restores can advance from a captured repository identity to
+	// the identity of the newly installed local repository.
+	if mappingData, err := readFileWithStaleRetry(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json")); err == nil {
+		activeMappings := make(map[string]activeRepositoryMapping)
+		if err := json.Unmarshal(mappingData, &activeMappings); err != nil {
+			return nil, fmt.Errorf("decoding active repository map: %w", err)
+		}
+		repositories, err := specutils.TTCVolumeRepositories(&spec)
+		if err != nil {
+			return nil, err
+		}
+		changed := false
+		for i := range repositories {
+			if mapping, ok := activeMappings[repositories[i].Source]; ok {
+				repositories[i].Path = mapping.Path
+				repositories[i].RestoreID = mapping.RestoreID
+				if mapping.CopyMode != "" {
+					repositories[i].CopyMode = mapping.CopyMode
+				}
+				changed = true
+			}
+		}
+		if changed {
+			encoded, err := json.Marshal(repositories)
+			if err != nil {
+				return nil, err
+			}
+			if spec.Annotations == nil {
+				spec.Annotations = make(map[string]string)
+			}
+			spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	return &spec, nil
+}
+
+// rewriteImageRoot makes every path-bearing immutable-image annotation agree
+// with rootfs. Canonical clustered bundles may have been written by another
+// node, so copying only Spec.Root.Path leaves the gofer looking for ownership
+// metadata or lazy-pack state in the former node's cache. Keep this operation
+// centralized so ordinary starts, checkpoint restore, and future cache
+// materializers cannot acquire subtly different node-local views.
+func rewriteImageRoot(spec *specs.Spec, rootfs string) error {
+	if spec == nil || spec.Root == nil {
+		return errors.New("OCI spec has no root")
+	}
+	if spec.Annotations == nil {
+		spec.Annotations = make(map[string]string)
+	}
+	spec.Root.Path = rootfs
+	spec.Annotations["dev.gvisor.spec.rootfs.source"] = rootfs
+	spec.Annotations[ownership.Annotation] = ownership.ManifestPath(rootfs)
+
+	// Lazy image backing is a property of this node's cache, not of the
+	// canonical image identity. A stale descriptor can make zero-length
+	// skeleton files appear complete and later SIGBUS executable mappings.
+	delete(spec.Annotations, ttcpack.LazyAnnotation)
+	if _, err := ttcpack.ReadLazyDescriptor(rootfs); err == nil {
+		spec.Annotations[ttcpack.LazyAnnotation] = ttcpack.LazyDescriptorPath(rootfs)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("loading node-local lazy image descriptor: %w", err)
+	}
+	return nil
+}
+
+// WriteActiveRepositoryMap records node-local materializations without
+// placing node-local host paths in the shared canonical OCI config.
+func (s Store) WriteActiveRepositoryMap(name string, repositories []specutils.TTCVolumeRepository) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	mappings := make(map[string]activeRepositoryMapping, len(repositories))
+	for _, repository := range repositories {
+		mappings[repository.Source] = activeRepositoryMapping{Path: repository.Path, RestoreID: repository.RestoreID, CopyMode: repository.CopyMode}
+	}
+	return writeJSON(filepath.Join(s.activeContainerDir(info.ID), "repository-map.json"), mappings)
+}
+
+// CommitActiveRepositoryRestoreIDs replaces one-shot restore aliases with the
+// identities of the repositories that are now installed on this node. Remote
+// and cold restores initially key VFS resources by the repository identity in
+// the captured Sentry. Once that restore has succeeded, any later capture is
+// made from the node-local repositories and therefore names their identities.
+// Keeping the old aliases would make a dehydrate/rehydrate cycle fail to
+// reconnect its filesystem resources.
+func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	spec, err := s.LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	repositories, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	for i := range repositories {
+		repository, err := ttcvolume.OpenRepository(repositories[i].Path, ttcvolume.CopyMode(repositories[i].CopyMode))
+		if err != nil {
+			return fmt.Errorf("opening restored repository %q: %w", repositories[i].Source, err)
+		}
+		repositories[i].RestoreID = repository.Info().ID
+		if err := repository.Close(); err != nil {
+			return fmt.Errorf("closing restored repository %q: %w", repositories[i].Source, err)
+		}
+	}
+	return s.WriteActiveRepositoryMap(info.ID, repositories)
 }
 
 // RefreshContainerImageRoot moves a stopped container bundle onto the current
 // immutable-image root format without changing its writable TTC volume. This
 // keeps containers created by older TTC builds startable after image backing
 // metadata gains new virtualization requirements.
+// ContainerImageRootReady reports whether the image root that the container
+// named name runs from is unpacked on this node.
+func (s Store) ContainerImageRootReady(name string) (bool, error) {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return false, err
+	}
+	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform)))
+	return err == nil, nil
+}
+
+// PrepareContainerImageRoot unpacks on this node the image root that the
+// container named name runs from, if it is not unpacked yet, without changing
+// the container's records; RefreshContainerImageRoot then finds it ready.
+func (s Store) PrepareContainerImageRoot(ctx context.Context, name string) error {
+	info, err := s.loadRuntimeContainer(name)
+	if err != nil {
+		return err
+	}
+	if _, err := loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform))); err == nil {
+		return nil
+	}
+	pulled, err := s.resolveImage(ctx, info.Digest, info.Platform, "never", nil)
+	if err != nil {
+		return fmt.Errorf("resolving image for container %q rootfs: %w", info.Name, err)
+	}
+	if _, _, err := s.prepareImageRoot(ctx, pulled, info.Platform, nil); err != nil {
+		return fmt.Errorf("preparing image root for container %q: %w", info.Name, err)
+	}
+	return nil
+}
+
 func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (ContainerInfo, error) {
-	info, err := s.LoadContainer(name)
+	info, err := s.loadRuntimeContainer(name)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	wantPrefix := imageRootFormatVersion + "-"
-	if strings.HasPrefix(filepath.Base(filepath.Dir(info.RootFS)), wantPrefix) {
+	want := filepath.Join(s.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
+	if info.RootFS == want {
+		if _, statErr := os.Stat(want); statErr == nil {
+			return info, nil
+		}
+	}
+	if s.activeRoot() == s.Root && strings.HasPrefix(filepath.Base(filepath.Dir(info.RootFS)), imageRootFormatVersion+"-") {
 		return info, nil
 	}
 	pulled, err := s.resolveImage(ctx, info.Digest, info.Platform, "never", nil)
@@ -2389,6 +3458,12 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 		return ContainerInfo{}, fmt.Errorf("preparing current image root for container %q: %w", info.Name, err)
 	}
 	if rootfs == info.RootFS {
+		return info, nil
+	}
+	if s.activeRoot() != s.Root {
+		// The shared catalog records image identity, not a node's cache path.
+		// LoadSpec rewrites the OCI root for each active node.
+		info.RootFS = rootfs
 		return info, nil
 	}
 	spec, err := s.LoadSpec(info.ID)
@@ -2408,8 +3483,11 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 	if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
 		return ContainerInfo{}, fmt.Errorf("updating OCI config for container %q image root: %w", info.Name, err)
 	}
-	info.RootFS = rootfs
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+	if err := s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		current.RootFS = rootfs
+		info = *current
+		return true, nil
+	}); err != nil {
 		return ContainerInfo{}, fmt.Errorf("updating container %q image root: %w", info.Name, err)
 	}
 	return info, nil
@@ -2417,12 +3495,37 @@ func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (Cont
 
 // ListContainers returns all persistent containers ordered by name.
 func (s Store) ListContainers() ([]ContainerInfo, error) {
-	return s.listContainers(false)
+	return s.listContainersWithPolicy(false, false, true)
+}
+
+// ListContainersForPlacement returns every published runtime-bearing
+// container, including the physical containers that back distributed logical
+// branches. Unlike ListContainers, this is an authority view rather than a
+// user-facing inventory. Prepared targets remain hidden until their placement
+// publication boundary commits.
+func (s Store) ListContainersForPlacement() ([]ContainerInfo, error) {
+	return s.listContainersWithPolicy(false, true, false)
+}
+
+// ListContainersForGC returns every durable container, including internal
+// removal tombstones, and fails rather than treating an unreadable record as
+// unreachable. Destructive graph reconciliation must use this view.
+func (s Store) ListContainersForGC() ([]ContainerInfo, error) {
+	return s.listContainers(true)
 }
 
 func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
+	return s.listContainersWithPolicy(includeHidden, true, false)
+}
+
+// listContainersWithPolicy separates availability-oriented discovery from
+// conservative internal scans. User-facing listing skips and warns about one
+// unreadable record so that an isolated damaged directory cannot hide every
+// healthy container. Mutations and garbage collection remain strict: they
+// must not infer that unreadable state is unreferenced.
+func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerateUnreadable bool) ([]ContainerInfo, error) {
 	containersDir := filepath.Join(s.Root, "containers")
-	entries, err := os.ReadDir(containersDir)
+	entries, err := readDirWithStaleRetry(containersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []ContainerInfo{}, nil
@@ -2434,11 +3537,46 @@ func (s Store) listContainers(includeHidden bool) ([]ContainerInfo, error) {
 		if !entry.IsDir() {
 			continue
 		}
+		containerDir := filepath.Join(containersDir, entry.Name())
+		_, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker))
+		creationMarked := markerErr == nil
+		if _, metadataErr := os.Stat(filepath.Join(containerDir, "container.json")); errors.Is(metadataErr, fs.ErrNotExist) {
+			if creationMarked {
+				// Another cluster node may still be preparing this directory in the
+				// shared data root. It becomes visible only when container.json is
+				// atomically published.
+				continue
+			}
+		}
 		info, err := s.loadContainerKey(entry.Name())
 		if err != nil {
+			if creationMarked {
+				// Publication can become visible to NFS clients one pathname at a
+				// time. The marker makes this an unpublished record, not corruption.
+				continue
+			}
+			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+				// Removed since the directory was read: removal renames the
+				// record away before anything else, so nothing it held is
+				// reachable from it. A family is removed while other commands
+				// run, and a strict listing must not fail for it.
+				continue
+			}
+			if tolerateUnreadable {
+				key := filepath.Join(containersDir, entry.Name())
+				if _, loaded := warnedUnreadableContainers.LoadOrStore(key, struct{}{}); !loaded {
+					log.Warningf("Skipping unreadable TTC container directory %q during listing: %v", key, err)
+				}
+				continue
+			}
 			return nil, err
 		}
-		if includeHidden || !info.DistributedForkHidden {
+		warnedUnreadableContainers.Delete(filepath.Join(containersDir, entry.Name()))
+		// A published physical runtime must remain exactly addressable by daemon
+		// lifecycle helpers, but Raft placement is its only user-visible identity.
+		// Never duplicate it in ordinary family inventory.
+		physicalDistributedRuntime := info.IsDistributedPhysicalRuntime()
+		if includeHidden || (!info.DistributedForkHidden && (includePhysical || !physicalDistributedRuntime)) {
 			containers = append(containers, info)
 		}
 	}
@@ -2458,69 +3596,122 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		if !info.DistributedForkHidden {
-			return info, nil
-		}
-		info.DistributedForkHidden = false
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		if pending.Migration {
-			found := false
-			for i := range info.Branches {
-				branch := &info.Branches[i]
-				if branch.ID != pending.BranchID {
-					continue
-				}
-				owner := branch.NodeID
-				if owner == "" {
-					owner = info.NodeID
-				}
-				if owner != pending.SourceNode {
-					return ContainerInfo{}, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, owner)
-				}
-				branch.FilesystemBranch = pending.FilesystemBranch
-				branch.NodeID = pending.TargetNode
-				branch.State = pending.State
-				branch.DistributedForkTransactionID = transactionID
-				branch.DistributedSparseRepository = pending.SparseRepository
-				branch.DistributedSparseBranch = pending.SparseBranch
-				branch.DistributedMigration = true
-				found = true
-				break
+	var published ContainerInfo
+	err = s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if current.DistributedForkTransactionID == transactionID {
+			if !current.DistributedForkHidden {
+				published = *current
+				return false, nil
 			}
-			if !found {
-				return ContainerInfo{}, fmt.Errorf("migration branch %q disappeared before publication", pending.BranchID)
+			current.DistributedForkHidden = false
+		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			physicalBranch := pending.PhysicalBranchID
+			if physicalBranch == "" {
+				physicalBranch = pending.BranchID
 			}
+			if pending.Migration {
+				found := false
+				for i := range current.Branches {
+					branch := &current.Branches[i]
+					if branch.ID != physicalBranch {
+						continue
+					}
+					if !pending.AuthoritativeMigration && branch.NodeID != pending.SourceNode {
+						return false, fmt.Errorf("migration branch %q owner changed from %q to %q", pending.BranchID, pending.SourceNode, branch.NodeID)
+					}
+					branch.FilesystemBranch = pending.FilesystemBranch
+					branch.Quarantined = pending.Quarantined
+					branch.NodeID = pending.TargetNode
+					branch.State = pending.State
+					branch.StorageState = "local"
+					branch.SourceNode = pending.SourceNode
+					branch.DependentMemoryBytes = pending.DependentMemoryBytes
+					branch.DependentFilesystemBytes = pending.DependentFilesystemBytes
+					branch.DistributedForkTransactionID = transactionID
+					branch.DistributedMigration = true
+					branch.SnapshotID = pending.SnapshotID
+					branch.MemoryRoots = append([]string(nil), pending.MemoryRoots...)
+					branch.MemoryRootObjects = append([]string(nil), pending.MemoryRootObjects...)
+					branch.DistributedGraphReferenceOperation = pending.GraphReferenceOperation
+					found = true
+					break
+				}
+				if !found {
+					// Physical family records on different nodes need not contain
+					// the same branch set. Import the migrating branch alongside the
+					// existing local siblings only after placement has cut over.
+					current.Branches = append(current.Branches, BranchInfo{
+						ID: physicalBranch, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt,
+						FilesystemBranch: pending.FilesystemBranch, Quarantined: pending.Quarantined,
+						NodeID: pending.TargetNode, State: pending.State, StorageState: "local", SourceNode: pending.SourceNode,
+						DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
+						DistributedForkTransactionID: transactionID, DistributedMigration: true,
+						SnapshotID: pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
+						MemoryRootObjects:                  append([]string(nil), pending.MemoryRootObjects...),
+						DistributedGraphReferenceOperation: pending.GraphReferenceOperation,
+					})
+				}
+			} else {
+				for _, branch := range current.Branches {
+					if branch.ID == pending.BranchID {
+						return false, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+					}
+				}
+				current.Branches = append(current.Branches, BranchInfo{
+					ID: pending.BranchID, ParentID: pending.ParentID, FilesystemBranch: pending.FilesystemBranch,
+					Quarantined: pending.Quarantined,
+					NodeID:      pending.TargetNode,
+					State:       pending.State, StorageState: "local", SourceNode: pending.SourceNode, CreatedAt: pending.CreatedAt,
+					DependentMemoryBytes: pending.DependentMemoryBytes, DependentFilesystemBytes: pending.DependentFilesystemBytes,
+					DistributedForkTransactionID: transactionID,
+					SnapshotID:                   pending.SnapshotID, MemoryRoots: append([]string(nil), pending.MemoryRoots...),
+					MemoryRootObjects:                  append([]string(nil), pending.MemoryRootObjects...),
+					DistributedGraphReferenceOperation: pending.GraphReferenceOperation,
+				})
+			}
+			delete(current.DistributedForkImports, transactionID)
+			current.DistributedCatalogOnly = false
+			recomputeContainerState(current)
 		} else {
-			for _, branch := range info.Branches {
-				if branch.ID == pending.BranchID {
-					return ContainerInfo{}, fmt.Errorf("branch %q appeared while publishing distributed import", pending.BranchID)
+			for _, branch := range current.Branches {
+				if branch.DistributedForkTransactionID == transactionID {
+					published = *current
+					return false, nil
 				}
 			}
-			info.Branches = append(info.Branches, BranchInfo{
-				ID: pending.BranchID, FilesystemBranch: pending.FilesystemBranch,
-				NodeID: info.NodeID,
-				State:  pending.State, CreatedAt: pending.CreatedAt,
-				DistributedForkTransactionID: transactionID,
-				DistributedSparseRepository:  pending.SparseRepository,
-				DistributedSparseBranch:      pending.SparseBranch,
-			})
+			return false, fmt.Errorf("distributed fork transaction %q has no pending target", transactionID)
 		}
-		delete(info.DistributedForkImports, transactionID)
-		recomputeContainerState(&info)
-	} else {
-		// An idempotent retry after publication finds the branch marker.
-		for _, branch := range info.Branches {
-			if branch.DistributedForkTransactionID == transactionID {
-				return info, nil
-			}
-		}
-		return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q has no pending target", transactionID)
-	}
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		published = *current
+		return true, nil
+	})
+	if err != nil {
 		return ContainerInfo{}, err
 	}
-	return info, nil
+	return published, nil
+}
+
+// UpdateDistributedForkDependencies records volatile source bytes while a
+// target is hidden or already visible. Values are observations and may move
+// downward without changing lifecycle placement.
+func (s Store) UpdateDistributedForkDependencies(transactionID string, memoryBytes, filesystemBytes uint64) error {
+	info, err := s.LoadDistributedForkTarget(transactionID)
+	if err != nil {
+		return err
+	}
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			current.Branches[index].DependentMemoryBytes = memoryBytes
+			current.Branches[index].DependentFilesystemBytes = filesystemBytes
+			return true, nil
+		}
+		if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.DependentMemoryBytes = memoryBytes
+			pending.DependentFilesystemBytes = filesystemBytes
+			current.DistributedForkImports[transactionID] = pending
+			return true, nil
+		}
+		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+	})
 }
 
 // UpdateDistributedForkTargetState records hidden-target lifecycle without
@@ -2530,64 +3721,71 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 	if err != nil {
 		return err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		info.State = state
-		for i := range info.Branches {
-			if info.Branches[i].ID == "main" {
-				info.Branches[i].State = state
-			}
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			current.Branches[index].State = state
+			recomputeContainerState(current)
+		} else if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.State = state
+			current.DistributedForkImports[transactionID] = pending
+		} else {
+			return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
 		}
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		pending.State = state
-		info.DistributedForkImports[transactionID] = pending
-	} else {
-		found := false
-		for i := range info.Branches {
-			if info.Branches[i].DistributedForkTransactionID == transactionID {
-				info.Branches[i].State = state
-				found = true
-			}
-		}
-		if !found {
-			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-		}
-		recomputeContainerState(&info)
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		return true, nil
+	})
 }
 
-// UpdateDistributedForkSparseRoot records the shared sparse-memory root that
-// keeps a distributed target restorable until its demand loader has installed
-// every chunk. Passing empty values clears an already-released root.
-func (s Store) UpdateDistributedForkSparseRoot(transactionID, repository, branch string) error {
-	if (repository == "") != (branch == "") {
-		return errors.New("distributed sparse repository and branch must be specified together")
+// UpdateDistributedForkMemoryGraph records the immutable graph roots selected
+// by a hidden or published distributed target. Target-local logical names are
+// derived from its immutable filesystem-branch identity, not its visible name.
+func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID uint64, objects []string, referenceOperation string) error {
+	if snapshotID == 0 || len(objects) == 0 || len(objects) > 4096 {
+		return errors.New("distributed graph memory identity is incomplete")
+	}
+	if referenceOperation == "" || filepath.Base(referenceOperation) != referenceOperation || strings.ContainsAny(referenceOperation, `/\\`) {
+		return errors.New("distributed graph reference operation is invalid")
 	}
 	info, err := s.LoadDistributedForkTarget(transactionID)
 	if err != nil {
 		return err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		info.DistributedSparseRepository = repository
-		info.DistributedSparseBranch = branch
-	} else if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		pending.SparseRepository = repository
-		pending.SparseBranch = branch
-		info.DistributedForkImports[transactionID] = pending
-	} else {
-		found := false
-		for i := range info.Branches {
-			if info.Branches[i].DistributedForkTransactionID == transactionID {
-				info.Branches[i].DistributedSparseRepository = repository
-				info.Branches[i].DistributedSparseBranch = branch
-				found = true
-			}
+	makeRoots := func(filesystemBranch string) []string {
+		roots := make([]string, len(objects))
+		for index := range roots {
+			roots[index] = fmt.Sprintf("memory/branch/%s/resource-%04x", filesystemBranch, index)
 		}
-		if !found {
-			return fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
-		}
+		return roots
 	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
+			branch := &current.Branches[index]
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
+			branch.DistributedGraphReferenceOperation = referenceOperation
+			return true, nil
+		}
+		if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			pending.SnapshotID = snapshotID
+			pending.MemoryRoots = makeRoots(pending.FilesystemBranch)
+			pending.MemoryRootObjects = append([]string(nil), objects...)
+			pending.GraphReferenceOperation = referenceOperation
+			current.DistributedForkImports[transactionID] = pending
+			return true, nil
+		}
+		for index := range current.Branches {
+			branch := &current.Branches[index]
+			if branch.DistributedForkTransactionID != transactionID {
+				continue
+			}
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = makeRoots(branch.FilesystemBranch)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
+			branch.DistributedGraphReferenceOperation = referenceOperation
+			return true, nil
+		}
+		return false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+	})
 }
 
 // DistributedForkTargetBranch resolves the branch associated with a target
@@ -2597,35 +3795,32 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 	if err != nil {
 		return ContainerInfo{}, BranchInfo{}, false, err
 	}
-	if info.DistributedForkTransactionID == transactionID {
-		for _, candidate := range info.Branches {
-			if candidate.ID == "main" {
-				candidate.DistributedForkTransactionID = transactionID
-				candidate.DistributedSparseRepository = info.DistributedSparseRepository
-				candidate.DistributedSparseBranch = info.DistributedSparseBranch
-				return info, candidate, false, nil
-			}
-		}
-		return ContainerInfo{}, BranchInfo{}, false, errors.New("distributed target family has no main branch")
+	if index, ok := distributedForkBranchIndex(info, transactionID); ok {
+		candidate := info.Branches[index]
+		candidate.DistributedForkTransactionID = transactionID
+		return info, candidate, info.DistributedForkTransactionID != transactionID || len(info.Branches) > 1, nil
 	}
 	if pending, ok := info.DistributedForkImports[transactionID]; ok {
-		branch = BranchInfo{ID: pending.BranchID, CreatedAt: pending.CreatedAt}
+		physicalBranch := pending.PhysicalBranchID
+		if physicalBranch == "" {
+			physicalBranch = pending.BranchID
+		}
+		branch = BranchInfo{ID: physicalBranch, ParentID: pending.ParentID, CreatedAt: pending.CreatedAt}
 		// A migration replaces an existing logical branch. Preserve its display
 		// lineage and other stable metadata while the pending import supplies the
 		// new runtime/filesystem identities.
 		if pending.Migration {
 			for _, candidate := range info.Branches {
-				if candidate.ID == pending.BranchID {
+				if candidate.ID == physicalBranch {
 					branch = candidate
 					break
 				}
 			}
 		}
 		branch.FilesystemBranch = pending.FilesystemBranch
+		branch.Quarantined = pending.Quarantined
 		branch.State = pending.State
 		branch.DistributedForkTransactionID = transactionID
-		branch.DistributedSparseRepository = pending.SparseRepository
-		branch.DistributedSparseBranch = pending.SparseBranch
 		branch.DistributedMigration = pending.Migration
 		return info, branch, true, nil
 	}
@@ -2635,6 +3830,22 @@ func (s Store) DistributedForkTargetBranch(transactionID string) (info Container
 		}
 	}
 	return ContainerInfo{}, BranchInfo{}, false, fmt.Errorf("distributed fork transaction %q target branch is unavailable", transactionID)
+}
+
+// distributedForkBranchIndex resolves the branch originally created by a
+// transaction even after its physical Sentry begins hosting imported sibling
+// branches. New records always carry the branch-level marker. The singleton
+// fallback supports a target while it is still in its initial hidden form.
+func distributedForkBranchIndex(info ContainerInfo, transactionID string) (int, bool) {
+	for index := range info.Branches {
+		if info.Branches[index].DistributedForkTransactionID == transactionID {
+			return index, true
+		}
+	}
+	if info.DistributedForkTransactionID == transactionID && len(info.Branches) == 1 {
+		return 0, true
+	}
+	return 0, false
 }
 
 // RemoveDistributedForkTarget removes a transaction target and its image
@@ -2660,44 +3871,35 @@ func (s Store) RemoveDistributedForkTarget(transactionID string) error {
 			// A migration import borrows the existing logical branch's console
 			// and exec artifacts. Cancel only the unpublished filesystem fork.
 			if !pendingImport.Migration {
-				if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+				if err := s.RemoveBranchArtifacts(info.ID, branch); err != nil {
 					return err
 				}
 			}
-			delete(info.DistributedForkImports, transactionID)
-			recomputeContainerState(&info)
-			return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+			return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
+				if _, ok := current.DistributedForkImports[transactionID]; !ok {
+					return false, nil
+				}
+				delete(current.DistributedForkImports, transactionID)
+				recomputeContainerState(current)
+				return true, nil
+			})
 		}
-		if err := s.RemoveBranchArtifacts(info.ID, branch.ID); err != nil {
+		if err := s.RemoveBranchArtifacts(info.ID, branch); err != nil {
 			return err
 		}
 		return s.RemoveBranchRecord(info.ID, branch.ID)
 	}
-	if info.LeaseID != "" {
-		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
-			return err
-		}
-	}
-	if err := s.removeDistributedMemorySnapshot(info); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
-		return err
-	}
-	return s.gcPromotedRepositories()
+	return s.removeContainerInfo(info)
 }
 
-func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
+func (s Store) removeDistributedMemoryMetadata(info ContainerInfo) error {
 	if info.DistributedForkTransactionID == "" {
 		return nil
 	}
 	artifacts := []struct {
 		path string
 		name string
-	}{
-		{filepath.Join(s.Root, "cluster", "memory-snapshots", info.DistributedForkTransactionID+".mem"), "memory snapshot"},
-		{filepath.Join(s.Root, "cluster", "memory-metadata", info.DistributedForkTransactionID+".state"), "kernel metadata"},
-	}
+	}{{filepath.Join(s.Root, "cluster", "memory-metadata", info.DistributedForkTransactionID+".state"), "kernel metadata"}}
 	for _, artifact := range artifacts {
 		if err := os.Remove(artifact.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("removing distributed %s: %w", artifact.name, err)
@@ -2710,39 +3912,34 @@ func (s Store) removeDistributedMemorySnapshot(info ContainerInfo) error {
 // contains only main. It never rewrites peer branches; callers managing an
 // existing family must use the branch-specific state methods instead.
 func (s Store) UpdateState(name, state string, exitStatus *int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
 	now := time.Now().UTC()
-	found := false
-	for i := range info.Branches {
-		if info.Branches[i].ID == "main" {
-			info.Branches[i].State = state
-			found = true
-			break
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		found := false
+		for i := range info.Branches {
+			if info.Branches[i].ID == "main" {
+				updateBranchLifecycle(&info.Branches[i], state, exitStatus, now)
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", "main")
-	}
-	switch state {
-	case "running":
-		info.StartedAt = &now
-	}
-	recomputeContainerState(&info)
-	if info.State == "exited" {
-		info.ExitStatus = exitStatus
-		info.ExitedAt = &now
-	} else {
-		info.ExitStatus = nil
-		info.ExitedAt = nil
-	}
-	path := filepath.Join(s.Root, "containers", info.ID, "container.json")
-	if err := writeJSON(path, &info); err != nil {
-		return fmt.Errorf("updating container %q: %w", name, err)
-	}
-	return nil
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", "main")
+		}
+		if state == "running" {
+			info.StartedAt = &now
+		}
+		recomputeContainerState(info)
+		if info.State == "exited" {
+			info.ExitStatus = exitStatus
+			info.ExitedAt = &now
+		} else {
+			info.ExitStatus = nil
+			info.ExitedAt = nil
+			info.OOMKilled = false
+			info.ExitError = ""
+		}
+		return true, nil
+	})
 }
 
 // AddPortBinding atomically records a branch-local published TCP listener.
@@ -2751,51 +3948,49 @@ func (s Store) AddPortBinding(name string, binding PortBinding) error {
 	if err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	if info.NetworkMode != "ttc" {
-		return fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
-	}
-	branchFound := false
-	for _, branch := range info.Branches {
-		if branch.ID != binding.BranchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		if info.NetworkMode != "ttc" {
+			return false, fmt.Errorf("container %q uses network mode %q, not ttc", info.Name, info.NetworkMode)
 		}
-		if branch.State != "running" && branch.State != "paused" {
-			return fmt.Errorf("branch %q is %s", binding.BranchID, branch.State)
+		branchFound := false
+		for _, branch := range info.Branches {
+			if branch.ID != binding.BranchID {
+				continue
+			}
+			if branch.State != "running" && branch.State != "paused" {
+				return false, fmt.Errorf("branch %q is %s", binding.BranchID, branch.State)
+			}
+			branchFound = true
+			break
 		}
-		branchFound = true
-		break
-	}
-	if !branchFound {
-		return fmt.Errorf("branch %q is not recorded", binding.BranchID)
-	}
-	endpoint := portHostEndpoint(binding)
-	for _, existing := range info.PublishedPorts {
-		if samePortBinding(existing, binding) {
-			return fmt.Errorf("published port for %s already exists on branch %q", endpoint, binding.BranchID)
+		if !branchFound {
+			return false, fmt.Errorf("branch %q is not recorded", binding.BranchID)
 		}
-		if portHostEndpoint(existing) == endpoint {
-			return fmt.Errorf("published host endpoint %s is already assigned to branch %q", endpoint, existing.Branch())
+		endpoint := portHostEndpoint(binding)
+		for _, existing := range info.PublishedPorts {
+			if samePortBinding(existing, binding) {
+				return false, fmt.Errorf("published port for %s already exists on branch %q", endpoint, binding.BranchID)
+			}
+			if portHostEndpoint(existing) == endpoint {
+				return false, fmt.Errorf("published host endpoint %s is already assigned to branch %q", endpoint, existing.Branch())
+			}
 		}
-	}
-	info.PublishedPorts = append(info.PublishedPorts, binding)
-	sort.Slice(info.PublishedPorts, func(i, j int) bool {
-		a, b := info.PublishedPorts[i], info.PublishedPorts[j]
-		if a.Branch() != b.Branch() {
-			return a.Branch() < b.Branch()
-		}
-		if a.HostIP != b.HostIP {
-			return a.HostIP < b.HostIP
-		}
-		if a.HostPort != b.HostPort {
-			return a.HostPort < b.HostPort
-		}
-		return a.ContainerPort < b.ContainerPort
+		info.PublishedPorts = append(info.PublishedPorts, binding)
+		sort.Slice(info.PublishedPorts, func(i, j int) bool {
+			a, b := info.PublishedPorts[i], info.PublishedPorts[j]
+			if a.Branch() != b.Branch() {
+				return a.Branch() < b.Branch()
+			}
+			if a.HostIP != b.HostIP {
+				return a.HostIP < b.HostIP
+			}
+			if a.HostPort != b.HostPort {
+				return a.HostPort < b.HostPort
+			}
+			return a.ContainerPort < b.ContainerPort
+		})
+		return true, nil
 	})
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
 }
 
 // RemovePortBinding atomically removes one exact branch-local listener.
@@ -2804,18 +3999,16 @@ func (s Store) RemovePortBinding(name string, binding PortBinding) error {
 	if err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	for i, existing := range info.PublishedPorts {
-		if !samePortBinding(existing, binding) {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i, existing := range info.PublishedPorts {
+			if !samePortBinding(existing, binding) {
+				continue
+			}
+			info.PublishedPorts = append(info.PublishedPorts[:i], info.PublishedPorts[i+1:]...)
+			return true, nil
 		}
-		info.PublishedPorts = append(info.PublishedPorts[:i], info.PublishedPorts[i+1:]...)
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("published port is not configured on branch %q", binding.BranchID)
+		return false, fmt.Errorf("published port is not configured on branch %q", binding.BranchID)
+	})
 }
 
 // RemovePortBindingsForBranch atomically forgets every listener for branchID.
@@ -2823,21 +4016,19 @@ func (s Store) RemovePortBindingsForBranch(name, branchID string) error {
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	bindings := info.PublishedPorts[:0]
-	for _, binding := range info.PublishedPorts {
-		if binding.Branch() != branchID {
-			bindings = append(bindings, binding)
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		bindings := info.PublishedPorts[:0]
+		for _, binding := range info.PublishedPorts {
+			if binding.Branch() != branchID {
+				bindings = append(bindings, binding)
+			}
 		}
-	}
-	if len(bindings) == len(info.PublishedPorts) {
-		return nil
-	}
-	info.PublishedPorts = bindings
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		if len(bindings) == len(info.PublishedPorts) {
+			return false, nil
+		}
+		info.PublishedPorts = bindings
+		return true, nil
+	})
 }
 
 // RecordBranch appends one branch identity or refreshes its lifecycle data.
@@ -2850,47 +4041,46 @@ func (s Store) RecordBranches(name string, branches []BranchInfo) error {
 	if len(branches) == 0 {
 		return errors.New("at least one branch is required")
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	index := make(map[string]int, len(info.Branches))
-	for i := range info.Branches {
-		index[info.Branches[i].ID] = i
-	}
-	seen := make(map[string]struct{}, len(branches))
-	for _, branch := range branches {
-		if branch.NodeID == "" {
-			if i, ok := index[branch.ID]; ok && info.Branches[i].NodeID != "" {
-				branch.NodeID = info.Branches[i].NodeID
-			} else if branch.ParentID != "" && info.BranchNodeID(branch.ParentID) != "" {
-				branch.NodeID = info.BranchNodeID(branch.ParentID)
-			} else {
-				branch.NodeID = info.NodeID
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		index := make(map[string]int, len(info.Branches))
+		for i := range info.Branches {
+			index[info.Branches[i].ID] = i
+		}
+		seen := make(map[string]struct{}, len(branches))
+		for _, branch := range branches {
+			if err := validateObjectName("branch", branch.ID); err != nil {
+				return false, err
 			}
-		}
-		if err := validateObjectName("branch", branch.ID); err != nil {
-			return err
-		}
-		if branch.ID == branch.ParentID {
-			return fmt.Errorf("branch %q cannot be its own parent", branch.ID)
-		}
-		if _, ok := seen[branch.ID]; ok {
-			return fmt.Errorf("branch %q is repeated", branch.ID)
-		}
-		seen[branch.ID] = struct{}{}
-		if i, ok := index[branch.ID]; ok {
-			if info.Branches[i].ParentID != branch.ParentID {
-				return fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
+			if branch.ID == branch.ParentID {
+				return false, fmt.Errorf("branch %q cannot be its own parent", branch.ID)
 			}
-			info.Branches[i] = branch
-			continue
+			if branch.State == "" {
+				return false, fmt.Errorf("branch %q has no lifecycle state", branch.ID)
+			}
+			if branch.FilesystemBranch == "" {
+				return false, fmt.Errorf("branch %q has no filesystem identity", branch.ID)
+			}
+			if branch.StorageState == "" {
+				return false, fmt.Errorf("branch %q has no storage state", branch.ID)
+			}
+			if _, ok := seen[branch.ID]; ok {
+				return false, fmt.Errorf("branch %q is repeated", branch.ID)
+			}
+			seen[branch.ID] = struct{}{}
+			if i, ok := index[branch.ID]; ok {
+				if info.Branches[i].ParentID != branch.ParentID {
+					return false, fmt.Errorf("branch %q parent changed from %q to %q", branch.ID, info.Branches[i].ParentID, branch.ParentID)
+				}
+				info.Branches[i] = branch
+				continue
+			}
+			index[branch.ID] = len(info.Branches)
+			info.Branches = append(info.Branches, branch)
 		}
-		index[branch.ID] = len(info.Branches)
-		info.Branches = append(info.Branches, branch)
-	}
-	recomputeContainerState(&info)
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		info.DistributedCatalogOnly = false
+		recomputeContainerState(info)
+		return true, nil
+	})
 }
 
 // recomputeContainerState derives the family summary from all surviving
@@ -2922,90 +4112,480 @@ func recomputeContainerState(info *ContainerInfo) {
 	if state != "exited" && state != "stopped" {
 		info.ExitStatus = nil
 		info.ExitedAt = nil
+		info.OOMKilled = false
+		info.ExitError = ""
 	}
+}
+
+// updateBranchLifecycle is the single persistence boundary for branch-local
+// process state. Exit status is branch state, not family state: siblings may
+// terminate independently and a cold branch must remain waitable after its
+// Sentry and console sidecar have been reclaimed.
+func updateBranchLifecycle(branch *BranchInfo, state string, exitStatus *int, now time.Time) {
+	branch.State = state
+	if state == "exited" || state == "stopped" {
+		if exitStatus != nil {
+			status := *exitStatus
+			branch.ExitStatus = &status
+			finished := now
+			branch.ExitedAt = &finished
+		}
+		return
+	}
+	branch.ExitStatus = nil
+	branch.ExitedAt = nil
 }
 
 // UpdateBranchState changes only the last known lifecycle state of a recorded branch.
 func (s Store) UpdateBranchState(name, branchID, state string) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ID != branchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			if info.Branches[i].ID != branchID {
+				continue
+			}
+			updateBranchLifecycle(&info.Branches[i], state, nil, time.Now().UTC())
+			recomputeContainerState(info)
+			return true, nil
 		}
-		info.Branches[i].State = state
-		recomputeContainerState(&info)
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("branch %q is not recorded", branchID)
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
 }
 
-// CompareAndSwapNodeID transfers whole-family cluster ownership while the
-// family is process-free. The per-container advisory lock serializes TTC
-// daemons sharing an NFS data root; higher-level placement generations fence
-// stale callers.
-func (s Store) CompareAndSwapNodeID(name, expected, replacement string) error {
+// MarkBranchDehydratedResident records that branchID is dehydrated and that
+// its capture exists only in its family's Sentry. See StorageResident.
+func (s Store) MarkBranchDehydratedResident(name, branchID string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			updateBranchLifecycle(branch, "dehydrated", nil, time.Now().UTC())
+			branch.StorageState = StorageResident
+			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// MarkBranchDehydrationDurable records that a resident dehydration of
+// branchID has been made durable in the data root.
+func (s Store) MarkBranchDehydrationDurable(name, branchID string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.StorageState != StorageResident {
+				return false, nil
+			}
+			branch.StorageState = "local"
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// UpdateBranchQuarantine changes the durable external-connectivity flag.
+func (s Store) UpdateBranchQuarantine(name, branchID string, quarantined bool) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			if info.Branches[i].ID != branchID {
+				continue
+			}
+			if info.Branches[i].Quarantined == quarantined {
+				return false, nil
+			}
+			info.Branches[i].Quarantined = quarantined
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// UpdateBranchMemoryGraph records or clears the authoritative logical memory
+// roots for a branch. Physical provider/cache locations are deliberately not
+// part of this record.
+func (s Store) UpdateBranchMemoryGraph(name, branchID string, snapshotID uint64, roots, objects []string, referenceOperation string) error {
+	return s.updateBranchSnapshotGraph(name, branchID, snapshotID, roots, objects, "", "", referenceOperation, false)
+}
+
+// UpdateBranchSnapshotGraph atomically records all immutable process-state
+// roots selected by one dehydration capture.
+func (s Store) UpdateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string) error {
+	return s.updateBranchSnapshotGraph(name, branchID, snapshotID, roots, objects, controlRoot, controlObject, referenceOperation, true)
+}
+
+// ParkBranchMemoryGraph transfers a branch's immutable graph references to
+// family-level runtime ownership. The operation is atomic and idempotent. It
+// is used before destroying a live branch whose unresolved page loader may be
+// transferred by the Sentry to a surviving sibling.
+func (s Store) ParkBranchMemoryGraph(name, branchID string) (RuntimeMemoryBacking, bool, error) {
+	var parked RuntimeMemoryBacking
+	var changed bool
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID == 0 || len(branch.MemoryRoots) == 0 {
+				return false, nil
+			}
+			if len(branch.MemoryRoots) != len(branch.MemoryRootObjects) {
+				return false, fmt.Errorf("branch %q memory graph has %d roots and %d objects", branchID, len(branch.MemoryRoots), len(branch.MemoryRootObjects))
+			}
+			parked = RuntimeMemoryBacking{
+				ID:                                 fmt.Sprintf("%s-%016x", branch.FilesystemBranch, branch.SnapshotID),
+				SnapshotID:                         branch.SnapshotID,
+				MemoryRoots:                        append([]string(nil), branch.MemoryRoots...),
+				MemoryRootObjects:                  append([]string(nil), branch.MemoryRootObjects...),
+				ControlRoot:                        branch.ControlRoot,
+				ControlRootObject:                  branch.ControlRootObject,
+				DistributedGraphReferenceOperation: branch.DistributedGraphReferenceOperation,
+			}
+			for _, existing := range info.RuntimeMemoryBackings {
+				if existing.ID != parked.ID {
+					continue
+				}
+				if existing.SnapshotID != parked.SnapshotID ||
+					!slices.Equal(existing.MemoryRoots, parked.MemoryRoots) ||
+					!slices.Equal(existing.MemoryRootObjects, parked.MemoryRootObjects) ||
+					existing.ControlRoot != parked.ControlRoot || existing.ControlRootObject != parked.ControlRootObject ||
+					existing.DistributedGraphReferenceOperation != parked.DistributedGraphReferenceOperation {
+					return false, fmt.Errorf("runtime memory backing %q already names different graph state", parked.ID)
+				}
+				break
+			}
+			found := false
+			for _, existing := range info.RuntimeMemoryBackings {
+				found = found || existing.ID == parked.ID
+			}
+			if !found {
+				info.RuntimeMemoryBackings = append(info.RuntimeMemoryBackings, parked)
+			}
+			branch.SnapshotID = 0
+			branch.MemoryRoots = nil
+			branch.MemoryRootObjects = nil
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
+			branch.DistributedGraphReferenceOperation = ""
+			changed = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return parked, changed, err
+}
+
+// RemoveRuntimeMemoryBacking removes id after its loader no longer has
+// outstanding pages. Graph and distributed references are released before
+// this metadata commit, making retries idempotent after a crash.
+func (s Store) RemoveRuntimeMemoryBacking(name, id string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.RuntimeMemoryBackings {
+			if info.RuntimeMemoryBackings[i].ID != id {
+				continue
+			}
+			info.RuntimeMemoryBackings = append(info.RuntimeMemoryBackings[:i], info.RuntimeMemoryBackings[i+1:]...)
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+func (s Store) updateBranchSnapshotGraph(name, branchID string, snapshotID uint64, roots, objects []string, controlRoot, controlObject, referenceOperation string, replaceControl bool) error {
+	if len(roots) != len(objects) {
+		return fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
+	}
+	if replaceControl && (controlRoot == "") != (controlObject == "") {
+		return errors.New("control graph root name and object must be set together")
+	}
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			branch.SnapshotID = snapshotID
+			branch.MemoryRoots = append([]string(nil), roots...)
+			branch.MemoryRootObjects = append([]string(nil), objects...)
+			if replaceControl {
+				branch.ControlRoot = controlRoot
+				branch.ControlRootObject = controlObject
+			}
+			branch.DistributedGraphReferenceOperation = referenceOperation
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// ClearBranchControlGraphIf clears a rehydrated branch's consumed control
+// root only if the branch still names the exact capture observed by the
+// caller, and keeps its memory roots.
+func (s Store) ClearBranchControlGraphIf(name, branchID string, snapshotID uint64, controlRoot, controlObject string) (bool, error) {
+	cleared := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID || branch.ControlRoot != controlRoot || branch.ControlRootObject != controlObject {
+				return false, nil
+			}
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
+			cleared = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return cleared, err
+}
+
+// ClearBranchMemoryGraphIf clears a consumed immutable-memory backing only if
+// the branch still names the exact capture observed by the caller. Rehydrate,
+// dehydrate, fork, migration, and name reuse may all replace branch metadata
+// while an asynchronous page loader is finishing; a stale completion must not
+// release the replacement capture.
+func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64, roots, objects []string, referenceOperation string) (bool, error) {
+	if len(roots) != len(objects) {
+		return false, fmt.Errorf("memory graph has %d root names and %d root objects", len(roots), len(objects))
+	}
+	cleared := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID ||
+				!slices.Equal(branch.MemoryRoots, roots) ||
+				!slices.Equal(branch.MemoryRootObjects, objects) ||
+				branch.DistributedGraphReferenceOperation != referenceOperation {
+				return false, nil
+			}
+			branch.SnapshotID = 0
+			branch.MemoryRoots = nil
+			branch.MemoryRootObjects = nil
+			branch.ControlRoot = ""
+			branch.ControlRootObject = ""
+			branch.DistributedGraphReferenceOperation = ""
+			cleared = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return cleared, err
+}
+
+// NewBranchPublicationID allocates an immutable publication identity without
+// changing branch metadata. Callers use this while constructing a hidden
+// capture, then install it with BeginBranchPublicationIf only after the capture
+// fence is complete. Keeping preparation invisible prevents a failed capture
+// from superseding a valid publication that is still being uploaded.
+func (s Store) NewBranchPublicationID() (string, error) {
+	nonce, err := randomObjectID("publication", 16)
+	if err != nil {
+		return "", err
+	}
+	return "publication-" + nonce, nil
+}
+
+// BeginBranchPublicationIf atomically installs publicationID if the branch
+// still names expectedPublicationID. It returns the exact storage metadata
+// that was replaced. The compare-and-swap fences overlapping exit observers
+// and publication workers running in other daemons against the same shared
+// container catalog.
+func (s Store) BeginBranchPublicationIf(name, branchID, expectedPublicationID, publicationID string) (BranchInfo, error) {
+	if publicationID == "" {
+		return BranchInfo{}, errors.New("publication identity is empty")
+	}
+	var previous BranchInfo
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.PublicationID != expectedPublicationID {
+				return false, fmt.Errorf("branch %q publication changed from %q to %q", branchID, expectedPublicationID, branch.PublicationID)
+			}
+			previous = *branch
+			branch.PublicationID = publicationID
+			branch.StorageState = "publishing"
+			branch.StorageError = ""
+			branch.StorageRetryAt = time.Time{}
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return previous, err
+}
+
+// BeginBranchPublication is retained for callers that do not construct a
+// capture in stages. New lifecycle code should use NewBranchPublicationID and
+// BeginBranchPublicationIf so a failed preparation never becomes visible.
+func (s Store) BeginBranchPublication(name, branchID string) (string, error) {
+	publicationID, err := s.NewBranchPublicationID()
+	if err != nil {
+		return "", err
+	}
 	info, err := s.LoadContainer(name)
 	if err != nil {
-		return err
+		return "", err
 	}
-	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
+	var expected string
+	for _, branch := range info.Branches {
+		if branch.ID == branchID {
+			expected = branch.PublicationID
+			break
+		}
 	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
+	_, err = s.BeginBranchPublicationIf(name, branchID, expected, publicationID)
+	return publicationID, err
+}
+
+// UpdateBranchStorage publishes an identity-fenced storage transition. A
+// worker from an older transaction cannot overwrite a newer capture or
+// resurrect a branch whose publication was canceled and removed.
+func (s Store) UpdateBranchStorage(name, branchID, publicationID, state, storageError string, retryAt time.Time) error {
+	switch state {
+	case "local", "publishing", "shared", "materializing", "error":
+	default:
+		return fmt.Errorf("invalid storage state %q", state)
 	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	info, err = s.loadContainerKey(info.ID)
-	if err != nil {
-		return err
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if publicationID == "" || publicationID != branch.PublicationID {
+				return false, fmt.Errorf("branch %q publication is %q, worker has %q", branchID, branch.PublicationID, publicationID)
+			}
+			branch.StorageState = state
+			branch.StorageError = storageError
+			branch.StorageRetryAt = retryAt
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// CompleteBranchPublication atomically commits shared durability and the
+// lifecycle transition that was waiting on it.
+func (s Store) CompleteBranchPublication(name, branchID, publicationID, manifest, lifecycle string, unplace bool) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if publicationID == "" || branch.PublicationID != publicationID {
+				return false, fmt.Errorf("branch %q publication is %q, worker has %q", branchID, branch.PublicationID, publicationID)
+			}
+			branch.StorageState = "shared"
+			branch.StorageError = ""
+			branch.StorageManifest = manifest
+			branch.StorageRetryAt = time.Time{}
+			if lifecycle != "" {
+				branch.State = lifecycle
+			}
+			if unplace {
+				branch.NodeID = ""
+				branch.Unplaced = true
+			}
+			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// CompleteConsumedBranchPublication rolls derived physical metadata forward
+// after Raft has consumed a publication transaction but retained its immutable
+// filesystem root. The exact manifest is the fence in this state: Raft no
+// longer names a publication ID, and StopBranch has cleared the physical ID so
+// a worker that passed an earlier queue check cannot replay its old lifecycle.
+func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifecycle string, unplace bool) error {
+	if manifest == "" {
+		return errors.New("consumed branch publication has no manifest")
 	}
-	if info.NodeID != expected {
-		return fmt.Errorf("container %q cluster owner changed from %q to %q", info.Name, expected, info.NodeID)
-	}
-	info.NodeID = replacement
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			branch.PublicationID = ""
+			branch.StorageState = "shared"
+			branch.StorageError = ""
+			branch.StorageManifest = manifest
+			branch.StorageRetryAt = time.Time{}
+			if lifecycle != "" {
+				branch.State = lifecycle
+			}
+			if unplace {
+				branch.NodeID = ""
+				branch.Unplaced = true
+			}
+			recomputeContainerState(info)
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+}
+
+// AbandonBranchPublication fences an asynchronous worker before a local
+// capture is consumed to make the branch active again. The old shared
+// manifest remains a valid immutable ancestor, but the active branch is no
+// longer represented by the publication being abandoned.
+func (s Store) AbandonBranchPublication(name, branchID, publicationID string) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.PublicationID != publicationID {
+				return false, fmt.Errorf("branch %q publication is %q, cancel has %q", branchID, branch.PublicationID, publicationID)
+			}
+			branch.PublicationID = ""
+			branch.StorageState = "local"
+			branch.StorageError = ""
+			branch.StorageRetryAt = time.Time{}
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
 }
 
 // CompareAndSwapBranchNodeID transfers one process-free branch without
-// changing sibling placement. Empty legacy branch owners inherit NodeID.
+// changing sibling placement.
 func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement string) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(s.Root, "containers", info.ID, ".node.lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	info, err = s.loadContainerKey(info.ID)
-	if err != nil {
-		return err
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ID != branchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			if info.Branches[i].ID != branchID {
+				continue
+			}
+			owner := info.Branches[i].NodeID
+			if info.Branches[i].Unplaced {
+				owner = ""
+			}
+			if owner != expected {
+				return false, fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
+			}
+			info.Branches[i].NodeID = replacement
+			info.Branches[i].Unplaced = replacement == ""
+			return true, nil
 		}
-		owner := info.Branches[i].NodeID
-		if owner == "" {
-			owner = info.NodeID
-		}
-		if owner != expected {
-			return fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
-		}
-		info.Branches[i].NodeID = replacement
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("branch %q is not recorded", branchID)
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
 }
 
 // RenameBranch changes a branch's visible name in the durable record.
@@ -3021,49 +4601,49 @@ func (s Store) RenameBranch(name, oldID, newID string) error {
 	if err := validateObjectName("branch", newID); err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	found := false
-	var renamedBranch BranchInfo
-	for i := range info.Branches {
-		switch info.Branches[i].ID {
-		case newID:
-			return fmt.Errorf("branch %q already exists", newID)
-		case oldID:
-			found = true
-			renamedBranch = info.Branches[i]
+	var rollback func() error
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		found := false
+		var renamedBranch BranchInfo
+		for i := range info.Branches {
+			switch info.Branches[i].ID {
+			case newID:
+				return false, fmt.Errorf("branch %q already exists", newID)
+			case oldID:
+				found = true
+				renamedBranch = info.Branches[i]
+			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", oldID)
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ID == oldID {
-			info.Branches[i].ID = newID
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", oldID)
 		}
-		if info.Branches[i].ParentID == oldID {
-			info.Branches[i].ParentID = newID
+		for i := range info.Branches {
+			if info.Branches[i].ID == oldID {
+				info.Branches[i].ID = newID
+			}
+			if info.Branches[i].ParentID == oldID {
+				info.Branches[i].ParentID = newID
+			}
 		}
-	}
-	for i := range info.PublishedPorts {
-		if info.PublishedPorts[i].Branch() == oldID {
-			info.PublishedPorts[i].BranchID = newID
+		for i := range info.PublishedPorts {
+			if info.PublishedPorts[i].Branch() == oldID {
+				info.PublishedPorts[i].BranchID = newID
+			}
 		}
-	}
-	rollback, err := s.renameBranchArtifacts(info.ID, renamedBranch, oldID, newID)
-	if err != nil {
-		return err
-	}
-	recomputeContainerState(&info)
-	if err := writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info); err != nil {
+		var err error
+		rollback, err = s.renameBranchArtifacts(info.ID, renamedBranch, oldID, newID)
+		if err != nil {
+			return false, err
+		}
+		recomputeContainerState(info)
+		return true, nil
+	})
+	if err != nil && rollback != nil {
 		if rollbackErr := rollback(); rollbackErr != nil {
 			return fmt.Errorf("recording renamed branch: %w; rolling back branch artifacts: %v", err, rollbackErr)
 		}
-		return err
 	}
-	return nil
+	return err
 }
 
 type renamePath struct {
@@ -3072,13 +4652,12 @@ type renamePath struct {
 }
 
 // renameBranchArtifacts moves name-keyed state as one rollback-capable
-// transaction. Memory directories from older TTC versions are also promoted
-// to the stable filesystem-branch key here; current directories never move on
-// subsequent renames.
+// transaction. Memory directories use stable filesystem-branch keys and do
+// not move when a visible branch is renamed.
 func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldID, newID string) (func() error, error) {
 	var paths []renamePath
-	dir := filepath.Join(s.Root, "containers", containerID, "console")
-	entries, err := os.ReadDir(dir)
+	dir := filepath.Join(s.activeRoot(), "containers", containerID, "console")
+	entries, err := readDirWithStaleRetry(dir)
 	if err == nil {
 		for _, entry := range entries {
 			name := entry.Name()
@@ -3096,19 +4675,6 @@ func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldI
 		paths = append(paths, renamePath{execDir, filepath.Join(dir, "exec", newID)})
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading exec console state: %w", err)
-	}
-
-	legacyKey := hex.EncodeToString([]byte(oldID))
-	stableKey := MemoryBranchKey(branch)
-	if legacyKey != stableKey {
-		for _, state := range []string{"dehydrated", "active"} {
-			oldPath := filepath.Join(s.Root, "containers", containerID, "memory", state, legacyKey)
-			if _, err := os.Lstat(oldPath); err == nil {
-				paths = append(paths, renamePath{oldPath, filepath.Join(filepath.Dir(oldPath), stableKey)})
-			} else if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("checking legacy %s memory state: %w", state, err)
-			}
-		}
 	}
 
 	for _, path := range paths {
@@ -3143,136 +4709,218 @@ func (s Store) renameBranchArtifacts(containerID string, branch BranchInfo, oldI
 
 // RecordBranchStart records a fresh process incarnation for one branch. Family
 // state is derived from all branches; starting one branch never deletes or
-// rewrites its peers.
-func (s Store) RecordBranchStart(name, branchID string) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
+// rewrites its peers. A publication ID fences one process-free capture, not
+// the mutable incarnation created from it. Keep StorageManifest as the
+// immutable filesystem ancestor for lazy reads and the next incremental
+// publication, but retire the old transaction identity when execution starts.
+func (s Store) RecordBranchStart(name, branchID, nodeID string) error {
+	return s.RecordBranchActivation(name, branchID, "running", nodeID)
+}
+
+// RecordBranchActivation commits a process-bearing incarnation reconstructed
+// from a cold branch. state is explicit because a dehydrated branch may have
+// been captured paused. This is also the common publication-fence retirement
+// boundary for fresh start and rehydration.
+func (s Store) RecordBranchActivation(name, branchID, state, nodeID string) error {
+	if state != "running" && state != "paused" {
+		return fmt.Errorf("invalid active branch state %q", state)
 	}
-	now := time.Now().UTC()
-	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if branch.ID != branchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		now := time.Now().UTC()
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			updateBranchLifecycle(branch, state, nil, now)
+			// Activation is the physical lifecycle commit, so it must also repair
+			// the derived owner atomically. A cold publication completion may clear
+			// NodeID after Raft has already claimed the branch for this node; merely
+			// clearing Unplaced here would otherwise leave a running physical branch
+			// with no owner and prevent placement from leaving materializing.
+			if nodeID != "" {
+				branch.NodeID = nodeID
+			}
+			branch.Unplaced = false
+			branch.PublicationID = ""
+			branch.StorageState = "local"
+			branch.StorageError = ""
+			branch.StorageRetryAt = time.Time{}
+			info.StartedAt = &now
+			info.ExitStatus = nil
+			info.ExitedAt = nil
+			recomputeContainerState(info)
+			return true, nil
 		}
-		branch.State = "running"
-		info.StartedAt = &now
-		info.ExitStatus = nil
-		info.ExitedAt = nil
-		recomputeContainerState(&info)
-		return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
-	}
-	return fmt.Errorf("branch %q is not recorded", branchID)
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
 }
 
 // StopBranch explicitly discards one branch's execution state while retaining
 // its filesystem, logs, identity, and peer branches.
 func (s Store) StopBranch(name, branchID string, exitStatus int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	found := false
-	alreadyExited := false
-	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if branch.ID != branchID {
-			continue
-		}
-		alreadyExited = branch.State == "exited" || branch.State == "stopped"
-		branch.State = "exited"
-		found = true
-		break
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", branchID)
-	}
-	recomputeContainerState(&info)
-	if info.State == "exited" {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
 		now := time.Now().UTC()
-		if !alreadyExited || info.ExitStatus == nil {
-			info.ExitStatus = &exitStatus
+		found := false
+		alreadyExited := false
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			alreadyExited = branch.State == "exited" || branch.State == "stopped"
+			if !alreadyExited || branch.ExitStatus == nil {
+				updateBranchLifecycle(branch, "exited", &exitStatus, now)
+			}
+			// Stopping a resident dehydration discards its capture, which
+			// was all the branch had that its filesystem did not.
+			if branch.StorageState == StorageResident {
+				branch.StorageState = "local"
+			}
+			// Stop consumes this process snapshot. Retire its publication fence in
+			// the same metadata transaction so a worker that already passed its
+			// queue cancellation check cannot replay the preceding lifecycle after
+			// execution state and memory roots have been discarded. The immutable
+			// StorageManifest remains the branch's filesystem ancestor.
+			branch.PublicationID = ""
+			found = true
+			break
 		}
-		info.ExitedAt = &now
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", branchID)
+		}
+		recomputeContainerState(info)
+		if info.State == "exited" {
+			if !alreadyExited || info.ExitStatus == nil {
+				info.ExitStatus = &exitStatus
+			}
+			info.ExitedAt = &now
+		}
+		return true, nil
+	})
 }
 
 // RecordBranchExit records one branch's termination without treating it as a
 // family-wide exit. exitStatus is retained on the family only when no other
 // surviving branch remains runnable or recoverable.
 func (s Store) RecordBranchExit(name, branchID string, exitStatus int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	found := false
-	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if branch.ID != branchID {
-			continue
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		now := time.Now().UTC()
+		found := false
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			found = true
+			if branch.State == "dehydrated" {
+				return false, nil
+			}
+			updateBranchLifecycle(branch, "exited", &exitStatus, now)
+			break
 		}
-		found = true
-		if branch.State == "dehydrated" {
-			return nil
+		if !found {
+			return false, fmt.Errorf("branch %q is not recorded", branchID)
 		}
-		branch.State = "exited"
-		break
-	}
-	if !found {
-		return fmt.Errorf("branch %q is not recorded", branchID)
-	}
-	recomputeContainerState(&info)
-	if info.State == "exited" {
-		info.ExitStatus = &exitStatus
-		info.ExitedAt = &now
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		recomputeContainerState(info)
+		if info.State == "exited" {
+			info.ExitStatus = &exitStatus
+			info.ExitedAt = &now
+		}
+		return true, nil
+	})
+}
+
+// KilledExitStatus is the exit status of a branch killed with its runtime:
+// SIGKILL's, which Docker reports for a container killed outright or by the
+// out-of-memory killer.
+const KilledExitStatus = 128 + 9
+
+// RuntimeExitedUnexpectedly is the error recorded for a family whose runtime
+// died under main, unless the out-of-memory killer took it, which OOMKilled
+// reports instead, as Docker does.
+const RuntimeExitedUnexpectedly = "the family's runtime exited unexpectedly"
+
+// RuntimeLoss is what became of the branches of a runtime found gone.
+type RuntimeLoss struct {
+	// ExitStatuses has the exit status of each branch whose init exited
+	// before the runtime did, as its console follower recorded it. Every
+	// other branch that needed the runtime was killed with it.
+	ExitStatuses map[string]int
+	// OOMKilled reports that the out-of-memory killer of the family's cgroup
+	// killed the runtime.
+	OOMKilled bool
 }
 
 // ReconcileRuntimeUnavailable marks only branches that required the missing
 // Sentry as exited. Durable dehydrated branches remain recoverable.
-func (s Store) ReconcileRuntimeUnavailable(name string, exitStatus *int) error {
-	return s.ReconcileNodeRuntimeUnavailable(name, "", exitStatus)
+func (s Store) ReconcileRuntimeUnavailable(name string, loss RuntimeLoss) error {
+	return s.ReconcileNodeRuntimeUnavailable(name, "", loss)
 }
 
 // ReconcileNodeRuntimeUnavailable marks branches whose runtime was lost on
-// nodeID as exited. An empty nodeID retains the legacy whole-family behavior.
-// Elastic families may have live siblings on other nodes, which this operation
-// must never rewrite merely because they are absent from the local runsc root.
-func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, exitStatus *int) error {
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	changed := false
-	for i := range info.Branches {
-		branch := &info.Branches[i]
-		if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
-			continue
-		}
-		switch branch.State {
-		case "creating", "running", "paused", "dehydrating", "rehydrating":
-			branch.State = "exited"
+// nodeID as exited: with the status their init exited with, if it had, and
+// otherwise as killed with the runtime. A family whose main was killed records
+// why, in OOMKilled or ExitError. An empty nodeID selects all branches
+// for standalone TTC. Elastic families may have live siblings on other nodes,
+// which this operation must never rewrite merely because they are absent from
+// the local runsc root.
+func (s Store) ReconcileNodeRuntimeUnavailable(name, nodeID string, loss RuntimeLoss) error {
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		changed, mainKilled := false, false
+		now := time.Now().UTC()
+		exit := func(branch *BranchInfo) {
+			status, exited := loss.ExitStatuses[branch.ID]
+			if !exited {
+				status = KilledExitStatus
+				mainKilled = mainKilled || branch.ID == "main"
+			}
+			updateBranchLifecycle(branch, "exited", &status, now)
 			changed = true
 		}
-	}
-	oldState := info.State
-	recomputeContainerState(&info)
-	if oldState != info.State {
-		changed = true
-	}
-	if info.State == "exited" && exitStatus != nil {
-		now := time.Now().UTC()
-		info.ExitStatus = exitStatus
-		info.ExitedAt = &now
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if nodeID != "" && info.BranchNodeID(branch.ID) != nodeID {
+				continue
+			}
+			switch branch.State {
+			case "creating", "running", "paused", "rehydrating":
+				exit(branch)
+			case "dehydrated":
+				// A resident capture was in the runtime that is gone. Like a
+				// running branch, it restarts from its filesystem.
+				if branch.StorageState == StorageResident {
+					exit(branch)
+					branch.StorageState = "local"
+				}
+			case "dehydrating":
+				// A successful dehydration deliberately removes the final
+				// Sentry before its asynchronous publication commits. The
+				// durable local capture and queue intent, rather than a live
+				// runtime, are authoritative throughout this state.
+			}
+		}
+		oldState := info.State
+		recomputeContainerState(info)
+		if oldState != info.State {
+			changed = true
+		}
+		// The family's exit is main's, as a container's is its init's.
+		if info.State == "exited" && changed {
+			for _, branch := range info.Branches {
+				if branch.ID == "main" && branch.ExitStatus != nil {
+					status := *branch.ExitStatus
+					info.ExitStatus = &status
+				}
+			}
+			info.ExitedAt = &now
+			info.OOMKilled = mainKilled && loss.OOMKilled
+			if mainKilled && !loss.OOMKilled {
+				info.ExitError = RuntimeExitedUnexpectedly
+			}
+		}
+		return changed, nil
+	})
 }
 
 // RemoveBranchRecord removes a branch from persistent metadata and splices its
@@ -3282,37 +4930,41 @@ func (s Store) RemoveBranchRecord(name, branchID string) error {
 	if err := validateObjectName("branch", branchID); err != nil {
 		return err
 	}
-	info, err := s.LoadContainer(name)
-	if err != nil {
-		return err
-	}
-	index := -1
-	parent := ""
-	for i := range info.Branches {
-		if info.Branches[i].ID == branchID {
-			index = i
-			parent = info.Branches[i].ParentID
-			break
+	return s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		index := -1
+		parent := ""
+		for i := range info.Branches {
+			if info.Branches[i].ID == branchID {
+				index = i
+				parent = info.Branches[i].ParentID
+				break
+			}
 		}
-	}
-	if index < 0 {
-		return fmt.Errorf("branch %q is not recorded", branchID)
-	}
-	for i := range info.Branches {
-		if info.Branches[i].ParentID == branchID {
-			info.Branches[i].ParentID = parent
+		if index < 0 {
+			return false, fmt.Errorf("branch %q is not recorded", branchID)
 		}
-	}
-	info.Branches = append(info.Branches[:index], info.Branches[index+1:]...)
-	recomputeContainerState(&info)
-	bindings := info.PublishedPorts[:0]
-	for _, binding := range info.PublishedPorts {
-		if binding.Branch() != branchID {
-			bindings = append(bindings, binding)
+		for i := range info.Branches {
+			if info.Branches[i].ParentID == branchID {
+				info.Branches[i].ParentID = parent
+			}
 		}
-	}
-	info.PublishedPorts = bindings
-	return writeJSON(filepath.Join(s.Root, "containers", info.ID, "container.json"), &info)
+		info.Branches = append(info.Branches[:index], info.Branches[index+1:]...)
+		if len(info.Branches) == 0 {
+			if info.IsDistributedPhysicalRuntime() {
+				return false, errors.New("cannot retain an empty physical container record")
+			}
+			info.DistributedCatalogOnly = true
+		}
+		recomputeContainerState(info)
+		bindings := info.PublishedPorts[:0]
+		for _, binding := range info.PublishedPorts {
+			if binding.Branch() != branchID {
+				bindings = append(bindings, binding)
+			}
+		}
+		info.PublishedPorts = bindings
+		return true, nil
+	})
 }
 
 // RemoveBranchFilesystems drops one branch pointer from every TTC-managed
@@ -3343,18 +4995,23 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 			persistentBranch = ttcvolume.ScopedBranchID(info.ID, branch.ID)
 		}
 	}
-	manager, err := ttcvolume.OpenManager(s.Root, true)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return err
 	}
 	seen := make(map[string]struct{}, len(repositories))
+	physicalDistributedRuntime := info.IsDistributedPhysicalRuntime()
 	for _, config := range repositories {
 		path := filepath.Clean(config.Path)
 		if _, duplicate := seen[path]; duplicate {
 			continue
 		}
 		seen[path] = struct{}{}
-		if persistentBranch == ttcvolume.MainBranch && !repositoryCanonicalBranchBelongsToFamily(config) {
+		repositoryBranch := persistentBranch
+		if persistentBranch == ttcvolume.MainBranch && config.Branch != "" {
+			repositoryBranch = config.Branch
+		}
+		if repositoryBranch == ttcvolume.MainBranch && !repositoryCanonicalBranchBelongsToFamily(config) {
 			// The canonical branch is named-volume state, not family-private
 			// state. Descendants and reused visible "main" branches are scoped
 			// and therefore take the normal removal path.
@@ -3362,21 +5019,59 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 		}
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
+			// Runtime eviction and active-tier reclamation may win the race with
+			// branch metadata cleanup. An absent node-local repository is already
+			// in the desired terminal state; treating it as fatal strands the
+			// branch's independent memory graph and transaction record.
+			if errors.Is(err, fs.ErrNotExist) {
+				if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				} else if statErr != nil {
+					return fmt.Errorf("stating repository %q: %w", config.Source, statErr)
+				}
+			}
 			return fmt.Errorf("opening repository %q: %w", config.Source, err)
 		}
-		removeErr := repository.RemoveBranch(persistentBranch)
+		removeErr := repository.RemoveBranch(repositoryBranch)
 		if errors.Is(removeErr, fs.ErrNotExist) {
 			removeErr = nil
 		}
+		// A transaction-scoped distributed container is a node-local physical
+		// materialization. Even a named volume repository belongs to that
+		// materialization once its last branch pointer is gone; the logical
+		// volume survives in the source/target authority, not in this obsolete
+		// node-local repository. Ordinary family removal must still preserve a
+		// named volume's canonical main pointer.
+		removeRepository := errors.Is(removeErr, ttcvolume.ErrFinalBranch) &&
+			(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime)
+		if removeRepository {
+			removeErr = nil
+		}
 		if removeErr == nil {
-			removeErr = repository.GarbageCollect()
+			if !removeRepository {
+				removeErr = repository.GarbageCollect()
+				if errors.Is(removeErr, ttcvolume.ErrEmptyRepository) &&
+					(repositoryCanonicalBranchBelongsToFamily(config) || physicalDistributedRuntime) {
+					// The Sentry may have committed its own branch-pointer
+					// deletion before daemon-side artifact cleanup begins. An
+					// empty family-private repository is therefore the same
+					// final-repository case as ErrFinalBranch, not a failure.
+					removeRepository = true
+					removeErr = nil
+				}
+			}
 		}
 		closeErr := repository.Close()
 		if removeErr != nil {
-			return fmt.Errorf("removing branch %q from repository %q: %w", persistentBranch, config.Source, removeErr)
+			return fmt.Errorf("removing branch %q from repository %q: %w", repositoryBranch, config.Source, removeErr)
 		}
 		if closeErr != nil {
 			return fmt.Errorf("closing repository %q: %w", config.Source, closeErr)
+		}
+		if removeRepository {
+			if err := manager.RemovePrivate(path); err != nil {
+				return fmt.Errorf("removing final private repository %q: %w", config.Source, err)
+			}
 		}
 	}
 	return nil
@@ -3387,34 +5082,13 @@ func (s Store) RemoveBranchFilesystems(name string, branch BranchInfo) error {
 // GC shares the mutation flock with Sentry, so this is safe while containers
 // are running.
 func (s Store) GarbageCollectRepositories() (int, error) {
-	manager, err := ttcvolume.OpenManager(s.Root, true)
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
 	if err != nil {
 		return 0, err
 	}
-	paths := make(map[string]struct{})
-	volumes, err := manager.List()
+	paths, err := s.repositoryPaths(manager)
 	if err != nil {
 		return 0, err
-	}
-	for _, volume := range volumes {
-		paths[filepath.Join(s.Root, "volumes-v2", volume.ID)] = struct{}{}
-	}
-	containers, err := s.listContainers(true)
-	if err != nil {
-		return 0, err
-	}
-	for _, container := range containers {
-		spec, err := s.LoadSpec(container.ID)
-		if err != nil {
-			return 0, err
-		}
-		repositories, err := specutils.TTCVolumeRepositories(spec)
-		if err != nil {
-			return 0, err
-		}
-		for _, repository := range repositories {
-			paths[filepath.Clean(repository.Path)] = struct{}{}
-		}
 	}
 	ordered := make([]string, 0, len(paths))
 	for path := range paths {
@@ -3425,6 +5099,17 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 	for _, path := range ordered {
 		repository, err := manager.OpenPrivate(path)
 		if err != nil {
+			// Cluster metadata describes the family on every node, while private
+			// rootfs and copied-host repositories exist only on nodes that have
+			// materialized the branch. A non-owner must not report routine GC
+			// failures for another node's absent active repository.
+			if errors.Is(err, fs.ErrNotExist) {
+				if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				} else if statErr != nil {
+					return collected, fmt.Errorf("stating repository %q: %w", path, statErr)
+				}
+			}
 			return collected, fmt.Errorf("opening repository %q: %w", path, err)
 		}
 		gcErr := repository.GarbageCollect()
@@ -3440,6 +5125,194 @@ func (s Store) GarbageCollectRepositories() (int, error) {
 	return collected, nil
 }
 
+// FilesystemSnapshotOrigins returns the origin IDs that still have local
+// authoritative graph metadata in any named or container repository. Snapshot
+// IDs are globally unique, so the union is sufficient to reconcile Raft's
+// coarse provider directory without putting per-file state in Raft.
+func (s Store) FilesystemSnapshotOrigins() (map[ttcsnapshot.SnapshotID]struct{}, error) {
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return nil, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return nil, err
+	}
+	origins := make(map[ttcsnapshot.SnapshotID]struct{})
+	for path := range paths {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening repository %q for origin inventory: %w", path, err)
+		}
+		for _, origin := range repository.SnapshotOrigins() {
+			origins[origin] = struct{}{}
+		}
+		if err := repository.Close(); err != nil {
+			return nil, fmt.Errorf("closing repository %q after origin inventory: %w", path, err)
+		}
+	}
+	return origins, nil
+}
+
+// PrepareFilesystemRetirementOrigins converts all surviving node-local
+// filesystem generations into immutable publication roots. Runtime fencing is
+// a precondition enforced by the node-retirement state machine; keeping the
+// repository traversal here ensures named volumes, rootfs uppers, copied
+// mounts, and transaction-private repositories use one inventory.
+func (s Store) PrepareFilesystemRetirementOrigins() ([]ttcsnapshot.SnapshotID, error) {
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return nil, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return nil, err
+	}
+	orderedPaths := make([]string, 0, len(paths))
+	for path := range paths {
+		orderedPaths = append(orderedPaths, path)
+	}
+	sort.Strings(orderedPaths)
+	seen := make(map[ttcsnapshot.SnapshotID]struct{})
+	var origins []ttcsnapshot.SnapshotID
+	for _, path := range orderedPaths {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("opening repository %q for retirement: %w", path, err)
+		}
+		prepared, prepareErr := repository.PrepareRetirementPublication()
+		closeErr := repository.Close()
+		if prepareErr != nil || closeErr != nil {
+			return nil, errors.Join(prepareErr, closeErr)
+		}
+		for _, origin := range prepared {
+			if _, duplicate := seen[origin]; duplicate {
+				continue
+			}
+			seen[origin] = struct{}{}
+			origins = append(origins, origin)
+		}
+	}
+	return origins, nil
+}
+
+// WithFilesystemSnapshotOrigin opens the unique node-local filesystem
+// repository that contains origin and invokes visit while that repository is
+// open. Snapshot origins are allocated cluster-wide, so finding the same
+// origin in more than one repository indicates corrupt local authority rather
+// than an ambiguous lookup.
+//
+// The callback form deliberately keeps repository discovery in Store. Callers
+// should not need to duplicate its inventory of named volumes, rootfs uppers,
+// copied mounts, and transaction-private repositories merely to complete an
+// origin-level operation such as provider handoff.
+func (s Store) WithFilesystemSnapshotOrigin(origin ttcsnapshot.SnapshotID, visit func(*ttcvolume.Repository) error) (bool, error) {
+	if origin == 0 {
+		return false, errors.New("filesystem snapshot origin is zero")
+	}
+	if visit == nil {
+		return false, errors.New("filesystem snapshot origin visitor is nil")
+	}
+	manager, err := ttcvolume.OpenManager(s.activeRoot())
+	if err != nil {
+		return false, err
+	}
+	paths, err := s.repositoryPaths(manager)
+	if err != nil {
+		return false, err
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	found := false
+	for _, path := range ordered {
+		repository, err := manager.OpenPrivate(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return found, fmt.Errorf("opening repository %q for origin lookup: %w", path, err)
+		}
+		contains := false
+		for _, candidate := range repository.SnapshotOrigins() {
+			if candidate == origin {
+				contains = true
+				break
+			}
+		}
+		if !contains {
+			if err := repository.Close(); err != nil {
+				return found, fmt.Errorf("closing repository %q after origin lookup: %w", path, err)
+			}
+			continue
+		}
+		if found {
+			_ = repository.Close()
+			return true, fmt.Errorf("filesystem snapshot origin %d appears in multiple repositories", origin)
+		}
+		found = true
+		visitErr := visit(repository)
+		closeErr := repository.Close()
+		if visitErr != nil || closeErr != nil {
+			return true, errors.Join(visitErr, closeErr)
+		}
+	}
+	return found, nil
+}
+
+func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{}, error) {
+	paths := make(map[string]struct{})
+	volumes, err := manager.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, volume := range volumes {
+		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.addContainerRepositoryPaths(paths, containers); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+// addContainerRepositoryPaths adds to paths the repositories of the listed
+// containers.
+func (s Store) addContainerRepositoryPaths(paths map[string]struct{}, containers []ContainerInfo) error {
+	for _, container := range containers {
+		spec, err := s.LoadSpec(container.ID)
+		if err != nil {
+			// Removed since it was listed, as a migrated or forked branch's
+			// staging record may be meanwhile: removal renames the record
+			// away before anything else, so nothing it held is reachable
+			// from it.
+			if _, statErr := os.Lstat(filepath.Join(s.Root, "containers", container.ID)); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			return err
+		}
+		repositories, err := specutils.TTCVolumeRepositories(spec)
+		if err != nil {
+			return err
+		}
+		for _, repository := range repositories {
+			paths[filepath.Clean(repository.Path)] = struct{}{}
+		}
+	}
+	return nil
+}
+
 // repositoryCanonicalBranchBelongsToFamily reports whether the initial main
 // branch is private state owned by one container family. Rootfs repositories
 // predate TTCVolumeRepository.Private and are identified by their reserved
@@ -3453,23 +5326,25 @@ func repositoryCanonicalBranchBelongsToFamily(config specutils.TTCVolumeReposito
 // RemoveBranchArtifacts deletes persistent state whose lifetime is exactly one
 // visible branch: active/dehydrated memory files, init logs, and managed-exec
 // logs.
-func (s Store) RemoveBranchArtifacts(name, branchID string) error {
-	if err := validateObjectName("branch", branchID); err != nil {
+func (s Store) RemoveBranchArtifacts(name string, branch BranchInfo) error {
+	if err := validateObjectName("branch", branch.ID); err != nil {
 		return err
 	}
 	info, err := s.LoadContainer(name)
 	if err != nil {
 		return err
 	}
-	containerDir := filepath.Join(s.Root, "containers", info.ID)
-	encodedBranch := hex.EncodeToString([]byte(branchID))
+	containerDir := s.activeContainerDir(info.ID)
+	// Current memory images are keyed by the stable filesystem identity so a
+	// visible branch rename doesn't move a potentially large image.
+	memoryKey := MemoryBranchKey(branch)
 	for _, kind := range []string{"active", "dehydrated"} {
-		if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, encodedBranch)); err != nil {
+		if err := os.RemoveAll(filepath.Join(containerDir, "memory", kind, memoryKey)); err != nil {
 			return err
 		}
 	}
 	consoleDir := filepath.Join(containerDir, "console")
-	base := filepath.Join(consoleDir, branchID)
+	base := filepath.Join(consoleDir, branch.ID)
 	paths := []string{
 		base + ".log", base + ".lock", base + ".stdin.lock", base + ".error.log",
 		base + ".wait-status", base + ".log.retention.json", base + ".pid",
@@ -3486,7 +5361,7 @@ func (s Store) RemoveBranchArtifacts(name, branchID string) error {
 			return err
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(consoleDir, "exec", branchID)); err != nil {
+	if err := os.RemoveAll(filepath.Join(consoleDir, "exec", branch.ID)); err != nil {
 		return err
 	}
 	return nil
@@ -3500,232 +5375,242 @@ func (s Store) RemoveContainer(name string) error {
 	if err != nil {
 		return err
 	}
+	return s.removeContainerInfo(info)
+}
+
+func (s Store) rename(oldPath, newPath string) error {
+	if s.renamePath != nil {
+		return s.renamePath(oldPath, newPath)
+	}
+	return os.Rename(oldPath, newPath)
+}
+
+func (s Store) removeAll(path string) error {
+	if s.removeAllPath != nil {
+		return s.removeAllPath(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (s Store) removedContainersRoot() string {
+	return filepath.Join(s.Root, removedContainerDir)
+}
+
+func (s Store) discardIncompleteContainer(id string) {
+	defer s.removeActiveContainer(id)
+	staging := filepath.Join(s.Root, containerStagingDir, id)
+	if err := s.removeAll(staging); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Warningf("Deferring cleanup of unpublished container %q: %v", id, err)
+	}
+	// A failed construction normally has no entry in containers/. Preserve the
+	// legacy recovery path for roots created by an interrupted older daemon and
+	// for a failure after the atomic publication rename.
+	if _, err := os.Lstat(filepath.Join(s.Root, "containers", id)); errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	tombstone, err := s.stageContainerRemoval(id)
+	if err != nil {
+		log.Warningf("Deferring cleanup of incomplete container %q in the active namespace: %v", id, err)
+		return
+	}
+	if err := s.cleanupRemovedContainer(tombstone, nil); err != nil {
+		log.Warningf("Deferring physical cleanup of incomplete container %q: %v", id, err)
+	}
+}
+
+func (s Store) removeActiveContainer(id string) {
+	if s.activeRoot() == s.Root {
+		return
+	}
+	if err := s.removeAll(s.activeContainerDir(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Warningf("Deferring cleanup of node-local state for container %q: %v", id, err)
+	}
+}
+
+// stageContainerRemoval atomically removes one container from the active
+// namespace. Physical cleanup happens only after this rename, so a partially
+// successful recursive deletion can damage only a tombstone.
+func (s Store) stageContainerRemoval(id string) (string, error) {
+	active := filepath.Join(s.Root, "containers", id)
+	root := s.removedContainersRoot()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", fmt.Errorf("creating removed-container staging directory: %w", err)
+	}
+	tombstone := filepath.Join(root, id)
+	if _, err := os.Lstat(tombstone); err == nil {
+		return "", fmt.Errorf("removed-container tombstone already exists for %q", id)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("checking removed-container tombstone for %q: %w", id, err)
+	}
+	if err := s.rename(active, tombstone); err != nil {
+		return "", fmt.Errorf("committing removal of container %q: %w", id, err)
+	}
+	// The rename is already the logical commit point. Directory sync failures
+	// affect crash durability, not whether callers may continue using the
+	// active namespace, so retain the tombstone and report them in the daemon
+	// log instead of turning a committed removal into an ambiguous failure.
+	for _, dir := range []string{filepath.Dir(active), root} {
+		directory, err := os.Open(dir)
+		if err == nil {
+			err = directory.Sync()
+			err = errors.Join(err, directory.Close())
+		}
+		if err != nil {
+			log.Warningf("Container %q was removed but syncing directory %q failed: %v", id, dir, err)
+		}
+	}
+	return tombstone, nil
+}
+
+func loadRemovedContainerInfo(path string) (*ContainerInfo, error) {
+	data, err := readFileWithStaleRetry(filepath.Join(path, "container.json"))
+	if err != nil {
+		return nil, err
+	}
+	var info ContainerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// cleanupRemovedContainer performs idempotent post-commit cleanup. Metadata is
+// deliberately retained until external resources have been released. Once
+// recursive removal begins, losing container.json is harmless: all cleanup
+// that needed it has already completed.
+func (s Store) cleanupRemovedContainer(path string, known *ContainerInfo) error {
+	info := known
+	if info == nil {
+		loaded, err := loadRemovedContainerInfo(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Older TTC versions could leave an empty active directory after first
+			// releasing the image lease. Also make the conventional lease cleanup
+			// idempotently in case creation was interrupted before publication.
+			id := filepath.Base(path)
+			if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: images.ContainerLeaseID(id)}); err != nil {
+				return fmt.Errorf("releasing inferred image content for removed container %q: %w", id, err)
+			}
+			return s.removeAll(path)
+		}
+		if err != nil {
+			return fmt.Errorf("reading removed container metadata from %q: %w", path, err)
+		}
+		info = loaded
+	}
 	if info.LeaseID != "" {
 		if err := images.DeleteContentLease(context.Background(), images.ContentLeaseOptions{Root: s.Root, LeaseID: info.LeaseID}); err != nil {
-			return fmt.Errorf("releasing image content for container %q: %w", name, err)
+			return fmt.Errorf("releasing image content for removed container %q: %w", info.ID, err)
 		}
 	}
-	if err := s.removeDistributedMemorySnapshot(info); err != nil {
+	if err := s.removeDistributedMemoryMetadata(*info); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(s.Root, "containers", info.ID)); err != nil {
-		return fmt.Errorf("removing container %q: %w", name, err)
-	}
-	return s.gcPromotedRepositories()
+	return s.removeAll(path)
 }
 
-// PromoteContainerRepositories moves container-private repositories into the
-// shared cluster repository namespace. Open repository directory descriptors
-// remain valid across the rename, while future starts and distributed targets
-// use the new stable paths recorded in the source OCI spec.
-//
-// Promotion is idempotent and is required before reserving a distributed fork
-// target. It ensures that deleting the source container metadata cannot delete
-// filesystem state still referenced by a remote branch.
-func (s Store) PromoteContainerRepositories(name string) error {
-	return s.withPromotedRepositoryLock(func() error {
-		info, err := s.LoadContainer(name)
-		if err != nil {
+// cleanupRemovedContainerAfterCommit absorbs only the short close-to-rmdir
+// visibility window exhibited by network filesystems. It does not inspect or
+// ignore directory entries: persistent busy/nonempty state remains a normal
+// deferred tombstone and cannot block removal of other families.
+func (s Store) cleanupRemovedContainerAfterCommit(path string, known *ContainerInfo) error {
+	deadline := time.Now().Add(time.Second)
+	delay := 10 * time.Millisecond
+	for {
+		err := s.cleanupRemovedContainer(path, known)
+		if err == nil || (!errors.Is(err, unix.EBUSY) && !errors.Is(err, unix.ENOTEMPTY)) || !time.Now().Before(deadline) {
 			return err
 		}
-		spec, err := s.LoadSpec(info.ID)
-		if err != nil {
-			return err
+		time.Sleep(delay)
+		if delay < 100*time.Millisecond {
+			delay *= 2
 		}
-		repositories, err := specutils.TTCVolumeRepositories(spec)
-		if err != nil {
-			return err
+		// Metadata may already have been unlinked by the preceding RemoveAll.
+		// Subsequent attempts therefore use the recovery path rather than a
+		// stale in-memory record.
+		known = nil
+	}
+}
+
+func (s Store) removeContainerInfo(info ContainerInfo) error {
+	tombstone, err := s.stageContainerRemoval(info.ID)
+	if err != nil {
+		return err
+	}
+	if err := s.cleanupRemovedContainerAfterCommit(tombstone, &info); err != nil {
+		log.Warningf("Container %q was removed; deferred physical cleanup of %q: %v", info.Name, tombstone, err)
+	}
+	s.removeActiveContainer(info.ID)
+	return nil
+}
+
+// RecoverContainerRemovals moves incomplete container directories out
+// of the active namespace, then retries every tombstone independently. It is
+// intended to run at daemon startup and during periodic maintenance while the
+// data-root mutation lock is held.
+func (s Store) RecoverContainerRemovals() (int, error) {
+	containersRoot := filepath.Join(s.Root, "containers")
+	entries, err := readDirWithStaleRetry(containersRoot)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return 0, fmt.Errorf("scanning incomplete container removals: %w", err)
+	}
+	var result error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
 		}
-		containerDir := filepath.Join(s.Root, "containers", info.ID)
-		familyDir := filepath.Join(s.promotedRepositoryRoot(), info.ID)
-		type movedRepository struct {
-			oldPath string
-			newPath string
-		}
-		var moved []movedRepository
-		changed := false
-		rollback := func() {
-			for i := len(moved) - 1; i >= 0; i-- {
-				_ = os.Rename(moved[i].newPath, moved[i].oldPath)
-			}
-		}
-		for i := range repositories {
-			repository := &repositories[i]
-			inside, err := pathWithin(containerDir, repository.Path)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q: %w", repository.Source, err)
-			}
-			if !inside {
-				continue
-			}
-			if err := os.MkdirAll(familyDir, 0700); err != nil {
-				rollback()
-				return fmt.Errorf("creating promoted repository namespace: %w", err)
-			}
-			digest := sha256.Sum256([]byte(repository.Source))
-			base := filepath.Base(repository.Path)
-			destination := filepath.Join(familyDir, base+"-"+hex.EncodeToString(digest[:8]))
-			oldExists, err := directoryExistsWithoutSymlink(repository.Path)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q source: %w", repository.Source, err)
-			}
-			newExists, err := directoryExistsWithoutSymlink(destination)
-			if err != nil {
-				rollback()
-				return fmt.Errorf("checking repository %q destination: %w", repository.Source, err)
-			}
-			switch {
-			case oldExists && !newExists:
-				if err := os.Rename(repository.Path, destination); err != nil {
-					rollback()
-					return fmt.Errorf("promoting repository %q: %w", repository.Source, err)
+		containerDir := filepath.Join(containersRoot, entry.Name())
+		metadata := filepath.Join(containerDir, "container.json")
+		if _, err := os.Stat(metadata); err == nil {
+			marker := filepath.Join(containerDir, containerCreationMarker)
+			if _, markerErr := os.Stat(marker); markerErr == nil {
+				if _, loadErr := s.loadContainerKey(entry.Name()); loadErr == nil {
+					if removeErr := os.Remove(marker); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+						result = errors.Join(result, fmt.Errorf("finalizing container creation %q: %w", entry.Name(), removeErr))
+					}
 				}
-				moved = append(moved, movedRepository{oldPath: repository.Path, newPath: destination})
-			case oldExists && newExists:
-				rollback()
-				return fmt.Errorf("promoting repository %q: both source and destination exist", repository.Source)
-			case !oldExists && !newExists:
-				rollback()
-				return fmt.Errorf("promoting repository %q: source is missing", repository.Source)
 			}
-			repository.Path = destination
-			changed = true
+			continue
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("checking container metadata %q: %w", metadata, err))
+			continue
 		}
-		if !changed {
-			return nil
+		if _, err := os.Stat(filepath.Join(containerDir, containerCreationMarker)); err == nil {
+			continue
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("checking container creation marker for %q: %w", entry.Name(), err))
+			continue
 		}
-		encoded, err := json.Marshal(repositories)
-		if err != nil {
-			rollback()
-			return err
+		if _, err := s.stageContainerRemoval(entry.Name()); err != nil {
+			result = errors.Join(result, fmt.Errorf("isolating incomplete container directory %q: %w", entry.Name(), err))
 		}
-		if spec.Annotations == nil {
-			spec.Annotations = make(map[string]string)
-		}
-		spec.Annotations[specutils.AnnotationTTCVolumeRepositories] = string(encoded)
-		if err := writeJSON(filepath.Join(info.BundleDir, "config.json"), spec); err != nil {
-			rollback()
-			return fmt.Errorf("recording promoted repository paths: %w", err)
-		}
-		return nil
-	})
+	}
+	removed, sweepErr := s.SweepRemovedContainers()
+	return removed, errors.Join(result, sweepErr)
 }
 
-func (s Store) promotedRepositoryRoot() string {
-	return filepath.Join(s.Root, "cluster", promotedRepositoryDir)
-}
-
-func (s Store) withPromotedRepositoryLock(fn func() error) error {
-	root := s.promotedRepositoryRoot()
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return err
-	}
-	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return err
-	}
-	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	return fn()
-}
-
-func pathWithin(parent, child string) (bool, error) {
-	parent = filepath.Clean(parent)
-	child = filepath.Clean(child)
-	relative, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false, err
-	}
-	return relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)), nil
-}
-
-func directoryExistsWithoutSymlink(path string) (bool, error) {
-	info, err := os.Lstat(path)
+// SweepRemovedContainers retries tombstones independently. One path that an
+// NFS server still considers busy is retained without preventing cleanup of
+// any other removed container.
+func (s Store) SweepRemovedContainers() (int, error) {
+	root := s.removedContainersRoot()
+	entries, err := readDirWithStaleRetry(root)
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
+		return 0, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, fmt.Errorf("listing removed containers: %w", err)
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("%q is not a directory", path)
+	removed := 0
+	var result error
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if err := s.cleanupRemovedContainer(path, nil); err != nil {
+			result = errors.Join(result, fmt.Errorf("cleaning removed container %q: %w", entry.Name(), err))
+			continue
+		}
+		removed++
 	}
-	return true, nil
-}
-
-// gcPromotedRepositories removes stable family repositories after no
-// remaining container spec references them. Scanning specs is deliberately
-// conservative: any unreadable metadata aborts collection rather than risking
-// live branch data.
-func (s Store) gcPromotedRepositories() error {
-	return s.withPromotedRepositoryLock(func() error {
-		root := s.promotedRepositoryRoot()
-		containers, err := s.listContainers(true)
-		if err != nil {
-			return err
-		}
-		referenced := make(map[string]struct{})
-		for _, container := range containers {
-			spec, err := s.LoadSpec(container.ID)
-			if err != nil {
-				return err
-			}
-			repositories, err := specutils.TTCVolumeRepositories(spec)
-			if err != nil {
-				return err
-			}
-			for _, repository := range repositories {
-				inside, err := pathWithin(root, repository.Path)
-				if err != nil {
-					return err
-				}
-				if inside {
-					referenced[filepath.Clean(repository.Path)] = struct{}{}
-				}
-			}
-		}
-		families, err := os.ReadDir(root)
-		if err != nil {
-			return err
-		}
-		for _, family := range families {
-			if family.Name() == ".lock" || !family.IsDir() {
-				continue
-			}
-			familyPath := filepath.Join(root, family.Name())
-			repositories, err := os.ReadDir(familyPath)
-			if err != nil {
-				return err
-			}
-			for _, repository := range repositories {
-				path := filepath.Join(familyPath, repository.Name())
-				if _, ok := referenced[path]; ok {
-					continue
-				}
-				if repository.Type()&os.ModeSymlink != 0 || !repository.IsDir() {
-					return fmt.Errorf("unexpected entry in promoted repository namespace: %s", path)
-				}
-				if err := os.RemoveAll(path); err != nil {
-					return err
-				}
-			}
-			remaining, err := os.ReadDir(familyPath)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-			if len(remaining) == 0 {
-				if err := os.Remove(familyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return err
-				}
-			}
-		}
-		return nil
-	})
+	return removed, result
 }
 
 // HasImageRoot reports whether TTC has materialized the immutable root for a
@@ -3735,7 +5620,7 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 	if digest == "" || platform == "" {
 		return false, nil
 	}
-	dir := filepath.Join(s.Root, "images", imageRootKey(digest, platform))
+	dir := filepath.Join(s.imageRootDir(), imageRootKey(digest, platform))
 	if _, err := loadImageRoot(dir); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -3745,13 +5630,136 @@ func (s Store) HasImageRoot(digest, platform string) (bool, error) {
 	return true, nil
 }
 
-var imageRootDirectoryPattern = regexp.MustCompile(`^(?:v[0-9]+-)?sha256-[0-9a-f]{64}-.+$`)
+// ImageCacheUsage reports complete immutable regular-file content in a
+// clustered node-local image skeleton. The boolean is false for an absent
+// cache or for standalone fully-extracted roots, which are authoritative image
+// storage rather than a disposable cache.
+func (s Store) ImageCacheUsage(digest, platform string) (ttcpack.LazyCacheUsage, bool, error) {
+	if s.activeRoot() == s.Root || digest == "" || platform == "" {
+		return ttcpack.LazyCacheUsage{}, false, nil
+	}
+	rootfs := filepath.Join(s.imageRootDir(), imageRootKey(digest, platform), "rootfs")
+	usage, err := ttcpack.InspectLazyCache(rootfs)
+	if errors.Is(err, os.ErrNotExist) {
+		return ttcpack.LazyCacheUsage{}, false, nil
+	}
+	if err != nil {
+		return ttcpack.LazyCacheUsage{}, false, fmt.Errorf("inspecting node-local image cache for %s (%s): %w", digest, platform, err)
+	}
+	return usage, true, nil
+}
 
-// PruneImageRoots removes materialized image roots that are no longer usable
-// by either the current image catalog or a persistent container. In
-// particular, this collects roots left behind when imageRootFormatVersion is
-// advanced. Container references are authoritative so that an older stopped
-// container remains startable until RefreshContainerImageRoot migrates it.
+// DefaultImageCacheTarget returns the default node-local immutable image
+// cache budget. It scales with the local filesystem while remaining bounded
+// on very large scratch devices. Active gofers may temporarily keep usage
+// above this target; correctness takes precedence over cache reclamation.
+func DefaultImageCacheTarget(root string) (uint64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(root, &stat); err != nil {
+		return 0, err
+	}
+	capacity := stat.Blocks * uint64(stat.Bsize)
+	target := capacity / 4
+	const (
+		minimum = uint64(512 << 20)
+		maximum = uint64(64 << 30)
+	)
+	if target < minimum && capacity >= minimum {
+		target = minimum
+	}
+	if target > maximum {
+		target = maximum
+	}
+	return target, nil
+}
+
+// PruneImageCache evicts oldest complete files from inactive clustered image
+// skeletons until their aggregate content is at most targetBytes. Metadata,
+// directories, symlinks, and hardlinks remain, and an active gofer pins its
+// whole image root with a shared lock so cache deletion cannot affect open or
+// running files.
+func (s Store) PruneImageCache(targetBytes uint64) (ImageCachePruneResult, error) {
+	var result ImageCachePruneResult
+	if s.activeRoot() == s.Root {
+		return result, nil
+	}
+	entries, err := readDirWithStaleRetry(s.imageRootDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
+	}
+	type cachedRoot struct {
+		path  string
+		usage ttcpack.LazyCacheUsage
+		mtime time.Time
+	}
+	var roots []cachedRoot
+	for _, entry := range entries {
+		if !entry.IsDir() || !imageRootDirectoryPattern.MatchString(entry.Name()) || strings.Contains(entry.Name(), ".tmp-") {
+			continue
+		}
+		path := filepath.Join(s.imageRootDir(), entry.Name(), "rootfs")
+		usage, err := ttcpack.InspectLazyCache(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return result, fmt.Errorf("inspecting image cache %q: %w", entry.Name(), err)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return result, err
+		}
+		result.BeforeBytes += usage.CompleteBytes
+		roots = append(roots, cachedRoot{path: path, usage: usage, mtime: info.ModTime()})
+	}
+	result.AfterBytes = result.BeforeBytes
+	if result.AfterBytes <= targetBytes {
+		return result, nil
+	}
+	sort.Slice(roots, func(i, j int) bool {
+		if !roots[i].mtime.Equal(roots[j].mtime) {
+			return roots[i].mtime.Before(roots[j].mtime)
+		}
+		return roots[i].path < roots[j].path
+	})
+	for _, root := range roots {
+		if result.AfterBytes <= targetBytes {
+			break
+		}
+		need := result.AfterBytes - targetBytes
+		rootTarget := uint64(0)
+		if root.usage.CompleteBytes > need {
+			rootTarget = root.usage.CompleteBytes - need
+		}
+		usage, evicted, err := ttcpack.EvictLazyCache(root.path, rootTarget)
+		if errors.Is(err, ttcpack.ErrLazyCacheBusy) {
+			result.BusyBytes += root.usage.CompleteBytes
+			continue
+		}
+		if err != nil {
+			return result, fmt.Errorf("evicting image cache %q: %w", root.path, err)
+		}
+		result.AfterBytes -= root.usage.CompleteBytes - usage.CompleteBytes
+		result.EvictedFiles += evicted.Files
+		result.EvictedBytes += evicted.Bytes
+	}
+	return result, nil
+}
+
+var imageRootDirectoryPattern = regexp.MustCompile(`^` + imageRootFormatVersion + `-sha256-[0-9a-f]{64}-.+$`)
+
+// nodeLocalImageCacheGrace closes the short interval between publishing a
+// freshly materialized image root and publishing the active container that
+// pins it. Image-root construction and pruning share a lock, but the container
+// record is deliberately created outside that lock. A young unreferenced cache
+// is retained for one maintenance interval and reconsidered later.
+const nodeLocalImageCacheGrace = time.Minute
+
+// PruneImageRoots removes current-format materialized image roots that are no
+// longer usable by either the image catalog or a persistent container.
 func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
 	if err != nil {
@@ -3766,25 +5774,30 @@ func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 
 func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo) (int, error) {
 	keep := make(map[string]struct{}, len(stored)+len(containers))
-	for _, image := range stored {
-		keep[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+	if s.activeRoot() == s.Root {
+		for _, image := range stored {
+			keep[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+		}
 	}
-	imagesDir := filepath.Join(s.Root, "images")
+	imagesDir := s.imageRootDir()
 	for _, container := range containers {
-		rootfs := filepath.Clean(container.RootFS)
-		if filepath.Base(rootfs) != "rootfs" {
-			return 0, fmt.Errorf("container %q has invalid image root path %q", container.Name, container.RootFS)
+		if s.activeRoot() != s.Root {
+			if _, err := os.Stat(s.activeContainerDir(container.ID)); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return 0, err
+			}
 		}
-		relative, err := filepath.Rel(imagesDir, filepath.Dir(rootfs))
-		if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || strings.ContainsRune(relative, filepath.Separator) {
-			return 0, fmt.Errorf("container %q image root %q is outside the TTC image-root directory", container.Name, container.RootFS)
+		if container.Digest == "" || container.Platform == "" {
+			return 0, fmt.Errorf("container %q has no image identity", container.Name)
 		}
-		keep[relative] = struct{}{}
+		keep[imageRootKey(container.Digest, container.Platform)] = struct{}{}
 	}
 
 	removed := 0
 	err := s.withImageRootLock(func() error {
-		entries, err := os.ReadDir(imagesDir)
+		entries, err := readDirWithStaleRetry(imagesDir)
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -3797,6 +5810,15 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 			}
 			if _, referenced := keep[entry.Name()]; referenced && !strings.Contains(entry.Name(), ".tmp-") {
 				continue
+			}
+			if s.activeRoot() != s.Root {
+				info, err := entry.Info()
+				if err != nil {
+					return err
+				}
+				if time.Since(info.ModTime()) < nodeLocalImageCacheGrace {
+					continue
+				}
 			}
 			if err := removeImageRoot(filepath.Join(imagesDir, entry.Name())); err != nil {
 				return fmt.Errorf("removing unreferenced image root %q: %w", entry.Name(), err)
@@ -3811,6 +5833,89 @@ func (s Store) pruneImageRoots(stored []images.Info, containers []ContainerInfo)
 	return removed, nil
 }
 
+// PruneSharedImagePacks removes manifests no longer referenced by an image tag
+// or container, then collects packs unreachable from the remaining manifests.
+// Publication and collection share an NFS-visible lock, so a completed pack
+// cannot be mistaken for garbage in the short interval before its manifest is
+// installed. This makes an explicit image removal reclaim storage immediately
+// instead of retaining every removed image for a one-hour crash grace.
+func (s Store) PruneSharedImagePacks(ctx context.Context) (removedManifests, removedPacks int, retErr error) {
+	if s.activeRoot() == s.Root {
+		return 0, 0, nil
+	}
+	err := s.withSharedImagePackLock(func() error {
+		var err error
+		removedManifests, removedPacks, err = s.pruneSharedImagePacksLocked(ctx)
+		return err
+	})
+	return removedManifests, removedPacks, err
+}
+
+func (s Store) pruneSharedImagePacksLocked(ctx context.Context) (int, int, error) {
+	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
+	if err != nil {
+		return 0, 0, err
+	}
+	containers, err := s.listContainers(true)
+	if err != nil {
+		return 0, 0, err
+	}
+	keepKeys := make(map[string]struct{}, len(stored)+len(containers))
+	for _, image := range stored {
+		keepKeys[imageRootKey(image.Digest, image.Platform)] = struct{}{}
+	}
+	for _, container := range containers {
+		if container.Digest != "" && container.Platform != "" {
+			keepKeys[imageRootKey(container.Digest, container.Platform)] = struct{}{}
+		}
+	}
+	manifestsDir := filepath.Join(s.sharedImagePackRoot(), "manifests")
+	entries, err := readDirWithStaleRetry(manifestsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	removedManifests := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		key := strings.TrimSuffix(entry.Name(), ".json")
+		if !imageRootDirectoryPattern.MatchString(key) {
+			continue
+		}
+		if _, ok := keepKeys[key]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(manifestsDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removedManifests, 0, err
+		}
+		removedManifests++
+	}
+	remaining, err := readDirWithStaleRetry(manifestsDir)
+	if err != nil {
+		return removedManifests, 0, err
+	}
+	keepPacks := make(map[ttcpack.ID]struct{}, len(remaining))
+	for _, entry := range remaining {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		manifest, err := loadSharedImagePackManifest(filepath.Join(manifestsDir, entry.Name()))
+		if err != nil {
+			// Unknown or malformed operator files are reported but never make a
+			// valid pack look unreachable.
+			return removedManifests, 0, fmt.Errorf("reading retained image pack manifest %q: %w", entry.Name(), err)
+		}
+		id, _ := ttcpack.ParseID(manifest.Pack)
+		keepPacks[id] = struct{}{}
+	}
+	removedPacks, err := ttcpack.Collect(s.sharedImagePackRoot(), keepPacks, 0)
+	return removedManifests, removedPacks, err
+}
+
 // RemoveImageRoots removes every platform-specific immutable root for digest.
 // Callers must first prove that no persistent container or image alias still
 // references the digest.
@@ -3818,16 +5923,11 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 	if digest == "" || !strings.Contains(digest, ":") {
 		return 0, fmt.Errorf("invalid image digest %q", digest)
 	}
-	imagesDir := filepath.Join(s.Root, "images")
-	prefixes := []string{
-		safeComponent(digest + "-"),
-		safeComponent("v2-" + digest + "-"),
-		safeComponent("v3-" + digest + "-"),
-		safeComponent(imageRootFormatVersion + "-" + digest + "-"),
-	}
+	imagesDir := s.imageRootDir()
+	prefix := safeComponent(imageRootFormatVersion + "-" + digest + "-")
 	removed := 0
 	err := s.withImageRootLock(func() error {
-		entries, err := os.ReadDir(imagesDir)
+		entries, err := readDirWithStaleRetry(imagesDir)
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -3835,14 +5935,7 @@ func (s Store) RemoveImageRoots(digest string) (int, error) {
 			return fmt.Errorf("listing image roots: %w", err)
 		}
 		for _, entry := range entries {
-			matches := false
-			for _, prefix := range prefixes {
-				if strings.HasPrefix(entry.Name(), prefix) {
-					matches = true
-					break
-				}
-			}
-			if !entry.IsDir() || !matches {
+			if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
 				continue
 			}
 			path := filepath.Join(imagesDir, entry.Name())
@@ -3868,16 +5961,20 @@ func (s Store) BranchConsolePaths(container, branch string) (ConsolePaths, error
 	if err := validateObjectName("branch", branch); err != nil {
 		return ConsolePaths{}, err
 	}
-	info, err := s.LoadContainer(container)
+	// Console sidecars are prepared before a distributed target is published.
+	// Exact physical IDs are authority-derived here, so hidden runtime records
+	// must be resolvable without exposing them through ordinary user lookup.
+	info, err := s.LoadRuntimeContainer(container)
 	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.Root, "containers", info.ID, "console")
+	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating console state for %q: %w", container, err)
 	}
 	base := filepath.Join(dir, branch)
 	return ConsolePaths{
+		FamilyDir:      dir,
 		Log:            base + ".log",
 		Lock:           base + ".lock",
 		StdinLock:      base + ".stdin.lock",
@@ -3900,16 +5997,17 @@ func (s Store) ExecConsolePaths(container, branch, execID string) (ConsolePaths,
 	if err := validateObjectName("exec session", execID); err != nil {
 		return ConsolePaths{}, err
 	}
-	info, err := s.LoadContainer(container)
+	info, err := s.LoadRuntimeContainer(container)
 	if err != nil {
 		return ConsolePaths{}, err
 	}
-	dir := filepath.Join(s.Root, "containers", info.ID, "console", "exec", branch)
+	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console", "exec", branch)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return ConsolePaths{}, fmt.Errorf("creating exec console state for %q: %w", container, err)
 	}
 	base := filepath.Join(dir, execID)
 	return ConsolePaths{
+		FamilyDir:      filepath.Dir(filepath.Dir(dir)),
 		Log:            base + ".log",
 		Lock:           base + ".lock",
 		StdinLock:      base + ".stdin.lock",
@@ -3932,8 +6030,8 @@ func (s Store) ListExecConsoleRetentionStats(container, branch string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(s.Root, "containers", info.ID, "console", "exec", branch)
-	entries, err := os.ReadDir(dir)
+	dir := filepath.Join(s.activeRoot(), "containers", info.ID, "console", "exec", branch)
+	entries, err := readDirWithStaleRetry(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -3974,6 +6072,47 @@ func normalizePullPolicy(policy string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported pull policy %q; supported policies are missing, always, and never", policy)
 	}
+}
+
+// ImageReady reports whether preparing a container from reference under the
+// pull policy would find the image, and its root on this node, ready: neither
+// pull it nor unpack it.
+func (s Store) ImageReady(ctx context.Context, reference, platform, policy string) (bool, error) {
+	policy, err := normalizePullPolicy(policy)
+	if err != nil || policy == "always" {
+		return false, err
+	}
+	stored, err := images.List(ctx, images.ListOptions{Root: s.Root})
+	if err != nil {
+		return false, err
+	}
+	return s.imageReadyAmong(stored, reference, platform)
+}
+
+// imageReadyAmong reports whether reference is one of the stored images and
+// its root is unpacked on this node.
+func (s Store) imageReadyAmong(stored []images.Info, reference, platform string) (bool, error) {
+	match, found, err := selectStoredImage(stored, reference, platform)
+	if err != nil || !found {
+		return false, err
+	}
+	selectedPlatform := platform
+	if selectedPlatform == "" {
+		selectedPlatform = match.Platform
+	}
+	_, err = loadImageRoot(filepath.Join(s.imageRootDir(), imageRootKey(match.Digest, selectedPlatform)))
+	return err == nil, nil
+}
+
+// PrepareImage pulls reference if the pull policy asks for it and prepares its
+// root on this node, as preparing a container from it would.
+func (s Store) PrepareImage(ctx context.Context, reference, platform, policy string, progress images.ProgressFunc) error {
+	pulled, err := s.resolveImage(ctx, reference, platform, policy, progress)
+	if err != nil {
+		return err
+	}
+	_, _, err = s.prepareImageRoot(ctx, pulled, platform, progress)
+	return err
 }
 
 func (s Store) resolveImage(ctx context.Context, reference, platform, policy string, progress images.ProgressFunc) (images.Info, error) {
@@ -4043,7 +6182,7 @@ func (s Store) prepareImportedImageRoot(ctx context.Context, imported images.Imp
 }
 
 func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, platform string, progress images.ProgressFunc, imported *images.ImportedImage) (_ images.RootFSInfo, _ string, retErr error) {
-	imagesDir := filepath.Join(s.Root, "images")
+	imagesDir := s.imageRootDir()
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("creating image cache: %w", err)
 	}
@@ -4073,6 +6212,22 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 		}
 	}()
 	rootfs := filepath.Join(tempDir, "rootfs")
+	if s.activeRoot() != s.Root {
+		if packed, found, err := s.materializeSharedImagePack(key, tempDir); err != nil {
+			return images.RootFSInfo{}, "", fmt.Errorf("materializing shared image pack: %w", err)
+		} else if found {
+			if err := writeJSON(filepath.Join(tempDir, "image.json"), &packed); err != nil {
+				return images.RootFSInfo{}, "", fmt.Errorf("writing image-root metadata: %w", err)
+			}
+			if err := os.Rename(tempDir, finalDir); err != nil {
+				if existing, loadErr := loadImageRoot(finalDir); loadErr == nil {
+					return existing, filepath.Join(finalDir, "rootfs"), nil
+				}
+				return images.RootFSInfo{}, "", fmt.Errorf("publishing image root: %w", err)
+			}
+			return packed, filepath.Join(finalDir, "rootfs"), nil
+		}
+	}
 	rootOptions := images.RootFSOptions{
 		StoreRoot: s.Root,
 		Reference: pulled.Reference,
@@ -4092,6 +6247,11 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 	if err := ensureNetworkMountpoints(rootfs); err != nil {
 		return images.RootFSInfo{}, "", err
 	}
+	if s.activeRoot() != s.Root {
+		if err := s.publishSharedImagePack(key, tempDir, info); err != nil {
+			return images.RootFSInfo{}, "", fmt.Errorf("publishing shared image pack: %w", err)
+		}
+	}
 	if err := writeJSON(filepath.Join(tempDir, "image.json"), &info); err != nil {
 		return images.RootFSInfo{}, "", fmt.Errorf("writing image-root metadata: %w", err)
 	}
@@ -4104,8 +6264,172 @@ func (s Store) prepareImageRootLocked(ctx context.Context, pulled images.Info, p
 	return info, filepath.Join(finalDir, "rootfs"), nil
 }
 
+const sharedImagePackFormat = 2
+
+type sharedImagePackManifest struct {
+	Format int               `json:"format"`
+	Pack   string            `json:"pack"`
+	Image  images.RootFSInfo `json:"image"`
+}
+
+func (s Store) sharedImagePackRoot() string {
+	return filepath.Join(s.Root, "image-packs")
+}
+
+func (s Store) sharedImagePackManifestPath(key string) string {
+	return filepath.Join(s.sharedImagePackRoot(), "manifests", key+".json")
+}
+
+func (s Store) publishSharedImagePack(key, imageDir string, info images.RootFSInfo) error {
+	return s.withSharedImagePackLock(func() error {
+		return s.publishSharedImagePackLocked(key, imageDir, info)
+	})
+}
+
+func (s Store) publishSharedImagePackLocked(key, imageDir string, info images.RootFSInfo) error {
+	root := s.sharedImagePackRoot()
+	manifestPath := s.sharedImagePackManifestPath(key)
+	if existing, err := loadSharedImagePackManifest(manifestPath); err == nil {
+		if existing.Image.ConfigDigest != info.ConfigDigest || existing.Image.Platform != info.Platform {
+			return fmt.Errorf("published image pack %q identifies different image contents", key)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	packID := ttcpack.IDForKey("image", key)
+	pack, err := ttcpack.WriteDirectory(imageDir, root, packID)
+	if err != nil {
+		return err
+	}
+	manifest := sharedImagePackManifest{Format: sharedImagePackFormat, Pack: pack.String(), Image: info}
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0700); err != nil {
+		return err
+	}
+	installed, err := installSharedImagePackManifest(manifestPath, manifest)
+	if err != nil {
+		return err
+	}
+	if !installed {
+		existing, err := loadSharedImagePackManifest(manifestPath)
+		if err != nil {
+			return fmt.Errorf("reading concurrently published image pack: %w", err)
+		}
+		if existing.Pack != manifest.Pack || existing.Image.ConfigDigest != info.ConfigDigest || existing.Image.Platform != info.Platform {
+			return fmt.Errorf("concurrent image pack publication for %q disagrees with immutable contents", key)
+		}
+	}
+	dir, err := os.Open(filepath.Dir(manifestPath))
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func (s Store) withSharedImagePackLock(fn func() error) error {
+	root := s.sharedImagePackRoot()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return fmt.Errorf("creating shared image-pack directory: %w", err)
+	}
+	lock, err := os.OpenFile(filepath.Join(root, ".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("opening shared image-pack lock: %w", err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("locking shared image packs: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	return fn()
+}
+
+// installSharedImagePackManifest publishes manifest exactly once. Hard-linking
+// a complete temporary file gives POSIX and NFS an atomic create-if-absent;
+// unlike rename, it cannot silently replace another node's authoritative
+// pointer.
+func installSharedImagePackManifest(path string, manifest sharedImagePackManifest) (_ bool, retErr error) {
+	data, err := json.MarshalIndent(&manifest, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	data = append(data, '\n')
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".image-pack-manifest.tmp-")
+	if err != nil {
+		return false, err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		if err := os.Remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return false, err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return false, err
+	}
+	if err := temporary.Sync(); err != nil {
+		return false, err
+	}
+	if err := temporary.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Link(temporaryPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func loadSharedImagePackManifest(path string) (sharedImagePackManifest, error) {
+	data, err := readFileWithStaleRetry(path)
+	if err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	var manifest sharedImagePackManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	if manifest.Format != sharedImagePackFormat || manifest.Pack == "" || manifest.Image.ConfigDigest == "" || manifest.Image.Platform == "" {
+		return sharedImagePackManifest{}, fmt.Errorf("shared image pack manifest is incomplete or uses unsupported format %d", manifest.Format)
+	}
+	if _, err := ttcpack.ParseID(manifest.Pack); err != nil {
+		return sharedImagePackManifest{}, err
+	}
+	return manifest, nil
+}
+
+func (s Store) materializeSharedImagePack(key, destinationImageDir string) (images.RootFSInfo, bool, error) {
+	manifest, err := loadSharedImagePackManifest(s.sharedImagePackManifestPath(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return images.RootFSInfo{}, false, nil
+	}
+	if err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	pack, err := ttcpack.ParseID(manifest.Pack)
+	if err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	if err := ttcpack.MaterializeSkeleton(s.sharedImagePackRoot(), pack, destinationImageDir, []string{ownership.ManifestName}); err != nil {
+		return images.RootFSInfo{}, false, err
+	}
+	rootfs := filepath.Join(destinationImageDir, "rootfs")
+	if _, err := ownership.Read(ownership.ManifestPath(rootfs)); err != nil {
+		return images.RootFSInfo{}, false, fmt.Errorf("materialized ownership manifest is invalid: %w", err)
+	}
+	if err := ttcpack.WriteLazyDescriptor(rootfs, s.sharedImagePackRoot(), pack, "rootfs"); err != nil {
+		return images.RootFSInfo{}, false, fmt.Errorf("writing lazy image descriptor: %w", err)
+	}
+	return manifest.Image, true, nil
+}
+
 func (s Store) withImageRootLock(fn func() error) error {
-	imagesDir := filepath.Join(s.Root, "images")
+	imagesDir := s.imageRootDir()
 	if err := os.MkdirAll(imagesDir, 0700); err != nil {
 		return fmt.Errorf("creating image-root directory: %w", err)
 	}
@@ -4122,7 +6446,7 @@ func (s Store) withImageRootLock(fn func() error) error {
 }
 
 func removeStaleImageRootTemps(imagesDir, key string) error {
-	entries, err := os.ReadDir(imagesDir)
+	entries, err := readDirWithStaleRetry(imagesDir)
 	if err != nil {
 		return err
 	}
@@ -4179,7 +6503,7 @@ func imageRootKey(digest, platform string) string {
 }
 
 func loadImageRoot(dir string) (images.RootFSInfo, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "image.json"))
+	data, err := readFileWithStaleRetry(filepath.Join(dir, "image.json"))
 	if err != nil {
 		return images.RootFSInfo{}, err
 	}

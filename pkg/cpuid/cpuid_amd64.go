@@ -446,6 +446,25 @@ var (
 	amxTileDataSize = native(In{Eax: uint32(xSaveInfo), Ecx: 18}).Eax
 )
 
+// HostXsaveABI identifies the userspace XSAVE ABI of the physical CPU. XSAVE
+// and XGETBV execute natively, so feature-bit masking alone cannot make their
+// buffer sizes or layouts portable. Applications may cache these values at
+// startup; a migration must preserve them for the lifetime of the process.
+func HostXsaveABI() string {
+	if !HostFeatureSet().UseXsave() {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "xcr0=%x", xgetbv(0))
+	for leaf := uint32(0); leaf < 64; leaf++ {
+		out := native(In{Eax: uint32(xSaveInfo), Ecx: leaf})
+		if out != (Out{}) {
+			fmt.Fprintf(&b, ";%x=%x,%x,%x,%x", leaf, out.Eax, out.Ebx, out.Ecx, out.Edx)
+		}
+	}
+	return b.String()
+}
+
 const (
 	// XCR0AmxCfgMask is the bits that enable xsave to operate on
 	// AMX TILECFG.
@@ -531,6 +550,50 @@ func (fs FeatureSet) UseXsavec() bool {
 func (fs FeatureSet) UseFSGSBASE() bool {
 	HWCAP2_FSGSBASE := uint64(1) << 1
 	return fs.HasFeature(X86FeatureFSGSBase) && ((fs.hwCap.hwCap2 & HWCAP2_FSGSBASE) != 0)
+}
+
+// WithoutFSGSBASE returns fs without advertising userspace FSGSBASE
+// instructions through CPUID or AT_HWCAP2. This is used by systrap while its
+// syscall-patching fast path temporarily owns GS; conforming applications then
+// request GS changes through arch_prctl, where systrap can transition safely.
+func (fs FeatureSet) WithoutFSGSBASE() FeatureSet {
+	static := fs.ToStatic()
+	static.Remove(X86FeatureFSGSBase)
+	masked := static.ToFeatureSet()
+	masked.hwCap = fs.hwCap
+	masked.hwCap.hwCap2 &^= HWCAP2_FSGSBASE
+	return masked
+}
+
+// WithoutAVX512 returns fs without advertising AVX-512 instructions. This is
+// useful for execution backends that intentionally preserve only the portable
+// x87/SSE/AVX subset of userspace XSAVE state.
+func (fs FeatureSet) WithoutAVX512() FeatureSet {
+	static := fs.ToStatic()
+	for _, feature := range []Feature{
+		X86FeatureAVX512F,
+		X86FeatureAVX512DQ,
+		X86FeatureAVX512IFMA,
+		X86FeatureAVX512PF,
+		X86FeatureAVX512ER,
+		X86FeatureAVX512CD,
+		X86FeatureAVX512BW,
+		X86FeatureAVX512VL,
+		X86FeatureAVX512VBMI,
+		X86FeatureAVX512_VBMI2,
+		X86FeatureAVX512_VNNI,
+		X86FeatureAVX512_BITALG,
+		X86FeatureAVX512_VPOPCNTDQ,
+		X86FeatureAVX512_4VNNIW,
+		X86FeatureAVX512_4FMAPS,
+		X86FeatureAVX512_VP2INTERSECT,
+		X86FeatureAVX512_FP16,
+	} {
+		static.Remove(feature)
+	}
+	masked := static.ToFeatureSet()
+	masked.hwCap = fs.hwCap
+	return masked
 }
 
 // archCheckHostCompatible checks for compatibility.

@@ -17,11 +17,35 @@
 
 package linux
 
-// TASK_SIZE can be one of two values, corresponding to 4-level and 5-level
-// paging.
-//
-// The array has to be sorted in decreasing order.
-var feasibleTaskSizes = []uintptr{0xfffffffffff000, 0x7ffffffff000}
+// detectTaskSize discovers the exact contiguous address-space ceiling. Native
+// amd64 Linux normally exposes one of the 4-level or 5-level paging limits,
+// but a nested systrap Sentry intentionally reserves a high stub band and
+// therefore exposes a non-standard, page-aligned ceiling to its children.
+func detectTaskSize(pageSize uintptr) uintptr {
+	const (
+		maximum = uintptr(0xfffffffffff000)
+		minimum = uintptr(0xfffff000)
+	)
+	if taskSizeUsable(maximum, pageSize) {
+		return maximum
+	}
+	if !taskSizeUsable(minimum, pageSize) {
+		panic("address space is smaller than the minimum supported task size")
+	}
+
+	// Binary-search page numbers. low is usable and high is not.
+	low := minimum / pageSize
+	high := maximum / pageSize
+	for low+1 < high {
+		mid := low + (high-low)/2
+		if taskSizeUsable(mid*pageSize, pageSize) {
+			low = mid
+		} else {
+			high = mid
+		}
+	}
+	return low * pageSize
+}
 
 // Page fault error codes
 const (

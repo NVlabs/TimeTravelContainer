@@ -162,6 +162,10 @@ analyzers:
         - codes/codes.go # go.opentelemetry.io/otel
         - yaml.go # github.com/go-openapi/swag/yamlutils
         - staticcheck/sa1030/sa1030.go # staticcheck
+        # bbolt's Logger methods are intentionally printf-shaped interfaces,
+        # but go vet cannot infer their formatting contract under Go 1.26.
+        - "io_etcd_go_bbolt/db.go"
+        - "io_etcd_go_bbolt/tx.go"
   shift:
     generated: # Disabled for generated code; these shifts are well-defined.
       exclude: [".*"]

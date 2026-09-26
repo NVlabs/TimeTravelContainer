@@ -9,8 +9,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -187,18 +189,57 @@ func legacyPortLockHolder(_, _, _, _ string) (int, error) {
 	return 0, fmt.Errorf("published-port lock is held by a legacy listener without a recorded process ID")
 }
 
-// currentNodeMemoryBytes reports the daemon's resident high-water mark as a
-// conservative process-local proxy. macOS has no Linux-style memory cgroup
-// encompassing the daemon and its Sentry siblings. ru_maxrss is measured in
-// bytes on Darwin; branch GuestRAM accounting remains authoritative for guest
-// memory.
-func currentNodeMemoryBytes() (uint64, error) {
-	var usage unix.Rusage
-	if err := unix.Getrusage(unix.RUSAGE_SELF, &usage); err != nil {
-		return 0, fmt.Errorf("reading current process memory usage: %w", err)
+// currentNodeMemoryBytes reports the resident memory of this daemon and of
+// every runtime or helper process whose argv names the node-local root. Darwin
+// has no /proc, so the process table comes from ps(1), which reports RSS in KiB.
+func currentNodeMemoryBytes(localRoot string) (uint64, error) {
+	output, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,rss=,command=").Output()
+	if err != nil {
+		return 0, fmt.Errorf("listing host processes: %w", err)
 	}
-	if usage.Maxrss <= 0 {
-		return 0, fmt.Errorf("current process maximum resident memory is %d", usage.Maxrss)
+	if localRoot != "" {
+		localRoot = filepath.Clean(localRoot)
 	}
-	return uint64(usage.Maxrss), nil
+	self := os.Getpid()
+	var total uint64
+	foundSelf := false
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		residentKiB, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if pid == self {
+			foundSelf = true
+		} else if localRoot == "" || !strings.Contains(strings.Join(fields[2:], " "), localRoot) {
+			continue
+		}
+		total += residentKiB << 10
+	}
+	if !foundSelf {
+		return 0, fmt.Errorf("ps did not report daemon process %d", self)
+	}
+	return total, nil
+}
+
+// cloexecStreamSocketpair creates a close-on-exec AF_UNIX stream pair. Darwin
+// has no SOCK_CLOEXEC; ForkLock keeps a concurrent exec from inheriting the
+// descriptors before they are marked, as os.Pipe does here.
+func cloexecStreamSocketpair() ([2]int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return fds, err
+	}
+	unix.CloseOnExec(fds[0])
+	unix.CloseOnExec(fds[1])
+	return fds, nil
 }

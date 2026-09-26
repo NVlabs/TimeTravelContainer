@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	// ControlProtocolVersion is the first cross-daemon control protocol.
-	ControlProtocolVersion = 1
+	// ControlProtocolVersion 11 moves ephemeral dehydrated-fork metadata from
+	// shared-filesystem paths to the transaction-fenced peer relay. Version 10
+	// records the target-reported physical runtime identity before cutover.
+	ControlProtocolVersion = 11
 
 	FeatureRemotePull           = "remote-memory-pull"
 	FeatureReversePush          = "reverse-page-push"
@@ -51,6 +53,9 @@ type Capabilities struct {
 	ProtocolMax     uint32           `json:"protocol_max"`
 	BuildID         string           `json:"build_id"`
 	Architecture    string           `json:"architecture"`
+	CPUProfile      string           `json:"cpu_profile"`
+	CPUFeatures     []string         `json:"cpu_features"`
+	XsaveABI        string           `json:"xsave_abi,omitempty"`
 	BasePageSize    uint64           `json:"base_page_size"`
 	MaxTransferSize uint64           `json:"max_transfer_size"`
 	RepositoryID    string           `json:"repository_id"`
@@ -60,7 +65,7 @@ type Capabilities struct {
 
 // Validate checks capability bounds before negotiation.
 func (c Capabilities) Validate() error {
-	if c.NodeID == "" || c.BuildID == "" || c.Architecture == "" || c.RepositoryID == "" {
+	if c.NodeID == "" || c.BuildID == "" || c.Architecture == "" || c.RepositoryID == "" || c.CPUProfile == "" {
 		return errors.New("cluster capabilities omit node, build, architecture, or repository identity")
 	}
 	if c.ProtocolMin == 0 || c.ProtocolMax < c.ProtocolMin {
@@ -72,7 +77,7 @@ func (c Capabilities) Validate() error {
 	if c.MaxTransferSize < c.BasePageSize || c.MaxTransferSize%c.BasePageSize != 0 || c.MaxTransferSize > 2<<20 {
 		return fmt.Errorf("invalid maximum transfer size %d for page size %d", c.MaxTransferSize, c.BasePageSize)
 	}
-	if err := validatePagingPolicy(c, normalizedPagingPolicy(c)); err != nil {
+	if err := validatePagingPolicy(c, c.PagingPolicy); err != nil {
 		return fmt.Errorf("paging policy: %w", err)
 	}
 	seen := make(map[string]struct{}, len(c.Features))
@@ -82,6 +87,25 @@ func (c Capabilities) Validate() error {
 		}
 		if _, ok := seen[feature]; ok {
 			return fmt.Errorf("duplicate feature %q", feature)
+		}
+		seen[feature] = struct{}{}
+	}
+	if !slices.IsSorted(c.CPUFeatures) {
+		return errors.New("CPU feature profile is not sorted")
+	}
+	if len(c.CPUFeatures) == 0 {
+		return errors.New("CPU feature profile is empty")
+	}
+	if slices.Contains(c.CPUFeatures, "xsave") && c.XsaveABI == "" {
+		return errors.New("XSAVE CPU profile omits the physical XSAVE ABI")
+	}
+	seen = make(map[string]struct{}, len(c.CPUFeatures))
+	for _, feature := range c.CPUFeatures {
+		if feature == "" || strings.TrimSpace(feature) != feature || strings.Contains(feature, ",") {
+			return fmt.Errorf("invalid CPU feature %q", feature)
+		}
+		if _, ok := seen[feature]; ok {
+			return fmt.Errorf("duplicate CPU feature %q", feature)
 		}
 		seen[feature] = struct{}{}
 	}
@@ -98,18 +122,6 @@ type NegotiatedCapabilities struct {
 	SourceBuildID   string           `json:"source_build_id"`
 	TargetBuildID   string           `json:"target_build_id"`
 	PagingPolicy    ttcremote.Policy `json:"paging_policy"`
-}
-
-func normalizedPagingPolicy(c Capabilities) ttcremote.Policy {
-	p := c.PagingPolicy
-	if p.PageSize == 0 {
-		p = ttcremote.DefaultPolicy()
-		p.PageSize = c.BasePageSize
-	}
-	if p.TransferBytes > c.MaxTransferSize {
-		p.TransferBytes = c.MaxTransferSize
-	}
-	return p
 }
 
 func validatePagingPolicy(c Capabilities, p ttcremote.Policy) error {
@@ -135,11 +147,17 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 	if source.Architecture != target.Architecture {
 		return NegotiatedCapabilities{}, fmt.Errorf("architecture mismatch: source=%s target=%s", source.Architecture, target.Architecture)
 	}
+	if source.CPUProfile != target.CPUProfile || !slices.Equal(source.CPUFeatures, target.CPUFeatures) || source.XsaveABI != target.XsaveABI {
+		return NegotiatedCapabilities{}, fmt.Errorf("guest CPU profile mismatch: source=%s target=%s", source.CPUProfile, target.CPUProfile)
+	}
 	if source.BasePageSize != target.BasePageSize {
 		return NegotiatedCapabilities{}, fmt.Errorf("base page size mismatch: source=%d target=%d", source.BasePageSize, target.BasePageSize)
 	}
 	if source.RepositoryID != target.RepositoryID {
 		return NegotiatedCapabilities{}, fmt.Errorf("shared repository mismatch: source=%q target=%q", source.RepositoryID, target.RepositoryID)
+	}
+	if source.BuildID != target.BuildID {
+		return NegotiatedCapabilities{}, fmt.Errorf("TTC build mismatch: source=%q target=%q", source.BuildID, target.BuildID)
 	}
 	protocolMin := max(source.ProtocolMin, target.ProtocolMin)
 	protocolMax := min(source.ProtocolMax, target.ProtocolMax)
@@ -162,8 +180,8 @@ func Negotiate(source, target Capabilities) (NegotiatedCapabilities, error) {
 			return NegotiatedCapabilities{}, fmt.Errorf("target lacks required common feature %q", required)
 		}
 	}
-	policy := normalizedPagingPolicy(target)
-	policy.Push = normalizedPagingPolicy(source).Push
+	policy := target.PagingPolicy
+	policy.Push = source.PagingPolicy.Push
 	policy.TransferBytes = min(policy.TransferBytes, source.MaxTransferSize, target.MaxTransferSize)
 	if policy.MaxOutstandingBytes < policy.TransferBytes {
 		policy.MaxOutstandingBytes = policy.TransferBytes

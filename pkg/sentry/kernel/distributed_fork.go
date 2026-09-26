@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -32,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
 // DistributedForkCaptureOptions controls portable source capture.
@@ -42,6 +44,7 @@ type DistributedForkCaptureOptions struct {
 	// the first element. A singular caller may continue using ChildBranchID.
 	ChildBranchIDs                 []string
 	AllowSharedFilesystemResources bool
+	FilesystemOrigins              vfs.LiveForkFilesystemOrigins
 }
 
 // DistributedForkCapture is the source-side product of a distributed fork.
@@ -55,16 +58,19 @@ type DistributedForkCapture struct {
 	// unrelated branches and sparse-chunk cache holes across migrations.
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
-	// MemoryBindings is the branch-scoped page graph. LoadRanges describe the
-	// same exact packed stream.
+	// MemoryBindings is the exact branch-scoped page graph. LoadRanges describes
+	// the same pages in their chunk-ordered packed stream. AllocatorMetadata is
+	// retained for wire compatibility; relocated restore uses MemoryBindings.
 	MemoryBindings []pgalloc.CapturedPageBinding
 	Snapshot       *pgalloc.RemoteSnapshot
 	Snapshots      []*pgalloc.RemoteSnapshot
-	// Snapshot, SparseSnapshot, and HandoffSnapshot are independent reservations
-	// over the same exact branch graph. Keeping separate reservations allows the
-	// live reader and durable handoff publisher to progress independently.
-	SparseSnapshot   *pgalloc.RemoteSnapshot
-	SparseSnapshots  []*pgalloc.RemoteSnapshot
+	// SparseSnapshot independently pins exactly MemoryBindings for callers that
+	// publish a durable branch image instead of transferring the live stream.
+	SparseSnapshot  *pgalloc.RemoteSnapshot
+	SparseSnapshots []*pgalloc.RemoteSnapshot
+	// HandoffSnapshot mirrors the branch-scoped TCP stream exactly. It is a
+	// second fork-time reservation used to publish a reader-compatible sparse
+	// manifest after a live target is already visible.
 	HandoffSnapshot  *pgalloc.RemoteSnapshot
 	HandoffSnapshots []*pgalloc.RemoteSnapshot
 	// HandoffBindings is an alias of MemoryBindings retained in the in-process
@@ -75,28 +81,6 @@ type DistributedForkCapture struct {
 	// may use them directly; a remote ttcd reopens equivalent handles from its
 	// shared repository before calling LoadDistributedFork.
 	FilesystemResources vfs.LiveForkFilesystemResources
-}
-
-// PublishSparse durably publishes this capture in repository. Page
-// reservations are released only after all objects and the manifest are
-// durable; the coordinator subsequently installs the mutable branch root.
-func (c *DistributedForkCapture) PublishSparse(repository *ttcchunk.MemoryRepository) (ttcchunk.ManifestID, error) {
-	if c == nil || repository == nil || c.SparseSnapshot == nil || len(c.SparseSnapshots) != 0 {
-		return ttcchunk.ManifestID{}, fmt.Errorf("sparse publication requires one live snapshot")
-	}
-	objects, bindings, err := ttcchunk.ReadSnapshot(c.SparseSnapshot, c.MemoryBindings)
-	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	manifestID, err := repository.Publish(objects, bindings)
-	if err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	if err := c.SparseSnapshot.Close(); err != nil {
-		return ttcchunk.ManifestID{}, err
-	}
-	c.SparseSnapshot = nil
-	return manifestID, nil
 }
 
 // Close cancels all outstanding remote pages.
@@ -206,6 +190,7 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 			vfs.CtxLiveForkChildBranchID:       childBranchIDs[0],
 			vfs.CtxLiveForkChildBranchIDs:      childBranchIDs,
 			vfs.CtxLiveForkTransactions:        fsTransactions,
+			vfs.CtxLiveForkFilesystemOrigins:   opts.FilesystemOrigins,
 		})
 		if err := k.vfs.PrepareSave(saveCtx); err != nil {
 			return fmt.Errorf("preparing VFS for distributed fork: %w", err)
@@ -230,27 +215,29 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		if err := k.captureKernelOwnedMemory(memoryCapture); err != nil {
 			return fmt.Errorf("capturing distributed-fork kernel memory graph: %w", err)
 		}
+		k.mf.MarkSavable()
+		allocatorMetadata, _, _, err := pgalloc.ExportMemoryFileMetadataForRemote(ctx, k.mf)
+		if err != nil {
+			return err
+		}
 		layout, err := memoryCapture.SnapshotLayout()
 		if err != nil {
 			return fmt.Errorf("resolving sparse distributed-fork memory graph: %w", err)
 		}
-		layout, err = layout.PackByLogicalChunk()
+		layout, err = layout.ChunkOrdered()
 		if err != nil {
-			return fmt.Errorf("packing distributed-fork memory graph: %w", err)
+			return fmt.Errorf("ordering distributed-fork memory chunks: %w", err)
 		}
-		loads := make([]pgalloc.RemoteLoadRange, 0, len(layout.Regions))
+		loads := make([]pgalloc.RemoteLoadRange, len(layout.Regions))
 		var streamOffset uint64
-		for _, region := range layout.Regions {
-			if region.File != k.mf {
-				return fmt.Errorf("distributed-fork graph contains unsupported private MemoryFile %q", region.File.ResourceID())
-			}
-			loads = append(loads, pgalloc.RemoteLoadRange{Target: region.Range, StreamOffset: streamOffset})
+		for i, region := range layout.Regions {
+			loads[i] = pgalloc.RemoteLoadRange{Target: region.Range, StreamOffset: streamOffset}
 			streamOffset += region.Range.Length()
 		}
-		// All three reservations are branch-scoped. Exporting k.mf's allocator
-		// state here used to include sparse residency cache holes and unrelated
-		// sibling pages. A restore then made those holes ordinary allocated pages,
-		// causing the captured page count to grow geometrically on every migration.
+		// Keep independent reservations for the live stream, direct sparse
+		// publication, and asynchronous shared-filesystem handoff. All three are
+		// branch-scoped: allocator-wide snapshots can race sibling destruction and
+		// retain pages that the restored state graph can never reference.
 		snapshots, err := pgalloc.NewRemoteSnapshots(layout.Regions, len(childBranchIDs))
 		if err != nil {
 			return err
@@ -287,7 +274,16 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 				}
 			}
 		}()
-		k.mf.MarkSavable()
+		// A remotely backed source may be destroyed as soon as migration cuts
+		// over, while these snapshots must remain readable until their targets
+		// become independent. Retain the upstream loaders in each independently
+		// owned snapshot group so page pins also retain their data source.
+		pageLoads := k.distributedForkMemorySources()
+		for _, group := range [][]*pgalloc.RemoteSnapshot{snapshots, sparseSnapshots, handoffSnapshots} {
+			if err := group[0].RetainPageLoads(pageLoads); err != nil {
+				return fmt.Errorf("retaining distributed-fork upstream page sources: %w", err)
+			}
+		}
 		var kernelMetadata bytes.Buffer
 		buffered := bufio.NewWriterSize(&kernelMetadata, 64<<10)
 		if _, err := k.saveStateGraph(saveCtx, buffered); err != nil {
@@ -309,8 +305,8 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 		}
 		committed = true
 		capture = &DistributedForkCapture{
-			KernelMetadata: kernelMetadata.Bytes(), LoadRanges: loads,
-			MemoryBindings: layout.Bindings, HandoffBindings: layout.Bindings, FilesystemResources: fsResources,
+			KernelMetadata: kernelMetadata.Bytes(), AllocatorMetadata: allocatorMetadata,
+			LoadRanges: loads, MemoryBindings: layout.Bindings, HandoffBindings: layout.Bindings, FilesystemResources: fsResources,
 		}
 		if len(snapshots) == 1 {
 			capture.Snapshot = snapshots[0]
@@ -332,10 +328,60 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	return capture, nil
 }
 
+func (k *Kernel) distributedForkMemorySources() []*pgalloc.AsyncPagesFileLoad {
+	loads := make([]*pgalloc.AsyncPagesFileLoad, 0, 1+len(k.auxiliaryRemotePageLoads))
+	if k.remotePageLoad != nil {
+		loads = append(loads, k.remotePageLoad)
+	}
+	loads = append(loads, k.auxiliaryRemotePageLoads...)
+	return loads
+}
+
+// InheritDistributedForkMemorySources retains page loaders that back sparse
+// chunks reused from source's family MemoryFile. Reusing a chunk is useful
+// only if its unresolved contents remain reachable: page references keep the
+// allocation alive, but they do not own the asynchronous reader. The first
+// inherited loader remains the branch's primary control target; additional
+// loaders are dependencies inherited from earlier imports.
+func (k *Kernel) InheritDistributedForkMemorySources(source *Kernel, packedLoadRanges []pgalloc.RemoteLoadRange) {
+	if k == nil || source == nil || k == source {
+		return
+	}
+	has := func(load *pgalloc.AsyncPagesFileLoad) bool {
+		if load == nil || k.remotePageLoad == load {
+			return true
+		}
+		for _, existing := range k.auxiliaryRemotePageLoads {
+			if existing == load {
+				return true
+			}
+		}
+		return false
+	}
+	inherit := func(load *pgalloc.AsyncPagesFileLoad, primary bool) {
+		if has(load) {
+			return
+		}
+		load.IncOwner()
+		if primary && k.remotePageLoad == nil {
+			k.remotePageLoad = load
+			k.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), packedLoadRanges...)
+			return
+		}
+		k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
+	}
+	inherit(source.remotePageLoad, true)
+	for _, load := range source.auxiliaryRemotePageLoads {
+		inherit(load, k.remotePageLoad == nil)
+	}
+}
+
 // DistributedForkLoadOptions controls target reconstruction.
 type DistributedForkLoadOptions struct {
 	Clocks                     sentrytime.Clocks
 	ChildBranchID              string
+	Quarantined                bool
+	OverrideQuarantine         bool
 	RestoreOptions             vfs.CompleteRestoreOptions
 	FilesystemResources        vfs.LiveForkFilesystemResources
 	RestoreFilesystemResources vfs.RestoreFilesystemResources
@@ -344,172 +390,10 @@ type DistributedForkLoadOptions struct {
 	PrefetchBytes              uint64
 	PrefetchBehindBytes        uint64
 	LogicalChunkDemand         bool
-	OwnSparseRepository        bool
-	// SparseBranch names the durable root whose objects may be released after
-	// their complete residency units are installed.
-	SparseBranch string
 
 	// ConfigureNetwork recreates target-local link/NAT plumbing omitted from
 	// Kernel state. It is required when the captured Kernel has a netstack.
 	ConfigureNetwork func(*Kernel, inet.Stack) error
-}
-
-// LoadSparseDistributedFork restores a branch into an existing family
-// MemoryFile from a shared immutable chunk repository. Identical resident
-// objects are reused; missing objects are demand-loaded transactionally in
-// 1 MiB units.
-func LoadSparseDistributedFork(ctx context.Context, p platform.Platform, targetMF *pgalloc.MemoryFile, kernelMetadata []byte, repository *ttcchunk.MemoryRepository, manifestID ttcchunk.ManifestID, opts DistributedForkLoadOptions) (*Kernel, error) {
-	if p == nil || targetMF == nil || repository == nil || opts.Clocks == nil || opts.ChildBranchID == "" || len(kernelMetadata) == 0 {
-		return nil, fmt.Errorf("sparse distributed fork load is missing required target state")
-	}
-	manifest, err := repository.LoadManifest(manifestID)
-	if err != nil {
-		return nil, fmt.Errorf("loading sparse branch manifest %s: %w", manifestID, err)
-	}
-	installation, err := repository.InstallManifest(targetMF, manifest, usage.Anonymous, 0)
-	if err != nil {
-		return nil, fmt.Errorf("installing sparse branch manifest: %w", err)
-	}
-	installationCommitted := false
-	defer func() {
-		if !installationCommitted {
-			_ = installation.Abort()
-		}
-	}()
-
-	var pages *pgalloc.AsyncPagesFileLoad
-	var chunkReader *ttcchunk.ChunkReader
-	consumptionActivated := false
-	defer func() {
-		if chunkReader != nil && !consumptionActivated {
-			chunkReader.AbortConsumption()
-		}
-	}()
-	if len(installation.Chunks) != 0 {
-		if opts.OwnSparseRepository && opts.SparseBranch != "" {
-			chunkReader, err = ttcchunk.NewOwnedConsumingChunkReader(repository, installation.Chunks, opts.SparseBranch, manifestID)
-		} else if opts.OwnSparseRepository {
-			chunkReader, err = ttcchunk.NewOwnedChunkReader(repository, installation.Chunks)
-		} else {
-			chunkReader, err = ttcchunk.NewChunkReader(repository, installation.Chunks)
-		}
-		if err != nil {
-			return nil, err
-		}
-		pages, err = pgalloc.StartAsyncPagesFileLoadWithOpts(chunkReader.AsyncReader(4), nil, nil, pgalloc.AsyncPagesFileLoadOpts{DemandOnly: true, RangeLoaded: chunkReader.RangeLoaded})
-		if err != nil {
-			chunkReader.AbortConsumption()
-			return nil, err
-		}
-		loadRanges := make([]pgalloc.RemoteLoadRange, len(installation.Chunks))
-		for i, chunk := range installation.Chunks {
-			loadRanges[i] = pgalloc.RemoteLoadRange{Target: chunk.Target, StreamOffset: chunk.StreamOffset}
-		}
-		if err := targetMF.AttachSparseChunkPageLoad(pages, loadRanges, nil, nil); err != nil {
-			pages.Cancel()
-			_ = pages.Wait()
-			return nil, err
-		}
-		pages.MemoryFilesDone()
-	}
-	repositoryOwned := len(installation.Chunks) == 0 && opts.OwnSparseRepository
-	defer func() {
-		if repositoryOwned {
-			_ = repository.Close()
-		}
-	}()
-	pagesOwned := pages != nil
-	defer func() {
-		if pagesOwned {
-			if chunkReader != nil {
-				chunkReader.AbortConsumption()
-			}
-			pages.Cancel()
-			_ = pages.Wait()
-		}
-	}()
-
-	targetMF.IncOwner()
-	childOwner := true
-	defer func() {
-		if childOwner {
-			targetMF.Destroy()
-		}
-	}()
-	child := &Kernel{Platform: p}
-	child.SetMemoryFile(targetMF)
-	child.initRuntimeFields()
-	referenceTransaction := pgalloc.NewSparseReferenceTransaction()
-	loadValues := map[any]any{
-		pgalloc.CtxMemoryFile:             targetMF,
-		pgalloc.CtxMemoryFileMap:          make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
-		pgalloc.CtxLiveForkClone:          true,
-		pgalloc.CtxSparseRelocation:       installation.Relocation,
-		pgalloc.CtxSparseRestoreRefs:      referenceTransaction,
-		vfs.CtxLiveForkChildBranchID:      opts.ChildBranchID,
-		devutil.CtxDevGoferClientProvider: child,
-	}
-	if opts.FilesystemResources != nil {
-		loadValues[vfs.CtxLiveForkFilesystemResources] = opts.FilesystemResources
-	}
-	if opts.RestoreFilesystemResources != nil {
-		loadValues[vfs.CtxRestoreFilesystemResources] = opts.RestoreFilesystemResources
-	}
-	if opts.RestoreFilesystemFDMap != nil {
-		loadValues[vfs.CtxRestoreFilesystemFDMap] = opts.RestoreFilesystemFDMap
-	}
-	loadCtx := context.WithValues(child.SupervisorContext(), loadValues)
-	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
-		referenceTransaction.Abort()
-		return nil, fmt.Errorf("loading sparse distributed Kernel metadata: %w", err)
-	}
-	if err := referenceTransaction.Commit(); err != nil {
-		return nil, err
-	}
-	if err := installation.Commit(); err != nil {
-		return nil, err
-	}
-	installationCommitted = true
-	childOwner = false
-	if pages != nil {
-		child.remotePageLoad = pages
-		pagesOwned = false
-	}
-	if err := child.vdsoParams.materialize(); err != nil {
-		child.Release()
-		return nil, fmt.Errorf("materializing sparse distributed-fork VDSO parameter page: %w", err)
-	}
-	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
-		return nil, err
-	}
-	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
-	if err := child.restoreReconfiguredNetworkStacks(func(stack inet.Stack) error {
-		if opts.ConfigureNetwork == nil {
-			return errors.New("sparse distributed target network configurator was not provided")
-		}
-		if err := opts.ConfigureNetwork(child, stack); err != nil {
-			return fmt.Errorf("configuring sparse distributed target network: %w", err)
-		}
-		return nil
-	}); err != nil {
-		child.Release()
-		return nil, err
-	}
-	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
-		child.Release()
-		return nil, vfs.PrependErrMsg("VFS sparse distributed-fork restore failed", err)
-	}
-	if chunkReader != nil {
-		chunkReader.ActivateConsumption(installation.ResidentObjects())
-		consumptionActivated = true
-	} else if opts.SparseBranch != "" {
-		// Every object was already resident in this family MemoryFile. This
-		// update is advisory reclamation: failure only retains backing.
-		_ = repository.MarkConsumed(opts.SparseBranch, manifestID, installation.Objects)
-	}
-	child.Pause()
-	return child, nil
 }
 
 // LoadDistributedFork reconstructs a Kernel from portable metadata and a
@@ -587,6 +471,9 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	if _, err := state.Load(loadCtx, bufio.NewReaderSize(bytes.NewReader(kernelMetadata), 64<<10), child); err != nil {
 		return nil, fmt.Errorf("loading distributed Kernel metadata: %w", err)
 	}
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	child.remotePageLoad = pages
 	child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), loadRanges...)
 	loaded = true
@@ -615,6 +502,10 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	}); err != nil {
 		child.Release()
 		return nil, err
+	}
+	if got := vfs.RestoreFilesystemResourcesFromContext(loadCtx); len(got) != len(opts.RestoreFilesystemResources) {
+		child.Release()
+		return nil, fmt.Errorf("relocated distributed restore filesystem resources changed from %d to %d during load", len(opts.RestoreFilesystemResources), len(got))
 	}
 	if err := child.vfs.CompleteRestore(loadCtx, &opts.RestoreOptions); err != nil {
 		child.Release()
@@ -692,6 +583,9 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		references.Abort()
 		return nil, fmt.Errorf("loading relocated distributed Kernel metadata: %w", err)
 	}
+	if opts.OverrideQuarantine {
+		child.liveForkQuarantine = opts.Quarantined
+	}
 	if err := references.Commit(); err != nil {
 		return nil, err
 	}
@@ -734,43 +628,72 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 	return child, nil
 }
 
-// HandoffDistributedForkMemory replaces a live remote page source with an
-// immutable shared-filesystem manifest without eagerly faulting remaining
-// pages. repository ownership transfers to the loader.
-func (k *Kernel) HandoffDistributedForkMemory(repository *ttcchunk.MemoryRepository, manifest ttcchunk.ManifestID) error {
-	if k.remoteHandoffManifest != (ttcchunk.ManifestID{}) {
-		_ = repository.Close()
-		if k.remoteHandoffManifest == manifest {
-			return nil
+// HandoffDistributedForkMemoryGraph replaces a live remote page source with
+// immutable graph-native 1 MiB objects. The existing target offsets and all
+// resident pages are preserved; only future faults change their source.
+func (k *Kernel) HandoffDistributedForkMemoryGraph(data *ttcsnapshot.LocalDataStore, remote *ttcsnapshot.ObjectRelayClient, manifest ttcchunk.Manifest, snapshot ttcsnapshot.SnapshotID) error {
+	closeInputs := func() {
+		if remote != nil {
+			_ = remote.Close()
 		}
-		return fmt.Errorf("distributed memory was already handed to manifest %s", k.remoteHandoffManifest)
+		if data != nil {
+			_ = data.Close()
+		}
+	}
+	if snapshot == 0 {
+		closeInputs()
+		return errors.New("distributed graph handoff has no snapshot identity")
+	}
+	if k.remoteHandoffSnapshot != 0 && k.remoteHandoffSnapshot != uint64(snapshot) {
+		closeInputs()
+		return fmt.Errorf("distributed memory was already handed to graph snapshot %d", k.remoteHandoffSnapshot)
 	}
 	if k.remotePageLoad == nil {
-		_ = repository.Close()
-		return fmt.Errorf("kernel has no active distributed remote-memory load")
+		closeInputs()
+		return errors.New("kernel has no active distributed remote-memory load")
+	}
+	// A branch may own a new loader while also referring to sparse chunks
+	// supplied by an older family loader. The new transaction cannot become
+	// independent until every inherited loader is either fully resident or has
+	// itself switched to durable graph backing.
+	for _, load := range k.auxiliaryRemotePageLoads {
+		if load.HasDurableBacking() {
+			continue
+		}
+		stats := load.Stats()
+		if stats.Done && stats.Error == "" {
+			continue
+		}
+		closeInputs()
+		if stats.Error != "" {
+			return fmt.Errorf("inherited distributed memory load failed before graph handoff: %s", stats.Error)
+		}
+		return errors.New("inherited distributed memory load is not durable yet")
 	}
 	if stats := k.remotePageLoad.Stats(); stats.Done {
-		_ = repository.Close()
+		closeInputs()
 		if stats.Error != "" {
-			return fmt.Errorf("distributed memory load stopped before handoff: %s", stats.Error)
+			return fmt.Errorf("distributed memory load stopped before graph handoff: %s", stats.Error)
 		}
-		k.remoteHandoffManifest = manifest
+		k.remoteHandoffSnapshot = uint64(snapshot)
 		return nil
 	}
 	geometry := k.remotePageLoad.ReaderGeometry()
 	if geometry.NeedsRegisterDestinationFD {
-		_ = repository.Close()
-		return errors.New("distributed memory handoff does not support registered destination files")
+		closeInputs()
+		return errors.New("distributed graph memory handoff does not support registered destination files")
 	}
-	packed, err := ttcchunk.NewPackedManifestReader(repository, manifest, k.remoteLoadRanges)
+	packed, err := ttcchunk.NewGraphPackedManifestReader(data, remote, manifest, k.remoteLoadRanges, true)
 	if err != nil {
+		closeInputs()
 		return err
 	}
 	reader := stateio.NewIOReader(packed, geometry.MaxReadBytes, geometry.MaxRanges, geometry.MaxParallel)
 	if err := k.remotePageLoad.SwitchReader(reader); err != nil {
+		_ = reader.Close()
 		return err
 	}
-	k.remoteHandoffManifest = manifest
+	k.remoteHandoffSnapshot = uint64(snapshot)
 	return nil
 }
 
@@ -805,16 +728,60 @@ func (k *Kernel) TryInstallRemotePagesState(offset uint64, data []byte) (pgalloc
 // DistributedForkDependencyStatus reports whether this Kernel still depends
 // on a remote memory source.
 func (k *Kernel) DistributedForkDependencyStatus() pgalloc.AsyncPagesFileLoadStats {
-	if k.remotePageLoad == nil {
+	return k.pageLoadStatus(false)
+}
+
+// PageLoadStatus reports progress for every asynchronous page loader,
+// including loaders backed by immutable durable graph objects. Lifecycle code
+// uses this stronger status before releasing those objects; durable backing
+// removes a node dependency, but it does not mean the pages were consumed.
+func (k *Kernel) PageLoadStatus() pgalloc.AsyncPagesFileLoadStats {
+	return k.pageLoadStatus(true)
+}
+
+func (k *Kernel) pageLoadStatus(includeDurable bool) pgalloc.AsyncPagesFileLoadStats {
+	loads := k.distributedForkMemorySources()
+	if len(loads) == 0 {
 		return pgalloc.AsyncPagesFileLoadStats{Done: true}
 	}
-	return k.remotePageLoad.Stats()
+	result := pgalloc.AsyncPagesFileLoadStats{Done: true}
+	var diagnostics []string
+	for _, load := range loads {
+		status := load.Stats()
+		// Durable backing removes the source-node dependency, but it does not
+		// make a failed immutable reader healthy. Always surface terminal reader
+		// errors so a later shared-pack/relay failure cannot masquerade as a
+		// successfully independent branch.
+		if status.Error != "" {
+			diagnostics = append(diagnostics, status.Error)
+		}
+		if load.HasDurableBacking() && !includeDurable {
+			continue
+		}
+		result.Done = result.Done && status.Done
+		result.DemandOnly = result.DemandOnly || status.DemandOnly
+		result.BytesLoaded += status.BytesLoaded
+		result.BytesOutstanding += status.BytesOutstanding
+		result.BytesWaited += status.BytesWaited
+		result.WaitDuration = max(result.WaitDuration, status.WaitDuration)
+		result.AggregateWaitDuration += status.AggregateWaitDuration
+		result.PrefetchBytes = max(result.PrefetchBytes, status.PrefetchBytes)
+		result.PrefetchBehindBytes = max(result.PrefetchBehindBytes, status.PrefetchBehindBytes)
+		result.Waiters += status.Waiters
+		result.TotalWaiters += status.TotalWaiters
+		result.Faults += status.Faults
+		result.SequentialFaults += status.SequentialFaults
+	}
+	result.Error = strings.Join(diagnostics, "; ")
+	return result
 }
 
 // DrainDistributedForkMemory eagerly materializes all remaining remote pages.
 func (k *Kernel) DrainDistributedForkMemory() {
-	if k.remotePageLoad != nil {
-		k.remotePageLoad.Drain()
+	for _, load := range k.distributedForkMemorySources() {
+		if !load.HasDurableBacking() {
+			load.Drain()
+		}
 	}
 }
 
@@ -833,5 +800,5 @@ func (k *Kernel) TransferDistributedForkMemorySources(target *Kernel) {
 	target.auxiliaryRemotePageLoads = append(target.auxiliaryRemotePageLoads, k.auxiliaryRemotePageLoads...)
 	k.auxiliaryRemotePageLoads = nil
 	k.remoteLoadRanges = nil
-	k.remoteHandoffManifest = ttcchunk.ManifestID{}
+	k.remoteHandoffSnapshot = 0
 }

@@ -16,8 +16,10 @@ package pgalloc
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -55,120 +57,85 @@ type CapturedMemoryLayout struct {
 	Bindings []CapturedPageBinding
 }
 
-// PackByLogicalChunk returns an equivalent exact layout whose stream is
-// ordered by logical chunk and chunk instance. This is the canonical live
-// transport layout: it keeps each demand-load residency unit contiguous while
-// continuing to omit allocator pages that are unreachable from the captured
-// state graph.
-func (l CapturedMemoryLayout) PackByLogicalChunk() (CapturedMemoryLayout, error) {
-	totalPages := uint64(0)
-	regionsByResource := make(map[checkpoint.ResourceID][]RemoteSnapshotRegion)
-	filesByResource := make(map[checkpoint.ResourceID]*MemoryFile)
-	for _, region := range l.Regions {
-		if region.File == nil || !region.Range.WellFormed() || region.Range.Length() == 0 ||
-			!hostarch.IsPageAligned(region.Range.Start) || !hostarch.IsPageAligned(region.Range.End) {
-			return CapturedMemoryLayout{}, fmt.Errorf("invalid captured memory region %+v", region)
-		}
-		resource := region.File.ResourceID()
-		if previous := filesByResource[resource]; previous != nil && previous != region.File {
-			return CapturedMemoryLayout{}, fmt.Errorf("captured resource %q refers to multiple MemoryFiles", resource)
-		}
-		filesByResource[resource] = region.File
-		regionsByResource[resource] = append(regionsByResource[resource], region)
-		totalPages += region.Range.Length() / hostarch.PageSize
+// ChunkOrdered returns an equivalent layout whose packed stream keeps every
+// logical 1 MiB chunk contiguous. Physical MemoryFile offsets are unrelated to
+// logical page allocation order after CoW, so the ordinary address-ordered
+// layout cannot provide this property. Live remote readers require it to load
+// and publish a chunk atomically.
+func (l CapturedMemoryLayout) ChunkOrdered() (CapturedMemoryLayout, error) {
+	// Sort indexes, and move each 100-byte binding once.
+	order := make([]int32, len(l.Bindings))
+	for i := range order {
+		order[i] = int32(i)
 	}
-	if totalPages != uint64(len(l.Bindings)) {
-		return CapturedMemoryLayout{}, fmt.Errorf("captured layout has %d unique pages but %d bindings", totalPages, len(l.Bindings))
-	}
-
-	bindings := append([]CapturedPageBinding(nil), l.Bindings...)
-	sort.Slice(bindings, func(i, j int) bool {
-		left, right := &bindings[i], &bindings[j]
-		if cmp := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); cmp != 0 {
-			return cmp < 0
+	slices.SortFunc(order, func(a, b int32) int {
+		left, right := &l.Bindings[a], &l.Bindings[b]
+		if c := bytes.Compare(left.Chunk.Allocator[:], right.Chunk.Allocator[:]); c != 0 {
+			return c
 		}
-		if left.Chunk.Sequence != right.Chunk.Sequence {
-			return left.Chunk.Sequence < right.Chunk.Sequence
+		if c := cmp.Compare(left.Chunk.Sequence, right.Chunk.Sequence); c != 0 {
+			return c
 		}
-		if left.Slot != right.Slot {
-			return left.Slot < right.Slot
+		if c := cmp.Compare(left.Slot, right.Slot); c != 0 {
+			return c
 		}
-		if cmp := bytes.Compare(left.Version.Allocator[:], right.Version.Allocator[:]); cmp != 0 {
-			return cmp < 0
+		if c := bytes.Compare(left.Version.Allocator[:], right.Version.Allocator[:]); c != 0 {
+			return c
 		}
-		if left.Version.Sequence != right.Version.Sequence {
-			return left.Version.Sequence < right.Version.Sequence
+		if c := cmp.Compare(left.Version.Sequence, right.Version.Sequence); c != 0 {
+			return c
 		}
-		if left.ResourceID.ContainerName != right.ResourceID.ContainerName {
-			return left.ResourceID.ContainerName < right.ResourceID.ContainerName
+		if left.ResourceID != right.ResourceID {
+			return cmp.Compare(left.ResourceID.String(), right.ResourceID.String())
 		}
-		if left.ResourceID.Path != right.ResourceID.Path {
-			return left.ResourceID.Path < right.ResourceID.Path
-		}
-		return left.OldOffset < right.OldOffset
+		return cmp.Compare(left.OldOffset, right.OldOffset)
 	})
-
-	var packed CapturedMemoryLayout
-	packed.Bindings = bindings
-	seenOffsets := make(map[SparseOffset]struct{}, len(bindings))
-	var (
-		currentChunk LogicalChunkID
-		instance     uint32
-		used         [4]uint64
-		streamOffset uint64
-	)
-	for i := range packed.Bindings {
-		binding := &packed.Bindings[i]
-		chunk, slot := binding.Page.Chunk()
-		if binding.References == 0 || binding.Chunk != chunk || binding.Slot != slot ||
-			!hostarch.IsPageAligned(binding.OldOffset) {
-			return CapturedMemoryLayout{}, fmt.Errorf("invalid captured page binding %+v", *binding)
+	bindings := make([]CapturedPageBinding, len(order))
+	for i, index := range order {
+		bindings[i] = l.Bindings[index]
+	}
+	files := make(map[checkpoint.ResourceID]*MemoryFile)
+	for _, region := range l.Regions {
+		resource := region.File.ResourceID()
+		if previous := files[resource]; previous != nil && previous != region.File {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured resource %s refers to multiple MemoryFiles", resource)
 		}
-		key := SparseOffset{ResourceID: binding.ResourceID, OldOffset: binding.OldOffset}
-		if _, ok := seenOffsets[key]; ok {
-			return CapturedMemoryLayout{}, fmt.Errorf("captured layout repeats page %s:%#x", binding.ResourceID, binding.OldOffset)
-		}
-		seenOffsets[key] = struct{}{}
-		file := filesByResource[binding.ResourceID]
+		files[resource] = region.File
+	}
+	ordered := CapturedMemoryLayout{Bindings: bindings}
+	var previousPage LogicalPageID
+	var previousVersion PageVersionID
+	for i := range ordered.Bindings {
+		binding := &ordered.Bindings[i]
+		file := files[binding.ResourceID]
 		if file == nil {
-			return CapturedMemoryLayout{}, fmt.Errorf("captured binding references unknown MemoryFile %q", binding.ResourceID)
+			return CapturedMemoryLayout{}, fmt.Errorf("captured binding %s:%#x has no MemoryFile", binding.ResourceID, binding.OldOffset)
 		}
-		covered := false
-		for _, region := range regionsByResource[binding.ResourceID] {
-			if region.Range.Start <= binding.OldOffset && binding.OldOffset < region.Range.End {
-				covered = true
-				break
-			}
+		// A branch may legitimately contain multiple content versions of one
+		// logical page. For example, two MAP_PRIVATE aliases initially share a
+		// page and then diverge through CoW. Chunk assembly deliberately places
+		// those versions in separate immutable objects. Only an identical
+		// page-version pair is ambiguous here: it would cause the same immutable
+		// version to have two physical stream sources.
+		if i != 0 && binding.Page == previousPage && binding.Version == previousVersion {
+			return CapturedMemoryLayout{}, fmt.Errorf("captured logical page %+v repeats version %+v", binding.Page, binding.Version)
 		}
-		if !covered {
-			return CapturedMemoryLayout{}, fmt.Errorf("captured binding %s:%#x is outside its snapshot regions", binding.ResourceID, binding.OldOffset)
-		}
-		if binding.Chunk != currentChunk {
-			currentChunk = binding.Chunk
-			instance = 0
-			used = [4]uint64{}
-		} else if used[binding.Slot/64]&(uint64(1)<<(binding.Slot%64)) != 0 {
-			instance++
-			used = [4]uint64{}
-		}
-		used[binding.Slot/64] |= uint64(1) << (binding.Slot % 64)
-		binding.StreamOffset = streamOffset
-		pageRange := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + hostarch.PageSize}
-		if len(packed.Regions) != 0 {
-			last := &packed.Regions[len(packed.Regions)-1]
-			if last.File == file && last.Range.End == pageRange.Start && last.LogicalChunk == binding.Chunk && last.LogicalChunkInstance == instance {
-				last.Range.End = pageRange.End
-				streamOffset += hostarch.PageSize
+		previousPage = binding.Page
+		previousVersion = binding.Version
+		binding.StreamOffset = uint64(i) * hostarch.PageSize
+		page := memmap.FileRange{Start: binding.OldOffset, End: binding.OldOffset + hostarch.PageSize}
+		if len(ordered.Regions) != 0 {
+			last := &ordered.Regions[len(ordered.Regions)-1]
+			if last.File == file && last.Range.End == page.Start {
+				last.Range.End = page.End
 				continue
 			}
 		}
-		packed.Regions = append(packed.Regions, RemoteSnapshotRegion{
-			ID: RemoteRegionID(len(packed.Regions) + 1), File: file, Range: pageRange,
-			LogicalChunk: binding.Chunk, LogicalChunkInstance: instance, LogicalChunked: true,
+		ordered.Regions = append(ordered.Regions, RemoteSnapshotRegion{
+			ID: RemoteRegionID(len(ordered.Regions) + 1), File: file, Range: page,
 		})
-		streamOffset += hostarch.PageSize
 	}
-	return packed, nil
+	return ordered, nil
 }
 
 type capturedReferencedRange struct {
@@ -328,13 +295,19 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 		}{captured.Range, nextStreamOffset})
 		nextStreamOffset += captured.Range.Length()
 	}
+	pages := uint64(0)
 	for _, mf := range c.files {
-		// Both referencedCapturedRanges and streamRanges are ordered by
-		// MemoryFile offset. Advance through the packed stream once instead of
-		// searching every captured range for every 4 KiB page. Fragmented
-		// address spaces may contain tens of thousands of ranges, making the
-		// nested search quadratic during fork and dehydration.
-		streamRangeIndex := 0
+		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
+			pages += referenced.range_.Length() / hostarch.PageSize
+		}
+	}
+	result = make([]CapturedPageBinding, 0, pages)
+	for _, mf := range c.files {
+		// The stream ranges of mf are sorted and disjoint, and its referenced
+		// ranges are visited in ascending order, so the stream range of each
+		// page is at or after the previous page's.
+		ranges := streamRanges[mf]
+		index := 0
 		for _, referenced := range referencedCapturedRanges(c.ranges[mf]) {
 			capturedRange := referenced.range_
 			cursor := capturedRange.Start
@@ -343,14 +316,13 @@ func (c *MemoryRangeCapture) Bindings() ([]CapturedPageBinding, error) {
 					return nil, fmt.Errorf("captured MemoryFile range %v has no logical page at offset %#x", capturedRange, cursor)
 				}
 				for off := run.Range.Start; off < run.Range.End; off += hostarch.PageSize {
-					for streamRangeIndex < len(streamRanges[mf]) && streamRanges[mf][streamRangeIndex].range_.End <= off {
-						streamRangeIndex++
+					for index < len(ranges) && ranges[index].range_.End <= off {
+						index++
 					}
-					if streamRangeIndex == len(streamRanges[mf]) || streamRanges[mf][streamRangeIndex].range_.Start > off {
+					if index == len(ranges) || ranges[index].range_.Start > off {
 						return nil, fmt.Errorf("captured MemoryFile offset %#x has no packed stream range", off)
 					}
-					streamRange := streamRanges[mf][streamRangeIndex]
-					streamOffset := streamRange.start + off - streamRange.range_.Start
+					streamOffset := ranges[index].start + off - ranges[index].range_.Start
 					pageDelta := (off - run.Range.Start) / hostarch.PageSize
 					pageID := LogicalPageID{Allocator: run.First.Allocator, Sequence: run.First.Sequence + pageDelta}
 					versionID := PageVersionID{Allocator: run.FirstVersion.Allocator, Sequence: run.FirstVersion.Sequence + pageDelta}

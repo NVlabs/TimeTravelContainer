@@ -17,27 +17,82 @@ package ttcvolume
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
+
+func TestRepositoryCloseReleasesDataStore(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("close-data-store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataLock := filepath.Join(repository.path, "data", ".gc.lock")
+	var lockStat syscall.Stat_t
+	if err := syscall.Stat(dataLock, &lockStat); err != nil {
+		t.Fatal(err)
+	}
+	// Identify open descriptors by inode rather than /proc/self/fd, which not
+	// every host has.
+	countOpen := func() int {
+		count := 0
+		for fd := 0; fd < 4096; fd++ {
+			var stat syscall.Stat_t
+			if syscall.Fstat(fd, &stat) == nil && stat.Dev == lockStat.Dev && stat.Ino == lockStat.Ino {
+				count++
+			}
+		}
+		return count
+	}
+	if got := countOpen(); got != 1 {
+		t.Fatalf("open data-store locks=%d, want 1", got)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countOpen(); got != 0 {
+		t.Fatalf("open data-store locks after Repository.Close=%d, want 0", got)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatalf("second Repository.Close: %v", err)
+	}
+}
 
 func openTestManager(t *testing.T) *Manager {
 	t.Helper()
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	return manager
+}
+
+func graphJournalPath(t *testing.T, repositoryPath string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(repositoryPath, "graph", "graph-*.journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("graph journals=%v, want exactly one", matches)
+	}
+	return matches[0]
 }
 
 func readAll(t *testing.T, repo *Repository, branch string, ino uint64) string {
@@ -64,6 +119,83 @@ func write(t *testing.T, repo *Repository, branch string, ino uint64, value stri
 		t.Fatalf("WriteAt wrote %d bytes, want %d", n, len(value))
 	}
 	return cloned
+}
+
+func TestConcurrentMetadataReadsStayOnLiveGraphGeneration(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("concurrent-reads")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	const files = 48
+	inodes := make([]uint64, 0, files)
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("file-%03d", i)
+		ino, err := repository.CreateRegular(MainBranch, RootInode, name, 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := repository.WriteAt(MainBranch, ino, []byte(name), 0); err != nil {
+			t.Fatal(err)
+		}
+		inodes = append(inodes, ino)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errorsCh := make(chan error, 16)
+	var readers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		readers.Add(1)
+		go func(seed int) {
+			defer readers.Done()
+			<-start
+			for iteration := 0; iteration < 500; iteration++ {
+				index := (iteration + seed) % files
+				name := fmt.Sprintf("file-%03d", index)
+				ino, err := repository.Lookup(MainBranch, RootInode, name)
+				if err == nil {
+					_, err = repository.Inode(MainBranch, ino)
+				}
+				if err == nil {
+					err = repository.EnsureDataRange(MainBranch, ino, 0, 1)
+				}
+				if err != nil {
+					select {
+					case errorsCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}(worker)
+	}
+	close(start)
+	for iteration := 0; iteration < 40; iteration++ {
+		updates := make([]Inode, 0, files)
+		for _, ino := range inodes {
+			inode, err := repository.Inode(MainBranch, ino)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inode.AtimeNsec++
+			updates = append(updates, inode)
+		}
+		if err := repository.UpdateMetadataBatch(MainBranch, updates); err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.SyncMetadata(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readers.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Fatalf("concurrent metadata read crossed a reclaimed graph generation: %v", err)
+	}
 }
 
 func TestForkWritesDivergeAcrossGenerations(t *testing.T) {
@@ -155,11 +287,7 @@ func TestJournalDiscardsTornTailBeforeNextTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	branch, err := repo.Branch(MainBranch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	journal := filepath.Join(repo.path, "layers", branch.Root, "journal")
+	journal := graphJournalPath(t, repo.path)
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +295,7 @@ func TestJournalDiscardsTornTailBeforeNextTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.Write([]byte("TTCJ\x80")); err != nil {
+	if _, err := file.Write([]byte{0, 0, 0}); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
@@ -227,12 +355,13 @@ func TestRegularFileRepositoryRootForks(t *testing.T) {
 	}
 }
 
-func TestActualReflinkPathSucceedsOrFailsClosed(t *testing.T) {
+func TestFileCloneAutomaticallyFallsBack(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("actual-reflink")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer repo.Close()
 	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -242,36 +371,18 @@ func TestActualReflinkPathSucceedsOrFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Exercise ioctl(FICLONE) even when OpenManager selected the explicitly
-	// allowed full-copy fallback for this test filesystem.
+	// The configured capability is only an optimization hint. Correctness must
+	// transparently fall back to a whole-file copy.
 	repo.copyMode = CopyModeReflink
 	n, cloned, writeErr := repo.WriteAt("child", ino, []byte("CH"), 0)
-	switch manager.Capability().Mode {
-	case CopyModeReflink:
-		if writeErr != nil {
-			t.Fatalf("FICLONE-capable filesystem rejected branch write: %v", writeErr)
-		}
-		if n != 2 || !cloned {
-			t.Fatalf("reflink branch write = n %d, cloned %t; want 2, true", n, cloned)
-		}
-		if got := readAll(t, repo, MainBranch, ino); got != "base" {
-			t.Fatalf("reflink child write changed parent to %q", got)
-		}
-		if got := readAll(t, repo, "child", ino); got != "CHse" {
-			t.Fatalf("reflink child data = %q, want CHse", got)
-		}
-	case CopyModeFull:
-		if writeErr == nil {
-			t.Fatalf("unsupported FICLONE silently fell back: n %d, cloned %t", n, cloned)
-		}
-		if got := readAll(t, repo, MainBranch, ino); got != "base" {
-			t.Fatalf("failed reflink changed parent to %q", got)
-		}
-		if got := readAll(t, repo, "child", ino); got != "base" {
-			t.Fatalf("failed reflink changed child to %q", got)
-		}
-	default:
-		t.Fatalf("unknown manager copy mode %q", manager.Capability().Mode)
+	if writeErr != nil || n != 2 || !cloned {
+		t.Fatalf("branch write = n %d, cloned %t, err %v; want 2, true, nil", n, cloned, writeErr)
+	}
+	if got := readAll(t, repo, MainBranch, ino); got != "base" {
+		t.Fatalf("child write changed parent to %q", got)
+	}
+	if got := readAll(t, repo, "child", ino); got != "CHse" {
+		t.Fatalf("child data = %q, want CHse", got)
 	}
 }
 
@@ -346,9 +457,9 @@ func TestHardLinksTrackBranchLocalInodeObject(t *testing.T) {
 	}
 }
 
-func TestRepositoryReopensWithoutImport(t *testing.T) {
+func TestRepositoryReopensAfterDurabilityFenceWithoutImport(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,9 +472,15 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, repo, "main", ino, "persisted", 0)
+	// A second Repository instance cannot observe this process's bounded live
+	// metadata batch until an ordinary filesystem durability boundary publishes
+	// it to the immutable graph.
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
 	id := repo.Info().ID
 
-	manager, err = OpenManager(root, true)
+	manager, err = OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,8 +494,55 @@ func TestRepositoryReopensWithoutImport(t *testing.T) {
 	if got := readAll(t, repo, "main", ino); got != "persisted" {
 		t.Fatalf("reopened data=%q", got)
 	}
-	if matches, err := filepath.Glob(filepath.Join(root, "volumes-v2", id, "*.tar")); err != nil || len(matches) != 0 {
+	if matches, err := filepath.Glob(filepath.Join(root, "filesystems", "volumes", id, "*.tar")); err != nil || len(matches) != 0 {
 		t.Fatalf("unexpected tar persistence: matches=%v err=%v", matches, err)
+	}
+}
+
+func TestMetadataBatchDropsDeletedTransientSubtree(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := repo.CreateDirectory("main", rootInode, "temporary", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular("main", dir, "payload", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repo, "main", ino, "discarded", 0)
+	if err := repo.Unlink("main", dir, "payload"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReapOrphan("main", ino); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RemoveDirectory("main", rootInode, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Lookup("main", rootInode, "temporary"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted transient directory lookup: %v", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("transient")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if _, err := repo.Lookup("main", rootInode, "temporary"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replayed transient directory lookup: %v", err)
 	}
 }
 
@@ -420,7 +584,7 @@ func TestRepositoryOperatesThroughDonatedDirectoryFD(t *testing.T) {
 }
 
 func TestForkTransactionAbortRestoresSource(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,8 +622,8 @@ func TestForkTransactionAbortRestoresSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after != before {
-		t.Fatalf("source after Abort=%+v, want %+v", after, before)
+	if after.Root != before.Root || after.WorkingSnapshot == before.WorkingSnapshot || after.Generation != before.Generation+1 {
+		t.Fatalf("source after Abort=%+v, want same root and a fresh working origin", after)
 	}
 	if _, err := repo.Branch("aborted"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("aborted child lookup error=%v, want not exist", err)
@@ -473,7 +637,7 @@ func TestForkTransactionAbortRestoresSource(t *testing.T) {
 }
 
 func TestForkTransactionCommitRetainsBranches(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,8 +671,107 @@ func TestForkTransactionCommitRetainsBranches(t *testing.T) {
 	}
 }
 
+func TestClusteredRepositoryUsesExternallyAllocatedOrigins(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.CreateWithOrigin("clustered", 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	main, err := repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.WorkingSnapshot != 1001 {
+		t.Fatalf("initial working origin=%d, want 1001", main.WorkingSnapshot)
+	}
+	if !repo.Info().Clustered {
+		t.Fatal("externally allocated repository was not marked clustered")
+	}
+	tx, err := repo.BeginForkWithOrigins(MainBranch, "child", 1002, 1003)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	main, err = repo.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := repo.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if main.WorkingSnapshot != 1002 || child.WorkingSnapshot != 1003 {
+		t.Fatalf("fork working origins=(%d,%d), want (1002,1003)", main.WorkingSnapshot, child.WorkingSnapshot)
+	}
+	sealed, ok := repo.graph.Snapshot(1001)
+	if !ok || sealed.State != ttcsnapshot.SnapshotSealedVolatile {
+		t.Fatalf("sealed clustered origin=(%+v,%t)", sealed, ok)
+	}
+}
+
+func TestClusteredRepositoryOpenPreservesSealedBranchUntilActivation(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("cold-clustered", 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		return repository.graph.Seal(1001, ttcsnapshot.SnapshotSealedVolatile)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err = manager.Open("cold-clustered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.WorkingSnapshot != 1001 {
+		t.Fatalf("read-only reopen changed sealed origin to %d", branch.WorkingSnapshot)
+	}
+	if needs, err := repository.BranchNeedsWorkingOrigin(MainBranch); err != nil || !needs {
+		t.Fatalf("BranchNeedsWorkingOrigin()=(%t,%v), want (true,nil)", needs, err)
+	}
+	adopted, err := repository.InstallBranchWorkingOrigin(MainBranch, 1002)
+	if err != nil || !adopted {
+		t.Fatalf("InstallBranchWorkingOrigin()=(%t,%v), want (true,nil)", adopted, err)
+	}
+	branch, err = repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch.WorkingSnapshot != 1002 {
+		t.Fatalf("activated working origin=%d, want 1002", branch.WorkingSnapshot)
+	}
+	working, ok := repository.graph.Snapshot(1002)
+	if !ok || working.State != ttcsnapshot.SnapshotWorking {
+		t.Fatalf("activated snapshot=(%+v,%t), want working", working, ok)
+	}
+	if needs, err := repository.BranchNeedsWorkingOrigin(MainBranch); err != nil || needs {
+		t.Fatalf("BranchNeedsWorkingOrigin() after activation=(%t,%v), want (false,nil)", needs, err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
-	manager, err := OpenManager(t.TempDir(), true)
+	manager, err := OpenManager(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,56 +840,133 @@ func TestPersistentNamespaceOperationsAcrossForks(t *testing.T) {
 	}
 }
 
-func TestMutationAppendsOneBoundedJournalTransactionAndForkCopiesNoMetadata(t *testing.T) {
+func TestMutationAndForkAppendBoundedGraphTransactions(t *testing.T) {
 	repo, err := openTestManager(t).Create("tree")
 	if err != nil {
 		t.Fatal(err)
 	}
-	journalSize := func(layer string) int64 {
+	journalSize := func() int64 {
 		t.Helper()
-		info, err := os.Stat(filepath.Join(repo.path, "layers", layer, "journal"))
+		info, err := os.Stat(graphJournalPath(t, repo.path))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return info.Size()
 	}
-	before, err := repo.Branch(MainBranch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealedSize := journalSize(before.Root)
+	sealedSize := journalSize()
 	if err := repo.Fork("main", "child"); err != nil {
 		t.Fatal(err)
 	}
-	if afterFork := journalSize(before.Root); afterFork != sealedSize {
-		t.Fatalf("fork changed sealed layer by %d bytes, want 0", afterFork-sealedSize)
+	if delta := journalSize() - sealedSize; delta <= 0 || delta > 16<<10 {
+		t.Fatalf("fork appended %d graph bytes, want one bounded root transaction", delta)
 	}
-	child, err := repo.Branch("child")
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeMutation := journalSize(child.Root)
+	beforeMutation := journalSize()
 	if _, err := repo.CreateRegular("child", rootInode, "x", 0644, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if delta := journalSize(child.Root) - beforeMutation; delta <= 0 || delta > 4096 {
-		t.Fatalf("one mutation appended %d bytes, want one bounded transaction", delta)
-	}
-	journal, err := os.Open(filepath.Join(repo.path, "layers", child.Root, "journal"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	transaction, next, err := readMetadataTransaction(journal, beforeMutation)
-	journal.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != journalSize(child.Root) || len(transaction.Ops) != 2 {
-		t.Fatalf("create transaction ended at %d with %d ops, want end %d and 2 ops", next, len(transaction.Ops), journalSize(child.Root))
+	if delta := journalSize() - beforeMutation; delta <= 0 || delta > 8<<10 {
+		t.Fatalf("one mutation appended %d graph bytes, want one compact logical filesystem transaction", delta)
 	}
 }
 
-func TestMetadataUsesJournalWithoutPerEntryFiles(t *testing.T) {
+func TestRepeatedMetadataUpdatesKeepGraphBoundedAndRecoverable(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := repo.graph.Stats().Objects
+	for iteration := 0; iteration < 1000; iteration++ {
+		inode, err := repo.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.Mode = uint32(0600 | iteration&077)
+		inode.MtimeNsec = int64(iteration + 1)
+		if err := repo.UpdateMetadata(MainBranch, inode); err != nil {
+			t.Fatalf("metadata update %d: %v", iteration, err)
+		}
+		if stats := repo.graph.Stats(); stats.Objects > baseline+4 || stats.Reclaiming != 0 {
+			t.Fatalf("metadata update %d left an unbounded graph: baseline=%d stats=%+v", iteration, baseline, stats)
+		}
+	}
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	root := repo.path
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err = manager.Open("metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	got, err := repo.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MtimeNsec != 1000 {
+		t.Fatalf("recovered mtime=%d, want 1000", got.MtimeNsec)
+	}
+	if stats := repo.graph.Stats(); stats.Objects > baseline+4 || stats.Reclaiming != 0 {
+		t.Fatalf("reopened graph at %q is unbounded: baseline=%d stats=%+v", root, baseline, stats)
+	}
+}
+
+func TestFsyncMetadataChurnCompactsGraphJournal(t *testing.T) {
+	manager := openTestManager(t)
+	repo, err := manager.Create("fsync-metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repo.CreateRegular(MainBranch, RootInode, "database", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use one legal-size xattr value to make the regression inexpensive. The
+	// important shape is a durability boundary after repeatedly updating the
+	// same inode: the metadata batch contains one key and therefore never
+	// reaches its distinct-operation flush threshold.
+	value := strings.Repeat("x", 60<<10)
+	for iteration := 0; iteration < 160; iteration++ {
+		inode, err := repo.Inode(MainBranch, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inode.MtimeNsec = int64(iteration + 1)
+		inode.Xattrs = map[string]string{"user.ttc-journal-test": value}
+		if err := repo.UpdateMetadata(MainBranch, inode); err != nil {
+			t.Fatalf("metadata update %d: %v", iteration, err)
+		}
+		if err := repo.SyncMetadata(); err != nil {
+			t.Fatalf("metadata sync %d: %v", iteration, err)
+		}
+	}
+	if got := repo.graph.JournalBytes(); got >= reclaimJournalBytes {
+		t.Fatalf("graph journal remained unbounded at %d bytes, threshold %d", got, reclaimJournalBytes)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("fsync-metadata-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if got, err := repo.Inode(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	} else if got.MtimeNsec != 160 || got.Xattrs["user.ttc-journal-test"] != value {
+		t.Fatalf("recovered inode metadata = %+v", got)
+	}
+}
+
+func TestMetadataUsesGraphWithoutPerEntryFiles(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("journal-only")
 	if err != nil {
@@ -636,15 +976,11 @@ func TestMetadataUsesJournalWithoutPerEntryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	branch, err := repo.Branch(MainBranch)
-	if err != nil {
-		t.Fatal(err)
-	}
 	root := repo.path
 	if err := repo.Close(); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(filepath.Join(root, "layers", branch.Root))
+	entries, err := os.ReadDir(filepath.Join(root, "graph"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,14 +989,14 @@ func TestMetadataUsesJournalWithoutPerEntryFiles(t *testing.T) {
 		names = append(names, entry.Name())
 	}
 	sort.Strings(names)
-	if got, want := strings.Join(names, ","), "journal,layer.json"; got != want {
-		t.Fatalf("metadata layer entries=%q, want %q", got, want)
+	if len(names) != 4 || names[0] != "graph-0000000000000001.checkpoint" || names[1] != "graph-0000000000000001.journal" || names[2] != "graph.head" || names[3] != "graph.lock" {
+		t.Fatalf("snapshot graph entries=%q, want one selected checkpoint/journal generation", strings.Join(names, ","))
 	}
 }
 
 func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,7 +1039,7 @@ func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 	}
 	repo.Close()
 
-	manager, err = OpenManager(root, true)
+	manager, err = OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +1056,7 @@ func TestAllocateAndXattrsAreBranchLocalAndDurable(t *testing.T) {
 
 func TestPrivateRepositoryIsDurableAndNotCatalogued(t *testing.T) {
 	root := t.TempDir()
-	manager, err := OpenManager(root, true)
+	manager, err := OpenManager(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,6 +1116,23 @@ func TestScopedBranchID(t *testing.T) {
 	}
 	if a == ScopedBranchID("family-b", "child") || a == "child" {
 		t.Fatalf("scoped branch IDs collide: %q", a)
+	}
+}
+
+func TestNewScopedBranchIDAllowsVisibleNameReuse(t *testing.T) {
+	first, err := NewScopedBranchID("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewScopedBranchID("family", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("new branch incarnations reused physical ID %q", first)
+	}
+	if !strings.HasPrefix(first, "b-") || !strings.HasPrefix(second, "b-") {
+		t.Fatalf("new scoped branch IDs = %q, %q, want b- prefixes", first, second)
 	}
 }
 
@@ -843,6 +1196,83 @@ func TestSnapshotRoundTripIsBranchScoped(t *testing.T) {
 	}
 	if _, err := restored.Branch("checkpoint"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("import retained source branch: %v", err)
+	}
+}
+
+func TestPathBackedRepositoryExportsBulkObjects(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("path-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "manager-side export", 0)
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Daemon publication opens repositories by their trusted absolute path,
+	// rather than through Manager.Open. This must still expose a path-backed
+	// LocalDataStore to ExportSnapshot.
+	repository, err = OpenRepository(path, CopyModeFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := repository.ExportSnapshot(MainBranch, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(snapshot, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("snapshot objects=%v, want one", entries)
+	}
+}
+
+func TestExportSnapshotNeverFallsBackToLegacyObjectPath(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("no-legacy-export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "authoritative graph object", 0)
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	inode, err := repository.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authoritative := filepath.Join(repository.path, repository.objectPath(inode.Object))
+	if err := os.Remove(authoritative); err != nil {
+		t.Fatal(err)
+	}
+	legacyDir := filepath.Join(repository.path, "objects")
+	if err := os.MkdirAll(legacyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, inode.Object), []byte("legacy decoy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repository.ExportSnapshot(MainBranch, filepath.Join(t.TempDir(), "snapshot")); err == nil {
+		t.Fatal("ExportSnapshot used a legacy flat object instead of rejecting missing graph data")
 	}
 }
 
@@ -926,8 +1356,69 @@ func TestRemoveBranchKeepsMain(t *testing.T) {
 	if _, err := repository.Branch(MainBranch); err != nil {
 		t.Fatalf("main branch was removed: %v", err)
 	}
-	if err := repository.RemoveBranch(MainBranch); err == nil {
-		t.Fatal("RemoveBranch accepted main")
+	if err := repository.RemoveBranch(MainBranch); !errors.Is(err, ErrFinalBranch) {
+		t.Fatalf("RemoveBranch(main)=%v, want ErrFinalBranch", err)
+	}
+}
+
+func TestRemoveBranchRejectsFinalScopedBranch(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := repository.Fork(MainBranch, "scoped"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch(MainBranch); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch("scoped"); !errors.Is(err, ErrFinalBranch) {
+		t.Fatalf("RemoveBranch(scoped)=%v, want ErrFinalBranch", err)
+	}
+	if _, err := repository.Branch("scoped"); err != nil {
+		t.Fatalf("final scoped branch was removed: %v", err)
+	}
+}
+
+func TestGarbageCollectReportsInterruptedFinalBranchRemoval(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if err := os.Remove(filepath.Join(repository.path, "branches", MainBranch+".json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.GarbageCollect(); !errors.Is(err, ErrEmptyRepository) {
+		t.Fatalf("GarbageCollect()=%v, want ErrEmptyRepository", err)
+	}
+}
+
+func TestManagerRemovePrivateFinalRepository(t *testing.T) {
+	manager := openTestManager(t)
+	parent := filepath.Join(manager.root, "families")
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreatePrivate(filepath.Join(parent, "rootfs"), "rootfs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RemovePrivate(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed private repository stat=%v, want not exist", err)
+	}
+	if err := manager.RemovePrivate(manager.root); err == nil {
+		t.Fatal("RemovePrivate accepted manager root")
 	}
 }
 
@@ -952,6 +1443,419 @@ func TestRemoveBranchAllowsMainWithSurvivingPeer(t *testing.T) {
 	}
 }
 
+func TestOpenRecoversCommittedGraphBeforeBranchPointer(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("recover-root-pointer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root ttcsnapshot.ObjectID
+	err = repository.withLock(func() error {
+		var applyErr error
+		root, applyErr = repository.graph.ApplyFilesystem(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			graphRootName(MainBranch),
+			[]ttcsnapshot.FilesystemOperation{{PutInode: &ttcsnapshot.InodeRecord{
+				Number: 99, Type: "directory", Mode: 0755, Nlink: 2,
+			}}},
+		)
+		return applyErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a crash before commitMetadata publishes the branch pointer.
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = manager.Open("recover-root-pointer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	recovered, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Root != root.String() {
+		t.Fatalf("recovered root=%q, want %q", recovered.Root, root)
+	}
+	if inode, err := repository.Inode(MainBranch, 99); err != nil || inode.Type != "directory" {
+		t.Fatalf("recovered inode=%+v, err=%v", inode, err)
+	}
+}
+
+func TestReopenUsesDirectGraphLookupWithoutWholeTreeDecode(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("direct-lookup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 100; index++ {
+		if _, err := repository.CreateRegular(MainBranch, RootInode, fmt.Sprintf("file-%03d", index), 0644, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = manager.Open("direct-lookup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.Lookup(MainBranch, RootInode, "file-050")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Inode(MainBranch, ino); err != nil {
+		t.Fatal(err)
+	}
+	repository.metadataMu.Lock()
+	state := repository.metadata[MainBranch]
+	repository.metadataMu.Unlock()
+	state.mu.RLock()
+	if state.complete || len(state.entries) != 1 || len(state.inodes) != 1 || len(state.directories) != 0 {
+		t.Fatalf("lookup eagerly decoded metadata: complete=%t entries=%d inodes=%d directories=%d", state.complete, len(state.entries), len(state.inodes), len(state.directories))
+	}
+	state.mu.RUnlock()
+	entries, err := repository.ListDirectory(MainBranch, RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 100 {
+		t.Fatalf("directory entries=%d, want 100", len(entries))
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if state.complete || len(state.inodes) != 1 || len(state.directories[RootInode]) != 100 {
+		t.Fatalf("readdir decoded unrelated inodes: complete=%t inodes=%d entries=%d", state.complete, len(state.inodes), len(state.directories[RootInode]))
+	}
+}
+
+func TestOpenRecoversInterruptedForkGraphTransaction(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("recover-fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.SealAndFork(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			ttcsnapshot.SnapshotSealedLocal,
+			map[string]string{graphRootName("unpublished"): graphRootName(MainBranch)},
+			2,
+		)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Model a crash before either branch pointer is published.
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = manager.Open("recover-fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	recovered, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.WorkingSnapshot == branch.WorkingSnapshot {
+		t.Fatalf("recovery reused sealed working origin %d", branch.WorkingSnapshot)
+	}
+	working, ok := repository.graph.Snapshot(ttcsnapshot.SnapshotID(recovered.WorkingSnapshot))
+	if !ok || working.State != ttcsnapshot.SnapshotWorking {
+		t.Fatalf("recovered working snapshot=%+v, found=%t", working, ok)
+	}
+	if _, ok := repository.graph.Root(graphRootName("unpublished")); ok {
+		t.Fatal("unpublished child graph root survived recovery")
+	}
+	if _, err := repository.Branch("unpublished"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unpublished branch lookup=%v, want not exist", err)
+	}
+}
+
+func TestOpenReleasesInterruptedConstructionPins(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("recover-construction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch, err := repository.Branch(MainBranch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id ttcsnapshot.ObjectID
+	err = repository.withLock(func() error {
+		var createErr error
+		id, createErr = repository.graph.CreateObject(
+			ttcsnapshot.SnapshotID(branch.WorkingSnapshot),
+			"construct/interrupted",
+			ttcsnapshot.ObjectKindFile,
+			nil,
+			nil,
+		)
+		return createErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository, err = manager.Open("recover-construction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, ok := repository.graph.Inspect().Pins["construct/interrupted"]; ok {
+		t.Fatal("interrupted construction pin survived recovery")
+	}
+	// Releasing the pin collects the object it alone held.
+	if object, ok := repository.graph.Object(id); ok {
+		t.Fatalf("interrupted object survived its pin's release: %+v", object)
+	}
+}
+
+func TestOriginHandoffUsesRepositoryWriterFence(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("handoff-fence", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, ok := repository.graph.Snapshot(100); !ok || snapshot.State != ttcsnapshot.SnapshotShared {
+		t.Fatalf("published snapshot=(%+v,%t), want shared", snapshot, ok)
+	}
+}
+
+// A fork that a frozen handoff refuses must leave the source as it was. It
+// used to publish the source's new file object, keep only a construction pin
+// on it and fail; the next process to open the repository took the pin for a
+// crashed transaction's and released it, and the source could never fork
+// again: "inode references unavailable working file".
+func TestForkRefusedByAFrozenHandoffLeavesTheSourceForkable(t *testing.T) {
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("frozen-fork", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "base", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "ck", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	created, err := repository.CreateRegular(MainBranch, RootInode, "newfile", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, created, []byte("hello"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "a1", 103, 104); !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
+		t.Fatalf("fork during a frozen handoff: %v, want ErrSnapshotLedgerFrozen", err)
+	}
+	// ttcd opens the repository to clean up after the refused fork.
+	other, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := other.Open("frozen-fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "a2", 105, 106); err != nil {
+		t.Fatalf("fork after the handoff completed: %v", err)
+	}
+	for _, branch := range []string{MainBranch, "a2"} {
+		data := make([]byte, 5)
+		if n, err := repository.ReadAt(branch, created, data, 0); err != nil || string(data[:n]) != "hello" {
+			t.Fatalf("%s reads %q, %v; want hello", branch, data[:n], err)
+		}
+	}
+}
+
+func TestBranchDiffDuringOriginHandoff(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("diff-handoff", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "peer", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt("peer", ino, []byte("peer"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.PrepareBranchPublication("peer"); err != nil {
+		t.Fatal(err)
+	}
+	root, ok := repository.graph.Root(graphRootName("peer"))
+	if !ok {
+		t.Fatal("peer graph root is absent")
+	}
+	if _, err := repository.FreezeOriginHandoff(root.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := repository.BranchDiff("peer")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("BranchDiff did not wait for handoff completion: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := repository.CompleteOriginHandoff(root.Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("BranchDiff remained blocked after handoff completion")
+	}
+}
+
+func TestOriginDependenciesIncludeNewerCrossOriginChildren(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.CreateWithOrigin("origin-dependencies", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	var child ttcsnapshot.ObjectID
+	if err := repository.withLock(func() error {
+		if err := repository.graph.AdoptWorking(101); err != nil {
+			return err
+		}
+		var err error
+		child, err = repository.graph.CreateObject(101, "construct/dependency-child", ttcsnapshot.ObjectKindFile, nil, nil)
+		if err != nil {
+			return err
+		}
+		_, err = repository.graph.CreateObject(100, "construct/dependency-parent", ttcsnapshot.ObjectKindInode, nil, []ttcsnapshot.Edge{{Slot: 0, Child: child}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dependencies, err := repository.OriginDependencies(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 1 || dependencies[0] != 101 {
+		t.Fatalf("OriginDependencies(100)=%v, want [101]", dependencies)
+	}
+	if dependencies, err := repository.OriginDependencies(101); err != nil || len(dependencies) != 0 {
+		t.Fatalf("OriginDependencies(101)=%v, err=%v, want empty", dependencies, err)
+	}
+	prepared, err := repository.PrepareRetirementPublication()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 2 || prepared[0] != 100 || prepared[1] != 101 {
+		t.Fatalf("PrepareRetirementPublication()=%v, want [100 101]", prepared)
+	}
+	for _, origin := range prepared {
+		snapshot, ok := repository.graph.Snapshot(origin)
+		if !ok || snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
+			t.Fatalf("snapshot %d=(%+v,%t), want sealed-volatile", origin, snapshot, ok)
+		}
+	}
+}
+
+func TestMaterializedRemoteMarkerDoesNotPoisonLaterSync(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("materialized-marker-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	local := "0000000000000001-02-0000000000000010"
+	source := "0000000000000002-02-0000000000000020"
+	if err := repository.markRemoteObjectPending(local, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.clearRemoteObjectPending(local); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatalf("SyncMetadata after materialization: %v", err)
+	}
+}
+
 func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("branch-churn")
@@ -965,7 +1869,7 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	}
 	write(t, repository, MainBranch, ino, "main", 0)
 
-	for round := 0; round < metadataCompactionLayerThreshold*2+3; round++ {
+	for round := 0; round < 131; round++ {
 		childID := fmt.Sprintf("temporary-%04d", round)
 		if err := repository.Fork(MainBranch, childID); err != nil {
 			t.Fatalf("round %d Fork: %v", round, err)
@@ -1007,12 +1911,14 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	if len(branches) != 1 || branches[0].Name() != MainBranch+".json" {
 		t.Fatalf("branch pointers after churn=%v", branches)
 	}
-	layers, err := os.ReadDir(filepath.Join(repository.path, "layers"))
-	if err != nil {
+	if err := repository.graph.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if len(layers) > metadataCompactionLayerThreshold {
-		t.Fatalf("metadata layers grew with deleted history: got %d, threshold %d", len(layers), metadataCompactionLayerThreshold)
+	if stats := repository.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("graph after churn=%+v, want the parentless main root, at most two live origins, and no reclaiming objects", stats)
+	}
+	if info, err := os.Stat(graphJournalPath(t, repository.path)); err != nil || info.Size() != int64(len("TTCSGJ2\n")) {
+		t.Fatalf("compacted graph journal: info=%v err=%v", info, err)
 	}
 	repository.metadataMu.Lock()
 	metadataEntries := len(repository.metadata)
@@ -1026,11 +1932,264 @@ func TestGarbageCollectBoundsRepeatedBranchChurn(t *testing.T) {
 	if branchCacheEntries > 1 {
 		t.Fatalf("process-local branch cache retained %d historical branches, want at most main", branchCacheEntries)
 	}
-	repository.journalMu.Lock()
-	journalEntries := len(repository.journals)
-	repository.journalMu.Unlock()
-	if journalEntries > metadataCompactionLayerThreshold {
-		t.Fatalf("process-local journals retained %d historical layers", journalEntries)
+}
+
+func TestGarbageCollectSkipsLiveDonatedRepositoryMetadataTail(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("live-gc-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := OpenRepositoryFD(directory, CopyModeFull)
+	if err != nil {
+		directory.Close()
+		t.Fatal(err)
+	}
+	directory.Close()
+
+	ino, err := runtime.CreateRegular(MainBranch, RootInode, "pending", 0644, 0, 0)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := runtime.WriteAt(MainBranch, ino, []byte("still-live"), 0); err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	inode, err := runtime.Inode(MainBranch, ino)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	objectID, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, ok := runtime.graph.Object(objectID); ok {
+		runtime.Close()
+		t.Fatal("test object was published before the metadata-tail GC check")
+	}
+	collector, err := manager.Open("live-gc-fence")
+	if err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(path, collector.objectPath(inode.Object))
+	if err := collector.GarbageCollect(); err != nil {
+		collector.Close()
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(objectPath); err != nil {
+		collector.Close()
+		runtime.Close()
+		t.Fatalf("GC removed a live Sentry metadata-tail object: %v", err)
+	}
+	if got := readAll(t, runtime, MainBranch, ino); got != "still-live" {
+		collector.Close()
+		runtime.Close()
+		t.Fatalf("data after skipped GC=%q", got)
+	}
+	if err := collector.Close(); err != nil {
+		runtime.Close()
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	collector, err = manager.Open("live-gc-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer collector.Close()
+	if err := collector.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, collector, MainBranch, ino); got != "still-live" {
+		t.Fatalf("published data after runtime close=%q", got)
+	}
+}
+
+func TestActiveGarbageCollectBoundsDonatedBranchChurn(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("active-branch-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "main", 0)
+	directory, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := OpenRepositoryFD(directory, CopyModeFull)
+	directory.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+
+	for round := 0; round < 160; round++ {
+		childID := fmt.Sprintf("temporary-%04d", round)
+		if err := runtime.Fork(MainBranch, childID); err != nil {
+			t.Fatalf("round %d Fork: %v", round, err)
+		}
+		if _, _, err := runtime.WriteAt(childID, ino, []byte("child"), 0); err != nil {
+			t.Fatalf("round %d child WriteAt: %v", round, err)
+		}
+		child, err := runtime.Inode(childID, ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		childObject := filepath.Join(path, runtime.objectPath(child.Object))
+		if err := runtime.RemoveBranchAndCollect(childID); err != nil {
+			t.Fatalf("round %d RemoveBranchAndCollect: %v", round, err)
+		}
+		if _, err := os.Stat(childObject); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("round %d child object survived active collection: %v", round, err)
+		}
+		if got := readAll(t, runtime, MainBranch, ino); got != "main" {
+			t.Fatalf("round %d main data=%q", round, got)
+		}
+	}
+
+	if stats := runtime.graph.Stats(); stats.Roots != 1 || stats.Reclaiming != 0 || stats.Snapshots > 2 {
+		t.Fatalf("active graph after churn=%+v, want the parentless main root, at most two live origins, and no reclaiming objects", stats)
+	}
+	runtime.metadataMu.Lock()
+	metadataEntries := len(runtime.metadata)
+	runtime.metadataMu.Unlock()
+	if metadataEntries > 1 {
+		t.Fatalf("active runtime retained %d historical metadata entries", metadataEntries)
+	}
+}
+
+func TestActiveGarbageCollectDefersForPeerRuntimeTail(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("active-peer-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryA, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directoryB, err := repository.Directory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := repository.path
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtimeA, err := OpenRepositoryFD(directoryA, CopyModeFull)
+	directoryA.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeA.Close()
+	runtimeB, err := OpenRepositoryFD(directoryB, CopyModeFull)
+	directoryB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeB.Close()
+
+	ino, err := runtimeA.CreateRegular(MainBranch, RootInode, "pending", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runtimeA.WriteAt(MainBranch, ino, []byte("peer-tail"), 0); err != nil {
+		t.Fatal(err)
+	}
+	inode, err := runtimeA.Inode(MainBranch, ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectPath := filepath.Join(path, "data", "files", fmt.Sprintf("%016x", objectID.Snapshot), fmt.Sprintf("%02x", byte(objectID.Ordinal)), inode.Object+".data")
+	collected, err := runtimeB.GarbageCollectActive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected {
+		t.Fatal("active collection succeeded while a peer runtime held an unpublished metadata tail")
+	}
+	if _, err := os.Stat(objectPath); err != nil {
+		t.Fatalf("deferred active collection removed peer-tail data: %v", err)
+	}
+	if got := readAll(t, runtimeA, MainBranch, ino); got != "peer-tail" {
+		t.Fatalf("peer-tail data=%q", got)
+	}
+}
+
+func TestMetadataDurabilityFenceReclaimsObsoleteBulkByID(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("bounded-bulk-churn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	countBulk := func() int {
+		count := 0
+		if err := filepath.WalkDir(filepath.Join(repository.path, "data", "files"), func(_ string, entry fs.DirEntry, walkErr error) error {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				return nil
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".data") {
+				count++
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	for iteration := 0; iteration < reclaimBatchObjects+100; iteration++ {
+		ino, err := repository.CreateRegular(MainBranch, RootInode, "temporary", 0600, 0, 0)
+		if err != nil {
+			t.Fatalf("iteration %d create: %v", iteration, err)
+		}
+		if err := repository.Unlink(MainBranch, RootInode, "temporary"); err != nil {
+			t.Fatalf("iteration %d unlink: %v", iteration, err)
+		}
+		if err := repository.ReapOrphan(MainBranch, ino); err != nil {
+			t.Fatalf("iteration %d reap: %v", iteration, err)
+		}
+	}
+	if got := countBulk(); got >= reclaimBatchObjects {
+		t.Fatalf("automatic durability fence retained %d obsolete objects, want fewer than %d", got, reclaimBatchObjects)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBulk(); got != 0 {
+		t.Fatalf("explicit durability fence retained %d obsolete objects", got)
 	}
 }
 
@@ -1172,6 +2331,151 @@ func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
 	}
 }
 
+func TestObservationPinRetainsReplacedRoot(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("observed-root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "before", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	roots, pins, err := repository.pinGraphRoots([]string{graphRootName(MainBranch)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := roots[graphRootName(MainBranch)]
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "after", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.Collect(4096)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.graph.FilesystemRecords(oldRoot); err != nil {
+		t.Fatalf("pinned replaced root is not traversable: %v", err)
+	}
+	if err := repository.releaseGraphObservation(pins); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.withLock(func() error {
+		_, err := repository.graph.Collect(4096)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := repository.graph.Object(oldRoot); ok {
+		t.Fatal("released observation root remained reachable after collection")
+	}
+}
+
+// A whiteout is a deletion, and diff says so.
+//
+// Overlayfs hides a name by putting a 0:0 character device where it was. The
+// entry is present, so a diff that only asks "is this path in the layer" sees
+// something added or changed and never a deletion — which is how a session that
+// had lost its whole /tmp was reported as having a modified character device
+// there, and how the person reading it went looking somewhere else.
+func TestBranchDiffReadsAWhiteoutAsTheDeletionItIs(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-whiteout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	// A directory the branch will hide, and a file beside it for contrast.
+	if _, err := repository.CreateDirectory(MainBranch, RootInode, "gone", 0755, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "stays", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveDirectory("child", RootInode, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateSpecial("child", RootInode, "gone", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// And one that hides something the branch never had an entry for, which is
+	// what deleting a directory the image brought looks like.
+	if _, err := repository.CreateSpecial("child", RootInode, "fromtheimage", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]PathChange{}
+	for _, change := range changes {
+		byPath[change.Path] = change
+	}
+	if got := byPath["/gone"]; got.Kind != "delete" {
+		t.Fatalf("a hidden directory is reported as %+v, not a deletion", got)
+	}
+	if got := byPath["/gone"]; got.Type != "directory" {
+		t.Fatalf("the deletion names %q as what went away, not the directory it was", got.Type)
+	}
+	// Nothing underneath says what it was, so nothing is claimed about it.
+	if got := byPath["/fromtheimage"]; got.Kind != "delete" {
+		t.Fatalf("hiding a path the branch never held is reported as %+v", got)
+	}
+	if got := byPath["/fromtheimage"]; got.Type != "" {
+		t.Fatalf("a type of %q was invented for a path nothing under the branch describes", got.Type)
+	}
+	if _, ok := byPath["/stays"]; ok {
+		t.Fatalf("an untouched file appears in the diff: %+v", byPath["/stays"])
+	}
+}
+
+// A name that comes back is an addition, not a modification of the whiteout.
+func TestBranchDiffReadsAReplacedWhiteoutAsThePathReturning(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-returns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	if _, err := repository.CreateSpecial(MainBranch, RootInode, "back", "char", 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Unlink("child", RootInode, "back"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular("child", RootInode, "back", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path != "/back" {
+			continue
+		}
+		if change.Kind != "add" || change.Type != "regular" {
+			t.Fatalf("a path that came back is reported as %+v", change)
+		}
+		return
+	}
+	t.Fatal("the path coming back is not in the diff at all")
+}
+
 func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.Create("diff")
@@ -1213,6 +2517,140 @@ func TestBranchDiffUsesWritableLayerMetadata(t *testing.T) {
 	}
 	if !reflect.DeepEqual(changes, want) {
 		t.Fatalf("BranchDiff=%+v, want %+v", changes, want)
+	}
+}
+
+// A live Sentry and ttcd observe a repository through different handles. The
+// Sentry keeps a bounded metadata tail in memory, so manager-side inspection
+// must not accidentally report the preceding graph root until the next fsync,
+// fork, or lifecycle transition. PublishMetadata is the inexpensive
+// visibility boundary used before observations such as `ttc diff`.
+func TestPublishMetadataMakesLiveTailVisibleToAnotherHandle(t *testing.T) {
+	manager := openTestManager(t)
+	writer, err := manager.Create("publish-metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.CreateRegular("child", RootInode, "visible", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	observer, err := manager.Open("publish-metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	changes, err := observer.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path == "/visible" {
+			t.Fatalf("unpublished process-local metadata became visible: %+v", changes)
+		}
+	}
+
+	if err := writer.PublishMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = observer.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes {
+		if change.Path == "/visible" && change.Kind == "add" && change.Type == "regular" {
+			return
+		}
+	}
+	t.Fatalf("published metadata is missing from second handle's diff: %+v", changes)
+}
+
+func TestDiffBaseIsAnAuthoritativeGraphRoot(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-root-lifetime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "base", 0)
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "main", 0)
+	write(t, repository, "child", ino, "child", 0)
+	if err := repository.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, change := range changes {
+		if change.Path == "/value" && change.Kind == "modify" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("diff after both current roots advanced=%+v, want /value modification", changes)
+	}
+	branch, err := repository.Branch("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, ok := repository.graph.Root(graphBaseRootName("child"))
+	if !ok || branch.BaseRoot != base.String() {
+		t.Fatalf("branch base=%q graph base=%v found=%t", branch.BaseRoot, base, ok)
+	}
+}
+
+func TestForkPreservesSourceDiffParent(t *testing.T) {
+	manager := openTestManager(t)
+	repository, err := manager.Create("diff-source-parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "value", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, MainBranch, ino, "base", 0)
+	if err := repository.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, repository, "child", ino, "changed", 0)
+	before, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].Path != "/value" || before[0].Kind != "modify" {
+		t.Fatalf("diff before child fork=%+v, want value modification", before)
+	}
+	if err := repository.Fork("child", "grandchild"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := repository.BranchDiff("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("fork changed source diff from %+v to %+v", before, after)
+	}
+	grandchild, err := repository.BranchDiff("grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grandchild) != 0 {
+		t.Fatalf("new child diff=%+v, want empty fork-point delta", grandchild)
 	}
 }
 
@@ -1322,5 +2760,206 @@ func TestWriteLayerTarPreservesVirtualMetadata(t *testing.T) {
 	}
 	if _, ok := headers["opaque"].PAXRecords["SCHILY.xattr.trusted.overlay.opaque"]; ok {
 		t.Fatalf("opaque implementation xattr leaked into layer: %+v", headers["opaque"].PAXRecords)
+	}
+}
+
+func TestRandomForkHardlinkOrphanAndNameReuse(t *testing.T) {
+	type branchModel struct {
+		entries map[string]uint64
+		data    map[uint64]string
+	}
+	cloneModel := func(source *branchModel) *branchModel {
+		clone := &branchModel{entries: make(map[string]uint64, len(source.entries)), data: make(map[uint64]string, len(source.data))}
+		for name, ino := range source.entries {
+			clone.entries[name] = ino
+		}
+		for ino, contents := range source.data {
+			clone.data[ino] = contents
+		}
+		return clone
+	}
+	sortedKeys := func(values map[string]uint64) []string {
+		result := make([]string, 0, len(values))
+		for value := range values {
+			result = append(result, value)
+		}
+		sort.Strings(result)
+		return result
+	}
+	sortedBranches := func(values map[string]*branchModel) []string {
+		result := make([]string, 0, len(values))
+		for value := range values {
+			result = append(result, value)
+		}
+		sort.Strings(result)
+		return result
+	}
+	linkCount := func(model *branchModel, ino uint64) uint32 {
+		var count uint32
+		for _, linked := range model.entries {
+			if linked == ino {
+				count++
+			}
+		}
+		return count
+	}
+
+	root := t.TempDir()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.Create("random-semantics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := map[string]*branchModel{MainBranch: {entries: make(map[string]uint64), data: make(map[uint64]string)}}
+	var random uint64 = 0x92346871da05bc4f
+	nextRandom := func(limit int) int {
+		random ^= random << 13
+		random ^= random >> 7
+		random ^= random << 17
+		return int(random % uint64(limit))
+	}
+	validate := func(step int) {
+		for branch, model := range models {
+			for name, wantIno := range model.entries {
+				gotIno, err := repository.Lookup(branch, RootInode, name)
+				if err != nil || gotIno != wantIno {
+					t.Fatalf("step %d %s/%s lookup=(%d,%v), want %d", step, branch, name, gotIno, err, wantIno)
+				}
+			}
+			for ino, wantData := range model.data {
+				inode, err := repository.Inode(branch, ino)
+				if err != nil {
+					t.Fatalf("step %d %s inode %d: %v", step, branch, ino, err)
+				}
+				if wantLinks := linkCount(model, ino); inode.Nlink != wantLinks {
+					t.Fatalf("step %d %s inode %d links=%d, want %d", step, branch, ino, inode.Nlink, wantLinks)
+				}
+				if got := readAll(t, repository, branch, ino); got != wantData {
+					t.Fatalf("step %d %s inode %d data=%q, want %q", step, branch, ino, got, wantData)
+				}
+			}
+		}
+		if err := repository.graph.Verify(); err != nil {
+			t.Fatalf("step %d graph: %v", step, err)
+		}
+	}
+
+	for step := 0; step < 300; step++ {
+		branches := sortedBranches(models)
+		branch := branches[nextRandom(len(branches))]
+		model := models[branch]
+		switch nextRandom(8) {
+		case 0:
+			name := fmt.Sprintf("file-%02d", nextRandom(24))
+			if _, exists := model.entries[name]; !exists {
+				ino, err := repository.CreateRegular(branch, RootInode, name, 0644, 0, 0)
+				if err != nil {
+					t.Fatalf("step %d create: %v", step, err)
+				}
+				model.entries[name] = ino
+				model.data[ino] = ""
+			}
+		case 1:
+			if len(model.data) != 0 {
+				var inodes []uint64
+				for ino := range model.data {
+					inodes = append(inodes, ino)
+				}
+				sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
+				ino := inodes[nextRandom(len(inodes))]
+				value := fmt.Sprintf("%08x", step)
+				write(t, repository, branch, ino, value, 0)
+				model.data[ino] = value
+			}
+		case 2:
+			entries := sortedKeys(model.entries)
+			name := fmt.Sprintf("link-%02d", nextRandom(24))
+			if len(entries) != 0 {
+				if _, exists := model.entries[name]; !exists {
+					ino := model.entries[entries[nextRandom(len(entries))]]
+					if err := repository.Link(branch, RootInode, name, ino); err != nil {
+						t.Fatalf("step %d link: %v", step, err)
+					}
+					model.entries[name] = ino
+				}
+			}
+		case 3:
+			entries := sortedKeys(model.entries)
+			if len(entries) != 0 {
+				name := entries[nextRandom(len(entries))]
+				if err := repository.Unlink(branch, RootInode, name); err != nil {
+					t.Fatalf("step %d unlink: %v", step, err)
+				}
+				delete(model.entries, name)
+			}
+		case 4:
+			var orphans []uint64
+			for ino := range model.data {
+				if linkCount(model, ino) == 0 {
+					orphans = append(orphans, ino)
+				}
+			}
+			if len(orphans) != 0 {
+				sort.Slice(orphans, func(i, j int) bool { return orphans[i] < orphans[j] })
+				ino := orphans[nextRandom(len(orphans))]
+				if err := repository.ReapOrphan(branch, ino); err != nil {
+					t.Fatalf("step %d reap: %v", step, err)
+				}
+				delete(model.data, ino)
+			}
+		case 5:
+			child := fmt.Sprintf("branch-%02d", nextRandom(16))
+			if _, exists := models[child]; !exists {
+				if err := repository.Fork(branch, child); err != nil {
+					t.Fatalf("step %d fork: %v", step, err)
+				}
+				models[child] = cloneModel(model)
+			}
+		case 6:
+			if len(models) > 1 {
+				if err := repository.RemoveBranch(branch); err != nil {
+					t.Fatalf("step %d remove branch: %v", step, err)
+				}
+				delete(models, branch)
+				if err := repository.GarbageCollect(); err != nil {
+					t.Fatalf("step %d collect: %v", step, err)
+				}
+			}
+		case 7:
+			entries := sortedKeys(model.entries)
+			newName := fmt.Sprintf("renamed-%02d", nextRandom(24))
+			if len(entries) != 0 {
+				if _, exists := model.entries[newName]; !exists {
+					oldName := entries[nextRandom(len(entries))]
+					ino := model.entries[oldName]
+					if err := repository.Rename(branch, RootInode, oldName, RootInode, newName, true); err != nil {
+						t.Fatalf("step %d rename: %v", step, err)
+					}
+					delete(model.entries, oldName)
+					model.entries[newName] = ino
+				}
+			}
+		}
+		validate(step)
+		if step%61 == 60 {
+			if err := repository.Close(); err != nil {
+				t.Fatal(err)
+			}
+			repository, err = manager.Open("random-semantics")
+			if err != nil {
+				t.Fatalf("step %d reopen: %v", step, err)
+			}
+			validate(step)
+		}
+	}
+	if err := repository.GarbageCollect(); err != nil {
+		t.Fatal(err)
+	}
+	validate(300)
+	if err := repository.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

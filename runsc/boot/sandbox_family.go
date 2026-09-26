@@ -18,7 +18,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -46,8 +46,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	gsync "gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/urpc"
+	ttcconsole "gvisor.dev/gvisor/runsc/ttc/console"
 )
 
 // DefaultBranchID is the branch used by existing, branch-unaware runsc RPCs.
@@ -81,6 +83,7 @@ type BranchInfo struct {
 	InitPID          kernel.ThreadID
 	InitState        string
 	SharesMemory     bool
+	Quarantined      bool
 	// ForkMetrics is populated for branches created by Fork.
 	ForkMetrics SandboxForkMetrics
 }
@@ -110,7 +113,38 @@ type ForkBranchArgs struct {
 	// connections are left up rather than reset, so nothing inside notices it
 	// is a copy; what it writes is accepted and dropped and what it reads never
 	// arrives, so nothing outside notices it exists.
-	Quarantine bool
+	Quarantine        bool
+	FilesystemOrigins []FilesystemOriginAssignment
+}
+
+// FilesystemOriginAssignment is the JSON/uRPC-safe form of one clustered
+// persistent-filesystem origin plan.
+type FilesystemOriginAssignment struct {
+	ResourceID checkpoint.ResourceID `json:"resource_id"`
+	Origins    []uint64              `json:"origins"`
+}
+
+func filesystemOriginPlan(assignments []FilesystemOriginAssignment) (vfs.LiveForkFilesystemOrigins, error) {
+	if len(assignments) == 0 {
+		return nil, nil
+	}
+	plan := make(vfs.LiveForkFilesystemOrigins, len(assignments))
+	for _, assignment := range assignments {
+		if !assignment.ResourceID.Ok() || len(assignment.Origins) == 0 {
+			return nil, errors.New("filesystem origin assignment is empty")
+		}
+		if _, exists := plan[assignment.ResourceID]; exists {
+			return nil, fmt.Errorf("filesystem origin assignment repeats %q", assignment.ResourceID)
+		}
+		origins := append([]uint64(nil), assignment.Origins...)
+		for _, origin := range origins {
+			if origin == 0 {
+				return nil, fmt.Errorf("filesystem origin assignment for %q contains zero", assignment.ResourceID)
+			}
+		}
+		plan[assignment.ResourceID] = origins
+	}
+	return plan, nil
 }
 
 // ForkBranchesArgs selects one source and multiple sibling destinations for a
@@ -124,6 +158,15 @@ type ForkBranchesArgs struct {
 	Paused bool
 	// Quarantine cuts every new branch off from outside the sandbox.
 	Quarantine bool
+	// FilesystemOrigins maps each persistent filesystem to
+	// [newSource,newChild] pairs in IDs order.
+	FilesystemOrigins []FilesystemOriginAssignment
+}
+
+// BranchQuarantineArgs changes the external-connectivity quarantine bit.
+type BranchQuarantineArgs struct {
+	ID      string
+	Enabled bool
 }
 
 // DistributedForkCaptureArgs starts a remotely readable snapshot session.
@@ -145,6 +188,7 @@ type DistributedForkCaptureArgs struct {
 	// LeaveSourcePaused turns a fork capture into a migration cutover capture.
 	// Errors still restore the source's original state.
 	LeaveSourcePaused bool
+	FilesystemOrigins []FilesystemOriginAssignment
 }
 
 // DistributedForkCaptureChildArgs identifies one target in a coordinated
@@ -158,24 +202,27 @@ type DistributedForkCaptureChildArgs struct {
 // DistributedForkCaptureManyArgs starts independent page sessions backed by
 // one paused Kernel capture and one set of source page references.
 type DistributedForkCaptureManyArgs struct {
-	Source           string
-	FamilyID         string
-	Children         []DistributedForkCaptureChildArgs
-	MaxTransferBytes uint64
-	PushPolicy       ttcremote.TCPPushPolicy
-	PushHighWater    uint64
+	Source            string
+	FamilyID          string
+	Children          []DistributedForkCaptureChildArgs
+	MaxTransferBytes  uint64
+	PushPolicy        ttcremote.TCPPushPolicy
+	PushHighWater     uint64
+	FilesystemOrigins []FilesystemOriginAssignment
 }
 
 // DistributedForkSessionInfo is safe to return through the runsc control
 // socket. Token is a bearer capability and must never appear in status or log
 // output after initial creation.
 type DistributedForkSessionInfo struct {
-	SessionID     string
-	Source        string
-	Address       string
-	Token         ttcremote.SnapshotToken
-	MetadataBytes uint64
-	StreamBytes   uint64
+	SessionID        string
+	Source           string
+	FilesystemBranch string
+	Address          string
+	Token            ttcremote.SnapshotToken
+	MetadataBytes    uint64
+	StreamBytes      uint64
+	ExecSessions     []ExecSessionInfo
 }
 
 // DistributedForkSessionArgs identifies an existing source snapshot.
@@ -189,19 +236,20 @@ type DistributedForkServeArgs struct {
 	SessionID string
 }
 
-// DistributedForkExportArgs donates a destination for a durable packed page
-// snapshot. The destination is controlled by ttcd and never guest-visible.
+// DistributedForkExportArgs donates a destination for a graph capture stream.
 type DistributedForkExportArgs struct {
 	urpc.FilePayload
 	SessionID string
-	AllowCopy bool
-	Sparse    bool
+	// FilteredGraphStream says the stream is two-way and the daemon answers
+	// the manifest with the pages its graph lacks; see
+	// ttcchunk.WriteFilteredGraphCapture. A Sentry predating it ignores it and
+	// sends every page, which such a daemon still accepts.
+	FilteredGraphStream bool
 }
 
-// DistributedForkExportInfo identifies a sparse distributed memory manifest
-// and the filesystem branch captured at the same instant.
+// DistributedForkExportInfo identifies the filesystem branch captured at the
+// same instant as a distributed memory export.
 type DistributedForkExportInfo struct {
-	Manifest         ttcchunk.ManifestID
 	FilesystemBranch string
 }
 
@@ -219,15 +267,20 @@ type DistributedForkDependencyArgs struct {
 	BranchID            string
 	PrefetchBytes       uint64
 	PrefetchBehindBytes uint64
+	// IncludeDurable requests consumption progress for immutable graph-backed
+	// readers as well as volatile source-node readers.
+	IncludeDurable bool
 }
 
 // DistributedForkHandoffArgs replaces a target's live network page source
-// with an immutable sparse manifest. FilePayload contains one repository
-// directory descriptor.
+// with an immutable snapshot-graph manifest. FilePayload contains the
+// manifest and object-store descriptors, followed by an optional relay.
 type DistributedForkHandoffArgs struct {
 	urpc.FilePayload
-	BranchID string
-	Manifest ttcchunk.ManifestID
+	BranchID         string
+	GraphSnapshot    ttcsnapshot.SnapshotID
+	GraphRemote      bool
+	GraphRemoteToken ttcsnapshot.ObjectRelayToken
 }
 
 // BranchArgs selects an existing branch. An empty ID selects the default.
@@ -247,8 +300,8 @@ type BranchDehydrateArgs struct {
 	ID string
 }
 
-// BranchDehydrationMemoryInfo describes one packed memory stream that ttcd
-// must persist before a fully dehydrated family can release its Sentry.
+// BranchDehydrationMemoryInfo describes one logical MemoryFile included in a
+// graph capture before a fully dehydrated family can release its Sentry.
 type BranchDehydrationMemoryInfo struct {
 	ResourceID  checkpoint.ResourceID `json:"resource_id"`
 	StreamBytes uint64                `json:"stream_bytes"`
@@ -260,21 +313,31 @@ type BranchDehydrateInfo struct {
 	Resume           bool                          `json:"resume"`
 	ExecSessions     []ExecSessionInfo             `json:"exec_sessions,omitempty"`
 	FilesystemBranch string                        `json:"filesystem_branch"`
-	SparseManifest   ttcchunk.ManifestID           `json:"sparse_manifest,omitempty"`
+	SnapshotID       uint64                        `json:"snapshot_id,omitempty"`
+	MemoryRoots      []BranchMemoryRoot            `json:"memory_roots,omitempty"`
 }
 
-// BranchDehydrationExportArgs donates packed snapshot destinations in the
-// exact order reported by BranchDehydrateInfo.
+// BranchMemoryRoot binds one captured MemoryFile to an ancestry-independent
+// snapshot-graph radix root.
+type BranchMemoryRoot struct {
+	ResourceID checkpoint.ResourceID `json:"resource_id"`
+	Name       string                `json:"name"`
+	Root       string                `json:"root"`
+}
+
+// BranchDehydrationExportArgs donates one graph capture stream destination.
 type BranchDehydrationExportArgs struct {
 	urpc.FilePayload
-	ID        string
-	AllowCopy bool
-	Sparse    bool
+	ID string
+	// FilteredGraphStream is as for DistributedForkExportArgs.
+	FilteredGraphStream bool
 }
 
-// BranchDehydrationExportInfo identifies a published sparse memory root.
+// BranchDehydrationExportInfo describes the capture an export published, so
+// that a daemon exporting a capture long after taking it need not have kept
+// the description it got then.
 type BranchDehydrationExportInfo struct {
-	Manifest ttcchunk.ManifestID `json:"manifest"`
+	Capture BranchDehydrateInfo `json:"capture"`
 }
 
 // BranchProcessesArgs selects a container inside one live branch.
@@ -289,8 +352,8 @@ type BranchRootfsSizeArgs struct {
 	CID      string
 }
 
-// BranchResidentMemory is mapped resident memory attributed to one live
-// branch. Private and shared classify physical Sentry pages across this family.
+// BranchResidentMemory is resident guest memory attributed to one live branch.
+// Private and shared classify physical Sentry pages across this family.
 type BranchResidentMemory struct {
 	ID           string `json:"id"`
 	State        string `json:"state"`
@@ -301,12 +364,13 @@ type BranchResidentMemory struct {
 
 // FamilyResidentMemory is a family-wide resident-memory accounting snapshot.
 type FamilyResidentMemory struct {
-	Branches                 []BranchResidentMemory      `json:"branches"`
-	SharingEdges             []ResidentMemorySharingEdge `json:"sharing_edges,omitempty"`
-	VersionRuns              []ResidentMemoryVersionRun  `json:"version_runs,omitempty"`
-	SharingEdgesTruncated    bool                        `json:"sharing_edges_truncated,omitempty"`
-	SharingEdgesOmittedBytes uint64                      `json:"sharing_edges_omitted_bytes,omitempty"`
-	UniqueBytes              uint64                      `json:"unique_bytes"`
+	Branches                 []BranchResidentMemory       `json:"branches"`
+	SharingEdges             []ResidentMemorySharingEdge  `json:"sharing_edges,omitempty"`
+	VersionRuns              []ResidentMemoryVersionRun   `json:"version_runs,omitempty"`
+	VersionChunks            []ResidentMemoryVersionChunk `json:"version_chunks,omitempty"`
+	SharingEdgesTruncated    bool                         `json:"sharing_edges_truncated,omitempty"`
+	SharingEdgesOmittedBytes uint64                       `json:"sharing_edges_omitted_bytes,omitempty"`
+	UniqueBytes              uint64                       `json:"unique_bytes"`
 }
 
 // ResidentMemoryVersionRun is a compressed stable identity range for resident
@@ -318,6 +382,17 @@ type ResidentMemoryVersionRun struct {
 	Allocator     string `json:"allocator"`
 	FirstSequence uint64 `json:"first_sequence"`
 	Pages         uint64 `json:"pages"`
+}
+
+// ResidentMemoryVersionChunk is a bounded bitmap of stable content-version
+// identities. Bitmap is 256 bits encoded as 64 lowercase hexadecimal digits;
+// bit N represents version Chunk*256+N. Unlike contiguous runs, this remains
+// compact when concurrent sibling CoW faults interleave allocator sequences.
+type ResidentMemoryVersionChunk struct {
+	Branch    string `json:"branch"`
+	Allocator string `json:"allocator"`
+	Chunk     uint64 `json:"chunk"`
+	Bitmap    string `json:"bitmap"`
 }
 
 // ResidentMemorySharingEdge is an exact weighted hyperedge. It coalesces all
@@ -340,16 +415,24 @@ type BranchWaitArgs struct {
 	PID      int32
 }
 
-// ConsoleFollowArgs streams one branch's init output and waits for init to
-// exit. FilePayload contains the final-output writer, wait-status writer,
-// release reader, and optional registration and attachment readiness writers.
-type ConsoleFollowArgs struct {
+// ConsolePushArgs selects a process whose console the Sentry pushes to the one
+// file given: see PushConsole.
+type ConsolePushArgs struct {
 	urpc.FilePayload
 	BranchID  string
 	CID       string
 	ConsoleID string
 	ExecID    string
 }
+
+// A console push ends with one record in the console frame format, of a
+// stream past stdout's and stderr's.
+const (
+	// ConsolePushExit carries the process's wait status, big-endian.
+	ConsolePushExit byte = 3
+	// ConsolePushError carries why the push ended without it.
+	ConsolePushError byte = 4
+)
 
 // BranchSignalArgs selects signal recipients inside one live branch.
 type BranchSignalArgs struct {
@@ -389,6 +472,9 @@ type ConsoleWatchArgs struct {
 	urpc.FilePayload
 	ConsoleObservationArgs
 }
+
+// MaxConsoleWait is the longest timeout ConsoleWait accepts.
+const MaxConsoleWait = 30 * time.Second
 
 // ConsoleWaitArgs waits for branch-local console I/O readiness. A zero timeout
 // performs a nonblocking readiness check.
@@ -490,6 +576,7 @@ type execSession struct {
 	info           ExecSessionInfo
 	tg             *kernel.ThreadGroup
 	managementDone <-chan struct{}
+	retain         bool
 }
 
 type consoleWaitLease struct {
@@ -524,6 +611,7 @@ type sandboxBranch struct {
 	state            BranchState
 	createdAt        time.Time
 	metrics          SandboxForkMetrics
+	quarantined      bool
 
 	execSessions map[string]*execSession
 	consoleWaits map[*consoleWaitLease]struct{}
@@ -567,9 +655,11 @@ type SandboxFamily struct {
 	testOnlyExecFailureInjector    func(SandboxExecStage) error
 	volumeBranchScope              string
 	distributedSessions            map[string]*distributedForkSession
+	distributedHandoffs            map[string]*distributedForkHandoff
 	configureNetwork               func(*kernel.Kernel, inet.Stack) error
 	onLoaderKernelChanged          func(*kernel.Kernel, *watchdog.Watchdog)
 	forgetFilesystemBranch         func(string)
+	reclaimFilesystemBranch        func(string) error
 }
 
 type distributedForkSession struct {
@@ -581,6 +671,23 @@ type distributedForkSession struct {
 	server           *ttcremote.TCPPageServer
 	sparseSnapshot   *pgalloc.RemoteSnapshot
 	memoryBindings   []pgalloc.CapturedPageBinding
+	filesystemToken  ttcvolume.RemoteToken
+}
+
+type distributedForkHandoff struct {
+	snapshot uint64
+	done     chan struct{}
+	err      error
+}
+
+// DistributedForkHandoffStatus reports completion of an asynchronous reader
+// switch. Starting the switch must not occupy the Sentry control server: the
+// old reader may have in-flight demand faults, while unrelated branch and exec
+// controls must remain available.
+type DistributedForkHandoffStatus struct {
+	Snapshot uint64 `json:"snapshot"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error,omitempty"`
 }
 
 // SandboxFamilyOptions controls eligibility policy shared by all branches.
@@ -599,9 +706,13 @@ type SandboxFamilyOptions struct {
 	ConfigureNetwork      func(*kernel.Kernel, inet.Stack) error
 	OnLoaderKernelChanged func(*kernel.Kernel, *watchdog.Watchdog)
 	// ForgetFilesystemBranch releases process-local TTC repository caches once
-	// a branch no longer has a Kernel. Persistent branch pointers are managed by
-	// ttcd and are intentionally unaffected by this callback.
+	// a branch becomes process-free but remains a live family member.
 	ForgetFilesystemBranch func(string)
+	// ReclaimFilesystemBranch removes the persistent filesystem root after a
+	// branch Kernel and all of its open file descriptions have been released.
+	// It also performs runtime-side graph collection when this is the only
+	// Sentry using the repository.
+	ReclaimFilesystemBranch func(string) error
 	// InitialBranchID and InitialFilesystemBranch identify the branch represented
 	// by the Loader's bootstrap Kernel. Empty values retain the canonical main
 	// defaults used by ordinary OCI creation.
@@ -661,8 +772,10 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 		configureNetwork:               opts.ConfigureNetwork,
 		onLoaderKernelChanged:          opts.OnLoaderKernelChanged,
 		forgetFilesystemBranch:         opts.ForgetFilesystemBranch,
+		reclaimFilesystemBranch:        opts.ReclaimFilesystemBranch,
 		defaultStarted:                 make(chan struct{}),
 		distributedSessions:            make(map[string]*distributedForkSession),
+		distributedHandoffs:            make(map[string]*distributedForkHandoff),
 		branches: map[string]*sandboxBranch{
 			initialID: {
 				id:               initialID,
@@ -672,6 +785,7 @@ func NewSandboxFamily(k *kernel.Kernel, opts SandboxFamilyOptions) *SandboxFamil
 				watchdog:         opts.LoaderWatchdog,
 				state:            kernelBranchState(k),
 				createdAt:        createdAt,
+				quarantined:      k.LiveForkQuarantine(),
 				execSessions:     make(map[string]*execSession),
 			},
 		},
@@ -723,7 +837,7 @@ func (f *SandboxFamily) CaptureDistributedFork(args *DistributedForkCaptureArgs)
 		SessionID: args.SessionID, TargetBranchID: args.TargetBranchID,
 		AdvertiseAddress: args.AdvertiseAddress,
 	}}
-	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener, args.LeaveSourcePaused)
+	infos, err := f.captureDistributedForkMany(args.Source, args.FamilyID, children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, listener, args.LeaveSourcePaused, args.FilesystemOrigins)
 	if err != nil {
 		if listener != nil {
 			listener.Close()
@@ -739,15 +853,19 @@ func (f *SandboxFamily) CaptureDistributedForkMany(args *DistributedForkCaptureM
 	if args == nil {
 		return nil, errors.New("missing distributed fork batch arguments")
 	}
-	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil, false)
+	return f.captureDistributedForkMany(args.Source, args.FamilyID, args.Children, args.MaxTransferBytes, args.PushPolicy, args.PushHighWater, nil, false, args.FilesystemOrigins)
 }
 
-func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener, leaveSourcePaused bool) ([]DistributedForkSessionInfo, error) {
+func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, children []DistributedForkCaptureChildArgs, maxTransferBytes uint64, pushPolicy ttcremote.TCPPushPolicy, pushHighWater uint64, listener net.Listener, leaveSourcePaused bool, filesystemAssignments []FilesystemOriginAssignment) ([]DistributedForkSessionInfo, error) {
 	if familyID == "" || len(children) == 0 || maxTransferBytes == 0 {
 		return nil, errors.New("distributed fork capture is missing family, children, or transfer limit")
 	}
 	if len(children) != 1 && listener != nil {
 		return nil, errors.New("a shared listener is valid only for a singular distributed capture")
+	}
+	filesystemOrigins, err := filesystemOriginPlan(filesystemAssignments)
+	if err != nil {
+		return nil, err
 	}
 	seenSessions := make(map[string]struct{}, len(children))
 	seenBranches := make(map[string]struct{}, len(children))
@@ -796,6 +914,13 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	if !sourceWasPaused {
 		source.k.Pause()
 	}
+	f.mu.Lock()
+	execSessions := make([]ExecSessionInfo, 0, len(source.execSessions))
+	for _, session := range source.execSessions {
+		execSessions = append(execSessions, cloneExecSessionInfo(session.info))
+	}
+	f.mu.Unlock()
+	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
 	resume := func() error {
 		if sourceWasPaused {
 			return nil
@@ -810,6 +935,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	capture, err := source.k.CaptureDistributedFork(source.k.SupervisorContext(), kernel.DistributedForkCaptureOptions{
 		ChildBranchIDs:                 volumeBranches,
 		AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
+		FilesystemOrigins:              filesystemOrigins,
 	})
 	if err != nil {
 		if resumeErr := resume(); resumeErr != nil {
@@ -859,30 +985,12 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		_ = resume()
 		return nil, fmt.Errorf("distributed capture returned %d handoff snapshots for %d children", len(handoffSnapshots), len(children))
 	}
-	// Kernel state contains the exec processes and internal consoles, while the
-	// branch-local session registry is loader control state. Carry the registry
-	// beside the Kernel image so remote forks and migrations retain wait, logs,
-	// signal, and reattachment identities for those processes.
-	f.mu.Lock()
-	execSessions := make([]ExecSessionInfo, 0, len(source.execSessions))
-	for _, session := range source.execSessions {
-		if session.info.State == ExecSessionRunning && source.k.RootPIDNamespace().ThreadGroupWithID(session.info.PID) != nil {
-			execSessions = append(execSessions, cloneExecSessionInfo(session.info))
-		}
-	}
-	f.mu.Unlock()
-	sort.Slice(execSessions, func(i, j int) bool { return execSessions[i].ID < execSessions[j].ID })
-	encodedExecSessions, err := json.Marshal(execSessions)
-	if err != nil {
-		_ = resume()
-		return nil, fmt.Errorf("encoding distributed exec sessions: %w", err)
-	}
 	infos := make([]DistributedForkSessionInfo, len(children))
 	for i, child := range children {
 		metadata, err := (&ttcremote.SessionMetadata{
 			FamilyID: familyID, SourceBranchID: sourceID, TargetBranchID: child.TargetBranchID,
 			KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata,
-			ExecSessions: encodedExecSessions, LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
+			LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
 		}).MarshalBinary()
 		if err != nil {
 			_ = resume()
@@ -933,6 +1041,7 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 			resources: capture.FilesystemResources, server: server,
 			sparseSnapshot: handoffSnapshots[i], memoryBindings: capture.MemoryBindings,
 		}
+		copy(sessions[i].filesystemToken[:], token[:])
 		if capture.HandoffSnapshot != nil {
 			capture.HandoffSnapshot = nil
 		} else {
@@ -940,7 +1049,9 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 		}
 		infos[i] = DistributedForkSessionInfo{
 			SessionID: child.SessionID, Source: sourceID, Address: address, Token: token,
-			MetadataBytes: uint64(len(metadata)), StreamBytes: server.StreamBytes(),
+			FilesystemBranch: volumeBranches[i],
+			MetadataBytes:    uint64(len(metadata)), StreamBytes: server.StreamBytes(),
+			ExecSessions: cloneExecSessionInfos(execSessions),
 		}
 	}
 	// The live and durable branch-scoped reservations have transferred to their
@@ -986,7 +1097,9 @@ func (f *SandboxFamily) captureDistributedForkMany(sourceID, familyID string, ch
 	return infos, nil
 }
 
-// ServeDistributedForkConnection handles one connection accepted by ttcd.
+// ServeDistributedForkConnection takes ownership of one connection accepted
+// by ttcd and starts serving it. The stream may live for the entire remote
+// dependency lifetime, so it must not occupy the Sentry control RPC handler.
 func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServeArgs) error {
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return errors.New("distributed page serving requires a session and one connected socket")
@@ -1001,11 +1114,23 @@ func (f *SandboxFamily) ServeDistributedForkConnection(args *DistributedForkServ
 	if err != nil {
 		return err
 	}
-	return session.server.ServeStream(conn)
+	go func() { _ = session.server.ServeStream(conn) }()
+	return nil
 }
 
-// ExportDistributedForkSnapshot persists a session's immutable page stream in
-// the exact packed layout consumed by distributed restore.
+// DistributedForkFilesystemToken returns the transaction-fenced token for a
+// live capture. The token remains valid exactly as long as the source session.
+func (f *SandboxFamily) DistributedForkFilesystemToken(id string) (ttcvolume.RemoteToken, error) {
+	f.mu.Lock()
+	session := f.distributedSessions[id]
+	f.mu.Unlock()
+	if session == nil {
+		return ttcvolume.RemoteToken{}, fmt.Errorf("distributed fork session %q does not exist", id)
+	}
+	return session.filesystemToken, nil
+}
+
+// ExportDistributedForkSnapshot writes a session's immutable memory graph.
 func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExportArgs) (*DistributedForkExportInfo, error) {
 	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
 		return nil, errors.New("distributed snapshot export requires a session and one destination")
@@ -1016,31 +1141,21 @@ func (f *SandboxFamily) ExportDistributedForkSnapshot(args *DistributedForkExpor
 	if session == nil {
 		return nil, fmt.Errorf("distributed fork session %q does not exist", args.SessionID)
 	}
-	if !args.Sparse {
-		return nil, session.server.ExportPackedSnapshot(args.FilePayload.Files[0], args.AllowCopy)
-	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.sparseSnapshot == nil {
 		return nil, fmt.Errorf("distributed fork session %q sparse snapshot is unavailable", args.SessionID)
 	}
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return nil, fmt.Errorf("opening distributed sparse memory repository: %w", err)
+	var err error
+	if args.FilteredGraphStream {
+		err = ttcchunk.WriteFilteredGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings)
+	} else {
+		err = ttcchunk.WriteGraphCapture(args.FilePayload.Files[0], session.sparseSnapshot, session.memoryBindings)
 	}
-	defer repository.Close()
-	objects, bindings, err := ttcchunk.ReadSnapshot(session.sparseSnapshot, session.memoryBindings)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("writing distributed graph capture: %w", err)
 	}
-	manifest, err := repository.Publish(objects, bindings)
-	if err != nil {
-		return nil, err
-	}
-	// Keep sparseSnapshot until distributed-complete. This makes publication
-	// retryable after a ttcd crash between repository publication and the
-	// target's durable handoff record.
-	return &DistributedForkExportInfo{Manifest: manifest, FilesystemBranch: session.filesystemBranch}, nil
+	return &DistributedForkExportInfo{FilesystemBranch: session.filesystemBranch}, nil
 }
 
 // DistributedForkSessionStatus returns progress without disclosing the bearer
@@ -1103,8 +1218,8 @@ func removeDistributedFilesystemBranch(resources vfs.LiveForkFilesystemResources
 	return result
 }
 
-// CompleteDistributedForkSession releases memory ownership after a target has
-// drained while preserving the filesystem branches now owned by that target.
+// CompleteDistributedForkSession releases memory ownership and the sealed
+// source-only filesystem generation after the target has materialized it.
 func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 	f.mu.Lock()
 	session := f.distributedSessions[id]
@@ -1122,7 +1237,7 @@ func (f *SandboxFamily) CompleteDistributedForkSession(id string) error {
 		session.sparseSnapshot = nil
 	}
 	session.mu.Unlock()
-	return errors.Join(session.server.Close(), sparseErr)
+	return errors.Join(session.server.Close(), sparseErr, removeDistributedFilesystemBranch(session.resources, session.filesystemBranch))
 }
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.
@@ -1133,6 +1248,17 @@ func (f *SandboxFamily) DistributedForkDependencyStatus(branchID string) (pgallo
 	}
 	defer release()
 	return b.k.DistributedForkDependencyStatus(), nil
+}
+
+// PageLoadStatus reports all asynchronous page readers, including immutable
+// durable readers whose roots must remain pinned until consumption completes.
+func (f *SandboxFamily) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileLoadStats, error) {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return pgalloc.AsyncPagesFileLoadStats{}, err
+	}
+	defer release()
+	return b.k.PageLoadStatus(), nil
 }
 
 // SetDistributedForkPrefetchWindow changes future remote-memory fault reads.
@@ -1157,21 +1283,113 @@ func (f *SandboxFamily) DrainDistributedForkMemory(branchID string) error {
 }
 
 // HandoffDistributedForkMemory switches future faults from the live source to
-// a durable sparse manifest after all in-flight network reads quiesce.
+// a durable snapshot graph after all in-flight network reads quiesce.
 func (f *SandboxFamily) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs) error {
-	if args == nil || args.BranchID == "" || args.Manifest == (ttcchunk.ManifestID{}) || len(args.FilePayload.Files) != 1 {
-		return errors.New("distributed fork handoff requires a branch, manifest, and one repository descriptor")
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed fork handoff requires a branch")
+	}
+	want := 2
+	if args.GraphRemote {
+		want++
+	}
+	if args.GraphSnapshot == 0 || len(args.FilePayload.Files) != want {
+		return errors.New("distributed graph handoff requires a snapshot, manifest, object store, and optional relay")
+	}
+	f.mu.Lock()
+	if current := f.distributedHandoffs[args.BranchID]; current != nil {
+		select {
+		case <-current.done:
+			// A completed handoff records the immutable snapshot, but its relay
+			// connection is deliberately replaceable. The helper serving that
+			// connection may have failed or may predate daemon-independent relays.
+			// Reinstalling the same snapshot switches only the unresolved-page
+			// reader and is therefore both safe and necessary during recovery.
+			delete(f.distributedHandoffs, args.BranchID)
+		default:
+			f.mu.Unlock()
+			if current.snapshot == uint64(args.GraphSnapshot) {
+				return nil
+			}
+			return fmt.Errorf("branch %q already has graph handoff %d in progress", args.BranchID, current.snapshot)
+		}
+	}
+	f.mu.Unlock()
+	encoded, err := io.ReadAll(args.FilePayload.Files[0])
+	if err != nil {
+		return fmt.Errorf("reading distributed graph handoff manifest: %w", err)
+	}
+	manifest, err := ttcchunk.DecodeManifest(encoded)
+	if err != nil {
+		return fmt.Errorf("decoding distributed graph handoff manifest: %w", err)
+	}
+	data, err := ttcsnapshot.OpenLocalDataStoreFD(args.FilePayload.Files[1])
+	if err != nil {
+		return fmt.Errorf("opening distributed graph handoff objects: %w", err)
+	}
+	var remote *ttcsnapshot.ObjectRelayClient
+	if args.GraphRemote {
+		fd, err := unix.Dup(int(args.FilePayload.Files[2].Fd()))
+		if err != nil {
+			data.Close()
+			return err
+		}
+		remote, err = ttcsnapshot.NewObjectRelayClient(os.NewFile(uintptr(fd), "distributed-graph-handoff-relay"), args.GraphRemoteToken)
+		if err != nil {
+			data.Close()
+			return err
+		}
 	}
 	b, release, err := f.beginControl(args.BranchID)
 	if err != nil {
+		if remote != nil {
+			_ = remote.Close()
+		}
+		_ = data.Close()
 		return err
 	}
-	defer release()
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return fmt.Errorf("opening distributed handoff repository: %w", err)
+	state := &distributedForkHandoff{snapshot: uint64(args.GraphSnapshot), done: make(chan struct{})}
+	f.mu.Lock()
+	if current := f.distributedHandoffs[args.BranchID]; current != nil {
+		f.mu.Unlock()
+		release()
+		if remote != nil {
+			_ = remote.Close()
+		}
+		_ = data.Close()
+		return errors.New("distributed graph handoff was started concurrently")
 	}
-	return b.k.HandoffDistributedForkMemory(repository, args.Manifest)
+	f.distributedHandoffs[args.BranchID] = state
+	f.mu.Unlock()
+	go func() {
+		err := b.k.HandoffDistributedForkMemoryGraph(data, remote, manifest, args.GraphSnapshot)
+		release()
+		f.mu.Lock()
+		state.err = err
+		close(state.done)
+		f.mu.Unlock()
+	}()
+	return nil
+}
+
+// DistributedForkMemoryHandoffStatus observes a reader switch without taking
+// the branch operation lock or waiting for its old in-flight reads.
+func (f *SandboxFamily) DistributedForkMemoryHandoffStatus(branchID string) (DistributedForkHandoffStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	state := f.distributedHandoffs[branchID]
+	if state == nil {
+		return DistributedForkHandoffStatus{}, fmt.Errorf("branch %q has no distributed graph handoff", branchID)
+	}
+	status := DistributedForkHandoffStatus{Snapshot: state.snapshot}
+	select {
+	case <-state.done:
+		status.Done = true
+		if state.err != nil {
+			status.Error = state.err.Error()
+		}
+	default:
+	}
+	return status, nil
 }
 
 // CloseDistributedForkSessions releases all remote dependencies during Sentry
@@ -1215,6 +1433,9 @@ func (f *SandboxFamily) injectExecFailure(stage SandboxExecStage) error {
 }
 
 func kernelBranchState(k *kernel.Kernel) BranchState {
+	if k == nil || k.TaskSet() == nil {
+		return BranchRunning
+	}
 	if k.IsPaused() {
 		return BranchPaused
 	}
@@ -1273,6 +1494,7 @@ func (f *SandboxFamily) ReplaceLoaderBranchFromDehydration(id, parentID, filesys
 			watchdog:         dog,
 			state:            BranchPaused,
 			createdAt:        createdAt,
+			quarantined:      k.LiveForkQuarantine(),
 			execSessions:     execSessions,
 		},
 	}
@@ -1363,20 +1585,29 @@ func (f *SandboxFamily) RestoreLoaderExecSessions(sessions []ExecSessionInfo) er
 func restoredExecSessions(k *kernel.Kernel, sessions []ExecSessionInfo) (map[string]*execSession, error) {
 	restored := make(map[string]*execSession)
 	for _, info := range sessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
 		if info.ID == "" || info.PID <= 0 {
 			return nil, fmt.Errorf("invalid restored exec session %+v", info)
 		}
 		if _, ok := restored[info.ID]; ok {
 			return nil, fmt.Errorf("duplicate restored exec session %q", info.ID)
 		}
+		if info.State == ExecSessionExited {
+			if info.ExitStatus == nil {
+				return nil, fmt.Errorf("restored exited exec session %q has no status", info.ID)
+			}
+			restored[info.ID] = &execSession{info: cloneExecSessionInfo(info), retain: true}
+			continue
+		}
+		if info.State != ExecSessionRunning {
+			return nil, fmt.Errorf("restored exec session %q has invalid state %q", info.ID, info.State)
+		}
 		tg := k.RootPIDNamespace().ThreadGroupWithID(info.PID)
 		if tg == nil || tg.Leader().Origin != kernel.OriginExec {
 			return nil, fmt.Errorf("restored exec session %q has no exec thread group with PID %d", info.ID, info.PID)
 		}
-		session := &execSession{info: cloneExecSessionInfo(info), tg: tg}
+		// Restored sessions have no foreground waiter. Keep their identity and
+		// output available after they exit.
+		session := &execSession{info: cloneExecSessionInfo(info), tg: tg, retain: true}
 		restored[info.ID] = session
 	}
 	return restored, nil
@@ -1446,6 +1677,14 @@ func cloneExecSessionInfo(info ExecSessionInfo) ExecSessionInfo {
 	return cloned
 }
 
+func cloneExecSessionInfos(in []ExecSessionInfo) []ExecSessionInfo {
+	out := make([]ExecSessionInfo, len(in))
+	for i := range in {
+		out[i] = cloneExecSessionInfo(in[i])
+	}
+	return out
+}
+
 // reserveExecSession registers a creating session. The caller must hold b.opMu
 // so that fork and lifecycle transitions cannot observe a partial publication.
 func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecArgs) error {
@@ -1467,7 +1706,7 @@ func (f *SandboxFamily) reserveExecSession(b *sandboxBranch, args *control.ExecA
 		Terminal:    args.StdioIsPty,
 		State:       ExecSessionCreating,
 		CreatedAt:   time.Now().UTC(),
-	}}
+	}, retain: args.RetainExecSession}
 	return nil
 }
 
@@ -1499,9 +1738,17 @@ func (f *SandboxFamily) publishExecSession(b *sandboxBranch, id string, pid kern
 }
 
 func (f *SandboxFamily) watchExecSession(branchID, id string, session *execSession) {
+	// Completed sessions are deliberately retained so clients can inspect their
+	// status and output after a fork, checkpoint restore, or remote import. They
+	// have no live ThreadGroup to watch. In particular, restorePeer installs
+	// both running and completed session records before starting watchers.
+	if session == nil || session.info.State != ExecSessionRunning || session.tg == nil {
+		return
+	}
+	tg := session.tg
 	go func() {
-		session.tg.WaitExited()
-		status := uint32(session.tg.ExitStatus())
+		tg.WaitExited()
+		status := uint32(tg.ExitStatus())
 		f.mu.Lock()
 		if branch := f.branches[branchID]; branch != nil && branch.execSessions[id] == session {
 			session.info.State = ExecSessionExited
@@ -1533,6 +1780,7 @@ func (f *SandboxFamily) List() []BranchInfo {
 			InitPID:          initPID,
 			InitState:        initState,
 			SharesMemory:     b.k != nil && liveKernels > 1,
+			Quarantined:      b.quarantined,
 			ForkMetrics:      b.metrics,
 		})
 	}
@@ -1541,7 +1789,7 @@ func (f *SandboxFamily) List() []BranchInfo {
 }
 
 func branchInitStatus(b *sandboxBranch) (kernel.ThreadID, string) {
-	if b.k == nil {
+	if b.k == nil || b.k.TaskSet() == nil || b.k.RootPIDNamespace() == nil {
 		return 0, "not-started"
 	}
 	if b.k.RootPIDNamespace().ThreadGroupWithID(1) != nil {
@@ -1559,10 +1807,11 @@ func (f *SandboxFamily) Fork(args *ForkBranchArgs) (*BranchInfo, error) {
 		return nil, fmt.Errorf("missing live-fork arguments")
 	}
 	infos, err := f.ForkMany(&ForkBranchesArgs{
-		Source:     args.Source,
-		IDs:        []string{args.ID},
-		Paused:     args.Paused,
-		Quarantine: args.Quarantine,
+		Source:            args.Source,
+		IDs:               []string{args.ID},
+		Paused:            args.Paused,
+		Quarantine:        args.Quarantine,
+		FilesystemOrigins: args.FilesystemOrigins,
 	})
 	if err != nil {
 		return nil, err
@@ -1583,6 +1832,10 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	}
 	if len(args.IDs) == 0 {
 		return nil, fmt.Errorf("at least one branch ID is required")
+	}
+	originPlan, err := filesystemOriginPlan(args.FilesystemOrigins)
+	if err != nil {
+		return nil, err
 	}
 	if !f.liveForkEligible {
 		return nil, fmt.Errorf("container family explicitly waived live fork eligibility at creation")
@@ -1614,12 +1867,18 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			f.mu.Unlock()
 			return nil, fmt.Errorf("branch %q already exists", id)
 		}
+		filesystemBranch, err := ttcvolume.NewScopedBranchID(f.volumeBranchScope, id)
+		if err != nil {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("allocating filesystem identity for branch %q: %w", id, err)
+		}
 		childBranches[i] = &sandboxBranch{
 			id:               id,
 			parentID:         sourceID,
-			filesystemBranch: f.volumeBranchID(id),
+			filesystemBranch: filesystemBranch,
 			state:            BranchCreating,
 			createdAt:        time.Now().UTC(),
+			quarantined:      source.quarantined || args.Quarantine,
 			execSessions:     make(map[string]*execSession),
 		}
 	}
@@ -1695,11 +1954,12 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 	for i, childBranch := range childBranches {
 		kernelOpts[i] = kernel.LiveForkOptions{
 			Clocks:                         sentrytime.NewCalibratedClocks(),
-			ChildBranchID:                  f.volumeBranchID(childBranch.id),
+			ChildBranchID:                  childBranch.filesystemBranch,
 			AllowNetworkStack:              f.allowNetworkStack,
 			AllowSharedFilesystemResources: f.allowSharedFilesystemResources,
 			Quarantine:                     args.Quarantine,
 			Metrics:                        &metrics[i].Kernel,
+			FilesystemOrigins:              originPlan,
 		}
 	}
 	children, err := source.k.LiveForkMany(source.k.SupervisorContext(), kernelOpts, resumeSource)
@@ -1748,7 +2008,9 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			info := cloneExecSessionInfo(sourceSession.info)
 			info.State = ExecSessionRunning
 			info.ExitStatus = nil
-			clonedExecSessions[i][id] = &execSession{info: info, tg: childTG}
+			// A foreground waiter belongs only to the source command. Its cloned
+			// process has no waiter, so expose the child copy as a retained session.
+			clonedExecSessions[i][id] = &execSession{info: info, tg: childTG, retain: true}
 		}
 		f.mu.Unlock()
 	}
@@ -1826,6 +2088,7 @@ func (f *SandboxFamily) ForkMany(args *ForkBranchesArgs) ([]BranchInfo, error) {
 			FilesystemBranch: childBranch.filesystemBranch,
 			State:            childBranch.state,
 			CreatedAt:        childBranch.createdAt,
+			Quarantined:      childBranch.quarantined,
 			ForkMetrics:      metrics[i],
 		}
 	}
@@ -1852,6 +2115,80 @@ func (f *SandboxFamily) Pause(id string) error {
 	f.mu.Lock()
 	b.state = BranchPaused
 	f.mu.Unlock()
+	return nil
+}
+
+// SnapshotFilesystemBranch creates an O(1) repository branch for one
+// persistent filesystem without cloning the Kernel. The guest branch is
+// paused across metadata flushing, mmap invalidation, and branch publication,
+// so an attachment in another Sentry cannot observe a torn filesystem or
+// leave the source writing through a pre-fork object generation.
+func (f *SandboxFamily) SnapshotFilesystemBranch(id string, resource checkpoint.ResourceID, child string, sourceWorking, childWorking uint64) (retErr error) {
+	if !resource.Ok() || child == "" {
+		return errors.New("filesystem snapshot requires a resource and child branch")
+	}
+	if (sourceWorking == 0) != (childWorking == 0) || (sourceWorking != 0 && sourceWorking == childWorking) {
+		return errors.New("filesystem snapshot requires two distinct clustered working origins")
+	}
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+
+	f.mu.Lock()
+	state := b.state
+	if state != BranchRunning && state != BranchPaused {
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, not running or paused", id, state)
+	}
+	wasRunning := state == BranchRunning
+	f.mu.Unlock()
+	if wasRunning {
+		b.k.Pause()
+	}
+	defer func() {
+		if !wasRunning {
+			return
+		}
+		b.k.Unpause()
+		if err := control.PostResume(b.k, nil); err != nil {
+			b.k.Pause()
+			if retErr == nil {
+				retErr = fmt.Errorf("resuming branch %q after filesystem snapshot: %w", id, err)
+			}
+		}
+	}()
+
+	resources := make(vfs.LiveForkFilesystemResources)
+	transactions := &vfs.LiveForkTransactions{}
+	ctxValues := map[any]any{
+		pgalloc.CtxLiveForkSource:          true,
+		vfs.CtxLiveForkFilesystemResources: resources,
+		vfs.CtxLiveForkChildBranchID:       child,
+		vfs.CtxLiveForkTransactions:        transactions,
+		vfs.CtxLiveForkFilesystemResource:  resource,
+	}
+	if sourceWorking != 0 {
+		ctxValues[vfs.CtxLiveForkFilesystemOrigins] = vfs.LiveForkFilesystemOrigins{
+			resource: []uint64{sourceWorking, childWorking},
+		}
+	}
+	ctx := context.WithValues(b.k.SupervisorContext(), ctxValues)
+	if err := b.k.VFS().PrepareSave(ctx); err != nil {
+		_ = transactions.Abort()
+		return fmt.Errorf("preparing filesystem resource %q: %w", resource, err)
+	}
+	defer b.k.VFS().BeforeResume(ctx)
+	if _, ok := resources[resource]; !ok {
+		_ = transactions.Abort()
+		return fmt.Errorf("filesystem resource %q is not mounted in branch %q", resource, id)
+	}
+	if err := transactions.Commit(); err != nil {
+		_ = transactions.Abort()
+		return fmt.Errorf("committing filesystem snapshot: %w", err)
+	}
 	return nil
 }
 
@@ -1889,6 +2226,10 @@ func (f *SandboxFamily) Rename(id, newID string) error {
 	delete(f.branches, id)
 	b.id = newID
 	f.branches[newID] = b
+	if handoff := f.distributedHandoffs[id]; handoff != nil {
+		delete(f.distributedHandoffs, id)
+		f.distributedHandoffs[newID] = handoff
+	}
 	if f.loaderBranchID == id {
 		f.loaderBranchID = newID
 	}
@@ -1926,6 +2267,71 @@ func (f *SandboxFamily) Resume(id string) error {
 	return nil
 }
 
+// PublishFilesystemMetadata flushes process-local TTC filesystem metadata for
+// one live branch and returns its authoritative repository branch. The Kernel
+// lifetime lease allows the branch to remain running or paused while the short
+// graph publication completes. Callers must not derive the repository branch
+// from the visible ID: restored and migrated branches can intentionally retain
+// a different physical filesystem identity.
+func (f *SandboxFamily) PublishFilesystemMetadata(id string) (string, error) {
+	b, done, err := f.beginControl(id)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+	if err := b.k.VFS().PublishFilesystemMetadata(b.k.SupervisorContext()); err != nil {
+		return "", err
+	}
+	branch := b.filesystemBranch
+	if branch == "" {
+		branch = f.volumeBranchID(b.id)
+	}
+	return branch, nil
+}
+
+// SetQuarantine changes the external-connectivity quarantine bit. Live
+// branches briefly pause while their runtime-owned link is replaced;
+// dehydrated branches only update the bit used by rehydration.
+func (f *SandboxFamily) SetQuarantine(id string, enabled bool) error {
+	b, err := f.branch(id)
+	if err != nil {
+		return err
+	}
+	b.opMu.Lock()
+	defer b.opMu.Unlock()
+	f.mu.Lock()
+	if b.state == BranchDehydrated {
+		b.quarantined = enabled
+		f.mu.Unlock()
+		return nil
+	}
+	if b.state != BranchRunning && b.state != BranchPaused {
+		state := b.state
+		f.mu.Unlock()
+		return fmt.Errorf("branch %q is %s, cannot change quarantine", id, state)
+	}
+	wasPaused := b.state == BranchPaused
+	k := b.k
+	f.mu.Unlock()
+	if !wasPaused {
+		k.Pause()
+	}
+	changeErr := k.SetLiveForkQuarantine(enabled)
+	if !wasPaused {
+		k.Unpause()
+		if err := control.PostResume(k, nil); changeErr == nil {
+			changeErr = err
+		}
+	}
+	if changeErr != nil {
+		return changeErr
+	}
+	f.mu.Lock()
+	b.quarantined = enabled
+	f.mu.Unlock()
+	return nil
+}
+
 // Dehydrate hibernates one branch. Its task and kernel-object graph is
 // serialized as metadata, page ownership is replaced by compact reservations,
 // and the live Kernel is released. The persistent filesystem branch is left in
@@ -1958,13 +2364,52 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 	}
 	wasRunning := b.state == BranchRunning
 	b.state = BranchDehydrating
+	// The Loader bookkeeping role must remain attached to a process-backed
+	// Kernel while any hydrated peer survives. Otherwise releasing the current
+	// loader below makes Loader.WaitForExit tear down the Sentry and strands all
+	// sibling branches even though dehydration was requested for only one of
+	// them.
+	var loaderKernel *kernel.Kernel
+	var loaderWatchdog *watchdog.Watchdog
+	loaderChanged := id == f.loaderBranchID
+	if loaderChanged {
+		if replacement := f.liveLoaderReplacementLocked(id); replacement != nil {
+			f.loaderBranchID = replacement.id
+			loaderKernel = replacement.k
+			loaderWatchdog = replacement.watchdog
+		} else {
+			loaderChanged = false
+		}
+	}
 	f.stateChanged.Broadcast()
 	k := b.k
 	f.mu.Unlock()
+	if loaderChanged && f.onLoaderKernelChanged != nil {
+		f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
+	}
 
 	f.cancelConsoleWaits(b)
 	if wasRunning {
 		k.Pause()
+	}
+	restoreLiveBranch := func() {
+		if wasRunning {
+			k.Unpause()
+			_ = control.PostResume(k, nil)
+		}
+		f.mu.Lock()
+		b.state = kernelBranchState(k)
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+	}
+	// Dehydration's memory image and persistent filesystem must describe the
+	// same paused instant. Disk-backed TTC filesystems deliberately batch inode
+	// and write metadata inside the Sentry; sealing the manager-side repository
+	// without publishing that tail can resurrect the previous contents when a
+	// dehydrated branch is stopped and later started fresh.
+	if err := k.VFS().PublishFilesystemMetadata(k.SupervisorContext()); err != nil {
+		restoreLiveBranch()
+		return fmt.Errorf("publishing filesystem metadata before dehydration: %w", err)
 	}
 	execSessions := make([]ExecSessionInfo, 0, len(b.execSessions))
 	f.mu.Lock()
@@ -1981,32 +2426,31 @@ func (f *SandboxFamily) Dehydrate(id string, metadataFile *os.File) error {
 		BranchID: filesystemBranch, MetadataFile: metadataFile,
 	})
 	if err != nil {
-		if wasRunning {
-			k.Unpause()
-			_ = control.PostResume(k, nil)
-		}
-		f.mu.Lock()
-		b.state = kernelBranchState(k)
-		f.stateChanged.Broadcast()
-		f.mu.Unlock()
+		restoreLiveBranch()
 		return err
 	}
 	metadataOwned = true
 	// A branch imported into an existing family can reuse ranges whose lazy
-	// loader belongs to a peer Kernel. Materialize the exact captured graph
-	// while every such loader is still alive; releasing k first would cancel its
-	// loader and could leave the later sparse export unable to read a page.
-	if err := image.SparseSnapshot.EnsureResident(); err != nil {
+	// loader belongs to a peer Kernel, and releasing k would cancel its own:
+	// either could leave a later export unable to read a page. Pages still
+	// loading from the snapshot graph stay readable while the capture keeps
+	// their loaders, and an export to the graph, which sends only what the
+	// graph lacks, does not read them at all. If a page is still loading from
+	// anything else, such as a live source, materialize the exact captured
+	// graph now, while every loader is alive.
+	retained, err := image.RetainGraphPageLoads()
+	if err == nil && !retained {
+		err = image.SparseSnapshot.EnsureResident()
+	}
+	if err != nil {
 		_ = image.Close()
-		if wasRunning {
-			k.Unpause()
-			_ = control.PostResume(k, nil)
-		}
-		f.mu.Lock()
-		b.state = kernelBranchState(k)
-		f.stateChanged.Broadcast()
-		f.mu.Unlock()
+		restoreLiveBranch()
 		return fmt.Errorf("materializing branch memory before dehydration: %w", err)
+	}
+	if err := image.ParkSparseSnapshot(); err != nil {
+		_ = image.Close()
+		restoreLiveBranch()
+		return fmt.Errorf("parking dehydrated branch memory: %w", err)
 	}
 	if b.watchdog != nil {
 		b.watchdog.Stop()
@@ -2153,8 +2597,13 @@ func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error)
 	defer b.opMu.Unlock()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.dehydrationInfoLocked(b)
+}
+
+// Preconditions: b.opMu and f.mu are locked.
+func (f *SandboxFamily) dehydrationInfoLocked(b *sandboxBranch) (*BranchDehydrateInfo, error) {
 	if b.state != BranchDehydrated || b.dehydration == nil || b.dehydration.image == nil {
-		return nil, fmt.Errorf("branch %q is not available for dehydration export", id)
+		return nil, fmt.Errorf("branch %q is not available for dehydration export", b.id)
 	}
 	info := &BranchDehydrateInfo{
 		Memories:         make([]BranchDehydrationMemoryInfo, len(b.dehydration.image.MemoryImages)),
@@ -2172,8 +2621,7 @@ func (f *SandboxFamily) DehydrationInfo(id string) (*BranchDehydrateInfo, error)
 	return info, nil
 }
 
-// ExportDehydration writes all packed memory streams for an already
-// dehydrated branch.
+// ExportDehydration writes graph-native memory for an already dehydrated branch.
 func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*BranchDehydrationExportInfo, error) {
 	if args == nil || args.ID == "" {
 		return nil, errors.New("dehydration export requires a branch ID")
@@ -2191,22 +2639,29 @@ func (f *SandboxFamily) ExportDehydration(args *BranchDehydrationExportArgs) (*B
 	}
 	image := b.dehydration.image
 	f.mu.Unlock()
-	if !args.Sparse {
-		return nil, image.ExportPackedSnapshots(args.FilePayload.Files, args.AllowCopy)
+	files := args.FilePayload.Files
+	if len(files) != 1 && len(files) != 2 {
+		return nil, fmt.Errorf("graph dehydration export has %d descriptors, want a stream and optionally a metadata file", len(files))
 	}
-	if len(args.FilePayload.Files) != 1 {
-		return nil, fmt.Errorf("sparse dehydration export has %d repository descriptors, want 1", len(args.FilePayload.Files))
+	if len(files) == 2 {
+		dup, err := unix.Dup(int(files[1].Fd()))
+		if err != nil {
+			return nil, fmt.Errorf("duplicating dehydration metadata file: %w", err)
+		}
+		if err := image.AttachMetadataFile(os.NewFile(uintptr(dup), "dehydration-metadata")); err != nil {
+			return nil, err
+		}
 	}
-	repository, err := ttcchunk.OpenMemoryRepositoryFD(args.FilePayload.Files[0])
-	if err != nil {
-		return nil, fmt.Errorf("opening sparse memory repository: %w", err)
+	if err := image.PublishGraphStream(files[0], args.FilteredGraphStream); err != nil {
+		return nil, err
 	}
-	defer repository.Close()
-	manifest, err := image.PublishSparse(repository)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	info, err := f.dehydrationInfoLocked(b)
 	if err != nil {
 		return nil, err
 	}
-	return &BranchDehydrationExportInfo{Manifest: manifest}, nil
+	return &BranchDehydrationExportInfo{Capture: *info}, nil
 }
 
 // Rehydrate reconstructs a dehydrated branch. The branch returns to its
@@ -2237,6 +2692,7 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 	}
 	child, err := kernel.LoadDehydration(context.Background(), d.platform, d.image, kernel.DehydrationLoadOptions{
 		Clocks: sentrytime.NewCalibratedClocks(), BranchID: filesystemBranch,
+		Quarantined: b.quarantined, OverrideQuarantine: true,
 		ConfigureNetwork: f.configureNetwork,
 	})
 	if err != nil {
@@ -2254,15 +2710,18 @@ func (f *SandboxFamily) Rehydrate(id string) error {
 		f.mu.Unlock()
 		return fmt.Errorf("starting rehydrated branch %q: %w", id, err)
 	}
-	newSessions := make(map[string]*execSession)
-	for _, info := range d.execSessions {
-		if info.State != ExecSessionRunning {
-			continue
-		}
-		tg := child.RootPIDNamespace().ThreadGroupWithID(info.PID)
-		if tg != nil {
-			newSessions[info.ID] = &execSession{info: cloneExecSessionInfo(info), tg: tg}
-		}
+	newSessions, err := restoredExecSessions(child, d.execSessions)
+	if err != nil {
+		child.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+		child.Unpause()
+		child.WaitExited()
+		child.Release()
+		f.mu.Lock()
+		b.dehydration = nil
+		b.state = BranchFailed
+		f.stateChanged.Broadcast()
+		f.mu.Unlock()
+		return fmt.Errorf("restoring dehydrated exec sessions: %w", err)
 	}
 	var dog *watchdog.Watchdog
 	if f.watchdogOpts != nil {
@@ -2326,6 +2785,19 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 		// naturally, not only through a TTC stop command, so transfer here as a
 		// final invariant rather than relying solely on PrepareStop.
 		replacement := f.liveLoaderReplacementLocked(b.id)
+		// So must it while any branch is dehydrated: its capture may exist
+		// nowhere but this Sentry's memory, because ttcd makes captures durable
+		// only when the last live branch on the node goes. ttcd does that when
+		// it sees this exit and then deletes the runtime. A branch it
+		// rehydrates instead becomes the loader.
+		for replacement == nil && f.loaderBranchID == b.id && f.holdsDehydrationLocked() {
+			f.stateChanged.Wait()
+			replacement = f.liveLoaderReplacementLocked(b.id)
+		}
+		if f.loaderBranchID != b.id {
+			f.mu.Unlock()
+			continue
+		}
 		if replacement == nil {
 			status := k.GlobalInit().ExitStatus()
 			f.mu.Unlock()
@@ -2340,6 +2812,20 @@ func (f *SandboxFamily) WaitDefaultExit() linux.WaitStatus {
 			f.onLoaderKernelChanged(loaderKernel, loaderWatchdog)
 		}
 	}
+}
+
+// holdsDehydrationLocked reports whether any branch is dehydrated, or on its
+// way into or out of that state.
+//
+// Preconditions: f.mu is locked.
+func (f *SandboxFamily) holdsDehydrationLocked() bool {
+	for _, b := range f.branches {
+		switch b.state {
+		case BranchDehydrating, BranchDehydrated, BranchRehydrating:
+			return true
+		}
+	}
+	return false
 }
 
 // liveLoaderReplacementLocked returns an established hydrated branch whose
@@ -2392,10 +2878,31 @@ func (f *SandboxFamily) PrepareStop(id string) error {
 	return nil
 }
 
+func (f *SandboxFamily) reclaimReleasedFilesystem(branch string) error {
+	if f.reclaimFilesystemBranch != nil {
+		return f.reclaimFilesystemBranch(branch)
+	}
+	if f.forgetFilesystemBranch != nil {
+		f.forgetFilesystemBranch(branch)
+	}
+	return nil
+}
+
 // Destroy destroys a branch and removes it from the family. If id currently
 // occupies the loader bookkeeping role, that role moves to an established
 // peer first. This role transfer has no guest-visible or lineage semantics.
 func (f *SandboxFamily) Destroy(id string) error {
+	return f.destroy(id, false)
+}
+
+// DestroyAndReclaim destroys a branch and releases its persistent filesystem
+// roots after all Kernel and open-file references have been released. It must
+// only be used for logical branch deletion, never stop or migration.
+func (f *SandboxFamily) DestroyAndReclaim(id string) error {
+	return f.destroy(id, true)
+}
+
+func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
 	b, err := f.branch(id)
@@ -2485,25 +2992,32 @@ func (f *SandboxFamily) Destroy(id string) error {
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
-		if f.forgetFilesystemBranch != nil {
+		err := image.image.Close()
+		if reclaimFilesystem {
+			err = errors.Join(err, f.reclaimReleasedFilesystem(b.filesystemBranch))
+		} else if f.forgetFilesystemBranch != nil {
 			f.forgetFilesystemBranch(b.filesystemBranch)
 		}
-		err := image.image.Close()
 		f.mu.Lock()
 		delete(f.branches, id)
+		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
 		return err
 	}
 	if b.k == nil {
-		if f.forgetFilesystemBranch != nil {
+		var releaseErr error
+		if reclaimFilesystem {
+			releaseErr = f.reclaimReleasedFilesystem(b.filesystemBranch)
+		} else if f.forgetFilesystemBranch != nil {
 			f.forgetFilesystemBranch(b.filesystemBranch)
 		}
 		f.mu.Lock()
 		delete(f.branches, id)
+		delete(f.distributedHandoffs, id)
 		f.stateChanged.Broadcast()
 		f.mu.Unlock()
-		return nil
+		return releaseErr
 	}
 
 	if dog != nil {
@@ -2521,14 +3035,19 @@ func (f *SandboxFamily) Destroy(id string) error {
 	b.k.Release()
 	familyMF.ReclaimUnusedSparseChunks()
 	familyMF.Destroy()
-	if f.forgetFilesystemBranch != nil {
+	var releaseErr error
+	if reclaimFilesystem {
+		releaseErr = f.reclaimReleasedFilesystem(b.filesystemBranch)
+	} else if f.forgetFilesystemBranch != nil {
 		f.forgetFilesystemBranch(b.filesystemBranch)
 	}
 
 	f.mu.Lock()
 	delete(f.branches, id)
+	delete(f.distributedHandoffs, id)
+	f.stateChanged.Broadcast()
 	f.mu.Unlock()
-	return nil
+	return releaseErr
 }
 
 // Processes returns processes from one branch's kernel task graph.
@@ -2694,8 +3213,49 @@ func residentMemoryVersionRuns(branchIDs []string, branchPages []map[mm.Resident
 	return result
 }
 
-// ResidentMemory accounts mapped resident guest pages across live branches.
-// It deliberately excludes Sentry Go heap and unmapped page-cache objects.
+func residentMemoryVersionChunks(branchIDs []string, branchPages []map[mm.ResidentPageVersion]struct{}) []ResidentMemoryVersionChunk {
+	if len(branchIDs) != len(branchPages) {
+		panic("resident memory branch identity/page count mismatch")
+	}
+	type chunkKey struct {
+		allocator pgalloc.LogicalAllocatorID
+		sequence  uint64
+	}
+	var result []ResidentMemoryVersionChunk
+	for index, pages := range branchPages {
+		chunks := make(map[chunkKey][32]byte)
+		for page := range pages {
+			key := chunkKey{allocator: page.Version.Allocator, sequence: page.Version.Sequence / 256}
+			bitmap := chunks[key]
+			slot := page.Version.Sequence % 256
+			bitmap[slot/8] |= byte(1 << (slot % 8))
+			chunks[key] = bitmap
+		}
+		keys := make([]chunkKey, 0, len(chunks))
+		for key := range chunks {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].allocator != keys[j].allocator {
+				return string(keys[i].allocator[:]) < string(keys[j].allocator[:])
+			}
+			return keys[i].sequence < keys[j].sequence
+		})
+		for _, key := range keys {
+			bitmap := chunks[key]
+			result = append(result, ResidentMemoryVersionChunk{
+				Branch: branchIDs[index], Allocator: hex.EncodeToString(key.allocator[:]),
+				Chunk: key.sequence, Bitmap: hex.EncodeToString(bitmap[:]),
+			})
+		}
+	}
+	return result
+}
+
+// ResidentMemory accounts resident guest pages across live branches. This
+// includes task mappings and tmpfs/shmem file contents, including unmapped
+// contents retained by /dev/shm files. It deliberately excludes the Sentry Go
+// heap and host-backed filesystem page-cache objects.
 func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	f.dehydrationMu.Lock()
 	defer f.dehydrationMu.Unlock()
@@ -2735,7 +3295,11 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}()
 
 	for index := range held {
-		held[index].pages = held[index].branch.k.ResidentPageVersions()
+		pages, err := held[index].branch.k.ResidentPageVersions()
+		if err != nil {
+			return fmt.Errorf("accounting resident memory for branch %q: %w", held[index].branch.id, err)
+		}
+		held[index].pages = pages
 	}
 	heldIDs := make([]string, 0, len(held))
 	heldPages := make([]map[mm.ResidentPageVersion]struct{}, 0, len(held))
@@ -2745,7 +3309,11 @@ func (f *SandboxFamily) ResidentMemory(out *FamilyResidentMemory) error {
 	}
 	var counts map[mm.ResidentPageVersion]uint32
 	out.SharingEdges, out.SharingEdgesTruncated, out.SharingEdgesOmittedBytes, counts = residentMemorySharingEdges(heldIDs, heldPages, maxResidentMemorySharingEdges)
-	out.VersionRuns = residentMemoryVersionRuns(heldIDs, heldPages)
+	// Bitmaps have a fixed cost per 256-version window even when concurrent
+	// sibling writes interleave every allocated sequence. This avoids
+	// page-count-sized planner RPCs under the exact workload that creates
+	// placement pressure.
+	out.VersionChunks = residentMemoryVersionChunks(heldIDs, heldPages)
 	out.Branches = make([]BranchResidentMemory, 0, len(ids))
 	const pageBytes = uint64(hostarch.PageSize)
 	for _, id := range ids {
@@ -2938,6 +3506,20 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 	if session == nil {
 		return 0, fmt.Errorf("exec session %q does not exist in branch %q", args.ExecID, args.BranchID)
 	}
+	f.mu.Lock()
+	if session.info.State == ExecSessionExited && session.info.ExitStatus != nil {
+		status := *session.info.ExitStatus
+		// The background watcher can publish exit before a foreground runsc exec
+		// reaches this waiter. Non-retained management sessions must be consumed in
+		// that fast path too; otherwise every paused ttc cp leaves a completed
+		// ttc-cp-* session in the branch forever.
+		if !session.retain && b.execSessions[args.ExecID] == session {
+			delete(b.execSessions, args.ExecID)
+		}
+		f.mu.Unlock()
+		return status, nil
+	}
+	f.mu.Unlock()
 	if session.tg == nil {
 		return 0, fmt.Errorf("exec session %q is not published", args.ExecID)
 	}
@@ -2962,7 +3544,7 @@ func (f *SandboxFamily) WaitExecSession(args *ExecSessionArgs, cancel <-chan str
 	f.mu.Lock()
 	session.info.State = ExecSessionExited
 	session.info.ExitStatus = &status
-	if session.info.ConsoleID == "" && b.execSessions[args.ExecID] == session {
+	if !session.retain && b.execSessions[args.ExecID] == session {
 		delete(b.execSessions, args.ExecID)
 	}
 	f.mu.Unlock()
@@ -2976,137 +3558,194 @@ func (f *SandboxFamily) SignalExecSession(args *ExecSessionArgs) error {
 		return err
 	}
 	defer done()
-	if session.tg == nil {
-		return fmt.Errorf("exec session %q is not published", args.ExecID)
-	}
 	f.mu.Lock()
 	exited := session.info.State == ExecSessionExited
 	f.mu.Unlock()
 	if exited {
 		return fmt.Errorf("exec session %q has exited", args.ExecID)
 	}
+	if session.tg == nil {
+		return fmt.Errorf("exec session %q is not published", args.ExecID)
+	}
 	return b.k.SendExternalSignalThreadGroup(session.tg, &linux.SignalInfo{Signo: args.Signo})
 }
 
-// FollowConsole coordinates a client-side console drainer with process lifetime.
-// ready acknowledges that the lifetime lease exists, before OCI start may run
-// guest code. attached acknowledges that the process and its console exist, so
-// the client may begin ConsoleRead calls. The lease remains held until output is
-// drained, preventing Sentry shutdown from racing the client's final reads.
-func (f *SandboxFamily) FollowConsole(id, cid, execID, consoleID string, finalWriter io.Writer, ready func() error, attached func() error, exited func(uint32) error, released func() error) (uint32, error) {
+// PushConsole pushes a process's console to output, in the background: the
+// output of its streams as timestamped console frames, as it comes, and once
+// both have ended, a ConsolePushExit record, or a ConsolePushError record if
+// the push fails; then it closes output. The push holds the Kernel's lifetime
+// from before PushConsole returns, which is before OCI start may run the init
+// of a new container, until it ends. Unlike a console follower's reads, it
+// holds no thread while the console is quiet.
+func (f *SandboxFamily) PushConsole(id, cid, execID, consoleID string, output io.WriteCloser) error {
+	// The push waits on Sentry-side console buffers rather than application
+	// memory, so a quiet console must not hold off platform memory compaction.
 	b, done, err := f.beginLifetimeControl(id, false)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	defer done()
-	if ready != nil {
-		if err := ready(); err != nil {
-			return 0, fmt.Errorf("acknowledging console follower registration: %w", err)
+	go func() {
+		defer done()
+		defer output.Close()
+		status, err := f.pushConsole(b, id, cid, execID, consoleID, output)
+		if err != nil {
+			_ = writeConsoleFrame(output, ConsolePushError, []byte(err.Error()))
+			return
 		}
-	}
+		var encoded [4]byte
+		binary.BigEndian.PutUint32(encoded[:], status)
+		_ = writeConsoleFrame(output, ConsolePushExit, encoded[:])
+	}()
+	return nil
+}
+
+func (f *SandboxFamily) pushConsole(b *sandboxBranch, id, cid, execID, consoleID string, output io.Writer) (uint32, error) {
 	var tg *kernel.ThreadGroup
 	if execID == "" {
 		if id == "" || id == f.LoaderBranchID() {
 			<-f.defaultStarted
 		}
-		tg, err = branchThreadGroup(b.k, cid, 0)
-		if err != nil {
+		var err error
+		if tg, err = branchThreadGroup(b.k, cid, 0); err != nil {
 			return 0, err
 		}
 	} else {
 		f.mu.Lock()
 		session := b.execSessions[execID]
-		if session != nil && session.info.ContainerID != cid {
-			session = nil
-		}
-		if session != nil && session.info.ConsoleID != consoleID {
-			f.mu.Unlock()
-			return 0, fmt.Errorf("exec session %q uses console %q, not %q", execID, session.info.ConsoleID, consoleID)
-		}
-		if session != nil {
+		if session != nil && session.info.ContainerID == cid && session.info.ConsoleID == consoleID {
 			tg = session.tg
 		}
 		f.mu.Unlock()
 		if tg == nil {
-			return 0, fmt.Errorf("exec session %q does not exist in branch %q", execID, id)
+			return 0, fmt.Errorf("exec session %q with console %q does not exist in branch %q", execID, consoleID, id)
 		}
 	}
-	if attached != nil {
-		if err := attached(); err != nil {
-			return 0, fmt.Errorf("acknowledging console attachment: %w", err)
+	exited := make(chan struct{})
+	go func() {
+		tg.WaitExited()
+		close(exited)
+	}()
+	streams := [...]struct {
+		kernel kernel.InternalConsoleStream
+		frame  byte
+		eof    bool
+	}{
+		{kernel: kernel.InternalConsoleStdout, frame: ttcconsole.StreamStdout},
+		{kernel: kernel.InternalConsoleStderr, frame: ttcconsole.StreamStderr},
+	}
+	// drain pushes what the console holds. Once the process has ended,
+	// nothing may be left to wait for.
+	drain := func(final bool) (bool, error) {
+		progress := false
+		for i := range streams {
+			stream := &streams[i]
+			for !stream.eof {
+				b.opMu.Lock()
+				data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), consoleID, stream.kernel, 65536)
+				b.opMu.Unlock()
+				if err != nil {
+					return false, fmt.Errorf("reading internal console stream %d: %w", stream.kernel, err)
+				}
+				if len(data) != 0 {
+					if err := ttcconsole.WriteTimestampedFrame(output, stream.frame, time.Now().UTC(), data); err != nil {
+						return false, fmt.Errorf("pushing internal console stream %d: %w", stream.kernel, err)
+					}
+					progress = true
+				}
+				if eof {
+					if err := ttcconsole.WriteTimestampedFrame(output, stream.frame, time.Now().UTC(), nil); err != nil {
+						return false, fmt.Errorf("pushing internal console EOF %d: %w", stream.kernel, err)
+					}
+					stream.eof = true
+					progress = true
+				}
+				if wouldBlock {
+					if final {
+						return false, fmt.Errorf("internal console stream %d would block after process exit", stream.kernel)
+					}
+					break
+				}
+				if len(data) == 0 && !eof {
+					break
+				}
+			}
+		}
+		return progress, nil
+	}
+	for !streams[0].eof || !streams[1].eof {
+		progress, err := drain(false)
+		if err != nil {
+			return 0, err
+		}
+		if progress {
+			continue
+		}
+		if closed(exited) {
+			break
+		}
+		if err := f.waitConsolePush(b, consoleID, kernel.InternalConsoleReadiness{Stdout: !streams[0].eof, Stderr: !streams[1].eof}, exited); err != nil {
+			return 0, err
 		}
 	}
-	tg.WaitExited()
+	<-exited
 	status := uint32(tg.ExitStatus())
+	f.mu.Lock()
 	if execID == "" {
-		f.mu.Lock()
 		if current := f.branches[b.id]; current == b && (b.state == BranchRunning || b.state == BranchPaused) {
 			b.state = BranchExited
 			f.stateChanged.Broadcast()
 		}
-		f.mu.Unlock()
-	} else {
-		f.mu.Lock()
-		if session := b.execSessions[execID]; session != nil && session.tg == tg {
-			session.info.State = ExecSessionExited
-			session.info.ExitStatus = &status
-		}
-		f.mu.Unlock()
+	} else if session := b.execSessions[execID]; session != nil && session.tg == tg {
+		session.info.State = ExecSessionExited
+		session.info.ExitStatus = &status
 	}
-	if exited != nil {
-		if err := exited(status); err != nil {
-			return 0, fmt.Errorf("reporting console process exit: %w", err)
-		}
-	}
+	f.mu.Unlock()
 	if execID == "" {
 		b.k.WaitExited()
 	}
-	if released != nil {
-		if err := released(); err != nil {
-			return 0, fmt.Errorf("waiting for client console-read handoff: %w", err)
-		}
-	}
-	streams := []struct {
-		stream kernel.InternalConsoleStream
-		eof    bool
-	}{
-		{stream: kernel.InternalConsoleStdout},
-		{stream: kernel.InternalConsoleStderr},
-	}
-	for {
-		allEOF := true
-		for i := range streams {
-			stream := &streams[i]
-			if stream.eof {
-				continue
-			}
-			allEOF = false
-			b.opMu.Lock()
-			data, eof, wouldBlock, err := b.k.ReadInternalConsole(b.k.SupervisorContext(), consoleID, stream.stream, 65536)
-			b.opMu.Unlock()
-			if err != nil {
-				return 0, fmt.Errorf("draining final internal console stream %d: %w", stream.stream, err)
-			}
-			if len(data) != 0 {
-				if err := writeConsoleFrame(finalWriter, byte(stream.stream), data); err != nil {
-					return 0, fmt.Errorf("writing final internal console stream %d: %w", stream.stream, err)
-				}
-			}
-			if eof {
-				if err := writeConsoleFrame(finalWriter, byte(stream.stream), nil); err != nil {
-					return 0, fmt.Errorf("writing final internal console EOF %d: %w", stream.stream, err)
-				}
-				stream.eof = true
-			}
-			if wouldBlock {
-				return 0, fmt.Errorf("internal console stream %d would block after process exit and client handoff", stream.stream)
-			}
-		}
-		if allEOF {
-			break
+	for !streams[0].eof || !streams[1].eof {
+		if _, err := drain(true); err != nil {
+			return 0, err
 		}
 	}
 	return status, nil
+}
+
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// waitConsolePush waits until the console of a push is ready, its process
+// has exited, or a lifecycle operation needs the branch, which cancels the
+// wait for the push to take again once it is done.
+func (f *SandboxFamily) waitConsolePush(b *sandboxBranch, consoleID string, want kernel.InternalConsoleReadiness, exited <-chan struct{}) error {
+	lease, finish, err := f.beginBranchConsoleWait(b)
+	if err != nil {
+		// The branch is being dehydrated or removed, which kills its
+		// Kernel and so ends the process.
+		<-exited
+		return nil
+	}
+	defer finish()
+	cancel := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-lease.cancel:
+		case <-exited:
+		case <-stop:
+			return
+		}
+		close(cancel)
+	}()
+	_, _, err = b.k.WaitInternalConsole(b.k.SupervisorContext(), consoleID, want, MaxConsoleWait, cancel)
+	return err
 }
 
 func writeConsoleFrame(writer io.Writer, stream byte, data []byte) error {
@@ -3212,8 +3851,8 @@ func (f *SandboxFamily) ConsoleWait(args *ConsoleWaitArgs, out *ConsoleWaitResul
 	if args == nil || out == nil {
 		return fmt.Errorf("missing internal console wait arguments or result")
 	}
-	if args.Timeout < 0 || args.Timeout > 30*time.Second {
-		return fmt.Errorf("internal console wait timeout %s is outside 0..30s", args.Timeout)
+	if args.Timeout < 0 || args.Timeout > MaxConsoleWait {
+		return fmt.Errorf("internal console wait timeout %s is outside 0..%s", args.Timeout, MaxConsoleWait)
 	}
 	b, lease, done, err := f.beginConsoleWait(args.BranchID)
 	if err != nil {
@@ -3334,18 +3973,30 @@ func (f *SandboxFamily) beginConsoleWait(id string) (*sandboxBranch, *consoleWai
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	lease, finish, err := f.beginBranchConsoleWait(b)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return b, lease, finish, nil
+}
+
+// beginBranchConsoleWait is beginConsoleWait for a branch already resolved.
+// A caller that waits on b's Kernel must take the lease on b itself: a rename
+// can give b's former ID to another branch, whose lifecycle operations would
+// then cancel the wait instead of b's.
+func (f *SandboxFamily) beginBranchConsoleWait(b *sandboxBranch) (*consoleWaitLease, func(), error) {
 	b.opMu.Lock()
 	f.mu.Lock()
 	if f.controlsQuiesced {
 		f.mu.Unlock()
 		b.opMu.Unlock()
-		return nil, nil, nil, fmt.Errorf("sandbox control operations are quiescing")
+		return nil, nil, fmt.Errorf("sandbox control operations are quiescing")
 	}
 	if b.state != BranchRunning && b.state != BranchPaused {
 		state := b.state
 		f.mu.Unlock()
 		b.opMu.Unlock()
-		return nil, nil, nil, fmt.Errorf("branch %q is %s", id, state)
+		return nil, nil, fmt.Errorf("branch %q is %s", b.id, state)
 	}
 	lease := &consoleWaitLease{cancel: make(chan struct{}), done: make(chan struct{})}
 	if b.consoleWaits == nil {
@@ -3364,7 +4015,7 @@ func (f *SandboxFamily) beginConsoleWait(id string) (*sandboxBranch, *consoleWai
 		b.compactionOps.Done()
 		b.controlOps.Done()
 	}
-	return b, lease, finish, nil
+	return lease, finish, nil
 }
 
 // cancelConsoleWaits cancels and joins active endpoint waiter registrations.
@@ -3581,8 +4232,8 @@ func (f *SandboxFamily) DestroyNonLoaderBranches() {
 }
 
 // CloseLoaderDehydration releases the final process-local capture during Sentry
-// teardown. ttcd has already persisted immutable packed snapshots before it
-// requests deletion of a fully dehydrated family.
+// teardown. ttcd has already pinned the immutable snapshot-graph roots before
+// it requests deletion of a fully dehydrated family.
 func (f *SandboxFamily) CloseLoaderDehydration() {
 	f.mu.Lock()
 	b := f.branches[f.loaderBranchID]

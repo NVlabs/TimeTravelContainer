@@ -62,6 +62,11 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.F_GETFD),
 		},
+		seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.F_SETFD),
+			seccomp.EqualTo(unix.FD_CLOEXEC),
+		},
 	},
 	unix.SYS_FSTAT:     seccomp.MatchAll{},
 	unix.SYS_FSYNC:     seccomp.MatchAll{},
@@ -498,12 +503,29 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.MaskedEqual(unix.O_NOFOLLOW, unix.O_NOFOLLOW),
 			seccomp.AnyValue{},
 		},
-		unix.SYS_UNLINKAT: seccomp.PerArg{
-			seccomp.NonNegativeFD{},
-			seccomp.AnyValue{},
-			seccomp.EqualTo(0),
+		unix.SYS_UNLINKAT: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.EqualTo(0),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.AnyValue{},
+				seccomp.EqualTo(unix.AT_REMOVEDIR),
+			},
 		},
 		unix.SYS_MKDIRAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+		},
+		// Snapshot-graph checkpoint rotation enumerates the donated graph
+		// directory to retire obsolete checkpoint and journal generations. The
+		// directory itself is opened by runsc and all names remain relative to
+		// that descriptor; without getdents64 the first bounded WAL compaction
+		// terminates the Sentry with SIGSYS.
+		unix.SYS_GETDENTS64: seccomp.PerArg{
 			seccomp.NonNegativeFD{},
 			seccomp.AnyValue{},
 			seccomp.AnyValue{},
@@ -538,6 +560,10 @@ func ttcVolumeFilters() seccomp.SyscallRules {
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(unix.LOCK_EX),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(unix.LOCK_EX | unix.LOCK_NB),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},

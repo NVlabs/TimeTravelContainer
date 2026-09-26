@@ -710,14 +710,20 @@ func (it *IPTables) resumeAfterLiveForkSave() {
 	}
 	it.liveForkSaveFrozen = false
 	it.connections.mu.Unlock()
-	if it.modified {
+	it.mu.RLock()
+	modified := it.modified
+	it.mu.RUnlock()
+	if modified {
 		it.startReaper(reaperDelay)
 	}
 }
 
 // afterLoad is invoked by stateify.
 func (it *IPTables) afterLoad(context.Context) {
-	if it.modified {
+	it.mu.RLock()
+	modified := it.modified
+	it.mu.RUnlock()
+	if modified {
 		it.startReaper(reaperDelay)
 	}
 }

@@ -1,0 +1,108 @@
+{
+  "schema": "ttc-snapshot-graph-invariants-v1",
+  "root_formats": {
+    "standalone": 2,
+    "cluster_shared": 5,
+    "cluster_local": 5,
+    "storage_schema": "snapshot-graph-v2"
+  },
+  "invariants": [
+    {
+      "id": "identity.snapshot-monotonic",
+      "requirement": "Snapshot IDs are unsigned, monotonic, and never reused.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/store.go", "runsc/ttc/cluster/authority_state.go"]
+    },
+    {
+      "id": "identity.object-typed",
+      "requirement": "Immutable object identity is snapshot, ordinal, and an explicit type.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/types.go"]
+    },
+    {
+      "id": "identity.distributed-filesystem-global",
+      "requirement": "Distributed filesystem objects use Raft-allocated snapshot origins and route directly by origin.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcvolume/repository.go", "runsc/ttc/bundle/store.go", "runsc/ttc/cmd/distributed.go", "runsc/ttc/cmd/elastic_cluster.go", "runsc/ttc/cmd/storage.go"]
+    },
+    {
+      "id": "immutability.sealed",
+      "requirement": "Sealed objects and graph metadata never change in place.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcsnapshot/store_test.go"]
+    },
+    {
+      "id": "authority.single-ledger",
+      "requirement": "Every immutable object has exactly one authoritative reference ledger.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/ledger.go", "runsc/ttc/cmd/shared_references.go"]
+    },
+    {
+      "id": "authority.node-to-shared-only",
+      "requirement": "Volatile origin authority transitions only from its provider node to shared storage.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cmd/graph_references.go", "runsc/ttc/cmd/storage.go"]
+    },
+    {
+      "id": "references.edges-count-once",
+      "requirement": "Each immutable parent edge contributes exactly one child reference independent of root count.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcsnapshot/store_test.go", "pkg/ttcsnapshot/ledger_test.go"]
+    },
+    {
+      "id": "references.zero-sufficient",
+      "requirement": "A zero authoritative reference count is sufficient to reclaim an immutable object.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcsnapshot/ledger.go", "runsc/ttc/cmd/shared_references.go"]
+    },
+    {
+      "id": "references.open-files-explicit",
+      "requirement": "Open-unlinked, executable, mapped, and FUSE-held objects remain explicit roots until last use.",
+      "status": "implemented",
+      "evidence": ["pkg/ttcvolume/repository.go", "pkg/ttcvolume/repository_test.go", "runsc/ttc/test/e2e_fuse_lifecycle.sh"]
+    },
+    {
+      "id": "publication.lifecycle-independent",
+      "requirement": "A late snapshot publication cannot mutate a newer branch lifecycle or placement incarnation.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cluster/authority_state_test.go", "runsc/ttc/test/e2e_publication_restart.sh"]
+    },
+    {
+      "id": "publication.restartable",
+      "requirement": "Publication is restartable, idempotent, immutable-identity-fenced, and cancelable by reactivation or removal.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/storage/queue.go", "runsc/ttc/cmd/storage.go", "runsc/ttc/cmd/shared_references.go"]
+    },
+    {
+      "id": "execution.single-owner",
+      "requirement": "A branch executes only under its committed placement generation and a valid node lease.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cluster/authority_state.go", "runsc/ttc/cmd/elastic_cluster.go", "runsc/ttc/test/e2e_distributed_source_loss.sh"]
+    },
+    {
+      "id": "integrity.structural-no-runtime-hash",
+      "requirement": "Bulk data uses structural validation and normal reads do not require TTC checksums.",
+      "status": "implemented-graph",
+      "evidence": ["pkg/ttcsnapshot/pack.go", "pkg/ttcsnapshot/data.go"]
+    },
+    {
+      "id": "asymptotic.fork-constant",
+      "requirement": "Fork and seal are O(1) in resident pages and recursive file count.",
+      "status": "implemented-and-scale-qualified",
+      "evidence": ["pkg/ttcsnapshot/store.go", "pkg/ttcvolume/repository.go", "runsc/ttc/test/e2e_fanout_lifecycle.sh", "runsc/ttc/test/e2e_distributed_fanout.sh"]
+    },
+    {
+      "id": "standalone.no-cluster-tier",
+      "requirement": "Standalone TTC uses no Raft, shared packs, cache tier, or lazy image materialization.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cmd/daemon.go", "runsc/ttc/bundle/store.go"]
+    },
+    {
+      "id": "format.no-legacy-fallback",
+      "requirement": "A new-format root cannot execute any legacy storage fallback.",
+      "status": "implemented",
+      "evidence": ["runsc/ttc/cmd/daemon.go", "runsc/ttc/cmd/daemon_test.go"],
+      "qualification_mode": "TTC_SNAPSHOT_GRAPH_STRICT=1"
+    }
+  ]
+}

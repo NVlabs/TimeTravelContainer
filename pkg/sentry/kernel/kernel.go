@@ -36,6 +36,7 @@
 package kernel
 
 import (
+	gocontext "context"
 	"errors"
 	"fmt"
 	"io"
@@ -79,7 +80,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -185,13 +185,13 @@ type Kernel struct {
 	// destroyed: its links are rebuilt with nothing on the other end, so that
 	// neither its own programs nor anything outside the sandbox can tell it
 	// was ever there.
-	liveForkQuarantine bool `state:"nosave"`
+	liveForkQuarantine bool
 	// remoteLoadRanges retain the packed-stream layout while remotePageLoad may
-	// be handed from a live source to shared sparse chunks.
+	// be handed from a live source to graph-native chunks.
 	remoteLoadRanges []pgalloc.RemoteLoadRange `state:"nosave"`
-	// remoteHandoffManifest makes daemon retries idempotent after a successful
-	// live-to-sparse reader switch.
-	remoteHandoffManifest ttcchunk.ManifestID `state:"nosave"`
+	// remoteHandoffSnapshot is the graph-native equivalent. Snapshot IDs are
+	// globally unique and make repeated control requests idempotent.
+	remoteHandoffSnapshot uint64 `state:"nosave"`
 	// auxiliaryRemotePageLoads supply private MemoryFiles (for example tmpfs)
 	// restored from a process-free dehydration image. Application memory uses
 	// remotePageLoad so existing distributed-fork controls retain their meaning.
@@ -509,6 +509,13 @@ type Kernel struct {
 	// DomainNamePoller is notified when the system domainname changes in *any*
 	// UTS namespace.
 	DomainNamePoller vfs.DynamicBytesPoller
+}
+
+// afterLoad reapplies execution-platform CPU feature restrictions to saved
+// kernels. This matters for TTC live fork and dehydration images created by an
+// older runtime that advertised a feature the current platform must hide.
+func (k *Kernel) afterLoad(gocontext.Context) {
+	k.featureSet = platform.SanitizeFeatureSet(k.Platform, k.featureSet)
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -1975,11 +1982,14 @@ func (k *Kernel) SendExternalSignal(info *linux.SignalInfo, context string) {
 
 // SendExternalSignalThreadGroup injects a signal into an specific ThreadGroup.
 //
-// This function doesn't skip signals like SendExternalSignal does.
+// This function doesn't skip signals like SendExternalSignal does. Like every
+// signal from outside the sandbox, one to a PID namespace's init reaches it
+// only as it would from a container runtime on Linux; see
+// ThreadGroup.externalSignalIgnoredLocked.
 func (k *Kernel) SendExternalSignalThreadGroup(tg *ThreadGroup, info *linux.SignalInfo) error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	return tg.SendSignal(info)
+	return tg.sendExternalSignal(info)
 }
 
 // SendExternalSignalProcessGroup sends a signal to all ThreadGroups in the
@@ -1996,7 +2006,7 @@ func (k *Kernel) SendExternalSignalProcessGroup(pg *ProcessGroup, info *linux.Si
 		if tg.ProcessGroup() != pg {
 			continue
 		}
-		if err := tg.SendSignal(info); err != nil && firstErr == nil {
+		if err := tg.sendExternalSignal(info); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -2015,9 +2025,13 @@ func (k *Kernel) SendContainerSignal(cid string, info *linux.SignalInfo) error {
 	for tg := range k.tasks.Root.tgids {
 		if tg.leader.ContainerID() == cid {
 			tg.signalHandlers.mu.Lock()
-			infoCopy := *info
-			if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
-				lastErr = err
+			if sig := linux.Signal(info.Signo); tg.externalSignalIgnoredLocked(sig) {
+				tg.applySignalSideEffectsLocked(sig)
+			} else {
+				infoCopy := *info
+				if err := tg.leader.sendSignalLocked(&infoCopy, true /*group*/); err != nil {
+					lastErr = err
+				}
 			}
 			tg.signalHandlers.mu.Unlock()
 		}
@@ -2497,15 +2511,13 @@ func (k *Kernel) Release() {
 	k.rootCgroupNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
 	if k.remotePageLoad != nil {
-		k.remotePageLoad.Cancel()
-		_ = k.remotePageLoad.Wait()
+		_ = k.remotePageLoad.DecOwner()
 		k.remotePageLoad = nil
 	}
 	k.remoteLoadRanges = nil
-	k.remoteHandoffManifest = ttcchunk.ManifestID{}
+	k.remoteHandoffSnapshot = 0
 	for _, load := range k.auxiliaryRemotePageLoads {
-		load.Cancel()
-		_ = load.Wait()
+		_ = load.DecOwner()
 	}
 	k.auxiliaryRemotePageLoads = nil
 	k.mf.Destroy()

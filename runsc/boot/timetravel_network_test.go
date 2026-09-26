@@ -42,17 +42,61 @@ func newTimeTravelNetworkTestStack(t *testing.T, nat bool) *sentrynetstack.Stack
 }
 
 func newTimeTravelNetworkTestStackWithConfig(t *testing.T, cfg TimeTravelNetworkConfig) *sentrynetstack.Stack {
+	return newTimeTravelNetworkTestStackWithState(t, cfg, false)
+}
+
+func newTimeTravelNetworkTestStackWithState(t *testing.T, cfg TimeTravelNetworkConfig, quarantined bool) *sentrynetstack.Stack {
 	t.Helper()
 	s := sentrynetstack.NewStack(stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        true,
 	}), 1)
-	if err := configureTimeTravelNetwork(s, cfg, true, false); err != nil {
+	if err := configureTimeTravelNetwork(s, cfg, true, quarantined); err != nil {
 		t.Fatalf("configureTimeTravelNetwork(%+v): %v", cfg, err)
 	}
 	t.Cleanup(s.Destroy)
 	return s
+}
+
+func TestTimeTravelNetworkCanStartQuarantinedAndReconnect(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	s := newTimeTravelNetworkTestStackWithState(t, TimeTravelNetworkConfig{NAT: true}, true)
+	if !s.LiveForkQuarantine() {
+		t.Fatal("initial quarantine bit is not set")
+	}
+	if conn, err := dialTimeTravelGateway(t, s, port, 200*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("initially quarantined network reached host listener")
+	}
+
+	s.Pause()
+	err = s.SetLiveForkQuarantineState(false)
+	s.Resume()
+	if err != nil {
+		t.Fatalf("leave initial quarantine: %v", err)
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := dialTimeTravelGateway(t, s, port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial after leaving initial quarantine: %v", err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("host accept after leaving initial quarantine: %v", err)
+	}
 }
 
 func TestTimeTravelNetworkCustomAddressAndMAC(t *testing.T) {
@@ -171,6 +215,93 @@ func TestTimeTravelNetworkRuntimeLinkCanBeReattached(t *testing.T) {
 	conn.Close()
 	if err := <-serverErr; err != nil {
 		t.Fatalf("host accept after runtime-link reattachment: %v", err)
+	}
+}
+
+func TestTimeTravelNetworkRuntimeLinkReplacementPreservesListener(t *testing.T) {
+	s := newTimeTravelNetworkTestStack(t, true)
+	listener, err := gonet.ListenTCP(s.Stack, tcpip.FullAddress{Addr: timeTravelGuestAddress}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("gonet.ListenTCP: %v", err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+
+	// Distributed restore replaces the runtime-only side of ttc0 after the
+	// guest's complete netstack, including this listener, has been decoded.
+	s.Pause()
+	if err := configureTimeTravelNetwork(s, TimeTravelNetworkConfig{NAT: true}, false, false); err != nil {
+		t.Fatalf("replacing TTC runtime link: %v", err)
+	}
+	s.Resume()
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, s.Stack, tcpip.FullAddress{Addr: timeTravelGuestAddress, Port: port}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("dial after TTC runtime-link replacement: %v", err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("accept after TTC runtime-link replacement: %v", err)
+	}
+}
+
+func TestTimeTravelNetworkQuarantineCanBeChangedAtRuntime(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	s := newTimeTravelNetworkTestStack(t, true)
+
+	s.Pause()
+	err = s.SetLiveForkQuarantineState(true)
+	s.Resume()
+	if err != nil {
+		t.Fatalf("enter quarantine: %v", err)
+	}
+	if !s.LiveForkQuarantine() {
+		t.Fatal("quarantine bit is not set")
+	}
+	if conn, err := dialTimeTravelGateway(t, s, port, 200*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("quarantined network reached host listener")
+	}
+
+	s.Pause()
+	err = s.SetLiveForkQuarantineState(false)
+	s.Resume()
+	if err != nil {
+		t.Fatalf("leave quarantine: %v", err)
+	}
+	if s.LiveForkQuarantine() {
+		t.Fatal("quarantine bit remained set")
+	}
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := dialTimeTravelGateway(t, s, port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial after leaving quarantine: %v", err)
+	}
+	conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("host accept after leaving quarantine: %v", err)
 	}
 }
 

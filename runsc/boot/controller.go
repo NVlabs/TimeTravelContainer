@@ -15,11 +15,12 @@
 package boot
 
 import (
-	"encoding/binary"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"runtime"
@@ -50,9 +51,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
+	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
@@ -121,6 +124,10 @@ const (
 	// ContMgrServeDistributedForkConnection serves a host-accepted stream.
 	ContMgrServeDistributedForkConnection = "containerManager.ServeDistributedForkConnection"
 
+	// ContMgrServeDistributedFilesystemConnection serves a host-accepted TTC
+	// filesystem stream from the live Sentry repository graph.
+	ContMgrServeDistributedFilesystemConnection = "containerManager.ServeDistributedFilesystemConnection"
+
 	// ContMgrExportDistributedForkSnapshot persists a session's immutable page stream.
 	ContMgrExportDistributedForkSnapshot = "containerManager.ExportDistributedForkSnapshot"
 
@@ -133,8 +140,17 @@ const (
 	// ContMgrDrainDistributedForkMemory makes a target source-independent.
 	ContMgrDrainDistributedForkMemory = "containerManager.DrainDistributedForkMemory"
 
+	// ContMgrDrainDistributedForkFilesystems materializes only remote files.
+	ContMgrDrainDistributedForkFilesystems = "containerManager.DrainDistributedForkFilesystems"
+
+	// ContMgrDistributedForkFilesystemDrainStatus reports asynchronous filesystem materialization progress.
+	ContMgrDistributedForkFilesystemDrainStatus = "containerManager.DistributedForkFilesystemDrainStatus"
+
 	// ContMgrHandoffDistributedForkMemory replaces live paging with sparse chunks.
 	ContMgrHandoffDistributedForkMemory = "containerManager.HandoffDistributedForkMemory"
+
+	// ContMgrDistributedForkMemoryHandoffStatus reports asynchronous reader-switch progress.
+	ContMgrDistributedForkMemoryHandoffStatus = "containerManager.DistributedForkMemoryHandoffStatus"
 
 	// ContMgrDistributedForkSessionStatus reports remote snapshot progress.
 	ContMgrDistributedForkSessionStatus = "containerManager.DistributedForkSessionStatus"
@@ -159,9 +175,21 @@ const (
 	// ContMgrResumeBranch resumes one in-memory branch.
 	ContMgrResumeBranch = "containerManager.ResumeBranch"
 
+	// ContMgrSnapshotFilesystemBranch snapshots one persistent filesystem
+	// resource while preserving the selected branch's run/pause state.
+	ContMgrSnapshotFilesystemBranch = "containerManager.SnapshotFilesystemBranch"
+
+	// ContMgrPublishBranchFilesystemMetadata publishes completed branch-local
+	// TTC filesystem mutations for manager-side observation.
+	ContMgrPublishBranchFilesystemMetadata = "containerManager.PublishBranchFilesystemMetadata"
+
+	// ContMgrSetBranchQuarantine changes one branch's external-connectivity bit.
+	ContMgrSetBranchQuarantine = "containerManager.SetBranchQuarantine"
+
 	// ContMgrDehydrateBranch hibernates one live branch.
 	ContMgrDehydrateBranch = "containerManager.DehydrateBranch"
-	// ContMgrExportDehydratedBranch persists a dehydrated branch's packed memory.
+	// ContMgrExportDehydratedBranch exports a dehydrated branch into the
+	// snapshot graph's immutable memory objects.
 	ContMgrExportDehydratedBranch = "containerManager.ExportDehydratedBranch"
 
 	// ContMgrRehydrateBranch reconstructs one dehydrated branch.
@@ -172,6 +200,9 @@ const (
 
 	// ContMgrDestroyBranch destroys one in-memory branch.
 	ContMgrDestroyBranch = "containerManager.DestroyBranch"
+	// ContMgrDestroyBranchAndReclaim destroys one in-memory branch and releases
+	// its persistent filesystem roots after all runtime references are gone.
+	ContMgrDestroyBranchAndReclaim = "containerManager.DestroyBranchAndReclaim"
 	// ContMgrPrepareStopBranch moves branch-unaware loader bookkeeping away
 	// from a branch that is about to terminate, when a peer survives.
 	ContMgrPrepareStopBranch = "containerManager.PrepareStopBranch"
@@ -200,8 +231,8 @@ const (
 	// ContMgrExecSignal signals a managed exec session.
 	ContMgrExecSignal = "containerManager.ExecSignal"
 
-	// ContMgrConsoleFollow streams init output and waits for init to exit.
-	ContMgrConsoleFollow = "containerManager.ConsoleFollow"
+	// ContMgrConsolePush has the Sentry push a process's console to a file.
+	ContMgrConsolePush = "containerManager.ConsolePush"
 
 	// ContMgrConsoleRead reads branch-local internal console output.
 	ContMgrConsoleRead = "containerManager.ConsoleRead"
@@ -423,6 +454,28 @@ type containerManager struct {
 	// restorer is set when the sandbox in being restored. It stores the state
 	// of all containers and perform all actions required by restore.
 	restorer *restorer
+
+	filesystemDrainMu sync.Mutex
+	// filesystemDrains is keyed by the branch whose source dependency is being
+	// released. A process-wide completed/in-progress flag is not a sufficient
+	// barrier: another distributed restore may attach a new remote catalog while
+	// an older branch is draining. The later branch must execute a fresh pass
+	// after its restore has completed, even when the repository-level operation
+	// lock serializes that pass behind an existing one.
+	filesystemDrains map[string]*distributedForkFilesystemDrain
+}
+
+type distributedForkFilesystemDrain struct {
+	done chan struct{}
+	err  error
+}
+
+// DistributedForkFilesystemDrainStatus reports completion of asynchronous
+// filesystem materialization. The work is process-wide because all branch
+// repositories in a Sentry share the same immutable remote object stores.
+type DistributedForkFilesystemDrainStatus struct {
+	Done  bool   `json:"done"`
+	Error string `json:"error,omitempty"`
 }
 
 // StartRoot will start the root container process.
@@ -751,6 +804,16 @@ type RestoreOpts struct {
 type BranchCheckpointArgs struct {
 	control.SaveOpts
 	BranchID string
+}
+
+// FilesystemBranchSnapshotArgs selects a live branch, one persistent
+// filesystem resource, and the new repository branch pointer to create.
+type FilesystemBranchSnapshotArgs struct {
+	BranchID      string
+	ResourceID    checkpoint.ResourceID
+	Child         string
+	SourceWorking uint64
+	ChildWorking  uint64
 }
 
 // Restore loads a container from a statefile.
@@ -1146,9 +1209,38 @@ func (cm *containerManager) CaptureDistributedForkMany(args *DistributedForkCapt
 	return nil
 }
 
-// ServeDistributedForkConnection handles one stream donated by ttcd.
+// ServeDistributedForkConnection transfers one stream donated by ttcd into
+// the Sentry. Serving continues asynchronously after the RPC returns.
 func (cm *containerManager) ServeDistributedForkConnection(args *DistributedForkServeArgs, _ *struct{}) error {
 	return cm.l.family.ServeDistributedForkConnection(args)
+}
+
+// ServeDistributedFilesystemConnection handles one filesystem stream donated
+// by ttcd. Serving in the Sentry is essential for multihop forks: its
+// repositories own the transient upstream resolvers for inherited objects.
+func (cm *containerManager) ServeDistributedFilesystemConnection(args *DistributedForkServeArgs, _ *struct{}) error {
+	if args == nil || args.SessionID == "" || len(args.FilePayload.Files) != 1 {
+		return errors.New("distributed filesystem serving requires a session and one connected socket")
+	}
+	token, err := cm.l.family.DistributedForkFilesystemToken(args.SessionID)
+	if err != nil {
+		return err
+	}
+	conn, err := ttcremote.NewDonatedTCPConn(args.FilePayload.Files[0])
+	if err != nil {
+		return err
+	}
+	sources := make([]ttcvolume.RemoteObjectSource, 0, len(cm.l.ttcVolumeRepositories))
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		key := ttcvolume.RemoteSourceKey(sha256.Sum256([]byte(source)))
+		sources = append(sources, ttcvolume.RemoteObjectSource{Key: key, Repository: volume.repository})
+	}
+	go func() {
+		if err := ttcvolume.ServeRemoteObjects(conn, token, sources); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			log.Warningf("Distributed filesystem stream failed: %v", err)
+		}
+	}()
+	return nil
 }
 
 // ExportDistributedForkSnapshot writes a durable shared-filesystem snapshot.
@@ -1165,7 +1257,13 @@ func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkE
 
 // DistributedForkDependencyStatus reports target-side remote-memory progress.
 func (cm *containerManager) DistributedForkDependencyStatus(args *DistributedForkDependencyArgs, out *pgalloc.AsyncPagesFileLoadStats) error {
-	status, err := cm.l.family.DistributedForkDependencyStatus(args.BranchID)
+	var status pgalloc.AsyncPagesFileLoadStats
+	var err error
+	if args.IncludeDurable {
+		status, err = cm.l.family.PageLoadStatus(args.BranchID)
+	} else {
+		status, err = cm.l.family.DistributedForkDependencyStatus(args.BranchID)
+	}
 	if err != nil {
 		return err
 	}
@@ -1178,14 +1276,98 @@ func (cm *containerManager) SetDistributedForkPrefetchWindow(args *DistributedFo
 	return cm.l.family.SetDistributedForkPrefetchWindow(args.BranchID, args.PrefetchBehindBytes, args.PrefetchBytes)
 }
 
-// DrainDistributedForkMemory eagerly loads all remote pages for one branch.
+// DrainDistributedForkMemory eagerly loads all remote pages and filesystem
+// objects for one branch. A source relay may be released only after both are
+// locally complete.
 func (cm *containerManager) DrainDistributedForkMemory(args *DistributedForkDependencyArgs, _ *struct{}) error {
-	return cm.l.family.DrainDistributedForkMemory(args.BranchID)
+	if err := cm.l.family.DrainDistributedForkMemory(args.BranchID); err != nil {
+		return err
+	}
+	return cm.materializeDistributedFilesystems()
+}
+
+// DrainDistributedForkFilesystems starts materializing filesystem dependencies
+// without forcing memory already backed by a durable sparse repository to
+// become resident. Materialization is asynchronous so it cannot monopolize the
+// Sentry's control server while ordinary exec and branch operations continue.
+func (cm *containerManager) DrainDistributedForkFilesystems(args *DistributedForkDependencyArgs, _ *struct{}) error {
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed filesystem drain requires a branch")
+	}
+	cm.filesystemDrainMu.Lock()
+	if cm.filesystemDrains == nil {
+		cm.filesystemDrains = make(map[string]*distributedForkFilesystemDrain)
+	}
+	if current := cm.filesystemDrains[args.BranchID]; current != nil {
+		select {
+		case <-current.done:
+			// A repeated request for the same branch establishes a fresh barrier.
+			// This makes retry correct even if a newer remote source was attached
+			// to the branch after an earlier transaction completed.
+			delete(cm.filesystemDrains, args.BranchID)
+		default:
+			cm.filesystemDrainMu.Unlock()
+			return nil
+		}
+	}
+	state := &distributedForkFilesystemDrain{done: make(chan struct{})}
+	cm.filesystemDrains[args.BranchID] = state
+	cm.filesystemDrainMu.Unlock()
+	go func() {
+		err := cm.materializeDistributedFilesystems()
+		cm.filesystemDrainMu.Lock()
+		state.err = err
+		close(state.done)
+		cm.filesystemDrainMu.Unlock()
+	}()
+	return nil
+}
+
+// DistributedForkFilesystemDrainStatus observes asynchronous filesystem
+// materialization without waiting for it on the control server.
+func (cm *containerManager) DistributedForkFilesystemDrainStatus(args *DistributedForkDependencyArgs, out *DistributedForkFilesystemDrainStatus) error {
+	if args == nil || args.BranchID == "" {
+		return errors.New("distributed filesystem drain status requires a branch")
+	}
+	cm.filesystemDrainMu.Lock()
+	defer cm.filesystemDrainMu.Unlock()
+	state := cm.filesystemDrains[args.BranchID]
+	if state == nil {
+		return fmt.Errorf("distributed filesystem drain for branch %q has not been started", args.BranchID)
+	}
+	select {
+	case <-state.done:
+		out.Done = true
+		if state.err != nil {
+			out.Error = state.err.Error()
+		}
+	default:
+	}
+	return nil
 }
 
 // HandoffDistributedForkMemory atomically replaces the target page reader.
 func (cm *containerManager) HandoffDistributedForkMemory(args *DistributedForkHandoffArgs, _ *struct{}) error {
 	return cm.l.family.HandoffDistributedForkMemory(args)
+}
+
+// DistributedForkMemoryHandoffStatus observes asynchronous reader-switch progress.
+func (cm *containerManager) DistributedForkMemoryHandoffStatus(args *BranchArgs, out *DistributedForkHandoffStatus) error {
+	status, err := cm.l.family.DistributedForkMemoryHandoffStatus(args.ID)
+	if err != nil {
+		return err
+	}
+	*out = status
+	return nil
+}
+
+func (cm *containerManager) materializeDistributedFilesystems() error {
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		if err := volume.repository.MaterializeRemoteObjects(); err != nil {
+			return fmt.Errorf("materializing distributed filesystem %q: %w", source, err)
+		}
+	}
+	return nil
 }
 
 // DistributedForkSessionStatus returns token-free transfer progress.
@@ -1209,8 +1391,8 @@ func (cm *containerManager) CancelDistributedForkSession(args *DistributedForkSe
 	return cm.l.family.CancelDistributedForkSession(args.SessionID)
 }
 
-// CompleteDistributedForkSession releases drained memory but preserves the
-// target's persistent filesystem branches.
+// CompleteDistributedForkSession releases drained memory and source-only
+// filesystem generations.
 func (cm *containerManager) CompleteDistributedForkSession(args *DistributedForkSessionArgs, _ *struct{}) error {
 	if args == nil {
 		return errors.New("missing distributed fork session arguments")
@@ -1232,6 +1414,50 @@ func (cm *containerManager) PauseBranch(args *BranchArgs, _ *struct{}) error {
 // ResumeBranch resumes one branch.
 func (cm *containerManager) ResumeBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Resume(args.ID)
+}
+
+// SnapshotFilesystemBranch creates a consistent filesystem-only snapshot.
+func (cm *containerManager) SnapshotFilesystemBranch(args *FilesystemBranchSnapshotArgs, _ *struct{}) error {
+	if args == nil {
+		return errors.New("missing filesystem snapshot arguments")
+	}
+	return cm.l.family.SnapshotFilesystemBranch(args.BranchID, args.ResourceID, args.Child, args.SourceWorking, args.ChildWorking)
+}
+
+// PublishBranchFilesystemMetadata makes completed filesystem mutations
+// visible to manager-side graph readers without imposing sync(2) durability.
+func (cm *containerManager) PublishBranchFilesystemMetadata(args *BranchArgs, _ *struct{}) error {
+	if args == nil || args.ID == "" {
+		return errors.New("missing branch filesystem metadata arguments")
+	}
+	branchID, err := cm.l.family.PublishFilesystemMetadata(args.ID)
+	if err != nil {
+		return err
+	}
+	// A remotely restored branch may still have graph metadata that is lazy
+	// behind the Sentry's peer connection. Manager-side observers reopen the
+	// repository and cannot use that process-local connection. Resolve both the
+	// current namespace and its immutable diff base here, but leave bulk file
+	// contents lazy.
+	seen := make(map[*ttcvolume.Repository]struct{}, len(cm.l.ttcVolumeRepositories))
+	for source, volume := range cm.l.ttcVolumeRepositories {
+		if _, duplicate := seen[volume.repository]; duplicate {
+			continue
+		}
+		seen[volume.repository] = struct{}{}
+		if err := volume.repository.ResolveBranchMetadata(branchID); err != nil {
+			return fmt.Errorf("publishing TTC volume %q metadata for branch %q: %w", source, args.ID, err)
+		}
+	}
+	return nil
+}
+
+// SetBranchQuarantine changes one branch's external-connectivity bit.
+func (cm *containerManager) SetBranchQuarantine(args *BranchQuarantineArgs, _ *struct{}) error {
+	if args == nil || args.ID == "" {
+		return errors.New("missing branch quarantine arguments")
+	}
+	return cm.l.family.SetQuarantine(args.ID, args.Enabled)
 }
 
 // DehydrateBranch hibernates one branch and releases its live Kernel graph.
@@ -1258,7 +1484,7 @@ func (cm *containerManager) DehydrateBranch(args *BranchDehydrateArgs, out *Bran
 	return nil
 }
 
-// ExportDehydratedBranch writes process-independent packed memory streams.
+// ExportDehydratedBranch writes a process-independent graph memory stream.
 func (cm *containerManager) ExportDehydratedBranch(args *BranchDehydrationExportArgs, out *BranchDehydrationExportInfo) error {
 	info, err := cm.l.family.ExportDehydration(args)
 	if err != nil {
@@ -1286,6 +1512,13 @@ func (cm *containerManager) RenameBranch(args *BranchRenameArgs, _ *struct{}) er
 // DestroyBranch destroys one branch.
 func (cm *containerManager) DestroyBranch(args *BranchArgs, _ *struct{}) error {
 	return cm.l.family.Destroy(args.ID)
+}
+
+// DestroyBranchAndReclaim destroys one branch and its persistent filesystem
+// roots. This is reserved for logical branch deletion; stop and migration use
+// DestroyBranch so that the filesystem can be restarted or handed off.
+func (cm *containerManager) DestroyBranchAndReclaim(args *BranchArgs, _ *struct{}) error {
+	return cm.l.family.DestroyAndReclaim(args.ID)
 }
 
 // PrepareStopBranch makes stopping one branch independent from its peers.
@@ -1357,51 +1590,22 @@ func (cm *containerManager) ExecSignal(args *ExecSessionArgs, _ *struct{}) error
 	return cm.l.family.SignalExecSession(args)
 }
 
-// ConsoleFollow coordinates client-side console draining with init lifetime.
-func (cm *containerManager) ConsoleFollow(args *ConsoleFollowArgs, waitStatus *uint32) error {
-	if len(args.FilePayload.Files) < 3 || len(args.FilePayload.Files) > 5 {
-		return fmt.Errorf("console follow received %d files, want final output, wait status, release, and optional registration and attachment readiness", len(args.FilePayload.Files))
+// ConsolePush pushes a process's console, in the background, to the one file
+// given.
+func (cm *containerManager) ConsolePush(args *ConsolePushArgs, _ *struct{}) error {
+	if len(args.FilePayload.Files) != 1 {
+		return fmt.Errorf("console push received %d files, want its output", len(args.FilePayload.Files))
 	}
-	var ready func() error
-	var attached func() error
-	if len(args.FilePayload.Files) >= 4 {
-		ready = func() error {
-			if _, err := args.FilePayload.Files[3].Write([]byte{1}); err != nil {
-				return fmt.Errorf("writing console follow readiness: %w", err)
-			}
-			return nil
-		}
-	}
-	if len(args.FilePayload.Files) == 5 {
-		attached = func() error {
-			if _, err := args.FilePayload.Files[4].Write([]byte{1}); err != nil {
-				return fmt.Errorf("writing console attachment readiness: %w", err)
-			}
-			return nil
-		}
-	}
-	exited := func(status uint32) error {
-		var encoded [4]byte
-		binary.BigEndian.PutUint32(encoded[:], status)
-		if n, err := args.FilePayload.Files[1].Write(encoded[:]); err != nil {
-			return fmt.Errorf("writing console follow wait status: %w", err)
-		} else if n != len(encoded) {
-			return fmt.Errorf("writing console follow wait status: %w", io.ErrShortWrite)
-		}
-		return nil
-	}
-	released := func() error {
-		var release [1]byte
-		if _, err := io.ReadFull(args.FilePayload.Files[2], release[:]); err != nil {
-			return err
-		}
-		return nil
-	}
-	status, err := cm.l.family.FollowConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, args.FilePayload.Files[0], ready, attached, exited, released)
+	// urpc closes the files it received when this returns: the push writes
+	// a copy, which the follower made blocking.
+	output, err := args.FilePayload.ReleaseFD(0)
 	if err != nil {
+		return fmt.Errorf("taking console push output: %w", err)
+	}
+	if err := cm.l.family.PushConsole(args.BranchID, args.CID, args.ExecID, args.ConsoleID, output); err != nil {
+		_ = output.Close()
 		return err
 	}
-	*waitStatus = status
 	return nil
 }
 

@@ -1189,7 +1189,11 @@ func (b *guestBacking) TotalUsage() (uint64, error) {
 
 func (*guestBacking) Sync() error { return nil }
 
-func (b *guestBacking) DropCache(fr memmap.FileRange) error { return b.Decommit(fr) }
+// DropCache retains fr's contents. Host MemoryFiles drop only a page-cache
+// copy of data their file keeps; GuestRAM frames are the data. Dehydration
+// drops the cache of a parked capture and exports its pages afterwards, and
+// the capture's references free the frames once the export is done.
+func (*guestBacking) DropCache(memmap.FileRange) error { return nil }
 
 func (*guestBacking) DataFD(memmap.FileRange) (int, error) {
 	return -1, fmt.Errorf("GuestRAM has no host data file descriptor")

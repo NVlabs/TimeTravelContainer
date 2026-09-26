@@ -1230,6 +1230,11 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 		}
 
 		ar := ars.Head()
+		if uintptr(addr) == linux.NT_PRSTATUS {
+			if err := t.ptracePrepareGuestGS(target, ar.Start, int(ar.Length())); err != nil {
+				return err
+			}
+		}
 		n, err := target.Arch().PtraceSetRegSet(uintptr(addr), &usermem.IOReadWriter{
 			Ctx:  t,
 			IO:   t.MemoryManager(),
