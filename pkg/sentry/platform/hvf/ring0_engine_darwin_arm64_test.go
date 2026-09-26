@@ -327,8 +327,13 @@ func TestSwitchApplicationGuestTrapAddress(t *testing.T) {
 }
 
 func TestApplicationResidencyYieldsOnlyUnderContention(t *testing.T) {
+	// A residency pins its host thread; the lookup below is by thread ID.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	engine := &ring0Engine{concurrency: 2}
-	engine.cpusByID[0] = &ring0ApplicationCPU{tid: hosttid.Current(), residentSince: time.Now().Add(-applicationResidencyQuantum)}
+	cpu := &ring0ApplicationCPU{tid: hosttid.Current(), residentSince: time.Now().Add(-applicationResidencyQuantum)}
+	engine.cpusByID[0] = cpu
+	engine.cpusByTID.Store(cpu.tid, cpu)
 	engine.applicationCPUs.Store(2)
 	if engine.ShouldYieldApplicationResidency() {
 		t.Fatal("fully leased application pool requested an uncontended yield")

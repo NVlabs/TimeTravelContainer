@@ -89,10 +89,10 @@ func (cpu *ring0ApplicationCPU) tryPin() bool {
 	}
 }
 
-// ring0ApplicationWaiter is intentionally non-zero-sized so pointer identity
-// is stable when entries are removed from the FIFO.
+// ring0ApplicationWaiter is a vCPU admission FIFO entry. wake is signaled when
+// a vCPU ID is freed or the queue ahead of the waiter shrinks.
 type ring0ApplicationWaiter struct {
-	token byte
+	wake chan struct{}
 }
 
 type ring0Stage2Identity struct {
@@ -933,7 +933,8 @@ func (e *ring0Engine) kickOneApplicationEntry() error {
 			pending++
 		}
 	}
-	wanted := int(e.applicationWaiters.Load())
+	// Free IDs admit waiters without a handoff.
+	wanted := int(e.applicationWaiters.Load()) - e.freeApplicationIDsLocked()
 	if wanted < 1 {
 		// Tests and backend maintenance may request an explicit handoff without
 		// entering the application FIFO.
@@ -951,6 +952,12 @@ func (e *ring0Engine) kickOneApplicationEntry() error {
 		if !retryPending && cpu.bridge.externalInterruptRequested() {
 			// A translation rendezvous or lifecycle interrupt already owns this
 			// exit. Let it complete before admission assigns the residency.
+			continue
+		}
+		if !retryPending && time.Since(cpu.residentSince) < applicationResidencyQuantum {
+			// As for syscall yields, a residency first runs for one quantum.
+			// Evicting new residencies makes every admission a vCPU
+			// destroy-and-create cycle.
 			continue
 		}
 		cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))
@@ -1364,6 +1371,7 @@ func (e *ring0Engine) getApplicationCPU(ctx context.Context) (*ring0ApplicationC
 	tid := hosttid.Current()
 	var waiter *ring0ApplicationWaiter
 	var waitStarted, nextWaitDiagnostic, lastWaiterKick time.Time
+	var pollTimer *time.Timer
 	defer func() {
 		if waiter != nil {
 			e.removeApplicationWaiter(waiter)
@@ -1448,7 +1456,16 @@ retry:
 		waitStarted = time.Now()
 		nextWaitDiagnostic = waitStarted.Add(2 * time.Second)
 	}
-	if id < 0 || waiter != nil && e.cpuWaiters[0] != waiter {
+	admissible := id >= 0
+	waiterIndex := 0
+	if waiter != nil {
+		// Admit queued waiters in FIFO order, as many as there are free IDs.
+		// Admitting only the head serializes every admission behind one
+		// waiter's wakeup even when most vCPUs are free.
+		waiterIndex = e.applicationWaiterIndexLocked(waiter)
+		admissible = admissible && waiterIndex < e.freeApplicationIDsLocked()
+	}
+	if !admissible {
 		e.cpuMu.Unlock()
 		// Admission pressure must preempt a CPU-bound incumbent as well as a
 		// syscall-heavy one. Without this kick, a task that never exits EL0 can
@@ -1470,12 +1487,26 @@ retry:
 			nextWaitDiagnostic = time.Now().Add(5 * time.Second)
 		}
 		// Every vCPU belongs to another pinned task residency. The caller remains
-		// thread-affine while it waits for an incumbent to hand off a slot. A
-		// bounded poll also handles cancellation and asynchronous bridge teardown.
+		// thread-affine while it waits for an incumbent to hand off a slot. Freed
+		// IDs wake admissible waiters directly; the bounded poll handles
+		// cancellation, asynchronous bridge teardown, and the head's periodic
+		// kick. Polling every waiter at a short interval instead saturates
+		// cpuMu, which incumbents also need to hand off their vCPUs.
+		pollInterval := 10 * time.Millisecond
+		if waiterIndex == 0 {
+			pollInterval = time.Millisecond
+		}
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(pollInterval)
+			defer pollTimer.Stop()
+		} else {
+			pollTimer.Reset(pollInterval)
+		}
 		select {
 		case <-ctx.Done():
 			return nil, false, ctx.Err()
-		case <-time.After(100 * time.Microsecond):
+		case <-waiter.wake:
+		case <-pollTimer.C:
 		}
 		goto retry
 	}
@@ -1489,6 +1520,7 @@ retry:
 	if err != nil {
 		e.cpuMu.Lock()
 		e.cpuIDs[id] = false
+		e.wakeApplicationWaitersLocked()
 		e.cpuMu.Unlock()
 		return nil, false, err
 	}
@@ -1498,6 +1530,7 @@ retry:
 		_ = vcpu.Close()
 		e.cpuMu.Lock()
 		e.cpuIDs[id] = false
+		e.wakeApplicationWaitersLocked()
 		e.cpuMu.Unlock()
 		return nil, false, err
 	}
@@ -1509,6 +1542,7 @@ retry:
 	e.cpuMu.Lock()
 	if e.closed.Load() {
 		e.cpuIDs[id] = false
+		e.wakeApplicationWaitersLocked()
 		e.cpuMu.Unlock()
 		bridge.close()
 		_ = vcpu.Close()
@@ -1588,7 +1622,7 @@ func (e *ring0Engine) writeApplicationWaitDiagnostic(tid uint64, started time.Ti
 }
 
 func (e *ring0Engine) enqueueApplicationWaiterLocked() *ring0ApplicationWaiter {
-	waiter := &ring0ApplicationWaiter{}
+	waiter := &ring0ApplicationWaiter{wake: make(chan struct{}, 1)}
 	e.cpuWaiters = append(e.cpuWaiters, waiter)
 	e.applicationWaiters.Add(1)
 	return waiter
@@ -1609,7 +1643,44 @@ func (e *ring0Engine) removeApplicationWaiterLocked(waiter *ring0ApplicationWait
 		e.cpuWaiters[len(e.cpuWaiters)-1] = nil
 		e.cpuWaiters = e.cpuWaiters[:len(e.cpuWaiters)-1]
 		e.applicationWaiters.Add(-1)
+		e.wakeApplicationWaitersLocked()
 		return
+	}
+}
+
+// applicationWaiterIndexLocked returns waiter's FIFO position, or -1.
+func (e *ring0Engine) applicationWaiterIndexLocked(waiter *ring0ApplicationWaiter) int {
+	for index, candidate := range e.cpuWaiters {
+		if candidate == waiter {
+			return index
+		}
+	}
+	return -1
+}
+
+// freeApplicationIDsLocked returns the number of unused vCPU IDs.
+func (e *ring0Engine) freeApplicationIDsLocked() int {
+	free := 0
+	for _, used := range e.cpuIDs {
+		if !used {
+			free++
+		}
+	}
+	return free
+}
+
+// wakeApplicationWaitersLocked wakes each waiter that a free vCPU ID can
+// admit, and the FIFO head, which kicks an incumbent when no ID is free.
+func (e *ring0Engine) wakeApplicationWaitersLocked() {
+	free := e.freeApplicationIDsLocked()
+	for index, waiter := range e.cpuWaiters {
+		if index > 0 && index >= free {
+			return
+		}
+		select {
+		case waiter.wake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -1621,12 +1692,10 @@ func (e *ring0Engine) ShouldYieldApplicationResidency() bool {
 	if e.applicationWaiters.Load() == 0 {
 		return false
 	}
-	tid := hosttid.Current()
-	e.cpuMu.Lock()
-	cpu := e.findApplicationCPUByTIDLocked(tid)
-	shouldYield := cpu != nil && time.Since(cpu.residentSince) >= applicationResidencyQuantum
-	e.cpuMu.Unlock()
-	return shouldYield
+	// residentSince is immutable once the CPU is published, so this runs on
+	// every syscall exit under contention without taking cpuMu.
+	cached, ok := e.cpusByTID.Load(hosttid.Current())
+	return ok && time.Since(cached.(*ring0ApplicationCPU).residentSince) >= applicationResidencyQuantum
 }
 
 // ShouldRetainApplicationFaultResidency keeps the owner vCPU available for
@@ -1707,6 +1776,7 @@ func (e *ring0Engine) reapApplicationCPULocked(cpu *ring0ApplicationCPU) {
 	e.cpusByID[id] = nil
 	e.applicationCPUs.Add(-1)
 	cpu.bridge.close()
+	e.wakeApplicationWaitersLocked()
 }
 
 // learnHostGateFault classifies an EL1 data abort that entered the host-service
