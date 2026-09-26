@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -534,5 +535,71 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 				t.Fatalf("released providers=%+v", released)
 			}
 		})
+	}
+}
+
+// A repository that expanded part of a tree through an earlier relay asks a
+// new relay for objects below ones this relay has not served, and in origins
+// published before the tree's own: the relay finds them below its root.
+func TestSharedSnapshotReaderFindsObjectsBelowItsRoot(t *testing.T) {
+	directory := t.TempDir()
+	graph, err := ttcsnapshot.Open(filepath.Join(directory, "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	local, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(directory, "local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(directory, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("file contents")
+	file, err := graph.ReserveObject(origin, ttcsnapshot.ObjectKindFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Install(file, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.CommitReservedObject(file, "construction/file", uint64(len(data)), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	directoryObject, err := graph.CreateObject(origin, "construction/directory", ttcsnapshot.ObjectKindMetadata, []byte("directory"), []ttcsnapshot.Edge{{Slot: 0, Child: file}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := graph.CreateObject(origin, "construction/root", ttcsnapshot.ObjectKindMetadata, []byte("root"), []ttcsnapshot.Edge{{Slot: 0, Child: directoryObject}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated, err := graph.CreateObject(origin, "construction/unrelated", ttcsnapshot.ObjectKindMetadata, []byte("unrelated"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedLocal); err != nil {
+		t.Fatal(err)
+	}
+	if err := shared.Publish(context.Background(), graph, origin, local); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := newSharedSnapshotObjectReader(shared, root.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The tree's publication made none of its origins.
+	reader.allowedOrigins = map[ttcsnapshot.SnapshotID]struct{}{}
+	got := make([]byte, len(data))
+	if n, err := reader.ReadObjectRange(file.String(), got, 0); err != nil || !bytes.Equal(got[:n], data) {
+		t.Fatalf("reading a file below the root, unserved: %q, %v", got[:n], err)
+	}
+	if _, err := reader.RemoteObject(unrelated); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("an object outside the tree: %v, want permission denied", err)
 	}
 }

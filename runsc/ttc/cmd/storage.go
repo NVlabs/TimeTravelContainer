@@ -38,6 +38,9 @@ type sharedSnapshotObjectReader struct {
 	mu             sync.Mutex
 	allowed        map[ttcsnapshot.ObjectID]struct{}
 	allowedOrigins map[ttcsnapshot.SnapshotID]struct{}
+	// unexpanded holds the allowed objects whose children are not allowed
+	// yet.
+	unexpanded []ttcsnapshot.ObjectID
 }
 
 func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root string) (*sharedSnapshotObjectReader, error) {
@@ -45,17 +48,56 @@ func newSharedSnapshotObjectReader(store *ttcsnapshot.SharedPackStore, root stri
 	if err != nil {
 		return nil, err
 	}
-	return &sharedSnapshotObjectReader{store: store, allowed: map[ttcsnapshot.ObjectID]struct{}{id: {}}}, nil
+	return &sharedSnapshotObjectReader{store: store, allowed: map[ttcsnapshot.ObjectID]struct{}{id: {}}, unexpanded: []ttcsnapshot.ObjectID{id}}, nil
 }
 
+// authorize reports whether id is in the tree the reader serves: the root,
+// an object of an origin the tree's publication made, or an object below
+// another it allows.
 func (r *sharedSnapshotObjectReader) authorize(id ttcsnapshot.ObjectID) bool {
 	r.mu.Lock()
-	_, ok := r.allowed[id]
-	if !ok {
-		_, ok = r.allowedOrigins[id.Snapshot]
+	defer r.mu.Unlock()
+	if _, ok := r.allowed[id]; ok {
+		return true
 	}
-	r.mu.Unlock()
-	return ok
+	if _, ok := r.allowedOrigins[id.Snapshot]; ok {
+		return true
+	}
+	// A repository that expanded part of the tree through an earlier relay,
+	// as a branch rehydrated on a node before does, resumes below objects
+	// this relay has yet to serve. Look for id below the allowed objects,
+	// once each.
+	for len(r.unexpanded) != 0 {
+		next := r.unexpanded[len(r.unexpanded)-1]
+		r.unexpanded = r.unexpanded[:len(r.unexpanded)-1]
+		object, err := r.store.Object(next)
+		if err != nil {
+			continue
+		}
+		r.allowLocked(object)
+		if _, ok := r.allowed[id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// allowLocked allows the objects below object.
+//
+// +checklocks:r.mu
+func (r *sharedSnapshotObjectReader) allowLocked(object ttcsnapshot.Object) {
+	allow := func(id ttcsnapshot.ObjectID) {
+		if _, ok := r.allowed[id]; !ok {
+			r.allowed[id] = struct{}{}
+			r.unexpanded = append(r.unexpanded, id)
+		}
+	}
+	for _, edge := range object.Children {
+		allow(edge.Child)
+	}
+	if object.Deferred && !object.SourceObject.IsZero() {
+		allow(object.SourceObject)
+	}
 }
 
 func (r *sharedSnapshotObjectReader) ReadObjectRange(object string, destination []byte, offset int64) (int, error) {
@@ -78,12 +120,7 @@ func (r *sharedSnapshotObjectReader) RemoteObject(id ttcsnapshot.ObjectID) (ttcs
 		return ttcsnapshot.Object{}, err
 	}
 	r.mu.Lock()
-	for _, edge := range object.Children {
-		r.allowed[edge.Child] = struct{}{}
-	}
-	if object.Deferred && !object.SourceObject.IsZero() {
-		r.allowed[object.SourceObject] = struct{}{}
-	}
+	r.allowLocked(object)
 	r.mu.Unlock()
 	return object, nil
 }
