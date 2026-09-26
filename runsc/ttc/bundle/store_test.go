@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -208,7 +209,6 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 	}
 }
 
-// A rehydrated branch gives up the control state it was restored from, and
 // A pruned image replaces the one it was pruned from, unless a dehydration
 // superseded that meanwhile.
 func TestReplaceBranchMemoryGraphIfIsFenced(t *testing.T) {
@@ -247,6 +247,7 @@ func TestReplaceBranchMemoryGraphIfIsFenced(t *testing.T) {
 	}
 }
 
+// A rehydrated branch gives up the control state it was restored from, and
 // keeps its memory roots for its next dehydration.
 func TestClearBranchControlGraphIfKeepsMemory(t *testing.T) {
 	root := t.TempDir()
@@ -745,7 +746,9 @@ func TestBeginBranchPublicationIfDoesNotSupersedeChangedIdentity(t *testing.T) {
 
 // A name that resolved once resolves again without a full listing, and still
 // follows the records when a family is renamed, removed, or its name reused.
-func TestLoadContainerByNameFollowsRenameRemovalAndReuse(t *testing.T) {
+// A container's name never changes, but it can be removed, and its name taken
+// by another.
+func TestLoadContainerByNameFollowsRemovalAndReuse(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
 	write := func(id, name string) {
@@ -779,15 +782,18 @@ func TestLoadContainerByNameFollowsRenameRemovalAndReuse(t *testing.T) {
 	write("id-two", "db")
 	want("web", "id-one")
 	want("db", "id-two")
-	write("id-one", "api")
-	want("web", "")
-	want("api", "id-one")
+	want("id-o", "id-one")
 	if err := os.RemoveAll(filepath.Join(root, "containers", "id-two")); err != nil {
 		t.Fatal(err)
 	}
 	want("db", "")
+	want("id-t", "")
 	write("id-three", "db")
 	want("db", "id-three")
+	want("id-t", "id-three")
+	if _, err := store.LoadContainer("id-"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("LoadContainer(%q) = %v, want an ambiguous ID prefix", "id-", err)
+	}
 }
 
 // A container removed after it was listed holds no repository an inventory

@@ -7481,6 +7481,116 @@ func TestReconcileStandaloneMemoryGraphRetainsRuntimeBacking(t *testing.T) {
 	}
 }
 
+// A cluster node releases the runtime memory backings it parked, and no
+// other node's. Once it has read the records of its containers for an earlier
+// daemon's, it reads only those of the containers whose backings it parks.
+func TestClusterReleasesOnlyItsParkedRuntimeMemoryBackings(t *testing.T) {
+	dir := t.TempDir()
+	shared, local := filepath.Join(dir, "shared"), filepath.Join(dir, "local")
+	graph, err := ttcsnapshot.Open(filepath.Join(local, "catalog", "snapshot-graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	data, err := ttcsnapshot.OpenLocalDataStore(filepath.Join(local, "objects"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := func(name string) ttcsnapshot.ObjectID {
+		t.Helper()
+		object, err := graph.CreateObject(origin, name+"/pin", ttcsnapshot.ObjectKindMemoryNode, []byte(name), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.SetRoot(name, object); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.DeletePin(name + "/pin"); err != nil {
+			t.Fatal(err)
+		}
+		return object
+	}
+	write := func(id string, backings ...ttcbundle.RuntimeMemoryBacking) {
+		t.Helper()
+		containerDir := filepath.Join(shared, "containers", id)
+		if err := os.MkdirAll(filepath.Join(containerDir, "bundle"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(local, "containers", id), 0700); err != nil {
+			t.Fatal(err)
+		}
+		info := ttcbundle.ContainerInfo{
+			ID: id, Name: id, BundleDir: filepath.Join(containerDir, "bundle"), State: "running", CreatedAt: time.Now(), LiveForkEligible: true,
+			Branches:              []ttcbundle.BranchInfo{{ID: "main", NodeID: "n1", FilesystemBranch: "main", State: "running", StorageState: "local", CreatedAt: time.Now()}},
+			RuntimeMemoryBackings: backings,
+		}
+		encoded, err := json.Marshal(&info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(containerDir, "container.json"), encoded, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backings := func(id string) int {
+		t.Helper()
+		info, err := ttcbundle.Store{Root: shared}.LoadContainer(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(info.RuntimeMemoryBackings)
+	}
+	ours := root("memory/runtime/ours")
+	write("family", ttcbundle.RuntimeMemoryBacking{ID: "runtime-1", SnapshotID: uint64(origin), MemoryRoots: []string{"memory/runtime/ours"}, MemoryRootObjects: []string{ours.String()}})
+	// Parked by another node, whose graph holds its roots.
+	write("elsewhere", ttcbundle.RuntimeMemoryBacking{ID: "runtime-2", SnapshotID: uint64(origin), MemoryRoots: []string{"memory/runtime/theirs"}, MemoryRootObjects: []string{ours.String()}})
+	runsc := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\nfor a; do [ \"$a\" = list ] && { echo '[]'; exit 0; }; done\necho \"unexpected: $*\" >&2\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := &distributedSourceRuntime{}
+	b := &runtimeBackend{root: filepath.Join(dir, "runtime"), runsc: runsc, dataRoot: shared, localRoot: local, nodeID: "n1", distributedSource: source, snapshotGraph: graph, snapshotData: data}
+	if err := b.reconcileConsumedMemoryBacking(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root("memory/runtime/ours"); ok {
+		t.Error("this node's parked backing was not released")
+	}
+	if got := backings("family"); got != 0 {
+		t.Errorf("family has %d backings, want its own released", got)
+	}
+	if got := backings("elsewhere"); got != 1 {
+		t.Errorf("another node's parked backing was released: %d left", got)
+	}
+
+	// A pass with nothing parked reads no record.
+	if err := os.WriteFile(filepath.Join(shared, "containers", "elsewhere", "container.json"), []byte("not a record"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.reconcileConsumedMemoryBacking(); err != nil {
+		t.Fatalf("a pass with nothing parked read a record: %v", err)
+	}
+
+	// Nor does it but for what it parks since.
+	again := root("memory/runtime/again")
+	write("family", ttcbundle.RuntimeMemoryBacking{ID: "runtime-3", SnapshotID: uint64(origin), MemoryRoots: []string{"memory/runtime/again"}, MemoryRootObjects: []string{again.String()}})
+	source.noteParked("family")
+	if err := b.reconcileConsumedMemoryBacking(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := graph.Root("memory/runtime/again"); ok {
+		t.Error("a backing parked since was not released")
+	}
+	if got := backings("family"); got != 0 {
+		t.Errorf("family has %d backings, want them released", got)
+	}
+}
+
 func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
 	for _, test := range []struct {
 		name   string

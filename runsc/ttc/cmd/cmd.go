@@ -11389,19 +11389,55 @@ func (b *runtimeBackend) listFamilies() ([]Family, error) {
 	return b.listFamiliesOf("")
 }
 
-// listFamiliesOf is listFamilies, but on a standalone daemon it lists only
-// the family with the given ID, if it is not empty: it reads no other
-// family's record and asks no other family's Sentry for its branches. A
-// cluster node lists every family, whose physical runtimes it can know only
-// from placements read after its runtimes.
+// listFamiliesOf is listFamilies, but it lists only the family with the given
+// ID, if it is not empty: it reads no other family's record and asks no other
+// family's Sentry for its branches.
+//
+// A cluster node reads its placements once. Listing every family, it reads
+// them after its runtimes, so that it knows the placement of every physical
+// runtime it lists; listing one family, it reads them first, to find which
+// physical runtimes of the family it has.
 func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
-	if b.nodeID != "" {
-		familyID = ""
+	var snapshot *cluster.AuthorityState
+	var authorityErr error
+	var placementRecords []cluster.PlacementRecord
+	var offlineOwners map[string]bool
+	placementsRead := false
+	readPlacements := func() {
+		placementsRead = true
+		if b.nodeID == "" {
+			return
+		}
+		var records []cluster.PlacementRecord
+		if b.distributedSource != nil && b.distributedSource.authority != nil {
+			if snapshot, authorityErr = b.distributedSource.authority.AuthorityState(); authorityErr != nil {
+				return
+			}
+			records, offlineOwners = snapshot.PlacementList(), snapshot.OfflineNodes()
+		} else if placements, err := b.placementCatalog(); err == nil {
+			if records, offlineOwners, err = placementsWithOfflineOwners(placements); err != nil {
+				return
+			}
+		}
+		for _, record := range records {
+			if familyID == "" || record.FamilyID == familyID {
+				placementRecords = append(placementRecords, record)
+			}
+		}
 	}
 	var runtimeFamilies []Family
 	var runtimeErr error
 	if familyID != "" {
-		runtimeFamilies, runtimeErr = b.listRuntimeFamiliesOf(familyID)
+		ids := []string{familyID}
+		if b.nodeID != "" {
+			readPlacements()
+			for _, record := range placementRecords {
+				if record.OwnerNode == b.nodeID && record.PhysicalContainer != "" && !slices.Contains(ids, record.PhysicalContainer) {
+					ids = append(ids, record.PhysicalContainer)
+				}
+			}
+		}
+		runtimeFamilies, runtimeErr = b.listRuntimeFamiliesOf(ids...)
 	} else {
 		runtimeFamilies, runtimeErr = b.listRuntimeFamilies()
 	}
@@ -11426,22 +11462,15 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 	// view. A target imported into an existing Sentry is stored under a private
 	// transaction branch name, even though Raft exposes only the stable logical
 	// name. The private name must never enter user-facing inventory.
+	if !placementsRead {
+		readPlacements()
+	}
 	physicalPlacements := make(map[string][]cluster.PlacementRecord)
 	logicalPlacements := make(map[string][]cluster.PlacementRecord)
-	var placementRecords []cluster.PlacementRecord
-	var offlineOwners map[string]bool
-	if b.nodeID != "" {
-		if placements, err := b.placementCatalog(); err == nil {
-			var records []cluster.PlacementRecord
-			if records, offlineOwners, err = placementsWithOfflineOwners(placements); err == nil {
-				placementRecords = records
-				for _, record := range records {
-					logicalPlacements[record.FamilyID] = append(logicalPlacements[record.FamilyID], record)
-					if record.PhysicalContainer != "" {
-						physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
-					}
-				}
-			}
+	for _, record := range placementRecords {
+		logicalPlacements[record.FamilyID] = append(logicalPlacements[record.FamilyID], record)
+		if record.PhysicalContainer != "" {
+			physicalPlacements[record.PhysicalContainer] = append(physicalPlacements[record.PhysicalContainer], record)
 		}
 	}
 	byID := make(map[string]Family, len(containers)+len(runtimeFamilies))
@@ -11541,10 +11570,18 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 		}
 	}
 	if runtimeErr == nil {
+		listed := make(map[string]struct{}, len(containers))
+		for _, container := range containers {
+			listed[container.ID] = struct{}{}
+		}
 		runtimeIDs := make(map[string]struct{}, len(runtimeFamilies))
 		for _, family := range runtimeFamilies {
-			runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
-			physicalRuntime := runtimeInfoErr == nil && runtimeInfo.IsDistributedPhysicalRuntime()
+			// A listed container is no physical runtime.
+			physicalRuntime := false
+			if _, ok := listed[family.ID]; !ok {
+				runtimeInfo, runtimeInfoErr := store.LoadRuntimeContainer(family.ID)
+				physicalRuntime = runtimeInfoErr == nil && runtimeInfo.IsDistributedPhysicalRuntime()
+			}
 			if placements := physicalPlacements[family.ID]; len(placements) != 0 {
 				physicalID := family.ID
 				family.ID = placements[0].FamilyID
@@ -11666,20 +11703,15 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 	// In clustered TTC, Raft is the lifecycle authority. Shared container JSON
 	// is a materialization catalog and may lag a lease-expiry or migration
 	// decision; never let it make a fenced/corrupted branch appear runnable.
-	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		authorities, err := b.distributedSource.authority.Branches()
-		if err != nil {
-			return nil, fmt.Errorf("reading cluster branch authority: %w", err)
+	if b.nodeID != "" && b.distributedSource != nil && b.distributedSource.authority != nil {
+		if authorityErr != nil {
+			return nil, fmt.Errorf("reading cluster branch authority: %w", authorityErr)
 		}
-		placementByBranch := make(map[string]cluster.PlacementRecord)
-		if placements, err := b.placementCatalog(); err == nil {
-			if records, err := placements.List(); err == nil {
-				for _, record := range records {
-					placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
-				}
-			}
+		placementByBranch := make(map[string]cluster.PlacementRecord, len(placementRecords))
+		for _, record := range placementRecords {
+			placementByBranch[record.FamilyID+"\x00"+record.BranchID] = record
 		}
-		for _, authority := range authorities {
+		for _, authority := range snapshot.BranchList() {
 			family, ok := byID[authority.FamilyID]
 			if !ok {
 				continue
@@ -13571,6 +13603,19 @@ func (b *runtimeBackend) cloneGraphControlRoot(sourceRoot, sourceObject string, 
 	return destination, nil
 }
 
+// holdsGraphRoots reports whether this node's graph holds a root of branch.
+func (b *runtimeBackend) holdsGraphRoots(branch ttcbundle.BranchInfo) bool {
+	if b.snapshotGraph == nil {
+		return false
+	}
+	for _, name := range branchGraphRootNames(branch) {
+		if _, ok := b.snapshotGraph.Root(name); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *runtimeBackend) releaseBranchGraphRoots(branch ttcbundle.BranchInfo) error {
 	return b.releaseGraphMemoryRoots(branchGraphRootNames(branch))
 }
@@ -13585,6 +13630,9 @@ func (b *runtimeBackend) parkBranchMemoryGraph(info ttcbundle.ContainerInfo, bra
 	}
 	if _, _, err := b.containerStore().ParkBranchMemoryGraph(info.ID, branch.ID); err != nil {
 		return info, branch, fmt.Errorf("parking runtime memory backing for %s@%s: %w", info.Name, branch.ID, err)
+	}
+	if b.nodeID != "" && b.distributedSource != nil {
+		b.distributedSource.noteParked(info.ID)
 	}
 	refreshed, err := b.containerStore().LoadContainer(info.ID)
 	if err != nil {
@@ -15386,17 +15434,59 @@ func (b *runtimeBackend) releaseConsumedStandaloneMemoryBacking(target selector,
 // demand loader completed after rehydrate returned. Polling is daemon-side and
 // infrequent; ordinary guest faults never mutate the graph or storage catalog.
 func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
-	containers, err := b.containerStore().ListContainersForGC()
-	if err != nil {
-		return err
+	// A cluster node parks the backings of the families whose runtimes it
+	// has, whose state is on it, and it releases only its own. It reads the
+	// records of the containers whose backings this daemon parked, once it
+	// has read those of all with state on it, for an earlier daemon's.
+	source := b.distributedSource
+	if b.nodeID == "" {
+		source = nil
 	}
-	runtimeFamilies, err := b.listRuntimeFamilies()
-	if err != nil {
-		return err
+	var counted map[string]uint64
+	all := true
+	if source != nil {
+		var known bool
+		counted, known = source.parkedContainers()
+		all = !known
 	}
-	runtimeByID := make(map[string]Family, len(runtimeFamilies))
-	for _, family := range runtimeFamilies {
-		runtimeByID[family.ID] = family
+	var containers []ttcbundle.ContainerInfo
+	if all {
+		var err error
+		if containers, err = b.containerStore().ContainersWithActiveState(); err != nil {
+			return err
+		}
+	} else {
+		for id := range counted {
+			info, err := b.containerStore().LoadRuntimeContainer(id)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			containers = append(containers, info)
+		}
+	}
+	// The containers left with none of this node's backings.
+	released := make(map[string]uint64)
+	for id, count := range counted {
+		released[id] = count
+	}
+	var parked []string
+	for _, container := range containers {
+		if len(container.RuntimeMemoryBackings) != 0 {
+			parked = append(parked, container.ID)
+		}
+	}
+	runtimeByID := make(map[string]Family, len(parked))
+	if len(parked) != 0 {
+		runtimeFamilies, err := b.listRuntimeFamiliesOf(parked...)
+		if err != nil {
+			return err
+		}
+		for _, family := range runtimeFamilies {
+			runtimeByID[family.ID] = family
+		}
 	}
 	for _, container := range containers {
 		if b.nodeID == "" {
@@ -15406,6 +15496,9 @@ func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 				}
 				switch normalizeLifecycleState(branch.State) {
 				case "running", "paused":
+					if err := b.pruneRetainedImage(container.ID, branch); err != nil && b.stderr != nil {
+						fmt.Fprintf(b.stderr, "ttc: warning: pruning the retained image of %s@%s: %v\n", container.Name, branch.ID, err)
+					}
 					if branch.ControlRoot != "" {
 						b.releaseConsumedStandaloneMemoryBacking(selector{container: container.ID, branch: branch.ID}, branch)
 					}
@@ -15416,7 +15509,8 @@ func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 			continue
 		}
 		allDone := true
-		if family, ok := runtimeByID[container.ID]; ok {
+		family, local := runtimeByID[container.ID]
+		if local {
 			for _, branch := range family.Branches {
 				switch normalizeLifecycleState(branch.State) {
 				case "running", "paused", "restarting":
@@ -15436,10 +15530,20 @@ func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 			}
 		}
 		if !allDone {
+			if source != nil {
+				delete(released, container.ID)
+				if all {
+					source.noteParked(container.ID)
+				}
+			}
 			continue
 		}
 		for _, backing := range container.RuntimeMemoryBackings {
 			branch := runtimeBackingAsBranch(backing)
+			if b.nodeID != "" && !local && !b.holdsGraphRoots(branch) {
+				// Parked by the node whose runtime still loads from it.
+				continue
+			}
 			operation := graphReferenceOperationForBranch(container, branch)
 			if operation == "" {
 				if err := b.releaseSharedGraphMemoryRoots(branchGraphRootNames(branch), branchGraphRootObjects(branch)); err != nil {
@@ -15456,6 +15560,9 @@ func (b *runtimeBackend) reconcileConsumedMemoryBacking() error {
 				return fmt.Errorf("retiring runtime memory backing %s for %s: %w", backing.ID, container.Name, err)
 			}
 		}
+	}
+	if source != nil {
+		source.releasedParked(released, all)
 	}
 	return nil
 }
@@ -15499,9 +15606,6 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	// RefreshContainerImageRoot reloads the authoritative container record.
 	// Do not keep using the BranchInfo snapshot supplied by a merged runtime
 	// view: quarantine may have changed while this branch was process-free.
-					if err := b.pruneRetainedImage(container.ID, branch); err != nil && b.stderr != nil {
-						fmt.Fprintf(b.stderr, "ttc: warning: pruning the retained image of %s@%s: %v\n", container.Name, branch.ID, err)
-					}
 	foundBranch := false
 	for _, current := range info.Branches {
 		if current.ID == branch.ID {

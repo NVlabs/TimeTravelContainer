@@ -32,7 +32,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -674,38 +673,6 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		}
 		return false
 	}
-	// Placement reconciliation needs the physical runtime behind every remote
-	// logical branch. The user-facing inventory deliberately hides those
-	// containers, so using ListContainers here made a newly committed fork look
-	// absent and allowed the target node to delete its own Raft placement.
-	containers, err := b.containerStore().ListContainersForPlacement()
-	if err != nil {
-		return err
-	}
-	containersByID := make(map[string]ttcbundle.ContainerInfo, len(containers))
-	for _, info := range containers {
-		containersByID[info.ID] = info
-	}
-	// Raft placement is the ownership authority. Keep the canonical bundle's
-	// denormalized owner in sync so cache reclamation and crash diagnostics do
-	// not treat a retired migration source as local work. Transaction-scoped
-	// physical wrappers may not have a canonical branch entry; those are
-	// intentionally ignored.
-	for _, record := range placementByBranch {
-		if record.OwnerNode == "" || record.State == cluster.PlacementMigrating || record.State == cluster.PlacementCorrupted {
-			continue
-		}
-		if busy(record.PhysicalContainer, record.FamilyID) {
-			continue
-		}
-		info, ok := containersByID[record.FamilyID]
-		if !ok {
-			continue
-		}
-		if err := b.syncLogicalBranchOwnerOf(info, record.BranchID, record.OwnerNode); err != nil {
-			result = errors.Join(result, fmt.Errorf("synchronizing logical owner for %s@%s: %w", record.FamilyID, record.BranchID, err))
-		}
-	}
 	// Persistent container metadata is not proof that a running placement still
 	// has execution state. In particular, a batch scheduler may SIGKILL every
 	// process in a job while leaving both the local runsc state directory and the
@@ -719,6 +686,72 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	liveSandboxes, err := b.liveRuntimeSandboxes()
 	if err != nil {
 		return fmt.Errorf("listing physical sandboxes for placement recovery: %w", err)
+	}
+	// Placement reconciliation needs the physical runtime behind every remote
+	// logical branch. The user-facing inventory deliberately hides those
+	// containers, so using ListContainers here made a newly committed fork look
+	// absent and allowed the target node to delete its own Raft placement.
+	//
+	// It reads the records of the families it acts on: those of this node's
+	// placements and live runtimes, and those whose placement's owner changed
+	// since this daemon last brought their record in line. Reading every
+	// family's record made each command's cost grow with the cluster.
+	needed := make(map[string]struct{})
+	for key, record := range placementByBranch {
+		if record.OwnerNode == b.nodeID {
+			needed[record.FamilyID] = struct{}{}
+			if record.PhysicalContainer != "" {
+				needed[record.PhysicalContainer] = struct{}{}
+			}
+		} else if record.OwnerNode != "" && !b.distributedSource.ownerSynced(key, record) {
+			needed[record.FamilyID] = struct{}{}
+		}
+	}
+	b.distributedSource.forgetRemovedOwners(placementByBranch)
+	for id := range liveSandboxes {
+		needed[id] = struct{}{}
+	}
+	containers := make([]ttcbundle.ContainerInfo, 0, len(needed))
+	for id := range needed {
+		info, found, err := b.containerStore().LoadContainerForPlacement(id)
+		if err != nil {
+			return err
+		}
+		if found {
+			containers = append(containers, info)
+		}
+	}
+	sort.Slice(containers, func(i, j int) bool {
+		if containers[i].Name != containers[j].Name {
+			return containers[i].Name < containers[j].Name
+		}
+		return containers[i].ID < containers[j].ID
+	})
+	containersByID := make(map[string]ttcbundle.ContainerInfo, len(containers))
+	for _, info := range containers {
+		containersByID[info.ID] = info
+	}
+	// Raft placement is the ownership authority. Keep the canonical bundle's
+	// denormalized owner in sync so cache reclamation and crash diagnostics do
+	// not treat a retired migration source as local work. Transaction-scoped
+	// physical wrappers may not have a canonical branch entry; those are
+	// intentionally ignored.
+	for key, record := range placementByBranch {
+		if record.OwnerNode == "" || record.State == cluster.PlacementMigrating || record.State == cluster.PlacementCorrupted {
+			continue
+		}
+		if busy(record.PhysicalContainer, record.FamilyID) {
+			continue
+		}
+		info, ok := containersByID[record.FamilyID]
+		if !ok {
+			continue
+		}
+		if err := b.syncLogicalBranchOwnerOf(info, record.BranchID, record.OwnerNode); err != nil {
+			result = errors.Join(result, fmt.Errorf("synchronizing logical owner for %s@%s: %w", record.FamilyID, record.BranchID, err))
+		} else {
+			b.distributedSource.markOwnerSynced(key, record)
+		}
 	}
 	persistentPhysicalBranches := make(map[string]struct{})
 	for _, info := range containers {
@@ -2876,18 +2909,7 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 }
 
 func distributedFamilyPhysicalIDs(store ttcbundle.Store, familyID string) ([]string, error) {
-	containers, err := store.ListContainersForPlacement()
-	if err != nil {
-		return nil, err
-	}
-	ids := []string{familyID}
-	for _, candidate := range containers {
-		if candidate.ID != familyID && logicalFamilyID(candidate) == familyID {
-			ids = append(ids, candidate.ID)
-		}
-	}
-	sort.Strings(ids)
-	return slices.Compact(ids), nil
+	return store.FamilyContainerIDs(familyID)
 }
 
 func (s *daemonServer) distributedCleanupNode(sourceNode string) (string, error) {
@@ -4000,6 +4022,15 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	}
 	if err == nil && localFamilyStateNeeded(info, b.nodeID) {
 		return nil
+	}
+	if err == nil {
+		// The state finds the backings this node parked for
+		// reconcileConsumedMemoryBacking to release.
+		for _, backing := range info.RuntimeMemoryBackings {
+			if b.holdsGraphRoots(runtimeBackingAsBranch(backing)) {
+				return nil
+			}
+		}
 	}
 	protected, err := b.pendingPublicationProtectsContainer(containerID)
 	if err != nil {

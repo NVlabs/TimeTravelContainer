@@ -183,11 +183,26 @@ var warnedUnreadableContainers sync.Map
 // record to find one by name. A hint is used only if the record it names
 // still has that name and is listed; otherwise the name is looked up as
 // before. Names are unique, which creation checks, so a hint resolves a name
-// as the full lookup would. The hints are forgotten whenever there are
-// maxContainerNameHints of them.
+// as the full lookup would.
+//
+// It also maps a data root and a container ID to the container's identity:
+// its name and its family, which never change for an ID: a container is never
+// renamed, only its branches are. So a search of every container reads only
+// the records it has not read before. The hints of each kind are forgotten
+// whenever there are maxContainerNameHints of them.
 var containerNameHints struct {
-	mu  sync.Mutex
-	ids map[string]string
+	mu         sync.Mutex
+	ids        map[string]string
+	identities map[string]containerIdentity
+}
+
+// containerIdentity is what never changes of a published container.
+type containerIdentity struct {
+	// name is the container's name, or empty for a physical runtime, which
+	// no lookup by name or ID prefix finds.
+	name string
+	// family is the ID of the container's logical family.
+	family string
 }
 
 const maxContainerNameHints = 1 << 16
@@ -206,6 +221,120 @@ func setContainerNameHint(key, id string) {
 		containerNameHints.ids = make(map[string]string)
 	}
 	containerNameHints.ids[key] = id
+}
+
+// publishedContainerIdentities returns the identities of the published
+// containers, those ListContainersForPlacement lists, by ID. It reads the
+// record of each it has not seen before.
+func (s Store) publishedContainerIdentities() (map[string]containerIdentity, error) {
+	entries, err := readDirWithStaleRetry(filepath.Join(s.Root, "containers"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	identities := make(map[string]containerIdentity, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		key := s.Root + "\x00" + id
+		containerNameHints.mu.Lock()
+		identity, known := containerNameHints.identities[key]
+		containerNameHints.mu.Unlock()
+		if !known {
+			info, err := s.loadContainerKey(id)
+			if err != nil || info.DistributedForkHidden {
+				// Unpublished, removed since the directory was read, or
+				// unreadable, which a listing skips too; or a hidden target,
+				// whose publication is yet to come.
+				continue
+			}
+			identity = containerIdentity{family: info.ID}
+			if info.DistributedFamilyID != "" {
+				identity.family = info.DistributedFamilyID
+			}
+			if !info.IsDistributedPhysicalRuntime() {
+				identity.name = info.Name
+				setContainerNameHint(s.Root+"\x00"+info.Name, id)
+			}
+			containerNameHints.mu.Lock()
+			if containerNameHints.identities == nil || len(containerNameHints.identities) >= maxContainerNameHints {
+				containerNameHints.identities = make(map[string]containerIdentity)
+			}
+			containerNameHints.identities[key] = identity
+			containerNameHints.mu.Unlock()
+		}
+		identities[id] = identity
+	}
+	return identities, nil
+}
+
+// checkContainerNameUnused fails if name is the name or the ID of a container.
+func (s Store) checkContainerNameUnused(name string) error {
+	existing, err := s.containersNamed(name)
+	if err != nil {
+		return err
+	}
+	if len(existing) != 0 {
+		return fmt.Errorf("container name %q is already in use by %s", name, existing[0].ID)
+	}
+	return nil
+}
+
+// containersNamed returns the containers listContainers(true) lists whose
+// name or ID is name, without reading any other container's record.
+func (s Store) containersNamed(name string) ([]ContainerInfo, error) {
+	identities, err := s.publishedContainerIdentities()
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for id, identity := range identities {
+		if identity.name == name {
+			ids = append(ids, id)
+		}
+	}
+	// A physical runtime, published or not, is named by its ID.
+	if _, err := os.Lstat(filepath.Join(s.Root, "containers", name)); err == nil && !slices.Contains(ids, name) {
+		ids = append(ids, name)
+	}
+	sort.Strings(ids)
+	var containers []ContainerInfo
+	for _, id := range ids {
+		info, err := s.loadContainerKey(id)
+		if err != nil {
+			containerDir := filepath.Join(s.Root, "containers", id)
+			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+				continue
+			}
+			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		containers = append(containers, info)
+	}
+	return containers, nil
+}
+
+// FamilyContainerIDs returns the IDs of the published containers of the
+// logical family familyID, its own and those of its physical runtimes.
+func (s Store) FamilyContainerIDs(familyID string) ([]string, error) {
+	identities, err := s.publishedContainerIdentities()
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{familyID}
+	for id, identity := range identities {
+		if id != familyID && identity.family == familyID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // PrepareBranchStartBundle creates a short-lived OCI bundle that starts a
@@ -1295,14 +1424,8 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
-	containers, err := s.listContainers(true)
-	if err != nil {
+	if err := s.checkContainerNameUnused(opts.Name); err != nil {
 		return Prepared{}, err
-	}
-	for _, existing := range containers {
-		if existing.Name == opts.Name || existing.ID == opts.Name {
-			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
-		}
 	}
 	pulled, err := s.resolveImage(ctx, opts.Reference, opts.Platform, opts.PullPolicy, opts.Progress)
 	if err != nil {
@@ -1313,7 +1436,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 		return Prepared{}, err
 	}
 	var cleanupManagedVolumeSnapshots func()
-	opts.ManagedVolumes, cleanupManagedVolumeSnapshots, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, containers, opts)
+	opts.ManagedVolumes, cleanupManagedVolumeSnapshots, err = s.resolveManagedVolumes(imageInfo.Image, rootfs, opts)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1323,7 +1446,7 @@ func (s Store) Prepare(ctx context.Context, opts PrepareOptions) (Prepared, erro
 			cleanupManagedVolumeSnapshots()
 		}
 	}()
-	id, containerDir, err := s.createContainerDir(containers)
+	id, containerDir, err := s.createContainerDir()
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1493,14 +1616,8 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err := validateName(opts.Name); err != nil {
 		return Prepared{}, err
 	}
-	containers, err := s.listContainers(true)
-	if err != nil {
+	if err := s.checkContainerNameUnused(opts.Name); err != nil {
 		return Prepared{}, err
-	}
-	for _, existing := range containers {
-		if existing.Name == opts.Name || existing.ID == opts.Name {
-			return Prepared{}, fmt.Errorf("container name %q is already in use by %s", opts.Name, existing.ID)
-		}
 	}
 	pulled, err := s.resolveImage(ctx, opts.Container.Digest, opts.Container.Platform, "never", nil)
 	if err != nil {
@@ -1513,7 +1630,7 @@ func (s Store) PrepareRestore(ctx context.Context, opts RestoreOptions) (Prepare
 	if err != nil {
 		return Prepared{}, err
 	}
-	id, containerDir, err := s.createContainerDir(containers)
+	id, containerDir, err := s.createContainerDir()
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1864,7 +1981,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if globalFamilyID == "" {
 		globalFamilyID = source.ID
 	}
-	containers, err := s.listContainers(true)
+	containers, err := s.containersNamed(opts.TargetName)
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -1989,7 +2106,7 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 		id = opts.TargetID
 		containerDir, err = s.createContainerStagingDir(id)
 	} else {
-		id, containerDir, err = s.createContainerDir(containers)
+		id, containerDir, err = s.createContainerDir()
 	}
 	if err != nil {
 		return Prepared{}, err
@@ -2178,8 +2295,22 @@ func copyRestoreHostFile(source, destination string, mode os.FileMode) error {
 	return output.Close()
 }
 
-func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, containers []ContainerInfo, opts PrepareOptions) ([]ManagedVolume, func(), error) {
+func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, opts PrepareOptions) ([]ManagedVolume, func(), error) {
 	volumes := append([]ManagedVolume(nil), opts.ManagedVolumes...)
+	// The containers that may attach a volume, listed once a volume needs them.
+	var containers []ContainerInfo
+	listed := false
+	listContainers := func() error {
+		if listed {
+			return nil
+		}
+		var err error
+		if containers, err = s.listContainers(true); err != nil {
+			return err
+		}
+		listed = true
+		return nil
+	}
 	mounted := make(map[string]bool)
 	for _, mount := range opts.HostMounts {
 		mounted[filepath.Clean(mount.Destination)] = true
@@ -2280,6 +2411,10 @@ func (s Store) resolveManagedVolumes(image ocispec.Image, rootfs string, contain
 			}
 		}
 		info := repository.Info()
+		if err := listContainers(); err != nil {
+			repository.Close()
+			return nil, nil, err
+		}
 		if err := validateManagedVolumeAttachment(info.ID, volumes[i], containers); err != nil {
 			repository.Close()
 			return nil, nil, err
@@ -2802,18 +2937,11 @@ func randomObjectID(kind string, size int) (string, error) {
 	return hex.EncodeToString(data), nil
 }
 
-func (s Store) createContainerDir(existing []ContainerInfo) (string, string, error) {
-	unavailable := make(map[string]bool, len(existing))
-	for _, info := range existing {
-		unavailable[info.Name] = true
-	}
+func (s Store) createContainerDir() (string, string, error) {
 	for attempt := 0; attempt < 100; attempt++ {
 		id, err := randomObjectID("container", containerIDBytes)
 		if err != nil {
 			return "", "", err
-		}
-		if unavailable[id] {
-			continue
 		}
 		var dir string
 		if s.hasUnifiedActiveRoot() {
@@ -2931,29 +3059,38 @@ func (s Store) LoadContainer(identifier string) (ContainerInfo, error) {
 			return info, nil
 		}
 	}
-	containers, err := s.ListContainers()
+	// Search every container ListContainers lists.
+	identities, err := s.publishedContainerIdentities()
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	var names []ContainerInfo
-	var ids []ContainerInfo
-	for _, info := range containers {
-		setContainerNameHint(s.Root+"\x00"+info.Name, info.ID)
-		if info.Name == identifier {
-			names = append(names, info)
+	var names, ids []string
+	for id, identity := range identities {
+		if identity.name == "" {
+			continue
 		}
-		if strings.HasPrefix(info.ID, identifier) {
-			ids = append(ids, info)
+		if identity.name == identifier {
+			names = append(names, id)
+		}
+		if strings.HasPrefix(id, identifier) {
+			ids = append(ids, id)
 		}
 	}
+	found := func(id string) (ContainerInfo, error) {
+		info, err := s.loadContainerKey(id)
+		if errors.Is(err, os.ErrNotExist) {
+			return ContainerInfo{}, fmt.Errorf("container %q does not exist: %w", identifier, os.ErrNotExist)
+		}
+		return info, err
+	}
 	if len(names) == 1 {
-		return names[0], nil
+		return found(names[0])
 	}
 	if len(names) > 1 {
 		return ContainerInfo{}, fmt.Errorf("container name %q is ambiguous", identifier)
 	}
 	if len(ids) == 1 {
-		return ids[0], nil
+		return found(ids[0])
 	}
 	if len(ids) > 1 {
 		return ContainerInfo{}, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
@@ -3164,9 +3301,6 @@ func (s Store) loadContainerKey(key string) (ContainerInfo, error) {
 	if err := validateResourceLimits(SpecOptions{PidsLimit: info.PidsLimit, MemoryLimit: info.MemoryLimit, MemorySwap: info.MemorySwap, NanoCPUs: info.NanoCPUs, CPUShares: info.CPUShares, CPUPeriod: info.CPUPeriod, CPUQuota: info.CPUQuota}); err != nil {
 		return ContainerInfo{}, fmt.Errorf("container %q has invalid resource limits: %w", key, err)
 	}
-	if _, err := os.Stat(filepath.Join(info.BundleDir, "config.json")); err != nil {
-		return ContainerInfo{}, fmt.Errorf("container %q bundle is unavailable: %w", key, err)
-	}
 	return info, nil
 }
 
@@ -3176,6 +3310,12 @@ func (s Store) LoadSpec(name string) (*specs.Spec, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.loadSpecOf(info, name)
+}
+
+// loadSpecOf is LoadSpec of the container whose record is info, which name
+// named.
+func (s Store) loadSpecOf(info ContainerInfo, name string) (*specs.Spec, error) {
 	data, err := readFileWithStaleRetry(filepath.Join(info.BundleDir, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("reading OCI config for container %q: %w", name, err)
@@ -3504,6 +3644,27 @@ func (s Store) ListContainersForPlacement() ([]ContainerInfo, error) {
 	return s.listContainersWithPolicy(false, true, false)
 }
 
+// LoadContainerForPlacement is ListContainersForPlacement for the container
+// id: it reports false for one that does not exist, is still being created,
+// or is a prepared target not yet published.
+func (s Store) LoadContainerForPlacement(id string) (ContainerInfo, bool, error) {
+	containerDir := filepath.Join(s.Root, "containers", id)
+	info, err := s.loadContainerKey(id)
+	if err != nil {
+		if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+			return ContainerInfo{}, false, nil
+		}
+		if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+			return ContainerInfo{}, false, nil
+		}
+		return ContainerInfo{}, false, err
+	}
+	if info.DistributedForkHidden {
+		return ContainerInfo{}, false, nil
+	}
+	return info, true, nil
+}
+
 // ListContainersForGC returns every durable container, including internal
 // removal tombstones, and fails rather than treating an unreadable record as
 // unreachable. Destructive graph reconciliation must use this view.
@@ -3535,21 +3696,14 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 			continue
 		}
 		containerDir := filepath.Join(containersDir, entry.Name())
-		_, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker))
-		creationMarked := markerErr == nil
-		if _, metadataErr := os.Stat(filepath.Join(containerDir, "container.json")); errors.Is(metadataErr, fs.ErrNotExist) {
-			if creationMarked {
-				// Another cluster node may still be preparing this directory in the
-				// shared data root. It becomes visible only when container.json is
-				// atomically published.
-				continue
-			}
-		}
 		info, err := s.loadContainerKey(entry.Name())
 		if err != nil {
-			if creationMarked {
-				// Publication can become visible to NFS clients one pathname at a
-				// time. The marker makes this an unpublished record, not corruption.
+			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+				// Another cluster node may still be preparing this directory in
+				// the shared data root: it is published when container.json is,
+				// atomically, and the publication can become visible to NFS
+				// clients one pathname at a time. The marker makes this an
+				// unpublished record, not corruption.
 				continue
 			}
 			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
@@ -4380,6 +4534,37 @@ func (s Store) ClearBranchMemoryGraphIf(name, branchID string, snapshotID uint64
 	return cleared, err
 }
 
+// ReplaceBranchMemoryGraphIf replaces the memory graph a branch retains, if
+// it is still roots under snapshotID, with newRoots under newSnapshotID. It
+// reports whether it replaced it.
+func (s Store) ReplaceBranchMemoryGraphIf(name, branchID string, snapshotID uint64, roots, objects []string, newSnapshotID uint64, newRoots, newObjects []string) (bool, error) {
+	if len(roots) != len(objects) || len(newRoots) != len(newObjects) || len(newRoots) == 0 || newSnapshotID == 0 {
+		return false, fmt.Errorf("invalid memory graph replacement of %d roots by %d", len(roots), len(newRoots))
+	}
+	replaced := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID ||
+				!slices.Equal(branch.MemoryRoots, roots) ||
+				!slices.Equal(branch.MemoryRootObjects, objects) ||
+				branch.DistributedGraphReferenceOperation != "" {
+				return false, nil
+			}
+			branch.SnapshotID = newSnapshotID
+			branch.MemoryRoots = append([]string(nil), newRoots...)
+			branch.MemoryRootObjects = append([]string(nil), newObjects...)
+			replaced = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return replaced, err
+}
+
 // NewBranchPublicationID allocates an immutable publication identity without
 // changing branch metadata. Callers use this while constructing a hidden
 // capture, then install it with BeginBranchPublicationIf only after the capture
@@ -4534,37 +4719,6 @@ func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifec
 			recomputeContainerState(info)
 			return true, nil
 		}
-// ReplaceBranchMemoryGraphIf replaces the memory graph a branch retains, if
-// it is still roots under snapshotID, with newRoots under newSnapshotID. It
-// reports whether it replaced it.
-func (s Store) ReplaceBranchMemoryGraphIf(name, branchID string, snapshotID uint64, roots, objects []string, newSnapshotID uint64, newRoots, newObjects []string) (bool, error) {
-	if len(roots) != len(objects) || len(newRoots) != len(newObjects) || len(newRoots) == 0 || newSnapshotID == 0 {
-		return false, fmt.Errorf("invalid memory graph replacement of %d roots by %d", len(roots), len(newRoots))
-	}
-	replaced := false
-	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
-		for i := range info.Branches {
-			branch := &info.Branches[i]
-			if branch.ID != branchID {
-				continue
-			}
-			if branch.SnapshotID != snapshotID ||
-				!slices.Equal(branch.MemoryRoots, roots) ||
-				!slices.Equal(branch.MemoryRootObjects, objects) ||
-				branch.DistributedGraphReferenceOperation != "" {
-				return false, nil
-			}
-			branch.SnapshotID = newSnapshotID
-			branch.MemoryRoots = append([]string(nil), newRoots...)
-			branch.MemoryRootObjects = append([]string(nil), newObjects...)
-			replaced = true
-			return true, nil
-		}
-		return false, fmt.Errorf("branch %q is not recorded", branchID)
-	})
-	return replaced, err
-}
-
 		return false, fmt.Errorf("branch %q is not recorded", branchID)
 	})
 }
@@ -5305,7 +5459,7 @@ func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{},
 	for _, volume := range volumes {
 		paths[filepath.Join(s.activeRoot(), "filesystems", "volumes", volume.ID)] = struct{}{}
 	}
-	containers, err := s.listContainers(true)
+	containers, err := s.ContainersWithActiveState()
 	if err != nil {
 		return nil, err
 	}
@@ -5315,11 +5469,48 @@ func (s Store) repositoryPaths(manager *ttcvolume.Manager) (map[string]struct{},
 	return paths, nil
 }
 
+// ContainersWithActiveState returns the containers whose state may be in the
+// active root, as ListContainersForGC does: all of them, or where the active
+// root is a node's own, those with state in it. A container's repositories,
+// but for named volumes, its image root, and its runtime on the node are in
+// its state there.
+func (s Store) ContainersWithActiveState() ([]ContainerInfo, error) {
+	if s.activeRoot() == s.Root {
+		return s.listContainers(true)
+	}
+	entries, err := os.ReadDir(filepath.Join(s.activeRoot(), "containers"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing active container state: %w", err)
+	}
+	var containers []ContainerInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := s.loadContainerKey(entry.Name())
+		if err != nil {
+			containerDir := filepath.Join(s.Root, "containers", entry.Name())
+			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
+				continue
+			}
+			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		containers = append(containers, info)
+	}
+	return containers, nil
+}
+
 // addContainerRepositoryPaths adds to paths the repositories of the listed
 // containers.
 func (s Store) addContainerRepositoryPaths(paths map[string]struct{}, containers []ContainerInfo) error {
 	for _, container := range containers {
-		spec, err := s.LoadSpec(container.ID)
+		spec, err := s.loadSpecOf(container, container.ID)
 		if err != nil {
 			// Removed since it was listed, as a migrated or forked branch's
 			// staging record may be meanwhile: removal renames the record
@@ -5793,7 +5984,7 @@ func (s Store) PruneImageRoots(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("listing images before pruning roots: %w", err)
 	}
-	containers, err := s.listContainers(true)
+	containers, err := s.ContainersWithActiveState()
 	if err != nil {
 		return 0, fmt.Errorf("listing containers before pruning image roots: %w", err)
 	}

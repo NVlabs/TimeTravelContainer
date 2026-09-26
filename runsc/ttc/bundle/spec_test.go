@@ -2059,7 +2059,7 @@ func TestContainerPublicationIsAtomicAgainstRecovery(t *testing.T) {
 func TestContainerPublicationWithUnifiedActiveRoot(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root, ActiveRoot: root}
-	id, building, err := store.createContainerDir(nil)
+	id, building, err := store.createContainerDir()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2526,7 +2526,7 @@ func TestStoreBranchPortBindings(t *testing.T) {
 func TestContainerIdentityResolution(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
-	generatedID, generatedDir, err := store.createContainerDir(nil)
+	generatedID, generatedDir, err := store.createContainerDir()
 	if err != nil {
 		t.Fatalf("createContainerDir: %v", err)
 	}

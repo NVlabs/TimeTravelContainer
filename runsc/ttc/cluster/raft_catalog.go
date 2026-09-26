@@ -513,17 +513,7 @@ func (c *RaftCatalog) Branches() ([]BranchAuthority, error) {
 	if err != nil {
 		return nil, err
 	}
-	records := make([]BranchAuthority, 0, len(state.Branches))
-	for _, record := range state.Branches {
-		records = append(records, record)
-	}
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].FamilyID != records[j].FamilyID {
-			return records[i].FamilyID < records[j].FamilyID
-		}
-		return records[i].BranchID < records[j].BranchID
-	})
-	return records, nil
+	return state.BranchList(), nil
 }
 
 // Branch returns one linearizable logical branch record.
@@ -838,13 +828,40 @@ func (r raftPlacementCatalog) ListWithOfflineOwners() ([]PlacementRecord, map[st
 	if err != nil {
 		return nil, nil, err
 	}
+	return state.PlacementList(), state.OfflineNodes(), nil
+}
+
+// PlacementList returns the placements of s ordered by family and branch, as
+// the placement catalog lists them.
+func (s *AuthorityState) PlacementList() []PlacementRecord {
+	return placementRecords(s)
+}
+
+// OfflineNodes returns the nodes of s that are offline.
+func (s *AuthorityState) OfflineNodes() map[string]bool {
 	offline := make(map[string]bool)
-	for id, node := range state.Nodes {
+	for id, node := range s.Nodes {
 		if node.State == NodeOffline {
 			offline[id] = true
 		}
 	}
-	return placementRecords(state), offline, nil
+	return offline
+}
+
+// BranchList returns the branch records of s ordered by family and branch,
+// as Branches lists them.
+func (s *AuthorityState) BranchList() []BranchAuthority {
+	records := make([]BranchAuthority, 0, len(s.Branches))
+	for _, record := range s.Branches {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].FamilyID != records[j].FamilyID {
+			return records[i].FamilyID < records[j].FamilyID
+		}
+		return records[i].BranchID < records[j].BranchID
+	})
+	return records
 }
 
 func placementRecords(state *AuthorityState) []PlacementRecord {

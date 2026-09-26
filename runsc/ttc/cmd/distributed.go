@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -291,6 +292,78 @@ type distributedSourceRuntime struct {
 	// exports has, by transaction, a function that stops the transaction's
 	// live graph export: one that no target will read.
 	exports sync.Map
+	// syncedOwners has, by family and branch, the placement generation and
+	// owner that placement reconciliation last brought the family's record in
+	// line with.
+	syncedOwners sync.Map
+	// parked has, by container ID, a count of the times this daemon parked
+	// runtime memory backings of the container: see noteParked.
+	parkedMu sync.Mutex
+	parked   map[string]uint64
+	// parkedKnown is set once parked also has the containers whose backings
+	// an earlier daemon parked.
+	parkedKnown bool
+}
+
+// noteParked records that this daemon parked a runtime memory backing of the
+// container id, for reconcileConsumedMemoryBacking to release.
+func (r *distributedSourceRuntime) noteParked(id string) {
+	r.parkedMu.Lock()
+	defer r.parkedMu.Unlock()
+	if r.parked == nil {
+		r.parked = make(map[string]uint64)
+	}
+	r.parked[id]++
+}
+
+// parkedContainers returns the containers with backings to release, with
+// their counts, and whether it knows them all.
+func (r *distributedSourceRuntime) parkedContainers() (map[string]uint64, bool) {
+	r.parkedMu.Lock()
+	defer r.parkedMu.Unlock()
+	return maps.Clone(r.parked), r.parkedKnown
+}
+
+// releasedParked forgets the containers found with no backings to release,
+// unless they were parked again since they were counted, and records that
+// parked knows every container if all were read.
+func (r *distributedSourceRuntime) releasedParked(released map[string]uint64, all bool) {
+	r.parkedMu.Lock()
+	defer r.parkedMu.Unlock()
+	for id, count := range released {
+		if r.parked[id] == count {
+			delete(r.parked, id)
+		}
+	}
+	if all {
+		r.parkedKnown = true
+	}
+}
+
+type syncedPlacementOwner struct {
+	generation uint64
+	owner      string
+}
+
+// ownerSynced reports whether the family record's owner of the branch whose
+// placement is record, under key, was brought in line with it.
+func (r *distributedSourceRuntime) ownerSynced(key string, record cluster.PlacementRecord) bool {
+	synced, ok := r.syncedOwners.Load(key)
+	return ok && synced.(syncedPlacementOwner) == syncedPlacementOwner{generation: record.Generation, owner: record.OwnerNode}
+}
+
+func (r *distributedSourceRuntime) markOwnerSynced(key string, record cluster.PlacementRecord) {
+	r.syncedOwners.Store(key, syncedPlacementOwner{generation: record.Generation, owner: record.OwnerNode})
+}
+
+// forgetRemovedOwners forgets the branches that have no placement.
+func (r *distributedSourceRuntime) forgetRemovedOwners(placements map[string]cluster.PlacementRecord) {
+	r.syncedOwners.Range(func(key, _ any) bool {
+		if _, ok := placements[key.(string)]; !ok {
+			r.syncedOwners.Delete(key)
+		}
+		return true
+	})
 }
 
 // errExportAbandoned is the error of a live graph export stopped because
