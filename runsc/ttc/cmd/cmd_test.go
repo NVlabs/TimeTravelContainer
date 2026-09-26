@@ -4329,7 +4329,7 @@ func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {
 	script := `#!/bin/sh
 echo discarded-output
 echo launch-diagnostic >&2
-sleep 30 &
+sleep 60 &
 echo $! >"$0.pid"
 exit 0
 `
@@ -4345,9 +4345,10 @@ exit 0
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
-	// The descendant sleeps for 30 seconds, so five seconds is a generous
-	// loaded-CI allowance while still proving that launch did not wait for it.
-	if elapsed := time.Since(started); elapsed >= 5*time.Second {
+	// The descendant sleeps for a minute, so 20 seconds is a generous
+	// allowance for a heavily loaded host while still proving that launch did
+	// not wait for it.
+	if elapsed := time.Since(started); elapsed >= 20*time.Second {
 		t.Fatalf("launch waited %v for a descendant holding stdio", elapsed)
 	}
 	if err != nil || status != 0 {
