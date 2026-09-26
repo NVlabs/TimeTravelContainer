@@ -95,14 +95,34 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		return nil, nil, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	frames, pages, failedOffset, err := s.resolveLocked(file, fr, at)
+	s.mu.Unlock()
+	if err == nil {
+		return frames, pages, nil
+	}
+	// MapFile never sees a failed result, so drop the reservations taken for
+	// earlier pages here. Both steps may decommit, which must not hold s.mu.
+	if failedOffset != nil {
+		err = errors.Join(err, s.backing.Decommit(memmap.FileRange{Start: *failedOffset, End: *failedOffset + hostarch.PageSize}))
+		s.mu.Lock()
+		s.free = append(s.free, *failedOffset)
+		s.mu.Unlock()
+	}
+	return nil, nil, errors.Join(err, s.cancelReservations(pages, at.Write))
+}
 
+// resolveLocked reserves a staged page for each page of fr. On error it
+// returns the pages already reserved and, if a newly staged frame must be
+// decommitted, its backing offset.
+//
+// Preconditions: s.mu is locked.
+func (s *stagingCache) resolveLocked(file memmap.File, fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, []*stagedPage, *uint64, error) {
 	frames := make([]pgalloc.BackingFrame, 0, fr.Length()/hostarch.PageSize)
 	pages := make([]*stagedPage, 0, cap(frames))
 	for sourceOffset := fr.Start; sourceOffset < fr.End; sourceOffset += hostarch.PageSize {
 		key, err := stagingFileKey(file, sourceOffset)
 		if err != nil {
-			return nil, nil, err
+			return nil, pages, nil, err
 		}
 		page := s.pages[key]
 		for page != nil && page.releasing {
@@ -112,22 +132,20 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		if page == nil {
 			backingOffset, err := s.allocateOffsetLocked()
 			if err != nil {
-				return nil, nil, err
+				return nil, pages, nil, err
 			}
 			resolved, frameLease, err := s.backing.AcquireMapping(memmap.FileRange{Start: backingOffset, End: backingOffset + hostarch.PageSize}, hostarch.Write)
 			if err != nil {
 				s.free = append(s.free, backingOffset)
-				return nil, nil, fmt.Errorf("allocating VM staging frame: %w", err)
+				return nil, pages, nil, fmt.Errorf("allocating VM staging frame: %w", err)
 			}
 			if len(resolved) != 1 {
 				frameLease.Release()
-				return nil, nil, fmt.Errorf("VM staging backing returned %d frames for one page", len(resolved))
+				return nil, pages, &backingOffset, fmt.Errorf("VM staging backing returned %d frames for one page", len(resolved))
 			}
 			if err := copyFileToFrame(file, sourceOffset, resolved[0]); err != nil {
 				frameLease.Release()
-				_ = s.backing.Decommit(memmap.FileRange{Start: backingOffset, End: backingOffset + hostarch.PageSize})
-				s.free = append(s.free, backingOffset)
-				return nil, nil, fmt.Errorf("staging %T offset %#x: %w", file, sourceOffset, err)
+				return nil, pages, &backingOffset, fmt.Errorf("staging %T offset %#x: %w", file, sourceOffset, err)
 			}
 			frameLease.Release()
 			page = &stagedPage{
@@ -140,10 +158,10 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		}
 		resolved, err := s.backing.ResolveFrames(memmap.FileRange{Start: page.backingOffset, End: page.backingOffset + hostarch.PageSize}, at)
 		if err != nil {
-			return nil, nil, err
+			return nil, pages, nil, err
 		}
 		if len(resolved) != 1 || resolved[0].ID != page.frame {
-			return nil, nil, fmt.Errorf("VM staging frame identity changed for %T offset %#x", file, sourceOffset)
+			return nil, pages, nil, fmt.Errorf("VM staging frame identity changed for %T offset %#x", file, sourceOffset)
 		}
 		if at.Write {
 			page.dirty = true
@@ -153,7 +171,7 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		frames = append(frames, resolved[0])
 		pages = append(pages, page)
 	}
-	return frames, pages, nil
+	return frames, pages, nil, nil
 }
 
 func (s *stagingCache) allocateOffsetLocked() (uint64, error) {

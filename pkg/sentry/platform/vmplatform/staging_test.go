@@ -77,6 +77,9 @@ type stagingTestFile struct {
 	memmap.NoBufferedIOFallback
 	data     []byte
 	writeErr error
+	// readErr fails reads of pages at or after readErrAt.
+	readErr   error
+	readErrAt uint64
 }
 
 func (*stagingTestFile) IncRef(memmap.FileRange, uint32) {}
@@ -89,6 +92,9 @@ func (*stagingTestFile) FD() int { return -1 }
 func (f *stagingTestFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	if at.Write && f.writeErr != nil {
 		return safemem.BlockSeq{}, f.writeErr
+	}
+	if !at.Write && f.readErr != nil && fr.Start >= f.readErrAt {
+		return safemem.BlockSeq{}, f.readErr
 	}
 	return safemem.BlockSeqOf(safemem.BlockFromSafeSlice(f.data[fr.Start:fr.End])), nil
 }
@@ -303,5 +309,27 @@ func TestStagingReadOnlyRemapCleansAfterFlush(t *testing.T) {
 	}
 	if err := cache.removeMapping(pages[0], false); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestStagingResolveFailureReleasesEarlierPages checks that a range which
+// fails partway leaves no reservation behind: MapFile never sees the pages
+// reserved before the failure.
+func TestStagingResolveFailureReleasesEarlierPages(t *testing.T) {
+	ram, cache := newStagingTestCache(t)
+	wantErr := errors.New("read failed")
+	file := &stagingTestFile{data: make([]byte, 2*hostarch.PageSize), readErr: wantErr, readErrAt: hostarch.PageSize}
+	_, _, err := cache.resolve(file, memmap.FileRange{Start: 0, End: 2 * hostarch.PageSize}, hostarch.Read)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("resolve error = %v, want %v", err, wantErr)
+	}
+	cache.mu.Lock()
+	cached := len(cache.pages)
+	cache.mu.Unlock()
+	if cached != 0 {
+		t.Fatalf("%d staged pages remain after a failed resolve", cached)
+	}
+	if metrics := ram.Metrics(); metrics.LogicalBytes != 0 {
+		t.Fatalf("staging frames remain resident after a failed resolve: %+v", metrics)
 	}
 }
