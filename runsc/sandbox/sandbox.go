@@ -2233,6 +2233,16 @@ func (s *Sandbox) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileLoadSta
 	return status, nil
 }
 
+// ReclaimImageChunks frees the rehydrated chunks of the family's memory that
+// no branch uses any more, and returns every chunk freed so, in hexadecimal.
+func (s *Sandbox) ReclaimImageChunks(branchID string) ([]string, error) {
+	var objects []string
+	if err := s.call(boot.ContMgrReclaimImageChunks, &boot.DistributedForkDependencyArgs{BranchID: branchID}, &objects); err != nil {
+		return nil, fmt.Errorf("reclaiming unused image chunks of branch %q: %w", branchID, err)
+	}
+	return objects, nil
+}
+
 // SetDistributedForkPrefetchWindow changes future target remote-memory reads.
 func (s *Sandbox) SetDistributedForkPrefetchWindow(branchID string, behind, ahead uint64) error {
 	args := &boot.DistributedForkDependencyArgs{BranchID: branchID, PrefetchBehindBytes: behind, PrefetchBytes: ahead}

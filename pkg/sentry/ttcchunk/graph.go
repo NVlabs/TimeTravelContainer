@@ -598,6 +598,12 @@ func graphChunkResidencyID(chunk ttcsnapshot.ObjectID) ID {
 	return id
 }
 
+// GraphChunkObject returns the graph memory chunk a Sentry names by id, its
+// residency identity.
+func GraphChunkObject(id ID) (ttcsnapshot.ObjectID, error) {
+	return graphChunkObjectID(id)
+}
+
 func graphChunkObjectID(id ID) (ttcsnapshot.ObjectID, error) {
 	if !bytes.Equal(id[:8], []byte{'T', 'T', 'C', 'G', 'R', 'A', 'P', 'H'}) {
 		return ttcsnapshot.ObjectID{}, errors.New("invalid graph memory residency identity")

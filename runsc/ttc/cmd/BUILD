@@ -30,6 +30,7 @@ go_library(
         "family_locks.go",
         "events.go",
         "idempotency.go",
+        "image_prune.go",
         "lifecycle_recovery.go",
         "long_operations.go",
 		"port_ingress.go",

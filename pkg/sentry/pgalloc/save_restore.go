@@ -2816,6 +2816,55 @@ func (apfl *AsyncPagesFileLoad) main() {
 	}
 }
 
+// cancelUnusedLoads forgets the pages of frs that amfl has yet to load and no
+// user of its file holds: nobody will await them. Pages being read stay until
+// their read completes. amfl finishes if nothing is left for it to load.
+//
+// Preconditions: frs are page-aligned, and their pages hold only the
+// reference of a sparse unit being released.
+func (amfl *asyncMemoryFileLoad) cancelUnusedLoads(frs []memmap.FileRange) {
+	apfl := amfl.pf
+	apfl.amflsMu.Lock()
+	defer apfl.amflsMu.Unlock()
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	removed := false
+	for _, fr := range frs {
+		ulseg := amfl.unloaded.LowerBoundSegment(fr.Start)
+		for ulseg.Ok() && ulseg.Start() < fr.End {
+			ulseg = amfl.unloaded.Isolate(ulseg, fr)
+			if ul := ulseg.ValuePtr(); ul.started || len(ul.waiters) != 0 {
+				ulseg = ulseg.NextSegment()
+				continue
+			}
+			ulseg = amfl.unloaded.Remove(ulseg).NextSegment()
+			removed = true
+		}
+	}
+	if !removed || !amfl.lfDone {
+		return
+	}
+	if !amfl.unloaded.IsEmpty() {
+		amfl.minUnloaded.Store(amfl.unloaded.FirstSegment().Start())
+		return
+	}
+	// As the loader finishes a sparse load it completes.
+	amfl.minUnloaded.Store(math.MaxUint64)
+	apfl.amfls.Remove(amfl)
+	if !amfl.sparse {
+		amfl.f.asyncPageLoad.Store(nil)
+	} else {
+		amfl.f.removeSparseAsyncLoad(amfl)
+		apfl.demandOnly.Store(false)
+		apfl.lfStatus.Notify(aplLFPending)
+	}
+	amfl.timeline.End()
+	if amfl.doneCallback != nil {
+		amfl.doneCallback(nil)
+		amfl.doneCallback = nil
+	}
+}
+
 // Preconditions:
 // - All pages in fr must be becoming waste pages.
 // - fr must be page-aligned.

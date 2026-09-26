@@ -390,6 +390,8 @@ func (t *TimeTravel) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		output, err = cont.Sandbox.DistributedForkDependencyStatus(f.Arg(2))
 	case "page-load-status":
 		output, err = cont.Sandbox.PageLoadStatus(f.Arg(2))
+	case "reclaim-image-chunks":
+		output, err = cont.Sandbox.ReclaimImageChunks(f.Arg(2))
 	case "distributed-prefetch":
 		err = cont.Sandbox.SetDistributedForkPrefetchWindow(f.Arg(2), t.distributedPrefetchBehind, t.distributedPrefetchBytes)
 	case "distributed-drain":

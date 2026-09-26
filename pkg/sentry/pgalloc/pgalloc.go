@@ -157,6 +157,15 @@ type MemoryFile struct {
 	// runtime-local and protected by mu.
 	sparseChunks map[SparseChunkObjectID]sparseResidentChunk `state:"nosave"`
 
+	// reclaimedSparseChunks has the sparse chunks ReclaimUnusedSparseChunks
+	// released, since they were last installed: no user of the file held any
+	// of their pages. It is protected by mu.
+	reclaimedSparseChunks map[SparseChunkObjectID]struct{} `state:"nosave"`
+
+	// sparseInstalling counts, by unit, the installations that install or
+	// reuse it and are not yet committed or aborted. It is protected by mu.
+	sparseInstalling map[SparseChunkObjectID]int `state:"nosave"`
+
 	// subreleased maps hugepage-aligned file offsets to the number of
 	// sub-released small pages within the hugepage beginning at that offset.
 	// subreleased is protected by mu.

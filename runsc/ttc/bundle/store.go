@@ -4534,6 +4534,37 @@ func (s Store) CompleteConsumedBranchPublication(name, branchID, manifest, lifec
 			recomputeContainerState(info)
 			return true, nil
 		}
+// ReplaceBranchMemoryGraphIf replaces the memory graph a branch retains, if
+// it is still roots under snapshotID, with newRoots under newSnapshotID. It
+// reports whether it replaced it.
+func (s Store) ReplaceBranchMemoryGraphIf(name, branchID string, snapshotID uint64, roots, objects []string, newSnapshotID uint64, newRoots, newObjects []string) (bool, error) {
+	if len(roots) != len(objects) || len(newRoots) != len(newObjects) || len(newRoots) == 0 || newSnapshotID == 0 {
+		return false, fmt.Errorf("invalid memory graph replacement of %d roots by %d", len(roots), len(newRoots))
+	}
+	replaced := false
+	err := s.mutateContainer(name, func(info *ContainerInfo) (bool, error) {
+		for i := range info.Branches {
+			branch := &info.Branches[i]
+			if branch.ID != branchID {
+				continue
+			}
+			if branch.SnapshotID != snapshotID ||
+				!slices.Equal(branch.MemoryRoots, roots) ||
+				!slices.Equal(branch.MemoryRootObjects, objects) ||
+				branch.DistributedGraphReferenceOperation != "" {
+				return false, nil
+			}
+			branch.SnapshotID = newSnapshotID
+			branch.MemoryRoots = append([]string(nil), newRoots...)
+			branch.MemoryRootObjects = append([]string(nil), newObjects...)
+			replaced = true
+			return true, nil
+		}
+		return false, fmt.Errorf("branch %q is not recorded", branchID)
+	})
+	return replaced, err
+}
+
 		return false, fmt.Errorf("branch %q is not recorded", branchID)
 	})
 }

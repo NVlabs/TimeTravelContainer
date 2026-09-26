@@ -364,4 +364,94 @@ func TestReclaimUnusedSparseChunks(t *testing.T) {
 	if _, ok := mf.SparseChunkRange(install.Object); ok {
 		t.Fatal("reclaimed chunk remains in residency map")
 	}
+	if reclaimed := mf.ReclaimedSparseChunks(); len(reclaimed) != 1 || reclaimed[0] != install.Object {
+		t.Fatalf("reclaimed chunks are %x, want only %x", reclaimed, install.Object)
+	}
+	// A chunk installed again is in use again.
+	installation, err = mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed := mf.ReclaimedSparseChunks(); len(reclaimed) != 0 {
+		t.Fatalf("a reinstalled chunk is still reported reclaimed: %x", reclaimed)
+	}
+}
+
+// A unit nobody uses is reclaimed though a demand-only loader, which loads
+// only what is touched, still holds its pages as not loaded: the loader
+// forgets them and finishes.
+func TestReclaimUnusedSparseChunksWithDemandLoader(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	fillRemoteTestRange(t, source, sourceFR, make([]byte, sourceFR.Length()))
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	pages, err := StartAsyncPagesFileLoadWithOpts(NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2), nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	install := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	unit, ok := mf.SparseChunkRange(install.Object)
+	if !ok {
+		t.Fatal("installed chunk is not resident")
+	}
+	if err := mf.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: unit, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d chunks with a demand loader attached, want 1", got)
+	}
+	if err := pages.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if stats := pages.Stats(); !stats.Done || stats.BytesOutstanding != 0 || stats.BytesLoaded != 0 {
+		t.Fatalf("loader after its only unit was reclaimed: %+v", stats)
+	}
+	if mf.IsAsyncLoading() {
+		t.Fatal("the file retained a loader with nothing to load")
+	}
+}
+
+// A unit an installation reuses stays until the installation is committed:
+// the owners it restores have yet to take their references.
+func TestReclaimUnusedSparseChunksSparesAnInstallationInProgress(t *testing.T) {
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	install := sparseTestInstall(1)
+	first, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mf.ReclaimUnusedSparseChunks(); got != 0 {
+		t.Fatalf("reclaimed %d chunks an installation reuses", got)
+	}
+	if err := second.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := mf.ReclaimUnusedSparseChunks(); got != 1 {
+		t.Fatalf("reclaimed %d chunks once the installation committed, want 1", got)
+	}
 }

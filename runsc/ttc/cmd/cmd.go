@@ -15499,6 +15499,9 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	// RefreshContainerImageRoot reloads the authoritative container record.
 	// Do not keep using the BranchInfo snapshot supplied by a merged runtime
 	// view: quarantine may have changed while this branch was process-free.
+					if err := b.pruneRetainedImage(container.ID, branch); err != nil && b.stderr != nil {
+						fmt.Fprintf(b.stderr, "ttc: warning: pruning the retained image of %s@%s: %v\n", container.Name, branch.ID, err)
+					}
 	foundBranch := false
 	for _, current := range info.Branches {
 		if current.ID == branch.ID {

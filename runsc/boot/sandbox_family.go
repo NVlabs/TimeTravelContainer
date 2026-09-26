@@ -1257,6 +1257,21 @@ func (f *SandboxFamily) PageLoadStatus(branchID string) (pgalloc.AsyncPagesFileL
 	return b.k.PageLoadStatus(), nil
 }
 
+// ReclaimImageChunks frees the rehydrated chunks of the family's memory that
+// no branch uses any more, as every page in them was since rewritten or
+// freed, and returns every chunk freed so since it was installed: the parts
+// of the family's images that no dehydration will share.
+func (f *SandboxFamily) ReclaimImageChunks(branchID string) ([]pgalloc.SparseChunkObjectID, error) {
+	b, release, err := f.beginControl(branchID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	mf := b.k.MemoryFile()
+	mf.ReclaimUnusedSparseChunks()
+	return mf.ReclaimedSparseChunks(), nil
+}
+
 // SetDistributedForkPrefetchWindow changes future remote-memory fault reads.
 func (f *SandboxFamily) SetDistributedForkPrefetchWindow(branchID string, behind, ahead uint64) error {
 	b, release, err := f.beginControl(branchID)

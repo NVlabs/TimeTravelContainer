@@ -16,6 +16,7 @@ package boot
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,6 +127,10 @@ const (
 
 	// ContMgrExportDistributedForkSnapshot persists a session's immutable page stream.
 	ContMgrExportDistributedForkSnapshot = "containerManager.ExportDistributedForkSnapshot"
+
+	// ContMgrReclaimImageChunks frees the rehydrated chunks a family no
+	// longer uses.
+	ContMgrReclaimImageChunks = "containerManager.ReclaimImageChunks"
 
 	// ContMgrDistributedForkDependencyStatus reports target loader progress.
 	ContMgrDistributedForkDependencyStatus = "containerManager.DistributedForkDependencyStatus"
@@ -1229,6 +1234,20 @@ func (cm *containerManager) ExportDistributedForkSnapshot(args *DistributedForkE
 	}
 	if info != nil {
 		*out = *info
+	}
+	return nil
+}
+
+// ReclaimImageChunks frees the rehydrated chunks no branch of the family
+// uses any more, and returns every chunk freed so, in hexadecimal.
+func (cm *containerManager) ReclaimImageChunks(args *DistributedForkDependencyArgs, out *[]string) error {
+	objects, err := cm.l.family.ReclaimImageChunks(args.BranchID)
+	if err != nil {
+		return err
+	}
+	*out = make([]string, len(objects))
+	for i, object := range objects {
+		(*out)[i] = hex.EncodeToString(object[:])
 	}
 	return nil
 }

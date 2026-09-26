@@ -209,6 +209,44 @@ func TestClearBranchMemoryGraphIfIsGenerationFenced(t *testing.T) {
 }
 
 // A rehydrated branch gives up the control state it was restored from, and
+// A pruned image replaces the one it was pruned from, unless a dehydration
+// superseded that meanwhile.
+func TestReplaceBranchMemoryGraphIfIsFenced(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "example")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	roots, objects := []string{"memory/7/resource-0000"}, []string{"7:1:memory-tree"}
+	info := ContainerInfo{
+		ID: "example", Name: "example", BundleDir: bundleDir, State: "running",
+		Branches: []BranchInfo{{ID: "main", State: "running", SnapshotID: 7, MemoryRoots: roots, MemoryRootObjects: objects}},
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(containerDir, "container.json"), &info); err != nil {
+		t.Fatal(err)
+	}
+	store := Store{Root: root}
+	newRoots, newObjects := []string{"memory/9/resource-0000"}, []string{"9:1:memory-tree"}
+	if replaced, err := store.ReplaceBranchMemoryGraphIf("example", "main", 8, roots, objects, 9, newRoots, newObjects); err != nil || replaced {
+		t.Fatalf("replacing another capture's image = %v, %v", replaced, err)
+	}
+	if replaced, err := store.ReplaceBranchMemoryGraphIf("example", "main", 7, roots, objects, 9, newRoots, newObjects); err != nil || !replaced {
+		t.Fatalf("replacing the image = %v, %v", replaced, err)
+	}
+	got, err := store.LoadContainer("example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := got.Branches[0]
+	if branch.SnapshotID != 9 || !slices.Equal(branch.MemoryRoots, newRoots) || !slices.Equal(branch.MemoryRootObjects, newObjects) {
+		t.Errorf("memory = %d %v %v, want 9 %v %v", branch.SnapshotID, branch.MemoryRoots, branch.MemoryRootObjects, newRoots, newObjects)
+	}
+}
+
 // keeps its memory roots for its next dehydration.
 func TestClearBranchControlGraphIfKeepsMemory(t *testing.T) {
 	root := t.TempDir()

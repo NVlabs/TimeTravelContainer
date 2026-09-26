@@ -195,7 +195,10 @@ type sparseResidentChunk struct {
 type SparseChunkInstallation struct {
 	mf        *MemoryFile
 	newRanges map[SparseChunkObjectID]memmap.FileRange
-	done      bool
+	// objects are the units the installation installs or reuses, which
+	// ReclaimUnusedSparseChunks leaves until it is committed or aborted.
+	objects []SparseChunkObjectID
+	done    bool
 }
 
 type sparsePendingReference struct {
@@ -285,7 +288,21 @@ func (i *SparseChunkInstallation) Commit() error {
 		return fmt.Errorf("sparse chunk installation is unavailable")
 	}
 	i.done = true
+	i.finish()
 	return nil
+}
+
+// finish lets ReclaimUnusedSparseChunks consider the installation's units.
+func (i *SparseChunkInstallation) finish() {
+	i.mf.mu.Lock()
+	defer i.mf.mu.Unlock()
+	for _, object := range i.objects {
+		if i.mf.sparseInstalling[object] <= 1 {
+			delete(i.mf.sparseInstalling, object)
+		} else {
+			i.mf.sparseInstalling[object]--
+		}
+	}
 }
 
 // Abort releases all references acquired by this installation.
@@ -294,6 +311,7 @@ func (i *SparseChunkInstallation) Abort() error {
 		return nil
 	}
 	i.done = true
+	i.finish()
 	for object, fr := range i.newRanges {
 		i.mf.mu.Lock()
 		delete(i.mf.sparseChunks, object)
@@ -419,6 +437,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 		f.mu.Lock()
 		resident, exists := f.sparseChunks[install.Object]
 		if exists {
+			f.markSparseInstallingLocked(installation, install.Object)
 			// One immutable chunk can back branches that each use a different
 			// subset of its pages. Its whole 1 MiB is read into the resident
 			// range whichever branch installed it first, so a page only a
@@ -471,6 +490,8 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 				})
 			}
 			f.sparseChunks[install.Object] = resident
+			delete(f.reclaimedSparseChunks, install.Object)
+			f.markSparseInstallingLocked(installation, install.Object)
 			f.mu.Unlock()
 			newRanges[install.Object] = fr
 		}
@@ -486,20 +507,47 @@ func (f *MemoryFile) SparseChunkRange(object SparseChunkObjectID) (memmap.FileRa
 	return chunk.Range, ok
 }
 
+// ReclaimedSparseChunks returns the sparse chunks ReclaimUnusedSparseChunks
+// has released since they were last installed, in no order: every page of
+// them was since freed or rewritten by all of the file's users.
+func (f *MemoryFile) ReclaimedSparseChunks() []SparseChunkObjectID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	objects := make([]SparseChunkObjectID, 0, len(f.reclaimedSparseChunks))
+	for object := range f.reclaimedSparseChunks {
+		objects = append(objects, object)
+	}
+	return objects
+}
+
+// markSparseInstallingLocked records that installation installs or reuses
+// object.
+//
+// Preconditions: f.mu is locked.
+func (f *MemoryFile) markSparseInstallingLocked(installation *SparseChunkInstallation, object SparseChunkObjectID) {
+	if f.sparseInstalling == nil {
+		f.sparseInstalling = make(map[SparseChunkObjectID]int)
+	}
+	f.sparseInstalling[object]++
+	installation.objects = append(installation.objects, object)
+}
+
 // ReclaimUnusedSparseChunks releases residency units whose cache reference is
 // their only remaining reference. It returns the number of units released.
-// Reclamation is skipped while any sparse loader is attached: a loader may
-// still be filling a range on behalf of a branch that is concurrently exiting.
+// A unit an installation still commits stays, as the owners it restores are
+// yet to take their references. A loader may hold a released unit's pages as
+// not yet loaded, the loader of a rehydration that loads only what is
+// touched: no user will await them, and the loader forgets them, so that it
+// can finish.
 func (f *MemoryFile) ReclaimUnusedSparseChunks() int {
-	f.sparseLoadMu.Lock()
-	defer f.sparseLoadMu.Unlock()
-	if loads := f.sparseAsyncLoads.Load(); loads != nil && len(*loads) != 0 {
-		return 0
-	}
-
 	var release []memmap.FileRange
 	f.mu.Lock()
 	for object, resident := range f.sparseChunks {
+		if f.sparseInstalling[object] != 0 {
+			continue
+		}
+		// A page being loaded or awaited has a reference of its loader or
+		// its waiter besides the cache's.
 		unique := true
 		f.forEachChunk(resident.Range, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 			unfree := &f.unfreeSmall
@@ -517,10 +565,23 @@ func (f *MemoryFile) ReclaimUnusedSparseChunks() int {
 		})
 		if unique {
 			delete(f.sparseChunks, object)
+			if f.reclaimedSparseChunks == nil {
+				f.reclaimedSparseChunks = make(map[SparseChunkObjectID]struct{})
+			}
+			f.reclaimedSparseChunks[object] = struct{}{}
 			release = append(release, resident.Range)
 		}
 	}
 	f.mu.Unlock()
+	if len(release) == 0 {
+		return 0
+	}
+	// Before the pages are released, and may be reused.
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			amfl.cancelUnusedLoads(release)
+		}
+	}
 	for _, fr := range release {
 		f.DecRef(fr)
 	}

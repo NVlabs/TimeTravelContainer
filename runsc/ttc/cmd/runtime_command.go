@@ -78,6 +78,9 @@ var embeddedBranchActions = map[string]func(c *container.Container, branch strin
 	"prepare-stop": func(c *container.Container, branch string) (any, error) {
 		return nil, c.Sandbox.PrepareStopBranch(branch)
 	},
+	"reclaim-image-chunks": func(c *container.Container, branch string) (any, error) {
+		return c.Sandbox.ReclaimImageChunks(branch)
+	},
 }
 
 // embeddedRuntimeCommand runs, in ttcd's own process, the runtime commands
