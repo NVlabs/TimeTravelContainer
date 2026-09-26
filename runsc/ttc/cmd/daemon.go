@@ -6816,10 +6816,15 @@ func topologyMemberSet(records []cluster.NodeRecord, now time.Time) map[string]s
 // validateClusterTopology proves that every currently live member can reach
 // the joining daemon and that the joining daemon can reach each member. It
 // repeats when membership changes during the probe, so readiness is never
-// committed from a stale partial view.
+// committed from a stale partial view. Nothing dials a control daemon's node,
+// which listens on its host's loopback alone: it proves nothing, and nothing
+// is proved of it.
 func validateClusterTopology(runtime *daemonClusterRuntime, self cluster.NodeRecord) error {
 	if runtime == nil || runtime.directory == nil || runtime.source == nil {
 		return errors.New("cluster topology services are unavailable")
+	}
+	if self.Labels[cluster.NodeRoleLabel] == cluster.RoleControl {
+		return nil
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	var lastErr error
@@ -6833,7 +6838,7 @@ func validateClusterTopology(runtime *daemonClusterRuntime, self cluster.NodeRec
 		before := topologyMemberSet(records, time.Now())
 		failed := false
 		for _, record := range records {
-			if record.NodeID == self.NodeID || before[record.NodeID] == "" {
+			if record.NodeID == self.NodeID || before[record.NodeID] == "" || record.Labels[cluster.NodeRoleLabel] == cluster.RoleControl {
 				continue
 			}
 			peer, err := runtime.source.peerForRecord(record)
