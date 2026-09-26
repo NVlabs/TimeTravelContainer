@@ -6592,7 +6592,7 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 			return physical, physicalBranch.ID, nil
 		}
 	}
-	containers, err := b.containerStore().ListContainersForPlacement()
+	containers, err := familyContainersForPlacement(b.containerStore(), logicalID)
 	if err != nil {
 		return ttcbundle.ContainerInfo{}, "", err
 	}
@@ -6602,9 +6602,6 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 	}
 	var candidates []candidate
 	for _, container := range containers {
-		if logicalFamilyID(container) != logicalID {
-			continue
-		}
 		for _, branch := range container.Branches {
 			// A migrated runtime's physical branch is a transaction ID. Once
 			// publication commits, Raft deliberately clears physical placement,
@@ -6629,6 +6626,27 @@ func (b *runtimeBackend) resolveDistributedPersistentBranch(logical ttcbundle.Co
 	default:
 		return ttcbundle.ContainerInfo{}, "", fmt.Errorf("branch %q has %d durable physical records in distributed family %q", branchID, len(candidates), logical.Name)
 	}
+}
+
+// familyContainersForPlacement is ListContainersForPlacement for the
+// containers of the logical family familyID: it reads no other family's
+// records.
+func familyContainersForPlacement(store ttcbundle.Store, familyID string) ([]ttcbundle.ContainerInfo, error) {
+	ids, err := store.FamilyContainerIDs(familyID)
+	if err != nil {
+		return nil, err
+	}
+	var containers []ttcbundle.ContainerInfo
+	for _, id := range ids {
+		info, ok, err := store.LoadContainerForPlacement(id)
+		if err != nil {
+			return nil, err
+		}
+		if ok && logicalFamilyID(info) == familyID {
+			containers = append(containers, info)
+		}
+	}
+	return containers, nil
 }
 
 func (b *runtimeBackend) resolveSelector(target selector) (selector, ttcbundle.ContainerInfo, error) {
@@ -10015,11 +10033,11 @@ func (b *runtimeBackend) removeContainerPlacements(info ttcbundle.ContainerInfo)
 	if err != nil {
 		return err
 	}
-	records, err := placements.List()
+	logicalFamily := logicalFamilyID(info)
+	records, err := placements.ListFamily(logicalFamily)
 	if err != nil {
 		return err
 	}
-	logicalFamily := logicalFamilyID(info)
 	physicalBranches := make(map[string]struct{}, len(info.Branches))
 	for _, branch := range info.Branches {
 		physicalBranches[branch.ID] = struct{}{}
@@ -10106,12 +10124,12 @@ func (b *runtimeBackend) distributedFamilyHasPeerPlacement(familyID, branchID st
 	if err != nil {
 		return false, err
 	}
-	records, err := placements.List()
+	records, err := placements.ListFamily(familyID)
 	if err != nil {
 		return false, err
 	}
 	for _, record := range records {
-		if record.FamilyID == familyID && record.BranchID != branchID {
+		if record.BranchID != branchID {
 			return true, nil
 		}
 	}
@@ -10198,21 +10216,19 @@ func (b *runtimeBackend) removeDistributedFamilyRecord(containerID string, volum
 		if err != nil {
 			return err
 		}
-		records, err := placements.List()
+		records, err := placements.ListFamily(info.ID)
 		if err != nil {
 			return err
 		}
-		for _, record := range records {
-			if record.FamilyID == info.ID {
-				return fmt.Errorf("cannot remove family record %q while branch %q still has placement state %s", info.Name, record.BranchID, record.State)
-			}
+		if len(records) != 0 {
+			return fmt.Errorf("cannot remove family record %q while branch %q still has placement state %s", info.Name, records[0].BranchID, records[0].State)
 		}
-		containers, err := store.ListContainersForPlacement()
+		containers, err := familyContainersForPlacement(store, info.ID)
 		if err != nil {
 			return err
 		}
 		for _, candidate := range containers {
-			if candidate.ID != info.ID && logicalFamilyID(candidate) == info.ID {
+			if candidate.ID != info.ID {
 				// With no remaining Raft placement, this is an inert physical
 				// catalog left by a completed migration, canceled fork, or lost
 				// runtime. Per-node cleanup has already fenced and removed any
@@ -10257,14 +10273,12 @@ func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs 
 	if err != nil {
 		return err
 	}
-	records, err := placements.List()
+	records, err := placements.ListFamily(familyID)
 	if err != nil {
 		return err
 	}
-	for _, record := range records {
-		if record.FamilyID == familyID {
-			return fmt.Errorf("family %q still has placement for branch %q", familyID, record.BranchID)
-		}
+	if len(records) != 0 {
+		return fmt.Errorf("family %q still has placement for branch %q", familyID, records[0].BranchID)
 	}
 	runtimes, err := b.listRuntimeSandboxes()
 	if err != nil {
@@ -11413,7 +11427,9 @@ func (b *runtimeBackend) listFamiliesOf(familyID string) ([]Family, error) {
 		}
 		var records []cluster.PlacementRecord
 		if b.distributedSource != nil && b.distributedSource.authority != nil {
-			if snapshot, authorityErr = b.distributedSource.authority.AuthorityState(); authorityErr != nil {
+			query := cluster.PlacementsWithOwners
+			query.Family = familyID
+			if snapshot, authorityErr = b.distributedSource.authority.AuthorityStateOf(query); authorityErr != nil {
 				return
 			}
 			records, offlineOwners = snapshot.PlacementList(), snapshot.OfflineNodes()
@@ -13858,7 +13874,7 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	for origin := range filesystem {
 		live[origin] = struct{}{}
 	}
-	state, err := b.distributedSource.authority.AuthorityState()
+	state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{VolatileOrigins: cluster.All[uint64]()})
 	if err != nil {
 		return 0, err
 	}

@@ -142,21 +142,34 @@ func (f *AuthorityFSM) Restore(reader io.ReadCloser) error {
 }
 
 func (f *AuthorityFSM) copyState() (*AuthorityState, error) {
-	f.mu.RLock()
-	// Requests and RequestOrder are replicated replay protection, not cluster
-	// state returned by a read. Including them made every catalog lookup copy
-	// all historical command results, so steady-state latency grew with Raft
-	// history even after transactions and placements were retired. Real Raft
-	// snapshots still use Snapshot() above and retain the replay window.
-	view := *f.state
-	view.Requests = nil
-	view.RequestOrder = nil
-	data, err := view.SnapshotBytes()
-	f.mu.RUnlock()
+	return f.query(WholeAuthority)
+}
+
+// query returns a copy of the records of the applied state that query names.
+func (f *AuthorityFSM) query(query AuthorityQuery) (*AuthorityState, error) {
+	data, err := f.encode(query)
 	if err != nil {
 		return nil, err
 	}
-	return RestoreAuthorityState(data)
+	return decodeAuthorityView(data)
+}
+
+// encode encodes the records of the applied state that query names.
+// Requests and RequestOrder are replicated replay protection, not cluster
+// state returned by a read, and no read has them: they would make every read
+// copy all historical command results. Raft snapshots still use Snapshot()
+// above and retain the replay window.
+func (f *AuthorityFSM) encode(query AuthorityQuery) ([]byte, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.state.view(query).SnapshotBytes()
+}
+
+// revision returns the revision of the applied state.
+func (f *AuthorityFSM) revision() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.state.Revision
 }
 
 func (f *AuthorityFSM) appliedTransaction(id string) (Transaction, bool) {
@@ -640,6 +653,27 @@ func (n *AuthorityRaftNode) AppliedState() (*AuthorityState, error) {
 	return state, err
 }
 
+// AppliedRevision returns the revision of the local applied state, which,
+// like AppliedState, a replica may not yet have caught up.
+func (n *AuthorityRaftNode) AppliedRevision() uint64 {
+	if n == nil || n.engine().fsm == nil {
+		return 0
+	}
+	return n.engine().fsm.revision()
+}
+
+// AppliedQuery is AppliedState for the records query names.
+func (n *AuthorityRaftNode) AppliedQuery(query AuthorityQuery) (*AuthorityState, error) {
+	if n == nil || n.engine().fsm == nil {
+		return nil, errors.New("nil Raft authority")
+	}
+	state, err := n.engine().fsm.query(query)
+	if err == nil {
+		state.LeaderObservedAt = time.Now().UTC()
+	}
+	return state, err
+}
+
 // AppliedTransaction returns one transaction from the local applied FSM. It
 // is intentionally non-linearizable and is suitable for high-rate background
 // observation, not ownership or publication decisions.
@@ -756,6 +790,30 @@ func (n *AuthorityRaftNode) contextTimeout(ctx context.Context) time.Duration {
 // LinearizableState returns a snapshot after all preceding committed commands
 // have been applied on the current leader.
 func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthorityState, error) {
+	return n.LinearizableQuery(ctx, WholeAuthority)
+}
+
+// LinearizableQuery is LinearizableState for the records query names.
+func (n *AuthorityRaftNode) LinearizableQuery(ctx context.Context, query AuthorityQuery) (*AuthorityState, error) {
+	data, err := n.EncodeLinearizable(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return decodeAuthorityView(data)
+}
+
+// EncodeLinearizable is LinearizableQuery, encoded.
+func (n *AuthorityRaftNode) EncodeLinearizable(ctx context.Context, query AuthorityQuery) ([]byte, error) {
+	engine, err := n.linearizable(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return engine.fsm.encode(query)
+}
+
+// linearizable returns the engine once the state it applied is the
+// cluster's.
+func (n *AuthorityRaftNode) linearizable(ctx context.Context) (*authorityEngine, error) {
 	if n == nil {
 		return nil, errors.New("nil Raft authority")
 	}
@@ -774,7 +832,7 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 		if err := engine.holder(); err != nil {
 			return nil, err
 		}
-		return engine.fsm.copyState()
+		return engine, nil
 	}
 	timeout := n.contextTimeout(ctx)
 	if err := engine.raft.VerifyLeader().Error(); err != nil {
@@ -784,7 +842,7 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 		return nil, err
 	}
 	engine.currentTerm.Store(term)
-	return engine.fsm.copyState()
+	return engine, nil
 }
 
 // AddNonvoter admits a learner. Promotion is separate so a lagging joiner

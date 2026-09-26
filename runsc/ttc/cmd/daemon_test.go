@@ -2159,7 +2159,7 @@ func TestJoinAuthorityWaitsForSeedListener(t *testing.T) {
 func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 	var second *httptest.Server
 	second = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/authority/state" {
+		if r.URL.Path != "/v1/authority/query" {
 			http.NotFound(w, r)
 			return
 		}
@@ -2182,7 +2182,7 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 			var mu sync.Mutex
 			_ = writeDaemonFrame(w, &mu, daemonFrameStdout, append(payload, '\n'))
 			_ = writeDaemonStatus(w, &mu, 0)
-		case "/v1/authority/state":
+		case "/v1/authority/query":
 			_ = json.NewEncoder(w).Encode(cluster.AuthorityState{Nodes: map[string]cluster.NodeRecord{
 				"seed":      {NodeID: "seed", State: cluster.NodeReady, ControlURL: seed.URL},
 				"compute-a": {NodeID: "compute-a", State: cluster.NodeReady, ControlURL: second.URL},
@@ -2212,7 +2212,7 @@ func TestControlOnlyClusterDiscoversComputePeers(t *testing.T) {
 func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
 	var leader *httptest.Server
 	leader = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/authority/state" {
+		if r.URL.Path != "/v1/authority/query" {
 			http.NotFound(w, r)
 			return
 		}
@@ -2234,7 +2234,7 @@ func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
 			var mu sync.Mutex
 			_ = writeDaemonFrame(w, &mu, daemonFrameStdout, append(payload, '\n'))
 			_ = writeDaemonStatus(w, &mu, 0)
-		case "/v1/authority/state":
+		case "/v1/authority/query":
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"error": "not leader", "not_leader": true, "leader_id": "leader",
@@ -2259,7 +2259,7 @@ func TestControlOnlyClusterFollowsRaftLeaderAfterElection(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	state, err := control.authorityState(ctx)
+	state, err := control.authorityState(ctx, cluster.AuthorityQuery{Nodes: cluster.All[string]()})
 	if err != nil {
 		t.Fatal(err)
 	}

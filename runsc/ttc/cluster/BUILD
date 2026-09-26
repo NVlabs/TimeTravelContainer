@@ -8,6 +8,7 @@ package(
 go_library(
     name = "cluster",
     srcs = [
+		"authority_query.go",
 		"authority_raft.go",
 		"authority_state.go",
         "capabilities.go",
@@ -39,6 +40,7 @@ go_test(
     name = "cluster_test",
     size = "small",
     srcs = [
+		"authority_query_test.go",
 		"authority_raft_test.go",
 		"authority_state_test.go",
         "cluster_test.go",

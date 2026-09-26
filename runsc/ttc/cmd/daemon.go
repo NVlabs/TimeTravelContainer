@@ -617,7 +617,7 @@ func (c *controlOnlyCluster) seedURLs() []string {
 // become a follower during ordinary elections. Treating that as an endpoint
 // failure leaves the gateway permanently pinned to a usable but non-authoritative
 // node and breaks every command that needs a linearizable snapshot.
-func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.AuthorityState, error) {
+func (c *controlOnlyCluster) authorityState(ctx context.Context, query cluster.AuthorityQuery) (*cluster.AuthorityState, error) {
 	if c == nil {
 		return nil, errors.New("control-only cluster is unavailable")
 	}
@@ -628,7 +628,7 @@ func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.Autho
 	}
 	var readErrors error
 	for _, peer := range peers {
-		state, err := peer.client.AuthorityState(ctx)
+		state, err := peer.client.AuthorityQuery(ctx, query)
 		if err == nil {
 			return state, nil
 		}
@@ -646,7 +646,7 @@ func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.Autho
 			}
 			clients[redirect.LeaderControlURL] = leader
 		}
-		state, err = leader.AuthorityState(ctx)
+		state, err = leader.AuthorityQuery(ctx, query)
 		if err == nil {
 			return state, nil
 		}
@@ -661,7 +661,8 @@ func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.Autho
 // stream is unaffected by a concurrent refresh.
 func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 	current := c.peerSnapshot()
-	state, err := c.authorityState(ctx)
+	nodes := cluster.AuthorityQuery{Nodes: cluster.All[string]()}
+	state, err := c.authorityState(ctx, nodes)
 	if (err != nil || len(current) == 0) && c.sharedRoot != "" {
 		// Every compute node it knew is gone, or it knew none: find the
 		// others in the shared root.
@@ -670,7 +671,7 @@ func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 			c.peers = found
 			c.peersMu.Unlock()
 			current = c.peerSnapshot()
-			state, err = c.authorityState(ctx)
+			state, err = c.authorityState(ctx, nodes)
 		}
 	}
 	if err != nil {

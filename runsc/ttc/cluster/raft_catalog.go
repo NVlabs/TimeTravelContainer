@@ -111,9 +111,12 @@ func forwardAttempt(ctx context.Context, deadline time.Time) (context.Context, c
 	return context.WithDeadline(ctx, deadline)
 }
 
-func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, error) {
+// linearizableQuery reads the records of the authority state that query
+// names, linearizably: from this node if it holds the authority, and
+// otherwise from the node that does, which sends only those.
+func (c *RaftCatalog) linearizableQuery(ctx context.Context, query AuthorityQuery) (*AuthorityState, error) {
 	deadline := time.Now().Add(15 * time.Second)
-	state, err := c.node.LinearizableState(ctx)
+	state, err := c.node.LinearizableQuery(ctx, query)
 	for err != nil && time.Now().Before(deadline) {
 		var redirect *AuthorityNotLeaderError
 		if !errors.As(err, &redirect) {
@@ -122,7 +125,7 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 				return nil, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
 			}
-			state, err = c.node.LinearizableState(ctx)
+			state, err = c.node.LinearizableQuery(ctx, query)
 			continue
 		}
 		if c.leaderClient == nil {
@@ -131,7 +134,7 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 				return nil, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
 			}
-			state, err = c.node.LinearizableState(ctx)
+			state, err = c.node.LinearizableQuery(ctx, query)
 			continue
 		}
 		peer, resolveErr := c.leaderClient(redirect.LeaderID)
@@ -141,11 +144,11 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 				return nil, ctx.Err()
 			case <-time.After(50 * time.Millisecond):
 			}
-			state, err = c.node.LinearizableState(ctx)
+			state, err = c.node.LinearizableQuery(ctx, query)
 			continue
 		}
 		attempt, cancel := forwardAttempt(ctx, deadline)
-		state, err = peer.AuthorityState(attempt)
+		state, err = peer.AuthorityQuery(attempt, query)
 		cancel()
 	}
 	if err == nil {
@@ -219,15 +222,21 @@ func applyRaftNoValue(catalog *RaftCatalog, _ time.Time, kind AuthorityCommandKi
 	return result.Err()
 }
 
-func (c *RaftCatalog) state() (*AuthorityState, error) {
-	return c.linearizableState(context.Background())
+func (c *RaftCatalog) query(query AuthorityQuery) (*AuthorityState, error) {
+	return c.linearizableQuery(context.Background(), query)
 }
 
 // AuthorityState returns a linearizable copy of the complete bounded cluster
 // control state. Bulk objects and object-level references are deliberately not
 // part of this snapshot.
 func (c *RaftCatalog) AuthorityState() (*AuthorityState, error) {
-	return c.state()
+	return c.query(WholeAuthority)
+}
+
+// AuthorityStateOf returns a linearizable copy of the records of the
+// authority state that query names.
+func (c *RaftCatalog) AuthorityStateOf(query AuthorityQuery) (*AuthorityState, error) {
+	return c.query(query)
 }
 
 // LinearizableState is AuthorityState with caller-controlled cancellation.
@@ -235,7 +244,7 @@ func (c *RaftCatalog) AuthorityState() (*AuthorityState, error) {
 // the current leader through the catalog's configured resolver, so a lagging
 // local FSM cannot reject an identity that registration already committed.
 func (c *RaftCatalog) LinearizableState(ctx context.Context) (*AuthorityState, error) {
-	return c.linearizableState(ctx)
+	return c.linearizableQuery(ctx, WholeAuthority)
 }
 
 // AppliedTransaction is a local, non-linearizable monitor read that avoids
@@ -287,7 +296,9 @@ func (c *RaftCatalog) PublishSnapshotOrigin(node, incarnation string, snapshotID
 // SnapshotProvider returns the exact volatile provider. found=false means the
 // origin must resolve from its committed shared manifest.
 func (c *RaftCatalog) SnapshotProvider(snapshotID uint64) (provider SnapshotOriginProvider, found bool, err error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{
+		VolatileOrigins: Only(snapshotID), AbandonedOrigins: Only(snapshotID), RetiredOrigins: Only(snapshotID),
+	})
 	if err != nil {
 		return SnapshotOriginProvider{}, false, err
 	}
@@ -351,7 +362,7 @@ func (c *RaftCatalog) RetireSharedSnapshot(lease SharedGCLease, snapshotID uint6
 // SharedGCLease returns the current replicated lease. Callers must still
 // compare ExpiresAt with the normalized local observation time.
 func (c *RaftCatalog) SharedGCLease() (SharedGCLease, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{})
 	if err != nil {
 		return SharedGCLease{}, err
 	}
@@ -361,7 +372,7 @@ func (c *RaftCatalog) SharedGCLease() (SharedGCLease, error) {
 // RetiredSharedSnapshots returns permanently fenced origins in stable order.
 // Coordinators use this to resume physical deletion after a crash.
 func (c *RaftCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{RetiredOrigins: All[uint64]()})
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +389,10 @@ func (c *RaftCatalog) RetiredSharedSnapshots() ([]SharedPackRetirement, error) {
 // by its current node until CommitPublication atomically installs durable
 // roots and releases placement.
 func (c *RaftCatalog) EnsurePublicationPreparing(family, branch, publicationID, lifecycle string) (*PublicationRecord, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{
+		Publications: Only(publicationKey(family, branch, publicationID)),
+		Branches:     Only(logicalBranchKey(family, branch)),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +445,7 @@ func (c *RaftCatalog) EnsurePublicationReady(family, branch, publicationID, life
 // placement. A worker cannot resurrect a removed/superseded branch because
 // both the branch incarnation and publication identity are checked by Raft.
 func (c *RaftCatalog) CommitPublication(family, branch, publicationID string, roots DurableRoots, providerNode, providerIncarnation string, snapshotOrigins []uint64) (*PublicationRecord, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Publications: Only(publicationKey(family, branch, publicationID))})
 	if err != nil {
 		return nil, err
 	}
@@ -456,7 +470,7 @@ func (c *RaftCatalog) CommitPublication(family, branch, publicationID string, ro
 // CancelPublication fences an uncommitted worker. A successful publication is
 // immutable and remains reachable from the committed branch roots.
 func (c *RaftCatalog) CancelPublication(family, branch, publicationID string) error {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Publications: Only(publicationKey(family, branch, publicationID))})
 	if err != nil {
 		return err
 	}
@@ -472,7 +486,7 @@ func (c *RaftCatalog) CancelPublication(family, branch, publicationID string) er
 
 // Publication returns one immutable publication's authoritative state.
 func (c *RaftCatalog) Publication(family, branch, publicationID string) (PublicationRecord, bool, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Publications: Only(publicationKey(family, branch, publicationID))})
 	if err != nil {
 		return PublicationRecord{}, false, err
 	}
@@ -484,7 +498,7 @@ func (c *RaftCatalog) Publication(family, branch, publicationID string) (Publica
 // has been lost. Its placement and pending publications are revoked in the
 // same log entry.
 func (c *RaftCatalog) MarkBranchCorrupted(family, branch, reason string) (*BranchAuthority, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Branches: Only(logicalBranchKey(family, branch))})
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +519,7 @@ func (c *RaftCatalog) MarkBranchCorrupted(family, branch, reason string) (*Branc
 // a concurrent rehydrate, and removing the memory root makes its immutable
 // chunks eligible for ordinary shared-GC tracing.
 func (c *RaftCatalog) DiscardDehydratedMemory(family, branch string) (*BranchAuthority, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Branches: Only(logicalBranchKey(family, branch))})
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +540,7 @@ func (c *RaftCatalog) DiscardDehydratedMemory(family, branch string) (*BranchAut
 // fencing generations, durable roots, and coarse volatile dependencies live
 // in the replicated control plane.
 func (c *RaftCatalog) Branches() ([]BranchAuthority, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Branches: All[string]()})
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +549,7 @@ func (c *RaftCatalog) Branches() ([]BranchAuthority, error) {
 
 // Branch returns one linearizable logical branch record.
 func (c *RaftCatalog) Branch(family, branch string) (*BranchAuthority, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Branches: Only(logicalBranchKey(family, branch))})
 	if err != nil {
 		return nil, err
 	}
@@ -551,7 +565,8 @@ func (c *RaftCatalog) Branch(family, branch string) (*BranchAuthority, error) {
 // from one applied Raft snapshot so placement and dependency edges cannot be
 // observed from different revisions.
 func (c *RaftCatalog) VolatileDependencyForwarded(family, branch, transactionID, formerNode string) (bool, error) {
-	state, err := c.state()
+	key := logicalBranchKey(family, branch)
+	state, err := c.query(AuthorityQuery{Branches: Only(key), Placements: Only(key), Transactions: All[string]()})
 	if err != nil {
 		return false, err
 	}
@@ -584,7 +599,7 @@ func (c *RaftCatalog) RemoveCorruptedBranch(family, branch string) error {
 // edges exactly once when a local CoW child is enrolled. Parent is only an
 // input to this creation event; it does not become an ownership relationship.
 func (c *RaftCatalog) InheritBranchDependencies(family, branch, sourceBranch string) (*BranchAuthority, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Branches: Only(logicalBranchKey(family, branch))})
 	if err != nil {
 		return nil, err
 	}
@@ -662,16 +677,21 @@ func (c *RaftCatalog) HeartbeatState(ctx context.Context, nodeID, incarnation st
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	localDeadline := time.Now().Add(100 * time.Millisecond)
+	// The node's execution grants, and its own record, renewed.
+	query := ExecutionGrants
+	query.Nodes = Only(nodeID)
 	for {
-		state, err := c.node.AppliedState()
-		if err != nil {
-			return nil, nil, err
-		}
-		if state.Revision >= result.Revision {
-			return &record, state, nil
+		if c.node.AppliedRevision() >= result.Revision {
+			state, err := c.node.AppliedQuery(query)
+			if err != nil {
+				return nil, nil, err
+			}
+			if state.Revision >= result.Revision {
+				return &record, state, nil
+			}
 		}
 		if !time.Now().Before(localDeadline) {
-			authoritative, err := c.linearizableState(ctx)
+			authoritative, err := c.linearizableQuery(ctx, query)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -705,7 +725,7 @@ func (c *RaftCatalog) Transition(nodeID, incarnation string, next NodeState, now
 }
 
 func (c *RaftCatalog) Lookup(nodeID string) (*NodeRecord, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Nodes: Only(nodeID)})
 	if err != nil {
 		return nil, err
 	}
@@ -717,7 +737,7 @@ func (c *RaftCatalog) Lookup(nodeID string) (*NodeRecord, error) {
 }
 
 func (c *RaftCatalog) List() ([]NodeRecord, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Nodes: All[string]()})
 	if err != nil {
 		return nil, err
 	}
@@ -801,7 +821,8 @@ func (c *RaftCatalog) Remove(family, branch string, generation uint64) error {
 }
 
 func (c *RaftCatalog) LookupPlacement(family, branch string) (*PlacementRecord, error) {
-	state, err := c.state()
+	key := logicalBranchKey(family, branch)
+	state, err := c.query(AuthorityQuery{Placements: Only(key), Branches: Only(key)})
 	if err != nil {
 		return nil, err
 	}
@@ -818,6 +839,15 @@ func (c *RaftCatalog) LookupPlacement(family, branch string) (*PlacementRecord, 
 	return &record, nil
 }
 
+// PlacementsWithOwners is the query of every placement, with the branches
+// and nodes that qualify it: whether a branch is corrupted, and whether its
+// owner is offline.
+var PlacementsWithOwners = AuthorityQuery{Placements: All[string](), Branches: All[string](), Nodes: All[string]()}
+
+// ExecutionGrants is the query of what a node's lease guardian checks its
+// execution grants against: every placement, transaction and branch.
+var ExecutionGrants = AuthorityQuery{Placements: All[string](), Transactions: All[string](), Branches: All[string]()}
+
 // Lookup implements PlacementCatalog. Go cannot overload NodeCatalog.Lookup,
 // so callers use a typed PlacementCatalog view whose method is provided by the
 // placementCatalogAdapter below.
@@ -830,7 +860,15 @@ func (r raftPlacementCatalog) Lookup(family, branch string) (*PlacementRecord, e
 }
 
 func (r raftPlacementCatalog) List() ([]PlacementRecord, error) {
-	state, err := r.state()
+	state, err := r.query(AuthorityQuery{Placements: All[string](), Branches: All[string]()})
+	if err != nil {
+		return nil, err
+	}
+	return placementRecords(state), nil
+}
+
+func (r raftPlacementCatalog) ListFamily(family string) ([]PlacementRecord, error) {
+	state, err := r.query(AuthorityQuery{Placements: All[string](), Branches: All[string](), Family: family})
 	if err != nil {
 		return nil, err
 	}
@@ -841,7 +879,7 @@ func (r raftPlacementCatalog) List() ([]PlacementRecord, error) {
 // read from the same authority state. A running or paused branch of an
 // offline node is unavailable until the node returns or is removed.
 func (r raftPlacementCatalog) ListWithOfflineOwners() ([]PlacementRecord, map[string]bool, error) {
-	state, err := r.state()
+	state, err := r.query(PlacementsWithOwners)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -914,7 +952,7 @@ func (c *RaftCatalog) CreateTransaction(tx *Transaction) error {
 }
 
 func (c *RaftCatalog) LoadTransaction(id string) (*Transaction, error) {
-	state, err := c.state()
+	state, err := c.query(AuthorityQuery{Transactions: Only(id)})
 	if err != nil {
 		return nil, err
 	}
@@ -975,7 +1013,7 @@ func (r raftTransactionCatalog) Delete(id string, revision uint64) error {
 	return applyRaftNoValue(r.RaftCatalog, time.Now().UTC(), AuthorityTransactionRetire, AuthorityTransactionPayload{ID: id, Revision: revision})
 }
 func (r raftTransactionCatalog) List() ([]Transaction, error) {
-	state, err := r.state()
+	state, err := r.query(AuthorityQuery{Transactions: All[string]()})
 	if err != nil {
 		return nil, err
 	}

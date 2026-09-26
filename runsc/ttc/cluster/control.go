@@ -508,6 +508,7 @@ type controlError struct {
 const (
 	controlAuthorityProposePath = "/v1/authority/propose"
 	controlAuthorityStatePath   = "/v1/authority/state"
+	controlAuthorityQueryPath   = "/v1/authority/query"
 	controlAuthorityJoinPath    = "/v1/authority/join"
 	controlAuthorityCancelPath  = "/v1/authority/cancel-join"
 	controlAuthorityRetirePath  = "/v1/authority/retire"
@@ -577,6 +578,19 @@ type AuthorityService struct {
 	ClusterID string
 }
 
+// serveQuery answers a linearizable read of the records query names.
+func (a *AuthorityService) serveQuery(w http.ResponseWriter, r *http.Request, query AuthorityQuery, notLeader func(error) bool) {
+	data, err := a.Node.EncodeLinearizable(r.Context(), query)
+	if err != nil {
+		if notLeader(err) {
+			return
+		}
+		writeControlError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeControlJSON(w, http.StatusOK, json.RawMessage(data))
+}
+
 func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, peer string) {
 	if a == nil || a.Node == nil {
 		writeControlError(w, http.StatusServiceUnavailable, "Raft authority is unavailable")
@@ -593,11 +607,9 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 		// A Raft transport address is not an HTTP endpoint. Include the
 		// leader's committed control endpoint so joining through any seed also
 		// works when that seed is a follower.
-		if state, stateErr := a.Node.AppliedState(); stateErr == nil {
-			if leader, ok := state.Nodes[response.LeaderID]; ok {
-				response.LeaderControlURL = leader.ControlURL
-				response.LeaderServerName = leader.ControlServerName
-			}
+		if leader, ok := a.Node.AppliedNode(response.LeaderID); ok {
+			response.LeaderControlURL = leader.ControlURL
+			response.LeaderServerName = leader.ControlServerName
 		}
 		_ = json.NewEncoder(w).Encode(response)
 		return true
@@ -648,21 +660,18 @@ func (a *AuthorityService) serveHTTP(w http.ResponseWriter, r *http.Request, pee
 			writeControlError(w, http.StatusMethodNotAllowed, "authority state requires GET")
 			return
 		}
-		state, err := a.Node.LinearizableState(r.Context())
-		if err != nil {
-			if notLeader(err) {
-				return
-			}
-			writeControlError(w, http.StatusServiceUnavailable, err.Error())
+		a.serveQuery(w, r, WholeAuthority, notLeader)
+	case controlAuthorityQueryPath:
+		if r.Method != http.MethodPost {
+			writeControlError(w, http.StatusMethodNotAllowed, "authority query requires POST")
 			return
 		}
-		// Request results are an internal replicated deduplication window. They
-		// are required in Raft snapshots, but never by catalog readers. Omitting
-		// them keeps the linearizable read path proportional to live control
-		// objects instead of the (deliberately much larger) retry window.
-		state.Requests = nil
-		state.RequestOrder = nil
-		writeControlJSON(w, http.StatusOK, state)
+		var query AuthorityQuery
+		if err := decodeControlJSON(r.Body, &query); err != nil {
+			writeControlError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		a.serveQuery(w, r, query, notLeader)
 	case controlAuthorityJoinPath:
 		if r.Method != http.MethodPost {
 			writeControlError(w, http.StatusMethodNotAllowed, "authority join requires POST")
@@ -2382,6 +2391,17 @@ func (c *Client) AuthorityState(ctx context.Context) (*AuthorityState, error) {
 	if err := c.callWithLimit(ctx, http.MethodGet, controlAuthorityStatePath, nil, &state, maxAuthoritySnapshotBytes); err != nil {
 		return nil, err
 	}
+	return &state, nil
+}
+
+// AuthorityQuery reads the records of the authority state that query names,
+// linearizably, from the node that holds the authority.
+func (c *Client) AuthorityQuery(ctx context.Context, query AuthorityQuery) (*AuthorityState, error) {
+	var state AuthorityState
+	if err := c.callWithLimit(ctx, http.MethodPost, controlAuthorityQueryPath, query, &state, maxAuthoritySnapshotBytes); err != nil {
+		return nil, err
+	}
+	state.initMaps()
 	return &state, nil
 }
 

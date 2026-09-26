@@ -296,11 +296,12 @@ func (r daemonPortIngressRouter) Forward(ctx context.Context, target selector, p
 
 func (r controlOnlyPortIngressRouter) Clustered() bool { return true }
 
-func (r controlOnlyPortIngressRouter) authorityState(ctx context.Context) (*cluster.AuthorityState, error) {
+// placements reads the placements of the authority state.
+func (r controlOnlyPortIngressRouter) placements(ctx context.Context) (*cluster.AuthorityState, error) {
 	if r.cluster == nil {
 		return nil, errors.New("control-only cluster is unavailable")
 	}
-	return r.cluster.authorityState(ctx)
+	return r.cluster.authorityState(ctx, cluster.AuthorityQuery{Placements: cluster.All[string]()})
 }
 
 func controlOnlyPlacement(state *cluster.AuthorityState, target selector) (cluster.PlacementRecord, error) {
@@ -327,7 +328,7 @@ func controlOnlyPlacement(state *cluster.AuthorityState, target selector) (clust
 func (r controlOnlyPortIngressRouter) Resolve(target selector) (selector, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	state, err := r.authorityState(ctx)
+	state, err := r.placements(ctx)
 	if err != nil {
 		return selector{}, err
 	}
@@ -354,7 +355,7 @@ func (r controlOnlyPortIngressRouter) Resolve(target selector) (selector, error)
 func (r controlOnlyPortIngressRouter) ResolveFamily(container string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	state, err := r.authorityState(ctx)
+	state, err := r.placements(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -367,7 +368,7 @@ func (r controlOnlyPortIngressRouter) ResolveFamily(container string) (string, e
 }
 
 func (r controlOnlyPortIngressRouter) Forward(ctx context.Context, target selector, port uint16, conn net.Conn) error {
-	state, err := r.authorityState(ctx)
+	state, err := r.placements(ctx)
 	if err != nil {
 		return err
 	}

@@ -276,7 +276,7 @@ func (s *sharedReferenceService) SnapshotReferenceInventory(_ context.Context, _
 	defer s.claimMu.Unlock()
 	retired := make(map[uint64]struct{})
 	if s.authority != nil {
-		state, err := s.authority.AuthorityState()
+		state, err := s.authority.AuthorityStateOf(cluster.AuthorityQuery{RetiredOrigins: cluster.All[uint64](), AbandonedOrigins: cluster.All[uint64]()})
 		if err != nil {
 			return nil, fmt.Errorf("reading retired snapshot origins: %w", err)
 		}

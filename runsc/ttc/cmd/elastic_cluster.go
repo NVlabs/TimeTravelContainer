@@ -573,19 +573,15 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args [
 	if placements == nil {
 		return errors.New("placement authority is unavailable")
 	}
-	records, err := placements.List()
-	if err != nil {
-		return fmt.Errorf("loading placement authority: %w", err)
-	}
-	byBranch := make(map[string]cluster.PlacementRecord, len(records))
-	for _, record := range records {
-		byBranch[record.FamilyID+"\x00"+record.BranchID] = record
-	}
 	for _, claim := range claims {
-		record, ok := byBranch[claim.FamilyID+"\x00"+claim.BranchID]
-		if !ok {
+		found, err := placements.Lookup(claim.FamilyID, claim.BranchID)
+		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("validating placement %s@%s: %w", claim.FamilyID, claim.BranchID, os.ErrNotExist)
 		}
+		if err != nil {
+			return fmt.Errorf("loading placement authority: %w", err)
+		}
+		record := *found
 		if record.State == cluster.PlacementUnplaced && daemonCommandClaimsUnplaced(args) {
 			// The branch's cold publication committed after the command was
 			// routed here, as it may whenever a dehydration's publication
@@ -627,7 +623,7 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	var current cluster.NodeRecord
 	placementByBranch := make(map[string]cluster.PlacementRecord)
 	if b.distributedSource.authority != nil {
-		authorityState, err = b.distributedSource.authority.AuthorityState()
+		authorityState, err = b.distributedSource.authority.AuthorityStateOf(cluster.PlacementsWithOwners)
 		if err != nil {
 			return err
 		}
@@ -2233,16 +2229,13 @@ func distributedChildRequestID(parent string, ordinal int, args []string) string
 // physical branches used to implement migration. Those private branches must
 // never be expanded into child CLI commands.
 func logicalFamilyPlacements(catalog cluster.PlacementCatalog, familyID string) ([]cluster.PlacementRecord, error) {
-	records, err := catalog.List()
+	records, err := catalog.ListFamily(familyID)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]cluster.PlacementRecord, 0)
 	seen := make(map[string]struct{})
 	for _, record := range records {
-		if record.FamilyID != familyID {
-			continue
-		}
 		if _, ok := seen[record.BranchID]; ok {
 			return nil, fmt.Errorf("family %q has duplicate placement for branch %q", familyID, record.BranchID)
 		}
@@ -4008,7 +4001,7 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	// common removal primitive so explicit cleanup, periodic reconciliation,
 	// and node-drain cleanup cannot disagree about the same directory.
 	if b.distributedSource != nil && b.distributedSource.authority != nil {
-		state, err := b.distributedSource.authority.AuthorityState()
+		state, err := b.distributedSource.authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string](), Transactions: cluster.All[string]()})
 		if err != nil {
 			return fmt.Errorf("checking cluster authority before local cleanup: %w", err)
 		}
@@ -6581,7 +6574,7 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 	if directory == nil || authority == nil || backend == nil || guardian == nil {
 		return nil, nil, errors.New("elastic heartbeat dependencies are incomplete")
 	}
-	authorityState, err := authority.AuthorityState()
+	authorityState, err := authority.AuthorityStateOf(cluster.ExecutionGrants)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading initial Raft execution grants: %w", err)
 	}
@@ -6593,7 +6586,7 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 		maintainElasticNode(directory, record, backend.activeDataRoot(), lease, stderr, done, func(state *cluster.AuthorityState) error {
 			if state == nil {
 				var err error
-				state, err = authority.AuthorityState()
+				state, err = authority.AuthorityStateOf(cluster.ExecutionGrants)
 				if err != nil {
 					return fmt.Errorf("reading Raft execution grants: %w", err)
 				}
@@ -6654,7 +6647,9 @@ func maintainOrphanLocalCacheCleanup(authority *cluster.RaftCatalog, backend *ru
 			case <-timer.C:
 			}
 
-			currentState, unlock, err := serializedAuthorityState(lockLocalState, authority.AuthorityState)
+			currentState, unlock, err := serializedAuthorityState(lockLocalState, func() (*cluster.AuthorityState, error) {
+				return authority.AuthorityStateOf(cluster.AuthorityQuery{Placements: cluster.All[string](), Transactions: cluster.All[string]()})
+			})
 			if err == nil {
 				fingerprint := localCleanupAuthorityFingerprint(currentState)
 				if !initialized || fingerprint != lastFingerprint {

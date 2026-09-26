@@ -144,6 +144,8 @@ type PlacementCatalog interface {
 	Remove(family, branch string, generation uint64) error
 	Lookup(family, branch string) (*PlacementRecord, error)
 	List() ([]PlacementRecord, error)
+	// ListFamily is List for the placements of one family.
+	ListFamily(family string) ([]PlacementRecord, error)
 }
 
 var _ PlacementCatalog = (*PlacementStore)(nil)
@@ -687,6 +689,20 @@ func (s *PlacementStore) List() ([]PlacementRecord, error) {
 		return err
 	})
 	return result, err
+}
+
+func (s *PlacementStore) ListFamily(family string) ([]PlacementRecord, error) {
+	records, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	var result []PlacementRecord
+	for _, record := range records {
+		if record.FamilyID == family {
+			result = append(result, record)
+		}
+	}
+	return result, nil
 }
 
 func (s *PlacementStore) listUnlocked() ([]PlacementRecord, error) {
