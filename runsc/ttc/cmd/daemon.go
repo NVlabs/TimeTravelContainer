@@ -4994,6 +4994,17 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		}
 	}()
 	liveness := &cluster.Liveness{}
+	if opts.ControlHolder {
+		var stillness []cluster.Stillness
+		if encoded := os.Getenv(controlHolderStillnessEnv); encoded != "" {
+			if err := json.Unmarshal([]byte(encoded), &stillness); err != nil {
+				return nil, fmt.Errorf("decoding what the gateway saw of the cluster: %w", err)
+			}
+		}
+		for _, seen := range stillness {
+			liveness.Assume(seen)
+		}
+	}
 	// The epoch of the Raft group this node is in: see
 	// cluster.AuthorityRaftOptions.Epoch.
 	raftEpoch := new(atomic.Uint64)

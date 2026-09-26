@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -39,6 +40,11 @@ import (
 // controlHolderSuffix makes the node ID of a gateway's control holder from
 // the gateway's own.
 const controlHolderSuffix = "-holder"
+
+// controlHolderStillnessEnv passes a control holder what its gateway saw of
+// the cluster's counters, so that the holder need not watch a daemon that
+// died stand still as long again.
+const controlHolderStillnessEnv = "TTC_CONTROL_HOLDER_STILLNESS"
 
 // controlHolder runs a gateway's control holder, in dir.
 type controlHolder struct {
@@ -115,13 +121,18 @@ func (h *controlHolder) consider(members map[string]cluster.MemberRecord, livene
 	if running || h.stopped || h.running() || time.Since(h.watchedSince) < cluster.AuthorityTakeover || time.Now().Before(h.retryAt) {
 		return
 	}
-	if err := h.start(); err != nil && h.stderr != nil {
+	stillness := make([]cluster.Stillness, 0, len(members))
+	for _, member := range members {
+		stillness = append(stillness, liveness.Stillness(member))
+	}
+	if err := h.start(stillness); err != nil && h.stderr != nil {
 		fmt.Fprintf(h.stderr, "ttcd: starting this login node's control holder: %v\n", err)
 	}
 }
 
-// start starts the holder, afresh: it keeps nothing of its own between runs.
-func (h *controlHolder) start() error {
+// start starts the holder, afresh: it keeps nothing of its own between runs,
+// but for what the gateway saw of the cluster's counters.
+func (h *controlHolder) start(stillness []cluster.Stillness) error {
 	local := filepath.Join(h.dir, "local")
 	if err := os.RemoveAll(local); err != nil {
 		return err
@@ -141,7 +152,11 @@ func (h *controlHolder) start() error {
 		"--cluster-page-listen", "127.0.0.1:0")
 	// It is this daemon's binary, and named as it is.
 	command.Args[0] = os.Args[0]
-	command.Env = append(os.Environ(), "TTC_ROOT="+h.sharedRoot, "TTC_LOCAL_ROOT="+local)
+	encoded, err := json.Marshal(stillness)
+	if err != nil {
+		return err
+	}
+	command.Env = append(os.Environ(), "TTC_ROOT="+h.sharedRoot, "TTC_LOCAL_ROOT="+local, controlHolderStillnessEnv+"="+string(encoded))
 	command.Stdout, command.Stderr = log, log
 	// It ends with the gateway, which relays to it.
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGTERM}

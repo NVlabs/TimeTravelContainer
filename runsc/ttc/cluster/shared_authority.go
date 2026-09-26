@@ -627,6 +627,41 @@ func (l *Liveness) Advancing(record MemberRecord) bool {
 	return seen.advanced && now.Sub(seen.since) < AuthorityTakeover && !record.Stopped
 }
 
+// Stillness is what a Liveness saw of a daemon's counter: that it stood at
+// Counter for Still, and whether it had been seen to advance before.
+type Stillness struct {
+	NodeID      string        `json:"node_id"`
+	Incarnation string        `json:"incarnation"`
+	Counter     uint64        `json:"counter"`
+	Still       time.Duration `json:"still"`
+	Advanced    bool          `json:"advanced,omitempty"`
+}
+
+// Stillness returns what this Liveness saw of the counter of the daemon of
+// record, for another Liveness on this host to Assume.
+func (l *Liveness) Stillness(record MemberRecord) Stillness {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.observe(record)
+	seen := l.seen[record.NodeID]
+	return Stillness{NodeID: record.NodeID, Incarnation: seen.incarnation, Counter: seen.counter, Still: now.Sub(seen.since), Advanced: seen.advanced}
+}
+
+// Assume takes what another Liveness on this host saw of a daemon's counter
+// for what this one saw, if it saw nothing of it yet: the counter has stood
+// still since at least s.Still ago.
+func (l *Liveness) Assume(s Stillness) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.seen == nil {
+		l.seen = make(map[string]livenessObservation)
+	}
+	if _, ok := l.seen[s.NodeID]; ok {
+		return
+	}
+	l.seen[s.NodeID] = livenessObservation{incarnation: s.Incarnation, counter: s.Counter, since: time.Now().Add(-s.Still), advanced: s.Advanced}
+}
+
 // observe records the counter of record, and returns when it did.
 func (l *Liveness) observe(record MemberRecord) time.Time {
 	if l.seen == nil {

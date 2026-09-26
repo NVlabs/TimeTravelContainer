@@ -506,6 +506,33 @@ func TestLivenessAdvancingNeedsACounterSeenToChange(t *testing.T) {
 	}
 }
 
+// A Liveness takes what another on the host saw of a counter for what it saw
+// itself, until it sees the counter itself.
+func TestLivenessAssumesWhatAnotherSaw(t *testing.T) {
+	var gateway Liveness
+	record := MemberRecord{NodeID: "node-a", Incarnation: "i-1", Counter: 7}
+	gateway.StillFor(record)
+	time.Sleep(50 * time.Millisecond)
+	seen := gateway.Stillness(record)
+	if seen.Still < 50*time.Millisecond || seen.Counter != 7 || seen.Incarnation != "i-1" {
+		t.Fatalf("the gateway saw %+v", seen)
+	}
+	var holder Liveness
+	holder.Assume(seen)
+	if still := holder.StillFor(record); still < 50*time.Millisecond {
+		t.Fatalf("the holder saw the counter still for %s, want what the gateway saw", still)
+	}
+	record.Counter++
+	if still := holder.StillFor(record); still != 0 {
+		t.Fatalf("a counter that moved stood still for %s", still)
+	}
+	// What the holder saw itself stands.
+	holder.Assume(seen)
+	if still := holder.StillFor(record); still > 10*time.Millisecond {
+		t.Fatalf("an assumption replaced what the holder saw: still for %s", still)
+	}
+}
+
 func TestDecideAuthorityWaitsForAClaimInProgress(t *testing.T) {
 	shared := NewSharedCluster(t.TempDir())
 	_, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
