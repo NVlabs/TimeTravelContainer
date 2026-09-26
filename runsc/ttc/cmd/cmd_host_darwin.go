@@ -142,7 +142,10 @@ func createRootlessProbe() error {
 	return fmt.Errorf("Linux user namespaces are unavailable on native macOS: %w", unix.EOPNOTSUPP)
 }
 
-func daemonStatfsIsNFS(statfs *unix.Statfs_t) bool {
+// daemonStatfsNetworkFilesystem returns the name of the network filesystem
+// statfs describes, or "" if it describes a local one: macOS marks every
+// local filesystem MNT_LOCAL.
+func daemonStatfsNetworkFilesystem(statfs *unix.Statfs_t) string {
 	name := make([]byte, 0, len(statfs.Fstypename))
 	for _, c := range statfs.Fstypename {
 		if c == 0 {
@@ -150,7 +153,22 @@ func daemonStatfsIsNFS(statfs *unix.Statfs_t) bool {
 		}
 		name = append(name, byte(c))
 	}
-	return string(name) == "nfs"
+	switch string(name) {
+	case "nfs", "smbfs", "afpfs", "webdav", "cifs", "ftp":
+		return string(name)
+	}
+	if statfs.Flags&unix.MNT_LOCAL == 0 {
+		return string(name)
+	}
+	return ""
+}
+
+// daemonUnixPathMax is the size of sockaddr_un.sun_path, terminator included.
+const daemonUnixPathMax = 104
+
+// readHostBootID returns an identifier of the host's current boot.
+func readHostBootID() (string, error) {
+	return unix.Sysctl("kern.bootsessionuuid")
 }
 
 func checkDaemonPeer(conn net.Conn) error {

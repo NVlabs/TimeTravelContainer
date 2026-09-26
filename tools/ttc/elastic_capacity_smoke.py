@@ -146,7 +146,6 @@ def main():
         result.update({
             "TTC_ROOT": str(data),
             "TTC_LOCAL_ROOT": str(runtime / "data"),
-            "TTC_SOCKET": str(runtime / "run" / "ttcd.sock"),
             "TTC_CAPACITY_TEST_ROOT": str(root),
         })
         result.pop("TTC_DATA_ROOT", None)
@@ -205,7 +204,7 @@ def main():
         request_path = data / "cluster" / "capacity-requests" / "node-a.json"
         wait_for("membership-confirmed outbox consumption", lambda: not request_path.exists())
         wait_for("automatic drain and daemon stop",
-                 lambda: not (runtime_a / "run" / "ttcd.sock").exists(),
+                 lambda: not (runtime_a / "data" / "ttcd.sock").exists(),
                  timeout=args.command_timeout)
         started_a = False
         inspected = json.loads(ttc(runtime_b, "inspect", "capacity-smoke").stdout)[0]
@@ -269,8 +268,8 @@ def main():
             # disappear so that cleanup cannot recreate the test root.
             wait_for(
                 "daemon shutdown",
-                lambda: not (runtime_a / "run" / "ttcd.sock").exists()
-                and not (runtime_b / "run" / "ttcd.sock").exists(),
+                lambda: not (runtime_a / "data" / "ttcd.sock").exists()
+                and not (runtime_b / "data" / "ttcd.sock").exists(),
                 timeout=args.command_timeout,
             )
             time.sleep(1)

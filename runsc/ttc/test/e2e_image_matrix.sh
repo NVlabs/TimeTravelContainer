@@ -66,7 +66,6 @@ else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
 BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
@@ -79,6 +78,9 @@ if [ "$(uname -s)" = Darwin ]; then
     "$BIN_DIR/ttcd" >/dev/null
 fi
 TTC="$BIN_DIR/ttc"
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
 export TTC_ROOT="$DATA_ROOT"
 HOST_FIXTURE="$TTC_E2E_ROOT/host-fixture"
 HOST_FIXTURE_TWO="$TTC_E2E_ROOT/host-fixture-two"
@@ -116,7 +118,7 @@ PUBLISHED_PORT=$((20000 + (($$ + 2000) % 30000)))
 CHILD_PUBLISHED_PORT=$((20000 + (($$ + 3000) % 30000)))
 NAT_FIXTURE_PID=
 ttc() {
-  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
+  "$TTC" "$@"
 }
 
 ttc_daemon_start() {

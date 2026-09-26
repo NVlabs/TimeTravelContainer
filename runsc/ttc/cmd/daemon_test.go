@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +44,18 @@ import (
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/version"
 )
+
+// shortDaemonTestRoot returns a new daemon root short enough for the paths of
+// the daemon's Unix sockets.
+func shortDaemonTestRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ttcr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 func shortDaemonTestSocket(t *testing.T) string {
 	t.Helper()
@@ -537,7 +550,7 @@ func TestDaemonKVMPreflightFailure(t *testing.T) {
 	if !testLinuxHost {
 		t.Skip("KVM preflight is Linux-specific")
 	}
-	t.Setenv("TTC_ROOT", t.TempDir())
+	t.Setenv("TTC_ROOT", shortDaemonTestRoot(t))
 	original := daemonPlatformPreflight
 	defer func() { daemonPlatformPreflight = original }()
 	var gotPlatform string
@@ -546,14 +559,14 @@ func TestDaemonKVMPreflightFailure(t *testing.T) {
 		return errors.New("test KVM unavailable")
 	}
 	var stdout, stderr bytes.Buffer
-	status := RunDaemon([]string{"--platform=kvm", "--socket", filepath.Join(t.TempDir(), "ttcd.sock")}, &stdout, &stderr)
+	status := RunDaemon([]string{"--platform=kvm"}, &stdout, &stderr)
 	if status != 1 || gotPlatform != "kvm" || !strings.Contains(stderr.String(), "test KVM unavailable") {
 		t.Fatalf("KVM preflight: status=%d platform=%q stdout=%q stderr=%q", status, gotPlatform, stdout.String(), stderr.String())
 	}
 }
 
 func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
-	t.Setenv("TTC_ROOT", t.TempDir())
+	t.Setenv("TTC_ROOT", shortDaemonTestRoot(t))
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
 	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "unsupported runtime platform") {
@@ -561,36 +574,240 @@ func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
 	}
 }
 
-func TestPrepareDaemonRuntimeStorageRejectsNFS(t *testing.T) {
+func TestDaemonRootMustBeOnALocalFilesystem(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
+	root := filepath.Join(t.TempDir(), "not", "yet", "made")
+	for _, test := range []struct {
+		name    string
+		statfs  func(*unix.Statfs_t)
+		allow   bool
+		wantErr string
+		wantFS  bool
+	}{
+		{name: "local", statfs: setTestLocalStatfs},
+		{name: "NFS", statfs: setTestNFSStatfs, wantErr: "network filesystem"},
+		{name: "Lustre", statfs: setTestLustreStatfs, wantErr: "network filesystem"},
+		{name: "allowed NFS", statfs: setTestNFSStatfs, allow: true, wantFS: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var checked []string
+			daemonStatfs = func(path string, statfs *unix.Statfs_t) error {
+				checked = append(checked, path)
+				if _, err := os.Stat(path); err != nil {
+					return unix.ENOENT
+				}
+				*statfs = unix.Statfs_t{}
+				test.statfs(statfs)
+				return nil
+			}
+			name, err := checkDaemonRootFilesystem("TTC_ROOT", root, test.allow)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) || !strings.Contains(err.Error(), "--allow-network-filesystem-root") {
+					t.Fatalf("checkDaemonRootFilesystem = %q, %v; want an error containing %q", name, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil || (name != "") != test.wantFS {
+				t.Fatalf("checkDaemonRootFilesystem = %q, %v", name, err)
+			}
+			// A root not yet made is on the filesystem of its nearest ancestor.
+			if last := checked[len(checked)-1]; last != filepath.Dir(filepath.Dir(filepath.Dir(root))) {
+				t.Errorf("checked %q last, want the root's nearest existing ancestor", checked)
+			}
+		})
+	}
+}
+
+func TestDaemonRootMustFitUnixSocketPaths(t *testing.T) {
+	short := newDaemonLayout("/ttc")
+	if err := checkDaemonSocketPaths(short); err != nil {
+		t.Fatalf("checkDaemonSocketPaths(%q): %v", short.root, err)
+	}
+	long := newDaemonLayout("/" + strings.Repeat("r", daemonUnixPathMax))
+	if err := checkDaemonSocketPaths(long); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("checkDaemonSocketPaths(%d-byte root) = %v, want an error", len(long.root), err)
+	}
+	// The longest root admitted still fits every socket.
+	longest := newDaemonLayout("/" + strings.Repeat("r", daemonUnixPathMax-len("/run/")-daemonRunNameMax-2))
+	if err := checkDaemonSocketPaths(longest); err != nil {
+		t.Fatalf("checkDaemonSocketPaths(%d-byte root): %v", len(longest.root), err)
+	}
+	if got := len(filepath.Join(longest.run, daemonRunSocketName("f", "any console directory"))); got >= daemonUnixPathMax {
+		t.Fatalf("socket path of %d bytes in an admitted root", got)
+	}
+}
+
+func TestControlOnlyDaemonRootMustFitItsHoldersSockets(t *testing.T) {
+	// A gateway's root that fits its own sockets, but not those of its
+	// control holder, whose root is in it.
+	root := "/" + strings.Repeat("r", daemonUnixPathMax-len("/run/")-daemonRunNameMax-2)
+	if err := checkDaemonSocketPaths(newDaemonLayout(root)); err != nil {
+		t.Fatalf("checkDaemonSocketPaths(%d-byte root): %v", len(root), err)
+	}
+	t.Setenv("TTC_ROOT", shortDaemonTestRoot(t))
+	t.Setenv("TTC_LOCAL_ROOT", root)
+	var stdout, stderr bytes.Buffer
+	if status := RunDaemon([]string{"--control-only"}, &stdout, &stderr); status != 2 || !strings.Contains(stderr.String(), "too long") {
+		t.Fatalf("control-only daemon whose holder's sockets do not fit: status=%d stderr=%q", status, stderr.String())
+	}
+}
+
+func TestDaemonSocketIsItsRoots(t *testing.T) {
+	root := shortDaemonTestRoot(t)
+	t.Setenv("TTC_ROOT", root)
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	var stdout, stderr bytes.Buffer
+	status := RunDaemon([]string{"--socket", filepath.Join(t.TempDir(), "ttcd.sock")}, &stdout, &stderr)
+	if status != 2 || !strings.Contains(stderr.String(), "is not the socket of the daemon's root") {
+		t.Fatalf("socket outside the root: status=%d stderr=%q", status, stderr.String())
+	}
+	if got, want := daemonSocketFromEnvironment(), filepath.Join(root, "ttcd.sock"); got != want {
+		t.Fatalf("daemonSocketFromEnvironment() = %q, want %q", got, want)
+	}
+}
+
+func TestDaemonRefusesNetworkRootUnlessAllowed(t *testing.T) {
+	t.Setenv("TTC_ROOT", shortDaemonTestRoot(t))
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	originalStatfs, originalPreflight := daemonStatfs, daemonPlatformPreflight
+	t.Cleanup(func() { daemonStatfs, daemonPlatformPreflight = originalStatfs, originalPreflight })
 	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
 		setTestNFSStatfs(statfs)
 		return nil
 	}
-	dir := t.TempDir()
-	err := prepareDaemonRuntimeStorage(filepath.Join(dir, "runtime", "ttcd.sock"), filepath.Join(dir, "runsc"))
-	if err == nil || !strings.Contains(err.Error(), "node-local") || !strings.Contains(err.Error(), "TTC_ROOT") {
-		t.Fatalf("prepareDaemonRuntimeStorage on NFS: %v", err)
+	daemonPlatformPreflight = func(string) error { return errors.New("fixture stops startup after the root checks") }
+	var stdout, stderr bytes.Buffer
+	if status := RunDaemon(nil, &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "network filesystem") {
+		t.Fatalf("network root: status=%d stderr=%q", status, stderr.String())
+	}
+	stderr.Reset()
+	status := RunDaemon([]string{"--allow-network-filesystem-root"}, &stdout, &stderr)
+	if status != 1 || !strings.Contains(stderr.String(), "warning") || !strings.Contains(stderr.String(), "fixture stops startup") {
+		t.Fatalf("allowed network root: status=%d stderr=%q", status, stderr.String())
 	}
 }
 
-func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
-	original := daemonStatfs
-	t.Cleanup(func() { daemonStatfs = original })
-	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
-		setTestLocalStatfs(statfs)
-		return nil
+func TestSweepDaemonFilesAfterRestartOfTheHost(t *testing.T) {
+	originalBoot := hostBootID
+	t.Cleanup(func() { hostBootID = originalBoot })
+	hostBootID = func() (string, error) { return "this-boot", nil }
+	layout := newDaemonLayout(shortDaemonTestRoot(t))
+	runtimeRoot := filepath.Join(layout.root, "runtime", "runsc")
+	for _, dir := range []string{layout.run, layout.tmp, filepath.Join(runtimeRoot, transientBundleDirName, ".branch-start-1")} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
 	}
-	dir := t.TempDir()
-	socketDir := filepath.Join(dir, "runtime")
-	root := filepath.Join(dir, "runsc")
-	if err := prepareDaemonRuntimeStorage(filepath.Join(socketDir, "ttcd.sock"), root); err != nil {
+	files := map[string]string{
+		filepath.Join(layout.run, daemonBootName):       "an-earlier-boot\n",
+		filepath.Join(layout.run, "c0123.sock"):         "",
+		filepath.Join(layout.tmp, "leftover"):           "",
+		filepath.Join(runtimeRoot, "a_sandbox:a.state"): `{"id":"a","sandbox":{"pid":1}}`,
+		filepath.Join(runtimeRoot, "a_sandbox:a.lock"):  "",
+		filepath.Join(runtimeRoot, "sentry-panic.log"):  "kept",
+	}
+	for path, data := range files {
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweepDaemonFiles(layout, runtimeRoot, func(id string) error {
+		t.Errorf("deleted sandbox %q of an earlier boot through runsc, whose PIDs may be others' now", id)
+		return nil
+	}, nil)
+	for path := range files {
+		_, err := os.Stat(path)
+		switch filepath.Base(path) {
+		case daemonBootName, "sentry-panic.log":
+			if err != nil {
+				t.Errorf("%s: %v, want it kept", path, err)
+			}
+		default:
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s: %v, want it removed", path, err)
+			}
+		}
+	}
+	if data, _ := os.ReadFile(filepath.Join(layout.run, daemonBootName)); string(data) != "this-boot\n" {
+		t.Errorf("recorded boot %q, want this one", data)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeRoot, transientBundleDirName)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("transient bundles of an earlier boot: %v, want them removed", err)
+	}
+}
+
+func TestSweepDaemonFilesRemovesWhatServesNoProcess(t *testing.T) {
+	originalBoot := hostBootID
+	t.Cleanup(func() { hostBootID = originalBoot })
+	hostBootID = func() (string, error) { return "this-boot", nil }
+	layout := newDaemonLayout(shortDaemonTestRoot(t))
+	runtimeRoot := filepath.Join(layout.root, "runtime", "runsc")
+	for _, dir := range []string{layout.run, layout.tmp, runtimeRoot} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(layout.run, daemonBootName), []byte("this-boot\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{socketDir, root} {
-		if info, err := os.Stat(path); err != nil || !info.IsDir() {
-			t.Fatalf("runtime path %q: info=%v err=%v", path, info, err)
+	live, err := net.Listen("unix", filepath.Join(layout.run, "flive.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	dead, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(layout.run, "cdead.sock"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead.SetUnlinkOnClose(false)
+	dead.Close()
+	// A reaped child's PID names no process.
+	child := exec.Command("true")
+	if err := child.Run(); err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]int{"gone": child.Process.Pid, "alive": os.Getpid()}
+	for id, pid := range states {
+		state := fmt.Sprintf(`{"id":%q,"sandbox":{"pid":%d}}`, id, pid)
+		if err := os.WriteFile(filepath.Join(runtimeRoot, id+"_sandbox:"+id+".state"), []byte(state), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(runtimeRoot, id+"_sandbox:"+id+".lock"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(runtimeRoot, "deleted_sandbox:deleted.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old, recent := filepath.Join(layout.tmp, "old"), filepath.Join(layout.tmp, "recent")
+	for _, path := range []string{old, recent} {
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	long := time.Now().Add(-2 * daemonTmpStaleAge)
+	if err := os.Chtimes(old, long, long); err != nil {
+		t.Fatal(err)
+	}
+	var deleted []string
+	sweepDaemonFiles(layout, runtimeRoot, func(id string) error {
+		deleted = append(deleted, id)
+		return nil
+	}, nil)
+	if !reflect.DeepEqual(deleted, []string{"gone"}) {
+		t.Errorf("deleted sandboxes %q, want only the one whose Sentry is gone", deleted)
+	}
+	for path, want := range map[string]bool{
+		filepath.Join(layout.run, "flive.sock"):                    true,
+		filepath.Join(layout.run, "cdead.sock"):                    false,
+		filepath.Join(runtimeRoot, "alive_sandbox:alive.lock"):     true,
+		filepath.Join(runtimeRoot, "deleted_sandbox:deleted.lock"): false,
+		old:    false,
+		recent: true,
+	} {
+		if _, err := os.Stat(path); (err == nil) != want {
+			t.Errorf("%s: stat error %v, want kept=%t", path, err, want)
 		}
 	}
 }
@@ -599,7 +816,6 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 	if !testLinuxHost {
 		t.Skip("Linux host-kernel compatibility is Linux-specific")
 	}
-	t.Setenv("TTC_ROOT", t.TempDir())
 	original := daemonKernelRelease
 	defer func() {
 		daemonKernelRelease = original
@@ -608,10 +824,11 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 		return "3.16.99-legacy", nil
 	}
 
-	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	root := shortDaemonTestRoot(t)
+	t.Setenv("TTC_ROOT", root)
+	socket := filepath.Join(root, "ttcd.sock")
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{
-		"--socket", socket,
 		"--unsafe-no-host-isolation",
 	}, &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires Linux 3.17 or newer") {
@@ -640,12 +857,10 @@ func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
 	daemonEffectiveUID = func() int { return 1000 }
 	createDaemonRootlessProbe = func() error { return errors.New("fixture stops startup after kernel warning") }
 
-	dataRoot := t.TempDir()
+	dataRoot := shortDaemonTestRoot(t)
 	t.Setenv("TTC_ROOT", dataRoot)
 	var stdout, stderr bytes.Buffer
-	status := RunDaemon([]string{
-		"--socket", filepath.Join(t.TempDir(), "runtime", "ttcd.sock"),
-	}, &stdout, &stderr)
+	status := RunDaemon(nil, &stdout, &stderr)
 	if status != 1 || stdout.Len() != 0 {
 		t.Fatalf("old kernel startup fixture: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
@@ -857,7 +1072,6 @@ func TestRootlessDaemonStartupPreflight(t *testing.T) {
 	if !testLinuxHost {
 		t.Skip("Linux rootless namespace preflight is Linux-specific")
 	}
-	t.Setenv("TTC_ROOT", t.TempDir())
 	original := createDaemonRootlessProbe
 	originalEUID := daemonEffectiveUID
 	defer func() {
@@ -878,9 +1092,11 @@ func TestRootlessDaemonStartupPreflight(t *testing.T) {
 		t.Fatalf("unsafe mode ran %d rootless probes, want zero", calls)
 	}
 
-	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	root := shortDaemonTestRoot(t)
+	t.Setenv("TTC_ROOT", root)
+	socket := filepath.Join(root, "ttcd.sock")
 	var stdout, stderr bytes.Buffer
-	status := RunDaemon([]string{"--socket", socket}, &stdout, &stderr)
+	status := RunDaemon(nil, &stdout, &stderr)
 	if status != 1 || !strings.Contains(stderr.String(), "rootless mode is unavailable") {
 		t.Fatalf("ttcd preflight: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
@@ -913,6 +1129,12 @@ func TestDaemonRootsRequireExplicitFreshEnvironment(t *testing.T) {
 	if roots, err := daemonRootsFromEnvironment(false); err != nil || roots.shared != shared || roots.local != shared || roots.runtime != filepath.Join(shared, "runtime", "runsc") {
 		t.Fatalf("standalone roots=%+v err=%v", roots, err)
 	}
+	// A client would look for a standalone daemon in its TTC_LOCAL_ROOT.
+	t.Setenv("TTC_LOCAL_ROOT", filepath.Join(t.TempDir(), "local"))
+	if _, err := daemonRootsFromEnvironment(false); err == nil || !strings.Contains(err.Error(), "TTC_LOCAL_ROOT") {
+		t.Fatalf("standalone daemon with TTC_LOCAL_ROOT: err=%v", err)
+	}
+	t.Setenv("TTC_LOCAL_ROOT", "")
 	if _, err := daemonRootsFromEnvironment(true); err == nil || !strings.Contains(err.Error(), "TTC_LOCAL_ROOT") {
 		t.Fatalf("missing cluster local root error=%v", err)
 	}
@@ -935,14 +1157,6 @@ func TestDaemonRootsRequireExplicitFreshEnvironment(t *testing.T) {
 	t.Setenv("TTC_LOCAL_ROOT", alias)
 	if _, err := daemonRootsFromEnvironment(true); err == nil || !strings.Contains(err.Error(), "distinct") {
 		t.Fatalf("symlink-aliased cluster roots error=%v", err)
-	}
-}
-
-func TestStandaloneRuntimeRootFollowsDaemonSocket(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
-	want := filepath.Join(filepath.Dir(socket), "runsc")
-	if got := standaloneRuntimeRoot(socket); got != want {
-		t.Fatalf("standaloneRuntimeRoot(%q)=%q, want %q", socket, got, want)
 	}
 }
 
@@ -1003,7 +1217,7 @@ func TestFreshDaemonRootAllowsOnlyActiveStartupLog(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("reading startup root: entries=%v err=%v", entries, err)
 	}
-	if !freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
+	if !freshDaemonRootEntryAllowed(entries[0], logInfo) {
 		t.Fatal("active startup log was not admitted")
 	}
 	other, err := os.CreateTemp(t.TempDir(), "other-log-")
@@ -1015,12 +1229,13 @@ func TestFreshDaemonRootAllowsOnlyActiveStartupLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if freshDaemonRootEntryAllowed(root, entries[0], otherInfo) {
+	if freshDaemonRootEntryAllowed(entries[0], otherInfo) {
 		t.Fatal("stale startup log was admitted")
 	}
 }
 
-func TestFreshDaemonRootAllowsNestedActiveStartupLog(t *testing.T) {
+func TestFreshDaemonRootRejectsNestedStartupLog(t *testing.T) {
+	// A daemon's log is in its root; a directory holding one is another's.
 	root := t.TempDir()
 	run := filepath.Join(root, "run", "daemon")
 	if err := os.MkdirAll(run, 0700); err != nil {
@@ -1036,15 +1251,8 @@ func TestFreshDaemonRootAllowsNestedActiveStartupLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 1 || !freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
-		t.Fatalf("nested active startup log was not admitted: entries=%v err=%v", entries, err)
-	}
-	if err := os.WriteFile(filepath.Join(run, "stale"), []byte("x"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	entries, err = os.ReadDir(root)
-	if err != nil || freshDaemonRootEntryAllowed(root, entries[0], logInfo) {
-		t.Fatalf("populated startup subtree was admitted: entries=%v err=%v", entries, err)
+	if err != nil || len(entries) != 1 || freshDaemonRootEntryAllowed(entries[0], logInfo) {
+		t.Fatalf("a directory holding the startup log was admitted: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -1225,7 +1433,7 @@ func TestStrictSnapshotGraphRootRejectsLegacyArtifacts(t *testing.T) {
 }
 
 func TestDaemonRejectsOldRootBeforePlatformProbe(t *testing.T) {
-	root := t.TempDir()
+	root := shortDaemonTestRoot(t)
 	markerPath := filepath.Join(root, ".ttc-root-format")
 	original := []byte("{\"version\":1,\"kind\":\"shared\"}\n")
 	if err := os.WriteFile(markerPath, original, 0600); err != nil {
@@ -1240,7 +1448,7 @@ func TestDaemonRejectsOldRootBeforePlatformProbe(t *testing.T) {
 		return nil
 	}
 	var stdout, stderr bytes.Buffer
-	status := RunDaemon([]string{"--socket", filepath.Join(t.TempDir(), "ttcd.sock"), "--unsafe-no-host-isolation"}, &stdout, &stderr)
+	status := RunDaemon([]string{"--unsafe-no-host-isolation"}, &stdout, &stderr)
 	if status != 1 || !strings.Contains(stderr.String(), "does not migrate existing roots") {
 		t.Fatalf("old-root startup: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
@@ -1834,13 +2042,6 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon did not stop")
-	}
-}
-
-func TestDefaultDaemonSocketHonorsTTCSocket(t *testing.T) {
-	t.Setenv("TTC_SOCKET", "/var/run/ttc-test/daemon.sock")
-	if got, want := defaultDaemonSocket(), "/var/run/ttc-test/daemon.sock"; got != want {
-		t.Fatalf("defaultDaemonSocket() = %q, want %q", got, want)
 	}
 }
 

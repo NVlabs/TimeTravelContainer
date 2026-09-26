@@ -114,13 +114,24 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	if args[0] == "daemon" {
-		return runDaemon(opts, args[1:], stdout, stderr)
-	}
-	if !knownCommand(args[0]) {
+	if args[0] != "daemon" && !knownCommand(args[0]) {
 		fmt.Fprintf(stderr, "ttc: unknown command %q\n", args[0])
 		printUsage(stderr)
 		return 2
+	}
+	if opts.socket == "" {
+		root, err := protocol.DaemonRoot(os.Getenv)
+		if err != nil {
+			fmt.Fprintf(stderr, "ttc: %v\n", err)
+			return 2
+		}
+		opts.socket = protocol.DaemonSocket(root)
+	} else if len(args) >= 2 && args[0] == "daemon" && args[1] == "start" {
+		fmt.Fprintln(stderr, "ttc: --daemon-socket does not apply to daemon start: a daemon's socket is in its root, TTC_ROOT or TTC_LOCAL_ROOT")
+		return 2
+	}
+	if args[0] == "daemon" {
+		return runDaemon(opts, args[1:], stdout, stderr)
 	}
 	args, stdin, stdout, closeArchive, err := prepareImageArchiveIO(args, stdin, stdout)
 	if err != nil {
@@ -257,7 +268,7 @@ func prepareImageArchiveIO(args []string, stdin io.Reader, stdout io.Writer) ([]
 }
 
 func parseGlobal(args []string, stdout io.Writer) (options, []string, bool, error) {
-	opts := options{socket: defaultSocket()}
+	var opts options
 	for len(args) != 0 {
 		switch arg := args[0]; {
 		case arg == "--help" || arg == "-h":
@@ -285,16 +296,6 @@ func parseGlobal(args []string, stdout io.Writer) (options, []string, bool, erro
 	return opts, args, false, nil
 }
 
-func defaultSocket() string {
-	if socket := os.Getenv("TTC_SOCKET"); socket != "" {
-		return socket
-	}
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "ttc", "ttcd.sock")
-	}
-	return filepath.Join(os.TempDir(), "ttc-"+strconv.Itoa(os.Geteuid()), "ttcd.sock")
-}
-
 var commands = map[string]struct{}{
 	"attach": {}, "checkpoint": {}, "commit": {}, "container": {}, "cp": {}, "create": {},
 	"dehydrate": {}, "diff": {}, "events": {}, "exec": {}, "fork": {}, "image": {}, "images": {},
@@ -314,8 +315,9 @@ func printUsage(w io.Writer) {
 
 Manage TimeTravelContainer container families and live branches.
 
-The client connects only to TTC_SOCKET (or --daemon-socket). Storage roots and
-runtime configuration belong exclusively to ttcd.
+The client connects to the daemon whose root the environment names: through
+$TTC_LOCAL_ROOT/ttcd.sock on a node of a cluster, and $TTC_ROOT/ttcd.sock
+otherwise. Storage and runtime configuration belong exclusively to ttcd.
 
 Commands:
   run, create, start, stop, restart, rm, exec, attach, logs, cp
@@ -332,9 +334,8 @@ units such as 512MiB and 8GiB. DURATION values use forms such as 250ms, 15s,
 and 2m. Defaults are stated in command-specific help.
 
 Global options:
-  --daemon-socket PATH   Unix socket to use (default: TTC_SOCKET, then
-                         $XDG_RUNTIME_DIR/ttc/ttcd.sock, then
-                         /tmp/ttc-<numeric-uid>/ttcd.sock)
+  --daemon-socket PATH   Unix socket of the daemon to use (default: ttcd.sock
+                         in TTC_LOCAL_ROOT if set, and otherwise in TTC_ROOT)
 
 Run 'ttc COMMAND --help' for command usage. ttcd requires TTC_ROOT; clustered
 compute daemons additionally require TTC_LOCAL_ROOT.
@@ -344,8 +345,9 @@ compute daemons additionally require TTC_LOCAL_ROOT.
 var commandHelp = map[string]string{
 	"daemon": `Usage: ttc daemon COMMAND [OPTIONS]
 
-Manage the local ttcd service. These commands use TTC_SOCKET or the global
---daemon-socket override; only "start" reads TTC_ROOT and TTC_LOCAL_ROOT.
+Manage the local ttcd service: the daemon whose root is TTC_LOCAL_ROOT on a
+node of a cluster, and TTC_ROOT otherwise. The global --daemon-socket selects
+another daemon's socket for every command but start.
 
 Commands:
   start [OPTIONS]        Start ttcd and wait until it is ready
@@ -359,9 +361,10 @@ Run 'ttc daemon COMMAND --help' for command-specific usage.`,
 	"daemon start": `Usage: ttc daemon start [OPTIONS]
 
 Start the sibling ttcd binary and wait until it is ready. TTC_ROOT must name
-an explicitly configured, new-format data root. Cluster compute mode
-additionally requires TTC_LOCAL_ROOT for node-local active state and cache
-data; control-only mode does not.
+an explicitly configured, new-format data root. A standalone daemon keeps all
+of its files there, including its socket and log. A daemon of a cluster shares
+TTC_ROOT with the cluster and keeps its node's own files in TTC_LOCAL_ROOT.
+The daemon's root, TTC_ROOT or TTC_LOCAL_ROOT, must be on a local filesystem.
 
 Options:
   --platform systrap|kvm          Execution platform (default: systrap)
@@ -369,6 +372,9 @@ Options:
                                   Guest CPU contract (default: portable)
   --cpu-features NAME,...         Required with explicit profile; no default
   --unsafe-no-host-isolation      Disable namespace/chroot isolation
+                                  (default: false)
+  --allow-network-filesystem-root Start although the daemon's root is on a
+                                  network filesystem such as NFS or Lustre
                                   (default: false)
   --cluster-init                  Create/restart the cluster's surviving Raft
                                   member (default: standalone mode)
@@ -411,14 +417,15 @@ node leases. The CPU profile remains immutable. --cluster-init and
 --cluster-join are mutually exclusive.
 
 Environment:
-  TTC_ROOT          Required data root; shared root in cluster mode
-  TTC_LOCAL_ROOT    Required node-local root for cluster compute daemons
-  TTC_SOCKET        Unix socket (see the global default above)
+  TTC_ROOT          Required data root; shared root in cluster mode. A
+                    standalone daemon keeps all of its files there
+  TTC_LOCAL_ROOT    Required node-local root of a daemon of a cluster, which
+                    keeps its node's files there
   TTC_CLUSTER_TOKEN Optional shared cluster authentication token (default: none)
 
 With --control-only, repeat --cluster-join for optional seed redundancy. The
-daemon opens only TTC_SOCKET: it does not advertise a TCP endpoint, join Raft,
-accept container placement, or require TTC_LOCAL_ROOT.`,
+daemon does not advertise a TCP endpoint, join Raft, or accept container
+placement; it opens only its socket in TTC_LOCAL_ROOT.`,
 	"daemon status": `Usage: ttc daemon status
 
 Show the running daemon's build ID, runtime mode, root format, and cluster
@@ -1013,7 +1020,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		return err
 	}
-	logPath := filepath.Join(filepath.Dir(socket), "ttcd.log")
+	logPath := protocol.DaemonLog(filepath.Dir(socket))
 	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err

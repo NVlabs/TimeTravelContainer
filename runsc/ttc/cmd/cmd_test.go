@@ -4441,7 +4441,7 @@ if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "exec-list" ] && [ "$
 	exit 0
 fi
 
-if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-ready-fd" ] && [ "$7" = "3" ] && [ "$8" = "web" ] && [ "$9" = "console-follow-family" ]; then
+if [ "$3" = "timetravel" ] && [ "$4" = "--console-socket" ] && [ "$6" = "--console-lock" ] && [ "$8" = "--console-ready-fd" ] && [ "$9" = "3" ] && [ "${10}" = "web" ] && [ "${11}" = "console-follow-family" ]; then
 	exec env ` + fakeFollowerSocketEnv + `="$5" ` + fakeFollowerMarkerEnv + `="$0.retention" "` + testBinary(t) + `"
 fi
 if [ "$3" = "timetravel" ] && [ "$4" = "web" ] && [ "$5" = "ps" ] && [ "$6" = "main" ]; then

@@ -27,32 +27,30 @@ fi
 SHARED=${TTC_DISTRIBUTED_TEST_SHARED_ROOT:-$ROOT/shared}
 LOCAL_A=${TTC_DISTRIBUTED_TEST_LOCAL_A_ROOT:-$ROOT/local-a}
 LOCAL_B=${TTC_DISTRIBUTED_TEST_LOCAL_B_ROOT:-$ROOT/local-b}
-RUN_A=$ROOT/run-a
-RUN_B=$ROOT/run-b
-SOCKET_A=$RUN_A/ttcd.sock
-SOCKET_B=$RUN_B/ttcd.sock
+SOCKET_A=$LOCAL_A/ttcd.sock
+SOCKET_B=$LOCAL_B/ttcd.sock
 TOKEN=ttc-distributed-multihop-$NAME
 PID_A=
 PID_B=
 
 client_a() {
-	TTC_SOCKET=$SOCKET_A timeout "$COMMAND_TIMEOUT" "$TTC" "$@"
+	TTC_LOCAL_ROOT=$LOCAL_A timeout "$COMMAND_TIMEOUT" "$TTC" "$@"
 }
 
 client_b() {
-	TTC_SOCKET=$SOCKET_B timeout "$COMMAND_TIMEOUT" "$TTC" "$@"
+	TTC_LOCAL_ROOT=$LOCAL_B timeout "$COMMAND_TIMEOUT" "$TTC" "$@"
 }
 
 cleanup() {
 	set +e
 	if test -S "$SOCKET_A"; then
-		TTC_SOCKET=$SOCKET_A timeout 30s "$TTC" rm -f "$NAME" >/dev/null 2>&1
+		TTC_LOCAL_ROOT=$LOCAL_A timeout 30s "$TTC" rm -f "$NAME" >/dev/null 2>&1
 	fi
 	if test -S "$SOCKET_B"; then
-		TTC_SOCKET=$SOCKET_B timeout 30s "$TTC" node stop node-b --stop-all >/dev/null 2>&1
+		TTC_LOCAL_ROOT=$LOCAL_B timeout 30s "$TTC" node stop node-b --stop-all >/dev/null 2>&1
 	fi
 	if test -S "$SOCKET_A"; then
-		TTC_SOCKET=$SOCKET_A timeout 30s "$TTC" node stop node-a --stop-all >/dev/null 2>&1
+		TTC_LOCAL_ROOT=$LOCAL_A timeout 30s "$TTC" node stop node-a --stop-all >/dev/null 2>&1
 	fi
 	if test -n "$PID_B"; then
 		kill "$PID_B" >/dev/null 2>&1
@@ -71,36 +69,35 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 wait_ready() {
-	socket=$1
+	root=$1
 	log=$2
 	attempt=0
 	while test "$attempt" -lt 600; do
-		if TTC_SOCKET=$socket timeout 2s "$TTC" node ls >/dev/null 2>&1; then
+		if TTC_LOCAL_ROOT=$root timeout 2s "$TTC" node ls >/dev/null 2>&1; then
 			return 0
 		fi
 		attempt=$((attempt + 1))
 		sleep 0.05
 	done
-	echo "TTC daemon using $socket did not become ready" >&2
+	echo "TTC daemon of $root did not become ready" >&2
 	tail -100 "$log" >&2 || true
 	return 1
 }
 
-mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B" "$RUN_A" "$RUN_B"
-chmod 700 "$RUN_A" "$RUN_B"
+mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --socket "$SOCKET_A" --cluster-init --node node-a \
+	"$TTCD" --cluster-init --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \
-	--memory-target 64GiB --unsafe-no-host-isolation >"$RUN_A/ttcd.log" 2>&1 &
+	--memory-target 64GiB --unsafe-no-host-isolation >"$LOCAL_A/ttcd.log" 2>&1 &
 PID_A=$!
-wait_ready "$SOCKET_A" "$RUN_A/ttcd.log"
+wait_ready "$LOCAL_A" "$LOCAL_A/ttcd.log"
 
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_B TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --socket "$SOCKET_B" --cluster-join "127.0.0.1:$PORT_A" --node node-b \
+	"$TTCD" --cluster-join "127.0.0.1:$PORT_A" --node node-b \
 	--listen "127.0.0.1:$PORT_B" --advertise "127.0.0.1:$PORT_B" \
-	--memory-target 64GiB --unsafe-no-host-isolation >"$RUN_B/ttcd.log" 2>&1 &
+	--memory-target 64GiB --unsafe-no-host-isolation >"$LOCAL_B/ttcd.log" 2>&1 &
 PID_B=$!
-wait_ready "$SOCKET_B" "$RUN_B/ttcd.log"
+wait_ready "$LOCAL_B" "$LOCAL_B/ttcd.log"
 
 client_a pull "$IMAGE" >/dev/null
 client_a run -d --node node-a --name "$NAME" --shm-size 64m "$IMAGE" sh -c \

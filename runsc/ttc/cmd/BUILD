@@ -24,6 +24,7 @@ go_library(
         "graph_references.go",
         "shared_references.go",
         "daemon.go",
+        "daemon_layout.go",
         "daemon_requests.go",
         "daemon_stdin_lease.go",
         "daemon_terminal.go",

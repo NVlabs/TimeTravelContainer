@@ -107,8 +107,43 @@ func createRootlessProbe() error {
 	return command.Run()
 }
 
-func daemonStatfsIsNFS(statfs *unix.Statfs_t) bool {
-	return int64(statfs.Type) == int64(unix.NFS_SUPER_MAGIC)
+// daemonNetworkFilesystems names the network and cluster filesystems by the
+// magic number statfs reports for them. FUSE filesystems are not among them:
+// statfs does not tell sshfs from a local FUSE filesystem.
+var daemonNetworkFilesystems = map[int64]string{
+	0x6969:     "NFS",
+	0x0bd00bd0: "Lustre",
+	0xff534d42: "CIFS",
+	0xfe534d42: "SMB2",
+	0x517b:     "SMB",
+	0x5346414f: "AFS",
+	0x6b414653: "AFS",
+	0x00c36400: "CephFS",
+	0x47504653: "GPFS",
+	0x19830326: "BeeGFS",
+	0x01021997: "9P",
+	0x73757245: "Coda",
+	0x564c:     "NCP",
+	0x7461636f: "OCFS2",
+	0x01161970: "GFS2",
+}
+
+// daemonStatfsNetworkFilesystem returns the name of the network filesystem
+// statfs describes, or "" if it describes a local one.
+func daemonStatfsNetworkFilesystem(statfs *unix.Statfs_t) string {
+	return daemonNetworkFilesystems[int64(statfs.Type)]
+}
+
+// daemonUnixPathMax is the size of sockaddr_un.sun_path, terminator included.
+const daemonUnixPathMax = 108
+
+// readHostBootID returns an identifier of the host's current boot.
+func readHostBootID() (string, error) {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func checkDaemonPeer(conn net.Conn) error {

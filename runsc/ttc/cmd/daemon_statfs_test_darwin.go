@@ -26,10 +26,19 @@ const testLinuxHost = false
 
 func setTestNFSStatfs(statfs *unix.Statfs_t) {
 	setTestFilesystemName(statfs, "nfs")
+	statfs.Flags &^= unix.MNT_LOCAL
 }
 
 func setTestLocalStatfs(statfs *unix.Statfs_t) {
 	setTestFilesystemName(statfs, "apfs")
+	statfs.Flags |= unix.MNT_LOCAL
+}
+
+// setTestLustreStatfs is as macOS would describe a Lustre filesystem, which
+// it has no client for, if it had: a filesystem not marked local.
+func setTestLustreStatfs(statfs *unix.Statfs_t) {
+	setTestFilesystemName(statfs, "lustre")
+	statfs.Flags &^= unix.MNT_LOCAL
 }
 
 func setTestFilesystemName(statfs *unix.Statfs_t, name string) {

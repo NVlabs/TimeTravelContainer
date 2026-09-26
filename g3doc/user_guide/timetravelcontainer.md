@@ -184,13 +184,27 @@ place both files together under `/usr/local/bin`.
 ## State and runtime paths
 
 `ttcd` refuses to start until `TTC_ROOT` names an explicit absolute path. In
-standalone mode it contains the image store, container catalog, active runtime
-state, writable filesystems, and durable cold state:
+standalone mode it contains everything of the daemon's: the image store,
+container catalog, writable filesystems, and durable cold state, and also its
+socket `ttcd.sock`, its log `ttcd.log`, the sockets of its sandboxes in `run/`,
+its temporary files in `tmp/`, and runsc's state of its sandboxes in
+`runtime/runsc/`. The root identifies the daemon, and `ttc` finds the daemon
+through it:
 
 ```shell
 export TTC_ROOT="$HOME/.local/share/ttc"
 ttc daemon start
 ```
+
+TTC keeps nothing of its own outside the root. What `run/`, `tmp/`, and
+`runtime/runsc/` hold lives only as long as the processes it serves: a starting
+daemon removes what outlived them, and all of it after the host restarted.
+
+The root must be on a local filesystem: `ttcd` refuses to start on NFS,
+Lustre, or another network filesystem, which does not keep the root's sockets,
+locks, and process state to one host, unless `ttc daemon start
+--allow-network-filesystem-root` insists. Unix socket paths are short, so the
+root's path may be at most 76 bytes long on macOS and 80 on Linux.
 
 Existing roots created before this format are deliberately not migrated; use
 a fresh directory. `TTC_DATA_ROOT`, `TTC_RUNTIME_DIR`, `--data-root`, runtime
@@ -206,22 +220,24 @@ ttc daemon start --node node-a \
   --listen 0.0.0.0:7443 --advertise node-a.example:7443
 ```
 
-`TTC_LOCAL_ROOT` is required on cluster compute nodes, must differ from
-`TTC_ROOT`, and is exclusively locked to one daemon. Active filesystems,
-runtime state, console/exec buffers, caches, and publication staging remain
-local. Sealed generations publish asynchronously as immutable indexed packs;
-after a clean node stop, remaining local files are disposable caches or
-staging residue.
+`TTC_LOCAL_ROOT` is required on cluster nodes, must differ from `TTC_ROOT`, and
+is exclusively locked to one daemon. It is the daemon's root, as `TTC_ROOT` is
+a standalone daemon's: the daemon's socket, log, sockets of its sandboxes,
+temporary files, and runtime state are there, and it must be on a local
+filesystem likewise. Active filesystems, console/exec buffers, caches, and
+publication staging remain local too. Sealed generations publish
+asynchronously as immutable indexed packs; after a clean node stop, remaining
+local files are disposable caches or staging residue.
 
-The client locates the daemon through `TTC_SOCKET`, then
-`$XDG_RUNTIME_DIR/ttc/ttcd.sock`, then `/tmp/ttc-$UID/ttcd.sock`.
-`--daemon-socket` takes precedence for one invocation. The client never needs
-access to either storage root. Help, shell completion, argument validation, and
-`ttc --version` are client-local and work without a daemon. Ordinary CLI
-operations require the client and daemon build IDs to match exactly; `daemon
-stop` remains available as the version-independent recovery operation. SDK and
-MCP clients negotiate the public API and features instead of asserting a CLI
-build ID.
+The client locates the daemon by its root: `$TTC_LOCAL_ROOT/ttcd.sock` if
+`TTC_LOCAL_ROOT` is set, as on a node of a cluster, and otherwise
+`$TTC_ROOT/ttcd.sock`. `--daemon-socket` takes precedence for one invocation,
+except for `daemon start`. The client reads nothing else of either root. Help,
+shell completion, argument validation, and `ttc --version` are client-local and
+work without a daemon. Ordinary CLI operations require the client and daemon
+build IDs to match exactly; `daemon stop` remains available as the
+version-independent recovery operation. SDK and MCP clients negotiate the public
+API and features instead of asserting a CLI build ID.
 
 ## Images
 
@@ -426,21 +442,21 @@ run an outbound-only gateway:
 
 ```shell
 export TTC_ROOT=/shared/ttc
+export TTC_LOCAL_ROOT=/local/scratch/ttc-login
 export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
 ttc daemon start --control-only
 ```
 
-This mode does not require `TTC_LOCAL_ROOT`. It opens only the per-user Unix
-socket selected by `TTC_SOCKET`; it does not open or advertise a TCP port,
-provide page data, or accept branch placement. It finds the compute nodes in
-the shared root, so the login host needs outbound connectivity to them, but
-compute nodes never initiate connections to it. Commands such as `run`,
-`exec`, `fork`, `migrate`, `ps`, and `node ls` are tunneled to a compute node
-whose counter advances and then routed by the normal cluster placement
-authority. The shared `TTC_ROOT` marker is read to prevent accidentally
-controlling a different repository, but the gateway does not write container
-data there. A failed stream is never replayed ambiguously; the next command
-goes to another compute node.
+The gateway keeps its own files in `TTC_LOCAL_ROOT`, as any daemon of a cluster
+does. It opens only its Unix socket there; it does not open or advertise a TCP
+port, provide page data, or accept branch placement. It finds the compute nodes
+in the shared root, so the login host needs outbound connectivity to them, but
+compute nodes never initiate connections to it. Commands such as `run`, `exec`,
+`fork`, `migrate`, `ps`, and `node ls` are tunneled to a compute node whose
+counter advances and then routed by the normal cluster placement authority. The
+shared `TTC_ROOT` marker is read to prevent accidentally controlling a different
+repository, but the gateway does not write container data there. A failed stream
+is never replayed ambiguously; the next command goes to another compute node.
 
 While no compute node runs, the gateway starts a control holder, a daemon of
 the login node that listens only on loopback: it takes the cluster's
@@ -557,7 +573,7 @@ membership. If a step fails, the node stays cordoned and the same command can
 be retried; the durable stop intent resumes after a daemon restart.
 
 `ttc daemon stop --migrate-all` applies the same scheduler-selected evacuation
-to the daemon reached by `TTC_SOCKET`. It is rejected outside distributed mode.
+to the daemon of `TTC_LOCAL_ROOT`. It is rejected outside distributed mode.
 
 If a daemon disappears during an individual migration, TTC reconciles the
 fenced transaction automatically. A branch still owned by the source waits for

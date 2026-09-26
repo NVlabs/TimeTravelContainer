@@ -40,13 +40,12 @@ fi
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
-  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-terminal-e2e.XXXXXX")
+  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-terminal.XXXXXX")
   owned_root=true
 else
   mkdir -p "$TTC_E2E_ROOT"
 fi
 DATA_ROOT="$TTC_E2E_ROOT/data"
-DAEMON_SOCKET="$TTC_E2E_ROOT/ttcd.sock"
 BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
@@ -59,6 +58,9 @@ if [ "$(uname -s)" = Darwin ]; then
     "$BIN_DIR/ttcd" >/dev/null
 fi
 TTC="$BIN_DIR/ttc"
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
 export TTC_ROOT="$DATA_ROOT"
 NAME="terminal-e2e-$$"
 CLIENT_TERM=${TERM:-xterm}
@@ -68,10 +70,10 @@ for value in "$TTC" "$TTCD" "$TTC_E2E_ROOT"; do
   esac
 done
 
-TTC_COMMAND="$TTC --daemon-socket $DAEMON_SOCKET"
+TTC_COMMAND="$TTC"
 
 ttc() {
-  "$TTC" --daemon-socket "$DAEMON_SOCKET" "$@"
+  "$TTC" "$@"
 }
 
 run_with_timeout() {

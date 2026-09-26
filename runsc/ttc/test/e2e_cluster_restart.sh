@@ -21,8 +21,8 @@ PORT_B=${TTC_CLUSTER_RESTART_PORT_B:-23593}
 TOKEN=ttc-cluster-restart-$NAME
 KEEP_ROOT=${TTC_CLUSTER_RESTART_KEEP_ROOT:-}
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout 120s "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$ROOT/local-$node timeout 120s "$TTC" "$@"; }
 read_counter() {
 	client a exec "$NAME@main" sh -c \
 		'while :; do value=$(cat /counter); case "$value" in ""|*[!0-9]*) sleep 0.01 ;; *) printf "%s\n" "$value"; break ;; esac; done'
@@ -33,7 +33,7 @@ start_node() {
 	port=$2
 	shift 2
 	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		TTC_SOCKET=$(socket "$node") timeout 60s "$TTC" daemon start \
+		timeout 60s "$TTC" daemon start \
 			--node "node-$node" --listen "127.0.0.1:$port" \
 			--advertise "127.0.0.1:$port" --memory-target 8GiB \
 			--unsafe-no-host-isolation "$@"
@@ -92,8 +92,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$ROOT/shared" "$ROOT/local-a" "$ROOT/local-b" "$ROOT/run-a" "$ROOT/run-b"
-chmod 700 "$ROOT/run-a" "$ROOT/run-b"
+mkdir -p "$ROOT/shared" "$ROOT/local-a" "$ROOT/local-b"
 start_node a "$PORT_A" --cluster-init >/dev/null
 start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A" >/dev/null
 

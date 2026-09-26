@@ -92,7 +92,9 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if status := Run([]string{"--daemon-socket", socket, "daemon", "start"}, strings.NewReader(""), &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "does not match") {
+	t.Setenv("TTC_ROOT", directory)
+	t.Setenv("TTC_LOCAL_ROOT", "")
+	if status := Run([]string{"daemon", "start"}, strings.NewReader(""), &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "does not match") {
 		t.Fatalf("mismatched start=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -121,8 +123,10 @@ func TestTerminateStartedDaemonKillsStartupSession(t *testing.T) {
 }
 
 func TestHelpAndCompletionAreOffline(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "absent.sock")
-	t.Setenv("TTC_SOCKET", socket)
+	root := t.TempDir()
+	socket := protocol.DaemonSocket(root)
+	t.Setenv("TTC_ROOT", root)
+	t.Setenv("TTC_LOCAL_ROOT", "")
 	for _, args := range [][]string{{"--help"}, {"run", "--help"}, {"completion", "bash"}} {
 		var stdout, stderr bytes.Buffer
 		if status := Run(args, strings.NewReader(""), &stdout, &stderr); status != 0 || stdout.Len() == 0 || stderr.Len() != 0 {
@@ -147,7 +151,9 @@ func TestHelpRejectsUnknownCommands(t *testing.T) {
 }
 
 func TestDetailedHelpIsClientLocal(t *testing.T) {
-	t.Setenv("TTC_SOCKET", filepath.Join(t.TempDir(), "absent.sock"))
+	// Help needs no daemon, nor a root to find one by.
+	t.Setenv("TTC_ROOT", "")
+	t.Setenv("TTC_LOCAL_ROOT", "")
 	tests := []struct {
 		args []string
 		want []string
@@ -187,14 +193,30 @@ func TestClientRejectsRemovedRootAndDirectOptions(t *testing.T) {
 	}
 }
 
-func TestTTCSocketAndOverride(t *testing.T) {
-	t.Setenv("TTC_SOCKET", "/tmp/from-env.sock")
-	if got := defaultSocket(); got != "/tmp/from-env.sock" {
-		t.Fatalf("defaultSocket=%q", got)
-	}
-	opts, rest, done, err := parseGlobal([]string{"--daemon-socket", "/tmp/from-flag.sock", "ps"}, os.Stdout)
-	if err != nil || done || opts.socket != "/tmp/from-flag.sock" || len(rest) != 1 || rest[0] != "ps" {
-		t.Fatalf("parseGlobal=(%+v, %q, %t, %v)", opts, rest, done, err)
+func TestDaemonSocketIsInItsRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, test := range []struct {
+		name  string
+		env   map[string]string
+		args  []string
+		want  string
+		wantS int
+	}{
+		{name: "standalone", env: map[string]string{"TTC_ROOT": root}, args: []string{"ps"}, want: protocol.DaemonSocket(root), wantS: 1},
+		{name: "cluster node", env: map[string]string{"TTC_ROOT": "/shared", "TTC_LOCAL_ROOT": filepath.Join(root, "local")}, args: []string{"ps"}, want: protocol.DaemonSocket(filepath.Join(root, "local")), wantS: 1},
+		{name: "override", env: map[string]string{"TTC_ROOT": root}, args: []string{"--daemon-socket", filepath.Join(root, "other.sock"), "ps"}, want: filepath.Join(root, "other.sock"), wantS: 1},
+		{name: "unset", env: map[string]string{}, args: []string{"ps"}, want: "TTC_ROOT is not set", wantS: 2},
+		{name: "override of daemon start", env: map[string]string{"TTC_ROOT": root}, args: []string{"--daemon-socket", filepath.Join(root, "other.sock"), "daemon", "start"}, want: "does not apply to daemon start", wantS: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, name := range []string{"TTC_ROOT", "TTC_LOCAL_ROOT"} {
+				t.Setenv(name, test.env[name])
+			}
+			var stdout, stderr bytes.Buffer
+			if status := Run(test.args, strings.NewReader(""), &stdout, &stderr); status != test.wantS || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("Run(%q): status=%d stderr=%q, want status %d and %q", test.args, status, stderr.String(), test.wantS, test.want)
+			}
+		})
 	}
 }
 

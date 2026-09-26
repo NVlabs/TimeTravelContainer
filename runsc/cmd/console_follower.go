@@ -66,13 +66,17 @@ type followedConsole struct {
 }
 
 // runFamilyConsoleFollower serves the consoles of the family whose Sentry is
-// s on socket, from the family's console directory, until none has been
-// followed for familyFollowerIdle. It writes ready once it listens.
-func runFamilyConsoleFollower(s *sandbox.Sandbox, cid, socket string, ready *os.File) error {
+// s on socket, holding lockPath, until none has been followed for
+// familyFollowerIdle. It writes ready once it listens. A lockPath of "" is
+// the lock beside socket.
+func runFamilyConsoleFollower(s *sandbox.Sandbox, cid, socket, lockPath string, ready *os.File) error {
 	// The lock keeps one follower to a family. A follower exiting for want
 	// of consoles removes its socket, then releases the lock: ttcd starts a
 	// new one only when it cannot connect, and it waits for the old one.
-	lock, err := os.OpenFile(filepath.Join(filepath.Dir(socket), ttcconsole.FollowerLockName), os.O_CREATE|os.O_RDWR, 0600)
+	if lockPath == "" {
+		lockPath = filepath.Join(filepath.Dir(socket), ttcconsole.FollowerLockName)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("opening console follower lock: %w", err)
 	}

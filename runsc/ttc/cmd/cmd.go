@@ -181,7 +181,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func parseGlobalOptions(args []string, stdout io.Writer) (options, []string, bool, error) {
 	opts := options{
 		runtimePlatform: runtimePlatformFromEnvironment(),
-		daemonSocket:    defaultDaemonSocket(),
+		daemonSocket:    daemonSocketFromEnvironment(),
 	}
 	for len(args) != 0 {
 		arg := args[0]
@@ -318,9 +318,9 @@ cluster whose shared root TTC_ROOT is, with its own TTC_LOCAL_ROOT. Every node
 starts alike: it holds the cluster's authority, or joins the node that does.
 
 --control-only starts an outbound-only login-node gateway. It accepts commands
-on TTC_SOCKET but advertises no TCP endpoint, joins no Raft group, and accepts
-no container placement. It finds the cluster's compute nodes in TTC_ROOT, the
-cluster's shared root; TTC_LOCAL_ROOT is not required.`,
+on the socket in its TTC_LOCAL_ROOT but advertises no TCP endpoint, joins no
+Raft group, and accepts no container placement. It finds the cluster's compute
+nodes in TTC_ROOT, the cluster's shared root.`,
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
 			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",
@@ -6409,7 +6409,7 @@ func environmentHasKey(env []string, key string) bool {
 func (b *runtimeBackend) containerStore() ttcbundle.Store {
 	store := ttcbundle.Store{Root: b.dataRoot, ActiveRoot: b.activeDataRoot(), CPUFeatures: b.cpuFeatures}
 	if b.root != "" {
-		store.TransientRoot = filepath.Join(b.root, "ttc-transient-bundles")
+		store.TransientRoot = filepath.Join(b.root, transientBundleDirName)
 	}
 	return store
 }
@@ -9284,8 +9284,8 @@ func (b *runtimeBackend) startFamilyConsoleFollower(container, dir string) error
 	}
 	defer readyReader.Close()
 	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), "timetravel",
-		"--console-socket", filepath.Join(dir, ttcconsole.FollowerSocketName), "--console-ready-fd", "3",
-		container, "console-follow-family")...)
+		"--console-socket", familyFollowerSocket(dir), "--console-lock", filepath.Join(dir, ttcconsole.FollowerLockName),
+		"--console-ready-fd", "3", container, "console-follow-family")...)
 	command.Stderr = errorFile
 	// A follower mostly waits, polling pipes: one processor serves it.
 	command.Env = append(os.Environ(), "GOMAXPROCS=1")

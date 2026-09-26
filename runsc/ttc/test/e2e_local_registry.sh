@@ -50,7 +50,7 @@ fi
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
-  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-local-registry.XXXXXX")
+  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-registry.XXXXXX")
   owned_root=true
 else
   mkdir -p "$TTC_E2E_ROOT"
@@ -69,10 +69,13 @@ if [ "$(uname -s)" = Darwin ]; then
     "$BIN_DIR/ttcd" >/dev/null
 fi
 TTC="$BIN_DIR/ttc"
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
 export TTC_ROOT="$TTC_E2E_ROOT/data"
 
 ttc() {
-  "$TTC" --daemon-socket "$TTC_E2E_ROOT/ttcd.sock" "$@"
+  "$TTC" "$@"
 }
 
 cleanup() {

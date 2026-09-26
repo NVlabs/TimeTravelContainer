@@ -257,13 +257,15 @@ Host requirements are deliberately small:
 - (Optional) A delegated cgroup v2 subtree only when hard host CPU or memory
   limits are requested.
 
-`TTC_ROOT` is always explicit. In standalone mode it contains all TTC state.
-Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
-node-local `TTC_LOCAL_ROOT` for active runtimes and caches. `TTC_SOCKET` may
-override the per-user daemon socket; `--daemon-socket` takes precedence for a
-single client invocation. `ttc` owns its help and command grammar locally, so
-help, completion, and version output do not depend on a running daemon. For
-daemon operations, the official client and daemon builds must match exactly.
+`TTC_ROOT` is always explicit and on a local filesystem. In standalone mode it
+contains all of the daemon's files, including its socket, which `ttc` finds
+there. Cluster nodes use the same shared `TTC_ROOT` and each set a distinct,
+node-local `TTC_LOCAL_ROOT` for their daemon's own files, active runtimes, and
+caches; `ttc` finds a node's daemon in its `TTC_LOCAL_ROOT`. `--daemon-socket`
+takes precedence for a single client invocation. `ttc` owns its help and
+command grammar locally, so help, completion, and version output do not depend
+on a running daemon. For daemon operations, the official client and daemon
+builds must match exactly.
 
 ## Current Limitations
 

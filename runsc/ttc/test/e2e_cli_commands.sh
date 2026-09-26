@@ -11,12 +11,16 @@ set -eu
 TTC=${TTC:-ttc}
 TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_CLI_TEST_IMAGE:-busybox:1.36}
-ROOT=${TTC_CLI_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-cli-commands.XXXXXX")}
+ROOT=${TTC_CLI_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-cli.XXXXXX")}
 KEEP_ROOT=${TTC_CLI_TEST_KEEP_ROOT:-}
 NAME=${TTC_CLI_TEST_NAME:-ttc-cli-commands-$$}
 RESTORED=$NAME-restored
 VOLUME=$NAME-volume
-SOCKET=$ROOT/ttcd.sock
+# The client finds the daemon through TTC_ROOT, which a node's TTC_LOCAL_ROOT
+# would override.
+unset TTC_LOCAL_ROOT
+export TTC_ROOT=$ROOT/data
+SOCKET=$TTC_ROOT/ttcd.sock
 CHECKPOINT=$ROOT/checkpoint.bin
 HOST_INPUT=$ROOT/host-input
 HOST_OUTPUT=$ROOT/host-output
@@ -77,7 +81,7 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 TTC=$ROOT/bin/ttc
 
-ttc() { TTC_SOCKET=$SOCKET "$TTC" "$@"; }
+ttc() { "$TTC" "$@"; }
 
 cleanup() {
 	set +e
@@ -102,7 +106,7 @@ done
 "$TTC" --version | grep -q 'ttc version'
 "$TTC" daemon --help | grep -q 'requests'
 
-TTC_ROOT=$ROOT/data TTC_SOCKET=$SOCKET "$TTC" daemon start --unsafe-no-host-isolation >/dev/null
+ttc daemon start --unsafe-no-host-isolation >/dev/null
 ttc daemon status | jq -e '.pid > 0 and .version > 0' >/dev/null
 
 ttc pull "$IMAGE" >/dev/null
@@ -126,7 +130,7 @@ ttc exec -itd --session repl "$NAME@main" sh >/dev/null
 ttc exec ls --json "$NAME@main" | grep -q 'repl'
 ttc tty stat "$NAME@main" --session repl --json | grep -q 'session_epoch'
 watch_status=0
-run_with_timeout 1s "$TTC" --daemon-socket "$SOCKET" tty watch "$NAME@main" --session repl --json >/dev/null 2>&1 || watch_status=$?
+run_with_timeout 1s "$TTC" tty watch "$NAME@main" --session repl --json >/dev/null 2>&1 || watch_status=$?
 test "$watch_status" -eq 124 || fail "tty watch exited unexpectedly with $watch_status"
 ttc exec kill --signal KILL "$NAME@main:repl" >/dev/null
 ttc exec wait "$NAME@main:repl" >/dev/null || true

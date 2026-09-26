@@ -22,8 +22,8 @@ FAMILIES="pressure-a-$$ pressure-b-$$"
 SOURCE_TARGET=${TTC_ELASTIC_PRESSURE_SOURCE_TARGET:-768MiB}
 BRANCH_BYTES=${TTC_ELASTIC_PRESSURE_BRANCH_BYTES:-67108864}
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$ROOT/local-$node timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
@@ -80,13 +80,12 @@ start_node() {
 	port=$2
 	target=$3
 	shift 3
-	mkdir -p "$ROOT/local-$node" "$ROOT/run-$node"
-	chmod 700 "$ROOT/run-$node"
+	mkdir -p "$ROOT/local-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
+		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target "$target" --cluster-lease 15s --unsafe-no-host-isolation "$@" \
-		>"$ROOT/run-$node/ttcd.log" 2>&1 &
+		>"$ROOT/local-$node/ttcd.log" 2>&1 &
 	eval "PID_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')=$!"
 	wait_ready "$node"
 }

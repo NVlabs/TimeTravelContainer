@@ -91,6 +91,17 @@ func controlSocketName(id string) string {
 	return fmt.Sprintf("runsc-%s.sock", id)
 }
 
+// ttcRunDirEnv names the directory in which ttcd, which sets it for the runsc
+// it runs, keeps the Unix sockets of its sandboxes.
+const ttcRunDirEnv = "TTC_RUN_DIR"
+
+// ttcControlSocketName is the name of a sandbox's control socket in ttcd's run
+// directory: that ttcd gives the socket of its root's key, rootDir and id.
+func ttcControlSocketName(rootDir, id string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(rootDir) + "\x00" + id))
+	return fmt.Sprintf("c%x.sock", digest[:8])
+}
+
 // fallbackControlSocketName keeps fallback paths short and namespaces them by
 // runsc root. Two ttcd instances on one host may intentionally manage the same
 // logical container ID in different node-local roots during a remote fork or
@@ -118,6 +129,12 @@ func createControlSocket(rootDir, id string) (string, int, error) {
 		{dir: "/var/run", name: fallbackName},
 		{dir: "/run", name: fallbackName},
 		{dir: "/tmp", name: fallbackName},
+	}
+	if dir := os.Getenv(ttcRunDirEnv); dir != "" {
+		// ttcd keeps every socket of its sandboxes in the run directory of
+		// its root, under a name short enough for any root it accepts.
+		locations = locations[:1]
+		locations[0].dir, locations[0].name = dir, ttcControlSocketName(rootDir, id)
 	}
 	for _, location := range locations {
 		path := filepath.Join(location.dir, location.name)

@@ -23,16 +23,14 @@ ROOT=${TTC_DISTRIBUTED_ACTIVE_FS_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-distribu
 SHARED=${TTC_DISTRIBUTED_ACTIVE_FS_SHARED_ROOT:-$ROOT/shared}
 LOCAL_A=$ROOT/local-a
 LOCAL_B=$ROOT/local-b
-RUN_A=$ROOT/run-a
-RUN_B=$ROOT/run-b
-SOCKET_A=$RUN_A/ttcd.sock
-SOCKET_B=$RUN_B/ttcd.sock
+SOCKET_A=$LOCAL_A/ttcd.sock
+SOCKET_B=$LOCAL_B/ttcd.sock
 TOKEN=ttc-distributed-active-fs-$NAME
 PID_A=
 PID_B=
 
-client_a() { TTC_SOCKET=$SOCKET_A timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
-client_b() { TTC_SOCKET=$SOCKET_B timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+client_a() { TTC_LOCAL_ROOT=$LOCAL_A timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+client_b() { TTC_LOCAL_ROOT=$LOCAL_B timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 cleanup() {
 	set +e
@@ -46,30 +44,29 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 wait_ready() {
-	socket=$1
+	root=$1
 	log=$2
 	for unused in $(seq 1 600); do
-		if TTC_SOCKET=$socket timeout 2s "$TTC" node ls >/dev/null 2>&1; then return 0; fi
+		if TTC_LOCAL_ROOT=$root timeout 2s "$TTC" node ls >/dev/null 2>&1; then return 0; fi
 		sleep 0.05
 	done
 	tail -100 "$log" >&2 || true
 	return 1
 }
 
-mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B" "$RUN_A" "$RUN_B"
-chmod 700 "$RUN_A" "$RUN_B"
+mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --socket "$SOCKET_A" --cluster-init --node node-a \
+	"$TTCD" --cluster-init --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \
-	--memory-target 64GiB $DAEMON_EXTRA >"$RUN_A/ttcd.log" 2>&1 &
+	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_A/ttcd.log" 2>&1 &
 PID_A=$!
-wait_ready "$SOCKET_A" "$RUN_A/ttcd.log"
+wait_ready "$LOCAL_A" "$LOCAL_A/ttcd.log"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_B TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --socket "$SOCKET_B" --cluster-join "127.0.0.1:$PORT_A" --node node-b \
+	"$TTCD" --cluster-join "127.0.0.1:$PORT_A" --node node-b \
 	--listen "127.0.0.1:$PORT_B" --advertise "127.0.0.1:$PORT_B" \
-	--memory-target 64GiB $DAEMON_EXTRA >"$RUN_B/ttcd.log" 2>&1 &
+	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_B/ttcd.log" 2>&1 &
 PID_B=$!
-wait_ready "$SOCKET_B" "$RUN_B/ttcd.log"
+wait_ready "$LOCAL_B" "$LOCAL_B/ttcd.log"
 
 client_a pull "$IMAGE" >/dev/null
 client_a run -d --node node-a --name "$NAME" "$IMAGE" python -c '

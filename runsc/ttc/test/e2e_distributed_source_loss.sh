@@ -26,8 +26,8 @@ PID_A=
 PID_B=
 PID_C=
 
-socket() { printf '%s/run-%s/ttcd.sock' "$ROOT" "$1"; }
-client() { node=$1; shift; TTC_SOCKET=$(socket "$node") timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
+socket() { printf '%s/local-%s/ttcd.sock' "$ROOT" "$1"; }
+client() { node=$1; shift; TTC_LOCAL_ROOT=$ROOT/local-$node timeout "$COMMAND_TIMEOUT" "$TTC" "$@"; }
 
 stop_session() {
 	pid=$1
@@ -78,7 +78,7 @@ wait_ready() {
 		attempt=$((attempt + 1))
 		sleep 0.05
 	done
-	tail -100 "$ROOT/run-$node/ttcd.log" >&2 || true
+	tail -100 "$ROOT/local-$node/ttcd.log" >&2 || true
 	return 1
 }
 
@@ -86,14 +86,13 @@ start_node() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$ROOT/local-$node" "$ROOT/run-$node"
-	chmod 700 "$ROOT/run-$node"
+	mkdir -p "$ROOT/local-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
-		setsid "$TTCD" --socket "$(socket "$node")" --node "node-$node" \
+		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
 		--memory-target 64GiB --cluster-lease 15s --cluster-prefetch none \
 		--cluster-push demand-only --unsafe-no-host-isolation "$@" \
-		>"$ROOT/run-$node/ttcd.log" 2>&1 &
+		>"$ROOT/local-$node/ttcd.log" 2>&1 &
 	eval "PID_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')=$!"
 	wait_ready "$node"
 }
@@ -121,7 +120,7 @@ attempt=0
 while test "$attempt" -lt 500; do
 	if test ! -S "$(socket b)"; then
 		echo "surviving node-b self-fenced after source loss" >&2
-		tail -100 "$ROOT/run-b/ttcd.log" >&2 || true
+		tail -100 "$ROOT/local-b/ttcd.log" >&2 || true
 		exit 1
 	fi
 	state=$(client b ls --json | jq -r --arg name "$NAME" '.[] | select(.name == $name or .id == $name) | .branches[] | select(.id == "dependent") | .state')

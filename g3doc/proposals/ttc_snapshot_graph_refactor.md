@@ -646,11 +646,12 @@ children's display hints but does not alter data sharing.
 This refactor changes storage and internal APIs, but keeps these previously
 agreed boundaries:
 
-* `ttc` remains a thin root-unaware client. CLI grammar, help, completion, and
-  version output are local to the client. Only `ttcd` reads `TTC_ROOT` or
-  `TTC_LOCAL_ROOT`.
-* `TTC_SOCKET` selects the client/daemon Unix socket, with
-  `--daemon-socket` taking precedence. Official client requests require an
+* `ttc` remains a thin client. CLI grammar, help, completion, and version
+  output are local to the client. Only `ttcd` interprets `TTC_ROOT` or
+  `TTC_LOCAL_ROOT`; `ttc` uses them only to find the daemon's socket.
+* The daemon's root, `TTC_LOCAL_ROOT` on a node of a cluster and otherwise
+  `TTC_ROOT`, holds the client/daemon Unix socket, with `--daemon-socket`
+  taking precedence. Official client requests require an
   exact daemon build match, except the stable minimal `daemon stop` request.
   SDKs and MCP negotiate API features rather than build identity.
 * Cluster nodes use one multiplexed TCP listener for Raft and TTC peer/control
