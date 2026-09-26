@@ -60,7 +60,10 @@ go_library(
 go_test(
     name = "hvf_test",
     size = "small",
-    pure = "off",
+    # The Darwin tests use Hypervisor.framework through cgo. Linux
+    # configurations, such as nogo analysis, have no test sources and no C++
+    # toolchain.
+    pure = select_system(darwin = "off", linux = "auto"),
     srcs = select_system(
         darwin = [
             "backend_darwin_arm64_test.go",

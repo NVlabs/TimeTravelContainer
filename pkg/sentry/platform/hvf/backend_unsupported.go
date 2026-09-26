@@ -14,6 +14,8 @@
 
 //go:build !darwin || !arm64 || !cgo
 
+// Package hvf adapts Apple Hypervisor.framework to vmplatform. Outside Apple
+// Silicon Darwin with cgo, it only reports that the platform is unavailable.
 package hvf
 
 import (
@@ -47,6 +49,6 @@ func NewVMEngine(vmm.VM, int) (vmplatform.VMEngine, error) {
 }
 
 func (*Backend) CreateVM(context.Context) (vmm.VM, error) {
-	return nil, fmt.Errorf("Hypervisor.framework is supported only on Apple Silicon Darwin")
+	return nil, fmt.Errorf("the Hypervisor.framework backend is supported only on Apple Silicon Darwin")
 }
 func (*Backend) HostMemory() vmm.HostMemory { return nil }
