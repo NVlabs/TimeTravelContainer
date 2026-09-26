@@ -331,19 +331,32 @@ func suspendWith(operations *familyOperations, hold *lifecycleHold) func(*family
 // describes to the family info. Outside a daemon request that holds the
 // lock, it just runs work.
 func (b *runtimeBackend) withoutLifecycleLock(info ttcbundle.ContainerInfo, op longOperation, work func() error) error {
-	if b.suspendLifecycle == nil || !b.lifecycleLockHeld {
-		return work()
-	}
-	resume, err := b.suspendLifecycle(&familyOperation{longOperation: op, id: info.ID, name: info.Name, started: time.Now(), owner: b})
+	resume, err := b.releaseLifecycleLock(info, op)
 	if err != nil {
 		return err
 	}
-	b.lifecycleLockHeld = false
-	defer func() {
-		resume()
-		b.lifecycleLockHeld = true
-	}()
+	defer resume()
 	return work()
+}
+
+// releaseLifecycleLock is withoutLifecycleLock for work that goes on until
+// its caller calls what it returns, which takes the lock back, once.
+func (b *runtimeBackend) releaseLifecycleLock(info ttcbundle.ContainerInfo, op longOperation) (func(), error) {
+	if b.suspendLifecycle == nil || !b.lifecycleLockHeld {
+		return func() {}, nil
+	}
+	resume, err := b.suspendLifecycle(&familyOperation{longOperation: op, id: info.ID, name: info.Name, started: time.Now(), owner: b})
+	if err != nil {
+		return nil, err
+	}
+	b.lifecycleLockHeld = false
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			resume()
+			b.lifecycleLockHeld = true
+		})
+	}, nil
 }
 
 // withoutLifecycleLock is runtimeBackend.withoutLifecycleLock for a command

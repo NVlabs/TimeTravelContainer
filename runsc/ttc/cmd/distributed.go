@@ -2592,6 +2592,14 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if err != nil {
 		return selector{}, err
 	}
+	// Reserving the target, capturing the branch and restoring it there take
+	// seconds, and more for more memory; other commands on this node go on
+	// meanwhile, except on its family.
+	resumeLifecycle, err := b.releaseLifecycleLock(sourceInfo, longOperation{branch: source.branch, state: "forking"})
+	if err != nil {
+		return selector{}, err
+	}
+	defer resumeLifecycle()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := reserveRemoteTarget(ctx, targetNode, b.distributedSource.directory.Lookup, func(ctx context.Context) (*cluster.Transaction, error) {
@@ -3262,6 +3270,14 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		captured     bool
 	}
 	children := make([]childState, len(targetContainers))
+	// Reserving the targets, capturing the branch and restoring it there take
+	// seconds, and more for more memory; other commands on this node go on
+	// meanwhile, except on its family.
+	resumeLifecycle, err := b.releaseLifecycleLock(sourceInfo, longOperation{branch: source.branch, state: "forking"})
+	if err != nil {
+		return nil, err
+	}
+	defer resumeLifecycle()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cleanup := true

@@ -3182,6 +3182,15 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
 		return err
 	}
+	// Reserving the target, capturing the branch and restoring it there take
+	// seconds, and more for more memory; other commands on this node go on
+	// meanwhile, except on its family.
+	resumeLifecycle, err := b.releaseLifecycleLock(info, longOperation{branch: target.branch, state: "migrating"})
+	if err != nil {
+		_, _ = placements.AbortMigration(logicalFamily, logicalTarget.branch, requestID, time.Now())
+		return err
+	}
+	defer resumeLifecycle()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	tx, err := peer.Reserve(ctx, cluster.ReserveRequest{SourceCapabilities: b.distributedSource.capabilities, Identity: identity, Family: family})
