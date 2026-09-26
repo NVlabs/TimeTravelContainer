@@ -34,7 +34,7 @@ func Current() uint64
 // Callers must use the result only for low-level execution-context
 // bookkeeping; the pointed-to runtime layouts remain opaque and
 // version-dependent.
-func RuntimePointers() (g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi uintptr)
+func RuntimePointers() (gp, mp, pp, mcachep, g0p, g0StackLo, g0StackHi, gsignalp, gsignalStackLo, gsignalStackHi uintptr)
 
 // RuntimeTLSBase returns the current host thread's architectural TLS base.
 // Callers must keep the calling goroutine locked to its OS thread while using
