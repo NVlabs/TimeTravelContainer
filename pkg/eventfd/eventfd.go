@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
@@ -27,8 +28,12 @@ const sizeofUint64 = 8
 
 // Eventfd represents a Linux eventfd object.
 type Eventfd struct {
-	fd       int
-	writeFD  int
+	fd      int
+	writeFD int
+	// counter is the value of a Darwin eventfd, whose pipe holds a byte
+	// exactly while counter is non-zero. It is shared by duplicates, and nil
+	// for Linux eventfds and wrapped FDs.
+	counter  *atomicbitops.Uint64
 	mmioAddr uintptr
 	mmioCtrl MMIOController
 }
@@ -64,7 +69,7 @@ func (ev Eventfd) Dup() (Eventfd, error) {
 			return Eventfd{}, fmt.Errorf("failed to dup event write fd: %v", err)
 		}
 	}
-	return Eventfd{fd: other, writeFD: otherWrite}, nil
+	return Eventfd{fd: other, writeFD: otherWrite, counter: ev.counter}, nil
 }
 
 // Notify alerts other users of the eventfd. Users can receive alerts by
@@ -83,15 +88,36 @@ func (ev Eventfd) Write(val uint64) error {
 		}
 		// Fall back to using a syscall.
 	}
+	if ev.counter != nil {
+		return ev.addToCounter(val)
+	}
+	writeAll(ev.writeFD, buf[:])
+	return nil
+}
+
+// addToCounter adds val to ev.counter, making the pipe readable if the
+// counter was zero.
+func (ev Eventfd) addToCounter(val uint64) error {
+	if val == 0 {
+		return nil
+	}
+	if ev.counter.Add(val) == val {
+		writeAll(ev.writeFD, []byte{1})
+	}
+	return nil
+}
+
+// writeAll writes buf to the non-blocking fd, which must have room for it.
+func writeAll(fd int, buf []byte) {
 	for {
-		n, err := nonBlockingWrite(ev.writeFD, buf[:])
+		n, err := nonBlockingWrite(fd, buf)
 		if err == unix.EINTR {
 			continue
 		}
-		if err != nil || n != sizeofUint64 {
-			panic(fmt.Sprintf("bad write to eventfd: got %d bytes, wanted %d with error %v", n, sizeofUint64, err))
+		if err != nil || n != len(buf) {
+			panic(fmt.Sprintf("bad write to eventfd: got %d bytes, wanted %d with error %v", n, len(buf), err))
 		}
-		return err
+		return
 	}
 }
 

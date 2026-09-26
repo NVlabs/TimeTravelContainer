@@ -20,6 +20,7 @@ go_library(
         "//cloud/cluster/node/network/client/go:__pkg__",
     ],
     deps = [
+        "//pkg/atomicbitops",
         "//pkg/hostarch",
         "//pkg/rawfile",
         "//pkg/safecopy",
@@ -31,4 +32,5 @@ go_test(
     name = "eventfd_test",
     srcs = ["eventfd_test.go"],
     library = ":eventfd",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

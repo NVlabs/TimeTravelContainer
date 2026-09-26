@@ -21,12 +21,18 @@ import (
 	"io"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
 
 // Create returns a local event notification pipe. The Darwin adapter keeps
 // the read and write descriptors together; protocols that transfer Eventfd.FD
 // alone must use a Darwin-specific two-FD transport instead.
+//
+// The value lives in a counter rather than in the pipe, which holds one byte
+// while the counter is non-zero. Like an eventfd, the read descriptor is thus
+// readable exactly while the value is non-zero, writes accumulate, and Read
+// returns and resets their sum; the pipe can never fill.
 func Create() (Eventfd, error) {
 	var fds [2]int
 	if err := unix.Pipe(fds[:]); err != nil {
@@ -39,11 +45,35 @@ func Create() (Eventfd, error) {
 		_ = unix.Close(fds[1])
 		return Eventfd{}, err
 	}
-	return Eventfd{fd: fds[0], writeFD: fds[1]}, nil
+	return Eventfd{fd: fds[0], writeFD: fds[1], counter: new(atomicbitops.Uint64)}, nil
 }
 
-// Read blocks until a complete notification value is available.
+// Read blocks until the value is non-zero, and returns and resets it.
 func (ev Eventfd) Read() (uint64, error) {
+	if ev.counter == nil {
+		return ev.readValue()
+	}
+	var b [1]byte
+	for {
+		n, err := unix.Read(ev.fd, b[:])
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return 0, io.EOF
+		}
+		// The byte was written when the counter became non-zero, and only
+		// this Swap makes it zero again.
+		return ev.counter.Swap(0), nil
+	}
+}
+
+// readValue blocks until a complete value written by Write is available in
+// a wrapped FD, which has no counter.
+func (ev Eventfd) readValue() (uint64, error) {
 	var tmp [sizeofUint64]byte
 	read := 0
 	for read != len(tmp) {
