@@ -21,47 +21,37 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// NonBlockingPoll queries fd readiness without blocking.
+// NonBlockingPoll queries fd readiness without blocking. Like Linux's poll(2),
+// it always reports hangups and errors, and reports EventRdHUp only if mask
+// requests it.
 func NonBlockingPoll(fd int32, mask waiter.EventMask) waiter.EventMask {
-	var requested int16
-	if mask&waiter.ReadableEvents != 0 {
-		requested |= unix.POLLIN
+	read, write, err := pollDirections(fd)
+	if err != nil {
+		return mask
 	}
-	if mask&waiter.WritableEvents != 0 {
-		requested |= unix.POLLOUT
+	if (read|write)&unix.POLLNVAL != 0 {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
+			// Darwin devices such as /dev/null don't support poll(2).
+			// Linux reports files without poll support as always ready.
+			return mask & (waiter.ReadableEvents | waiter.WritableEvents)
+		}
+		return waiter.EventErr
 	}
-	if mask&waiter.EventPri != 0 {
-		requested |= unix.POLLPRI
+	var ready waiter.EventMask
+	if read&unix.POLLIN != 0 {
+		ready |= waiter.ReadableEvents
 	}
-	events := []unix.PollFd{{Fd: fd, Events: requested}}
-	for {
-		count, err := unix.Poll(events, 0)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return mask
-		}
-		if count == 0 {
-			return 0
-		}
-		var ready waiter.EventMask
-		revents := events[0].Revents
-		if revents&unix.POLLIN != 0 {
-			ready |= waiter.ReadableEvents
-		}
-		if revents&unix.POLLOUT != 0 {
-			ready |= waiter.WritableEvents
-		}
-		if revents&unix.POLLPRI != 0 {
-			ready |= waiter.EventPri
-		}
-		if revents&unix.POLLHUP != 0 {
-			ready |= waiter.EventHUp | waiter.EventRdHUp
-		}
-		if revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
-			ready |= waiter.EventErr
-		}
-		return ready & (mask | waiter.EventErr | waiter.EventHUp | waiter.EventRdHUp)
+	if read&unix.POLLPRI != 0 {
+		ready |= waiter.EventPri
 	}
+	if write&unix.POLLOUT != 0 {
+		ready |= waiter.WritableEvents
+	}
+	if (read|write)&unix.POLLERR != 0 {
+		ready |= waiter.EventErr
+	}
+	if readEOF, writeEOF := read&unix.POLLHUP != 0, write&unix.POLLHUP != 0; readEOF || writeEOF {
+		ready |= eofEvents(classifyFD(fd), readEOF, writeEOF)
+	}
+	return ready & (mask | waiter.EventErr | waiter.EventHUp)
 }

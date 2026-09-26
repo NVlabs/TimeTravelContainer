@@ -7,7 +7,18 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
+// isEpollable returns true if Linux epoll could wait on a file like fd.
+// kqueue also watches regular files and directories, whose readiness it
+// defines by the file offset, but epoll refuses them, and poll(2) always
+// reports them ready.
 func isEpollable(fd int) bool {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return false
+	}
+	if mode := st.Mode & unix.S_IFMT; mode == unix.S_IFREG || mode == unix.S_IFDIR {
+		return false
+	}
 	kq, err := unix.Kqueue()
 	if err != nil {
 		return false

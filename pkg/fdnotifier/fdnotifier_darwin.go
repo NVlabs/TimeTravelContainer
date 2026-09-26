@@ -28,6 +28,7 @@ import (
 
 type fdInfo struct {
 	queue        *waiter.Queue
+	class        fdClass
 	readWaiting  bool
 	writeWaiting bool
 }
@@ -65,8 +66,18 @@ func (n *notifier) setFilter(fd int32, filter int, add bool) error {
 }
 
 func (n *notifier) waitFD(fd int32, info *fdInfo, mask waiter.EventMask) error {
-	wantRead := mask&waiter.ReadableEvents != 0
+	wantRead := mask&(waiter.ReadableEvents|waiter.EventPri|waiter.EventRdHUp) != 0
 	wantWrite := mask&waiter.WritableEvents != 0
+	if mask != 0 && !wantRead && !wantWrite {
+		// Like epoll, report hangups and errors to every waiter. kqueue
+		// reports them through the filter of the direction that failed, so
+		// watch a direction the FD can use.
+		if info.class.readable {
+			wantRead = true
+		} else {
+			wantWrite = true
+		}
+	}
 	if wantRead != info.readWaiting {
 		if err := n.setFilter(fd, unix.EVFILT_READ, wantRead); err != nil {
 			return err
@@ -88,7 +99,7 @@ func (n *notifier) addFD(fd int32, queue *waiter.Queue) error {
 	if _, ok := n.fdMap[fd]; ok {
 		panic(fmt.Sprintf("file descriptor %d added twice", fd))
 	}
-	info := &fdInfo{queue: queue}
+	info := &fdInfo{queue: queue, class: classifyFD(fd)}
 	if err := n.waitFD(fd, info, queue.Events()); err != nil {
 		return err
 	}
@@ -144,11 +155,22 @@ func (n *notifier) waitAndNotify() error {
 			switch event.Filter {
 			case unix.EVFILT_READ:
 				mask |= waiter.ReadableEvents
+				if event.Flags&unix.EV_OOBAND != 0 {
+					mask |= waiter.EventPri
+				}
 			case unix.EVFILT_WRITE:
 				mask |= waiter.WritableEvents
 			}
 			if event.Flags&unix.EV_EOF != 0 {
-				mask |= waiter.EventHUp | waiter.EventRdHUp
+				if event.Fflags != 0 {
+					// A socket error, such as ECONNRESET.
+					mask |= waiter.EventErr
+				}
+				// Whether EOF is a hangup depends on the other direction.
+				read, write, err := pollDirections(int32(event.Ident))
+				readEOF := event.Filter == unix.EVFILT_READ || (err == nil && read&unix.POLLHUP != 0)
+				writeEOF := event.Filter == unix.EVFILT_WRITE || (err == nil && write&unix.POLLHUP != 0)
+				mask |= eofEvents(info.class, readEOF, writeEOF)
 			}
 			if event.Flags&unix.EV_ERROR != 0 && event.Data != 0 {
 				mask |= waiter.EventErr
