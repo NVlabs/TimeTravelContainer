@@ -1830,6 +1830,11 @@ func (e *ring0Engine) extendHostMirror(ctx context.Context) error {
 		return fmt.Errorf("excluding application entries for Sentry working-set extension: %w", err)
 	}
 	defer e.unlockApplicationEntries()
+	// Finish the stage-1 update for slabs whose stage-2 mapping changes below.
+	// Stopping in between on a canceled run leaves a slab mapped only in stage
+	// 2, which later extensions treat as done, so every EL1 access to it would
+	// take the host gate until the next flush.
+	ctx = context.WithoutCancel(ctx)
 	desiredSlabs := make(map[uintptr]ring0Stage2Identity)
 	desiredAccess := make(map[uint64]monitorabi.Access)
 	seenRegions := make(map[uintptr]ring0HostRegion)
@@ -1990,6 +1995,8 @@ func (e *ring0Engine) refreshHostMirror(ctx context.Context) error {
 		return fmt.Errorf("excluding application entries for host-memory reconciliation: %w", err)
 	}
 	defer e.unlockApplicationEntries()
+	// As in extendHostMirror, keep stage 1 in step with the stage-2 changes.
+	ctx = context.WithoutCancel(ctx)
 	regions, err := snapshotRing0HostRegions(ring0HostVALimit)
 	if err != nil {
 		return err
