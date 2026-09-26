@@ -16,38 +16,30 @@
 
 package lisafs
 
-import (
-	"fmt"
-
-	"golang.org/x/sys/unix"
-)
+import "golang.org/x/sys/unix"
 
 func waitForHangup(fd int) error {
-	events := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP}}
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(kq)
+	// Darwin has no POLLRDHUP. Waiting for readability with poll spins at full
+	// CPU whenever unread RPC bytes sit on the socket. An EV_CLEAR read filter
+	// instead wakes once per change and flags the peer's close with EV_EOF.
+	changes := []unix.Kevent_t{{Ident: uint64(fd), Filter: unix.EVFILT_READ, Flags: unix.EV_ADD | unix.EV_CLEAR}}
+	events := make([]unix.Kevent_t, 1)
 	for {
-		events[0].Revents = 0
-		n, err := unix.Poll(events, -1)
-		if err == unix.EINTR || err == unix.EAGAIN {
+		n, err := unix.Kevent(kq, changes, events, nil)
+		if err == unix.EINTR {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		if n != 1 {
-			return fmt.Errorf("poll returned %d events, want 1", n)
-		}
-		if events[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+		changes = nil
+		if n == 1 && events[0].Flags&(unix.EV_EOF|unix.EV_ERROR) != 0 {
 			return nil
-		}
-		if events[0].Revents&unix.POLLIN != 0 {
-			var byte [1]byte
-			n, _, recvErr := unix.Recvfrom(fd, byte[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
-			if recvErr == nil && n == 0 {
-				return nil
-			}
-			if recvErr != nil && recvErr != unix.EAGAIN && recvErr != unix.EWOULDBLOCK {
-				return recvErr
-			}
 		}
 	}
 }

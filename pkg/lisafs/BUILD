@@ -128,6 +128,14 @@ go_library(
 )
 
 go_test(
+    name = "host_poll_test",
+    size = "small",
+    srcs = ["host_poll_test.go"],
+    library = ":lisafs",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
+)
+
+go_test(
     name = "starved_test",
     size = "small",
     srcs = ["starved_test.go"],
