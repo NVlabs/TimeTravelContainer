@@ -229,6 +229,20 @@ func publicationBridgeIntentNeeded(state *cluster.AuthorityState, intent sharedP
 	}
 }
 
+// snapshotOriginsQuery is the query of the snapshot origins' records, which
+// the shared-GC coordinator's passes read.
+func snapshotOriginsQuery() cluster.AuthorityQuery {
+	return withSnapshotOrigins(cluster.AuthorityQuery{})
+}
+
+// withSnapshotOrigins adds the snapshot origins' records to query.
+func withSnapshotOrigins(query cluster.AuthorityQuery) cluster.AuthorityQuery {
+	query.VolatileOrigins = cluster.All[uint64]()
+	query.AbandonedOrigins = cluster.All[uint64]()
+	query.RetiredOrigins = cluster.All[uint64]()
+	return query
+}
+
 // sharedReferenceService serializes exact shared-origin reference mutations
 // through the daemon holding Raft's shared-GC lease. The hot ledger lives only
 // on TTC_LOCAL_ROOT and is rebuilt for every new lease generation from shared
@@ -435,7 +449,7 @@ func (s *sharedReferenceService) drainOutbox(ctx context.Context, limit int) (in
 		if len(pending) == 0 {
 			return delivered, nil
 		}
-		state, err := s.authority.AuthorityState()
+		state, err := s.authority.AuthorityStateOf(snapshotOriginsQuery())
 		if err != nil {
 			return delivered, err
 		}
@@ -1340,7 +1354,7 @@ func (s *sharedReferenceService) authoritativeColdReferences(state *cluster.Auth
 // walking immutable objects. Retains precede releases so replacing one branch
 // root can never expose a transient zero-count graph.
 func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
-	state, err := s.authority.AuthorityState()
+	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Branches: cluster.All[string](), Publications: cluster.All[string]()}))
 	if err != nil {
 		return err
 	}
@@ -1439,7 +1453,7 @@ func (s *sharedReferenceService) reconcileAuthoritativeColdReferences() error {
 // absent remote/... name cannot be reused by another lifetime: operation names
 // are branch/transaction-unique, making release-only reconciliation monotonic.
 func (s *sharedReferenceService) reconcileInactiveGraphReferences(lease cluster.SharedGCLease) error {
-	state, err := s.authority.AuthorityState()
+	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Nodes: cluster.All[string]()}))
 	if err != nil {
 		return err
 	}
@@ -1534,7 +1548,7 @@ func applySharedReferenceBatches(ledger *ttcsnapshot.ReferenceLedger, mutations 
 // committed publications, terminal handoffs, and generic origin transfers
 // already have replacement roots in Raft or node inventories.
 func (s *sharedReferenceService) reconcilePublicationBridgeIntents() error {
-	state, err := s.authority.AuthorityState()
+	state, err := s.authority.AuthorityStateOf(withSnapshotOrigins(cluster.AuthorityQuery{Publications: cluster.All[string](), Transactions: cluster.All[string]()}))
 	if err != nil {
 		return err
 	}
@@ -1644,7 +1658,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if _, err := s.drainOutbox(ctx, limit*4); err != nil {
 		return collected, err
 	}
-	state, err := s.authority.AuthorityState()
+	state, err := s.authority.AuthorityStateOf(snapshotOriginsQuery())
 	if err != nil {
 		return collected, err
 	}
@@ -1748,7 +1762,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			// The origin was imported concurrently after the bulk authority
 			// read. Refresh before classifying it; an absent entry only means
 			// shared authority for IDs that had already been allocated.
-			state, err = s.authority.AuthorityState()
+			state, err = s.authority.AuthorityStateOf(snapshotOriginsQuery())
 			if err != nil {
 				return collected, err
 			}
@@ -1791,7 +1805,7 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 			// state read above. Resolve that one transition again: it committed
 			// either publication (ordinary shared retirement below) or permanent
 			// abandonment. Once shared, an origin cannot become abandoned.
-			latest, err := s.authority.AuthorityState()
+			latest, err := s.authority.AuthorityStateOf(snapshotOriginsQuery())
 			if err != nil {
 				return collected, err
 			}
