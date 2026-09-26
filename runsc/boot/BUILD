@@ -280,7 +280,12 @@ go_test(
     library = ":boot",
     deps = [
         "//pkg/abi/linux",
+        "//pkg/context",
+        "//pkg/sentry/inet",
+        "//pkg/sentry/socket/netlink/nlmsg",
+        "//pkg/sentry/socket/netstack",
         "//pkg/tcpip",
+        "//pkg/tcpip/network/ipv4",
     ],
 )
 
