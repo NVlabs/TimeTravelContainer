@@ -363,19 +363,34 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	if size < 0 || object.ID.Kind != ttcsnapshot.ObjectKindFile || object.BulkLength != uint64(size) || sourceID.Kind != ttcsnapshot.ObjectKindFile {
 		return fmt.Errorf("deferred file %s metadata disagrees with length %d", id, size)
 	}
-	pending, err := r.remoteObjectPending(id.String())
-	if err != nil {
+	if local, err := r.deferredObjectLocal(id, size); err != nil || local {
 		return err
 	}
-	file, openErr := r.data.Open(id, size)
-	if openErr == nil {
-		openErr = file.Close()
+	return r.registerDeferredFileObject(id, size, catalog, sourceID)
+}
+
+// deferredObjectLocal reports whether a deferred file object's bytes are all
+// installed: its file exists, and no pending marker says that what it lacks
+// is still to come from its source.
+func (r *Repository) deferredObjectLocal(id ttcsnapshot.ObjectID, size int64) (bool, error) {
+	pending, err := r.remoteObjectPending(id.String())
+	if err != nil || pending {
+		return false, err
 	}
-	if openErr == nil && !pending {
-		return nil
-	} else if openErr != nil && !errors.Is(openErr, os.ErrNotExist) {
-		return openErr
+	file, err := r.data.Open(id, size)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	return true, file.Close()
+}
+
+// registerDeferredFileObject marks a deferred file object pending and
+// resolves it through the source attached for its catalog, unless its bytes
+// have become local since the caller looked.
+func (r *Repository) registerDeferredFileObject(id ttcsnapshot.ObjectID, size int64, catalog string, sourceID ttcsnapshot.ObjectID) error {
 	// Publish the durable pending marker and its live resolver atomically with
 	// respect to repository-wide source detachment. In the old order, an eager
 	// independence drain could observe the new object in remote.objects, fetch
@@ -383,21 +398,30 @@ func (r *Repository) prepareDeferredFileObject(id ttcsnapshot.ObjectID, size int
 	// That left a fresh pending marker whose sole authoritative connection had
 	// already been closed. Holding remoteMu makes the marker+resolver pair appear
 	// before the materializer's final scan, or makes this operation observe that
-	// the provider has already detached and fail without creating a marker.
+	// the provider has already detached.
 	r.remoteMu.Lock()
+	defer r.remoteMu.Unlock()
+	// A fetch of the object, a reader's or a drain's, may have ended since the
+	// caller looked; a drain then detaches the source. A fetch installs the
+	// bytes and then retires the marker under remoteMarkerMu: looking again
+	// under it, this neither fails for a file whose bytes are here nor marks
+	// one pending again, a marker no source would retire, on which every later
+	// read failed once the source detached.
+	r.remoteMarkerMu.Lock()
+	defer r.remoteMarkerMu.Unlock()
+	if local, err := r.deferredObjectLocal(id, size); err != nil || local {
+		return err
+	}
 	remote := r.remoteByCatalog[catalog]
 	if remote == nil {
-		r.remoteMu.Unlock()
 		return fmt.Errorf("deferred filesystem catalog %q has no attached authoritative source", catalog)
 	}
 	if err := r.markRemoteObjectPending(id.String(), sourceID.String()); err != nil {
-		r.remoteMu.Unlock()
 		return err
 	}
 	remote.objects[id.String()] = size
 	remote.sources[id.String()] = sourceID.String()
 	r.remoteByObject[id.String()] = remote
-	r.remoteMu.Unlock()
 	return nil
 }
 

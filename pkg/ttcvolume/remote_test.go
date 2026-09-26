@@ -950,6 +950,73 @@ func TestDeferredMetadataObservationDoesNotRequireBulkTransport(t *testing.T) {
 	}
 }
 
+// An open of a deferred file that looked for its bytes before a fetch of them
+// ended registers the file only after the fetch: it must not mark the file
+// pending again, a marker no source would retire, nor fail once a drain has
+// detached the source.
+func TestDeferredFileRegisteredAfterItsFetch(t *testing.T) {
+	sourceManager := openTestManager(t)
+	source, err := sourceManager.Create("source-fetched")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	ino, err := source.CreateRegular(MainBranch, RootInode, "artifact", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("fetched before its open registered it\n"), 1000)
+	if n, _, err := source.WriteAt(MainBranch, ino, payload, 0); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt: %d, %v", n, err)
+	}
+	if err := source.Fork(MainBranch, "sealed"); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := source.DescribeRemoteSnapshot("sealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetManager := openTestManager(t)
+	target, err := targetManager.ImportPrivateRemoteDescriptorWithOrigins(filepath.Join(targetManager.root, "target-fetched"), "target-fetched", descriptor, "imported", 100, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	serverErr := attachTestRemote(t, source, target, "sealed", "imported", nil)
+	inode, err := target.Inode("imported", ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := ttcsnapshot.ParseObjectID(inode.Object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, sourceID, deferred := target.graph.DeferredSource(id)
+	if !deferred {
+		t.Fatalf("imported file object %s is not deferred", id)
+	}
+	// A reader fetches the file while the source stays attached; then the
+	// open that looked before registers it.
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("the fetched file differs")
+	}
+	if err := target.registerDeferredFileObject(id, inode.Size, catalog, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := target.remoteObjectPending(inode.Object); err != nil || pending {
+		t.Fatalf("a fetched file is pending again: %t, %v", pending, err)
+	}
+	// The drain detaches the source: the file stays readable, and an open
+	// that looked before registers it without the source.
+	finishTestRemote(t, target, serverErr)
+	if err := target.registerDeferredFileObject(id, inode.Size, catalog, sourceID); err != nil {
+		t.Fatalf("registering a file fetched before its source detached: %v", err)
+	}
+	if got := readAll(t, target, "imported", ino); !bytes.Equal([]byte(got), payload) {
+		t.Fatal("the fetched file differs after its source detached")
+	}
+}
+
 func TestRemoteDescriptorPreservesDiffBase(t *testing.T) {
 	sourceManager := openTestManager(t)
 	source, err := sourceManager.Create("source-diff")

@@ -337,7 +337,11 @@ type Repository struct {
 	// ordinary filesystem operations can hold those runtime locks before taking
 	// operationMu.
 	remoteMarkerSyncMu sync.Mutex
-	lockFile           *os.File
+	// remoteMarkerMu serializes the retirement of a pending marker, once its
+	// object's bytes are installed, with a registration that would mark the
+	// object pending. It is held for a few file operations and nothing else.
+	remoteMarkerMu sync.Mutex
+	lockFile       *os.File
 	// activeLock holds a shared lifecycle lease for descriptor-backed
 	// repositories donated to a live Sentry. Manager-side garbage collection
 	// takes the same file exclusively and non-blockingly, so it cannot mistake
@@ -4181,6 +4185,8 @@ func (r *Repository) clearRemoteObjectPending(id string) error {
 func (r *Repository) retireRemoteObjectPending(id string) error {
 	r.remoteMarkerSyncMu.Lock()
 	defer r.remoteMarkerSyncMu.Unlock()
+	r.remoteMarkerMu.Lock()
+	defer r.remoteMarkerMu.Unlock()
 	return r.clearRemoteObjectPending(id)
 }
 
