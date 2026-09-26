@@ -272,9 +272,11 @@ var ErrNoAuthorityState = errors.New("the cluster's Raft state is in its former 
 //     restarts, unless another daemon has claimed a later epoch since.
 //   - A daemon takes the authority, claiming the next epoch, from a holder
 //     that has left it or ended, and from one whose counter stood still for
-//     AuthorityTakeover; and a compute daemon takes it from a control
-//     daemon at once, which gives it up.
-//   - Otherwise it joins the holder.
+//     AuthorityTakeover.
+//   - A compute daemon waits for a control daemon to give the authority up,
+//     as it does once it sees a compute daemon run, and takes it from one
+//     that has not after AuthorityTakeover.
+//   - Otherwise it joins the holder; a control daemon never does.
 func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord, legacy bool, liveness *Liveness) (AuthorityDecision, error) {
 	for {
 		record, recorded, err := c.ReadAuthority()
@@ -330,9 +332,22 @@ func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord
 			decision, done, err = decided(takeFrom(record.Epoch))
 		case record.Holds(self):
 			return AuthorityDecision{Hold: true, Record: record}, nil
-		case record.Role == RoleControl && self.Role == RoleCompute,
-			!c.alive(record, liveness):
+		case !c.alive(record, liveness):
 			decision, done, err = decided(takeFrom(record.Epoch))
+		case record.Role == RoleControl && self.Role == RoleCompute:
+			// A control daemon holds the authority only while no compute
+			// daemon runs, and gives it up once it sees one's counter
+			// advance; nothing dials it. So this daemon waits for it to, and
+			// takes the authority from one that has not after
+			// AuthorityTakeover.
+			if liveness.waitedFor(record) >= AuthorityTakeover {
+				decision, done, err = decided(takeFrom(record.Epoch))
+			}
+		case self.Role == RoleControl && !c.running(record, liveness):
+			// A control daemon holds the authority only while no other
+			// daemon does, and waits to see whether the holder runs: until
+			// its counter advances, or has stood still for
+			// AuthorityTakeover.
 		default:
 			return AuthorityDecision{Record: record}, nil
 		}
@@ -356,6 +371,13 @@ func (c SharedCluster) alive(record AuthorityRecord, liveness *Liveness) bool {
 		return false
 	}
 	return liveness.StillFor(member) < AuthorityTakeover
+}
+
+// running reports whether the counter of the daemon of record, whose
+// authority it holds, has been seen to advance.
+func (c SharedCluster) running(record AuthorityRecord, liveness *Liveness) bool {
+	member, err := c.ReadMember(record.NodeID)
+	return err == nil && member.Incarnation == record.Incarnation && liveness.Advancing(member)
 }
 
 // predatesSharedAuthority reports whether the cluster ran before its Raft
@@ -556,12 +578,18 @@ func (h *Heartbeat) Stop() {
 type Liveness struct {
 	mu   sync.Mutex
 	seen map[string]livenessObservation
+	// waiting has, by the control daemon's record it names, since when a
+	// compute daemon has waited for a control daemon to give up the
+	// authority; see DecideAuthority.
+	waiting map[AuthorityRecord]time.Time
 }
 
 type livenessObservation struct {
 	incarnation string
 	counter     uint64
 	since       time.Time
+	// advanced is set once the counter changed while observed.
+	advanced bool
 }
 
 // StillFor returns for how long, on this host's clock, the counter of the
@@ -569,16 +597,51 @@ type livenessObservation struct {
 func (l *Liveness) StillFor(record MemberRecord) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.observe(record)
+	return now.Sub(l.seen[record.NodeID].since)
+}
+
+// Advancing reports whether this Liveness has seen the counter of the daemon
+// of record advance, and not stand still since for AuthorityTakeover: whether
+// the daemon runs, where StillFor tells only for how long it has not.
+func (l *Liveness) Advancing(record MemberRecord) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.observe(record)
+	seen := l.seen[record.NodeID]
+	return seen.advanced && now.Sub(seen.since) < AuthorityTakeover
+}
+
+// observe records the counter of record, and returns when it did.
+func (l *Liveness) observe(record MemberRecord) time.Time {
 	if l.seen == nil {
 		l.seen = make(map[string]livenessObservation)
 	}
 	now := time.Now()
 	seen, ok := l.seen[record.NodeID]
-	if !ok || seen.incarnation != record.Incarnation || seen.counter != record.Counter {
+	switch {
+	case !ok || seen.incarnation != record.Incarnation:
 		l.seen[record.NodeID] = livenessObservation{incarnation: record.Incarnation, counter: record.Counter, since: now}
-		return 0
+	case seen.counter != record.Counter:
+		l.seen[record.NodeID] = livenessObservation{incarnation: record.Incarnation, counter: record.Counter, since: now, advanced: true}
 	}
-	return now.Sub(seen.since)
+	return now
+}
+
+// waitedFor returns for how long a compute daemon has waited for the control
+// daemon of record to give up the authority, from now if it had not.
+func (l *Liveness) waitedFor(record AuthorityRecord) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.waiting == nil {
+		l.waiting = make(map[AuthorityRecord]time.Time)
+	}
+	since, ok := l.waiting[record]
+	if !ok {
+		since = time.Now()
+		l.waiting[record] = since
+	}
+	return time.Since(since)
 }
 
 // fencedLogStore is the Raft log store of an epoch's authority. It fails every

@@ -447,8 +447,12 @@ type daemonConsoleClient struct {
 }
 
 type daemonClusterOptions struct {
-	Configured      bool
-	ControlOnly     bool
+	Configured  bool
+	ControlOnly bool
+	// ControlHolder runs this daemon as a login node's control holder: it
+	// holds the cluster's authority while no compute daemon runs, and stops
+	// once one does; see controlHolder. It runs no container.
+	ControlHolder   bool
 	Listen          string
 	NodeID          string
 	RepositoryID    string
@@ -542,6 +546,9 @@ type controlOnlyCluster struct {
 	liveness   cluster.Liveness
 	stalledMu  sync.Mutex
 	stalled    map[string]bool
+	// holder runs this login node's control holder while the cluster needs
+	// one; see controlHolder.
+	holder *controlHolder
 
 	peersMu sync.RWMutex
 	peers   []controlOnlyPeer
@@ -580,6 +587,9 @@ func (c *controlOnlyCluster) observePeers() {
 	c.stalledMu.Lock()
 	c.stalled = stalled
 	c.stalledMu.Unlock()
+	if c.holder != nil {
+		c.holder.consider(members, &c.liveness)
+	}
 }
 
 // responsivePeers returns the peers whose daemons' counters in the shared
@@ -730,8 +740,9 @@ type controlOnlyPeerStatus struct {
 	} `json:"cluster"`
 }
 
-// sharedRootComputePeers returns, as peers to probe, the compute daemons the
-// shared root names: the cluster's authority first, then its compute members.
+// sharedRootComputePeers returns, as peers to probe, the daemons the shared
+// root names: the cluster's authority first, which is this login node's
+// control holder while no compute daemon runs, then its compute members.
 func sharedRootComputePeers(sharedRoot string) []string {
 	shared := cluster.NewSharedCluster(sharedRoot)
 	var peers []string
@@ -740,8 +751,8 @@ func sharedRootComputePeers(sharedRoot string) []string {
 			peers = append(peers, nodeID+"="+strings.TrimPrefix(controlURL, "http://"))
 		}
 	}
-	if record, ok, err := shared.ReadAuthority(); err == nil && ok {
-		add(record.NodeID, record.Role, record.ControlURL)
+	if record, ok, err := shared.ReadAuthority(); err == nil && ok && record.ControlURL != "" {
+		peers = append(peers, record.NodeID+"="+strings.TrimPrefix(record.ControlURL, "http://"))
 	}
 	members, _ := shared.ReadMembers()
 	ids := make([]string, 0, len(members))
@@ -3915,6 +3926,8 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+	} else if clusterOpts.ControlHolder {
+		// A control holder runs no container.
 	} else if err := preflightDaemonIsolation(false); err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
@@ -3990,6 +4003,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			return DaemonRestartExitCode
 		}
 		if errors.Is(err, errClusterAuthorityChanged) {
+			if clusterOpts.ControlHolder {
+				// It held the authority only while no compute daemon ran.
+				return 0
+			}
 			fmt.Fprintln(stderr, "ttcd: restarting for the cluster's new authority; this node's sandboxes stay stopped until it answers")
 			return DaemonRestartExitCode
 		}
@@ -4639,6 +4656,11 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return 1, nil
 	}
+	if args[0] == "--control-holder" {
+		opts.ControlHolder = true
+		opts.Configured = true
+		return 1, nil
+	}
 	setString := func(name string, dst *string) (int, error) {
 		if args[0] == name {
 			if len(args) < 2 || args[1] == "" {
@@ -4943,8 +4965,12 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	// cluster.SharedCluster. This daemon holds it, or joins its holder as a
 	// non-voter, keeping a replica of its state in the local root.
 	shared := cluster.NewSharedCluster(dataRoot)
+	role := cluster.RoleCompute
+	if opts.ControlHolder {
+		role = cluster.RoleControl
+	}
 	self := cluster.AuthorityRecord{
-		NodeID: opts.NodeID, Incarnation: incarnation, Role: cluster.RoleCompute,
+		NodeID: opts.NodeID, Incarnation: incarnation, Role: role,
 		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: parsedAdvertise.Host,
 	}
 	heartbeat, err := cluster.StartHeartbeat(shared, cluster.MemberRecord{
@@ -4996,6 +5022,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			return nil, err
 		}
 		authority = decision.Record
+		if opts.ControlHolder && !decision.Hold {
+			return nil, fmt.Errorf("node %s holds the cluster's authority, which a control holder holds only while no other daemon does", authority.NodeID)
+		}
 		if decision.Hold {
 			if !shared.Prepared(authority.Epoch) {
 				source := ""
@@ -5182,6 +5211,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		NodeID: opts.NodeID, Incarnation: incarnation,
 		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: raftNode.Address(),
 		Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+	}
+	if opts.ControlHolder {
+		nodeRecord.Labels = map[string]string{cluster.NodeRoleLabel: cluster.RoleControl}
 	}
 	transactions := catalog.Transactions()
 	placements := catalog.Placements()
@@ -5795,10 +5827,11 @@ type controlOnlyDaemonServer struct {
 
 // serveControlOnlyDaemon exposes only the local Unix API. It never opens a TCP
 // listener and never registers a cluster node, so compute nodes cannot select
-// it for placement or initiate a connection to it.
+// it for placement or initiate a connection to it. While no compute daemon
+// runs, it runs a control holder, which listens only on loopback.
 func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyCluster, stdout, stderr io.Writer) error {
-	if control == nil || len(control.peerSnapshot()) == 0 {
-		return errors.New("control-only cluster has no compute seed")
+	if control == nil {
+		return errors.New("control-only cluster is unavailable")
 	}
 	dir := filepath.Dir(socket)
 	if err := secureDaemonDirectory(dir); err != nil {
@@ -5840,6 +5873,12 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 	server.mutationRoot = mutationRoot
 	server.portIngress = newRoutedPortIngressManager(controlOnlyPortIngressRouter{cluster: control, root: sharedRoot})
 	defer server.portIngress.Close()
+	holderDir := filepath.Join(dir, "holder")
+	if err := os.MkdirAll(holderDir, 0700); err != nil {
+		return fmt.Errorf("creating the control holder's directory: %w", err)
+	}
+	control.holder = &controlHolder{dir: holderDir, sharedRoot: sharedRoot, nodeID: control.nodeID, stderr: stderr}
+	defer control.holder.stop()
 	discoveryDone := make(chan struct{})
 	defer close(discoveryDone)
 	go func() {
@@ -5869,7 +5908,11 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 		}
 	}()
 	if stdout != nil {
-		fmt.Fprintf(stdout, "ttcd control-only gateway listening on %s (repository=%s, seed=%s)\n", socket, control.repositoryID, control.seedURLs()[0])
+		seed := "none"
+		if urls := control.seedURLs(); len(urls) != 0 {
+			seed = urls[0]
+		}
+		fmt.Fprintf(stdout, "ttcd control-only gateway listening on %s (repository=%s, seed=%s)\n", socket, control.repositoryID, seed)
 	}
 	for {
 		conn, err := listener.Accept()
@@ -6678,6 +6721,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			authorityChanged.Store(&wrapped)
 			_ = listener.Close()
 			_ = clusterServer.Close()
+		}, func() {
+			server.cleanStop.Store(true)
+			server.stopOnce.Do(func() { _ = server.listener.Close() })
 		}, stderr, clusterDone)
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)

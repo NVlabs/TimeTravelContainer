@@ -432,17 +432,25 @@ ttc daemon start --control-only
 
 This mode does not require `TTC_LOCAL_ROOT`. It opens only the per-user Unix
 socket selected by `TTC_SOCKET`; it does not open or advertise a TCP port,
-join Raft, create a cluster `NodeRecord`, provide page data, or accept branch
-placement. It finds the compute nodes in the shared root, so the login host
-needs outbound connectivity to them, but compute nodes never initiate
-connections to it. Commands such as `run`, `exec`, `fork`, `migrate`, `ps`,
-and `node ls` are tunneled to a compute node whose counter advances and then
-routed by the normal cluster placement authority. `ttc daemon stop` stops only
-the login-node gateway; use `ttc node stop` to retire a compute node. The
-shared `TTC_ROOT` marker is read to prevent accidentally controlling a
-different repository, but the gateway does not write container data there. A
-failed stream is never replayed ambiguously; the next command goes to another
-compute node.
+provide page data, or accept branch placement. It finds the compute nodes in
+the shared root, so the login host needs outbound connectivity to them, but
+compute nodes never initiate connections to it. Commands such as `run`,
+`exec`, `fork`, `migrate`, `ps`, and `node ls` are tunneled to a compute node
+whose counter advances and then routed by the normal cluster placement
+authority. The shared `TTC_ROOT` marker is read to prevent accidentally
+controlling a different repository, but the gateway does not write container
+data there. A failed stream is never replayed ambiguously; the next command
+goes to another compute node.
+
+While no compute node runs, the gateway starts a control holder, a daemon of
+the login node that listens only on loopback: it takes the cluster's
+authority, and the gateway relays to it. It answers what needs no compute
+node, such as `ps`, `inspect`, `node ls`, and `rm` of dehydrated or exited
+branches, and a command that needs one, such as `run` or `rehydrate`, fails
+until a compute node starts. A compute node that starts takes the authority
+back within a few seconds, and the holder stops. `ttc daemon stop` stops the
+gateway, and its holder with it; use `ttc node stop` to retire a compute node.
+Run one gateway per cluster.
 
 HTTP control requests and Raft streams share the single TCP port named by
 `--listen` and `--advertise`; page-transfer listeners are ephemeral per

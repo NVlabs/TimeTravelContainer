@@ -6326,8 +6326,10 @@ var errClusterAuthorityChanged = errors.New("the cluster authority changed hands
 // every heartbeat. The holder gives the authority up and restarts, to join
 // its successor, once it no longer holds it: its lease lapsed, or another node
 // took it. Another node rejoins the holder of each new epoch, and takes the
-// authority in place from a holder that ended, stalled or gave it up.
-func watchClusterAuthority(runtime *daemonClusterRuntime, restart func(error), stderr io.Writer, done <-chan struct{}) {
+// authority in place from a holder that ended, stalled or gave it up. A
+// control holder, which holds the authority only while no compute daemon
+// runs, stops, as a daemon stop does, once it sees one run.
+func watchClusterAuthority(runtime *daemonClusterRuntime, restart func(error), stop func(), stderr io.Writer, done <-chan struct{}) {
 	ticker := time.NewTicker(cluster.HeartbeatInterval)
 	defer ticker.Stop()
 	joined := runtime.currentAuthority()
@@ -6343,6 +6345,13 @@ func watchClusterAuthority(runtime *daemonClusterRuntime, restart func(error), s
 			if err := holder.Held(); err != nil {
 				releaseClusterAuthority(runtime)
 				restart(err)
+				return
+			}
+			if runtime.self.Role == cluster.RoleControl && computeDaemonRuns(runtime) {
+				if stderr != nil {
+					fmt.Fprintln(stderr, "ttcd: a compute daemon runs, and this control holder gives it the cluster's authority")
+				}
+				stop()
 				return
 			}
 			continue
@@ -6382,6 +6391,21 @@ func watchClusterAuthority(runtime *daemonClusterRuntime, restart func(error), s
 		}
 		joined = decision.Record
 	}
+}
+
+// computeDaemonRuns reports whether the counter of a compute daemon of the
+// cluster advances, as far as runtime has seen.
+func computeDaemonRuns(runtime *daemonClusterRuntime) bool {
+	members, err := runtime.shared.ReadMembers()
+	if err != nil {
+		return false
+	}
+	for _, member := range members {
+		if member.Role == cluster.RoleCompute && runtime.liveness.Advancing(member) {
+			return true
+		}
+	}
+	return false
 }
 
 // takeClusterAuthority makes this daemon, a non-voter that claimed the
@@ -6746,6 +6770,18 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 		}
 		now := time.Now()
 		for _, record := range records {
+			if record.State == cluster.NodeOffline && record.Labels[cluster.NodeRoleLabel] == cluster.RoleControl {
+				// A control holder that stopped held nothing but the
+				// authority, and the shared-GC lease until another node
+				// takes that; its node has no reason to be listed.
+				if lease, err := authority.SharedGCLease(); err != nil || (lease.NodeID == record.NodeID && lease.Incarnation == record.Incarnation) {
+					continue
+				}
+				if _, err := authority.RemoveNode(record.NodeID, record.Incarnation, record.Revision); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: removing stopped control holder %s/%s: %v\n", record.NodeID, record.Incarnation, err)
+				}
+				continue
+			}
 			if record.State == cluster.NodeOffline || record.LeaseActive(now) {
 				continue
 			}

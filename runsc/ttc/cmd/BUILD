@@ -12,6 +12,7 @@ go_library(
         "cmd.go",
         "completion.go",
         "console_followers.go",
+        "control_holder.go",
         "cp.go",
 		"cpuid_fault_amd64.go",
 		"cpuid_fault_other.go",

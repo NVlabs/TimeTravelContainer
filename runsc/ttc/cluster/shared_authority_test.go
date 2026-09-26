@@ -421,27 +421,56 @@ func TestDecideAuthorityTakesItFromAControlDaemonWhichGivesItUp(t *testing.T) {
 	if err != nil || !held.Hold {
 		t.Fatalf("the login daemon alone decided %+v, %v", held, err)
 	}
+	// A compute daemon waits for the control daemon to give the authority
+	// up, rather than join it.
 	_, compute := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
-	taken, err := shared.DecideAuthority(ctx, compute, false, &liveness)
-	if err != nil || !taken.Hold || taken.Record.Epoch != 2 || taken.Record.Previous != 1 {
-		t.Fatalf("a compute daemon beside a control holder decided %+v, %v", taken, err)
-	}
-	released := make(chan error, 1)
-	go func() { released <- shared.AwaitRelease(ctx, held.Record, taken.Record.Epoch, &liveness) }()
+	var computeLiveness Liveness
+	decisions := make(chan AuthorityDecision, 1)
+	go func() {
+		taken, err := shared.DecideAuthority(ctx, compute, false, &computeLiveness)
+		if err != nil {
+			t.Error(err)
+		}
+		decisions <- taken
+	}()
 	select {
-	case err := <-released:
-		t.Fatalf("AwaitRelease returned %v before the control daemon gave the authority up", err)
+	case taken := <-decisions:
+		t.Fatalf("a compute daemon beside a control holder decided %+v before it gave the authority up", taken)
 	case <-time.After(3 * HeartbeatInterval / 2):
 	}
 	if err := loginHeartbeat.Update(func(record *MemberRecord) { record.Released = held.Record.Epoch }, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-released; err != nil {
+	taken := <-decisions
+	if !taken.Hold || taken.Record.Epoch != 2 || taken.Record.Previous != 1 {
+		t.Fatalf("a compute daemon decided %+v once the control daemon gave the authority up", taken)
+	}
+	if err := shared.AwaitRelease(ctx, held.Record, taken.Record.Epoch, &computeLiveness); err != nil {
 		t.Fatal(err)
 	}
 	// A control daemon does not take it from a compute one.
 	if joined, err := shared.DecideAuthority(ctx, login, false, &liveness); err != nil || joined.Hold {
 		t.Fatalf("the control daemon decided %+v, %v", joined, err)
+	}
+}
+
+func TestLivenessAdvancingNeedsACounterSeenToChange(t *testing.T) {
+	var liveness Liveness
+	record := MemberRecord{NodeID: "node-a", Incarnation: "i-1", Counter: 7}
+	if liveness.Advancing(record) {
+		t.Fatal("a counter seen once is advancing")
+	}
+	if liveness.Advancing(record) {
+		t.Fatal("a counter that stood still is advancing")
+	}
+	record.Counter++
+	if !liveness.Advancing(record) {
+		t.Fatal("a counter that changed is not advancing")
+	}
+	// Another incarnation's counter starts over.
+	record.Incarnation, record.Counter = "i-2", 1
+	if liveness.Advancing(record) {
+		t.Fatal("a new incarnation's counter is advancing when first seen")
 	}
 }
 

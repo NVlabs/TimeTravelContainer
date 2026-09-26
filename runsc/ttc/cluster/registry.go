@@ -94,9 +94,14 @@ func (r NodeRecord) LeaseActive(now time.Time) bool {
 	return r.State != NodeOffline && now.Before(r.LeaseExpiresAt)
 }
 
-// AcceptsPlacement reports whether a scheduler may reserve new work here.
+// NodeRoleLabel labels the record of a node by its role; see RoleControl.
+const NodeRoleLabel = "ttc.role"
+
+// AcceptsPlacement reports whether a scheduler may reserve new work here. A
+// control daemon's node, which holds the authority while no compute daemon
+// runs, takes none.
 func (r NodeRecord) AcceptsPlacement(now time.Time) bool {
-	return r.LeaseActive(now) && r.State == NodeReady
+	return r.LeaseActive(now) && r.State == NodeReady && r.Labels[NodeRoleLabel] != RoleControl
 }
 
 // NewNodeIncarnation returns an unpredictable identifier that fences daemon
