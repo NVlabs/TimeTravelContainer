@@ -8312,6 +8312,15 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			if diagnostic := b.runtimeDiagnosticSince(request.target.container, started); diagnostic != "" && b.stderr != nil {
 				fmt.Fprintf(b.stderr, "ttc: sandbox diagnostic: %s\n", diagnostic)
 			}
+			// runsc exec fails with 128 when the runtime dies under it, as
+			// its cgroup's out-of-memory killer may kill it. The process was
+			// killed with the runtime: report it as docker exec reports one
+			// killed with its container, and record the loss.
+			if exitErr.ExitCode() == 128 {
+				if _, lost := b.lostRuntimeWaitStatus(request.target); lost {
+					return 128 + int(unix.SIGKILL), nil
+				}
+			}
 			return exitErr.ExitCode(), nil
 		}
 		return 1, fmt.Errorf("executing runsc: %w", err)
