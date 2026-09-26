@@ -20,7 +20,6 @@ package sighandling
 import (
 	"fmt"
 	"os"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -62,60 +61,22 @@ func forwardedSignals() []forwardedSignal {
 	}
 }
 
-// IgnoreChildStop sets the SA_NOCLDSTOP flag, causing child processes to not
-// generate SIGCHLD when they stop.
-func IgnoreChildStop() error {
-	var old sigactionDarwin
-	if err := sigactionRaw(unix.SIGCHLD, nil, &old); err != nil {
-		return err
-	}
-	old.flags |= darwinSANoChildStop
-	return sigactionRaw(unix.SIGCHLD, &old, nil)
-}
-
-// ReplaceSignalHandler replaces the existing signal handler for the provided
-// signal with the function pointer at `handler`. This bypasses the Go runtime
-// signal handlers, and should only be used for low-level signal handlers where
-// use of signal.Notify is not appropriate.
+// IgnoreChildStop is a no-op on Darwin.
 //
-// It stores the value of the previously set handler in previous.
-func ReplaceSignalHandler(sig unix.Signal, handler uintptr, previous *uintptr) error {
-	var old sigactionDarwin
-	if err := sigactionRaw(sig, nil, &old); err != nil {
-		return err
-	}
-	if old.handler == 0 {
-		return fmt.Errorf("previous handler for signal %x isn't set", sig)
-	}
-	*previous = old.handler
-	old.handler = handler
-	old.flags |= darwinSASiginfo
-	return sigactionRaw(sig, &old, nil)
-}
-
-const (
-	darwinSANoChildStop = 0x8
-	darwinSASiginfo     = 0x40
-)
-
-// sigactionDarwin matches the 64-bit Darwin sigaction ABI used by both
-// supported macOS architectures. Keep this host ABI separate from Linux's
-// guest-visible SigAction layout.
-type sigactionDarwin struct {
-	handler uintptr
-	mask    uint32
-	flags   int32
-}
-
-func sigactionRaw(sig unix.Signal, act, old *sigactionDarwin) error {
-	_, _, errno := unix.RawSyscall(
-		unix.SYS_SIGACTION,
-		uintptr(sig),
-		uintptr(unsafe.Pointer(act)),
-		uintptr(unsafe.Pointer(old)),
-	)
-	if errno != 0 {
-		return errno
-	}
+// On Linux it sets SA_NOCLDSTOP so that the Sentry's stub and ptrace
+// subprocesses do not deliver SIGCHLD whenever they stop; a Darwin Sentry has
+// no such children. Re-installing the Go runtime's handler here would also be
+// unsafe: the raw sigaction syscall does not report the libc signal
+// trampoline, so the handler cannot be re-registered without it, and a
+// disposition with a bogus trampoline crashes the process on the next
+// SIGCHLD.
+func IgnoreChildStop() error {
 	return nil
+}
+
+// ReplaceSignalHandler is unsupported on Darwin, for the same reason: without
+// libc's sigaction the replacement handler cannot be given a valid signal
+// trampoline. Its callers are Linux-only platforms.
+func ReplaceSignalHandler(sig unix.Signal, _ uintptr, _ *uintptr) error {
+	return fmt.Errorf("replacing the handler for signal %d is unsupported on Darwin", sig)
 }
