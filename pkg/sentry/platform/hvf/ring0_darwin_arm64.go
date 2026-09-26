@@ -375,16 +375,21 @@ static uintptr_t ttc_ring0_runtime_ensure_host_address(void) {
 // host clock_gettime call. HVF applies the VM-wide VTimer offset separately so
 // guest CNTVCT remains in this same architectural-counter domain.
 static int ttc_ring0_calibrate_time_fastpath(
-		struct ttc_ring0_time_fastpath *result) {
+		struct ttc_ring0_time_fastpath *result, uint64_t vtimer_offset) {
 	mach_timebase_info_data_t timebase;
 	if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
 			timebase.numer == 0 || timebase.denom == 0) {
 		return EINVAL;
 	}
-	uint64_t before = ttc_ring0_host_cntvct();
+	// Anchor realtime to the counter that EL1 reads. Guest CNTVCT is
+	// mach_absolute_time minus the vtimer offset, and Mach absolute time stops
+	// while the host sleeps, whereas the host CNTVCT keeps counting. Anchoring
+	// to the host CNTVCT left EL1 realtime behind by the host's sleep time
+	// since the VM was created.
+	uint64_t before = mach_absolute_time() - vtimer_offset;
 	struct timespec realtime;
 	if (clock_gettime(CLOCK_REALTIME, &realtime) != 0) return errno;
-	uint64_t after = ttc_ring0_host_cntvct();
+	uint64_t after = mach_absolute_time() - vtimer_offset;
 	uint64_t midpoint = before + (after - before) / 2;
 	__uint128_t counter_ns = (__uint128_t)midpoint * timebase.numer /
 		timebase.denom;
@@ -2525,7 +2530,7 @@ type ring0TimeFastpath struct {
 
 func calibrateRing0TimeFastpath(vtimerOffset uint64) (ring0TimeFastpath, error) {
 	var calibration C.struct_ttc_ring0_time_fastpath
-	if errno := C.ttc_ring0_calibrate_time_fastpath(&calibration); errno != 0 {
+	if errno := C.ttc_ring0_calibrate_time_fastpath(&calibration, C.uint64_t(vtimerOffset)); errno != 0 {
 		return ring0TimeFastpath{}, fmt.Errorf("calibrating EL1 runtime clocks: errno %d", int(errno))
 	}
 	result := ring0TimeFastpath{
