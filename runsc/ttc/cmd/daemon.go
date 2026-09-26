@@ -536,9 +536,12 @@ type controlOnlyCluster struct {
 	repositoryID string
 	authToken    string
 	// sharedRoot is where the gateway finds compute nodes when it knows of
-	// none alive, and liveness judges from it which ones stalled.
+	// none alive, and liveness judges from it which ones stalled, as
+	// observePeers records in stalled every heartbeat.
 	sharedRoot string
 	liveness   cluster.Liveness
+	stalledMu  sync.Mutex
+	stalled    map[string]bool
 
 	peersMu sync.RWMutex
 	peers   []controlOnlyPeer
@@ -557,21 +560,39 @@ func (c *controlOnlyCluster) peerSnapshot() []controlOnlyPeer {
 	return append([]controlOnlyPeer(nil), c.peers...)
 }
 
+// observePeers records which daemons' counters in the shared root stood
+// still for three heartbeats. It runs every heartbeat, as the counters
+// advance, so that it sees a stall within a heartbeat of when it is three.
+func (c *controlOnlyCluster) observePeers() {
+	if c.sharedRoot == "" {
+		return
+	}
+	members, err := cluster.NewSharedCluster(c.sharedRoot).ReadMembers()
+	if err != nil {
+		return
+	}
+	stalled := make(map[string]bool)
+	for id, member := range members {
+		if c.liveness.StillFor(member) > 3*cluster.HeartbeatInterval {
+			stalled[id] = true
+		}
+	}
+	c.stalledMu.Lock()
+	c.stalled = stalled
+	c.stalledMu.Unlock()
+}
+
 // responsivePeers returns the peers whose daemons' counters in the shared
 // root advance: one stalled a while, as a stopped process is, still accepts
 // connections, but answers none. It returns every peer if none does.
 func (c *controlOnlyCluster) responsivePeers() []controlOnlyPeer {
 	peers := c.peerSnapshot()
-	if c.sharedRoot == "" {
-		return peers
-	}
-	members, err := cluster.NewSharedCluster(c.sharedRoot).ReadMembers()
-	if err != nil {
-		return peers
-	}
+	c.stalledMu.Lock()
+	stalled := c.stalled
+	c.stalledMu.Unlock()
 	responsive := make([]controlOnlyPeer, 0, len(peers))
 	for _, peer := range peers {
-		if member, ok := members[peer.nodeID]; ok && c.liveness.StillFor(member) > 3*cluster.HeartbeatInterval {
+		if stalled[peer.nodeID] {
 			continue
 		}
 		responsive = append(responsive, peer)
@@ -5831,9 +5852,18 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				_ = control.refreshPeers(ctx)
 				cancel()
-				// Observe the peers' counters, so that a command knows the
-				// ones that stalled.
-				_ = control.responsivePeers()
+			}
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(cluster.HeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-discoveryDone:
+				return
+			case <-ticker.C:
+				control.observePeers()
 			}
 		}
 	}()
