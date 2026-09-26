@@ -17,13 +17,13 @@ package fuse
 import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 // fuseInitRes is a variable-length wrapper of linux.FUSEInitOut. The FUSE
@@ -195,18 +195,19 @@ type Response struct {
 
 // Error returns the error of the FUSE call.
 func (r *Response) Error() error {
-	errno := r.hdr.Error
-	if errno >= 0 {
+	if r.hdr.Error >= 0 {
 		return nil
 	}
 
-	// If we get a bad error in the response, warn and convert it to EINVAL.
-	sysErrNo := unix.Errno(-errno)
-	if !syserr.IsValid(sysErrNo) {
-		log.Warningf("fusefs: invalid response error %d does not correspond to a Linux error", sysErrNo)
-		sysErrNo = unix.EINVAL
+	// The FUSE server runs in the sandbox, so the error is a Linux errno,
+	// whatever the host. If it isn't a valid one, warn and convert it to
+	// EINVAL.
+	e := errno.Errno(-r.hdr.Error)
+	if !linuxerr.IsValid(e) {
+		log.Warningf("fusefs: invalid response error %d does not correspond to a Linux error", e)
+		e = errno.EINVAL
 	}
-	return linuxerr.ErrorFromUnix(sysErrNo)
+	return linuxerr.ErrorFromUnix(unix.Errno(e))
 }
 
 // DataLen returns the size of the response without the header.
