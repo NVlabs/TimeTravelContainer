@@ -1479,6 +1479,37 @@ func TestCloneRootsIsAtomicAndReferenceCounted(t *testing.T) {
 	}
 }
 
+// A lookup searches a node in place, and finds the entry decoding the node
+// and positioning the key in it would.
+func TestBTreeNodeSearchAgreesWithDecoding(t *testing.T) {
+	keys := [][]byte{[]byte("b"), []byte("d"), []byte("dd"), []byte("f")}
+	children := make([]ObjectID, len(keys))
+	for index := range children {
+		children[index] = ObjectID{Snapshot: 1, Kind: ObjectKindInode, Ordinal: uint64(index + 1)}
+	}
+	for _, leaf := range []bool{true, false} {
+		data, edges, err := encodeBTreeNode(bTreeNode{leaf: leaf, keys: keys, children: children})
+		if err != nil {
+			t.Fatal(err)
+		}
+		object := Object{ID: ObjectID{Snapshot: 1, Kind: ObjectKindDirectoryNode, Ordinal: 9}, Data: data, Children: edges}
+		node, err := decodeBTreeNode(object, ObjectKindDirectoryNode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"a", "b", "c", "d", "da", "dd", "de", "f", "g"} {
+			index := bTreePosition(node.keys, []byte(key))
+			gotLeaf, entry, child, err := searchBTreeNode(object, ObjectKindDirectoryNode, []byte(key))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotLeaf != leaf || !bytes.Equal(entry, node.keys[index]) || child != node.children[index] {
+				t.Errorf("searching %q in a node of %q (leaf %t) found %q, %v, leaf %t, want %q, %v", key, keys, leaf, entry, child, gotLeaf, node.keys[index], node.children[index])
+			}
+		}
+	}
+}
+
 func TestPersistentBTreeSplitsAndHardlinks(t *testing.T) {
 	store := openTestStore(t)
 	origin, err := store.AllocateWorking()

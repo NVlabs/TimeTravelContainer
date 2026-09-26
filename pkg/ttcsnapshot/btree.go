@@ -99,6 +99,47 @@ func decodeBTreeNode(object Object, kind ObjectKind) (bTreeNode, error) {
 	return node, nil
 }
 
+// searchBTreeNode is decodeBTreeNode and then bTreePosition, for a lookup: it
+// finds, in the encoded node, the entry key falls under and that entry's key,
+// reading the node's keys only as far as it must, and copying none.
+func searchBTreeNode(object Object, kind ObjectKind, key []byte) (leaf bool, entry []byte, child ObjectID, err error) {
+	if object.ID.Kind != kind || !validBTreeKind(kind) || len(object.Data) < 3 || object.Data[0] > 1 {
+		return false, nil, ObjectID{}, fmt.Errorf("object %s is not a TTC B-tree node of kind %d", object.ID.key(), kind)
+	}
+	count := int(binary.BigEndian.Uint16(object.Data[1:3]))
+	if count == 0 || count > bTreeMaxEntries || len(object.Children) != count {
+		return false, nil, ObjectID{}, fmt.Errorf("object %s has invalid TTC B-tree cardinality", object.ID.key())
+	}
+	index, offset := 0, 3
+	var previous []byte
+	for i := 0; i < count; i++ {
+		if offset+2 > len(object.Data) {
+			return false, nil, ObjectID{}, fmt.Errorf("object %s has truncated TTC B-tree key", object.ID.key())
+		}
+		length := int(binary.BigEndian.Uint16(object.Data[offset : offset+2]))
+		offset += 2
+		if length == 0 || length > bTreeMaxKeyBytes || offset+length > len(object.Data) {
+			return false, nil, ObjectID{}, fmt.Errorf("object %s has invalid TTC B-tree key length", object.ID.key())
+		}
+		current := object.Data[offset : offset+length]
+		offset += length
+		if i != 0 && bytes.Compare(previous, current) >= 0 {
+			return false, nil, ObjectID{}, fmt.Errorf("object %s has unordered TTC B-tree keys", object.ID.key())
+		}
+		if i == 0 {
+			entry = current
+		}
+		if bytes.Compare(current, key) > 0 {
+			break
+		}
+		index, entry, previous = i, current, current
+	}
+	if object.Children[index].Slot != uint16(index) {
+		return false, nil, ObjectID{}, fmt.Errorf("object %s has noncanonical TTC B-tree edge slots", object.ID.key())
+	}
+	return object.Data[0] == 1, entry, object.Children[index].Child, nil
+}
+
 func bTreePosition(keys [][]byte, key []byte) int {
 	index := sort.Search(len(keys), func(i int) bool { return bytes.Compare(keys[i], key) > 0 }) - 1
 	if index < 0 {

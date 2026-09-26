@@ -371,7 +371,7 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 			return fmt.Errorf("flushing bounded filesystem metadata batch: %w", err)
 		}
 		r.dirtyMu.Lock()
-		durabilityFence := len(r.pendingReclaims) >= reclaimBatchObjects || r.graph.JournalBytes() >= reclaimJournalBytes
+		durabilityFence := len(r.pendingReclaims) >= reclaimBatchObjects || r.graph.CheckpointDue(reclaimJournalBytes)
 		r.dirtyMu.Unlock()
 		if durabilityFence {
 			if err := r.syncMetadataLocked(); err != nil {

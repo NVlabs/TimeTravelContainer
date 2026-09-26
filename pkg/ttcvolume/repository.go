@@ -2944,7 +2944,7 @@ func (r *Repository) syncBranchMetadataLocked(branchID string) error {
 	// The same compaction boundary as a full fence. A database that fsyncs
 	// one inode thousands of times appends a record each time, and now does
 	// so through here.
-	if r.graph.JournalBytes() >= reclaimJournalBytes {
+	if r.graph.CheckpointDue(reclaimJournalBytes) {
 		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
 			return fmt.Errorf("compacting repository snapshot journal: %w", err)
 		}
@@ -3149,7 +3149,9 @@ func (r *Repository) syncMetadataLocked() error {
 	// databases commonly fsync the same inode thousands of times; distinct-key
 	// metadata batching does not fire for that workload, so relying on namespace
 	// churn alone permits an unbounded journal and multi-minute daemon restart.
-	if r.graph.JournalBytes() >= reclaimJournalBytes {
+	// A checkpoint costs in proportion to the graph, so it comes once the
+	// journal outgrows the last one, and a restart replays at most as much.
+	if r.graph.CheckpointDue(reclaimJournalBytes) {
 		if err := r.graph.CheckpointExternallyCoordinated(); err != nil {
 			return fmt.Errorf("compacting repository snapshot journal: %w", err)
 		}

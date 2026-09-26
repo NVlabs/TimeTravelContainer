@@ -280,13 +280,43 @@ func (store *LocalDataStore) syncRelativeDirectory(relative string) error {
 func (store *LocalDataStore) createRelativeTemporary(directory, prefix string) (*os.File, string, error) {
 	for attempts := 0; attempts < 100; attempts++ {
 		name := filepath.Join(directory, fmt.Sprintf("%s%016x", prefix, dataTemporarySequence.Add(1)))
-		file, err := store.openRelative(name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0600)
+		file, err := store.createRelative(name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0600)
 		if errors.Is(err, unix.EEXIST) {
 			continue
 		}
 		return file, name, err
 	}
 	return nil, "", errors.New("allocating temporary TTC bulk-object file")
+}
+
+// createRelative is openRelative for a file it may create, whose directories
+// it makes if they are missing. Most exist already, so it tries first: the
+// objects of an origin share a few directories, which reclamation may remove
+// once they are empty, as it may between making one and creating in it.
+func (store *LocalDataStore) createRelative(relative string, flags int, mode uint32) (*os.File, error) {
+	for attempt := 0; ; attempt++ {
+		file, err := store.openRelative(relative, flags, mode)
+		if !errors.Is(err, unix.ENOENT) || attempt == 3 {
+			return file, err
+		}
+		if err := store.mkdirAllRelative(filepath.Dir(relative)); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// linkRelative links source to destination, relative to the store, making
+// destination's directories if they are missing, as createRelative does.
+func (store *LocalDataStore) linkRelative(source, destination string) error {
+	for attempt := 0; ; attempt++ {
+		err := unix.Linkat(int(store.rootFD.Fd()), source, int(store.rootFD.Fd()), destination, 0)
+		if !errors.Is(err, unix.ENOENT) || attempt == 3 {
+			return err
+		}
+		if err := store.mkdirAllRelative(filepath.Dir(destination)); err != nil {
+			return err
+		}
+	}
 }
 
 func objectRelativePath(id ObjectID) (string, error) {
@@ -383,9 +413,6 @@ func (store *LocalDataStore) replaceDeferred(id ObjectID, source io.Reader, leng
 	}
 	if store.rootFD != nil {
 		directory := filepath.Dir(relative)
-		if err := store.mkdirAllRelative(directory); err != nil {
-			return err
-		}
 		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".replace-")
 		if err != nil {
 			return err
@@ -499,6 +526,34 @@ func (store *LocalDataStore) install(id ObjectID, source io.Reader, length int64
 	})
 }
 
+// installEmptyRelative publishes the empty object at relative. Its name,
+// created exclusively, publishes it whole: it needs no temporary file.
+func (store *LocalDataStore) installEmptyRelative(relative string, durable bool) error {
+	file, err := store.createRelative(relative, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL, 0600)
+	if errors.Is(err, unix.EEXIST) {
+		existing, openErr := store.openRelative(relative, unix.O_RDONLY, 0)
+		if openErr != nil {
+			return openErr
+		}
+		info, statErr := existing.Stat()
+		closeErr := existing.Close()
+		if statErr != nil || closeErr != nil || info.Size() != 0 {
+			return fmt.Errorf("existing immutable object %q has unexpected length: %w", relative, errors.Join(statErr, closeErr))
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if durable {
+		return store.syncRelativeDirectory(filepath.Dir(relative))
+	}
+	return nil
+}
+
 // installWith atomically publishes id, which fill writes into an empty
 // temporary file, as an object of length bytes.
 func (store *LocalDataStore) installWith(id ObjectID, length int64, durable bool, fill func(*os.File) error) error {
@@ -511,8 +566,8 @@ func (store *LocalDataStore) installWith(id ObjectID, length int64, durable bool
 	}
 	if store.rootFD != nil {
 		directory := filepath.Dir(relative)
-		if err := store.mkdirAllRelative(directory); err != nil {
-			return err
+		if length == 0 {
+			return store.installEmptyRelative(relative, durable)
 		}
 		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".object-")
 		if err != nil {
@@ -649,10 +704,7 @@ func (store *LocalDataStore) LinkDeferred(sourceID, destinationID ObjectID) erro
 		return err
 	}
 	if store.rootFD != nil {
-		if err := store.mkdirAllRelative(filepath.Dir(destination)); err != nil {
-			return err
-		}
-		if err := unix.Linkat(int(store.rootFD.Fd()), source, int(store.rootFD.Fd()), destination, 0); err != nil {
+		if err := store.linkRelative(source, destination); err != nil {
 			return err
 		}
 	} else {
@@ -686,9 +738,6 @@ func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink,
 			return err
 		}
 		directory := filepath.Dir(relative)
-		if err := store.mkdirAllRelative(directory); err != nil {
-			return err
-		}
 		temporary, temporaryName, err := store.createRelativeTemporary(directory, ".clone-")
 		if err != nil {
 			return err

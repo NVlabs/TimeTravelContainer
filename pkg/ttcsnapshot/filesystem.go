@@ -950,18 +950,17 @@ func bTreeLookupObjects(root ObjectID, kind ObjectKind, key []byte, objectFor fu
 		if !ok {
 			return ObjectID{}, false, fmt.Errorf("TTC B-tree node %s does not exist", current.key())
 		}
-		node, err := decodeBTreeNode(object, kind)
+		leaf, entry, child, err := searchBTreeNode(object, kind, key)
 		if err != nil {
 			return ObjectID{}, false, err
 		}
-		index := bTreePosition(node.keys, key)
-		if node.leaf {
-			if !bytes.Equal(node.keys[index], key) {
+		if leaf {
+			if !bytes.Equal(entry, key) {
 				return ObjectID{}, false, nil
 			}
-			return node.children[index], true, nil
+			return child, true, nil
 		}
-		current = node.children[index]
+		current = child
 	}
 	return ObjectID{}, false, errors.New("TTC B-tree exceeds maximum structural depth")
 }
