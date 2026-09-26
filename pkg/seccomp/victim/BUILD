@@ -19,4 +19,5 @@ go_binary(
         "//pkg/seccomp",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

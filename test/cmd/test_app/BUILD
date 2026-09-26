@@ -29,4 +29,5 @@ go_binary(
         "@com_github_google_subcommands//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

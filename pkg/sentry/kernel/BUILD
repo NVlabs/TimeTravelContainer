@@ -570,4 +570,6 @@ go_test(
         "//pkg/sentry/vfs",
         "//pkg/usermem",
     ],
+    # Systrap runs only on Linux.
+    target_compatible_with = ["@platforms//os:linux"],
 )

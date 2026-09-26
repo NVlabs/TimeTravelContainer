@@ -13,6 +13,7 @@ go_library(
         "tunnel_veth_ebpf.o",  # keep
     ],
     visibility = ["//visibility:public"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 bpf_program(

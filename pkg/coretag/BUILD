@@ -29,4 +29,5 @@ go_test(
     deps = [
         "//pkg/hostos",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

@@ -106,6 +106,7 @@ go_library(
         "//pkg/syncevent",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 go_test(

@@ -12,6 +12,7 @@ go_binary(
     features = ["fully_static_link"],
     visibility = ["//visibility:public"],
     deps = ["@org_golang_x_sys//unix:go_default_library"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 filegroup(

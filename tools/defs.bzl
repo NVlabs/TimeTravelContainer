@@ -100,6 +100,7 @@ def go_binary(name, nogo = True, pure = False, static = False, x_defs = None, **
             deps = kwargs.get("deps", []),
             embedsrcs = kwargs.get("embedsrcs", []),
             testonly = 1,
+            target_compatible_with = kwargs.get("target_compatible_with", []),
         )
         nogo_test(
             name = name + "_nogo",
@@ -107,6 +108,7 @@ def go_binary(name, nogo = True, pure = False, static = False, x_defs = None, **
             srcs = kwargs.get("srcs", []),
             deps = [":" + name + "_nogo_library"],
             tags = ["nogo"],
+            target_compatible_with = kwargs.get("target_compatible_with", []),
         )
 
 def calculate_sets(srcs):
@@ -293,6 +295,8 @@ def go_library(name, srcs, deps = [], imports = [], stateify = True, force_add_s
             srcs = all_srcs,
             deps = [":" + name],
             tags = ["nogo"],
+            # See go_test.
+            target_compatible_with = kwargs.get("target_compatible_with", []),
         )
 
     if hostlayout:
@@ -340,6 +344,9 @@ def go_test(name, nogo = True, **kwargs):
             srcs = kwargs.get("srcs", []),
             deps = [":" + name],
             tags = ["nogo"],
+            # Analysis builds the test's dependencies, which a host that can't
+            # build the test may not be able to build either.
+            target_compatible_with = kwargs.get("target_compatible_with", []),
         )
 
 def proto_library(name, srcs, deps = None, has_services = 0, **kwargs):

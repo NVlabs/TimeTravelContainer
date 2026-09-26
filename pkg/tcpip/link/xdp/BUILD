@@ -41,4 +41,5 @@ go_test(
     srcs = ["endpoint_test.go"],
     library = ":xdp",
     deps = ["//pkg/tcpip"],
+    target_compatible_with = ["@platforms//os:linux"],
 )

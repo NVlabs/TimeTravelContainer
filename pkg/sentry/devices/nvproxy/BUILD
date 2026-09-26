@@ -114,6 +114,7 @@ go_test(
         "//pkg/sentry/devices/nvproxy/nvconf",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 go_test(
@@ -129,4 +130,5 @@ go_test(
         "//tools/gpu/drivers",
         "//tools/nvidia_driver_differ/parser",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

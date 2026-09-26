@@ -45,4 +45,5 @@ go_test(
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )
