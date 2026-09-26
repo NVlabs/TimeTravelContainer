@@ -1401,6 +1401,15 @@ func TestDarwinLibcCallRedpillsBeforeASMCGOCall(t *testing.T) {
 	if err := unix.SetNonblock(sockets[1], true); err != nil {
 		t.Fatal(err)
 	}
+	// Darwin's default AF_UNIX stream buffers hold 8 KiB, less than the
+	// single nonblocking sendmsg below.
+	for _, fd := range sockets {
+		for _, option := range []int{unix.SO_SNDBUF, unix.SO_RCVBUF} {
+			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, option, 4*int(vmm.HostSlabSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
