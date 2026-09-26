@@ -127,3 +127,33 @@ func TestDecodeDebugException(t *testing.T) {
 		})
 	}
 }
+
+// TestDecodeFaultSignalCode checks that unresolved stage-1 aborts carry the
+// Linux si_code rather than 0, which applications read as SI_USER.
+func TestDecodeFaultSignalCode(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		esr  uint64
+		code int32
+	}{
+		{name: "level 0 translation", esr: 0x24<<26 | 0x04, code: 1},
+		{name: "level 3 translation", esr: 0x24<<26 | 0x07, code: 1},
+		{name: "instruction translation", esr: 0x20<<26 | 0x06, code: 1},
+		{name: "access flag", esr: 0x24<<26 | 0x0b, code: 2},
+		{name: "permission", esr: 0x24<<26 | 1<<6 | 0x0f, code: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			info, _, err := (Architecture{}).DecodeExit(vmplatform.Exit{
+				Reason:   vmplatform.ExitFault,
+				Syndrome: test.esr,
+				Address:  0x10,
+			})
+			if !errors.Is(err, sentryplatform.ErrContextSignal) {
+				t.Fatalf("DecodeExit error=%v, want ErrContextSignal", err)
+			}
+			if info.Signo != int32(linux.SIGSEGV) || info.Code != test.code || info.Addr() != 0x10 {
+				t.Fatalf("DecodeExit info=%+v addr=%#x, want SIGSEGV code=%d addr=0x10", info, info.Addr(), test.code)
+			}
+		})
+	}
+}

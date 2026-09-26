@@ -69,10 +69,21 @@ func (Architecture) SaveApplicationState(dst *arch.Context64, src any, full bool
 	return nil
 }
 
+// segvCode returns the si_code that Linux reports for a stage-1 abort with
+// syndrome esr. The code must not be 0 (SI_USER): the Go runtime, for one,
+// treats such a SIGSEGV as sent by kill(2) and crashes instead of turning a
+// nil dereference into a recoverable panic.
+func segvCode(esr uint64) int32 {
+	if fsc := esr & 0x3f; fsc >= 0x04 && fsc <= 0x07 {
+		return 1 // SEGV_MAPERR: translation fault at level 0-3.
+	}
+	return 2 // SEGV_ACCERR: access flag and permission faults.
+}
+
 func (Architecture) DecodeExit(exit vmplatform.Exit) (*linux.SignalInfo, hostarch.AccessType, error) {
 	switch exit.Reason {
 	case vmplatform.ExitFault:
-		info := &linux.SignalInfo{Signo: int32(linux.SIGSEGV)}
+		info := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvCode(exit.Syndrome)}
 		info.SetAddr(exit.Address)
 		access := hostarch.AccessType{
 			Read:    exit.Access&vmm.Stage2Read != 0,
