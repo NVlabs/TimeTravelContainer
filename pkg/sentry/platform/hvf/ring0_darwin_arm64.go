@@ -691,12 +691,23 @@ static bool ttc_ring0_ranges_overlap(uintptr_t first, uint64_t first_length,
 	return first < second_end && second < first_end;
 }
 
-static bool ttc_ring0_mapping_slab_overlaps(
-		const struct ttc_ring0_mirror_mapping *mapping, size_t slab,
-		uintptr_t address, uintptr_t length) {
-	return ttc_ring0_ranges_overlap(
-		mapping->host + slab * TTC_RING0_HOST_SLAB_SIZE,
-		TTC_RING0_HOST_SLAB_SIZE, address, length);
+// ttc_ring0_mapping_slab_range sets [*first, *end) to the slabs of mapping
+// that overlap [address, address+length), and returns false if none do. The
+// Go runtime's VM hooks look up small ranges in a mirror of the whole Sentry
+// heap, so consider only those slabs rather than every slab of every mapping.
+static bool ttc_ring0_mapping_slab_range(
+		const struct ttc_ring0_mirror_mapping *mapping, uintptr_t address,
+		uintptr_t length, size_t *first, size_t *end) {
+	if (!ttc_ring0_ranges_overlap(mapping->host, mapping->length, address,
+			length)) return false;
+	uintptr_t mapping_end = mapping->host + (uintptr_t)mapping->length;
+	uintptr_t start = address > mapping->host ? address : mapping->host;
+	uintptr_t stop = address + length;
+	if (stop < address || stop > mapping_end) stop = mapping_end;
+	*first = (size_t)((start - mapping->host) / TTC_RING0_HOST_SLAB_SIZE);
+	*end = (size_t)((stop - mapping->host + TTC_RING0_HOST_SLAB_SIZE - 1) /
+			TTC_RING0_HOST_SLAB_SIZE);
+	return *first < *end;
 }
 
 // Guest admission is a lock-free read side. The second blocked sample closes
@@ -1040,13 +1051,14 @@ static bool ttc_ring0_mirror_live_overlap(uintptr_t address,
 	for (struct ttc_ring0_mirror_mapping *mapping =
 			ttc_ring0_mirror_mappings; mapping != NULL;
 			mapping = mapping->next) {
+		size_t first, end;
+		if (!ttc_ring0_mapping_slab_range(mapping, address, length, &first,
+				&end)) continue;
 		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
 		uint64_t *live = ttc_ring0_mapping_live(mapping);
-		for (size_t slab = 0; slab < mapping->slabs; ++slab) {
+		for (size_t slab = first; slab < end; ++slab) {
 			if (ttc_ring0_bit_test(registered, slab) &&
-					ttc_ring0_bit_test(live, slab) &&
-					ttc_ring0_mapping_slab_overlaps(mapping, slab,
-						address, length)) return true;
+					ttc_ring0_bit_test(live, slab)) return true;
 		}
 	}
 	return false;
@@ -1057,13 +1069,14 @@ static bool ttc_ring0_mirror_dormant_overlap(uintptr_t address,
 	for (struct ttc_ring0_mirror_mapping *mapping =
 			ttc_ring0_mirror_mappings; mapping != NULL;
 			mapping = mapping->next) {
+		size_t first, end;
+		if (!ttc_ring0_mapping_slab_range(mapping, address, length, &first,
+				&end)) continue;
 		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
 		uint64_t *live = ttc_ring0_mapping_live(mapping);
-		for (size_t slab = 0; slab < mapping->slabs; ++slab) {
+		for (size_t slab = first; slab < end; ++slab) {
 			if (ttc_ring0_bit_test(registered, slab) &&
-					!ttc_ring0_bit_test(live, slab) &&
-					ttc_ring0_mapping_slab_overlaps(mapping, slab,
-						address, length)) return true;
+					!ttc_ring0_bit_test(live, slab)) return true;
 		}
 	}
 	return false;
@@ -1074,22 +1087,21 @@ static hv_return_t ttc_ring0_suspend_mirror(uintptr_t address,
 	for (struct ttc_ring0_mirror_mapping *mapping =
 			ttc_ring0_mirror_mappings; mapping != NULL;
 			mapping = mapping->next) {
+		size_t first, end;
+		if (!ttc_ring0_mapping_slab_range(mapping, address, length, &first,
+				&end)) continue;
 		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
 		uint64_t *live = ttc_ring0_mapping_live(mapping);
-		for (size_t slab = 0; slab < mapping->slabs;) {
+		for (size_t slab = first; slab < end;) {
 			if (!ttc_ring0_bit_test(registered, slab) ||
-					!ttc_ring0_bit_test(live, slab) ||
-					!ttc_ring0_mapping_slab_overlaps(mapping, slab,
-						address, length)) {
+					!ttc_ring0_bit_test(live, slab)) {
 				++slab;
 				continue;
 			}
 			size_t run = slab + 1;
-			while (run < mapping->slabs &&
+			while (run < end &&
 					ttc_ring0_bit_test(registered, run) &&
-					ttc_ring0_bit_test(live, run) &&
-					ttc_ring0_mapping_slab_overlaps(mapping, run,
-						address, length)) ++run;
+					ttc_ring0_bit_test(live, run)) ++run;
 			hv_return_t status = ttc_ring0_unmap_live_run(mapping,
 					slab, run);
 			if (status != HV_SUCCESS) return status;
@@ -1123,28 +1135,27 @@ static hv_return_t ttc_ring0_rebind_mirror(uintptr_t address,
 	for (struct ttc_ring0_mirror_mapping *mapping =
 			ttc_ring0_mirror_mappings; mapping != NULL;
 			mapping = mapping->next) {
+		size_t first, end;
+		if (!ttc_ring0_mapping_slab_range(mapping, address, length, &first,
+				&end)) continue;
 		uint64_t *registered = ttc_ring0_mapping_registered(mapping);
 		uint64_t *live = ttc_ring0_mapping_live(mapping);
-		for (size_t slab = 0; slab < mapping->slabs;) {
+		for (size_t slab = first; slab < end;) {
 			uintptr_t host = mapping->host +
 					slab * TTC_RING0_HOST_SLAB_SIZE;
 			if (!ttc_ring0_bit_test(registered, slab) ||
 					ttc_ring0_bit_test(live, slab) ||
-					!ttc_ring0_mapping_slab_overlaps(mapping, slab,
-						address, length) ||
 					!ttc_ring0_host_slab_accessible(host,
 						mapping->access)) {
 				++slab;
 				continue;
 			}
 			size_t run = slab + 1;
-			while (run < mapping->slabs) {
+			while (run < end) {
 				uintptr_t run_host = mapping->host +
 						run * TTC_RING0_HOST_SLAB_SIZE;
 				if (!ttc_ring0_bit_test(registered, run) ||
 						ttc_ring0_bit_test(live, run) ||
-						!ttc_ring0_mapping_slab_overlaps(mapping, run,
-							address, length) ||
 						!ttc_ring0_host_slab_accessible(run_host,
 							mapping->access)) break;
 				++run;
