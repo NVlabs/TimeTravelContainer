@@ -5586,13 +5586,32 @@ func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Which processes are the node's is read from their command lines, which
+	// a host runs many of, once, and again every nodeProcessRereads
+	// measurements, for one read between its fork and its exec.
+	value, _ := nodeProcessesByRoot.LoadOrStore(localRoot, &nodeProcesses{})
+	known := value.(*nodeProcesses)
+	known.mu.Lock()
+	defer known.mu.Unlock()
+	if known.measurements++; known.measurements%nodeProcessRereads == 0 {
+		known.ours = nil
+	}
+	present := make(map[int]bool, len(known.ours))
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil || pid == self {
 			continue
 		}
-		cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-		if err != nil || !bytes.Contains(cmdline, []byte(localRoot)) {
+		ours, seen := known.ours[pid]
+		if !seen {
+			cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+			if err != nil {
+				continue
+			}
+			ours = bytes.Contains(cmdline, []byte(localRoot))
+		}
+		present[pid] = ours
+		if !ours {
 			continue
 		}
 		resident, err := processResidentMemoryBytes(pid)
@@ -5603,8 +5622,24 @@ func currentNodeMemoryBytes(localRoot string) (uint64, error) {
 		}
 		total += resident
 	}
+	known.ours = present
 	return total, nil
 }
+
+// nodeProcesses remembers, by PID, whether a process on the host is one of a
+// node's; see currentNodeMemoryBytes.
+type nodeProcesses struct {
+	mu           sync.Mutex
+	ours         map[int]bool
+	measurements int
+}
+
+// nodeProcessRereads is how often a node reads every process's command line
+// again: a minute of heartbeats.
+const nodeProcessRereads = 12
+
+// nodeProcessesByRoot has the nodeProcesses of each node's local root.
+var nodeProcessesByRoot sync.Map
 
 type elasticFencedProcess struct {
 	PID         int    `json:"pid"`

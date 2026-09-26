@@ -718,11 +718,9 @@ func (b *runtimeBackend) renewDistributedExecutionAuthority() (*cluster.NodeReco
 	if lease <= 0 {
 		return nil, errors.New("distributed node has no configured execution lease")
 	}
-	current := record.MemoryCurrentBytes
-	if measured, measureErr := currentNodeMemoryBytes(b.activeDataRoot()); measureErr == nil {
-		current = measured
-	}
-	renewed, err := b.distributedSource.directory.Heartbeat(record.NodeID, record.Incarnation, current, time.Now(), lease)
+	// The node's memory is what its last heartbeat measured, a few seconds
+	// ago at most: this renewal is for the lease.
+	renewed, err := b.distributedSource.directory.Heartbeat(record.NodeID, record.Incarnation, record.MemoryCurrentBytes, time.Now(), lease)
 	if err != nil {
 		return nil, err
 	}
