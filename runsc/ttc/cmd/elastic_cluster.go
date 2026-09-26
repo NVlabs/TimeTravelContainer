@@ -1698,6 +1698,68 @@ func waitForCommittedColdBranchMetadata(ctx context.Context, store ttcbundle.Sto
 	return info, branch, nil
 }
 
+// activateMaterializedLifecycleTargets makes routable at once the placements
+// that a lifecycle command, a rehydration for one, has just materialized on
+// this node. The reconciliation after the command would too, but it passes
+// over a family that a long operation is working on, as a remote fork's
+// handoff does, and until a later pass every command on the branch was
+// refused as materializing.
+func (s *daemonServer) activateMaterializedLifecycleTargets(backend *runtimeBackend, args []string) error {
+	if s == nil || backend == nil || s.clusterDirectory == nil || s.clusterCapabilities == nil || !daemonCommandClaimsUnplaced(args) ||
+		backend.distributedSource == nil || backend.distributedSource.directory == nil {
+		return nil
+	}
+	node, err := backend.distributedSource.directory.Lookup(backend.nodeID)
+	if err != nil {
+		return err
+	}
+	placements, err := backend.placementCatalog()
+	if err != nil {
+		return err
+	}
+	operands, err := lifecycleCommandOperands(args)
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, operand := range operands {
+		target, err := parseSelector(operand)
+		if err != nil {
+			return err
+		}
+		// Read the record as it is: resolving the selector waits out the
+		// family's long operations.
+		info, err := backend.containerStore().LoadContainer(target.container)
+		if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		record, err := placements.Lookup(logicalFamilyID(info), target.branch)
+		if err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		if record.State != cluster.PlacementMaterializing || record.OwnerNode != backend.nodeID || record.OwnerIncarnation != node.Incarnation {
+			continue
+		}
+		physicalContainer, physicalBranch := record.PhysicalContainer, record.PhysicalBranch
+		if physicalContainer == "" {
+			physicalContainer = info.ID
+		}
+		if physicalBranch == "" {
+			physicalBranch = target.branch
+		}
+		state, err := backend.runtimeBranchLifecycle(physicalContainer, physicalBranch)
+		if err != nil || (state != "running" && state != "paused") {
+			continue
+		}
+		if _, err := placements.UpdateStableState(record.FamilyID, record.BranchID, record.OwnerNode, record.OwnerIncarnation, record.Generation, cluster.PlacementState(state), time.Now()); err != nil {
+			result = errors.Join(result, fmt.Errorf("activating placement of %s: %w", target, err))
+		}
+	}
+	return result
+}
+
 // claimUnplacedLifecycleTargets turns admission of a durable cold branch into
 // a generation-fenced placement before its runtime is reconstructed. Without
 // this claim, two entry daemons may independently start or rehydrate the same

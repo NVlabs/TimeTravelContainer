@@ -1271,6 +1271,88 @@ func TestPlacementReconciliationLeavesABusyFamily(t *testing.T) {
 	}
 }
 
+// A rehydration makes its branch routable even while a long operation, a
+// remote fork's handoff for one, works on its family: the reconciliation
+// after the command passes over such a family.
+func TestRehydrationActivatesItsPlacementInABusyFamily(t *testing.T) {
+	root := t.TempDir()
+	local := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-a", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{
+			{ID: "main", NodeID: "node-a", State: "running", CreatedAt: time.Unix(1, 0).UTC()},
+			{ID: "b1", ParentID: "main", NodeID: "node-a", State: "running", CreatedAt: time.Unix(2, 0).UTC()},
+		},
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+		t.Fatal(err)
+	}
+	// The runtime runs b1, and not main.
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	if err := os.WriteFile(runsc, []byte("#!/bin/sh\nfor a; do [ \"$a\" = branches ] && { echo '[{\"ID\":\"b1\",\"State\":\"running\"}]'; exit 0; }; done\nexit 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "cluster", "placements"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := cluster.OpenNodeDirectory(filepath.Join(root, "cluster", "nodes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	node, err := directory.Register(testElasticCapacityRecord("node-a", 0, 1<<60), now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node, err = directory.Transition(node.NodeID, node.Incarnation, cluster.NodeReady, now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	for _, branch := range []string{"main", "b1"} {
+		if _, err := placements.Create(cluster.PlacementRecord{
+			FamilyID: "web", BranchID: branch, PhysicalContainer: "web", PhysicalBranch: branch,
+			OwnerNode: "node-a", OwnerIncarnation: node.Incarnation, State: cluster.PlacementMaterializing,
+		}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var operations familyOperations
+	op := &familyOperation{id: "web", name: "web", longOperation: longOperation{branch: "main", state: "forking"}}
+	if err := operations.begin(op); err != nil {
+		t.Fatal(err)
+	}
+	defer operations.end(op)
+	server := &daemonServer{clusterDirectory: directory, clusterCapabilities: &node.Capabilities}
+	backend := &runtimeBackend{
+		root: filepath.Join(root, "runsc-root"), runsc: runsc, dataRoot: root, localRoot: local, nodeID: "node-a",
+		operations: &operations, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+		distributedSource: &distributedSourceRuntime{directory: directory, placements: placements},
+	}
+	for _, target := range []string{"web@b1", "web@main"} {
+		if err := server.activateMaterializedLifecycleTargets(backend, []string{"rehydrate", target}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if record, err := placements.Lookup("web", "b1"); err != nil || record.State != cluster.PlacementRunning {
+		t.Fatalf("rehydrated placement=%+v, %v, want running", record, err)
+	}
+	if owner, _, err := daemonCommandPlacementWithCatalog(root, placements, []string{"exec", "web@b1", "true"}); err != nil || owner != "node-a" {
+		t.Fatalf("exec on the rehydrated branch routes to (%q, %v)", owner, err)
+	}
+	// A branch whose runtime does not run it is not activated.
+	if record, err := placements.Lookup("web", "main"); err != nil || record.State != cluster.PlacementMaterializing {
+		t.Fatalf("placement of a branch with no runtime=%+v, %v, want materializing", record, err)
+	}
+}
+
 func TestRegisterCreatedContainerPlacementRetainsLocalOwner(t *testing.T) {
 	root := t.TempDir()
 	placements, err := cluster.OpenPlacementStore(filepath.Join(root, "placements"))

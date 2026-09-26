@@ -7875,6 +7875,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 				fmt.Fprintf(&mutationStderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 				status = 1
 			} else if daemonCommandNeedsMutationLock(request.Args) {
+				if err := s.activateMaterializedLifecycleTargets(mutationBackend, request.Args); err != nil {
+					fmt.Fprintf(&mutationStderr, "ttcd: warning: activating materialized placement: %v\n", err)
+				}
 				if err := mutationBackend.reconcilePlacementCatalog(); err != nil {
 					fmt.Fprintf(&mutationStderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 				}
@@ -7919,6 +7922,9 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			fmt.Fprintf(backend.stderr, "ttcd: claiming completed rehydration placement: %v\n", err)
 			status = 1
 		} else if daemonCommandNeedsMutationLock(request.Args) {
+			if err := s.activateMaterializedLifecycleTargets(backend, request.Args); err != nil {
+				fmt.Fprintf(backend.stderr, "ttcd: warning: activating materialized placement: %v\n", err)
+			}
 			if err := backend.reconcilePlacementCatalog(); err != nil {
 				fmt.Fprintf(backend.stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
 			}
