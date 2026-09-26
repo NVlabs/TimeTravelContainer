@@ -66,7 +66,7 @@ func TestBoundedFillRange(t *testing.T) {
 
 func TestLiveForkFilesystemEligibility(t *testing.T) {
 	id := checkpoint.ResourceID{ContainerName: "container", Path: "/data"}
-	for _, tc := range []struct {
+	tests := []struct {
 		name     string
 		fs       filesystem
 		decision vfs.LiveForkFilesystemDecision
@@ -76,7 +76,9 @@ func TestLiveForkFilesystemEligibility(t *testing.T) {
 		{name: "writable server", fs: filesystem{iopts: InternalFilesystemOptions{UniqueID: id}}, decision: vfs.LiveForkFilesystemReject, reason: "not read-only"},
 		{name: "missing identity", fs: filesystem{iopts: InternalFilesystemOptions{ReadOnly: true}}, decision: vfs.LiveForkFilesystemReject, reason: "no stable resource ID"},
 		{name: "read-only lisafs", fs: filesystem{iopts: InternalFilesystemOptions{ReadOnly: true, UniqueID: id}}, decision: vfs.LiveForkFilesystemShareExternal},
-	} {
+	}
+	for i := range tests {
+		tc := &tests[i]
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.fs.LiveForkFilesystemEligibility()
 			if got.Decision != tc.decision {

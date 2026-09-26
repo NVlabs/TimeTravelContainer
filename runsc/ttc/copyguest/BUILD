@@ -8,6 +8,7 @@ package(
 go_library(
     name = "copyguest",
     srcs = [
+        "copyguest.go",
         "guest_darwin_arm64.go",
         "guest_other.go",
     ],

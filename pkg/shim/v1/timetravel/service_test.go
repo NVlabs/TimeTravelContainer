@@ -46,7 +46,9 @@ func invoke(t *testing.T, operation string, request Request) (*anypb.Any, error)
 	envelope := &anypb.Any{TypeUrl: RequestTypeURL, Value: data}
 	controller := &fakeController{}
 	response, err := ServiceDesc(controller).Methods[operation](context.Background(), func(value interface{}) error {
-		*value.(*anypb.Any) = *envelope
+		target := value.(*anypb.Any)
+		target.TypeUrl = envelope.TypeUrl
+		target.Value = envelope.Value
 		return nil
 	})
 	if err != nil {

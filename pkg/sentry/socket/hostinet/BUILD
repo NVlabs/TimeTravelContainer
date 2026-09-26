@@ -22,7 +22,7 @@ go_library(
     srcs = [
         "hostinet.go",
         "host_socket_darwin.go",
-        "host_socket_linux.go",
+        "host_socket_linux_unsafe.go",
         "netlink.go",
         "netlink_darwin.go",
         "save_restore.go",
