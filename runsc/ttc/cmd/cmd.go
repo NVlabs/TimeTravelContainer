@@ -9984,6 +9984,11 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	}
 	store := b.containerStore()
 	info, err := store.LoadContainer(name)
+	if errors.Is(err, os.ErrNotExist) {
+		if found, err := b.removeRecordlessRuntime(name, force); found || err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -10458,6 +10463,83 @@ func (b *runtimeBackend) removeOrphanRuntime(containerID string) error {
 		localErr = os.RemoveAll(filepath.Join(b.activeDataRoot(), "containers", containerID))
 	}
 	return errors.Join(consoleErr, deleteErr, localErr)
+}
+
+// removeRecordlessRuntime removes the sandbox that identifier names by its ID
+// or a unique ID prefix, if runsc lists that sandbox but no container record
+// describes it: its record went with the TTC_ROOT that held it, or was lost
+// before a daemon reconciled the sandbox's exit. ps lists such a sandbox by
+// its ID. A sandbox that still runs is removed only with force. It reports
+// whether identifier named such a sandbox.
+func (b *runtimeBackend) removeRecordlessRuntime(identifier string, force bool) (bool, error) {
+	states, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return false, fmt.Errorf("listing sandboxes: %w", err)
+	}
+	var matches []runtimeSandboxState
+	for _, state := range states {
+		if state.ID == identifier {
+			matches = []runtimeSandboxState{state}
+			break
+		}
+		if identifier != "" && strings.HasPrefix(state.ID, identifier) {
+			matches = append(matches, state)
+		}
+	}
+	if len(matches) == 0 {
+		return false, nil
+	}
+	if len(matches) > 1 {
+		return true, fmt.Errorf("container ID prefix %q is ambiguous", identifier)
+	}
+	state := matches[0]
+	if _, err := b.containerStore().LoadRuntimeContainer(state.ID); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return true, err
+	}
+	if placed, err := b.runtimePlaced(state.ID); err != nil {
+		return true, fmt.Errorf("checking the placements of sandbox %q: %w", state.ID, err)
+	} else if placed {
+		return false, nil
+	}
+	if _, busy := b.operations.lookup(state.ID); busy {
+		return true, fmt.Errorf("sandbox %q is busy", state.ID)
+	}
+	if !force && normalizeLifecycleState(state.Status) != "exited" && processutil.IsRunning(state.PID) {
+		return true, fmt.Errorf("container %q has no record, but its sandbox is %s; use --force to remove it", state.ID, normalizeLifecycleState(state.Status))
+	}
+	return true, b.removeOrphanRuntime(state.ID)
+}
+
+// runtimePlaced reports whether a cluster placement names id as the physical
+// runtime of a branch.
+func (b *runtimeBackend) runtimePlaced(id string) (bool, error) {
+	if b.nodeID == "" {
+		return false, nil
+	}
+	var records []cluster.PlacementRecord
+	if b.distributedSource != nil && b.distributedSource.authority != nil {
+		snapshot, err := b.distributedSource.authority.AuthorityStateOf(cluster.PlacementsWithOwners)
+		if err != nil {
+			return false, err
+		}
+		records = snapshot.PlacementList()
+	} else {
+		placements, err := b.placementCatalog()
+		if err != nil {
+			return false, err
+		}
+		if records, _, err = placementsWithOfflineOwners(placements); err != nil {
+			return false, err
+		}
+	}
+	for _, record := range records {
+		if record.PhysicalContainer == id {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // The gofer holds host descriptors for the dentries the sentry is holding —
@@ -16379,6 +16461,12 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	}
 	requested := target
 	logicalInfo, err := b.resolveContainer(requested.container)
+	if errors.Is(err, os.ErrNotExist) && requested.branch == defaultBranchID {
+		// A sandbox without a record lists as a family with only this branch.
+		if found, err := b.removeRecordlessRuntime(requested.container, force); found || err != nil {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
