@@ -395,6 +395,38 @@ func TestDecideAuthorityKeepsAHolderAndTakesOverFromAStoppedOne(t *testing.T) {
 	}
 }
 
+// A daemon that stops cleanly leaves: a reader takes it for stopped at once,
+// without waiting for its counter to stand still, and takes the authority it
+// held.
+func TestDecideAuthorityTakesOverAtOnceFromAHolderThatLeft(t *testing.T) {
+	shared := NewSharedCluster(t.TempDir())
+	aHeartbeat, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)
+	var aLiveness Liveness
+	ctx := context.Background()
+	if decision, err := shared.DecideAuthority(ctx, a, false, &aLiveness); err != nil || !decision.Hold {
+		t.Fatalf("the first daemon decided %+v, %v", decision, err)
+	}
+	_, b := startTestMember(t, shared, "node-b", "i-1", RoleCompute)
+	var bLiveness Liveness
+	if joined, err := shared.DecideAuthority(ctx, b, false, &bLiveness); err != nil || joined.Hold {
+		t.Fatalf("a daemon beside a live holder decided %+v, %v", joined, err)
+	}
+	if err := aHeartbeat.Leave(); err != nil {
+		t.Fatal(err)
+	}
+	left, err := shared.ReadMember("node-a")
+	if err != nil || !left.Stopped {
+		t.Fatalf("the member record of a daemon that left is %+v, %v", left, err)
+	}
+	if bLiveness.Advancing(left) {
+		t.Fatal("a daemon that left is advancing")
+	}
+	taken, err := shared.DecideAuthority(ctx, b, false, &bLiveness)
+	if err != nil || !taken.Hold || taken.Record.NodeID != "node-b" || taken.Record.Previous != 1 {
+		t.Fatalf("a daemon beside a holder that left decided %+v, %v", taken, err)
+	}
+}
+
 func TestDecideAuthorityTakesOverFromAReplacedIncarnation(t *testing.T) {
 	shared := NewSharedCluster(t.TempDir())
 	aHeartbeat, a := startTestMember(t, shared, "node-a", "i-1", RoleCompute)

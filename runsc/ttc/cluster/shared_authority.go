@@ -120,6 +120,10 @@ type MemberRecord struct {
 	Authority uint64 `json:"authority,omitempty"`
 	// Released is the latest epoch whose authority the daemon gave up.
 	Released uint64 `json:"released,omitempty"`
+	// Stopped is set by the last heartbeat of a daemon that stops cleanly,
+	// so that a reader knows it stopped without waiting for its counter to
+	// stand still.
+	Stopped bool `json:"stopped,omitempty"`
 	// UpdatedAt is the daemon's own time of the heartbeat, for people.
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -364,10 +368,10 @@ func (c SharedCluster) DecideAuthority(ctx context.Context, self AuthorityRecord
 
 // alive reports whether the daemon of record, whose authority it holds or
 // claimed, may still hold it: its counter has not stood still for
-// AuthorityTakeover, and it has not given the authority up.
+// AuthorityTakeover, and it has neither given the authority up nor stopped.
 func (c SharedCluster) alive(record AuthorityRecord, liveness *Liveness) bool {
 	member, err := c.ReadMember(record.NodeID)
-	if err != nil || member.Incarnation != record.Incarnation || member.Released >= record.Epoch {
+	if err != nil || member.Incarnation != record.Incarnation || member.Released >= record.Epoch || member.Stopped {
 		return false
 	}
 	return liveness.StillFor(member) < AuthorityTakeover
@@ -396,7 +400,7 @@ func (c SharedCluster) AwaitRelease(ctx context.Context, previous AuthorityRecor
 	for {
 		member, err := c.ReadMember(previous.NodeID)
 		if err != nil || member.Incarnation != previous.Incarnation || member.Released >= previous.Epoch ||
-			liveness.StillFor(member) >= AuthorityTakeover {
+			member.Stopped || liveness.StillFor(member) >= AuthorityTakeover {
 			return nil
 		}
 		select {
@@ -563,6 +567,16 @@ func (h *Heartbeat) Record() MemberRecord {
 	return h.record
 }
 
+// Leave stops the heartbeat of a daemon that stops cleanly, and records that
+// it stopped.
+func (h *Heartbeat) Leave() error {
+	h.Stop()
+	h.mu.Lock()
+	h.record.Stopped = true
+	h.mu.Unlock()
+	return h.beat()
+}
+
 // Stop stops the heartbeat. The lease lapses LeaseHold later.
 func (h *Heartbeat) Stop() {
 	select {
@@ -602,14 +616,15 @@ func (l *Liveness) StillFor(record MemberRecord) time.Duration {
 }
 
 // Advancing reports whether this Liveness has seen the counter of the daemon
-// of record advance, and not stand still since for AuthorityTakeover: whether
-// the daemon runs, where StillFor tells only for how long it has not.
+// of record advance, and not stand still since for AuthorityTakeover, nor the
+// daemon stop: whether the daemon runs, where StillFor tells only for how
+// long it has not.
 func (l *Liveness) Advancing(record MemberRecord) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.observe(record)
 	seen := l.seen[record.NodeID]
-	return seen.advanced && now.Sub(seen.since) < AuthorityTakeover
+	return seen.advanced && now.Sub(seen.since) < AuthorityTakeover && !record.Stopped
 }
 
 // observe records the counter of record, and returns when it did.

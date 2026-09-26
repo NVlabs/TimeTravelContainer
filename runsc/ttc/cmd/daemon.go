@@ -568,8 +568,9 @@ func (c *controlOnlyCluster) peerSnapshot() []controlOnlyPeer {
 }
 
 // observePeers records which daemons' counters in the shared root stood
-// still for three heartbeats. It runs every heartbeat, as the counters
-// advance, so that it sees a stall within a heartbeat of when it is three.
+// still for three heartbeats, or stopped. It runs every heartbeat, as the
+// counters advance, so that it sees a stall within a heartbeat of when it is
+// three.
 func (c *controlOnlyCluster) observePeers() {
 	if c.sharedRoot == "" {
 		return
@@ -580,7 +581,7 @@ func (c *controlOnlyCluster) observePeers() {
 	}
 	stalled := make(map[string]bool)
 	for id, member := range members {
-		if c.liveness.StillFor(member) > 3*cluster.HeartbeatInterval {
+		if member.Stopped || c.liveness.StillFor(member) > 3*cluster.HeartbeatInterval {
 			stalled[id] = true
 		}
 	}
@@ -6444,8 +6445,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			// keeps it, unless another takes it meanwhile.
 			if server.cleanStop.Load() {
 				releaseClusterAuthority(clusterRuntime)
+				if err := clusterRuntime.heartbeat.Leave(); err != nil && stderr != nil {
+					fmt.Fprintf(stderr, "ttcd: warning: recording that this node stopped: %v\n", err)
+				}
+			} else {
+				clusterRuntime.heartbeat.Stop()
 			}
-			clusterRuntime.heartbeat.Stop()
 		}
 		if leaseGuardian != nil {
 			_ = leaseGuardian.Close()
