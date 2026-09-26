@@ -4004,11 +4004,15 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 	}
 	for _, family := range runtimes {
 		if family.ID == containerID {
-			return fmt.Errorf("runtime family %q still exists", containerID)
+			return fmt.Errorf("runtime family %q still exists: %w", containerID, errRuntimeFamilyLive)
 		}
 	}
 	return os.RemoveAll(filepath.Join(b.localRoot, "containers", containerID))
 }
+
+// errRuntimeFamilyLive is why node-local family state that no placement needs
+// stays: the family's runtime still runs on the node.
+var errRuntimeFamilyLive = errors.New("its runtime still runs")
 
 // authorityProtectsLocalContainer is the single control-plane predicate for
 // node-local container data. Placements protect active runtimes. Transactions

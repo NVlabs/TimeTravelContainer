@@ -16351,15 +16351,18 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 		if err := b.removeLogicalBranchPlacement(logicalFamily, requested.branch); err != nil {
 			return fmt.Errorf("removing cluster placement for %s: %w", requested, err)
 		}
-		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil {
-			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
-		}
 		latest, err := store.LoadContainer(target.container)
 		if err != nil {
 			return err
 		}
 		if err := b.deleteRuntimeIfProcessFree(latest); err != nil {
 			return err
+		}
+		// The family's node-local state goes with its last runtime on the
+		// node. While one still runs there, the state stays until the node
+		// reclaims it as orphaned.
+		if err := b.removeLocalFamilyStateIfUnowned(info.ID); err != nil && !errors.Is(err, errRuntimeFamilyLive) {
+			return fmt.Errorf("reclaiming node-local state for %s: %w", target, err)
 		}
 	}
 	return portErr
