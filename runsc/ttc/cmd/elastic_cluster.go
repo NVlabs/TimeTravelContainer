@@ -6624,7 +6624,11 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 				if err == nil {
 					localDeadline = renewalStarted.Add(lease)
 					lastErr = nil
-					timer.Reset(interval)
+					// The lease runs from when the renewal began: one that
+					// took long, as one does while the authority changes
+					// hands, is followed at once, so that another takeover
+					// soon after finds the lease as long as ever.
+					timer.Reset(max(interval-time.Since(renewalStarted), retryDelay))
 					continue
 				}
 			}
