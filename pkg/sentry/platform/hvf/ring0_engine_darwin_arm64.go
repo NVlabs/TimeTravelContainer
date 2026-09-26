@@ -47,6 +47,13 @@ const (
 	stateApplicationFP          = 0x3000
 	stateRing0Entry             = 0x3340
 	stateTLBFlushRequested      = 0x2a68
+	// ring0TLBFlushAll and ring0TLBFlushEnteringSpace are the requests in
+	// stateTLBFlushRequested; see monitor_layout.h.
+	ring0TLBFlushAll           = 1
+	ring0TLBFlushEnteringSpace = 2
+	// ring0MaxTLBSpaceSync bounds the address spaces whose flushes an
+	// application vCPU tracks individually.
+	ring0MaxTLBSpaceSync = 256
 	stateVTimerOffset           = 0x3360
 	stateClockGettimePC         = 0x3368
 	stateMachAbsoluteTimePC     = 0x3370
@@ -70,8 +77,13 @@ type ring0ApplicationCPU struct {
 	applicationActive atomic.Bool
 	entryActive       atomic.Bool
 	admissionHandoff  atomic.Bool
-	tlbGeneration     uint64
 	residentSince     time.Time
+
+	// tlbFullSync is the ring0Engine.mmuSequence at the vCPU's last full
+	// local TLB flush, and tlbSpaceSync maps address spaces to the sequence
+	// at its last flush of each. Only the owner thread accesses them.
+	tlbFullSync  uint64
+	tlbSpaceSync map[uint64]uint64
 }
 
 // tryPin prevents bridge reclamation while a caller uses cpu. A negative
@@ -143,12 +155,16 @@ type ring0Engine struct {
 	clockStop        chan struct{}
 	clockDone        chan struct{}
 
-	// entryMutationMu serializes translation mutations. entryBlocked and each
-	// vCPU's entryActive implement a lock-free read-side rendezvous: ordinary
-	// syscalls touch only owner-local state instead of bouncing sync.RWMutex's
-	// global reader counter between physical CPUs.
-	entryMutationMu sync.Mutex
-	entryBlocked    atomic.Bool
+	// entryMutationMu serializes translation mutations. entryBlockedSpace and
+	// each vCPU's entryActive implement a lock-free read-side rendezvous:
+	// ordinary syscalls touch only owner-local state instead of bouncing
+	// sync.RWMutex's global reader counter between physical CPUs. While a
+	// mutation holds entryMutationMu, entryBlockedSpace is the application
+	// address space whose entries it blocks, or ring0SentryAddressSpaceID if it
+	// blocks all of them; otherwise it is zero, which is never an address space
+	// ID. Entries into other address spaces proceed during a mutation.
+	entryMutationMu   sync.Mutex
+	entryBlockedSpace atomic.Uint64
 	mirrorMu        sync.Mutex
 	stage2Slabs     map[uintptr]ring0Stage2Slab
 	stage1Access    map[uint64]monitorabi.Access
@@ -177,10 +193,17 @@ type ring0Engine struct {
 	closeMu             sync.Mutex
 	closeErr            error
 
-	// mmuGeneration changes after every acknowledged monitor transaction.
-	// Application vCPUs locally invalidate stage-1 translations on their first
-	// subsequent entry, avoiding dependence on HVF cross-vCPU TLBI delivery.
-	mmuGeneration atomic.Uint64
+	// mmuSequence counts monitor transactions that may change translations.
+	// Application vCPUs locally invalidate the stage-1 translations that
+	// changed since they last did, on their first subsequent entry, avoiding
+	// dependence on HVF cross-vCPU TLBI delivery. globalMMUChange is the
+	// sequence of the last transaction that may have changed translations
+	// outside application address spaces, which requires a full flush, and
+	// spaceMMUChanges maps each application address space to the sequence of
+	// its last change (*atomic.Uint64), which requires flushing only its ASID.
+	mmuSequence     atomic.Uint64
+	globalMMUChange atomic.Uint64
+	spaceMMUChanges sync.Map
 
 	// applicationWaiters is non-zero only when every owner-affine application
 	// vCPU is leased. Incumbents consult it after returning to host Sentry so
@@ -334,7 +357,7 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 	if !mutatesTranslations {
 		return e.runMonitorCommand(ctx, encoded)
 	}
-	if err := e.lockApplicationEntries(ctx); err != nil {
+	if err := e.lockApplicationEntriesFor(ctx, monitorCommandAddressSpace(encoded)); err != nil {
 		return nil, err
 	}
 	defer e.unlockApplicationEntries()
@@ -343,10 +366,11 @@ func (e *ring0Engine) RunMonitor(ctx context.Context, encoded []byte) ([]byte, e
 
 // tryRunResidentMonitor executes an uncontended page-table transaction on the
 // current Sentry-at-EL1 vCPU. Independent address spaces need neither a
-// redpill nor a second hv_vcpu_run: entryBlocked prevents a new application
-// reader from entering, and the owner table proves that no other existing vCPU
-// is currently executing the root being changed. CPUs retaining dormant TLB
-// entries observe mmuGeneration and flush locally before their next entry.
+// redpill nor a second hv_vcpu_run: blocking entries into the mutated address
+// space prevents a new reader of it from entering, and the owner table proves
+// that no other existing vCPU is currently executing the root being changed.
+// CPUs retaining dormant TLB entries observe the change and flush locally
+// before their next entry into it.
 //
 // Executable mutations issue a lightweight native cache-maintenance HVC before
 // entering the monitor. Any lock contention is delegated to the host path so a
@@ -393,9 +417,9 @@ func (e *ring0Engine) tryRunResidentMonitor(ctx context.Context, encoded []byte)
 		e.monitorResidentFallbackEntryLock.Add(1)
 		return nil, false, nil
 	}
-	e.entryBlocked.Store(true)
+	e.entryBlockedSpace.Store(command.AddressSpaceID)
 	defer func() {
-		e.entryBlocked.Store(false)
+		e.entryBlockedSpace.Store(0)
 		e.entryMutationMu.Unlock()
 	}()
 	if !e.monitorMu.TryLock() {
@@ -513,8 +537,9 @@ func atomicMaxUint64(target *atomic.Uint64, value uint64) {
 
 // residentMonitorConflicts reports whether another application vCPU is
 // actively executing the address space that a direct monitor command will
-// mutate. The caller has already published entryBlocked, so an inactive vCPU
-// cannot become a new reader until after mmuGeneration is advanced. TryLock is
+// mutate. The caller has already blocked entries into that address space, so an
+// inactive vCPU cannot become a new reader of it until after the change is
+// recorded. TryLock is
 // deliberate: direct EL1 execution must fall back instead of parking on a Go
 // mutex while its continuation is guest-resident.
 func (e *ring0Engine) residentMonitorConflicts(addressSpaceID uint64, current *ring0ApplicationCPU) (conflicting, inspected bool) {
@@ -541,19 +566,32 @@ func (e *ring0Engine) residentMonitorConflicts(addressSpaceID uint64, current *r
 // The returned state owns entryMutationMu and must be released with
 // unlockApplicationEntries.
 func (e *ring0Engine) lockApplicationEntries(ctx context.Context) error {
+	return e.lockApplicationEntriesFor(ctx, ring0SentryAddressSpaceID)
+}
+
+// lockApplicationEntriesFor is lockApplicationEntries for a mutation of only
+// addressSpaceID, which leaves entries into other address spaces admitted.
+// ring0SentryAddressSpaceID blocks all entries.
+func (e *ring0Engine) lockApplicationEntriesFor(ctx context.Context, addressSpaceID uint64) error {
 	for !e.entryMutationMu.TryLock() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		time.Sleep(50 * time.Microsecond)
 	}
-	e.entryBlocked.Store(true)
+	e.entryBlockedSpace.Store(addressSpaceID)
 	return nil
 }
 
 func (e *ring0Engine) unlockApplicationEntries() {
-	e.entryBlocked.Store(false)
+	e.entryBlockedSpace.Store(0)
 	e.entryMutationMu.Unlock()
+}
+
+// entryBlocked returns true if a mutation blocks entries into addressSpaceID.
+func (e *ring0Engine) entryBlocked(addressSpaceID uint64) bool {
+	blocked := e.entryBlockedSpace.Load()
+	return blocked != 0 && (blocked == addressSpaceID || blocked == ring0SentryAddressSpaceID)
 }
 
 // pinCurrentIdleApplicationCPU returns the reusable application vCPU owned by
@@ -625,8 +663,90 @@ func (e *ring0Engine) recordMonitorCommand(command monitorabi.Command, response 
 		}
 	}
 	if mutatesTranslations {
-		e.mmuGeneration.Add(1)
+		e.recordTranslationChange(command.AddressSpaceID, validCommand, command.Opcode == monitorabi.OpcodeDestroyAddressSpace)
 	}
+}
+
+// recordTranslationChange publishes a transaction that may have changed the
+// translations of addressSpaceID, or of an unknown address space if !valid.
+// Application vCPUs flush their local TLBs accordingly before their next entry
+// into an affected address space. It must be called before entries into the
+// address space are admitted again.
+func (e *ring0Engine) recordTranslationChange(addressSpaceID uint64, valid, destroyed bool) {
+	sequence := e.mmuSequence.Add(1)
+	if !valid || addressSpaceID == ring0SentryAddressSpaceID {
+		e.globalMMUChange.Store(sequence)
+		return
+	}
+	if destroyed {
+		// A later address space that reuses its ASID records its creation.
+		e.spaceMMUChanges.Delete(addressSpaceID)
+		return
+	}
+	changed, _ := e.spaceMMUChanges.LoadOrStore(addressSpaceID, new(atomic.Uint64))
+	changed.(*atomic.Uint64).Store(sequence)
+}
+
+// applicationTLBFlush returns the local TLB maintenance that cpu needs before
+// entering addressSpaceID, and records it as done.
+//
+// Preconditions: The caller is cpu's owner thread, has published
+// cpu.entryActive, and has since observed entries into addressSpaceID
+// unblocked.
+func (e *ring0Engine) applicationTLBFlush(cpu *ring0ApplicationCPU, addressSpaceID uint64) uint64 {
+	// A change recorded after this load is seen by the vCPU's next entry, since
+	// it compares against a sequence no later than the change.
+	sequence := e.mmuSequence.Load()
+	flushAll := func() uint64 {
+		cpu.tlbFullSync = sequence
+		clear(cpu.tlbSpaceSync)
+		return ring0TLBFlushAll
+	}
+	if e.globalMMUChange.Load() > cpu.tlbFullSync {
+		return flushAll()
+	}
+	value, ok := e.spaceMMUChanges.Load(addressSpaceID)
+	if !ok {
+		// Every application address space records its creation.
+		return flushAll()
+	}
+	changed := value.(*atomic.Uint64).Load()
+	if changed <= cpu.tlbFullSync || changed <= cpu.tlbSpaceSync[addressSpaceID] {
+		return 0
+	}
+	if cpu.tlbSpaceSync == nil {
+		cpu.tlbSpaceSync = make(map[uint64]uint64)
+	} else if len(cpu.tlbSpaceSync) >= ring0MaxTLBSpaceSync {
+		return flushAll()
+	}
+	cpu.tlbSpaceSync[addressSpaceID] = sequence
+	return ring0TLBFlushEnteringSpace
+}
+
+// monitorCommandAddressSpace returns the address space whose translations
+// encoded may change, or ring0SentryAddressSpaceID if it may change any.
+func monitorCommandAddressSpace(encoded []byte) uint64 {
+	if len(encoded) < 32 {
+		return ring0SentryAddressSpaceID
+	}
+	if id := binary.LittleEndian.Uint64(encoded[24:32]); id != 0 {
+		return id
+	}
+	return ring0SentryAddressSpaceID
+}
+
+// monitorCommandTLBFlush returns the local TLB maintenance that application
+// vCPUs need after encoded executes: none if it doesn't change translations,
+// that of the address space they enter if it changes an application address
+// space, and a full flush otherwise.
+func monitorCommandTLBFlush(encoded []byte) uint64 {
+	if !monitorCommandMutatesTranslations(encoded) {
+		return 0
+	}
+	if monitorCommandAddressSpace(encoded) == ring0SentryAddressSpaceID {
+		return ring0TLBFlushAll
+	}
+	return ring0TLBFlushEnteringSpace
 }
 
 func (e *ring0Engine) recordMonitorCommandView(command monitorabi.CommandView, response []byte, mutatesTranslations bool) {
@@ -639,7 +759,7 @@ func (e *ring0Engine) recordMonitorCommandView(command monitorabi.CommandView, r
 		}
 	}
 	if mutatesTranslations {
-		e.mmuGeneration.Add(1)
+		e.recordTranslationChange(command.AddressSpaceID, true, command.Opcode == monitorabi.OpcodeDestroyAddressSpace)
 	}
 }
 
@@ -1178,7 +1298,7 @@ retryApplication:
 	if err := ctx.Err(); err != nil {
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
-	if err := e.beginApplicationEntry(ctx, cpu); err != nil {
+	if err := e.beginApplicationEntry(ctx, cpu, application.AddressSpaceID); err != nil {
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
 	if e.closed.Load() {
@@ -1188,15 +1308,15 @@ retryApplication:
 		}
 		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
 	}
-	// Sample the translation generation only after publishing entryActive and
-	// observing entryBlocked clear. A monitor mutation that starts before this
+	// Sample translation changes only after publishing entryActive and
+	// observing entries into this address space unblocked. A monitor mutation that starts before this
 	// point must finish first; one that starts after it must cancel this entry
 	// before changing page tables. Sampling earlier leaves a window in which a
 	// mutation can complete after the sample but before guest admission, letting
 	// this vCPU enter an application with stale local translations.
-	if generation := e.mmuGeneration.Load(); cpu.tlbGeneration != generation {
-		atomic.StoreUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateTLBFlushRequested)), 1)
-		cpu.tlbGeneration = generation
+	if flush := e.applicationTLBFlush(cpu, application.AddressSpaceID); flush != 0 {
+		// Keep any request that a paused monitor transaction published.
+		atomic.OrUint64((*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateTLBFlushRequested)), flush)
 	}
 	if atGuestEL1 && ring0asm.CurrentEL() == 0 {
 		// A concurrent Sentry-root refresh may redpill this continuation after
@@ -1302,11 +1422,11 @@ func stage1FaultAccess(syndrome uint64) vmm.Stage2Access {
 	return access
 }
 
-func (e *ring0Engine) beginApplicationEntry(ctx context.Context, cpu *ring0ApplicationCPU) error {
+func (e *ring0Engine) beginApplicationEntry(ctx context.Context, cpu *ring0ApplicationCPU, addressSpaceID uint64) error {
 	for {
-		if !e.entryBlocked.Load() {
+		if !e.entryBlocked(addressSpaceID) {
 			cpu.entryActive.Store(true)
-			if !e.entryBlocked.Load() {
+			if !e.entryBlocked(addressSpaceID) {
 				return nil
 			}
 			cpu.entryActive.Store(false)

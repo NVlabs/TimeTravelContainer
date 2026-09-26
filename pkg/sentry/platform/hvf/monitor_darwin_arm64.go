@@ -438,7 +438,7 @@ func (v *hvfVCPU) ensureBooted() error {
 		C.uint64_t(v.stateGPA+vmm.HostSlabSize)); status != C.HV_SUCCESS {
 		return fmt.Errorf("setting EL1 monitor bootstrap registers: %d", status)
 	}
-	if err := v.runUntilHVC(context.Background(), monitorHVCBoot, false); err != nil {
+	if err := v.runUntilHVC(context.Background(), monitorHVCBoot, false, 0, 0); err != nil {
 		return fmt.Errorf("booting EL1 monitor: %w", err)
 	}
 	ttbr1 := v.monitor.ttbr1()
@@ -454,12 +454,16 @@ func (v *hvfVCPU) ensureBooted() error {
 	return nil
 }
 
-func (v *hvfVCPU) runUntilHVC(ctx context.Context, expected uint64, pauseGuests bool) error {
+// runUntilHVC runs the vCPU until the monitor issues the expected HVC. If
+// pauseGuests is set, application vCPUs are paused meanwhile, and asked for
+// the local TLB maintenance tlbFlush for addressSpaceID before they next
+// enter.
+func (v *hvfVCPU) runUntilHVC(ctx context.Context, expected uint64, pauseGuests bool, tlbFlush, addressSpaceID uint64) error {
 	for {
 		C.ttc_monitor_fence()
 		status := int32(C.HV_SUCCESS)
 		if pauseGuests {
-			status = runNativeMonitorPaused(uint64(v.handle), unsafe.Pointer(v.exit))
+			status = runNativeMonitorPaused(uint64(v.handle), unsafe.Pointer(v.exit), tlbFlush, addressSpaceID)
 		} else {
 			status = int32(C.hv_vcpu_run(v.handle))
 		}
@@ -523,7 +527,7 @@ func (v *hvfVCPU) RunMonitor(ctx context.Context, encoded []byte) ([]byte, error
 		C.uint64_t(monitorCodeVA+v.monitor.commandOffset), C.uint64_t(v.stateVA)); status != C.HV_SUCCESS {
 		return nil, fmt.Errorf("setting EL1 monitor command entry: %d", status)
 	}
-	err := v.runUntilHVC(ctx, monitorHVCCommand, true)
+	err := v.runUntilHVC(ctx, monitorHVCCommand, true, monitorCommandTLBFlush(encoded), monitorCommandAddressSpace(encoded))
 	if err != nil {
 		return nil, err
 	}

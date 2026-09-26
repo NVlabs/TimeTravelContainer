@@ -84,6 +84,10 @@
 #define TTC_STATE_INTERNAL_INPUT_PSTATE_OFFSET 0x2a58
 #define TTC_STATE_CANCEL_REQUESTED_OFFSET 0x2a60
 #define TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET 0x2a68
+// Local stage-1 TLB maintenance that an application vCPU performs before its
+// next entry: all translations, or only those of the address space entered.
+#define TTC_TLB_FLUSH_ALL 1
+#define TTC_TLB_FLUSH_ENTERING_SPACE 2
 #define TTC_STATE_PENDING_INTERRUPT_EXIT_KIND_OFFSET 0x2a70
 #define TTC_STATE_SENTRY_TTBR0_OFFSET 0x2a80
 #define TTC_STATE_SENTRY_X0_OFFSET 0x2a88

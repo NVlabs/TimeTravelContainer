@@ -2206,3 +2206,71 @@ func TestApplicationEL0MatchesLinux(t *testing.T) {
 		t.Errorf("load through a tagged address = %#x, want 0x5a", got)
 	}
 }
+
+// TestApplicationTLBFlushTracksAddressSpaces checks that an application vCPU
+// flushes only the translations that changed since its last flush: those of
+// the address space it enters, or all of them after a change elsewhere.
+func TestApplicationTLBFlushTracksAddressSpaces(t *testing.T) {
+	e := &ring0Engine{}
+	cpu := &ring0ApplicationCPU{}
+	check := func(what string, space uint64, want uint64) {
+		t.Helper()
+		if got := e.applicationTLBFlush(cpu, space); got != want {
+			t.Errorf("%s: applicationTLBFlush(%d) = %d, want %d", what, space, got, want)
+		}
+	}
+	e.recordTranslationChange(ring0SentryAddressSpaceID, true, false)
+	e.recordTranslationChange(1, true, false)
+	e.recordTranslationChange(2, true, false)
+	check("first entry after a Sentry change", 1, ring0TLBFlushAll)
+	check("unchanged since the full flush", 2, 0)
+
+	e.recordTranslationChange(2, true, false)
+	check("another address space changed", 1, 0)
+	check("the entered address space changed", 2, ring0TLBFlushEnteringSpace)
+	check("already flushed", 2, 0)
+
+	e.recordTranslationChange(1, false, false)
+	check("an unknown address space changed", 2, ring0TLBFlushAll)
+	check("unchanged since the full flush", 1, 0)
+
+	e.recordTranslationChange(1, true, true)
+	check("a destroyed address space", 1, ring0TLBFlushAll)
+	e.recordTranslationChange(1, true, false)
+	check("the address space was created again", 1, ring0TLBFlushEnteringSpace)
+
+	e.recordTranslationChange(ring0SentryAddressSpaceID, true, false)
+	check("another Sentry change", 1, ring0TLBFlushAll)
+	for space := uint64(100); space < 100+ring0MaxTLBSpaceSync; space++ {
+		e.recordTranslationChange(space, true, false)
+		check("tracking another address space", space, ring0TLBFlushEnteringSpace)
+	}
+	e.recordTranslationChange(2, true, false)
+	check("too many address spaces tracked", 2, ring0TLBFlushAll)
+}
+
+func TestMonitorCommandTLBFlush(t *testing.T) {
+	unmap := []monitorabi.Operation{{Type: monitorabi.OperationUnmap, VA: 0x100000, Length: vmm.LogicalPageSize}}
+	encode := func(c monitorabi.Command) []byte {
+		t.Helper()
+		encoded, err := monitorabi.MarshalCommand(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	for _, tc := range []struct {
+		name    string
+		encoded []byte
+		want    uint64
+	}{
+		{"activate", encode(monitorabi.Command{Sequence: 1, Opcode: monitorabi.OpcodeActivate, AddressSpaceID: 1}), 0},
+		{"application change", encode(monitorabi.Command{Sequence: 1, Opcode: monitorabi.OpcodeApply, AddressSpaceID: 1, Operations: unmap}), ring0TLBFlushEnteringSpace},
+		{"Sentry change", encode(monitorabi.Command{Sequence: 1, Opcode: monitorabi.OpcodeApply, AddressSpaceID: ring0SentryAddressSpaceID, Operations: unmap}), ring0TLBFlushAll},
+		{"malformed", []byte{1, 2, 3}, ring0TLBFlushAll},
+	} {
+		if got := monitorCommandTLBFlush(tc.encoded); got != tc.want {
+			t.Errorf("%s: monitorCommandTLBFlush = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

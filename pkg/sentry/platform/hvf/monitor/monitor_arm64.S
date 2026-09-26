@@ -219,18 +219,28 @@ _ttc_monitor_ring0_application_entry:
   mrs x16, tpidr_el1
   // Hypervisor.framework does not reliably propagate a TLBI executed by the
   // dedicated monitor vCPU to a dormant application vCPU. The host publishes
-  // a page-table generation change in this permanently mapped state page.
-  // Flush locally before the first application entry that observes it; the
-  // common syscall path pays nothing when mappings have not changed.
+  // the page-table changes that this vCPU hasn't flushed in this permanently
+  // mapped state page. Flush locally before the first application entry that
+  // observes them; the common syscall path pays nothing when mappings have
+  // not changed.
   ldr x17, [x16, #TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET]
   cbz x17, 1f
   str xzr, [x16, #TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET]
   dsb ishst
-  // Use the inner-shareable form even though this generation rendezvous is
-  // local to the entering vCPU. HVF's ARM64 implementation reliably handles
-  // the shareable TLBI family used by the monitor's BBM path; the local-only
-  // VMALLE1 form can leave an old application leaf resident across vCPU reuse.
+  // Use the inner-shareable forms even though this rendezvous is local to the
+  // entering vCPU. HVF's ARM64 implementation reliably handles the shareable
+  // TLBI family used by the monitor's BBM path; the local-only VMALLE1 form
+  // can leave an old application leaf resident across vCPU reuse.
+  tbnz x17, #0, Lttc_monitor_flush_all_translations
+  // Application leaves are non-global, so when only the entered address
+  // space changed, flush just its ASID and keep other address spaces' entries.
+  ldr x17, [x16, #TTC_STATE_APPLICATION_TTBR0_OFFSET]
+  and x17, x17, #0xffff000000000000
+  tlbi aside1is, x17
+  b Lttc_monitor_translations_flushed
+Lttc_monitor_flush_all_translations:
   tlbi vmalle1is
+Lttc_monitor_translations_flushed:
   dsb ish
   // The monitor transaction broadcasts IALLUIS, but HVF does not reliably
   // propagate that maintenance to every dormant application vCPU either.

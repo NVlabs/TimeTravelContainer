@@ -834,11 +834,15 @@ static void ttc_ring0_resume_guest_execution(void) {
 }
 
 // Publish a local stage-1 flush to every application vCPU before reopening
-// guest admission. The Go-side MMU generation is updated only after this
+// guest admission. The Go-side record of the change is updated only after this
 // native frame returns. Without this publication, a host-resident reader that
 // passed entry admission immediately before the pause can resume in the small
-// interval between the monitor acknowledgement and that Go update.
-static int ttc_ring0_request_application_tlb_flushes(void) {
+// interval between the monitor acknowledgement and that Go update. Such a
+// reader enters once before it rechecks admission, so after a change to
+// application address space space_id, flushing that space on the vCPUs about
+// to enter it suffices; others enter it only after the Go update.
+static int ttc_ring0_request_application_tlb_flushes(uint64_t request,
+		uint64_t space_id) {
 	int status = pthread_mutex_lock(&ttc_ring0_bridge_registry_mu);
 	if (status != 0) return status;
 	for (struct ttc_ring0_bridge *bridge = ttc_ring0_bridges;
@@ -847,9 +851,17 @@ static int ttc_ring0_request_application_tlb_flushes(void) {
 				memory_order_acquire) != 0) {
 			continue;
 		}
+		if (request == TTC_TLB_FLUSH_ENTERING_SPACE) {
+			_Atomic uint64_t *entering = (_Atomic uint64_t *)(
+					bridge->state_host + TTC_STATE_ADDRESS_SPACE_ID_OFFSET);
+			if (atomic_load_explicit(entering, memory_order_acquire) !=
+					space_id) {
+				continue;
+			}
+		}
 		_Atomic uint64_t *requested = (_Atomic uint64_t *)(
 				bridge->state_host + TTC_STATE_TLB_FLUSH_REQUESTED_OFFSET);
-		atomic_store_explicit(requested, 1, memory_order_release);
+		atomic_fetch_or_explicit(requested, request, memory_order_release);
 	}
 	pthread_mutex_unlock(&ttc_ring0_bridge_registry_mu);
 	return 0;
@@ -860,7 +872,7 @@ static int ttc_ring0_request_application_tlb_flushes(void) {
 // shared Go runtime, so executing Go allocation, channel, or safepoint code
 // before reopening admission can deadlock a concurrent GC cycle.
 static int32_t ttc_ring0_run_monitor_paused(uint64_t raw_vcpu,
-		uintptr_t raw_exit) {
+		uintptr_t raw_exit, uint64_t tlb_flush, uint64_t space_id) {
 	int status = ttc_ring0_pause_guest_execution();
 	if (status != 0) return (int32_t)HV_ERROR;
 	hv_vcpu_t vcpu = (hv_vcpu_t)raw_vcpu;
@@ -876,8 +888,8 @@ static int32_t ttc_ring0_run_monitor_paused(uint64_t raw_vcpu,
 		}
 		break;
 	}
-	if (hv_status == HV_SUCCESS) {
-		status = ttc_ring0_request_application_tlb_flushes();
+	if (hv_status == HV_SUCCESS && tlb_flush != 0) {
+		status = ttc_ring0_request_application_tlb_flushes(tlb_flush, space_id);
 		if (status != 0) hv_status = HV_ERROR;
 	}
 	ttc_ring0_resume_guest_execution();
@@ -2990,8 +3002,8 @@ func unmapNativeStage2(gpa, length uint64, tracked bool) error {
 	return nil
 }
 
-func runNativeMonitorPaused(vcpu uint64, exit unsafe.Pointer) int32 {
-	return int32(C.ttc_ring0_run_monitor_paused(C.uint64_t(vcpu), C.uintptr_t(uintptr(exit))))
+func runNativeMonitorPaused(vcpu uint64, exit unsafe.Pointer, tlbFlush, addressSpaceID uint64) int32 {
+	return int32(C.ttc_ring0_run_monitor_paused(C.uint64_t(vcpu), C.uintptr_t(uintptr(exit)), C.uint64_t(tlbFlush), C.uint64_t(addressSpaceID)))
 }
 
 func (v *hvfVM) monitorAddressSpaceTTBR(id uint64) uint64 {
