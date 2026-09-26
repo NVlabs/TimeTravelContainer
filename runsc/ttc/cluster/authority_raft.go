@@ -367,6 +367,12 @@ type authorityEngine struct {
 	store     *raftboltdb.BoltStore
 	listener  net.Listener
 	hadState  bool
+	// holder, for an epoch's authority, returns nil while it holds it; see
+	// LinearizableState.
+	holder func() error
+	// currentTerm is the term in which the engine, leading, last committed
+	// a barrier.
+	currentTerm atomic.Uint64
 }
 
 // engine returns the member's current engine, or an empty one if it has
@@ -517,6 +523,9 @@ func openAuthorityEngine(options AuthorityRaftOptions) (*authorityEngine, error)
 		return nil, fmt.Errorf("starting Raft: %w", err)
 	}
 	opened := &authorityEngine{raft: engine, fsm: fsm, transport: transport, store: store, listener: plainListener, hadState: hasState}
+	if options.EpochDir != "" {
+		opened.holder = options.Holder
+	}
 	if options.Bootstrap {
 		if !hasState {
 			configuration := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(options.NodeID), Address: raft.ServerAddress(advertise), Suffrage: raft.Voter}}}
@@ -754,6 +763,19 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 		return nil, &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
 	engine := n.engine()
+	// An epoch's authority is its only voter, and the state it applied is the
+	// cluster's while it holds the authority, once it committed an entry as
+	// the leader of its term: a write acknowledged before is applied by then,
+	// and one acknowledged since was applied before it was. So after one
+	// barrier a term, a read asks only whether it still holds the authority,
+	// and writes nothing.
+	term := engine.raft.CurrentTerm()
+	if engine.holder != nil && engine.currentTerm.Load() == term {
+		if err := engine.holder(); err != nil {
+			return nil, err
+		}
+		return engine.fsm.copyState()
+	}
 	timeout := n.contextTimeout(ctx)
 	if err := engine.raft.VerifyLeader().Error(); err != nil {
 		return nil, err
@@ -761,6 +783,7 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 	if err := engine.raft.Barrier(timeout).Error(); err != nil {
 		return nil, err
 	}
+	engine.currentTerm.Store(term)
 	return engine.fsm.copyState()
 }
 

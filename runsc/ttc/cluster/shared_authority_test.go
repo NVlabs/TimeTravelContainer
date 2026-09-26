@@ -551,6 +551,20 @@ func TestEpochHoldersTakeOverOnTheNetwork(t *testing.T) {
 	if record, ok := state.Nodes["node-a"]; !ok || record.State != NodeReady {
 		t.Fatalf("epoch 2 has node-a as %+v (%t)", record, ok)
 	}
+	// A read takes one barrier a term, and then only asks whether the node
+	// still holds the authority.
+	if _, err := second.LinearizableState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before := second.engine().raft.LastIndex()
+	for range 3 {
+		if _, err := second.LinearizableState(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := second.engine().raft.LastIndex(); after != before {
+		t.Fatalf("reads wrote the log from %d to %d", before, after)
+	}
 	// Epoch 3's holder would prune what came before epoch 2.
 	if err := shared.PruneEpochs(2); err != nil {
 		t.Fatal(err)
