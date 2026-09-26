@@ -2242,3 +2242,36 @@ func TestPlacementKeepsRuntime(t *testing.T) {
 		}
 	}
 }
+
+func TestPlacementAwaitsActivation(t *testing.T) {
+	placement := cluster.PlacementRecord{FamilyID: "family", BranchID: "branch", OwnerNode: "n3", PhysicalContainer: "fork-1", PhysicalBranch: "fork-1"}
+	tx := cluster.Transaction{
+		Identity:                cluster.ForkIdentity{TransactionID: "fork-1", TargetNodeID: "n3", Migration: true},
+		State:                   cluster.TransactionPublished,
+		TargetPhysicalContainer: "fork-1",
+		TargetPhysicalBranch:    "fork-1",
+	}
+	state := &cluster.AuthorityState{Transactions: map[string]cluster.Transaction{"fork-1": tx}}
+	if !placementAwaitsActivation(state, placement, "n3") {
+		t.Error("the target's placement before activation was not left to the migration")
+	}
+	if placementAwaitsActivation(state, placement, "n2") {
+		t.Error("another node's reconciliation left the placement alone")
+	}
+	for name, change := range map[string]func(*cluster.Transaction){
+		"activated": func(tx *cluster.Transaction) { tx.Activated = true },
+		"canceled":  func(tx *cluster.Transaction) { tx.State = cluster.TransactionCanceled },
+		"a fork":    func(tx *cluster.Transaction) { tx.Identity.Migration = false },
+		"elsewhere": func(tx *cluster.Transaction) { tx.TargetPhysicalBranch = "fork-2" },
+	} {
+		changed := tx
+		change(&changed)
+		state.Transactions["fork-1"] = changed
+		if placementAwaitsActivation(state, placement, "n3") {
+			t.Errorf("%s: the placement was left to the migration", name)
+		}
+	}
+	if placementAwaitsActivation(nil, placement, "n3") {
+		t.Error("a node without the authority's state left the placement alone")
+	}
+}

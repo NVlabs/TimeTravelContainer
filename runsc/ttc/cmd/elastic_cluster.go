@@ -1009,6 +1009,9 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		if busy(record.PhysicalContainer, record.FamilyID) {
 			continue
 		}
+		if placementAwaitsActivation(authorityState, record, b.nodeID) {
+			continue
+		}
 		// An unplaced or corrupted branch is authoritative Raft state with no
 		// physical owner. Its derived shared container record may legitimately
 		// lag an atomic publication commit. Reconciliation may clean up only
@@ -1346,6 +1349,27 @@ func logicalFamilyForPhysicalRuntime(state *cluster.AuthorityState, physicalCont
 // exact placement generation to be temporarily process-free while its sealed
 // state is published. Publication commit atomically changes the placement to
 // unplaced, so committed or terminal publications never need this exception.
+// placementAwaitsActivation reports whether placement is a migration's that
+// its cutover gave nodeID, whose target has yet to activate. Until the target
+// activates, its record stays hidden, and reconciliation, which reads records
+// it can see, would take the placement for one whose branch nodeID no longer
+// has and remove it: the migrated branch would be lost.
+func placementAwaitsActivation(state *cluster.AuthorityState, placement cluster.PlacementRecord, nodeID string) bool {
+	if state == nil {
+		return false
+	}
+	for _, tx := range state.Transactions {
+		if !tx.Identity.Migration || tx.Activated || tx.Identity.TargetNodeID != nodeID ||
+			tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
+			continue
+		}
+		if tx.TargetPhysicalContainer == placement.PhysicalContainer && tx.TargetPhysicalBranch == placement.PhysicalBranch {
+			return true
+		}
+	}
+	return false
+}
+
 func placementHasProcessFreePublication(state *cluster.AuthorityState, placement cluster.PlacementRecord) bool {
 	branch, ok := state.Branches[placement.FamilyID+"\x00"+placement.BranchID]
 	if !ok || branch.Corrupted || branch.Generation != placement.Generation || branch.PublicationID == "" {
