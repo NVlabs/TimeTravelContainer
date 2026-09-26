@@ -940,9 +940,64 @@ func TestGuestRAMEpochRollover(t *testing.T) {
 	if _, err := backing.ResolveFrames(memmap.FileRange{2 * HostSlabSize, 2*HostSlabSize + GuestFrameSize}, hostarch.Read); err != nil {
 		t.Fatalf("ResolveFrames triggering rollover: %v", err)
 	}
-	if replacement == nil || ram.Metrics().Epoch != 2 {
-		t.Fatalf("rollover replacement=%v metrics=%+v", replacement, ram.Metrics())
+	// The rollover runs in the background, outside the caller's locks.
+	waitForGuestRAMEpoch(t, ram, 2)
+	ram.mu.Lock()
+	defer ram.mu.Unlock()
+	if replacement == nil {
+		t.Fatalf("rollover did not rebind stage 2: metrics=%+v", ram.Metrics())
 	}
+}
+
+func waitForGuestRAMEpoch(t *testing.T, ram *GuestRAM, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for ram.Metrics().Epoch != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("GuestRAM epoch did not reach %d: %+v", want, ram.Metrics())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestGuestRAMRolloverDoesNotRunUnderCallerLocks checks that the allocation
+// that crosses the rollover threshold does not run the rollover itself. The
+// caller may hold GuestRAM leases and staging or address-space locks that the
+// rollover's epoch rebuild waits behind.
+func TestGuestRAMRolloverDoesNotRunUnderCallerLocks(t *testing.T) {
+	ram, backing, _, _, _ := newRAMTestBacking(t, 4*HostSlabSize)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	ram.SetRollover(func(ram *GuestRAM) error {
+		close(started)
+		<-release
+		return ram.RebindStage2(&ramTestVM{})
+	})
+	for i := uint64(0); i < 2; i++ {
+		start := i * HostSlabSize
+		if _, err := backing.ResolveFrames(memmap.FileRange{start, start + GuestFrameSize}, hostarch.Read); err != nil {
+			t.Fatal(err)
+		}
+		if err := backing.Decommit(memmap.FileRange{start, start + GuestFrameSize}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	frames, lease, err := backing.AcquireMapping(memmap.FileRange{2 * HostSlabSize, 2*HostSlabSize + GuestFrameSize}, hostarch.Read)
+	if err != nil {
+		t.Fatalf("allocation crossing the rollover threshold: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("got %d frames, want 1", len(frames))
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollover did not start")
+	}
+	// The rollover waits for this test, which still holds its lease.
+	lease.Release()
+	close(release)
+	waitForGuestRAMEpoch(t, ram, 2)
 }
 
 func TestGuestRAMEpochRebindRollsBackBeforePublishingGPAs(t *testing.T) {

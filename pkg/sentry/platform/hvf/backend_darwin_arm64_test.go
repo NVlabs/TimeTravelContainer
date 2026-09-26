@@ -951,9 +951,11 @@ func TestRing0PlatformEpochRolloverRebuildsExecutingAddressSpace(t *testing.T) {
 		postRollover.DecRef(postRange)
 		postRollover.Destroy()
 	}()
-	if got := p.GuestRAM().Metrics().Epoch; got != 2 {
-		t.Fatalf("VM epoch after threshold allocation = %d, want 2", got)
-	}
+	// The rollover runs in the background and must retire this goroutine's
+	// owner-affine vCPU. Like a task that blocks, give up the residency
+	// before waiting.
+	platformCtx.PrepareSleep()
+	waitForPlatformEpoch(t, p, 2)
 	run("after rollover")
 }
 
@@ -1181,9 +1183,7 @@ func TestRing0PlatformRolloverRetiresIdleResidency(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("rollover did not finish")
 	}
-	if got := p.GuestRAM().Metrics().Epoch; got != 2 {
-		t.Fatalf("VM epoch after rollover = %d, want 2", got)
-	}
+	waitForPlatformEpoch(t, p, 2)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -1191,5 +1191,18 @@ func TestRing0PlatformRolloverRetiresIdleResidency(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("owner did not run after rollover")
+	}
+}
+
+// waitForPlatformEpoch waits for the background GuestRAM rollover that a
+// threshold allocation starts.
+func waitForPlatformEpoch(t *testing.T, p *vmplatform.Platform, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for p.GuestRAM().Metrics().Epoch != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("VM epoch did not reach %d: %+v", want, p.GuestRAM().Metrics())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -22,6 +22,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
@@ -128,6 +129,9 @@ type GuestRAM struct {
 	revoker   FrameRevoker
 	relocator FrameRelocator
 	rollover  func(*GuestRAM) error
+	// rolloverPending is set while a background rollover runs. It is
+	// protected by mu.
+	rolloverPending bool
 
 	ipaStart uint64
 	ipaSize  uint64
@@ -320,24 +324,22 @@ func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType
 		if newFrames > freeSlots {
 			newSlabs = (newFrames - freeSlots + FramesPerSlab - 1) / FramesPerSlab
 		}
-		needsRollover := newSlabs != 0 && b.ram.wouldReachRolloverLocked(newSlabs)
-		if needsRollover {
-			rollover := b.ram.rollover
+		if newSlabs != 0 && b.ram.wouldReachRolloverLocked(newSlabs) {
 			epoch := b.ram.epoch
-			b.ram.mu.Unlock()
-			if rollover == nil {
+			if b.ram.rollover == nil {
+				b.ram.mu.Unlock()
 				return nil, fmt.Errorf("GuestRAM IPA epoch %d reached 75%% rollover threshold", epoch)
 			}
-			if err := rollover(b.ram); err != nil {
-				return nil, fmt.Errorf("rebuilding GuestRAM VM epoch: %w", err)
+			// Roll over in the background. Callers hold GuestRAM leases and
+			// staging or address-space locks, while the rebuild waits for
+			// every epoch reader, and those readers can wait for the same
+			// locks, so rolling over inline could deadlock. Allocation
+			// continues from the IPA above the threshold in the meantime.
+			b.ram.startRolloverLocked()
+			if b.ram.wouldExhaustIPALocked(newSlabs) {
+				b.ram.mu.Unlock()
+				return nil, fmt.Errorf("GuestRAM IPA epoch %d is exhausted while its rollover is pending", epoch)
 			}
-			b.ram.mu.Lock()
-			unchanged := b.ram.epoch == epoch
-			b.ram.mu.Unlock()
-			if unchanged {
-				return nil, fmt.Errorf("GuestRAM rollover did not advance VM epoch %d", epoch)
-			}
-			continue
 		}
 		additional := newFrames * GuestFrameSize
 		if limit := b.ram.logicalLimit; limit != 0 && (additional > limit || b.ram.logicalBytes > limit-additional) {
@@ -400,6 +402,34 @@ func (b *guestBacking) AcquireMappings(requests []pgalloc.BackingMappingRequest)
 		frames[i] = resolved
 	}
 	return frames, &guestMappingLease{ram: b.ram}, nil
+}
+
+// startRolloverLocked runs the epoch rollover on a new goroutine unless one
+// is already pending.
+//
+// Preconditions: r.mu is locked and r.rollover is set.
+func (r *GuestRAM) startRolloverLocked() {
+	if r.rolloverPending {
+		return
+	}
+	r.rolloverPending = true
+	rollover := r.rollover
+	go func() {
+		err := rollover(r)
+		r.mu.Lock()
+		r.rolloverPending = false
+		r.mu.Unlock()
+		if err != nil {
+			log.Warningf("GuestRAM epoch rollover failed: %v", err)
+		}
+	}()
+}
+
+// wouldExhaustIPALocked reports whether additionalSlabs more slabs do not fit
+// in the IPA range at all.
+func (r *GuestRAM) wouldExhaustIPALocked(additionalSlabs uint64) bool {
+	remaining := r.ipaSize - (r.nextGPA - r.ipaStart)
+	return additionalSlabs > remaining/HostSlabSize
 }
 
 func (r *GuestRAM) wouldReachRolloverLocked(additionalSlabs uint64) bool {
