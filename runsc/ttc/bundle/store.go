@@ -103,6 +103,19 @@ func retryStalePathRead[T any](operation func() (T, error)) (T, error) {
 	}
 }
 
+// sharedPathGone reports whether the file or directory at path, which may be
+// on a network filesystem, no longer exists. It opens it: an NFS client
+// answers a stat from attributes it cached for seconds, but revalidates a
+// name it opens, and so finds a directory another node renamed away.
+func sharedPathGone(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	_ = file.Close()
+	return false
+}
+
 func readFileWithStaleRetry(path string) ([]byte, error) {
 	return retryStalePathRead(func() ([]byte, error) {
 		return os.ReadFile(path)
@@ -5555,7 +5568,7 @@ func (s Store) ContainersWithActiveState() ([]ContainerInfo, error) {
 			if _, markerErr := os.Stat(filepath.Join(containerDir, containerCreationMarker)); markerErr == nil {
 				continue
 			}
-			if _, statErr := os.Lstat(containerDir); errors.Is(statErr, fs.ErrNotExist) {
+			if sharedPathGone(containerDir) {
 				continue
 			}
 			return nil, err
@@ -5576,7 +5589,7 @@ func (s Store) addContainerRepositoryPaths(paths map[string]struct{}, containers
 			// family's is once the node holds none of its branches: removal
 			// renames either away before anything else, so nothing it held
 			// is reachable from it.
-			if _, statErr := os.Lstat(filepath.Join(s.Root, "containers", container.ID)); errors.Is(statErr, fs.ErrNotExist) {
+			if sharedPathGone(filepath.Join(s.Root, "containers", container.ID)) {
 				continue
 			}
 			if _, statErr := os.Lstat(s.activeContainerDir(container.ID)); errors.Is(statErr, fs.ErrNotExist) {
