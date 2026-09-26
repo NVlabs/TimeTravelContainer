@@ -1176,7 +1176,7 @@ func reusablePhysicalTarget(records []cluster.PlacementRecord, family, node stri
 
 func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transaction, session cluster.RemoteSessionDescriptor) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
-	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, targetBranch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
@@ -1210,7 +1210,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if session.GraphArtifact != "" {
 		memoryDependencyBytes = 0
 	}
-	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, memoryDependencyBytes, session.FilesystemBytes); err != nil {
+	if err := r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, tx.Identity.TransactionID, memoryDependencyBytes, session.FilesystemBytes); err != nil {
 		return fmt.Errorf("recording distributed source dependency: %w", err)
 	}
 	var token ttcremote.SnapshotToken
@@ -1247,7 +1247,7 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		if err := r.backend.retainDistributedGraphReferences(tx.Identity.TransactionID, tx.Identity.TransactionID, info.ID, targetBranch.ID, session.GraphRootObjects); err != nil {
 			return fmt.Errorf("retaining distributed graph memory origins: %w", err)
 		}
-		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects, tx.Identity.TransactionID); err != nil {
+		if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TargetContainer, tx.Identity.TransactionID, session.GraphSnapshot, session.GraphRootObjects, tx.Identity.TransactionID); err != nil {
 			_ = r.backend.releaseDistributedGraphReferences(tx.Identity.TransactionID)
 			return fmt.Errorf("recording distributed graph memory identity: %w", err)
 		}
@@ -1520,12 +1520,12 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 	if err := r.backend.installRemoteExecSessionStates(info.ID, targetBranch.ID, session.ExecSessions); err != nil {
 		return err
 	}
-	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "paused")
+	return r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TargetContainer, tx.Identity.TransactionID, "paused")
 }
 
 func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction, paused bool) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
@@ -1533,12 +1533,12 @@ func (r *daemonTargetRuntime) Publish(_ context.Context, tx *cluster.Transaction
 		if _, err := r.backend.command("timetravel", info.ID, "resume", branch.ID); err != nil {
 			return fmt.Errorf("resuming distributed target: %w", err)
 		}
-		if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, "running"); err != nil {
+		if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TargetContainer, tx.Identity.TransactionID, "running"); err != nil {
 			return err
 		}
 	}
 	if !tx.Identity.Migration {
-		info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+		info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 		if err != nil {
 			return err
 		}
@@ -1564,7 +1564,7 @@ func (r *daemonTargetRuntime) PublishedTarget(tx *cluster.Transaction) (family, 
 		err = errors.New("distributed target runtime is unavailable")
 		return
 	}
-	info, targetBranch, _, loadErr := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, targetBranch, _, loadErr := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if loadErr != nil {
 		err = loadErr
 		return
@@ -1578,7 +1578,7 @@ func (r *daemonTargetRuntime) PublishedTarget(tx *cluster.Transaction) (family, 
 
 func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transaction) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return err
 	}
@@ -1593,7 +1593,7 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 	} else if state != "running" && state != "paused" {
 		return fmt.Errorf("distributed target is %q, want paused or running", state)
 	}
-	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TransactionID)
+	info, err = r.backend.containerStore().PublishDistributedForkTarget(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return fmt.Errorf("publishing distributed target ownership: %w", err)
 	}
@@ -1606,7 +1606,7 @@ func (r *daemonTargetRuntime) Activate(_ context.Context, tx *cluster.Transactio
 	if tx.DesiredPaused {
 		targetState = "paused"
 	}
-	if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TransactionID, targetState); err != nil {
+	if err := r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TargetContainer, tx.Identity.TransactionID, targetState); err != nil {
 		return err
 	}
 	if err := r.backend.ensurePublishedPortsForBranch(info, branch.ID); err != nil {
@@ -1650,7 +1650,7 @@ func (r *daemonTargetRuntime) forwardedDependencyError(tx *cluster.Transaction, 
 }
 
 func (r *daemonTargetRuntime) Drain(_ context.Context, tx *cluster.Transaction) error {
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return r.forwardedDependencyError(tx, err)
 	}
@@ -1668,7 +1668,7 @@ func (r *daemonTargetRuntime) Handoff(ctx context.Context, tx *cluster.Transacti
 }
 
 func (r *daemonTargetRuntime) handoffLocked(ctx context.Context, tx *cluster.Transaction, graph cluster.GraphHandoffDescriptor) error {
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return r.forwardedDependencyError(tx, err)
 	}
@@ -1687,7 +1687,7 @@ func (r *daemonTargetRuntime) handoffLocked(ctx context.Context, tx *cluster.Tra
 			_ = r.backend.releaseDistributedGraphReferences(handoffReferenceOperation)
 		}
 	}()
-	if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TransactionID, graph.GraphSnapshot, objects, handoffReferenceOperation); err != nil {
+	if err := r.backend.containerStore().UpdateDistributedForkMemoryGraph(tx.Identity.TargetContainer, tx.Identity.TransactionID, graph.GraphSnapshot, objects, handoffReferenceOperation); err != nil {
 		return fmt.Errorf("recording graph handoff roots: %w", err)
 	}
 	// The persistent branch record now owns this reference intent. A later
@@ -1733,7 +1733,7 @@ func (r *daemonTargetRuntime) graphHandoffStatus(tx *cluster.Transaction) (boot.
 	if r == nil || r.backend == nil || tx == nil || tx.GraphHandoff == nil {
 		return boot.DistributedForkHandoffStatus{}, errors.New("distributed graph handoff is unavailable")
 	}
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return boot.DistributedForkHandoffStatus{}, r.forwardedDependencyError(tx, err)
 	}
@@ -1805,7 +1805,7 @@ func refreshDistributedGraphHandoffsAtStartup(r *daemonTargetRuntime) error {
 		if !transactionPlacementOwnedBy(*tx, state, r.nodeID, r.incarnation) {
 			continue
 		}
-		_, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+		_, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -1868,7 +1868,7 @@ func distributedGraphHandoffHasLiveRuntime(branch ttcbundle.BranchInfo) bool {
 func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction) error {
 	defer r.lockTarget(tx.Identity.TargetContainer)()
 	var familyID string
-	info, branch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, peer, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err == nil {
 		familyID = info.ID
 		if tx.Identity.Migration && branch.DistributedMigration {
@@ -1894,7 +1894,7 @@ func (r *daemonTargetRuntime) Cancel(_ context.Context, tx *cluster.Transaction)
 			return releaseErr
 		}
 	}
-	if err := r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TransactionID); err != nil {
+	if err := r.backend.containerStore().RemoveDistributedForkTarget(tx.Identity.TargetContainer, tx.Identity.TransactionID); err != nil {
 		return err
 	}
 	if familyID != "" {
@@ -1918,7 +1918,7 @@ func (r *daemonTargetRuntime) MarkIndependent(ctx context.Context, tx *cluster.T
 	// this complete release fence per family: source relays remain live until
 	// every filesystem dependency observed by this operation is local.
 	defer r.lockTarget(tx.Identity.TargetContainer)()
-	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TransactionID)
+	info, branch, _, err := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, tx.Identity.TransactionID)
 	if err != nil {
 		return r.forwardedDependencyError(tx, err)
 	}
@@ -1979,7 +1979,7 @@ func (r *daemonTargetRuntime) MarkIndependent(ctx context.Context, tx *cluster.T
 	if filesystemStatus.Error != "" {
 		return fmt.Errorf("distributed filesystem drain failed: %s", filesystemStatus.Error)
 	}
-	return r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TransactionID, 0, 0)
+	return r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, tx.Identity.TransactionID, 0, 0)
 }
 
 type adaptivePrefetchController struct {
@@ -2135,7 +2135,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				// Independence means all future reads resolve without the source
 				// node. A graph-backed demand loader may still report nonresident
 				// pages, but those are cache misses, not volatile dependencies.
-				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
+				_ = r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, transactionID, 0, 0)
 				return
 			}
 			if tx.State != cluster.TransactionPublished && tx.State != cluster.TransactionDraining && tx.State != cluster.TransactionIndependent {
@@ -2147,7 +2147,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					if sourceFailedPolls < 3 {
 						continue
 					}
-					if info, loadErr := r.backend.containerStore().LoadDistributedForkTarget(transactionID); loadErr == nil {
+					if info, loadErr := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TargetContainer, transactionID); loadErr == nil {
 						if branch, branchErr := persistentBranchInfo(info, tx.Identity.VisibleTargetBranch()); branchErr == nil &&
 							(branch.DependentMemoryBytes != 0 || branch.DependentFilesystemBytes != 0) {
 							reason := "unrecoverable volatile-state loss: source node disappeared before memory and filesystem dependencies became durable"
@@ -2173,7 +2173,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			// therefore observed a nonexistent branch after the first hop and left
 			// source-side heuristics as the only independence driver. Resolve the
 			// transaction's exact physical branch for every poll instead.
-			_, physicalBranch, _, branchErr := r.backend.containerStore().DistributedForkTargetBranch(transactionID)
+			_, physicalBranch, _, branchErr := r.backend.containerStore().DistributedForkTargetBranch(tx.Identity.TargetContainer, transactionID)
 			if branchErr != nil {
 				if tx.State == cluster.TransactionIndependent || tx.State == cluster.TransactionCanceled || tx.State == cluster.TransactionFailed {
 					return
@@ -2236,7 +2236,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					)
 				}
 			}
-			info, infoErr := r.backend.containerStore().LoadDistributedForkTarget(transactionID)
+			info, infoErr := r.backend.containerStore().LoadDistributedForkTarget(tx.Identity.TargetContainer, transactionID)
 			var filesystemBytes uint64
 			if infoErr == nil {
 				if branch, branchErr := persistentBranchInfo(info, targetBranch); branchErr == nil {
@@ -2244,7 +2244,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				}
 			}
 			if !status.Done {
-				_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, status.BytesOutstanding, filesystemBytes)
+				_ = r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, transactionID, status.BytesOutstanding, filesystemBytes)
 				continue
 			}
 			if status.Error != "" {
@@ -2252,7 +2252,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					"remote memory loader failed: "+status.Error, time.Now())
 				return
 			}
-			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, filesystemBytes)
+			_ = r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, transactionID, 0, filesystemBytes)
 			if tx.State != cluster.TransactionIndependent {
 				// Resource byte counters are accounting, not authorization. A
 				// metadata-only filesystem can have zero logical data bytes while
@@ -2267,7 +2267,7 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 					continue
 				}
 			}
-			_ = r.backend.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0)
+			_ = r.backend.containerStore().UpdateDistributedForkDependencies(tx.Identity.TargetContainer, transactionID, 0, 0)
 			// The graph reference remains branch-scoped until the branch itself
 			// is replaced or removed; becoming independent only removes its
 			// volatile provider dependency.

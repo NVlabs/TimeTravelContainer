@@ -3709,7 +3709,7 @@ func resumeDistributedForkMonitors(targetRuntime *daemonTargetRuntime, backend *
 			continue
 		}
 		if tx.Identity.TargetNodeID == localNode && (tx.State == cluster.TransactionPublished || tx.State == cluster.TransactionDraining || tx.State == cluster.TransactionIndependent) {
-			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TransactionID); err == nil {
+			if info, err := backend.containerStore().LoadDistributedForkTarget(tx.Identity.TargetContainer, tx.Identity.TransactionID); err == nil {
 				if !tx.Activated {
 					if placements, openErr := backend.placementCatalog(); openErr == nil {
 						placementBranch := tx.Identity.VisibleTargetBranch()

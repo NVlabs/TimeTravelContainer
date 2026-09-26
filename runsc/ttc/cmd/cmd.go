@@ -15171,7 +15171,7 @@ func (b *runtimeBackend) ensureDistributedTargetMemoryIndependent(info ttcbundle
 			return err
 		}
 	}
-	if err := b.containerStore().UpdateDistributedForkDependencies(transactionID, 0, 0); err != nil {
+	if err := b.containerStore().UpdateDistributedForkDependencies(logicalFamilyID(info), transactionID, 0, 0); err != nil {
 		return err
 	}
 	transactions, err := b.transactionCatalog()

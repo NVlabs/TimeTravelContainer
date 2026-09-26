@@ -239,10 +239,10 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	root := t.TempDir()
 	store := Store{Root: root}
 	info := ContainerInfo{
-		ID: "hidden-target-id", Name: "hidden-target", Digest: "sha256:" + strings.Repeat("a", 64),
+		ID: "tx-hidden", Name: "hidden-target", Digest: "sha256:" + strings.Repeat("a", 64),
 		Platform: "linux/amd64", DistributedForkHidden: true,
 		DistributedForkTransactionID: "tx-hidden", DistributedFamilyID: "logical-family",
-		BundleDir: filepath.Join(root, "containers", "hidden-target-id", "bundle"),
+		BundleDir: filepath.Join(root, "containers", "tx-hidden", "bundle"),
 	}
 	info.RootFS = filepath.Join(store.imageRootDir(), imageRootKey(info.Digest, info.Platform), "rootfs")
 	if err := os.MkdirAll(info.RootFS, 0700); err != nil {
@@ -308,7 +308,7 @@ func TestRefreshContainerImageRootAcceptsExactHiddenTargetID(t *testing.T) {
 	if refreshed.State != "paused" {
 		t.Fatalf("refreshed target state=%q, want paused", refreshed.State)
 	}
-	published, err := store.PublishDistributedForkTarget("tx-hidden")
+	published, err := store.PublishDistributedForkTarget("logical-family", "tx-hidden")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,14 +362,14 @@ func TestMigrationImportsBranchIntoSiblingPhysicalFamily(t *testing.T) {
 	if err != nil || len(pending.Branches) != 1 {
 		t.Fatalf("reservation exposed migrating branch: %+v, %v", pending.Branches, err)
 	}
-	if _, branch, _, err := store.DistributedForkTargetBranch("tx-move"); err != nil || !branch.Quarantined {
+	if _, branch, _, err := store.DistributedForkTargetBranch("family-id", "tx-move"); err != nil || !branch.Quarantined {
 		t.Fatalf("pending migration lost quarantine: %+v, %v", branch, err)
 	}
-	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+	if err := store.UpdateDistributedForkTargetState("family-id", "tx-move", "paused"); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
-		published, err := store.PublishDistributedForkTarget("tx-move")
+		published, err := store.PublishDistributedForkTarget("family-id", "tx-move")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -419,10 +419,10 @@ func TestAuthoritativeMigrationReplacesStalePhysicalOwner(t *testing.T) {
 	if _, err := store.PrepareDistributedFork(context.Background(), base); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateDistributedForkTargetState("tx-move", "paused"); err != nil {
+	if err := store.UpdateDistributedForkTargetState("family-id", "tx-move", "paused"); err != nil {
 		t.Fatal(err)
 	}
-	published, err := store.PublishDistributedForkTarget("tx-move")
+	published, err := store.PublishDistributedForkTarget("family-id", "tx-move")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -461,20 +461,20 @@ func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testin
 	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", info.ID, "container.json"), &info); err != nil {
 		t.Fatal(err)
 	}
-	resolved, branch, peer, err := store.DistributedForkTargetBranch("fork-original")
+	resolved, branch, peer, err := store.DistributedForkTargetBranch("physical", "fork-original")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resolved.ID != info.ID || branch.ID != "original" || !peer {
 		t.Fatalf("resolved=%q branch=%+v peer=%t", resolved.ID, branch, peer)
 	}
-	if err := store.UpdateDistributedForkDependencies("fork-original", 0, 0); err != nil {
+	if err := store.UpdateDistributedForkDependencies("physical", "fork-original", 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateDistributedForkTargetState("fork-original", "paused"); err != nil {
+	if err := store.UpdateDistributedForkTargetState("physical", "fork-original", "paused"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateDistributedForkMemoryGraph("fork-original", 9, []string{"0000000000000009-03-0000000000000001"}, "fork-original"); err != nil {
+	if err := store.UpdateDistributedForkMemoryGraph("physical", "fork-original", 9, []string{"0000000000000009-03-0000000000000001"}, "fork-original"); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.LoadContainer(info.ID)
@@ -483,6 +483,56 @@ func TestOriginalDistributedTargetRemainsAddressableAfterSiblingImport(t *testin
 	}
 	if updated.Branches[0].State != "paused" || updated.Branches[0].SnapshotID != 9 || updated.Branches[1].State != "running" || updated.Branches[1].SnapshotID != 0 {
 		t.Fatalf("branch states changed incorrectly: %+v", updated.Branches)
+	}
+}
+
+func TestDistributedForkTargetReadsOnlyItsFamily(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	target := ContainerInfo{
+		ID: "tx-target", Name: "tx-target", State: "running", DistributedFamilyID: "family",
+		BundleDir:                    filepath.Join(root, "containers", "tx-target", "bundle"),
+		DistributedForkTransactionID: "tx-target", DistributedForkHidden: true,
+		Branches: []BranchInfo{{ID: "tx-target", State: "running", DistributedForkTransactionID: "tx-target", DependentMemoryBytes: 7}},
+	}
+	if err := os.MkdirAll(target.BundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCurrentContainerFixture(filepath.Join(root, "containers", target.ID, "container.json"), &target); err != nil {
+		t.Fatal(err)
+	}
+	// Another family's record, which the lookup must not read.
+	if err := os.MkdirAll(filepath.Join(root, "containers", "other"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "containers", "other", "container.json"), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	found, err := store.LoadDistributedForkTarget("family", "tx-target")
+	if err != nil || found.ID != target.ID {
+		t.Fatalf("target = %q, %v", found.ID, err)
+	}
+	// Unchanged counters leave the record as it is.
+	path := filepath.Join(root, "containers", target.ID, "container.json")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateDistributedForkDependencies("family", "tx-target", 7, 0); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("unchanged dependency counters rewrote the record")
+	}
+	if err := store.UpdateDistributedForkDependencies("family", "tx-target", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := store.LoadDistributedForkTarget("family", "tx-target"); err != nil || updated.Branches[0].DependentMemoryBytes != 0 {
+		t.Fatalf("updated target = %+v, %v", updated.Branches, err)
 	}
 }
 
@@ -518,7 +568,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 	if prepared.Container.ID != "target-id" {
 		t.Fatalf("prepared container=%q, want existing target-id", prepared.Container.ID)
 	}
-	_, branch, peer, err := store.DistributedForkTargetBranch("tx-import")
+	_, branch, peer, err := store.DistributedForkTargetBranch("global-family", "tx-import")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,16 +595,16 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 		t.Fatalf("peer bootstrap filesystem annotation=%q, want %q", got, branch.FilesystemBranch)
 	}
 	graphObjects := []string{"0000000000000007-03-0000000000000001", "0000000000000006-03-0000000000000002"}
-	if err := store.UpdateDistributedForkMemoryGraph("tx-import", 7, graphObjects, "tx-import"); err != nil {
+	if err := store.UpdateDistributedForkMemoryGraph("global-family", "tx-import", 7, graphObjects, "tx-import"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateDistributedForkTargetState("tx-import", "paused"); err != nil {
+	if err := store.UpdateDistributedForkTargetState("global-family", "tx-import", "paused"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishDistributedForkTarget("tx-import"); err != nil {
+	if _, err := store.PublishDistributedForkTarget("global-family", "tx-import"); err != nil {
 		t.Fatal(err)
 	}
-	info, branch, peer, err := store.DistributedForkTargetBranch("tx-import")
+	info, branch, peer, err := store.DistributedForkTargetBranch("global-family", "tx-import")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +614,7 @@ func TestDistributedForkImportUsesExistingFamily(t *testing.T) {
 		branch.MemoryRoots[0] != fmt.Sprintf("memory/branch/%s/resource-0000", branch.FilesystemBranch) {
 		t.Fatalf("published peer=%t branch=%+v family=%+v", peer, branch, info.Branches)
 	}
-	if err := store.RemoveDistributedForkTarget("tx-import"); err != nil {
+	if err := store.RemoveDistributedForkTarget("global-family", "tx-import"); err != nil {
 		t.Fatal(err)
 	}
 	remaining, err := store.LoadContainer("target")
@@ -609,7 +659,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		_, branch, peer, err := store.DistributedForkTargetBranch(transaction)
+		_, branch, peer, err := store.DistributedForkTargetBranch("global-family", transaction)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -639,7 +689,7 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	if got := spec.Annotations[specutils.AnnotationTTCInitialBranchParentID]; got != "main" {
 		t.Fatalf("cold migration parent annotation=%q, want main", got)
 	}
-	if err := store.RemoveDistributedForkTarget("tx-cancel"); err != nil {
+	if err := store.RemoveDistributedForkTarget("global-family", "tx-cancel"); err != nil {
 		t.Fatal(err)
 	}
 	afterCancel, err := store.LoadContainer("family")
@@ -651,10 +701,10 @@ func TestDistributedMigrationReplacesBranchAndPreservesIdentity(t *testing.T) {
 	}
 
 	prepare("tx-publish")
-	if err := store.UpdateDistributedForkTargetState("tx-publish", "paused"); err != nil {
+	if err := store.UpdateDistributedForkTargetState("global-family", "tx-publish", "paused"); err != nil {
 		t.Fatal(err)
 	}
-	published, err := store.PublishDistributedForkTarget("tx-publish")
+	published, err := store.PublishDistributedForkTarget("global-family", "tx-publish")
 	if err != nil {
 		t.Fatal(err)
 	}

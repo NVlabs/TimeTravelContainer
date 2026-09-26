@@ -1927,14 +1927,6 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	if opts.Migration && opts.SourceNode == "" {
 		return Prepared{}, errors.New("distributed migration source node ID is empty")
 	}
-	if existing, err := s.LoadDistributedForkTarget(opts.TransactionID); err == nil {
-		if existing.Name != opts.TargetName || existing.DistributedForkNodeID != opts.NodeID {
-			return Prepared{}, fmt.Errorf("distributed fork transaction %q is bound to another target", opts.TransactionID)
-		}
-		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return Prepared{}, err
-	}
 	var source ContainerInfo
 	if opts.Source != nil {
 		source = *opts.Source
@@ -1980,6 +1972,14 @@ func (s Store) PrepareDistributedFork(ctx context.Context, opts DistributedForkO
 	globalFamilyID := source.DistributedFamilyID
 	if globalFamilyID == "" {
 		globalFamilyID = source.ID
+	}
+	if existing, err := s.LoadDistributedForkTarget(globalFamilyID, opts.TransactionID); err == nil {
+		if existing.Name != opts.TargetName || existing.DistributedForkNodeID != opts.NodeID {
+			return Prepared{}, fmt.Errorf("distributed fork transaction %q is bound to another target", opts.TransactionID)
+		}
+		return Prepared{BundleDir: existing.BundleDir, RootFS: existing.RootFS, Container: existing}, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return Prepared{}, err
 	}
 	containers, err := s.containersNamed(opts.TargetName)
 	if err != nil {
@@ -3157,21 +3157,35 @@ func (s Store) mutateContainer(identifier string, mutate func(*ContainerInfo) (b
 
 // LoadDistributedForkTarget resolves a hidden or published target by its
 // immutable transaction marker. It is intended only for ttcd reconciliation.
-func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, error) {
+func (s Store) LoadDistributedForkTarget(family, transactionID string) (ContainerInfo, error) {
 	if err := validateObjectName("distributed fork transaction", transactionID); err != nil {
 		return ContainerInfo{}, err
 	}
-	containers, err := s.listContainers(true)
+	// The target is a record of its own, named by the transaction and
+	// hidden until the transaction publishes it, or one of the family's
+	// published records, which imports the branch.
+	ids, err := s.FamilyContainerIDs(family)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
+	if !slices.Contains(ids, transactionID) {
+		ids = append(ids, transactionID)
+	}
 	var found *ContainerInfo
-	for i := range containers {
-		matches := containers[i].DistributedForkTransactionID == transactionID
-		if _, ok := containers[i].DistributedForkImports[transactionID]; ok {
+	for _, id := range ids {
+		info, err := s.loadContainerKey(id)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Removed since it was listed, or not yet published.
+			continue
+		}
+		if err != nil {
+			return ContainerInfo{}, err
+		}
+		matches := info.DistributedForkTransactionID == transactionID
+		if _, ok := info.DistributedForkImports[transactionID]; ok {
 			matches = true
 		}
-		for _, branch := range containers[i].Branches {
+		for _, branch := range info.Branches {
 			if branch.DistributedForkTransactionID == transactionID {
 				matches = true
 				break
@@ -3183,8 +3197,7 @@ func (s Store) LoadDistributedForkTarget(transactionID string) (ContainerInfo, e
 		if found != nil {
 			return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q has multiple target containers", transactionID)
 		}
-		copy := containers[i]
-		found = &copy
+		found = &info
 	}
 	if found == nil {
 		return ContainerInfo{}, fmt.Errorf("distributed fork transaction %q target: %w", transactionID, fs.ErrNotExist)
@@ -3742,8 +3755,8 @@ func (s Store) listContainersWithPolicy(includeHidden, includePhysical, tolerate
 
 // PublishDistributedForkTarget atomically makes a prepared target visible to
 // ordinary TTC listing and lookup.
-func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo, error) {
-	info, err := s.LoadDistributedForkTarget(transactionID)
+func (s Store) PublishDistributedForkTarget(family, transactionID string) (ContainerInfo, error) {
+	info, err := s.LoadDistributedForkTarget(family, transactionID)
 	if err != nil {
 		return ContainerInfo{}, err
 	}
@@ -3844,18 +3857,25 @@ func (s Store) PublishDistributedForkTarget(transactionID string) (ContainerInfo
 // UpdateDistributedForkDependencies records volatile source bytes while a
 // target is hidden or already visible. Values are observations and may move
 // downward without changing lifecycle placement.
-func (s Store) UpdateDistributedForkDependencies(transactionID string, memoryBytes, filesystemBytes uint64) error {
-	info, err := s.LoadDistributedForkTarget(transactionID)
+func (s Store) UpdateDistributedForkDependencies(family, transactionID string, memoryBytes, filesystemBytes uint64) error {
+	info, err := s.LoadDistributedForkTarget(family, transactionID)
 	if err != nil {
 		return err
 	}
 	return s.mutateContainer(info.ID, func(current *ContainerInfo) (bool, error) {
 		if index, ok := distributedForkBranchIndex(*current, transactionID); ok {
-			current.Branches[index].DependentMemoryBytes = memoryBytes
-			current.Branches[index].DependentFilesystemBytes = filesystemBytes
+			branch := &current.Branches[index]
+			if branch.DependentMemoryBytes == memoryBytes && branch.DependentFilesystemBytes == filesystemBytes {
+				return false, nil
+			}
+			branch.DependentMemoryBytes = memoryBytes
+			branch.DependentFilesystemBytes = filesystemBytes
 			return true, nil
 		}
 		if pending, ok := current.DistributedForkImports[transactionID]; ok {
+			if pending.DependentMemoryBytes == memoryBytes && pending.DependentFilesystemBytes == filesystemBytes {
+				return false, nil
+			}
 			pending.DependentMemoryBytes = memoryBytes
 			pending.DependentFilesystemBytes = filesystemBytes
 			current.DistributedForkImports[transactionID] = pending
@@ -3867,8 +3887,8 @@ func (s Store) UpdateDistributedForkDependencies(transactionID string, memoryByt
 
 // UpdateDistributedForkTargetState records hidden-target lifecycle without
 // making the target visible.
-func (s Store) UpdateDistributedForkTargetState(transactionID, state string) error {
-	info, err := s.LoadDistributedForkTarget(transactionID)
+func (s Store) UpdateDistributedForkTargetState(family, transactionID, state string) error {
+	info, err := s.LoadDistributedForkTarget(family, transactionID)
 	if err != nil {
 		return err
 	}
@@ -3889,14 +3909,14 @@ func (s Store) UpdateDistributedForkTargetState(transactionID, state string) err
 // UpdateDistributedForkMemoryGraph records the immutable graph roots selected
 // by a hidden or published distributed target. Target-local logical names are
 // derived from its immutable filesystem-branch identity, not its visible name.
-func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID uint64, objects []string, referenceOperation string) error {
+func (s Store) UpdateDistributedForkMemoryGraph(family, transactionID string, snapshotID uint64, objects []string, referenceOperation string) error {
 	if snapshotID == 0 || len(objects) == 0 || len(objects) > 4096 {
 		return errors.New("distributed graph memory identity is incomplete")
 	}
 	if referenceOperation == "" || filepath.Base(referenceOperation) != referenceOperation || strings.ContainsAny(referenceOperation, `/\\`) {
 		return errors.New("distributed graph reference operation is invalid")
 	}
-	info, err := s.LoadDistributedForkTarget(transactionID)
+	info, err := s.LoadDistributedForkTarget(family, transactionID)
 	if err != nil {
 		return err
 	}
@@ -3941,8 +3961,8 @@ func (s Store) UpdateDistributedForkMemoryGraph(transactionID string, snapshotID
 
 // DistributedForkTargetBranch resolves the branch associated with a target
 // transaction. peer is true when it was imported into an existing family.
-func (s Store) DistributedForkTargetBranch(transactionID string) (info ContainerInfo, branch BranchInfo, peer bool, err error) {
-	info, err = s.LoadDistributedForkTarget(transactionID)
+func (s Store) DistributedForkTargetBranch(family, transactionID string) (info ContainerInfo, branch BranchInfo, peer bool, err error) {
+	info, err = s.LoadDistributedForkTarget(family, transactionID)
 	if err != nil {
 		return ContainerInfo{}, BranchInfo{}, false, err
 	}
@@ -4002,8 +4022,8 @@ func distributedForkBranchIndex(info ContainerInfo, transactionID string) (int, 
 // RemoveDistributedForkTarget removes a transaction target and its image
 // lease. Borrowed source-family repositories live outside the target directory
 // and are deliberately retained.
-func (s Store) RemoveDistributedForkTarget(transactionID string) error {
-	info, branch, peer, err := s.DistributedForkTargetBranch(transactionID)
+func (s Store) RemoveDistributedForkTarget(family, transactionID string) error {
+	info, branch, peer, err := s.DistributedForkTargetBranch(family, transactionID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}

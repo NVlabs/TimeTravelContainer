@@ -3605,7 +3605,7 @@ func (b *runtimeBackend) releaseMigratedSourceRuntimeWithPolicy(containerID, bra
 			if err := b.reclaimMigratedSourceBackingWithPolicy(info, branchID, publishBacking); err != nil {
 				return err
 			}
-			return b.containerStore().RemoveDistributedForkTarget(info.DistributedForkTransactionID)
+			return b.containerStore().RemoveDistributedForkTarget(logicalFamilyID(info), info.DistributedForkTransactionID)
 		}
 		return b.removeMigratedSourceMetadataWithPolicy(info, branchID, publishBacking)
 	}
