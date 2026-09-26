@@ -1097,13 +1097,6 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 		message := []byte("ttc hvf application error: " + retErr.Error() + "\n")
 		_, _ = syscall.Write(3, message)
 	}()
-	registers, ok := application.Registers.(*vmm.ARM64State)
-	if !ok {
-		return vmm.Exit{}, fmt.Errorf("HVF ring0 ARM64 state has type %T, want *vmm.ARM64State", application.Registers)
-	}
-	if !validApplicationPState(registers.PState) {
-		return vmm.Exit{}, fmt.Errorf("invalid ARM64 application PSTATE %#x before ring0 EL0 entry", registers.PState)
-	}
 	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
 	cleanupCPU := func() {
 		cpu.applicationActive.Store(false)
@@ -1113,7 +1106,17 @@ func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.App
 			e.releaseApplicationCPU(cpu)
 		}
 	}
+	// Register cleanup before validating, so an invalid request does not
+	// leak the pin that getApplicationCPU took; a leaked pin keeps the vCPU
+	// from ever being reaped.
 	defer cleanupCPU()
+	registers, ok := application.Registers.(*vmm.ARM64State)
+	if !ok {
+		return vmm.Exit{}, fmt.Errorf("HVF ring0 ARM64 state has type %T, want *vmm.ARM64State", application.Registers)
+	}
+	if !validApplicationPState(registers.PState) {
+		return vmm.Exit{}, fmt.Errorf("invalid ARM64 application PSTATE %#x before ring0 EL0 entry", registers.PState)
+	}
 
 retryApplication:
 	atGuestEL1 := ring0asm.CurrentEL() != 0
