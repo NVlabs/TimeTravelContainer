@@ -91,3 +91,22 @@ go_test(
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
+
+# hvf_test skips unless its binary is signed with the hypervisor entitlement.
+sh_test(
+    name = "hvf_entitled_test",
+    size = "medium",
+    srcs = ["//runsc:run_entitled_test.sh"],
+    args = [
+        "$(rootpath :hvf_test)",
+        "$(rootpath //runsc:hvf.entitlements)",
+    ],
+    data = [
+        ":hvf_test",
+        "//runsc:hvf.entitlements",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:arm64",
+        "@platforms//os:osx",
+    ],
+)

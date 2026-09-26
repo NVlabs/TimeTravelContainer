@@ -17,6 +17,7 @@
 package hvf
 
 import (
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -46,7 +47,7 @@ func TestPlatformRegistrationConstructsSentryAtEL1Engine(t *testing.T) {
 	}
 	p, err := constructor.New(platform.Options{ApplicationCores: 2})
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	if got := p.SeccompInfo().ConfigKey(); got != "hvf" {
 		t.Errorf("platform config key = %q, want hvf", got)
@@ -61,4 +62,15 @@ func TestPlatformRegistrationConstructsSentryAtEL1Engine(t *testing.T) {
 	if err := closer.Close(); err != nil {
 		t.Fatalf("closing hvf platform: %v", err)
 	}
+}
+
+// skipWithoutHypervisor skips the test because Hypervisor.framework is
+// unavailable, as it is to an unsigned test binary, unless TTC_REQUIRE_HVF is
+// set, as it is when the binary has been signed to use it.
+func skipWithoutHypervisor(t *testing.T, err error) {
+	t.Helper()
+	if os.Getenv("TTC_REQUIRE_HVF") != "" {
+		t.Fatalf("Hypervisor.framework unavailable: %v", err)
+	}
+	t.Skipf("Hypervisor.framework unavailable: %v", err)
 }

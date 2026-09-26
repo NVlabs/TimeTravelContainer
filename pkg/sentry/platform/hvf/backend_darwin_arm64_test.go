@@ -50,7 +50,7 @@ func TestRing0ContinuationTransfer(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	if err := hvf.ValidateRing0Continuation(vm); err != nil {
@@ -107,7 +107,7 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	engine, err := hvf.NewVMEngine(vm, 2)
@@ -247,7 +247,7 @@ func TestRing0EngineForwardsBreakpointAndSoftwareStep(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	engine, err := hvf.NewVMEngine(vm, 1)
@@ -328,7 +328,7 @@ func TestStage2HostReverseIndexTracksMapLifecycle(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
@@ -359,7 +359,7 @@ func TestRing0EngineCloseRetiresOwnerVCPU(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	engine, err := hvf.NewVMEngine(vm, 1)
@@ -451,7 +451,7 @@ func TestMonitorExecutesFourLogicalPagesInOneHostSlab(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 
@@ -642,7 +642,7 @@ func TestMonitorMultiVCPUTranslationReplacementTorture(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer vm.Close()
 	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
@@ -739,7 +739,7 @@ func TestRing0PlatformCompactionRelocatesExecutingFrame(t *testing.T) {
 	backend := hvf.NewBackend()
 	vm, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	p, err := vmplatform.New(vmplatform.Config{
 		VM: vm, HostMemory: backend.HostMemory(), Architecture: vmarm64.Architecture{},
@@ -853,7 +853,7 @@ func TestRing0PlatformEpochRolloverRebuildsExecutingAddressSpace(t *testing.T) {
 		PlatformName: "hvf-rollover-test", VMEngineFactory: hvf.NewVMEngine,
 	})
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer p.Close()
 
@@ -1051,7 +1051,7 @@ func TestRing0PlatformRolloverRetiresIdleResidency(t *testing.T) {
 		PlatformName: "hvf-idle-rollover-test", VMEngineFactory: hvf.NewVMEngine,
 	})
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	defer p.Close()
 
@@ -1205,4 +1205,15 @@ func waitForPlatformEpoch(t *testing.T, p *vmplatform.Platform, want uint64) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// skipWithoutHypervisor skips the test because Hypervisor.framework is
+// unavailable, as it is to an unsigned test binary, unless TTC_REQUIRE_HVF is
+// set, as it is when the binary has been signed to use it.
+func skipWithoutHypervisor(t *testing.T, err error) {
+	t.Helper()
+	if os.Getenv("TTC_REQUIRE_HVF") != "" {
+		t.Fatalf("Hypervisor.framework unavailable: %v", err)
+	}
+	t.Skipf("Hypervisor.framework unavailable: %v", err)
 }

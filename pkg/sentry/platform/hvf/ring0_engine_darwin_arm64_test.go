@@ -200,7 +200,7 @@ func TestFlushHostExecutionCacheReleasesAllocatorMappings(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -258,7 +258,7 @@ func TestHostMemoryDecommitRetiresSentryMirror(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -381,7 +381,7 @@ func TestApplicationWaiterInterruptsCPUBoundIncumbent(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -474,7 +474,7 @@ func TestAdmissionKickTargetsOneCPUBoundIncumbent(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -586,7 +586,7 @@ func TestTranslationMutationQuiescesCPUBoundApplication(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -686,7 +686,7 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -958,7 +958,7 @@ func TestRing0ConcurrentSyscallMonitorAndRecycle(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1086,7 +1086,7 @@ func TestMonitorRecyclesDestroyedAddressSpaceTables(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1130,7 +1130,7 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1335,7 +1335,7 @@ func TestSentryHeapRemainsCoherentAcrossHostService(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1435,7 +1435,7 @@ func TestDarwinLibcCallRedpillsBeforeASMCGOCall(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1538,7 +1538,7 @@ func TestCPUboundApplicationDoesNotStarveGoScheduler(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1607,7 +1607,7 @@ func TestArchitectedInterruptionPreservesApplicationRegisters(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -1930,7 +1930,7 @@ func newRing0MonitorTestEngine(t *testing.T) (*hvfVM, *ring0Engine) {
 	t.Helper()
 	vmInterface, err := NewBackend().CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	t.Cleanup(func() { vm.Close() })
@@ -2009,7 +2009,7 @@ func TestInterruptApplicationStopsOnlyTargetRun(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -2118,7 +2118,7 @@ func TestApplicationEL0MatchesLinux(t *testing.T) {
 	backend := NewBackend()
 	vmInterface, err := backend.CreateVM(context.Background())
 	if err != nil {
-		t.Skipf("Hypervisor.framework unavailable: %v", err)
+		skipWithoutHypervisor(t, err)
 	}
 	vm := vmInterface.(*hvfVM)
 	defer vm.Close()
@@ -2273,4 +2273,15 @@ func TestMonitorCommandTLBFlush(t *testing.T) {
 			t.Errorf("%s: monitorCommandTLBFlush = %d, want %d", tc.name, got, tc.want)
 		}
 	}
+}
+
+// skipWithoutHypervisor skips the test because Hypervisor.framework is
+// unavailable, as it is to an unsigned test binary, unless TTC_REQUIRE_HVF is
+// set, as it is when the binary has been signed to use it.
+func skipWithoutHypervisor(t *testing.T, err error) {
+	t.Helper()
+	if os.Getenv("TTC_REQUIRE_HVF") != "" {
+		t.Fatalf("Hypervisor.framework unavailable: %v", err)
+	}
+	t.Skipf("Hypervisor.framework unavailable: %v", err)
 }
