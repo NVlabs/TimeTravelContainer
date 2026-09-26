@@ -442,3 +442,61 @@ func TestCancelFinishesACaptureCheckItFenced(t *testing.T) {
 		t.Fatalf("canceled capture cleaned %d times, want 1", len(publisher.cleaned))
 	}
 }
+
+// gatedPublisher's completion waits for a gate that the test holds, as a
+// capture holds the snapshot handoff gate.
+type gatedPublisher struct {
+	testPublisher
+	waiting chan struct{}
+	gate    chan struct{}
+}
+
+func (p *gatedPublisher) BeginCompletion() func() {
+	close(p.waiting)
+	<-p.gate
+	return func() {}
+}
+
+func TestCompletionWaitsForItsGateWithoutTheQueueLock(t *testing.T) {
+	publisher := &gatedPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		waiting:       make(chan struct{}), gate: make(chan struct{}),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-4", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-4"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-publisher.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completion did not begin")
+	}
+	// A removal that holds what the gate's holder waits for cancels another
+	// branch's publication meanwhile.
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "other", PublicationID: "publication-5", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- queue.Cancel("family", "other", "publication-5") }()
+	select {
+	case err := <-canceled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel waited for a completion that waits for its gate")
+	}
+	close(publisher.gate)
+	select {
+	case <-publisher.completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publication did not complete once its gate opened")
+	}
+}

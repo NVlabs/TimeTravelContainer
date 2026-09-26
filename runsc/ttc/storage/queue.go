@@ -65,6 +65,14 @@ type Publisher interface {
 	Cleanup(Intent) error
 }
 
+// completionGater is implemented by publishers whose Complete needs a lock
+// that its holders may keep while they wait for this queue. The queue takes
+// that lock before its own, never under it, and what BeginCompletion returns
+// releases it.
+type completionGater interface {
+	BeginCompletion() func()
+}
+
 // cancellationFencer is implemented by distributed publishers whose control
 // plane can reject an in-flight Complete before physical cleanup is safe. The
 // durable local tombstone is installed first; Raft then gives commit versus
@@ -436,6 +444,10 @@ func (q *Queue) process() time.Duration {
 		q.mu.Unlock()
 
 		result, publishErr := q.publisher.Publish(context.Background(), intent)
+		endCompletion := func() {}
+		if gater, ok := q.publisher.(completionGater); ok && publishErr == nil {
+			endCompletion = gater.BeginCompletion()
+		}
 		q.mu.Lock()
 		canceled := q.canceled(intent.ID)
 		if publishErr == nil && !canceled {
@@ -443,6 +455,7 @@ func (q *Queue) process() time.Duration {
 			canceled = q.canceled(intent.ID)
 		}
 		q.mu.Unlock()
+		endCompletion()
 
 		if canceled {
 			cleanupErr := q.publisher.Cleanup(intent)

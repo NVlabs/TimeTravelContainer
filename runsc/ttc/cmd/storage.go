@@ -1320,6 +1320,20 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 	return releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot)
 }
 
+// BeginCompletion takes, for Complete, the snapshot handoff gate: the final
+// provider-to-shared ledger switch freezes reference changes, which live and
+// dehydration captures, creating new DAG edges to these immutable origins,
+// must not make meanwhile. Slow pack construction happened before and does not
+// hold the gate. The queue takes it before its own lock: a capture keeps the
+// gate while it waits for the lifecycle lock, whose holder may wait for the
+// queue, as a removal canceling the branch's publications does.
+func (p *branchPublisher) BeginCompletion() func() {
+	if p.authority == nil {
+		return func() {}
+	}
+	return p.peers.beginBackgroundSnapshotWork()
+}
+
 func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.Result) error {
 	store := ttcbundle.Store{Root: p.sharedRoot, ActiveRoot: p.localRoot}
 	info, err := store.LoadContainer(intent.Container)
@@ -1335,12 +1349,6 @@ func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.R
 		bridgeIntent := sharedPublicationBridgeIntent{
 			Kind: sharedPublicationBridgePublication, Family: family, Branch: authorityBranch, PublicationID: intent.PublicationID,
 		}
-		// The final provider-to-shared ledger switch freezes reference changes.
-		// Coordinate it with live/dehydration captures, which may create new DAG
-		// edges to these immutable origins. Slow pack construction happened before
-		// this point and does not hold the gate.
-		finishReferenceHandoff := p.peers.beginBackgroundSnapshotWork()
-		defer finishReferenceHandoff()
 		branch, branchErr := persistentBranchInfo(info, intent.Branch)
 		if branchErr != nil {
 			return branchErr
