@@ -740,12 +740,10 @@ func (n *AuthorityRaftNode) Propose(ctx context.Context, requestID string, kind 
 	}
 	// Replacing or expiring an incarnation can authorize execution elsewhere.
 	// After leader failover, wait at least the old grant duration so a node
-	// using only its conservative monotonic-local deadline has self-fenced.
+	// using only its conservative monotonic-local deadline has self-fenced;
+	// an incarnation whose record grants no execution has nothing to wait
+	// out.
 	if kind == AuthorityNodeRegister || kind == AuthorityNodeExpire {
-		state, stateErr := n.AppliedState()
-		if stateErr != nil {
-			return AuthorityResult{}, stateErr
-		}
 		var nodeID, incarnation string
 		var safety time.Duration
 		if kind == AuthorityNodeRegister {
@@ -761,8 +759,12 @@ func (n *AuthorityRaftNode) Propose(ctx context.Context, requestID string, kind 
 			}
 			nodeID, incarnation = decoded.NodeID, decoded.Incarnation
 		}
+		state, stateErr := n.AppliedQuery(AuthorityQuery{Nodes: Only(nodeID)})
+		if stateErr != nil {
+			return AuthorityResult{}, stateErr
+		}
 		if current, ok := state.Nodes[nodeID]; ok && current.Incarnation != incarnation || kind == AuthorityNodeExpire {
-			if current, ok := state.Nodes[nodeID]; ok {
+			if current, ok := state.Nodes[nodeID]; ok && current.mayExecute() {
 				safety = current.LeaseDuration
 			}
 			if safety > 0 && !n.LeadershipSafeFor(safety) {

@@ -97,6 +97,13 @@ func (r NodeRecord) LeaseActive(now time.Time) bool {
 // NodeRoleLabel labels the record of a node by its role; see RoleControl.
 const NodeRoleLabel = "ttc.role"
 
+// mayExecute reports whether the record may grant its node's incarnation
+// execution: not once the incarnation is offline, having retired or
+// expired, and never on a control daemon's node, which runs nothing.
+func (r NodeRecord) mayExecute() bool {
+	return r.State != NodeOffline && r.Labels[NodeRoleLabel] != RoleControl
+}
+
 // AcceptsPlacement reports whether a scheduler may reserve new work here. A
 // control daemon's node, which holds the authority while no compute daemon
 // runs, takes none.

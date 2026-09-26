@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,6 +174,45 @@ func registerReadyRaftNode(t *testing.T, leader *AuthorityRaftNode, id, incarnat
 		if err != nil || result.Err() != nil {
 			t.Fatalf("applying %s: result=%+v err=%v", entry.kind, result, err)
 		}
+	}
+}
+
+// A leader that has led for less than a node's lease waits it out before it
+// lets another incarnation of the node register, for the old incarnation may
+// still run what its lease let it; not for an incarnation that is offline.
+func TestRegisteringAnotherIncarnationWaitsOnlyForOneThatMayRun(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+		NodeID: "node-a", LocalDir: filepath.Join(t.TempDir(), "raft"),
+		ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+		ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	waitAuthorityLeader(t, node)
+	propose := func(id string, kind AuthorityCommandKind, payload any) error {
+		result, err := node.Propose(context.Background(), id, kind, payload)
+		if err != nil {
+			return err
+		}
+		return result.Err()
+	}
+	register := func(id, incarnation string) error {
+		record := testAuthorityNode(time.Now().UTC())
+		record.NodeID, record.Incarnation, record.Capabilities.NodeID = id, incarnation, id
+		return propose("register-"+id+"-"+incarnation, AuthorityNodeRegister, AuthorityNodeRegisterPayload{Record: record, LeaseDuration: time.Hour})
+	}
+	registerReadyRaftNode(t, node, "node-b", "i-1")
+	if err := register("node-b", "i-2"); err == nil || !strings.Contains(err.Error(), "self-fence") {
+		t.Fatalf("registering another incarnation of a ready node: %v, want it to wait", err)
+	}
+	if err := propose("offline-node-b", AuthorityNodeTransition, AuthorityNodeTransitionPayload{NodeID: "node-b", Incarnation: "i-1", State: NodeOffline, LeaseDuration: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if err := register("node-b", "i-2"); err != nil {
+		t.Fatalf("registering another incarnation of an offline node: %v", err)
 	}
 }
 

@@ -248,3 +248,21 @@ func TestNodeDirectoryRejectsCorruptSharedRecord(t *testing.T) {
 		t.Fatal("corrupt node record was accepted")
 	}
 }
+
+// Only a record of a live incarnation of a compute node may grant execution.
+func TestOnlyALiveComputeIncarnationMayExecute(t *testing.T) {
+	control := map[string]string{NodeRoleLabel: RoleControl}
+	for _, test := range []struct {
+		record NodeRecord
+		want   bool
+	}{
+		{NodeRecord{State: NodeReady}, true},
+		{NodeRecord{State: NodeDraining}, true},
+		{NodeRecord{State: NodeOffline}, false},
+		{NodeRecord{State: NodeReady, Labels: control}, false},
+	} {
+		if got := test.record.mayExecute(); got != test.want {
+			t.Errorf("%+v may execute: %t, want %t", test.record, got, test.want)
+		}
+	}
+}
