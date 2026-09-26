@@ -13,6 +13,7 @@ go_library(
         "data.go",
 		"deferred.go",
         "filesystem.go",
+        "filesystem_json.go",
         "host_ops_darwin.go",
         "host_ops_linux.go",
 		"hosttree.go",
@@ -37,6 +38,7 @@ go_test(
     srcs = [
 		"catalog_test.go",
 		"deferred_test.go",
+		"filesystem_json_test.go",
 		"hosttree_test.go",
 		"ledger_test.go",
 		"names_test.go",
