@@ -566,6 +566,14 @@ func daemonCommandClaimsUnplaced(args []string) bool {
 	return len(args) >= 2 && (args[0] == "rehydrate" || args[0] == "start" || args[0] == "restart")
 }
 
+// daemonCommandActsOnUnplaced reports whether a command routed to the owner
+// of a branch still acts on the branch once it has become unplaced, as a
+// stop's or a dehydration's publication unplaces it: one that claims it does,
+// and so does a removal, which removes it as it is.
+func daemonCommandActsOnUnplaced(args []string) bool {
+	return daemonCommandClaimsUnplaced(args) || len(args) >= 2 && args[0] == "rm"
+}
+
 func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args []string, claims []daemonPlacementClaim, placements cluster.PlacementCatalog) error {
 	if len(claims) == 0 {
 		return nil
@@ -582,12 +590,13 @@ func validateDaemonPlacementClaimsWithCatalog(dataRoot, localNode string, args [
 			return fmt.Errorf("loading placement authority: %w", err)
 		}
 		record := *found
-		if record.State == cluster.PlacementUnplaced && daemonCommandClaimsUnplaced(args) {
+		if record.State == cluster.PlacementUnplaced && daemonCommandActsOnUnplaced(args) {
 			// The branch's cold publication committed after the command was
 			// routed here, as it may whenever a dehydration's publication
-			// outlasts the command that asks for the branch back. The
-			// branch has no owner now, and the command claims it for this
-			// node as it claims any unplaced branch.
+			// outlasts the command that asks for the branch back, or a
+			// stop's outlasts the removal that follows it. The branch has no
+			// owner now: the command claims it for this node as it claims
+			// any unplaced branch, or removes it as it is.
 			continue
 		}
 		if record.State != cluster.PlacementRunning && record.State != cluster.PlacementPaused && !(claim.AllowMaterializing && record.State == cluster.PlacementMaterializing) {
