@@ -52,6 +52,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/processutil"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
@@ -8687,7 +8688,11 @@ func exchangeDaemon(conn net.Conn, request daemonRequest, stdin io.Reader, stdou
 }
 
 func writeDaemonQuorumWait(socket string) error {
-	state := protocol.DaemonQuorumWait{PID: os.Getpid(), APIVersion: daemonAPIVersion, BuildID: version.Version()}
+	started, err := processutil.StartTime(os.Getpid())
+	if err != nil {
+		return err
+	}
+	state := protocol.DaemonQuorumWait{PID: os.Getpid(), StartTime: started, APIVersion: daemonAPIVersion, BuildID: version.Version()}
 	data, err := json.Marshal(state)
 	if err != nil {
 		return err

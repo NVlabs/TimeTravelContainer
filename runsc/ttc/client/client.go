@@ -1093,26 +1093,19 @@ func quorumWaitDaemon(socket string) (protocol.DaemonQuorumWait, bool) {
 		return protocol.DaemonQuorumWait{}, false
 	}
 	var waiting protocol.DaemonQuorumWait
-	if err := json.Unmarshal(data, &waiting); err != nil || waiting.PID <= 0 || waiting.APIVersion <= 0 || waiting.BuildID == "" || syscall.Kill(waiting.PID, 0) != nil {
+	if err := json.Unmarshal(data, &waiting); err != nil || waiting.PID <= 0 || waiting.StartTime == "" || waiting.APIVersion <= 0 || waiting.BuildID == "" || syscall.Kill(waiting.PID, 0) != nil {
+		return protocol.DaemonQuorumWait{}, false
+	}
+	// The marker is in the root of the daemon that wrote it; a process that
+	// started at another time has the PID of one that is gone.
+	if started, err := processutil.StartTime(waiting.PID); err != nil || started != waiting.StartTime {
 		return protocol.DaemonQuorumWait{}, false
 	}
 	executable, err := processutil.Executable(waiting.PID)
 	if err != nil || filepath.Base(executable) != "ttcd" {
 		return protocol.DaemonQuorumWait{}, false
 	}
-	arguments, err := processutil.Arguments(waiting.PID)
-	if err != nil {
-		return protocol.DaemonQuorumWait{}, false
-	}
-	for index, argument := range arguments {
-		if argument == "--socket" && index+1 < len(arguments) && arguments[index+1] == socket {
-			return waiting, true
-		}
-		if strings.TrimPrefix(argument, "--socket=") != argument && strings.TrimPrefix(argument, "--socket=") == socket {
-			return waiting, true
-		}
-	}
-	return protocol.DaemonQuorumWait{}, false
+	return waiting, true
 }
 
 func terminateStartedDaemon(command *exec.Cmd, done <-chan error) {

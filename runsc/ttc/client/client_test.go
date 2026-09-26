@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -58,7 +59,7 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 	if copyErr != nil || closeErr != nil {
 		t.Fatal(errors.Join(copyErr, closeErr))
 	}
-	command := exec.Command(daemon, "-test.run=TestQuorumWaitHelperProcess", "--", "--socket", socket)
+	command := exec.Command(daemon, "-test.run=TestQuorumWaitHelperProcess")
 	command.Env = append(os.Environ(), "TTC_TEST_QUORUM_WAIT_HELPER=1")
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
@@ -69,8 +70,24 @@ func TestQuorumWaitDaemonLifecycle(t *testing.T) {
 		_, _ = command.Process.Wait()
 	}()
 
-	waiting := protocol.DaemonQuorumWait{PID: command.Process.Pid, APIVersion: daemonAPIVersion, BuildID: version.Version()}
+	started, err := processutil.StartTime(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A marker of a process that is gone, whose PID another took.
+	waiting := protocol.DaemonQuorumWait{PID: command.Process.Pid, StartTime: started + "0", APIVersion: daemonAPIVersion, BuildID: version.Version()}
 	data, err := json.Marshal(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(protocol.DaemonQuorumWaitPath(socket), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := quorumWaitDaemon(socket); ok {
+		t.Fatalf("quorumWaitDaemon accepted the marker %+v of a process that started at another time", got)
+	}
+	waiting.StartTime = started
+	data, err = json.Marshal(waiting)
 	if err != nil {
 		t.Fatal(err)
 	}
