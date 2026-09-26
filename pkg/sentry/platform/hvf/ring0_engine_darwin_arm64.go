@@ -39,21 +39,21 @@ import (
 )
 
 const (
-	ring0SentryAddressSpaceID   = ^uint64(0) // Sentry mirror and qualification only.
-	ring0HostVALimit            = uint64(1 << 48)
-	ring0HostMirrorGPAStart     = SentryMirrorIPAStart
-	ring0HostWorkingSetRadius   = uint64(256 << 10)
-	ring0MonitorVCPUID          = 63
-	stateApplicationFP          = 0x3000
-	stateRing0Entry             = 0x3340
-	stateTLBFlushRequested      = 0x2a68
+	ring0SentryAddressSpaceID = ^uint64(0) // Sentry mirror and qualification only.
+	ring0HostVALimit          = uint64(1 << 48)
+	ring0HostMirrorGPAStart   = SentryMirrorIPAStart
+	ring0HostWorkingSetRadius = uint64(256 << 10)
+	ring0MonitorVCPUID        = 63
+	stateApplicationFP        = 0x3000
+	stateRing0Entry           = 0x3340
+	stateTLBFlushRequested    = 0x2a68
 	// ring0TLBFlushAll and ring0TLBFlushEnteringSpace are the requests in
 	// stateTLBFlushRequested; see monitor_layout.h.
 	ring0TLBFlushAll           = 1
 	ring0TLBFlushEnteringSpace = 2
 	// ring0MaxTLBSpaceSync bounds the address spaces whose flushes an
 	// application vCPU tracks individually.
-	ring0MaxTLBSpaceSync = 256
+	ring0MaxTLBSpaceSync        = 256
 	stateVTimerOffset           = 0x3360
 	stateClockGettimePC         = 0x3368
 	stateMachAbsoluteTimePC     = 0x3370
@@ -165,14 +165,14 @@ type ring0Engine struct {
 	// ID. Entries into other address spaces proceed during a mutation.
 	entryMutationMu   sync.Mutex
 	entryBlockedSpace atomic.Uint64
-	mirrorMu        sync.Mutex
-	stage2Slabs     map[uintptr]ring0Stage2Slab
-	stage1Access    map[uint64]monitorabi.Access
-	applicationGPAs map[uint64]map[uint64]uint64
-	nextMirrorGPA   uint64
-	faultMu         sync.Mutex
-	pendingMirror   map[uintptr]struct{}
-	sentryTTBR0     uint64
+	mirrorMu          sync.Mutex
+	stage2Slabs       map[uintptr]ring0Stage2Slab
+	stage1Access      map[uint64]monitorabi.Access
+	applicationGPAs   map[uint64]map[uint64]uint64
+	nextMirrorGPA     uint64
+	faultMu           sync.Mutex
+	pendingMirror     map[uintptr]struct{}
+	sentryTTBR0       uint64
 	// mirrorInitialized is protected by mirrorMu. Once the initial Sentry
 	// working set is installed, refreshHostMirror can ignore host-service gates
 	// that only sampled slabs which are already present. This is essential for
