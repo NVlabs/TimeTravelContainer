@@ -623,7 +623,12 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 	var current cluster.NodeRecord
 	placementByBranch := make(map[string]cluster.PlacementRecord)
 	if b.distributedSource.authority != nil {
-		authorityState, err = b.distributedSource.authority.AuthorityStateOf(cluster.PlacementsWithOwners)
+		// Beside the placements and what qualifies them, a runtime gone for
+		// a publication, and one mapped through a transaction, are read in
+		// the same state.
+		query := cluster.PlacementsWithOwners
+		query.Publications, query.Transactions = cluster.All[string](), cluster.All[string]()
+		authorityState, err = b.distributedSource.authority.AuthorityStateOf(query)
 		if err != nil {
 			return err
 		}
