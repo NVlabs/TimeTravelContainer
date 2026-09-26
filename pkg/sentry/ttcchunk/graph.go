@@ -732,23 +732,38 @@ func (f *objectFetcher) open(id ttcsnapshot.ObjectID, length int64) (*os.File, e
 		done := make(chan struct{})
 		f.fetching[id] = done
 		f.mu.Unlock()
-		err = f.fetch(id, length)
+		file, err = f.fetch(id, length)
 		f.mu.Lock()
 		delete(f.fetching, id)
 		f.mu.Unlock()
 		close(done)
-		if err != nil {
-			return nil, err
-		}
+		return file, err
 	}
 }
 
-func (f *objectFetcher) fetch(id ttcsnapshot.ObjectID, length int64) error {
+// fetch fetches, installs and opens one object.
+func (f *objectFetcher) fetch(id ttcsnapshot.ObjectID, length int64) (*os.File, error) {
 	data, err := f.remote.Fetch(id, uint64(length))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return f.data.Install(id, bytes.NewReader(data), length)
+	// The node's daemon sweeps the store of the objects its graph does not
+	// hold, as it does not hold this one. Install and open it under the
+	// store's fence, so that a sweep takes neither the temporary file it is
+	// written to nor the object before it is open: once one had, loading the
+	// page failed, "materializing sparse dehydrated VDSO parameter page: I/O
+	// error". A sweep may take it after; a reader that finds it gone fetches
+	// it again.
+	var file *os.File
+	err = f.data.WithGraphMutation(func() error {
+		if err := f.data.Install(id, bytes.NewReader(data), length); err != nil {
+			return err
+		}
+		var openErr error
+		file, openErr = f.data.Open(id, length)
+		return openErr
+	})
+	return file, err
 }
 
 // NewGraphChunkReader constructs a demand reader without materializing a

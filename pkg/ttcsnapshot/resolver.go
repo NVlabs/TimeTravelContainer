@@ -102,60 +102,75 @@ func (resolver *Resolver) resolveObject(ctx context.Context, object Object) (*os
 	if err != nil {
 		return nil, err
 	}
-	if file, err := resolver.local.Open(id, length); err == nil {
-		return file, nil
-	}
-
 	key := id.key()
-	resolver.mu.Lock()
-	if call := resolver.inflight[key]; call != nil {
-		resolver.mu.Unlock()
-		select {
-		case <-call.done:
-			if call.err != nil {
-				return nil, call.err
-			}
-			return resolver.local.Open(id, length)
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	for {
+		if file, err := resolver.local.Open(id, length); err == nil {
+			return file, nil
 		}
-	}
-	call := &resolveCall{done: make(chan struct{})}
-	resolver.inflight[key] = call
-	resolver.mu.Unlock()
+		resolver.mu.Lock()
+		if call := resolver.inflight[key]; call != nil {
+			resolver.mu.Unlock()
+			select {
+			case <-call.done:
+				if call.err != nil {
+					return nil, call.err
+				}
+				// A sweep of the store may have taken the object since:
+				// look again.
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		call := &resolveCall{done: make(chan struct{})}
+		resolver.inflight[key] = call
+		resolver.mu.Unlock()
 
-	// Once admitted, finish installation independently of one waiter being
-	// canceled. Later readers can safely reuse the complete cached object.
-	call.err = resolver.fetch(context.Background(), object)
-	resolver.mu.Lock()
-	delete(resolver.inflight, key)
-	close(call.done)
-	resolver.mu.Unlock()
-	if call.err != nil {
-		return nil, call.err
+		// Once admitted, finish installation independently of one waiter being
+		// canceled. Later readers can safely reuse the complete cached object.
+		var file *os.File
+		file, call.err = resolver.fetch(context.Background(), object)
+		resolver.mu.Lock()
+		delete(resolver.inflight, key)
+		close(call.done)
+		resolver.mu.Unlock()
+		return file, call.err
 	}
-	return resolver.local.Open(id, length)
 }
 
-func (resolver *Resolver) fetch(ctx context.Context, object Object) error {
+// fetch fetches, installs and opens one object.
+func (resolver *Resolver) fetch(ctx context.Context, object Object) (*os.File, error) {
 	node, volatile, err := resolver.origins.Provider(ctx, object.ID.Snapshot)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	source := resolver.shared
 	if volatile {
 		source, err = resolver.peers.Peer(ctx, node)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	reader, length, err := source.Fetch(ctx, object.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer reader.Close()
 	if length != object.BulkLength {
-		return fmt.Errorf("object %s source length is %d, want %d", object.ID.key(), length, object.BulkLength)
+		return nil, fmt.Errorf("object %s source length is %d, want %d", object.ID.key(), length, object.BulkLength)
 	}
-	return resolver.local.Install(object.ID, reader, int64(length))
+	// An object of an immutable catalog is not in the local graph, and a
+	// sweep of the store takes what the graph does not hold. Install and open
+	// the object under the store's fence, so that a sweep takes neither the
+	// temporary file it is written to nor the object before it is open.
+	var file *os.File
+	err = resolver.local.WithGraphMutation(func() error {
+		if err := resolver.local.Install(object.ID, reader, int64(length)); err != nil {
+			return err
+		}
+		var openErr error
+		file, openErr = resolver.local.Open(object.ID, int64(length))
+		return openErr
+	})
+	return file, err
 }

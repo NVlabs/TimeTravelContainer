@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +58,107 @@ func (peers testPeerSource) Peer(_ context.Context, node string) (ObjectSource, 
 		panic("unexpected provider " + node)
 	}
 	return peers.source, nil
+}
+
+// pausingObjectSource serves an object whose reader stops halfway until
+// released.
+type pausingObjectSource struct {
+	data    []byte
+	halfway chan struct{}
+	once    sync.Once
+	release chan struct{}
+}
+
+func (source *pausingObjectSource) Fetch(context.Context, ObjectID) (io.ReadCloser, uint64, error) {
+	return io.NopCloser(&pausingReader{source: source}), uint64(len(source.data)), nil
+}
+
+type pausingReader struct {
+	source *pausingObjectSource
+	offset int
+	paused bool
+}
+
+func (reader *pausingReader) Read(p []byte) (int, error) {
+	data := reader.source.data
+	if reader.offset == len(data) {
+		return 0, io.EOF
+	}
+	if reader.offset != 0 && !reader.paused {
+		reader.paused = true
+		reader.source.once.Do(func() { close(reader.source.halfway) })
+		<-reader.source.release
+	}
+	end := len(data)
+	if reader.offset == 0 {
+		end = len(data) / 2
+	}
+	n := copy(p, data[reader.offset:end])
+	reader.offset += n
+	return n, nil
+}
+
+// An object of an immutable catalog is not in the local graph, and a sweep of
+// the store takes what the graph does not hold. Resolving one must install and
+// open it whole while sweeps go on: one took the temporary file the object was
+// being written to, or the object before it was open.
+func TestResolverInstallsAnObjectTheGraphDoesNotHoldDespiteSweeps(t *testing.T) {
+	dir := t.TempDir()
+	graph, err := Open(dir + "/graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	cache, err := OpenLocalDataStore(dir + "/cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("catalog-object"), 8192)
+	object := Object{ID: ObjectID{Snapshot: 77, Kind: ObjectKindFile, Ordinal: 3}, State: ObjectLive, BulkLength: uint64(len(data))}
+	shared := &pausingObjectSource{data: data, halfway: make(chan struct{}), release: make(chan struct{})}
+	resolver, err := NewResolver(graph, cache, testOriginLocator{}, testPeerSource{}, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type resolved struct {
+		file *os.File
+		err  error
+	}
+	done := make(chan resolved, 1)
+	go func() {
+		file, err := resolver.ResolveKnown(context.Background(), object)
+		done <- resolved{file, err}
+	}()
+	<-shared.halfway
+	swept := make(chan error, 1)
+	go func() {
+		_, _, err := cache.ReclaimUnreferenced(graph)
+		swept <- err
+	}()
+	select {
+	case err := <-swept:
+		t.Fatalf("a sweep crossed the installation of an object: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(shared.release)
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("resolving the object: %v", result.err)
+	}
+	defer result.file.Close()
+	if err := <-swept; err != nil {
+		t.Fatal(err)
+	}
+	// The sweep has taken the object, which the open file still reads.
+	got, err := io.ReadAll(result.file)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("the resolved object reads %d bytes, %v; want %d", len(got), err, len(data))
+	}
+	file, err := resolver.ResolveKnown(context.Background(), object)
+	if err != nil {
+		t.Fatalf("resolving the object after a sweep took it: %v", err)
+	}
+	file.Close()
 }
 
 func TestResolverCoalescesOriginDirectedFetch(t *testing.T) {
