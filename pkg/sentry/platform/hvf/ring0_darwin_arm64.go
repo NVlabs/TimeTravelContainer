@@ -1944,6 +1944,27 @@ static void ttc_ring0_host_entry(struct ttc_ring0_bridge *bridge) {
 							&host_ns, (uint32_t)status,
 							TTC_RING0_PHASE_CANCEL_PSTATE);
 				}
+				if ((pstate & 0xf) != 0) {
+					uint64_t pc = 0;
+					status = hv_vcpu_get_reg(bridge->vcpu, HV_REG_PC, &pc);
+					if (status != HV_SUCCESS) {
+						ttc_ring0_fail_host_return(bridge, ucontext, &host_ss,
+								&host_ns, (uint32_t)status,
+								TTC_RING0_PHASE_CANCEL_PC);
+					}
+					// The monitor's application entry reads TLB_FLUSH_REQUESTED
+					// before its eret. A vCPU resumed after that read would enter
+					// EL0 without the flush that this pause publishes, and HVF
+					// may not deliver the monitor vCPU's broadcast TLBI to it.
+					// Monitor code never waits for the host, so let it run on:
+					// the drain loop stops it again at EL0, where the IRQ below
+					// sends the entry back through the flag check, or back in
+					// the Sentry.
+					if (pc >= TTC_MONITOR_CODE_VA &&
+							pc - TTC_MONITOR_CODE_VA < TTC_MONITOR_CODE_CAPACITY) {
+						continue;
+					}
+				}
 				if ((pstate & 0xf) == 0) {
 					// A page-table transaction cannot resume a stopped EL0
 					// context directly: that would bypass the per-vCPU local TLB
