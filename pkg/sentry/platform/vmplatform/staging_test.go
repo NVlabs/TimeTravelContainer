@@ -229,7 +229,7 @@ func (b *stagingUnlockedDecommitBacking) Decommit(fr memmap.FileRange) error {
 		return errors.New("staging cache mutex held during GuestRAM decommit")
 	}
 	b.observed = true
-	b.cache.mu.Unlock()
+	b.cache.mu.Unlock() // +checklocksforce: TryLock succeeded.
 	return b.Backing.Decommit(fr)
 }
 
