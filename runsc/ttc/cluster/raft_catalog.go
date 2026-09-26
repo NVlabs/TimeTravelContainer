@@ -100,9 +100,11 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 
 // forwardAttemptTimeout bounds one request forwarded to the authority's
 // holder: a holder that stalled accepts connections but answers none, and the
-// next attempt asks whichever node holds the authority then. A proposal's
-// request ID makes its retry safe.
-const forwardAttemptTimeout = 5 * time.Second
+// next attempt asks whichever node holds the authority then, as the shared
+// root names it. A node's lease renewal must reach the new holder in the few
+// seconds between a takeover and the node's self-fence, so this is short; a
+// proposal's request ID makes its retry safe.
+const forwardAttemptTimeout = 2 * time.Second
 
 func forwardAttempt(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
 	if attempt := time.Now().Add(forwardAttemptTimeout); attempt.Before(deadline) {

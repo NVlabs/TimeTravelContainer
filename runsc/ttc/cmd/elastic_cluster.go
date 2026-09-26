@@ -6481,8 +6481,12 @@ func maintainElasticNode(directory cluster.NodeCatalog, initial cluster.NodeReco
 	// Begin renewing well before the fencing window. Cluster control traffic may
 	// share a constrained link with peer paging or a network filesystem, so a
 	// healthy renewal must be allowed to absorb a transient multi-second queue
-	// without turning an otherwise healthy node into a false failure.
-	interval := lease / 4
+	// without turning an otherwise healthy node into a false failure. When
+	// the authority's holder stalls, renewals fail until another node takes
+	// the authority, cluster.AuthorityTakeover later, and a node fences the
+	// margin before its lease ends: renewing every sixth of the lease leaves
+	// a few seconds for the first renewal with the new holder.
+	interval := lease / 6
 	if interval < 250*time.Millisecond {
 		interval = 250 * time.Millisecond
 	}
