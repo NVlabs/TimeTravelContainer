@@ -49,6 +49,7 @@ go_library(
     deps = [
         "//pkg/hostarch",
         "//pkg/hosttid",
+        "//pkg/log",
         "//pkg/metric",
         "//pkg/sentry/platform/hvf/ring0asm",
         "//pkg/sentry/platform/vmplatform",

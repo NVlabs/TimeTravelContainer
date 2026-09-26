@@ -117,3 +117,17 @@ type HostMemory interface {
 	Copy(dst, src uintptr, length uint64) error
 	Release(address uintptr, length uint64) error
 }
+
+// HostRange is a range of host virtual addresses.
+type HostRange struct {
+	Address uintptr
+	Length  uint64
+}
+
+// HostRangeReleaser is implemented by HostMemory that can decommit and release
+// many reservations together much more cheaply than one at a time.
+type HostRangeReleaser interface {
+	// ReleaseRanges decommits and releases every range. If it returns an
+	// error, it has released none of them.
+	ReleaseRanges(ranges []HostRange) error
+}

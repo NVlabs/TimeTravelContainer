@@ -35,6 +35,8 @@ type VCPU = vmm.VCPU
 type ExitReason = vmm.ExitReason
 type Exit = vmm.Exit
 type HostMemory = vmm.HostMemory
+type HostRange = vmm.HostRange
+type HostRangeReleaser = vmm.HostRangeReleaser
 type MonitorPoolExpansion = vmm.MonitorPoolExpansion
 type MonitorPoolExpander = vmm.MonitorPoolExpander
 

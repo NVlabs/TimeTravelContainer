@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"sync"
@@ -1661,4 +1662,159 @@ func TestGuestRAMPageCacheIOWithApplicationWaits(t *testing.T) {
 	}
 	cache.DropAll(mf)
 	mf.Destroy()
+}
+
+// batchReleaseTestHost is a ramTestHost that releases many ranges at once.
+type batchReleaseTestHost struct {
+	*ramTestHost
+	batches [][]HostRange
+}
+
+func (h *batchReleaseTestHost) ReleaseRanges(ranges []HostRange) error {
+	h.batches = append(h.batches, append([]HostRange(nil), ranges...))
+	for _, r := range ranges {
+		if _, ok := h.reservations[r.Address]; !ok {
+			return fmt.Errorf("releasing unreserved range %#x", r.Address)
+		}
+	}
+	for _, r := range ranges {
+		if err := h.Release(r.Address, r.Length); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TestGuestRAMReleasesSlabsTogether checks that GuestRAM releases the slabs
+// that a decommit empties together when the host can, and can then allocate
+// frames again.
+func TestGuestRAMReleasesSlabsTogether(t *testing.T) {
+	host := &batchReleaseTestHost{ramTestHost: newRAMTestHost()}
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: host, Revoker: &ramTestRevoker{}, IPAStart: 0x100000, IPASize: 1 << 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing, err := ram.NewBacking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		t.Fatal(err)
+	}
+	fr := memmap.FileRange{Start: 0, End: 4 * FramesPerSlab * GuestFrameSize}
+	if _, err := backing.ResolveFrames(fr, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	if got := ram.Metrics().HostResidentBytes; got != 4*HostSlabSize {
+		t.Fatalf("HostResidentBytes = %#x, want four slabs", got)
+	}
+	if err := backing.Decommit(fr); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.batches) != 1 || len(host.batches[0]) != 4 {
+		t.Fatalf("released slabs in batches %v, want one batch of four", host.batches)
+	}
+	if got := ram.Metrics().HostResidentBytes; got != 0 {
+		t.Errorf("HostResidentBytes after decommit = %#x, want 0", got)
+	}
+	if len(host.reservations) != 0 {
+		t.Errorf("%d host reservations remain after release", len(host.reservations))
+	}
+	if _, err := backing.ResolveFrames(fr, hostarch.Write); err != nil {
+		t.Fatalf("allocating after the release: %v", err)
+	}
+}
+
+// slabTestHost tracks reserved host memory 16 KiB at a time, since munmap(2)
+// can release part of a reservation.
+type slabTestHost struct {
+	*ramTestHost
+	reserved map[uintptr]struct{}
+}
+
+func newSlabTestHost() *slabTestHost {
+	return &slabTestHost{ramTestHost: newRAMTestHost(), reserved: make(map[uintptr]struct{})}
+}
+
+func (h *slabTestHost) Reserve(length uint64) (uintptr, error) {
+	address, err := h.ramTestHost.Reserve(length)
+	for offset := uint64(0); offset < length; offset += HostSlabSize {
+		h.reserved[address+uintptr(offset)] = struct{}{}
+	}
+	return address, err
+}
+
+func (h *slabTestHost) Release(address uintptr, length uint64) error {
+	for offset := uint64(0); offset < length; offset += HostSlabSize {
+		if _, ok := h.reserved[address+uintptr(offset)]; !ok {
+			return fmt.Errorf("releasing unreserved host memory at %#x", address+uintptr(offset))
+		}
+		delete(h.reserved, address+uintptr(offset))
+	}
+	return nil
+}
+
+// TestGuestRAMAllocatesSlabsInChunks checks that GuestRAM reserves and maps
+// slabs a chunk at a time, but still releases them one at a time.
+func TestGuestRAMAllocatesSlabsInChunks(t *testing.T) {
+	vm := &ramTestVM{}
+	host := newSlabTestHost()
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: vm, Host: host, Revoker: &ramTestRevoker{}, IPAStart: 1 << 30, IPASize: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing, err := ram.NewBacking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		t.Fatal(err)
+	}
+	const slabBytes = FramesPerSlab * GuestFrameSize
+	const chunkBytes = maxSlabChunkSlabs * HostSlabSize
+	if _, err := backing.ResolveFrames(memmap.FileRange{Start: 0, End: 5 * slabBytes}, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	if len(vm.maps) != 1 || vm.maps[0].length != chunkBytes {
+		t.Fatalf("stage-2 maps %+v, want one of %#x bytes", vm.maps, chunkBytes)
+	}
+	if m := ram.Metrics(); m.HostResidentBytes != 5*HostSlabSize || m.IPABytesConsumed != chunkBytes {
+		t.Fatalf("metrics %+v, want five resident slabs and one chunk of IPA", m)
+	}
+
+	// Emptying one slab releases just that slab.
+	if err := backing.Decommit(memmap.FileRange{Start: 2 * slabBytes, End: 3 * slabBytes}); err != nil {
+		t.Fatal(err)
+	}
+	if len(vm.unmaps) != 1 || vm.unmaps[0].gpa != vm.maps[0].gpa+2*HostSlabSize || vm.unmaps[0].length != HostSlabSize {
+		t.Fatalf("stage-2 unmaps %+v, want the third slab of the chunk", vm.unmaps)
+	}
+	if got, want := len(host.reserved), maxSlabChunkSlabs-1; got != want {
+		t.Fatalf("%d host slabs reserved, want %d", got, want)
+	}
+
+	// Using up the chunk maps another.
+	if _, err := backing.ResolveFrames(memmap.FileRange{Start: 5 * slabBytes, End: (5 + maxSlabChunkSlabs) * slabBytes}, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	if len(vm.maps) != 2 || vm.maps[1].gpa != vm.maps[0].gpa+chunkBytes {
+		t.Fatalf("stage-2 maps %+v, want a second chunk after the first", vm.maps)
+	}
+
+	// A new epoch releases the unused slabs of the current chunk, which were
+	// mapped only in the old VM, and maps a new chunk when it needs one.
+	newVM := &ramTestVM{}
+	if err := ram.RebindStage2(newVM); err != nil {
+		t.Fatal(err)
+	}
+	live := uint64(len(ram.slabs))
+	if got := uint64(len(host.reserved)); got != live {
+		t.Fatalf("%d host slabs reserved after rebinding, want the %d live ones", got, live)
+	}
+	if _, err := backing.ResolveFrames(memmap.FileRange{Start: (5 + maxSlabChunkSlabs) * slabBytes, End: (6 + maxSlabChunkSlabs) * slabBytes}, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(newVM.maps); n != int(live)+1 || newVM.maps[n-1].length != chunkBytes {
+		t.Fatalf("new VM maps %+v, want the live slabs and then a new chunk", newVM.maps)
+	}
 }

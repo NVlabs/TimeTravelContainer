@@ -68,9 +68,11 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"unsafe"
 
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
 )
 
@@ -111,7 +113,7 @@ func (s *hostMemoryState) unregister(engine *ring0Engine) {
 	s.mu.Unlock()
 }
 
-func (s *hostMemoryState) retire(address uintptr, length uint64) error {
+func (s *hostMemoryState) retire(ranges ...vmm.HostRange) error {
 	if s == nil {
 		return nil
 	}
@@ -122,7 +124,7 @@ func (s *hostMemoryState) retire(address uintptr, length uint64) error {
 	if s.engine == nil {
 		return nil
 	}
-	return s.engine.retireHostMirrorRange(context.Background(), address, length)
+	return s.engine.retireHostMirrorRanges(context.Background(), ranges)
 }
 
 // NewBackend returns the baseline Hypervisor.framework backend. It never asks
@@ -525,7 +527,7 @@ func (h hostMemory) Decommit(address uintptr, length uint64) error {
 	if err := validateHostRange(address, length); err != nil {
 		return err
 	}
-	if err := h.state.retire(address, length); err != nil {
+	if err := h.state.retire(vmm.HostRange{Address: address, Length: length}); err != nil {
 		return fmt.Errorf("retiring Sentry alias before host decommit: %w", err)
 	}
 	if result := C.ttc_madvise_free(unsafe.Pointer(address), C.size_t(length)); result != 0 {
@@ -554,11 +556,43 @@ func (h hostMemory) Release(address uintptr, length uint64) error {
 	if err := validateHostRange(address, length); err != nil {
 		return err
 	}
-	if err := h.state.retire(address, length); err != nil {
+	if err := h.state.retire(vmm.HostRange{Address: address, Length: length}); err != nil {
 		return fmt.Errorf("retiring Sentry alias before host release: %w", err)
 	}
 	if result := C.munmap(unsafe.Pointer(address), C.size_t(length)); result != 0 {
 		return fmt.Errorf("munmap(%#x, %#x) failed", address, length)
+	}
+	return nil
+}
+
+// ReleaseRanges implements vmm.HostRangeReleaser.ReleaseRanges. It retires any
+// Sentry aliases of the ranges together, which blocks application entries and
+// changes the Sentry's translations once rather than once per range.
+func (h hostMemory) ReleaseRanges(ranges []vmm.HostRange) error {
+	for _, r := range ranges {
+		if err := validateHostRange(r.Address, r.Length); err != nil {
+			return err
+		}
+	}
+	if err := h.state.retire(ranges...); err != nil {
+		return fmt.Errorf("retiring Sentry aliases before host release: %w", err)
+	}
+	// Slabs carved from one reservation are adjacent; unmap each run at once.
+	sorted := append([]vmm.HostRange(nil), ranges...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Address < sorted[j].Address })
+	for start := 0; start < len(sorted); {
+		end := start + 1
+		length := sorted[start].Length
+		for end < len(sorted) && sorted[end].Address == sorted[start].Address+uintptr(length) {
+			length += sorted[end].Length
+			end++
+		}
+		if result := C.munmap(unsafe.Pointer(sorted[start].Address), C.size_t(length)); result != 0 {
+			// munmap fails only for invalid ranges, and these are valid
+			// reservations; leaking them is harmless.
+			log.Warningf("munmap(%#x, %#x) of GuestRAM reservations failed", sorted[start].Address, length)
+		}
+		start = end
 	}
 	return nil
 }

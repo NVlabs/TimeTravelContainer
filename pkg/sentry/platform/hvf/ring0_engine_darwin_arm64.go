@@ -2539,53 +2539,66 @@ func (e *ring0Engine) releaseHostMirror() error {
 	return e.unmapHostStage2Slabs(addresses)
 }
 
-// retireHostMirrorRange removes every Sentry stage-1 and secondary stage-2
-// alias of a VMM-owned host range before its backing is decommitted or its HVA
-// can be reused. The Go runtime VM hook cannot observe GuestRAM's explicit
+// retireHostMirrorRanges removes every Sentry stage-1 and secondary stage-2
+// alias of VMM-owned host ranges before their backing is decommitted or their
+// HVAs can be reused. The Go runtime VM hook cannot observe GuestRAM's explicit
 // host allocator, so this is the corresponding owner-driven MMU notifier.
-func (e *ring0Engine) retireHostMirrorRange(ctx context.Context, address uintptr, length uint64) error {
-	if length == 0 || address%uintptr(vmm.HostSlabSize) != 0 ||
-		length%vmm.HostSlabSize != 0 || address+uintptr(length) < address {
-		return fmt.Errorf("invalid Sentry mirror retirement [%#x, %#x)", address, address+uintptr(length))
+func (e *ring0Engine) retireHostMirrorRanges(ctx context.Context, ranges []vmm.HostRange) error {
+	for _, r := range ranges {
+		if r.Length == 0 || r.Address%uintptr(vmm.HostSlabSize) != 0 ||
+			r.Length%vmm.HostSlabSize != 0 || r.Address+uintptr(r.Length) < r.Address {
+			return fmt.Errorf("invalid Sentry mirror retirement [%#x, %#x)", r.Address, r.Address+uintptr(r.Length))
+		}
 	}
-	ring0asm.EnsureHost()
-	e.mirrorMu.Lock()
+	// Find the aliases before blocking application entries: many retired
+	// ranges have none. A Sentry continuation at EL1 must not wait for
+	// mirrorMu, so wait only after returning to the host.
+	if !e.mirrorMu.TryLock() {
+		ring0asm.EnsureHost()
+		e.mirrorMu.Lock()
+	}
 	defer e.mirrorMu.Unlock()
-	if err := e.lockApplicationEntries(ctx); err != nil {
-		return err
-	}
-	defer e.unlockApplicationEntries()
-	end := address + uintptr(length)
 	var addresses []uintptr
 	pages := make(map[uint64]struct{})
 	// stage2Slabs is keyed by HVA slab base. Retirement ranges are aligned, so
-	// walk only the requested range instead of scanning the entire Sentry
-	// mirror. GuestRAM commonly retires one 16 KiB slab at a time; an O(total
-	// mirrored heap) scan here otherwise dominates process-exit churn.
-	for slabAddress := address; slabAddress < end; slabAddress += uintptr(vmm.HostSlabSize) {
-		if _, mapped := e.stage2Slabs[slabAddress]; !mapped {
-			continue
-		}
-		addresses = append(addresses, slabAddress)
-		for va := uint64(slabAddress); va < uint64(slabAddress)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
-			if _, mapped := e.stage1Access[va]; mapped {
-				pages[va] = struct{}{}
+	// walk only the requested ranges instead of scanning the entire Sentry
+	// mirror. GuestRAM retires 16 KiB slabs; an O(total mirrored heap) scan
+	// here otherwise dominates process-exit churn.
+	for _, r := range ranges {
+		end := r.Address + uintptr(r.Length)
+		for slabAddress := r.Address; slabAddress < end; slabAddress += uintptr(vmm.HostSlabSize) {
+			if _, mapped := e.stage2Slabs[slabAddress]; !mapped {
+				continue
+			}
+			addresses = append(addresses, slabAddress)
+			for va := uint64(slabAddress); va < uint64(slabAddress)+vmm.HostSlabSize; va += vmm.LogicalPageSize {
+				if _, mapped := e.stage1Access[va]; mapped {
+					pages[va] = struct{}{}
+				}
 			}
 		}
 	}
 	if len(addresses) == 0 {
 		return nil
 	}
+	ring0asm.EnsureHost()
+	if err := e.lockApplicationEntries(ctx); err != nil {
+		return err
+	}
+	defer e.unlockApplicationEntries()
 	if err := e.applyHostStage1(ctx, hostStage1UnmapOperations(pages)); err != nil {
-		return fmt.Errorf("retiring Sentry stage-1 aliases for host range [%#x, %#x): %w", address, end, err)
+		return fmt.Errorf("retiring Sentry stage-1 aliases of %d host slabs: %w", len(addresses), err)
 	}
 	if err := e.unmapHostStage2Slabs(addresses); err != nil {
-		return fmt.Errorf("retiring Sentry stage-2 aliases for host range [%#x, %#x): %w", address, end, err)
+		return fmt.Errorf("retiring Sentry stage-2 aliases of %d host slabs: %w", len(addresses), err)
 	}
 	e.faultMu.Lock()
 	for pending := range e.pendingMirror {
-		if pending >= address && pending < end {
-			delete(e.pendingMirror, pending)
+		for _, r := range ranges {
+			if pending >= r.Address && pending < r.Address+uintptr(r.Length) {
+				delete(e.pendingMirror, pending)
+				break
+			}
 		}
 	}
 	e.faultMu.Unlock()

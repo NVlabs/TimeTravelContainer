@@ -161,6 +161,15 @@ type GuestRAM struct {
 	epoch    uint64
 	layout   uint64
 
+	// Slabs are carved from chunks of host memory that are reserved,
+	// committed, and mapped at stage 2 together, since each of those
+	// operations is costly and independent of its length. chunkHost and
+	// chunkGPA locate the next unused slab of the current chunk, and
+	// chunkSlabs counts its unused slabs. A slab is released individually.
+	chunkHost  uintptr
+	chunkGPA   uint64
+	chunkSlabs uint64
+
 	nextBackingID uint64
 	nextFrameID   pgalloc.FrameID
 	nextSlabID    uint64
@@ -356,6 +365,7 @@ func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType
 		if newFrames > freeSlots {
 			newSlabs = (newFrames - freeSlots + FramesPerSlab - 1) / FramesPerSlab
 		}
+		newSlabs = b.ram.newIPASlabsLocked(newSlabs)
 		if newSlabs != 0 && b.ram.wouldReachRolloverLocked(newSlabs) {
 			epoch := b.ram.epoch
 			if b.ram.rollover == nil {
@@ -481,6 +491,21 @@ func (r *GuestRAM) startRolloverLocked() {
 
 // wouldExhaustIPALocked reports whether additionalSlabs more slabs do not fit
 // in the IPA range at all.
+// maxSlabChunkSlabs bounds the slabs that GuestRAM reserves and maps at once.
+const maxSlabChunkSlabs = 64
+
+// slabChunkSlabsLocked returns the number of slabs to reserve and map at once:
+// maxSlabChunkSlabs, unless that is a significant part of the IPA range.
+func (r *GuestRAM) slabChunkSlabsLocked() uint64 {
+	return max(1, min(maxSlabChunkSlabs, r.ipaSize/HostSlabSize/1024))
+}
+
+// newIPASlabsLocked returns the slabs of IPA that allocating slabs more slabs
+// consumes beyond the current chunk.
+func (r *GuestRAM) newIPASlabsLocked(slabs uint64) uint64 {
+	return slabs - min(slabs, r.chunkSlabs)
+}
+
 func (r *GuestRAM) wouldExhaustIPALocked(additionalSlabs uint64) bool {
 	remaining := r.ipaSize - (r.nextGPA - r.ipaStart)
 	return additionalSlabs > remaining/HostSlabSize
@@ -659,34 +684,74 @@ func (r *GuestRAM) allocateFrameLocked(backing *guestBacking, offset uint64) (*g
 }
 
 func (r *GuestRAM) allocateSlabLocked() (*guestSlab, error) {
-	hostAddress, err := r.host.Reserve(HostSlabSize)
-	if err != nil {
-		return nil, fmt.Errorf("reserving GuestRAM slab: %w", err)
+	if r.chunkSlabs == 0 {
+		if err := r.allocateChunkLocked(); err != nil {
+			return nil, err
+		}
 	}
-	if uint64(hostAddress)%HostSlabSize != 0 {
-		_ = r.host.Release(hostAddress, HostSlabSize)
-		return nil, fmt.Errorf("host reservation %#x is not %d-byte aligned", hostAddress, HostSlabSize)
-	}
-	if err := r.host.Commit(hostAddress, HostSlabSize); err != nil {
-		_ = r.host.Release(hostAddress, HostSlabSize)
-		return nil, fmt.Errorf("committing GuestRAM slab: %w", err)
-	}
-	gpa := r.nextGPA
-	if err := r.vm.MapStage2(gpa, hostAddress, HostSlabSize, Stage2Read|Stage2Write|Stage2Execute); err != nil {
-		_ = r.host.Decommit(hostAddress, HostSlabSize)
-		_ = r.host.Release(hostAddress, HostSlabSize)
-		return nil, fmt.Errorf("mapping GuestRAM stage-2 slab: %w", err)
-	}
-	r.nextGPA += HostSlabSize
 	r.nextSlabID++
 	slab := &guestSlab{
 		key:         slabKey(r.nextSlabID),
-		hostAddress: hostAddress,
-		gpa:         gpa,
+		hostAddress: r.chunkHost,
+		gpa:         r.chunkGPA,
 	}
+	r.chunkHost += uintptr(HostSlabSize)
+	r.chunkGPA += HostSlabSize
+	r.chunkSlabs--
 	r.slabs[slab.key] = slab
 	r.considerAllocationSlabLocked(slab)
 	return slab, nil
+}
+
+// allocateChunkLocked reserves, commits, and maps the next chunk of slabs.
+//
+// Preconditions: r.chunkSlabs == 0.
+func (r *GuestRAM) allocateChunkLocked() error {
+	slabs := min(r.slabChunkSlabsLocked(), (r.ipaSize-(r.nextGPA-r.ipaStart))/HostSlabSize)
+	if slabs == 0 {
+		return fmt.Errorf("GuestRAM IPA epoch %d is exhausted", r.epoch)
+	}
+	length := slabs * HostSlabSize
+	hostAddress, err := r.host.Reserve(length)
+	if err != nil {
+		return fmt.Errorf("reserving GuestRAM slabs: %w", err)
+	}
+	if uint64(hostAddress)%HostSlabSize != 0 {
+		_ = r.host.Release(hostAddress, length)
+		return fmt.Errorf("host reservation %#x is not %d-byte aligned", hostAddress, HostSlabSize)
+	}
+	if err := r.host.Commit(hostAddress, length); err != nil {
+		_ = r.host.Release(hostAddress, length)
+		return fmt.Errorf("committing GuestRAM slabs: %w", err)
+	}
+	gpa := r.nextGPA
+	if err := r.vm.MapStage2(gpa, hostAddress, length, Stage2Read|Stage2Write|Stage2Execute); err != nil {
+		_ = r.host.Decommit(hostAddress, length)
+		_ = r.host.Release(hostAddress, length)
+		return fmt.Errorf("mapping GuestRAM stage-2 slabs: %w", err)
+	}
+	r.nextGPA += length
+	r.chunkHost = hostAddress
+	r.chunkGPA = gpa
+	r.chunkSlabs = slabs
+	return nil
+}
+
+// releaseChunkLocked releases the unused slabs of the current chunk, whose
+// stage-2 mappings the caller has already discarded.
+func (r *GuestRAM) releaseChunkLocked() {
+	if r.chunkSlabs == 0 {
+		return
+	}
+	length := r.chunkSlabs * HostSlabSize
+	if err := r.host.Decommit(r.chunkHost, length); err != nil {
+		log.Warningf("Decommitting unused GuestRAM slabs: %v", err)
+	} else if err := r.host.Release(r.chunkHost, length); err != nil {
+		log.Warningf("Releasing unused GuestRAM slabs: %v", err)
+	}
+	r.chunkHost = 0
+	r.chunkGPA = 0
+	r.chunkSlabs = 0
 }
 
 func (b *guestBacking) Decommit(fr memmap.FileRange) error {
@@ -918,6 +983,9 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 		return firstErr
 	}
 
+	if releaser, ok := r.host.(HostRangeReleaser); ok {
+		return r.releaseSlabRangesLocked(releases, releaser, clearReleasing, remap)
+	}
 	for groupStart := 0; groupStart < len(releases); {
 		groupEnd := groupStart + 1
 		for groupEnd < len(releases) && releases[groupEnd].slab.gpa == releases[groupEnd-1].slab.gpa+HostSlabSize {
@@ -968,6 +1036,54 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 			}
 		}
 		groupStart = groupEnd
+	}
+	r.cond.Broadcast()
+	return nil
+}
+
+// releaseSlabRangesLocked is releaseSlabs for host memory that releases many
+// reservations together: releasing slabs one at a time retires each one's
+// Sentry aliases separately, which on HVF blocks every application entry and
+// changes the Sentry's translations per 16 KiB.
+//
+// Preconditions: r.mu is locked, and releases are sorted by GPA.
+func (r *GuestRAM) releaseSlabRangesLocked(releases []slabRelease, releaser HostRangeReleaser, clearReleasing func([]slabRelease), remap func([]slabRelease) error) error {
+	for groupStart := 0; groupStart < len(releases); {
+		groupEnd := groupStart + 1
+		for groupEnd < len(releases) && releases[groupEnd].slab.gpa == releases[groupEnd-1].slab.gpa+HostSlabSize {
+			groupEnd++
+		}
+		group := releases[groupStart:groupEnd]
+		if err := r.vm.UnmapStage2(group[0].slab.gpa, uint64(len(group))*HostSlabSize); err != nil {
+			remapErr := remap(releases[:groupStart])
+			clearReleasing(releases[groupStart:])
+			r.cond.Broadcast()
+			if remapErr != nil {
+				return fmt.Errorf("unmapping GuestRAM slabs: %v; restoring stage-2 mappings: %w", err, remapErr)
+			}
+			return err
+		}
+		groupStart = groupEnd
+	}
+	ranges := make([]HostRange, 0, len(releases))
+	for _, release := range releases {
+		ranges = append(ranges, HostRange{Address: release.slab.hostAddress, Length: HostSlabSize})
+	}
+	if err := releaser.ReleaseRanges(ranges); err != nil {
+		remapErr := remap(releases)
+		r.cond.Broadcast()
+		if remapErr != nil {
+			return fmt.Errorf("releasing GuestRAM slabs: %v; restoring stage-2 mappings: %w", err, remapErr)
+		}
+		return fmt.Errorf("releasing GuestRAM slabs: %w", err)
+	}
+	for _, release := range releases {
+		slab := release.slab
+		delete(r.slabs, slab.key)
+		r.removePartialSlabLocked(slab)
+		if r.allocationSlab == slab {
+			r.allocationSlab = nil
+		}
 	}
 	r.cond.Broadcast()
 	return nil
@@ -1285,6 +1401,8 @@ func (p *epochRebindPlan) commit() error {
 	for _, binding := range p.bindings {
 		binding.slab.gpa = binding.gpa
 	}
+	// The current chunk's unused slabs were mapped only in the old VM.
+	r.releaseChunkLocked()
 	r.vm = p.vm
 	r.nextGPA = r.ipaStart + uint64(len(p.bindings))*HostSlabSize
 	r.epoch++
