@@ -23,7 +23,9 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -253,7 +255,16 @@ func (p *Platform) NewAddressSpace() (sentryplatform.AddressSpace, error) {
 		Opcode:         monitorabi.OpcodeCreateAddressSpace,
 		AddressSpaceID: id,
 	}); err != nil {
-		return nil, err
+		// fork, clone, and execve return this error to the application, so it
+		// must carry a Linux errno.
+		var statusErr *MonitorStatusError
+		if errors.As(err, &statusErr) && statusErr.Response.Status == monitorabi.StatusLimit {
+			// Linux reports exhausted process resources from fork as EAGAIN.
+			log.Warningf("vmplatform: address-space limit reached: %v", err)
+			return nil, linuxerr.EAGAIN
+		}
+		log.Warningf("vmplatform: creating address space: %v", err)
+		return nil, linuxerr.ENOMEM
 	}
 	as := &addressSpace{platform: p, id: id, mappings: make(map[hostarch.Addr]addressMapping)}
 	p.mu.Lock()

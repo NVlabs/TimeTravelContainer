@@ -142,6 +142,9 @@ const (
 	StatusNotFound
 	StatusConflict
 	StatusInternal
+	// StatusLimit reports that a fixed-size monitor table, such as the
+	// address-space table, is full.
+	StatusLimit
 )
 
 // Response acknowledges a command sequence.
@@ -364,7 +367,7 @@ func UnmarshalResponse(b []byte) (Response, error) {
 	if r.Sequence == 0 {
 		return Response{}, fmt.Errorf("monitor response sequence is zero")
 	}
-	if r.Status > StatusInternal {
+	if r.Status > StatusLimit {
 		return Response{}, fmt.Errorf("monitor response status %d is invalid", r.Status)
 	}
 	return r, nil

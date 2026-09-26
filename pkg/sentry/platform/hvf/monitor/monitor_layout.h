@@ -28,7 +28,7 @@
 #define TTC_MONITOR_PAGE_SIZE UINT64_C(4096)
 #define TTC_MONITOR_HOST_SLAB_SIZE UINT64_C(16384)
 #define TTC_MONITOR_MAX_OPERATIONS 256
-#define TTC_MONITOR_MAX_ADDRESS_SPACES 128
+#define TTC_MONITOR_MAX_ADDRESS_SPACES 320
 #define TTC_MONITOR_MAX_POOL_REGIONS 64
 
 // Ring0 bridge calls. Application exits use a distinct call so the host can
@@ -170,6 +170,8 @@ enum ttc_monitor_status {
   TTC_STATUS_NOT_FOUND = 4,
   TTC_STATUS_CONFLICT = 5,
   TTC_STATUS_INTERNAL = 6,
+  // A fixed-size monitor table, such as the address-space table, is full.
+  TTC_STATUS_LIMIT = 7,
 };
 
 struct ttc_monitor_pool_region {

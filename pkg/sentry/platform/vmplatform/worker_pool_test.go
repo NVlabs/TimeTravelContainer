@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
 )
 
@@ -202,5 +203,48 @@ func TestMonitorExpandsPoolAndRetries(t *testing.T) {
 		vm.commands[1].Opcode != monitorabi.OpcodeExpandPageTablePool ||
 		vm.commands[2].Opcode != monitorabi.OpcodeCreateAddressSpace {
 		t.Fatalf("monitor commands = %+v", vm.commands)
+	}
+}
+
+// addressSpaceLimitVM rejects every monitor command the way the monitor
+// rejects address-space creation when its table is full.
+type addressSpaceLimitVM struct{ expandingVM }
+
+func (v *addressSpaceLimitVM) CreateVCPU(int) (VCPU, error) { return addressSpaceLimitVCPU{vm: v}, nil }
+
+type addressSpaceLimitVCPU struct{ vm *addressSpaceLimitVM }
+
+func (v addressSpaceLimitVCPU) RunMonitor(_ context.Context, encoded []byte) ([]byte, error) {
+	command, err := monitorabi.UnmarshalCommand(encoded)
+	if err != nil {
+		return nil, err
+	}
+	v.vm.mu.Lock()
+	v.vm.commands = append(v.vm.commands, command)
+	v.vm.mu.Unlock()
+	return monitorabi.MarshalResponse(monitorabi.Response{Sequence: command.Sequence, Status: monitorabi.StatusLimit}), nil
+}
+func (addressSpaceLimitVCPU) RequestExit() error { return nil }
+func (addressSpaceLimitVCPU) Close() error       { return nil }
+
+// TestNewAddressSpaceLimitIsEAGAIN checks that a full monitor address-space
+// table fails fork with EAGAIN instead of growing the page-table pool or
+// returning an error that has no Linux errno.
+func TestNewAddressSpaceLimitIsEAGAIN(t *testing.T) {
+	vm := &addressSpaceLimitVM{}
+	pool, err := NewWorkerPool(vm, 1)
+	if err != nil {
+		t.Fatalf("NewWorkerPool: %v", err)
+	}
+	defer pool.Close()
+	engine := newWorkerPoolTestEngine(pool)
+	p := &Platform{engine: engine, monitor: NewMonitor(engine, monitorPoolExpander(vm)), spaces: make(map[uint64]*addressSpace)}
+	if _, err := p.NewAddressSpace(); err != linuxerr.EAGAIN {
+		t.Fatalf("NewAddressSpace() error = %v, want EAGAIN", err)
+	}
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	if vm.prepared || len(vm.commands) != 1 {
+		t.Fatalf("pool expansion prepared=%t after commands %+v", vm.prepared, vm.commands)
 	}
 }

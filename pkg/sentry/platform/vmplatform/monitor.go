@@ -39,6 +39,16 @@ func NewMonitor(executor MonitorExecutor, expander MonitorPoolExpander) *Monitor
 	return &Monitor{executor: executor, expander: expander}
 }
 
+// MonitorStatusError reports a transaction that the monitor rejected.
+type MonitorStatusError struct {
+	Response monitorabi.Response
+}
+
+// Error implements error.Error.
+func (e *MonitorStatusError) Error() string {
+	return fmt.Sprintf("monitor transaction %d failed with status %d detail %d", e.Response.Sequence, e.Response.Status, e.Response.Detail)
+}
+
 // Execute applies a transaction and returns only after the monitor's
 // synchronous TLB acknowledgement.
 func (m *Monitor) Execute(ctx context.Context, command monitorabi.Command) error {
@@ -59,7 +69,7 @@ func (m *Monitor) Execute(ctx context.Context, command monitorabi.Command) error
 			return nil
 		}
 		if response.Status != monitorabi.StatusNoMemory || attempts >= 64 {
-			return fmt.Errorf("monitor transaction %d failed with status %d detail %d", response.Sequence, response.Status, response.Detail)
+			return &MonitorStatusError{Response: response}
 		}
 		if err := m.expandPoolLocked(executionCtx); err != nil {
 			return fmt.Errorf("expanding monitor page-table pool: %w", err)

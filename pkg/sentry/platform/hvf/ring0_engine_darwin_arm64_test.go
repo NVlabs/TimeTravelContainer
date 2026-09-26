@@ -1886,3 +1886,97 @@ func BenchmarkRing0ApplicationSwitchParallel(b *testing.B) {
 		}
 	})
 }
+
+func runRing0InternalMonitorStatus(t testing.TB, engine *ring0Engine, command monitorabi.Command) monitorabi.Status {
+	t.Helper()
+	command.Sequence = 1
+	encoded, err := monitorabi.MarshalCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBytes, err := engine.RunMonitor(context.Background(), encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := monitorabi.UnmarshalResponse(responseBytes)
+	if err != nil || response.Sequence != command.Sequence {
+		t.Fatalf("monitor response=%+v err=%v", response, err)
+	}
+	return response.Status
+}
+
+func newRing0MonitorTestEngine(t *testing.T) (*hvfVM, *ring0Engine) {
+	t.Helper()
+	vmInterface, err := NewBackend().CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	t.Cleanup(func() { vm.Close() })
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	t.Cleanup(func() { engine.Close() })
+	return vm, engine
+}
+
+// TestMonitorASIDsStayUniqueAcrossWrap churns enough address spaces to wrap
+// the 16-bit ASID counter while other spaces stay live. Stage-1 leaves are
+// non-global, so a live space's ASID, including the Sentry mirror's, must
+// never be given to another space.
+func TestMonitorASIDsStayUniqueAcrossWrap(t *testing.T) {
+	vm, engine := newRing0MonitorTestEngine(t)
+	asid := func(id uint64) uint64 {
+		t.Helper()
+		ttbr := vm.monitorAddressSpaceTTBR(id)
+		if ttbr == 0 {
+			t.Fatalf("address space %#x is not live", id)
+		}
+		return ttbr >> 48
+	}
+	live := map[uint64]uint64{ring0SentryAddressSpaceID: asid(ring0SentryAddressSpaceID)}
+	for id := uint64(1); id <= 4; id++ {
+		runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: id})
+		live[id] = asid(id)
+	}
+	for i := uint64(0); i < 1<<16; i++ {
+		id := 100 + i
+		runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: id})
+		got := asid(id)
+		for owner, used := range live {
+			if got == used {
+				t.Fatalf("iteration %d: address space %d got ASID %d, still owned by live space %#x", i, id, got, owner)
+			}
+		}
+		runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: id})
+	}
+}
+
+// TestMonitorAddressSpaceTableFullReportsLimit checks that a full address-space
+// table is distinguishable from page-table pool exhaustion, which the host
+// answers by permanently growing the pool.
+func TestMonitorAddressSpaceTableFullReportsLimit(t *testing.T) {
+	_, engine := newRing0MonitorTestEngine(t)
+	created := 0
+	for id := uint64(1); ; id++ {
+		status := runRing0InternalMonitorStatus(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: id})
+		if status == monitorabi.StatusLimit {
+			break
+		}
+		if status != monitorabi.StatusOK {
+			t.Fatalf("creating address space %d: status %d", id, status)
+		}
+		created++
+		if created > 1<<12 {
+			t.Fatal("address-space table never filled")
+		}
+	}
+	// The Sentry mirror owns one slot.
+	if want := 319; created != want {
+		t.Errorf("created %d application address spaces before the limit, want %d", created, want)
+	}
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: 1})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: 1 << 20})
+}

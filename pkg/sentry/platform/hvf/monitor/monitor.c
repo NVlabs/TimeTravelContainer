@@ -440,6 +440,41 @@ static uint32_t MONITOR_CODE expand_pool(struct ttc_monitor_control* ctl,
   return TTC_STATUS_OK;
 }
 
+static int MONITOR_CODE asid_in_use(struct ttc_monitor_control* ctl,
+                                    uint64_t asid) {
+  for (uint64_t i = 0; i < TTC_MONITOR_MAX_ADDRESS_SPACES; ++i) {
+    if (*(volatile uint8_t*)&ctl->spaces[i].active &&
+        ctl->spaces[i].asid == asid) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// allocate_asid returns an ASID that no live address space owns. ASIDs are
+// issued in increasing order, so a value is reused only after the counter
+// wraps, and the wrap discards every stage-1 translation. Live spaces keep
+// their ASIDs across a wrap and must be skipped: stage-1 leaves are
+// non-global, so two live spaces with one ASID would hit each other's TLB
+// entries. The Sentry mirror owns the first ASID for the whole VM epoch.
+static uint64_t MONITOR_CODE allocate_asid(struct ttc_monitor_control* ctl) {
+  // At most TTC_MONITOR_MAX_ADDRESS_SPACES ASIDs are live, so one more
+  // candidate than that is always free.
+  for (uint64_t attempt = 0; attempt <= TTC_MONITOR_MAX_ADDRESS_SPACES;
+       ++attempt) {
+    uint64_t asid = ctl->next_asid++;
+    if (asid == 0 || asid > UINT16_MAX) {
+      asid = 1;
+      ctl->next_asid = 2;
+      __asm__ __volatile__("tlbi vmalle1is\n\tdsb ish\n\tisb" ::: "memory");
+    }
+    if (!asid_in_use(ctl, asid)) {
+      return asid;
+    }
+  }
+  return 0;
+}
+
 static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
                                           uint64_t id, uint64_t flags) {
   if (id == 0 || (flags & ~TTC_ADDRESS_SPACE_FLAGS_MASK) != 0 ||
@@ -452,12 +487,10 @@ static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
       if (root == 0) {
         return TTC_STATUS_NO_MEMORY;
       }
-      uint64_t asid = ctl->next_asid++;
-      if (asid == 0 || asid > UINT16_MAX) {
-        asid = 1;
-        ctl->next_asid = 2;
-        // ASID reuse is safe only after flushing all stage-1 translations.
-        __asm__ __volatile__("tlbi vmalle1is\n\tdsb ish\n\tisb" ::: "memory");
+      uint64_t asid = allocate_asid(ctl);
+      if (asid == 0) {
+        (void)recycle_page(ctl, root);
+        return TTC_STATUS_INTERNAL;
       }
       ctl->spaces[i].id = id;
       ctl->spaces[i].root_gpa = root;
@@ -469,7 +502,9 @@ static uint32_t MONITOR_CODE create_space(struct ttc_monitor_control* ctl,
       return TTC_STATUS_OK;
     }
   }
-  return TTC_STATUS_NO_MEMORY;
+  // Every slot is live. This is not page-table memory exhaustion, which the
+  // host answers by growing the pool.
+  return TTC_STATUS_LIMIT;
 }
 
 static uint32_t MONITOR_CODE destroy_space(struct ttc_monitor_control* ctl,
