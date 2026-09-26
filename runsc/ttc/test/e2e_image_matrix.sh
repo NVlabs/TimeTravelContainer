@@ -45,7 +45,9 @@ container_id_valid() {
 [ -x "$TTC" ] || fail "TTC is not executable: $TTC"
 [ -n "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
-if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
+# Rootless Linux sandboxes need user namespaces; macOS confines ttcd with
+# Seatbelt instead.
+if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] && [ "$(uname -s)" = Linux ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required for the rootless prerequisite probe"
   if ! unshare -Ur /bin/true >/dev/null 2>&1; then
     fail "rootless UID/GID mapping is unavailable; enable unprivileged user namespaces or set TTC_UNSAFE_NO_HOST_ISOLATION=1 for trusted workloads"

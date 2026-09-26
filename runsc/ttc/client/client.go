@@ -371,8 +371,9 @@ Options:
   --cpu-profile portable|host|explicit
                                   Guest CPU contract (default: portable)
   --cpu-features NAME,...         Required with explicit profile; no default
-  --unsafe-no-host-isolation      Disable namespace/chroot isolation
-                                  (default: false)
+  --unsafe-no-host-isolation      Disable host isolation: user namespaces
+                                  and chroots on Linux, the Seatbelt sandbox
+                                  on macOS (default: false)
   --allow-network-filesystem-root Start although the daemon's root is on a
                                   network filesystem such as NFS or Lustre
                                   (default: false)

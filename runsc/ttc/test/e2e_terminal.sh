@@ -33,7 +33,9 @@ fail() {
 [ -n "$TTCD" ] || fail "set TTCD to the matching ttcd binary"
 [ -x "$TTCD" ] || fail "TTCD is not executable: $TTCD"
 command -v script >/dev/null 2>&1 || fail "script is required"
-if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
+# Rootless Linux sandboxes need user namespaces; macOS confines ttcd with
+# Seatbelt instead.
+if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] && [ "$(uname -s)" = Linux ]; then
   command -v unshare >/dev/null 2>&1 || fail "unshare is required"
   unshare -Ur /bin/true >/dev/null 2>&1 || fail "rootless user namespaces are unavailable; set TTC_UNSAFE_NO_HOST_ISOLATION=1 only for trusted workloads"
 fi

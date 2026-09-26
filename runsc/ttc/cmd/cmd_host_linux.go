@@ -78,6 +78,22 @@ func currentHostCompatibilityWarning(c hostKernelCompatibility) string {
 	return fmt.Sprintf("host Linux kernel %s predates 4.14.77; disabling host GSO for compatibility; network performance, especially for large payloads, will be reduced", c.release)
 }
 
+// daemonHostIsolationMode names the host isolation of a daemon started without
+// --unsafe-no-host-isolation: runsc's rootless sandboxes, which it confines to
+// user namespaces and chroots.
+const daemonHostIsolationMode = "rootless"
+
+// daemonNoHostIsolationWarning is the warning of a daemon started with
+// --unsafe-no-host-isolation.
+const daemonNoHostIsolationWarning = "host namespace and chroot isolation is disabled; run trusted workloads only"
+
+// enterDaemonHostIsolation does nothing: runsc isolates each sandbox itself.
+func enterDaemonHostIsolation(bool) error { return nil }
+
+// runscNoHostIsolation reports whether runsc runs its sandboxes without host
+// isolation of its own.
+func runscNoHostIsolation(unsafeNoHostIsolation bool) bool { return unsafeNoHostIsolation }
+
 func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
 	if unsafeNoHostIsolation || daemonEffectiveUID() == 0 {
 		return nil

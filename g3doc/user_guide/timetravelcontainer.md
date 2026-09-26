@@ -85,11 +85,18 @@ ttc daemon start --unsafe-no-host-isolation
 ttc run --rm busybox:1.36 echo hello
 ```
 
+macOS has no user namespaces. There `ttcd` instead confines itself, and every
+process it starts, with the macOS sandbox, Seatbelt: they keep all file and
+network access, but can open no devices, USB ones among them, and reach only the
+system services every process uses. `--unsafe-no-host-isolation` starts the
+daemon unconfined.
+
 Isolation mode is fixed for the lifetime of that daemon. All ordinary commands
 inherit it, so do not repeat the flag on `run`, `exec`, or other operations.
-`ttc daemon status` reports `isolation_mode` and
-`unsafe_no_host_isolation`. It also reports `runtime_platform`, which defaults
-to `systrap`. To use KVM instead:
+`ttc daemon status` reports `isolation_mode`, which is `rootless`, `seatbelt`
+on macOS, or `unsafe-no-host-isolation`, and `unsafe_no_host_isolation`. It
+also reports `runtime_platform`, which defaults to `systrap`. To use KVM
+instead:
 
 ```shell
 test -r /dev/kvm && test -w /dev/kvm

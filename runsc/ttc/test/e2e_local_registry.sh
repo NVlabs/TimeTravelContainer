@@ -44,7 +44,10 @@ fail() {
 [ -x "$REGISTRY_FIXTURE" ] || fail "REGISTRY_FIXTURE is not executable: $REGISTRY_FIXTURE"
 [ -x "$FIXTURE_BINARY" ] || fail "FIXTURE_BINARY is not executable: $FIXTURE_BINARY"
 
-if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] && ! unshare -Ur /bin/true >/dev/null 2>&1; then
+# Rootless Linux sandboxes need user namespaces; macOS confines ttcd with
+# Seatbelt instead.
+if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ] && [ "$(uname -s)" = Linux ] &&
+  ! unshare -Ur /bin/true >/dev/null 2>&1; then
   fail "rootless UID/GID mapping is unavailable; set TTC_UNSAFE_NO_HOST_ISOLATION=1 only for trusted test workloads"
 fi
 

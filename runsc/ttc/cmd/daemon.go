@@ -2714,7 +2714,7 @@ func daemonIsolationMode(unsafeNoHostIsolation bool) string {
 	if unsafeNoHostIsolation {
 		return "unsafe-no-host-isolation"
 	}
-	return "rootless"
+	return daemonHostIsolationMode
 }
 
 func directBackend(opts options, stdin io.Reader, stdout, stderr io.Writer) *runtimeBackend {
@@ -3663,7 +3663,7 @@ func (s *daemonServer) optionsFromRequest() options {
 	opts := options{}
 	opts.root = s.root
 	opts.runsc = s.runsc
-	opts.unsafeNoHostIsolation = s.unsafeNoHostIsolation
+	opts.unsafeNoHostIsolation = runscNoHostIsolation(s.unsafeNoHostIsolation)
 	opts.disableHostGSO = s.disableHostGSO
 	opts.runtimePlatform = s.runtimePlatform
 	opts.cpuFeatures = s.cpuFeatures
@@ -3867,6 +3867,11 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 	} else if name != "" {
 		fmt.Fprintf(stderr, "ttcd: warning: %s %q is on a network filesystem (%s); its sockets, locks, and process state may not work there\n", rootVariable, layout.root, name)
 	}
+	// Isolate the daemon before it touches its roots.
+	if err := enterDaemonHostIsolation(unsafeNoHostIsolation); err != nil {
+		fmt.Fprintf(stderr, "ttcd: %v\n", err)
+		return 1
+	}
 	sharedRole := daemonRootRoleStandaloneAuthority
 	if clusterOpts.Configured {
 		sharedRole = daemonRootRoleClusterShared
@@ -3959,7 +3964,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: warning: %s\n", warning)
 	}
 	if unsafeNoHostIsolation {
-		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+		fmt.Fprintln(stderr, "ttcd: warning: "+daemonNoHostIsolationWarning)
 	} else if clusterOpts.ControlHolder {
 		// A control holder runs no container.
 	} else if err := preflightDaemonIsolation(false); err != nil {
@@ -6241,7 +6246,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	// No daemon serves this root: remove what outlived the processes it
 	// served.
 	sweepDaemonFiles(newDaemonLayout(dir), root, func(id string) error {
-		backend := &runtimeBackend{root: root, runsc: runsc, unsafeNoHostIsolation: unsafeNoHostIsolation}
+		backend := &runtimeBackend{root: root, runsc: runsc, unsafeNoHostIsolation: runscNoHostIsolation(unsafeNoHostIsolation)}
 		_, err := backend.command("delete", "--force", id)
 		return err
 	}, stderr)
@@ -6463,7 +6468,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			root: server.root, runsc: server.runsc, dataRoot: server.dataRoot, localRoot: server.localRoot,
 			runtimePlatform:       server.runtimePlatform,
 			cpuFeatures:           server.cpuFeatures,
-			unsafeNoHostIsolation: server.unsafeNoHostIsolation,
+			unsafeNoHostIsolation: runscNoHostIsolation(server.unsafeNoHostIsolation),
 			disableHostGSO:        server.disableHostGSO,
 		}, strings.NewReader(""), io.Discard, io.Discard)
 		clusterTargetBackend = targetBackend
@@ -8944,7 +8949,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			return 0
 		}
 		if opts.unsafeNoHostIsolation {
-			fmt.Fprintln(stderr, "ttc: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
+			fmt.Fprintln(stderr, "ttc: warning: "+daemonNoHostIsolationWarning)
 		}
 		logPath, processDone, err := startDaemonProcess(opts.daemonSocket, opts.runtimePlatform, opts.unsafeNoHostIsolation, clusterOpts)
 		if err != nil {

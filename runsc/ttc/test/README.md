@@ -210,6 +210,10 @@ credentials, procfs, mounts, and filesystem CoW remain implemented by the
 Sentry, but this mode removes host-side defense in depth and must not be used
 for untrusted containers.
 
+macOS has no user namespaces, and needs neither probe nor opt-in: without
+`TTC_UNSAFE_NO_HOST_ISOLATION=1`, the harness's `ttcd` confines itself and its
+Sentries with the macOS sandbox, Seatbelt, as `ttcd` on macOS does by default.
+
 Build and invoke the matrix with:
 
 ```shell
@@ -289,10 +293,11 @@ TTCD="$PWD/bazel-bin/runsc/ttcd/ttcd_/ttcd" \
   "$PWD/runsc/ttc/test/e2e_terminal.sh"
 ```
 
-Omit `TTC_UNSAFE_NO_HOST_ISOLATION=1` on a host where `unshare -Ur /bin/true`
-succeeds. The test uses util-linux `script` and `timeout` on Linux; on macOS it
-uses BSD `script` and Perl as the timeout fallback. Set `TTC_E2E_ROOT` to retain
-terminal transcripts, console logs, and runtime state.
+Omit `TTC_UNSAFE_NO_HOST_ISOLATION=1` on macOS, and on a Linux host where
+`unshare -Ur /bin/true` succeeds. The test uses util-linux `script` and
+`timeout` on Linux; on macOS it uses BSD `script` and Perl as the timeout
+fallback. Set `TTC_E2E_ROOT` to retain terminal transcripts, console logs, and
+runtime state.
 
 ## Docker main-container compatibility
 

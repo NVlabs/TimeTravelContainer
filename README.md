@@ -76,9 +76,15 @@ immediately without creating a daemon socket.
 
 The native macOS backend requires Apple Silicon and macOS 15.0 or newer. It
 uses baseline Hypervisor.framework APIs, 4 KiB Linux pages over 16 KiB host
-allocation slabs, and does not boot a Linux VM. This first backend is a trusted
-workload mode: it deliberately omits Linux host namespaces, seccomp, and
-cgroups, and therefore makes no macOS host-security-boundary claim.
+allocation slabs, and does not boot a Linux VM. It omits Linux host
+namespaces, seccomp, and cgroups. Instead, `ttcd` confines itself, and every
+Sentry, gofer, and helper it starts, with the macOS sandbox, Seatbelt. The
+confinement keeps all file and network access, which containers and image pulls
+use, but denies devices, USB ones among them, and the system's services beyond
+those every process uses. Like the user namespace of a rootless Linux sandbox,
+it bounds what code execution in TTC reaches of the host; it is no boundary
+around the user's files or the network. `--unsafe-no-host-isolation` starts the
+daemon unconfined, for trusted workloads only.
 
 Use the installer to build, copy, and ad-hoc sign `ttcd` at its final path. It
 defaults to `../bin`; pass a destination directory as its first argument and
@@ -103,12 +109,12 @@ codesign --force --sign - \
   bin/ttcd
 ```
 
-Start the daemon only with the explicit trusted-mode opt-in. `ttcd` checks
-its own Hypervisor.framework entitlement at startup:
+Start the daemon. `ttcd` checks its own Hypervisor.framework entitlement at
+startup:
 
 ```sh
 export TTC_ROOT="$HOME/.local/share/ttc"
-bin/ttc daemon start --unsafe-no-host-isolation
+bin/ttc daemon start
 ```
 
 TTC_ROOT must name a new-format data root; data roots created by earlier TTC

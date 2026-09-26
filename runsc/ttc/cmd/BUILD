@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -7,6 +7,8 @@ package(
 
 go_library(
     name = "cmd",
+    # Its deps select the Darwin-only Seatbelt package.
+    force_add_state_pkg = True,
     srcs = [
         "checkpoint.go",
         "cmd.go",
@@ -77,7 +79,10 @@ go_library(
         "@com_github_opencontainers_runtime_spec//specs-go",
         "@org_golang_x_sys//unix:go_default_library",
         "@org_golang_x_term//:go_default_library",
-    ],
+    ] + select_system(
+        darwin = ["//runsc/ttc/seatbelt"],
+        linux = [],
+    ),
 )
 
 go_test(
