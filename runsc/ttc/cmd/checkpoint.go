@@ -529,12 +529,12 @@ func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerIn
 	capture.MemoryRoots = nil
 	capture.Resume = resume
 
-	finishGraphCapture := func() {}
-	if b.distributedSource != nil {
-		finishGraphCapture = b.distributedSource.beginForegroundCapture()
+	finishGraphCapture, err := b.beginForegroundCapture(info, longOperation{state: "restoring"})
+	if err != nil {
+		return err
 	}
 	defer finishGraphCapture()
-	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	origin, sealState, built, err := b.allocateGraphSnapshotOrigin()
 	if err != nil {
 		return fmt.Errorf("allocating a snapshot origin: %w", err)
 	}

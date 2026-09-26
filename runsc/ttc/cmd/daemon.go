@@ -7375,7 +7375,11 @@ func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
 			backend := directBackend(opts, strings.NewReader(""), io.Discard,
 				daemonFrameWriter{conn: conn, mu: &writeMu, typ: daemonFrameStderr})
 			s.configureCommandBackend(backend)
-			unlock := s.lockDataRoot(opts.dataRoot)
+			// As a node command does, the stop takes the lock once no long
+			// operation is in progress: one that holds the snapshot handoff
+			// gate takes the lock back before it lets the gate go, and the
+			// stop's own captures would wait for the gate holding the lock.
+			unlock := s.lockDataRootIdle(opts.dataRoot)
 			var err error
 			if s.clusterCapabilities != nil {
 				// A distributed daemon stop is also a node retirement. Reuse the

@@ -12694,9 +12694,9 @@ func (b *runtimeBackend) forkDehydratedMany(source selector, logicalParent strin
 	// path on the foreground side of the snapshot handoff gate so each edge is
 	// accounted either by the provider ledger or by the shared ledger, never in
 	// the frozen interval between them. The gate is a no-op in standalone mode.
-	finishForegroundCapture := func() {}
-	if b.distributedSource != nil {
-		finishForegroundCapture = b.distributedSource.beginForegroundCapture()
+	finishForegroundCapture, err := b.beginForegroundCapture(info, longOperation{branch: sourceBranch.ID, state: "forking"})
+	if err != nil {
+		return nil, err
 	}
 	defer finishForegroundCapture()
 	if err := b.ensureLocalColdBranch(info, sourceBranch); err != nil {
@@ -14926,12 +14926,11 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 	// A graph capture installs roots and parent edges to immutable origins.
 	// Exclude the short provider-to-shared ledger freeze so every new reference
 	// is included on exactly one side of the authority handoff.
-	finishGraphCapture := func() {}
-	graphCaptureActive := false
-	if b.distributedSource != nil {
-		finishGraphCapture = b.distributedSource.beginForegroundCapture()
-		graphCaptureActive = true
+	finishGraphCapture, err := b.beginForegroundCapture(info, longOperation{branch: target.branch, state: "dehydrating", shown: true})
+	if err != nil {
+		return err
 	}
+	graphCaptureActive := true
 	defer func() {
 		if graphCaptureActive {
 			finishGraphCapture()

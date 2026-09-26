@@ -575,6 +575,40 @@ func (r *distributedSourceRuntime) beginForegroundCapture() func() {
 	return r.handoffGate.Unlock
 }
 
+// tryBeginForegroundCapture is beginForegroundCapture, if the gate is free.
+func (r *distributedSourceRuntime) tryBeginForegroundCapture() (func(), bool) {
+	if r == nil {
+		return func() {}, true
+	}
+	if !r.handoffGate.TryLock() {
+		return nil, false
+	}
+	return r.handoffGate.Unlock, true
+}
+
+// beginForegroundCapture takes the snapshot handoff gate for a capture of a
+// branch of info's family, as distributedSourceRuntime.beginForegroundCapture
+// does. A command that holds the gate may wait for the lifecycle lock, as a
+// dehydration that streamed its memory without the lock waits to take it
+// again; so a command that finds the gate taken waits for it without the
+// lock, as the long operation op.
+func (b *runtimeBackend) beginForegroundCapture(info ttcbundle.ContainerInfo, op longOperation) (func(), error) {
+	if finish, ok := b.distributedSource.tryBeginForegroundCapture(); ok {
+		return finish, nil
+	}
+	var finish func()
+	if err := b.withoutLifecycleLock(info, op, func() error {
+		finish = b.distributedSource.beginForegroundCapture()
+		return nil
+	}); err != nil {
+		if finish != nil {
+			finish()
+		}
+		return nil, err
+	}
+	return finish, nil
+}
+
 // scheduleColdCollection coalesces terminal handoff cleanup onto the same
 // bounded background queue. Collection traces the cluster's immutable roots;
 // running it once per sibling makes an N-way fan-out perform N near-identical
@@ -2476,7 +2510,10 @@ func (b *runtimeBackend) forkRemote(source selector, targetNode, targetDestinati
 	if state := normalizeLifecycleState(sourceBranch.State); state == "dehydrated" || state == "dehydrating" {
 		return b.forkRemoteDehydrated(source, logicalSource, sourceInfo, peer, targetNode, target, paused, nil)
 	}
-	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	finishForegroundCapture, err := b.beginForegroundCapture(sourceInfo, longOperation{branch: source.branch, state: "forking"})
+	if err != nil {
+		return selector{}, err
+	}
 	foregroundCaptureActive := true
 	defer func() {
 		if foregroundCaptureActive {
@@ -2662,7 +2699,10 @@ func (b *runtimeBackend) forkRemoteDehydrated(source, logicalSource selector, so
 	// in progress. Without the gate, FreezeSnapshotLedger can reject a perfectly
 	// valid fork in the narrow interval after publication freezes the provider
 	// ledger and before shared authority becomes visible.
-	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	finishForegroundCapture, err := b.beginForegroundCapture(sourceInfo, longOperation{branch: source.branch, state: "forking"})
+	if err != nil {
+		return selector{}, err
+	}
 	defer finishForegroundCapture()
 	if err := b.ensureLocalColdBranch(sourceInfo, sourceBranch); err != nil {
 		return selector{}, fmt.Errorf("materializing dehydrated remote-fork source: %w", err)
@@ -3145,7 +3185,10 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 		}
 		return results, nil
 	}
-	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
+	finishForegroundCapture, err := b.beginForegroundCapture(sourceInfo, longOperation{branch: source.branch, state: "forking"})
+	if err != nil {
+		return nil, err
+	}
 	foregroundCaptureActive := true
 	defer func() {
 		if foregroundCaptureActive {

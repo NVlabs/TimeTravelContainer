@@ -474,3 +474,60 @@ func TestForkWaitsOutAHandoff(t *testing.T) {
 		t.Fatalf("an ordinary failure was retried: %d attempts, %v", attempts, err)
 	}
 }
+
+// A capture that finds the snapshot handoff gate taken waits for it without
+// the lifecycle lock: the gate's holder, a dehydration that streamed its
+// memory without the lock, takes the lock back before it lets the gate go.
+func TestCaptureWaitsForTheGateWithoutTheLifecycleLock(t *testing.T) {
+	server := &daemonServer{}
+	root := t.TempDir()
+	source := &distributedSourceRuntime{}
+	hold := &lifecycleHold{acquire: func() func() { return server.lockDataRoot(root) }, release: server.lockDataRoot(root)}
+	b := &runtimeBackend{distributedSource: source, lifecycleLockHeld: true, mutating: true}
+	server.configureLongOperations(b, hold)
+	defer hold.unlock()
+	info := ttcbundle.ContainerInfo{ID: "id", Name: "s"}
+
+	finish, err := b.beginForegroundCapture(info, longOperation{branch: "main", state: "forking"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unlock, locked := server.tryLockDataRoot(root); locked {
+		unlock()
+		t.Error("a capture that found the gate free gave the lifecycle lock up")
+	}
+	finish()
+
+	finishStreamed := source.beginForegroundCapture()
+	streamed := make(chan struct{})
+	go func() {
+		defer close(streamed)
+		unlock := server.lockDataRoot(root)
+		finishStreamed()
+		unlock()
+	}()
+	captured := make(chan error, 1)
+	go func() {
+		finish, err := b.beginForegroundCapture(info, longOperation{branch: "main", state: "forking"})
+		if err == nil {
+			finish()
+		}
+		captured <- err
+	}()
+	select {
+	case err := <-captured:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the capture waits for the gate holding the lock that the gate's holder waits for")
+	}
+	<-streamed
+	if !b.lifecycleLockHeld {
+		t.Error("the capture does not know it holds the lifecycle lock again")
+	}
+	if unlock, locked := server.tryLockDataRoot(root); locked {
+		unlock()
+		t.Error("the capture did not take the lifecycle lock back")
+	}
+}

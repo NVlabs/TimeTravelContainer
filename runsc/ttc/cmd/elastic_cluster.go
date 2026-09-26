@@ -3041,19 +3041,24 @@ func (b *runtimeBackend) migrate(target selector, targetNode string) error {
 	// durable snapshot is still finishing this handoff; a migration requested
 	// immediately afterwards must wait rather than fail with a transient
 	// "references are frozen" error.
-	finishForegroundCapture := b.distributedSource.beginForegroundCapture()
-	foregroundCaptureActive := true
-	defer func() {
-		if foregroundCaptureActive {
-			finishForegroundCapture()
-		}
-	}()
+	// Taken once the family is resolved: resolving waits for a long operation
+	// on it, which may itself wait for the gate.
 	logicalTarget := target
 	resolved, info, err := b.resolveSelector(target)
 	if err != nil {
 		return err
 	}
 	target = resolved
+	finishForegroundCapture, err := b.beginForegroundCapture(info, longOperation{branch: target.branch, state: "migrating"})
+	if err != nil {
+		return err
+	}
+	foregroundCaptureActive := true
+	defer func() {
+		if foregroundCaptureActive {
+			finishForegroundCapture()
+		}
+	}()
 	logicalFamily := info.DistributedFamilyID
 	if logicalFamily == "" {
 		logicalFamily = info.ID
