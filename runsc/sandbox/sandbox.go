@@ -95,6 +95,13 @@ func controlSocketName(id string) string {
 // it runs, keeps the Unix sockets of its sandboxes.
 const ttcRunDirEnv = "TTC_RUN_DIR"
 
+// TTCRunDir returns the directory in which the ttcd that runs this runsc keeps
+// the Unix sockets of its sandboxes, or "" if no ttcd runs it. A socket there
+// needs a name of at most 22 bytes to fit any root the ttcd accepts.
+func TTCRunDir() string {
+	return os.Getenv(ttcRunDirEnv)
+}
+
 // ttcControlSocketName is the name of a sandbox's control socket in ttcd's run
 // directory: that ttcd gives the socket of its root's key, rootDir and id.
 func ttcControlSocketName(rootDir, id string) string {
@@ -130,7 +137,7 @@ func createControlSocket(rootDir, id string) (string, int, error) {
 		{dir: "/run", name: fallbackName},
 		{dir: "/tmp", name: fallbackName},
 	}
-	if dir := os.Getenv(ttcRunDirEnv); dir != "" {
+	if dir := TTCRunDir(); dir != "" {
 		// ttcd keeps every socket of its sandboxes in the run directory of
 		// its root, under a name short enough for any root it accepts.
 		locations = locations[:1]

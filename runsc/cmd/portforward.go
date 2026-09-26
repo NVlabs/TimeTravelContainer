@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // PortForward implements subcommands.Command for the "portforward" command.
@@ -365,7 +366,13 @@ func portCopy(ctx context.Context, c *container.Container, branch string, allowS
 
 // tmpUDS generates a temporary UDS addr.
 func tmpUDSAddr() (string, error) {
-	tmpFile, err := os.CreateTemp("", "runsc-port-forward")
+	// ttcd keeps the sockets of its sandboxes in its run directory, where
+	// only a short name fits.
+	dir, pattern := sandbox.TTCRunDir(), "p"
+	if dir == "" {
+		pattern = "runsc-port-forward"
+	}
+	tmpFile, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return "", err
 	}
