@@ -28,6 +28,7 @@ import (
 	"time"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
 	gcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -1032,5 +1033,163 @@ func BenchmarkRing0PlatformSwitch(b *testing.B) {
 	b.StopTimer()
 	if got := ac.Regs.Regs[8]; got != 172 {
 		b.Fatalf("syscall sentinel = %d, want 172", got)
+	}
+}
+
+// TestRing0PlatformRolloverRetiresIdleResidency rolls the VM epoch over while
+// another task holds an owner-affine vCPU that is idle at host EL0. Only the
+// owner thread can destroy that vCPU, and the owner's next Switch blocks on
+// the transition, so it must give up the residency before waiting. Otherwise
+// closing the old engine times out and the platform fails permanently.
+func TestRing0PlatformRolloverRetiresIdleResidency(t *testing.T) {
+	backend := hvf.NewBackend()
+	p, err := vmplatform.New(vmplatform.Config{
+		NewVM: backend.CreateVM, HostMemory: backend.HostMemory(), Architecture: vmarm64.Architecture{},
+		VCPUs: 2, IPAStart: hvf.GuestRAMIPAStart, IPASize: 4 * vmplatform.HostSlabSize,
+		PlatformName: "hvf-idle-rollover-test", VMEngineFactory: hvf.NewVMEngine,
+	})
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	defer p.Close()
+
+	newMemoryFile := func() *pgalloc.MemoryFile {
+		mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+			BackingProvider:         p.MemoryFileBackingProvider(),
+			DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+			DisableMemoryAccounting: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mf
+	}
+	codeMF := newMemoryFile()
+	defer codeMF.Destroy()
+	codeRange, err := codeMF.Allocate(hostarch.PageSize, pgalloc.AllocOpts{
+		Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer codeMF.DecRef(codeRange)
+	code := []byte{0x88, 0x15, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4} // movz x8,#172; svc #0
+	blocks, lease, err := memmap.MapInternalWithLease(codeMF, codeRange, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := safemem.CopySeq(blocks, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(code))); err != nil || n != uint64(len(code)) {
+		lease.Release()
+		t.Fatalf("writing code: n=%d err=%v", n, err)
+	}
+	lease.Release()
+
+	as, err := p.NewAddressSpace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer as.Release()
+	const va = hostarch.Addr(0x700000)
+	if err := as.MapFile(va, codeMF, codeRange, hostarch.ReadExecute, false); err != nil {
+		t.Fatal(err)
+	}
+	platformCtx := p.NewContext(gcontext.Background())
+	defer platformCtx.Release()
+	mm := &compactionTestMemoryManager{as: as}
+	run := func() error {
+		ac := arch.New(arch.ARM64)
+		ac.SetIP(uintptr(va))
+		if _, _, err := platformCtx.Switch(gcontext.Background(), mm, ac, -1); err != nil {
+			return err
+		}
+		if got := ac.Regs.Regs[8]; got != 172 {
+			return fmt.Errorf("syscall sentinel = %d, want 172", got)
+		}
+		return nil
+	}
+
+	idle := make(chan error, 1)
+	proceed := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := run(); err != nil {
+			idle <- err
+			return
+		}
+		// A Darwin libc call returns the continuation to host EL0 while the
+		// residency, and so its vCPU, stays idle.
+		_ = unix.Getpid()
+		if ring0asm.CurrentEL() != 0 {
+			idle <- errors.New("libc call left the continuation at EL1")
+			return
+		}
+		idle <- nil
+		<-proceed
+		err := run()
+		// Like an exiting task, end the residency on its owner thread.
+		platformCtx.PrepareExit()
+		done <- err
+	}()
+	if err := <-idle; err != nil {
+		t.Fatal(err)
+	}
+
+	// As in TestRing0PlatformEpochRolloverRebuildsExecutingAddressSpace, the
+	// second slab's GPA is spent, so the next slab reaches the 75% threshold.
+	rolled := make(chan error, 1)
+	go func() {
+		mf := newMemoryFile()
+		fr, err := mf.Allocate(4*hostarch.PageSize, pgalloc.AllocOpts{
+			Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate,
+		})
+		if err != nil {
+			mf.Destroy()
+			rolled <- err
+			return
+		}
+		mf.DecRef(fr)
+		mf.Destroy()
+		deadline := time.Now().Add(5 * time.Second)
+		for p.GuestRAM().Metrics().LogicalBytes != hostarch.PageSize {
+			if time.Now().After(deadline) {
+				rolled <- fmt.Errorf("temporary frames were not reclaimed: %+v", p.GuestRAM().Metrics())
+				return
+			}
+			runtime.Gosched()
+		}
+		post := newMemoryFile()
+		postRange, err := post.Allocate(4*hostarch.PageSize, pgalloc.AllocOpts{
+			Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate,
+		})
+		if err == nil {
+			post.DecRef(postRange)
+		}
+		post.Destroy()
+		rolled <- err
+	}()
+	// Let the rollover start closing the old engine, then let the owner reach
+	// its next Switch while the transition is in progress.
+	time.Sleep(500 * time.Millisecond)
+	close(proceed)
+	select {
+	case err := <-rolled:
+		if err != nil {
+			t.Fatalf("rollover allocation: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("rollover did not finish")
+	}
+	if got := p.GuestRAM().Metrics().Epoch; got != 2 {
+		t.Fatalf("VM epoch after rollover = %d, want 2", got)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("owner run after rollover: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("owner did not run after rollover")
 	}
 }

@@ -1068,8 +1068,17 @@ func (e *ring0Engine) retireCurrentApplicationCPU() (retErr error) {
 	return retErr
 }
 
+// errRing0EngineClosed reports that admission found the engine closed, as
+// during an epoch rollover.
+var errRing0EngineClosed = errors.New("HVF ring0 engine is closed")
+
 func (e *ring0Engine) RunApplication(ctx context.Context, application vmm.ApplicationState) (retExit vmm.Exit, retErr error) {
 	cpu, _, err := e.getApplicationCPU(ctx)
+	if errors.Is(err, errRing0EngineClosed) {
+		// The platform is replacing this engine. The caller retries on the
+		// next epoch; an error here would kill the thread group.
+		return vmm.Exit{Reason: vmm.ExitInterrupted}, nil
+	}
 	if err != nil {
 		return vmm.Exit{}, err
 	}
@@ -1414,7 +1423,7 @@ retry:
 	e.reapDestroyedCPUsLocked()
 	if e.closed.Load() {
 		e.cpuMu.Unlock()
-		return nil, false, fmt.Errorf("HVF ring0 engine is closed")
+		return nil, false, errRing0EngineClosed
 	}
 	if cpu := e.findApplicationCPUByTIDLocked(tid); cpu != nil {
 		if cpu.bridge.destroyed() {
@@ -1546,7 +1555,7 @@ retry:
 		e.cpuMu.Unlock()
 		bridge.close()
 		_ = vcpu.Close()
-		return nil, false, fmt.Errorf("HVF ring0 engine closed while creating vCPU")
+		return nil, false, errRing0EngineClosed
 	}
 	e.cpusByID[id] = cpu
 	e.cpusByTID.Store(tid, cpu)

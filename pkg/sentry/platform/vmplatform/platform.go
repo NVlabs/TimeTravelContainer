@@ -351,6 +351,13 @@ func (p *Platform) Close() error {
 }
 
 func (p *Platform) lockEpoch(ctx stdcontext.Context) error {
+	return p.lockEpochBeforeWait(ctx, nil)
+}
+
+// lockEpochBeforeWait is lockEpoch, but calls beforeWait, if non-nil,
+// whenever it is about to block on an epoch transition.
+// +checklocksignore: returns with epochMu read-locked on success.
+func (p *Platform) lockEpochBeforeWait(ctx stdcontext.Context, beforeWait func()) error {
 	for {
 		p.epochMu.RLock()
 		p.mu.Lock()
@@ -372,6 +379,9 @@ func (p *Platform) lockEpoch(ctx stdcontext.Context) error {
 		done := p.transitionDone
 		p.mu.Unlock()
 		p.epochMu.RUnlock()
+		if beforeWait != nil {
+			beforeWait()
+		}
 		select {
 		case <-done:
 		case <-ctx.Done():
@@ -1194,7 +1204,11 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 	if !ok || as.platform != c.platform {
 		return nil, hostarch.NoAccess, fmt.Errorf("vmplatform Context used with incompatible address space")
 	}
-	if err := c.platform.lockEpoch(ctx); err != nil {
+	// Closing the old engine during a transition must retire this context's
+	// owner-affine vCPU, which only its owner thread can do. Do it here rather
+	// than hold the vCPU while blocked on the transition, which would make the
+	// transition time out and fail the platform.
+	if err := c.platform.lockEpochBeforeWait(ctx, func() { _ = c.endApplicationResidency() }); err != nil {
 		if errors.Is(err, stdcontext.Canceled) {
 			return nil, hostarch.NoAccess, sentryplatform.ErrContextInterrupt
 		}
