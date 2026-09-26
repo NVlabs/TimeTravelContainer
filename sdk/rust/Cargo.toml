@@ -9,5 +9,4 @@ keywords = ["container", "gvisor", "sandbox"]
 categories = ["api-bindings"]
 
 [dependencies]
-libc = "0.2"
 serde_json = "1"

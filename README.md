@@ -190,7 +190,7 @@ For example, Python agents can branch a sandbox directly:
 ```python
 from ttcx import Client
 
-ttc = Client()
+ttc = Client("/path/to/ttc-root")
 ttc.fork("agent@main", "candidate").check()
 result = ttc.exec("agent@candidate", ["sh", "-lc", "make test"])
 result.check()

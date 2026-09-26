@@ -18,7 +18,7 @@ Start `ttcd`, then create a client:
 use ttcx::Client;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ttc = Client::default();
+    let ttc = Client::new("/path/to/ttc-root");
     println!("{}", ttc.ping()?);
 
     ttc.pull("alpine:3.20")?.check()?;
@@ -108,10 +108,11 @@ non-forkable.
 the daemon. Use absolute host paths in raw file-oriented commands because
 `ttcd` does not share the client process's working directory.
 
-Set `TTC_SOCKET` or `XDG_RUNTIME_DIR`, or use
-`Client::new("/path/to/ttcd.sock")`. SDK clients never need `TTC_ROOT` or
-`TTC_LOCAL_ROOT`. They negotiate the public API/features returned by `ping`;
-exact build matching is specific to the official CLI.
+`Client::new(root)` takes the root of the daemon to use explicitly: the
+`TTC_ROOT` of a standalone `ttcd`, or the `TTC_LOCAL_ROOT` of a node of a
+cluster. It connects to `ttcd.sock` there, reads no environment variables, and
+never accesses the daemon's storage. Clients negotiate the public API/features
+returned by `ping`; exact build matching is specific to the official CLI.
 
 ## Test
 

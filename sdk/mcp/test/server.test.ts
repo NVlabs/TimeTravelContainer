@@ -67,8 +67,7 @@ test("MCP client lists tools and reaches ttcd directly", async () => {
 
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [resolve("dist/src/bin.js")],
-    env: { ...process.env, TTC_SOCKET: path } as Record<string, string>,
+    args: [resolve("dist/src/bin.js"), "--root", runtime],
     stderr: "pipe",
   });
   const client = new McpClient({ name: "ttcx-mcp-test", version: "0.1.0" });

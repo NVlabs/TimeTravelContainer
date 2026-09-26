@@ -14,7 +14,6 @@
 
 import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
 import { createConnection, type Socket } from "node:net";
 
 export const API_VERSION = 9;
@@ -65,7 +64,8 @@ export class Result {
 }
 
 export interface ClientOptions {
-  socketPath?: string;
+  /** The root of the ttcd to use: its TTC_ROOT, or TTC_LOCAL_ROOT. */
+  root: string;
   timeoutMs?: number;
 }
 
@@ -100,16 +100,16 @@ export interface ImageSaveOptions {
   platform?: string;
 }
 
-export function defaultSocketPath(
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  if (env.TTC_SOCKET) {
-    return env.TTC_SOCKET;
-  }
-  if (env.XDG_RUNTIME_DIR) {
-    return join(env.XDG_RUNTIME_DIR, "ttc", "ttcd.sock");
-  }
-  return join(tmpdir(), `ttc-${process.getuid?.() ?? 0}`, "ttcd.sock");
+/** The name of a daemon's socket in its root. */
+export const SOCKET_NAME = "ttcd.sock";
+
+/**
+ * Returns the socket of the ttcd whose root is root. A daemon's root, the
+ * TTC_ROOT of a standalone ttcd or the TTC_LOCAL_ROOT of a node of a cluster,
+ * identifies it.
+ */
+export function daemonSocketPath(root: string): string {
+  return join(root, SOCKET_NAME);
 }
 
 function frame(kind: string, payload: Uint8Array = new Uint8Array()): Buffer {
@@ -410,12 +410,13 @@ export class Client {
   readonly socketPath: string;
   readonly timeoutMs: number;
 
-  constructor(options: ClientOptions | string = {}) {
+  /** Returns a client of the ttcd whose root is root, or options.root. */
+  constructor(options: ClientOptions | string) {
     if (typeof options === "string") {
-      this.socketPath = options;
+      this.socketPath = daemonSocketPath(options);
       this.timeoutMs = 30_000;
     } else {
-      this.socketPath = options.socketPath ?? defaultSocketPath();
+      this.socketPath = daemonSocketPath(options.root);
       this.timeoutMs = options.timeoutMs ?? 30_000;
     }
   }
