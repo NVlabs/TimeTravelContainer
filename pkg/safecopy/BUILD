@@ -39,6 +39,7 @@ go_library(
 go_test(
     name = "safecopy_test",
     srcs = [
+        "safecopy_darwin_test.go",
         "safecopy_test.go",
     ],
     # Darwin fault recovery uses the Mach exception server in machexc.
@@ -46,7 +47,7 @@ go_test(
     library = ":safecopy",
     deps = [
         "@org_golang_x_sys//unix:go_default_library",
-    ],
+    ] + select_system(linux = [], darwin = ["//pkg/safecopy/machexc"]),
 )
 
 go_test(

@@ -151,7 +151,17 @@ kern_return_t catch_exception_raise_state_identity(
     new_ts->__x[0] = exception_state.__far;
     new_ts->__x[1] = code[0] == KERN_MEMORY_ERROR ? SIGBUS : SIGSEGV;
     *new_state_count = ARM_THREAD_STATE64_COUNT;
+    // A MIG server routine that succeeds owns the send rights that the request
+    // carried; mach_msg_server destroys them only when the routine fails.
+    // Leaking them would add a reference per fault, and leave a dead name
+    // behind for every faulting thread that exits.
+    (void)mach_port_deallocate(mach_task_self(), thread);
+    (void)mach_port_deallocate(mach_task_self(), task);
     return KERN_SUCCESS;
+}
+
+static kern_return_t task_port_refs(mach_port_urefs_t *refs) {
+    return mach_port_get_refs(mach_task_self(), mach_task_self(), MACH_PORT_RIGHT_SEND, refs);
 }
 
 static void *exception_server_main(void *unused) {
@@ -172,7 +182,7 @@ static kern_return_t install_exception_handler(void) {
     }
     kr = mach_port_insert_right(mach_task_self(), exception_port, exception_port, MACH_MSG_TYPE_MAKE_SEND);
     if (kr != KERN_SUCCESS) {
-        mach_port_destroy(mach_task_self(), exception_port);
+        (void)mach_port_destruct(mach_task_self(), exception_port, 0, 0);
         exception_port = MACH_PORT_NULL;
         return kr;
     }
@@ -183,7 +193,8 @@ static kern_return_t install_exception_handler(void) {
         EXCEPTION_STATE_IDENTITY,
         ARM_THREAD_STATE64);
     if (kr != KERN_SUCCESS) {
-        mach_port_destroy(mach_task_self(), exception_port);
+        // Drop the send right made above along with the receive right.
+        (void)mach_port_destruct(mach_task_self(), exception_port, -1, 0);
         exception_port = MACH_PORT_NULL;
         return kr;
     }
@@ -212,6 +223,17 @@ func AddFaultRange(begin, end, handler uintptr) error {
 		return fmt.Errorf("add_fault_range returned Mach error %d", int(result))
 	}
 	return nil
+}
+
+// TaskPortRefs returns the user references of this task's send right to its
+// own task port. Every Mach exception message carries another one, so tests
+// use it to check that handling exceptions releases them.
+func TaskPortRefs() (uint32, error) {
+	var refs C.mach_port_urefs_t
+	if result := C.task_port_refs(&refs); result != C.KERN_SUCCESS {
+		return 0, fmt.Errorf("mach_port_get_refs returned Mach error %d", int(result))
+	}
+	return uint32(refs), nil
 }
 
 // Install installs the task exception port and starts its C-only server.
