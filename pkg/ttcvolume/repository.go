@@ -2206,7 +2206,13 @@ func (r *Repository) createNonRegular(branchID string, parent uint64, name strin
 		}
 		entry := DirectoryEntry{Name: name, Inode: created}
 		ops = append(ops, metadataOp{Kind: metadataSetEntry, Parent: parent, Entry: &entry})
-		return r.commitMetadata(&branch, state, ops)
+		if err := r.commitMetadata(&branch, state, ops); err != nil {
+			return err
+		}
+		if inode.Type == "directory" {
+			state.markNewDirectory(created)
+		}
+		return nil
 	})
 	return created, err
 }

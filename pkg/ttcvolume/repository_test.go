@@ -542,6 +542,77 @@ func TestMetadataBatchDropsDeletedTransientSubtree(t *testing.T) {
 	}
 }
 
+func TestNewDirectoryLookupsAgreeWithTheGraph(t *testing.T) {
+	manager, err := OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := manager.Create("lookups")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := repo.CreateDirectory(MainBranch, RootInode, "dir", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// More files than a metadata batch holds, so that some are in the graph.
+	const files = metadataBatchOperations + 44
+	inodes := make(map[string]uint64)
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("f%d", i)
+		ino, err := repo.CreateRegular(MainBranch, dir, name, 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inodes[name] = ino
+	}
+	if _, err := repo.CreateRegular(MainBranch, dir, "f0", 0644, 0, 0); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("creating an existing name: %v", err)
+	}
+	if err := repo.Unlink(MainBranch, dir, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	delete(inodes, "f1")
+	if err := repo.Rename(MainBranch, dir, "f2", RootInode, "moved", false); err != nil {
+		t.Fatal(err)
+	}
+	delete(inodes, "f2")
+	check := func(repo *Repository, branch, when string) {
+		t.Helper()
+		for name, want := range inodes {
+			if got, err := repo.Lookup(branch, dir, name); err != nil || got != want {
+				t.Fatalf("%s: lookup of %s = %d, %v, want %d", when, name, got, err, want)
+			}
+		}
+		for _, name := range []string{"f1", "f2", "missing"} {
+			if _, err := repo.Lookup(branch, dir, name); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("%s: lookup of %s: %v, want not found", when, name, err)
+			}
+		}
+		entries, err := repo.ListDirectory(branch, dir)
+		if err != nil || len(entries) != len(inodes) {
+			t.Fatalf("%s: %d entries, %v, want %d", when, len(entries), err, len(inodes))
+		}
+	}
+	check(repo, MainBranch, "before a sync")
+	if err := repo.Fork(MainBranch, "child"); err != nil {
+		t.Fatal(err)
+	}
+	check(repo, "child", "in a fork")
+	if err := repo.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err = manager.Open("lookups")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	check(repo, MainBranch, "reopened")
+}
+
 func TestRepositoryOperatesThroughDonatedDirectoryFD(t *testing.T) {
 	manager := openTestManager(t)
 	repo, err := manager.Create("donated")

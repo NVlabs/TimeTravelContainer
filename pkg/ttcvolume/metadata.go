@@ -639,12 +639,14 @@ func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name s
 	key := metadataEntryKey{Parent: parent, Name: name}
 	entry, ok := state.entries[key]
 	deleted := state.deletedEntries[key]
+	// A loaded directory has all its entries in state.entries.
+	loaded := state.loadedDirectories[parent]
 	branch := state.branch
 	state.mu.RUnlock()
 	if ok {
 		return entry.Inode, nil
 	}
-	if deleted {
+	if deleted || loaded {
 		return 0, fs.ErrNotExist
 	}
 	root, err := ttcsnapshot.ParseObjectID(branch.Root)
@@ -665,6 +667,21 @@ func (r *Repository) metadataLookup(state *branchMetadata, parent uint64, name s
 	}
 	state.mu.Unlock()
 	return entry.Inode, nil
+}
+
+// markNewDirectory records that the directory number, which the branch of
+// state has just made, has no entries but those state holds, so that looking
+// a name up in it need not read the graph.
+func (state *branchMetadata) markNewDirectory(number uint64) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if _, ok := state.inodes[number]; !ok {
+		return
+	}
+	state.loadedDirectories[number] = true
+	if state.directories[number] == nil {
+		state.directories[number] = make(map[string]DirectoryEntry)
+	}
 }
 
 func (r *Repository) metadataDirectory(state *branchMetadata, parent uint64) ([]DirectoryEntry, error) {
