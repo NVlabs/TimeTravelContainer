@@ -1125,6 +1125,16 @@ func (e *ring0Engine) applicationCPUCountLocked() int {
 	return count
 }
 
+func init() {
+	// The main thread's pthread TSD is in the dyld shared cache's data, which
+	// hostSlabCanMirror can't import. A Sentry continuation resident at EL1 on
+	// that thread would take a host gate whenever the Go runtime saves g to
+	// TLS, which it does on most syscalls. An init function that locks the
+	// main goroutine to the main thread keeps every other goroutine, and so
+	// every application residency, off it.
+	runtime.LockOSThread()
+}
+
 // BeginApplicationResidency pins the Sentry task goroutine to one Darwin host
 // thread. Hypervisor.framework vCPUs are owner-thread affine, so this lock is
 // retained across the application's syscall exit and the corresponding Sentry
