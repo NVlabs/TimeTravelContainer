@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -1084,8 +1083,9 @@ type platformContext struct {
 	mu         sync.Mutex
 	runContext applicationRunContext
 	runActive  bool
-	// runTID is the host thread running the active application run.
-	runTID      uint64
+	// runOwner identifies the host thread running the active application run
+	// for ApplicationInterruptEngine.
+	runOwner    uint64
 	interrupted bool
 	released    bool
 	resident    ApplicationResidencyEngine
@@ -1223,7 +1223,9 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 	}
 	c.runContext.reset(ctx)
 	c.runActive = true
-	c.runTID = hosttid.Current()
+	if engine, ok := engine.(ApplicationInterruptEngine); ok {
+		c.runOwner = engine.ApplicationOwner()
+	}
 	c.mu.Unlock()
 
 	if err := c.platform.arch.LoadApplicationState(c.registers, ac); err != nil {
@@ -1272,7 +1274,7 @@ func (c *platformContext) Interrupt() {
 	c.mu.Lock()
 	c.interrupted = true
 	running := c.runActive
-	tid := c.runTID
+	owner := c.runOwner
 	if running {
 		c.runContext.cancel()
 	}
@@ -1285,7 +1287,7 @@ func (c *platformContext) Interrupt() {
 	// architected guest exit after publishing interrupted so Switch observes a
 	// coherent register snapshot.
 	if engine, ok := c.platform.engine.(ApplicationInterruptEngine); ok {
-		engine.InterruptApplication(tid)
+		engine.InterruptApplication(owner)
 		return
 	}
 	c.platform.engine.InterruptApplications()

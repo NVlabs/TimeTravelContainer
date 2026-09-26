@@ -40,13 +40,15 @@ type VMEngine interface {
 }
 
 // ApplicationInterruptEngine is optionally implemented by engines whose
-// application runs are owned by host threads. InterruptApplication stops only
-// the run owned by host thread tid, if any, and returns once that run has
-// acknowledged or left the guest. Signals and preemption target one task;
-// interrupting every run instead makes each running task end its residency.
+// application runs are owned by host threads. ApplicationOwner identifies the
+// calling thread. InterruptApplication stops only the run owned by that
+// thread, if any, and returns once the run has acknowledged or left the
+// guest. Signals and preemption target one task; interrupting every run
+// instead makes each running task end its residency.
 type ApplicationInterruptEngine interface {
 	VMEngine
-	InterruptApplication(tid uint64)
+	ApplicationOwner() uint64
+	InterruptApplication(owner uint64)
 }
 
 // HostExecutionCacheEngine is optionally implemented by engines that execute

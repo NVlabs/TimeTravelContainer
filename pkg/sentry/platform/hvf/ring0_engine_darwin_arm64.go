@@ -2629,6 +2629,11 @@ func (e *ring0Engine) InterruptApplications() {
 	e.interruptApplicationCPUs(cpus)
 }
 
+// ApplicationOwner implements vmplatform.ApplicationInterruptEngine.
+func (*ring0Engine) ApplicationOwner() uint64 {
+	return hosttid.Current()
+}
+
 // InterruptApplication implements vmplatform.ApplicationInterruptEngine.
 func (e *ring0Engine) InterruptApplication(tid uint64) {
 	cached, ok := e.cpusByTID.Load(tid)

@@ -178,8 +178,10 @@ type targetedInterruptEngine struct {
 	targets []uint64
 }
 
-func (e *targetedInterruptEngine) InterruptApplication(tid uint64) {
-	e.targets = append(e.targets, tid)
+func (*targetedInterruptEngine) ApplicationOwner() uint64 { return 42 }
+
+func (e *targetedInterruptEngine) InterruptApplication(owner uint64) {
+	e.targets = append(e.targets, owner)
 }
 
 // TestPlatformContextInterruptTargetsOwnRun checks that interrupting one
@@ -190,7 +192,7 @@ func TestPlatformContextInterruptTargetsOwnRun(t *testing.T) {
 	c := &platformContext{platform: &Platform{engine: engine}}
 	c.runContext.reset(context.Background())
 	c.runActive = true
-	c.runTID = 42
+	c.runOwner = 42
 	c.Interrupt()
 	if got := engine.interrupts.Load(); got != 0 {
 		t.Fatalf("engine-wide interrupts = %d, want 0", got)
