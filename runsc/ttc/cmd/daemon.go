@@ -8188,13 +8188,6 @@ func daemonCommandBoolFlag(args []string, short byte, long string) bool {
 	return value
 }
 
-func (s *daemonServer) lockMutation(dataRoot string, args []string) func() {
-	if !daemonCommandNeedsMutationLock(args) && !daemonCommandReadsLifecycle(args) {
-		return func() {}
-	}
-	return s.lockDataRoot(dataRoot)
-}
-
 func (s *daemonServer) lockDataRoot(dataRoot string) func() {
 	lock := s.dataRootLock(dataRoot)
 	lock.Lock()

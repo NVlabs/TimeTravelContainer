@@ -1590,47 +1590,27 @@ func TestDaemonCommandNeedsMutationJournal(t *testing.T) {
 func TestDaemonMutationLocksAreScopedByDataRoot(t *testing.T) {
 	server := &daemonServer{}
 	root := filepath.Join(t.TempDir(), "state")
-	unlockFirst := server.lockMutation(root, []string{"pause", "demo"})
+	unlockFirst := server.lockDataRoot(root)
 
 	secondAcquired := make(chan func(), 1)
 	go func() {
-		secondAcquired <- server.lockMutation(root, []string{"stop", "demo"})
+		secondAcquired <- server.lockDataRoot(root)
 	}()
 	select {
 	case unlock := <-secondAcquired:
 		unlock()
-		t.Fatal("conflicting mutation acquired the same data-root lock")
+		t.Fatal("a second request acquired the same data-root lock")
 	case <-time.After(50 * time.Millisecond):
 	}
-
-	readAcquired := make(chan func(), 1)
-	go func() {
-		readAcquired <- server.lockMutation(root, []string{"inspect", "demo"})
-	}()
-	select {
-	case unlock := <-readAcquired:
-		unlock()
-		t.Fatal("lifecycle read acquired the lock during a conflicting mutation")
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlockOther := server.lockMutation(root+"-other", []string{"stop", "demo"})
+	unlockOther := server.lockDataRoot(root + "-other")
 	unlockOther()
 
 	unlockFirst()
-	remaining := 2
-	for remaining != 0 {
-		select {
-		case unlock := <-secondAcquired:
-			secondAcquired = nil
-			unlock()
-			remaining--
-		case unlock := <-readAcquired:
-			readAcquired = nil
-			unlock()
-			remaining--
-		case <-time.After(5 * time.Second):
-			t.Fatal("lifecycle operation remained blocked after unlock")
-		}
+	select {
+	case unlock := <-secondAcquired:
+		unlock()
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle operation remained blocked after unlock")
 	}
 }
 

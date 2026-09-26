@@ -2932,73 +2932,20 @@ func (s *daemonServer) distributedCleanupNode(sourceNode string) (string, error)
 	return sourceNode, nil
 }
 
+// executeLocalDistributedCommand runs a child of a distributed command on
+// this node, as a peer runs one sent to it: through the daemon's own socket,
+// so that it takes the family and lifecycle locks as every request does, and
+// a long operation, such as a dehydration, gives the lifecycle lock up while
+// it works. The cluster peer service rejects a node dialing itself.
 func (s *daemonServer) executeLocalDistributedCommand(request daemonRequest) (int, string, string, error) {
-	opts := s.optionsFromRequest()
-	var stdout, stderr bytes.Buffer
-	backend := directBackend(opts, strings.NewReader(""), &stdout, &stderr)
-	s.configureVolumeBackend(backend)
-	backend.consoleSidecars = s
-	backend.distributedSource = s.distributedSource
-	backend.nodeID = s.clusterCapabilities.NodeID
-	unlock := s.lockMutation(opts.dataRoot, request.Args)
-	defer unlock()
-	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
-		record, replay, err := replayCompletedDaemonMutation(s.mutationRoot(), request)
-		if err != nil {
-			return 1, stdout.String(), stderr.String(), err
-		}
-		if replay {
-			return record.Status, string(record.Stdout), string(record.Stderr), nil
-		}
+	conn, err := connectDaemon(s.socket)
+	if err != nil {
+		return 0, "", "", err
 	}
-	s.reconcile(backend)
-	placements, err := backend.placementCatalog()
-	if err != nil && len(request.PlacementClaims) != 0 {
-		return 1, stdout.String(), stderr.String(), err
-	}
-	if err := validateDaemonPlacementClaimsWithCatalog(opts.dataRoot, backend.nodeID, request.Args, request.PlacementClaims, placements); err != nil {
-		return 1, stdout.String(), stderr.String(), err
-	}
-	if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
-		return 1, stdout.String(), stderr.String(), err
-	}
-	if request.RequestID != "" && daemonCommandNeedsMutationJournal(request.Args) {
-		mutationRoot := s.mutationRoot()
-		record, replay, err := beginDaemonMutation(mutationRoot, request)
-		if err != nil {
-			return 1, stdout.String(), stderr.String(), err
-		}
-		if replay {
-			return record.Status, string(record.Stdout), string(record.Stderr), nil
-		}
-		status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
-		s.recordCommandEvents(opts.dataRoot, request.Args, status)
-		if status == 0 {
-			if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
-				return 1, stdout.String(), stderr.String(), err
-			}
-			if err := backend.reconcilePlacementCatalog(); err != nil {
-				fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
-			}
-		}
-		record, err = completeDaemonMutation(mutationRoot, record, status, stdout.Bytes(), stderr.Bytes())
-		if err != nil {
-			return 1, stdout.String(), stderr.String(), err
-		}
-		s.maybeCompactDaemonMutations(mutationRoot)
-		return record.Status, string(record.Stdout), string(record.Stderr), nil
-	}
-	status := runCommand(request.Args, backend.stdout, backend.stderr, backend)
-	s.recordCommandEvents(opts.dataRoot, request.Args, status)
-	if status == 0 {
-		if err := s.claimUnplacedLifecycleTargets(backend, request.Args); err != nil {
-			return 1, stdout.String(), stderr.String(), err
-		}
-		if err := backend.reconcilePlacementCatalog(); err != nil {
-			fmt.Fprintf(&stderr, "ttcd: warning: reconciling placement catalog: %v\n", err)
-		}
-	}
-	return status, stdout.String(), stderr.String(), nil
+	defer conn.Close()
+	var stdout, stderr strings.Builder
+	status, err := exchangeDaemon(conn, request, strings.NewReader(""), &stdout, &stderr)
+	return status, stdout.String(), stderr.String(), err
 }
 
 func (b *runtimeBackend) runtimeBranchLifecycle(containerID, branchID string) (string, error) {
