@@ -22,7 +22,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	fileDescriptor "gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -109,7 +108,7 @@ func (s *hostInetConn) Read(ctx context.Context, buf []byte, cancel <-chan struc
 	var ch chan struct{}
 	var e waiter.Entry
 	n, err := s.fd.Read(buf)
-	for ctx.Err() == nil && linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+	for ctx.Err() == nil && isHostWouldBlock(err) {
 		if ch == nil {
 			e, ch = waiter.NewTransientChannelEntry(waiter.ReadableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
@@ -133,7 +132,7 @@ func (s *hostInetConn) Write(ctx context.Context, buf []byte, cancel <-chan stru
 	var ch chan struct{}
 	var e waiter.Entry
 	n, err := s.fd.Write(buf)
-	for ctx.Err() == nil && linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+	for ctx.Err() == nil && isHostWouldBlock(err) {
 		if ch == nil {
 			e, ch = waiter.NewTransientChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
@@ -151,6 +150,12 @@ func (s *hostInetConn) Write(ctx context.Context, buf []byte, cancel <-chan stru
 		n, err = s.fd.Write(buf)
 	}
 	return n, err
+}
+
+// isHostWouldBlock returns true if err, from an operation on a host FD, means
+// that the operation would block. Host errnos differ from Linux's on Darwin.
+func isHostWouldBlock(err error) bool {
+	return err == unix.EAGAIN || err == unix.EWOULDBLOCK
 }
 
 func (s *hostInetConn) eventRegister(e *waiter.Entry) {
