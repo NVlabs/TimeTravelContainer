@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math/rand"
 	"sync"
 	"testing"
@@ -1216,4 +1217,313 @@ func BenchmarkGuestRAMFragmentedAllocation(b *testing.B) {
 			}
 		}
 	}
+}
+
+// TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit checks that a caller
+// holding a lease can see a pending decommit instead of queueing behind it.
+// Async page loads hold leases until their reads complete, and a decommit
+// waits for those leases, so queueing behind it deadlocked restores.
+func TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit(t *testing.T) {
+	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	tryMapper := backing.(interface {
+		TryAcquireMapping(memmap.FileRange, hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, bool, error)
+	})
+	held := memmap.FileRange{Start: 0, End: GuestFrameSize}
+	freed := memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}
+	if _, err := backing.ResolveFrames(freed, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	_, lease, err := backing.AcquireMapping(held, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decommitted := make(chan error, 1)
+	go func() { decommitted <- backing.Decommit(freed) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, other, acquired, err := tryMapper.TryAcquireMapping(held, hostarch.Write)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acquired {
+			break
+		}
+		other.Release()
+		if time.Now().After(deadline) {
+			t.Fatal("TryAcquireMapping never observed the pending decommit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	lease.Release()
+	select {
+	case err := <-decommitted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("decommit did not finish after the lease was released")
+	}
+	if _, other, acquired, err := tryMapper.TryAcquireMapping(held, hostarch.Write); err != nil || !acquired {
+		t.Fatalf("TryAcquireMapping after decommit = (%t, %v), want acquired", acquired, err)
+	} else {
+		other.Release()
+	}
+}
+
+// gatedReaderAt holds each read until the test grants a permit.
+type gatedReaderAt struct {
+	io.ReaderAt
+	arrived chan struct{}
+	permits chan struct{}
+}
+
+func (g *gatedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	g.arrived <- struct{}{}
+	<-g.permits
+	return g.ReaderAt.ReadAt(p, off)
+}
+
+// gatedWriter holds each write until the test grants a permit.
+type gatedWriter struct {
+	io.Writer
+	arrived chan struct{}
+	permits chan struct{}
+}
+
+func (g *gatedWriter) Write(p []byte) (int, error) {
+	g.arrived <- struct{}{}
+	<-g.permits
+	return g.Writer.Write(p)
+}
+
+func waitForSignal(t *testing.T, c <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-c:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func waitForError(t *testing.T, c <-chan error, what string) {
+	t.Helper()
+	select {
+	case err := <-c:
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func newGuestRAMTestMemoryFile(t *testing.T, ram *GuestRAM) *pgalloc.MemoryFile {
+	t.Helper()
+	mf, err := pgalloc.NewMemoryFile(nil, pgalloc.MemoryFileOpts{
+		BackingProvider:         ram,
+		DelayedEviction:         pgalloc.DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mf
+}
+
+// populateGuestRAMTestMemoryFile allocates frames of mf and fills each with a
+// distinct pattern, which it returns.
+func populateGuestRAMTestMemoryFile(t *testing.T, mf *pgalloc.MemoryFile, frames uint64) (memmap.FileRange, []byte) {
+	t.Helper()
+	fr, err := mf.Allocate(frames*GuestFrameSize, pgalloc.AllocOpts{Kind: usage.Anonymous, Mode: pgalloc.AllocateAndWritePopulate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, fr.Length())
+	for i := range want {
+		want[i] = byte((i*131 + 17 + i/int(GuestFrameSize)*7) & 0xff)
+	}
+	dst, lease, err := memmap.MapInternalWithLease(mf, fr, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if n, err := safemem.CopySeq(dst, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(want))); err != nil || n != uint64(len(want)) {
+		t.Fatalf("populating source: n=%d err=%v", n, err)
+	}
+	return fr, want
+}
+
+// startPendingDecommit starts a Decommit of an unrelated frame and returns
+// once it is waiting for outstanding mapping leases.
+func startPendingDecommit(t *testing.T, ram *GuestRAM) <-chan error {
+	t.Helper()
+	backing, err := ram.NewBacking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		t.Fatal(err)
+	}
+	fr := memmap.FileRange{Start: 0, End: GuestFrameSize}
+	if _, err := backing.ResolveFrames(fr, hostarch.Write); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- backing.Decommit(fr) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for ram.accessMu.TryRLock() {
+		ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
+		if time.Now().After(deadline) {
+			t.Fatal("Decommit never waited for outstanding leases")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return done
+}
+
+// TestGuestRAMAsyncLoadWithPendingDecommit checks that async page loading
+// makes progress while a Decommit waits for the leases of in-flight reads.
+// The loader used to wait for a new lease behind the Decommit, so it could
+// not complete the reads the Decommit was waiting for, hanging restores.
+func TestGuestRAMAsyncLoadWithPendingDecommit(t *testing.T) {
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newGuestRAMTestMemoryFile(t, ram)
+	fr, want := populateGuestRAMTestMemoryFile(t, source, 8)
+	var metadata, pages bytes.Buffer
+	saveDone := make(chan error, 1)
+	saver, err := pgalloc.StartAsyncPagesFileSave(stateio.NewIOWriter(&pages, 4*GuestFrameSize, 4, 2), func(err error) {
+		saveDone <- err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SaveTo(gcontext.Background(), &metadata, &pgalloc.SaveOpts{PagesFile: saver}); err != nil {
+		t.Fatal(err)
+	}
+	saver.MemoryFilesDone()
+	waitForError(t, saveDone, "saving pages")
+
+	// Read one frame at a time, two reads at once.
+	reader := &gatedReaderAt{
+		ReaderAt: bytes.NewReader(pages.Bytes()),
+		arrived:  make(chan struct{}, 64),
+		permits:  make(chan struct{}),
+	}
+	target := newGuestRAMTestMemoryFile(t, ram)
+	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(reader, GuestFrameSize, 1, 2), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.LoadFrom(gcontext.Background(), bytes.NewReader(metadata.Bytes()), &pgalloc.LoadOpts{PagesFile: loader}); err != nil {
+		loader.Cancel()
+		t.Fatal(err)
+	}
+	loader.MemoryFilesDone()
+	for range 2 {
+		waitForSignal(t, reader.arrived, "an in-flight read")
+	}
+	decommitted := startPendingDecommit(t, ram)
+	// Complete one read, so that the loader maps the next frame while the
+	// other read still holds its lease.
+	reader.permits <- struct{}{}
+	time.Sleep(50 * time.Millisecond)
+	close(reader.permits)
+	loaded := make(chan error, 1)
+	go func() { loaded <- loader.Wait() }()
+	waitForError(t, loaded, "async page load")
+	waitForError(t, decommitted, "Decommit")
+
+	gotBlocks, gotLease, err := memmap.MapInternalWithLease(target, fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), gotBlocks)
+	gotLease.Release()
+	if err != nil || n != uint64(len(got)) {
+		t.Fatalf("reading restored data: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("asynchronously restored GuestRAM data differs from source")
+	}
+	target.DecRef(fr)
+	target.Destroy()
+	source.DecRef(fr)
+	source.Destroy()
+}
+
+// TestGuestRAMAsyncSaveWithPendingDecommit is
+// TestGuestRAMAsyncLoadWithPendingDecommit for async page saving.
+func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := newGuestRAMTestMemoryFile(t, ram)
+	fr, want := populateGuestRAMTestMemoryFile(t, source, 8)
+
+	// Write one frame at a time, with two writes queued.
+	var pages bytes.Buffer
+	writer := &gatedWriter{
+		Writer:  &pages,
+		arrived: make(chan struct{}, 64),
+		permits: make(chan struct{}),
+	}
+	saveDone := make(chan error, 1)
+	saver, err := pgalloc.StartAsyncPagesFileSave(stateio.NewIOWriter(writer, GuestFrameSize, 1, 2), func(err error) {
+		saveDone <- err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata bytes.Buffer
+	saved := make(chan error, 1)
+	go func() {
+		saved <- source.SaveTo(gcontext.Background(), &metadata, &pgalloc.SaveOpts{PagesFile: saver})
+	}()
+	waitForSignal(t, writer.arrived, "an in-flight write")
+	decommitted := startPendingDecommit(t, ram)
+	// Complete one write, so that the saver maps the next frame while the
+	// queued write still holds its lease.
+	writer.permits <- struct{}{}
+	time.Sleep(50 * time.Millisecond)
+	close(writer.permits)
+	waitForError(t, saved, "SaveTo")
+	saver.MemoryFilesDone()
+	waitForError(t, saveDone, "async page save")
+	waitForError(t, decommitted, "Decommit")
+
+	target := newGuestRAMTestMemoryFile(t, ram)
+	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.LoadFrom(gcontext.Background(), bytes.NewReader(metadata.Bytes()), &pgalloc.LoadOpts{PagesFile: loader}); err != nil {
+		loader.Cancel()
+		t.Fatal(err)
+	}
+	loader.MemoryFilesDone()
+	if err := loader.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	gotBlocks, gotLease, err := memmap.MapInternalWithLease(target, fr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), gotBlocks)
+	gotLease.Release()
+	if err != nil || n != uint64(len(got)) {
+		t.Fatalf("reading restored data: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("GuestRAM data saved with a pending Decommit differs from source")
+	}
+	target.DecRef(fr)
+	target.Destroy()
+	source.DecRef(fr)
+	source.Destroy()
 }

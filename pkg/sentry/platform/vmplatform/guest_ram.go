@@ -407,6 +407,28 @@ func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType
 	}
 }
 
+// TryAcquireMapping is AcquireMapping, but reports acquired == false instead
+// of waiting behind an exclusive operation such as Decommit.
+func (b *guestBacking) TryAcquireMapping(fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, bool, error) {
+	if !b.ram.accessMu.TryRLock() {
+		return nil, nil, false, nil
+	}
+	frames, err := b.ResolveFrames(fr, at)
+	if err != nil {
+		b.ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
+		return nil, nil, true, err
+	}
+	return frames, &guestMappingLease{ram: b.ram}, true, nil
+}
+
+// AwaitMappingIdle waits for pending exclusive operations such as Decommit by
+// acquiring a lease, which queues behind them, and releasing it.
+func (b *guestBacking) AwaitMappingIdle() {
+	b.ram.accessMu.RLock()
+	lease := guestMappingLease{ram: b.ram}
+	lease.Release()
+}
+
 func (b *guestBacking) AcquireMapping(fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, error) {
 	frames, lease, err := b.AcquireMappings([]pgalloc.BackingMappingRequest{{Range: fr, Access: at}})
 	if err != nil {

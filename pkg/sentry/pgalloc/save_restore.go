@@ -693,6 +693,19 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) (uint64, error) {
 			apfs.curOpID = id
 		}
 		n, err := apfs.combine(mfr)
+		if err == errBackingBusy {
+			// Submit the current op so that its leases are released when it
+			// completes. combine only reports busy while writes are queued or
+			// op holds leases, so the main loop then waits for queued writes,
+			// and maps without leases once they have completed.
+			if apfs.curOp.total != 0 {
+				apfs.enqueueCurOp()
+			} else {
+				apfs.opsBusy.Remove(apfs.curOpID)
+				apfs.curOp = nil
+			}
+			return 0, nil
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -739,7 +752,15 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) (uint64, error) {
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	blocks, mappingLease, err := mfr.amfs.f.MapInternalWithLease(mfr.FileRange, hostarch.Read)
+	mapInternal := mfr.amfs.f.MapInternalWithLease
+	if apfs.qavail != len(apfs.ops) || len(op.leases) != 0 {
+		// This goroutine holds leases until their writes complete, so it
+		// must not wait: an exclusive backing operation such as a decommit
+		// waits for the held leases, and both new leases and async page
+		// loads wait behind it.
+		mapInternal = mfr.amfs.f.tryMapInternalWithLease
+	}
+	blocks, mappingLease, err := mapInternal(mfr.FileRange, hostarch.Read)
 	if err != nil {
 		return 0, err
 	}
@@ -1381,6 +1402,12 @@ type AsyncPagesFileLoad struct {
 	// its index into ops.
 	curOp   *aplOp
 	curOpID uint32
+
+	// busyBacking is the MemoryFile whose backing refused a mapping lease in
+	// the current main loop iteration, or nil. Reads hold leases until they
+	// complete, and an exclusive backing operation such as a decommit waits
+	// for them, so the main loop must not wait for a lease itself.
+	busyBacking *MemoryFile
 
 	// opsBusy tracks which aplOps in ops are in use (correspond to
 	// inflight operations or curOp).
@@ -2187,6 +2214,19 @@ func (f *MemoryFile) AwaitLoadAll() error {
 	return nil
 }
 
+// loaded returns true if data has been loaded for all pages in fr.
+func (amfl *asyncMemoryFileLoad) loaded(fr memmap.FileRange) bool {
+	if fr.End <= amfl.minUnloaded.Load() {
+		return true
+	}
+	fr.Start = hostarch.PageRoundDown(fr.Start)
+	fr.End = hostarch.MustPageRoundUp(fr.End)
+	apfl := amfl.pf
+	apfl.mu.Lock()
+	defer apfl.mu.Unlock()
+	return amfl.unloaded.IsEmptyRange(fr)
+}
+
 // awaitLoad blocks until data has been loaded for all pages in fr.
 //
 // Preconditions: At least one reference must be held on all unloaded pages in
@@ -2384,6 +2424,18 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			apfl.curOpID = id
 		}
 		n, err := apfl.combine(amfl, fr, off, tempRef, logicalChunk)
+		if err == errBackingBusy {
+			// Submit the current op so that its leases are released when it
+			// completes, and stop enqueueing until the main loop has waited.
+			apfl.busyBacking = amfl.f
+			if apfl.curOp.total != 0 {
+				apfl.enqueueCurOp()
+			} else {
+				apfl.opsBusy.Remove(apfl.curOpID)
+				apfl.curOp = nil
+			}
+			return 0, nil
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -2444,7 +2496,9 @@ func (apfl *AsyncPagesFileLoad) combine(amfl *asyncMemoryFileLoad, fr memmap.Fil
 
 	// Collect iovecs, which may further limit length.
 	n = 0
-	blocks, mappingLease, err := amfl.f.mapInternalWithLeaseNoWait(fr, hostarch.Write)
+	// Don't wait for a lease: this goroutine may hold leases for queued reads,
+	// and holds locks that lease holders may need. See busyBacking.
+	blocks, mappingLease, err := amfl.f.tryMapInternalWithLeaseNoWait(fr, hostarch.Write)
 	if err != nil {
 		return 0, err
 	}
@@ -2710,7 +2764,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		// Prioritize reading pages with waiters.
 		apfl.mu.Lock()
-		for !readerSwitchPending && apfl.canEnqueue() && !apfl.priority.Empty() {
+		for !readerSwitchPending && apfl.busyBacking == nil && apfl.canEnqueue() && !apfl.priority.Empty() {
 			fr := apfl.priority.PopFront()
 			// All pages in apfl.priority have non-zero waiters and were split
 			// around fr by fr.amfl.awaitLoad(), and fr.amfl.unloaded never
@@ -2760,10 +2814,10 @@ func (apfl *AsyncPagesFileLoad) main() {
 		// Use spare queue slots for forward prefetches created by faults. The
 		// lock order matches background loading: amflsMu -> MemoryFile.mu ->
 		// apfl.mu. Awaited reads above remain strictly higher priority.
-		if !readerSwitchPending && apfl.canEnqueue() && apfl.demandOnly.Load() &&
+		if !readerSwitchPending && apfl.busyBacking == nil && apfl.canEnqueue() && apfl.demandOnly.Load() &&
 			(apfl.prefetchBehindBytes.Load() != 0 || apfl.prefetchAheadBytes.Load() != 0) {
 			apfl.amflsMu.Lock()
-			for apfl.canEnqueue() {
+			for apfl.busyBacking == nil && apfl.canEnqueue() {
 				apfl.mu.Lock()
 				if apfl.prefetch.Empty() {
 					apfl.mu.Unlock()
@@ -2811,7 +2865,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 			apfl.amflsMu.Unlock()
 		}
 		// Fill remaining queue with reads for pages with no waiters.
-		if !readerSwitchPending && apfl.canEnqueue() && !apfl.demandOnly.Load() {
+		if !readerSwitchPending && apfl.busyBacking == nil && apfl.canEnqueue() && !apfl.demandOnly.Load() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -2872,6 +2926,18 @@ func (apfl *AsyncPagesFileLoad) main() {
 		// Flush pending op.
 		if !readerSwitchPending && apfl.curOp != nil {
 			apfl.enqueueCurOp()
+		}
+
+		if f := apfl.busyBacking; f != nil {
+			apfl.busyBacking = nil
+			if apfl.qavail == maxParallel {
+				// No reads are queued, so this goroutine holds no leases.
+				// Wait for the exclusive backing operation without holding
+				// any locks, then try again. Otherwise, wait below for queued
+				// reads to complete and release their leases.
+				f.awaitBackingIdle()
+				continue
+			}
 		}
 
 		if apfl.qavail == maxParallel {

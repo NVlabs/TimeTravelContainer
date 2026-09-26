@@ -1951,6 +1951,62 @@ func (f *MemoryFile) mapInternalWithLeaseNoWait(fr memmap.FileRange, at hostarch
 	return blocks, lease, nil
 }
 
+// tryMapInternalWithLease is MapInternalWithLease for callers that already
+// hold a mapping lease. Besides the exclusive backing operations described by
+// tryMapInternalWithLeaseNoWait, it does not wait for an async page load of
+// fr, since the loader may itself be waiting behind such an operation.
+func (f *MemoryFile) tryMapInternalWithLease(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, memmap.InternalMappingLease, error) {
+	if at.Execute {
+		return safemem.BlockSeq{}, nil, linuxerr.EACCES
+	}
+	if !f.backingLoaded(fr) {
+		return safemem.BlockSeq{}, nil, errBackingBusy
+	}
+	return f.tryMapInternalWithLeaseNoWait(fr, at)
+}
+
+// errBackingBusy is returned by the try mapping methods when mapping would
+// wait. Callers must release their leases before waiting, using a blocking
+// mapping method or awaitBackingIdle.
+var errBackingBusy = fmt.Errorf("MemoryFile backing is busy")
+
+// awaitBackingIdle waits for the exclusive backing operations that could have
+// caused tryMapInternalWithLeaseNoWait to return errBackingBusy. The caller
+// must not hold a mapping lease.
+func (f *MemoryFile) awaitBackingIdle() {
+	if tryMapper, ok := f.backing.(backingTryMapper); ok {
+		tryMapper.AwaitMappingIdle()
+	}
+}
+
+// tryMapInternalWithLeaseNoWait is mapInternalWithLeaseNoWait for callers
+// that already hold a mapping lease. It returns errBackingBusy instead of
+// waiting behind an exclusive backing operation, which would wait for the
+// caller's own leases.
+func (f *MemoryFile) tryMapInternalWithLeaseNoWait(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, memmap.InternalMappingLease, error) {
+	tryMapper, ok := f.backing.(backingTryMapper)
+	if !ok {
+		return f.mapInternalWithLeaseNoWait(fr, at)
+	}
+	aligned, err := pageAlignFileRange(fr)
+	if err != nil {
+		return safemem.BlockSeq{}, nil, err
+	}
+	frames, lease, acquired, err := tryMapper.TryAcquireMapping(aligned, at)
+	if err != nil {
+		return safemem.BlockSeq{}, nil, err
+	}
+	if !acquired {
+		return safemem.BlockSeq{}, nil, errBackingBusy
+	}
+	blocks, err := blockSeqFromBackingFrames(fr, aligned.Start, frames)
+	if err != nil {
+		lease.Release()
+		return safemem.BlockSeq{}, nil, err
+	}
+	return blocks, lease, nil
+}
+
 // MapInternalForPMA implements memmap's PMA-only mapping interface. PMA
 // mappings are invalidated by the family compaction coordinator while every
 // MemoryManager is quiescent, so they do not hold a long-lived GuestRAM lease.
@@ -1999,6 +2055,21 @@ func (f *MemoryFile) awaitBackingLoads(fr memmap.FileRange) error {
 		}
 	}
 	return nil
+}
+
+// backingLoaded returns true if no async page load is pending for fr.
+func (f *MemoryFile) backingLoaded(fr memmap.FileRange) bool {
+	if amfl := f.asyncPageLoad.Load(); amfl != nil && !amfl.loaded(fr) {
+		return false
+	}
+	if loads := f.sparseAsyncLoads.Load(); loads != nil {
+		for _, amfl := range *loads {
+			if !amfl.loaded(fr) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func pageAlignFileRange(fr memmap.FileRange) (memmap.FileRange, error) {

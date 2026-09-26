@@ -71,6 +71,20 @@ type Backing interface {
 	Destroy() error
 }
 
+// backingTryMapper is implemented by backings whose AcquireMapping can wait
+// for an exclusive operation, such as a decommit, that itself waits for every
+// outstanding lease. A caller that already holds a lease must not wait there.
+type backingTryMapper interface {
+	// TryAcquireMapping is AcquireMapping, but reports acquired == false
+	// instead of waiting.
+	TryAcquireMapping(fr memmap.FileRange, at hostarch.AccessType) (frames []BackingFrame, lease memmap.InternalMappingLease, acquired bool, err error)
+
+	// AwaitMappingIdle waits for the exclusive operations that
+	// TryAcquireMapping could have observed to finish. The caller must not
+	// hold a lease.
+	AwaitMappingIdle()
+}
+
 type backingBatchMapper interface {
 	AcquireMappings([]BackingMappingRequest) ([][]BackingFrame, memmap.InternalMappingLease, error)
 }
