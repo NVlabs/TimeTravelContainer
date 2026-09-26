@@ -18,3 +18,6 @@ package client
 
 // hostHelpText returns help text as it applies to this host.
 func hostHelpText(text string) string { return text }
+
+// explainDaemonExecFailure explains err, the failure to run the ttcd at path.
+func explainDaemonExecFailure(path string, err error) error { return err }

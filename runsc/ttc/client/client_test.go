@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -470,5 +471,21 @@ func TestNormalizeEnvironmentImports(t *testing.T) {
 		if got := normalizeEnvironmentImports(test.args); !reflect.DeepEqual(got, test.want) {
 			t.Errorf("normalizeEnvironmentImports(%q)=%q, want %q", test.args, got, test.want)
 		}
+	}
+}
+
+func TestExplainDaemonExecFailure(t *testing.T) {
+	killed := exec.Command("/bin/sh", "-c", "kill -KILL $$").Run()
+	explained := explainDaemonExecFailure("/nonexistent/ttcd", killed)
+	if runtime.GOOS == "darwin" {
+		if !strings.Contains(explained.Error(), "code signature") || !strings.Contains(explained.Error(), "codesign --force") {
+			t.Errorf("killed ttcd explained as %q, want its code signature and how to sign it", explained)
+		}
+	} else if explained != killed {
+		t.Errorf("killed ttcd explained as %q, want %q", explained, killed)
+	}
+	failed := exec.Command("/bin/sh", "-c", "exit 3").Run()
+	if got := explainDaemonExecFailure("/nonexistent/ttcd", failed); got != failed {
+		t.Errorf("failed ttcd explained as %q, want %q", got, failed)
 	}
 }

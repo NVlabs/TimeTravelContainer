@@ -1004,7 +1004,7 @@ func startDaemon(socket string, args []string, stdout, stderr io.Writer) error {
 	}
 	versionOutput, err := exec.Command(daemon, "--version").Output()
 	if err != nil {
-		return fmt.Errorf("checking ttcd version: %w", err)
+		return fmt.Errorf("checking ttcd version: %w", explainDaemonExecFailure(daemon, err))
 	}
 	want := "ttcd version " + version.Version()
 	if strings.TrimSpace(string(versionOutput)) != want {
