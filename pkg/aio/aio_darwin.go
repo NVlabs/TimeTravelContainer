@@ -69,8 +69,11 @@ func executeVectoredRequest(r Request) Completion {
 		} else {
 			n, err = unix.Pwrite(int(r.FD), buffer, offset)
 		}
-		total += int64(n)
-		offset += int64(n)
+		// Failed calls return n == -1, which must not count as progress.
+		if n > 0 {
+			total += int64(n)
+			offset += int64(n)
+		}
 		if err != nil {
 			if total != 0 {
 				return Completion{ID: r.ID, Result: total}
