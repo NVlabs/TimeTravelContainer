@@ -779,7 +779,8 @@ func NewExponentialBucketer(numFiniteBuckets int, width uint64, scale, growth fl
 	if numFiniteBuckets < exponentialMinBuckets || numFiniteBuckets > exponentialMaxBuckets {
 		panic(fmt.Sprintf("number of finite buckets must be in [%d, %d]", exponentialMinBuckets, exponentialMaxBuckets))
 	}
-	if scale < 0 || growth < 0 {
+	// Written to also reject NaNs.
+	if !(scale >= 0 && growth >= 0) {
 		panic(fmt.Sprintf("scale and growth for exponential buckets must be >0, got scale=%f and growth=%f", scale, growth))
 	}
 	b := &ExponentialBucketer{
@@ -792,10 +793,13 @@ func NewExponentialBucketer(numFiniteBuckets int, width uint64, scale, growth fl
 	}
 	b.lowerBounds[0] = 0
 	for i := 1; i <= numFiniteBuckets; i++ {
-		b.lowerBounds[i] = int64(b.width*float64(i) + b.scale*math.Pow(b.growth, float64(i-1)))
-		if b.lowerBounds[i] < 0 {
+		// The conversion of a float64 outside int64's range, or of a NaN, gives
+		// an architecture-dependent result, so check the float64.
+		bound := b.width*float64(i) + b.scale*math.Pow(b.growth, float64(i-1))
+		if !(bound >= 0 && bound < math.MaxInt64) {
 			panic(fmt.Sprintf("encountered bucket width overflow at bucket %d", i))
 		}
+		b.lowerBounds[i] = int64(bound)
 	}
 	b.maxSample = b.lowerBounds[numFiniteBuckets] - 1
 	return b
