@@ -1224,25 +1224,58 @@ func installPortableInternalMounts(spec *specs.Spec, directory string, mounts []
 	for _, mount := range mounts {
 		provided[filepath.Clean(mount.Destination)] = mount
 	}
-	if err := os.MkdirAll(directory, 0700); err != nil {
+	// A reader of the container's spec, which overlays the mounts in
+	// directory once it exists, must find all of them: a directory made
+	// here is filled under another name, and renamed into place.
+	filled := directory
+	if _, err := os.Lstat(directory); errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(directory), 0700); err != nil {
+			return err
+		}
+		staging, err := os.MkdirTemp(filepath.Dir(directory), "."+filepath.Base(directory)+".tmp-")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(staging)
+		filled = staging
+	} else if err != nil {
 		return err
 	}
-	rewritten := 0
-	for i := range spec.Mounts {
-		mount := &spec.Mounts[i]
-		portable, ok := provided[filepath.Clean(mount.Destination)]
-		if !ok {
-			continue
+	install := func(into string) (int, error) {
+		rewritten := 0
+		for i := range spec.Mounts {
+			mount := &spec.Mounts[i]
+			portable, ok := provided[filepath.Clean(mount.Destination)]
+			if !ok {
+				continue
+			}
+			base := fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination))
+			if err := replacePortableInternalMount(filepath.Join(into, base), portable.Contents, portable.Mode.Perm()); err != nil {
+				return rewritten, fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
+			}
+			mount.Source = filepath.Join(directory, base)
+			rewritten++
 		}
-		name := filepath.Join(directory, fmt.Sprintf("%d-%s", i, filepath.Base(mount.Destination)))
-		if err := replacePortableInternalMount(name, portable.Contents, portable.Mode.Perm()); err != nil {
-			return fmt.Errorf("materializing TTC internal mount %q: %w", mount.Destination, err)
-		}
-		mount.Source = name
-		rewritten++
+		return rewritten, nil
+	}
+	rewritten, err := install(filled)
+	if err != nil {
+		return err
 	}
 	if rewritten != len(destinations) || rewritten != len(provided) {
 		return fmt.Errorf("portable TTC internal mounts do not match OCI declarations: declared=%d supplied=%d matched=%d", len(destinations), len(provided), rewritten)
+	}
+	if filled != directory {
+		if err := os.Rename(filled, directory); err != nil {
+			// Another installation made the directory meanwhile; the
+			// files are replaced in it one by one, each atomically.
+			if _, statErr := os.Lstat(directory); statErr != nil {
+				return err
+			}
+			if _, err := install(directory); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
