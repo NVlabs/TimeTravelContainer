@@ -28,6 +28,18 @@ const maxErrno = 134
 
 var linuxHostTranslations [maxErrno]*Error
 
+// linuxBackwardsError returns the error that ToError produces for a Linux
+// errno. On Linux, Linux ABI errno values are also host errno values.
+func linuxBackwardsError(e errno.Errno, _ string) error {
+	return unix.Errno(e)
+}
+
+// HostToLinux returns the Linux ABI errno for a host errno. Linux errno
+// values are host errno values on Linux, so the value is returned unchanged.
+func HostToLinux(err unix.Errno) errno.Errno {
+	return errno.Errno(err)
+}
+
 func getHostTranslation(err unix.Errno) *Error {
 	if uint64(err) >= uint64(len(linuxHostTranslations)) {
 		return nil

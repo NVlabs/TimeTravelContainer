@@ -18,6 +18,7 @@ go_library(
         "//pkg/abi/linux/errno",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
+        "//pkg/log",
         "//pkg/safecopy",
         "//pkg/tcpip",
         "@org_golang_x_sys//unix:go_default_library",
@@ -32,5 +33,6 @@ go_test(
     deps = [
         "//pkg/abi/linux/errno",
         "//pkg/errors/linuxerr",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

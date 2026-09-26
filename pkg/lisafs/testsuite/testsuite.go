@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -385,7 +386,9 @@ func testRegularFileOpen(ctx context.Context, t *testing.T, tester Tester, root 
 	roFile, roHostFD := openFile(ctx, t, controlFile, unix.O_RDONLY, true /* isReg */)
 	defer closeFD(ctx, t, roFile)
 	defer unix.Close(roHostFD)
-	if err := writeFD(ctx, t, roFile, 0, []byte{1, 2, 3}); err != unix.EBADF {
+	// Protocol errors are Linux errno values, which are not unix.Errno on
+	// every host.
+	if err := writeFD(ctx, t, roFile, 0, []byte{1, 2, 3}); !linuxerr.Equals(linuxerr.EBADF, err) {
 		t.Errorf("writing to read only FD should generate EBADF, but got %v", err)
 	}
 }

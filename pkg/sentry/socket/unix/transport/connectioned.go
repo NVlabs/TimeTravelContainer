@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -523,7 +524,9 @@ func (e *connectionedEndpoint) getAcceptedEndpointLocked(ctx context.Context) (*
 
 	// Check for external connections.
 	nfd, err := e.boundSocketFD.Accept(ctx)
-	if err == unix.EWOULDBLOCK {
+	// Accept errors cross the gofer protocol, which yields Linux errno values
+	// that are not unix.Errno on every host.
+	if linuxerr.Equals(linuxerr.EWOULDBLOCK, err) {
 		return nil, syserr.ErrWouldBlock
 	}
 	if err != nil {

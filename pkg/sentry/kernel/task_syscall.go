@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 // SyscallRestartBlock represents the restart block for a syscall restartable
@@ -473,7 +474,9 @@ func ExtractErrno(err error, sysno int) int {
 	case nil:
 		return 0
 	case unix.Errno:
-		return int(err)
+		// unix.Errno holds a host errno, which shares Linux numbering only
+		// when the host is Linux. Linux ABI errors are *errors.Error.
+		return int(syserr.HostToLinux(err))
 	case *errors.Error:
 		return int(linuxerr.ToUnix(err))
 	case *memmap.BusError:

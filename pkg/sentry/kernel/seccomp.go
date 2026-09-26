@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/sentry"
 	"gvisor.dev/gvisor/pkg/bpf"
@@ -118,9 +117,8 @@ func (t *Task) checkSeccompSyscall(sysno int32, args arch.SyscallArguments, ip h
 		// If there is no tracer present, -ENOSYS is returned to userland and
 		// the system call is not executed."
 		if !t.ptraceSeccomp(result.Data()) {
-			// This useless-looking temporary is needed because Go.
-			tmp := uintptr(unix.ENOSYS)
-			t.Arch().SetReturn(-tmp)
+			// Use the Linux errno: host unix.ENOSYS differs on Darwin.
+			t.Arch().SetReturn(-uintptr(linuxerr.ENOSYS.Errno()))
 			return linux.SECCOMP_RET_ERRNO
 		}
 
