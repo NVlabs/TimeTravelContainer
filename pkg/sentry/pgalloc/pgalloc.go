@@ -966,6 +966,14 @@ type AllocOpts struct {
 	// page. If this is shorter than length bytes due to an error returned by
 	// ReaderFunc, it returns the partially filled fr and error.
 	ReaderFunc safemem.ReaderFunc
+
+	// ReaderMayWaitForApplication indicates that ReaderFunc may wait for
+	// application tasks, as reads from a FUSE server do. Allocate then fills
+	// the allocation through a temporary buffer instead of holding a platform
+	// mapping lease while ReaderFunc runs: those tasks may need leases, and
+	// new leases wait behind exclusive backing operations that wait for the
+	// held ones.
+	ReaderMayWaitForApplication bool
 }
 
 // Direction is the type of AllocOpts.Dir.
@@ -1145,14 +1153,23 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 		}
 	}
 	if alloc.opts.ReaderFunc != nil {
-		if dsts.IsEmpty() {
-			dsts, mappingLease, err = f.MapInternalWithLease(fr, hostarch.Write)
-			if err != nil {
-				f.DecRef(fr)
-				return memmap.FileRange{}, err
+		var n uint64
+		if alloc.opts.ReaderMayWaitForApplication && f.backing != nil {
+			if mappingLease != nil {
+				mappingLease.Release()
+				mappingLease = nil
 			}
+			n, err = f.fillThroughBuffer(fr, alloc.opts.ReaderFunc)
+		} else {
+			if dsts.IsEmpty() {
+				dsts, mappingLease, err = f.MapInternalWithLease(fr, hostarch.Write)
+				if err != nil {
+					f.DecRef(fr)
+					return memmap.FileRange{}, err
+				}
+			}
+			n, err = safemem.ReadFullToBlocks(alloc.opts.ReaderFunc, dsts)
 		}
-		n, err := safemem.ReadFullToBlocks(alloc.opts.ReaderFunc, dsts)
 		un := uint64(hostarch.Addr(n).RoundDown())
 		if un < length {
 			// Free unused memory and update fr to contain only the memory that is
@@ -1166,6 +1183,29 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 	}
 
 	return fr, nil
+}
+
+// fillThroughBuffer fills fr from reader, as safemem.ReadFullToBlocks does,
+// without holding a mapping lease while reader runs. It returns the number of
+// bytes filled.
+func (f *MemoryFile) fillThroughBuffer(fr memmap.FileRange, reader safemem.ReaderFunc) (uint64, error) {
+	buf := make([]byte, fr.Length())
+	n, readErr := safemem.ReadFullToBlocks(reader, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)))
+	if n == 0 {
+		return 0, readErr
+	}
+	dsts, mappingLease, err := f.MapInternalWithLease(memmap.FileRange{Start: fr.Start, End: fr.Start + hostarch.MustPageRoundUp(n)}, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+	copied, err := safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:n])))
+	if mappingLease != nil {
+		mappingLease.Release()
+	}
+	if err != nil {
+		return copied, err
+	}
+	return n, readErr
 }
 
 func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.FileRange, err error) {

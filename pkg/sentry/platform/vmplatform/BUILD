@@ -49,6 +49,7 @@ go_test(
     library = ":vmplatform",
     deps = [
         "//pkg/hostarch",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/state/stateio",

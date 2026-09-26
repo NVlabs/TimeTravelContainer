@@ -28,6 +28,7 @@ import (
 	gcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
@@ -1526,4 +1527,138 @@ func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
 	target.Destroy()
 	source.DecRef(fr)
 	source.Destroy()
+}
+
+// acquireLeaseLikeApplication stands in for an application task, such as a
+// FUSE server, that needs a mapping lease while a Decommit may be waiting for
+// leases that the caller holds. It returns an error instead of waiting for
+// the caller.
+func acquireLeaseLikeApplication(ram *GuestRAM) error {
+	backing, err := ram.NewBacking()
+	if err != nil {
+		return err
+	}
+	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		return err
+	}
+	freed := memmap.FileRange{Start: 0, End: GuestFrameSize}
+	held := memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}
+	if _, err := backing.ResolveFrames(memmap.FileRange{Start: freed.Start, End: held.End}, hostarch.Write); err != nil {
+		return err
+	}
+	decommitted := make(chan error, 1)
+	go func() { decommitted <- backing.Decommit(freed) }()
+	// Wait for the Decommit to finish, or to wait for held leases.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		select {
+		case err := <-decommitted:
+			if err != nil {
+				return err
+			}
+			_, lease, err := backing.AcquireMapping(held, hostarch.Read)
+			if err == nil {
+				lease.Release()
+			}
+			return err
+		default:
+		}
+		if !ram.accessMu.TryRLock() {
+			break
+		}
+		ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
+		if time.Now().After(deadline) {
+			return errors.New("Decommit neither finished nor waited for leases")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	acquired := make(chan error, 1)
+	go func() {
+		_, lease, err := backing.AcquireMapping(held, hostarch.Read)
+		if err == nil {
+			lease.Release()
+		}
+		acquired <- err
+	}()
+	select {
+	case err := <-acquired:
+		return err
+	case <-time.After(time.Second):
+		return errors.New("a new mapping lease waited behind a Decommit that waited for a lease held by the caller")
+	}
+}
+
+// TestGuestRAMPageCacheIOWithApplicationWaits checks that FUSE-style page
+// cache fills and writeback don't hold a mapping lease while they wait for an
+// application task: the task may need a lease of its own while a Decommit
+// waits for the held one.
+func TestGuestRAMPageCacheIOWithApplicationWaits(t *testing.T) {
+	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf := newGuestRAMTestMemoryFile(t, ram)
+	// Span more than one writeback buffer and end mid-page.
+	size := uint64(1<<20 + 3*GuestFrameSize - 100)
+	want := make([]byte, size)
+	for i := range want {
+		want[i] = byte((i*131 + 17 + i/int(GuestFrameSize)*7) & 0xff)
+	}
+	ctx := gcontext.Background()
+	mr := memmap.MappableRange{Start: 0, End: hostarch.MustPageRoundUp(size)}
+
+	var cache fsutil.FileRangeSet
+	if _, err := cache.Fill(ctx, mr, mr, size, mf, pgalloc.AllocOpts{
+		Kind:                        usage.PageCache,
+		Mode:                        pgalloc.AllocateAndWritePopulate,
+		ReaderMayWaitForApplication: true,
+	}, func(ctx gcontext.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error) {
+		if err := acquireLeaseLikeApplication(ram); err != nil {
+			return 0, err
+		}
+		return safemem.CopySeq(dsts, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(want[offset:])))
+	}); err != nil && err != io.EOF {
+		t.Fatalf("Fill: %v", err)
+	}
+	if cache.SpanRange(mr) != mr.Length() {
+		t.Fatalf("Fill cached %d bytes, want %d", cache.SpanRange(mr), mr.Length())
+	}
+	for seg := cache.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		blocks, lease, err := memmap.MapInternalWithLease(mf, seg.FileRange(), hostarch.Read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, seg.Range().Length())
+		n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), blocks)
+		lease.Release()
+		if err != nil || n != uint64(len(got)) {
+			t.Fatalf("reading cache: n=%d err=%v", n, err)
+		}
+		wantSeg := make([]byte, len(got))
+		if seg.Start() < size {
+			copy(wantSeg, want[seg.Start():])
+		}
+		if !bytes.Equal(got, wantSeg) {
+			t.Fatalf("cache contents of %v differ from the file", seg.Range())
+		}
+	}
+
+	var dirty fsutil.DirtySet
+	dirty.MarkDirty(mr)
+	written := make([]byte, size)
+	var writtenBytes uint64
+	if err := fsutil.SyncDirty(ctx, mr, &cache, &dirty, size, mf, func(ctx gcontext.Context, srcs safemem.BlockSeq, offset uint64) (uint64, error) {
+		if err := acquireLeaseLikeApplication(ram); err != nil {
+			return 0, err
+		}
+		n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(written[offset:])), srcs)
+		writtenBytes += n
+		return n, err
+	}); err != nil {
+		t.Fatalf("SyncDirty: %v", err)
+	}
+	if writtenBytes != size || !bytes.Equal(written, want) {
+		t.Fatalf("writeback wrote %d bytes that differ from the cache, want %d", writtenBytes, size)
+	}
+	cache.DropAll(mf)
+	mf.Destroy()
 }

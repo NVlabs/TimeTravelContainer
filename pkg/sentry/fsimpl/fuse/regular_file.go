@@ -496,9 +496,10 @@ func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	cache.dataMu.Lock()
 	defer cache.dataMu.Unlock()
 	_, fillErr := cache.data.Fill(r.ctx, required, required, r.fileSize, inode.fs.mf, pgalloc.AllocOpts{
-		Kind:    usage.PageCache,
-		MemCgID: pgalloc.MemoryCgroupIDFromContext(r.ctx),
-		Mode:    pgalloc.AllocateAndWritePopulate,
+		Kind:                        usage.PageCache,
+		MemCgID:                     pgalloc.MemoryCgroupIDFromContext(r.ctx),
+		Mode:                        pgalloc.AllocateAndWritePopulate,
+		ReaderMayWaitForApplication: true,
 	}, r.fd.readToBlocksAt)
 
 	var done uint64
@@ -719,9 +720,10 @@ func (fd *regularFileFD) Translate(ctx context.Context, required, optional memma
 		return nil, &memmap.BusError{Err: err}
 	}
 	_, fillErr := cache.data.Fill(ctx, required, optional, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
-		Kind:    usage.PageCache,
-		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
-		Mode:    pgalloc.AllocateAndWritePopulate,
+		Kind:                        usage.PageCache,
+		MemCgID:                     pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:                        pgalloc.AllocateAndWritePopulate,
+		ReaderMayWaitForApplication: true,
 	}, fd.readToBlocksAt)
 
 	var translations []memmap.Translation
