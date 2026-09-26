@@ -163,29 +163,49 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	registers := &vmm.ARM64State{PC: codeVA}
 	hostCounterBefore := sentrytime.Rdtsc()
 	hostWallBefore := time.Now()
-	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-		AddressSpaceID: spaceID,
-		Registers:      registers,
-	})
-	if err != nil {
-		t.Fatal(err)
+	var guestCounter sentrytime.TSCValue
+	var guestWall time.Time
+	// Unrelated Go runtime work, such as a preemption request, can need a
+	// host service at any time, which returns the continuation to the host.
+	// Retry until an entry keeps the continuation at EL1 throughout.
+	var notResident string
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt != 0 {
+			time.Sleep(time.Millisecond)
+		}
+		registers.PC = codeVA
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
+			t.Fatalf("first ring0 SVC exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
+		}
+		if got := ring0asm.CurrentEL(); got != 1 {
+			notResident = fmt.Sprintf("Sentry syscall continuation resumed at EL%d, want EL1", got)
+			continue
+		}
+		guestCounter = sentrytime.Rdtsc()
+		if _, err := calibratedClock.GetTime(); err != nil {
+			t.Fatalf("reading calibrated clock at EL1: %v", err)
+		}
+		if got := ring0asm.CurrentEL(); got != 1 {
+			notResident = fmt.Sprintf("calibrated EL1 clock read host-gated the Sentry continuation to EL%d", got)
+			continue
+		}
+		guestWall = time.Now()
+		if got := ring0asm.CurrentEL(); got != 1 {
+			notResident = fmt.Sprintf("Darwin runtime wall clock host-gated the Sentry continuation to EL%d", got)
+			continue
+		}
+		notResident = ""
+		break
 	}
-	if exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != codeVA+8 {
-		t.Fatalf("first ring0 SVC exit=%+v x8=%d pc=%#x", exit, registers.X[8], registers.PC)
-	}
-	if got := ring0asm.CurrentEL(); got != 1 {
-		t.Fatalf("Sentry syscall continuation resumed at EL%d, want EL1", got)
-	}
-	guestCounter := sentrytime.Rdtsc()
-	if _, err := calibratedClock.GetTime(); err != nil {
-		t.Fatalf("reading calibrated clock at EL1: %v", err)
-	}
-	if got := ring0asm.CurrentEL(); got != 1 {
-		t.Fatalf("calibrated EL1 clock read host-gated the Sentry continuation to EL%d", got)
-	}
-	guestWall := time.Now()
-	if got := ring0asm.CurrentEL(); got != 1 {
-		t.Fatalf("Darwin runtime wall clock host-gated the Sentry continuation to EL%d", got)
+	if notResident != "" {
+		t.Fatalf("%s in every attempt", notResident)
 	}
 	if delta := guestWall.Sub(hostWallBefore); delta < 0 || delta > 5*time.Second {
 		t.Fatalf("EL1 Darwin runtime wall clock advanced by %s, want [0, 5s]", delta)
@@ -194,7 +214,7 @@ func TestRing0EngineApplicationRoundTrip(t *testing.T) {
 	// resumed this exact Go continuation at EL1, so the second entry does not
 	// cross Hypervisor.framework.
 	registers.PC = codeVA
-	exit, err = engine.RunApplication(context.Background(), vmm.ApplicationState{
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
 		AddressSpaceID: spaceID,
 		Registers:      registers,
 	})

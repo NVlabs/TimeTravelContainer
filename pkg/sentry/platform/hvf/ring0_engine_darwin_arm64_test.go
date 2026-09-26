@@ -1217,46 +1217,52 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		t.Fatalf("host returns scaled with %d guest syscalls: stats=%+v stack-region=%+v present=%t err=%v last-far=%#x fault-region=%+v present=%t err=%v", calls, stats, region, present, regionErr, far, faultRegion, faultPresent, faultErr)
 	}
 	// A final-iteration demand import may have returned this continuation to
-	// Darwin after the last application exit. Re-enter once so the explicit SVC
-	// below measures the guest-to-host service boundary, not host-native SVC.
-	if ring0asm.CurrentEL() == 0 {
-		registers.PC = codeVA
-		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-			AddressSpaceID: spaceID,
-			Registers:      registers,
-		})
-		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
-			t.Fatalf("demand-import re-entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+	// Darwin after the last application exit; re-enter if so. Like the engine,
+	// publish the guest-critical section before issuing a guest-only HVC.
+	// Otherwise a cancellation, such as a runtime preemption signal, can first
+	// export the continuation to Darwin EL0, where the HVC is undefined.
+	cpu := value.(*ring0ApplicationCPU)
+	critical := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateGuestCritical))
+	for attempt := 0; ; attempt++ {
+		atomic.StoreUint64(critical, 1)
+		if ring0asm.CurrentEL() != 0 {
+			break
 		}
-		stats = value.(*ring0ApplicationCPU).bridge.stats()
+		atomic.StoreUint64(critical, 0)
+		if attempt == 9 {
+			t.Fatal("application syscalls returned the Sentry to the host before every cache-sync attempt")
+		}
+		enterResident(t, engine, spaceID, codeVA, registers)
 	}
-	beforeResidentMonitor := stats
-	if status := ring0asm.SyncGuestCode(uintptr(unsafe.Pointer(&stats)), 1); status == 0 {
+	beforeRejectedCacheSync := cpu.bridge.stats()
+	status := ring0asm.SyncGuestCode(uintptr(unsafe.Pointer(&stats)), 1)
+	resident := ring0asm.CurrentEL() != 0
+	afterRejectedCacheSync := cpu.bridge.stats()
+	atomic.StoreUint64(critical, 0)
+	if cpu.bridge.externalInterruptRequested() || cpu.bridge.destroyRequested() {
+		ring0asm.EnsureHost()
+	}
+	if status == 0 {
 		t.Fatal("native cache-sync HVC accepted an untagged Go-stack range")
 	}
-	if ring0asm.CurrentEL() == 0 {
+	if !resident {
 		t.Fatal("rejected cache-sync HVC exported the resident continuation")
 	}
-	afterRejectedCacheSync := value.(*ring0ApplicationCPU).bridge.stats()
-	if afterRejectedCacheSync != beforeResidentMonitor {
-		t.Fatalf("rejected cache-sync HVC changed bridge accounting: before=%+v after=%+v", beforeResidentMonitor, afterRejectedCacheSync)
+	if afterRejectedCacheSync != beforeRejectedCacheSync {
+		t.Fatalf("rejected cache-sync HVC changed bridge accounting: before=%+v after=%+v", beforeRejectedCacheSync, afterRejectedCacheSync)
 	}
+	var beforeResidentMonitor ring0BridgeStats
 	var responseBytes []byte
 	direct := false
-	for attempt := 0; attempt < 5 && !direct; attempt++ {
+	for attempt := 0; attempt < 20 && !direct; attempt++ {
 		if ring0asm.CurrentEL() == 0 {
-			registers.PC = codeVA
-			exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-				AddressSpaceID: spaceID,
-				Registers:      registers,
-			})
-			if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
-				t.Fatalf("resident-monitor retry entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
-			}
+			// Let the runtime finish the work that needed the host.
+			time.Sleep(time.Millisecond)
+			enterResident(t, engine, spaceID, codeVA, registers)
 		}
-		beforeResidentMonitor = value.(*ring0ApplicationCPU).bridge.stats()
+		beforeResidentMonitor = cpu.bridge.stats()
 		responseBytes, err = engine.RunMonitor(context.Background(), residentMonitorCommand)
-		stats = value.(*ring0ApplicationCPU).bridge.stats()
+		stats = cpu.bridge.stats()
 		if err != nil {
 			t.Fatalf("resident monitor command: %v", err)
 		}
@@ -1272,53 +1278,55 @@ func TestApplicationSyscallBurstStaysInGuest(t *testing.T) {
 		}
 	}
 	if !direct {
-		t.Fatalf("two-slab executable monitor mutation did not reach resident path after retries: before=%+v after=%+v", beforeResidentMonitor, stats)
+		t.Fatalf("two-slab executable monitor mutation did not reach resident path after retries: before=%+v after=%+v %s", beforeResidentMonitor, stats, residencyDiagnostics(engine, cpu))
 	}
 	response, err := monitorabi.UnmarshalResponse(responseBytes)
 	if err != nil || response.Sequence != 2 || response.Status != monitorabi.StatusOK {
 		t.Fatalf("resident monitor response=%+v err=%v", response, err)
 	}
-	// Go runtime maintenance after the acknowledged direct transaction may
-	// independently require a Darwin host service. Restore residency before
-	// measuring the explicit service gate below; cacheSyncs above proves the
-	// executable monitor transaction itself used the in-place HVC path.
-	if ring0asm.CurrentEL() == 0 {
+	// Go runtime maintenance after the acknowledged direct transaction, or
+	// during the measurements below, may independently require a Darwin host
+	// service. Retry until an attempt measures only the explicit service gate
+	// and the re-entry; cacheSyncs above proves the executable monitor
+	// transaction itself used the in-place HVC path.
+	for attempt := 0; ; attempt++ {
+		if attempt != 0 {
+			time.Sleep(time.Millisecond)
+		}
+		if ring0asm.CurrentEL() == 0 {
+			enterResident(t, engine, spaceID, codeVA, registers)
+		}
+		beforeHostService := cpu.bridge.stats()
+		if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
+			t.Fatalf("host service getpid=%d, want %d", got, hostPID)
+		}
+		afterHostService := cpu.bridge.stats()
 		registers.PC = codeVA
 		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
 			AddressSpaceID: spaceID,
 			Registers:      registers,
 		})
 		if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
-			t.Fatalf("post-monitor residency re-entry exit=%+v pc=%#x err=%v", exit, registers.PC, err)
+			t.Fatalf("post-host-service application exit=%+v pc=%#x err=%v", exit, registers.PC, err)
 		}
-		stats = value.(*ring0ApplicationCPU).bridge.stats()
-	}
-	beforeHostService := stats
-	if got := int(ring0asm.HostSVCGetpid()); got != hostPID {
-		t.Fatalf("host service getpid=%d, want %d", got, hostPID)
-	}
-	stats = value.(*ring0ApplicationCPU).bridge.stats()
-	if stats.guestEntries != beforeHostService.guestEntries ||
-		stats.hostGates != beforeHostService.hostGates+1 ||
-		stats.redpills != beforeHostService.redpills ||
-		stats.hostReturns != beforeHostService.hostReturns+1 {
-		t.Fatalf("explicit host service did not cross exactly one host gate: stats=%+v", stats)
-	}
-	beforeReentry := stats
-	registers.PC = codeVA
-	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-		AddressSpaceID: spaceID,
-		Registers:      registers,
-	})
-	if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+8 {
-		t.Fatalf("post-host-service application exit=%+v pc=%#x err=%v", exit, registers.PC, err)
-	}
-	stats = value.(*ring0ApplicationCPU).bridge.stats()
-	if stats.guestEntries != beforeReentry.guestEntries+1 ||
-		stats.hostGates != beforeReentry.hostGates ||
-		stats.redpills != beforeReentry.redpills ||
-		stats.hostReturns != beforeReentry.hostReturns {
-		t.Fatalf("post-host-service re-entry did not reuse the residency: stats=%+v", stats)
+		afterReentry := cpu.bridge.stats()
+		// The explicit host service crosses exactly one host gate, and the
+		// next application entry reuses the residency.
+		serviceGated := afterHostService.guestEntries == beforeHostService.guestEntries &&
+			afterHostService.hostGates == beforeHostService.hostGates+1 &&
+			afterHostService.redpills == beforeHostService.redpills &&
+			afterHostService.hostReturns == beforeHostService.hostReturns+1
+		reentered := afterReentry.guestEntries == afterHostService.guestEntries+1 &&
+			afterReentry.hostGates == afterHostService.hostGates &&
+			afterReentry.redpills == afterHostService.redpills &&
+			afterReentry.hostReturns == afterHostService.hostReturns
+		if serviceGated && reentered {
+			break
+		}
+		if attempt == 9 {
+			t.Fatalf("explicit host service and re-entry did not cross exactly one host gate and reuse the residency in any attempt: before=%+v after-service=%+v after-reentry=%+v %s",
+				beforeHostService, afterHostService, afterReentry, residencyDiagnostics(engine, cpu))
+		}
 	}
 }
 
@@ -1378,17 +1386,8 @@ func TestSentryHeapRemainsCoherentAcrossHostService(t *testing.T) {
 			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
 		}},
 	})
-	registers := &vmm.ARM64State{PC: codeVA}
-	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-		AddressSpaceID: spaceID,
-		Registers:      registers,
-	})
-	if err != nil || exit.Reason != vmm.ExitSyscall {
-		t.Fatalf("application exit=%+v err=%v", exit, err)
-	}
-	if ring0asm.CurrentEL() == 0 {
-		t.Fatal("application syscall returned Sentry to host instead of EL1")
-	}
+	registers := &vmm.ARM64State{}
+	enterResident(t, engine, spaceID, codeVA, registers)
 	for i := range payload {
 		payload[i] = byte(i*131 + 17)
 	}
@@ -1478,17 +1477,8 @@ func TestDarwinLibcCallRedpillsBeforeASMCGOCall(t *testing.T) {
 			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
 		}},
 	})
-	registers := &vmm.ARM64State{PC: codeVA}
-	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
-		AddressSpaceID: spaceID,
-		Registers:      registers,
-	})
-	if err != nil || exit.Reason != vmm.ExitSyscall {
-		t.Fatalf("application exit=%+v err=%v", exit, err)
-	}
-	if ring0asm.CurrentEL() == 0 {
-		t.Fatal("application syscall returned Sentry to host instead of EL1")
-	}
+	registers := &vmm.ARM64State{}
+	enterResident(t, engine, spaceID, codeVA, registers)
 
 	payload := make([]byte, vmm.HostSlabSize)
 	for i := range payload {
@@ -2284,4 +2274,51 @@ func skipWithoutHypervisor(t *testing.T, err error) {
 		t.Fatalf("Hypervisor.framework unavailable: %v", err)
 	}
 	t.Skipf("Hypervisor.framework unavailable: %v", err)
+}
+
+// enterResident runs the application at codeVA until its syscall exit leaves
+// the Sentry continuation at EL1. Unrelated Go runtime work can need a host
+// service at any time, which returns the continuation to the host instead.
+func enterResident(t *testing.T, engine *ring0Engine, spaceID, codeVA uint64, registers *vmm.ARM64State) {
+	t.Helper()
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt != 0 {
+			time.Sleep(time.Millisecond)
+		}
+		registers.PC = codeVA
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil || exit.Reason != vmm.ExitSyscall {
+			t.Fatalf("application exit=%+v err=%v", exit, err)
+		}
+		if ring0asm.CurrentEL() != 0 {
+			return
+		}
+	}
+	t.Fatal("application syscalls returned the Sentry to the host instead of EL1 in every attempt")
+}
+
+// residencyDiagnostics describes why cpu's continuation last left EL1.
+func residencyDiagnostics(engine *ring0Engine, cpu *ring0ApplicationCPU) string {
+	state := unsafe.Slice((*byte)(unsafe.Pointer(cpu.vcpu.stateHost)), vmm.HostSlabSize)
+	pc := binary.LittleEndian.Uint64(state[stateHostGatePC:])
+	where := "?"
+	if fn := runtime.FuncForPC(uintptr(pc)); fn != nil {
+		file, line := fn.FileLine(uintptr(pc))
+		where = fmt.Sprintf("%s (%s:%d)", fn.Name(), file, line)
+	}
+	return fmt.Sprintf("last-gate %s pc=%#x esr=%#x far=%#x last-x0=%#x fallbacks host-el=%d unsupported=%d entry-lock=%d monitor-lock=%d owner=%d conflict=%d resources=%d",
+		where, pc,
+		binary.LittleEndian.Uint64(state[stateHostGateESR:]),
+		binary.LittleEndian.Uint64(state[stateHostGateFAR:]),
+		cpu.bridge.lastX0(),
+		engine.monitorResidentFallbackHostEL.Load(),
+		engine.monitorResidentFallbackUnsupported.Load(),
+		engine.monitorResidentFallbackEntryLock.Load(),
+		engine.monitorResidentFallbackMonitorLock.Load(),
+		engine.monitorResidentFallbackOwner.Load(),
+		engine.monitorResidentFallbackConflict.Load(),
+		engine.monitorResidentFallbackResources.Load())
 }
