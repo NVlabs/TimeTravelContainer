@@ -56,10 +56,10 @@ type controlHolder struct {
 	// watchedSince is when the gateway first looked at the shared root.
 	watchedSince time.Time
 	// stopped is set once the gateway stops, which starts no holder since.
-	stopped      bool
-	process      *os.Process
-	exited       chan struct{}
-	started      time.Time
+	stopped bool
+	process *os.Process
+	exited  chan struct{}
+	started time.Time
 	// retryAt is when the holder may start again after it ended, backoff
 	// later, doubling while each ends soon after it starts; ended is set
 	// once the gateway noticed the last one end.
