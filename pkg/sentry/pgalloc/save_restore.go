@@ -755,7 +755,7 @@ func (apfs *AsyncPagesFileSave) combine(mfr apsRange) (uint64, error) {
 	mapInternal := mfr.amfs.f.MapInternalWithLease
 	if apfs.qavail != len(apfs.ops) || len(op.leases) != 0 {
 		// This goroutine holds leases until their writes complete, so it
-		// must not wait: an exclusive backing operation such as a decommit
+		// must not wait: an exclusive backing operation such as a compaction
 		// waits for the held leases, and both new leases and async page
 		// loads wait behind it.
 		mapInternal = mfr.amfs.f.tryMapInternalWithLease
@@ -1405,7 +1405,7 @@ type AsyncPagesFileLoad struct {
 
 	// busyBacking is the MemoryFile whose backing refused a mapping lease in
 	// the current main loop iteration, or nil. Reads hold leases until they
-	// complete, and an exclusive backing operation such as a decommit waits
+	// complete, and an exclusive backing operation such as a compaction waits
 	// for them, so the main loop must not wait for a lease itself.
 	busyBacking *MemoryFile
 

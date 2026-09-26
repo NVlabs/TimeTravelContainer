@@ -1221,15 +1221,11 @@ func BenchmarkGuestRAMFragmentedAllocation(b *testing.B) {
 	}
 }
 
-// TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit checks that a caller
-// holding a lease can see a pending decommit instead of queueing behind it.
-// Async page loads hold leases until their reads complete, and a decommit
-// waits for those leases, so queueing behind it deadlocked restores.
-func TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit(t *testing.T) {
-	_, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
-	tryMapper := backing.(interface {
-		TryAcquireMapping(memmap.FileRange, hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, bool, error)
-	})
+// TestGuestRAMDecommitDoesNotBlockLeases checks that a Decommit waiting for a
+// lease that could cover its frames delays no other lease, not even one
+// taken by the holder of that lease.
+func TestGuestRAMDecommitDoesNotBlockLeases(t *testing.T) {
+	ram, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
 	held := memmap.FileRange{Start: 0, End: GuestFrameSize}
 	freed := memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}
 	if _, err := backing.ResolveFrames(freed, hostarch.Write); err != nil {
@@ -1242,19 +1238,22 @@ func TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit(t *testing.T) {
 	decommitted := make(chan error, 1)
 	go func() { decommitted <- backing.Decommit(freed) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, other, acquired, err := tryMapper.TryAcquireMapping(held, hostarch.Write)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !acquired {
-			break
-		}
-		other.Release()
+	for ram.drainsWaiting.Load() == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("TryAcquireMapping never observed the pending decommit")
+			t.Fatal("Decommit never waited for the outstanding lease")
 		}
 		time.Sleep(time.Millisecond)
+	}
+	// Another lease, as a holder of the first might take.
+	_, other, err := backing.AcquireMapping(held, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Release()
+	select {
+	case err := <-decommitted:
+		t.Fatalf("Decommit finished (%v) while a lease that could cover its frame was held", err)
+	default:
 	}
 	lease.Release()
 	select {
@@ -1263,10 +1262,30 @@ func TestGuestRAMTryAcquireMappingDoesNotWaitForDecommit(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("decommit did not finish after the lease was released")
+		t.Fatal("Decommit did not finish after the lease was released")
 	}
+}
+
+// TestGuestRAMTryAcquireMappingDoesNotWaitForDestroy checks that a caller
+// holding a lease can see a pending Destroy instead of queueing behind it.
+func TestGuestRAMTryAcquireMappingDoesNotWaitForDestroy(t *testing.T) {
+	ram, backing, _, _, _ := newRAMTestBacking(t, 1<<20)
+	tryMapper := backing.(interface {
+		TryAcquireMapping(memmap.FileRange, hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, bool, error)
+	})
+	held := memmap.FileRange{Start: 0, End: GuestFrameSize}
+	_, lease, err := backing.AcquireMapping(held, hostarch.Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destroyed := startPendingDestroy(t, ram)
+	if _, _, acquired, err := tryMapper.TryAcquireMapping(held, hostarch.Write); err != nil || acquired {
+		t.Fatalf("TryAcquireMapping with a Destroy pending = (%t, %v), want not acquired", acquired, err)
+	}
+	lease.Release()
+	waitForError(t, destroyed, "Destroy")
 	if _, other, acquired, err := tryMapper.TryAcquireMapping(held, hostarch.Write); err != nil || !acquired {
-		t.Fatalf("TryAcquireMapping after decommit = (%t, %v), want acquired", acquired, err)
+		t.Fatalf("TryAcquireMapping after Destroy = (%t, %v), want acquired", acquired, err)
 	} else {
 		other.Release()
 	}
@@ -1355,9 +1374,9 @@ func populateGuestRAMTestMemoryFile(t *testing.T, mf *pgalloc.MemoryFile, frames
 	return fr, want
 }
 
-// startPendingDecommit starts a Decommit of an unrelated frame and returns
-// once it is waiting for outstanding mapping leases.
-func startPendingDecommit(t *testing.T, ram *GuestRAM) <-chan error {
+// startPendingDestroy starts destroying an unrelated backing, which excludes
+// every lease, and returns once it is waiting for outstanding leases.
+func startPendingDestroy(t *testing.T, ram *GuestRAM) <-chan error {
 	t.Helper()
 	backing, err := ram.NewBacking()
 	if err != nil {
@@ -1366,28 +1385,28 @@ func startPendingDecommit(t *testing.T, ram *GuestRAM) <-chan error {
 	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
 		t.Fatal(err)
 	}
-	fr := memmap.FileRange{Start: 0, End: GuestFrameSize}
-	if _, err := backing.ResolveFrames(fr, hostarch.Write); err != nil {
+	if _, err := backing.ResolveFrames(memmap.FileRange{Start: 0, End: GuestFrameSize}, hostarch.Write); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- backing.Decommit(fr) }()
+	go func() { done <- backing.Destroy() }()
 	deadline := time.Now().Add(5 * time.Second)
 	for ram.accessMu.TryRLock() {
 		ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
 		if time.Now().After(deadline) {
-			t.Fatal("Decommit never waited for outstanding leases")
+			t.Fatal("Destroy never waited for outstanding leases")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	return done
 }
 
-// TestGuestRAMAsyncLoadWithPendingDecommit checks that async page loading
-// makes progress while a Decommit waits for the leases of in-flight reads.
-// The loader used to wait for a new lease behind the Decommit, so it could
-// not complete the reads the Decommit was waiting for, hanging restores.
-func TestGuestRAMAsyncLoadWithPendingDecommit(t *testing.T) {
+// TestGuestRAMAsyncLoadWithPendingExclusion checks that async page loading
+// makes progress while an exclusive operation, such as a Destroy, waits for the
+// leases of in-flight reads. The loader used to wait for a new lease behind
+// such an operation, then a Decommit, so it could not complete the reads the
+// operation was waiting for, hanging restores.
+func TestGuestRAMAsyncLoadWithPendingExclusion(t *testing.T) {
 	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
 	if err != nil {
 		t.Fatal(err)
@@ -1427,7 +1446,7 @@ func TestGuestRAMAsyncLoadWithPendingDecommit(t *testing.T) {
 	for range 2 {
 		waitForSignal(t, reader.arrived, "an in-flight read")
 	}
-	decommitted := startPendingDecommit(t, ram)
+	destroyed := startPendingDestroy(t, ram)
 	// Complete one read, so that the loader maps the next frame while the
 	// other read still holds its lease.
 	reader.permits <- struct{}{}
@@ -1436,7 +1455,7 @@ func TestGuestRAMAsyncLoadWithPendingDecommit(t *testing.T) {
 	loaded := make(chan error, 1)
 	go func() { loaded <- loader.Wait() }()
 	waitForError(t, loaded, "async page load")
-	waitForError(t, decommitted, "Decommit")
+	waitForError(t, destroyed, "Destroy")
 
 	gotBlocks, gotLease, err := memmap.MapInternalWithLease(target, fr, hostarch.Read)
 	if err != nil {
@@ -1457,9 +1476,9 @@ func TestGuestRAMAsyncLoadWithPendingDecommit(t *testing.T) {
 	source.Destroy()
 }
 
-// TestGuestRAMAsyncSaveWithPendingDecommit is
-// TestGuestRAMAsyncLoadWithPendingDecommit for async page saving.
-func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
+// TestGuestRAMAsyncSaveWithPendingExclusion is
+// TestGuestRAMAsyncLoadWithPendingExclusion for async page saving.
+func TestGuestRAMAsyncSaveWithPendingExclusion(t *testing.T) {
 	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
 	if err != nil {
 		t.Fatal(err)
@@ -1487,7 +1506,7 @@ func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
 		saved <- source.SaveTo(gcontext.Background(), &metadata, &pgalloc.SaveOpts{PagesFile: saver})
 	}()
 	waitForSignal(t, writer.arrived, "an in-flight write")
-	decommitted := startPendingDecommit(t, ram)
+	destroyed := startPendingDestroy(t, ram)
 	// Complete one write, so that the saver maps the next frame while the
 	// queued write still holds its lease.
 	writer.permits <- struct{}{}
@@ -1496,7 +1515,7 @@ func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
 	waitForError(t, saved, "SaveTo")
 	saver.MemoryFilesDone()
 	waitForError(t, saveDone, "async page save")
-	waitForError(t, decommitted, "Decommit")
+	waitForError(t, destroyed, "Destroy")
 
 	target := newGuestRAMTestMemoryFile(t, ram)
 	loader, err := pgalloc.StartAsyncPagesFileLoad(stateio.NewIOReader(bytes.NewReader(pages.Bytes()), 4*GuestFrameSize, 4, 2), nil, nil)
@@ -1522,7 +1541,7 @@ func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
 		t.Fatalf("reading restored data: n=%d err=%v", n, err)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatal("GuestRAM data saved with a pending Decommit differs from source")
+		t.Fatal("GuestRAM data saved with a pending Destroy differs from source")
 	}
 	target.DecRef(fr)
 	target.Destroy()
@@ -1531,9 +1550,9 @@ func TestGuestRAMAsyncSaveWithPendingDecommit(t *testing.T) {
 }
 
 // acquireLeaseLikeApplication stands in for an application task, such as a
-// FUSE server, that needs a mapping lease while a Decommit may be waiting for
-// leases that the caller holds. It returns an error instead of waiting for
-// the caller.
+// FUSE server, that needs a mapping lease while an exclusive operation may be
+// waiting for leases that the caller holds. It returns an error instead of
+// waiting for the caller.
 func acquireLeaseLikeApplication(ram *GuestRAM) error {
 	backing, err := ram.NewBacking()
 	if err != nil {
@@ -1542,17 +1561,26 @@ func acquireLeaseLikeApplication(ram *GuestRAM) error {
 	if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
 		return err
 	}
-	freed := memmap.FileRange{Start: 0, End: GuestFrameSize}
-	held := memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}
-	if _, err := backing.ResolveFrames(memmap.FileRange{Start: freed.Start, End: held.End}, hostarch.Write); err != nil {
+	held := memmap.FileRange{Start: 0, End: GuestFrameSize}
+	if _, err := backing.ResolveFrames(held, hostarch.Write); err != nil {
 		return err
 	}
-	decommitted := make(chan error, 1)
-	go func() { decommitted <- backing.Decommit(freed) }()
-	// Wait for the Decommit to finish, or to wait for held leases.
+	other, err := ram.NewBacking()
+	if err != nil {
+		return err
+	}
+	if _, err := other.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+		return err
+	}
+	if _, err := other.ResolveFrames(held, hostarch.Write); err != nil {
+		return err
+	}
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- other.Destroy() }()
+	// Wait for the Destroy to finish, or to wait for held leases.
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		select {
-		case err := <-decommitted:
+		case err := <-destroyed:
 			if err != nil {
 				return err
 			}
@@ -1568,7 +1596,7 @@ func acquireLeaseLikeApplication(ram *GuestRAM) error {
 		}
 		ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
 		if time.Now().After(deadline) {
-			return errors.New("Decommit neither finished nor waited for leases")
+			return errors.New("Destroy neither finished nor waited for leases")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1584,14 +1612,14 @@ func acquireLeaseLikeApplication(ram *GuestRAM) error {
 	case err := <-acquired:
 		return err
 	case <-time.After(time.Second):
-		return errors.New("a new mapping lease waited behind a Decommit that waited for a lease held by the caller")
+		return errors.New("a new mapping lease waited behind a Destroy that waited for a lease held by the caller")
 	}
 }
 
 // TestGuestRAMPageCacheIOWithApplicationWaits checks that FUSE-style page
 // cache fills and writeback don't hold a mapping lease while they wait for an
-// application task: the task may need a lease of its own while a Decommit
-// waits for the held one.
+// application task: the task may need a lease of its own while an exclusive
+// operation waits for the held one.
 func TestGuestRAMPageCacheIOWithApplicationWaits(t *testing.T) {
 	ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newStagingTestHost(), IPAStart: 0x100000, IPASize: 1 << 24})
 	if err != nil {

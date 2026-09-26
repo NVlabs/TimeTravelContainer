@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -137,10 +139,26 @@ type guestBacking struct {
 // GuestRAM implements pgalloc.BackingProvider over 16 KiB host slabs.
 type GuestRAM struct {
 	mu sync.Mutex
-	// accessMu excludes physical frame relocation, zeroing, and retirement from
-	// leased Sentry host mappings. Stage-1 mappings are synchronized
-	// independently by the monitor.
+	// accessMu excludes physical frame relocation and backing destruction from
+	// leased Sentry host mappings, which hold it for reading. Stage-1 mappings
+	// are synchronized independently by the monitor.
 	accessMu sync.RWMutex
+	// Decommit frees frames without excluding leases, which would make every
+	// new lease wait behind it; and since a lease may be held while taking
+	// another, it could not wait for the leases it holds. Instead, each lease
+	// also registers in leaseCounts[leaseEpoch&1] when it resolves its frames,
+	// and a Decommit, after making its frames inactive so that new leases
+	// cannot resolve them, advances leaseEpoch and waits for the leases
+	// registered under the previous epoch to be released before zeroing or
+	// releasing their memory. drainMu serializes those waits.
+	leaseEpoch  atomic.Uint64
+	leaseCounts [2]atomic.Int64
+	drainMu     sync.Mutex
+	// drainsWaiting counts Decommits waiting for leases, for tests.
+	drainsWaiting atomic.Int32
+	// compacting is set while Compact relocates frames; Decommit waits for it
+	// to clear. It is protected by mu.
+	compacting bool
 	// cond wakes backing operations after a frame decommit or slab release.
 	// It prevents a logical 4K frame from being reactivated while its old
 	// stage-1 translations are still being revoked.
@@ -200,15 +218,56 @@ type GuestRAM struct {
 }
 
 type guestMappingLease struct {
-	ram  *GuestRAM
-	once sync.Once
+	ram *GuestRAM
+	// epoch is the parity of the lease epoch that the lease registered in.
+	epoch uint64
+	once  sync.Once
 }
 
 func (l *guestMappingLease) Release() {
 	if l == nil || l.ram == nil {
 		return
 	}
-	l.once.Do(l.ram.accessMu.RUnlock)
+	l.once.Do(func() {
+		l.ram.leaseCounts[l.epoch].Add(-1)
+		l.ram.accessMu.RUnlock() // +checklocksforce: the lease holds it.
+	})
+}
+
+// registerLeaseLocked registers a lease in the current lease epoch and returns
+// the epoch's parity. The caller must have resolved every frame that the lease
+// covers in the same critical section.
+//
+// Preconditions: r.mu is locked.
+func (r *GuestRAM) registerLeaseLocked() uint64 {
+	for {
+		parity := r.leaseEpoch.Load() & 1
+		r.leaseCounts[parity].Add(1)
+		// A registration in an epoch that drainLeases has already ended would
+		// not be waited for; retry in the new one.
+		if r.leaseEpoch.Load()&1 == parity {
+			return parity
+		}
+		r.leaseCounts[parity].Add(-1)
+	}
+}
+
+// drainLeases waits until every lease registered before the call has been
+// released. It never delays new leases.
+func (r *GuestRAM) drainLeases() {
+	r.drainMu.Lock()
+	defer r.drainMu.Unlock()
+	// Earlier drains waited for the other parity's leases, so every lease
+	// registered before this call is in this parity's count.
+	parity := (r.leaseEpoch.Add(1) - 1) & 1
+	if r.leaseCounts[parity].Load() == 0 {
+		return
+	}
+	r.drainsWaiting.Add(1)
+	defer r.drainsWaiting.Add(-1)
+	for delay := time.Microsecond; r.leaseCounts[parity].Load() != 0; delay = min(2*delay, time.Millisecond) {
+		time.Sleep(delay)
+	}
 }
 
 // NewGuestRAM constructs an empty allocator.
@@ -334,104 +393,107 @@ func (b *guestBacking) ResolveFrames(fr memmap.FileRange, at hostarch.AccessType
 	if err := validateFrameRange(fr); err != nil {
 		return nil, err
 	}
+	b.ram.mu.Lock()
+	defer b.ram.mu.Unlock()
 	for {
-		b.ram.mu.Lock()
-		if b.destroyed || fr.End > b.size {
-			b.ram.mu.Unlock()
-			return nil, fmt.Errorf("GuestRAM range %v exceeds backing size %#x", fr, b.size)
+		frames, waited, err := b.resolveFramesLocked(fr, at)
+		if !waited {
+			return frames, err
 		}
-		blocked := false
-		for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
-			if frame := b.frames[offset]; frame != nil {
-				if frame.slab.releasing || frame.decommitting {
-					b.ram.cond.Wait()
-					blocked = true
-					break
-				}
-			}
-		}
-		if blocked {
-			b.ram.mu.Unlock()
-			continue
-		}
-		var newFrames uint64
-		for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
-			if b.frames[offset] == nil {
-				newFrames++
-			}
-		}
-		freeSlots := b.ram.freeSlotsLocked(b)
-		newSlabs := uint64(0)
-		if newFrames > freeSlots {
-			newSlabs = (newFrames - freeSlots + FramesPerSlab - 1) / FramesPerSlab
-		}
-		newSlabs = b.ram.newIPASlabsLocked(newSlabs)
-		if newSlabs != 0 && b.ram.wouldReachRolloverLocked(newSlabs) {
-			epoch := b.ram.epoch
-			if b.ram.rollover == nil {
-				b.ram.mu.Unlock()
-				return nil, fmt.Errorf("GuestRAM IPA epoch %d reached 75%% rollover threshold", epoch)
-			}
-			// Roll over in the background. Callers hold GuestRAM leases and
-			// staging or address-space locks, while the rebuild waits for
-			// every epoch reader, and those readers can wait for the same
-			// locks, so rolling over inline could deadlock. Allocation
-			// continues from the IPA above the threshold in the meantime.
-			b.ram.startRolloverLocked()
-			if b.ram.wouldExhaustIPALocked(newSlabs) {
-				b.ram.mu.Unlock()
-				return nil, fmt.Errorf("GuestRAM IPA epoch %d is exhausted while its rollover is pending", epoch)
-			}
-		}
-		additional := newFrames * GuestFrameSize
-		if limit := b.ram.logicalLimit; limit != 0 && (additional > limit || b.ram.logicalBytes > limit-additional) {
-			b.ram.mu.Unlock()
-			return nil, linuxerr.ENOMEM
-		}
-
-		frames := make([]pgalloc.BackingFrame, 0, fr.Length()/GuestFrameSize)
-		for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
-			frame := b.frames[offset]
-			if frame == nil {
-				var err error
-				frame, err = b.ram.allocateFrameLocked(b, offset)
-				if err != nil {
-					b.ram.mu.Unlock()
-					return nil, err
-				}
-			}
-			if frame.slab.releasing {
-				b.ram.mu.Unlock()
-				return nil, fmt.Errorf("GuestRAM frame at offset %#x is being released", offset)
-			}
-			slot := uint64(frame.slot)
-			frames = append(frames, pgalloc.BackingFrame{
-				ID:          frame.id,
-				FileOffset:  offset,
-				GPA:         frame.slab.gpa + slot*GuestFrameSize,
-				HostAddress: frame.slab.hostAddress + uintptr(slot*GuestFrameSize),
-			})
-		}
-		b.ram.mu.Unlock()
-		return frames, nil
 	}
 }
 
+// resolveFramesLocked is ResolveFrames with b.ram.mu held. If a frame in fr is
+// being decommitted or released, it waits on b.ram.cond, which releases
+// b.ram.mu, and returns waited == true without resolving fr.
+//
+// Preconditions: fr is valid.
+func (b *guestBacking) resolveFramesLocked(fr memmap.FileRange, at hostarch.AccessType) (frames []pgalloc.BackingFrame, waited bool, err error) {
+	if b.destroyed || fr.End > b.size {
+		return nil, false, fmt.Errorf("GuestRAM range %v exceeds backing size %#x", fr, b.size)
+	}
+	for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
+		if frame := b.frames[offset]; frame != nil {
+			if frame.slab.releasing || frame.decommitting {
+				b.ram.cond.Wait()
+				return nil, true, nil
+			}
+		}
+	}
+	var newFrames uint64
+	for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
+		if b.frames[offset] == nil {
+			newFrames++
+		}
+	}
+	freeSlots := b.ram.freeSlotsLocked(b)
+	newSlabs := uint64(0)
+	if newFrames > freeSlots {
+		newSlabs = (newFrames - freeSlots + FramesPerSlab - 1) / FramesPerSlab
+	}
+	newSlabs = b.ram.newIPASlabsLocked(newSlabs)
+	if newSlabs != 0 && b.ram.wouldReachRolloverLocked(newSlabs) {
+		epoch := b.ram.epoch
+		if b.ram.rollover == nil {
+			return nil, false, fmt.Errorf("GuestRAM IPA epoch %d reached 75%% rollover threshold", epoch)
+		}
+		// Roll over in the background. Callers hold GuestRAM leases and
+		// staging or address-space locks, while the rebuild waits for every
+		// epoch reader, and those readers can wait for the same locks, so
+		// rolling over inline could deadlock. Allocation continues from the
+		// IPA above the threshold in the meantime.
+		b.ram.startRolloverLocked()
+		if b.ram.wouldExhaustIPALocked(newSlabs) {
+			return nil, false, fmt.Errorf("GuestRAM IPA epoch %d is exhausted while its rollover is pending", epoch)
+		}
+	}
+	additional := newFrames * GuestFrameSize
+	if limit := b.ram.logicalLimit; limit != 0 && (additional > limit || b.ram.logicalBytes > limit-additional) {
+		return nil, false, linuxerr.ENOMEM
+	}
+
+	frames = make([]pgalloc.BackingFrame, 0, fr.Length()/GuestFrameSize)
+	for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
+		frame := b.frames[offset]
+		if frame == nil {
+			var err error
+			frame, err = b.ram.allocateFrameLocked(b, offset)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		if frame.slab.releasing {
+			return nil, false, fmt.Errorf("GuestRAM frame at offset %#x is being released", offset)
+		}
+		slot := uint64(frame.slot)
+		frames = append(frames, pgalloc.BackingFrame{
+			ID:          frame.id,
+			FileOffset:  offset,
+			GPA:         frame.slab.gpa + slot*GuestFrameSize,
+			HostAddress: frame.slab.hostAddress + uintptr(slot*GuestFrameSize),
+		})
+	}
+	return frames, false, nil
+}
+
 // TryAcquireMapping is AcquireMapping, but reports acquired == false instead
-// of waiting behind an exclusive operation such as Decommit.
+// of waiting behind an exclusive operation such as Compact or Destroy.
 func (b *guestBacking) TryAcquireMapping(fr memmap.FileRange, at hostarch.AccessType) ([]pgalloc.BackingFrame, memmap.InternalMappingLease, bool, error) {
+	if err := validateFrameRange(fr); err != nil {
+		return nil, nil, true, err
+	}
 	if !b.ram.accessMu.TryRLock() {
 		return nil, nil, false, nil
 	}
-	frames, err := b.ResolveFrames(fr, at)
+	frames, epoch, err := b.resolveLeased([]pgalloc.BackingMappingRequest{{Range: fr, Access: at}})
 	if err != nil {
 		b.ram.accessMu.RUnlock() // +checklocksforce: TryRLock succeeded.
 		return nil, nil, true, err
 	}
-	return frames, &guestMappingLease{ram: b.ram}, true, nil
+	return frames[0], &guestMappingLease{ram: b.ram, epoch: epoch}, true, nil
 }
 
-// AwaitMappingIdle waits for pending exclusive operations such as Decommit by
+// AwaitMappingIdle waits for pending exclusive operations such as Destroy by
 // acquiring a lease, which queues behind them, and releasing it.
 func (b *guestBacking) AwaitMappingIdle() {
 	b.ram.accessMu.RLock()
@@ -455,17 +517,44 @@ func (b *guestBacking) AcquireMappings(requests []pgalloc.BackingMappingRequest)
 	if len(requests) == 0 {
 		return nil, nil, nil
 	}
-	b.ram.accessMu.RLock()
-	frames := make([][]pgalloc.BackingFrame, len(requests))
-	for i, request := range requests {
-		resolved, err := b.ResolveFrames(request.Range, request.Access)
-		if err != nil {
-			b.ram.accessMu.RUnlock()
+	for _, request := range requests {
+		if err := validateFrameRange(request.Range); err != nil {
 			return nil, nil, err
 		}
-		frames[i] = resolved
 	}
-	return frames, &guestMappingLease{ram: b.ram}, nil
+	b.ram.accessMu.RLock()
+	frames, epoch, err := b.resolveLeased(requests)
+	if err != nil {
+		b.ram.accessMu.RUnlock()
+		return nil, nil, err
+	}
+	return frames, &guestMappingLease{ram: b.ram, epoch: epoch}, nil
+}
+
+// resolveLeased resolves requests and registers a lease covering them in one
+// critical section, so that a Decommit of any of their frames waits for the
+// lease. While it waits for a frame being decommitted, it holds no
+// registration that the Decommit would wait for.
+//
+// Preconditions: The requests' ranges are valid.
+func (b *guestBacking) resolveLeased(requests []pgalloc.BackingMappingRequest) ([][]pgalloc.BackingFrame, uint64, error) {
+	b.ram.mu.Lock()
+	defer b.ram.mu.Unlock()
+retry:
+	for {
+		frames := make([][]pgalloc.BackingFrame, len(requests))
+		for i, request := range requests {
+			resolved, waited, err := b.resolveFramesLocked(request.Range, request.Access)
+			if err != nil {
+				return nil, 0, err
+			}
+			if waited {
+				continue retry
+			}
+			frames[i] = resolved
+		}
+		return frames, b.ram.registerLeaseLocked(), nil
+	}
 }
 
 // startRolloverLocked runs the epoch rollover on a new goroutine unless one
@@ -758,16 +847,19 @@ func (b *guestBacking) Decommit(fr memmap.FileRange) error {
 	if err := validateFrameRange(fr); err != nil {
 		return err
 	}
-	// Decommit may zero a frame and release its containing host mapping. Drain
-	// every operation-scoped Sentry mapping before changing either the bytes or
-	// the lifetime of those host addresses.
-	b.ram.accessMu.Lock()
-	defer b.ram.accessMu.Unlock()
+	// Decommit may zero a frame and release its containing host mapping. It
+	// drains the operation-scoped Sentry mappings that could have resolved the
+	// frame before changing either the bytes or the lifetime of those host
+	// addresses; see GuestRAM.leaseEpoch.
 	b.ram.mu.Lock()
 	for {
 		if b.destroyed || fr.End > b.size {
 			b.ram.mu.Unlock()
 			return fmt.Errorf("invalid GuestRAM decommit %v", fr)
+		}
+		if b.ram.compacting {
+			b.ram.cond.Wait()
+			continue
 		}
 		blocked := false
 		for offset := fr.Start; offset < fr.End; offset += GuestFrameSize {
@@ -832,6 +924,9 @@ func (b *guestBacking) Decommit(fr memmap.FileRange) error {
 			return err
 		}
 	}
+	// New leases can't resolve the frames being decommitted. Wait for those
+	// that could have.
+	b.ram.drainLeases()
 
 	b.ram.mu.Lock()
 	for _, frame := range deactivated {
@@ -878,6 +973,27 @@ func (b *guestBacking) Decommit(fr memmap.FileRange) error {
 	b.ram.cond.Broadcast()
 	b.ram.mu.Unlock()
 	return b.ram.releaseSlabs(releases)
+}
+
+// decommitInProgressLocked returns true if a frame of backing, or of any
+// backing if backing is nil, is being decommitted, or its slab released.
+//
+// Preconditions: r.mu is locked.
+func (r *GuestRAM) decommitInProgressLocked(backing *guestBacking) bool {
+	for _, slab := range r.slabs {
+		for _, frame := range slab.frames {
+			if frame == nil || (backing != nil && frame.backing != backing) {
+				continue
+			}
+			if frame.decommitting || slab.releasing {
+				return true
+			}
+		}
+		if backing == nil && slab.releasing {
+			return true
+		}
+	}
+	return false
 }
 
 type slabRelease struct {
@@ -1134,19 +1250,29 @@ func (r *GuestRAM) Compact(ctx context.Context) (GuestRAMCompaction, error) {
 	r.accessMu.Lock()
 	defer r.accessMu.Unlock()
 
+	// Decommit doesn't exclude leases, so it can run concurrently; wait for
+	// those in progress and hold off new ones while frames move. They need no
+	// leases to finish.
 	r.mu.Lock()
-	for _, slab := range r.slabs {
-		if slab.releasing {
-			r.mu.Unlock()
-			return GuestRAMCompaction{}, fmt.Errorf("GuestRAM slab release is in progress")
-		}
-		for _, frame := range slab.frames {
-			if frame != nil && frame.decommitting {
-				r.mu.Unlock()
-				return GuestRAMCompaction{}, fmt.Errorf("GuestRAM frame decommit is in progress")
-			}
-		}
+	r.compacting = true
+	for r.decommitInProgressLocked(nil) {
+		r.cond.Wait()
 	}
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.compacting = false
+		r.cond.Broadcast()
+		r.mu.Unlock()
+	}()
+	return r.compactExclusive(ctx)
+}
+
+// compactExclusive implements Compact.
+//
+// Preconditions: r.accessMu is locked for writing, and r.compacting is set.
+func (r *GuestRAM) compactExclusive(ctx context.Context) (GuestRAMCompaction, error) {
+	r.mu.Lock()
 
 	var moves []frameMove
 	slabs := make([]*guestSlab, 0, len(r.slabs))
@@ -1467,6 +1593,11 @@ func (b *guestBacking) Destroy() error {
 	if b.destroyed {
 		b.ram.mu.Unlock()
 		return nil
+	}
+	// Decommit doesn't exclude leases, so it can be in progress; let it
+	// finish with this backing's frames first.
+	for b.ram.decommitInProgressLocked(b) {
+		b.ram.cond.Wait()
 	}
 	b.destroyed = true
 	frames := make([]*guestFrame, 0, len(b.frames))

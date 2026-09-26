@@ -72,7 +72,7 @@ type Backing interface {
 }
 
 // backingTryMapper is implemented by backings whose AcquireMapping can wait
-// for an exclusive operation, such as a decommit, that itself waits for every
+// for an exclusive operation, such as a compaction, that itself waits for every
 // outstanding lease. A caller that already holds a lease must not wait there.
 type backingTryMapper interface {
 	// TryAcquireMapping is AcquireMapping, but reports acquired == false
