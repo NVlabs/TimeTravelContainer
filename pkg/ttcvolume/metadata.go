@@ -368,6 +368,15 @@ func (r *Repository) commitMetadata(branch *Branch, state *branchMetadata, ops [
 	r.dirtyMu.Unlock()
 	if flush {
 		if err := r.flushMetadataBatchLocked(branch.ID); err != nil {
+			// The operation is applied, and its batch keeps it. While an
+			// authority handoff has frozen a snapshot, the graph refuses
+			// any batch, and a later operation flushes this one once the
+			// handoff is over: failing an operation already made visible
+			// left the file system's caller unable to undo it, and a live
+			// sibling of a branch being dehydrated or stopped panicked.
+			if errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
+				return nil
+			}
 			return fmt.Errorf("flushing bounded filesystem metadata batch: %w", err)
 		}
 		r.dirtyMu.Lock()

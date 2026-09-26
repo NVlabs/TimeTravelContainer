@@ -1806,6 +1806,126 @@ func TestForkRefusedByAFrozenHandoffLeavesTheSourceForkable(t *testing.T) {
 	}
 }
 
+// frozenHandoffRepository returns a repository whose main branch shares
+// origin 100 with a fork "ck", with origin 100 frozen for an authority
+// handoff, as a sibling's publication freezes it.
+func frozenHandoffRepository(t *testing.T, root string) *Repository {
+	t.Helper()
+	manager, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("frozen", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, err := repository.CreateRegular(MainBranch, RootInode, "base", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(MainBranch, ino, []byte("base"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(MainBranch, "ck", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	return repository
+}
+
+// A live branch goes on creating files while a handoff has a snapshot it
+// shares frozen: the batch that fills up meanwhile waits for the handoff to
+// end. Failing the file creation that filled it made the Sentry's overlay
+// panic.
+func TestMetadataBatchWaitsOutAFrozenHandoff(t *testing.T) {
+	root := t.TempDir()
+	repository := frozenHandoffRepository(t, root)
+	defer repository.Close()
+	const files = 2*metadataBatchOperations + 10
+	for i := 0; i < files; i++ {
+		if _, err := repository.CreateRegular(MainBranch, RootInode, fmt.Sprintf("f%d", i), 0600, 0, 0); err != nil {
+			t.Fatalf("creating file %d during the handoff: %v", i, err)
+		}
+	}
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.CreateRegular(MainBranch, RootInode, "after", 0600, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.SyncMetadata(); err != nil {
+		t.Fatal(err)
+	}
+	other, err := OpenManager(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := other.Open("frozen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.ListDirectory(MainBranch, RootInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// base, the files, and after.
+	if len(entries) != files+2 {
+		t.Fatalf("main has %d entries, want %d", len(entries), files+2)
+	}
+}
+
+// Removing a branch whose roots reach a snapshot a handoff has frozen removes
+// it, and the repository still opens: the roots wait for an open after the
+// handoff. The removal used to fail with the branch's pointer gone, and every
+// open after it failed while the handoff lasted, the cleanup that ends a
+// canceled one among them.
+func TestBranchRemovedDuringAFrozenHandoff(t *testing.T) {
+	root := t.TempDir()
+	repository := frozenHandoffRepository(t, root)
+	defer repository.Close()
+	if err := repository.RemoveBranch("ck"); err != nil {
+		t.Fatalf("removing a branch during the handoff: %v", err)
+	}
+	if _, err := repository.Branch("ck"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("removed branch: %v, want not found", err)
+	}
+	open := func() {
+		t.Helper()
+		other, err := OpenManager(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := other.Open("frozen")
+		if err != nil {
+			t.Fatalf("opening during the handoff: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open()
+	if err := repository.CancelOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	open()
+	if err := repository.graph.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := repository.graph.Root(graphRootName("ck")); ok {
+		t.Fatal("the removed branch's root remains after the handoff")
+	}
+}
+
 func TestBranchDiffDuringOriginHandoff(t *testing.T) {
 	manager := openTestManager(t)
 	repository, err := manager.CreateWithOrigin("diff-handoff", 100)

@@ -1640,7 +1640,11 @@ func (r *Repository) recoverGraphState() error {
 			}
 			orphanRoots = append(orphanRoots, name)
 		}
-		if err := r.graph.DeleteRoots(orphanRoots); err != nil {
+		// A root whose release an authority handoff's freeze refuses is left
+		// to a later open: failing this one left the repository unopenable
+		// until the handoff ended, and the cleanup that ends a canceled
+		// handoff opens it first.
+		if err := r.graph.DeleteRoots(orphanRoots); err != nil && !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
 			return fmt.Errorf("releasing unpublished graph roots: %w", err)
 		}
 
@@ -1654,7 +1658,7 @@ func (r *Repository) recoverGraphState() error {
 			}
 		}
 		sort.Strings(pinNames)
-		if err := r.graph.DeletePins(pinNames); err != nil {
+		if err := r.graph.DeletePins(pinNames); err != nil && !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
 			return fmt.Errorf("releasing interrupted construction pins: %w", err)
 		}
 		// Recovery has already paid the cost of replaying the selected WAL. Seal
@@ -1819,7 +1823,11 @@ func (r *Repository) RemoveBranch(id string) error {
 		if branch.BaseRoot != "" {
 			roots = append(roots, graphBaseRootName(id))
 		}
-		if err := r.graph.DeleteRoots(roots); err != nil {
+		// With its pointer gone the branch is removed. While an authority
+		// handoff has frozen a snapshot its roots reach, releasing them is
+		// refused, and the next open of the repository releases them as a
+		// removed branch's.
+		if err := r.graph.DeleteRoots(roots); err != nil && !errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) {
 			return err
 		}
 		r.dirtyMu.Lock()
