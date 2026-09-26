@@ -139,15 +139,20 @@ ttc_daemon_crash() {
   done
 }
 
+stop_nat_fixture() {
+  if [ -n "$NAT_FIXTURE_PID" ]; then
+    kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+    wait "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+    NAT_FIXTURE_PID=
+  fi
+}
+
 cleanup() {
   for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$NETNS" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
     ttc rm --force "$container" >/dev/null 2>&1 || true
   done
   ttc daemon stop >/dev/null 2>&1 || true
-  if [ -n "$NAT_FIXTURE_PID" ]; then
-    kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
-    wait "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
-  fi
+  stop_nat_fixture
   if $owned_root; then
     rm -rf "$TTC_E2E_ROOT"
   fi
@@ -870,6 +875,7 @@ ttc rm --force "$DAEMON_STOP"
 ttc daemon stop >/dev/null
 
 trap - EXIT HUP INT TERM
+stop_nat_fixture
 if $owned_root; then
   rm -rf "$TTC_E2E_ROOT"
 fi
