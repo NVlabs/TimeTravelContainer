@@ -13935,66 +13935,89 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 		// to adopt, is building by the time this returns.
 		b.distributedSource.awaitOriginAllocations()
 	}
+	// The stale origins are independent, and each costs rechecks and a Raft
+	// proposal: several go at once, and the authority commits theirs together.
+	work := make(chan uint64)
+	errs := make([]error, min(len(stale), staleOriginWorkers))
+	var workers sync.WaitGroup
+	for worker := range errs {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for encoded := range work {
+				if err := b.abandonStaleOrigin(node, encoded); err != nil && errs[worker] == nil {
+					errs[worker] = err
+				}
+			}
+		}()
+	}
 	for _, encoded := range stale {
-		origin := ttcsnapshot.SnapshotID(encoded)
-		unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
-		// The inventory above is only a candidate list. A concurrent publisher or
-		// branch mutation may have made the origin live before this origin fence
-		// was acquired, so repeat both data-plane and authority observations.
-		if b.distributedSource.buildingOrigin(origin) {
-			unlockOrigin()
-			continue
-		}
-		if b.snapshotGraph != nil {
-			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
-				unlockOrigin()
-				continue
-			}
-		}
-		filesystemLive, liveErr := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
-		if liveErr != nil {
-			unlockOrigin()
-			return 0, fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, liveErr)
-		}
-		if filesystemLive {
-			unlockOrigin()
-			continue
-		}
-		provider, volatile, providerErr := b.distributedSource.authority.SnapshotProvider(encoded)
-		if errors.Is(providerErr, os.ErrNotExist) || (!volatile && providerErr == nil) {
-			unlockOrigin()
-			continue
-		}
-		if providerErr != nil {
-			unlockOrigin()
-			return 0, fmt.Errorf("rechecking orphan snapshot origin %d authority: %w", origin, providerErr)
-		}
-		if provider.NodeID != node {
-			unlockOrigin()
-			continue
-		}
-		if b.snapshotShared != nil {
-			busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
-			if discardErr != nil {
-				unlockOrigin()
-				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: %w", origin, discardErr)
-			}
-			if busy {
-				unlockOrigin()
-				return 0, fmt.Errorf("discarding orphan snapshot origin %d handoff: pack is busy", origin)
-			}
-		}
-		if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, encoded); err != nil {
-			// Another serialized cleanup may have completed between the state
-			// read and this proposal. Treat an already-retired origin as success.
-			if _, found, lookupErr := b.distributedSource.authority.SnapshotProvider(encoded); lookupErr != nil || found {
-				unlockOrigin()
-				return 0, fmt.Errorf("abandoning orphan snapshot origin %d: %w", origin, errors.Join(err, lookupErr))
-			}
-		}
-		unlockOrigin()
+		work <- encoded
+	}
+	close(work)
+	workers.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return 0, err
 	}
 	return abandoned + len(stale), nil
+}
+
+// staleOriginWorkers is how many stale origins a reconciliation abandons at
+// once.
+const staleOriginWorkers = 8
+
+// abandonStaleOrigin abandons the snapshot origin that reconciliation found
+// this node the provider of, and neither its memory graph nor a repository
+// holds, unless that is no longer so.
+func (b *runtimeBackend) abandonStaleOrigin(node string, encoded uint64) error {
+	origin := ttcsnapshot.SnapshotID(encoded)
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
+	// The inventory is only a candidate list. A concurrent publisher or
+	// branch mutation may have made the origin live before this origin fence
+	// was acquired, so repeat both data-plane and authority observations.
+	if b.distributedSource.buildingOrigin(origin) {
+		return nil
+	}
+	if b.snapshotGraph != nil {
+		if _, ok := b.snapshotGraph.Snapshot(origin); ok {
+			return nil
+		}
+	}
+	filesystemLive, liveErr := b.containerStore().WithFilesystemSnapshotOrigin(origin, func(*ttcvolume.Repository) error { return nil })
+	if liveErr != nil {
+		return fmt.Errorf("rechecking orphan snapshot origin %d: %w", origin, liveErr)
+	}
+	if filesystemLive {
+		return nil
+	}
+	provider, volatile, providerErr := b.distributedSource.authority.SnapshotProvider(encoded)
+	if errors.Is(providerErr, os.ErrNotExist) || (!volatile && providerErr == nil) {
+		return nil
+	}
+	if providerErr != nil {
+		return fmt.Errorf("rechecking orphan snapshot origin %d authority: %w", origin, providerErr)
+	}
+	if provider.NodeID != node {
+		return nil
+	}
+	if b.snapshotShared != nil {
+		busy, discardErr := b.snapshotShared.DiscardHandoff(origin)
+		if discardErr != nil {
+			return fmt.Errorf("discarding orphan snapshot origin %d handoff: %w", origin, discardErr)
+		}
+		if busy {
+			return fmt.Errorf("discarding orphan snapshot origin %d handoff: pack is busy", origin)
+		}
+	}
+	if err := b.distributedSource.authority.AbandonSnapshotOrigin(node, b.distributedSource.incarnation, encoded); err != nil {
+		// Another serialized cleanup may have completed between the state
+		// read and this proposal. Treat an already-retired origin as success.
+		if _, found, lookupErr := b.distributedSource.authority.SnapshotProvider(encoded); lookupErr != nil || found {
+			return fmt.Errorf("abandoning orphan snapshot origin %d: %w", origin, errors.Join(err, lookupErr))
+		}
+	}
+	return nil
 }
 
 const snapshotGraphJournalCompactBytes = 8 << 20
