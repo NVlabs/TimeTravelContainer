@@ -11,7 +11,10 @@ set -eu
 TTC=${TTC:-ttc}
 TTCD=${TTCD:-ttcd}
 IMAGE=${TTC_CLI_TEST_IMAGE:-busybox:1.36}
-ROOT=${TTC_CLI_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/ttc-cli.XXXXXX")}
+# macOS gives TMPDIR a trailing slash; a doubled one would differ from the
+# cleaned paths TTC reports.
+tmp=${TMPDIR:-/tmp}
+ROOT=${TTC_CLI_TEST_ROOT:-$(mktemp -d "${tmp%/}/ttc-cli.XXXXXX")}
 KEEP_ROOT=${TTC_CLI_TEST_KEEP_ROOT:-}
 NAME=${TTC_CLI_TEST_NAME:-ttc-cli-commands-$$}
 RESTORED=$NAME-restored

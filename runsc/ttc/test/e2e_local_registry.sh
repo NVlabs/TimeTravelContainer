@@ -50,7 +50,10 @@ fi
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
-  TTC_E2E_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ttc-registry.XXXXXX")
+  # macOS gives TMPDIR a trailing slash; a doubled one would differ from
+  # the cleaned paths TTC reports.
+  tmp=${TMPDIR:-/tmp}
+  TTC_E2E_ROOT=$(mktemp -d "${tmp%/}/ttc-registry.XXXXXX")
   owned_root=true
 else
   mkdir -p "$TTC_E2E_ROOT"
