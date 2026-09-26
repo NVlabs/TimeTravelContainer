@@ -4373,6 +4373,12 @@ func inspectDaemonStorageRoot(root, role string) error {
 	}
 	startupLog := daemonStartupLogInfo()
 	for _, entry := range entries {
+		if entry.Name() == ".ttc-root-format" {
+			// Published since the read above, as by another daemon of a new
+			// cluster starting at the same time; it is linked into place
+			// whole, so read it as if it had been there.
+			return inspectDaemonStorageRoot(root, role)
+		}
 		if !freshDaemonRootEntryAllowed(root, entry, startupLog) {
 			return fmt.Errorf("%q is not a fresh TTC root (found %q); existing TTC data roots are not migrated", root, entry.Name())
 		}
@@ -5355,25 +5361,14 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	want := immutableClusterConfigFromOptions(*opts)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		encoded, err := json.Marshal(want)
-		if err != nil {
-			return nil, err
+		encoded, marshalErr := json.Marshal(want)
+		if marshalErr != nil {
+			return nil, marshalErr
 		}
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			_, writeErr := file.Write(append(encoded, '\n'))
-			closeErr := errors.Join(file.Sync(), file.Close())
-			if writeErr != nil || closeErr != nil {
-				_ = os.Remove(path)
-				return nil, errors.Join(writeErr, closeErr)
-			}
-			return nil, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
+		// Another daemon of a new cluster may record it first.
+		if data, err = publishOnce(path, append(encoded, '\n')); err != nil {
 			return nil, fmt.Errorf("creating immutable cluster configuration: %w", err)
 		}
-		// Another daemon of a new cluster recorded it first.
-		data, err = os.ReadFile(path)
 	}
 	if err != nil {
 		return nil, err
@@ -5402,6 +5397,29 @@ func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) 
 	opts.AutoRebalance = got.AutoRebalance
 	opts.ResolvedCPU = got.CPUProfile
 	return pending, nil
+}
+
+// publishOnce makes path hold data, unless another daemon made it first, and
+// returns what path holds. No reader sees it partly written: data is written
+// to a file of its own, which is then linked to path, as link(2) does only if
+// path does not exist.
+func publishOnce(path string, data []byte) ([]byte, error) {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(temp.Name())
+	_, err = temp.Write(data)
+	if err = errors.Join(err, temp.Sync(), temp.Close()); err != nil {
+		return nil, err
+	}
+	if err := os.Link(temp.Name(), path); err == nil {
+		return data, syncDaemonRootDirectory(dir)
+	} else if !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }
 
 func persistClusterRuntimePolicy(sharedRoot string, base daemonImmutableClusterConfig, policy cluster.ClusterRuntimePolicy) error {
@@ -5611,21 +5629,9 @@ func prepareClusterRaftIdentity(sharedRoot, localRaftDir, repositoryID, nodeID s
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				return "", err
 			}
-			file, createErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-			if createErr == nil {
-				_, writeErr := file.Write(encoded)
-				closeErr := errors.Join(file.Sync(), file.Close())
-				if writeErr != nil || closeErr != nil {
-					_ = os.Remove(path)
-					return "", errors.Join(writeErr, closeErr)
-				}
-				data = encoded
-				err = nil
-			} else if errors.Is(createErr, os.ErrExist) {
-				// Another daemon of a new cluster created it first.
-				data, err = os.ReadFile(path)
-			} else {
-				return "", fmt.Errorf("creating the cluster's Raft identity: %w", createErr)
+			// Another daemon of a new cluster may create it first.
+			if data, err = publishOnce(path, encoded); err != nil {
+				return "", fmt.Errorf("creating the cluster's Raft identity: %w", err)
 			}
 		}
 	}
