@@ -470,20 +470,35 @@ func (c *RaftCatalog) CommitPublication(family, branch, publicationID string, ro
 }
 
 // CancelPublication fences an uncommitted worker. A successful publication is
-// immutable and remains reachable from the committed branch roots.
+// immutable and remains reachable from the committed branch roots. The
+// worker may advance the publication while it is canceled, and a
+// cancellation of a revision the publication has left is refused; it is
+// proposed again for the revision the publication has then.
 func (c *RaftCatalog) CancelPublication(family, branch, publicationID string) error {
-	state, err := c.query(AuthorityQuery{Publications: Only(publicationKey(family, branch, publicationID))})
-	if err != nil {
-		return err
+	key := publicationKey(family, branch, publicationID)
+	var refused error
+	var revision uint64
+	for {
+		state, err := c.query(AuthorityQuery{Publications: Only(key)})
+		if err != nil {
+			return err
+		}
+		record, ok := state.Publications[key]
+		if !ok || record.State == PublicationCommitted || record.State == PublicationCanceled {
+			return nil
+		}
+		if refused != nil && record.Revision == revision {
+			return refused
+		}
+		revision = record.Revision
+		refused = applyRaftNoValue(c, time.Now().UTC(), AuthorityPublicationCancel, AuthorityPublicationPayload{
+			Family: family, Branch: branch, PublicationID: record.PublicationID,
+			BranchGeneration: record.BranchGeneration, Revision: record.Revision,
+		})
+		if refused == nil {
+			return nil
+		}
 	}
-	record, ok := state.Publications[publicationKey(family, branch, publicationID)]
-	if !ok || record.State == PublicationCommitted || record.State == PublicationCanceled {
-		return nil
-	}
-	return applyRaftNoValue(c, time.Now().UTC(), AuthorityPublicationCancel, AuthorityPublicationPayload{
-		Family: family, Branch: branch, PublicationID: record.PublicationID,
-		BranchGeneration: record.BranchGeneration, Revision: record.Revision,
-	})
 }
 
 // Publication returns one immutable publication's authoritative state.
