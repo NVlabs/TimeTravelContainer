@@ -2178,3 +2178,25 @@ func TestLifecycleCommandOperandsSkipsOptions(t *testing.T) {
 		}
 	}
 }
+
+// A family's removal merges the removals of branches on one node that share
+// their flags into one command.
+func TestBranchRemovalParts(t *testing.T) {
+	for _, test := range []struct {
+		args           []string
+		flags, targets []string
+		ok             bool
+	}{
+		{[]string{"rm", "-f", "fam@b1"}, []string{"rm", "-f"}, []string{"fam@b1"}, true},
+		{[]string{"rm", "fam@b1", "fam@b2"}, []string{"rm"}, []string{"fam@b1", "fam@b2"}, true},
+		{[]string{"rm", "-f", "fam"}, nil, nil, false},
+		{[]string{"rm", "-f"}, nil, nil, false},
+		{[]string{"_remove-family-record", "id"}, nil, nil, false},
+		{[]string{"stop", "fam@b1"}, nil, nil, false},
+	} {
+		flags, targets, ok := branchRemovalParts(test.args)
+		if ok != test.ok || !slices.Equal(flags, test.flags) || !slices.Equal(targets, test.targets) {
+			t.Errorf("branchRemovalParts(%q) = %q, %q, %t; want %q, %q, %t", test.args, flags, targets, ok, test.flags, test.targets, test.ok)
+		}
+	}
+}

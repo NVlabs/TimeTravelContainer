@@ -3152,27 +3152,33 @@ func runRemove(args []string, stdout, stderr io.Writer, backend backend) error {
 	if fs.NArg() == 0 {
 		return errors.New("usage: ttc rm [--force] [--volumes] (CONTAINER|CONTAINER@BRANCH) [TARGET...]")
 	}
-	for _, value := range fs.Args() {
-		if strings.Contains(value, "@") {
-			if *volumes {
-				return fmt.Errorf("--volumes applies only when removing a whole container family, not %q", value)
+	removeAll := func() error {
+		for _, value := range fs.Args() {
+			if strings.Contains(value, "@") {
+				if *volumes {
+					return fmt.Errorf("--volumes applies only when removing a whole container family, not %q", value)
+				}
+				target, err := parseSelector(value)
+				if err != nil {
+					return fmt.Errorf("invalid target %q: %w", value, err)
+				}
+				if err := backend.destroy(target, *force); err != nil {
+					return err
+				}
+				fmt.Fprintln(stdout, target)
+				continue
 			}
-			target, err := parseSelector(value)
-			if err != nil {
-				return fmt.Errorf("invalid target %q: %w", value, err)
-			}
-			if err := backend.destroy(target, *force); err != nil {
+			if err := backend.remove(value, *force, *volumes); err != nil {
 				return err
 			}
-			fmt.Fprintln(stdout, target)
-			continue
+			fmt.Fprintln(stdout, value)
 		}
-		if err := backend.remove(value, *force, *volumes); err != nil {
-			return err
-		}
-		fmt.Fprintln(stdout, value)
+		return nil
 	}
-	return nil
+	if runtime, ok := backend.(*runtimeBackend); ok && fs.NArg() > 1 {
+		return runtime.removingBranches(removeAll)
+	}
+	return removeAll()
 }
 
 func runAutoRemoveNow(args []string, backend backend) error {
@@ -6255,6 +6261,37 @@ type runtimeBackend struct {
 	// daemonStopRequested is set only after a node-stop policy has completed.
 	// The daemon sends the command result before closing its listener.
 	daemonStopRequested bool
+	// removals is set while a command removes several branches, which does
+	// once what each removal would: renew the node's execution lease before
+	// the first, and reconcile the node's snapshot providers after the last.
+	removals *branchRemovals
+}
+
+// branchRemovals is what a command that removes several branches did once
+// for them all, or has yet to.
+type branchRemovals struct {
+	// renewed is set once the node renewed its execution lease.
+	renewed bool
+	// originsDue is set once a removal left the providers to reconcile.
+	originsDue bool
+}
+
+// removingBranches runs work, which removes branches, as branchRemovals
+// describes.
+func (b *runtimeBackend) removingBranches(work func() error) error {
+	if b.removals != nil {
+		return work()
+	}
+	removals := &branchRemovals{}
+	b.removals = removals
+	err := work()
+	b.removals = nil
+	if removals.originsDue {
+		if _, reconcileErr := b.reconcileVolatileSnapshotOrigins(); reconcileErr != nil {
+			err = errors.Join(err, fmt.Errorf("reconciling snapshot providers: %w", reconcileErr))
+		}
+	}
+	return err
 }
 
 func (b *runtimeBackend) lockBackgroundLifecycle() func() {
@@ -13694,6 +13731,10 @@ func (b *runtimeBackend) reclaimBranchBacking(info ttcbundle.ContainerInfo, bran
 	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
 		return fmt.Errorf("removing branch filesystems: %w", err)
 	}
+	if b.removals != nil {
+		b.removals.originsDue = true
+		return nil
+	}
 	if _, err := b.reconcileVolatileSnapshotOrigins(); err != nil {
 		return fmt.Errorf("reconciling snapshot providers: %w", err)
 	}
@@ -16170,9 +16211,12 @@ func dehydrationNetworkArgs(info ttcbundle.ContainerInfo) (*boot.CreateLinksAndR
 }
 
 func (b *runtimeBackend) destroy(target selector, force bool) error {
-	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" {
+	if b.distributedSource != nil && b.distributedSource.authority != nil && b.nodeID != "" && (b.removals == nil || !b.removals.renewed) {
 		if _, err := b.renewDistributedExecutionAuthority(); err != nil {
 			return fmt.Errorf("renewing branch removal execution authority: %w", err)
+		}
+		if b.removals != nil {
+			b.removals.renewed = true
 		}
 	}
 	requested := target

@@ -423,6 +423,7 @@ func (b *runtimeBackend) forBackground() *runtimeBackend {
 	background.heldFamilies = nil
 	background.mutating = false
 	background.commandName = ""
+	background.removals = nil
 	return &background
 }
 

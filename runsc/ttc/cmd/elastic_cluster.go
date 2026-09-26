@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -404,6 +405,13 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 	}
 	var claims []daemonPlacementClaim
 	seen := make(map[string]struct{})
+	// A command may name many branches of one family, as a family's removal
+	// does one node's branches: its record is read once.
+	type loaded struct {
+		info ttcbundle.ContainerInfo
+		err  error
+	}
+	families := make(map[string]loaded)
 	for _, arg := range args[1:] {
 		candidate := arg
 		if colon := strings.IndexByte(candidate, ':'); colon >= 0 {
@@ -417,7 +425,12 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 		if err != nil {
 			continue
 		}
-		info, err := store.LoadContainer(selected.container)
+		family, ok := families[selected.container]
+		if !ok {
+			family.info, family.err = store.LoadContainer(selected.container)
+			families[selected.container] = family
+		}
+		info, err := family.info, family.err
 		if err != nil {
 			familyID, resolveErr := resolvePlacementFamily(placements, selected.container)
 			if resolveErr != nil {
@@ -2863,7 +2876,23 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 			postflight = append(postflight, child{node: cleanupNode, args: append([]string{"_discard-removed-migration-sources"}, ids...)})
 		}
 	}
-	children = append(append(append(append(preflight, children...), localCleanups...), finalizers...), postflight...)
+	// Each run of removals of branches on one node becomes one command,
+	// which removes them in order, as the node removes one: each command is a
+	// request to the node, and a removal reconciles the node's snapshot
+	// providers once.
+	merged := make([]child, 0, len(children))
+	for _, next := range children {
+		if last := len(merged) - 1; last >= 0 && merged[last].node == next.node {
+			flags, _, ok := branchRemovalParts(merged[last].args)
+			nextFlags, targets, nextOK := branchRemovalParts(next.args)
+			if ok && nextOK && slices.Equal(flags, nextFlags) {
+				merged[last].args = append(merged[last].args, targets...)
+				continue
+			}
+		}
+		merged = append(merged, child{node: next.node, args: append([]string(nil), next.args...), claims: next.claims})
+	}
+	children = append(append(append(append(preflight, merged...), localCleanups...), finalizers...), postflight...)
 
 	var diagnostic bytes.Buffer
 	for i, child := range children {
@@ -2913,6 +2942,27 @@ func (s *daemonServer) executeDistributedFamilyMutation(request daemonRequest) (
 		fmt.Fprintln(&output, operand)
 	}
 	return true, 0, []byte(output.String()), diagnostic.Bytes(), nil
+}
+
+// branchRemovalParts splits the arguments of an rm of branches into its flags
+// and its targets, and reports whether they are that.
+func branchRemovalParts(args []string) (flags, targets []string, ok bool) {
+	if len(args) < 2 || args[0] != "rm" {
+		return nil, nil, false
+	}
+	i := 1
+	for i < len(args) && strings.HasPrefix(args[i], "-") {
+		i++
+	}
+	if i == len(args) {
+		return nil, nil, false
+	}
+	for _, target := range args[i:] {
+		if !strings.Contains(target, "@") {
+			return nil, nil, false
+		}
+	}
+	return args[:i], args[i:], true
 }
 
 func distributedFamilyPhysicalIDs(store ttcbundle.Store, familyID string) ([]string, error) {
