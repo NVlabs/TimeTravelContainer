@@ -85,7 +85,7 @@ func NewSocket(fd int) (*Socket, error) {
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, err
 	}
-	unix.CloseOnExec(fd)
+	closeOnExecAdopted(fd)
 
 	efd, err := eventfd.Create()
 	if err != nil {

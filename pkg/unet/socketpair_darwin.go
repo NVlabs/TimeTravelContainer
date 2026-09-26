@@ -34,3 +34,9 @@ func hostSocketPair(packet bool) ([2]int, error) {
 	}
 	return fds, err
 }
+
+// closeOnExecAdopted makes a socket that NewSocket adopts close-on-exec, as
+// Darwin creates none so.
+func closeOnExecAdopted(fd int) {
+	unix.CloseOnExec(fd)
+}
