@@ -37,7 +37,7 @@ func TestAReadOnRegularFileBorrowsTheDescriptorAlreadyOpenOnIt(t *testing.T) {
 // Everything else opens its own, and behaves exactly as it did.
 func TestOnlyTheCaseThatIsCertainlySafeBorrows(t *testing.T) {
 	readable := &controlFDLisa{openedFlags: unix.O_RDONLY | unix.O_NONBLOCK | openFlags}
-	path := &controlFDLisa{openedFlags: unix.O_PATH | openFlags}
+	path := &controlFDLisa{openedFlags: pathOpenFlagMask | openFlags}
 
 	for _, one := range []struct {
 		why   string
@@ -58,7 +58,7 @@ func TestOnlyTheCaseThatIsCertainlySafeBorrows(t *testing.T) {
 		// Anything else the Sentry asks for goes the long way round rather
 		// than being quietly dropped.
 		{"a truncating open", readable, unix.O_RDONLY | unix.O_TRUNC, unix.S_IFREG},
-		{"a direct open", readable, unix.O_RDONLY | unix.O_DIRECT, unix.S_IFREG},
+		{"a direct open", readable, unix.O_RDONLY | linux.O_DIRECT, unix.S_IFREG},
 	} {
 		if one.fd.lendableFor(one.flags, one.ftype) {
 			t.Errorf("%s borrowed a descriptor it cannot use", one.why)

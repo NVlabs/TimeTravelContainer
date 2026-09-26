@@ -24,9 +24,14 @@ import (
 )
 
 func TestDonatedTCPConnWaitsForNonblockingRead(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK, 0)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, fd := range fds {
+		if err := unix.SetNonblock(fd, true); err != nil {
+			t.Fatal(err)
+		}
 	}
 	source := os.NewFile(uintptr(fds[0]), "donated-source")
 	peer := os.NewFile(uintptr(fds[1]), "donated-peer")

@@ -26,16 +26,40 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
+// fuseSocketpair returns a connected pair of sockets that preserve message
+// boundaries, as a host FUSE connection needs: SOCK_SEQPACKET where the host
+// has it, and otherwise, as on Darwin, SOCK_DGRAM with buffers that fit any
+// message of the tests.
+func fuseSocketpair(t *testing.T) [2]int {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err == nil {
+		return fds
+	}
+	if err != unix.EPROTONOSUPPORT {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	fds, err = unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	for _, fd := range fds {
+		for _, opt := range []int{unix.SO_SNDBUF, unix.SO_RCVBUF} {
+			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, opt, 1<<20); err != nil {
+				t.Fatalf("setting socket buffer size: %v", err)
+			}
+		}
+	}
+	return fds
+}
+
 // newTestHostConnection creates a hostConnection backed by a socketpair.
 // Returns the hostConnection, the server-side FD, and a cleanup function.
 // The connection is pre-initialized and the reader goroutine is started.
 func newTestHostConnection(t *testing.T) (*hostConnection, int, func()) {
 	t.Helper()
 
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
-	if err != nil {
-		t.Fatalf("Socketpair: %v", err)
-	}
+	fds := fuseSocketpair(t)
 
 	fsopts := filesystemOptions{
 		maxActiveRequests: maxActiveRequestsDefault,
@@ -184,10 +208,7 @@ func TestHostConnectionInit(t *testing.T) {
 	s := setup(t)
 	defer s.Destroy()
 
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
-	if err != nil {
-		t.Fatalf("Socketpair: %v", err)
-	}
+	fds := fuseSocketpair(t)
 	defer unix.Close(fds[1])
 	defer unix.Close(fds[0])
 	defer unix.Shutdown(fds[0], unix.SHUT_RDWR)
