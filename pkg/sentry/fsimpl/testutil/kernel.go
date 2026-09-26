@@ -39,16 +39,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 
-	// Platforms are pluggable.
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
-	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
-
 	// Cgroup2fs is required by Kernel.Init.
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 )
 
 var (
-	platformFlag           = flag.String("platform", "ptrace", "specify which platform to use")
+	platformFlag           = flag.String("platform", defaultPlatform, "specify which platform to use")
 	platformDevicePathFlag = flag.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
 )
 
