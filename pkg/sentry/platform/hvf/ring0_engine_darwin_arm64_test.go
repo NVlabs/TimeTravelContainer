@@ -1980,3 +1980,112 @@ func TestMonitorAddressSpaceTableFullReportsLimit(t *testing.T) {
 	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeDestroyAddressSpace, AddressSpaceID: 1})
 	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: 1 << 20})
 }
+
+// TestInterruptApplicationStopsOnlyTargetRun runs two CPU-bound applications
+// and interrupts one by owner thread. The other must keep running: an
+// engine-wide interrupt makes every running task give up its vCPU.
+func TestInterruptApplicationStopsOnlyTargetRun(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory, 0x14000000) // b .
+
+	const (
+		spaceID = uint64(98)
+		loopVA  = uint64(0xe20000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: loopVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}},
+	})
+
+	type applicationResult struct {
+		tid  uint64
+		exit vmm.Exit
+		err  error
+	}
+	tids := make(chan uint64, 2)
+	done := make(chan applicationResult, 2)
+	for range 2 {
+		go func() {
+			engine.BeginApplicationResidency()
+			tid := hosttid.Current()
+			tids <- tid
+			exit, runErr := engine.RunApplication(context.Background(), vmm.ApplicationState{
+				AddressSpaceID: spaceID,
+				Registers:      &vmm.ARM64State{PC: loopVA},
+			})
+			done <- applicationResult{tid: tid, exit: exit, err: errors.Join(runErr, engine.EndApplicationResidency())}
+		}()
+	}
+	first, second := <-tids, <-tids
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		engine.cpuMu.Lock()
+		active := engine.applicationCPUCountLocked() == 2
+		for _, cpu := range engine.cpusByID {
+			if cpu != nil && (!cpu.applicationActive.Load() || !cpu.bridge.inGuest()) {
+				active = false
+			}
+		}
+		engine.cpuMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("CPU-bound applications did not both enter the guest")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+
+	engine.InterruptApplication(first)
+	select {
+	case result := <-done:
+		if result.tid != first || result.err != nil || result.exit.Reason != vmm.ExitInterrupted {
+			t.Fatalf("first result = %+v, want thread %d interrupted", result, first)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("targeted application was not interrupted")
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("untargeted application stopped: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	engine.InterruptApplication(second)
+	select {
+	case result := <-done:
+		if result.tid != second || result.err != nil || result.exit.Reason != vmm.ExitInterrupted {
+			t.Fatalf("second result = %+v, want thread %d interrupted", result, second)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second application was not interrupted")
+	}
+}

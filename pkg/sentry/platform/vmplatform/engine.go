@@ -39,6 +39,16 @@ type VMEngine interface {
 	Close() error
 }
 
+// ApplicationInterruptEngine is optionally implemented by engines whose
+// application runs are owned by host threads. InterruptApplication stops only
+// the run owned by host thread tid, if any, and returns once that run has
+// acknowledged or left the guest. Signals and preemption target one task;
+// interrupting every run instead makes each running task end its residency.
+type ApplicationInterruptEngine interface {
+	VMEngine
+	InterruptApplication(tid uint64)
+}
+
 // HostExecutionCacheEngine is optionally implemented by engines that execute
 // Sentry code through a disposable mirror of host virtual memory. A quiesced
 // state capture must discard mutable aliases: host allocators may recycle the

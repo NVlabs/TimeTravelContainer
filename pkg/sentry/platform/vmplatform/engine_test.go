@@ -154,11 +154,52 @@ func TestPlatformContextInterruptWakesVMEngine(t *testing.T) {
 	engine := &interruptCountingEngine{}
 	c := &platformContext{platform: &Platform{engine: engine}}
 	c.Interrupt()
-	if got := engine.interrupts.Load(); got != 1 {
-		t.Fatalf("VM engine interrupts = %d, want 1", got)
+	if got := engine.interrupts.Load(); got != 0 {
+		t.Fatalf("VM engine interrupts for an idle context = %d, want 0", got)
 	}
 	if !c.interrupted {
 		t.Fatal("platform context did not retain the interrupt")
+	}
+
+	c.interrupted = false
+	c.runContext.reset(context.Background())
+	c.runActive = true
+	c.Interrupt()
+	if got := engine.interrupts.Load(); got != 1 {
+		t.Fatalf("VM engine interrupts for a running context = %d, want 1", got)
+	}
+	if c.runContext.Err() == nil {
+		t.Fatal("interrupt did not cancel the running application")
+	}
+}
+
+type targetedInterruptEngine struct {
+	interruptCountingEngine
+	targets []uint64
+}
+
+func (e *targetedInterruptEngine) InterruptApplication(tid uint64) {
+	e.targets = append(e.targets, tid)
+}
+
+// TestPlatformContextInterruptTargetsOwnRun checks that interrupting one
+// task stops only that task's run. An engine-wide interrupt would end the
+// residency of every running task.
+func TestPlatformContextInterruptTargetsOwnRun(t *testing.T) {
+	engine := &targetedInterruptEngine{}
+	c := &platformContext{platform: &Platform{engine: engine}}
+	c.runContext.reset(context.Background())
+	c.runActive = true
+	c.runTID = 42
+	c.Interrupt()
+	if got := engine.interrupts.Load(); got != 0 {
+		t.Fatalf("engine-wide interrupts = %d, want 0", got)
+	}
+	if len(engine.targets) != 1 || engine.targets[0] != 42 {
+		t.Fatalf("targeted interrupts = %v, want [42]", engine.targets)
+	}
+	if c.runContext.Err() == nil {
+		t.Fatal("interrupt did not cancel the running application")
 	}
 }
 

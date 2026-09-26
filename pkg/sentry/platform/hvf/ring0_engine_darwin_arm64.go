@@ -2556,6 +2556,29 @@ func splitHostStage1Operations(operations []monitorabi.Operation) []monitorabi.O
 func (e *ring0Engine) InterruptApplications() {
 	cpus := e.pinApplicationCPUs()
 	defer e.unpinApplicationCPUs(cpus)
+	e.interruptApplicationCPUs(cpus)
+}
+
+// InterruptApplication implements vmplatform.ApplicationInterruptEngine.
+func (e *ring0Engine) InterruptApplication(tid uint64) {
+	cached, ok := e.cpusByTID.Load(tid)
+	if !ok {
+		// The run has not been admitted yet; it checks its canceled context
+		// before entering the guest.
+		return
+	}
+	cpu := cached.(*ring0ApplicationCPU)
+	if !cpu.tryPin() {
+		return
+	}
+	defer e.releaseApplicationCPU(cpu)
+	e.interruptApplicationCPUs([]*ring0ApplicationCPU{cpu})
+}
+
+// interruptApplicationCPUs requests an architected exit from each pinned CPU
+// running an application and waits, up to one second, until each exit is
+// acknowledged or its run ends.
+func (e *ring0Engine) interruptApplicationCPUs(cpus []*ring0ApplicationCPU) {
 	lastRequest := make(map[*ring0ApplicationCPU]time.Time, len(cpus))
 	for _, cpu := range cpus {
 		cancel := (*uint64)(unsafe.Add(unsafe.Pointer(cpu.vcpu.stateHost), stateCancelRequested))

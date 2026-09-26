@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -1080,9 +1081,11 @@ type platformContext struct {
 	platform  *Platform
 	registers any
 
-	mu          sync.Mutex
-	runContext  applicationRunContext
-	runActive   bool
+	mu         sync.Mutex
+	runContext applicationRunContext
+	runActive  bool
+	// runTID is the host thread running the active application run.
+	runTID      uint64
 	interrupted bool
 	released    bool
 	resident    ApplicationResidencyEngine
@@ -1220,6 +1223,7 @@ func (c *platformContext) Switch(ctx context.Context, mm sentryplatform.MemoryMa
 	}
 	c.runContext.reset(ctx)
 	c.runActive = true
+	c.runTID = hosttid.Current()
 	c.mu.Unlock()
 
 	if err := c.platform.arch.LoadApplicationState(c.registers, ac); err != nil {
@@ -1267,13 +1271,23 @@ func (*platformContext) FullStateChanged()                                      
 func (c *platformContext) Interrupt() {
 	c.mu.Lock()
 	c.interrupted = true
-	if c.runActive {
+	running := c.runActive
+	tid := c.runTID
+	if running {
 		c.runContext.cancel()
 	}
 	c.mu.Unlock()
+	if !running {
+		// Switch consumes interrupted before its next application entry.
+		return
+	}
 	// Canceling the Go context alone cannot wake a running EL0 task. Request an
 	// architected guest exit after publishing interrupted so Switch observes a
 	// coherent register snapshot.
+	if engine, ok := c.platform.engine.(ApplicationInterruptEngine); ok {
+		engine.InterruptApplication(tid)
+		return
+	}
 	c.platform.engine.InterruptApplications()
 }
 func (c *platformContext) Preempt() { c.Interrupt() }

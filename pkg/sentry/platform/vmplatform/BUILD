@@ -24,6 +24,7 @@ go_library(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
+        "//pkg/hosttid",
         "//pkg/log",
         "//pkg/safemem",
         "//pkg/sentry/arch",
