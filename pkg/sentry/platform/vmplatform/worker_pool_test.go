@@ -95,6 +95,80 @@ func TestWorkerPoolCancellationInterruptsWorker(t *testing.T) {
 	}
 }
 
+// startUninterruptibleJob runs a job that, like a monitor transaction,
+// ignores interruption and finishes only when release is closed. It returns
+// the result of Do.
+func startUninterruptibleJob(t *testing.T, pool *WorkerPool, ctx context.Context, release <-chan struct{}) <-chan workerResult {
+	t.Helper()
+	started := make(chan struct{})
+	done := make(chan workerResult, 1)
+	go func() {
+		value, err := pool.Do(ctx, func(context.Context, VCPU) (any, error) {
+			close(started)
+			<-release
+			return "completed", nil
+		})
+		done <- workerResult{value: value, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not start the job")
+	}
+	return done
+}
+
+func checkDoWaitsForJob(t *testing.T, done <-chan workerResult, release chan<- struct{}) {
+	t.Helper()
+	select {
+	case result := <-done:
+		t.Fatalf("Do returned (%v, %v) while its job was still running", result.value, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case result := <-done:
+		if result.value != "completed" || result.err != nil {
+			t.Fatalf("Do = (%v, %v), want the completed job's (completed, nil)", result.value, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Do did not return after its job completed")
+	}
+}
+
+// TestWorkerPoolDoWaitsForJobWhenPoolStops checks that Do doesn't return
+// while a job it handed to a worker is still running when the pool stops.
+func TestWorkerPoolDoWaitsForJobWhenPoolStops(t *testing.T) {
+	pool, err := NewWorkerPool(&fakeVM{started: make(chan struct{})}, 1)
+	if err != nil {
+		t.Fatalf("NewWorkerPool: %v", err)
+	}
+	release := make(chan struct{})
+	done := startUninterruptibleJob(t, pool, context.Background(), release)
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+	checkDoWaitsForJob(t, done, release)
+	<-closed
+}
+
+// TestWorkerPoolDoReportsJobCompletedAfterCancel checks that Do reports the
+// outcome of a job that completed despite its context being canceled.
+func TestWorkerPoolDoReportsJobCompletedAfterCancel(t *testing.T) {
+	pool, err := NewWorkerPool(&fakeVM{started: make(chan struct{})}, 1)
+	if err != nil {
+		t.Fatalf("NewWorkerPool: %v", err)
+	}
+	defer pool.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	done := startUninterruptibleJob(t, pool, ctx, release)
+	cancel()
+	checkDoWaitsForJob(t, done, release)
+}
+
 func TestMonitorRejectsWrongSequence(t *testing.T) {
 	vm := &wrongSequenceVM{}
 	pool, err := NewWorkerPool(vm, 1)

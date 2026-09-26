@@ -197,21 +197,21 @@ func (p *WorkerPool) Do(ctx context.Context, fn func(context.Context, VCPU) (any
 	case <-p.stop:
 		return nil, fmt.Errorf("vCPU worker pool is closed")
 	}
+	// A worker is running the job, whose effects may already be visible:
+	// monitor transactions, for example, ignore interruption and always
+	// complete. If the caller gives up or the pool stops, interrupt the job,
+	// but wait for it and report what it actually did either way, so that
+	// callers never mistake a completed job for a failed one, or overlap it
+	// with the next.
 	select {
 	case result := <-job.done:
 		return result.value, result.err
 	case <-ctx.Done():
-		job.interrupt()
-		select {
-		case <-job.done:
-			return nil, ctx.Err()
-		case <-p.stop:
-			return nil, ctx.Err()
-		}
 	case <-p.stop:
-		job.interrupt()
-		return nil, fmt.Errorf("vCPU worker pool is closed")
 	}
+	job.interrupt()
+	result := <-job.done
+	return result.value, result.err
 }
 
 func (p *WorkerPool) closeQueues() {
