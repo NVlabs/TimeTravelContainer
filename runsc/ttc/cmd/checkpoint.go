@@ -538,6 +538,7 @@ func (b *runtimeBackend) installCheckpointDehydration(info ttcbundle.ContainerIn
 	if err != nil {
 		return fmt.Errorf("allocating a snapshot origin: %w", err)
 	}
+	defer built()
 	var roots, rootObjects []string
 	controlRoot := ""
 	installed := false

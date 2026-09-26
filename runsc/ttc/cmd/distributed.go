@@ -281,6 +281,16 @@ type distributedSourceRuntime struct {
 	monitorCount  atomic.Int64
 	sourceLocks   [64]sync.Mutex
 	originLocks   [64]sync.Mutex
+	// building has the origins being built: a capture's memory origin,
+	// which owns no object until the capture's first objects commit, and
+	// the filesystem origins a bundle has yet to install. Either may be
+	// built without the lifecycle lock, so the cleanup of empty and
+	// orphaned origins leaves them alone. allocating is held, for reading,
+	// from an origin's allocation until it is building, so that cleanup can
+	// wait for each origin allocated before it looked to be marked.
+	buildingMu sync.Mutex
+	building   map[ttcsnapshot.SnapshotID]struct{}
+	allocating sync.RWMutex
 	// reclamationMu serializes terminal physical-source reclamation across
 	// families. Each reclamation performs repository-wide origin inventory and
 	// provider reconciliation, so per-family locks alone are insufficient: one
@@ -386,6 +396,49 @@ func (r *distributedSourceRuntime) lockReclamation() func() {
 	}
 	r.reclamationMu.Lock()
 	return r.reclamationMu.Unlock
+}
+
+// buildOrigin marks origin as one a capture builds, until the returned
+// function is called.
+func (r *distributedSourceRuntime) buildOrigin(origin ttcsnapshot.SnapshotID) func() {
+	if r == nil {
+		return func() {}
+	}
+	r.buildingMu.Lock()
+	defer r.buildingMu.Unlock()
+	if r.building == nil {
+		r.building = make(map[ttcsnapshot.SnapshotID]struct{})
+	}
+	r.building[origin] = struct{}{}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.buildingMu.Lock()
+			defer r.buildingMu.Unlock()
+			delete(r.building, origin)
+		})
+	}
+}
+
+// buildingOrigin reports whether a capture builds origin.
+func (r *distributedSourceRuntime) buildingOrigin(origin ttcsnapshot.SnapshotID) bool {
+	if r == nil {
+		return false
+	}
+	r.buildingMu.Lock()
+	defer r.buildingMu.Unlock()
+	_, ok := r.building[origin]
+	return ok
+}
+
+// awaitOriginAllocations waits until each origin allocated so far is marked
+// building, if a capture builds it.
+func (r *distributedSourceRuntime) awaitOriginAllocations() {
+	if r == nil {
+		return
+	}
+	r.allocating.Lock()
+	r.allocating.Unlock()
 }
 
 func (r *distributedSourceRuntime) lockSnapshotOrigin(origin ttcsnapshot.SnapshotID) func() {
@@ -1882,10 +1935,11 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if b.snapshotGraph == nil || b.snapshotData == nil || b.snapshotShared == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, errors.New("distributed graph publication is unavailable")
 	}
-	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	origin, sealState, built, err := b.allocateGraphSnapshotOrigin()
 	if err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
+	defer built()
 	shared := false
 	manifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
 	manifestPath := filepath.Join(b.dataRoot, manifestRelative)

@@ -7928,10 +7928,11 @@ func (b *runtimeBackend) captureTransientBranch(runtimeID, branchID, stagingDir 
 	if len(capture.Memories) == 0 {
 		return boot.BranchDehydrateInfo{}, nil, errors.New("bootstrap capture contains no memory images")
 	}
-	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	origin, sealState, built, err := b.allocateGraphSnapshotOrigin()
 	if err != nil {
 		return boot.BranchDehydrateInfo{}, nil, fmt.Errorf("allocating bootstrap snapshot origin: %w", err)
 	}
+	defer built()
 	var roots []string
 	defer func() {
 		if retErr == nil {
@@ -13765,7 +13766,7 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 			unlockOrigin()
 			return len(abandoned), fmt.Errorf("inspecting memory origin %d: %w", snapshot.ID, err)
 		}
-		if len(objects) != 0 {
+		if len(objects) != 0 || b.distributedSource.buildingOrigin(snapshot.ID) {
 			unlockOrigin()
 			continue
 		}
@@ -13888,12 +13889,21 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 		}
 	}
 	sort.Slice(stale, func(i, j int) bool { return stale[i] < stale[j] })
+	if len(stale) != 0 {
+		// An origin a capture allocated before the inventory, and has yet
+		// to adopt, is building by the time this returns.
+		b.distributedSource.awaitOriginAllocations()
+	}
 	for _, encoded := range stale {
 		origin := ttcsnapshot.SnapshotID(encoded)
 		unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
 		// The inventory above is only a candidate list. A concurrent publisher or
 		// branch mutation may have made the origin live before this origin fence
 		// was acquired, so repeat both data-plane and authority observations.
+		if b.distributedSource.buildingOrigin(origin) {
+			unlockOrigin()
+			continue
+		}
 		if b.snapshotGraph != nil {
 			if _, ok := b.snapshotGraph.Snapshot(origin); ok {
 				unlockOrigin()
@@ -14224,34 +14234,42 @@ func (b *runtimeBackend) deleteRuntimeIfProcessFree(info ttcbundle.ContainerInfo
 
 // allocateGraphSnapshotOrigin keeps the core graph independent of its ID
 // allocator. Standalone roots allocate locally; clustered roots first commit
-// the globally unique origin and exact volatile provider through Raft.
-func (b *runtimeBackend) allocateGraphSnapshotOrigin() (ttcsnapshot.SnapshotID, ttcsnapshot.SnapshotState, error) {
+// the globally unique origin and exact volatile provider through Raft. The
+// origin is building, and cleanup of empty origins leaves it alone, until
+// the capture calls built, once it is over.
+func (b *runtimeBackend) allocateGraphSnapshotOrigin() (_ ttcsnapshot.SnapshotID, _ ttcsnapshot.SnapshotState, built func(), _ error) {
 	if b.snapshotGraph == nil {
-		return 0, "", errors.New("snapshot graph is unavailable")
+		return 0, "", nil, errors.New("snapshot graph is unavailable")
 	}
 	if b.distributedSource == nil || b.distributedSource.authority == nil {
 		origin, err := b.snapshotGraph.AllocateWorking()
-		return origin, ttcsnapshot.SnapshotSealedLocal, err
+		return origin, ttcsnapshot.SnapshotSealedLocal, func() {}, err
 	}
 	node := b.nodeID
 	if node == "" {
 		node = b.distributedSource.capabilities.NodeID
 	}
 	if node == "" || b.distributedSource.incarnation == "" {
-		return 0, "", errors.New("cluster snapshot allocation lacks node incarnation")
+		return 0, "", nil, errors.New("cluster snapshot allocation lacks node incarnation")
 	}
+	b.distributedSource.allocating.RLock()
 	allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, b.distributedSource.incarnation, 1)
-	if err != nil {
-		return 0, "", fmt.Errorf("allocating Raft snapshot origin: %w", err)
-	}
 	origin := ttcsnapshot.SnapshotID(allocation.First)
-	if allocation.Count != 1 || origin == 0 {
-		return 0, "", fmt.Errorf("raft returned invalid snapshot allocation %+v", allocation)
+	if err == nil && allocation.Count == 1 && origin != 0 {
+		built = b.distributedSource.buildOrigin(origin)
+	}
+	b.distributedSource.allocating.RUnlock()
+	if err != nil {
+		return 0, "", nil, fmt.Errorf("allocating Raft snapshot origin: %w", err)
+	}
+	if built == nil {
+		return 0, "", nil, fmt.Errorf("raft returned invalid snapshot allocation %+v", allocation)
 	}
 	if err := b.snapshotGraph.AdoptWorking(origin); err != nil {
-		return 0, "", fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
+		built()
+		return 0, "", nil, fmt.Errorf("adopting Raft snapshot origin %d: %w", origin, err)
 	}
-	return origin, ttcsnapshot.SnapshotSealedVolatile, nil
+	return origin, ttcsnapshot.SnapshotSealedVolatile, built, nil
 }
 
 // graphCaptureStream returns the two ends of a stream a Sentry writes a
@@ -14414,15 +14432,26 @@ func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot
 	}
 	incarnation := b.distributedSource.incarnation
 	var allocated []ttcsnapshot.SnapshotID
+	// The origins are building, as a capture's are, until the scope
+	// finishes: none is in a repository until the bundle installs it.
+	var built []func()
 	allocate := func(count uint32) ([]ttcsnapshot.SnapshotID, error) {
 		if node == "" || incarnation == "" {
 			return nil, errors.New("cluster filesystem snapshot allocation lacks node incarnation")
 		}
+		b.distributedSource.allocating.RLock()
 		allocation, err := b.distributedSource.authority.AllocateSnapshotOrigins(node, incarnation, count)
+		valid := err == nil && allocation.Count == count && allocation.First != 0
+		if valid {
+			for index := uint64(0); index < uint64(count); index++ {
+				built = append(built, b.distributedSource.buildOrigin(ttcsnapshot.SnapshotID(allocation.First+index)))
+			}
+		}
+		b.distributedSource.allocating.RUnlock()
 		if err != nil {
 			return nil, fmt.Errorf("allocating Raft filesystem origins: %w", err)
 		}
-		if allocation.Count != count || allocation.First == 0 {
+		if !valid {
 			return nil, fmt.Errorf("raft returned invalid filesystem snapshot allocation %+v", allocation)
 		}
 		origins := make([]ttcsnapshot.SnapshotID, count)
@@ -14433,6 +14462,12 @@ func (b *runtimeBackend) newFilesystemOriginScope() (func(uint32) ([]ttcsnapshot
 		return origins, nil
 	}
 	finish := func(committed bool) error {
+		defer func() {
+			for _, done := range built {
+				done()
+			}
+			built = nil
+		}()
 		if committed {
 			allocated = nil
 			return nil
@@ -15002,10 +15037,11 @@ func (b *runtimeBackend) persistDehydration(target selector, info ttcbundle.Cont
 			_ = metadataFile.Close()
 		}
 	}()
-	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	origin, sealState, built, err := b.allocateGraphSnapshotOrigin()
 	if err != nil {
 		return fmt.Errorf("allocating dehydration snapshot origin: %w", err)
 	}
+	defer built()
 	graphMemorySnapshot = uint64(origin)
 	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
 	reader, writer, err := graphCaptureStream()

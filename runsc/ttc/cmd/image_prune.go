@@ -92,10 +92,11 @@ func (b *runtimeBackend) pruneRetainedImage(containerID string, branch ttcbundle
 	if !dropped {
 		return nil
 	}
-	origin, sealState, err := b.allocateGraphSnapshotOrigin()
+	origin, sealState, built, err := b.allocateGraphSnapshotOrigin()
 	if err != nil {
 		return err
 	}
+	defer built()
 	// Each root keeps its name within the origin's; a root left with
 	// nothing goes.
 	prefix := fmt.Sprintf("memory/%016x", uint64(origin))
