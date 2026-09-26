@@ -290,11 +290,19 @@ func Pull(ctx context.Context, opts PullOptions) (Info, error) {
 	if err != nil {
 		return Info{}, err
 	}
-	resolverOptions := docker.ResolverOptions{}
+	client := newRegistryClient(registryStallTimeout)
+	authorizerOpts := []docker.AuthorizerOpt{docker.WithAuthClient(client)}
 	if configured {
-		resolverOptions.Credentials = credentials
+		authorizerOpts = append(authorizerOpts, docker.WithAuthCreds(credentials))
 	}
-	resolver := docker.NewResolver(resolverOptions)
+	// These are NewResolver's default hosts, but with client.
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(
+			docker.WithAuthorizer(docker.NewDockerAuthorizer(authorizerOpts...)),
+			docker.WithClient(client),
+			docker.WithPlainHTTP(docker.MatchLocalhost),
+		),
+	})
 	name, target, err := resolver.Resolve(ctx, reference)
 	if err != nil {
 		return Info{}, fmt.Errorf("resolving %q: %w", reference, err)

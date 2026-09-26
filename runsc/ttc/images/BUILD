@@ -12,6 +12,7 @@ go_library(
         "credentials.go",
         "rootfs.go",
         "native_store.go",
+        "registry_client.go",
     ],
     visibility = ["//runsc/ttc:__subpackages__"],
     deps = [
@@ -36,6 +37,7 @@ go_test(
     size = "small",
     srcs = [
         "images_test.go",
+        "registry_client_test.go",
         "rootfs_test.go",
         "xattr_test_darwin.go",
         "xattr_test_linux.go",
@@ -46,6 +48,7 @@ go_test(
         "@com_github_containerd_containerd_v2//core/content",
         "@com_github_containerd_containerd_v2//core/images",
         "@com_github_containerd_containerd_v2//core/images/archive",
+        "@com_github_containerd_containerd_v2//core/remotes/docker",
         "@com_github_containerd_platforms//:platforms",
         "@com_github_opencontainers_image_spec//specs-go/v1:specs-go",
         "@org_golang_x_sys//unix:go_default_library",
