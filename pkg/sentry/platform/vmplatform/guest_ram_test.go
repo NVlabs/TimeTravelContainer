@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -1112,5 +1113,107 @@ func TestGuestRAMLogicalLimit(t *testing.T) {
 	}
 	if _, err := backing.ResolveFrames(memmap.FileRange{Start: GuestFrameSize, End: 2 * GuestFrameSize}, hostarch.Write); err != nil {
 		t.Fatalf("allocation after reclaim: %v", err)
+	}
+}
+
+// checkPartialSlabIndex compares GuestRAM's partial-slab accounting with a
+// recount, and its choice of allocation slab with a full scan.
+func checkPartialSlabIndex(t *testing.T, ram *GuestRAM) {
+	t.Helper()
+	ram.mu.Lock()
+	defer ram.mu.Unlock()
+	var free uint64
+	var best *guestSlab
+	for _, slab := range ram.slabs {
+		occupancy := slabOccupancy(slab)
+		partial := !slab.releasing && occupancy < FramesPerSlab
+		if _, ok := ram.partialSlabs[slab.key]; ok != partial || slab.inPartial != partial {
+			t.Fatalf("slab %d partial membership = %t/%t, want %t", slab.key, ok, slab.inPartial, partial)
+		}
+		if !partial {
+			continue
+		}
+		if slab.partialOccupancy != occupancy {
+			t.Fatalf("slab %d recorded occupancy %d, want %d", slab.key, slab.partialOccupancy, occupancy)
+		}
+		free += FramesPerSlab - occupancy
+		if betterAllocationSlab(slab, best) {
+			best = slab
+		}
+	}
+	if ram.partialFree != free {
+		t.Fatalf("partialFree = %d, want %d", ram.partialFree, free)
+	}
+	ram.allocationSlab = nil
+	if got := ram.selectAllocationSlabLocked(); got != best {
+		t.Fatalf("selected slab %v, want %v", got, best)
+	}
+}
+
+// TestGuestRAMPartialSlabIndex checks the partial-slab accounting across
+// random allocation and decommit of individual frames.
+func TestGuestRAMPartialSlabIndex(t *testing.T) {
+	ram, backing, _, _, _ := newRAMTestBacking(t, 1<<30)
+	const frames = 256
+	rng := rand.New(rand.NewSource(1))
+	resident := make(map[uint64]bool)
+	for i := 0; i < 4000; i++ {
+		offset := uint64(rng.Intn(frames)) * GuestFrameSize
+		fr := memmap.FileRange{Start: offset, End: offset + GuestFrameSize}
+		if resident[offset] {
+			if err := backing.Decommit(fr); err != nil {
+				t.Fatal(err)
+			}
+			delete(resident, offset)
+		} else {
+			if _, err := backing.ResolveFrames(fr, hostarch.Write); err != nil {
+				t.Fatal(err)
+			}
+			resident[offset] = true
+		}
+		if i%50 == 0 {
+			checkPartialSlabIndex(t, ram)
+		}
+	}
+	checkPartialSlabIndex(t, ram)
+}
+
+// BenchmarkGuestRAMFragmentedAllocation allocates frames when most slabs are
+// partially used, as after memory churn. Selecting a slab used to scan every
+// partial slab under GuestRAM.mu.
+func BenchmarkGuestRAMFragmentedAllocation(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		ram, err := NewGuestRAM(GuestRAMConfig{VM: &ramTestVM{}, Host: newRAMTestHost(), Revoker: &ramTestRevoker{}, IPAStart: 0x100000, IPASize: 1 << 34})
+		if err != nil {
+			b.Fatal(err)
+		}
+		backing, err := ram.NewBacking()
+		if err != nil {
+			b.Fatal(err)
+		}
+		const slabs = 8192
+		if _, err := backing.Grow(0, pgalloc.BackingChunkSize, false); err != nil {
+			b.Fatal(err)
+		}
+		// Keep one frame of every slab resident.
+		for offset := uint64(0); offset < slabs*HostSlabSize; offset += GuestFrameSize {
+			if _, err := backing.ResolveFrames(memmap.FileRange{Start: offset, End: offset + GuestFrameSize}, hostarch.Write); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for offset := uint64(0); offset < slabs*HostSlabSize; offset += GuestFrameSize {
+			if offset%HostSlabSize != 0 {
+				if err := backing.Decommit(memmap.FileRange{Start: offset, End: offset + GuestFrameSize}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		b.StartTimer()
+		for offset := uint64(slabs * HostSlabSize); offset < 2*slabs*HostSlabSize; offset += GuestFrameSize {
+			if _, err := backing.ResolveFrames(memmap.FileRange{Start: offset, End: offset + GuestFrameSize}, hostarch.Write); err != nil {
+				b.Fatal(err)
+			}
+		}
 	}
 }

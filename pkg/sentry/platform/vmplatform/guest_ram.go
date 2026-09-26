@@ -15,6 +15,7 @@
 package vmplatform
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"sort"
@@ -102,6 +103,27 @@ type guestSlab struct {
 	gpa         uint64
 	releasing   bool
 	frames      [FramesPerSlab]*guestFrame
+
+	// inPartial and partialOccupancy record the slab's membership in
+	// GuestRAM.partialSlabs and the occupancy that GuestRAM.partialFree and
+	// GuestRAM.partialByOccupancy account for. They are protected by
+	// GuestRAM.mu.
+	inPartial        bool
+	partialOccupancy uint64
+}
+
+// slabKeyHeap is a min-heap of slab keys.
+type slabKeyHeap []slabKey
+
+func (h slabKeyHeap) Len() int           { return len(h) }
+func (h slabKeyHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h slabKeyHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *slabKeyHeap) Push(x any)        { *h = append(*h, x.(slabKey)) }
+func (h *slabKeyHeap) Pop() any {
+	old := *h
+	key := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return key
 }
 
 type guestBacking struct {
@@ -149,6 +171,16 @@ type GuestRAM struct {
 	// free 4K frame. Full page-cache slabs are deliberately absent so that
 	// choosing an allocation target does not become O(total resident memory).
 	partialSlabs map[slabKey]*guestSlab
+	// partialFree counts the free frames in partialSlabs, so sizing an
+	// allocation does not scan them.
+	partialFree uint64
+	// partialByOccupancy indexes partialSlabs by occupancy, each as a min-heap
+	// of slab keys, so choosing the densest slab does not scan them either.
+	// Memory churn leaves many partial slabs, and both scans ran under mu on
+	// every allocation. Entries are invalidated lazily; partialIndexEntries
+	// counts them to bound the stale ones.
+	partialByOccupancy  [FramesPerSlab]slabKeyHeap
+	partialIndexEntries int
 	// allocationSlab caches the densest non-full slab. Allocation increases
 	// its occupancy, so it remains optimal until full. Decommit updates or
 	// invalidates it while holding mu. This avoids scanning every live slab for
@@ -472,8 +504,9 @@ func (r *GuestRAM) considerAllocationSlabLocked(candidate *guestSlab) {
 	if candidate == nil {
 		return
 	}
-	if candidate.releasing || slabOccupancy(candidate) >= FramesPerSlab {
-		delete(r.partialSlabs, candidate.key)
+	occupancy := slabOccupancy(candidate)
+	if candidate.releasing || occupancy >= FramesPerSlab {
+		r.removePartialSlabLocked(candidate)
 		if r.allocationSlab == candidate {
 			r.allocationSlab = nil
 		}
@@ -482,33 +515,89 @@ func (r *GuestRAM) considerAllocationSlabLocked(candidate *guestSlab) {
 	if r.partialSlabs == nil {
 		r.partialSlabs = make(map[slabKey]*guestSlab)
 	}
-	r.partialSlabs[candidate.key] = candidate
+	if !candidate.inPartial {
+		r.partialSlabs[candidate.key] = candidate
+		candidate.inPartial = true
+		candidate.partialOccupancy = occupancy
+		r.partialFree += FramesPerSlab - occupancy
+		r.indexPartialSlabLocked(candidate)
+	} else if candidate.partialOccupancy != occupancy {
+		r.partialFree += FramesPerSlab - occupancy
+		r.partialFree -= FramesPerSlab - candidate.partialOccupancy
+		candidate.partialOccupancy = occupancy
+		r.indexPartialSlabLocked(candidate)
+	}
 	if betterAllocationSlab(candidate, r.allocationSlab) {
 		r.allocationSlab = candidate
 	}
 }
 
+// removePartialSlabLocked removes slab from partialSlabs and its accounting.
+func (r *GuestRAM) removePartialSlabLocked(slab *guestSlab) {
+	if !slab.inPartial {
+		return
+	}
+	delete(r.partialSlabs, slab.key)
+	r.partialFree -= FramesPerSlab - slab.partialOccupancy
+	slab.inPartial = false
+}
+
+// resetPartialSlabsLocked empties partialSlabs and its accounting; callers
+// then consider every live slab again.
+func (r *GuestRAM) resetPartialSlabsLocked() {
+	for _, slab := range r.partialSlabs {
+		slab.inPartial = false
+	}
+	r.partialSlabs = make(map[slabKey]*guestSlab)
+	r.partialFree = 0
+	r.partialByOccupancy = [FramesPerSlab]slabKeyHeap{}
+	r.partialIndexEntries = 0
+}
+
+// indexPartialSlabLocked records slab under its current partial occupancy.
+// Entries under its previous occupancy become stale.
+func (r *GuestRAM) indexPartialSlabLocked(slab *guestSlab) {
+	heap.Push(&r.partialByOccupancy[slab.partialOccupancy], slab.key)
+	r.partialIndexEntries++
+	if r.partialIndexEntries > 4*len(r.partialSlabs)+64 {
+		for occupancy := range r.partialByOccupancy {
+			r.partialByOccupancy[occupancy] = r.partialByOccupancy[occupancy][:0]
+		}
+		for _, partial := range r.partialSlabs {
+			h := &r.partialByOccupancy[partial.partialOccupancy]
+			*h = append(*h, partial.key)
+		}
+		for occupancy := range r.partialByOccupancy {
+			heap.Init(&r.partialByOccupancy[occupancy])
+		}
+		r.partialIndexEntries = len(r.partialSlabs)
+	}
+}
+
+// selectAllocationSlabLocked returns the densest partial slab, preferring
+// the lowest key among equally dense slabs, as betterAllocationSlab does.
 func (r *GuestRAM) selectAllocationSlabLocked() *guestSlab {
 	if r.allocationSlab != nil && !r.allocationSlab.releasing && slabOccupancy(r.allocationSlab) < FramesPerSlab {
 		return r.allocationSlab
 	}
 	r.allocationSlab = nil
-	for _, candidate := range r.partialSlabs {
-		r.considerAllocationSlabLocked(candidate)
+	for occupancy := FramesPerSlab; occupancy > 0; occupancy-- {
+		h := &r.partialByOccupancy[occupancy-1]
+		for h.Len() != 0 {
+			slab := r.partialSlabs[(*h)[0]]
+			if slab != nil && slab.inPartial && !slab.releasing && slab.partialOccupancy == occupancy-1 {
+				r.allocationSlab = slab
+				return slab
+			}
+			heap.Pop(h)
+			r.partialIndexEntries--
+		}
 	}
-	return r.allocationSlab
+	return nil
 }
 
 func (r *GuestRAM) freeSlotsLocked(_ *guestBacking) uint64 {
-	var free uint64
-	for _, slab := range r.partialSlabs {
-		for _, frame := range slab.frames {
-			if frame == nil {
-				free++
-			}
-		}
-	}
-	return free
+	return r.partialFree
 }
 
 func (r *GuestRAM) allocateFrameLocked(backing *guestBacking, offset uint64) (*guestFrame, error) {
@@ -851,7 +940,7 @@ func (r *GuestRAM) releaseSlabs(releases []slabRelease) error {
 				return fmt.Errorf("releasing GuestRAM slab host reservation: %w", err)
 			}
 			delete(r.slabs, slab.key)
-			delete(r.partialSlabs, slab.key)
+			r.removePartialSlabLocked(slab)
 			if r.allocationSlab == slab {
 				r.allocationSlab = nil
 			}
@@ -1046,7 +1135,7 @@ func (r *GuestRAM) Compact(ctx context.Context) (GuestRAMCompaction, error) {
 		}
 	}
 	r.allocationSlab = nil
-	r.partialSlabs = make(map[slabKey]*guestSlab)
+	r.resetPartialSlabsLocked()
 	for _, slab := range r.slabs {
 		r.considerAllocationSlabLocked(slab)
 	}
@@ -1301,6 +1390,9 @@ func (b *guestBacking) Destroy() error {
 			slab.releasing = true
 			releases = append(releases, slabRelease{slab: slab})
 		}
+		// Frames freed here become available, and releasing slabs leave the
+		// partial set.
+		b.ram.considerAllocationSlabLocked(slab)
 	}
 	b.ram.cond.Broadcast()
 	b.ram.mu.Unlock()
