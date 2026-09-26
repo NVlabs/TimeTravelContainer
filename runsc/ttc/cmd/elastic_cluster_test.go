@@ -2200,3 +2200,27 @@ func TestBranchRemovalParts(t *testing.T) {
 		}
 	}
 }
+
+// Enforcing placements keeps the runtime of a branch its node is
+// materializing, as a rehydration does, and of one it runs; not of one
+// placed elsewhere, or with another incarnation, or unplaced.
+func TestPlacementKeepsRuntime(t *testing.T) {
+	for _, test := range []struct {
+		placement cluster.PlacementRecord
+		want      bool
+	}{
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementRunning}, true},
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementPaused}, true},
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementMigrating}, true},
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementMaterializing}, true},
+		{cluster.PlacementRecord{OwnerNode: "node-b", OwnerIncarnation: "inc-b", State: cluster.PlacementRunning}, false},
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-old", State: cluster.PlacementRunning}, false},
+		{cluster.PlacementRecord{State: cluster.PlacementUnplaced}, false},
+		{cluster.PlacementRecord{OwnerNode: "node-a", OwnerIncarnation: "inc-a", State: cluster.PlacementCorrupted}, false},
+	} {
+		placement := test.placement
+		if got := placementKeepsRuntime(&placement, "node-a", "inc-a"); got != test.want {
+			t.Errorf("placementKeepsRuntime(%+v) = %t, want %t", placement, got, test.want)
+		}
+	}
+}

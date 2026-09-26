@@ -5986,6 +5986,20 @@ func fencedRuntimeAuthorized(family Family, nodeID, incarnation string, lookup f
 	return true
 }
 
+// placementKeepsRuntime reports whether placement lets the node incarnation
+// keep a branch's runtime: one it runs, pauses or migrates away, or is
+// materializing, as a rehydration does, and will run once it has.
+func placementKeepsRuntime(placement *cluster.PlacementRecord, nodeID, incarnation string) bool {
+	if placement == nil || placement.OwnerNode != nodeID || placement.OwnerIncarnation != incarnation {
+		return false
+	}
+	switch placement.State {
+	case cluster.PlacementRunning, cluster.PlacementPaused, cluster.PlacementMigrating, cluster.PlacementMaterializing:
+		return true
+	}
+	return false
+}
+
 // enforceLocalRaftPlacements projects committed branch authority into the
 // running Sentry. Node leases are renewed only after this succeeds. Therefore
 // a branch revoked since the preceding lease grant can run only through that
@@ -6019,8 +6033,7 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		infoLoaded := false
 		for _, branch := range family.Branches {
 			placement, lookupErr := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
-			if lookupErr == nil && placement.OwnerNode == nodeID && placement.OwnerIncarnation == incarnation &&
-				(placement.State == cluster.PlacementRunning || placement.State == cluster.PlacementPaused || placement.State == cluster.PlacementMigrating) {
+			if lookupErr == nil && placementKeepsRuntime(placement, nodeID, incarnation) {
 				continue
 			}
 			// Migration transfers guest execution authority before the target has
