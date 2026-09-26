@@ -24,6 +24,19 @@
 #define TTC_MONITOR_CODE_VA 0xffff000000000000
 #endif
 #define TTC_MONITOR_CODE_CAPACITY 0x00010000
+
+// Guest EL1&0 translation and system control, used for both monitor and
+// application execution. TCR_EL1: 48-bit TTBR0/TTBR1, 4K granules,
+// inner-shareable WBWA walks, 40-bit IPA, 16-bit ASIDs, and TBI0, since Linux
+// ignores the top byte of EL0 addresses. SCTLR_EL1 matches Linux's EL0 view:
+// M, C, I, SA0 (EL0 stack alignment checks), ITD, SED, DZE (EL0 DC ZVA), UCT,
+// UCI, TSCXT, SPAN, nTLSMD, and LSMAOE. Unlike Linux it leaves nTWE clear, so
+// EL0 WFE traps to the monitor, which completes it, rather than to HVF.
+#define TTC_GUEST_TCR_EL1 \
+	(16ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) | (16ULL << 16) | \
+	 (1ULL << 24) | (1ULL << 26) | (3ULL << 28) | (2ULL << 30) | \
+	 (2ULL << 32) | (1ULL << 36) | (1ULL << 37))
+#define TTC_GUEST_SCTLR_EL1 0x3490d195ULL
 #define TTC_MONITOR_VERSION 1
 #define TTC_MONITOR_PAGE_SIZE UINT64_C(4096)
 #define TTC_MONITOR_HOST_SLAB_SIZE UINT64_C(16384)

@@ -84,7 +84,9 @@ func (Architecture) DecodeExit(exit vmplatform.Exit) (*linux.SignalInfo, hostarc
 	switch exit.Reason {
 	case vmplatform.ExitFault:
 		info := &linux.SignalInfo{Signo: int32(linux.SIGSEGV), Code: segvCode(exit.Syndrome)}
-		info.SetAddr(exit.Address)
+		// EL0 addresses ignore their top byte, which FAR may include. Like
+		// Linux, report the untagged address.
+		info.SetAddr(uint64(hostarch.UntaggedUserAddr(hostarch.Addr(exit.Address))))
 		access := hostarch.AccessType{
 			Read:    exit.Access&vmm.Stage2Read != 0,
 			Write:   exit.Access&vmm.Stage2Write != 0,

@@ -1684,11 +1684,8 @@ static int ttc_ring0_load_context(struct ttc_ring0_bridge *bridge,
 	// restoring TTBR0 leaves a later application entry running with a zero TCR,
 	// TTBR1, or VBAR. These calls occur once per host residency, never on the
 	// guest-resident Linux syscall path.
-	uint64_t tcr = 16ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) |
-		(16ULL << 16) | (1ULL << 24) | (1ULL << 26) | (3ULL << 28) |
-		(2ULL << 30) | (2ULL << 32) | (1ULL << 36);
 	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TCR_EL1,
-			tcr)) != HV_SUCCESS) return status;
+			TTC_GUEST_TCR_EL1)) != HV_SUCCESS) return status;
 	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_MAIR_EL1,
 			UINT64_C(0xff))) != HV_SUCCESS) return status;
 	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_TTBR1_EL1,
@@ -1702,7 +1699,7 @@ static int ttc_ring0_load_context(struct ttc_ring0_bridge *bridge,
 	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_CNTKCTL_EL1,
 			UINT64_C(2))) != HV_SUCCESS) return status;
 	if ((status = hv_vcpu_set_sys_reg(bridge->vcpu, HV_SYS_REG_SCTLR_EL1,
-			UINT64_C(0x34909185))) != HV_SUCCESS) return status;
+			TTC_GUEST_SCTLR_EL1)) != HV_SUCCESS) return status;
 	for (int i = 0; i < 29; ++i) {
 		*phase_out = TTC_RING0_PHASE_LOAD_X0 + (uint32_t)i;
 		status = hv_vcpu_set_reg(bridge->vcpu, (hv_reg_t)(HV_REG_X0 + i),

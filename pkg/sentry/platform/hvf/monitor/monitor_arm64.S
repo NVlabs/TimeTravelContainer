@@ -461,6 +461,26 @@ _ttc_monitor_fast_time_return:
 _ttc_monitor_el0_sync_handler:
   sub sp, sp, #32
   stp x16, x17, [sp, #0]
+  // WFI and WFE (EC 0x01) only hint that the thread has nothing to do, and
+  // may complete at any time. Complete them here, as Linux completes a
+  // trapped WFI, rather than exiting to the Sentry; SCTLR_EL1.nTWE is clear
+  // so that EL0 WFE traps here rather than to HVF.
+  mrs x16, esr_el1
+  lsr x17, x16, #26
+  cmp x17, #0x01
+  b.ne Lttc_monitor_el0_sync_not_wfx
+  mrs x16, elr_el1
+  add x16, x16, #4
+  msr elr_el1, x16
+  // Like Linux after emulating an instruction, clear SPSR.SS so that a
+  // pending single step completes on return.
+  mrs x16, spsr_el1
+  bic x16, x16, #(1 << 21)
+  msr spsr_el1, x16
+  ldp x16, x17, [sp, #0]
+  add sp, sp, #32
+  eret
+Lttc_monitor_el0_sync_not_wfx:
   stp x18, x19, [sp, #16]
   mrs x16, tpidr_el1
   add x16, x16, #2, lsl #12

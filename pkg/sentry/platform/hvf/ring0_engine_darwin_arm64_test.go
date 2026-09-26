@@ -2110,3 +2110,99 @@ func TestInterruptApplicationStopsOnlyTargetRun(t *testing.T) {
 		t.Fatal("second application was not interrupted")
 	}
 }
+
+// TestApplicationEL0MatchesLinux checks EL0 behaviour that Linux applications
+// rely on: WFE and WFI complete, DC ZVA is permitted, and the top byte of
+// addresses is ignored.
+func TestApplicationEL0MatchesLinux(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		t.Skipf("Hypervisor.framework unavailable: %v", err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(2 * vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, 2*vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, 2*vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, 2*vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(2*vmm.HostSlabSize))
+	code := []uint32{
+		0xd503205f, // wfe
+		0xd503207f, // wfi
+		0xd53b00e0, // mrs x0, dczid_el0
+		0xd50b7421, // dc zva, x1
+		0x39400062, // ldrb w2, [x3]
+		0xd2801588, // movz x8, #172
+		0xd4000001, // svc #0
+	}
+	for i, instruction := range code {
+		binary.LittleEndian.PutUint32(memory[4*i:], instruction)
+	}
+	data := memory[vmm.HostSlabSize:]
+	for i := range data[:vmm.LogicalPageSize] {
+		data[i] = 0xaa
+	}
+	data[200] = 0x5a
+
+	const (
+		spaceID = uint64(95)
+		codeVA  = uint64(0xb00000)
+		dataVA  = uint64(0xc00000)
+	)
+	runRing0InternalMonitor(t, engine, monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID})
+	runRing0InternalMonitor(t, engine, monitorabi.Command{
+		Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID,
+		Operations: []monitorabi.Operation{{
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+			VA: codeVA, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+		}, {
+			Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessWrite,
+			VA: dataVA, GPA: GuestRAMIPAStart + vmm.HostSlabSize, Length: vmm.LogicalPageSize,
+		}},
+	})
+	registers := &vmm.ARM64State{PC: codeVA}
+	registers.X[1] = dataVA + 64
+	registers.X[3] = (dataVA + 200) | 0x2a<<56
+	exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+		AddressSpaceID: spaceID,
+		Registers:      registers,
+	})
+	if err != nil || exit.Reason != vmm.ExitSyscall || registers.PC != codeVA+uint64(4*len(code)) {
+		t.Fatalf("application exit=%+v pc=%#x err=%v, want a syscall after every instruction", exit, registers.PC, err)
+	}
+	if dzp := registers.X[0] >> 4 & 1; dzp != 0 {
+		t.Errorf("DCZID_EL0 = %#x, want DZP clear", registers.X[0])
+	}
+	block := 4 << (registers.X[0] & 0xf)
+	for i := 64; i < 64+block; i++ {
+		if data[i] != 0 {
+			t.Fatalf("DC ZVA left byte %d = %#x, want 0", i-64, data[i])
+		}
+	}
+	if data[63] != 0xaa || data[64+block] != 0xaa {
+		t.Errorf("DC ZVA zeroed bytes outside its %d-byte block", block)
+	}
+	if got := registers.X[2]; got != 0x5a {
+		t.Errorf("load through a tagged address = %#x, want 0x5a", got)
+	}
+}

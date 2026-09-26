@@ -87,12 +87,7 @@ static hv_return_t ttc_monitor_enable_mmu(hv_vcpu_t vcpu, uint64_t ttbr1,
 					   uint64_t vector_va,
 					   uint64_t state_va) {
 	hv_return_t ret;
-	// 48-bit TTBR0/TTBR1, 4K granules, inner-shareable WBWA, 40-bit IPA,
-	// and 16-bit ASIDs.
-	uint64_t tcr = 16ULL | (1ULL << 8) | (1ULL << 10) | (3ULL << 12) |
-		(16ULL << 16) | (1ULL << 24) | (1ULL << 26) | (3ULL << 28) |
-		(2ULL << 30) | (2ULL << 32) | (1ULL << 36);
-	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tcr)) != HV_SUCCESS) return ret;
+	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TTC_GUEST_TCR_EL1)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xff)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, ttbr1)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, 0)) != HV_SUCCESS) return ret;
@@ -107,7 +102,7 @@ static hv_return_t ttc_monitor_enable_mmu(hv_vcpu_t vcpu, uint64_t ttbr1,
 	// cannot enter the software-step state machine.
 	if ((ret = hv_vcpu_set_trap_debug_exceptions(vcpu, false)) != HV_SUCCESS) return ret;
 	if ((ret = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MDSCR_EL1, 0)) != HV_SUCCESS) return ret;
-	return hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x34909185);
+	return hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, TTC_GUEST_SCTLR_EL1);
 }
 
 static hv_return_t ttc_monitor_set_entry(hv_vcpu_t vcpu, uint64_t pc,
