@@ -405,6 +405,11 @@ func TestCompareAndSwapBranchNodeIDClaimsUnplacedBranch(t *testing.T) {
 	if err := store.CompareAndSwapBranchNodeID("example", "cold", "", "node-c"); err == nil {
 		t.Fatal("stale unplaced owner changed claimed branch")
 	}
+	// A claim that finds its change already made, as an activation makes
+	// it, succeeds.
+	if err := store.CompareAndSwapBranchNodeID("example", "cold", "", "node-b"); err != nil {
+		t.Fatalf("claiming a branch already recorded as the claimant's: %v", err)
+	}
 }
 
 func TestReconcileNodeRuntimeUnavailable(t *testing.T) {

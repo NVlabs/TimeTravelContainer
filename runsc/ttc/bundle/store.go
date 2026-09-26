@@ -4834,6 +4834,11 @@ func (s Store) CompareAndSwapBranchNodeID(name, branchID, expected, replacement 
 			if info.Branches[i].Unplaced {
 				owner = ""
 			}
+			// Another writer made the same change: an activation, say,
+			// records the owner Raft gave the branch.
+			if owner == replacement {
+				return false, nil
+			}
 			if owner != expected {
 				return false, fmt.Errorf("branch %s@%s cluster owner changed from %q to %q", info.Name, branchID, expected, owner)
 			}
