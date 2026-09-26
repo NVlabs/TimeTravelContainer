@@ -140,13 +140,13 @@ func TestStagingSharesFrameAndWritesBackOnLastUnmap(t *testing.T) {
 	}
 	staged[0] = 0x7a
 
-	if err := cache.removeMapping(firstPages[0]); err != nil {
+	if err := cache.removeMapping(firstPages[0], false); err != nil {
 		t.Fatal(err)
 	}
 	if file.data[0] != 0x11 {
 		t.Fatalf("writeback occurred before last mapping: got %#x", file.data[0])
 	}
-	if err := cache.removeMapping(secondPages[0]); err != nil {
+	if err := cache.removeMapping(secondPages[0], true); err != nil {
 		t.Fatal(err)
 	}
 	if file.data[0] != 0x7a {
@@ -171,7 +171,7 @@ func TestStagingPreservesAndRetriesWritebackError(t *testing.T) {
 		t.Fatal(err)
 	}
 	unsafe.Slice((*byte)(unsafe.Pointer(frames[0].HostAddress)), int(hostarch.PageSize))[0] = 0x55
-	if err := cache.removeMapping(pages[0]); !errors.Is(err, wantErr) {
+	if err := cache.removeMapping(pages[0], true); !errors.Is(err, wantErr) {
 		t.Fatalf("removeMapping error = %v, want %v", err, wantErr)
 	}
 	file.writeErr = nil
@@ -198,7 +198,7 @@ func TestStagingReservationPreventsResolveUnmapRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.removeMapping(firstPages[0]); err != nil {
+	if err := cache.removeMapping(firstPages[0], false); err != nil {
 		t.Fatal(err)
 	}
 	if got := ram.Metrics().LogicalBytes; got != hostarch.PageSize {
@@ -207,7 +207,7 @@ func TestStagingReservationPreventsResolveUnmapRace(t *testing.T) {
 	if err := cache.commitMapping(secondPages[0]); err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.removeMapping(secondPages[0]); err != nil {
+	if err := cache.removeMapping(secondPages[0], false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -240,10 +240,68 @@ func TestStagingDecommitDoesNotHoldCacheMutex(t *testing.T) {
 	if err := cache.commitMapping(pages[0]); err != nil {
 		t.Fatal(err)
 	}
-	if err := cache.removeMapping(pages[0]); err != nil {
+	if err := cache.removeMapping(pages[0], false); err != nil {
 		t.Fatal(err)
 	}
 	if !probe.observed {
 		t.Fatal("staging page was not decommitted")
+	}
+}
+
+// TestStagingWriteAfterFlushReachesFile checks that a flush does not clean a
+// page that is still mapped writable. The guest keeps writing through its PTE
+// without faulting, so the last unmap must write those bytes back too.
+func TestStagingWriteAfterFlushReachesFile(t *testing.T) {
+	_, cache := newStagingTestCache(t)
+	file := &stagingTestFile{data: make([]byte, hostarch.PageSize)}
+	fr := memmap.FileRange{Start: 0, End: hostarch.PageSize}
+	frames, pages, err := cache.resolve(file, fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.commitMapping(pages[0]); err != nil {
+		t.Fatal(err)
+	}
+	staged := unsafe.Slice((*byte)(unsafe.Pointer(frames[0].HostAddress)), int(hostarch.PageSize))
+	staged[0] = 0x01
+	if err := cache.flushPages(pages); err != nil {
+		t.Fatal(err)
+	}
+	if file.data[0] != 0x01 {
+		t.Fatalf("flushed byte = %#x, want %#x", file.data[0], 0x01)
+	}
+	staged[0] = 0x02
+	if err := cache.removeMapping(pages[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if file.data[0] != 0x02 {
+		t.Fatalf("write after flush was lost: file byte = %#x, want %#x", file.data[0], 0x02)
+	}
+}
+
+// TestStagingReadOnlyRemapCleansAfterFlush checks that a mapping downgraded
+// to read-only no longer keeps its page dirty.
+func TestStagingReadOnlyRemapCleansAfterFlush(t *testing.T) {
+	_, cache := newStagingTestCache(t)
+	file := &stagingTestFile{data: make([]byte, hostarch.PageSize)}
+	fr := memmap.FileRange{Start: 0, End: hostarch.PageSize}
+	_, pages, err := cache.resolve(file, fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.commitMapping(pages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.setMappingWritable(pages[0], true, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.flushPages(pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages[0].dirty {
+		t.Fatal("page with only read-only mappings stayed dirty after writeback")
+	}
+	if err := cache.removeMapping(pages[0], false); err != nil {
+		t.Fatal(err)
 	}
 }

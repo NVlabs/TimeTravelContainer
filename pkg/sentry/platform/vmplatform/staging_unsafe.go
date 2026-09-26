@@ -61,8 +61,12 @@ type stagedPage struct {
 	// shared page and recording its reverse mapping.
 	reservations uint64
 	mappings     uint64
-	dirty        bool
-	releasing    bool
+	// writable counts the reservations and mappings that permit writes. A
+	// writeback cleans the page only when none remain: the guest can keep
+	// writing through a writable PTE without faulting.
+	writable  uint64
+	dirty     bool
+	releasing bool
 }
 
 func newStagingCache(ram *GuestRAM) (*stagingCache, error) {
@@ -143,6 +147,7 @@ func (s *stagingCache) resolve(file memmap.File, fr memmap.FileRange, at hostarc
 		}
 		if at.Write {
 			page.dirty = true
+			page.writable++
 		}
 		page.reservations++
 		frames = append(frames, resolved[0])
@@ -189,13 +194,14 @@ func (s *stagingCache) commitMapping(page *stagedPage) error {
 	return nil
 }
 
-// cancelReservations abandons unresolved MapFile results. Pages with neither
+// cancelReservations abandons unresolved MapFile results, which resolve
+// returned with writable access if writable is set. Pages with neither
 // mappings nor other reservations are reclaimed just like a last unmap.
-func (s *stagingCache) cancelReservations(pages []*stagedPage) error {
+func (s *stagingCache) cancelReservations(pages []*stagedPage, writable bool) error {
 	var retErr error
 	for _, page := range pages {
 		if page != nil {
-			retErr = errors.Join(retErr, s.dropReference(page, true))
+			retErr = errors.Join(retErr, s.dropReference(page, true, writable))
 		}
 	}
 	return retErr
@@ -203,18 +209,39 @@ func (s *stagingCache) cancelReservations(pages []*stagedPage) error {
 
 // removeMapping writes a dirty page back before releasing its last mapping.
 // The entry is then discarded so a later translation observes invalidation or
-// truncation performed by the backing file.
-func (s *stagingCache) removeMapping(page *stagedPage) error {
+// truncation performed by the backing file. writable reports whether the
+// mapping permitted writes.
+func (s *stagingCache) removeMapping(page *stagedPage, writable bool) error {
 	if page == nil {
 		return nil
 	}
-	return s.dropReference(page, false)
+	return s.dropReference(page, false, writable)
+}
+
+// setMappingWritable records that an installed mapping of page changed
+// whether it permits writes.
+func (s *stagingCache) setMappingWritable(page *stagedPage, was, now bool) error {
+	if page == nil || was == now {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now {
+		page.writable++
+		page.dirty = true
+		return nil
+	}
+	if page.writable == 0 {
+		return fmt.Errorf("VM staging writable mapping underflow for %T offset %#x", page.file, page.key.offset)
+	}
+	page.writable--
+	return nil
 }
 
 // dropReference drops either a provisional reservation or an installed
 // mapping. The page remains discoverable but marked releasing while decommit
 // runs, so a concurrent resolve cannot reuse its frame or backing offset.
-func (s *stagingCache) dropReference(page *stagedPage, reservation bool) error {
+func (s *stagingCache) dropReference(page *stagedPage, reservation, writable bool) error {
 	s.mu.Lock()
 	for page.releasing {
 		s.cond.Wait()
@@ -235,6 +262,13 @@ func (s *stagingCache) dropReference(page *stagedPage, reservation bool) error {
 			return fmt.Errorf("VM staging mapping underflow for %T offset %#x", page.file, page.key.offset)
 		}
 		page.mappings--
+	}
+	if writable {
+		if page.writable == 0 {
+			s.mu.Unlock()
+			return fmt.Errorf("VM staging writable reference underflow for %T offset %#x", page.file, page.key.offset)
+		}
+		page.writable--
 	}
 	if page.mappings != 0 || page.reservations != 0 {
 		s.mu.Unlock()
@@ -327,7 +361,9 @@ func (s *stagingCache) flushPageLocked(page *stagedPage) error {
 	if err := copyFrameToFile(resolved[0], page.file, page.key.offset); err != nil {
 		return fmt.Errorf("writing back %T offset %#x: %w", page.file, page.key.offset, err)
 	}
-	page.dirty = false
+	// Writes through a remaining writable mapping do not fault, so the page
+	// stays dirty until the last one goes away.
+	page.dirty = page.writable != 0
 	return nil
 }
 
