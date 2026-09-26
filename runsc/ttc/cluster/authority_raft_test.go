@@ -19,8 +19,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +33,8 @@ func TestAuthorityAppliedObjectLookups(t *testing.T) {
 	fsm.state.Transactions["fork-1"] = Transaction{Identity: ForkIdentity{TransactionID: "fork-1"}, Revision: 7}
 	fsm.state.Nodes["node-a"] = NodeRecord{NodeID: "node-a", Incarnation: "inc-a", State: NodeReady}
 	fsm.mu.Unlock()
-	node := &AuthorityRaftNode{fsm: fsm}
+	node := &AuthorityRaftNode{}
+	node.current.Store(&authorityEngine{fsm: fsm})
 
 	tx, ok := node.AppliedTransaction("fork-1")
 	if !ok || tx.Revision != 7 {
@@ -73,28 +74,43 @@ func TestAuthorityPlainStreamToken(t *testing.T) {
 	}
 	_ = listener.Close()
 
+	// A connection without the token, or from another epoch's group, is
+	// closed, and the next one accepted.
 	listener, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	server = &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(listener.Addr().String()), authToken: "secret"}
-	client = &authorityStreamLayer{authToken: "wrong"}
-	accepted = make(chan error, 1)
+	epoch := func(e uint64) func() uint64 { return func() uint64 { return e } }
+	server = &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(listener.Addr().String()), authToken: "secret", epoch: epoch(2)}
+	acceptedConn := make(chan net.Conn, 1)
 	go func() {
 		conn, err := server.Accept()
-		if conn != nil {
-			_ = conn.Close()
+		if err != nil {
+			t.Error(err)
 		}
-		accepted <- err
+		acceptedConn <- conn
 	}()
-	conn, err = client.Dial(raft.ServerAddress(listener.Addr().String()), time.Second)
+	for _, bad := range []*authorityStreamLayer{{authToken: "wrong", epoch: epoch(2)}, {authToken: "secret", epoch: epoch(1)}} {
+		conn, err := bad.Dial(raft.ServerAddress(listener.Addr().String()), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("a refused connection read %v, want it closed", err)
+		}
+		_ = conn.Close()
+	}
+	good, err := (&authorityStreamLayer{authToken: "secret", epoch: epoch(2)}).Dial(raft.ServerAddress(listener.Addr().String()), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = conn.Close()
-	if err := <-accepted; err == nil || !strings.Contains(err.Error(), "authentication token") {
-		t.Fatalf("accepting wrong token error=%v", err)
+	defer good.Close()
+	if conn := <-acceptedConn; conn == nil {
+		t.Fatal("the good connection was not accepted")
+	} else {
+		_ = conn.Close()
 	}
 }
 
@@ -508,7 +524,7 @@ func TestAuthorityRaftRemovedMemberCanRejoinWithoutProcessRestart(t *testing.T) 
 	if err := leader.ReconcileVoters(ctx, 3); err != nil {
 		t.Fatalf("removing fenced node-b: %v", err)
 	}
-	if b.raft.State() == raft.Shutdown {
+	if b.engine().raft.State() == raft.Shutdown {
 		t.Fatal("removed TTC member shut down before it could be re-admitted")
 	}
 	if err := leader.AddNonvoter(ctx, b.id, b.Address()); err != nil {
@@ -581,7 +597,7 @@ func TestAuthorityRaftThreeNodeReplicationAndFailover(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		state, err := c.fsm.copyState()
+		state, err := c.engine().fsm.copyState()
 		if err != nil {
 			t.Fatal(err)
 		}

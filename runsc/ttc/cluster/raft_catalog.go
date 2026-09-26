@@ -91,9 +91,24 @@ func (c *RaftCatalog) propose(ctx context.Context, requestID string, kind Author
 		if encodeErr != nil {
 			return AuthorityResult{}, encodeErr
 		}
-		result, err = peer.ProposeAuthority(ctx, AuthorityProposal{RequestID: requestID, Kind: kind, Payload: encoded})
+		attempt, cancel := forwardAttempt(ctx, deadline)
+		result, err = peer.ProposeAuthority(attempt, AuthorityProposal{RequestID: requestID, Kind: kind, Payload: encoded})
+		cancel()
 	}
 	return result, err
+}
+
+// forwardAttemptTimeout bounds one request forwarded to the authority's
+// holder: a holder that stalled accepts connections but answers none, and the
+// next attempt asks whichever node holds the authority then. A proposal's
+// request ID makes its retry safe.
+const forwardAttemptTimeout = 5 * time.Second
+
+func forwardAttempt(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if attempt := time.Now().Add(forwardAttemptTimeout); attempt.Before(deadline) {
+		deadline = attempt
+	}
+	return context.WithDeadline(ctx, deadline)
 }
 
 func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, error) {
@@ -129,7 +144,9 @@ func (c *RaftCatalog) linearizableState(ctx context.Context) (*AuthorityState, e
 			state, err = c.node.LinearizableState(ctx)
 			continue
 		}
-		state, err = peer.AuthorityState(ctx)
+		attempt, cancel := forwardAttempt(ctx, deadline)
+		state, err = peer.AuthorityState(attempt)
+		cancel()
 	}
 	if err == nil {
 		normalizeAuthorityLeaseClock(state, time.Now().UTC())

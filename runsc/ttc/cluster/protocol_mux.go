@@ -61,8 +61,10 @@ func (l *protocolListener) Addr() net.Addr { return l.parent.listener.Addr() }
 // plaintext TCP listener. Raft connections start with raftWireMagic; all other
 // connections are passed to net/http with their sniffed bytes replayed.
 type ProtocolMux struct {
-	listener  net.Listener
-	http      *protocolListener
+	listener net.Listener
+	http     *protocolListener
+	// raftMu guards raft, which RenewRaftListener replaces.
+	raftMu    sync.Mutex
 	raft      *protocolListener
 	done      chan struct{}
 	closeOnce sync.Once
@@ -88,7 +90,21 @@ func NewProtocolMux(listener net.Listener) (*ProtocolMux, error) {
 func (m *ProtocolMux) HTTPListener() net.Listener { return m.http }
 
 // RaftListener returns the listener consumed by Hashicorp Raft.
-func (m *ProtocolMux) RaftListener() net.Listener { return m.raft }
+func (m *ProtocolMux) RaftListener() net.Listener {
+	m.raftMu.Lock()
+	defer m.raftMu.Unlock()
+	return m.raft
+}
+
+// RenewRaftListener closes the listener consumed by Hashicorp Raft, if its
+// Raft engine has not, and returns a new one for the engine that replaces it.
+func (m *ProtocolMux) RenewRaftListener() net.Listener {
+	m.raftMu.Lock()
+	defer m.raftMu.Unlock()
+	_ = m.raft.Close()
+	m.raft = &protocolListener{parent: m, conns: make(chan net.Conn), done: make(chan struct{})}
+	return m.raft
+}
 
 // Addr returns the shared physical listening address.
 func (m *ProtocolMux) Addr() net.Addr { return m.listener.Addr() }
@@ -115,7 +131,7 @@ func (m *ProtocolMux) classify(conn net.Conn) {
 	wrapped := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(prefix[:]), conn)}
 	destination := m.http
 	if string(prefix[:]) == raftWireMagic {
-		destination = m.raft
+		destination = m.RaftListener().(*protocolListener)
 	}
 	select {
 	case destination.conns <- wrapped:
@@ -132,7 +148,7 @@ func (m *ProtocolMux) Close() error {
 	m.closeOnce.Do(func() {
 		close(m.done)
 		_ = m.http.Close()
-		_ = m.raft.Close()
+		_ = m.RaftListener().Close()
 		err = m.listener.Close()
 	})
 	return err

@@ -1890,7 +1890,6 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		"--cluster-ack-interval", "250us",
 		"--cluster-prefetch", "adaptive",
 		"--cluster-push", "eager-drain",
-		"--cluster-peer", "node-b=10.0.0.2:7443",
 	}
 	opts := defaultDaemonClusterOptions()
 	for len(args) != 0 {
@@ -1910,11 +1909,10 @@ func TestConsumeDaemonClusterOptions(t *testing.T) {
 		opts.PagingPolicy.MaxOutstandingBytes != 8<<20 || opts.PagingPolicy.MaxConcurrency != 8 ||
 		opts.PagingPolicy.AckBatchPages != 128 || opts.PagingPolicy.AckInterval != 250*time.Microsecond ||
 		opts.PagingPolicy.Prefetch != ttcpolicy.PrefetchAdaptive || !opts.PagingPolicy.Adaptive ||
-		opts.PagingPolicy.Push != ttcpolicy.PushEagerDrain ||
-		!reflect.DeepEqual(opts.Peers, []string{"node-b=10.0.0.2:7443"}) {
+		opts.PagingPolicy.Push != ttcpolicy.PushEagerDrain {
 		t.Fatalf("cluster options=%+v", opts)
 	}
-	if node, url, name, err := parseClusterPeer(opts.Peers[0]); err != nil || node != "node-b" || url != "http://10.0.0.2:7443" || name != "" {
+	if node, url, name, err := parseClusterPeer("node-b=10.0.0.2:7443"); err != nil || node != "node-b" || url != "http://10.0.0.2:7443" || name != "" {
 		t.Fatalf("parseClusterPeer=(%q, %q, %q, %v)", node, url, name, err)
 	}
 }
@@ -1940,9 +1938,10 @@ func TestClusterRaftStabilityTimeout(t *testing.T) {
 	}
 }
 
+// Every node of a cluster starts alike: its shared root anchors the cluster.
 func TestSimpleClusterOptions(t *testing.T) {
 	opts := defaultDaemonClusterOptions()
-	args := []string{"--cluster-init", "--node", "node-a", "--listen", "127.0.0.1:7443", "--advertise", "node-a.example:7443", "--memory-target", "8GiB"}
+	args := []string{"--node", "node-a", "--listen", "127.0.0.1:7443", "--advertise", "node-a.example:7443", "--memory-target", "8GiB"}
 	for len(args) != 0 {
 		consumed, err := consumeDaemonClusterOption(args, &opts)
 		if err != nil || consumed == 0 {
@@ -1954,41 +1953,22 @@ func TestSimpleClusterOptions(t *testing.T) {
 	if err := resolveSimpleClusterOptions(&opts, roots); err != nil {
 		t.Fatal(err)
 	}
-	if !opts.RaftBootstrap || opts.NodeID != "node-a" || opts.MemoryTarget != 8<<30 || opts.Listen != "127.0.0.1:7443" || opts.Advertise != "node-a.example:7443" || opts.RepositoryID == "" {
+	if !opts.Configured || opts.NodeID != "node-a" || opts.MemoryTarget != 8<<30 || opts.Listen != "127.0.0.1:7443" || opts.Advertise != "node-a.example:7443" || opts.RepositoryID == "" || !opts.RepositoryGenerated {
 		t.Fatalf("simple cluster options=%+v", opts)
 	}
-
-	conflict := defaultDaemonClusterOptions()
-	conflict.RaftBootstrap = true
-	conflict.Peers = []string{"seed=node-a.example:7443"}
-	if err := resolveSimpleClusterOptions(&conflict, roots); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("bootstrap/join conflict error=%v", err)
+	// A node finds the repository of a shared root that has one.
+	if err := prepareDaemonStorageRoot(roots.shared, daemonRootRoleClusterShared, "repo-found", ""); err != nil {
+		t.Fatal(err)
 	}
-
-	join := defaultDaemonClusterOptions()
-	if consumed, err := consumeDaemonClusterOption([]string{"--cluster-join=node-a.example:7443"}, &join); err != nil || consumed != 1 {
-		t.Fatalf("consuming equals-form join: consumed=%d err=%v", consumed, err)
+	found := defaultDaemonClusterOptions()
+	found.Configured, found.NodeID = true, "node-b"
+	if err := resolveSimpleClusterOptions(&found, roots); err != nil || found.RepositoryID != "repo-found" || found.RepositoryGenerated {
+		t.Fatalf("options=%+v, %v, want repo-found", found, err)
 	}
-	if !reflect.DeepEqual(join.Peers, []string{"seed=node-a.example:7443"}) {
-		t.Fatalf("equals-form join peers=%q", join.Peers)
-	}
-	// --cluster-join is repeatable, and each seed becomes its own peer.
-	for _, args := range [][]string{{"--cluster-join", "node-b.example:7443"}, {"--cluster-join=node-c.example:7443"}} {
-		if consumed, err := consumeDaemonClusterOption(args, &join); err != nil || consumed != len(args) {
-			t.Fatalf("consuming %q: consumed=%d err=%v", args, consumed, err)
+	for _, gone := range [][]string{{"--cluster-init"}, {"--cluster-join", "node-a.example:7443"}, {"--cluster-join=node-a.example:7443"}, {"--cluster-peer", "node-b=10.0.0.2:7443"}} {
+		if _, err := consumeDaemonClusterOption(gone, &found); err == nil || !strings.Contains(err.Error(), "is gone") {
+			t.Fatalf("consuming %q: %v, want it gone", gone, err)
 		}
-	}
-	want := []string{"seed=node-a.example:7443", "seed-2=node-b.example:7443", "seed-3=node-c.example:7443"}
-	if !reflect.DeepEqual(join.Peers, want) {
-		t.Fatalf("repeated join peers=%q, want %q", join.Peers, want)
-	}
-	seen := make(map[string]bool)
-	for _, peer := range join.Peers {
-		nodeID, _, _, err := parseClusterPeer(peer)
-		if err != nil || seen[nodeID] {
-			t.Fatalf("seed peer %q: name %q, err %v, already seen %t", peer, nodeID, err, seen[nodeID])
-		}
-		seen[nodeID] = true
 	}
 }
 
@@ -2035,7 +2015,7 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 	}
 	roots := daemonRoots{shared: shared, local: shared}
 	opts := defaultDaemonClusterOptions()
-	args := []string{"--control-only", "--cluster-join", "compute-a.example:7443", "--node", "login-gateway"}
+	args := []string{"--control-only", "--node", "login-gateway"}
 	for len(args) != 0 {
 		consumed, err := consumeDaemonClusterOption(args, &opts)
 		if err != nil || consumed == 0 {
@@ -2055,7 +2035,6 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 		edit func(*daemonClusterOptions)
 		want string
 	}{
-		{name: "bootstrap", edit: func(o *daemonClusterOptions) { o.RaftBootstrap = true }, want: "cluster-init"},
 		{name: "listen", edit: func(o *daemonClusterOptions) { o.Listen = "0.0.0.0:7443" }, want: "outbound-only"},
 		{name: "advertise", edit: func(o *daemonClusterOptions) { o.Advertise = "login.example:7443" }, want: "outbound-only"},
 		{name: "capacity", edit: func(o *daemonClusterOptions) { o.MemoryTarget = 1 << 30 }, want: "capacity"},
@@ -2070,12 +2049,6 @@ func TestControlOnlyClusterOptions(t *testing.T) {
 				t.Fatalf("resolve error=%v, want substring %q", err, test.want)
 			}
 		})
-	}
-
-	missingSeed := defaultDaemonClusterOptions()
-	missingSeed.ControlOnly, missingSeed.Configured = true, true
-	if err := resolveSimpleClusterOptions(&missingSeed, roots); err == nil || !strings.Contains(err.Error(), "cluster-join") {
-		t.Fatalf("missing seed error=%v", err)
 	}
 }
 
@@ -2348,21 +2321,22 @@ func TestImmutableClusterConfigCreatedAndAdopted(t *testing.T) {
 	bootstrap.MaxTransactions = 41
 	bootstrap.AutoRebalance = true
 	bootstrap.ResolvedCPU = daemonCPUProfile{Version: daemonCPUProfileVersion, Mode: "portable", Features: []string{"sse", "sse2"}}
-	if pending, err := applyImmutableClusterConfig(root, true, false, &bootstrap); err != nil || pending != nil {
+	if pending, err := applyImmutableClusterConfig(root, &bootstrap); err != nil || pending != nil {
 		t.Fatal(err)
 	}
+	// A later daemon adopts it, and asks the authority for the policy it
+	// asks for, if it differs.
 	join := defaultDaemonClusterOptions()
-	if pending, err := applyImmutableClusterConfig(root, false, false, &join); err != nil || pending != nil {
-		t.Fatal(err)
+	pending, err := applyImmutableClusterConfig(root, &join)
+	if err != nil || pending == nil {
+		t.Fatalf("policy change=(%+v, %v), want a pending change", pending, err)
 	}
 	if join.PagingPolicy != bootstrap.PagingPolicy || join.LeaseDuration != bootstrap.LeaseDuration || join.MaxTransactions != bootstrap.MaxTransactions || join.AutoRebalance != bootstrap.AutoRebalance {
 		t.Fatalf("joining policy=%+v, want bootstrap policy=%+v", join, bootstrap)
 	}
-
-	mismatch := defaultDaemonClusterOptions()
-	pending, err := applyImmutableClusterConfig(root, true, true, &mismatch)
-	if err != nil || pending == nil {
-		t.Fatalf("bootstrap policy change=(%+v, %v), want pending change", pending, err)
+	same := bootstrap
+	if pending, err := applyImmutableClusterConfig(root, &same); err != nil || pending != nil {
+		t.Fatalf("same policy=(%+v, %v), want no change", pending, err)
 	}
 }
 
@@ -2427,13 +2401,6 @@ func TestExplicitCPUProfileXsaveABI(t *testing.T) {
 	}
 }
 
-func TestImmutableClusterConfigRequiresBootstrap(t *testing.T) {
-	opts := defaultDaemonClusterOptions()
-	if _, err := applyImmutableClusterConfig(t.TempDir(), false, false, &opts); err == nil || !strings.Contains(err.Error(), "fresh first node") {
-		t.Fatalf("missing config error=%v", err)
-	}
-}
-
 func TestClusterPageAddressesRequireEphemeralPorts(t *testing.T) {
 	for _, address := range []string{"127.0.0.1:0", "[::1]:0", "node-a.example:0"} {
 		if err := requireEphemeralClusterPagePort("--cluster-page-listen", address); err != nil {
@@ -2445,29 +2412,36 @@ func TestClusterPageAddressesRequireEphemeralPorts(t *testing.T) {
 	}
 }
 
-func TestRaftClusterIdentityPreventsSecondBootstrap(t *testing.T) {
+// A cluster's first daemon records its identity, which every later one
+// shares; an older cluster's identity is kept.
+func TestRaftClusterIdentity(t *testing.T) {
 	shared := t.TempDir()
 	localA := filepath.Join(t.TempDir(), "raft")
-	clusterID, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a", true, false)
+	clusterID, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if clusterID == "" {
-		t.Fatal("bootstrap produced an empty cluster ID")
+		t.Fatal("the first daemon produced an empty cluster ID")
 	}
-	// Retrying startup with the same local root is safe even if Raft failed
-	// before creating its WAL.
-	if retry, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a", true, false); err != nil || retry != clusterID {
-		t.Fatalf("same-root bootstrap retry=(%q, %v), want %q", retry, err, clusterID)
+	if retry, err := prepareClusterRaftIdentity(shared, localA, "repository", "node-a"); err != nil || retry != clusterID {
+		t.Fatalf("same-root retry=(%q, %v), want %q", retry, err, clusterID)
 	}
-	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b", true, false); err == nil || !strings.Contains(err.Error(), "second Raft group") {
-		t.Fatalf("second bootstrap error=%v", err)
+	if joined, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b"); err != nil || joined != clusterID {
+		t.Fatalf("second node's identity=(%q, %v), want %q", joined, err, clusterID)
 	}
-	if joined, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "repository", "node-b", false, false); err != nil || joined != clusterID {
-		t.Fatalf("join identity=(%q, %v), want %q", joined, err, clusterID)
-	}
-	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "another-repository", "node-c", false, false); err == nil {
+	if _, err := prepareClusterRaftIdentity(shared, filepath.Join(t.TempDir(), "raft"), "another-repository", "node-c"); err == nil {
 		t.Fatal("mismatched repository joined Raft cluster")
+	}
+	if _, err := prepareClusterRaftIdentity(t.TempDir(), localA, "repository", "node-a"); err == nil || !strings.Contains(err.Error(), "another Raft cluster") {
+		t.Fatalf("a local root of another cluster: %v", err)
+	}
+	older := t.TempDir()
+	if err := os.WriteFile(filepath.Join(older, ".ttc-raft-cluster.json"), []byte(`{"version":1,"cluster_id":"older-cluster","repository_id":"repository"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := prepareClusterRaftIdentity(older, filepath.Join(t.TempDir(), "raft"), "repository", "node-a"); err != nil || kept != "older-cluster" {
+		t.Fatalf("older cluster's identity=(%q, %v), want older-cluster", kept, err)
 	}
 }
 

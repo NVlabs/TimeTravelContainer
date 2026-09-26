@@ -202,7 +202,7 @@ node-local scratch directory:
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
-ttc daemon start --cluster-init --node node-a \
+ttc daemon start --node node-a \
   --listen 0.0.0.0:7443 --advertise node-a.example:7443
 ```
 
@@ -396,28 +396,30 @@ trusted private network. Set the same `TTC_CLUSTER_TOKEN` on every node when a
 shared bearer secret is useful; omit it only when every process that can reach
 the cluster network is trusted as a cluster administrator.
 
-Cluster authority is one Raft group. Its WAL and snapshots live in each node's
-local root, never on the shared filesystem. Bootstrap node A with:
+The shared root anchors the cluster, and every node starts alike, in any
+order and at any time, as the jobs of a batch system do:
 
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_LOCAL_ROOT=/local/scratch/ttc-node-a
-export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # optional
-ttc daemon start --cluster-init --node node-a \
+export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # optional, the same on every node
+ttc daemon start --node node-a \
   --listen 0.0.0.0:7443 --advertise node-a.example:7443 \
   --memory-target 64GiB
 ```
 
-Start node B by naming any live seed:
-
-```shell
-export TTC_ROOT=/shared/ttc
-export TTC_LOCAL_ROOT=/local/scratch/ttc-node-b
-export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
-ttc daemon start --cluster-join node-a.example:7443 --node node-b \
-  --listen 0.0.0.0:7443 --advertise node-b.example:7443 \
-  --memory-target 64GiB
-```
+The cluster's authority is one node at a time, the only voter of a Raft group
+whose log is kept in the shared root; the other nodes hold replicas of its
+state. The first node to start takes the authority, and every later one joins
+the node that holds it, which the shared root names. Each daemon advances a
+counter in the shared root every second; when the authority's has stood still
+for 10 seconds, as when its node fails or its daemon stalls, another node takes
+the authority over, from the log in the shared root, and the others follow
+it. Branches keep running meanwhile. A node that starts with no local root,
+as a new batch job does, takes over a cluster whose nodes are all gone. A
+daemon that stops gives the authority up at once. The authority depends on the
+shared filesystem: while it cannot write there, it holds the authority for 7
+seconds at most, and then gives it up.
 
 A login node that should control the cluster but never execute containers can
 run an outbound-only gateway:
@@ -425,31 +427,29 @@ run an outbound-only gateway:
 ```shell
 export TTC_ROOT=/shared/ttc
 export TTC_CLUSTER_TOKEN='replace-with-a-cluster-secret' # same optional value
-ttc daemon start --control-only --cluster-join node-a.example:7443
+ttc daemon start --control-only
 ```
 
 This mode does not require `TTC_LOCAL_ROOT`. It opens only the per-user Unix
 socket selected by `TTC_SOCKET`; it does not open or advertise a TCP port,
 join Raft, create a cluster `NodeRecord`, provide page data, or accept branch
-placement. The login host therefore needs outbound connectivity to one compute
-seed, but compute nodes never initiate connections to it. Commands such as
-`run`, `exec`, `fork`, `migrate`, `ps`, and `node ls` are tunneled to the seed
-and then routed by the normal cluster placement authority. `ttc daemon stop`
-stops only the login-node gateway; use `ttc node stop` to retire a compute
-node. The shared `TTC_ROOT` marker is read to prevent accidentally controlling
-a different repository, but the gateway does not write container data there.
+placement. It finds the compute nodes in the shared root, so the login host
+needs outbound connectivity to them, but compute nodes never initiate
+connections to it. Commands such as `run`, `exec`, `fork`, `migrate`, `ps`,
+and `node ls` are tunneled to a compute node whose counter advances and then
+routed by the normal cluster placement authority. `ttc daemon stop` stops only
+the login-node gateway; use `ttc node stop` to retire a compute node. The
+shared `TTC_ROOT` marker is read to prevent accidentally controlling a
+different repository, but the gateway does not write container data there. A
+failed stream is never replayed ambiguously; the next command goes to another
+compute node.
 
-For seed redundancy, repeat `--cluster-join HOST:PORT`. TTC verifies at least
-one seed and exact build/repository compatibility before publishing its local
-Unix socket. A failed stream is never replayed ambiguously; the next command
-rotates to another configured seed.
-
-Only one seed is needed. Membership and leader discovery come from Raft after
-admission. HTTP control requests and Raft streams share the single TCP port
-named by `--listen` and `--advertise`; page-transfer listeners are ephemeral
-per operation. Cluster-wide paging, lease,
-transaction, and automatic-rebalance policy is created once by the bootstrap
-node and adopted by joiners. Node names, addresses, local memory targets, and
+HTTP control requests and Raft streams share the single TCP port named by
+`--listen` and `--advertise`; page-transfer listeners are ephemeral per
+operation. Cluster-wide paging, lease, transaction, and automatic-rebalance
+policy is created once, by the cluster's first node, and adopted by later ones;
+a node started with a different policy has the authority adopt it when it holds
+the authority. Node names, addresses, local memory targets, and
 capacity-provider hooks remain node-local settings.
 
 Node names default to their hostnames. Admission checks connectivity in both
@@ -458,12 +458,12 @@ Raft. Use `--advertise` when the hostname does not resolve to an address that
 the other nodes can reach. Firewalls must also allow the ephemeral page-data
 connections used during remote fork and migration.
 
-The first three admitted members are voting replicas; further elastic compute
-nodes remain non-voting replicas. Thus a large worker fleet does not enlarge
-the commit quorum. Membership, leases, placements, distributed transactions,
-publication generations, and durable root IDs are Raft state. Memory pages,
-filesystem extents, and immutable packs remain on the data plane and ordinary
-guest reads and writes perform no consensus operation.
+Only the authority votes, so a fleet of any size commits as fast as one node
+writes the shared filesystem, and the loss of any other node stops nothing.
+Membership, leases, placements, distributed transactions, publication
+generations, and durable root IDs are Raft state. Memory pages, filesystem
+extents, and immutable packs remain on the data plane and ordinary guest reads
+and writes perform no consensus operation.
 
 From node A, create one child on node B:
 

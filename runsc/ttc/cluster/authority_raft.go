@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -64,6 +65,15 @@ type AuthorityRaftOptions struct {
 	// churn while still leaving time to elect a replacement before workloads
 	// must self-fence.
 	StabilityTimeout time.Duration
+	// EpochDir, if set, runs this member as the authority of an epoch: the
+	// only voter, whose Raft state SharedCluster.PrepareEpoch made in
+	// EpochDir, in the shared root, and whose log store Holder fences. Its
+	// LocalDir is not used.
+	EpochDir string
+	Holder   func() error
+	// Epoch returns the authority epoch of the Raft group this member is
+	// in; see authorityStreamLayer.
+	Epoch func() uint64
 }
 
 // AuthorityNotLeaderError tells callers where to retry an authority request.
@@ -220,6 +230,18 @@ type authorityStreamLayer struct {
 	advertise authorityRaftAddress
 	clientTLS *tls.Config
 	authToken string
+	// epoch returns the authority epoch of this member's Raft group, which
+	// it sends on every connection it dials and requires of every one it
+	// accepts: a member of another epoch's group, as a holder that lost the
+	// authority and still campaigns, never reaches it.
+	epoch func() uint64
+}
+
+func (l *authorityStreamLayer) currentEpoch() uint64 {
+	if l.epoch == nil {
+		return 0
+	}
+	return l.epoch()
 }
 
 func (l *authorityStreamLayer) Addr() net.Addr { return l.advertise }
@@ -253,19 +275,34 @@ func (l *authorityStreamLayer) Dial(address raft.ServerAddress, timeout time.Dur
 		connection.Close()
 		return nil, err
 	}
-	return connection, nil
-}
-
-func (l *authorityStreamLayer) Accept() (net.Conn, error) {
-	connection, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if err := readRaftToken(connection, l.authToken); err != nil {
+	var epoch [8]byte
+	binary.BigEndian.PutUint64(epoch[:], l.currentEpoch())
+	if _, err := connection.Write(epoch[:]); err != nil {
 		connection.Close()
 		return nil, err
 	}
 	return connection, nil
+}
+
+// Accept returns the next connection whose peer presents the cluster's token
+// and this member's epoch, closing any other.
+func (l *authorityStreamLayer) Accept() (net.Conn, error) {
+	for {
+		connection, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		var epoch [8]byte
+		if err := readRaftToken(connection, l.authToken); err != nil {
+			connection.Close()
+			continue
+		}
+		if _, err := io.ReadFull(connection, epoch[:]); err != nil || binary.BigEndian.Uint64(epoch[:]) != l.currentEpoch() {
+			connection.Close()
+			continue
+		}
+		return connection, nil
+	}
 }
 
 func writeRaftToken(w io.Writer, token string) error {
@@ -310,24 +347,84 @@ func readRaftToken(r io.Reader, want string) error {
 	return nil
 }
 
-// AuthorityRaftNode owns the consensus engine and node-local durable log.
+// AuthorityRaftNode owns the consensus engine and its durable log: the
+// node-local log of a member that replicates the authority, or the shared log
+// of an epoch's authority. Reopen replaces its engine, as when a member takes
+// the authority, and every method uses the engine current when it is called.
 type AuthorityRaftNode struct {
 	id          string
-	raft        *raft.Raft
-	fsm         *AuthorityFSM
-	transport   *raft.NetworkTransport
-	store       *raftboltdb.BoltStore
-	listener    net.Listener
 	timeout     time.Duration
-	hadState    bool
+	current     atomic.Pointer[authorityEngine]
 	leaderMu    sync.RWMutex
 	leaderSince time.Time
 }
 
+// authorityEngine is one Raft engine of an AuthorityRaftNode.
+type authorityEngine struct {
+	raft      *raft.Raft
+	fsm       *AuthorityFSM
+	transport *raft.NetworkTransport
+	store     *raftboltdb.BoltStore
+	listener  net.Listener
+	hadState  bool
+}
+
+// engine returns the member's current engine, or an empty one if it has
+// none.
+func (n *AuthorityRaftNode) engine() *authorityEngine {
+	if engine := n.current.Load(); engine != nil {
+		return engine
+	}
+	return &authorityEngine{}
+}
+
 // OpenAuthorityRaftNode opens or creates one persistent Raft member.
 func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, error) {
+	engine, err := openAuthorityEngine(options)
+	if err != nil {
+		return nil, err
+	}
+	node := &AuthorityRaftNode{id: options.NodeID, timeout: options.ApplyTimeout}
+	if node.timeout == 0 {
+		node.timeout = defaultAuthorityApplyTimeout
+	}
+	node.current.Store(engine)
+	go node.observeLeadership(engine, engine.raft.LeaderCh())
+	return node, nil
+}
+
+// Reopen replaces this member's engine with one opened with options, whose
+// listener is a new one: the member of the same ID, holding an epoch's
+// authority or replicating it. The current engine is closed first.
+func (n *AuthorityRaftNode) Reopen(options AuthorityRaftOptions) error {
+	if options.NodeID != n.id {
+		return fmt.Errorf("reopening Raft member %q as %q", n.id, options.NodeID)
+	}
+	if err := n.engine().close(); err != nil {
+		return fmt.Errorf("closing the replaced Raft engine: %w", err)
+	}
+	engine, err := openAuthorityEngine(options)
+	if err != nil {
+		return err
+	}
+	n.leaderMu.Lock()
+	n.leaderSince = time.Time{}
+	n.leaderMu.Unlock()
+	n.current.Store(engine)
+	go n.observeLeadership(engine, engine.raft.LeaderCh())
+	return nil
+}
+
+func openAuthorityEngine(options AuthorityRaftOptions) (*authorityEngine, error) {
 	if !transactionIDPattern.MatchString(options.NodeID) {
 		return nil, fmt.Errorf("invalid Raft node ID %q", options.NodeID)
+	}
+	if options.EpochDir != "" {
+		if options.Holder == nil || options.Bootstrap {
+			return nil, errors.New("an epoch's authority is fenced by its holder, and its Raft state made before")
+		}
+		// The only voter waits for no other, and no other ever campaigns.
+		options.LocalDir, options.StabilityTimeout = options.EpochDir, 0
 	}
 	if options.LocalDir == "" || !filepath.IsAbs(options.LocalDir) {
 		return nil, errors.New("raft local directory must be an absolute node-local path")
@@ -372,7 +469,7 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 		listener = tls.NewListener(plainListener, options.ServerTLS.Clone())
 		clientTLS = options.ClientTLS.Clone()
 	}
-	stream := &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(advertise), clientTLS: clientTLS, authToken: options.AuthToken}
+	stream := &authorityStreamLayer{Listener: listener, advertise: authorityRaftAddress(advertise), clientTLS: clientTLS, authToken: options.AuthToken, epoch: options.Epoch}
 	transport := raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
 		Stream: stream, MaxPool: 4, MaxRPCsInFlight: 2, Timeout: 10 * time.Second,
 	})
@@ -396,15 +493,10 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 		plainListener.Close()
 		return nil, err
 	}
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(options.NodeID)
-	config.LogOutput = io.Discard
-	config.SnapshotThreshold = 8192
-	config.SnapshotInterval = 2 * time.Minute
-	if options.StabilityTimeout > 0 {
-		config.HeartbeatTimeout = options.StabilityTimeout
-		config.ElectionTimeout = options.StabilityTimeout
-		config.LeaderLeaseTimeout = options.StabilityTimeout
+	config := authorityRaftConfig(options.NodeID, options.StabilityTimeout)
+	var logs raft.LogStore = store
+	if options.EpochDir != "" {
+		logs = fencedLogStore{LogStore: store, held: options.Holder}
 	}
 	// A TTC node whose execution lease expires is removed from the live voter
 	// set, but the physical node is allowed to return later. Keep its Raft
@@ -417,47 +509,66 @@ func OpenAuthorityRaftNode(options AuthorityRaftOptions) (*AuthorityRaftNode, er
 	// host-level guardian remain the data-plane fence.
 	config.ShutdownOnRemove = false
 	fsm := NewAuthorityFSM()
-	engine, err := raft.NewRaft(config, fsm, store, store, snapshots, transport)
+	engine, err := raft.NewRaft(config, fsm, logs, store, snapshots, transport)
 	if err != nil {
 		store.Close()
 		transport.Close()
 		plainListener.Close()
 		return nil, fmt.Errorf("starting Raft: %w", err)
 	}
-	node := &AuthorityRaftNode{id: options.NodeID, raft: engine, fsm: fsm, transport: transport, store: store, listener: plainListener, timeout: options.ApplyTimeout, hadState: hasState}
-	go node.observeLeadership(engine.LeaderCh())
-	if node.timeout == 0 {
-		node.timeout = defaultAuthorityApplyTimeout
-	}
+	opened := &authorityEngine{raft: engine, fsm: fsm, transport: transport, store: store, listener: plainListener, hadState: hasState}
 	if options.Bootstrap {
 		if !hasState {
 			configuration := raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(options.NodeID), Address: raft.ServerAddress(advertise), Suffrage: raft.Voter}}}
 			if err := engine.BootstrapCluster(configuration).Error(); err != nil {
-				node.Close()
+				_ = opened.close()
 				return nil, fmt.Errorf("bootstrapping TTC Raft cluster: %w", err)
 			}
 		}
 	}
-	return node, nil
+	return opened, nil
+}
+
+// authorityRaftConfig returns the Raft configuration of the member nodeID.
+func authorityRaftConfig(nodeID string, stabilityTimeout time.Duration) *raft.Config {
+	config := raft.DefaultConfig()
+	config.LocalID = raft.ServerID(nodeID)
+	config.LogOutput = io.Discard
+	config.SnapshotThreshold = 8192
+	config.SnapshotInterval = 2 * time.Minute
+	if stabilityTimeout > 0 {
+		config.HeartbeatTimeout = stabilityTimeout
+		config.ElectionTimeout = stabilityTimeout
+		config.LeaderLeaseTimeout = stabilityTimeout
+	}
+	return config
 }
 
 // HadExistingState reports whether this member opened a prior WAL/snapshot.
-func (n *AuthorityRaftNode) HadExistingState() bool { return n != nil && n.hadState }
+func (n *AuthorityRaftNode) HadExistingState() bool { return n != nil && n.engine().hadState }
 
 // Address returns the identity-bearing advertised Raft address.
-func (n *AuthorityRaftNode) Address() string { return string(n.transport.LocalAddr()) }
+func (n *AuthorityRaftNode) Address() string { return string(n.engine().transport.LocalAddr()) }
 
 func (n *AuthorityRaftNode) IsLeader() bool {
-	return n != nil && n.raft != nil && n.raft.State() == raft.Leader
+	if n == nil {
+		return false
+	}
+	engine := n.engine()
+	return engine.raft != nil && engine.raft.State() == raft.Leader
 }
 
-func (n *AuthorityRaftNode) observeLeadership(ch <-chan bool) {
+// observeLeadership records when engine, while it is this member's, became
+// the leader.
+func (n *AuthorityRaftNode) observeLeadership(engine *authorityEngine, ch <-chan bool) {
 	for leader := range ch {
 		n.leaderMu.Lock()
-		if leader {
-			n.leaderSince = time.Now()
-		} else {
-			n.leaderSince = time.Time{}
+		if n.engine() == engine {
+			if leader {
+				n.leaderSince = time.Now()
+			} else {
+				n.leaderSince = time.Time{}
+			}
 		}
 		n.leaderMu.Unlock()
 	}
@@ -477,10 +588,10 @@ func (n *AuthorityRaftNode) LeadershipSafeFor(duration time.Duration) bool {
 }
 
 func (n *AuthorityRaftNode) currentTerm() (uint64, error) {
-	if n == nil || n.raft == nil {
+	if n == nil || n.engine().raft == nil {
 		return 0, errors.New("nil Raft authority")
 	}
-	term, err := strconv.ParseUint(n.raft.Stats()["term"], 10, 64)
+	term, err := strconv.ParseUint(n.engine().raft.Stats()["term"], 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("reading current Raft term: %w", err)
 	}
@@ -491,18 +602,18 @@ func (n *AuthorityRaftNode) currentTerm() (uint64, error) {
 }
 
 func (n *AuthorityRaftNode) Leader() string {
-	if n == nil || n.raft == nil {
+	if n == nil || n.engine().raft == nil {
 		return ""
 	}
-	return string(n.raft.Leader())
+	return string(n.engine().raft.Leader())
 }
 
 // LeaderID returns the Raft server identity associated with Leader.
 func (n *AuthorityRaftNode) LeaderID() string {
-	if n == nil || n.raft == nil {
+	if n == nil || n.engine().raft == nil {
 		return ""
 	}
-	_, id := n.raft.LeaderWithID()
+	_, id := n.engine().raft.LeaderWithID()
 	return string(id)
 }
 
@@ -510,10 +621,10 @@ func (n *AuthorityRaftNode) LeaderID() string {
 // read. It is suitable for diagnostics and locating the current leader, never
 // for an ownership decision.
 func (n *AuthorityRaftNode) AppliedState() (*AuthorityState, error) {
-	if n == nil || n.fsm == nil {
+	if n == nil || n.engine().fsm == nil {
 		return nil, errors.New("nil Raft authority")
 	}
-	state, err := n.fsm.copyState()
+	state, err := n.engine().fsm.copyState()
 	if err == nil {
 		state.LeaderObservedAt = time.Now().UTC()
 	}
@@ -524,19 +635,19 @@ func (n *AuthorityRaftNode) AppliedState() (*AuthorityState, error) {
 // is intentionally non-linearizable and is suitable for high-rate background
 // observation, not ownership or publication decisions.
 func (n *AuthorityRaftNode) AppliedTransaction(id string) (Transaction, bool) {
-	if n == nil || n.fsm == nil {
+	if n == nil || n.engine().fsm == nil {
 		return Transaction{}, false
 	}
-	return n.fsm.appliedTransaction(id)
+	return n.engine().fsm.appliedTransaction(id)
 }
 
 // AppliedNode returns one node from the local applied FSM. Like
 // AppliedTransaction, callers may use it for monitoring only.
 func (n *AuthorityRaftNode) AppliedNode(id string) (NodeRecord, bool) {
-	if n == nil || n.fsm == nil {
+	if n == nil || n.engine().fsm == nil {
 		return NodeRecord{}, false
 	}
-	return n.fsm.appliedNode(id)
+	return n.engine().fsm.appliedNode(id)
 }
 
 // Apply appends one already timestamped deterministic command. Remote callers
@@ -563,7 +674,7 @@ func (n *AuthorityRaftNode) Apply(ctx context.Context, command AuthorityCommand)
 	if timeout <= 0 {
 		return AuthorityResult{}, context.DeadlineExceeded
 	}
-	future := n.raft.Apply(data, timeout)
+	future := n.engine().raft.Apply(data, timeout)
 	if err := future.Error(); err != nil {
 		return AuthorityResult{}, err
 	}
@@ -642,14 +753,15 @@ func (n *AuthorityRaftNode) LinearizableState(ctx context.Context) (*AuthoritySt
 	if !n.IsLeader() {
 		return nil, &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
+	engine := n.engine()
 	timeout := n.contextTimeout(ctx)
-	if err := n.raft.VerifyLeader().Error(); err != nil {
+	if err := engine.raft.VerifyLeader().Error(); err != nil {
 		return nil, err
 	}
-	if err := n.raft.Barrier(timeout).Error(); err != nil {
+	if err := engine.raft.Barrier(timeout).Error(); err != nil {
 		return nil, err
 	}
-	return n.fsm.copyState()
+	return engine.fsm.copyState()
 }
 
 // AddNonvoter admits a learner. Promotion is separate so a lagging joiner
@@ -664,7 +776,7 @@ func (n *AuthorityRaftNode) AddNonvoter(ctx context.Context, id, address string)
 	if err := validateRaftServerAddress(address); err != nil {
 		return err
 	}
-	return n.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
+	return n.engine().raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
 }
 
 // CancelNonvoter removes an exact learner admission. It never removes a voter
@@ -694,7 +806,7 @@ func (n *AuthorityRaftNode) CancelNonvoter(ctx context.Context, id, address stri
 		if server.Suffrage != raft.Nonvoter {
 			return fmt.Errorf("raft member %q is already a voter", id)
 		}
-		return n.raft.RemoveServer(server.ID, 0, n.contextTimeout(ctx)).Error()
+		return n.engine().raft.RemoveServer(server.ID, 0, n.contextTimeout(ctx)).Error()
 	}
 	return nil
 }
@@ -704,7 +816,7 @@ func (n *AuthorityRaftNode) Promote(ctx context.Context, id, address string) err
 	if !n.IsLeader() {
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
-	return n.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
+	return n.engine().raft.AddVoter(raft.ServerID(id), raft.ServerAddress(address), 0, n.contextTimeout(ctx)).Error()
 }
 
 // ReconcileVoters removes authoritatively fenced voters and promotes admitted,
@@ -715,8 +827,9 @@ func (n *AuthorityRaftNode) ReconcileVoters(ctx context.Context, maxVoters int) 
 	if !n.IsLeader() {
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
+	// The authority of an epoch is its only voter: see SharedCluster.
 	if maxVoters <= 0 {
-		maxVoters = 3
+		maxVoters = 1
 	}
 	configuration, err := n.Configuration()
 	if err != nil {
@@ -803,7 +916,7 @@ func (n *AuthorityRaftNode) RemoveMember(ctx context.Context, id string) error {
 	if !n.IsLeader() {
 		return &AuthorityNotLeaderError{LeaderID: n.LeaderID(), Leader: n.Leader()}
 	}
-	return n.raft.RemoveServer(raft.ServerID(id), 0, n.contextTimeout(ctx)).Error()
+	return n.engine().raft.RemoveServer(raft.ServerID(id), 0, n.contextTimeout(ctx)).Error()
 }
 
 // RetireMember maintains a compact three-voter control plane when possible,
@@ -821,7 +934,7 @@ func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
 	// this also promotes an eligible learner before we choose a replacement
 	// leader below. ReconcileVoters uses RemoveMember, not RetireMember, so this
 	// cannot recurse.
-	if err := n.ReconcileVoters(ctx, 3); err != nil {
+	if err := n.ReconcileVoters(ctx, 1); err != nil {
 		return fmt.Errorf("reconciling Raft membership before retirement: %w", err)
 	}
 	configuration, err := n.Configuration()
@@ -869,7 +982,7 @@ func (n *AuthorityRaftNode) RetireMember(ctx context.Context, id string) error {
 			if string(voter.ID) == id {
 				continue
 			}
-			if err := n.raft.LeadershipTransferToServer(voter.ID, voter.Address).Error(); err != nil {
+			if err := n.engine().raft.LeadershipTransferToServer(voter.ID, voter.Address).Error(); err != nil {
 				return fmt.Errorf("transferring Raft leadership before retirement: %w", err)
 			}
 			// LeadershipTransferToServer waits for the handoff, but LeaderID's
@@ -887,29 +1000,33 @@ func (n *AuthorityRaftNode) Configuration() (raft.Configuration, error) {
 	if n == nil {
 		return raft.Configuration{}, errors.New("nil Raft authority")
 	}
-	future := n.raft.GetConfiguration()
+	future := n.engine().raft.GetConfiguration()
 	if err := future.Error(); err != nil {
 		return raft.Configuration{}, err
 	}
 	return future.Configuration(), nil
 }
 
-// Close stops consensus and closes node-local durable state.
+// Close stops consensus and closes its durable state.
 func (n *AuthorityRaftNode) Close() error {
 	if n == nil {
 		return nil
 	}
+	return n.engine().close()
+}
+
+func (e *authorityEngine) close() error {
 	var result error
-	if n.raft != nil {
-		result = errors.Join(result, n.raft.Shutdown().Error())
+	if e.raft != nil {
+		result = errors.Join(result, e.raft.Shutdown().Error())
 	}
-	if n.transport != nil {
-		result = errors.Join(result, n.transport.Close())
-	} else if n.listener != nil {
-		result = errors.Join(result, n.listener.Close())
+	if e.transport != nil {
+		result = errors.Join(result, e.transport.Close())
+	} else if e.listener != nil {
+		result = errors.Join(result, e.listener.Close())
 	}
-	if n.store != nil {
-		result = errors.Join(result, n.store.Close())
+	if e.store != nil {
+		result = errors.Join(result, e.store.Close())
 	}
 	return result
 }

@@ -283,8 +283,7 @@ Commands:
   completion SHELL                 Generate Bash, Zsh, or Fish completion
   daemon start [--platform systrap|kvm] [--cpu-profile portable|host|explicit]
                [--cpu-features FEATURE,...] [--unsafe-no-host-isolation]
-               [--cluster-init | --cluster-join HOST:PORT]
-               [--control-only --cluster-join HOST:PORT]
+               [--control-only]
                [--node NAME] [--listen ADDR] [--advertise HOST:PORT]
                [--memory-target SIZE]
                                   Start the per-user service in one fixed mode
@@ -308,15 +307,19 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
-			"daemon": `Usage: ttc daemon start [--cluster-init|--cluster-join HOST:PORT] [OPTIONS]
-       ttc daemon start --control-only --cluster-join HOST:PORT [--cluster-join HOST:PORT...]
+			"daemon": `Usage: ttc daemon start [OPTIONS]
+       ttc daemon start --control-only [OPTIONS]
        ttc daemon status
        ttc daemon stop [--migrate-all|--dehydrate-all|--stop-all]
 
+With --listen, --advertise, or --node, the daemon is a compute node of the
+cluster whose shared root TTC_ROOT is, with its own TTC_LOCAL_ROOT. Every node
+starts alike: it holds the cluster's authority, or joins the node that does.
+
 --control-only starts an outbound-only login-node gateway. It accepts commands
 on TTC_SOCKET but advertises no TCP endpoint, joins no Raft group, and accepts
-no container placement. TTC_ROOT must identify the cluster shared root;
-TTC_LOCAL_ROOT is not required.`,
+no container placement. It finds the cluster's compute nodes in TTC_ROOT, the
+cluster's shared root; TTC_LOCAL_ROOT is not required.`,
 			"events":       "Usage: ttc events [--json] [-f|--follow] [--since TIME] [--until TIME] [--filter KEY=VALUE]",
 			"pause":        "Usage: ttc pause TARGET [TARGET...]",
 			"rename":       "Usage: ttc rename CONTAINER@BRANCH NEW_BRANCH",

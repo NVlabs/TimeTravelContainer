@@ -6320,6 +6320,136 @@ func resumeFencedElasticRuntimes(backend *runtimeBackend, nodeID, incarnation st
 	return os.Remove(path)
 }
 
+// errClusterAuthorityChanged is why a node restarts that lost the cluster's
+// authority, or failed to take it.
+var errClusterAuthorityChanged = errors.New("the cluster authority changed hands")
+
+// watchClusterAuthority follows the cluster's authority for this daemon,
+// every heartbeat. The holder gives the authority up and restarts, to join
+// its successor, once it no longer holds it: its lease lapsed, or another node
+// took it. Another node rejoins the holder of each new epoch, and takes the
+// authority in place from a holder that ended, stalled or gave it up.
+func watchClusterAuthority(runtime *daemonClusterRuntime, restart func(error), stderr io.Writer, done <-chan struct{}) {
+	ticker := time.NewTicker(cluster.HeartbeatInterval)
+	defer ticker.Stop()
+	joined := runtime.currentAuthority()
+	holding := joined.Holds(runtime.self)
+	holder := cluster.AuthorityHolder{Cluster: runtime.shared, Heartbeat: runtime.heartbeat, Record: joined}
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		if holding {
+			if err := holder.Held(); err != nil {
+				releaseClusterAuthority(runtime)
+				restart(err)
+				return
+			}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), cluster.HeartbeatInterval)
+		decision, err := runtime.shared.DecideAuthority(ctx, runtime.self, false, runtime.liveness)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if decision.Hold {
+			if err := takeClusterAuthority(runtime, decision.Record); err != nil {
+				restart(fmt.Errorf("node %s ended, and this node took the authority of epoch %d: %w", joined.NodeID, decision.Record.Epoch, err))
+				return
+			}
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: node %s ended, and this node holds the cluster authority of epoch %d\n", joined.NodeID, decision.Record.Epoch)
+			}
+			holding = true
+			holder.Record = decision.Record
+			continue
+		}
+		if decision.Record.Epoch == joined.Epoch {
+			continue
+		}
+		// The new holder's Raft group, to which this node's member now
+		// answers.
+		runtime.raftEpoch.Store(decision.Record.Epoch)
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		err = runtime.recoverMembership(ctx)
+		cancel()
+		if err != nil {
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: joining the cluster authority of epoch %d, node %s: %v\n", decision.Record.Epoch, decision.Record.NodeID, err)
+			}
+			continue
+		}
+		joined = decision.Record
+	}
+}
+
+// takeClusterAuthority makes this daemon, a non-voter that claimed the
+// authority of record's epoch, its holder, in place: once its previous holder
+// can write its log no more, it makes the epoch's Raft state from the
+// previous epoch's, and runs its Raft member as the epoch's only voter.
+func takeClusterAuthority(runtime *daemonClusterRuntime, record cluster.AuthorityRecord) error {
+	shared := runtime.shared
+	if !shared.Prepared(record.Epoch) {
+		source := ""
+		if record.Previous != 0 {
+			previous, err := shared.ReadClaim(record.Previous)
+			if err != nil {
+				return err
+			}
+			if err := shared.AwaitRelease(context.Background(), previous, record.Epoch, runtime.liveness); err != nil {
+				return err
+			}
+			source = shared.RaftDir(record.Previous)
+		}
+		if err := shared.PrepareEpochFor(source, record.Epoch, runtime.self.NodeID, runtime.self.RaftAddress); err != nil {
+			return fmt.Errorf("making the Raft state of epoch %d: %w", record.Epoch, err)
+		}
+	}
+	holder := cluster.AuthorityHolder{Cluster: shared, Heartbeat: runtime.heartbeat, Record: record}
+	runtime.raftEpoch.Store(record.Epoch)
+	if err := runtime.raft.Reopen(cluster.AuthorityRaftOptions{
+		NodeID: runtime.self.NodeID, Listener: runtime.mux.RenewRaftListener(), AdvertiseHost: runtime.self.RaftAddress,
+		AuthToken: runtime.authToken, EpochDir: shared.RaftDir(record.Epoch), Holder: holder.Held,
+		Epoch: runtime.raftEpoch.Load,
+	}); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for !runtime.raft.IsLeader() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the authority of epoch %d, this node, was not elected its Raft leader", record.Epoch)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	runtime.setAuthority(record)
+	if err := runtime.heartbeat.Update(func(member *cluster.MemberRecord) { member.Authority = record.Epoch }, true); err != nil {
+		return err
+	}
+	_ = shared.PruneEpochs(record.Previous)
+	return nil
+}
+
+// releaseClusterAuthority records that this daemon gave up the authority it
+// held, so that another node takes it at once rather than after its lease
+// lapses.
+func releaseClusterAuthority(runtime *daemonClusterRuntime) {
+	if runtime == nil || runtime.heartbeat == nil {
+		return
+	}
+	authority := runtime.currentAuthority()
+	if !authority.Holds(runtime.self) {
+		return
+	}
+	epoch := authority.Epoch
+	_ = runtime.heartbeat.Update(func(record *cluster.MemberRecord) {
+		record.Authority = 0
+		record.Released = epoch
+	}, true)
+}
+
 // errLeaseSelfFenced is why a node that could not renew its execution lease
 // stopped its Sentries and its daemon. The daemon starts again at once, and
 // waits for the cluster to answer; see DaemonRestartExitCode.
@@ -6597,7 +6727,8 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 		// quorum and strand the existing cluster.
 		if node.IsLeader() {
 			ctx, cancel := context.WithTimeout(context.Background(), lease)
-			err := node.ReconcileVoters(ctx, 3)
+			// The authority is the only voter; see cluster.SharedCluster.
+			err := node.ReconcileVoters(ctx, 1)
 			cancel()
 			if err != nil && stderr != nil {
 				fmt.Fprintf(stderr, "ttcd: warning: reconciling Raft voters: %v\n", err)

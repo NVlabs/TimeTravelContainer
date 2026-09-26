@@ -462,13 +462,17 @@ type daemonClusterOptions struct {
 	MaxTransactions int
 	PageListen      string
 	PageAdvertise   string
-	Peers           []string
-	RaftBootstrap   bool
-	PagingPolicy    ttcpolicy.Policy
-	CPUProfileMode  string
-	CPUFeatures     string
-	CPUProfileSet   bool
-	ResolvedCPU     daemonCPUProfile
+	// Peers are a control-only daemon's first compute daemons, which it
+	// finds in the shared root unless they are given.
+	Peers []string
+	// RepositoryGenerated is set when this daemon made RepositoryID up for a
+	// shared root it found without one; another may have made it first.
+	RepositoryGenerated bool
+	PagingPolicy        ttcpolicy.Policy
+	CPUProfileMode      string
+	CPUFeatures         string
+	CPUProfileSet       bool
+	ResolvedCPU         daemonCPUProfile
 }
 
 func defaultDaemonClusterOptions() daemonClusterOptions {
@@ -495,10 +499,32 @@ type daemonClusterRuntime struct {
 	lease             time.Duration
 	clusterID         string
 	recoverMembership func(context.Context) error
-	cancelFreshJoin   func(context.Context) error
-	autoRebalance     bool
-	capacitySink      elasticCapacitySink
-	cpuProfile        daemonCPUProfile
+	// shared is the part of the cluster in the shared root; heartbeat keeps
+	// this daemon alive in it, liveness judges others', and authority names
+	// the authority this daemon holds, if it is self, or joined.
+	shared          cluster.SharedCluster
+	heartbeat       *cluster.Heartbeat
+	liveness        *cluster.Liveness
+	authorityMu     sync.Mutex
+	authority       cluster.AuthorityRecord
+	self            cluster.AuthorityRecord
+	raftEpoch       *atomic.Uint64
+	cancelFreshJoin func(context.Context) error
+	autoRebalance   bool
+	capacitySink    elasticCapacitySink
+	cpuProfile      daemonCPUProfile
+}
+
+func (r *daemonClusterRuntime) currentAuthority() cluster.AuthorityRecord {
+	r.authorityMu.Lock()
+	defer r.authorityMu.Unlock()
+	return r.authority
+}
+
+func (r *daemonClusterRuntime) setAuthority(record cluster.AuthorityRecord) {
+	r.authorityMu.Lock()
+	defer r.authorityMu.Unlock()
+	r.authority = record
 }
 
 // controlOnlyCluster is an outbound-only cluster gateway. It deliberately has
@@ -509,6 +535,10 @@ type controlOnlyCluster struct {
 	nodeID       string
 	repositoryID string
 	authToken    string
+	// sharedRoot is where the gateway finds compute nodes when it knows of
+	// none alive, and liveness judges from it which ones stalled.
+	sharedRoot string
+	liveness   cluster.Liveness
 
 	peersMu sync.RWMutex
 	peers   []controlOnlyPeer
@@ -525,6 +555,31 @@ func (c *controlOnlyCluster) peerSnapshot() []controlOnlyPeer {
 	c.peersMu.RLock()
 	defer c.peersMu.RUnlock()
 	return append([]controlOnlyPeer(nil), c.peers...)
+}
+
+// responsivePeers returns the peers whose daemons' counters in the shared
+// root advance: one stalled a while, as a stopped process is, still accepts
+// connections, but answers none. It returns every peer if none does.
+func (c *controlOnlyCluster) responsivePeers() []controlOnlyPeer {
+	peers := c.peerSnapshot()
+	if c.sharedRoot == "" {
+		return peers
+	}
+	members, err := cluster.NewSharedCluster(c.sharedRoot).ReadMembers()
+	if err != nil {
+		return peers
+	}
+	responsive := make([]controlOnlyPeer, 0, len(peers))
+	for _, peer := range peers {
+		if member, ok := members[peer.nodeID]; ok && c.liveness.StillFor(member) > 3*cluster.HeartbeatInterval {
+			continue
+		}
+		responsive = append(responsive, peer)
+	}
+	if len(responsive) == 0 {
+		return peers
+	}
+	return responsive
 }
 
 func (c *controlOnlyCluster) seedURLs() []string {
@@ -586,6 +641,17 @@ func (c *controlOnlyCluster) authorityState(ctx context.Context) (*cluster.Autho
 func (c *controlOnlyCluster) refreshPeers(ctx context.Context) error {
 	current := c.peerSnapshot()
 	state, err := c.authorityState(ctx)
+	if (err != nil || len(current) == 0) && c.sharedRoot != "" {
+		// Every compute node it knew is gone, or it knew none: find the
+		// others in the shared root.
+		if found, findErr := c.probePeers(sharedRootComputePeers(c.sharedRoot)); findErr == nil {
+			c.peersMu.Lock()
+			c.peers = found
+			c.peersMu.Unlock()
+			current = c.peerSnapshot()
+			state, err = c.authorityState(ctx)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -642,11 +708,60 @@ type controlOnlyPeerStatus struct {
 	} `json:"cluster"`
 }
 
+// sharedRootComputePeers returns, as peers to probe, the compute daemons the
+// shared root names: the cluster's authority first, then its compute members.
+func sharedRootComputePeers(sharedRoot string) []string {
+	shared := cluster.NewSharedCluster(sharedRoot)
+	var peers []string
+	add := func(nodeID, role, controlURL string) {
+		if role == cluster.RoleCompute && controlURL != "" {
+			peers = append(peers, nodeID+"="+strings.TrimPrefix(controlURL, "http://"))
+		}
+	}
+	if record, ok, err := shared.ReadAuthority(); err == nil && ok {
+		add(record.NodeID, record.Role, record.ControlURL)
+	}
+	members, _ := shared.ReadMembers()
+	ids := make([]string, 0, len(members))
+	for id := range members {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		add(id, members[id].Role, members[id].ControlURL)
+	}
+	return peers
+}
+
 func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*controlOnlyCluster, error) {
-	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: os.Getenv("TTC_CLUSTER_TOKEN")}
+	control := &controlOnlyCluster{nodeID: opts.NodeID, repositoryID: opts.RepositoryID, authToken: os.Getenv("TTC_CLUSTER_TOKEN"), sharedRoot: sharedRoot}
+	peers := opts.Peers
+	if len(peers) == 0 {
+		peers = sharedRootComputePeers(sharedRoot)
+	}
+	found, err := control.probePeers(peers)
+	if err != nil && len(opts.Peers) != 0 {
+		return nil, fmt.Errorf("no compute node of the cluster is reachable and compatible with %q: %w", sharedRoot, err)
+	}
+	// A gateway may start before any compute node does: it finds them in
+	// the shared root as they start.
+	control.peers = found
+	// Discovery is best-effort during startup: a compatible seed is sufficient
+	// to start, and the background refresher will retry a temporarily
+	// unavailable authority read.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_ = control.refreshPeers(ctx)
+	cancel()
+	return control, nil
+}
+
+// probePeers returns the peers, given as NODE=HOST:PORT, that answer and
+// serve this gateway's repository.
+func (c *controlOnlyCluster) probePeers(peers []string) ([]controlOnlyPeer, error) {
+	var found []controlOnlyPeer
 	seen := make(map[string]struct{})
 	var probeErrors error
-	for _, peerSpec := range opts.Peers {
+	for _, peerSpec := range peers {
 		_, baseURL, _, err := parseClusterPeer(peerSpec)
 		if err != nil {
 			return nil, err
@@ -655,7 +770,7 @@ func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*c
 			continue
 		}
 		seen[baseURL] = struct{}{}
-		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, control.authToken, 2*time.Minute)
+		client, err := cluster.NewPlainClient(baseURL, c.nodeID, c.authToken, 2*time.Minute)
 		if err != nil {
 			return nil, err
 		}
@@ -670,22 +785,19 @@ func prepareControlOnlyCluster(opts daemonClusterOptions, sharedRoot string) (*c
 			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: peer is not a clustered TTC daemon", baseURL))
 			continue
 		}
-		if status.Cluster.Capabilities.RepositoryID != opts.RepositoryID {
-			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: repository %q does not match TTC_ROOT repository %q", baseURL, status.Cluster.Capabilities.RepositoryID, opts.RepositoryID))
+		if status.Cluster.Capabilities.RepositoryID != c.repositoryID {
+			probeErrors = errors.Join(probeErrors, fmt.Errorf("%s: repository %q does not match TTC_ROOT repository %q", baseURL, status.Cluster.Capabilities.RepositoryID, c.repositoryID))
 			continue
 		}
-		control.peers = append(control.peers, controlOnlyPeer{nodeID: status.Cluster.Capabilities.NodeID, url: baseURL, client: client})
+		found = append(found, controlOnlyPeer{nodeID: status.Cluster.Capabilities.NodeID, url: baseURL, client: client})
 	}
-	if len(control.peers) == 0 {
-		return nil, fmt.Errorf("no control seed is reachable and compatible with %q: %w", sharedRoot, probeErrors)
+	if len(found) == 0 {
+		if probeErrors == nil {
+			probeErrors = errors.New("the shared root names none")
+		}
+		return nil, probeErrors
 	}
-	// Discovery is best-effort during startup: a compatible seed is sufficient
-	// to start, and the background refresher will retry a temporarily
-	// unavailable authority read.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = control.refreshPeers(ctx)
-	cancel()
-	return control, nil
+	return found, nil
 }
 
 func probeControlOnlyPeer(ctx context.Context, client *cluster.Client) (controlOnlyPeerStatus, error) {
@@ -3786,8 +3898,17 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := prepareDaemonStorageRoot(roots.shared, sharedRole, clusterOpts.RepositoryID, ""); err != nil {
-		fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
-		return 1
+		// Another daemon of a new cluster published its repository first.
+		marker, markerErr := readClusterSharedRootMarker(roots.shared, clusterSharedRootVisibilityTimeout)
+		if !clusterOpts.RepositoryGenerated || markerErr != nil || marker.RepositoryID == clusterOpts.RepositoryID {
+			fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
+			return 1
+		}
+		clusterOpts.RepositoryID, clusterOpts.RepositoryGenerated = marker.RepositoryID, false
+		if err := prepareDaemonStorageRoot(roots.shared, sharedRole, clusterOpts.RepositoryID, ""); err != nil {
+			fmt.Fprintf(stderr, "ttcd: preparing TTC_ROOT: %v\n", err)
+			return 1
+		}
 	}
 	var cpuProfile daemonCPUProfile
 	if !clusterOpts.Configured {
@@ -3846,6 +3967,10 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ttcd: restarting to wait for the cluster; this node's sandboxes stay stopped until it answers")
 			return DaemonRestartExitCode
 		}
+		if errors.Is(err, errClusterAuthorityChanged) {
+			fmt.Fprintln(stderr, "ttcd: restarting for the cluster's new authority; this node's sandboxes stay stopped until it answers")
+			return DaemonRestartExitCode
+		}
 		return 1
 	}
 	return 0
@@ -3866,12 +3991,6 @@ type daemonRoots struct {
 
 func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) error {
 	if opts.ControlOnly {
-		if opts.RaftBootstrap {
-			return errors.New("--control-only cannot be combined with --cluster-init")
-		}
-		if len(opts.Peers) == 0 {
-			return errors.New("--control-only requires at least one --cluster-join HOST:PORT")
-		}
 		if opts.Listen != "" || opts.Advertise != "" || opts.PageAdvertise != "" {
 			return errors.New("a control-only daemon is outbound-only; --listen, --advertise, and --cluster-page-advertise are not permitted")
 		}
@@ -3901,9 +4020,6 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		opts.PageListen = ""
 		return nil
 	}
-	if opts.RaftBootstrap && len(opts.Peers) != 0 {
-		return errors.New("--cluster-init and --cluster-join are mutually exclusive")
-	}
 	if opts.Listen == "" {
 		opts.Listen = "0.0.0.0:7443"
 	}
@@ -3926,24 +4042,20 @@ func resolveSimpleClusterOptions(opts *daemonClusterOptions, roots daemonRoots) 
 		}
 	}
 	if opts.RepositoryID == "" {
-		visibilityWait := clusterSharedRootVisibilityTimeout
-		if opts.RaftBootstrap {
-			// The first node owns initialization; a genuinely fresh root must not
-			// pay the joiner's NFS visibility grace period.
-			visibilityWait = 0
-		}
-		if marker, err := readClusterSharedRootMarker(roots.shared, visibilityWait); err == nil {
+		// A daemon that finds no repository in the shared root makes one up;
+		// if another daemon of a new cluster published its own first, this one
+		// adopts it as it prepares the shared root: see RunDaemon.
+		if marker, err := readClusterSharedRootMarker(roots.shared, 0); err == nil {
 			opts.RepositoryID = marker.RepositoryID
-		} else if opts.RaftBootstrap && errors.Is(err, os.ErrNotExist) {
+		} else if errors.Is(err, os.ErrNotExist) {
 			id, err := newDaemonRequestID()
 			if err != nil {
 				return err
 			}
 			opts.RepositoryID = "repo-" + strings.TrimPrefix(id, "req-")
-		} else if opts.RaftBootstrap {
-			return err
+			opts.RepositoryGenerated = true
 		} else {
-			return fmt.Errorf("joining a cluster requires an initialized shared TTC_ROOT: %w", err)
+			return err
 		}
 	}
 	_, port, err := net.SplitHostPort(opts.Listen)
@@ -4495,15 +4607,10 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 		opts.Configured = true
 		return 1, nil
 	}
-	if args[0] == "--cluster-raft-bootstrap" {
-		opts.RaftBootstrap = true
-		opts.Configured = true
-		return 1, nil
-	}
-	if args[0] == "--cluster-init" {
-		opts.RaftBootstrap = true
-		opts.Configured = true
-		return 1, nil
+	for _, removed := range []string{"--cluster-init", "--cluster-raft-bootstrap", "--cluster-join", "--cluster-peer"} {
+		if args[0] == removed || strings.HasPrefix(args[0], removed+"=") {
+			return 0, fmt.Errorf("%s is gone: every daemon of a cluster starts alike, and finds the cluster in its shared TTC_ROOT", removed)
+		}
 	}
 	if args[0] == "--control-only" {
 		opts.ControlOnly = true
@@ -4526,35 +4633,6 @@ func consumeDaemonClusterOption(args []string, opts *daemonClusterOptions) (int,
 			return 1, nil
 		}
 		return 0, nil
-	}
-	if consumed, err := setString("--cluster-peer", new(string)); consumed != 0 || err != nil {
-		if err != nil {
-			return consumed, err
-		}
-		var value string
-		if args[0] == "--cluster-peer" {
-			value = args[1]
-		} else {
-			value = strings.TrimPrefix(args[0], "--cluster-peer=")
-		}
-		opts.Peers = append(opts.Peers, value)
-		opts.Configured = true
-		return consumed, nil
-	}
-	var clusterJoin string
-	if consumed, err := setString("--cluster-join", &clusterJoin); consumed != 0 || err != nil {
-		if err != nil {
-			return consumed, err
-		}
-		// A seed has no node name of its own, and peers are keyed by name, so
-		// the second and later seeds are numbered.
-		name := "seed"
-		for i := 2; slices.ContainsFunc(opts.Peers, func(peer string) bool { return strings.HasPrefix(peer, name+"=") }); i++ {
-			name = fmt.Sprintf("seed-%d", i)
-		}
-		opts.Peers = append(opts.Peers, name+"="+clusterJoin)
-		opts.Configured = true
-		return consumed, nil
 	}
 	for name, dst := range map[string]*string{
 		"--cluster-listen": &opts.Listen, "--cluster-node-id": &opts.NodeID,
@@ -4740,22 +4818,19 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if localRaftErr != nil && !errors.Is(localRaftErr, os.ErrNotExist) {
 		return nil, localRaftErr
 	}
-	if !opts.RaftBootstrap && !localRaftState && len(opts.Peers) == 0 {
-		return nil, errors.New("a new Raft member requires --cluster-peer; use --cluster-raft-bootstrap only for the first node")
-	}
 	resolvedCPU, err := resolveDaemonCPUProfile(opts.CPUProfileMode, opts.CPUFeatures, runtimePlatform)
 	if err != nil {
 		return nil, fmt.Errorf("resolving cluster CPU profile: %w", err)
 	}
 	opts.ResolvedCPU = resolvedCPU
-	pendingClusterPolicy, err := applyImmutableClusterConfig(dataRoot, opts.RaftBootstrap, localRaftState, &opts)
+	pendingClusterPolicy, err := applyImmutableClusterConfig(dataRoot, &opts)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateDaemonCPUProfile(opts.ResolvedCPU, runtimePlatform); err != nil {
 		return nil, fmt.Errorf("validating cluster CPU profile: %w", err)
 	}
-	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID, opts.RaftBootstrap, localRaftState)
+	clusterID, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -4780,8 +4855,8 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			}
 		}
 	}
-	if (len(opts.Peers) != 0 || opts.Advertise != "") && opts.PageAdvertise == "" {
-		return nil, errors.New("cluster nodes with peers require --cluster-page-advertise HOST:0")
+	if opts.Advertise != "" && opts.PageAdvertise == "" {
+		return nil, errors.New("cluster nodes require --cluster-page-advertise HOST:0")
 	}
 	if err := requireEphemeralClusterPagePort("--cluster-page-listen", opts.PageListen); err != nil {
 		return nil, err
@@ -4813,64 +4888,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err := capabilities.Validate(); err != nil {
 		return nil, err
 	}
-	clients := make(map[string]*cluster.Client, len(opts.Peers))
-	for _, peerSpec := range opts.Peers {
-		nodeID, baseURL, _, err := parseClusterPeer(peerSpec)
-		if err != nil {
-			return nil, err
-		}
-		if nodeID == opts.NodeID {
-			return nil, fmt.Errorf("cluster peer %q is the local node", nodeID)
-		}
-		if _, ok := clients[nodeID]; ok {
-			return nil, fmt.Errorf("cluster peer %q is configured more than once", nodeID)
-		}
-		client, err := cluster.NewPlainClient(baseURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
-		if err != nil {
-			return nil, fmt.Errorf("configuring cluster peer %q: %w", nodeID, err)
-		}
-		clients[nodeID] = client
-	}
+	clients := make(map[string]*cluster.Client)
 	incarnation, err := localNodeIncarnation(localRoot, opts.NodeID)
 	if err != nil {
 		return nil, err
-	}
-	// A removed or expired member's WAL describes a configuration in which it
-	// still participates. Opening that WAL and waiting for its historical quorum
-	// cannot re-admit it to the current configuration. Once a configured seed
-	// proves that this incarnation is offline, discard its Raft replica and
-	// rejoin; once it proves the node absent, discard its node-local authority
-	// and rotate the execution epoch. Immutable image cache and shared snapshot
-	// authority remain either way.
-	if !opts.RaftBootstrap && len(clients) != 0 {
-		recovery, err := localNodeAuthorityRecovery(opts.NodeID, incarnation, opts.AuthToken, clients)
-		if err != nil {
-			return nil, err
-		}
-		if recovery == rejoinLocalAuthority {
-			if err := os.RemoveAll(raftLocalDir); err != nil {
-				return nil, fmt.Errorf("discarding the Raft replica of an expired incarnation: %w", err)
-			}
-			localRaftState = false
-		}
-		if recovery == resetLocalAuthority {
-			// An offline or absent incarnation has no remaining execution or
-			// storage authority. Its other local journals are just as stale as its
-			// Raft WAL and must not be replayed under the replacement incarnation.
-			// Reap the guardian-stopped runtime before deleting the fence record
-			// and runsc sockets needed to identify and clean those processes.
-			if err := terminateRetiredElasticRuntimeRoot(filepath.Join(localRoot, "runtime", "runsc")); err != nil {
-				return nil, fmt.Errorf("reaping retired local runtimes: %w", err)
-			}
-			if err := discardRetiredLocalAuthority(localRoot); err != nil {
-				return nil, err
-			}
-			localRaftState = false
-			incarnation, err = localNodeIncarnation(localRoot, opts.NodeID)
-			if err != nil {
-				return nil, err
-			}
-		}
 	}
 	sharedListener, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
@@ -4895,57 +4916,39 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	if err != nil || parsedAdvertise.Host == "" {
 		return nil, fmt.Errorf("resolving shared cluster advertise address %q", advertiseURL)
 	}
-	raftNode, err := cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
-		NodeID: opts.NodeID, LocalDir: raftLocalDir,
-		Listener: protocolMux.RaftListener(), AdvertiseHost: parsedAdvertise.Host,
-		AuthToken: opts.AuthToken, Bootstrap: opts.RaftBootstrap,
-		StabilityTimeout: clusterRaftStabilityTimeout(opts.LeaseDuration),
+	// The cluster is anchored in the shared root, which says which node holds
+	// its authority, the only Raft voter, and keeps its log: see
+	// cluster.SharedCluster. This daemon holds it, or joins its holder as a
+	// non-voter, keeping a replica of its state in the local root.
+	shared := cluster.NewSharedCluster(dataRoot)
+	self := cluster.AuthorityRecord{
+		NodeID: opts.NodeID, Incarnation: incarnation, Role: cluster.RoleCompute,
+		ControlURL: advertiseURL, ControlServerName: advertiseServerName, RaftAddress: parsedAdvertise.Host,
+	}
+	heartbeat, err := cluster.StartHeartbeat(shared, cluster.MemberRecord{
+		NodeID: self.NodeID, Incarnation: self.Incarnation, Role: self.Role,
+		ControlURL: self.ControlURL, ControlServerName: self.ControlServerName, RaftAddress: self.RaftAddress,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("starting this node's cluster heartbeat: %w", err)
 	}
-	authorityJoinRequest := cluster.AuthorityJoinRequest{
-		NodeID: opts.NodeID, Incarnation: incarnation,
-		ControlURL: advertiseURL, ControlServerName: advertiseServerName,
-		RaftAddress: raftNode.Address(), ClusterID: clusterID,
-		Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
-	}
-	// A restarted server may have been removed from the current Raft
-	// configuration after its execution lease expired. Its local WAL still
-	// contains the last configuration it observed, including the addresses of
-	// surviving members, but a bootstrap node normally has no --cluster-join
-	// seed in its command line. Reuse those persisted addresses as recovery
-	// seeds. The leader treats AddNonvoter for an existing voter as a no-op and
-	// admits a removed server as a learner, so the same path safely covers both
-	// an ordinary restart and a restart after authoritative removal.
-	if raftNode.HadExistingState() {
-		configuration, configErr := raftNode.Configuration()
-		if configErr != nil {
-			raftNode.Close()
-			return nil, fmt.Errorf("reading persisted Raft peer configuration: %w", configErr)
+	closeHeartbeat := true
+	defer func() {
+		if closeHeartbeat {
+			heartbeat.Stop()
 		}
-		for _, server := range configuration.Servers {
-			peerID := string(server.ID)
-			if peerID == opts.NodeID || clients[peerID] != nil {
-				continue
-			}
-			address := string(server.Address)
-			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
-				raftNode.Close()
-				return nil, fmt.Errorf("invalid persisted Raft peer %q address %q: %w", peerID, address, splitErr)
-			}
-			client, clientErr := cluster.NewPlainClient("http://"+address, opts.NodeID, opts.AuthToken, 2*time.Minute)
-			if clientErr != nil {
-				raftNode.Close()
-				return nil, fmt.Errorf("configuring persisted Raft recovery peer %q: %w", peerID, clientErr)
-			}
-			clients[peerID] = client
-		}
-	}
+	}()
+	liveness := &cluster.Liveness{}
+	// The epoch of the Raft group this node is in: see
+	// cluster.AuthorityRaftOptions.Epoch.
+	raftEpoch := new(atomic.Uint64)
+	var raftNode *cluster.AuthorityRaftNode
+	var authority cluster.AuthorityRecord
+	var authorityJoinRequest cluster.AuthorityJoinRequest
 	var cancelFreshJoin func(context.Context) error
 	closeRaft := true
 	defer func() {
-		if closeRaft {
+		if closeRaft && raftNode != nil {
 			if cancelFreshJoin != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				_ = cancelFreshJoin(ctx)
@@ -4954,81 +4957,182 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 			_ = raftNode.Close()
 		}
 	}()
-	if raftNode.HadExistingState() {
-		// Keep the Raft listener alive even when this is the first member being
-		// restarted after a whole-cluster outage. Waiting for a leader here and
-		// then exiting makes sequential service startup impossible: no process
-		// survives long enough to form a quorum. The control server is installed
-		// before registerClusterNodeWithRetry, which supplies the bounded
-		// readiness wait once the remaining members return.
-	} else if opts.RaftBootstrap {
-		deadline := time.Now().Add(15 * time.Second)
-		for !raftNode.IsLeader() && time.Now().Before(deadline) {
-			time.Sleep(20 * time.Millisecond)
+	raftListener := protocolMux.RaftListener()
+	// A node whose Sentries a fence stopped keeps trying, however long the
+	// cluster is away; see registerClusterNodeWithRetry.
+	wait := holdsFencedRuntimes(localRoot)
+	giveUp := time.Now().Add(2 * cluster.AuthorityTakeover)
+	recoveryChecked := false
+	for report := time.Now().Add(clusterWaitReport); ; {
+		// A member of a cluster that kept its Raft state in its members'
+		// local roots may start the authority from its own.
+		decision, err := shared.DecideAuthority(context.Background(), self, localRaftState, liveness)
+		if errors.Is(err, cluster.ErrNoAuthorityState) {
+			return nil, errors.New("this cluster kept its Raft state in its members' local roots: first start a former member, whose local root holds it")
 		}
-		if !raftNode.IsLeader() {
-			return nil, errors.New("bootstrapped TTC Raft group did not elect its leader")
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		joined := false
-		var joinErr error
+		authority = decision.Record
+		if decision.Hold {
+			if !shared.Prepared(authority.Epoch) {
+				source := ""
+				if authority.Previous != 0 {
+					previous, err := shared.ReadClaim(authority.Previous)
+					if err != nil {
+						return nil, err
+					}
+					if err := shared.AwaitRelease(context.Background(), previous, authority.Epoch, liveness); err != nil {
+						return nil, err
+					}
+					source = shared.RaftDir(authority.Previous)
+				} else if localRaftState {
+					source = raftLocalDir
+				}
+				if err := shared.PrepareEpochFor(source, authority.Epoch, opts.NodeID, self.RaftAddress); err != nil {
+					return nil, fmt.Errorf("making the Raft state of the authority of epoch %d: %w", authority.Epoch, err)
+				}
+			}
+			holder := cluster.AuthorityHolder{Cluster: shared, Heartbeat: heartbeat, Record: authority}
+			raftEpoch.Store(authority.Epoch)
+			raftNode, err = cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
+				NodeID: opts.NodeID, Listener: raftListener, AdvertiseHost: parsedAdvertise.Host,
+				AuthToken: opts.AuthToken, EpochDir: shared.RaftDir(authority.Epoch), Holder: holder.Held,
+				Epoch: raftEpoch.Load,
+			})
+			if err != nil {
+				return nil, err
+			}
+			deadline := time.Now().Add(15 * time.Second)
+			for !raftNode.IsLeader() && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !raftNode.IsLeader() {
+				return nil, fmt.Errorf("the authority of epoch %d, this node, was not elected its Raft leader", authority.Epoch)
+			}
+			if err := heartbeat.Update(func(record *cluster.MemberRecord) { record.Authority = authority.Epoch }, true); err != nil {
+				return nil, err
+			}
+			_ = shared.PruneEpochs(authority.Previous)
+			authorityJoinRequest = cluster.AuthorityJoinRequest{
+				NodeID: opts.NodeID, Incarnation: incarnation,
+				ControlURL: advertiseURL, ControlServerName: advertiseServerName,
+				RaftAddress: raftNode.Address(), ClusterID: clusterID,
+				Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+			}
+			break
+		}
+		holderClient, err := cluster.NewPlainClient(authority.ControlURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("configuring the cluster authority %q: %w", authority.NodeID, err)
+		}
+		clients = map[string]*cluster.Client{authority.NodeID: holderClient}
+		// A removed or expired member's local Raft replica describes a
+		// configuration in which it still takes part. Once the authority
+		// proves this incarnation offline, discard the replica and rejoin;
+		// once it proves the node absent, discard its node-local authority
+		// and rotate the execution epoch. Immutable image cache and shared
+		// snapshot authority remain either way.
+		recovery := keepLocalAuthority
+		if !recoveryChecked {
+			if recovery, err = localNodeAuthorityRecovery(opts.NodeID, incarnation, opts.AuthToken, clients); err != nil {
+				return nil, err
+			}
+			recoveryChecked = true
+		}
+		if recovery == rejoinLocalAuthority {
+			if err := os.RemoveAll(raftLocalDir); err != nil {
+				return nil, fmt.Errorf("discarding the Raft replica of an expired incarnation: %w", err)
+			}
+			localRaftState = false
+		}
+		if recovery == resetLocalAuthority {
+			// An offline or absent incarnation has no remaining execution or
+			// storage authority. Its other local journals are just as stale as
+			// its Raft replica and must not be replayed under the replacement
+			// incarnation. Reap the guardian-stopped runtime before deleting
+			// the fence record and runsc sockets needed to identify and clean
+			// those processes.
+			if err := terminateRetiredElasticRuntimeRoot(filepath.Join(localRoot, "runtime", "runsc")); err != nil {
+				return nil, fmt.Errorf("reaping retired local runtimes: %w", err)
+			}
+			if err := discardRetiredLocalAuthority(localRoot); err != nil {
+				return nil, err
+			}
+			localRaftState = false
+			if incarnation, err = localNodeIncarnation(localRoot, opts.NodeID); err != nil {
+				return nil, err
+			}
+			self.Incarnation = incarnation
+			if err := heartbeat.Update(func(record *cluster.MemberRecord) { record.Incarnation = incarnation }, true); err != nil {
+				return nil, err
+			}
+			if _, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID); err != nil {
+				return nil, err
+			}
+		}
+		raftEpoch.Store(authority.Epoch)
+		raftNode, err = cluster.OpenAuthorityRaftNode(cluster.AuthorityRaftOptions{
+			NodeID: opts.NodeID, LocalDir: raftLocalDir,
+			Listener: raftListener, AdvertiseHost: parsedAdvertise.Host,
+			AuthToken: opts.AuthToken, StabilityTimeout: clusterRaftStabilityTimeout(opts.LeaseDuration),
+			Epoch: raftEpoch.Load,
+		})
+		if err != nil {
+			return nil, err
+		}
+		authorityJoinRequest = cluster.AuthorityJoinRequest{
+			NodeID: opts.NodeID, Incarnation: incarnation,
+			ControlURL: advertiseURL, ControlServerName: advertiseServerName,
+			RaftAddress: raftNode.Address(), ClusterID: clusterID,
+			Capabilities: capabilities, MemoryTargetBytes: opts.MemoryTarget,
+		}
 		cancelRequest := cluster.AuthorityCancelJoinRequest{NodeID: opts.NodeID, Incarnation: incarnation, RaftAddress: raftNode.Address()}
 		cancelFreshJoin = func(ctx context.Context) error {
-			var result error
-			for _, peer := range clients {
-				if err := cancelAuthorityJoinThroughSeed(ctx, peer, cancelRequest, opts.NodeID, opts.AuthToken); err == nil {
-					return nil
-				} else {
-					result = errors.Join(result, err)
-				}
-			}
-			return result
+			return cancelAuthorityJoinThroughSeed(ctx, holderClient, cancelRequest, opts.NodeID, opts.AuthToken)
 		}
-		// A node whose Sentries a fence stopped keeps trying, however long the
-		// cluster is away; see registerClusterNodeWithRetry.
-		wait := holdsFencedRuntimes(localRoot)
-		for report := time.Now().Add(clusterWaitReport); ; {
-			for _, peer := range clients {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				joinErr = joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken)
-				cancel()
-				if joinErr == nil {
-					joined = true
-					break
-				}
-			}
-			if joined || !wait {
-				break
-			}
-			if !time.Now().Before(report) {
-				fmt.Fprintf(stderr, "ttcd: waiting for the cluster, with this node's sandboxes stopped: %v\n", joinErr)
-				report = time.Now().Add(clusterWaitReport)
-			}
-			time.Sleep(time.Second)
-		}
-		if !joined {
-			// A timeout can lose the successful AddNonvoter response, so cancel
-			// even when no seed acknowledged the join. A freshly opened Bolt
-			// store still counts as existing Raft state; retaining it would make
-			// the next attempt wait forever as a member that was never admitted.
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = cancelFreshJoin(ctx)
-			cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		joinErr := joinAuthorityThroughSeed(ctx, holderClient, authorityJoinRequest, opts.NodeID, opts.AuthToken)
+		cancel()
+		if joinErr == nil {
 			cancelFreshJoin = nil
-			_ = raftNode.Close()
-			closeRaft = false
+			deadline := time.Now().Add(15 * time.Second)
+			for raftNode.Leader() == "" && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if raftNode.Leader() == "" {
+				return nil, errors.New("this node joined the cluster authority as a non-voter but hears no leader")
+			}
+			break
+		}
+		// A timeout can lose the successful AddNonvoter response, so cancel
+		// even when the holder acknowledged nothing. A freshly opened Bolt
+		// store still counts as existing Raft state; retaining it would make
+		// the next attempt wait forever as a member that was never admitted.
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		_ = cancelFreshJoin(ctx)
+		cancel()
+		cancelFreshJoin = nil
+		_ = raftNode.Close()
+		raftNode = nil
+		if !localRaftState {
 			_ = os.RemoveAll(raftLocalDir)
-			return nil, fmt.Errorf("joining TTC Raft group through configured peers: %w", joinErr)
+			if _, err := prepareClusterRaftIdentity(dataRoot, raftLocalDir, opts.RepositoryID, opts.NodeID); err != nil {
+				return nil, err
+			}
 		}
-		deadline := time.Now().Add(15 * time.Second)
-		for raftNode.Leader() == "" && time.Now().Before(deadline) {
-			time.Sleep(20 * time.Millisecond)
+		raftListener = protocolMux.RenewRaftListener()
+		if !wait && time.Now().After(giveUp) {
+			return nil, fmt.Errorf("joining the cluster authority, node %s: %w", authority.NodeID, joinErr)
 		}
-		if raftNode.Leader() == "" {
-			return nil, errors.New("joined TTC Raft member could not discover the elected leader")
+		if !time.Now().Before(report) {
+			fmt.Fprintf(stderr, "ttcd: waiting for the cluster authority, node %s: %v\n", authority.NodeID, joinErr)
+			report = time.Now().Add(clusterWaitReport)
 		}
+		// Decide again: the holder may have ended.
+		time.Sleep(time.Second)
 	}
-	if opts.RaftBootstrap {
+	if authority.Holds(self) {
 		base := immutableClusterConfigFromOptions(opts)
 		policy, err := reconcileClusterRuntimePolicy(raftNode, dataRoot, base, pendingClusterPolicy)
 		if err != nil {
@@ -5039,15 +5143,10 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		if err := capabilities.Validate(); err != nil {
 			return nil, err
 		}
-	} else if localRaftState {
-		// A node that was removed while offline may restart with a stale local
-		// Raft log in which no leader (and sometimes no ClusterPolicy) is yet
-		// visible. It is a joining node, not the authority allowed to change
-		// policy. applyImmutableClusterConfig already loaded the successfully
-		// published cluster policy from the shared root; retain that policy until
-		// membership recovery re-adds this process as a learner and catches its
-		// log up. Requiring this stale process to become leader deadlocks exactly
-		// the supported remove-then-rejoin path.
+	} else {
+		// A member that is not the authority adopts the policy the shared
+		// root records, which applyImmutableClusterConfig loaded, until its
+		// replica catches up with the authority's.
 		capabilities.PagingPolicy = opts.PagingPolicy
 		if err := capabilities.Validate(); err != nil {
 			return nil, err
@@ -5071,63 +5170,56 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 		dynamicPeers: make(map[string]dynamicClusterPeer),
 		pageListen:   opts.PageListen, pageAdvertise: opts.PageAdvertise,
 	}
-	catalog.SetLeaderClientResolver(func(nodeID string) (*cluster.Client, error) {
-		if nodeID != "" {
-			if peer := clients[nodeID]; peer != nil {
-				return peer, nil
-			}
-		} else {
-			// A re-admitted learner may not have observed the current leader yet.
-			// Any seed can answer directly or return the ordinary leader redirect.
-			// Sort the IDs to keep restart behavior and diagnostics deterministic.
-			ids := make([]string, 0, len(clients))
-			for id := range clients {
-				ids = append(ids, id)
-			}
-			sort.Strings(ids)
-			if len(ids) != 0 {
-				return clients[ids[0]], nil
-			}
-		}
-		// A node only needs one seed to join. After elections, discover any
-		// leader from the replicated membership map rather than requiring every
-		// peer to be repeated on every daemon command line.
-		state, err := raftNode.AppliedState()
+	// The authority's holder is its only voter, and so the Raft leader: the
+	// shared root names it, where this member's Raft engine may still
+	// remember a holder that ended or stalled.
+	var holderClients sync.Map
+	catalog.SetLeaderClientResolver(func(string) (*cluster.Client, error) {
+		record, ok, err := shared.ReadAuthority()
 		if err != nil {
 			return nil, err
 		}
-		record, ok := state.Nodes[nodeID]
-		if !ok {
-			return nil, fmt.Errorf("raft leader %q has no replicated node record", nodeID)
+		if !ok || record.Holds(self) {
+			return nil, errors.New("the cluster authority has no other holder to forward to")
 		}
-		return source.peerForRecord(record)
+		if client, ok := holderClients.Load(record.ControlURL); ok {
+			return client.(*cluster.Client), nil
+		}
+		client, err := cluster.NewPlainClient(record.ControlURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
+		if err != nil {
+			return nil, err
+		}
+		actual, _ := holderClients.LoadOrStore(record.ControlURL, client)
+		return actual.(*cluster.Client), nil
 	})
 	closeRaft = false
 	closeMux = false
+	closeHeartbeat = false
 	return &daemonClusterRuntime{
 		listen: protocolMux.Addr().String(), authToken: opts.AuthToken,
 		mux: protocolMux, controlListener: protocolMux.HTTPListener(),
 		controlPlane: &cluster.ControlPlane{
 			Capabilities: capabilities, Store: transactions, MaxTransactions: opts.MaxTransactions, Now: time.Now,
-			Authority:     &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID},
+			Authority:     &cluster.AuthorityService{Node: raftNode, Capabilities: capabilities, ClusterID: clusterID, MaxVoters: 1},
 			TopologyState: catalog.LinearizableState, AuthToken: opts.AuthToken,
 		},
 		source: source, directory: catalog, placements: placements, transactions: transactions,
 		raft: raftNode, raftLocalDir: raftLocalDir, raftCatalog: catalog, nodeRecord: nodeRecord, lease: opts.LeaseDuration, clusterID: clusterID,
 		recoverMembership: func(ctx context.Context) error {
-			if len(clients) == 0 {
-				return errors.New("no cluster seed is configured for Raft membership recovery")
+			current, ok, err := shared.ReadAuthority()
+			if err != nil {
+				return err
 			}
-			var result error
-			for _, peer := range clients {
-				if err := joinAuthorityThroughSeed(ctx, peer, authorityJoinRequest, opts.NodeID, opts.AuthToken); err == nil {
-					return nil
-				} else {
-					result = errors.Join(result, err)
-				}
+			if !ok || current.Holds(self) {
+				return nil
 			}
-			return result
+			holder, err := cluster.NewPlainClient(current.ControlURL, opts.NodeID, opts.AuthToken, 2*time.Minute)
+			if err != nil {
+				return err
+			}
+			return joinAuthorityThroughSeed(ctx, holder, authorityJoinRequest, opts.NodeID, opts.AuthToken)
 		},
+		shared: shared, heartbeat: heartbeat, liveness: liveness, authority: authority, self: self, raftEpoch: raftEpoch,
 		cancelFreshJoin: cancelFreshJoin,
 		autoRebalance:   opts.AutoRebalance, capacitySink: capacitySink, cpuProfile: opts.ResolvedCPU,
 	}, nil
@@ -5200,29 +5292,34 @@ func equalClusterRuntimePolicy(a, b cluster.ClusterRuntimePolicy) bool {
 // applyImmutableClusterConfig reads the shared bootstrap record. It returns a
 // requested operational-policy change instead of applying it: only the Raft
 // state machine can prove that every execution lease is inactive.
-func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, opts *daemonClusterOptions) (*daemonImmutableClusterConfig, error) {
+// applyImmutableClusterConfig applies to opts the cluster-wide configuration
+// the shared root records, which the cluster's first daemon records. It
+// returns the configuration opts asks for instead, if it differs: the
+// authority makes it the cluster's, when it holds it.
+func applyImmutableClusterConfig(sharedRoot string, opts *daemonClusterOptions) (*daemonImmutableClusterConfig, error) {
 	path := filepath.Join(sharedRoot, ".ttc-cluster-config.json")
 	want := immutableClusterConfigFromOptions(*opts)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		if !bootstrap || localState {
-			return nil, errors.New("shared TTC_ROOT has no immutable cluster configuration; only a fresh first node may create it")
-		}
 		encoded, err := json.Marshal(want)
 		if err != nil {
 			return nil, err
 		}
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
+		if err == nil {
+			_, writeErr := file.Write(append(encoded, '\n'))
+			closeErr := errors.Join(file.Sync(), file.Close())
+			if writeErr != nil || closeErr != nil {
+				_ = os.Remove(path)
+				return nil, errors.Join(writeErr, closeErr)
+			}
+			return nil, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("creating immutable cluster configuration: %w", err)
 		}
-		_, writeErr := file.Write(append(encoded, '\n'))
-		closeErr := errors.Join(file.Sync(), file.Close())
-		if writeErr != nil || closeErr != nil {
-			_ = os.Remove(path)
-			return nil, errors.Join(writeErr, closeErr)
-		}
-		return nil, nil
+		// Another daemon of a new cluster recorded it first.
+		data, err = os.ReadFile(path)
 	}
 	if err != nil {
 		return nil, err
@@ -5242,10 +5339,7 @@ func applyImmutableClusterConfig(sharedRoot string, bootstrap, localState bool, 
 		compareWant.CPUProfile = got.CPUProfile
 	}
 	var pending *daemonImmutableClusterConfig
-	if bootstrap && !equalImmutableClusterConfig(got, compareWant) {
-		if !localState {
-			return nil, errors.New("cluster-wide paging, lease, transaction, or rebalance policy differs from the initialized cluster")
-		}
+	if !equalImmutableClusterConfig(got, compareWant) {
 		pending = &compareWant
 	}
 	opts.PagingPolicy = got.PagingPolicy
@@ -5283,7 +5377,7 @@ func reconcileClusterRuntimePolicy(node *cluster.AuthorityRaftNode, sharedRoot s
 	// Raft commit, so it is a safe temporary projection while the remaining
 	// voters return. registerClusterNodeWithRetry below keeps this process alive
 	// until quorum is restored and the committed policy is replayed.
-	if effective.Revision == 0 && !changeRequested && node.HadExistingState() {
+	if effective.Revision == 0 && !changeRequested && node.HadExistingState() && !node.IsLeader() {
 		if err := desired.Validate(); err != nil {
 			return cluster.ClusterRuntimePolicy{}, fmt.Errorf("persisted cluster operational policy: %w", err)
 		}
@@ -5441,52 +5535,59 @@ type daemonRaftClusterIdentity struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-func prepareClusterRaftIdentity(sharedRoot, localRaftDir, repositoryID, nodeID string, bootstrap, localState bool) (string, error) {
-	sharedPath := filepath.Join(sharedRoot, ".ttc-raft-cluster.json")
+func prepareClusterRaftIdentity(sharedRoot, localRaftDir, repositoryID, nodeID string) (string, error) {
+	// A cluster that kept its Raft state in its members' local roots
+	// recorded its identity at the top of the shared root; one that keeps it
+	// in the shared root records it with its authority, which the first of
+	// its daemons creates.
 	var identity daemonRaftClusterIdentity
-	createdIdentity := false
-	data, err := os.ReadFile(sharedPath)
+	data, err := os.ReadFile(filepath.Join(sharedRoot, ".ttc-raft-cluster.json"))
 	if errors.Is(err, os.ErrNotExist) {
-		if !bootstrap || localState {
-			return "", errors.New("shared TTC_ROOT has no Raft cluster identity; only a fresh first node may bootstrap it")
+		path := filepath.Join(sharedRoot, "cluster", "authority", "cluster.json")
+		if data, err = os.ReadFile(path); errors.Is(err, os.ErrNotExist) {
+			clusterID, idErr := newDaemonRequestID()
+			if idErr != nil {
+				return "", idErr
+			}
+			identity = daemonRaftClusterIdentity{Version: 1, ClusterID: clusterID, RepositoryID: repositoryID, CreatedBy: nodeID, CreatedAt: time.Now().UTC()}
+			encoded, marshalErr := json.Marshal(identity)
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				return "", err
+			}
+			file, createErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if createErr == nil {
+				_, writeErr := file.Write(encoded)
+				closeErr := errors.Join(file.Sync(), file.Close())
+				if writeErr != nil || closeErr != nil {
+					_ = os.Remove(path)
+					return "", errors.Join(writeErr, closeErr)
+				}
+				data = encoded
+				err = nil
+			} else if errors.Is(createErr, os.ErrExist) {
+				// Another daemon of a new cluster created it first.
+				data, err = os.ReadFile(path)
+			} else {
+				return "", fmt.Errorf("creating the cluster's Raft identity: %w", createErr)
+			}
 		}
-		clusterID, idErr := newDaemonRequestID()
-		if idErr != nil {
-			return "", idErr
-		}
-		identity = daemonRaftClusterIdentity{Version: 1, ClusterID: clusterID, RepositoryID: repositoryID, CreatedBy: nodeID, CreatedAt: time.Now().UTC()}
-		createdIdentity = true
-		encoded, marshalErr := json.Marshal(identity)
-		if marshalErr != nil {
-			return "", marshalErr
-		}
-		file, createErr := os.OpenFile(sharedPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if createErr != nil {
-			return "", fmt.Errorf("creating Raft cluster identity: %w", createErr)
-		}
-		_, writeErr := file.Write(encoded)
-		closeErr := errors.Join(file.Sync(), file.Close())
-		if writeErr != nil || closeErr != nil {
-			_ = os.Remove(sharedPath)
-			return "", errors.Join(writeErr, closeErr)
-		}
-	} else if err != nil {
+	}
+	if err != nil {
 		return "", err
-	} else if err := json.Unmarshal(data, &identity); err != nil {
+	}
+	if err := json.Unmarshal(data, &identity); err != nil {
 		return "", fmt.Errorf("decoding Raft cluster identity: %w", err)
 	}
 	if identity.Version != 1 || !transactionIDPatternForDaemon(identity.ClusterID) || identity.RepositoryID != repositoryID {
 		return "", errors.New("shared TTC_ROOT has an incompatible Raft cluster identity")
 	}
-	localPath := filepath.Join(localRaftDir, "cluster-id")
-	localIdentity, localIdentityErr := os.ReadFile(localPath)
-	localIdentityMatches := localIdentityErr == nil && strings.TrimSpace(string(localIdentity)) == identity.ClusterID
-	if bootstrap && !localState && !createdIdentity && !localIdentityMatches {
-		return "", fmt.Errorf("refusing to bootstrap a second Raft group for cluster %q", identity.ClusterID)
-	}
 	if err := os.MkdirAll(localRaftDir, 0700); err != nil {
 		return "", err
 	}
+	localPath := filepath.Join(localRaftDir, "cluster-id")
 	if local, err := os.ReadFile(localPath); err == nil {
 		if strings.TrimSpace(string(local)) != identity.ClusterID {
 			return "", errors.New("TTC_LOCAL_ROOT belongs to another Raft cluster")
@@ -5730,6 +5831,9 @@ func serveControlOnlyDaemon(socket, sharedRoot string, control *controlOnlyClust
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				_ = control.refreshPeers(ctx)
 				cancel()
+				// Observe the peers' counters, so that a command knows the
+				// ones that stalled.
+				_ = control.responsivePeers()
 			}
 		}
 	}()
@@ -5871,9 +5975,15 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 			header = string(append(encoded, '\n'))
 		}
 	}
-	peers := s.cluster.peerSnapshot()
+	peers := s.cluster.responsivePeers()
 	if len(peers) == 0 {
-		writeError(errors.New("control-only cluster has no known compute peer"))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = s.cluster.refreshPeers(ctx)
+		cancel()
+		peers = s.cluster.responsivePeers()
+	}
+	if len(peers) == 0 {
+		writeError(errors.New("no compute node of the cluster is running: a compute node that starts takes the cluster over from the shared root"))
 		return
 	}
 	index := s.cluster.active.Load() % uint64(len(peers))
@@ -5939,7 +6049,7 @@ func (s *controlOnlyDaemonServer) handle(conn net.Conn, serverErrors io.Writer) 
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			_ = s.cluster.refreshPeers(ctx)
 			cancel()
-			refreshed := s.cluster.peerSnapshot()
+			refreshed := s.cluster.responsivePeers()
 			for _, candidate := range refreshed {
 				if candidate.url == peer.url {
 					continue
@@ -6247,6 +6357,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		if err := retireClusterNode(server.cleanStop.Load()); err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: retiring cluster node: %v\n", err)
 		}
+		if clusterRuntime != nil && clusterRuntime.heartbeat != nil {
+			// A node that leaves gives the authority up; one that restarts
+			// keeps it, unless another takes it meanwhile.
+			if server.cleanStop.Load() {
+				releaseClusterAuthority(clusterRuntime)
+			}
+			clusterRuntime.heartbeat.Stop()
+		}
 		if leaseGuardian != nil {
 			_ = leaseGuardian.Close()
 		}
@@ -6262,6 +6380,14 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	defer func() {
 		if selfFenced.Load() {
 			err = errors.Join(<-heartbeatErr, err)
+		}
+	}()
+	// An authority that changed hands restarts the daemon too; see
+	// watchClusterAuthority.
+	var authorityChanged atomic.Pointer[error]
+	defer func() {
+		if cause := authorityChanged.Load(); cause != nil {
+			err = errors.Join(*cause, err)
 		}
 	}()
 	if clusterRuntime != nil {
@@ -6516,6 +6642,12 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 		server.clusterPlacements = clusterRuntime.placements
 		server.clusterListen = clusterRuntime.listen
 		server.distributedSource = clusterRuntime.source
+		go watchClusterAuthority(clusterRuntime, func(cause error) {
+			wrapped := fmt.Errorf("%w: %w", errClusterAuthorityChanged, cause)
+			authorityChanged.Store(&wrapped)
+			_ = listener.Close()
+			_ = clusterServer.Close()
+		}, stderr, clusterDone)
 		if elasticRecord != nil {
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
 		}
@@ -8596,14 +8728,10 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 			if clusterOpts.NodeID != "" {
 				commandArgs = append(commandArgs, "--cluster-node-id", clusterOpts.NodeID)
 			}
-			for _, peer := range clusterOpts.Peers {
-				commandArgs = append(commandArgs, "--cluster-peer", peer)
-			}
 		} else {
 			commandArgs = append(commandArgs,
 				"--cluster-listen", clusterOpts.Listen,
 				"--cluster-node-id", clusterOpts.NodeID,
-				"--cluster-repository-id", clusterOpts.RepositoryID,
 				"--cluster-lease", clusterOpts.LeaseDuration.String(),
 				"--cluster-max-transactions", strconv.Itoa(clusterOpts.MaxTransactions),
 				"--cluster-page-listen", clusterOpts.PageListen,
@@ -8615,6 +8743,11 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 				"--cluster-prefetch", string(clusterOpts.PagingPolicy.Prefetch),
 				"--cluster-push", string(clusterOpts.PagingPolicy.Push),
 			)
+			// ttcd makes up a repository for a new shared root itself, and
+			// adopts one another daemon publishes first.
+			if !clusterOpts.RepositoryGenerated {
+				commandArgs = append(commandArgs, "--cluster-repository-id", clusterOpts.RepositoryID)
+			}
 			if clusterOpts.Advertise != "" {
 				commandArgs = append(commandArgs, "--cluster-advertise", clusterOpts.Advertise)
 			}
@@ -8624,9 +8757,6 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 			if clusterOpts.AutoRebalance {
 				commandArgs = append(commandArgs, "--cluster-auto-rebalance")
 			}
-			if clusterOpts.RaftBootstrap {
-				commandArgs = append(commandArgs, "--cluster-raft-bootstrap")
-			}
 			if clusterOpts.CapacityCommand != "" {
 				commandArgs = append(commandArgs, "--cluster-capacity-command", clusterOpts.CapacityCommand)
 			}
@@ -8635,9 +8765,6 @@ func startDaemonProcess(socket, runtimePlatform string, unsafeNoHostIsolation bo
 			}
 			if clusterOpts.PageAdvertise != "" {
 				commandArgs = append(commandArgs, "--cluster-page-advertise", clusterOpts.PageAdvertise)
-			}
-			for _, peer := range clusterOpts.Peers {
-				commandArgs = append(commandArgs, "--cluster-peer", peer)
 			}
 		}
 	}
