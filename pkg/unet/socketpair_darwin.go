@@ -16,9 +16,17 @@
 
 package unet
 
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 func hostSocketPair(packet bool) ([2]int, error) {
+	// Darwin has no SOCK_CLOEXEC. Hold ForkLock until both ends are
+	// close-on-exec so a concurrent fork cannot inherit them.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, socketType(packet), 0)
 	if err == nil {
 		unix.CloseOnExec(fds[0])

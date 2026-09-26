@@ -17,6 +17,7 @@
 package fdchannel
 
 import (
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -33,7 +34,11 @@ func sendFDFlags() uintptr { return unix.MSG_DONTWAIT }
 
 func newConnectedSockets() ([2]int, error) {
 	// Darwin does not implement AF_UNIX SOCK_SEQPACKET. SCM_RIGHTS on
-	// SOCK_STREAM requires the one-byte iovec configured by initIov.
+	// SOCK_STREAM requires the one-byte iovec configured by initIov. Darwin
+	// also has no SOCK_CLOEXEC, so hold ForkLock until both ends are
+	// close-on-exec.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fds, err

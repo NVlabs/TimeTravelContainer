@@ -18,6 +18,7 @@ package fsgofer
 
 import (
 	"math"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -144,6 +145,10 @@ func allocate(fd int, mode, off, length uint64) error {
 }
 
 func acceptNonblockCloexec(fd, _ int) (int, error) {
+	// Darwin has no accept4. Hold ForkLock until the new descriptor is
+	// close-on-exec so a concurrent fork cannot inherit it.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	nfd, _, err := unix.Accept(fd)
 	if err != nil {
 		return -1, err

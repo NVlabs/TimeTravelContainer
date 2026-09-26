@@ -18,6 +18,7 @@ package unet
 
 import (
 	"io"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -95,10 +96,19 @@ func (r *SocketReader) ReadVec(bufs [][]byte) (int, error) {
 	// to the caller.
 	recvControl := make([]byte, unix.CmsgSpace(253*4))
 	for {
+		// Darwin has no MSG_CMSG_CLOEXEC. Hold ForkLock from the nonblocking
+		// receive until retainReceivedFDs makes the descriptors close-on-exec,
+		// so a concurrent fork cannot inherit them.
+		syscall.ForkLock.RLock()
 		n, oobn, recvFlags, _, err := unix.RecvmsgBuffers(fd, bufs, recvControl, unix.MSG_DONTWAIT|unix.MSG_TRUNC)
+		var retainErr error
 		if err == nil {
-			if err := r.retainReceivedFDs(recvControl[:oobn], fdCapacity, recvFlags); err != nil {
-				return 0, err
+			retainErr = r.retainReceivedFDs(recvControl[:oobn], fdCapacity, recvFlags)
+		}
+		syscall.ForkLock.RUnlock()
+		if err == nil {
+			if retainErr != nil {
+				return 0, retainErr
 			}
 			if n == 0 {
 				return 0, io.EOF
@@ -153,6 +163,9 @@ func (r *SocketReader) retainReceivedFDs(control []byte, capacity int, recvFlags
 			return err
 		}
 		received = append(received, fds...)
+	}
+	for _, fd := range received {
+		unix.CloseOnExec(fd)
 	}
 	keep := len(received)
 	if keep > capacity {

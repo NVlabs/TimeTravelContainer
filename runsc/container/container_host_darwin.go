@@ -5,11 +5,16 @@ package container
 import (
 	"fmt"
 	"os/exec"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 func containerHostSocketPair() ([2]int, error) {
+	// Darwin has no SOCK_CLOEXEC. Hold ForkLock until both ends are
+	// close-on-exec so a concurrent fork cannot inherit them.
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return fds, err
