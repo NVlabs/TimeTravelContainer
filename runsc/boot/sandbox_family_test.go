@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	gcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/testutil"
@@ -183,7 +184,9 @@ type testMemoryCompactingPlatform struct {
 	compactCalls int
 }
 
-func (p *testMemoryCompactingPlatform) CompactMemory(context.Context) (sentryplatform.MemoryCompaction, error) {
+var _ sentryplatform.MemoryCompactor = (*testMemoryCompactingPlatform)(nil)
+
+func (p *testMemoryCompactingPlatform) CompactMemory(gcontext.Context) (sentryplatform.MemoryCompaction, error) {
 	p.compactCalls++
 	return sentryplatform.MemoryCompaction{}, nil
 }
