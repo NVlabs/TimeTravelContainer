@@ -589,28 +589,35 @@ while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
   sleep 1
 done
-echo "== console sidecar crash recovery =="
-SIDECAR_PID_FILE="$DATA_ROOT/containers/$LIFECYCLE_ID/console/main.pid"
+echo "== console follower crash recovery =="
+# One follower process keeps the logs of a family's consoles. A reader of a
+# console whose follower is gone starts another.
+family_follower_pid() {
+  pgrep -f "$LIFECYCLE_ID console-follow-family" | grep -vx "${1:-}" | head -n 1
+}
+last_tick() {
+  ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | sed -n 's/.*tick:\([0-9][0-9]*\).*/\1/p' | tail -n 1
+}
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
-while [ ! -s "$SIDECAR_PID_FILE" ]; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "active console sidecar did not publish its PID"
+while OLD_FOLLOWER_PID=$(family_follower_pid); [ -z "$OLD_FOLLOWER_PID" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "the family's console follower is not running"
   sleep 1
 done
-OLD_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE")
-kill -KILL "$OLD_SIDECAR_PID"
+kill -KILL "$OLD_FOLLOWER_PID"
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while :; do
   ttc logs --tail 10 "$LIFECYCLE@main" >/dev/null 2>&1 || true
-  NEW_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE" 2>/dev/null || true)
-  if [ -n "$NEW_SIDECAR_PID" ] && [ "$NEW_SIDECAR_PID" != "$OLD_SIDECAR_PID" ] && kill -0 "$NEW_SIDECAR_PID" 2>/dev/null; then
+  NEW_FOLLOWER_PID=$(family_follower_pid "$OLD_FOLLOWER_PID")
+  if [ -n "$NEW_FOLLOWER_PID" ] && kill -0 "$NEW_FOLLOWER_PID" 2>/dev/null; then
     break
   fi
-  [ "$(date +%s)" -lt "$deadline" ] || fail "console sidecar was not replaced after SIGKILL"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console follower was not replaced after SIGKILL"
   sleep 1
 done
+REPLACED_TICK=$(last_tick)
 deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
-while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q "tick:"; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after sidecar replacement"
+while TICK=$(last_tick); [ -z "$TICK" ] || [ "$TICK" -le "${REPLACED_TICK:--1}" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after follower replacement"
   sleep 1
 done
 
