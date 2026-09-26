@@ -208,6 +208,21 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 	}
 }
 
+// useClocksToRelease gives a restored Timekeeper, whose Kernel failed to load
+// after its state did and will never run, clocks to read, without the VDSO
+// parameters SetClocks writes or their updater. Releasing the Kernel reads
+// the time, which would otherwise wait for SetClocks forever. It does nothing
+// to a Timekeeper that has clocks.
+func (t *Timekeeper) useClocksToRelease(c sentrytime.Clocks) {
+	if t.clocks != nil {
+		return
+	}
+	t.clocks = c
+	if t.restored != nil {
+		close(t.restored)
+	}
+}
+
 // update samples the backing clocks and writes the new parameters to the VDSO
 // parameter page.
 //

@@ -581,7 +581,7 @@ func LoadDehydration(ctx context.Context, p platform.Platform, image *Dehydratio
 	// final Kernel teardown, and may also remain shared with a live sibling.
 	// Rebind it before SetClocks resets the restored sequence counter.
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
@@ -784,11 +784,11 @@ func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		pagesOwned = false
 	}
 	if err := child.vdsoParams.materialize(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, fmt.Errorf("materializing sparse dehydrated VDSO parameter page: %w", err)
 	}
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)

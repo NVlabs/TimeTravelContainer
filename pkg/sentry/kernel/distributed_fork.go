@@ -483,11 +483,11 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	// otherwise a target that never faults VVAR retains exactly one source page
 	// forever and cannot complete a drain.
 	if err := child.vdsoParams.materialize(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, fmt.Errorf("materializing distributed-fork VDSO parameter page: %w", err)
 	}
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
@@ -600,11 +600,11 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		pagesOwned = false
 	}
 	if err := child.vdsoParams.materialize(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, fmt.Errorf("materializing relocated distributed VDSO parameter page: %w", err)
 	}
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)

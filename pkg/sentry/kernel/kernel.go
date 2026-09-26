@@ -2484,6 +2484,14 @@ func (k *Kernel) stopCPUClockTicker() {
 	k.cpuClockTickTimer.Stop()
 }
 
+// releaseLoaded releases a Kernel whose load failed after its state loaded,
+// which may be before SetClocks gave its Timekeeper clocks: releasing the
+// Kernel reads the time.
+func (k *Kernel) releaseLoaded(clocks sentrytime.Clocks) {
+	k.timekeeper.useClocksToRelease(clocks)
+	k.Release()
+}
+
 // Release releases resources owned by k.
 //
 // Precondition: This should only be called after the kernel is fully

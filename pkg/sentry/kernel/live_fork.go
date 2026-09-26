@@ -417,7 +417,7 @@ func (k *Kernel) LiveFork(ctx context.Context, opts LiveForkOptions) (*Kernel, e
 				return
 			}
 			if childLoaded {
-				child.Release()
+				child.releaseLoaded(opts.Clocks)
 			} else {
 				if remotePageLoad != nil {
 					remotePageLoad.Cancel()
@@ -815,7 +815,7 @@ func (k *Kernel) loadCapturedLiveForkChild(
 
 	restoreStarted := time.Now()
 	if err := child.privatizeLiveForkVDSOParamPage(); err != nil {
-		child.Release()
+		child.releaseLoaded(opts.Clocks)
 		return nil, err
 	}
 	child.Timekeeper().SetClocks(opts.Clocks, child.vdsoParams)
