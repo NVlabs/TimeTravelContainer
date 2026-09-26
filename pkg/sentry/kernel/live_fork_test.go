@@ -23,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -47,7 +49,9 @@ type captureCoherencePlatform struct {
 	flushes int
 }
 
-func (p *captureCoherencePlatform) FlushForCheckpoint(stdcontext.Context) error {
+var _ sentryplatform.CheckpointCoherence = (*captureCoherencePlatform)(nil)
+
+func (p *captureCoherencePlatform) FlushForCheckpoint(context.Context) error {
 	p.flushes++
 	return nil
 }
@@ -728,11 +732,11 @@ func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	}
 	root.DecRef(ctx)
 	parentTask := parent.GlobalInit().Leader()
-	tables := kernel.SyscallTables()
-	if len(tables) == 0 {
-		t.Fatal("no syscall tables are registered")
+	table, ok := kernel.LookupSyscallTable(abi.Linux, arch.Host)
+	if !ok {
+		t.Fatalf("no syscall table is registered for %v", arch.Host)
 	}
-	parentTask.TestOnlySetArchAndSyscallTable(arch.New(tables[0].Arch), tables[0])
+	parentTask.TestOnlySetArchAndSyscallTable(arch.New(table.Arch), table)
 	parentTID := parent.RootPIDNamespace().IDOfTask(parentTask)
 	pidfd, err := parentTask.PIDFDOpen(parentTID, false /* isThread */, false /* nonBlock */)
 	if err != nil {
