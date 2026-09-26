@@ -6350,7 +6350,9 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 	// to physically remove one tombstone is non-fatal: it is outside the active
 	// container namespace and periodic maintenance will retry it.
 	unlockRecovery := server.lockDataRoot(dataRoot)
-	_, recoveryErr := (ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}).RecoverContainerRemovals()
+	recoveryStore := ttcbundle.Store{Root: dataRoot, ActiveRoot: localRoot}
+	_, recoveryErr := recoveryStore.RecoverContainerRemovals()
+	recoveryErr = errors.Join(recoveryErr, recoveryStore.SweepRemovedActiveContainerState())
 	unlockRecovery()
 	if recoveryErr != nil && stderr != nil {
 		fmt.Fprintf(stderr, "ttcd: warning: recovering removed containers: %v\n", recoveryErr)

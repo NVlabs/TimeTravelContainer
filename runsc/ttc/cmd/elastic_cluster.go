@@ -4007,7 +4007,7 @@ func (b *runtimeBackend) removeLocalFamilyStateIfUnowned(containerID string) err
 			return fmt.Errorf("runtime family %q still exists: %w", containerID, errRuntimeFamilyLive)
 		}
 	}
-	return os.RemoveAll(filepath.Join(b.localRoot, "containers", containerID))
+	return b.containerStore().RemoveActiveContainerState(containerID)
 }
 
 // errRuntimeFamilyLive is why node-local family state that no placement needs
@@ -4210,7 +4210,7 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 			result = errors.Join(result, fmt.Errorf("stopping orphan console followers for %q: %w", id, err))
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(b.localRoot, "containers", id)); err != nil {
+		if err := b.containerStore().RemoveActiveContainerState(id); err != nil {
 			result = errors.Join(result, fmt.Errorf("removing orphan local container %q: %w", id, err))
 		}
 	}

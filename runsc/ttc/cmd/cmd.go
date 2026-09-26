@@ -10307,7 +10307,7 @@ func (b *runtimeBackend) reclaimRemovedFamilyLocal(familyID string, physicalIDs 
 		if err := b.stopContainerConsoleDrains(physicalID); err != nil {
 			return fmt.Errorf("stopping console followers for unplaced runtime %q: %w", physicalID, err)
 		}
-		if err := os.RemoveAll(filepath.Join(b.localRoot, "containers", physicalID)); err != nil {
+		if err := b.containerStore().RemoveActiveContainerState(physicalID); err != nil {
 			return fmt.Errorf("removing local cache for unplaced runtime %q: %w", physicalID, err)
 		}
 	}

@@ -65,6 +65,12 @@ const (
 // filesystem, including when Store.Root is an NFS mount.
 const removedContainerDir = "removed-containers"
 
+// removedActiveContainerDir, in a node's own active root, holds the
+// node-local state of containers being removed, out of the active
+// namespace, so that a reader finds a container's state whole or not at
+// all.
+const removedActiveContainerDir = "removed-local-containers"
+
 const containerCreationMarker = ".creating"
 
 // containerStagingDir holds unpublished container directories. Container
@@ -5533,10 +5539,14 @@ func (s Store) addContainerRepositoryPaths(paths map[string]struct{}, containers
 		spec, err := s.loadSpecOf(container, container.ID)
 		if err != nil {
 			// Removed since it was listed, as a migrated or forked branch's
-			// staging record may be meanwhile: removal renames the record
-			// away before anything else, so nothing it held is reachable
-			// from it.
+			// staging record may be meanwhile, or its node-local state, as a
+			// family's is once the node holds none of its branches: removal
+			// renames either away before anything else, so nothing it held
+			// is reachable from it.
 			if _, statErr := os.Lstat(filepath.Join(s.Root, "containers", container.ID)); errors.Is(statErr, fs.ErrNotExist) {
+				continue
+			}
+			if _, statErr := os.Lstat(s.activeContainerDir(container.ID)); errors.Is(statErr, fs.ErrNotExist) {
 				continue
 			}
 			return err
@@ -5661,9 +5671,41 @@ func (s Store) removeActiveContainer(id string) {
 	if s.activeRoot() == s.Root {
 		return
 	}
-	if err := s.removeAll(s.activeContainerDir(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := s.RemoveActiveContainerState(id); err != nil {
 		log.Warningf("Deferring cleanup of node-local state for container %q: %v", id, err)
 	}
+}
+
+// RemoveActiveContainerState removes the node-local state of the container
+// with this ID. The state leaves the active namespace first, in one rename,
+// and is deleted after.
+func (s Store) RemoveActiveContainerState(id string) error {
+	if err := validateObjectName("container", id); err != nil {
+		return err
+	}
+	root := filepath.Join(s.activeRoot(), removedActiveContainerDir)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return fmt.Errorf("creating the directory of removed node-local state: %w", err)
+	}
+	tombstone, err := os.MkdirTemp(root, id+".")
+	if err != nil {
+		return fmt.Errorf("removing node-local state of container %q: %w", id, err)
+	}
+	if err := s.rename(s.activeContainerDir(id), filepath.Join(tombstone, "state")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		_ = os.Remove(tombstone)
+		return fmt.Errorf("removing node-local state of container %q: %w", id, err)
+	}
+	return s.removeAll(tombstone)
+}
+
+// SweepRemovedActiveContainerState deletes the node-local state that
+// removals moved away but had not deleted when their daemon stopped. It must
+// not run while a removal may.
+func (s Store) SweepRemovedActiveContainerState() error {
+	if s.activeRoot() == s.Root {
+		return nil
+	}
+	return s.removeAll(filepath.Join(s.activeRoot(), removedActiveContainerDir))
 }
 
 // stageContainerRemoval atomically removes one container from the active
