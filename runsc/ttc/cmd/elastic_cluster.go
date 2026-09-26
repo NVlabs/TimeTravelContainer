@@ -6607,7 +6607,7 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 	if directory == nil || authority == nil || backend == nil || guardian == nil {
 		return nil, nil, errors.New("elastic heartbeat dependencies are incomplete")
 	}
-	authorityState, err := authority.AuthorityStateOf(cluster.ExecutionGrants)
+	authorityState, err := authority.AuthorityStateOf(cluster.ExecutionGrantsOf(initial.NodeID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading initial Raft execution grants: %w", err)
 	}
@@ -6619,14 +6619,28 @@ func startElasticNodeHeartbeat(directory cluster.NodeCatalog, authority *cluster
 		maintainElasticNode(directory, record, backend.activeDataRoot(), lease, stderr, done, func(state *cluster.AuthorityState) error {
 			if state == nil {
 				var err error
-				state, err = authority.AuthorityStateOf(cluster.ExecutionGrants)
+				state, err = authority.AuthorityStateOf(cluster.ExecutionGrantsOf(record.NodeID))
 				if err != nil {
 					return fmt.Errorf("reading Raft execution grants: %w", err)
 				}
 			}
 			currentExecutionGrants := nodeExecutionGrants(state, record.NodeID, record.Incarnation)
-			if executionGrantRevoked(lastExecutionGrants, currentExecutionGrants) &&
-				executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
+			revoked := executionGrantRevoked(lastExecutionGrants, currentExecutionGrants)
+			if revoked {
+				// What became of the revoked grants, which another node may
+				// own now.
+				var keys []string
+				for grant := range lastExecutionGrants {
+					if _, retained := currentExecutionGrants[grant]; !retained {
+						keys = append(keys, grant)
+					}
+				}
+				var err error
+				if state, err = authority.AuthorityStateOf(cluster.RevokedGrants(keys)); err != nil {
+					return fmt.Errorf("reading revoked Raft execution grants: %w", err)
+				}
+			}
+			if revoked && executionRevocationsRequireImmediateFence(lastExecutionGrants, currentExecutionGrants, state, record.NodeID, record.Incarnation) {
 				// A node may still be recovering physically stopped Sentries while it
 				// is Joining. Project any replicated revocation before extending the
 				// guardian lease, using the same selective-fence rule as Ready nodes.

@@ -680,7 +680,7 @@ func (c *RaftCatalog) HeartbeatState(ctx context.Context, nodeID, incarnation st
 	defer ticker.Stop()
 	localDeadline := time.Now().Add(100 * time.Millisecond)
 	// The node's execution grants, and its own record, renewed.
-	query := ExecutionGrants
+	query := ExecutionGrantsOf(nodeID)
 	query.Nodes = Only(nodeID)
 	for {
 		if c.node.AppliedRevision() >= result.Revision {
@@ -846,9 +846,18 @@ func (c *RaftCatalog) LookupPlacement(family, branch string) (*PlacementRecord, 
 // owner is offline.
 var PlacementsWithOwners = AuthorityQuery{Placements: All[string](), Branches: All[string](), Nodes: All[string]()}
 
-// ExecutionGrants is the query of what a node's lease guardian checks its
-// execution grants against: every placement, transaction and branch.
-var ExecutionGrants = AuthorityQuery{Placements: All[string](), Transactions: All[string](), Branches: All[string]()}
+// ExecutionGrantsOf is the query of what the lease guardian of node reads its
+// execution grants from: the placements it owns, and every transaction.
+func ExecutionGrantsOf(node string) AuthorityQuery {
+	return AuthorityQuery{Placements: All[string](), Owner: node, Transactions: All[string]()}
+}
+
+// RevokedGrants is the query of what the lease guardian checks grants that
+// disappeared against: their placements and branches, whoever owns them now,
+// and every transaction.
+func RevokedGrants(keys []string) AuthorityQuery {
+	return AuthorityQuery{Placements: Only(keys...), Branches: Only(keys...), Transactions: All[string]()}
+}
 
 // Lookup implements PlacementCatalog. Go cannot overload NodeCatalog.Lookup,
 // so callers use a typed PlacementCatalog view whose method is provided by the

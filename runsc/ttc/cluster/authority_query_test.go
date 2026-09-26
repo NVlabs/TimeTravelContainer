@@ -95,3 +95,26 @@ func TestAuthorityQuerySelectsOnlyItsRecords(t *testing.T) {
 		t.Fatal("changing a read changed the state")
 	}
 }
+
+func TestAuthorityQueryOwnerKeepsTheNodesPlacements(t *testing.T) {
+	state := NewAuthorityState()
+	mine, theirs := logicalBranchKey("fam-a", "main"), logicalBranchKey("fam-b", "main")
+	state.Placements[mine] = PlacementRecord{FamilyID: "fam-a", BranchID: "main", OwnerNode: "node-a"}
+	state.Placements[theirs] = PlacementRecord{FamilyID: "fam-b", BranchID: "main", OwnerNode: "node-b"}
+	fsm := &AuthorityFSM{state: state}
+	got, err := fsm.query(ExecutionGrantsOf("node-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Placements) != 1 || got.Placements[mine].OwnerNode != "node-a" {
+		t.Fatalf("node-a's grants have placements %v", got.Placements)
+	}
+	// A revoked grant's placement is read whoever owns it now.
+	got, err = fsm.query(RevokedGrants([]string{theirs}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Placements) != 1 || got.Placements[theirs].OwnerNode != "node-b" {
+		t.Fatalf("a revoked grant reads placements %v", got.Placements)
+	}
+}

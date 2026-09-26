@@ -37,6 +37,9 @@ type AuthorityQuery struct {
 	// Family, if set, keeps of the placements, branches and publications
 	// selected only those of this family.
 	Family string `json:"family,omitempty"`
+	// Owner, if set, keeps of the placements selected only those this node
+	// owns.
+	Owner string `json:"owner,omitempty"`
 }
 
 // Keys selects records of one kind: every one, or those with these keys.
@@ -94,6 +97,23 @@ func ofFamily[V any](records map[string]V, family string) map[string]V {
 	return selected
 }
 
+// ownedBy returns the placements node owns, or all of them if node is empty.
+func ownedBy(placements map[string]PlacementRecord, node string) map[string]PlacementRecord {
+	if node == "" {
+		return placements
+	}
+	var owned map[string]PlacementRecord
+	for key, placement := range placements {
+		if placement.OwnerNode == node {
+			if owned == nil {
+				owned = make(map[string]PlacementRecord)
+			}
+			owned[key] = placement
+		}
+	}
+	return owned
+}
+
 // view returns the records of s that query names. It shares them with s,
 // which must not change until the view is encoded.
 func (s *AuthorityState) view(query AuthorityQuery) *AuthorityState {
@@ -103,7 +123,7 @@ func (s *AuthorityState) view(query AuthorityQuery) *AuthorityState {
 	if !query.RetiredNodes {
 		view.RetiredNodes = nil
 	}
-	view.Placements = ofFamily(selectRecords(s.Placements, query.Placements), query.Family)
+	view.Placements = ownedBy(ofFamily(selectRecords(s.Placements, query.Placements), query.Family), query.Owner)
 	view.Transactions = selectRecords(s.Transactions, query.Transactions)
 	view.Branches = ofFamily(selectRecords(s.Branches, query.Branches), query.Family)
 	view.Publications = ofFamily(selectRecords(s.Publications, query.Publications), query.Family)
