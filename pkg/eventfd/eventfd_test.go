@@ -17,6 +17,8 @@ package eventfd
 import (
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestReadWrite(t *testing.T) {
@@ -72,4 +74,75 @@ func TestWait(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Read() did not return after Notify()")
 	}
+}
+
+// TestWritesAccumulate checks that writes add up until a read returns and
+// resets their sum, however many there are.
+func TestWritesAccumulate(t *testing.T) {
+	efd, err := Create()
+	if err != nil {
+		t.Fatalf("failed to Create(): %v", err)
+	}
+	defer efd.Close()
+
+	// More writes than a pipe could hold as separate records.
+	const writes = 100000
+	for i := 0; i < writes; i++ {
+		if err := efd.Notify(); err != nil {
+			t.Fatalf("Notify() failed: %v", err)
+		}
+	}
+	if err := efd.Write(5); err != nil {
+		t.Fatalf("Write(5) failed: %v", err)
+	}
+	if got, err := efd.Read(); err != nil || got != writes+5 {
+		t.Fatalf("Read() = %d, %v, want %d, nil", got, err, writes+5)
+	}
+
+	// The read consumed every write, so the eventfd isn't readable.
+	if readable(t, efd) {
+		t.Fatalf("eventfd is readable after its value was read")
+	}
+	if err := efd.Notify(); err != nil {
+		t.Fatalf("Notify() failed: %v", err)
+	}
+	if !readable(t, efd) {
+		t.Fatalf("eventfd isn't readable after Notify()")
+	}
+	if got, err := efd.Read(); err != nil || got != 1 {
+		t.Fatalf("Read() = %d, %v, want 1, nil", got, err)
+	}
+}
+
+// TestDupSharesValue checks that a duplicate observes writes to the original.
+func TestDupSharesValue(t *testing.T) {
+	efd, err := Create()
+	if err != nil {
+		t.Fatalf("failed to Create(): %v", err)
+	}
+	defer efd.Close()
+	dup, err := efd.Dup()
+	if err != nil {
+		t.Fatalf("Dup() failed: %v", err)
+	}
+	defer dup.Close()
+	if err := efd.Write(3); err != nil {
+		t.Fatalf("Write(3) failed: %v", err)
+	}
+	if err := dup.Write(4); err != nil {
+		t.Fatalf("Write(4) failed: %v", err)
+	}
+	if got, err := dup.Read(); err != nil || got != 7 {
+		t.Fatalf("Read() = %d, %v, want 7, nil", got, err)
+	}
+}
+
+func readable(t *testing.T, efd Eventfd) bool {
+	t.Helper()
+	fds := []unix.PollFd{{Fd: int32(efd.FD()), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 0)
+	if err != nil {
+		t.Fatalf("poll failed: %v", err)
+	}
+	return n == 1 && fds[0].Revents&unix.POLLIN != 0
 }

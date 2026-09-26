@@ -88,12 +88,16 @@ go_library(
         "control_fd_refs.go",
         "fd.go",
         "handlers.go",
+        "host_poll_darwin.go",
+        "host_poll_linux.go",
         "lisafs.go",
         "message.go",
         "node.go",
         "node_fd_refs.go",
         "open_fd_list.go",
         "open_fd_refs.go",
+        "protocol_error_darwin.go",
+        "protocol_error_linux.go",
         "sample_message.go",
         "server.go",
         "sock.go",
@@ -102,6 +106,7 @@ go_library(
     marshal = True,
     deps = [
         "//pkg/abi/linux",
+        "//pkg/abi/linux/errno",
         "//pkg/atomicbitops",
         "//pkg/cleanup",
         "//pkg/context",
@@ -116,9 +121,18 @@ go_library(
         "//pkg/p9",
         "//pkg/refs",
         "//pkg/sync",
+        "//pkg/syserr",
         "//pkg/unet",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "host_poll_test",
+    size = "small",
+    srcs = ["host_poll_test.go"],
+    library = ":lisafs",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )
 
 go_test(

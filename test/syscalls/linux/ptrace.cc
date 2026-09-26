@@ -2261,8 +2261,49 @@ TEST(PtraceTest, Interrupt_Listen_RequireSeize) {
       << " status " << status;
 }
 
-// TODO(b/416779744): PTRACE_SINGLESTEP doesn't work properly on ARM64.
-#ifdef __x86_64__
+#ifdef __aarch64__
+TEST(PtraceTest, Brk) {
+  pid_t const child_pid = fork();
+  if (child_pid == 0) {
+    TEST_PCHECK(ptrace(PTRACE_TRACEME, 0, 0, 0) == 0);
+    asm volatile("brk #0");
+    _exit(56);
+  }
+  ASSERT_THAT(child_pid, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+      << " status " << status;
+  siginfo_t siginfo = {};
+  ASSERT_THAT(ptrace(PTRACE_GETSIGINFO, child_pid, 0, &siginfo),
+              SyscallSucceeds());
+  EXPECT_EQ(SIGTRAP, siginfo.si_signo);
+  EXPECT_EQ(TRAP_BRKPT, siginfo.si_code);
+
+  // AArch64 reports ELR at the BRK instruction. A debugger normally restores
+  // its hidden instruction at this PC; this standalone tracee has no hidden
+  // instruction, so advance explicitly before continuing.
+  struct user_regs_struct regs = {};
+  struct iovec iov;
+  iov.iov_base = &regs;
+  iov.iov_len = sizeof(regs);
+  ASSERT_THAT(ptrace(PTRACE_GETREGSET, child_pid, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  regs.pc += 4;
+  iov.iov_len = sizeof(regs);
+  ASSERT_THAT(ptrace(PTRACE_SETREGSET, child_pid, NT_PRSTATUS, &iov),
+              SyscallSucceeds());
+  ASSERT_THAT(ptrace(PTRACE_CONT, child_pid, 0, 0), SyscallSucceeds());
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 56)
+      << " status " << status;
+}
+#endif /* __aarch64__ */
+
+#if defined(__x86_64__) || defined(__aarch64__)
 TEST(PtraceTest, SingleStep) {
   pid_t const child_pid = fork();
   if (child_pid == 0) {
@@ -2300,7 +2341,7 @@ TEST(PtraceTest, SingleStep) {
   EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
       << " status " << status;
 }
-#endif /* __x86_64__ */
+#endif /* __x86_64__ || __aarch64__ */
 
 TEST(PtraceTest, SeizeSetOptions) {
   pid_t const child_pid = fork();

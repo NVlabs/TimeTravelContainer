@@ -19,11 +19,9 @@ package hostarch
 import "encoding/binary"
 
 const (
-	// PageSize is the system page size.
-	// arm64 support 4K/16K/64K page size,
-	// which can be get by unix.Getpagesize().
-	// Currently, only 4K page size is supported by default,
-	// or 64K pages by using the pagesize_64k build tag.
+	// PageSize is the page size of the Linux ABI implemented by the sentry.
+	// It is intentionally independent of the host VM allocation granule. Host
+	// mmap/munmap users must use pkg/hostmem for host alignment.
 	PageSize = 1 << PageShift
 
 	// HugePageSize is the system huge page size.

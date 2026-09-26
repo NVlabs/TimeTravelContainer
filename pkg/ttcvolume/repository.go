@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -176,8 +177,13 @@ func probeCapability(root string) (Capability, error) {
 	}
 	cloneName := clone.Name()
 	defer os.Remove(cloneName)
-	defer clone.Close()
-	if err := unix.IoctlFileClone(int(clone.Fd()), int(source.Fd())); err != nil {
+	defer func() {
+		if clone != nil {
+			clone.Close()
+		}
+	}()
+	clone, err = cloneFile(source, clone, unix.AT_FDCWD, cloneName)
+	if err != nil {
 		capability.Mode = CopyModeFull
 		return capability, nil
 	}
@@ -1198,8 +1204,12 @@ func OpenRepositoryFD(dir *os.File, mode CopyMode) (*Repository, error) {
 		return nil, err
 	}
 	repo := &Repository{dir: os.NewFile(uintptr(dup), "ttc-volume-repository"), copyMode: mode}
-	graphPath := fmt.Sprintf("/proc/self/fd/%d/graph", repo.dir.Fd())
-	repo.graph, err = ttcsnapshot.OpenExternallyCoordinated(graphPath)
+	dirPath, err := directoryFDPath(repo.dir)
+	if err != nil {
+		repo.Close()
+		return nil, fmt.Errorf("resolving donated repository directory: %w", err)
+	}
+	repo.graph, err = ttcsnapshot.OpenExternallyCoordinated(filepath.Join(dirPath, "graph"))
 	if err != nil {
 		repo.Close()
 		return nil, fmt.Errorf("opening donated repository snapshot graph: %w", err)
@@ -2849,7 +2859,7 @@ func (r *Repository) SyncData(branchID string, ino uint64, dataOnly bool) error 
 	}
 	defer file.Close()
 	if dataOnly {
-		if err := unix.Fdatasync(int(file.Fd())); err != nil {
+		if err := syncFileData(file); err != nil {
 			return fmt.Errorf("fdatasync branch %q inode %d: %w", branchID, ino, err)
 		}
 		return nil
@@ -3248,7 +3258,7 @@ func (r *Repository) AllocateWithCoW(branchID string, ino uint64, offset, length
 		if err != nil {
 			return err
 		}
-		err = unix.Fallocate(int(file.Fd()), 0, offset, length)
+		err = allocateFile(file, offset, length)
 		closeErr := file.Close()
 		if err != nil {
 			return err
@@ -3330,7 +3340,7 @@ func (r *Repository) BranchUsage(branchID string) (uint64, uint64, error) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	var bytes uint64
-	pageSize := uint64(os.Getpagesize())
+	pageSize := uint64(hostarch.PageSize)
 	for _, inode := range state.inodes {
 		if inode.Type == "regular" && inode.Size > 0 {
 			size := uint64(inode.Size)
@@ -3441,7 +3451,7 @@ func (r *Repository) BranchSetUsage(branchIDs []string) (result BranchSetDataUsa
 	snapshots := make(map[string]snapshot, len(ids))
 	objectBranches := make(map[string]uint64)
 	objectSizes := make(map[string]uint64)
-	pageSize := uint64(os.Getpagesize())
+	pageSize := uint64(hostarch.PageSize)
 	for _, id := range ids {
 		branch, err := r.Branch(id)
 		if err != nil {

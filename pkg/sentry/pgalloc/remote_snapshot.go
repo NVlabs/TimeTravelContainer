@@ -1163,9 +1163,9 @@ type RemoteLoadRange struct {
 }
 
 // AttachRemotePageLoad marks existing target pages as unloaded and attaches
-// them to pages. Access through MapInternal or DataFD blocks until the relevant
-// remote ranges have been installed. The caller must call
-// AsyncPagesFileLoad.MemoryFilesDone after attaching every destination
+// them to pages. Access through MapInternal, ResolveBackingFrames, or DataFD
+// blocks until the relevant remote ranges have been installed. The caller must
+// call AsyncPagesFileLoad.MemoryFilesDone after attaching every destination
 // MemoryFile.
 //
 // The target ranges must already be allocated with at least one reference.
@@ -1563,7 +1563,7 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		if err != nil {
 			return written, err
 		}
-		src, err := lease.File().MapInternal(lease.Range(), hostarch.Read)
+		src, mappingLease, err := memmap.MapInternalWithLease(lease.File(), lease.Range(), hostarch.Read)
 		if err != nil {
 			lease.Close()
 			return written, fmt.Errorf("mapping remote snapshot region %d source range %v for stream offset %#x: %w", region.ID, lease.Range(), streamOff, err)
@@ -1572,6 +1572,9 @@ func (s *RemoteSnapshot) CopyStreamAt(dst []byte, off int64) (int, error) {
 		copied, copyErr := safemem.CopySeq(dstSeq, src)
 		if copyErr == nil && copied != length {
 			copyErr = io.ErrUnexpectedEOF
+		}
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
 		lease.Close()
 		written += int(copied)
@@ -1616,7 +1619,10 @@ func (s *RemoteSnapshot) EnsureResident() error {
 			if err != nil {
 				return err
 			}
-			blocks, mapErr := lease.File().MapInternal(lease.Range(), hostarch.Read)
+			blocks, mappingLease, mapErr := memmap.MapInternalWithLease(lease.File(), lease.Range(), hostarch.Read)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			lease.Close()
 			if mapErr != nil {
 				return mapErr

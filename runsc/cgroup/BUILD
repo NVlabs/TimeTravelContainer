@@ -9,6 +9,8 @@ go_library(
     name = "cgroup",
     srcs = [
         "cgroup.go",
+        "cgroup_host_darwin.go",
+        "cgroup_host_linux.go",
         "cgroup_v2.go",
         "systemd.go",
     ],
@@ -43,4 +45,5 @@ go_test(
         "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

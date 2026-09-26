@@ -7,6 +7,8 @@ licenses(["notice"])
 go_library(
     name = "util",
     srcs = [
+        "host_mmap_darwin.go",
+        "host_mmap_linux.go",
         "ioctl_unsafe.go",
         "util.go",
     ],
@@ -14,6 +16,7 @@ go_library(
         "//pkg/sentry:internal",
     ],
     deps = [
+        "//pkg/abi/linux",
         "@org_golang_x_exp//constraints:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],

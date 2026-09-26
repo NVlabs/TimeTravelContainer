@@ -140,6 +140,67 @@ func (rw *readerWriter) Release(context.Context) {
 	rw.released = true
 }
 
+// partialWouldBlockWriter models Darwin's small nonblocking Unix-socket send
+// queue: a write can successfully consume a prefix while also reporting that
+// the remainder would block.
+type partialWouldBlockWriter struct {
+	readerWriter
+	maxWrite   int
+	writes     int
+	registered bool
+}
+
+func (w *partialWouldBlockWriter) Write(ctx context.Context, src usermem.IOSequence, _ vfs.WriteOptions) (int64, error) {
+	w.writes++
+	length := int(src.NumBytes())
+	if length > w.maxWrite {
+		length = w.maxWrite
+	}
+	buf := make([]byte, length)
+	n, err := src.TakeFirst64(int64(length)).CopyIn(ctx, buf)
+	if err != nil {
+		return int64(n), err
+	}
+	if _, err := w.buf.Write(buf[:n]); err != nil {
+		return int64(n), err
+	}
+	return int64(n), linuxerr.ErrWouldBlock
+}
+
+func (w *partialWouldBlockWriter) EventRegister(*waiter.Entry) error {
+	w.registered = true
+	return nil
+}
+
+func TestFileDescriptionConnPreservesPartialWrite(t *testing.T) {
+	ctx := contexttest.Context(t)
+	impl := &partialWouldBlockWriter{maxWrite: 8}
+	fd, err := newMockFileDescription(ctx, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.DecRef(ctx)
+
+	payload := []byte("partial writes must advance")
+	conn := fileDescriptionConn{file: fd}
+	n, err := conn.Write(ctx, payload, make(chan struct{}))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != impl.maxWrite {
+		t.Fatalf("Write returned %d bytes, want successful prefix %d", n, impl.maxWrite)
+	}
+	if impl.writes != 1 {
+		t.Fatalf("underlying write called %d times, want 1", impl.writes)
+	}
+	if impl.registered {
+		t.Fatal("registered a waiter after a successful partial write")
+	}
+	if got := impl.buf.Bytes(); !bytes.Equal(got, payload[:impl.maxWrite]) {
+		t.Fatalf("underlying payload = %q, want %q", got, payload[:impl.maxWrite])
+	}
+}
+
 // waiterRW implements mockFileDescriptionRWImpl. waiterRW works the same way as readerWriter above,
 // but it interleaves blocks in between Read and Write calls.
 type waiterRW struct {

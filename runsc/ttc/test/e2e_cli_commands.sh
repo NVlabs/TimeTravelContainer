@@ -26,12 +26,55 @@ fail() {
 	exit 1
 }
 
+# run_with_timeout is timeout(1), which macOS lacks, with GNU gtimeout or
+# Perl as fallbacks. A timed-out command exits with 124.
+run_with_timeout() {
+	seconds=$1
+	shift
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$seconds" "$@"
+		return
+	fi
+	if command -v gtimeout >/dev/null 2>&1; then
+		gtimeout "$seconds" "$@"
+		return
+	fi
+	perl -e '
+		use POSIX qw(:sys_wait_h);
+		my $seconds = shift @ARGV;
+		my $pid = fork();
+		die "fork: $!\n" unless defined $pid;
+		if ($pid == 0) {
+			exec @ARGV;
+			die "exec $ARGV[0]: $!\n";
+		}
+		$SIG{ALRM} = sub {
+			kill "TERM", $pid;
+			select undef, undef, undef, 1;
+			kill "KILL", $pid;
+			exit 124;
+		};
+		alarm $seconds;
+		waitpid($pid, 0);
+		my $status = $?;
+		alarm 0;
+		exit(WIFEXITED($status) ? WEXITSTATUS($status) : 128 + WTERMSIG($status));
+	' "${seconds%s}" "$@"
+}
+
 test -x "$TTC" || fail "TTC is not executable: $TTC"
 test -x "$TTCD" || fail "TTCD is not executable: $TTCD"
 mkdir -p "$ROOT/bin"
 chmod 700 "$ROOT"
 install -m 0755 "$(readlink -f "$TTC")" "$ROOT/bin/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$ROOT/bin/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$ROOT/bin/ttcd" >/dev/null
+fi
 TTC=$ROOT/bin/ttc
 
 ttc() { TTC_SOCKET=$SOCKET "$TTC" "$@"; }
@@ -83,7 +126,7 @@ ttc exec -itd --session repl "$NAME@main" sh >/dev/null
 ttc exec ls --json "$NAME@main" | grep -q 'repl'
 ttc tty stat "$NAME@main" --session repl --json | grep -q 'session_epoch'
 watch_status=0
-timeout 1s "$TTC" --daemon-socket "$SOCKET" tty watch "$NAME@main" --session repl --json >/dev/null 2>&1 || watch_status=$?
+run_with_timeout 1s "$TTC" --daemon-socket "$SOCKET" tty watch "$NAME@main" --session repl --json >/dev/null 2>&1 || watch_status=$?
 test "$watch_status" -eq 124 || fail "tty watch exited unexpectedly with $watch_status"
 ttc exec kill --signal KILL "$NAME@main:repl" >/dev/null
 ttc exec wait "$NAME@main:repl" >/dev/null || true

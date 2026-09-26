@@ -54,6 +54,8 @@ go_library(
         "pagetables_x86.go",
         "pcids.go",
         "pcids_aarch64.go",
+        "pcids_aarch64_darwin.go",
+        "pcids_aarch64_linux.go",
         "pcids_aarch64.s",
         "pcids_x86.go",
         "walker_amd64.go",

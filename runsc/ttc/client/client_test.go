@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -197,7 +198,7 @@ func TestTTCSocketAndOverride(t *testing.T) {
 }
 
 func TestDaemonStopRetriesReportedLegacyAPI(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "ttcd.sock")
+	socket := filepath.Join(shortSocketDir(t), "ttcd.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +289,7 @@ func TestReportedDaemonAPIVersion(t *testing.T) {
 }
 
 func TestDetachedTTYRequestKeepsTerminalControlStreamOpen(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "ttcd.sock")
+	socket := filepath.Join(shortSocketDir(t), "ttcd.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -437,5 +438,37 @@ func TestPrepareCheckpointArchiveIOUsesClientFiles(t *testing.T) {
 	}
 	if got := strings.Join(args, " "); got != "restore --node node-b --name copy -" || string(data) != "checkpoint-input" || output != io.Discard || !commandUsesStdin(args) {
 		t.Fatalf("restore args=%q data=%q stdin=%t", args, data, commandUsesStdin(args))
+	}
+}
+
+// shortSocketDir returns a directory for a Unix socket whose path fits in
+// sockaddr_un on every host; t.TempDir can exceed Darwin's 104 bytes.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ttc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func TestNormalizeEnvironmentImports(t *testing.T) {
+	t.Setenv("TTC_TEST_CLIENT_ENV", "from-client")
+	for _, test := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"run", "-e", "TTC_TEST_CLIENT_ENV", "alpine"}, []string{"run", "-e", "TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"create", "--name", "demo", "--env=TTC_TEST_CLIENT_ENV", "alpine"}, []string{"create", "--name", "demo", "--env=TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"container", "run", "-e=TTC_TEST_CLIENT_ENV", "alpine"}, []string{"container", "run", "-e=TTC_TEST_CLIENT_ENV=from-client", "alpine"}},
+		{[]string{"run", "--env", "TTC_TEST_CLIENT_ENV=explicit", "alpine"}, []string{"run", "--env", "TTC_TEST_CLIENT_ENV=explicit", "alpine"}},
+		{[]string{"run", "--env", "TTC_TEST_MISSING_ENV", "alpine"}, []string{"run", "--env", "TTC_TEST_MISSING_ENV", "alpine"}},
+		{[]string{"run", "alpine", "sh", "-c", "echo", "--env", "TTC_TEST_CLIENT_ENV"}, []string{"run", "alpine", "sh", "-c", "echo", "--env", "TTC_TEST_CLIENT_ENV"}},
+		{[]string{"exec", "-e", "TTC_TEST_CLIENT_ENV", "demo@main", "true"}, []string{"exec", "-e", "TTC_TEST_CLIENT_ENV", "demo@main", "true"}},
+	} {
+		if got := normalizeEnvironmentImports(test.args); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("normalizeEnvironmentImports(%q)=%q, want %q", test.args, got, test.want)
+		}
 	}
 }

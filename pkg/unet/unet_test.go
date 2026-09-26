@@ -17,6 +17,7 @@ package unet
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func randomFilename() (string, error) {
 
 	// NOTE(b/26918832): We try to use relative path if possible. This is
 	// to help conforming to the unix path length limit.
-	if rel, err := filepath.Rel(cwd, file); err == nil {
+	if rel, err := filepath.Rel(cwd, file); err == nil && len(rel) < len(file) {
 		return rel, nil
 	}
 
@@ -226,6 +227,9 @@ func TestSymmetric(t *testing.T) {
 }
 
 func TestPacket(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("Darwin does not support AF_UNIX SOCK_SEQPACKET")
+	}
 	server, client := socketPair(t, true)
 	defer server.Close()
 	defer client.Close()
@@ -427,10 +431,7 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	expected := len(origFDs)
 
 	// Count the number of FDs.
-	preEntries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("Can't readdir, got err %v expected nil", err)
-	}
+	preCount := openFDCount(t)
 
 	// Read on the client.
 	b := [][]byte{{'b'}}
@@ -446,12 +447,9 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	}
 
 	// Count the new number of FDs.
-	postEntries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("Can't readdir, got err %v expected nil", err)
-	}
-	if len(preEntries)+expected != len(postEntries) {
-		t.Errorf("Process fd count isn't right, expected %d got %d", len(preEntries)+expected, len(postEntries))
+	postCount := openFDCount(t)
+	if preCount+expected != postCount {
+		t.Errorf("Process fd count isn't right, expected %d got %d", preCount+expected, postCount)
 	}
 
 	// Make sure the FDs are there.
@@ -479,12 +477,9 @@ func recvFDs(t *testing.T, s *Socket, enableSize int, origFDs []int) {
 	r.CloseFDs()
 
 	// Make sure the count is back to normal.
-	finalEntries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("Can't readdir, got err %v expected nil", err)
-	}
-	if len(finalEntries) != len(preEntries) {
-		t.Errorf("Process fd count isn't right, expected %d got %d", len(preEntries), len(finalEntries))
+	finalCount := openFDCount(t)
+	if finalCount != preCount {
+		t.Errorf("Process fd count isn't right, expected %d got %d", preCount, finalCount)
 	}
 }
 
@@ -534,8 +529,13 @@ func TestFDsReceiveSmallBuffer(t *testing.T) {
 	sendFDs(t, server, []int{0, 1, 2})
 
 	// Per the spec, we may still receive more than the buffer. In fact,
-	// it'll be rounded up and we can receive two with a size one buffer.
-	recvFDs(t, client, 1, []int{0, 1})
+	// Linux alignment rounds this up and receives two with a size-one buffer;
+	// Darwin's control-message alignment receives exactly one.
+	want := []int{0, 1}
+	if runtime.GOOS == "darwin" {
+		want = []int{0}
+	}
+	recvFDs(t, client, 1, want)
 }
 
 func TestFDsReceiveNotEnabled(t *testing.T) {

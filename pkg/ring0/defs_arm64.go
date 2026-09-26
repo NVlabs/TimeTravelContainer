@@ -76,6 +76,10 @@ type CPUArchState struct {
 
 	// appASID is the asid value of guest application.
 	appASID uintptr
+
+	// debugStepActive is nonzero while MDSCR_EL1.SS is enabled for the current
+	// application entry. It is owned by the EL1 entry/exit assembly.
+	debugStepActive uintptr
 }
 
 // ErrorCode returns the last error code.

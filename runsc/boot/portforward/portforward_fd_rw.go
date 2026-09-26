@@ -77,8 +77,17 @@ func (r *fileDescriptionConn) Read(ctx context.Context, buf []byte, cancel <-cha
 func (r *fileDescriptionConn) Write(ctx context.Context, buf []byte, cancel <-chan struct{}) (int, error) {
 	var notifyCh chan struct{}
 	var waitEntry waiter.Entry
-	n, err := r.file.Write(ctx, usermem.BytesIOSequence(buf), vfs.WriteOptions{})
-	for linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+	for {
+		n, err := r.file.Write(ctx, usermem.BytesIOSequence(buf), vfs.WriteOptions{})
+		// A nonblocking stream write may make progress and report EAGAIN at
+		// the same time. Return the successful prefix immediately: retrying
+		// the original slice here replays bytes on small host socket queues.
+		if n > 0 {
+			return int(n), nil
+		}
+		if !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+			return int(n), err
+		}
 		if notifyCh == nil {
 			waitEntry, notifyCh = waiter.NewTransientChannelEntry(waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 			// Register for when the endpoint is writable or disconnected.
@@ -90,9 +99,7 @@ func (r *fileDescriptionConn) Write(ctx context.Context, buf []byte, cancel <-ch
 		case <-cancel:
 			return 0, io.EOF
 		}
-		n, err = r.file.Write(ctx, usermem.BytesIOSequence(buf), vfs.WriteOptions{})
 	}
-	return int(n), err
 }
 
 // Close implements proxyConn.Close.

@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
 	"gvisor.dev/gvisor/pkg/sentry/ttcremote"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -175,6 +176,16 @@ func TestResidentMemoryVersionChunksBoundFragmentation(t *testing.T) {
 
 type testDistributedBranchResource struct {
 	removed []string
+}
+
+type testMemoryCompactingPlatform struct {
+	sentryplatform.Platform
+	compactCalls int
+}
+
+func (p *testMemoryCompactingPlatform) CompactMemory(context.Context) (sentryplatform.MemoryCompaction, error) {
+	p.compactCalls++
+	return sentryplatform.MemoryCompaction{}, nil
 }
 
 func TestSandboxFamilyWaivedLiveForkIsSystematicallyRejected(t *testing.T) {
@@ -457,6 +468,8 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Boot: %v", err)
 	}
+	compactingPlatform := &testMemoryCompactingPlatform{Platform: parent.Platform}
+	parent.Platform = compactingPlatform
 	parent.PipeMount().IncRef()
 	parent.SetHostMount(parent.PipeMount())
 	parent.Pause()
@@ -474,6 +487,24 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	if _, err := family.Fork(&ForkBranchArgs{ID: "sleeping", Paused: true}); err != nil {
 		t.Fatalf("Fork: %v", err)
 	}
+	// Model both halves of the loader's persistent console follower: its
+	// process-lifetime lease must not block memory compaction, while its
+	// transient console wait must be canceled before compaction.
+	_, finishLifetimeWait, err := family.beginLifetimeControl(DefaultBranchID, false)
+	if err != nil {
+		t.Fatalf("beginLifetimeControl: %v", err)
+	}
+	defer finishLifetimeWait()
+	_, consoleWait, finishConsoleWait, err := family.beginConsoleWait(DefaultBranchID)
+	if err != nil {
+		t.Fatalf("beginConsoleWait: %v", err)
+	}
+	consoleCanceled := make(chan struct{})
+	go func() {
+		<-consoleWait.cancel
+		finishConsoleWait()
+		close(consoleCanceled)
+	}()
 	family.mu.Lock()
 	original := family.branches["sleeping"].k
 	exitStatus := uint32(linux.WaitStatusExit(7))
@@ -488,6 +519,14 @@ func TestSandboxFamilyDehydrateRehydrateForkedBranch(t *testing.T) {
 	}
 	if err := family.Dehydrate("sleeping", metadata); err != nil {
 		t.Fatalf("Dehydrate: %v", err)
+	}
+	select {
+	case <-consoleCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("sibling console follower was not canceled before compaction")
+	}
+	if compactingPlatform.compactCalls != 1 {
+		t.Fatalf("platform compaction calls=%d, want 1", compactingPlatform.compactCalls)
 	}
 	if stat, err := os.Stat(metadata.Name()); err != nil || stat.Size() <= 48 {
 		t.Fatalf("metadata stat=%v err=%v", stat, err)

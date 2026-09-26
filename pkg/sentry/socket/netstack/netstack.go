@@ -870,7 +870,7 @@ func (s *sock) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.E
 	switch err := s.Endpoint.Connect(addr); err.(type) {
 	case *tcpip.ErrConnectStarted, *tcpip.ErrAlreadyConnecting:
 	case *tcpip.ErrNoPortAvailable:
-		if (s.family == unix.AF_INET || s.family == unix.AF_INET6) && s.skType == linux.SOCK_STREAM {
+		if (s.family == linux.AF_INET || s.family == linux.AF_INET6) && s.skType == linux.SOCK_STREAM {
 			// TCP unlike UDP returns EADDRNOTAVAIL when it can't
 			// find an available local ephemeral port.
 			return syserr.ErrAddressNotAvailable
@@ -1051,7 +1051,7 @@ func GetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, family
 		return &optP, nil
 
 	case linux.SO_PEERCRED:
-		if family != linux.AF_UNIX || outLen < unix.SizeofUcred {
+		if family != linux.AF_UNIX || outLen < linux.SizeOfControlMessageCredentials {
 			return nil, syserr.ErrInvalidArgument
 		}
 		return s.GetPeerCreds(t)
@@ -3575,6 +3575,16 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
 
+	case linux.SIOCSIFFLAGS:
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		if err := setInterfaceFlagsIoctl(ctx, t, &ifr); err != nil {
+			return 0, err.ToError()
+		}
+		return 0, nil
+
 	case linux.SIOCGIFCONF:
 		// Return a list of interface addresses or the buffer size
 		// necessary to hold the list.
@@ -3624,6 +3634,31 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 	}
 
 	return 0, linuxerr.ENOTTY
+}
+
+// setInterfaceFlagsIoctl implements SIOCSIFFLAGS. Only IFF_UP has an effect;
+// see Stack.setLinkUpLocked. Linux likewise ignores flags that cannot be
+// changed, such as IFF_LOOPBACK and IFF_RUNNING, which callers pass back
+// unchanged after SIOCGIFFLAGS.
+func setInterfaceFlagsIoctl(ctx context.Context, t *kernel.Task, ifr *linux.IFReq) *syserr.Error {
+	ns := t.NetworkNamespace()
+	if ns == nil || !ns.HasCapability(ctx, linux.CAP_NET_ADMIN) {
+		return syserr.ErrNotPermitted
+	}
+	stk, ok := ns.Stack().(*Stack)
+	if !ok {
+		return syserr.ErrNoDevice
+	}
+	for index, iface := range stk.Interfaces() {
+		if iface.Name != ifr.Name() {
+			continue
+		}
+		flags := uint32(hostarch.ByteOrder.Uint16(ifr.Data[:2]))
+		stk.linkMu.Lock()
+		defer stk.linkMu.Unlock()
+		return stk.setLinkUpLocked(ctx, tcpip.NICID(index), flags&linux.IFF_UP != 0)
+	}
+	return syserr.ErrNoDevice
 }
 
 // interfaceIoctl implements interface requests.
@@ -3832,7 +3867,10 @@ func interfaceStatusFlags(stack inet.Stack, name string) (uint32, *syserr.Error)
 
 func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	var rv uint32
-	if f.Up {
+	// Netstack reports every NIC as up and models administrative state as
+	// enablement. A disabled NIC, such as the loopback device of a new
+	// network namespace before userspace brings it up, is down.
+	if f.Up && f.Running {
 		rv |= linux.IFF_UP | linux.IFF_LOWER_UP
 	}
 	if f.Running {

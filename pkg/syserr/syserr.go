@@ -51,7 +51,7 @@ func New(message string, linuxTranslation errno.Errno) *Error {
 		panic(fmt.Sprint("invalid errno: ", err.errno))
 	}
 
-	e := error(unix.Errno(err.errno))
+	e := linuxBackwardsError(err.errno, message)
 	// linuxerr.ErrWouldBlock gets translated to linuxerr.EWOULDBLOCK and
 	// enables proper blocking semantics. This should temporary address the
 	// class of blocking bugs that keep popping up with the current state of
@@ -60,6 +60,13 @@ func New(message string, linuxTranslation errno.Errno) *Error {
 		e = linuxerr.ErrWouldBlock
 	}
 	linuxBackwardsTranslations[err.errno] = linuxBackwardsTranslation{err: e, ok: true}
+	// Preserve the first canonical Error for each Linux errno. Multiple
+	// syserr values may intentionally have the same Linux translation (for
+	// example ErrTryAgain and ErrWouldBlock), but either canonical value has
+	// the same userspace ABI result.
+	if linuxTranslations[err.errno] == nil {
+		linuxTranslations[err.errno] = err
+	}
 
 	return err
 }
@@ -95,6 +102,25 @@ type linuxBackwardsTranslation struct {
 
 // TODO(b/34162363): Remove this.
 var linuxBackwardsTranslations [maxErrno]linuxBackwardsTranslation
+
+// linuxTranslations maps Linux ABI errno values to canonical syserr values.
+// This is distinct from the host-errno table: errno numbers are not portable
+// between Linux and other hosts.
+var linuxTranslations [maxErrno]*Error
+
+// FromLinux translates a Linux ABI errno to a corresponding Error value.
+func FromLinux(err errno.Errno) *Error {
+	if int(err) >= len(linuxTranslations) {
+		panic(fmt.Sprintf("unknown Linux errno %d", err))
+	}
+	if linuxTranslations[err] == nil {
+		// Some Linux-only errno values have no corresponding host errno on
+		// non-Linux platforms, so no static syserr value initializes this
+		// slot. They are still valid Linux ABI errors.
+		return NewDynamic(fmt.Sprintf("Linux errno %d", err), err)
+	}
+	return linuxTranslations[err]
+}
 
 // ToError translates an Error to a corresponding error value.
 //
@@ -272,7 +298,10 @@ func FromError(err error) *Error {
 	case unix.Errno:
 		return FromHost(e)
 	case *errors.Error:
-		return FromHost(unix.Errno(e.Errno()))
+		// errors.Error contains a Linux ABI errno, not a host errno. Treating
+		// it as unix.Errno is only valid when the Sentry host is Linux. On
+		// Darwin, for example, Linux EAGAIN (11) is host EDEADLK.
+		return FromLinux(e.Errno())
 	case safecopy.SegvError, safecopy.BusError, safecopy.AlignmentError:
 		return FromHost(unix.EFAULT)
 	}

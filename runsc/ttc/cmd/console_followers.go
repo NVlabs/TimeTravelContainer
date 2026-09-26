@@ -56,7 +56,7 @@ func dialFamilyFollower(dir string, done func(lock string), lost func(*familyFol
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: address, Net: "unixpacket"})
+	conn, err := net.DialUnix(ttcconsole.FollowerNetwork, nil, &net.UnixAddr{Name: address, Net: ttcconsole.FollowerNetwork})
 	closeDir()
 	if err != nil {
 		return nil, err

@@ -9,6 +9,8 @@ go_library(
     name = "console",
     srcs = [
         "follower.go",
+        "follower_darwin.go",
+        "follower_linux.go",
         "frame.go",
         "rotating.go",
         "status.go",

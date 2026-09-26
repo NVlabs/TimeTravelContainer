@@ -53,7 +53,7 @@ func runFakeFamilyFollower(socket, marker string) int {
 	if err != nil {
 		return 1
 	}
-	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: address, Net: "unixpacket"})
+	listener, err := net.ListenUnix(ttcconsole.FollowerNetwork, &net.UnixAddr{Name: address, Net: ttcconsole.FollowerNetwork})
 	closeDir()
 	if err != nil {
 		return 1

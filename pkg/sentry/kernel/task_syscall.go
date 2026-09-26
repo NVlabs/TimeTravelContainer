@@ -32,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 // SyscallRestartBlock represents the restart block for a syscall restartable
@@ -227,11 +228,10 @@ func (t *Task) doSyscall() taskRunState {
 	sysno := t.Arch().SyscallNo()
 	args := t.Arch().SyscallArgs()
 
-	// Tracers expect to see this between when the task traps into the kernel
-	// to perform a syscall and when the syscall is actually invoked.
-	// This useless-looking temporary is needed because Go.
-	tmp := uintptr(unix.ENOSYS)
-	t.Arch().SetReturn(-tmp)
+	// Set the architecture-specific register state exposed to tracers between
+	// syscall entry and invocation. On x86 this places -ENOSYS in RAX. On
+	// arm64 X0 must retain the first syscall argument, matching Linux.
+	t.Arch().PrepareSyscallEntry()
 
 	// Check seccomp filters. The nil check is for performance (as seccomp use
 	// is rare), not needed for correctness.
@@ -295,6 +295,10 @@ func (*runSyscallAfterSyscallEnterStop) execute(t *Task) taskRunState {
 	if t.killed() {
 		return (*runInterrupt)(nil)
 	}
+	// A tracer may have changed the first syscall argument while stopped. On
+	// arm64 this synchronizes the ptrace-visible X0 back to the saved argument
+	// used by SyscallArgs; it is a no-op on x86.
+	t.Arch().SyscallSaveOrig()
 	sysno := t.Arch().SyscallNo()
 	if sysno == ^uintptr(0) {
 		return (*runSyscallExit)(nil)
@@ -470,7 +474,9 @@ func ExtractErrno(err error, sysno int) int {
 	case nil:
 		return 0
 	case unix.Errno:
-		return int(err)
+		// unix.Errno holds a host errno, which shares Linux numbering only
+		// when the host is Linux. Linux ABI errors are *errors.Error.
+		return int(syserr.HostToLinux(err))
 	case *errors.Error:
 		return int(linuxerr.ToUnix(err))
 	case *memmap.BusError:

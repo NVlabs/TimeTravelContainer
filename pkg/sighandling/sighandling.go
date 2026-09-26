@@ -20,19 +20,20 @@ import (
 	"os/signal"
 	"reflect"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
-// numSignals is the number of normal (non-realtime) signals on Linux.
-const numSignals = 32
+type forwardedSignal struct {
+	host  os.Signal
+	guest linux.Signal
+}
 
 // handleSignals listens for incoming signals and calls the given handler
 // function.
 //
 // It stops when the stop channel is closed. The done channel is closed once it
 // will no longer deliver signals to k.
-func handleSignals(sigchans []chan os.Signal, handler func(linux.Signal), stop, done chan struct{}) {
+func handleSignals(sigchans []chan os.Signal, guests []linux.Signal, handler func(linux.Signal), stop, done chan struct{}) {
 	// Build a select case.
 	sc := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(stop)}}
 	for _, sigchan := range sigchans {
@@ -58,9 +59,9 @@ func handleSignals(sigchans []chan os.Signal, handler func(linux.Signal), stop, 
 			panic("signal channel closed unexpectedly")
 		}
 
-		// Otherwise, it was a signal on channel N. Index 0 represents the stop
-		// channel, so index N represents the channel for signal N.
-		handler(linux.Signal(index))
+		// Otherwise, translate the host signal represented by this channel to
+		// the Linux signal ABI exposed to the container.
+		handler(guests[index-1])
 	}
 }
 
@@ -84,27 +85,17 @@ func StartSignalForwarding(handler func(linux.Signal)) func() {
 	//
 	// We do not forward some signals that are likely induced by the behavior
 	// of the forwarding process.
-	var sigchans []chan os.Signal
-	for sig := 1; sig <= numSignals+1; sig++ {
+	registrations := forwardedSignals()
+	sigchans := make([]chan os.Signal, 0, len(registrations))
+	guests := make([]linux.Signal, 0, len(registrations))
+	for _, registration := range registrations {
 		sigchan := make(chan os.Signal, 1)
 		sigchans = append(sigchans, sigchan)
-
-		// SIGURG is used by Go's runtime scheduler.
-		if sig == int(linux.SIGURG) {
-			continue
-		}
-		// SIGPIPE is received when sending to disconnected host pipes/sockets.
-		if sig == int(linux.SIGPIPE) {
-			continue
-		}
-		// SIGCHLD is received when a child of the forwarding process exits.
-		if sig == int(linux.SIGCHLD) {
-			continue
-		}
-		signal.Notify(sigchan, unix.Signal(sig))
+		guests = append(guests, registration.guest)
+		signal.Notify(sigchan, registration.host)
 	}
 	// Start up our listener.
-	go handleSignals(sigchans, handler, stop, done) // S/R-SAFE: synchronized by Kernel.extMu.
+	go handleSignals(sigchans, guests, handler, stop, done) // S/R-SAFE: synchronized by Kernel.extMu.
 
 	return func() {
 		close(stop)

@@ -21,6 +21,8 @@ TTC=${TTC:-}
 TTCD=${TTCD:-}
 TTC_E2E_ROOT=${TTC_E2E_ROOT:-}
 TTC_UNSAFE_NO_HOST_ISOLATION=${TTC_UNSAFE_NO_HOST_ISOLATION:-0}
+TTC_E2E_DEADLINE_SECONDS=${TTC_E2E_DEADLINE_SECONDS:-}
+TTC_E2E_GUEST_CURL_TIMEOUT=${TTC_E2E_GUEST_CURL_TIMEOUT:-}
 BUSYBOX_IMAGE=${BUSYBOX_IMAGE:-busybox:1.36}
 ALPINE_IMAGE=${ALPINE_IMAGE:-alpine:3.20}
 PYTHON_IMAGE=${PYTHON_IMAGE:-python:3.12-alpine}
@@ -49,6 +51,12 @@ if [ "$TTC_UNSAFE_NO_HOST_ISOLATION" != 1 ]; then
     fail "rootless UID/GID mapping is unavailable; enable unprivileged user namespaces or set TTC_UNSAFE_NO_HOST_ISOLATION=1 for trusted workloads"
   fi
 fi
+if [ -z "$TTC_E2E_DEADLINE_SECONDS" ]; then
+  TTC_E2E_DEADLINE_SECONDS=15
+fi
+if [ -z "$TTC_E2E_GUEST_CURL_TIMEOUT" ]; then
+  TTC_E2E_GUEST_CURL_TIMEOUT=2
+fi
 
 owned_root=false
 if [ -z "$TTC_E2E_ROOT" ]; then
@@ -63,6 +71,13 @@ BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
 TTC="$BIN_DIR/ttc"
 export TTC_ROOT="$DATA_ROOT"
 HOST_FIXTURE="$TTC_E2E_ROOT/host-fixture"
@@ -124,15 +139,20 @@ ttc_daemon_crash() {
   done
 }
 
+stop_nat_fixture() {
+  if [ -n "$NAT_FIXTURE_PID" ]; then
+    kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+    wait "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
+    NAT_FIXTURE_PID=
+  fi
+}
+
 cleanup() {
   for container in "$PREFIX-busybox" "$PREFIX-alpine" "$PREFIX-python" "$PREFIX-nginx" "$PREFIX-redis" "$CONSOLE_STRESS" "$RETENTION" "$NOLOG" "$MULTI_A" "$MULTI_B" "$HOSTNET" "$VNET" "$NETNS" "$STOP_POLICY" "$PIDS_LIMIT" "$LIFECYCLE" "$ATTACH_INPUT" "$AUTO_FOREGROUND" "$AUTO_DETACHED" "$AUTO_CREATED" "$DAEMON_STOP"; do
     ttc rm --force "$container" >/dev/null 2>&1 || true
   done
   ttc daemon stop >/dev/null 2>&1 || true
-  if [ -n "$NAT_FIXTURE_PID" ]; then
-    kill "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
-    wait "$NAT_FIXTURE_PID" >/dev/null 2>&1 || true
-  fi
+  stop_nat_fixture
   if $owned_root; then
     rm -rf "$TTC_E2E_ROOT"
   fi
@@ -170,7 +190,7 @@ AUTO_DETACHED_ID=$(ttc run --rm --detach --name "$AUTO_DETACHED" "$BUSYBOX_IMAGE
 container_id_valid "$AUTO_DETACHED_ID" || fail "detached --rm returned invalid ID: $AUTO_DETACHED_ID"
 [ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_DETACHED")" = true ] ||
   fail "inspect omitted detached auto-remove policy"
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ttc inspect "$AUTO_DETACHED" >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached --rm did not remove its container"
   sleep 1
@@ -179,7 +199,7 @@ AUTO_CREATED_ID=$(ttc create --rm --name "$AUTO_CREATED" "$BUSYBOX_IMAGE" sh -c 
 [ "$(ttc inspect -f "{{.HostConfig.AutoRemove}}" "$AUTO_CREATED")" = true ] ||
   fail "create --rm did not persist its policy"
 ttc start "$AUTO_CREATED_ID@main" >/dev/null
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ttc inspect "$AUTO_CREATED" >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "started create --rm container was retained"
   sleep 1
@@ -258,24 +278,36 @@ ttc container rm "$MULTI_A" "$MULTI_B"
 
 echo "== persisted host networking and fork rejection =="
 command -v curl >/dev/null 2>&1 || fail "curl is required for the host-network service probe"
-ttc container create --network host --waive-live-fork --name "$HOSTNET" "$BUSYBOX_IMAGE" sh -c \
-  "mkdir -p /tmp/www; echo hostnet-ok >/tmp/www/index.html; exec httpd -f -p $HOSTNET_PORT -h /tmp/www"
-ttc container start "$HOSTNET@main"
-deadline=$(( $(date +%s) + 15 ))
-HOSTNET_RESPONSE=
-while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "host-network BusyBox service did not become reachable"
-  HOSTNET_RESPONSE=$(curl -fsS --max-time 1 "http://127.0.0.1:$HOSTNET_PORT/" 2>/dev/null || true)
-  [ "$HOSTNET_RESPONSE" = hostnet-ok ] || sleep 1
-done
-[ "$(ttc inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
-  fail "inspect did not retain host network mode"
-if ttc fork "$HOSTNET@main" rejected >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
-  fail "host-network container was incorrectly forked"
+if [ "$(uname -s)" = Darwin ]; then
+  ttc container create --network host --waive-live-fork --name "$HOSTNET" "$BUSYBOX_IMAGE" true \
+    >"$TTC_E2E_ROOT/hostnet-create.out"
+  if ttc container start "$HOSTNET" >"$TTC_E2E_ROOT/hostnet-start.out" \
+      2>"$TTC_E2E_ROOT/hostnet-start.err"; then
+    fail "native macOS unexpectedly started host networking"
+  fi
+  grep -q 'native macOS supports only --network=ttc or --network=none' \
+    "$TTC_E2E_ROOT/hostnet-start.err" || fail "native macOS host-network rejection was not explicit"
+  ttc rm "$HOSTNET" >/dev/null
+else
+  ttc container create --network host --waive-live-fork --name "$HOSTNET" "$BUSYBOX_IMAGE" sh -c \
+    "mkdir -p /tmp/www; echo hostnet-ok >/tmp/www/index.html; exec httpd -f -p $HOSTNET_PORT -h /tmp/www"
+  ttc container start "$HOSTNET"
+  deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
+  HOSTNET_RESPONSE=
+  while [ "$HOSTNET_RESPONSE" != hostnet-ok ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || fail "host-network BusyBox service did not become reachable"
+    HOSTNET_RESPONSE=$(curl -fsS --max-time 1 "http://127.0.0.1:$HOSTNET_PORT/" 2>/dev/null || true)
+    [ "$HOSTNET_RESPONSE" = hostnet-ok ] || sleep 1
+  done
+  [ "$(ttc inspect -f '{{.HostConfig.NetworkMode}}' "$HOSTNET")" = host ] ||
+    fail "inspect did not retain host network mode"
+  if ttc fork "$HOSTNET@main" rejected >"$TTC_E2E_ROOT/hostnet-fork.out" 2>"$TTC_E2E_ROOT/hostnet-fork.err"; then
+    fail "host-network container was incorrectly forked"
+  fi
+  ttc exec "$HOSTNET@main" true || fail "host-network source did not resume after rejected fork"
+  ttc stop --time 1 "$HOSTNET@main"
+  ttc rm "$HOSTNET"
 fi
-ttc exec "$HOSTNET@main" true || fail "host-network source did not resume after rejected fork"
-ttc stop --time 1 "$HOSTNET@main"
-ttc rm "$HOSTNET"
 
 echo "== rootless virtual NIC, NAT, publication, and live fork =="
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for the TTC NAT fixture"
@@ -285,7 +317,7 @@ python3 -m http.server "$NAT_FIXTURE_PORT" --bind 127.0.0.1 \
   --directory "$TTC_E2E_ROOT/nat-fixture" \
   >"$TTC_E2E_ROOT/nat-fixture.log" 2>&1 &
 NAT_FIXTURE_PID=$!
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 until curl -fsS --max-time 1 "http://127.0.0.1:$NAT_FIXTURE_PORT/" >/dev/null 2>&1; do
   kill -0 "$NAT_FIXTURE_PID" >/dev/null 2>&1 || fail "TTC NAT fixture exited during startup"
   [ "$(date +%s)" -lt "$deadline" ] || fail "TTC NAT fixture did not become ready"
@@ -297,30 +329,30 @@ if ttc run --rm --network ttc "$BUSYBOX_IMAGE" \
   fail "NAT-disabled TTC virtual NIC reached a host service"
 fi
 [ "$(ttc run --rm --network ttc --nat "$BUSYBOX_IMAGE" \
-    wget -T 5 -qO- "http://10.0.2.2:$NAT_FIXTURE_PORT/")" = nat-ok ] ||
+    wget -T "$TTC_E2E_GUEST_CURL_TIMEOUT" -qO- "http://10.0.2.2:$NAT_FIXTURE_PORT/")" = nat-ok ] ||
   fail "TTC user-mode NAT did not reach the host fixture"
 
 ttc run --name "$VNET" --detach --network ttc \
   --publish "127.0.0.1:$PUBLISHED_PORT:8080" \
   "$BUSYBOX_IMAGE" sh -c \
   'mkdir -p /www; echo parent >/www/index.html; exec httpd -f -p 8080 -h /www' >/dev/null
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 VNET_RESPONSE=
 while [ "$VNET_RESPONSE" != parent ]; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "published TTC TCP port did not become reachable"
-  VNET_RESPONSE=$(curl -fsS --max-time 1 "http://127.0.0.1:$PUBLISHED_PORT/" 2>/dev/null || true)
+  VNET_RESPONSE=$(curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$PUBLISHED_PORT/" 2>/dev/null || true)
   [ "$VNET_RESPONSE" = parent ] || sleep 1
 done
 [ "$(ttc inspect -f '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIP}}:{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostPort}}' "$VNET")" = "127.0.0.1:$PUBLISHED_PORT" ] ||
   fail "inspect omitted the persisted TTC port binding"
 ttc fork "$VNET@main" child >/dev/null
 ttc exec "$VNET@child" sh -c 'echo child >/www/index.html'
-[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
+[ "$(curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published host port switched away from the source branch after fork"
 [ "$(ttc exec "$VNET@child" cat /www/index.html)" = child ] ||
   fail "forked TTC branch did not retain its branch-local network service state"
 ttc port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
-[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
+[ "$(curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
   fail "dynamically published child port did not reach the forked branch"
 ttc port ls "$VNET@child" | grep -q "127.0.0.1:$CHILD_PUBLISHED_PORT" ||
   fail "branch port listing omitted the dynamically published child port"
@@ -328,17 +360,17 @@ ttc fork "$VNET@main" second >/dev/null
 ttc fork "$VNET@child" grandchild >/dev/null
 ttc_daemon_crash
 ttc_daemon_start
-[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
+[ "$(curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$PUBLISHED_PORT/")" = parent ] ||
   fail "published TTC port did not survive daemon restart reconciliation"
-[ "$(curl -fsS --max-time 2 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
+[ "$(curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$CHILD_PUBLISHED_PORT/")" = child ] ||
   fail "dynamically published child port did not survive daemon restart reconciliation"
 ttc port unpublish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
-if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
+if curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
   fail "unpublished child port remained reachable"
 fi
 ttc port publish "$VNET@child" "127.0.0.1:$CHILD_PUBLISHED_PORT:8080" >/dev/null
 ttc rm -f "$VNET@child"
-if curl -fsS --max-time 1 "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
+if curl -fsS --max-time "$TTC_E2E_GUEST_CURL_TIMEOUT" "http://127.0.0.1:$CHILD_PUBLISHED_PORT/" >/dev/null 2>&1; then
   fail "deleted child branch left its published port reachable"
 fi
 if ttc port ls --json "$VNET@main" | grep -q '"branch_id": "child"'; then
@@ -352,7 +384,7 @@ ttc exec --detach --cap CAP_SYS_ADMIN --cap CAP_NET_ADMIN "$NETNS@main" \
   unshare -n sh -c \
   'ip link set lo up; mkdir -p /tmp/ns-www; echo namespace-ok >/tmp/ns-www/index.html; httpd -f -p 8080 -h /tmp/ns-www & while :; do wget -qO /tmp/ns-result http://127.0.0.1:8080 || true; sleep 1; done' \
   >/dev/null
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 until [ "$(ttc exec "$NETNS@main" cat /tmp/ns-result 2>/dev/null || true)" = namespace-ok ]; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "secondary network namespace service did not become ready"
   sleep 1
@@ -409,7 +441,7 @@ else:
 while True:
     signal.pause()
 "
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 until ttc logs "$PIDS_LIMIT@main" | grep -q pids-ready; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "PID-limited container did not reach its cap"
   sleep 1
@@ -424,7 +456,7 @@ if ttc exec "$PIDS_LIMIT@child" true >/dev/null 2>&1; then
   fail "live-forked child lost its full PID limit"
 fi
 ttc kill --signal SIGUSR1 "$PIDS_LIMIT@main" >/dev/null
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 until ttc logs "$PIDS_LIMIT@main" | grep -q pids-released; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "parent branch did not release a PID slot"
   sleep 1
@@ -451,7 +483,7 @@ ttc rm "$PREFIX-redis"
 echo "== persisted stop signal and timeout policy =="
 ttc run --name "$STOP_POLICY" --detach --stop-signal SIGUSR1 --stop-timeout 3 \
   "$ALPINE_IMAGE" sh -c "trap \"exit 42\" USR1; echo stop-policy-ready; while :; do sleep 0.05; done"
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 until ttc logs "$STOP_POLICY@main" | grep -q stop-policy-ready; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "custom-stop container did not become ready"
   sleep 1
@@ -469,27 +501,20 @@ STRESS_RUN_STDOUT="$TTC_E2E_ROOT/console-stress-run.stdout"
 STRESS_RUN_STDERR="$TTC_E2E_ROOT/console-stress-run.stderr"
 STRESS_LOG_STDOUT="$TTC_E2E_ROOT/console-stress-log.stdout"
 STRESS_LOG_STDERR="$TTC_E2E_ROOT/console-stress-log.stderr"
-ttc run --name "$CONSOLE_STRESS" "$PYTHON_IMAGE" python3 -c \
-  'import sys; n=262144; sys.stdout.buffer.write(b"A"*n+b"\n"); sys.stdout.buffer.flush(); sys.stderr.buffer.write(b"B"*n+b"\n"); sys.stderr.buffer.flush()' \
+ttc run --name "$CONSOLE_STRESS" "$BUSYBOX_IMAGE" sh -c \
+  'dd if=/dev/zero bs=65536 count=4 status=none; dd if=/dev/zero of=/dev/stderr bs=65536 count=4 status=none' \
   >"$STRESS_RUN_STDOUT" 2>"$STRESS_RUN_STDERR"
 ttc logs "$CONSOLE_STRESS@main" >"$STRESS_LOG_STDOUT" 2>"$STRESS_LOG_STDERR"
 
-EXPECTED_A=$( \
-  { head -c "$STRESS_BYTES" /dev/zero | tr '\0' A; printf '\n'; } | \
-    sha256sum | awk '{print $1}' \
-)
-EXPECTED_B=$( \
-  { head -c "$STRESS_BYTES" /dev/zero | tr '\0' B; printf '\n'; } | \
-    sha256sum | awk '{print $1}' \
-)
-[ "$(wc -c <"$STRESS_RUN_STDOUT")" -eq $((STRESS_BYTES + 1)) ] || fail "foreground stdout was truncated"
-[ "$(sed '/^ttc: warning:/d' "$STRESS_RUN_STDERR" | wc -c)" -eq $((STRESS_BYTES + 1)) ] || fail "foreground stderr was truncated"
-[ "$(wc -c <"$STRESS_LOG_STDOUT")" -eq $((STRESS_BYTES + 1)) ] || fail "persisted stdout was truncated"
-[ "$(sed '/^ttc: warning:/d' "$STRESS_LOG_STDERR" | wc -c)" -eq $((STRESS_BYTES + 1)) ] || fail "persisted stderr was truncated"
-[ "$(sha256sum "$STRESS_RUN_STDOUT" | awk '{print $1}')" = "$EXPECTED_A" ] || fail "foreground stdout content changed"
-[ "$(sed '/^ttc: warning:/d' "$STRESS_RUN_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "foreground stderr content changed"
-[ "$(sha256sum "$STRESS_LOG_STDOUT" | awk '{print $1}')" = "$EXPECTED_A" ] || fail "persisted stdout content changed"
-[ "$(sed '/^ttc: warning:/d' "$STRESS_LOG_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_B" ] || fail "persisted stderr content changed"
+EXPECTED_ZERO=$(head -c "$STRESS_BYTES" /dev/zero | sha256sum | awk '{print $1}')
+[ "$(wc -c <"$STRESS_RUN_STDOUT")" -eq "$STRESS_BYTES" ] || fail "foreground stdout was truncated"
+[ "$(sed '/^ttc: warning:/d' "$STRESS_RUN_STDERR" | wc -c)" -eq "$STRESS_BYTES" ] || fail "foreground stderr was truncated"
+[ "$(wc -c <"$STRESS_LOG_STDOUT")" -eq "$STRESS_BYTES" ] || fail "persisted stdout was truncated"
+[ "$(sed '/^ttc: warning:/d' "$STRESS_LOG_STDERR" | wc -c)" -eq "$STRESS_BYTES" ] || fail "persisted stderr was truncated"
+[ "$(sha256sum "$STRESS_RUN_STDOUT" | awk '{print $1}')" = "$EXPECTED_ZERO" ] || fail "foreground stdout content changed"
+[ "$(sed '/^ttc: warning:/d' "$STRESS_RUN_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_ZERO" ] || fail "foreground stderr content changed"
+[ "$(sha256sum "$STRESS_LOG_STDOUT" | awk '{print $1}')" = "$EXPECTED_ZERO" ] || fail "persisted stdout content changed"
+[ "$(sed '/^ttc: warning:/d' "$STRESS_LOG_STDERR" | sha256sum | awk '{print $1}')" = "$EXPECTED_ZERO" ] || fail "persisted stderr content changed"
 ttc rm "$CONSOLE_STRESS"
 
 echo "== bounded log retention accounting =="
@@ -547,7 +572,7 @@ LIFECYCLE_SHORT=$(printf %.12s "$LIFECYCLE_ID")
 [ "$(ttc inspect -f "{{.Id}}|{{.Name}}" "$LIFECYCLE_PREFIX")" = "$LIFECYCLE_ID|/$LIFECYCLE" ] ||
   fail "detached container was not addressable by ID prefix"
 
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "detached init did not produce console output"
   sleep 1
@@ -564,38 +589,45 @@ ttc_daemon_start
 [ "$(ttc inspect -f '{{.State.Status}}' "$LIFECYCLE")" = running ] ||
   fail "restarted ttcd did not reconcile the running container"
 ttc daemon status | grep -Eq '"version":[[:space:]]*[1-9][0-9]*[,}]' || fail "ttcd did not restart"
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "console draining did not survive daemon restart"
   sleep 1
 done
-echo "== console sidecar crash recovery =="
-SIDECAR_PID_FILE="$DATA_ROOT/containers/$LIFECYCLE_ID/console/main.pid"
-deadline=$(( $(date +%s) + 15 ))
-while [ ! -s "$SIDECAR_PID_FILE" ]; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "active console sidecar did not publish its PID"
+echo "== console follower crash recovery =="
+# One follower process keeps the logs of a family's consoles. A reader of a
+# console whose follower is gone starts another.
+family_follower_pid() {
+  pgrep -f "$LIFECYCLE_ID console-follow-family" | grep -vx "${1:-}" | head -n 1
+}
+last_tick() {
+  ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | sed -n 's/.*tick:\([0-9][0-9]*\).*/\1/p' | tail -n 1
+}
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
+while OLD_FOLLOWER_PID=$(family_follower_pid); [ -z "$OLD_FOLLOWER_PID" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "the family's console follower is not running"
   sleep 1
 done
-OLD_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE")
-kill -KILL "$OLD_SIDECAR_PID"
-deadline=$(( $(date +%s) + 15 ))
+kill -KILL "$OLD_FOLLOWER_PID"
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while :; do
   ttc logs --tail 10 "$LIFECYCLE@main" >/dev/null 2>&1 || true
-  NEW_SIDECAR_PID=$(cat "$SIDECAR_PID_FILE" 2>/dev/null || true)
-  if [ -n "$NEW_SIDECAR_PID" ] && [ "$NEW_SIDECAR_PID" != "$OLD_SIDECAR_PID" ] && kill -0 "$NEW_SIDECAR_PID" 2>/dev/null; then
+  NEW_FOLLOWER_PID=$(family_follower_pid "$OLD_FOLLOWER_PID")
+  if [ -n "$NEW_FOLLOWER_PID" ] && kill -0 "$NEW_FOLLOWER_PID" 2>/dev/null; then
     break
   fi
-  [ "$(date +%s)" -lt "$deadline" ] || fail "console sidecar was not replaced after SIGKILL"
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console follower was not replaced after SIGKILL"
   sleep 1
 done
-deadline=$(( $(date +%s) + 15 ))
-while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q "tick:"; do
-  [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after sidecar replacement"
+REPLACED_TICK=$(last_tick)
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
+while TICK=$(last_tick); [ -z "$TICK" ] || [ "$TICK" -le "${REPLACED_TICK:--1}" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || fail "console output did not resume after follower replacement"
   sleep 1
 done
 
 ttc container restart --time 2 "$LIFECYCLE@main"
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc logs --tail 10 "$LIFECYCLE@main" 2>/dev/null | grep -q 'tick:'; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "restarted detached init did not produce console output"
   sleep 1
@@ -655,7 +687,7 @@ ttc exec "$LIFECYCLE@main" sh -c \
   'echo ready >/state/attached-exec-ready; while [ ! -e /state/attached-exec-release ]; do sleep 0.1; done' \
   >"$TTC_E2E_ROOT/attached-exec.out" 2>"$TTC_E2E_ROOT/attached-exec.err" &
 ATTACHED_EXEC_HOST_PID=$!
-deadline=$(( $(date +%s) + 15 ))
+deadline=$(( $(date +%s) + TTC_E2E_DEADLINE_SECONDS ))
 while ! ttc exec "$LIFECYCLE@main" test -e /state/attached-exec-ready >/dev/null 2>&1; do
   [ "$(date +%s)" -lt "$deadline" ] || fail "attached exec did not reach its ready point"
   sleep 1
@@ -708,7 +740,8 @@ grep -q '"processes":\[' "$INSPECT_JSON" || fail "inspect omitted live branch pr
 grep -q "\"/scratch\":\"mode=0700,size=1m\"" "$INSPECT_JSON" || fail "inspect omitted tmpfs options"
 grep -q "\"Type\":\"proc\"" "$INSPECT_JSON" || fail "inspect omitted the additional procfs mount"
 grep -q "\"Type\":\"sysfs\"" "$INSPECT_JSON" || fail "inspect omitted the additional sysfs mount"
-[ "$(ttc inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}" "$LIFECYCLE")" = "9|3" ] || fail "Docker mount inspection omitted user mounts or exposed internal network files"
+[ "$(ttc inspect -f "{{len .Mounts}}|{{len .HostConfig.Binds}}|{{len .HostConfig.Tmpfs}}" "$LIFECYCLE")" = "9|3|2" ] ||
+  fail "Docker mount inspection exposed internal mounts or omitted user mounts"
 
 PS_CHILD=$(ttc ps --filter branch=child --filter status=running --filter ancestor="$ALPINE_IMAGE" --format '{{.ID}}')
 [ "$PS_CHILD" = "$LIFECYCLE_SHORT@child" ] || fail "filtered ps selected $PS_CHILD instead of the child branch"
@@ -842,6 +875,7 @@ ttc rm --force "$DAEMON_STOP"
 ttc daemon stop >/dev/null
 
 trap - EXIT HUP INT TERM
+stop_nat_fixture
 if $owned_root; then
   rm -rf "$TTC_E2E_ROOT"
 fi

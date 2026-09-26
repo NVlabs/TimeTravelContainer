@@ -65,9 +65,10 @@ type FileDescription struct {
 
 	ioRings linux.IORings
 
-	ioRingsBuf sharedBuffer `state:"nosave"`
-	sqesBuf    sharedBuffer `state:"nosave"`
-	cqesBuf    sharedBuffer `state:"nosave"`
+	ioRingsBuf    sharedBuffer                  `state:"nosave"`
+	sqesBuf       sharedBuffer                  `state:"nosave"`
+	cqesBuf       sharedBuffer                  `state:"nosave"`
+	mappingLeases []memmap.InternalMappingLease `state:"nosave"`
 
 	// remap indicates whether the shared buffers need to be remapped
 	// due to a S/R. Protected by ProcessSubmissions critical section.
@@ -189,6 +190,7 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, entries uint32, par
 	if err := iouringfd.mapSharedBuffers(); err != nil {
 		return nil, err
 	}
+	defer iouringfd.unmapSharedBuffers()
 
 	// Initialize IORings struct from params.
 	iouringfd.ioRings.SqRingMask = params.SqEntries - 1
@@ -209,12 +211,12 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, entries uint32, par
 	if _, err := iouringfd.ioRingsBuf.writeback(iouringfd.ioRings.SizeBytes()); err != nil {
 		return nil, err
 	}
-
 	return &iouringfd.vfsfd, nil
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *FileDescription) Release(ctx context.Context) {
+	fd.unmapSharedBuffers()
 	fd.mf.DecRef(fd.rbmf.fr)
 	fd.mf.DecRef(fd.sqemf.fr)
 }
@@ -230,31 +232,48 @@ func (fd *FileDescription) CaptureMemoryFileRanges(capture *pgalloc.MemoryRangeC
 // mapSharedBuffers caches internal mappings for the ring's shared memory
 // regions.
 func (fd *FileDescription) mapSharedBuffers() error {
-	// Mapping for the IORings header struct.
-	rb, err := fd.mf.MapInternal(fd.rbmf.fr, hostarch.ReadWrite)
+	mappings, mappingLease, err := memmap.MapInternalBatchWithLease(fd.mf, []memmap.InternalMappingRequest{
+		{Range: fd.rbmf.fr, Access: hostarch.ReadWrite},
+		{Range: fd.sqemf.fr, Access: hostarch.ReadWrite},
+	})
 	if err != nil {
 		return err
 	}
+	// Mapping for the IORings header struct.
+	rb := mappings[0]
 	fd.ioRingsBuf.init(rb)
 
 	// Mapping for the CQEs array. This is contiguous to the header struct.
 	cqesOffset := uint64(fd.ioRings.SizeBytes())
 	cqesOffset, ok := hostarch.CacheLineRoundUp(cqesOffset)
 	if !ok {
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
 		return linuxerr.EOVERFLOW
 	}
 	cqes := rb.DropFirst(int(cqesOffset))
 	fd.cqesBuf.init(cqes)
 
 	// Mapping for the SQEs array.
-	sqes, err := fd.mf.MapInternal(fd.sqemf.fr, hostarch.ReadWrite)
-	if err != nil {
-		return err
-	}
+	sqes := mappings[1]
 	fd.sqesBuf.init(sqes)
+	fd.mappingLeases = fd.mappingLeases[:0]
+	if mappingLease != nil {
+		fd.mappingLeases = append(fd.mappingLeases, mappingLease)
+	}
 
 	return nil
+}
 
+func (fd *FileDescription) unmapSharedBuffers() {
+	fd.ioRingsBuf.init(safemem.BlockSeq{})
+	fd.sqesBuf.init(safemem.BlockSeq{})
+	fd.cqesBuf.init(safemem.BlockSeq{})
+	for _, lease := range fd.mappingLeases {
+		lease.Release()
+	}
+	fd.mappingLeases = nil
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
@@ -342,10 +361,11 @@ func (fd *FileDescription) ProcessSubmissions(t *kernel.Task, toSubmit uint32, m
 	// The rest of this function is a critical section with respect to
 	// concurrent callers.
 
-	if fd.remap {
-		fd.mapSharedBuffers()
-		fd.remap = false
+	if err := fd.mapSharedBuffers(); err != nil {
+		return -1, err
 	}
+	defer fd.unmapSharedBuffers()
+	fd.remap = false
 
 	var err error
 	var sqe linux.IOUringSqe

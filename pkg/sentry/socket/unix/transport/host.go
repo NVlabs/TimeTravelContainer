@@ -113,7 +113,7 @@ func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
 		return nil
 	}
 
-	family, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_DOMAIN)
+	family, err := hostSocketDomain(c.fd)
 	if err != nil {
 		return syserr.FromError(err)
 	}
@@ -137,14 +137,14 @@ func (c *HostConnectedEndpoint) initFromOptions() *syserr.Error {
 		return syserr.FromError(err)
 	}
 
-	passcred, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_PASSCRED)
+	passcred, err := hostSocketPasscred(c.fd)
 	if err != nil {
 		return syserr.FromError(err)
 	}
 
 	c.stype = linux.SockType(stype)
 	c.sndbuf.Store(int64(sndbuf))
-	c.passcred = passcred != 0
+	c.passcred = passcred
 
 	return nil
 }
@@ -226,9 +226,11 @@ func (c *HostConnectedEndpoint) closeSendLocked() {
 		return
 	}
 
-	if err := unix.Shutdown(c.fd, unix.SHUT_WR); err != nil {
+	if err := unix.Shutdown(c.fd, unix.SHUT_WR); err != nil && err != unix.ENOTCONN {
 		// A well-formed UDS shutdown can't fail. See
-		// net/unix/af_unix.c:unix_shutdown.
+		// net/unix/af_unix.c:unix_shutdown. Darwin is an exception: it
+		// returns ENOTCONN after the peer has already disconnected, which
+		// is equivalent to the requested write shutdown.
 		panic(fmt.Sprintf("failed write shutdown on host socket %+v: %v", c, err))
 	}
 	c.wrShutdown.Store(true)
@@ -346,9 +348,11 @@ func (c *HostConnectedEndpoint) closeRecvLocked() {
 		return
 	}
 
-	if err := unix.Shutdown(c.fd, unix.SHUT_RD); err != nil {
+	if err := unix.Shutdown(c.fd, unix.SHUT_RD); err != nil && err != unix.ENOTCONN {
 		// A well-formed UDS shutdown can't fail. See
-		// net/unix/af_unix.c:unix_shutdown.
+		// net/unix/af_unix.c:unix_shutdown. Darwin is an exception: it
+		// returns ENOTCONN after the peer has already disconnected, which
+		// is equivalent to the requested read shutdown.
 		panic(fmt.Sprintf("failed read shutdown on host socket %+v: %v", c, err))
 	}
 	c.rdShutdown.Store(true)

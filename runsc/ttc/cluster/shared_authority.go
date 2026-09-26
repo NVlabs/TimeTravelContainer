@@ -1019,19 +1019,6 @@ func readSharedBlock(path string, value any) error {
 	}
 }
 
-// openShared opens path with direct I/O, or without it where the filesystem
-// does not allow it.
-func openShared(path string, flags int) (int, error) {
-	fd, err := unix.Open(path, flags|unix.O_DIRECT|unix.O_CLOEXEC, 0600)
-	if err == unix.EINVAL {
-		fd, err = unix.Open(path, flags|unix.O_CLOEXEC, 0600)
-	}
-	if err != nil {
-		return -1, &os.PathError{Op: "open", Path: path, Err: err}
-	}
-	return fd, nil
-}
-
 // alignedBlock returns a block that direct I/O can use, and what releases it.
 func alignedBlock() ([]byte, func(), error) {
 	block, err := unix.Mmap(-1, 0, sharedBlockSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)

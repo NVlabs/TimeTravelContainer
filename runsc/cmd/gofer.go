@@ -563,13 +563,14 @@ func (g *Gofer) serve(spec *specs.Spec, conf *config.Config, root string, ruid i
 
 	// These are global fsgofer configurations.
 	fsgoferConf := &fsgofer.Config{
-		HostUDS:            conf.GetHostUDS(),
-		HostFifo:           conf.HostFifo,
-		DonateMountPointFD: conf.DirectFS,
-		RUID:               ruid,
-		EUID:               euid,
-		RGID:               rgid,
-		EGID:               egid,
+		HostUDS:              conf.GetHostUDS(),
+		HostFifo:             conf.HostFifo,
+		DonateMountPointFD:   conf.DirectFS,
+		RUID:                 ruid,
+		EUID:                 euid,
+		RGID:                 rgid,
+		EGID:                 egid,
+		TrustedRootOwnership: conf.UnsafeNoHostIsolation,
 	}
 
 	// Create the server and start connections.

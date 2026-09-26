@@ -19,4 +19,5 @@ go_library(
         "@com_github_moby_sys_capability//:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

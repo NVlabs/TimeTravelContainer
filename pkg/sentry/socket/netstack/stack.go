@@ -303,6 +303,7 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 	if flags&(linux.NLM_F_EXCL|linux.NLM_F_REPLACE) != 0 {
 		return syserr.ErrExists
 	}
+	changeUp, up := false, false
 	if ifinfomsg.Flags != 0 || ifinfomsg.Change != 0 {
 		if ifinfomsg.Change & ^uint32(linux.IFF_UP) != 0 {
 			ctx.Warningf("Unsupported ifi_change flags: %x", ifinfomsg.Change)
@@ -312,7 +313,10 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 			ctx.Warningf("Unsupported ifi_flags: %x", ifinfomsg.Flags)
 			return syserr.ErrInvalidArgument
 		}
-		// Netstack interfaces are always up.
+		// A zero ifi_change makes ifi_flags replace every flag, as in Linux's
+		// rtnl_dev_combine_flags.
+		changeUp = ifinfomsg.Change == 0 || ifinfomsg.Change&linux.IFF_UP != 0
+		up = ifinfomsg.Flags&linux.IFF_UP != 0
 	}
 
 	dstNs, err := s.lockSrcAndDst(ctx, attrs)
@@ -320,7 +324,85 @@ func (s *Stack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Er
 		return err
 	}
 	defer s.unlockSrcAndDst(ctx, dstNs)
+	if changeUp {
+		// Only the loopback device changes state, and Linux never moves it
+		// to another namespace, so this precedes any IFLA_NET_NS_FD move.
+		if err := s.setLinkUpLocked(ctx, tcpip.NICID(ifinfomsg.Index), up); err != nil {
+			return err
+		}
+	}
 	return s.setLinkLocked(ctx, tcpip.NICID(ifinfomsg.Index), attrs, dstNs)
+}
+
+// loopbackAutoAddresses are the addresses Linux assigns to a loopback device
+// when it comes up: 127.0.0.1/8 (inetdev_event) and ::1/128 (addrconf).
+var loopbackAutoAddresses = []inet.InterfaceAddr{
+	{Family: linux.AF_INET, PrefixLen: 8, Addr: []byte{127, 0, 0, 1}},
+	{Family: linux.AF_INET6, PrefixLen: 128, Addr: []byte{15: 1}},
+}
+
+// setLinkUpLocked brings interface id administratively up or down for an
+// RTM_NEWLINK or SIOCSIFFLAGS request. Only the loopback device has such a
+// state: other netstack interfaces are always up, and requests to change
+// them are accepted without effect.
+//
+// As in Linux, bringing the loopback device up assigns it 127.0.0.1/8 and
+// ::1/128 unless already assigned, and taking it down removes its IPv6
+// addresses (addrconf_ifdown). The loopback device of a new network
+// namespace therefore has no address until userspace brings it up, or adds
+// one itself as Bubblewrap does before bringing it up.
+//
+// Preconditions: s.linkMu is locked.
+func (s *Stack) setLinkUpLocked(ctx context.Context, id tcpip.NICID, up bool) *syserr.Error {
+	info, ok := s.Stack.SingleNICInfo(id)
+	if !ok {
+		return syserr.ErrNoDevice
+	}
+	if !info.Flags.Loopback || info.Flags.Running == up {
+		return nil
+	}
+	if up {
+		if err := s.Stack.EnableNIC(id); err != nil {
+			return syserr.TranslateNetstackError(err)
+		}
+		for _, addr := range loopbackAutoAddresses {
+			if addr.Family == linux.AF_INET6 && s.Stack.NetworkProtocolInstance(ipv6.ProtocolNumber) == nil {
+				continue
+			}
+			assigned := false
+			for _, existing := range info.ProtocolAddresses {
+				if existing.AddressWithPrefix.Address == tcpip.AddrFromSlice(addr.Addr) {
+					assigned = true
+					break
+				}
+			}
+			if assigned {
+				continue
+			}
+			if err := s.AddInterfaceAddr(int32(id), addr); err != nil && !linuxerr.Equals(linuxerr.EEXIST, err) {
+				return syserr.FromError(err)
+			}
+		}
+	} else {
+		for _, existing := range info.ProtocolAddresses {
+			if existing.Protocol != ipv6.ProtocolNumber {
+				continue
+			}
+			addr := inet.InterfaceAddr{
+				Family:    linux.AF_INET6,
+				PrefixLen: uint8(existing.AddressWithPrefix.PrefixLen),
+				Addr:      existing.AddressWithPrefix.Address.AsSlice(),
+			}
+			if err := s.RemoveInterfaceAddr(int32(id), addr); err != nil {
+				return syserr.FromError(err)
+			}
+		}
+		if err := s.Stack.DisableNIC(id); err != nil {
+			return syserr.TranslateNetstackError(err)
+		}
+	}
+	s.sendChangeEvent(ctx, id)
+	return nil
 }
 
 // If the linkAttrs map contains IFLA_NET_NS_FD, locks the source and

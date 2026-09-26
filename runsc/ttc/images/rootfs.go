@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -32,7 +33,6 @@ import (
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
-	"github.com/containerd/platforms"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gvisor.dev/gvisor/runsc/ttc/ownership"
 )
@@ -96,13 +96,9 @@ func materializeRootFSRecord(ctx context.Context, opts RootFSOptions, store *nat
 		return RootFSInfo{}, err
 	}
 	reference := record.Info.Reference
-	matcher := platforms.DefaultStrict()
-	if opts.Platform != "" {
-		platform, err := platforms.Parse(opts.Platform)
-		if err != nil {
-			return RootFSInfo{}, fmt.Errorf("invalid platform %q: %w", opts.Platform, err)
-		}
-		matcher = platforms.OnlyStrict(platform)
+	matcher, err := platformMatcher(opts.Platform)
+	if err != nil {
+		return RootFSInfo{}, err
 	}
 	manifest, err := containerdimages.Manifest(ctx, store.content, record.Target, matcher)
 	if err != nil {
@@ -244,6 +240,18 @@ func applyLayerWithOwnership(ctx context.Context, root string, compressed io.Rea
 		return directoryModes.record(header)
 	}
 	_, applyErr := archive.Apply(ctx, root, stream, archive.WithNoSameOwner(), archive.WithFilter(filter))
+	// containerd defers directory timestamps until the complete tar stream has
+	// been applied. A valid diff may declare a directory and then remove it with
+	// a later whiteout (dpkg-generated TTC layers do this for transient
+	// *.dpkg-new trees). In that case extraction is complete and the only
+	// failure is the deferred timestamp syscall observing the intended final
+	// absence. Do not reject the otherwise fully applied layer. Keep the string
+	// qualification narrow: an unrelated ENOENT during entry extraction still
+	// indicates a malformed layer.
+	if applyErr != nil && errors.Is(applyErr, os.ErrNotExist) &&
+		strings.Contains(applyErr.Error(), "failed call to UtimesNanoAt for ") {
+		applyErr = nil
+	}
 	restoreErr := directoryModes.restore(root)
 	if applyErr != nil {
 		if restoreErr != nil {

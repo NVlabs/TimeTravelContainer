@@ -539,6 +539,93 @@ type File interface {
 	FD() int
 }
 
+// InternalMappingLease pins a host mapping returned by
+// MapInternalWithLease. Release must be called exactly once after the caller
+// has stopped using every Block in the mapping. A nil lease denotes a mapping
+// whose validity continues to be governed solely by File page references.
+//
+// VM-backed files use leases to exclude relocation while Sentry code is
+// dereferencing host addresses. The ordinary File.MapInternal contract cannot
+// provide this boundary because it has no corresponding release operation.
+type InternalMappingLease interface {
+	Release()
+}
+
+type internalMappingLeaser interface {
+	MapInternalWithLease(FileRange, hostarch.AccessType) (safemem.BlockSeq, InternalMappingLease, error)
+}
+
+// InternalMappingRequest describes one range in a batch of operation-scoped
+// host mappings. Batching is important for relocatable VM memory: acquiring a
+// second read lease while retaining the first can deadlock with a queued
+// relocation writer on implementations backed by sync.RWMutex.
+type InternalMappingRequest struct {
+	Range  FileRange
+	Access hostarch.AccessType
+}
+
+type internalMappingBatchLeaser interface {
+	MapInternalBatchWithLease([]InternalMappingRequest) ([]safemem.BlockSeq, InternalMappingLease, error)
+}
+
+type internalMappingLeaseGroup []InternalMappingLease
+
+func (g internalMappingLeaseGroup) Release() {
+	for i := len(g) - 1; i >= 0; i-- {
+		if g[i] != nil {
+			g[i].Release()
+		}
+	}
+}
+
+type pmaInternalMapper interface {
+	MapInternalForPMA(FileRange, hostarch.AccessType) (safemem.BlockSeq, error)
+}
+
+// MapInternalWithLease maps fr and, for relocatable implementations, returns
+// a lease that keeps the returned host addresses stable. Callers must release
+// a non-nil lease after their final access.
+func MapInternalWithLease(file File, fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, InternalMappingLease, error) {
+	if file, ok := file.(internalMappingLeaser); ok {
+		return file.MapInternalWithLease(fr, at)
+	}
+	blocks, err := file.MapInternal(fr, at)
+	return blocks, nil, err
+}
+
+// MapInternalBatchWithLease maps all requests under one operation-scoped
+// lease when file supports it. The fallback retains the ordinary File
+// contract while releasing already-acquired mappings if a later request
+// fails.
+func MapInternalBatchWithLease(file File, requests []InternalMappingRequest) ([]safemem.BlockSeq, InternalMappingLease, error) {
+	if file, ok := file.(internalMappingBatchLeaser); ok {
+		return file.MapInternalBatchWithLease(requests)
+	}
+	blocks := make([]safemem.BlockSeq, 0, len(requests))
+	leases := make(internalMappingLeaseGroup, 0, len(requests))
+	for _, request := range requests {
+		mapping, lease, err := MapInternalWithLease(file, request.Range, request.Access)
+		if err != nil {
+			leases.Release()
+			return nil, nil, err
+		}
+		blocks = append(blocks, mapping)
+		leases = append(leases, lease)
+	}
+	return blocks, leases, nil
+}
+
+// MapInternalForPMA obtains a mapping that may be cached only inside a
+// MemoryManager PMA. It is intentionally separate from MapInternalWithLease:
+// the VM compaction coordinator quiesces the MemoryManager and drops all PMA
+// caches before relocating frames.
+func MapInternalForPMA(file File, fr FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if file, ok := file.(pmaInternalMapper); ok {
+		return file.MapInternalForPMA(fr, at)
+	}
+	return file.MapInternal(fr, at)
+}
+
 // MemoryFileRange identifies one range whose ownership is serialized as part
 // of a Mappable. It is used by TTC branch-scoped sparse memory capture; it is
 // distinct from transient translations cached in PMAs.

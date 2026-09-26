@@ -274,7 +274,7 @@ func statToFUSEAttr(stat unix.Stat_t, ino uint64) linux.FUSEAttr {
 		AtimeNsec: uint32(stat.Atim.Nsec),
 		MtimeNsec: uint32(stat.Mtim.Nsec),
 		CtimeNsec: uint32(stat.Ctim.Nsec),
-		Mode:      stat.Mode,
+		Mode:      uint32(stat.Mode),
 		Nlink:     uint32(stat.Nlink),
 		UID:       stat.Uid,
 		GID:       stat.Gid,
@@ -288,10 +288,7 @@ func statToFUSEAttr(stat unix.Stat_t, ino uint64) linux.FUSEAttr {
 func newTestHostFUSEConnection(t *testing.T, backDir string) (*hostConnection, chan struct{}, func()) {
 	t.Helper()
 
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
-	if err != nil {
-		t.Fatalf("Socketpair: %v", err)
-	}
+	fds := fuseSocketpair(t)
 
 	server := newTestFUSEServer(fds[1], backDir)
 	serverDone := make(chan struct{})

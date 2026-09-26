@@ -511,9 +511,15 @@ func writeExtents(file *os.File, length int64, extents []Extent) error {
 	if err := file.Truncate(length); err != nil {
 		return err
 	}
+	var dataEnd int64
+	for _, extent := range extents {
+		punchHole(file, dataEnd, extent.Offset-dataEnd)
+		dataEnd = extent.Offset + int64(len(extent.Data))
+	}
+	punchHole(file, dataEnd, length-dataEnd)
 	// Only a hint: a later sync is what makes the object durable, so a
 	// filesystem that does not take it loses nothing.
-	_ = unix.SyncFileRange(int(file.Fd()), 0, 0, unix.SYNC_FILE_RANGE_WRITE)
+	startWriteback(file)
 	return nil
 }
 
@@ -637,7 +643,9 @@ var zeroSparsePage [sparsePageSize]byte
 // returns how many bytes it consumed from source.
 func copySparse(file *os.File, source io.Reader, length int64) (int64, error) {
 	buffer := make([]byte, min(length, 1<<20))
-	var offset int64
+	var offset, dataEnd int64
+	type hole struct{ offset, length int64 }
+	var holes []hole
 	for offset < length {
 		n, err := io.ReadFull(source, buffer[:min(int64(len(buffer)), length-offset)])
 		if err != nil {
@@ -662,11 +670,22 @@ func copySparse(file *os.File, source io.Reader, length int64) (int64, error) {
 			if _, err := file.WriteAt(buffer[start:end], offset+int64(start)); err != nil {
 				return offset + int64(start), err
 			}
+			if gap := offset + int64(start) - dataEnd; gap != 0 {
+				holes = append(holes, hole{dataEnd, gap})
+			}
+			dataEnd = offset + int64(end)
 			start = end
 		}
 		offset += int64(n)
 	}
-	return offset, file.Truncate(length)
+	if err := file.Truncate(length); err != nil {
+		return offset, err
+	}
+	holes = append(holes, hole{dataEnd, length - dataEnd})
+	for _, h := range holes {
+		punchHole(file, h.offset, h.length)
+	}
+	return offset, nil
 }
 
 // Clone installs destination from a complete source object. If tryReflink is
@@ -745,7 +764,12 @@ func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink,
 		defer unix.Unlinkat(int(store.rootFD.Fd()), temporaryName, 0)
 		var cloneErr error
 		if tryReflink {
-			cloneErr = unix.IoctlFileClone(int(temporary.Fd()), int(source.Fd()))
+			var cloned *os.File
+			cloned, cloneErr = cloneFile(source, temporary, int(store.rootFD.Fd()), temporaryName)
+			if cloned == nil {
+				return cloneErr
+			}
+			temporary = cloned
 		} else {
 			cloneErr = unix.EOPNOTSUPP
 		}
@@ -819,7 +843,12 @@ func (store *LocalDataStore) clone(sourceID, destinationID ObjectID, tryReflink,
 	defer os.Remove(temporaryPath)
 	var cloneErr error
 	if tryReflink {
-		cloneErr = unix.IoctlFileClone(int(temporary.Fd()), int(source.Fd()))
+		var cloned *os.File
+		cloned, cloneErr = cloneFile(source, temporary, unix.AT_FDCWD, temporaryPath)
+		if cloned == nil {
+			return cloneErr
+		}
+		temporary = cloned
 	} else {
 		cloneErr = unix.EOPNOTSUPP
 	}

@@ -79,6 +79,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/abi/linux/errno",
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
@@ -115,6 +116,7 @@ go_test(
         "dev_test.go",
         "host_connection_integration_test.go",
         "host_connection_test.go",
+        "request_response_test.go",
         "utils_test.go",
         "xattr_test.go",
     ],

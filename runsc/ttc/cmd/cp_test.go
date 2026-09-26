@@ -248,6 +248,28 @@ func TestOfflineCopySpecRejectsLegacyWritableRoot(t *testing.T) {
 	}
 }
 
+func TestOpenEmbeddedGuestCopyHelper(t *testing.T) {
+	previous := guestCopyHelper
+	t.Cleanup(func() { guestCopyHelper = previous })
+	want := []byte("guest-elf-fixture")
+	SetGuestCopyHelper(want)
+	helper, err := (&runtimeBackend{}).openCopyHelper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer helper.Close()
+	got, err := io.ReadAll(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("embedded helper = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(helper.Name()); !os.IsNotExist(err) {
+		t.Fatalf("embedded helper path remains after open: %v", err)
+	}
+}
+
 func TestNormalizeCopyCommandArgsResolvesHostPath(t *testing.T) {
 	args, err := normalizeCopyCommandArgs([]string{"cp", "-a", "local/.", "demo@main:/dest"})
 	if err != nil {

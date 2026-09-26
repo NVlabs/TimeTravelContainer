@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
+
 package fsutil
 
 import (
@@ -24,6 +26,10 @@ import (
 
 // UnixDirentMaxSize is the maximum size of unix.Dirent in bytes.
 var UnixDirentMaxSize = int(unsafe.Sizeof(unix.Dirent{}))
+
+func readDirents(fd int, buf []byte) (int, error) {
+	return unix.Getdents(fd, buf)
+}
 
 // Utimensat is a convenience wrapper to make the utimensat(2) syscall. It
 // additionally handles empty name.

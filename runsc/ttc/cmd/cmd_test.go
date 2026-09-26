@@ -579,6 +579,8 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 		{"commit", []string{"commit", "--help"}, "Usage: ttc commit"},
 		{"exec wait", []string{"exec", "wait", "--help"}, "Usage: ttc exec wait"},
 		{"daemon", []string{"daemon", "--help"}, "Usage: ttc daemon"},
+		{"volume", []string{"volume", "--help"}, "Usage: ttc volume"},
+		{"volume create", []string{"volume", "create", "--help"}, "Usage: ttc volume create"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -597,6 +599,65 @@ func TestDockerCompatibleHelpIsLocalAndSuccessful(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPortLockHolderUsesRecordedPID(t *testing.T) {
+	const (
+		container = "port-owner-test"
+		branch    = "child"
+		endpoint  = "127.0.0.1:32123:8080"
+	)
+	lockPath := filepath.Join(t.TempDir(), "port.lock")
+	command := exec.Command(os.Args[0], "-test.run=^TestPortLockHolderHelper$", "--", "port-forward", "--branch="+branch, container, endpoint)
+	command.Env = append(os.Environ(), "TTC_PORT_LOCK_HELPER="+lockPath)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(stdout, ready); err != nil {
+		t.Fatalf("waiting for helper: %v", err)
+	}
+	if string(ready) != "ready\n" {
+		t.Fatalf("helper readiness = %q", ready)
+	}
+
+	pid, err := portLockHolder(lockPath, container, branch, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != command.Process.Pid {
+		t.Fatalf("portLockHolder returned PID %d, want %d", pid, command.Process.Pid)
+	}
+}
+
+func TestPortLockHolderHelper(t *testing.T) {
+	lockPath := os.Getenv("TTC_PORT_LOCK_HELPER")
+	if lockPath == "" {
+		return
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordPortSidecarPID(lockFile, os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stdout.WriteString("ready\n"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Minute)
 }
 
 func TestQuarantineCommandsAddressBranchState(t *testing.T) {
@@ -740,6 +801,31 @@ func TestParseSelector(t *testing.T) {
 			}
 			if got != test.want {
 				t.Errorf("parseSelector(%q) = %+v, want %+v", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseSelectorOrMain(t *testing.T) {
+	tests := []struct {
+		input string
+		want  selector
+		err   bool
+	}{
+		{input: "web", want: selector{container: "web", branch: defaultBranchID}},
+		{input: strings.Repeat("a", 64), want: selector{container: strings.Repeat("a", 64), branch: defaultBranchID}},
+		{input: "web@child", want: selector{container: "web", branch: "child"}},
+		{input: "", err: true},
+		{input: "web@", err: true},
+	}
+	for _, test := range tests {
+		t.Run(test.input, func(t *testing.T) {
+			got, err := parseSelectorOrMain(test.input)
+			if (err != nil) != test.err {
+				t.Fatalf("parseSelectorOrMain(%q) error: %v, want error=%t", test.input, err, test.err)
+			}
+			if got != test.want {
+				t.Errorf("parseSelectorOrMain(%q) = %+v, want %+v", test.input, got, test.want)
 			}
 		})
 	}
@@ -2315,6 +2401,16 @@ func TestCreateAndStart(t *testing.T) {
 	if stdout.String() != "demo@main\n" {
 		t.Errorf("start output=%q", stdout.String())
 	}
+	stdout.Reset()
+	if status := runCommand([]string{"start", containerID}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("start by container ID status=%d, stderr=%q", status, stderr.String())
+	}
+	if b.started != (selector{container: containerID, branch: defaultBranchID}) {
+		t.Errorf("start by container ID target=%v", b.started)
+	}
+	if got, want := stdout.String(), containerID+"\n"; got != want {
+		t.Errorf("start by container ID output=%q, want %q", got, want)
+	}
 }
 
 func TestStartMultipleAndContainerAliases(t *testing.T) {
@@ -3653,11 +3749,19 @@ func TestRestartRunningExitedPausedAndDehydratedBranches(t *testing.T) {
 		t.Errorf("restart starts=%+v, want %+v", got, want)
 	}
 
-	b = &fakeBackend{}
+	b = &fakeBackend{inspectInfo: InspectInfo{
+		TTC: TTCInspectInfo{Branches: []InspectBranch{{Metadata: Branch{ID: defaultBranchID, State: "exited"}}}},
+	}}
 	stdout.Reset()
 	stderr.Reset()
-	if status := runCommand([]string{"restart", "web"}, &stdout, &stderr, b); status == 0 {
-		t.Fatal("restart accepted a family name")
+	if status := runCommand([]string{"restart", "--force", "web"}, &stdout, &stderr, b); status != 0 {
+		t.Fatalf("restart main container status=%d stderr=%q", status, stderr.String())
+	}
+	if got, want := b.startCalls, []startCall{{target: selector{container: "web", branch: defaultBranchID}, detach: true}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("main-container restart starts=%+v, want %+v", got, want)
+	}
+	if got, want := stdout.String(), "web\n"; got != want {
+		t.Errorf("main-container restart output=%q, want %q", got, want)
 	}
 }
 
@@ -4045,15 +4149,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 	if size, known := dentryCacheSize(); known {
 		dcache = []string{"--dcache=" + strconv.Itoa(size)}
 	}
-	wantHardened := append([]string{"--root", "/runtime", "--platform=systrap", "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
+	wantHardened := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgs(); !reflect.DeepEqual(got, wantHardened) {
 		t.Errorf("hardened runsc args=%q, want %q", got, wantHardened)
 	}
-	wantHost := append([]string{"--root", "/runtime", "--platform=systrap", "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
+	wantHost := append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=host", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetwork("host"); !reflect.DeepEqual(got, wantHost) {
 		t.Errorf("host-network runsc args=%q, want %q", got, wantHost)
 	}
-	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=systrap", "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...), "--ttc-network-nat=true")
+	wantTTCNAT := append(append([]string{"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=true", "--network=ttc", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory"}, dcache...), "--ttc-network-nat=true")
 	if got := (&runtimeBackend{root: "/runtime"}).configuredRunscArgsForNetworkNAT("ttc", true); !reflect.DeepEqual(got, wantTTCNAT) {
 		t.Errorf("TTC NAT runsc args=%q, want %q", got, wantTTCNAT)
 	}
@@ -4062,11 +4166,15 @@ func TestUnsafeNoHostIsolationRequiresExplicitOptIn(t *testing.T) {
 		t.Errorf("TTC custom NIC runsc args=%q, want %q", got, wantCustomNIC)
 	}
 	wantUnsafe := append([]string{
-		"--root", "/runtime", "--platform=systrap", "--panic-log=/runtime/sentry-panic.log", "--rootless=false", "--unsafe-no-host-isolation=true",
+		"--root", "/runtime", "--platform=" + defaultRuntimePlatform, "--panic-log=/runtime/sentry-panic.log", "--rootless=false", "--unsafe-no-host-isolation=true",
 		"--network=none", "--directfs=false", "--allow-suid=true", "--overlay2=all:memory",
 	}, dcache...)
 	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantUnsafe) {
 		t.Errorf("unsafe runsc args=%q, want %q", got, wantUnsafe)
+	}
+	wantUnsafeControl := []string{"--root", "/runtime", "--rootless=false", "--unsafe-no-host-isolation=true"}
+	if got := (&runtimeBackend{root: "/runtime", unsafeNoHostIsolation: true}).runtimeControlArgs(); !reflect.DeepEqual(got, wantUnsafeControl) {
+		t.Errorf("unsafe runsc control args=%q, want %q", got, wantUnsafeControl)
 	}
 	wantOldKernel := append(append([]string(nil), wantHardened...), "--gso=false")
 	if got := (&runtimeBackend{root: "/runtime", disableHostGSO: true}).configuredRunscArgs(); !reflect.DeepEqual(got, wantOldKernel) {
@@ -4221,7 +4329,8 @@ func TestRunConfiguredCommandDoesNotInheritCallerPipes(t *testing.T) {
 	script := `#!/bin/sh
 echo discarded-output
 echo launch-diagnostic >&2
-sleep 3 &
+sleep 60 &
+echo $! >"$0.pid"
 exit 0
 `
 	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
@@ -4231,7 +4340,15 @@ exit 0
 	b := &runtimeBackend{root: "/runtime", runsc: runsc, stdout: &stdout, stderr: &stderr}
 	started := time.Now()
 	status, err := b.runConfiguredCommand("start", "demo")
-	if elapsed := time.Since(started); elapsed >= time.Second {
+	if pidBytes, readErr := os.ReadFile(runsc + ".pid"); readErr == nil {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(pidBytes))); parseErr == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	// The descendant sleeps for a minute, so 20 seconds is a generous
+	// allowance for a heavily loaded host while still proving that launch did
+	// not wait for it.
+	if elapsed := time.Since(started); elapsed >= 20*time.Second {
 		t.Fatalf("launch waited %v for a descendant holding stdio", elapsed)
 	}
 	if err != nil || status != 0 {
@@ -4242,6 +4359,33 @@ exit 0
 	}
 	if got, want := stderr.String(), "launch-diagnostic\n"; got != want {
 		t.Errorf("runsc launch diagnostic=%q, want %q", got, want)
+	}
+}
+
+func TestRuntimeDiagnostics(t *testing.T) {
+	dataRoot := t.TempDir()
+	b := &runtimeBackend{dataRoot: dataRoot}
+	configured, err := b.withRuntimeDiagnostics([]string{"--root", "/runtime"}, "container-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	panicLog := filepath.Join(dataRoot, "containers", "container-id", "runtime", "panic.log")
+	want := []string{"--root", "/runtime", "--panic-log=" + panicLog}
+	if !reflect.DeepEqual(configured, want) {
+		t.Fatalf("diagnostic arguments=%q, want %q", configured, want)
+	}
+	started := time.Now()
+	contents := "unrelated runtime text\n" +
+		"ttc ring0 bridge error: status=0xfae94003 phase=0x100\n" +
+		"ttc hvf application error: owner continuation publication raced host return\n"
+	if err := os.WriteFile(panicLog, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b.runtimeDiagnosticSince("container-id", started), "ttc hvf application error: owner continuation publication raced host return"; got != want {
+		t.Fatalf("runtime diagnostic=%q, want %q", got, want)
+	}
+	if got := b.runtimeDiagnosticSince("missing", started); got != "" {
+		t.Fatalf("missing runtime diagnostic=%q, want empty", got)
 	}
 }
 
@@ -6403,6 +6547,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 		imageList:       []ImageInfo{{Reference: "docker.io/library/alpine:3.20", Digest: "sha256:abc"}},
 		execSessionList: []runscExecSession{{ID: "exec-123", State: "running"}},
 	}
+	platformCompletions := runtimePlatformCompletions()
 	tests := []struct {
 		args    []string
 		want    []string
@@ -6410,7 +6555,7 @@ func TestDynamicCompletionUsesTTCObjects(t *testing.T) {
 	}{
 		{args: []string{"_complete", "pa"}, want: []string{"pause"}},
 		{args: []string{"_complete", "daemon", "start", ""}, want: []string{"--platform", "--unsafe-no-host-isolation"}},
-		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: []string{"kvm", "systrap"}},
+		{args: []string{"_complete", "daemon", "start", "--platform", ""}, want: platformCompletions},
 		{args: []string{"_complete", "unp"}, want: []string{"unpause"}},
 		{args: []string{"_complete", "unpause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},
 		{args: []string{"_complete", "pause", "demo@"}, want: []string{"demo@child", "demo@main"}, notWant: "demo@old"},

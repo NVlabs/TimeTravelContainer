@@ -31,10 +31,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -183,7 +181,6 @@ func (fs FeatureSet) CheckHostCompatible() error {
 	return fs.archCheckHostCompatible(hfs)
 }
 
-// +stateify savable
 type hwCap struct {
 	// hwCap1 stores HWCAP bits exposed through the elf auxiliary vector.
 	hwCap1 uint64
@@ -219,11 +216,6 @@ type hwCap struct {
 //	0000460                    0                    0
 func readHWCap(auxvFilepath string) (hwCap, error) {
 	c := hwCap{}
-	if runtime.GOOS != "linux" {
-		// Don't try to read Linux-specific /proc files.
-		return c, fmt.Errorf("readHwCap only supported on linux, not %s", runtime.GOOS)
-	}
-
 	auxv, err := os.ReadFile(auxvFilepath)
 	if err != nil {
 		return c, fmt.Errorf("failed to read file %s: %w", auxvFilepath, err)
@@ -245,15 +237,6 @@ func readHWCap(auxvFilepath string) (hwCap, error) {
 		}
 	}
 	return c, nil
-}
-
-func initHWCap() {
-	c, err := readHWCap("/proc/self/auxv")
-	if err != nil {
-		log.Warningf("cpuid HWCap not initialized: %v", err)
-	} else {
-		hostFeatureSet.hwCap = c
-	}
 }
 
 var initOnce sync.Once

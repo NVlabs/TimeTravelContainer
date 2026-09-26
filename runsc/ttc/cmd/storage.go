@@ -203,7 +203,7 @@ func startSharedMemoryRelay(sharedRoot string, objects map[ttcsnapshot.ObjectID]
 		return nil, nil, err
 	}
 	defer catalogFile.Close()
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	fds, err := cloexecStreamSocketpair()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -293,7 +293,7 @@ func startSharedFilesystemRelay(sharedRoot, root, sourceName string, origins []u
 	if len(origins) == 0 {
 		return nil, nil, errors.New("shared filesystem relay has no immutable origin scope")
 	}
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	fds, err := cloexecStreamSocketpair()
 	if err != nil {
 		return nil, nil, err
 	}

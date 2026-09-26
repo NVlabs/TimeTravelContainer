@@ -182,20 +182,23 @@ func (cache *fileCache) copyOnWriteLocked(ctx context.Context, fs *filesystem, m
 		if err != nil {
 			return err
 		}
-		oldIMS, err := fs.mf.MapInternal(oldRange, hostarch.Read)
+		mappings, mappingLease, err := memmap.MapInternalBatchWithLease(fs.mf, []memmap.InternalMappingRequest{
+			{Range: oldRange, Access: hostarch.Read},
+			{Range: newRange, Access: hostarch.Write},
+		})
 		if err != nil {
 			fs.mf.DecRef(newRange)
 			return err
 		}
-		newIMS, err := fs.mf.MapInternal(newRange, hostarch.Write)
-		if err != nil {
-			fs.mf.DecRef(newRange)
-			return err
+		oldIMS, newIMS := mappings[0], mappings[1]
+		n, copyErr := safemem.CopySeq(newIMS, oldIMS)
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
-		if n, err := safemem.CopySeq(newIMS, oldIMS); err != nil || n != cowRange.Length() {
+		if copyErr != nil || n != cowRange.Length() {
 			fs.mf.DecRef(newRange)
-			if err != nil {
-				return err
+			if copyErr != nil {
+				return copyErr
 			}
 			return io.ErrUnexpectedEOF
 		}
@@ -493,19 +496,23 @@ func (r *fuseCacheReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	cache.dataMu.Lock()
 	defer cache.dataMu.Unlock()
 	_, fillErr := cache.data.Fill(r.ctx, required, required, r.fileSize, inode.fs.mf, pgalloc.AllocOpts{
-		Kind:    usage.PageCache,
-		MemCgID: pgalloc.MemoryCgroupIDFromContext(r.ctx),
-		Mode:    pgalloc.AllocateAndWritePopulate,
+		Kind:                        usage.PageCache,
+		MemCgID:                     pgalloc.MemoryCgroupIDFromContext(r.ctx),
+		Mode:                        pgalloc.AllocateAndWritePopulate,
+		ReaderMayWaitForApplication: true,
 	}, r.fd.readToBlocksAt)
 
 	var done uint64
 	for seg := cache.data.FindSegment(r.off); seg.Ok() && seg.Start() < end; seg, _ = seg.NextNonEmpty() {
 		mr := seg.Range().Intersect(memmap.MappableRange{Start: r.off, End: end})
-		ims, err := inode.fs.mf.MapInternal(seg.FileRangeOf(mr), hostarch.Read)
+		ims, mappingLease, err := memmap.MapInternalWithLease(inode.fs.mf, seg.FileRangeOf(mr), hostarch.Read)
 		if err != nil {
 			return done, err
 		}
 		n, err := safemem.CopySeq(dsts.DropFirst64(done), ims)
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
 		done += n
 		r.off += n
 		if err != nil {
@@ -713,9 +720,10 @@ func (fd *regularFileFD) Translate(ctx context.Context, required, optional memma
 		return nil, &memmap.BusError{Err: err}
 	}
 	_, fillErr := cache.data.Fill(ctx, required, optional, inode.size.Load(), inode.fs.mf, pgalloc.AllocOpts{
-		Kind:    usage.PageCache,
-		MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
-		Mode:    pgalloc.AllocateAndWritePopulate,
+		Kind:                        usage.PageCache,
+		MemCgID:                     pgalloc.MemoryCgroupIDFromContext(ctx),
+		Mode:                        pgalloc.AllocateAndWritePopulate,
+		ReaderMayWaitForApplication: true,
 	}, fd.readToBlocksAt)
 
 	var translations []memmap.Translation

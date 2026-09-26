@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -132,6 +133,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttc: %v\n", err)
 		return 2
 	}
+	args = normalizeEnvironmentImports(args)
 	args, err = normalizeHostPaths(args)
 	if err != nil {
 		_ = closeCheckpoint()
@@ -780,12 +782,12 @@ func knownHelpCommand(command string) bool {
 func printHelpTopic(topic []string, stdout io.Writer) {
 	key := strings.Join(topic, " ")
 	if text, ok := commandHelp[key]; ok {
-		fmt.Fprintln(stdout, text)
+		fmt.Fprintln(stdout, hostHelpText(text))
 		return
 	}
 	if len(topic) != 0 {
 		if text, ok := commandHelp[topic[0]]; ok {
-			fmt.Fprintln(stdout, text)
+			fmt.Fprintln(stdout, hostHelpText(text))
 			return
 		}
 	}
@@ -1087,15 +1089,14 @@ func quorumWaitDaemon(socket string) (protocol.DaemonQuorumWait, bool) {
 	if err := json.Unmarshal(data, &waiting); err != nil || waiting.PID <= 0 || waiting.APIVersion <= 0 || waiting.BuildID == "" || syscall.Kill(waiting.PID, 0) != nil {
 		return protocol.DaemonQuorumWait{}, false
 	}
-	executable, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(waiting.PID), "exe"))
+	executable, err := processutil.Executable(waiting.PID)
 	if err != nil || filepath.Base(executable) != "ttcd" {
 		return protocol.DaemonQuorumWait{}, false
 	}
-	commandLine, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(waiting.PID), "cmdline"))
+	arguments, err := processutil.Arguments(waiting.PID)
 	if err != nil {
 		return protocol.DaemonQuorumWait{}, false
 	}
-	arguments := strings.Split(strings.TrimSuffix(string(commandLine), "\x00"), "\x00")
 	for index, argument := range arguments {
 		if argument == "--socket" && index+1 < len(arguments) && arguments[index+1] == socket {
 			return waiting, true
@@ -1360,6 +1361,65 @@ func hasBoolFlag(args []string, short byte, long string) bool {
 		}
 	}
 	return false
+}
+
+// normalizeEnvironmentImports resolves run/create --env NAME in this process,
+// as Docker does. The command itself runs in ttcd, which may have been started
+// before NAME was exported and must not substitute its own environment for
+// the client's.
+func normalizeEnvironmentImports(args []string) []string {
+	command := 0
+	if len(args) != 0 && args[0] == "container" {
+		command = 1
+	}
+	if command >= len(args) || (args[command] != "run" && args[command] != "create") {
+		return args
+	}
+	result := append([]string(nil), args...)
+	valueFlags := map[string]bool{
+		"--name": true, "--pull": true, "--workdir": true, "-w": true,
+		"--user": true, "-u": true, "--hostname": true, "-h": true,
+		"--network": true, "--net": true, "--ip": true, "--mac-address": true,
+		"--publish": true, "-p": true, "--add-host": true, "--dns": true,
+		"--dns-search": true, "--dns-option": true, "--dns-opt": true,
+		"--entrypoint": true, "--stop-signal": true, "--stop-timeout": true,
+		"--pids-limit": true, "--memory": true, "-m": true, "--memory-swap": true,
+		"--cpus": true, "--cpu-shares": true, "--cpu-period": true, "--cpu-quota": true,
+		"--shm-size": true, "--group-add": true, "--cap-add": true,
+		"--cap-drop": true, "--ulimit": true, "--env": true, "-e": true,
+		"--env-file": true, "--label": true, "-l": true, "--label-file": true,
+		"--volume": true, "-v": true, "--mount": true, "--tmpfs": true,
+		"--log-driver": true, "--log-opt": true, "--node": true, "--platform": true,
+	}
+	resolve := func(value string) string {
+		if strings.Contains(value, "=") {
+			return value
+		}
+		if hostValue, ok := os.LookupEnv(value); ok {
+			return value + "=" + hostValue
+		}
+		return value
+	}
+	for i := command + 1; i < len(result); i++ {
+		arg := result[i]
+		if arg == "--" || arg == "-" || !strings.HasPrefix(arg, "-") {
+			break
+		}
+		switch {
+		case arg == "--env" || arg == "-e":
+			if i+1 < len(result) {
+				i++
+				result[i] = resolve(result[i])
+			}
+		case strings.HasPrefix(arg, "--env="):
+			result[i] = "--env=" + resolve(strings.TrimPrefix(arg, "--env="))
+		case strings.HasPrefix(arg, "-e="):
+			result[i] = "-e=" + resolve(strings.TrimPrefix(arg, "-e="))
+		case valueFlags[arg]:
+			i++
+		}
+	}
+	return result
 }
 
 func normalizeHostPaths(args []string) ([]string, error) {

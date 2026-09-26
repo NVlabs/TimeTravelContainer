@@ -57,5 +57,6 @@ bzl_library(
 exports_files([
     "build_cover.sh",
     "containerd-close-fsverity-probe.patch",
+    "go_darwin_vm_hooks.patch",
     "go-allow-internal.patch",
 ])

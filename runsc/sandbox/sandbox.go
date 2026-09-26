@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,14 +30,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/client"
@@ -92,6 +91,15 @@ func controlSocketName(id string) string {
 	return fmt.Sprintf("runsc-%s.sock", id)
 }
 
+// fallbackControlSocketName keeps fallback paths short and namespaces them by
+// runsc root. Two ttcd instances on one host may intentionally manage the same
+// logical container ID in different node-local roots during a remote fork or
+// migration; the historical ID-only /tmp name made those sandboxes collide.
+func fallbackControlSocketName(rootDir, id string) string {
+	digest := sha256.Sum256([]byte(filepath.Clean(rootDir) + "\x00" + id))
+	return fmt.Sprintf("runsc-%x.sock", digest[:16])
+}
+
 // createControlSocket finds a location and creates the socket used to
 // communicate with the sandbox. The socket is a UDS on the host filesystem.
 //
@@ -99,10 +107,20 @@ func controlSocketName(id string) string {
 // them. There is no file mode protecting abstract sockets.
 func createControlSocket(rootDir, id string) (string, int, error) {
 	name := controlSocketName(id)
+	fallbackName := fallbackControlSocketName(rootDir, id)
 
 	// Only use absolute paths to guarantee resolution from anywhere.
-	for _, dir := range []string{rootDir, "/var/run", "/run", "/tmp"} {
-		path := filepath.Join(dir, name)
+	locations := []struct {
+		dir  string
+		name string
+	}{
+		{dir: rootDir, name: name},
+		{dir: "/var/run", name: fallbackName},
+		{dir: "/run", name: fallbackName},
+		{dir: "/tmp", name: fallbackName},
+	}
+	for _, location := range locations {
+		path := filepath.Join(location.dir, location.name)
 		log.Debugf("Attempting to create socket file %q", path)
 		fd, err := server.CreateSocket(path)
 		if err == nil {
@@ -627,7 +645,7 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 		pagesReadFlags := os.O_RDONLY
 		if direct {
 			// The contents are page-aligned, so it can be opened with O_DIRECT.
-			pagesReadFlags |= syscall.O_DIRECT
+			pagesReadFlags |= directIOFlag()
 		}
 		pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0)
 		if err != nil {
@@ -843,17 +861,11 @@ func (s *Sandbox) sandboxConnect() (*urpc.Client, error) {
 	if path == "" {
 		return nil, fmt.Errorf("no control socket found for sandbox %q", s.ID)
 	}
-	if len(path) >= linux.UnixPathMax {
-		// This is not an abstract socket path. It is a filesystem path.
-		// UDS connect fails when the len(socket path) >= UNIX_PATH_MAX. Instead
-		// open the socket using open(2) and use /proc to refer to the open FD.
-		sockFD, err := unix.Open(path, unix.O_PATH, 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open socket at %q", path)
-		}
-		defer unix.Close(sockFD)
-		path = filepath.Join("/proc/self/fd", fmt.Sprintf("%d", sockFD))
+	path, cleanupPath, err := usableControlSocketPath(path)
+	if err != nil {
+		return nil, err
 	}
+	defer cleanupPath()
 	conn, err := client.ConnectTo(path)
 	if err != nil {
 		return nil, s.connError(err)
@@ -1170,7 +1182,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			if rootlessEUID {
 				if CanUseUnprivilegedMapping(args.Spec) {
 					specutils.SetUIDGIDMappings(cmd, args.Spec)
-					cmd.SysProcAttr.GidMappingsEnableSetgroups = false
+					if err := disableSetgroupsForIDMapping(cmd); err != nil {
+						return err
+					}
 				} else {
 					setUserMappings = true
 				}
@@ -1189,7 +1203,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			} else {
 				specutils.SetUIDGIDMappings(cmd, args.Spec)
 				// We need to set UID and GID to have capabilities in a new user namespace.
-				cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+				if err := setCommandCredential(cmd, 0, 0); err != nil {
+					return err
+				}
 			}
 		} else {
 			if rootlessEUID {
@@ -1251,34 +1267,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 			}
 
 			// Set credentials inside the new user namespace.
-			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: sandboxID, Gid: sandboxID}
-			cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
-				{
-					ContainerID: int(sandboxID),
-					HostID:      s.UID,
-					Size:        1,
-				},
-			}
-			cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
-				{
-					ContainerID: int(sandboxID),
-					HostID:      s.GID,
-					Size:        1,
-				},
+			if err := configureSandboxIDMapping(cmd, sandboxID, s.UID, s.GID); err != nil {
+				return err
 			}
 
 			// A sandbox process will construct an empty root for itself, so it has
 			// to have CAP_SYS_ADMIN and CAP_SYS_CHROOT capabilities.
 			if !legacyUserNamespaceRoot {
-				cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
-					uintptr(capability.CAP_SYS_ADMIN),
-					uintptr(capability.CAP_SYS_CHROOT),
-					// CAP_SETPCAP is required to clear the bounding set.
-					uintptr(capability.CAP_SETPCAP),
-				)
-				if gPlatform.Requirements().RequiresCapSysPtrace {
-					cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps,
-						uintptr(capability.CAP_SYS_PTRACE))
+				if err := addChrootAmbientCapabilities(cmd, gPlatform.Requirements().RequiresCapSysPtrace); err != nil {
+					return err
 				}
 			}
 		} else {
@@ -1370,6 +1367,11 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	cmd.Args = append(cmd.Args, "--total-host-memory", strconv.FormatUint(totalSysMem, 10))
 
 	mem := totalSysMem
+	if args.Spec != nil && args.Spec.Linux != nil && args.Spec.Linux.Resources != nil && args.Spec.Linux.Resources.Memory != nil {
+		if limit := args.Spec.Linux.Resources.Memory.Limit; limit != nil && *limit > 0 && uint64(*limit) < mem {
+			mem = uint64(*limit)
+		}
+	}
 	if s.CgroupJSON.Cgroup != nil {
 		cpuNum, err := s.CgroupJSON.Cgroup.NumCPU()
 		if err != nil {
@@ -1420,7 +1422,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	if args.Attached {
 		// Kill sandbox if parent process exits in attached mode.
-		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
+		setCommandParentDeathSignal(cmd)
 		// Tells boot that any process it creates must have pdeathsig set.
 		cmd.Args = append(cmd.Args, "--attached")
 	}
@@ -1827,7 +1829,7 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 		pagesWriteFlags := os.O_CREATE | os.O_EXCL | os.O_RDWR
 		if direct {
 			// The writes will be page-aligned, so it can be opened with O_DIRECT.
-			pagesWriteFlags |= syscall.O_DIRECT
+			pagesWriteFlags |= directIOFlag()
 		}
 		f, err := os.OpenFile(pagesFilePath, pagesWriteFlags, 0644)
 		if err != nil {
@@ -1950,7 +1952,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 	// bufio.Reader/Writer(os.File) in the sentry.
 	maybeODirect := 0
 	if direct {
-		maybeODirect = unix.O_DIRECT
+		maybeODirect = directIOFlag()
 	}
 
 	manifestFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointManifestFileName)
@@ -2008,7 +2010,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 		return nil, fmt.Errorf("failed to open %s: %w", os.DevNull, err)
 	}
 	defer devNullFile.Close()
-	socketFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	socketFDs, err := hostSocketPair()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create checkpoint gofer socketpair: %w", err)
 	}
@@ -2988,7 +2990,7 @@ func (s *Sandbox) fixPidns(spec *specs.Spec) {
 // ConfigureCmdForRootless configures cmd to donate a socket FD that can be
 // used to synchronize userns configuration.
 func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.File, error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := hostSocketPair()
 	if err != nil {
 		return nil, err
 	}
@@ -2997,21 +2999,10 @@ func ConfigureCmdForRootless(cmd *exec.Cmd, donations *donation.Agency) (*os.Fil
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
-	cmd.SysProcAttr.AmbientCaps = []uintptr{
-		// Same as `cap` in cmd/gofer.go.
-		unix.CAP_CHOWN,
-		unix.CAP_DAC_OVERRIDE,
-		unix.CAP_DAC_READ_SEARCH,
-		unix.CAP_FOWNER,
-		unix.CAP_FSETID,
-		unix.CAP_SYS_CHROOT,
-		// Needed for setuid(2)/setgid(2).
-		unix.CAP_SETUID,
-		unix.CAP_SETGID,
-		// Needed for chroot.
-		unix.CAP_SYS_ADMIN,
-		// Needed to be able to clear bounding set (PR_CAPBSET_DROP).
-		unix.CAP_SETPCAP,
+	if err := configureRootlessCommandCapabilities(cmd); err != nil {
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+		return nil, err
 	}
 	return os.NewFile(uintptr(fds[0]), "userns sync FD"), nil
 }
@@ -3154,9 +3145,10 @@ func (s *Sandbox) ReadFile(containerID, path string, offset, size int64, outFD *
 }
 
 func setCloExeOnAllFDs() error {
-	f, err := os.Open("/proc/self/fd")
+	fdDir := hostFDDirectory()
+	f, err := os.Open(fdDir)
 	if err != nil {
-		return fmt.Errorf("failed to open /proc/self/fd: %w", err)
+		return fmt.Errorf("failed to open %s: %w", fdDir, err)
 
 	}
 	defer f.Close()
@@ -3166,12 +3158,12 @@ func setCloExeOnAllFDs() error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read /proc/self/fd: %w", err)
+			return fmt.Errorf("failed to read %s: %w", fdDir, err)
 		}
 		for _, dent := range dents {
 			fd, err := strconv.Atoi(dent)
 			if err != nil {
-				return fmt.Errorf("failed to convert /proc/self/fd entry %q to int: %w", dent, err)
+				return fmt.Errorf("failed to convert %s entry %q to int: %w", fdDir, dent, err)
 			}
 			if fd == int(f.Fd()) {
 				continue
@@ -3202,7 +3194,8 @@ func setCloExeOnAllFDs() error {
 
 var setCloseExecOnce sync.Once
 
-// SetCloExeOnAllFDs sets CLOEXEC on all FDs in /proc/self/fd. This avoids
+// SetCloExeOnAllFDs sets CLOEXEC on every descriptor exposed by the host's
+// descriptor directory. This avoids
 // leaking inherited FDs from the parent (caller) to subprocesses created.
 func SetCloExeOnAllFDs() (retErr error) {
 	// Sufficient to do this only once per runsc invocation. Avoid double work.

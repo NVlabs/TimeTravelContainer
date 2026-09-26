@@ -38,12 +38,12 @@ func TestFollowerMessageCarriesItsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer done()
-	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: address, Net: "unixpacket"})
+	listener, err := net.ListenUnix(FollowerNetwork, &net.UnixAddr{Name: address, Net: FollowerNetwork})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	client, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: address, Net: "unixpacket"})
+	client, err := net.DialUnix(FollowerNetwork, nil, &net.UnixAddr{Name: address, Net: FollowerNetwork})
 	if err != nil {
 		t.Fatal(err)
 	}

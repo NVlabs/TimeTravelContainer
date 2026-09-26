@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_binary")
+load("//tools:defs.bzl", "go_binary", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -10,4 +10,12 @@ go_binary(
     testonly = 1,
     srcs = ["main.go"],
     visibility = ["//runsc/ttc/test:__pkg__"],
+)
+
+go_test(
+    name = "registry_fixture_test",
+    srcs = [
+        "main.go",
+        "main_test.go",
+    ],
 )

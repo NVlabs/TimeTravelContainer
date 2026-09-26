@@ -1,0 +1,66 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build darwin
+
+package cmd
+
+import "testing"
+
+func TestDarwinHostCompatibilityDoesNotApplyLinuxGSOFallback(t *testing.T) {
+	compatibility, err := evaluateCurrentHostCompatibility("24.6.0")
+	if err != nil {
+		t.Fatalf("evaluateCurrentHostCompatibility: %v", err)
+	}
+	if compatibility.disableHostGSO {
+		t.Fatal("Darwin compatibility unexpectedly enabled the Linux host-GSO fallback")
+	}
+}
+
+func TestDarwinHypervisorEntitlement(t *testing.T) {
+	const entitlement = "com.apple.security.hypervisor"
+	for _, test := range []struct {
+		name  string
+		plist string
+		want  bool
+	}{
+		{
+			name:  "present",
+			plist: `<?xml version="1.0"?><plist><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>`,
+			want:  true,
+		},
+		{
+			name:  "false",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key><false/></dict></plist>`,
+		},
+		{
+			name:  "unrelated true",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key><false/><key>other</key><true/></dict></plist>`,
+		},
+		{
+			name:  "missing",
+			plist: `<plist><dict><key>other</key><true/></dict></plist>`,
+		},
+		{
+			name:  "malformed",
+			plist: `<plist><dict><key>com.apple.security.hypervisor</key>`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasDarwinBooleanEntitlement([]byte(test.plist), entitlement); got != test.want {
+				t.Fatalf("hasDarwinBooleanEntitlement(%q) = %t, want %t", test.plist, got, test.want)
+			}
+		})
+	}
+}

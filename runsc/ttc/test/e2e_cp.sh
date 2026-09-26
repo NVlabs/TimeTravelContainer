@@ -43,6 +43,13 @@ BIN_DIR="$TTC_E2E_ROOT/bin"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$(readlink -f "$TTC")" "$BIN_DIR/ttc"
 install -m 0755 "$(readlink -f "$TTCD")" "$BIN_DIR/ttcd"
+if [ "$(uname -s)" = Darwin ]; then
+  # A copy loses its ad-hoc signature; Hypervisor.framework requires the
+  # entitlement on the executable at its final path.
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)/hvf.entitlements" \
+    "$BIN_DIR/ttcd" >/dev/null
+fi
 TTC="$BIN_DIR/ttc"
 export TTC_ROOT="$DATA_ROOT"
 CONTAINER="cp-$$"

@@ -12,44 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package eventfd wraps Linux's eventfd(2) syscall.
+// Package eventfd provides the event notification primitive used by the
+// sentry. Linux uses eventfd(2); Darwin uses an in-process pipe adapter.
 package eventfd
 
 import (
 	"fmt"
-	"io"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/rawfile"
-	"gvisor.dev/gvisor/pkg/safecopy"
 )
 
 const sizeofUint64 = 8
 
 // Eventfd represents a Linux eventfd object.
 type Eventfd struct {
-	fd       int
+	fd      int
+	writeFD int
+	// counter is the value of a Darwin eventfd, whose pipe holds a byte
+	// exactly while counter is non-zero. It is shared by duplicates, and nil
+	// for Linux eventfds and wrapped FDs.
+	counter  *atomicbitops.Uint64
 	mmioAddr uintptr
 	mmioCtrl MMIOController
 }
 
-// Create returns an initialized eventfd.
-func Create() (Eventfd, error) {
-	fd, _, err := unix.RawSyscall(unix.SYS_EVENTFD2, 0, 0, 0)
-	if err != 0 {
-		return Eventfd{}, fmt.Errorf("failed to create eventfd: %v", error(err))
-	}
-	if err := unix.SetNonblock(int(fd), true); err != nil {
-		unix.Close(int(fd))
-		return Eventfd{}, err
-	}
-	return Eventfd{fd: int(fd)}, nil
-}
-
 // Wrap returns an initialized Eventfd using the provided fd.
 func Wrap(fd int) Eventfd {
-	return Eventfd{fd: fd}
+	return Eventfd{fd: fd, writeFD: fd}
 }
 
 // Close closes the eventfd, after which it should not be used.
@@ -57,7 +48,11 @@ func (ev Eventfd) Close() error {
 	if ev.mmioCtrl != nil {
 		ev.mmioCtrl.Close(ev)
 	}
-	return unix.Close(ev.fd)
+	err := unix.Close(ev.fd)
+	if ev.writeFD != ev.fd {
+		err = errorsJoin(err, unix.Close(ev.writeFD))
+	}
+	return err
 }
 
 // Dup copies the eventfd, calling dup(2) on the underlying file descriptor.
@@ -66,7 +61,15 @@ func (ev Eventfd) Dup() (Eventfd, error) {
 	if err != nil {
 		return Eventfd{}, fmt.Errorf("failed to dup: %v", other)
 	}
-	return Eventfd{fd: other}, nil
+	otherWrite := other
+	if ev.writeFD != ev.fd {
+		otherWrite, err = unix.Dup(ev.writeFD)
+		if err != nil {
+			_ = unix.Close(other)
+			return Eventfd{}, fmt.Errorf("failed to dup event write fd: %v", err)
+		}
+	}
+	return Eventfd{fd: other, writeFD: otherWrite, counter: ev.counter}, nil
 }
 
 // Notify alerts other users of the eventfd. Users can receive alerts by
@@ -80,20 +83,41 @@ func (ev Eventfd) Write(val uint64) error {
 	var buf [sizeofUint64]byte
 	hostarch.ByteOrder.PutUint64(buf[:], val)
 	if ev.mmioAddr != 0 && ev.mmioCtrl.Enabled() {
-		if _, err := safecopy.CopyOut(ev.mmioPtr(), buf[:]); err == nil {
+		if _, err := mmioCopyOut(ev.mmioPtr(), buf[:]); err == nil {
 			return nil
 		}
 		// Fall back to using a syscall.
 	}
+	if ev.counter != nil {
+		return ev.addToCounter(val)
+	}
+	writeAll(ev.writeFD, buf[:])
+	return nil
+}
+
+// addToCounter adds val to ev.counter, making the pipe readable if the
+// counter was zero.
+func (ev Eventfd) addToCounter(val uint64) error {
+	if val == 0 {
+		return nil
+	}
+	if ev.counter.Add(val) == val {
+		writeAll(ev.writeFD, []byte{1})
+	}
+	return nil
+}
+
+// writeAll writes buf to the non-blocking fd, which must have room for it.
+func writeAll(fd int, buf []byte) {
 	for {
-		n, err := nonBlockingWrite(ev.fd, buf[:])
+		n, err := nonBlockingWrite(fd, buf)
 		if err == unix.EINTR {
 			continue
 		}
-		if err != nil || n != sizeofUint64 {
-			panic(fmt.Sprintf("bad write to eventfd: got %d bytes, wanted %d with error %v", n, sizeofUint64, err))
+		if err != nil || n != len(buf) {
+			panic(fmt.Sprintf("bad write to eventfd: got %d bytes, wanted %d with error %v", n, len(buf), err))
 		}
-		return err
+		return
 	}
 }
 
@@ -109,7 +133,7 @@ func (ev Eventfd) MMIOWrite(val uint64) error {
 	if !ev.mmioCtrl.Enabled() {
 		return fmt.Errorf("MMIO is temporarily disabled")
 	}
-	_, err := safecopy.CopyOut(ev.mmioPtr(), buf[:])
+	_, err := mmioCopyOut(ev.mmioPtr(), buf[:])
 	return err
 }
 
@@ -119,27 +143,17 @@ func (ev Eventfd) Wait() error {
 	return err
 }
 
-// Read blocks until eventfd is non-zero (i.e. someone calls Notify or Write)
-// and returns the value read.
-func (ev Eventfd) Read() (uint64, error) {
-	var tmp [sizeofUint64]byte
-	n, errno := rawfile.BlockingRead(ev.fd, tmp[:])
-	if errno != 0 {
-		return 0, errno
-	}
-	if n == 0 {
-		return 0, io.EOF
-	}
-	if n != sizeofUint64 {
-		panic(fmt.Sprintf("short read from eventfd: got %d bytes, wanted %d", n, sizeofUint64))
-	}
-	return hostarch.ByteOrder.Uint64(tmp[:]), nil
-}
-
 // FD returns the underlying file descriptor. Use with care, as this breaks the
 // Eventfd abstraction.
 func (ev Eventfd) FD() int {
 	return ev.fd
+}
+
+func errorsJoin(first, second error) error {
+	if first != nil {
+		return first
+	}
+	return second
 }
 
 // MMIOController controls eventfd memory-mapped I/O.

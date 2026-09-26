@@ -33,7 +33,11 @@ func TestSandboxProcessArgv0(t *testing.T) {
 }
 
 func TestIsProcessRunningRejectsZombie(t *testing.T) {
-	command := exec.Command("/bin/true")
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(truePath)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}

@@ -44,9 +44,19 @@ func (fs FeatureSet) Fixed() FeatureSet {
 
 // Intersect returns the intersection of features between self and allowedFeatures.
 //
-// Just return error as there is no ARM64 equivalent to cpuid.Static.Remove().
+// An ARM64 Feature is its HWCAP bit, so the intersection masks HWCAP. No
+// HWCAP2 feature is exposed to guests (see AllowedHWCap2), so HWCAP2 is left
+// unchanged.
 func (fs FeatureSet) Intersect(allowedFeatures map[Feature]struct{}) (FeatureSet, error) {
-	return FeatureSet{}, fmt.Errorf("FeatureSet intersection is not supported on ARM64")
+	var allowed uint64
+	for feature := range allowedFeatures {
+		if feature < 0 || feature >= 64 {
+			return FeatureSet{}, fmt.Errorf("feature %v has no ARM64 HWCAP bit", feature)
+		}
+		allowed |= 1 << feature
+	}
+	fs.hwCap.hwCap1 &= allowed
+	return fs, nil
 }
 
 // Reads CPU information from host /proc/cpuinfo.

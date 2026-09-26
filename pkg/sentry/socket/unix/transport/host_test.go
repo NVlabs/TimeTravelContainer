@@ -1,0 +1,138 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package transport
+
+import (
+	"testing"
+
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
+	"gvisor.dev/gvisor/pkg/context"
+)
+
+func TestHostConnectedEndpointLinuxErrorTranslation(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	if serr != nil {
+		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+	}
+	// Force fdReadVec's pre-syscall truncation path. The resulting buildIovec
+	// error is a Linux EAGAIN, not a host errno. On Darwin, interpreting its
+	// numeric value as a host errno used to panic with EDEADLK.
+	ep.sndbuf.Store(-1)
+	_, _, serr = ep.Recv(context.Background(), nil, RecvArgs{})
+	if serr == nil {
+		t.Fatal("Recv unexpectedly succeeded")
+	}
+	if got := serr.ToLinux(); got != errno.EAGAIN {
+		t.Fatalf("Recv error = %d, want EAGAIN (%d)", got, errno.EAGAIN)
+	}
+}
+
+func TestHostConnectedEndpointWouldBlock(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	if serr != nil {
+		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+	}
+	_, _, serr = ep.Recv(context.Background(), [][]byte{make([]byte, 8)}, RecvArgs{})
+	if serr == nil {
+		t.Fatal("Recv unexpectedly succeeded")
+	}
+	if got := serr.ToLinux(); got != errno.EAGAIN {
+		t.Fatalf("Recv error = %d, want EAGAIN (%d)", got, errno.EAGAIN)
+	}
+}
+
+func TestHostConnectedEndpointRoundTrip(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	if serr != nil {
+		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+	}
+	want := []byte("host socket transport")
+	if _, err := unix.Write(fds[1], want); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	first := make([]byte, 5)
+	second := make([]byte, len(want)-len(first))
+	out, _, serr := ep.Recv(context.Background(), [][]byte{first, second}, RecvArgs{})
+	if serr != nil {
+		t.Fatalf("Recv: %v", serr)
+	}
+	if out.RecvLen != int64(len(want)) || out.MsgLen != int64(len(want)) {
+		t.Fatalf("Recv lengths = (%d, %d), want (%d, %d)", out.RecvLen, out.MsgLen, len(want), len(want))
+	}
+	got := append(first, second...)
+	if string(got) != string(want) {
+		t.Fatalf("Recv data = %q, want %q", got, want)
+	}
+
+	reply := [][]byte{[]byte("round"), []byte(" trip")}
+	n, _, serr := ep.Send(context.Background(), reply, ControlMessages{}, Address{})
+	if serr != nil {
+		t.Fatalf("Send: %v", serr)
+	}
+	if n != 10 {
+		t.Fatalf("Send length = %d, want 10", n)
+	}
+	buf := make([]byte, n)
+	if n, err := unix.Read(fds[1], buf); err != nil || n != len(buf) {
+		t.Fatalf("Read = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+	if got, want := string(buf), "round trip"; got != want {
+		t.Fatalf("Send data = %q, want %q", got, want)
+	}
+}
+
+func TestHostConnectedEndpointShutdownAfterPeerDisconnect(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+
+	ep, serr := NewHostConnectedEndpoint(fds[0], "test")
+	if serr != nil {
+		t.Fatalf("NewHostConnectedEndpoint: %v", serr)
+	}
+	if err := unix.Close(fds[1]); err != nil {
+		t.Fatalf("closing peer: %v", err)
+	}
+
+	// Darwin returns ENOTCONN here after the peer disconnects. Closing a
+	// port-forwarded connection must not turn that harmless condition into a
+	// Sentry-wide panic.
+	ep.CloseSend()
+	ep.CloseRecv()
+}

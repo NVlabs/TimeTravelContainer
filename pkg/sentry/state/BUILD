@@ -9,6 +9,7 @@ go_library(
     name = "state",
     srcs = [
         "state.go",
+        "state_darwin.go",
         "state_metadata.go",
         "state_unsafe.go",
     ],

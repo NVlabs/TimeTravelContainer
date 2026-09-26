@@ -8,7 +8,10 @@ package(
 go_library(
     name = "unet",
     srcs = [
+        "socketpair_darwin.go",
+        "socketpair_linux.go",
         "unet.go",
+        "unet_darwin.go",
         "unet_unsafe.go",
     ],
     visibility = ["//visibility:public"],
@@ -24,6 +27,8 @@ go_test(
     name = "unet_test",
     size = "small",
     srcs = [
+        "fd_count_darwin_test.go",
+        "fd_count_linux_test.go",
         "unet_test.go",
     ],
     library = ":unet",

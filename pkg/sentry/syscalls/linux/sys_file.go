@@ -98,6 +98,61 @@ func Openat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 	return openat(t, dirfd, addr, flags, mode)
 }
 
+const openHowSize = 24
+
+// Openat2 implements Linux syscall openat2(2). Path-resolution restrictions
+// are security properties and must not be silently ignored, so this initial
+// implementation accepts only resolve=0. This still covers callers that use
+// openat2 as an extensible openat, including GNU tar's directory traversal.
+func Openat2(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	dirfd := args[0].Int()
+	addr := args[1].Pointer()
+	howAddr := args[2].Pointer()
+	size := args[3].SizeT()
+	if size < openHowSize {
+		return 0, nil, linuxerr.EINVAL
+	}
+	if size > hostarch.PageSize {
+		return 0, nil, linuxerr.E2BIG
+	}
+
+	buf := make([]byte, size)
+	if _, err := t.CopyInBytes(howAddr, buf); err != nil {
+		return 0, nil, err
+	}
+	flags, mode, err := parseOpenHow(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	return openat(t, dirfd, addr, flags, mode)
+}
+
+func parseOpenHow(buf []byte) (uint32, uint, error) {
+	if len(buf) < openHowSize {
+		return 0, 0, linuxerr.EINVAL
+	}
+	for _, b := range buf[openHowSize:] {
+		if b != 0 {
+			return 0, 0, linuxerr.E2BIG
+		}
+	}
+	flags := hostarch.ByteOrder.Uint64(buf[0:8])
+	mode := hostarch.ByteOrder.Uint64(buf[8:16])
+	resolve := hostarch.ByteOrder.Uint64(buf[16:24])
+	validFlags := uint64(linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY |
+		linux.O_TRUNC | linux.O_APPEND | linux.O_NONBLOCK | linux.O_DSYNC | linux.O_ASYNC |
+		linux.O_DIRECT | linux.O_LARGEFILE | linux.O_DIRECTORY | linux.O_NOFOLLOW |
+		linux.O_NOATIME | linux.O_CLOEXEC | linux.O_SYNC | linux.O_PATH | linux.O_TMPFILE)
+	validMode := uint64(0777 | linux.S_ISUID | linux.S_ISGID | linux.S_ISVTX)
+	if flags > uint64(^uint32(0)) || flags&^validFlags != 0 || mode&^validMode != 0 || resolve != 0 {
+		return 0, 0, linuxerr.EINVAL
+	}
+	if mode != 0 && flags&uint64(linux.O_CREAT|linux.O_TMPFILE) == 0 {
+		return 0, 0, linuxerr.EINVAL
+	}
+	return uint32(flags), uint(mode), nil
+}
+
 // Creat implements Linux syscall creat(2).
 func Creat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()

@@ -14,6 +14,7 @@ go_test(
         "//pkg/test/testutil",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 go_binary(
@@ -23,4 +24,5 @@ go_binary(
         "//runsc/specutils",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

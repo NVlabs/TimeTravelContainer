@@ -25,6 +25,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fsutil"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/vfio"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -153,21 +154,9 @@ func safeReadDir(path string) ([]string, error) {
 	}
 	defer unix.Close(fd)
 
-	var names []string
-	buf := make([]byte, 4096)
-	for {
-		n, err := unix.Getdents(fd, buf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get dents for %s: %w", path, err)
-		}
-		if n == 0 {
-			break
-		}
-		var count int
-		_, count, names = unix.ParseDirent(buf[:n], -1, names)
-		if count == 0 {
-			break
-		}
+	names, err := fsutil.DirentNames(fd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dents for %s: %w", path, err)
 	}
 	var filtered []string
 	for _, name := range names {

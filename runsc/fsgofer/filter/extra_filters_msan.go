@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build msan
-// +build msan
+//go:build linux && msan
+// +build linux,msan
 
 package filter
 

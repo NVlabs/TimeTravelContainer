@@ -15,15 +15,35 @@
 package pgalloc
 
 import (
+	"fmt"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
 // Preconditions: The FileRange represented by c is a superset of fr.
 func (c *chunkInfo) sliceAt(fr memmap.FileRange) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(c.mapping+uintptr(fr.Start&chunkMask))), fr.Length())
+}
+
+func blockSeqFromBackingFrames(fr memmap.FileRange, alignedStart uint64, frames []BackingFrame) (safemem.BlockSeq, error) {
+	want := (fr.End + uint64(hostarch.PageSize-1) - alignedStart) / uint64(hostarch.PageSize)
+	if uint64(len(frames)) != want {
+		return safemem.BlockSeq{}, fmt.Errorf("platform backing returned %d frames for mapping %v, want %d", len(frames), fr, want)
+	}
+	blocks := make([]safemem.Block, 0, len(frames))
+	for i, frame := range frames {
+		frameStart := alignedStart + uint64(i)*uint64(hostarch.PageSize)
+		start := max(fr.Start, frameStart)
+		end := min(fr.End, frameStart+uint64(hostarch.PageSize))
+		address := frame.HostAddress + uintptr(start-frameStart)
+		bytes := unsafe.Slice((*byte)(unsafe.Pointer(address)), end-start)
+		blocks = append(blocks, safemem.BlockFromSafeSlice(bytes))
+	}
+	return safemem.BlockSeqFromSlice(blocks), nil
 }
 
 func mincore(s []byte, buf []byte) error {

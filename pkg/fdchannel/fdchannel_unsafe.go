@@ -33,7 +33,7 @@ const sizeofInt32 = int(unsafe.Sizeof(int32(0)))
 // representing connected sockets that may be passed to separate calls to
 // NewEndpoint to create connected Endpoints.
 func NewConnectedSockets() ([2]int, error) {
-	return unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	return newConnectedSockets()
 }
 
 // Endpoint sends file descriptors to, and receives them from, another
@@ -41,13 +41,15 @@ func NewConnectedSockets() ([2]int, error) {
 //
 // Endpoint is not copyable or movable by value.
 type Endpoint struct {
-	sockfd int32
-	msghdr unix.Msghdr
-	cmsg   *unix.Cmsghdr // followed by sizeofInt32 bytes of data
+	sockfd  int32
+	msghdr  unix.Msghdr
+	cmsg    *unix.Cmsghdr // followed by sizeofInt32 bytes of data
+	iov     unix.Iovec    // Darwin requires one byte with SCM_RIGHTS on SOCK_STREAM.
+	iovByte byte
 }
 
 // Init must be called on zero-value Endpoints before first use. sockfd must be
-// a blocking AF_UNIX SOCK_SEQPACKET socket.
+// a blocking AF_UNIX SOCK_SEQPACKET socket on Linux or SOCK_STREAM on Darwin.
 func (ep *Endpoint) Init(sockfd int) {
 	// "Datagram sockets in various domains (e.g., the UNIX and Internet
 	// domains) permit zero-length datagrams." - recv(2). Experimentally,
@@ -59,6 +61,7 @@ func (ep *Endpoint) Init(sockfd int) {
 	ep.cmsg = (*unix.Cmsghdr)(unsafe.Pointer(&cmsgSlice[0]))
 	// ep.msghdr.Controllen and ep.cmsg.* are mutated by recvmsg(2), so they're
 	// set before calling sendmsg/recvmsg.
+	ep.initIov()
 }
 
 // NewEndpoint is a convenience function that returns an initialized Endpoint
@@ -95,7 +98,7 @@ func (ep *Endpoint) SendFD(fd int) error {
 	ep.cmsg.SetLen(cmsgLen)
 	*ep.cmsgData() = int32(fd)
 	ep.msghdr.SetControllen(cmsgLen)
-	_, _, e := unix.Syscall(unix.SYS_SENDMSG, uintptr(ep.sockfd), uintptr(unsafe.Pointer(&ep.msghdr)), 0)
+	_, _, e := unix.Syscall(unix.SYS_SENDMSG, uintptr(ep.sockfd), uintptr(unsafe.Pointer(&ep.msghdr)), sendFDFlags())
 	if e != 0 {
 		return e
 	}

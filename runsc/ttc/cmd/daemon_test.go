@@ -44,6 +44,16 @@ import (
 	"gvisor.dev/gvisor/runsc/version"
 )
 
+func shortDaemonTestSocket(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ttc-daemon-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "ttcd.sock")
+}
+
 type transactionLoadCatalog struct {
 	cluster.TransactionCatalog
 	load func(string) (*cluster.Transaction, error)
@@ -495,16 +505,23 @@ func TestHostKernelCompatibility(t *testing.T) {
 }
 
 func TestRuntimePlatformValidation(t *testing.T) {
-	for _, test := range []struct {
+	tests := []struct {
 		value string
 		want  string
 		ok    bool
 	}{
-		{value: "systrap", want: "systrap", ok: true},
-		{value: "KVM", want: "kvm", ok: true},
+		{value: defaultRuntimePlatform, want: defaultRuntimePlatform, ok: true},
 		{value: "ptrace"},
 		{value: ""},
-	} {
+	}
+	if testLinuxHost {
+		tests = append(tests, struct {
+			value string
+			want  string
+			ok    bool
+		}{value: "KVM", want: "kvm", ok: true})
+	}
+	for _, test := range tests {
 		got, err := normalizeRuntimePlatform(test.value)
 		if test.ok {
 			if err != nil || got != test.want {
@@ -517,6 +534,9 @@ func TestRuntimePlatformValidation(t *testing.T) {
 }
 
 func TestDaemonKVMPreflightFailure(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("KVM preflight is Linux-specific")
+	}
 	t.Setenv("TTC_ROOT", t.TempDir())
 	original := daemonPlatformPreflight
 	defer func() { daemonPlatformPreflight = original }()
@@ -536,7 +556,7 @@ func TestDaemonRejectsUnsupportedRuntimePlatform(t *testing.T) {
 	t.Setenv("TTC_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	status := RunDaemon([]string{"--platform=ptrace"}, &stdout, &stderr)
-	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "supported platforms are systrap and kvm") {
+	if status != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "unsupported runtime platform") {
 		t.Fatalf("unsupported platform: status=%d stdout=%q stderr=%q", status, stdout.String(), stderr.String())
 	}
 }
@@ -545,7 +565,7 @@ func TestPrepareDaemonRuntimeStorageRejectsNFS(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
 	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
-		statfs.Type = unix.NFS_SUPER_MAGIC
+		setTestNFSStatfs(statfs)
 		return nil
 	}
 	dir := t.TempDir()
@@ -559,7 +579,7 @@ func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
 	daemonStatfs = func(_ string, statfs *unix.Statfs_t) error {
-		statfs.Type = unix.TMPFS_MAGIC
+		setTestLocalStatfs(statfs)
 		return nil
 	}
 	dir := t.TempDir()
@@ -576,6 +596,9 @@ func TestPrepareDaemonRuntimeStorageCreatesLocalPaths(t *testing.T) {
 }
 
 func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux host-kernel compatibility is Linux-specific")
+	}
 	t.Setenv("TTC_ROOT", t.TempDir())
 	original := daemonKernelRelease
 	defer func() {
@@ -600,6 +623,9 @@ func TestDaemonRejectsUnsupportedHostKernel(t *testing.T) {
 }
 
 func TestDaemonWarnsWhenHostGSOMustBeDisabled(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux host-GSO fallback is Linux-specific")
+	}
 	original := daemonKernelRelease
 	originalProbe := createDaemonRootlessProbe
 	originalEUID := daemonEffectiveUID
@@ -828,6 +854,9 @@ func TestClientCannotSelectDaemonIsolationMode(t *testing.T) {
 }
 
 func TestRootlessDaemonStartupPreflight(t *testing.T) {
+	if !testLinuxHost {
+		t.Skip("Linux rootless namespace preflight is Linux-specific")
+	}
 	t.Setenv("TTC_ROOT", t.TempDir())
 	original := createDaemonRootlessProbe
 	originalEUID := daemonEffectiveUID
@@ -1701,11 +1730,11 @@ func TestDaemonAttachTakeoverParsing(t *testing.T) {
 }
 
 func TestDaemonVersionedCommandTransport(t *testing.T) {
-	socket := filepath.Join(t.TempDir(), "runtime", "ttcd.sock")
+	socket := shortDaemonTestSocket(t)
 	dataRoot := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(socket, "kvm", true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, "/runtime", "/runsc", ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
+		done <- serveDaemon(socket, defaultRuntimePlatform, true, hostKernelCompatibility{release: "6.8.0"}, dataRoot, "/runtime", "/runsc", ttcvolume.Capability{Mode: ttcvolume.CopyModeFull}, io.Discard, io.Discard)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -1750,7 +1779,7 @@ func TestDaemonVersionedCommandTransport(t *testing.T) {
 		!strings.Contains(stdout, `"features":["batch-fork"`) ||
 		!strings.Contains(stdout, `"filesystem-object-paging"`) ||
 		strings.Contains(stdout, `"filesystem-range-paging"`) ||
-		!strings.Contains(stdout, `"runtime_platform":"kvm"`) ||
+		!strings.Contains(stdout, `"runtime_platform":"`+defaultRuntimePlatform+`"`) ||
 		!strings.Contains(stdout, `"isolation_mode":"unsafe-no-host-isolation"`) ||
 		!strings.Contains(stdout, `"unsafe_no_host_isolation":true`) ||
 		!strings.Contains(stdout, `"host_kernel_release":"6.8.0"`) ||
@@ -2567,5 +2596,30 @@ func TestAdaptivePrefetchControllerAccumulatesLocalitySamples(t *testing.T) {
 	behind, ahead, changed := controller.observe(status, now.Add(120*time.Millisecond))
 	if !changed || behind != 0 || ahead != controller.maxAhead {
 		t.Fatalf("accumulated sequential update=(%d,%d,%t)", behind, ahead, changed)
+	}
+}
+
+func TestDecodeRuntimeStateStatusDistinguishesStoppedSandbox(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		encoded string
+		want    string
+		wantErr bool
+	}{
+		{name: "running", encoded: `{"status":"running","pid":123}`, want: "running"},
+		{name: "stopped", encoded: `{"status":"stopped","pid":-1}`, want: "stopped"},
+		{name: "normalized", encoded: `{"status":" Paused "}`, want: "paused"},
+		{name: "missing", encoded: `{"pid":123}`, wantErr: true},
+		{name: "malformed", encoded: `{`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := decodeRuntimeStateStatus([]byte(test.encoded))
+			if (err != nil) != test.wantErr {
+				t.Fatalf("decodeRuntimeStateStatus(%q)=(%q,%v), want error=%t", test.encoded, got, err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("decodeRuntimeStateStatus(%q)=%q, want %q", test.encoded, got, test.want)
+			}
+		})
 	}
 }

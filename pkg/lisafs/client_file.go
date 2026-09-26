@@ -310,7 +310,8 @@ func (f *ClientFD) SetStat(ctx context.Context, stat *linux.Statx) (uint32, erro
 	if resp.FailureMask == 0 {
 		return 0, nil, nil
 	}
-	return resp.FailureMask, unix.Errno(resp.FailureErrNo), nil
+	// FailureErrNo is a Linux errno, like every errno in the protocol.
+	return resp.FailureMask, protocolError(resp.FailureErrNo), nil
 }
 
 // WalkMultiple makes the Walk RPC with multiple path components.

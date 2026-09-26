@@ -16,20 +16,21 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/runsc/cli/maincli"
+	"gvisor.dev/gvisor/runsc/processutil"
 	"gvisor.dev/gvisor/runsc/ttc/cmd"
+	"gvisor.dev/gvisor/runsc/ttc/copyguest"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 func main() {
+	cmd.SetGuestCopyHelper(copyguest.Binary())
 	if len(os.Args) >= 2 && os.Args[1] == "_cp-helper" {
 		os.Exit(cmd.RunCopyHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -51,7 +52,7 @@ func main() {
 		os.Args = append([]string{"ttcd-runsc"}, os.Args[2:]...)
 	}
 	if runscMode {
-		// runsc re-executes /proc/self/exe for sandbox helpers. The marker makes
+		// runsc re-executes its own host path for sandbox helpers. The marker makes
 		// those children return to the embedded runtime instead of starting the
 		// TTC control daemon.
 		_ = os.Setenv("TTC_EMBEDDED_RUNTIME", "1")
@@ -106,25 +107,14 @@ func reapInheritedChildren() {
 }
 
 func inheritedChildren() []int {
-	entries, err := os.ReadDir("/proc")
+	pids, err := processutil.PIDs()
 	if err != nil {
 		return nil
 	}
-	self := strconv.Itoa(os.Getpid())
+	self := os.Getpid()
 	var children []int
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
-		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
-		if err != nil {
-			continue
-		}
-		// The parent follows the state, after the command name, which is in
-		// parentheses and may hold spaces and parentheses itself.
-		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
-		if len(fields) > 1 && fields[1] == self {
+	for _, pid := range pids {
+		if parent, err := processutil.ParentPID(pid); err == nil && parent == self {
 			children = append(children, pid)
 		}
 	}

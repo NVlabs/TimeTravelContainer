@@ -34,6 +34,7 @@ type testArg struct {
 type testResult struct {
 	StringResult string
 	IntResult    int
+	Data         []byte
 	FilePayload
 }
 
@@ -63,6 +64,14 @@ func (t test) SendFile(a *testArg, r *testResult) error {
 func (t test) TooManyFiles(a *testArg, r *testResult) error {
 	for i := 0; i <= maxFiles; i++ {
 		r.Files = append(r.Files, os.Stdin)
+	}
+	return nil
+}
+
+func (t test) Data(a *testArg, r *testResult) error {
+	r.Data = make([]byte, a.IntArg)
+	for i := range r.Data {
+		r.Data[i] = byte(i)
 	}
 	return nil
 }
@@ -105,6 +114,32 @@ func TestCall(t *testing.T) {
 		t.Errorf("basic call failed: %v", err)
 	} else if r.IntResult != 1 {
 		t.Errorf("unexpected result, got %v expected 1", r.IntResult)
+	}
+}
+
+func TestCallByteSlice(t *testing.T) {
+	for _, size := range []int{4096, 5000, 6144, 8192, 65536} {
+		c, err := testClient()
+		if err != nil {
+			t.Fatalf("error creating test client: %v", err)
+		}
+		var result testResult
+		err = c.Call("test.Data", &testArg{IntArg: size}, &result)
+		_ = c.Close()
+		if err != nil {
+			t.Errorf("%d-byte call failed: %v", size, err)
+			continue
+		}
+		if len(result.Data) != size {
+			t.Errorf("%d-byte call returned %d bytes", size, len(result.Data))
+			continue
+		}
+		for i, got := range result.Data {
+			if want := byte(i); got != want {
+				t.Errorf("%d-byte call: byte %d=%#x, want %#x", size, i, got, want)
+				break
+			}
+		}
 	}
 }
 

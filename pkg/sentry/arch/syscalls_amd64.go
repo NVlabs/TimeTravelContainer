@@ -17,6 +17,8 @@
 
 package arch
 
+import "golang.org/x/sys/unix"
+
 const restartSyscallNr = uintptr(219)
 
 // SyscallSaveOrig save the value of the register which is clobbered in
@@ -24,6 +26,13 @@ const restartSyscallNr = uintptr(219)
 //
 // Noop on x86.
 func (c *Context64) SyscallSaveOrig() {
+}
+
+// PrepareSyscallEntry implements contextInterface.PrepareSyscallEntry.
+func (c *Context64) PrepareSyscallEntry() {
+	// Linux exposes -ENOSYS in RAX between syscall entry and invocation.
+	errno := uintptr(unix.ENOSYS)
+	c.SetReturn(-errno)
 }
 
 // SyscallNo returns the syscall number according to the 64-bit convention.

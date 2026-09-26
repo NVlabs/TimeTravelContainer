@@ -2743,7 +2743,10 @@ func copyHostRegularIntoRepository(repository *ttcvolume.Repository, ino uint64,
 	if err != nil {
 		return err
 	}
-	cloneErr := unix.IoctlFileClone(int(destination.Fd()), int(source.Fd()))
+	destination, cloneErr := cloneOpenFile(destination, source)
+	if destination == nil {
+		return cloneErr
+	}
 	if cloneErr != nil {
 		if err := destination.Truncate(0); err != nil {
 			destination.Close()
@@ -3601,10 +3604,6 @@ func (s Store) CommitActiveRepositoryRestoreIDs(name string) error {
 	return s.WriteActiveRepositoryMap(info.ID, repositories)
 }
 
-// RefreshContainerImageRoot moves a stopped container bundle onto the current
-// immutable-image root format without changing its writable TTC volume. This
-// keeps containers created by older TTC builds startable after image backing
-// metadata gains new virtualization requirements.
 // ContainerImageRootReady reports whether the image root that the container
 // named name runs from is unpacked on this node.
 func (s Store) ContainerImageRootReady(name string) (bool, error) {
@@ -3637,6 +3636,10 @@ func (s Store) PrepareContainerImageRoot(ctx context.Context, name string) error
 	return nil
 }
 
+// RefreshContainerImageRoot moves a stopped container bundle onto the current
+// immutable-image root format without changing its writable TTC volume. This
+// keeps containers created by older TTC builds startable after image backing
+// metadata gains new virtualization requirements.
 func (s Store) RefreshContainerImageRoot(ctx context.Context, name string) (ContainerInfo, error) {
 	info, err := s.loadRuntimeContainer(name)
 	if err != nil {

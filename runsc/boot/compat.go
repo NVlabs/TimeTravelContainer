@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 
-	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/log"
@@ -87,22 +86,23 @@ func (c *compatEmitter) emitUnimplementedSyscall(us *spb.UnimplementedSyscall) {
 	defer c.mu.Unlock()
 
 	sysnr := syscallNum(regs)
+	name := c.nameMap.Name(uintptr(sysnr))
 	tr := c.trackers[sysnr]
 	if tr == nil {
-		switch sysnr {
-		case unix.SYS_PRCTL:
+		switch name {
+		case "prctl":
 			// args: cmd, ...
 			tr = newArgsTracker(0)
 
-		case unix.SYS_IOCTL, unix.SYS_EPOLL_CTL, unix.SYS_SHMCTL, unix.SYS_FUTEX, unix.SYS_FALLOCATE:
+		case "ioctl", "epoll_ctl", "shmctl", "futex", "fallocate":
 			// args: fd/addr, cmd, ...
 			tr = newArgsTracker(1)
 
-		case unix.SYS_GETSOCKOPT, unix.SYS_SETSOCKOPT:
+		case "getsockopt", "setsockopt":
 			// args: fd, level, name, ...
 			tr = newArgsTracker(1, 2)
 
-		case unix.SYS_SEMCTL:
+		case "semctl":
 			// args: semid, semnum, cmd, ...
 			tr = newArgsTracker(2)
 
@@ -116,7 +116,6 @@ func (c *compatEmitter) emitUnimplementedSyscall(us *spb.UnimplementedSyscall) {
 	}
 
 	if tr.shouldReport(regs) {
-		name := c.nameMap.Name(uintptr(sysnr))
 		c.sink.Infof("Unsupported syscall %s(%#x,%#x,%#x,%#x,%#x,%#x). It is "+
 			"likely that you can safely ignore this message and that this is not "+
 			"the cause of any error. Please, refer to %s/%s for more information.",

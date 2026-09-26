@@ -51,7 +51,11 @@ type DistributedForkCaptureOptions struct {
 // Snapshot owns source page references and must be closed if no target takes
 // responsibility for completing or canceling the transfer.
 type DistributedForkCapture struct {
-	KernelMetadata    []byte
+	KernelMetadata []byte
+	// AllocatorMetadata is retained for the legacy no-binding loader. New
+	// captures always describe the branch-scoped graph with MemoryBindings and
+	// leave this empty; serializing the family-wide allocator would retain
+	// unrelated branches and sparse-chunk cache holes across migrations.
 	AllocatorMetadata []byte
 	LoadRanges        []pgalloc.RemoteLoadRange
 	// MemoryBindings is the exact branch-scoped page graph. LoadRanges describes
@@ -69,7 +73,9 @@ type DistributedForkCapture struct {
 	// manifest after a live target is already visible.
 	HandoffSnapshot  *pgalloc.RemoteSnapshot
 	HandoffSnapshots []*pgalloc.RemoteSnapshot
-	HandoffBindings  []pgalloc.CapturedPageBinding
+	// HandoffBindings is an alias of MemoryBindings retained in the in-process
+	// API while callers transition to the branch-scoped name.
+	HandoffBindings []pgalloc.CapturedPageBinding
 
 	// FilesystemResources contains process-local handles. A same-process target
 	// may use them directly; a remote ttcd reopens equivalent handles from its
@@ -143,6 +149,9 @@ func (k *Kernel) CaptureDistributedFork(ctx context.Context, opts DistributedFor
 	k.ReceiveTaskStates()
 	var capture *DistributedForkCapture
 	err := k.quiescePausedAnd(ctx, func() (retErr error) {
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
+		}
 		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, true)
 		if err != nil {
 			return err
@@ -473,7 +482,7 @@ func LoadDistributedFork(ctx context.Context, p platform.Platform, targetMF *pga
 	// allocation. Materialize the old page first so its pull is acknowledged;
 	// otherwise a target that never faults VVAR retains exactly one source page
 	// forever and cannot complete a drain.
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing distributed-fork VDSO parameter page: %w", err)
 	}
@@ -590,7 +599,7 @@ func loadRelocatedDistributedFork(p platform.Platform, targetMF *pgalloc.MemoryF
 		child.remoteLoadRanges = append([]pgalloc.RemoteLoadRange(nil), packedLoadRanges...)
 		pagesOwned = false
 	}
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing relocated distributed VDSO parameter page: %w", err)
 	}

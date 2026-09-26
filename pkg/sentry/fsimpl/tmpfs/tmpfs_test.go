@@ -26,12 +26,32 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // nextFileID is used to generate unique file names.
 var nextFileID atomicbitops.Int64
+
+func TestReleasePartiallyInitializedFilesystem(t *testing.T) {
+	ctx := contexttest.Context(t)
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatalf("VFS init: %v", err)
+	}
+	minor, err := vfsObj.GetAnonBlockDevMinor()
+	if err != nil {
+		t.Fatalf("GetAnonBlockDevMinor: %v", err)
+	}
+	fstype := FilesystemType{}
+	fs := filesystem{mf: pgalloc.MemoryFileFromContext(ctx), devMinor: minor}
+	fs.vfsfs.Init(vfsObj, &fstype, &fs)
+
+	// Model GetFilesystem failing before it assigns fs.root. Release owns the
+	// anonymous device minor at this point and must be safe to call.
+	fs.Release(ctx)
+}
 
 // newTmpfsRoot creates a new tmpfs mount, and returns the root. If the error
 // is not nil, then cleanup should be called when the root is no longer needed.

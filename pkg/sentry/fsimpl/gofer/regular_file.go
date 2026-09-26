@@ -403,13 +403,16 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 		switch {
 		case seg.Ok():
 			// Get internal mappings from the cache.
-			ims, err := mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
+			ims, mappingLease, err := memmap.MapInternalWithLease(mf, seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
 			if err != nil {
 				return done, err
 			}
 
 			// Copy from internal mappings.
 			n, err := safemem.CopySeq(dsts, ims)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			done += n
 			rw.off += n
 			dsts = dsts.DropFirst64(n)
@@ -517,7 +520,7 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 		case seg.Ok():
 			// Get internal mappings from the cache.
 			segMR := seg.Range().Intersect(mr)
-			ims, err := mf.MapInternal(seg.FileRangeOf(segMR), hostarch.Write)
+			ims, mappingLease, err := memmap.MapInternalWithLease(mf, seg.FileRangeOf(segMR), hostarch.Write)
 			if err != nil {
 				retErr = err
 				goto exitLoop
@@ -525,6 +528,9 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 
 			// Copy to internal mappings.
 			n, err := safemem.CopySeq(ims, srcs)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			done += n
 			rw.off += n
 			srcs = srcs.DropFirst64(n)
@@ -745,32 +751,17 @@ func (d *dentry) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 func (d *dentry) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	d.inode.handleMu.RLock()
 	defer d.inode.handleMu.RUnlock()
-	if d.inode.mmapFD.RacyLoad() >= 0 && !d.inode.fs.opts.forcePageCache {
-		mr := optional
-		if d.inode.fs.opts.limitHostFDTranslation {
-			mr = maxFillRange(required, optional)
-		}
-		return []memmap.Translation{
-			{
-				Source: mr,
-				File:   &d.inode.mmapFile,
-				Offset: mr.Start,
-				Perms:  hostarch.AnyAccess,
-			},
-		}, nil
-	}
 
-	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
-	d.inode.dataMu.Lock()
-	defer d.inode.dataMu.Unlock()
-
-	// Constrain translations to d.inode.size (rounded up) to prevent translation to
-	// pages that may be concurrently truncated.
+	// Constrain translations to d.inode.size (rounded up). In addition to
+	// preserving SIGBUS semantics across concurrent truncation, this is
+	// required by platforms that copy file translations into guest-owned
+	// memory: unlike a lazy host mmap, they must read every page returned here
+	// immediately and cannot safely touch full pages beyond EOF.
 	pgend, _ := hostarch.PageRoundUp(d.inode.size.Load())
 	var beyondEOF bool
 	if required.End > pgend {
 		if required.Start >= pgend {
-			return nil, &memmap.BusError{io.EOF}
+			return nil, &memmap.BusError{Err: io.EOF}
 		}
 		beyondEOF = true
 		required.End = pgend
@@ -778,10 +769,41 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 	if optional.End > pgend {
 		optional.End = pgend
 	}
+	if d.inode.mmapFD.RacyLoad() >= 0 && !d.inode.fs.opts.forcePageCache {
+		mr := optional
+		if d.inode.fs.opts.limitHostFDTranslation {
+			mr = maxFillRange(required, optional)
+		}
+		translations := []memmap.Translation{
+			{
+				Source: mr,
+				File:   &d.inode.mmapFile,
+				Offset: mr.Start,
+				Perms:  hostarch.AnyAccess,
+			},
+		}
+		if beyondEOF {
+			return translations, &memmap.BusError{Err: io.EOF}
+		}
+		return translations, nil
+	}
+
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	d.inode.dataMu.Lock()
+	defer d.inode.dataMu.Unlock()
 
 	mf := d.inode.fs.mf
 	h := d.inode.readHandle()
-	_, cerr := d.inode.cache.Fill(ctx, required, maxFillRange(required, optional), d.inode.size.Load(), mf, pgalloc.AllocOpts{
+	fillRange := maxFillRange(required, optional)
+	if d.inode.fs.opts.forcePageCache {
+		// VM platforms materialize each returned page in GuestRAM and install
+		// stage-1 leaves through an EL1 monitor. One MiB is the monitor's natural
+		// 256-page transaction size, which amortizes executable faults without
+		// returning unbounded merged cache segments. Host-FD platforms retain the
+		// smaller generic fill policy below.
+		fillRange = boundedFillRange(required, optional, 1<<20)
+	}
+	_, cerr := d.inode.cache.Fill(ctx, required, fillRange, d.inode.size.Load(), mf, pgalloc.AllocOpts{
 		Kind:    usage.PageCache,
 		MemCgID: memCgID,
 		Mode:    pgalloc.AllocateAndWritePopulate,
@@ -790,7 +812,11 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 	var ts []memmap.Translation
 	var translatedEnd uint64
 	for seg := d.inode.cache.FindSegment(required.Start); seg.Ok() && seg.Start() < required.End; seg, _ = seg.NextNonEmpty() {
-		segMR := seg.Range().Intersect(optional)
+		// A cache segment may have merged with pages populated by earlier
+		// processes. Returning the complete merged segment defeats maxFillRange:
+		// VM platforms would rebuild every cached PTE for each short-lived exec.
+		// Keep the translation itself within the same bounded window as the fill.
+		segMR := seg.Range().Intersect(fillRange)
 		// TODO(jamieliu): Make Translations writable even if writability is
 		// not required if already kept-dirty by another writable translation.
 		perms := hostarch.ReadExecute
@@ -822,6 +848,10 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 
 func maxFillRange(required, optional memmap.MappableRange) memmap.MappableRange {
 	const maxReadahead = 64 << 10 // 64 KB, chosen arbitrarily
+	return boundedFillRange(required, optional, maxReadahead)
+}
+
+func boundedFillRange(required, optional memmap.MappableRange, maxReadahead uint64) memmap.MappableRange {
 	if required.Length() >= maxReadahead {
 		return required
 	}

@@ -216,12 +216,11 @@ func validHostRelative(path string) bool {
 }
 
 func importInode(item importPath, number uint64, fileID ObjectID) (InodeRecord, string, error) {
+	atime, ctime, mtime := statTimesNsec(item.stat)
 	record := InodeRecord{
 		Number: number, Mode: uint32(item.stat.Mode), UID: item.stat.Uid, GID: item.stat.Gid,
 		Nlink: uint32(item.stat.Nlink), Size: item.stat.Size,
-		AtimeNsec: item.stat.Atim.Sec*1e9 + item.stat.Atim.Nsec,
-		CtimeNsec: item.stat.Ctim.Sec*1e9 + item.stat.Ctim.Nsec,
-		MtimeNsec: item.stat.Mtim.Sec*1e9 + item.stat.Mtim.Nsec,
+		AtimeNsec: atime, CtimeNsec: ctime, MtimeNsec: mtime,
 	}
 	xattrs, err := hostXattrs(item.host, item.info.Mode()&os.ModeSymlink != 0)
 	if err != nil {

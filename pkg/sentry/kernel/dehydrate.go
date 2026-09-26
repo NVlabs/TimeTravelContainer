@@ -432,6 +432,9 @@ func (k *Kernel) CaptureDehydration(ctx context.Context, opts DehydrationCapture
 		metadataFile:        opts.MetadataFile,
 	}
 	err := k.quiescePausedAnd(ctx, func() error {
+		if err := k.flushPlatformForStateCapture(ctx); err != nil {
+			return err
+		}
 		resumeNetwork, err := k.pauseLiveForkNetworkStacks(true, false)
 		if err != nil {
 			return err
@@ -780,7 +783,7 @@ func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 		child.remotePageLoad = pages
 		pagesOwned = false
 	}
-	if _, err := child.vdsoParams.access(); err != nil {
+	if err := child.vdsoParams.materialize(); err != nil {
 		child.Release()
 		return nil, fmt.Errorf("materializing sparse dehydrated VDSO parameter page: %w", err)
 	}

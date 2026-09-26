@@ -26,3 +26,10 @@ var Reader = rand.Reader
 func Read(b []byte) (int, error) {
 	return rand.Read(b)
 }
+
+// Init eagerly verifies that the host random source is available.
+func Init() error {
+	var b [1]byte
+	_, err := Read(b[:])
+	return err
+}

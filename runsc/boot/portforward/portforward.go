@@ -17,6 +17,7 @@ package portforward
 
 import (
 	"fmt"
+	"io"
 	"sync"
 
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -100,9 +101,15 @@ func doCopy(ctx context.Context, dst, src proxyConn, buf []byte, cancel chan str
 		return fmt.Errorf("failed to read from %q: err %v", src.Name(), err)
 	}
 
-	_, err = dst.Write(ctx, buf[0:n], cancel)
-	if err != nil {
-		return fmt.Errorf("failed to write to %q: err %v", src.Name(), err)
+	for written := 0; written < n; {
+		nw, err := dst.Write(ctx, buf[written:n], cancel)
+		written += nw
+		if err != nil {
+			return fmt.Errorf("failed to write to %q after %d of %d bytes: err %v", dst.Name(), written, n, err)
+		}
+		if nw == 0 {
+			return fmt.Errorf("failed to write to %q after %d of %d bytes: err %v", dst.Name(), written, n, io.ErrShortWrite)
+		}
 	}
 	return nil
 }

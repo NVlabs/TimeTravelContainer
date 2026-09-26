@@ -22,6 +22,8 @@ go_library(
         "registry.go",
 		"resource_window.go",
 		"shared_authority.go",
+		"shared_authority_darwin.go",
+		"shared_authority_linux.go",
         "store.go",
         "transaction.go",
     ],

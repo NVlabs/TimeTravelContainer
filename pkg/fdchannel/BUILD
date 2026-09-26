@@ -6,7 +6,12 @@ licenses(["notice"])
 
 go_library(
     name = "fdchannel",
-    srcs = ["fdchannel_unsafe.go"],
+    srcs = [
+        "fdchannel_darwin.go",
+        "fdchannel_linux.go",
+        "fdchannel_other.go",
+        "fdchannel_unsafe.go",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "@org_golang_x_sys//unix:go_default_library",

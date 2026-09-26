@@ -1074,6 +1074,68 @@ func TestRemoteSnapshotOutstandingStreamRanges(t *testing.T) {
 	}
 }
 
+func TestSparseLoadCanceledBeforeWastePageReuse(t *testing.T) {
+	source, sourceFR := newRemoteTestMemoryFile(t, 1)
+	fillRemoteTestRange(t, source, sourceFR, bytes.Repeat([]byte{0x7b}, int(hostarch.PageSize)))
+	target := newEmptyRemoteTestMemoryFile(t)
+	t.Cleanup(target.Destroy)
+	targetFR, err := target.Allocate(hostarch.PageSize, AllocOpts{
+		Kind: usage.Anonymous,
+		Mode: AllocateAndWritePopulate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewLoopbackRemoteReader(snapshot, hostarch.PageSize, 1, 1)
+	pages, err := StartAsyncPagesFileLoadWithOpts(reader, nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: targetFR, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+
+	// Dropping the last reference must detach the pending sparse load before
+	// the allocator is allowed to return this physical range for new data.
+	target.DecRef(targetFR)
+	replacement, err := target.Allocate(hostarch.PageSize, AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.DecRef(replacement)
+	mapped, err := target.MapInternal(replacement, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatalf("mapping recycled range waited on canceled sparse load: %v", err)
+	}
+	got := make([]byte, hostarch.PageSize)
+	if n, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), mapped); err != nil || n != hostarch.PageSize {
+		t.Fatalf("reading recycled range: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, make([]byte, hostarch.PageSize)) {
+		t.Fatal("recycled range contains data from its canceled sparse load")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- pages.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sparse loader did not stop after its last pending page became waste")
+	}
+	if target.IsAsyncLoading() {
+		t.Fatal("target retained a sparse loader after canceled page reclamation")
+	}
+}
+
 func TestDemandOnlyRemotePageLoadForwardPrefetch(t *testing.T) {
 	source, sourceFR := newRemoteTestMemoryFile(t, 8)
 	target, targetFR := newRemoteTestMemoryFile(t, 8)

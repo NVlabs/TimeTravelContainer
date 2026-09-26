@@ -1462,6 +1462,11 @@ func (s *Stack) NewRouteForMulticast(nicID tcpip.NICID, remoteAddr tcpip.Address
 //
 // +checklocksread:s.mu
 func (s *Stack) findLocalRouteFromNICRLocked(localAddressNIC *nic, localAddr, remoteAddr tcpip.Address, netProto tcpip.NetworkProtocolNumber) *Route {
+	// Like Linux, which removes a device's routes while it is down, never
+	// deliver locally to or from the addresses of a disabled NIC.
+	if !localAddressNIC.Enabled() {
+		return nil
+	}
 	localAddressEndpoint := localAddressNIC.getAddressOrCreateTempInner(netProto, localAddr, false /* createTemp */, NeverPrimaryEndpoint)
 	if localAddressEndpoint == nil {
 		return nil
@@ -1477,7 +1482,7 @@ func (s *Stack) findLocalRouteFromNICRLocked(localAddressNIC *nic, localAddr, re
 	// NICs.
 	if outgoingNIC == nil {
 		for _, nic := range s.nics {
-			if nic.hasAddress(netProto, remoteAddr) {
+			if nic.Enabled() && nic.hasAddress(netProto, remoteAddr) {
 				outgoingNIC = nic
 				break
 			}
@@ -1542,11 +1547,17 @@ func (s *Stack) findLocalRouteRLocked(localAddressNICID tcpip.NICID, localAddr, 
 		localAddr = remoteAddr
 	}
 
+	// Local traffic goes through the loopback device, so none is delivered
+	// while it is down, as in Linux.
+	if s.loopbackNIC != nil && !s.loopbackNIC.Enabled() {
+		return nil
+	}
+
 	if localAddressNICID == 0 {
 		if s.loopbackNIC != nil {
 			// Send all packets directed to local ip addresses through the loopback device.
 			for _, nic := range s.nics {
-				if !nic.hasAddress(netProto, remoteAddr) {
+				if !nic.Enabled() || !nic.hasAddress(netProto, remoteAddr) {
 					continue
 				}
 				if isSubnetBroadcastOnNIC(nic, netProto, remoteAddr) {

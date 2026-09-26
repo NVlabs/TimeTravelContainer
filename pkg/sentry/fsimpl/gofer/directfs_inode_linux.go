@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2022 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +18,7 @@ package gofer
 
 import (
 	"bytes"
+	goContext "context"
 	"fmt"
 	"math"
 	"path"
@@ -40,6 +43,18 @@ import (
 const (
 	hostOpenFlags = unix.O_NOFOLLOW | unix.O_CLOEXEC
 )
+
+func dentryTimestampFromUnix(t unix.StatxTimestamp) int64 {
+	return dentryTimestamp(lisafs.StatxTimestamp{Sec: t.Sec, Nsec: t.Nsec})
+}
+
+func inoKeyFromUnixStatx(stat *unix.Statx_t) inoKey {
+	return inoKey{
+		ino:      stat.Ino,
+		devMinor: stat.Dev_minor,
+		devMajor: stat.Dev_major,
+	}
+}
 
 // tryOpen tries to open() with different modes in the following order:
 //  1. RDONLY | NONBLOCK: for all files, directories, ro mounts, FIFOs.
@@ -108,6 +123,11 @@ type directfsInode struct {
 	// For sockets, controlFDLisa is protected by dentry.handleMu and is
 	// immutable after initialization.
 	controlFDLisa lisafs.ClientFD `state:"nosave"`
+}
+
+// afterLoad is invoked by stateify.
+func (i *directfsInode) afterLoad(goContext.Context) {
+	i.controlFD = -1
 }
 
 // newDirectfsDentry serves two purposes:

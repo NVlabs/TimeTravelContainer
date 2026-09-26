@@ -119,6 +119,54 @@ type Platform interface {
 	NumCPUs() int
 }
 
+// RestoreReuser is implemented by platforms whose disposable execution cache
+// can be reused when replacing a bootstrap Kernel with a restored Kernel.
+// This is required by process-scoped hypervisors that permit only one active
+// VM. The caller releases every AddressSpace owned by the bootstrap Kernel
+// before calling PrepareRestore; MemoryFile backings for the restored Kernel
+// may already exist.
+type RestoreReuser interface {
+	Platform
+	PrepareRestore() error
+}
+
+// MemoryUsage reports VM-platform allocation geometry without exposing a
+// concrete hypervisor or allocator implementation to Sentry control paths.
+type MemoryUsage struct {
+	LogicalBytes      uint64
+	HostResidentBytes uint64
+	IPABytesConsumed  uint64
+	LogicalLimitBytes uint64
+	VMEpoch           uint64
+}
+
+// MemoryAccounting is optionally implemented by platforms whose host
+// residency differs from Linux's logical page accounting.
+type MemoryAccounting interface {
+	PlatformMemoryUsage() MemoryUsage
+}
+
+// MemoryLimiter is optionally implemented by platforms that enforce guest
+// memory limits independently of host cgroups.
+type MemoryLimiter interface {
+	SetMemoryLimit(uint64) error
+}
+
+// MemoryCompaction reports the physical effect of one platform memory
+// compaction. Logical pages and their contents remain unchanged.
+type MemoryCompaction struct {
+	FramesMoved   uint64
+	SlabsReleased uint64
+	BytesCopied   uint64
+}
+
+// MemoryCompactor is optionally implemented by platforms with relocatable
+// physical memory. The caller must first stop every Kernel sharing the
+// platform and discard their cached internal PMA mappings.
+type MemoryCompactor interface {
+	CompactMemory(context.Context) (MemoryCompaction, error)
+}
+
 // GuestGSBaseSupport is implemented by platforms that can preserve an
 // application-selected x86 GS base across context switches. It is optional so
 // architecture-independent platform implementations and test fakes do not
@@ -444,6 +492,25 @@ type AddressSpace interface {
 	// Platform.SupportsAddressSpaceIO() == true. AddressSpaces for which this
 	// does not hold may panic if AddressSpaceIO methods are invoked.
 	AddressSpaceIO
+}
+
+// AddressSpaceCoherence is optionally implemented by AddressSpaces whose
+// guest-visible data plane is not automatically coherent with every
+// memmap.File. Linux platforms do not need to implement it.
+//
+// SyncRange makes guest writes in [addr, addr+length) visible to the backing
+// memmap.Files before their MappingIdentity.Msync methods run. Implementations
+// retain asynchronous writeback failures until a synchronous call can report
+// them.
+type AddressSpaceCoherence interface {
+	SyncRange(ctx context.Context, addr hostarch.Addr, length uint64) error
+}
+
+// CheckpointCoherence is optionally implemented by Platforms that must flush
+// execution caches or staged writable mappings before portable memory and
+// filesystem state is captured. Linux platforms do not need to implement it.
+type CheckpointCoherence interface {
+	FlushForCheckpoint(ctx context.Context) error
 }
 
 // AddressSpaceIO supports IO through the memory mappings installed in an

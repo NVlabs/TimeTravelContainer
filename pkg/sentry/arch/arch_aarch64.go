@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
 )
@@ -119,19 +120,20 @@ func (s *State) StateData() *State {
 
 // SingleStep implements Context.SingleStep.
 func (s *State) SingleStep() bool {
-	return false
+	return s.Regs.Pstate&ARMTrapFlag != 0
 }
 
 // SetSingleStep enables single stepping.
 func (s *State) SetSingleStep() {
-	// Set the trap flag.
-	// TODO(gvisor.dev/issue/1239): ptrace single-step is not supported.
+	// MDSCR_EL1.SS is owned by the execution backend. Linux's ptrace backend
+	// sets it as part of PTRACE_SINGLESTEP; in-VM backends derive its transient
+	// state from PSTATE.SS when entering and leaving the application.
+	s.Regs.Pstate |= ARMTrapFlag
 }
 
-// ClearSingleStep enables single stepping.
+// ClearSingleStep disables single stepping.
 func (s *State) ClearSingleStep() {
-	// Clear the trap flag.
-	// TODO(gvisor.dev/issue/1239): ptrace single-step is not supported.
+	s.Regs.Pstate &^= ARMTrapFlag
 }
 
 // RegisterMap returns a map of all registers.
@@ -190,12 +192,15 @@ var ptraceRegistersSize = (*linux.PtraceRegs)(nil).SizeBytes()
 
 // PtraceSetRegs implements Context.PtraceSetRegs.
 func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
-	var regs Registers
+	// Linux user_pt_regs does not contain TPIDR_EL0; it is exposed through the
+	// independent NT_ARM_TLS regset. Start from the current internal state so a
+	// general-register write cannot silently clear the tracee's TLS pointer.
+	regs := s.Regs
 	buf := make([]byte, ptraceRegistersSize)
 	if _, err := io.ReadFull(src, buf); err != nil {
 		return 0, err
 	}
-	regs.UnmarshalUnsafe(buf)
+	regs.PtraceRegs.UnmarshalUnsafe(buf)
 	if !regs.validRegs() {
 		return 0, linuxerr.EINVAL
 	}
@@ -217,9 +222,11 @@ func (s *State) PtraceSetFPRegs(src io.Reader) (int, error) {
 
 // Register sets defined in include/uapi/linux/elf.h.
 const (
-	_NT_PRSTATUS = 1
-	_NT_PRFPREG  = 2
-	_NT_ARM_TLS  = 0x401
+	_NT_PRSTATUS     = linux.NT_PRSTATUS
+	_NT_PRFPREG      = linux.NT_PRFPREG
+	_NT_ARM_TLS      = linux.NT_ARM_TLS
+	_NT_ARM_HW_BREAK = linux.NT_ARM_HW_BREAK
+	_NT_ARM_HW_WATCH = linux.NT_ARM_HW_WATCH
 )
 
 // PtraceGetRegSet implements Context.PtraceGetRegSet.
@@ -239,6 +246,29 @@ func (s *State) PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int, _ cpu
 		buf := make([]byte, regs.SizeBytes())
 		regs.MarshalBytes(buf)
 		return dst.Write(buf[:maxlen])
+	case _NT_ARM_TLS:
+		if maxlen <= 0 {
+			return 0, linuxerr.EFAULT
+		}
+		var tls [8]byte
+		hostarch.ByteOrder.PutUint64(tls[:], s.Regs.TPIDR_EL0)
+		if maxlen < len(tls) {
+			return dst.Write(tls[:maxlen])
+		}
+		return dst.Write(tls[:])
+	case _NT_ARM_HW_BREAK, _NT_ARM_HW_WATCH:
+		if maxlen <= 0 {
+			return 0, linuxerr.EFAULT
+		}
+		// TTC does not yet virtualize AArch64 hardware debug registers. Report a
+		// valid user_hwdebug_state header with zero slots so debuggers select
+		// software breakpoints without treating capability discovery as an ABI
+		// failure.
+		var debugInfo [8]byte
+		if maxlen < len(debugInfo) {
+			return dst.Write(debugInfo[:maxlen])
+		}
+		return dst.Write(debugInfo[:])
 	default:
 		return 0, linuxerr.EINVAL
 	}
@@ -252,6 +282,16 @@ func (s *State) PtraceSetRegSet(regset uintptr, src io.Reader, maxlen int, _ cpu
 			return 0, linuxerr.EFAULT
 		}
 		return s.PtraceSetRegs(src)
+	case _NT_ARM_TLS:
+		if maxlen < 8 {
+			return 0, linuxerr.EFAULT
+		}
+		var tls [8]byte
+		if _, err := io.ReadFull(src, tls[:]); err != nil {
+			return 0, err
+		}
+		s.Regs.TPIDR_EL0 = hostarch.ByteOrder.Uint64(tls[:])
+		return len(tls), nil
 	default:
 		return 0, linuxerr.EINVAL
 	}

@@ -24,7 +24,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/ib"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
@@ -180,7 +179,7 @@ func MirrorAppPages(t *kernel.Task, addr, length uint64) (*MirroredPages, uintpt
 			}
 			for !ims.IsEmpty() {
 				im := ims.Head()
-				if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, im.Addr(), 0, uintptr(im.Len()), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
+				if errno := mirrorMapping(im.Addr(), uintptr(im.Len()), sentryAddr); errno != 0 {
 					return nil, 0, errno
 				}
 				sentryAddr += uintptr(im.Len())
@@ -193,7 +192,7 @@ func MirrorAppPages(t *kernel.Task, addr, length uint64) (*MirroredPages, uintpt
 	// MADV_POPULATE_WRITE needs Linux 5.14; if it is unavailable the failure is
 	// permanent, so stop retrying it after the first failure.
 	if !madvPopulateWriteDisabled.Load() {
-		if _, _, errno := unix.Syscall(unix.SYS_MADVISE, m, uintptr(alignedLen), unix.MADV_POPULATE_WRITE); errno != 0 {
+		if errno := advisePopulateWrite(m, uintptr(alignedLen)); errno != 0 {
 			if !madvPopulateWriteDisabled.Swap(true) {
 				log.Infof("rdmaproxy: disabling MADV_POPULATE_WRITE pre-fault: %s", errno)
 			}

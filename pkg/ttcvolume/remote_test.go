@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 )
 
@@ -911,7 +912,7 @@ func TestDeferredMetadataObservationDoesNotRequireBulkTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(usage.Branches) != 1 || usage.Branches[0].Inodes != 2 || usage.Branches[0].TotalBytes != uint64(os.Getpagesize()) {
+	if len(usage.Branches) != 1 || usage.Branches[0].Inodes != 2 || usage.Branches[0].TotalBytes != uint64(hostarch.PageSize) {
 		t.Fatalf("usage=%+v, want two inodes and one page", usage)
 	}
 	branch, err := target.Branch("imported")

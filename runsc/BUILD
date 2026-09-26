@@ -3,6 +3,11 @@ package(
     licenses = ["notice"],
 )
 
+exports_files([
+    "hvf.entitlements",
+    "run_entitled_test.sh",
+])
+
 # Test-only compatibility launcher for inherited gVisor tests that expect a
 # //runsc executable in runfiles. TTC releases do not contain this launcher;
 # ttcd embeds the runtime entry point.

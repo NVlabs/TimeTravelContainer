@@ -23,6 +23,16 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 )
 
+func newUnixSocket(t *testing.T) int {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal("unix.Socket:", err)
+	}
+	unix.CloseOnExec(fd)
+	return fd
+}
+
 func TestSetNegOne(t *testing.T) {
 	type entry struct {
 		name string
@@ -31,10 +41,7 @@ func TestSetNegOne(t *testing.T) {
 	}
 	var tests []entry
 
-	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal("unix.Socket:", err)
-	}
+	fd := newUnixSocket(t)
 	f1 := New(fd)
 	tests = append(tests, entry{
 		"Release",
@@ -44,10 +51,7 @@ func TestSetNegOne(t *testing.T) {
 		},
 	})
 
-	fd, err = unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal("unix.Socket:", err)
-	}
+	fd = newUnixSocket(t)
 	f2 := New(fd)
 	tests = append(tests, entry{
 		"Close",
@@ -87,10 +91,7 @@ func TestStartsNegOne(t *testing.T) {
 }
 
 func TestFileDotFile(t *testing.T) {
-	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal("unix.Socket:", err)
-	}
+	fd := newUnixSocket(t)
 
 	f := New(fd)
 	of, err := f.File()

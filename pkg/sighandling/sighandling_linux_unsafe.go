@@ -26,6 +26,22 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 )
 
+func forwardedSignals() []forwardedSignal {
+	// Linux host signal numbers are already the guest ABI. External real-time
+	// signals are intentionally not forwarded.
+	registrations := make([]forwardedSignal, 0, 29)
+	for sig := 1; sig <= 32; sig++ {
+		guest := linux.Signal(sig)
+		// SIGURG is used by Go's runtime scheduler. SIGPIPE is induced by host
+		// pipes and SIGCHLD by child process lifecycle.
+		if guest == linux.SIGURG || guest == linux.SIGPIPE || guest == linux.SIGCHLD {
+			continue
+		}
+		registrations = append(registrations, forwardedSignal{host: unix.Signal(sig), guest: guest})
+	}
+	return registrations
+}
+
 // IgnoreChildStop sets the SA_NOCLDSTOP flag, causing child processes to not
 // generate SIGCHLD when they stop.
 func IgnoreChildStop() error {

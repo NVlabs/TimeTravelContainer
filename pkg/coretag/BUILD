@@ -9,6 +9,7 @@ go_library(
     name = "coretag",
     srcs = [
         "coretag.go",
+        "coretag_darwin.go",
         "coretag_unsafe.go",
     ],
     visibility = ["//:sandbox"],
@@ -28,4 +29,5 @@ go_test(
     deps = [
         "//pkg/hostos",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

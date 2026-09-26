@@ -19,7 +19,6 @@ import (
 	"runtime"
 	"testing"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -36,11 +35,31 @@ func checkProcid(t *testing.T, start *sync.WaitGroup, done *sync.WaitGroup) {
 	start.Wait()
 
 	procID := Current()
-	tid := unix.Gettid()
-
-	if procID != uint64(tid) {
+	tid, exact := nativeTIDForTest()
+	if exact && procID != tid {
 		t.Logf("Bad procid: expected %v, got %v", tid, procID)
 		t.Fail()
+	} else if procID == 0 {
+		t.Error("Bad procid: got zero")
+	}
+}
+
+func TestRuntimePointers(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	g, m, p, mcache, g0, g0StackLo, g0StackHi, gsignal, gsignalStackLo, gsignalStackHi := RuntimePointers()
+	for name, pointer := range map[string]uintptr{
+		"g": g, "m": m, "p": p, "mcache": mcache, "g0": g0,
+	} {
+		if pointer == 0 {
+			t.Errorf("RuntimePointers returned a nil %s", name)
+		}
+	}
+	if g0StackLo == 0 || g0StackLo >= g0StackHi {
+		t.Errorf("RuntimePointers returned invalid g0 stack [%#x, %#x)", g0StackLo, g0StackHi)
+	}
+	if gsignal != 0 && (gsignalStackLo == 0 || gsignalStackLo >= gsignalStackHi) {
+		t.Errorf("RuntimePointers returned invalid gsignal stack [%#x, %#x)", gsignalStackLo, gsignalStackHi)
 	}
 }
 

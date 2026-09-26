@@ -20,8 +20,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -325,16 +328,60 @@ func (r *Repository) exportSnapshot(branchID, destination string) (SnapshotInfo,
 		if err := r.ensureObjectRange(id, objects[id], 0, objects[id]); err != nil {
 			return SnapshotInfo{}, fmt.Errorf("materializing remote object %q: %w", id, err)
 		}
-		source := filepath.Join(r.path, r.objectPath(id))
-		if err := snapshotCopyFile(source, filepath.Join(destination, "objects", id), r.copyMode == CopyModeReflink); err != nil {
-			return SnapshotInfo{}, fmt.Errorf("copying object %q: %w", id, err)
-		}
+	}
+	if err := r.exportSnapshotObjects(objectIDs, filepath.Join(destination, "objects")); err != nil {
+		return SnapshotInfo{}, err
 	}
 	if err := writeJSONAtomic(destination, filepath.Join(destination, "snapshot.json"), snapshot); err != nil {
 		return SnapshotInfo{}, err
 	}
 	keep = true
 	return snapshot, nil
+}
+
+// exportSnapshotObjects stages immutable, already-local branch objects
+// concurrently. The
+// exported directory is an intermediate representation: checkpoint.Pack()
+// fsyncs the atomically published archive, so flushing every individual APFS
+// clone here adds no durability and makes large package trees prohibitively
+// slow. Importing a snapshot still requests durable object copies below.
+func (r *Repository) exportSnapshotObjects(objectIDs []string, destination string) error {
+	workers := min(runtime.GOMAXPROCS(0), 16)
+	if workers > len(objectIDs) {
+		workers = len(objectIDs)
+	}
+	if workers == 0 {
+		return nil
+	}
+
+	var next atomic.Uint64
+	var failed atomic.Bool
+	var firstErr error
+	var errOnce sync.Once
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for !failed.Load() {
+				index := int(next.Add(1) - 1)
+				if index >= len(objectIDs) {
+					return
+				}
+				id := objectIDs[index]
+				source := filepath.Join(r.path, r.objectPath(id))
+				if err := snapshotCopyFile(source, filepath.Join(destination, id), r.copyMode == CopyModeReflink, false); err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("copying object %q: %w", id, err)
+						failed.Store(true)
+					})
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // ImportPrivateSnapshot creates a private repository and installs snapshot as
@@ -665,7 +712,7 @@ func (r *Repository) importGraphFiles(metadata *snapshotMetadata, objectsDir str
 	return nil
 }
 
-func snapshotCopyFile(source, destination string, reflink bool) error {
+func snapshotCopyFile(source, destination string, reflink, durable bool) error {
 	fd, err := unix.Open(source, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -678,25 +725,37 @@ func snapshotCopyFile(source, destination string, reflink bool) error {
 	}
 	keep := false
 	defer func() {
-		_ = dst.Close()
+		if dst != nil {
+			_ = dst.Close()
+		}
 		if !keep {
 			_ = os.Remove(destination)
 		}
 	}()
 	if reflink {
-		if err := unix.IoctlFileClone(int(dst.Fd()), int(src.Fd())); err == nil {
-			if err := dst.Sync(); err != nil {
-				return err
+		if cloned, err := cloneFile(src, dst, unix.AT_FDCWD, destination); err == nil {
+			dst = cloned
+			if durable {
+				if err := dst.Sync(); err != nil {
+					return err
+				}
 			}
 			keep = true
 			return nil
+		} else {
+			dst = cloned
+			if dst == nil {
+				return err
+			}
 		}
 	}
 	if _, err := io.Copy(dst, src); err != nil {
 		return err
 	}
-	if err := dst.Sync(); err != nil {
-		return err
+	if durable {
+		if err := dst.Sync(); err != nil {
+			return err
+		}
 	}
 	keep = true
 	return nil

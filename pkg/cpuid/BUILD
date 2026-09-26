@@ -15,6 +15,10 @@ go_library(
         "features_arm64.go",
         "hwcap_amd64.go",
         "hwcap_arm64.go",
+        "hwcap_host_darwin_arm64.go",
+        "hwcap_host_linux.go",
+        "hwcap_host_other.go",
+		"hwcap_state.go",
         "native_amd64.go",
         "native_amd64.s",
         "native_arm64.go",
@@ -33,6 +37,8 @@ go_test(
     srcs = [
         "cpuid_amd64_test.go",
         "cpuid_test.go",
+        "hwcap_host_darwin_arm64_test.go",
+        "intersect_arm64_test.go",
     ],
     library = ":cpuid",
     # NOTE: It seems that bazel code generation does not properly parse tags
@@ -40,6 +46,7 @@ go_test(
     # at some point in the future, but for now we can simply skip nogo analysis
     # on the test itself. It still applies to the core library.
     nogo = False,
+	deps = ["//pkg/state"],
 )
 
 go_test(

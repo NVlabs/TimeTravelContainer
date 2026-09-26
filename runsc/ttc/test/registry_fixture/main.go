@@ -62,7 +62,7 @@ func digest(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func image(binary []byte) (map[string][]byte, []byte, error) {
+func image(binary []byte, guestOS, guestArch string) (map[string][]byte, []byte, error) {
 	var tarData bytes.Buffer
 	tw := tar.NewWriter(&tarData)
 	header := &tar.Header{
@@ -96,8 +96,8 @@ func image(binary []byte) (map[string][]byte, []byte, error) {
 	}
 
 	config, err := json.Marshal(map[string]any{
-		"architecture": runtime.GOARCH,
-		"os":           runtime.GOOS,
+		"architecture": guestArch,
+		"os":           guestOS,
 		"config": map[string]any{
 			"Entrypoint": []string{"/bin/fixture"},
 			"Env":        []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
@@ -143,6 +143,8 @@ func serveContent(w http.ResponseWriter, r *http.Request, mediaType, contentDige
 func main() {
 	binaryPath := flag.String("binary", "", "static guest binary to place at /bin/fixture")
 	addressFile := flag.String("address-file", "", "file in which to publish host:port")
+	guestOS := flag.String("guest-os", "linux", "operating system recorded in the image config")
+	guestArch := flag.String("guest-arch", runtime.GOARCH, "architecture recorded in the image config")
 	flag.Parse()
 	if *binaryPath == "" || *addressFile == "" {
 		log.Fatal("--binary and --address-file are required")
@@ -151,7 +153,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("read guest binary: %v", err)
 	}
-	blobs, manifestBytes, err := image(binary)
+	if *guestOS == "" || *guestArch == "" {
+		log.Fatal("--guest-os and --guest-arch must be non-empty")
+	}
+	blobs, manifestBytes, err := image(binary, *guestOS, *guestArch)
 	if err != nil {
 		log.Fatalf("build image: %v", err)
 	}

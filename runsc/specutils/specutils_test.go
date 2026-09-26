@@ -73,7 +73,8 @@ func TestWaitForReadyFail(t *testing.T) {
 }
 
 func TestWaitForReadyNotRunning(t *testing.T) {
-	cmd := exec.Command("/bin/true")
+	// macOS has no /bin/true.
+	cmd := exec.Command("true")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("cmd.Start() failed, err: %v", err)
 	}

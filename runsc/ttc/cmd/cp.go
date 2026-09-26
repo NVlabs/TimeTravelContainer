@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/specutils"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/copyhelper"
 )
 
 const (
@@ -41,6 +42,17 @@ const (
 	copyHelperArg        = "_cp-helper"
 	copyPreparedInputArg = "--ttc-prepared-input"
 )
+
+// guestCopyHelper contains a Linux executable used for copy operations inside
+// a container. Native Linux builds leave this empty and execute the TTC binary
+// itself; non-Linux hosts register a guest-ISA helper during process startup.
+var guestCopyHelper []byte
+
+// SetGuestCopyHelper registers the Linux executable used by container copy
+// operations. It must be called before Run or RunDaemon starts serving work.
+func SetGuestCopyHelper(binary []byte) {
+	guestCopyHelper = binary
+}
 
 type copyCommandOptions struct {
 	archive       bool
@@ -362,6 +374,33 @@ func offlineCopyState(state string) bool {
 }
 
 func (b *runtimeBackend) openCopyHelper() (*os.File, error) {
+	if len(guestCopyHelper) != 0 {
+		staging, err := os.CreateTemp("", "ttc-linux-copy-helper-")
+		if err != nil {
+			return nil, fmt.Errorf("creating TTC Linux copy helper: %w", err)
+		}
+		name := staging.Name()
+		if _, err := staging.Write(guestCopyHelper); err != nil {
+			staging.Close()
+			_ = os.Remove(name)
+			return nil, fmt.Errorf("writing TTC Linux copy helper: %w", err)
+		}
+		if err := staging.Close(); err != nil {
+			_ = os.Remove(name)
+			return nil, fmt.Errorf("closing staged TTC Linux copy helper: %w", err)
+		}
+		// Executable host FDs are required to be O_RDONLY. Reopen the staged
+		// bytes accordingly before unlinking the path.
+		helper, err := os.Open(name)
+		if err != nil {
+			_ = os.Remove(name)
+			return nil, fmt.Errorf("opening TTC Linux copy helper read-only: %w", err)
+		}
+		// The open descriptor remains usable after unlink on Darwin, while no
+		// guest-helper artifact is left behind after a host process crash.
+		_ = os.Remove(name)
+		return helper, nil
+	}
 	// The copy helper is built into ttcd. Donating the daemon executable keeps
 	// the client binary out of the Sentry and out of the wire protocol.
 	executable := currentExecutable()
@@ -386,13 +425,13 @@ func (b *runtimeBackend) runLiveCopyHelper(resolved selector, helperArgs []strin
 		return err
 	}
 	defer helper.Close()
-	args := []string{
-		"--root", b.root, "exec", "--branch", resolved.branch,
+	args := append(b.runtimeControlArgs(),
+		"exec", "--branch", resolved.branch,
 		"--user", "0:0",
 		"--cap", "CAP_CHOWN", "--cap", "CAP_DAC_OVERRIDE",
 		"--cap", "CAP_FOWNER", "--cap", "CAP_MKNOD",
 		"--exec-fd", "3",
-	}
+	)
 	if paused {
 		args = append(args, "--paused-management", "--exec-id", execID)
 	}
@@ -636,57 +675,7 @@ func (b *runtimeBackend) runOfflineCopyHelper(resolved selector, info ttcbundle.
 }
 
 func runCopyHelper(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprintln(stderr, "ttc copy helper: expected export or import")
-		return 2
-	}
-	var err error
-	switch args[0] {
-	case "export":
-		follow := false
-		args = args[1:]
-		if len(args) != 0 && args[0] == "--follow-link" {
-			follow = true
-			args = args[1:]
-		}
-		if len(args) != 1 {
-			err = errors.New("export requires one source path")
-		} else {
-			err = writeCopyArchive(args[0], follow, stdout)
-		}
-	case "import":
-		preserveOwner := false
-		rawArchive := false
-		args = args[1:]
-		for len(args) != 0 && strings.HasPrefix(args[0], "--") {
-			switch args[0] {
-			case "--archive":
-				preserveOwner = true
-			case "--raw":
-				rawArchive = true
-			default:
-				err = fmt.Errorf("unknown import option %q", args[0])
-			}
-			if err != nil {
-				break
-			}
-			args = args[1:]
-		}
-		if err == nil {
-			if len(args) != 1 {
-				err = errors.New("import requires one destination path")
-			} else {
-				err = extractCopyArchive(stdin, args[0], preserveOwner, 0, 0, rawArchive)
-			}
-		}
-	default:
-		err = fmt.Errorf("unknown operation %q", args[0])
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "ttc copy helper: %v\n", err)
-		return 1
-	}
-	return 0
+	return copyhelper.Run(args, stdin, stdout, stderr)
 }
 
 // RunCopyHelper runs the private container-side copy helper embedded in ttcd.

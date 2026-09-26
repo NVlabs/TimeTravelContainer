@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
 // HandleUserFault handles an application page fault. sp is the faulting
@@ -1400,6 +1401,13 @@ func (mm *MemoryManager) MSync(ctx context.Context, addr hostarch.Addr, length u
 	ar, ok := addr.ToRange(uint64(la))
 	if !ok {
 		return linuxerr.ENOMEM
+	}
+	if opts.Sync && mm.as != nil {
+		if coherent, ok := mm.as.(platform.AddressSpaceCoherence); ok {
+			if err := coherent.SyncRange(ctx, ar.Start, uint64(ar.Length())); err != nil {
+				return err
+			}
+		}
 	}
 
 	mm.mappingMu.RLock()

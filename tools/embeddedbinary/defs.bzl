@@ -4,6 +4,7 @@ load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 _EMBEDDED_BINARY_TEMPLATE = "//tools/embeddedbinary:embeddedbinary_template"
+_EMBEDDED_BINARY_TEMPLATE_DARWIN = "//tools/embeddedbinary:embeddedbinary_template_darwin"
 _FLATECOMPRESS = "//tools/embeddedbinary:flatecompress"
 
 def embedded_binary_go_library(
@@ -48,8 +49,9 @@ def embedded_binary_go_library(
         cmd = "cat < $(SRCS) > $(OUTS)",
         srcs = [binary],
     )
+    darwin_out = out[:-3] + "_darwin.go"
     go_template_instance(
-        name = name + "_lib",
+        name = name + "_lib_linux",
         template = _EMBEDDED_BINARY_TEMPLATE,
         package = go_package_name,
         out = out,
@@ -65,9 +67,26 @@ def embedded_binary_go_library(
             },
         }),
     )
+    go_template_instance(
+        name = name + "_lib_darwin",
+        template = _EMBEDDED_BINARY_TEMPLATE_DARWIN,
+        package = go_package_name,
+        out = darwin_out,
+        substrs = select({
+            "//tools/embeddedbinary:compilation_mode_opt": {
+                "embedded.bin.name": binary_name,
+                "//go:embed embedded.bin.flate": "//go:embed %s" % (compressed_binary,),
+            },
+            "//conditions:default": {
+                "embedded.bin.name": binary_name,
+                "//go:embed embedded.bin.flate": "//go:embed %s" % (uncompressed_binary,),
+                "flate.NewReader": "io.Reader",
+            },
+        }),
+    )
     go_library(
         name = name,
-        srcs = [out],
+        srcs = [out, darwin_out],
         embedsrcs = select({
             "//tools/embeddedbinary:compilation_mode_opt": [compressed_binary],
             "//conditions:default": [uncompressed_binary],

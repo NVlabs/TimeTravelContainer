@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	linuxerrno "gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -28,11 +29,12 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
+	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 const (
 	allowedOpenFlags     = unix.O_ACCMODE | unix.O_TRUNC
-	setStatSupportedMask = unix.STATX_MODE | unix.STATX_UID | unix.STATX_GID | unix.STATX_SIZE | unix.STATX_ATIME | unix.STATX_MTIME
+	setStatSupportedMask = linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_SIZE | linux.STATX_ATIME | linux.STATX_MTIME
 	// unixDirentMaxSize is the maximum size of unix.Dirent for amd64.
 	unixDirentMaxSize = 280
 )
@@ -268,7 +270,7 @@ func SetStatHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32
 		failureMask, failureErr := fd.impl.SetStat(req)
 		resp.FailureMask = failureMask
 		if failureErr != nil {
-			resp.FailureErrNo = uint32(ExtractErrno(failureErr))
+			resp.FailureErrNo = uint32(extractLinuxErrno(failureErr))
 		}
 		return nil
 	}); err != nil {
@@ -1574,14 +1576,56 @@ func checkSafeName(name string) error {
 	return unix.EINVAL
 }
 
-// ExtractErrno extracts a unix.Errno from an error, best effort.
+// extractLinuxErrno converts a host-side error to the Linux errno carried by
+// the lisafs wire protocol.
+func extractLinuxErrno(err error) linuxerrno.Errno {
+	errno, _ := tryExtractLinuxErrno(err)
+	return errno
+}
+
+func tryExtractLinuxErrno(err error) (linuxerrno.Errno, bool) {
+	switch err {
+	case os.ErrNotExist:
+		return linuxerrno.ENOENT, true
+	case os.ErrExist:
+		return linuxerrno.EEXIST, true
+	case os.ErrPermission:
+		return linuxerrno.EACCES, true
+	case os.ErrInvalid:
+		return linuxerrno.EINVAL, true
+	}
+
+	// Attempt to unwrap.
+	switch e := err.(type) {
+	case *errors.Error:
+		return linuxerrno.Errno(e.Errno()), true
+	case unix.Errno:
+		if !syserr.IsValid(e) {
+			return linuxerrno.EIO, false
+		}
+		return syserr.FromHost(e).ToLinux(), true
+	case *os.PathError:
+		return tryExtractLinuxErrno(e.Err)
+	case *os.SyscallError:
+		return tryExtractLinuxErrno(e.Err)
+	case *os.LinkError:
+		return tryExtractLinuxErrno(e.Err)
+	}
+
+	// Default case.
+	log.Warningf("unknown error: %v", err)
+	return linuxerrno.EIO, false
+}
+
+// ExtractErrno extracts a native host unix.Errno from an error, best effort.
+// Host-side gofer code uses this before an error enters the lisafs protocol.
 func ExtractErrno(err error) unix.Errno {
 	errno, _ := TryExtractErrno(err)
 	return errno
 }
 
-// TryExtractErrno extracts a unix.Errno from an error, and reports whether it
-// was successful. If unsuccessful, the returned errno is EIO.
+// TryExtractErrno extracts a native host unix.Errno from an error and reports
+// whether it was successful. If unsuccessful, the returned errno is EIO.
 func TryExtractErrno(err error) (unix.Errno, bool) {
 	switch err {
 	case os.ErrNotExist:
@@ -1594,7 +1638,6 @@ func TryExtractErrno(err error) (unix.Errno, bool) {
 		return unix.EINVAL, true
 	}
 
-	// Attempt to unwrap.
 	switch e := err.(type) {
 	case *errors.Error:
 		return linuxerr.ToUnix(e), true
@@ -1608,7 +1651,6 @@ func TryExtractErrno(err error) (unix.Errno, bool) {
 		return TryExtractErrno(e.Err)
 	}
 
-	// Default case.
 	log.Warningf("unknown error: %v", err)
 	return unix.EIO, false
 }

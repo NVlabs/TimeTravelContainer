@@ -21,4 +21,5 @@ go_binary(
         "//pkg/tcpip/transport/tcp",
         "//pkg/waiter",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

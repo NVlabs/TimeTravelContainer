@@ -9,10 +9,13 @@ go_library(
     name = "client",
     srcs = [
         "client.go",
+        "host_darwin.go",
+        "host_linux.go",
         "terminal.go",
     ],
     visibility = ["//runsc/ttc:__pkg__"],
     deps = [
+        "//runsc/processutil",
         "//runsc/ttc/protocol",
         "//runsc/version",
         "@org_golang_x_term//:go_default_library",

@@ -60,18 +60,14 @@ import (
 )
 
 const (
-	daemonAPIVersion       = protocol.DaemonAPIVersion
-	defaultRuntimePlatform = "systrap"
-	daemonStartTimeout     = 2 * time.Minute
+	daemonAPIVersion   = protocol.DaemonAPIVersion
+	daemonStartTimeout = 2 * time.Minute
 	// A clustered TTC_ROOT is commonly hosted on NFS. A node that looked up the
 	// root before the first member initialized it may retain a negative directory
 	// entry for the server's acdirmax interval (commonly 60 seconds). Keep the
 	// joining daemon alive long enough for that cache entry to expire instead of
 	// turning a successful cluster initialization into a spurious join failure.
 	clusterSharedRootVisibilityTimeout = 90 * time.Second
-	kvmGetAPIVersion                   = uintptr(0xae00)
-	kvmCreateVM                        = uintptr(0xae01)
-	kvmAPIVersion                      = uintptr(12)
 	daemonFrameStdin                   = byte('I')
 	daemonFrameStdinAck                = byte('A')
 	daemonFrameEOF                     = byte('C')
@@ -1279,6 +1275,10 @@ func (r *daemonTargetRuntime) Prepare(ctx context.Context, tx *cluster.Transacti
 		restoreArgs.PrefetchBytes = (windowPages - windowPages/2) * tx.Negotiated.PagingPolicy.PageSize
 	}
 	configured := r.backend.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured, err = r.backend.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	runtimeCreated := false
 	var runtimeState struct {
 		Status string `json:"status"`
@@ -2225,11 +2225,27 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 				if failedPolls < 3 {
 					continue
 				}
-				if _, stateErr := r.backend.command("state", containerID); stateErr == nil {
-					continue
+				runtimeState := "unavailable"
+				if stateOutput, stateErr := r.backend.command("state", containerID); stateErr == nil {
+					state, decodeErr := decodeRuntimeStateStatus(stateOutput)
+					if decodeErr != nil {
+						// A transiently unreadable state record is not evidence that a
+						// published target died. Keep polling until runsc reports a
+						// coherent lifecycle state or the control RPC recovers.
+						continue
+					}
+					runtimeState = state
+					if state == "running" {
+						continue
+					}
 				}
-				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed,
-					"dependent target exited before remote memory drain completed", time.Now())
+				failure := fmt.Sprintf("dependent target exited before remote memory drain completed (runtime state %q)", runtimeState)
+				_, _ = r.store.Advance(transactionID, tx.Revision, cluster.TransactionFailed, failure, time.Now())
+				// runsc state succeeds for a dead sandbox and reports "stopped".
+				// Treating any successful state command as liveness previously left
+				// the transaction published forever and the logical branch marked
+				// running, which fenced every later operation behind a dead target.
+				_ = r.backend.containerStore().UpdateDistributedForkTargetState(tx.Identity.TargetContainer, transactionID, "exited")
 				return
 			}
 			failedPolls = 0
@@ -2286,6 +2302,20 @@ func (r *daemonTargetRuntime) monitorDependency(transactionID, containerID strin
 			return
 		}
 	}()
+}
+
+func decodeRuntimeStateStatus(encoded []byte) (string, error) {
+	var state struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(encoded, &state); err != nil {
+		return "", fmt.Errorf("decoding runtime state: %w", err)
+	}
+	state.Status = strings.TrimSpace(strings.ToLower(state.Status))
+	if state.Status == "" {
+		return "", errors.New("runtime state omitted status")
+	}
+	return state.Status, nil
 }
 
 func (r *daemonTargetRuntime) corruptDependentTarget(family, branch, reason string) {
@@ -3736,13 +3766,7 @@ func currentHostKernelRelease() (string, error) {
 }
 
 func normalizeRuntimePlatform(value string) (string, error) {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
-	case "systrap", "kvm":
-		return value, nil
-	default:
-		return "", fmt.Errorf("unsupported runtime platform %q; supported platforms are systrap and kvm", value)
-	}
+	return normalizeHostRuntimePlatform(strings.ToLower(strings.TrimSpace(value)))
 }
 
 func runtimePlatformFromEnvironment() string {
@@ -3751,32 +3775,6 @@ func runtimePlatformFromEnvironment() string {
 		return normalized
 	}
 	return defaultRuntimePlatform
-}
-
-func preflightDaemonPlatform(runtimePlatform string) error {
-	if runtimePlatform != "kvm" {
-		return nil
-	}
-	device, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("runtime platform kvm requires read/write access to /dev/kvm: %w", err)
-	}
-	defer device.Close()
-	version, _, errno := unix.Syscall(unix.SYS_IOCTL, device.Fd(), kvmGetAPIVersion, 0)
-	if errno != 0 {
-		return fmt.Errorf("querying /dev/kvm API version: %w", errno)
-	}
-	if version != kvmAPIVersion {
-		return fmt.Errorf("unsupported /dev/kvm API version %d; want %d", version, kvmAPIVersion)
-	}
-	vmFD, _, errno := unix.Syscall(unix.SYS_IOCTL, device.Fd(), kvmCreateVM, 0)
-	if errno != 0 {
-		return fmt.Errorf("creating a KVM VM: %w", errno)
-	}
-	if err := unix.Close(int(vmFD)); err != nil {
-		return fmt.Errorf("closing KVM preflight VM: %w", err)
-	}
-	return nil
 }
 
 // RunDaemon serves the versioned TTC local API from the ttcd binary.
@@ -3801,7 +3799,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 			args = args[1:]
 		case args[0] == "--platform":
 			if len(args) < 2 || args[1] == "" {
-				fmt.Fprintln(stderr, "ttcd: --platform requires systrap or kvm")
+				fmt.Fprintf(stderr, "ttcd: --platform requires %s\n", runtimePlatformFlagUsage())
 				return 2
 			}
 			runtimePlatform = args[1]
@@ -3912,18 +3910,28 @@ func RunDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
+	// The client starts the sibling ttcd directly. Validate host requirements
+	// on the installed executable here so a missing macOS Hypervisor.framework
+	// entitlement fails startup instead of the first container launch.
+	if executable, err := os.Executable(); err != nil {
+		fmt.Fprintf(stderr, "ttcd: finding executable: %v\n", err)
+		return 1
+	} else if err := preflightDaemonExecutable(executable); err != nil {
+		fmt.Fprintf(stderr, "ttcd: validating executable %q: %v\n", executable, err)
+		return 1
+	}
 	kernelRelease, err := daemonKernelRelease()
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: detecting host Linux kernel release: %v\n", err)
 		return 1
 	}
-	kernelCompatibility, err := evaluateHostKernelCompatibility(kernelRelease)
+	kernelCompatibility, err := evaluateCurrentHostCompatibility(kernelRelease)
 	if err != nil {
 		fmt.Fprintf(stderr, "ttcd: %v\n", err)
 		return 1
 	}
-	if kernelCompatibility.disableHostGSO {
-		fmt.Fprintf(stderr, "ttcd: warning: host Linux kernel %s predates 4.14.77; disabling host GSO for compatibility; network performance, especially for large payloads, will be reduced\n", kernelRelease)
+	if warning := currentHostCompatibilityWarning(kernelCompatibility); warning != "" {
+		fmt.Fprintf(stderr, "ttcd: warning: %s\n", warning)
 	}
 	if unsafeNoHostIsolation {
 		fmt.Fprintln(stderr, "ttcd: warning: host namespace and chroot isolation is disabled; run trusted workloads only")
@@ -4291,7 +4299,7 @@ func freshDaemonRootEntryAllowed(root string, entry os.DirEntry, startupLog os.F
 }
 
 func daemonStartupLogInfo() os.FileInfo {
-	info, err := os.Stat("/proc/self/fd/2")
+	info, err := os.Stderr.Stat()
 	if err != nil {
 		return nil
 	}
@@ -4995,6 +5003,9 @@ func prepareDaemonCluster(opts daemonClusterOptions, dataRoot, localRoot, runtim
 	}()
 	liveness := &cluster.Liveness{}
 	if opts.ControlHolder {
+		if err := armControlHolderParentDeath(); err != nil {
+			return nil, fmt.Errorf("watching the gateway that started this control holder: %w", err)
+		}
 		var stillness []cluster.Stillness
 		if encoded := os.Getenv(controlHolderStillnessEnv); encoded != "" {
 			if err := json.Unmarshal([]byte(encoded), &stillness); err != nil {
@@ -5714,40 +5725,6 @@ func parseClusterPeer(value string) (nodeID, baseURL, serverName string, err err
 	return nodeID, "http://" + host, "", nil
 }
 
-func preflightDaemonIsolation(unsafeNoHostIsolation bool) error {
-	if unsafeNoHostIsolation || daemonEffectiveUID() == 0 {
-		return nil
-	}
-	if err := createDaemonRootlessProbe(); err != nil {
-		hint := "permit unprivileged user namespaces in the host kernel and LSM policy"
-		if data, readErr := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); readErr == nil && strings.TrimSpace(string(data)) == "1" {
-			hint = "the host AppArmor policy restricts unprivileged user namespaces; grant userns permission to TTC/runsc"
-		}
-		return fmt.Errorf("rootless mode is unavailable: creating a disposable user/mount namespace: %w; %s, or restart with --unsafe-no-host-isolation for trusted workloads", err, hint)
-	}
-	return nil
-}
-
-func createRootlessProbe() error {
-	command := exec.Command("/proc/self/exe", daemonRootlessProbeArg)
-	command.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-		UidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-		},
-		Credential:                 &syscall.Credential{Uid: 0, Gid: 0},
-		GidMappingsEnableSetgroups: false,
-		Pdeathsig:                  syscall.SIGKILL,
-	}
-	if err := command.Run(); err != nil {
-		return err
-	}
-	return nil
-}
-
 func secureDaemonDirectory(dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("creating socket directory: %w", err)
@@ -6203,7 +6180,7 @@ func prepareDaemonRuntimeStorage(socket, root string) error {
 		if err := daemonStatfs(clean, &statfs); err != nil {
 			return fmt.Errorf("checking %s filesystem %q: %w", candidate.name, clean, err)
 		}
-		if int64(statfs.Type) == int64(unix.NFS_SUPER_MAGIC) {
+		if daemonStatfsIsNFS(&statfs) {
 			return fmt.Errorf("%s %q is on NFS; TTC_SOCKET and TTC_LOCAL_ROOT runtime state must be node-local (only TTC_ROOT may be shared)", candidate.name, clean)
 		}
 	}
@@ -7259,34 +7236,6 @@ func maintainRepositories(dataRoot, localRoot, runtimeRoot, runsc string, public
 			timer.Reset(repositoryMaintenanceInterval)
 		}
 	}
-}
-
-func checkDaemonPeer(conn net.Conn) error {
-	unixConn, ok := conn.(*net.UnixConn)
-	if !ok {
-		return fmt.Errorf("non-Unix daemon connection %T", conn)
-	}
-	raw, err := unixConn.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var credential *syscall.Ucred
-	var socketErr error
-	if err := raw.Control(func(fd uintptr) {
-		credential, socketErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); err != nil {
-		return err
-	}
-	if socketErr != nil {
-		return socketErr
-	}
-	if credential == nil {
-		return errors.New("daemon peer credentials are unavailable")
-	}
-	if int(credential.Uid) != os.Geteuid() {
-		return fmt.Errorf("daemon peer UID %d does not match server UID %d", credential.Uid, os.Geteuid())
-	}
-	return nil
 }
 
 func (s *daemonServer) handle(conn net.Conn, serverErrors io.Writer) {
@@ -8937,7 +8886,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 			switch {
 			case startArgs[0] == "--platform":
 				if len(startArgs) < 2 || startArgs[1] == "" {
-					fmt.Fprintln(stderr, "ttc: --platform requires systrap or kvm")
+					fmt.Fprintf(stderr, "ttc: --platform requires %s\n", runtimePlatformFlagUsage())
 					return 2
 				}
 				opts.runtimePlatform = startArgs[1]
@@ -9001,7 +8950,7 @@ func runDaemonControl(opts options, args []string, stdout, stderr io.Writer) int
 		args = args[:1]
 	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "ttc: usage: ttc daemon start [--platform systrap|kvm] [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve")
+		fmt.Fprintf(stderr, "ttc: usage: ttc daemon start [--platform %s] [isolation/volume/cluster options]|status|stop|requests|request inspect|request resolve\n", runtimePlatformFlagUsage())
 		return 2
 	}
 	action := args[0]

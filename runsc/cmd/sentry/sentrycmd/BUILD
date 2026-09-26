@@ -10,6 +10,10 @@ go_library(
     srcs = [
         "boot.go",
         "chroot.go",
+        "chroot_darwin.go",
+        "parentdeath_darwin.go",
+        "parentdeath_linux.go",
+        "umount_darwin.go",
         "umount_unsafe.go",
     ],
     visibility = ["//runsc:__subpackages__"],
@@ -20,6 +24,7 @@ go_library(
         "//pkg/cpuid",
         "//pkg/fd",
         "//pkg/hostarch",
+        "//pkg/hostmem",
         "//pkg/log",
         "//pkg/metric",
         "//pkg/prometheus",

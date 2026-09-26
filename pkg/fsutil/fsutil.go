@@ -24,6 +24,12 @@ const SelfFilestorePrefix = ".gvisor.filestore."
 // DirentHandler is a function that handles a dirent.
 type DirentHandler func(ino uint64, off int64, ftype uint8, name string, reclen uint16)
 
+// ReadDirents fills buf with host directory-entry records. Callers must parse
+// the result with ParseDirents, since record layout is host-specific.
+func ReadDirents(fd int, buf []byte) (int, error) {
+	return readDirents(fd, buf)
+}
+
 // ForEachDirent retrieves all dirents from dirfd using getdents64(2) and
 // invokes handleDirent on them.
 func ForEachDirent(dirfd int, handleDirent DirentHandler) error {
@@ -32,7 +38,7 @@ func ForEachDirent(dirfd int, handleDirent DirentHandler) error {
 	}
 	var direntsBuf [8192]byte
 	for {
-		n, err := unix.Getdents(dirfd, direntsBuf[:])
+		n, err := readDirents(dirfd, direntsBuf[:])
 		if err != nil {
 			return err
 		}

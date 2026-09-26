@@ -159,9 +159,12 @@ func (rb *ringBuffer) writeStatus(frameNum uint32, status uint32) error {
 	}
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	ims, err := rb.internalMappingsForFrame(frameNum, hostarch.Write)
+	ims, mappingLease, err := rb.internalMappingsForFrame(frameNum, hostarch.Write)
 	if err != nil {
 		return err
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 	// Status is the first uint32 in the frame. It is a uint64 in TPACKET_V1,
 	// but is a uint32 in TPACKET_V2. In practice status is never larger than a
@@ -175,9 +178,12 @@ func (rb *ringBuffer) writeStatus(frameNum uint32, status uint32) error {
 func (rb *ringBuffer) writeFrame(frameNum uint32, hdrView *buffer.View, pkt buffer.Buffer) error {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	ims, err := rb.internalMappingsForFrame(frameNum, hostarch.Write)
+	ims, mappingLease, err := rb.internalMappingsForFrame(frameNum, hostarch.Write)
 	if err != nil {
 		return err
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 	frame := buffer.MakeWithView(hdrView)
 	frame.Merge(&pkt)
@@ -259,7 +265,7 @@ func (rb *ringBuffer) bufferSize() uint64 {
 }
 
 // +checklocks:rb.mu
-func (rb *ringBuffer) internalMappingsForFrame(frameNum uint32, at hostarch.AccessType) (safemem.BlockSeq, error) {
+func (rb *ringBuffer) internalMappingsForFrame(frameNum uint32, at hostarch.AccessType) (safemem.BlockSeq, memmap.InternalMappingLease, error) {
 	rb.dataMu.RLock()
 	defer rb.dataMu.RUnlock()
 
@@ -270,14 +276,17 @@ func (rb *ringBuffer) internalMappingsForFrame(frameNum uint32, at hostarch.Acce
 	frameEnd := frameStart + uint64(rb.frameSize)
 
 	frameFR := memmap.FileRange{Start: frameStart, End: frameEnd}
-	return rb.mf.MapInternal(frameFR, at)
+	return memmap.MapInternalWithLease(rb.mf, frameFR, at)
 }
 
 // +checklocks:rb.mu
 func (rb *ringBuffer) frameStatus(frameNum uint32) (uint32, error) {
-	ims, err := rb.internalMappingsForFrame(frameNum, hostarch.Read)
+	ims, mappingLease, err := rb.internalMappingsForFrame(frameNum, hostarch.Read)
 	if err != nil {
 		return 0, err
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 	// Status is the first uint32 in the frame.
 	return safemem.LoadUint32(ims.Head())

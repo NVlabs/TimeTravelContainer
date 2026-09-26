@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -204,6 +203,25 @@ func TestClusterAdvertiseResolution(t *testing.T) {
 	}
 	if page != "node-a.example:0" {
 		t.Fatalf("page address=%q", page)
+	}
+}
+
+func TestDistributedSourceTerminalCommandPreservesActivatedMigrationFilesystem(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		tx   *cluster.Transaction
+		want string
+	}{
+		{name: "missing", want: "distributed-cancel"},
+		{name: "ordinary-fork", tx: &cluster.Transaction{}, want: "distributed-cancel"},
+		{name: "migration-before-cutover", tx: &cluster.Transaction{Identity: cluster.ForkIdentity{Migration: true}}, want: "distributed-cancel"},
+		{name: "activated-migration", tx: &cluster.Transaction{Identity: cluster.ForkIdentity{Migration: true}, Activated: true}, want: "distributed-complete"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := distributedSourceTerminalCommand(test.tx); got != test.want {
+				t.Fatalf("distributedSourceTerminalCommand(%+v)=%q, want %q", test.tx, got, test.want)
+			}
+		})
 	}
 }
 
@@ -1734,11 +1752,11 @@ func TestResumeFencedElasticRuntimeChecksProcessIdentity(t *testing.T) {
 	}
 	deadline := time.Now().Add(time.Second)
 	for {
-		status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
+		state, err := processState(command.Process.Pid)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(status), "State:\tT") {
+		if state != 'T' {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1897,15 +1915,15 @@ func TestLeaseGuardianFencesMatchingRuntimeRoot(t *testing.T) {
 	}
 	deadline = time.Now().Add(time.Second)
 	for {
-		status, err := os.ReadFile(filepath.Join("/proc", fmt.Sprint(command.Process.Pid), "status"))
+		state, err := processState(command.Process.Pid)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(status), "State:\tT") {
+		if state == 'T' {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("guardian target was not stopped:\n%s", status)
+			t.Fatalf("guardian target was not stopped: state %c", state)
 		}
 		time.Sleep(time.Millisecond)
 	}

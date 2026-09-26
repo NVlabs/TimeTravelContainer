@@ -83,6 +83,9 @@ func init() {
 func testConfig() *config.Config {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	config.RegisterFlags(testFlags)
+	if err := configureHostTestFlags(testFlags); err != nil {
+		panic(err)
+	}
 	conf, err := config.NewFromFlags(testFlags)
 	if err != nil {
 		panic(err)
@@ -112,17 +115,15 @@ func testSpec() *specs.Spec {
 // sandbox side of the connection, and a function that when called will stop the
 // gofer.
 func startGofer(root string, conf *config.Config) (int, func(), error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	sandboxSocket, socket, err := unet.SocketPair(false)
 	if err != nil {
 		return 0, nil, err
 	}
-	sandboxEnd, goferEnd := fds[0], fds[1]
-
-	socket, err := unet.NewSocket(goferEnd)
+	sandboxEnd, err := sandboxSocket.Release()
 	if err != nil {
-		unix.Close(sandboxEnd)
-		unix.Close(goferEnd)
-		return 0, nil, fmt.Errorf("error creating server on FD %d: %v", goferEnd, err)
+		sandboxSocket.Close()
+		socket.Close()
+		return 0, nil, fmt.Errorf("releasing sandbox socket: %v", err)
 	}
 	server := lisafs.NewServer()
 	connImpl := fsgofer.NewConnectionImpl(&fsgofer.Config{
@@ -1084,8 +1085,11 @@ func TestRunLiveForkNetworkNone(t *testing.T) {
 	if aio := parentTask.MemoryManager().DestroyAIOContext(parentTask, aioID); aio == nil {
 		t.Fatal("AIO ring mapping disappeared after rejected live fork")
 	}
-	hostEventFD, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	hostEventFD, err := createHostEventFDForTest()
 	if err != nil {
+		if errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skip("host eventfd import is unavailable on this host")
+		}
 		t.Fatalf("creating host eventfd: %v", err)
 	}
 	hostEventFile, err := eventfd.NewFromHost(ctx, l.k.VFS(), hostEventFD, linux.O_RDWR|linux.O_NONBLOCK)

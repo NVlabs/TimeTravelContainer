@@ -45,6 +45,13 @@ go_library(
 )
 
 go_test(
+    name = "syscalls_test",
+    size = "small",
+    srcs = ["syscalls_test.go"],
+    library = ":arch",
+)
+
+go_test(
     name = "arch_test",
     size = "small",
     srcs = ["signal_fault_amd64_test.go"],

@@ -19,10 +19,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	gErrors "gvisor.dev/gvisor/pkg/errors"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
@@ -175,30 +175,32 @@ func TestErrorTranslation(t *testing.T) {
 	}
 }
 
+// TestSyscallErrnoToErrors checks that ErrorFromUnix maps Linux errnos,
+// which are also the host's errnos on Linux, to linuxerr errors.
 func TestSyscallErrnoToErrors(t *testing.T) {
 	for _, tc := range []struct {
-		errno syscall.Errno
+		errno errno.Errno
 		err   error
 	}{
-		{errno: syscall.EACCES, err: linuxerr.EACCES},
-		{errno: syscall.EAGAIN, err: linuxerr.EAGAIN},
-		{errno: syscall.EBADF, err: linuxerr.EBADF},
-		{errno: syscall.EBUSY, err: linuxerr.EBUSY},
-		{errno: syscall.EDOM, err: linuxerr.EDOM},
-		{errno: syscall.EEXIST, err: linuxerr.EEXIST},
-		{errno: syscall.EFAULT, err: linuxerr.EFAULT},
-		{errno: syscall.EFBIG, err: linuxerr.EFBIG},
-		{errno: syscall.EINTR, err: linuxerr.EINTR},
-		{errno: syscall.EINVAL, err: linuxerr.EINVAL},
-		{errno: syscall.EIO, err: linuxerr.EIO},
-		{errno: syscall.ENOTDIR, err: linuxerr.ENOTDIR},
-		{errno: syscall.ENOTTY, err: linuxerr.ENOTTY},
-		{errno: syscall.EPERM, err: linuxerr.EPERM},
-		{errno: syscall.EPIPE, err: linuxerr.EPIPE},
-		{errno: syscall.ESPIPE, err: linuxerr.ESPIPE},
-		{errno: syscall.EWOULDBLOCK, err: linuxerr.EAGAIN},
+		{errno: errno.EACCES, err: linuxerr.EACCES},
+		{errno: errno.EAGAIN, err: linuxerr.EAGAIN},
+		{errno: errno.EBADF, err: linuxerr.EBADF},
+		{errno: errno.EBUSY, err: linuxerr.EBUSY},
+		{errno: errno.EDOM, err: linuxerr.EDOM},
+		{errno: errno.EEXIST, err: linuxerr.EEXIST},
+		{errno: errno.EFAULT, err: linuxerr.EFAULT},
+		{errno: errno.EFBIG, err: linuxerr.EFBIG},
+		{errno: errno.EINTR, err: linuxerr.EINTR},
+		{errno: errno.EINVAL, err: linuxerr.EINVAL},
+		{errno: errno.EIO, err: linuxerr.EIO},
+		{errno: errno.ENOTDIR, err: linuxerr.ENOTDIR},
+		{errno: errno.ENOTTY, err: linuxerr.ENOTTY},
+		{errno: errno.EPERM, err: linuxerr.EPERM},
+		{errno: errno.EPIPE, err: linuxerr.EPIPE},
+		{errno: errno.ESPIPE, err: linuxerr.ESPIPE},
+		{errno: errno.EWOULDBLOCK, err: linuxerr.EAGAIN},
 	} {
-		t.Run(tc.errno.Error(), func(t *testing.T) {
+		t.Run(tc.err.Error(), func(t *testing.T) {
 			e := linuxerr.ErrorFromUnix(unix.Errno(tc.errno))
 			if e != tc.err {
 				t.Fatalf("Mismatch errors: want: %+v %T got: %+v %T", tc.err, tc.err, e, e)
@@ -305,5 +307,24 @@ func TestConvertIntr(t *testing.T) {
 				t.Fatalf("ConvertIntr(%v, %v) = %v, want %v", tc.err, tc.intr, got, tc.expected)
 			}
 		})
+	}
+}
+
+// TestIsValid checks that IsValid accepts exactly the Linux errnos for which
+// ErrorFromUnix returns an error, including those that a Darwin host doesn't
+// have and excluding the gaps in the Linux numbering.
+func TestIsValid(t *testing.T) {
+	for _, e := range []errno.Errno{errno.EPERM, errno.ENOSYS, errno.ENOTCONN, errno.ESTALE, errno.EHWPOISON} {
+		if !linuxerr.IsValid(e) {
+			t.Errorf("IsValid(%d) = false, want true", e)
+		}
+		if err := linuxerr.ErrorFromUnix(unix.Errno(e)); err == nil {
+			t.Errorf("ErrorFromUnix(%d) = nil for a valid errno", e)
+		}
+	}
+	for _, e := range []errno.Errno{0, 41, 58, errno.EHWPOISON + 1, 1 << 31} {
+		if linuxerr.IsValid(e) {
+			t.Errorf("IsValid(%d) = true, want false", e)
+		}
 	}
 }

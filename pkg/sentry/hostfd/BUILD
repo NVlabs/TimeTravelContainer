@@ -8,6 +8,7 @@ go_library(
     name = "hostfd",
     srcs = [
         "hostfd.go",
+        "hostfd_darwin.go",
         "hostfd_linux.go",
         "hostfd_unsafe.go",
     ],

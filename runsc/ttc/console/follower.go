@@ -18,10 +18,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
@@ -43,17 +41,6 @@ const (
 	// runs, which keeps it one to a family.
 	FollowerLockName = ".follower.lock"
 )
-
-// SocketAddress returns a name for the socket at path that fits in a socket
-// address however long path is, through the directory's descriptor, and a
-// function to call once the socket is bound or connected.
-func SocketAddress(path string) (string, func(), error) {
-	dir, err := unix.Open(filepath.Dir(path), unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return "", nil, &os.PathError{Op: "open", Path: filepath.Dir(path), Err: err}
-	}
-	return fmt.Sprintf("/proc/self/fd/%d/%s", dir, filepath.Base(path)), func() { _ = unix.Close(dir) }, nil
-}
 
 // Operations ttcd asks of a follower.
 const (
@@ -119,14 +106,7 @@ func WriteFollowerMessage(conn *net.UnixConn, message FollowerMessage, files ...
 		}
 		rights = unix.UnixRights(fds...)
 	}
-	n, rightsn, err := conn.WriteMsgUnix(data, rights, nil)
-	if err != nil {
-		return err
-	}
-	if n != len(data) || rightsn != len(rights) {
-		return io.ErrShortWrite
-	}
-	return nil
+	return sendFollowerPacket(conn, data, rights)
 }
 
 // ReadFollowerMessage receives one message from conn, and the files sent with
@@ -134,7 +114,7 @@ func WriteFollowerMessage(conn *net.UnixConn, message FollowerMessage, files ...
 func ReadFollowerMessage(conn *net.UnixConn) (FollowerMessage, []*os.File, error) {
 	data := make([]byte, maxFollowerMessage)
 	rights := make([]byte, unix.CmsgSpace(4*maxFollowerFiles))
-	n, rightsn, flags, _, err := conn.ReadMsgUnix(data, rights)
+	n, rightsn, flags, err := recvFollowerPacket(conn, data, rights)
 	var files []*os.File
 	if rightsn != 0 {
 		controls, parseErr := unix.ParseSocketControlMessage(rights[:rightsn])

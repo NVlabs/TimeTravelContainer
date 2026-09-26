@@ -30,6 +30,8 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
@@ -42,15 +44,17 @@ func TestRepositoryCloseReleasesDataStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataLock := filepath.Join(repository.path, "data", ".gc.lock")
+	var lockStat syscall.Stat_t
+	if err := syscall.Stat(dataLock, &lockStat); err != nil {
+		t.Fatal(err)
+	}
+	// Identify open descriptors by inode rather than /proc/self/fd, which not
+	// every host has.
 	countOpen := func() int {
-		entries, err := os.ReadDir("/proc/self/fd")
-		if err != nil {
-			t.Fatal(err)
-		}
 		count := 0
-		for _, entry := range entries {
-			target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
-			if err == nil && target == dataLock {
+		for fd := 0; fd < 4096; fd++ {
+			var stat syscall.Stat_t
+			if syscall.Fstat(fd, &stat) == nil && stat.Dev == lockStat.Dev && stat.Ino == lockStat.Ino {
 				count++
 			}
 		}
@@ -2351,7 +2355,7 @@ func TestListDirectoryItemsAndBranchUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantBytes := uint64(2 * os.Getpagesize())
+	wantBytes := uint64(2 * hostarch.PageSize)
 	if inodes != 3 || bytes != wantBytes {
 		t.Fatalf("BranchUsage=(%d, %d), want (3, %d)", inodes, bytes, wantBytes)
 	}
@@ -2387,7 +2391,7 @@ func TestBranchSetUsageClassifiesFileCoW(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := uint64(os.Getpagesize())
+	page := uint64(hostarch.PageSize)
 	if usage.UniqueBytes != 3*page || len(usage.Branches) != 2 {
 		t.Fatalf("usage=%+v, want three unique pages and two branches", usage)
 	}

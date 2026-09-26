@@ -219,7 +219,7 @@ func (fd *vfioFD) iommuMapDma(ctx context.Context, t *kernel.Task, arg hostarch.
 		}
 		for !ims.IsEmpty() {
 			im := ims.Head()
-			if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, im.Addr(), 0, uintptr(im.Len()), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
+			if errno := util.MirrorMapping(im.Addr(), uintptr(im.Len()), sentryAddr); errno != 0 {
 				return 0, errno
 			}
 			sentryAddr += uintptr(im.Len())

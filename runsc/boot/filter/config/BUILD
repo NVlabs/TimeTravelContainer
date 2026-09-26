@@ -12,6 +12,8 @@ go_library(
         "config_amd64.go",
         "config_arm64.go",
         "config_cgo.go",
+        "config_darwin.go",
+        "config_host_linux.go",
         "config_main.go",
         "config_precompiled.go",
         "config_profile.go",

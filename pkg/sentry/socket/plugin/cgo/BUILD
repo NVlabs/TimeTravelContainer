@@ -43,4 +43,5 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

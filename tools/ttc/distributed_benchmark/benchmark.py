@@ -7,6 +7,7 @@ import errno
 import json
 import os
 import pathlib
+import platform
 import shutil
 import subprocess
 import sys
@@ -66,7 +67,29 @@ def make_worker(root):
         return assets
     assets.mkdir(parents=True, exist_ok=True)
     source = pathlib.Path(__file__).with_name("page_worker.c")
-    run(["cc", "-O2", "-static", "-Wall", "-Wextra", "-o", worker, source], timeout=120)
+    compiled = run(
+        ["cc", "-O2", "-static", "-Wall", "-Wextra", "-o", worker, source],
+        timeout=120, check=False,
+    )
+    if compiled.returncode:
+        # Darwin's system compiler cannot emit a static Linux ELF. Keep the
+        # workload backend-neutral and cross-build its equivalent pure-Go
+        # implementation for the host ISA instead. This also makes the
+        # two-daemon distributed qualification runnable on macOS without a
+        # separate Linux cross-toolchain.
+        machine = platform.machine().lower()
+        goarch = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64", "amd64": "amd64"}.get(machine)
+        if not goarch:
+            raise RuntimeError(
+                f"static C worker compilation failed and host ISA {machine!r} has no Linux Go mapping:\n"
+                f"{compiled.stderr}"
+            )
+        go_source = pathlib.Path(__file__).with_name("page_worker.go")
+        build_env = os.environ.copy()
+        build_env.update({"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": goarch})
+        run([
+            "go", "build", "-trimpath", "-ldflags=-s -w", "-o", worker, go_source,
+        ], env=build_env, timeout=120)
     worker.chmod(0o755)
     return assets
 
@@ -87,6 +110,8 @@ class Experiment:
         self.target_ids = []
         self.txids = []
         self.netem_active = False
+        self.source_node = "node-a"
+        self.target_node = "node-b"
 
     def branch(self, branch):
         return f"{self.source}@{branch}"
@@ -109,6 +134,14 @@ class Experiment:
 
     def ttc(self, node, *argv, timeout=120, check=True):
         return run([self.args.ttc, *argv], env=self.env(node), timeout=timeout, check=check)
+
+    @staticmethod
+    def client_for_node(node_id):
+        if node_id == "node-a":
+            return "a"
+        if node_id == "node-b":
+            return "b"
+        raise RuntimeError(f"unexpected benchmark placement node {node_id!r}")
 
     def start_daemons(self):
         for path in (self.runtime_a, self.runtime_b, self.data):
@@ -181,6 +214,8 @@ class Experiment:
     def source_status(self, transaction):
         if not self.source_id or not transaction:
             return None
+        source_client = self.client_for_node(self.source_node)
+        runtime = self.runtime_a if source_client == "a" else self.runtime_b
         result = run([
             self.args.ttcd, "runsc", "--root", self.runsc_root("a"),
             "timetravel", self.source_id, "distributed-status", transaction,
@@ -192,6 +227,8 @@ class Experiment:
     def target_status(self, branch):
         if not self.source_id:
             return None
+        target_client = self.client_for_node(self.target_node)
+        runtime = self.runtime_a if target_client == "a" else self.runtime_b
         result = run([
             self.args.ttcd, "runsc", "--root", self.runsc_root("b"),
             "timetravel", self.source_id, "distributed-dependency", branch,
@@ -240,18 +277,18 @@ class Experiment:
         if self.args.verify_dehydrate:
             transition_start = time.monotonic_ns()
             for target in self.targets:
-                self.ttc("b", "dehydrate", self.branch(target), timeout=300)
+                self.ttc(target_client, "dehydrate", self.branch(target), timeout=300)
             transition_middle = time.monotonic_ns()
             for target in self.targets:
-                self.ttc("b", "rehydrate", self.branch(target), timeout=300)
+                self.ttc(target_client, "rehydrate", self.branch(target), timeout=300)
             transition_end = time.monotonic_ns()
             dehydrate_ms = (transition_middle - transition_start) / 1e6
             rehydrate_ms = (transition_end - transition_middle) / 1e6
         work_start = time.monotonic_ns()
         def run_target(target):
             branch = self.branch(target)
-            self.ttc("b", "kill", "--signal", "CONT", branch)
-            self.wait_exec("b", branch,
+            self.ttc(target_client, "kill", "--signal", "CONT", branch)
+            self.wait_exec(target_client, branch,
                            "while [ ! -f /tmp/ttc-bench-done ]; do sleep 0.01; done",
                            300)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.targets)) as executor:

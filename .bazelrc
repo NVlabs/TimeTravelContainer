@@ -20,6 +20,12 @@ startup --host_jvm_args=-Dbazel.DigestFunction=SHA256
 build --cxxopt=-std=c++17 --cxxopt=-Wno-error=maybe-uninitialized
 build --host_cxxopt=-std=c++17 --host_cxxopt=-Wno-error=maybe-uninitialized
 
+# Native Darwin artifacts must run on the oldest supported TTC host. Without
+# this, Bazel's local Apple C toolchain records the build machine's OS version
+# in LC_BUILD_VERSION, even when individual cgo packages pass an older target.
+build --macos_minimum_os=15.0
+test --macos_minimum_os=15.0
+
 # Display the current git revision in the info block.
 build --stamp --workspace_status_command tools/workspace_status.sh
 

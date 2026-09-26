@@ -36,10 +36,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -163,7 +163,7 @@ func runBoundedBatch(count, limit int, fn func(int)) {
 // sufficiently wide sibling batches exceed the host pipe capacity and would
 // otherwise deadlock the daemon while it still owns the family mutation lock.
 func newConfigMemFD(name string, payload []byte) (*os.File, error) {
-	fd, err := memutil.CreateMemFD(name, unix.MFD_CLOEXEC)
+	fd, err := memutil.CreateMemFD(name, linux.MFD_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +610,7 @@ func terminalSourceAction(tx *cluster.Transaction, err error) (string, bool) {
 	case cluster.TransactionIndependent:
 		return "distributed-complete", true
 	case cluster.TransactionCanceled, cluster.TransactionFailed:
-		return "distributed-cancel", true
+		return distributedSourceTerminalCommand(tx), true
 	default:
 		return "", false
 	}
@@ -1577,15 +1577,15 @@ func (r *distributedPageRelay) serveRunscFile(file *os.File, action string) {
 	// kills the serving command, so explicit transaction completion remains the
 	// lifetime fence without turning an idle, authoritative source into a
 	// broken pipe.
-	command := runscCommand(r.backend.runsc,
-		"--root", r.backend.root, "timetravel", "--distributed-connection-fd=3",
-		r.source, action, r.session)
+	command := runscCommand(r.backend.runsc, append(r.backend.runtimeControlArgs(),
+		"timetravel", "--distributed-connection-fd=3",
+		r.source, action, r.session)...)
 	command.ExtraFiles = []*os.File{file}
 	command.Stdin = strings.NewReader("")
 	command.Stdout = io.Discard
 	var commandError bytes.Buffer
 	command.Stderr = &commandError
-	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	setTTCCommandParentDeathSignal(command)
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -3586,7 +3586,7 @@ func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceCont
 					}
 				case cluster.TransactionCanceled, cluster.TransactionFailed:
 					cancel()
-					finishTerminal("distributed-cancel")
+					finishTerminal(distributedSourceTerminalCommand(current))
 					return
 				}
 			}
@@ -3653,7 +3653,7 @@ func (b *runtimeBackend) monitorHandoffCompletion(peer *cluster.Client, sourceCo
 				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 				return
 			case cluster.TransactionCanceled, cluster.TransactionFailed:
-				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				_, _ = b.command("timetravel", sourceContainer, distributedSourceTerminalCommand(status), transactionID)
 				return
 			}
 		}
@@ -3715,7 +3715,7 @@ func (b *runtimeBackend) monitorDistributedFork(peer *cluster.Client, sourceCont
 				_, _ = b.command("timetravel", sourceContainer, "distributed-complete", transactionID)
 				return
 			case cluster.TransactionCanceled, cluster.TransactionFailed:
-				_, _ = b.command("timetravel", sourceContainer, "distributed-cancel", transactionID)
+				_, _ = b.command("timetravel", sourceContainer, distributedSourceTerminalCommand(peerStatus), transactionID)
 				return
 			}
 		}
@@ -3907,4 +3907,17 @@ func recoverTargetGraphHandoff(targetRuntime *daemonTargetRuntime, control *clus
 		return
 	}
 	_, _ = control.Store.Advance(tx.Identity.TransactionID, tx.Revision, cluster.TransactionDraining, "", control.Now())
+}
+
+// distributedSourceTerminalCommand chooses how a source releases a terminal
+// remote session. Once an activated migration has crossed the placement CAS,
+// its target owns the forked filesystem branch even if the target process dies
+// before draining memory. Completing releases page reservations while retaining
+// that filesystem; canceling would delete the branch referenced by the now-
+// exited target and make an ordinary later `ttc start` impossible.
+func distributedSourceTerminalCommand(tx *cluster.Transaction) string {
+	if tx != nil && tx.Identity.Migration && tx.Activated {
+		return "distributed-complete"
+	}
+	return "distributed-cancel"
 }

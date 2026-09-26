@@ -44,6 +44,7 @@ import (
 	ttcpolicy "gvisor.dev/gvisor/pkg/ttcremote"
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/processutil"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 	"gvisor.dev/gvisor/runsc/ttc/protocol"
@@ -321,6 +322,11 @@ func (p daemonClusterProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/vnd.ttc.daemon-stream")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		// Commit the authenticated full-duplex stream before a slow command
+		// starts so the caller can exchange daemon frames immediately.
+		flusher.Flush()
+	}
 	buffer := make([]byte, 32<<10)
 	for {
 		n, readErr := conn.Read(buffer)
@@ -3828,10 +3834,11 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 		}
 		physicalLocalOwned := false
 		protectedMigration := false
+		protectedBranches := make(map[string]bool)
 		for _, branch := range runtimeFamily.Branches {
 			if info.BranchNodeID(branch.ID) == b.nodeID {
 				physicalLocalOwned = true
-				break
+				continue
 			}
 			// A migration target is deliberately hidden until placement cutover,
 			// so its persistent branch still names the source node while a target
@@ -3840,25 +3847,26 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 			// Otherwise a reconciliation request in this window SIGKILLs the
 			// provisional target and leaves successfully published metadata
 			// pointing at an exited Kernel.
-			if pendingDistributedTarget(info, branch.ID, b.nodeID) {
+			if pendingDistributedTarget(info, branch.ID, b.nodeID) || b.activeSparseMigrationSource(info.ID, branch.ID) {
 				protectedMigration = true
-			}
-			if b.activeSparseMigrationSource(info.ID, branch.ID) {
-				protectedMigration = true
+				protectedBranches[branch.ID] = true
 			}
 		}
-		if !physicalLocalOwned && !protectedMigration {
-			result = errors.Join(result, b.purgeRuntime(info.ID))
+		if !physicalLocalOwned {
+			if !protectedMigration {
+				result = errors.Join(result, b.purgeRuntime(info.ID))
+			}
+			// A family containing only a still-active migration source must be
+			// retained whole. Rechecking the transaction per branch creates a
+			// TOCTOU window in which independence arrives between the two checks
+			// and cleanup attempts to destroy runsc's last branch.
 			continue
 		}
 		for _, runtimeBranch := range runtimeFamily.Branches {
 			if info.BranchNodeID(runtimeBranch.ID) == b.nodeID {
 				continue
 			}
-			if pendingDistributedTarget(info, runtimeBranch.ID, b.nodeID) {
-				continue
-			}
-			if b.activeSparseMigrationSource(info.ID, runtimeBranch.ID) {
+			if protectedBranches[runtimeBranch.ID] {
 				continue
 			}
 			if _, err := b.command("timetravel", info.ID, "destroy", runtimeBranch.ID); err != nil {
@@ -5594,103 +5602,6 @@ func advertisedPageAddress(baseURL string) (string, error) {
 	return net.JoinHostPort(parsed.Hostname(), "0"), nil
 }
 
-// processResidentMemoryBytes returns the resident bytes charged to one host
-// process. /proc contains process leaders, rather than every thread, so this
-// does not multiply the Sentry's shared address space by its systrap threads.
-func processResidentMemoryBytes(pid int) (uint64, error) {
-	statm, err := os.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
-	if err != nil {
-		return 0, err
-	}
-	fields := strings.Fields(string(statm))
-	if len(fields) < 2 {
-		return 0, errors.New("/proc/self/statm has no resident page count")
-	}
-	residentPages, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return residentPages * uint64(os.Getpagesize()), nil
-}
-
-// currentNodeMemoryBytes accounts only memory controlled by this TTC node.
-//
-// A daemon is often launched directly from a login shell, systemd --user, or a
-// batch allocation. Its containing cgroup can therefore include unrelated
-// jobs, caches, and even other TTC roots. Using memory.current from that cgroup
-// made an idle daemon appear pressured and caused placement churn that TTC
-// could not relieve. Sentries are daemon siblings, but every runtime and
-// helper created for this node carries its node-local root in argv. Scan those
-// process leaders and add the daemon itself explicitly.
-func currentNodeMemoryBytes(localRoot string) (uint64, error) {
-	self := os.Getpid()
-	total, err := processResidentMemoryBytes(self)
-	if err != nil {
-		return 0, err
-	}
-	if localRoot == "" {
-		return total, nil
-	}
-	localRoot = filepath.Clean(localRoot)
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	// Which processes are the node's is read from their command lines, which
-	// a host runs many of, once, and again every nodeProcessRereads
-	// measurements, for one read between its fork and its exec.
-	value, _ := nodeProcessesByRoot.LoadOrStore(localRoot, &nodeProcesses{})
-	known := value.(*nodeProcesses)
-	known.mu.Lock()
-	defer known.mu.Unlock()
-	if known.measurements++; known.measurements%nodeProcessRereads == 0 {
-		known.ours = nil
-	}
-	present := make(map[int]bool, len(known.ours))
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		ours, seen := known.ours[pid]
-		if !seen {
-			cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-			if err != nil {
-				continue
-			}
-			ours = bytes.Contains(cmdline, []byte(localRoot))
-		}
-		present[pid] = ours
-		if !ours {
-			continue
-		}
-		resident, err := processResidentMemoryBytes(pid)
-		if err != nil {
-			// Processes naturally race the scan by exiting. An unreadable entry
-			// no longer contributes to current resident usage.
-			continue
-		}
-		total += resident
-	}
-	known.ours = present
-	return total, nil
-}
-
-// nodeProcesses remembers, by PID, whether a process on the host is one of a
-// node's; see currentNodeMemoryBytes.
-type nodeProcesses struct {
-	mu           sync.Mutex
-	ours         map[int]bool
-	measurements int
-}
-
-// nodeProcessRereads is how often a node reads every process's command line
-// again: a minute of heartbeats.
-const nodeProcessRereads = 12
-
-// nodeProcessesByRoot has the nodeProcesses of each node's local root.
-var nodeProcessesByRoot sync.Map
-
 type elasticFencedProcess struct {
 	PID         int    `json:"pid"`
 	StartTime   string `json:"start_time"`
@@ -5715,35 +5626,11 @@ func elasticFencePath(localRoot string) string {
 }
 
 func processStartTime(pid int) (string, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return "", err
-	}
-	end := strings.LastIndex(string(data), ") ")
-	if end < 0 {
-		return "", errors.New("malformed process stat")
-	}
-	fields := strings.Fields(string(data)[end+2:])
-	if len(fields) <= 19 {
-		return "", errors.New("process stat omits start time")
-	}
-	return fields[19], nil
+	return processutil.StartTime(pid)
 }
 
 func processState(pid int) (byte, error) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0, err
-	}
-	end := strings.LastIndex(string(data), ") ")
-	if end < 0 {
-		return 0, errors.New("malformed process stat")
-	}
-	fields := strings.Fields(string(data)[end+2:])
-	if len(fields) == 0 || len(fields[0]) != 1 {
-		return 0, errors.New("process stat omits state")
-	}
-	return fields[0][0], nil
+	return processutil.State(pid)
 }
 
 // RunLeaseGuardian is the private ttcd child entry point. It intentionally
@@ -5848,22 +5735,17 @@ func processUsesRuntimeRoot(arguments []string, runtimeRoot string) bool {
 }
 
 func elasticProcessesForRuntimeRoot(runtimeRoot string, sentryOnly bool) ([]elasticFencedProcess, error) {
-	entries, err := os.ReadDir("/proc")
+	pids, err := processutil.PIDs()
 	if err != nil {
 		return nil, err
 	}
 	var processes []elasticFencedProcess
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid == os.Getpid() {
+	for _, pid := range pids {
+		if pid == os.Getpid() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
-		if err != nil || len(data) == 0 {
-			continue
-		}
-		arguments := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-		if len(arguments) == 0 || (sentryOnly && !strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[")) {
+		arguments, err := processutil.Arguments(pid)
+		if err != nil || len(arguments) == 0 || (sentryOnly && !strings.HasPrefix(filepath.Base(arguments[0]), "ttc-sentry[")) {
 			continue
 		}
 		if !processUsesRuntimeRoot(arguments, runtimeRoot) {

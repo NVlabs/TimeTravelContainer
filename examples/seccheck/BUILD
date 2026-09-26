@@ -16,4 +16,5 @@ cc_binary(
         "@com_google_absl//absl/strings",
         "@com_google_protobuf//:protobuf",
     ],
+    target_compatible_with = ["@platforms//os:linux"],
 )

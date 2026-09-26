@@ -19,7 +19,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,6 +71,25 @@ func TestApplyLayerHandlesCompressionAndWhiteouts(t *testing.T) {
 	}
 }
 
+func TestApplyLayerAllowsLaterWhiteoutOfDeclaredDirectory(t *testing.T) {
+	root := t.TempDir()
+	layer := makeLayer(t, true, []tarEntry{
+		{name: "transient/", mode: 0755},
+		{name: "transient/value", body: "temporary", mode: 0644},
+		{name: ".wh.transient", mode: 0600},
+		{name: "retained", body: "complete", mode: 0644},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(layer)); err != nil {
+		t.Fatalf("applying layer with later directory whiteout: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "transient")); !os.IsNotExist(err) {
+		t.Fatalf("whiteouted transient directory stat error = %v, want not-exist", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "retained")); err != nil || string(got) != "complete" {
+		t.Fatalf("retained entry = %q, err %v", got, err)
+	}
+}
+
 func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 	root := t.TempDir()
 	t.Cleanup(func() {
@@ -109,6 +127,21 @@ func TestApplyLayerDefersRestrictiveDirectoryModes(t *testing.T) {
 		t.Fatal(err)
 	} else if got, want := info.Mode().Perm(), os.FileMode(0500); got != want {
 		t.Fatalf("lower mode=%#o, want %#o", got, want)
+	}
+}
+
+func TestApplyLayerPreservesEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	layer := makeLayer(t, true, []tarEntry{
+		{name: "run/", mode: 0755},
+		{name: "var/", mode: 0755},
+		{name: "var/run", mode: 0777, typeflag: tar.TypeSymlink, linkname: "../run"},
+	})
+	if err := applyLayer(context.Background(), root, bytes.NewReader(layer)); err != nil {
+		t.Fatalf("applying layer with empty directory: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "run")); err != nil || !info.IsDir() {
+		t.Fatalf("empty directory was not preserved: info=%v err=%v", info, err)
 	}
 }
 
@@ -150,14 +183,14 @@ func TestApplyLayerVirtualizesXattrs(t *testing.T) {
 	if !ok || string(value) != "capability-data" {
 		t.Fatalf("virtual capability=%q, ok=%t", value, ok)
 	}
-	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !errors.Is(err, unix.ENODATA) {
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "security.capability", nil); !isMissingXattr(err) {
 		t.Fatalf("physical security.capability unexpectedly exists: %v", err)
 	}
 	value, ok = manifest.LookupXattr("usr/bin/newgidmap", "user.image-metadata")
 	if !ok || string(value) != "portable-data" {
 		t.Fatalf("virtual user xattr=%q, ok=%t", value, ok)
 	}
-	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "user.image-metadata", nil); !errors.Is(err, unix.ENODATA) {
+	if _, err := unix.Lgetxattr(filepath.Join(root, "usr/bin/newgidmap"), "user.image-metadata", nil); !isMissingXattr(err) {
 		t.Fatalf("physical user.image-metadata unexpectedly exists: %v", err)
 	}
 	if _, ok := manifest.LookupXattr("replace", "security.capability"); ok {

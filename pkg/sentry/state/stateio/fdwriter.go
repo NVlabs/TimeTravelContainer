@@ -89,42 +89,7 @@ func NewFDWriter(fd int32, maxWriteBytes uint64, maxRanges, maxParallel int) *FD
 		panic("invalid maxParallel")
 	}
 
-	direct := false
-	if statusFlags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err != nil {
-		log.Warningf("stateio.FDWriter: failed to get file status flags for FD %d: %v", fd, err)
-		// leave direct false
-	} else {
-		direct = (statusFlags & unix.O_DIRECT) != 0
-	}
-
-	var q aio.Queue
-	preextend := false
-	switch direct {
-	case true:
-		// Linux AIO writes on O_DIRECT files can often execute in parallel.
-		// (Don't try to use Linux AIO without O_DIRECT: AIO non-O_DIRECT
-		// writes ~always execute serially, and AIO is a resource that is
-		// globally limited by /proc/sys/fs/aio-max-nr).
-		var err error
-		q, err = aio.NewLinuxQueue(maxParallel)
-		if err == nil {
-			// On many Linux filesystems, AIO O_DIRECT writes become
-			// synchronous if they extend a file's size (see e.g. ext4:
-			// `extend` in fs/ext4/file.c:ext4_dio_write_iter(), FUSE:
-			// fs/fuse/file.c:fuse_direct_IO()), necessitating file extension
-			// in advance of writes to preserve write parallelism.
-			preextend = true
-			break
-		}
-		log.Warningf("stateio.FDWriter: failed to create aio.LinuxQueue with capacity %d: %v; falling back to serial aio.GoQueue", maxParallel, err)
-		fallthrough
-	case false:
-		// Don't use parallel aio.GoQueue for writing since most filesystems
-		// will serialize write syscalls on a given file, e.g. by holding
-		// inode_lock() during the call to file_operations::write_iter.
-		q = aio.NewSerialGoQueue(maxParallel)
-		// leave preextend false
-	}
+	q, preextend := newFDWriterQueue(fd, maxParallel)
 
 	return &FDWriter{
 		fd:            atomicbitops.FromInt32(fd),

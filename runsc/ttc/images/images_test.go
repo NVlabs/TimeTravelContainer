@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -49,6 +50,20 @@ func TestContentReuse(t *testing.T) {
 	}
 	if got := contentReuse(nil, map[string]int64{"extra": 120}, 100); got.DownloadedBytes != 100 || got.ReusedBytes != 0 {
 		t.Fatalf("capped download=%+v", got)
+	}
+}
+
+func TestDefaultPlatformIsLinuxGuest(t *testing.T) {
+	matcher, err := platformMatcher("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest := platforms.Normalize(ocispec.Platform{OS: "linux", Architecture: runtime.GOARCH})
+	if !matcher.Match(guest) {
+		t.Fatalf("default matcher does not match guest platform %+v", guest)
+	}
+	if matcher.Match(ocispec.Platform{OS: "darwin", Architecture: runtime.GOARCH}) {
+		t.Fatalf("default matcher unexpectedly matches Darwin host platform")
 	}
 }
 

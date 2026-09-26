@@ -283,8 +283,9 @@ func linuxError(err error) error {
 	// The error may contain arbitrary errno values that can't be converted.
 	switch e := err.(type) {
 	case unix.Errno:
+		// A unix.Errno comes from the host.
 		if syserr.IsValid(e) {
-			return linuxerr.ErrorFromUnix(e)
+			return linuxerr.ErrorFromUnix(unix.Errno(syserr.HostToLinux(e)))
 		}
 	default:
 		return err

@@ -8,6 +8,7 @@ go_library(
     name = "tpuproxy",
     srcs = [
         "seccomp_filter.go",
+        "seccomp_filter_darwin.go",
         "tpuproxy.go",
     ],
     visibility = [

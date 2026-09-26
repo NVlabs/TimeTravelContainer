@@ -94,6 +94,10 @@ type contextInterface interface {
 	// SyscallSaveOrig save original register value.
 	SyscallSaveOrig()
 
+	// PrepareSyscallEntry sets architecture-specific register state expected
+	// by tracers before a syscall is invoked.
+	PrepareSyscallEntry()
+
 	// SyscallArgs returns the syscall arguments in an array.
 	SyscallArgs() SyscallArguments
 

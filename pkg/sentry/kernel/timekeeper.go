@@ -150,6 +150,7 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 		if err := params.Write(func() vdsoParams {
 			return vdsoParams{}
 		}); err != nil {
+			log.Warningf("unable to reset restored VDSO parameters: %v", err)
 			panic("unable to reset VDSO params: " + err.Error())
 		}
 	}

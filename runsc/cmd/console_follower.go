@@ -95,7 +95,7 @@ func runFamilyConsoleFollower(s *sandbox.Sandbox, cid, socket string, ready *os.
 	if err != nil {
 		return err
 	}
-	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: address, Net: "unixpacket"})
+	listener, err := net.ListenUnix(ttcconsole.FollowerNetwork, &net.UnixAddr{Name: address, Net: ttcconsole.FollowerNetwork})
 	closeDir()
 	if err != nil {
 		return fmt.Errorf("listening for ttcd: %w", err)
@@ -264,8 +264,17 @@ func (console *followedConsole) open() (*os.File, error) {
 	if console.log, err = ttcconsole.NewRotatingWriterWithStats(request.Log, request.LogMaxBytes, request.LogMaxFiles, request.RetentionStats); err != nil {
 		return nil, err
 	}
+	// pipe(2) and close-on-exec under ForkLock, as os.Pipe does where there
+	// is no pipe2(2): a concurrent exec must not inherit either end.
 	var fds [2]int
-	if err := unix.Pipe2(fds[:], unix.O_CLOEXEC); err != nil {
+	syscall.ForkLock.RLock()
+	err = unix.Pipe(fds[:])
+	if err == nil {
+		unix.CloseOnExec(fds[0])
+		unix.CloseOnExec(fds[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
 		return nil, fmt.Errorf("creating console push pipe: %w", err)
 	}
 	// The read end is nonblocking, so that the Go runtime polls it; the

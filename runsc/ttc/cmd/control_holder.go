@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
@@ -145,7 +144,11 @@ func (h *controlHolder) start(stillness []cluster.Stillness) error {
 		return err
 	}
 	defer log.Close()
-	command := exec.Command("/proc/self/exe", "--socket", h.socket(),
+	executable, err := selfExecutable()
+	if err != nil {
+		return err
+	}
+	command := exec.Command(executable, "--socket", h.socket(),
 		"--platform", defaultRuntimePlatform, "--control-holder",
 		"--cluster-node-id", h.nodeID+controlHolderSuffix,
 		"--cluster-listen", "127.0.0.1:0", "--cluster-advertise", "127.0.0.1:0",
@@ -159,7 +162,7 @@ func (h *controlHolder) start(stillness []cluster.Stillness) error {
 	command.Env = append(os.Environ(), "TTC_ROOT="+h.sharedRoot, "TTC_LOCAL_ROOT="+local, controlHolderStillnessEnv+"="+string(encoded))
 	command.Stdout, command.Stderr = log, log
 	// It ends with the gateway, which relays to it.
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Pdeathsig: syscall.SIGTERM}
+	setControlHolderProcess(command)
 	if err := command.Start(); err != nil {
 		return err
 	}

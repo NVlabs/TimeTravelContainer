@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/ttcchunk"
@@ -327,14 +328,38 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			_ = reader.Close()
 		}
 	}()
-	if l.distributedMemoryFile == nil {
-		return nil, errors.New("distributed target has no reserved application memory file")
+	var (
+		p        platform.Platform
+		reusable platform.RestoreReuser
+		targetMF *pgalloc.MemoryFile
+	)
+	if candidate, ok := l.k.Platform.(platform.RestoreReuser); ok {
+		// VM platforms are process-scoped. Reuse the bootstrap VM and allocate
+		// restored application memory from its GuestRAM instead of constructing a
+		// second VM around a host-backed reserved memfd.
+		reusable = candidate
+		p = candidate
+		if l.distributedMemoryFile != nil {
+			_ = l.distributedMemoryFile.Close()
+			l.distributedMemoryFile = nil
+		}
+		targetMF, err = createMemoryFileForPlatform(p, l.root.conf.AppHugePages, l.hostTHP)
+	} else {
+		if l.distributedMemoryFile == nil {
+			return nil, errors.New("distributed target has no reserved application memory file")
+		}
+		reservedMemoryFile := l.distributedMemoryFile
+		l.distributedMemoryFile = nil
+		targetMF, err = createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
+		if err == nil {
+			p, err = createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
+		}
 	}
-	reservedMemoryFile := l.distributedMemoryFile
-	l.distributedMemoryFile = nil
-	targetMF, err := createMemoryFileFromFile(l.root.conf.AppHugePages, l.hostTHP, reservedMemoryFile, false)
 	if err != nil {
-		return nil, fmt.Errorf("creating distributed target memory file: %w", err)
+		if targetMF != nil {
+			targetMF.Destroy()
+		}
+		return nil, fmt.Errorf("creating distributed target platform and application memory: %w", err)
 	}
 	targetMFOwned := true
 	defer func() {
@@ -342,10 +367,6 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			targetMF.Destroy()
 		}
 	}()
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, nil, l.sandboxID)
-	if err != nil {
-		return nil, fmt.Errorf("creating distributed target platform: %w", err)
-	}
 	restoreMnts := restoreMounts{
 		fdmap:     make(map[checkpoint.ResourceID]int),
 		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
@@ -414,6 +435,20 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		DemandOnly: true, PrefetchBytes: args.PrefetchBytes, PrefetchBehindBytes: args.PrefetchBehindBytes,
 		LogicalChunkDemand: !args.GraphSparse, ConfigureNetwork: l.configureNetwork,
 	}
+	loadCtx := l.k.SupervisorContext()
+	old := l.k
+	bootstrapReleased := false
+	if reusable != nil {
+		// Hypervisor.framework permits one VM per process. Releasing the
+		// bootstrap Kernel drops all of its AddressSpaces; PrepareRestore then
+		// resets the disposable monitor and execution caches for the imported
+		// Kernel without changing the GuestRAM provider selected above.
+		old.Release()
+		bootstrapReleased = true
+		if err := reusable.PrepareRestore(); err != nil {
+			return nil, fmt.Errorf("preparing platform for distributed restore: %w", err)
+		}
+	}
 	var child *kernel.Kernel
 	if args.DurableDehydration {
 		memoryFiles := map[checkpoint.ResourceID]*pgalloc.MemoryFile{{}: targetMF}
@@ -437,11 +472,11 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 			ConfigureNetwork: l.configureNetwork,
 		}
 		graphOwned = false
-		child, err = kernel.LoadGraphDurableDehydration(l.k.SupervisorContext(), p, durableMetadata,
+		child, err = kernel.LoadGraphDurableDehydration(loadCtx, p, durableMetadata,
 			memoryFiles, graphManifest, graphChunks, graphData, graphRemote, durableOpts)
 	} else {
 		readerOwned = false
-		child, err = kernel.LoadDistributedFork(l.k.SupervisorContext(), p, targetMF,
+		child, err = kernel.LoadDistributedFork(loadCtx, p, targetMF,
 			metadata.KernelMetadata, metadata.AllocatorMetadata, metadata.LoadRanges, metadata.MemoryBindings, reader, loadOpts)
 	}
 	if err != nil {
@@ -475,22 +510,29 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		return nil, err
 	}
 	newWatchdog := watchdog.New(child, dogOpts)
-	old := l.k
-	old.Pause()
-	if err := old.StartPaused(); err != nil {
-		return nil, fmt.Errorf("starting placeholder kernel for release: %w", err)
+	if !bootstrapReleased {
+		old.Pause()
+		if err := old.StartPaused(); err != nil {
+			return nil, fmt.Errorf("starting placeholder kernel for release: %w", err)
+		}
 	}
 	if err := l.family.ReplaceDefaultKernel(child); err != nil {
-		old.Release()
+		if !bootstrapReleased {
+			old.Release()
+		}
 		return nil, err
 	}
 	if err := l.family.RestoreLoaderExecSessions(args.ExecSessions); err != nil {
-		old.Release()
+		if !bootstrapReleased {
+			old.Release()
+		}
 		return nil, err
 	}
 	if filesystemBranch != "" {
 		if err := l.family.SetDefaultFilesystemBranch(filesystemBranch); err != nil {
-			old.Release()
+			if !bootstrapReleased {
+				old.Release()
+			}
 			return nil, err
 		}
 	}
@@ -508,7 +550,9 @@ func (l *Loader) restoreDistributedFork(args *DistributedForkRestoreArgs) (*Dist
 		pushConn = nil // receiver owns it.
 		go func() { _ = pushReceiver.ServeStream(conn) }()
 	}
-	old.Release()
+	if !bootstrapReleased {
+		old.Release()
+	}
 	childOwned = false
 	var remoteBytes uint64
 	if metadata != nil {

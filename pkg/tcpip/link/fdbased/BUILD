@@ -31,6 +31,7 @@ go_library(
     name = "fdbased",
     srcs = [
         "endpoint.go",
+        "endpoint_darwin.go",
         "endpoint_mutex.go",
         "endpoint_unsafe.go",
         "injectable_endpoint_mutex.go",

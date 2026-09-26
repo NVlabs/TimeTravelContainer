@@ -456,20 +456,23 @@ func (rf *regularFile) copyOnWriteLocked(ctx context.Context, mr memmap.Mappable
 		if err != nil {
 			return err
 		}
-		oldIMS, err := rf.inode.fs.mf.MapInternal(oldRange, hostarch.Read)
+		mappings, mappingLease, err := memmap.MapInternalBatchWithLease(rf.inode.fs.mf, []memmap.InternalMappingRequest{
+			{Range: oldRange, Access: hostarch.Read},
+			{Range: newRange, Access: hostarch.Write},
+		})
 		if err != nil {
 			rf.inode.fs.mf.DecRef(newRange)
 			return err
 		}
-		newIMS, err := rf.inode.fs.mf.MapInternal(newRange, hostarch.Write)
-		if err != nil {
-			rf.inode.fs.mf.DecRef(newRange)
-			return err
+		oldIMS, newIMS := mappings[0], mappings[1]
+		n, copyErr := safemem.CopySeq(newIMS, oldIMS)
+		if mappingLease != nil {
+			mappingLease.Release()
 		}
-		if n, err := safemem.CopySeq(newIMS, oldIMS); err != nil || n != cowRange.Length() {
+		if copyErr != nil || n != cowRange.Length() {
 			rf.inode.fs.mf.DecRef(newRange)
-			if err != nil {
-				return err
+			if copyErr != nil {
+				return copyErr
 			}
 			return io.ErrUnexpectedEOF
 		}
@@ -1281,7 +1284,7 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			dataOnly := opts.Flags&linux.RWF_SYNC == 0 && status&linux.O_SYNC == 0
 			var err error
 			if dataOnly {
-				err = unix.Fdatasync(int(file.Fd()))
+				err = syncFileData(int(file.Fd()))
 			} else {
 				err = file.Sync()
 			}
@@ -1468,13 +1471,16 @@ func (rw *regularFileReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, er
 		switch {
 		case seg.Ok():
 			// Get internal mappings.
-			ims, err := rw.file.inode.fs.mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
+			ims, mappingLease, err := memmap.MapInternalWithLease(rw.file.inode.fs.mf, seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
 			if err != nil {
 				return done, err
 			}
 
 			// Copy from internal mappings.
 			n, err := safemem.CopySeq(dsts, ims)
+			if mappingLease != nil {
+				mappingLease.Release()
+			}
 			done += n
 			rw.off += uint64(n)
 			dsts = dsts.DropFirst64(n)
@@ -1665,9 +1671,12 @@ func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.Blo
 		)
 	}
 	// Get internal mappings.
-	ims, err := rw.file.inode.fs.mf.MapInternal(fr, hostarch.Write)
+	ims, mappingLease, err := memmap.MapInternalWithLease(rw.file.inode.fs.mf, fr, hostarch.Write)
 	if err != nil {
 		return 0, err
+	}
+	if mappingLease != nil {
+		defer mappingLease.Release()
 	}
 	// Copy to internal mappings.
 	return safemem.CopySeq(ims, srcs)

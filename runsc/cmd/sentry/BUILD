@@ -55,6 +55,7 @@ deps_test(
         "//runsc/gvisorbinaries",
         "//runsc/profile",
         "//runsc/starttime",
+        "//runsc/ttc/console",
         "//runsc/version",
 
         # External deps.

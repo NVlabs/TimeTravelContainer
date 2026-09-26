@@ -16,33 +16,16 @@ package host
 
 import (
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
-
-func toTimespec(ts linux.StatxTimestamp, omit bool) unix.Timespec {
-	if omit {
-		return unix.Timespec{
-			Sec:  0,
-			Nsec: unix.UTIME_OMIT,
-		}
-	}
-	return unix.Timespec{
-		Sec:  ts.Sec,
-		Nsec: int64(ts.Nsec),
-	}
-}
-
-func unixToLinuxStatxTimestamp(ts unix.StatxTimestamp) linux.StatxTimestamp {
-	return linux.StatxTimestamp{Sec: ts.Sec, Nsec: ts.Nsec}
-}
-
-func timespecToStatxTimestamp(ts unix.Timespec) linux.StatxTimestamp {
-	return linux.StatxTimestamp{Sec: int64(ts.Sec), Nsec: uint32(ts.Nsec)}
-}
 
 // isBlockError checks if an error is EAGAIN or EWOULDBLOCK.
 // If so, they can be transformed into linuxerr.ErrWouldBlock.
 func isBlockError(err error) bool {
-	return linuxerr.Equals(linuxerr.EAGAIN, err) || linuxerr.Equals(linuxerr.EWOULDBLOCK, err)
+	// unix.Errno is a host ABI value. Darwin's EAGAIN/EWOULDBLOCK is 35,
+	// which Linux interprets as EDEADLK; comparing it only through linuxerr
+	// therefore leaked "resource deadlock avoided" into the guest instead of
+	// waiting for an imported host pipe to become readable.
+	return err == unix.EAGAIN || err == unix.EWOULDBLOCK ||
+		linuxerr.Equals(linuxerr.EAGAIN, err) || linuxerr.Equals(linuxerr.EWOULDBLOCK, err)
 }

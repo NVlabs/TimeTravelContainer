@@ -324,6 +324,15 @@ var errorSlice = []*errors.Error{
 	errno.EHWPOISON:       EHWPOISON,
 }
 
+// IsValid returns true if e is a Linux errno that ErrorFromUnix accepts.
+func IsValid(e errno.Errno) bool {
+	if e == 0 || uint64(e) >= uint64(len(errorSlice)) {
+		return false
+	}
+	err := errorSlice[e]
+	return err != nil && err != errNotValidError
+}
+
 // ErrorFromUnix returns a linuxerr from a unix.Errno.
 func ErrorFromUnix(err unix.Errno) error {
 	if err == unix.Errno(0) {

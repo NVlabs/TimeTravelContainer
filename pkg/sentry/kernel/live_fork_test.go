@@ -23,7 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -33,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	sentryplatform "gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
@@ -40,6 +43,18 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+type captureCoherencePlatform struct {
+	sentryplatform.Platform
+	flushes int
+}
+
+var _ sentryplatform.CheckpointCoherence = (*captureCoherencePlatform)(nil)
+
+func (p *captureCoherencePlatform) FlushForCheckpoint(context.Context) error {
+	p.flushes++
+	return nil
+}
 
 type ownedKernelTCPReader struct {
 	stateio.AsyncReader
@@ -249,6 +264,31 @@ func TestLiveForkTwoKernelsSharePlatformAndMemoryFile(t *testing.T) {
 	child.Release()
 }
 
+func TestLiveForkFlushesPlatformExecutionCaches(t *testing.T) {
+	parent, err := testutil.Boot()
+	if err != nil {
+		t.Fatalf("Boot: %v", err)
+	}
+	parent.PipeMount().IncRef()
+	parent.SetHostMount(parent.PipeMount())
+	coherent := &captureCoherencePlatform{Platform: parent.Platform}
+	parent.Platform = coherent
+	parent.Pause()
+
+	child, err := parent.LiveFork(parent.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		parent.Release()
+		t.Fatalf("LiveFork: %v", err)
+	}
+	if coherent.flushes != 1 {
+		t.Errorf("platform state-capture flushes = %d, want 1", coherent.flushes)
+	}
+	child.Release()
+	parent.Release()
+}
+
 func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	parent, err := testutil.Boot()
 	if err != nil {
@@ -310,6 +350,16 @@ func TestLiveForkRemoteMemoryFileLoopback(t *testing.T) {
 	if err := restored.StartPaused(); err != nil {
 		t.Fatalf("starting rehydrated distributed target: %v", err)
 	}
+	grandchild, err := restored.LiveFork(restored.SupervisorContext(), kernel.LiveForkOptions{
+		Clocks: sentrytime.NewCalibratedClocks(),
+	})
+	if err != nil {
+		t.Fatalf("live-forking rehydrated distributed target: %v", err)
+	}
+	if err := grandchild.StartPaused(); err != nil {
+		t.Fatalf("starting live fork of rehydrated distributed target: %v", err)
+	}
+	grandchild.Release()
 	restored.Release()
 	parent.Release()
 }
@@ -402,7 +452,7 @@ func TestPortableDistributedForkCaptureLoadTCP(t *testing.T) {
 	ownedReader := &ownedKernelTCPReader{AsyncReader: reader, server: server, serveDone: serveDone}
 	targetMF := newRemoteKernelMemoryFile(t)
 	child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, ownedReader,
+		capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, ownedReader,
 		kernel.DistributedForkLoadOptions{
 			Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: "remote",
 			FilesystemResources: capture.FilesystemResources, DemandOnly: true,
@@ -450,7 +500,7 @@ func TestDistributedForkRepeatedImportSharesMemoryFile(t *testing.T) {
 		reader := pgalloc.NewLoopbackRemoteReader(capture.Snapshots[i], pgalloc.SparseChunkBytes, pgalloc.PagesPerSparseChunk(), 4)
 		capture.Snapshots[i] = nil
 		child, err := kernel.LoadDistributedFork(parent.SupervisorContext(), parent.Platform, targetMF,
-			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.HandoffBindings, reader,
+			capture.KernelMetadata, capture.AllocatorMetadata, capture.LoadRanges, capture.MemoryBindings, reader,
 			kernel.DistributedForkLoadOptions{
 				Clocks: sentrytime.NewCalibratedClocks(), ChildBranchID: id,
 				FilesystemResources: capture.FilesystemResources, DemandOnly: true,
@@ -622,7 +672,7 @@ func TestPortableDistributedForkKernelSubprocess(t *testing.T) {
 	}
 	envelope, err := (&ttcremote.SessionMetadata{
 		FamilyID: "kernel-subprocess", SourceBranchID: "main", TargetBranchID: "subprocess",
-		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges, MemoryBindings: capture.HandoffBindings,
+		KernelMetadata: capture.KernelMetadata, AllocatorMetadata: capture.AllocatorMetadata, LoadRanges: capture.LoadRanges, MemoryBindings: capture.MemoryBindings,
 	}).MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -682,11 +732,11 @@ func TestLiveForkClonesPIDFDTarget(t *testing.T) {
 	}
 	root.DecRef(ctx)
 	parentTask := parent.GlobalInit().Leader()
-	tables := kernel.SyscallTables()
-	if len(tables) == 0 {
-		t.Fatal("no syscall tables are registered")
+	table, ok := kernel.LookupSyscallTable(abi.Linux, arch.Host)
+	if !ok {
+		t.Fatalf("no syscall table is registered for %v", arch.Host)
 	}
-	parentTask.TestOnlySetArchAndSyscallTable(arch.New(tables[0].Arch), tables[0])
+	parentTask.TestOnlySetArchAndSyscallTable(arch.New(table.Arch), table)
 	parentTID := parent.RootPIDNamespace().IDOfTask(parentTask)
 	pidfd, err := parentTask.PIDFDOpen(parentTID, false /* isThread */, false /* nonBlock */)
 	if err != nil {

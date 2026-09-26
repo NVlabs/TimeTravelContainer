@@ -693,7 +693,7 @@ func New(args Args) (*Loader, error) {
 			return nil, fmt.Errorf("unable to remap stdios, FD %d is already in use", newfd)
 		}
 
-		err := unix.Dup3(stdioFD, newfd, unix.O_CLOEXEC)
+		err := remapFD(stdioFD, newfd)
 		if err != nil {
 			return nil, fmt.Errorf("dup3 of stdios failed: %w", err)
 		}
@@ -775,6 +775,11 @@ func New(args Args) (*Loader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
+	if limiter, ok := p.(platform.MemoryLimiter); ok && args.TotalMem != 0 {
+		if err := limiter.SetMemoryLimit(args.TotalMem); err != nil {
+			return nil, fmt.Errorf("setting platform memory limit to %d bytes: %w", args.TotalMem, err)
+		}
+	}
 	if args.Conf.Platform == "kvm" && specutils.NVProxyEnabled(args.Spec, args.Conf) {
 		if caps, err := specutils.NVProxyDriverCapsAllowed(args.Conf); err == nil && caps&nvconf.CapCompute != 0 {
 			log.Warningf("Application cudaMallocManaged() is flaky on -platform=kvm, see gvisor.dev/docs/user_guide/gpu/#platforms")
@@ -799,17 +804,21 @@ func New(args Args) (*Loader, error) {
 		LiveForkEligible:    liveForkEligible,
 	}
 
-	// Distributed and cold-dehydration targets need an unused MemoryFile backing
-	// that survives their bootstrap Kernel. Keep it anonymous: durable page data
-	// belongs in TTC's immutable chunk repository, never in the live allocator.
+	// Non-VM distributed and cold-dehydration targets need an unused MemoryFile
+	// backing that survives their bootstrap Kernel. Process-scoped VM platforms
+	// instead reuse the bootstrap platform and allocate the replacement
+	// MemoryFile directly from GuestRAM.
 	if specutils.TTCDistributedTarget(args.Spec) {
-		fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
-		if err != nil {
-			return nil, fmt.Errorf("creating reserved application memory file: %w", err)
+		_, reusesPlatform := p.(platform.RestoreReuser)
+		if !reusesPlatform {
+			fd, err := memutil.CreateMemFD("ttc-reserved-application-memory", 0)
+			if err != nil {
+				return nil, fmt.Errorf("creating reserved application memory file: %w", err)
+			}
+			l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
 		}
-		l.distributedMemoryFile = os.NewFile(uintptr(fd), "ttc-reserved-application-memory")
 	}
-	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP)
+	mf, err := createMemoryFileForPlatform(p, args.Conf.AppHugePages, args.HostTHP)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1303,8 +1312,23 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	return createMemoryFileFromFile(appHugePages, hostTHP, os.NewFile(uintptr(memfd), memfileName), false)
 }
 
+type memoryFileBackingPlatform interface {
+	MemoryFileBackingProvider() pgalloc.BackingProvider
+}
+
+func createMemoryFileForPlatform(p platform.Platform, appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
+	backed, ok := p.(memoryFileBackingPlatform)
+	if !ok {
+		return createMemoryFile(appHugePages, hostTHP)
+	}
+	if appHugePages {
+		log.Infof("Disabling application huge pages: VM platform memory uses canonical 4K frames")
+	}
+	return createMemoryFileFromFileWithOptions(false, hostTHP, nil, false, true, backed.MemoryFileBackingProvider())
+}
+
 func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
-	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, false)
+	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, false, nil)
 }
 
 // createPrePrimedMemoryFileFromFile creates a MemoryFile for a backing file on
@@ -1312,16 +1336,17 @@ func createMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.Fi
 // sandbox. Raw executable mmap is unsafe after systrap has installed its
 // application address-space mappings, so peer restore must use this path.
 func createPrePrimedMemoryFileFromFile(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked bool) (*pgalloc.MemoryFile, error) {
-	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, true)
+	return createMemoryFileFromFileWithOptions(appHugePages, hostTHP, memfile, diskBacked, true, nil)
 }
 
-func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked, disableIMAWorkAround bool) (*pgalloc.MemoryFile, error) {
+func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, memfile *os.File, diskBacked, disableIMAWorkAround bool, backingProvider pgalloc.BackingProvider) (*pgalloc.MemoryFile, error) {
 	mfopts := pgalloc.MemoryFileOpts{
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
 		DiskBackedFile:       diskBacked,
 		DisableIMAWorkAround: disableIMAWorkAround,
+		BackingProvider:      backingProvider,
 	}
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {
@@ -1368,7 +1393,9 @@ func createMemoryFileFromFileWithOptions(appHugePages bool, hostTHP HostTHP, mem
 
 	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
 	if err != nil {
-		_ = memfile.Close()
+		if memfile != nil {
+			_ = memfile.Close()
+		}
 		return nil, fmt.Errorf("error creating pgalloc.MemoryFile: %w", err)
 	}
 	return mf, nil
@@ -1914,17 +1941,7 @@ func (l *Loader) startGoferMonitor(info *containerInfo) {
 	}
 	go func() {
 		log.Debugf("Monitoring gofer health for container %q", info.cid)
-		events := []unix.PollFd{
-			{
-				Fd:     int32(goferFD),
-				Events: unix.POLLHUP | unix.POLLRDHUP,
-			},
-		}
-		_, _, err := specutils.RetryEintr(func() (uintptr, uintptr, error) {
-			// Use ppoll instead of poll because it's already allowed in seccomp.
-			n, err := unix.Ppoll(events, nil, nil)
-			return uintptr(n), 0, err
-		})
+		err := waitForGoferDisconnect(goferFD)
 		if err != nil {
 			panic(fmt.Sprintf("Error monitoring gofer FDs: %s", err))
 		}
@@ -2483,20 +2500,24 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 	}
 
 	// Setup loopback.
-	n := &Network{Stack: s.Stack}
 	nicID := s.Stack.NextNICID()
 	if nicID != linux.LOOPBACK_IFINDEX {
 		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
 	}
-	link := DefaultLoopbackLink
 	linkEP := ethernet.New(loopback.New())
+	// A newly created Linux network namespace contains a loopback device that
+	// is down and unconfigured: 127.0.0.1 and ::1 are assigned when userspace
+	// brings it up (see netstack.Stack.setLinkUpLocked). Bubblewrap relies on
+	// this and adds the IPv4 address with NLM_F_EXCL before bringing the device
+	// up; preconfiguring it here makes that request fail with EEXIST and
+	// prevents nested sandboxes from starting.
 	opts := stack.NICOptions{
-		Name:               link.Name,
+		Name:               DefaultLoopbackLink.Name,
 		DeliverLinkPackets: true,
+		Disabled:           true,
 	}
-
-	if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
-		return nil, err
+	if err := s.Stack.CreateNICWithOptions(nicID, linkEP, opts); err != nil {
+		return nil, fmt.Errorf("creating nested network namespace loopback: %v", err)
 	}
 
 	return s, nil
@@ -2751,7 +2772,7 @@ func (l *Loader) portForward(opts *PortForwardOpts) error {
 	if branchID == "" {
 		branchID = l.family.LoaderBranchID()
 	}
-	branch, done, err := l.family.beginControl(branchID)
+	branch, done, err := l.family.beginLifetimeControl(branchID, false)
 	if err != nil {
 		return fmt.Errorf("selecting branch %q: %w", branchID, err)
 	}

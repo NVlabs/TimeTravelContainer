@@ -45,7 +45,6 @@ import (
 	"text/template"
 	"time"
 
-	mobysignal "github.com/moby/sys/signal"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
@@ -223,7 +222,7 @@ func currentExecutable() string {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprint(w, `Usage: ttc [GLOBAL OPTIONS] COMMAND
+	usage := `Usage: ttc [GLOBAL OPTIONS] COMMAND
 
 Manage TimeTravelContainer container families and live branches.
 
@@ -294,7 +293,8 @@ Commands:
 Branch selectors must use CONTAINER@BRANCH. Local fork destinations are branch
 names in the source family. Forked branches run immediately unless --paused is
 set; omitting DEST generates a branch ID.
-`)
+`
+	fmt.Fprint(w, strings.ReplaceAll(usage, "systrap|kvm", runtimePlatformFlagUsage()))
 }
 
 func printCustomCommandHelp(args []string, stdout io.Writer) bool {
@@ -306,6 +306,7 @@ func printCustomCommandHelp(args []string, stdout io.Writer) bool {
 			"save":       "Usage: ttc save [--output FILE] [--platform PLATFORM] IMAGE [IMAGE...]",
 			"commit":     "Usage: ttc commit [-a AUTHOR] [-c CHANGE] [-m MESSAGE] [-p=true|false] CONTAINER@BRANCH REPOSITORY[:TAG]",
 			"port":       "Usage: ttc port publish|ls|unpublish [OPTIONS]",
+			"volume":     "Usage: ttc volume create|ls|inspect|rm [OPTIONS]",
 			"completion": "Usage: ttc completion bash|zsh|fish",
 			"daemon": `Usage: ttc daemon start [OPTIONS]
        ttc daemon start --control-only [OPTIONS]
@@ -354,6 +355,12 @@ cluster's shared root; TTC_LOCAL_ROOT is not required.`,
 			"port publish":      "Usage: ttc port publish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
 			"port ls":           "Usage: ttc port ls [--json] CONTAINER@BRANCH",
 			"port unpublish":    "Usage: ttc port unpublish TARGET [HOST_IP:]HOST_PORT:CONTAINER_PORT[/tcp]",
+			"volume create":     "Usage: ttc volume create NAME",
+			"volume ls":         "Usage: ttc volume ls",
+			"volume list":       "Usage: ttc volume ls",
+			"volume inspect":    "Usage: ttc volume inspect NAME [NAME...]",
+			"volume rm":         "Usage: ttc volume rm [--force] NAME [NAME...]",
+			"volume remove":     "Usage: ttc volume rm [--force] NAME [NAME...]",
 			"exec wait":         "Usage: ttc exec wait CONTAINER@BRANCH:EXEC_ID",
 		}
 		if text, ok := usage[args[0]+" "+args[1]]; ok {
@@ -2359,7 +2366,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc start [--attach] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
+		return errors.New("usage: ttc start [--attach] (CONTAINER|CONTAINER@BRANCH) [(CONTAINER|CONTAINER@BRANCH)...]")
 	}
 	if *interactive && !*attach {
 		return errors.New("--interactive requires --attach")
@@ -2368,7 +2375,7 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 		return errors.New("--attach supports exactly one container")
 	}
 	for _, value := range fs.Args() {
-		target, err := parseSelector(value)
+		target, err := parseSelectorOrMain(value)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
@@ -2380,7 +2387,9 @@ func runStart(args []string, stdout, stderr io.Writer, backend backend) error {
 			return exitStatus{code: status}
 		}
 		if !*attach {
-			fmt.Fprintln(stdout, target)
+			// Match Docker's output shape for an unqualified main-container
+			// operand while retaining the explicit branch for TTC callers.
+			fmt.Fprintln(stdout, value)
 		}
 	}
 	return nil
@@ -5055,18 +5064,26 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 	fs.IntVar(&timeout, "time", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "timeout", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
 	fs.IntVar(&timeout, "t", ttcbundle.DefaultStopTimeoutSeconds, "seconds to wait for graceful termination; -1 waits forever")
+	// Restart already escalates to SIGKILL after the configured timeout. Accept
+	// Docker/TTC's historical --force spelling as an explicit acknowledgement
+	// of that behavior.
+	fs.Bool("force", false, "force termination after the graceful timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
-		return errors.New("usage: ttc restart [--time SECONDS] CONTAINER@BRANCH [CONTAINER@BRANCH...]")
+		return errors.New("usage: ttc restart [--force] [--time SECONDS] (CONTAINER|CONTAINER@BRANCH) [(CONTAINER|CONTAINER@BRANCH)...]")
 	}
 	timeoutSet := flagWasSet(fs, "time") || flagWasSet(fs, "timeout") || flagWasSet(fs, "t")
 	if timeoutSet && timeout < -1 {
 		return errors.New("restart timeout must be -1 or greater")
 	}
 	for _, value := range fs.Args() {
-		targets, err := branchOperationTargets(value, backend, false)
+		selected, err := parseSelectorOrMain(value)
+		if err != nil {
+			return fmt.Errorf("invalid target %q: %w", value, err)
+		}
+		targets, err := branchOperationTargets(selected.String(), backend, false)
 		if err != nil {
 			return fmt.Errorf("invalid target %q: %w", value, err)
 		}
@@ -5105,7 +5122,7 @@ func runRestart(args []string, stdout, stderr io.Writer, backend backend) error 
 		if status != 0 {
 			return exitStatus{code: status}
 		}
-		fmt.Fprintln(stdout, target.selector)
+		fmt.Fprintln(stdout, value)
 	}
 	return nil
 }
@@ -5186,11 +5203,36 @@ func stopBranch(target selector, stopSignal, timeoutSeconds int, backend backend
 }
 
 func parseSignal(value string) (int, error) {
-	signal, err := mobysignal.ParseSignal(value)
-	if err != nil || !mobysignal.ValidSignalForPlatform(signal) {
+	if signal, err := strconv.Atoi(value); err == nil {
+		if signal >= 1 && signal <= 64 {
+			return signal, nil
+		}
 		return 0, fmt.Errorf("unknown signal %q", value)
 	}
-	return int(signal), nil
+	name := strings.ToUpper(value)
+	name = strings.TrimPrefix(name, "SIG")
+	if signal, ok := linuxSignalNames[name]; ok {
+		return int(signal), nil
+	}
+	return 0, fmt.Errorf("unknown signal %q", value)
+}
+
+// linuxSignalNames is deliberately independent of GOOS. TTC controls Linux
+// guest processes even when its host process runs on Darwin, whose SIGUSR1,
+// SIGUSR2, and several other signal numbers differ from Linux.
+var linuxSignalNames = map[string]linux.Signal{
+	"HUP": linux.SIGHUP, "INT": linux.SIGINT, "QUIT": linux.SIGQUIT,
+	"ILL": linux.SIGILL, "TRAP": linux.SIGTRAP, "ABRT": linux.SIGABRT,
+	"IOT": linux.SIGIOT, "BUS": linux.SIGBUS, "FPE": linux.SIGFPE,
+	"KILL": linux.SIGKILL, "USR1": linux.SIGUSR1, "SEGV": linux.SIGSEGV,
+	"USR2": linux.SIGUSR2, "PIPE": linux.SIGPIPE, "ALRM": linux.SIGALRM,
+	"TERM": linux.SIGTERM, "STKFLT": linux.SIGSTKFLT, "CHLD": linux.SIGCHLD,
+	"CLD": linux.SIGCLD, "CONT": linux.SIGCONT, "STOP": linux.SIGSTOP,
+	"TSTP": linux.SIGTSTP, "TTIN": linux.SIGTTIN, "TTOU": linux.SIGTTOU,
+	"URG": linux.SIGURG, "XCPU": linux.SIGXCPU, "XFSZ": linux.SIGXFSZ,
+	"VTALRM": linux.SIGVTALRM, "PROF": linux.SIGPROF, "WINCH": linux.SIGWINCH,
+	"IO": linux.SIGIO, "POLL": linux.SIGPOLL, "PWR": linux.SIGPWR,
+	"SYS": linux.SIGSYS, "UNUSED": linux.SIGUNUSED,
 }
 
 func portBindingSpec(binding ttcbundle.PortBinding) string {
@@ -5325,6 +5367,19 @@ func parseSelector(value string) (selector, error) {
 		return selector{}, errors.New("branch name must not be empty")
 	}
 	return selector{container: parts[0], branch: parts[1]}, nil
+}
+
+// parseSelectorOrMain preserves Docker's main-container lifecycle surface for
+// commands such as `ttc start ID`, while parseSelector remains strict for TTC
+// operations that must identify one branch explicitly.
+func parseSelectorOrMain(value string) (selector, error) {
+	if strings.Contains(value, "@") {
+		return parseSelector(value)
+	}
+	if value == "" {
+		return selector{}, errors.New("container name or ID must not be empty")
+	}
+	return selector{container: value, branch: defaultBranchID}, nil
 }
 
 type execSelector struct {
@@ -7819,6 +7874,10 @@ func (b *runtimeBackend) startFreshBranchBesidePeers(info ttcbundle.ContainerInf
 	}
 	runtimeID := "ttc-bootstrap-" + hex.EncodeToString(random)
 	configured := b.configuredRunscArgsForBranch(info, branch)
+	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, runtimeID)
 	if err != nil {
 		return fmt.Errorf("creating paused bootstrap for %s: %w", target, err)
@@ -8165,7 +8224,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			return 1, err
 		}
 	}
-	args := []string{"--root", b.root, "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch}
+	args := append(b.runtimeControlArgs(), "exec", "--ttc-allow-stopped-sandbox", "--branch", request.target.branch)
 	consoleID := ""
 	execID := request.execID
 	if execID == "" {
@@ -8239,6 +8298,7 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 			}()
 		}
 	}
+	started := time.Now()
 	if err := command.Start(); err != nil {
 		return 1, fmt.Errorf("starting runsc exec: %w", err)
 	}
@@ -8249,6 +8309,9 @@ func (b *runtimeBackend) exec(request execRequest) (retStatus int, retErr error)
 	if err := command.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			if diagnostic := b.runtimeDiagnosticSince(request.target.container, started); diagnostic != "" && b.stderr != nil {
+				fmt.Fprintf(b.stderr, "ttc: sandbox diagnostic: %s\n", diagnostic)
+			}
 			return exitErr.ExitCode(), nil
 		}
 		return 1, fmt.Errorf("executing runsc: %w", err)
@@ -9211,9 +9274,9 @@ func (b *runtimeBackend) startFamilyConsoleFollower(container, dir string) error
 		return fmt.Errorf("creating console follower readiness pipe: %w", err)
 	}
 	defer readyReader.Close()
-	command := runscCommand(b.runsc, "--root", b.root, "timetravel",
+	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), "timetravel",
 		"--console-socket", filepath.Join(dir, ttcconsole.FollowerSocketName), "--console-ready-fd", "3",
-		container, "console-follow-family")
+		container, "console-follow-family")...)
 	command.Stderr = errorFile
 	// A follower mostly waits, polling pipes: one processor serves it.
 	command.Env = append(os.Environ(), "GOMAXPROCS=1")
@@ -10441,6 +10504,18 @@ func (b *runtimeBackend) configuredRunscArgs() []string {
 	return b.configuredRunscArgsForNetwork("none")
 }
 
+// runtimeControlArgs returns the global arguments required by runsc commands
+// that operate on an existing sandbox. The daemon's trusted-mode decision is
+// process-wide configuration on Darwin, so it must be carried by sidecars and
+// read-only lifecycle commands just as it is by create and start.
+func (b *runtimeBackend) runtimeControlArgs() []string {
+	args := []string{"--root", b.root}
+	if b.unsafeNoHostIsolation {
+		args = append(args, "--rootless=false", "--unsafe-no-host-isolation=true")
+	}
+	return args
+}
+
 func (b *runtimeBackend) configuredRunscArgsForNetwork(networkMode string) []string {
 	return b.configuredRunscArgsForNetworkNAT(networkMode, false)
 }
@@ -10494,6 +10569,54 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	return args
 }
 
+func (b *runtimeBackend) withRuntimeDiagnostics(args []string, containerID string) ([]string, error) {
+	if b.dataRoot == "" || containerID == "" {
+		return args, nil
+	}
+	directory := filepath.Join(b.dataRoot, "containers", containerID, "runtime")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, fmt.Errorf("creating runtime diagnostic directory for %q: %w", containerID, err)
+	}
+	return append(args, "--panic-log="+filepath.Join(directory, "panic.log")), nil
+}
+
+func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.Time) string {
+	if b.dataRoot == "" || containerID == "" {
+		return ""
+	}
+	path := filepath.Join(b.dataRoot, "containers", containerID, "runtime", "panic.log")
+	info, err := os.Stat(path)
+	if err != nil || info.ModTime().Before(since.Add(-time.Second)) {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	const tailBytes = int64(64 << 10)
+	start := max(int64(0), info.Size()-tailBytes)
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(file, tailBytes))
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "ttc ring0 bridge error:") ||
+			strings.HasPrefix(line, "ttc hvf application error:") {
+			if len(line) > 4096 {
+				line = line[:4096]
+			}
+			return line
+		}
+	}
+	return ""
+}
+
 func (b *runtimeBackend) configuredRunscArgsForBranch(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo) []string {
 	args := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
 	if branch.Quarantined {
@@ -10515,15 +10638,24 @@ func (b *runtimeBackend) runConfiguredCommandForNetworkNAT(networkMode string, n
 }
 
 func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args ...string) (int, error) {
+	status, _, err := b.runConfiguredCommandWithArgsAndDiagnostic(configured, args...)
+	return status, err
+}
+
+// runConfiguredCommandWithArgsAndDiagnostic is the cluster-control variant of
+// runConfiguredCommandWithArgs. Cluster target operations have no attached TTC
+// client stream, so their peer response must retain the launch diagnostic
+// instead of reducing every runtime failure to an opaque exit status.
+func (b *runtimeBackend) runConfiguredCommandWithArgsAndDiagnostic(configured []string, args ...string) (int, string, error) {
 	args = append(configured, args...)
 	stdout, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
-		return 1, fmt.Errorf("opening runsc launch stdout: %w", err)
+		return 1, "", fmt.Errorf("opening runsc launch stdout: %w", err)
 	}
 	defer stdout.Close()
 	stderr, err := os.CreateTemp("", "ttc-runsc-launch-*.log")
 	if err != nil {
-		return 1, fmt.Errorf("creating runsc launch stderr: %w", err)
+		return 1, "", fmt.Errorf("creating runsc launch stderr: %w", err)
 	}
 	stderrName := stderr.Name()
 	defer os.Remove(stderrName)
@@ -10537,21 +10669,30 @@ func (b *runtimeBackend) runConfiguredCommandWithArgs(configured []string, args 
 	command.Stderr = stderr
 	runErr := command.Run()
 	if _, err := stderr.Seek(0, io.SeekStart); err != nil {
-		return 1, fmt.Errorf("rewinding runsc launch stderr: %w", err)
+		return 1, "", fmt.Errorf("rewinding runsc launch stderr: %w", err)
 	}
+	const maxLaunchDiagnosticBytes = 64 << 10
+	diagnosticBytes, err := io.ReadAll(io.LimitReader(stderr, maxLaunchDiagnosticBytes))
+	if err != nil {
+		return 1, "", fmt.Errorf("reading runsc launch stderr: %w", err)
+	}
+	diagnostic := strings.TrimSpace(string(diagnosticBytes))
 	if b.stderr != nil {
+		if _, err := stderr.Seek(0, io.SeekStart); err != nil {
+			return 1, diagnostic, fmt.Errorf("rewinding runsc launch stderr for replay: %w", err)
+		}
 		if _, err := io.Copy(b.stderr, stderr); err != nil {
-			return 1, fmt.Errorf("replaying runsc launch stderr: %w", err)
+			return 1, diagnostic, fmt.Errorf("replaying runsc launch stderr: %w", err)
 		}
 	}
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
-			return exitErr.ExitCode(), nil
+			return exitErr.ExitCode(), diagnostic, nil
 		}
-		return 1, fmt.Errorf("starting runsc: %w", runErr)
+		return 1, diagnostic, fmt.Errorf("starting runsc: %w", runErr)
 	}
-	return 0, nil
+	return 0, diagnostic, nil
 }
 
 func verifyCgroupV2Resources(pid int, procCgroup []byte, mountRoot, expectedPath string, resources *specs.LinuxResources) error {
@@ -10820,6 +10961,10 @@ func (b *runtimeBackend) launch(info ttcbundle.ContainerInfo, target selector, b
 		return 1, false, err
 	}
 	configuredArgs := b.configuredRunscArgsForBranch(info, branch)
+	configuredArgs, err = b.withRuntimeDiagnostics(configuredArgs, info.ID)
+	if err != nil {
+		return 1, false, err
+	}
 	status, err = b.runConfiguredCommandWithArgs(configuredArgs, "create", "--bundle", bundleDir, name)
 	if err != nil || status != 0 {
 		return status, false, err
@@ -10955,6 +11100,12 @@ func (b *runtimeBackend) ensurePublishedPort(info ttcbundle.ContainerInfo, bindi
 		readyWriter.Close()
 		return fmt.Errorf("starting published port %s: %w", endpoint, err)
 	}
+	if err := recordPortSidecarPID(lockFile, command.Process.Pid); err != nil {
+		readyWriter.Close()
+		command.Process.Kill()
+		command.Wait()
+		return fmt.Errorf("recording published-port process: %w", err)
+	}
 	if err := readyWriter.Close(); err != nil {
 		command.Process.Kill()
 		command.Wait()
@@ -11063,57 +11214,26 @@ func (b *runtimeBackend) listPorts(container string) ([]ttcbundle.PortBinding, e
 	return append([]ttcbundle.PortBinding(nil), info.PublishedPorts...), nil
 }
 
-func portForwardProcessMatches(pid int, container, branch, endpoint string) bool {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-	if err != nil {
-		return false
+func recordPortSidecarPID(lockFile *os.File, pid int) error {
+	if err := lockFile.Truncate(0); err != nil {
+		return err
 	}
-	fields := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
-	want := map[string]bool{
-		"port-forward":       false,
-		"--branch=" + branch: false,
-		container:            false,
-		endpoint:             false,
+	if _, err := lockFile.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
-	for _, field := range fields {
-		if _, ok := want[field]; ok {
-			want[field] = true
-		}
+	if _, err := fmt.Fprintf(lockFile, "%d\n", pid); err != nil {
+		return err
 	}
-	for _, found := range want {
-		if !found {
-			return false
-		}
-	}
-	return true
+	return lockFile.Sync()
 }
 
 func portLockHolder(lockPath, container, branch, endpoint string) (int, error) {
-	want, err := os.Stat(lockPath)
-	if err != nil {
-		return 0, err
-	}
-	processes, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	for _, process := range processes {
-		pid, err := strconv.Atoi(process.Name())
-		if err != nil || pid == os.Getpid() {
-			continue
-		}
-		fds, err := os.ReadDir(filepath.Join("/proc", process.Name(), "fd"))
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			info, err := os.Stat(filepath.Join("/proc", process.Name(), "fd", fd.Name()))
-			if err == nil && os.SameFile(want, info) && portForwardProcessMatches(pid, container, branch, endpoint) {
-				return pid, nil
-			}
+	if data, err := os.ReadFile(lockPath); err == nil {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data))); parseErr == nil && pid > 0 && pid != os.Getpid() && portForwardProcessMatches(pid, container, branch, endpoint) {
+			return pid, nil
 		}
 	}
-	return 0, fmt.Errorf("published-port lock is held by an unknown process")
+	return legacyPortLockHolder(lockPath, container, branch, endpoint)
 }
 
 func waitForPortLock(file *os.File, timeout time.Duration) error {
@@ -11354,8 +11474,7 @@ func (b *runtimeBackend) commandWithFiles(files []*os.File, args ...string) ([]b
 			return output, err
 		}
 	}
-	global := []string{"--root", b.root}
-	command := runscCommand(b.runsc, append(global, args...)...)
+	command := runscCommand(b.runsc, append(b.runtimeControlArgs(), args...)...)
 	command.ExtraFiles = files
 	var stderr strings.Builder
 	command.Stderr = &stderr
@@ -14342,7 +14461,7 @@ func (b *runtimeBackend) allocateGraphSnapshotOrigin() (_ ttcsnapshot.SnapshotID
 // the daemon can answer the capture's manifest with the pages its graph
 // lacks, and a fork still sharing most of its memory sends little.
 func graphCaptureStream() (daemon, sentry *os.File, err error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	fds, err := cloexecStreamSocketpair()
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating memory capture stream: %w", err)
 	}
@@ -15795,6 +15914,10 @@ func (b *runtimeBackend) rehydrateCold(target selector, info ttcbundle.Container
 	}
 	defer cleanupBundle()
 	configured := b.configuredRunscArgsForNetworkConfig(info.NetworkMode, info.NetworkNAT, info.NetworkIP, info.NetworkMAC)
+	configured, err = b.withRuntimeDiagnostics(configured, info.ID)
+	if err != nil {
+		return err
+	}
 	status, err := b.runConfiguredCommandWithArgs(configured, "create", "--bundle", bundleDir, info.ID)
 	if err != nil {
 		return fmt.Errorf("creating dehydration runtime: %w", err)
@@ -16062,7 +16185,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		restore.close()
 		return nil, errors.New("graph memory has non-local chunks and no distributed resolver")
 	}
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	fds, err := cloexecStreamSocketpair()
 	if err != nil {
 		restore.close()
 		return nil, err

@@ -238,19 +238,39 @@ func SyncDirtyAll(ctx context.Context, cache *FileRangeSet, dirty *DirtySet, max
 	return nil
 }
 
+// syncDirtyBufferSize bounds the bytes that syncDirtyRange copies out of
+// leased mappings at a time.
+const syncDirtyBufferSize = 1 << 20
+
 // Preconditions: mr must be page-aligned.
 func syncDirtyRange(ctx context.Context, mr memmap.MappableRange, cache *FileRangeSet, max uint64, mem memmap.File, writeAt func(ctx context.Context, srcs safemem.BlockSeq, offset uint64) (uint64, error)) error {
+	var buf []byte
 	for cseg := cache.LowerBoundSegment(mr.Start); cseg.Ok() && cseg.Start() < mr.End; cseg = cseg.NextSegment() {
 		wbr := cseg.Range().Intersect(mr)
 		if max < wbr.Start {
 			break
 		}
-		ims, err := mem.MapInternal(cseg.FileRangeOf(wbr), hostarch.Read)
+		ims, mappingLease, err := memmap.MapInternalWithLease(mem, cseg.FileRangeOf(wbr), hostarch.Read)
 		if err != nil {
 			return err
 		}
 		if max < wbr.End {
 			ims = ims.TakeFirst64(max - wbr.Start)
+		}
+		if mappingLease != nil {
+			// writeAt may wait for a long time, e.g. for a FUSE server that
+			// needs mapping leases itself. Holding this one meanwhile holds
+			// off exclusive operations on platform memory, and every new
+			// lease queues behind those. Write copies instead.
+			n := ims.NumBytes()
+			mappingLease.Release()
+			if want := min(n, syncDirtyBufferSize); uint64(len(buf)) < want {
+				buf = make([]byte, want)
+			}
+			if err := syncDirtyThroughBuffer(ctx, mem, cseg.FileRangeOf(wbr), n, wbr.Start, buf, writeAt); err != nil {
+				return err
+			}
+			continue
 		}
 		offset := wbr.Start
 		for !ims.IsEmpty() {
@@ -261,6 +281,41 @@ func syncDirtyRange(ctx context.Context, mr memmap.MappableRange, cache *FileRan
 			offset += n
 			ims = ims.DropFirst64(n)
 		}
+	}
+	return nil
+}
+
+// syncDirtyThroughBuffer passes the first n bytes of fr, which start at offset
+// in the cached object, to writeAt through buf. It holds a mapping lease only
+// while copying into buf.
+//
+// Preconditions: fr must be page-aligned.
+func syncDirtyThroughBuffer(ctx context.Context, mem memmap.File, fr memmap.FileRange, n, offset uint64, buf []byte, writeAt func(ctx context.Context, srcs safemem.BlockSeq, offset uint64) (uint64, error)) error {
+	for done := uint64(0); done < n; {
+		chunk := min(n-done, uint64(len(buf)))
+		start := fr.Start + done
+		end := min(start+hostarch.MustPageRoundUp(chunk), fr.End)
+		ims, mappingLease, err := memmap.MapInternalWithLease(mem, memmap.FileRange{Start: start, End: end}, hostarch.Read)
+		if err != nil {
+			return err
+		}
+		copied, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:chunk])), ims.TakeFirst64(chunk))
+		if mappingLease != nil {
+			mappingLease.Release()
+		}
+		if err != nil {
+			return err
+		}
+		srcs := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:copied]))
+		for !srcs.IsEmpty() {
+			written, err := writeAt(ctx, srcs, offset)
+			if err != nil {
+				return err
+			}
+			offset += written
+			srcs = srcs.DropFirst64(written)
+		}
+		done += copied
 	}
 	return nil
 }
