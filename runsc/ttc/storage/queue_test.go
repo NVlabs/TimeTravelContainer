@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -382,5 +383,62 @@ func TestOpenRejectsIncompleteRecoveredCapture(t *testing.T) {
 		}
 	default:
 		t.Fatal("incomplete capture was not cleaned")
+	}
+}
+
+// fencedCapturePublisher's capture is not ready when it is activated; the
+// worker's check of it then waits for release, and fails as a publication
+// identity the cancellation fenced fails.
+type fencedCapturePublisher struct {
+	testPublisher
+	checks  atomic.Int32
+	started chan struct{}
+	release chan struct{}
+	cleaned chan Intent
+}
+
+func (p *fencedCapturePublisher) CaptureAvailable(Intent) (bool, error) {
+	if p.checks.Add(1) == 1 {
+		return false, nil
+	}
+	close(p.started)
+	<-p.release
+	return false, errors.New("publication identity is not usable")
+}
+func (p *fencedCapturePublisher) Cleanup(intent Intent) error { p.cleaned <- intent; return nil }
+
+func TestCancelFinishesACaptureCheckItFenced(t *testing.T) {
+	publisher := &fencedCapturePublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		started:       make(chan struct{}), release: make(chan struct{}), cleaned: make(chan Intent, 2),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	intent := Intent{Container: "family", Branch: "main", PublicationID: "publication-3", Kind: "stop", FilesystemBranch: "capture"}
+	if err := queue.Enqueue(intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-3"); err == nil {
+		t.Fatal("Activate succeeded before the capture was ready")
+	}
+	select {
+	case <-publisher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker's capture check did not start")
+	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- queue.Cancel("family", "main", "publication-3") }()
+	close(publisher.release)
+	if err := <-canceled; err != nil {
+		t.Fatalf("Cancel returned the error of the capture check it fenced: %v", err)
+	}
+	if pending, err := queue.Pending(); err != nil || len(pending) != 0 {
+		t.Fatalf("canceled intent remains: pending=%+v err=%v", pending, err)
+	}
+	if len(publisher.cleaned) != 1 {
+		t.Fatalf("canceled capture cleaned %d times, want 1", len(publisher.cleaned))
 	}
 }

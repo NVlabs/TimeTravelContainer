@@ -208,25 +208,40 @@ func (q *Queue) Cancel(container, branch, publicationID string) error {
 	}
 	q.signal()
 	if inFlight {
+		// Wait for the attempt the cancellation raced, and hold the intent
+		// against the worker once it ends. An attempt that completed or saw
+		// the fence has removed the intent; one that failed, as a capture that
+		// the fence made unusable fails, left it for a retry, and this
+		// cancellation finishes it.
 		for {
 			q.mu.Lock()
-			_, active := q.inFlight[id]
-			q.mu.Unlock()
-			if !active {
-				pending, err := q.read(id + ".json")
-				if errors.Is(err, os.ErrNotExist) {
-					return readErr
-				}
-				if err != nil {
-					return errors.Join(readErr, err)
-				}
-				if pending.LastError != "" {
-					return errors.Join(readErr, errors.New(pending.LastError))
-				}
-				return readErr
+			if _, active := q.inFlight[id]; !active {
+				q.inFlight[id] = struct{}{}
+				q.mu.Unlock()
+				break
 			}
+			q.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
 		}
+		defer func() {
+			q.mu.Lock()
+			delete(q.inFlight, id)
+			q.mu.Unlock()
+		}()
+		pending, err := q.read(id + ".json")
+		if errors.Is(err, os.ErrNotExist) {
+			return readErr
+		}
+		if err != nil {
+			return errors.Join(readErr, err)
+		}
+		if err := q.publisher.Cleanup(pending); err != nil {
+			pending.Attempts++
+			pending.LastError = err.Error()
+			pending.RetryAt = time.Now().Add(time.Second << min(pending.Attempts-1, 8)).UTC()
+			return errors.Join(readErr, err, writeJSONAtomic(q.path("pending", id), pending))
+		}
+		return errors.Join(readErr, q.finishCancellation(id))
 	}
 	return readErr
 }
