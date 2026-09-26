@@ -235,6 +235,22 @@ func TestFlushHostExecutionCacheReleasesAllocatorMappings(t *testing.T) {
 			t.Fatalf("allocator-owned Sentry slab %#x remained after execution-cache flush", address)
 		}
 	}
+
+	// Each flush precedes a live fork or checkpoint, after which the working
+	// set is mirrored again. Repeating the cycle must reuse mirror GPAs.
+	flushedNext := engine.nextMirrorGPA
+	for range 100 {
+		engine.requestHostMirror(target)
+		if err := engine.extendHostMirror(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.FlushHostExecutionCache(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if engine.nextMirrorGPA != flushedNext {
+		t.Fatalf("mirror GPA allocation grew from %#x to %#x across flush cycles", flushedNext, engine.nextMirrorGPA)
+	}
 	runtime.KeepAlive(allocation)
 }
 

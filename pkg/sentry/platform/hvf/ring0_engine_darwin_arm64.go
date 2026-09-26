@@ -2486,6 +2486,18 @@ func (e *ring0Engine) FlushHostExecutionCache(ctx context.Context) error {
 	if err := e.unmapHostStage2Slabs(addresses); err != nil {
 		return err
 	}
+	// Only main-image slabs remain in the mirror aperture, and no stage-1
+	// leaf refers to the GPAs just unmapped. Reuse everything above the
+	// remaining slabs. The allocator otherwise never recycles GPAs, and every
+	// live fork, dehydration, and checkpoint flushes and then re-mirrors the
+	// Sentry working set, so repeated forks exhausted the aperture.
+	next := uint64(ring0HostMirrorGPAStart)
+	for _, slab := range e.stage2Slabs {
+		if !slab.canonical && slab.gpa+vmm.HostSlabSize > next {
+			next = slab.gpa + vmm.HostSlabSize
+		}
+	}
+	e.nextMirrorGPA = next
 	e.faultMu.Lock()
 	for address := range e.pendingMirror {
 		if _, mapped := e.stage2Slabs[address]; !mapped {
