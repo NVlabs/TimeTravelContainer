@@ -20,6 +20,12 @@ import (
 
 const defaultRuntimePlatform = "systrap"
 
+// runtimeDiagnosticsPerContainer is whether a container's Sentry writes its
+// panics to a log of the container's own; see withRuntimeDiagnostics. A Linux
+// Sentry writes them to the runtime root's sentry-panic.log, which outlives
+// the container and stays on the node.
+const runtimeDiagnosticsPerContainer = false
+
 func runtimePlatformFlagUsage() string { return "systrap|kvm" }
 
 func runtimePlatformCompletions() []string { return []string{"kvm", "systrap"} }

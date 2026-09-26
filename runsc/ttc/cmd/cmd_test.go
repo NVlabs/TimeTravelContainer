@@ -4365,6 +4365,13 @@ exit 0
 func TestRuntimeDiagnostics(t *testing.T) {
 	dataRoot := t.TempDir()
 	b := &runtimeBackend{dataRoot: dataRoot}
+	if !runtimeDiagnosticsPerContainer {
+		configured, err := b.withRuntimeDiagnostics([]string{"--root", "/runtime"}, "container-id")
+		if err != nil || !reflect.DeepEqual(configured, []string{"--root", "/runtime"}) {
+			t.Fatalf("diagnostic arguments=%q, %v, want the runtime root's log alone", configured, err)
+		}
+		return
+	}
 	configured, err := b.withRuntimeDiagnostics([]string{"--root", "/runtime"}, "container-id")
 	if err != nil {
 		t.Fatal(err)

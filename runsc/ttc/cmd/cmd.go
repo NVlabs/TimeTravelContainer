@@ -10569,8 +10569,11 @@ func (b *runtimeBackend) configuredRunscArgsForNetworkConfig(networkMode string,
 	return args
 }
 
+// withRuntimeDiagnostics has the Sentry that args launch write its panics to
+// a log of the container's own, in which runtimeDiagnosticSince finds them,
+// on a host whose Sentries do so; see runtimeDiagnosticsPerContainer.
 func (b *runtimeBackend) withRuntimeDiagnostics(args []string, containerID string) ([]string, error) {
-	if b.dataRoot == "" || containerID == "" {
+	if !runtimeDiagnosticsPerContainer || b.dataRoot == "" || containerID == "" {
 		return args, nil
 	}
 	directory := filepath.Join(b.dataRoot, "containers", containerID, "runtime")
@@ -10581,7 +10584,7 @@ func (b *runtimeBackend) withRuntimeDiagnostics(args []string, containerID strin
 }
 
 func (b *runtimeBackend) runtimeDiagnosticSince(containerID string, since time.Time) string {
-	if b.dataRoot == "" || containerID == "" {
+	if !runtimeDiagnosticsPerContainer || b.dataRoot == "" || containerID == "" {
 		return ""
 	}
 	path := filepath.Join(b.dataRoot, "containers", containerID, "runtime", "panic.log")

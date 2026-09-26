@@ -19,6 +19,11 @@ import (
 
 const defaultRuntimePlatform = "hvf"
 
+// runtimeDiagnosticsPerContainer is whether a container's Sentry writes its
+// panics to a log of the container's own, in which a failed command finds the
+// HVF engine's errors; see withRuntimeDiagnostics.
+const runtimeDiagnosticsPerContainer = true
+
 func runtimePlatformFlagUsage() string { return "hvf" }
 
 func runtimePlatformCompletions() []string { return []string{"hvf"} }
