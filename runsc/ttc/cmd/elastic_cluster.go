@@ -6826,7 +6826,7 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 				fmt.Fprintf(stderr, "ttcd: warning: reconciling Raft voters: %v\n", err)
 			}
 		}
-		if !node.LeadershipSafeFor(lease) {
+		if !node.IsLeader() {
 			continue
 		}
 		records, err := authority.List()
@@ -6836,6 +6836,10 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 			}
 			continue
 		}
+		// Expiring a lease needs a leadership as old as the lease; see
+		// Propose. Removing a stopped control holder, which ran nothing,
+		// does not.
+		expire := node.LeadershipSafeFor(lease)
 		now := time.Now()
 		for _, record := range records {
 			if record.State == cluster.NodeOffline && record.Labels[cluster.NodeRoleLabel] == cluster.RoleControl {
@@ -6850,7 +6854,7 @@ func maintainAuthorityExpirations(node *cluster.AuthorityRaftNode, authority *cl
 				}
 				continue
 			}
-			if record.State == cluster.NodeOffline || record.LeaseActive(now) {
+			if !expire || record.State == cluster.NodeOffline || record.LeaseActive(now) {
 				continue
 			}
 			if _, err := authority.ExpireNode(record.NodeID, record.Incarnation, record.Revision); err != nil && stderr != nil {
