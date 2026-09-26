@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,15 @@ func daemonEventsPath(dataRoot string) string {
 	return filepath.Join(dataRoot, "events", "events.jsonl")
 }
 
+// eventLogPath is the event log s appends to: a cluster node's own, in the
+// shared root, which no other node writes or rotates, or the daemon's.
+func (s *daemonServer) eventLogPath(dataRoot string) string {
+	if s.clusterCapabilities != nil && s.clusterCapabilities.NodeID != "" {
+		return filepath.Join(dataRoot, "events", "node-"+s.clusterCapabilities.NodeID+".jsonl")
+	}
+	return daemonEventsPath(dataRoot)
+}
+
 func daemonEventLogPath(path string, generation int) string {
 	if generation == 0 {
 		return path
@@ -68,17 +78,9 @@ func daemonEventLogPath(path string, generation int) string {
 	return path + "." + strconv.Itoa(generation)
 }
 
-func retainedDaemonEventPaths(path string, files int) []string {
-	paths := make([]string, 0, files)
-	for generation := files - 1; generation >= 0; generation-- {
-		paths = append(paths, daemonEventLogPath(path, generation))
-	}
-	return paths
-}
-
 // rotateDaemonEventLog bounds durable operational history independently of
-// branch lifecycle state. The caller holds eventMu, so a follower can never
-// leave unread records behind in a file that is being rotated.
+// branch lifecycle state. The caller holds eventMu. A follower finishes the
+// file it reads under its rotated name: see eventLogCursor.
 func rotateDaemonEventLog(path string, incoming, maxBytes int64, files int) error {
 	if maxBytes <= 0 || files < 1 {
 		return errors.New("event log retention must have positive bytes and files")
@@ -174,8 +176,8 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 	event.Version = daemonEventSchemaVersion
 	event.Time = time.Now().UTC()
 	event.ID = fmt.Sprintf("%d-%d-%d", event.Time.UnixNano(), os.Getpid(), s.eventSeq)
-	dir := filepath.Dir(daemonEventsPath(dataRoot))
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	path := s.eventLogPath(dataRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return
 	}
 	data, err := json.Marshal(event)
@@ -183,10 +185,10 @@ func (s *daemonServer) recordEvent(dataRoot string, event DaemonEvent) {
 		return
 	}
 	data = append(data, '\n')
-	if err := rotateDaemonEventLog(daemonEventsPath(dataRoot), int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
+	if err := rotateDaemonEventLog(path, int64(len(data)), daemonEventMaxBytes, daemonEventFiles); err != nil {
 		return
 	}
-	file, err := os.OpenFile(daemonEventsPath(dataRoot), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return
 	}
@@ -464,6 +466,114 @@ func writeDaemonEvent(writer io.Writer, event DaemonEvent, jsonOutput bool) erro
 	return err
 }
 
+// eventLogCursor reads one event log as its writer appends to it and rotates
+// it. It opens the log afresh at each read, which on a network filesystem also
+// shows what another node appended since, and once the log was rotated, it
+// reads the rest of the file it was reading under that file's new name.
+type eventLogCursor struct {
+	path string
+	// info is the file read so far, offset how far, and partial a line its
+	// writer was still appending.
+	info    os.FileInfo
+	offset  int64
+	partial []byte
+}
+
+// read returns the complete events appended since the last read.
+func (c *eventLogCursor) read() ([]DaemonEvent, error) {
+	file, err := os.Open(c.path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("opening event log: %w", err)
+	}
+	var info os.FileInfo
+	if file != nil {
+		defer file.Close()
+		if info, err = file.Stat(); err != nil {
+			return nil, err
+		}
+	}
+	var events []DaemonEvent
+	if c.info != nil && (info == nil || !os.SameFile(info, c.info)) {
+		if older, err := os.Open(daemonEventLogPath(c.path, 1)); err == nil {
+			olderInfo, err := older.Stat()
+			if err == nil && os.SameFile(olderInfo, c.info) {
+				events, err = c.readFrom(older)
+			}
+			_ = older.Close()
+			if err != nil {
+				return events, err
+			}
+		}
+		c.info, c.offset, c.partial = nil, 0, nil
+	}
+	if file == nil {
+		return events, nil
+	}
+	c.info = info
+	newer, err := c.readFrom(file)
+	return append(events, newer...), err
+}
+
+func (c *eventLogCursor) readFrom(file *os.File) ([]DaemonEvent, error) {
+	if _, err := file.Seek(c.offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	reader := bufio.NewReaderSize(file, 64<<10)
+	var events []DaemonEvent
+	for {
+		line, err := reader.ReadSlice('\n')
+		c.offset += int64(len(line))
+		if err == bufio.ErrBufferFull || err == io.EOF {
+			// A line its writer is still appending.
+			c.partial = append(c.partial, line...)
+			if len(c.partial) > daemonMaxFrame {
+				return events, fmt.Errorf("event log %q has a line of over %d bytes", filepath.Base(file.Name()), daemonMaxFrame)
+			}
+			if err == io.EOF {
+				return events, nil
+			}
+			continue
+		}
+		if err != nil {
+			return events, err
+		}
+		if len(c.partial) != 0 {
+			line = append(c.partial, line...)
+			c.partial = nil
+		}
+		var event DaemonEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return events, fmt.Errorf("decoding event log %q at offset %d: %w", filepath.Base(file.Name()), c.offset, err)
+		}
+		events = append(events, event)
+	}
+}
+
+// eventLogs returns the event logs of the events directory of dataRoot: a
+// daemon's, and in a cluster each node's.
+func eventLogs(dataRoot string) ([]string, error) {
+	dir := filepath.Dir(daemonEventsPath(dataRoot))
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing event logs: %w", err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jsonl") {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return paths, nil
+}
+
+// sortEvents orders events of several logs as they happened.
+func sortEvents(events []DaemonEvent) {
+	sort.SliceStable(events, func(i, j int) bool { return events[i].Time.Before(events[j].Time) })
+}
+
 func (s *daemonServer) streamEvents(dataRoot string, args []string, writer io.Writer) error {
 	if dataRoot == "" {
 		return errors.New("events require ttcd to have an explicit TTC_ROOT")
@@ -472,77 +582,51 @@ func (s *daemonServer) streamEvents(dataRoot string, args []string, writer io.Wr
 	if err != nil {
 		return err
 	}
-	path := daemonEventsPath(dataRoot)
-	var offset int64
-	var currentInfo os.FileInfo
-	initial := true
-	for {
-		s.eventMu.Lock()
-		paths := []string{path}
-		if initial {
-			paths = retainedDaemonEventPaths(path, daemonEventFiles)
-		}
-		var events []DaemonEvent
-		for _, eventPath := range paths {
-			file, err := os.Open(eventPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
-				s.eventMu.Unlock()
-				return fmt.Errorf("opening event log: %w", err)
-			}
-			info, err := file.Stat()
-			if err != nil {
-				file.Close()
-				s.eventMu.Unlock()
-				return err
-			}
-			fileOffset := int64(0)
-			if eventPath == path {
-				if !initial && currentInfo != nil && os.SameFile(currentInfo, info) {
-					fileOffset = offset
-				}
-				currentInfo = info
-			}
-			if _, err := file.Seek(fileOffset, io.SeekStart); err != nil {
-				file.Close()
-				s.eventMu.Unlock()
-				return err
-			}
-			scanner := bufio.NewScanner(file)
-			scanner.Buffer(make([]byte, 4096), daemonMaxFrame)
-			for scanner.Scan() {
-				fileOffset += int64(len(scanner.Bytes()) + 1)
-				var event DaemonEvent
-				if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-					file.Close()
-					s.eventMu.Unlock()
-					return fmt.Errorf("decoding event log %q at offset %d: %w", filepath.Base(eventPath), fileOffset, err)
-				}
-				if eventMatches(event, options) {
-					events = append(events, event)
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				file.Close()
-				s.eventMu.Unlock()
-				return err
-			}
-			if err := file.Close(); err != nil {
-				s.eventMu.Unlock()
-				return err
-			}
-			if eventPath == path {
-				offset = fileOffset
-			}
-		}
-		s.eventMu.Unlock()
-		initial = false
+	cursors := make(map[string]*eventLogCursor)
+	emit := func(events []DaemonEvent) error {
+		sortEvents(events)
 		for _, event := range events {
+			if !eventMatches(event, options) {
+				continue
+			}
 			if err := writeDaemonEvent(writer, event, options.jsonOutput); err != nil {
 				return err
 			}
+		}
+		return nil
+	}
+	initial := true
+	for {
+		paths, err := eventLogs(dataRoot)
+		if err != nil {
+			return err
+		}
+		var events []DaemonEvent
+		for _, path := range paths {
+			cursor := cursors[path]
+			if cursor == nil {
+				cursor = &eventLogCursor{path: path}
+				cursors[path] = cursor
+				if initial {
+					// The generations it retains, oldest first.
+					for generation := daemonEventFiles - 1; generation >= 1; generation-- {
+						older, err := (&eventLogCursor{path: daemonEventLogPath(path, generation)}).read()
+						if err != nil {
+							return err
+						}
+						events = append(events, older...)
+					}
+				}
+			}
+			newer, err := cursor.read()
+			if err != nil {
+				return err
+			}
+			events = append(events, newer...)
+		}
+		initial = false
+		if err := emit(events); err != nil {
+			return err
 		}
 		if !options.follow || (!options.until.IsZero() && !time.Now().Before(options.until)) {
 			return nil

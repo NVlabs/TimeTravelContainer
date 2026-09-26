@@ -24,6 +24,7 @@ import (
 	"time"
 
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
+	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
 func TestCommandEventsClassifyManagerOperations(t *testing.T) {
@@ -242,5 +243,74 @@ func TestCommandEventsExposeExitAndDestroy(t *testing.T) {
 		if len(events) != 1 || events[0].Type != test.wantType || events[0].Action != test.wantAction {
 			t.Errorf("commandEvents(%q)=%+v, want %s/%s", test.args, events, test.wantType, test.wantAction)
 		}
+	}
+}
+
+// In a cluster each node writes its own log, and a reader merges them all as
+// the events happened, and follows a node's log across its rotation.
+func TestDaemonEventsMergeNodeLogs(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Dir(daemonEventsPath(root))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	write := func(node string, events ...DaemonEvent) {
+		t.Helper()
+		file, err := os.OpenFile(filepath.Join(dir, "node-"+node+".jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		for _, event := range events {
+			data, err := json.Marshal(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Write(append(data, '\n')); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	event := func(id string, offset time.Duration) DaemonEvent {
+		return DaemonEvent{Version: daemonEventSchemaVersion, ID: id, Time: base.Add(offset), Type: "branch", Action: "fork"}
+	}
+	write("n1", event("first", 0), event("third", 2*time.Second))
+	write("n2", event("second", time.Second))
+	var output bytes.Buffer
+	if err := (&daemonServer{}).streamEvents(root, []string{"--json"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		var got DaemonEvent
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, got.ID)
+	}
+	if strings.Join(ids, ",") != "first,second,third" {
+		t.Fatalf("merged events %v, want first, second, third", ids)
+	}
+
+	// n2 records and rotates while a reader follows.
+	n2 := &daemonServer{clusterCapabilities: &cluster.Capabilities{NodeID: "n2"}}
+	until := time.Now().Add(700 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+	output.Reset()
+	done := make(chan error, 1)
+	go func() {
+		done <- (&daemonServer{}).streamEvents(root, []string{"--json", "--follow", "--until", until, "--filter", "action=start"}, &output)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	n2.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "before"})
+	if err := rotateDaemonEventLog(n2.eventLogPath(root), 1<<30, 1, daemonEventFiles); err != nil {
+		t.Fatal(err)
+	}
+	n2.recordEvent(root, DaemonEvent{Type: "container", Action: "start", Subject: "after"})
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := output.String(); !strings.Contains(got, `"subject":"before"`) || !strings.Contains(got, `"subject":"after"`) {
+		t.Fatalf("followed %q across a rotation, want both events", got)
 	}
 }
