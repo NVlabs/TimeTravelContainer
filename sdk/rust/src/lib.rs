@@ -1205,11 +1205,12 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::thread;
 
+    // macOS's temporary directory is long: keep the socket's path within the
+    // limit of a Unix socket address.
     fn temporary_socket(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
-            "ttcx-rust-{}-{}-{name}",
-            std::process::id(),
-            random_request_id().unwrap()
+            "ttcx-{}-{name}",
+            &random_request_id().unwrap()[..8]
         ));
         fs::create_dir(&path).unwrap();
         path.join("ttcd.sock")
@@ -1217,7 +1218,10 @@ mod tests {
 
     #[test]
     fn socket_is_in_the_daemon_root() {
-        assert_eq!(socket_path("/data/ttc"), PathBuf::from("/data/ttc/ttcd.sock"));
+        assert_eq!(
+            socket_path("/data/ttc"),
+            PathBuf::from("/data/ttc/ttcd.sock")
+        );
         assert_eq!(
             Client::new("/local/ttc").socket_path(),
             Path::new("/local/ttc/ttcd.sock")
@@ -1249,7 +1253,10 @@ mod tests {
             write_frame(&mut stream, b'O', br#"{"version":9}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        assert_eq!(Client::new(path.parent().unwrap()).ping().unwrap()["version"], API_VERSION);
+        assert_eq!(
+            Client::new(path.parent().unwrap()).ping().unwrap()["version"],
+            API_VERSION
+        );
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -1303,7 +1310,9 @@ mod tests {
             write_frame(&mut stream, b'S', br#"{"output_bytes":2}"#).unwrap();
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let stream = Client::new(path.parent().unwrap()).watch_tty("demo@main", "repl").unwrap();
+        let stream = Client::new(path.parent().unwrap())
+            .watch_tty("demo@main", "repl")
+            .unwrap();
         assert_eq!(
             stream.recv().unwrap(),
             StreamEvent::Observation(br#"{"output_bytes":1}"#.to_vec())
@@ -1487,7 +1496,9 @@ mod tests {
             );
             write_frame(&mut stream, b'X', &0u32.to_be_bytes()).unwrap();
         });
-        let result = Client::new(path.parent().unwrap()).migrate("demo@main", "node-b").unwrap();
+        let result = Client::new(path.parent().unwrap())
+            .migrate("demo@main", "node-b")
+            .unwrap();
         assert!(result.ok());
         server.join().unwrap();
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
