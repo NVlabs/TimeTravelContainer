@@ -72,9 +72,10 @@ type DurableDehydrationRestoreArgs struct {
 	// committed cold pack chain.
 	FilesystemConnections int
 	FilesystemToken       ttcvolume.RemoteToken
-	// FilesystemRestoreIDs maps a logical mount source to the repository ID
-	// serialized by this particular branch. A long-lived Sentry may host cold
-	// branches captured across several local materializations, whose physical
+	// FilesystemRestoreIDs maps the current identity of each local repository
+	// to the one this particular branch was serialized against, as a
+	// distributed fork's does. A long-lived Sentry may host cold branches
+	// captured across several local materializations, whose physical
 	// repository IDs differ while their logical mount is the same.
 	FilesystemRestoreIDs map[string]string
 }
@@ -439,24 +440,9 @@ func (l *Loader) restoreDurableDehydrationPeer(args *DurableDehydrationRestoreAr
 		}
 	}()
 	err = l.family.RestoreDurablePeer(args, func(source *kernel.Kernel, resources vfs.LiveForkFilesystemResources) (*kernel.Kernel, error) {
-		if len(args.FilesystemRestoreIDs) != 0 {
-			aliased := make(vfs.LiveForkFilesystemResources, len(resources)+len(args.FilesystemRestoreIDs))
-			for id, resource := range resources {
-				aliased[id] = resource
-			}
-			for _, volume := range l.ttcVolumeRepositories {
-				restoreID := args.FilesystemRestoreIDs[volume.config.Source]
-				if restoreID == "" {
-					continue
-				}
-				current := checkpoint.ResourceID{ContainerName: "ttc-volume", Path: volume.repository.Info().ID}
-				resource, ok := resources[current]
-				if !ok {
-					return nil, fmt.Errorf("active TTC volume resource %q was not exported", current)
-				}
-				aliased[checkpoint.ResourceID{ContainerName: "ttc-volume", Path: restoreID}] = resource
-			}
-			resources = aliased
+		resources, err := aliasLiveForkFilesystemResources(resources, args.FilesystemRestoreIDs)
+		if err != nil {
+			return nil, err
 		}
 		// Branches in one Sentry share the platform. In particular, systrap's
 		// stub mapping and source subprocess are process-global; constructing a
