@@ -2260,12 +2260,8 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")
 	}
-	// This node's repositories may still hold the branch from an earlier
-	// incarnation here, whose tree the import would keep: a branch that ran
-	// and was captured elsewhere since would come back to its older files.
-	// The manifest is the branch's authority, as it is for its control state.
-	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
-		return fmt.Errorf("discarding earlier local filesystems of %s@%s: %w", info.Name, branch.ID, err)
+	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
+		return err
 	}
 	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
 		return err
@@ -2310,12 +2306,94 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
 		return err
 	}
+	manifest, err := readColdBranchManifest(branch.StorageManifest)
+	if err != nil {
+		return err
+	}
+	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
+		return err
+	}
 	// Materializing a committed snapshot into this node's disposable cache is
 	// not an authority transition. In particular, cp and cold-fork source
 	// preparation may run on any node while the branch remains unplaced. The
 	// caller records "local" only after it has claimed placement and committed
 	// a live runtime.
 	return b.materializeColdFilesystem(info, branch)
+}
+
+// discardSupersededBranchFilesystems removes branch's filesystems from this
+// node's repositories if they are not the ones roots, the branch's committed
+// filesystems, name. An earlier incarnation of the branch here leaves them,
+// and importing roots keeps a branch a repository already has: a branch that
+// ran and was captured elsewhere since would come back to its older files.
+// A branch last committed here, or imported from roots, is kept.
+func (b *runtimeBackend) discardSupersededBranchFilesystems(info ttcbundle.ContainerInfo, branch ttcbundle.BranchInfo, roots []cluster.FilesystemRootDescriptor) error {
+	spec, err := b.containerStore().LoadSpec(info.ID)
+	if err != nil {
+		return err
+	}
+	configs, err := specutils.TTCVolumeRepositories(spec)
+	if err != nil {
+		return err
+	}
+	bySource := make(map[string]string, len(roots))
+	for _, root := range roots {
+		bySource[root.Source] = root.Root
+	}
+	superseded := false
+	seen := make(map[string]bool)
+	for _, config := range configs {
+		want, ok := bySource[config.Source]
+		if !ok {
+			continue
+		}
+		for _, path := range []string{config.Path, distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)} {
+			path = filepath.Clean(path)
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			if _, err := os.Stat(filepath.Join(path, "volume.json")); errors.Is(err, os.ErrNotExist) {
+				continue
+			} else if err != nil {
+				return err
+			}
+			repository, err := ttcvolume.OpenRepository(path, ttcvolume.CopyMode(config.CopyMode))
+			if err != nil {
+				return err
+			}
+			current, branchErr := repository.Branch(branch.FilesystemBranch)
+			if err := repository.Close(); err != nil {
+				return err
+			}
+			if errors.Is(branchErr, os.ErrNotExist) {
+				continue
+			}
+			if branchErr != nil {
+				return branchErr
+			}
+			if current.Root != want && remoteCatalogRoot(current.RemoteCatalog) != want {
+				superseded = true
+			}
+		}
+	}
+	if !superseded {
+		return nil
+	}
+	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
+		return fmt.Errorf("discarding superseded local filesystems of %s@%s: %w", info.Name, branch.ID, err)
+	}
+	return nil
+}
+
+// remoteCatalogRoot returns the root that a branch imported from a remote
+// descriptor was imported from, as its catalog names it, or "".
+func remoteCatalogRoot(catalog string) string {
+	parts := strings.Split(catalog, ":")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[1]
 }
 
 // materializeColdFilesystem installs one committed filesystem snapshot in the
