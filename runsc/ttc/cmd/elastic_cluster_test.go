@@ -714,6 +714,19 @@ func TestProcessFreeStartRelocationEligibility(t *testing.T) {
 	if _, ok, err := processFreeStartRelocationOperands(root, catalog, []string{"start", "web@main"}); err != nil || ok {
 		t.Fatalf("running relocation eligibility = (%t, %v), want false", ok, err)
 	}
+	// A branch whose rehydration failed on the node that claimed it can be
+	// removed there, and nothing else can be done to it but retrying.
+	branch.Lifecycle = "dehydrated"
+	catalog.branches["family\x00main"] = branch
+	owner, claims, err = daemonCommandPlacementWithCatalog(root, catalog, []string{"rm", "-f", "web@main"})
+	if err != nil || owner != "node-a" || len(claims) != 1 || !claims[0].AllowMaterializing {
+		t.Fatalf("rm of a branch whose rehydration failed routes to (%q, %+v, %v)", owner, claims, err)
+	}
+	for _, args := range [][]string{{"exec", "web@main", "true"}, {"cp", "/etc/hostname", "web@main:/prepared"}} {
+		if _, _, err := daemonCommandPlacementWithCatalog(root, catalog, args); err == nil {
+			t.Fatalf("%v of a materializing dehydrated branch was routed", args)
+		}
+	}
 }
 
 func TestDaemonCommandMayAwaitColdUnplacementUsesRaftAuthority(t *testing.T) {

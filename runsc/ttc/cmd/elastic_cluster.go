@@ -464,7 +464,17 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 						Branch(family, branch string) (*cluster.BranchAuthority, error)
 					}); ok {
 						branch, branchErr := authority.Branch(placement.FamilyID, placement.BranchID)
-						claimMaterializing = branchErr == nil && normalizeLifecycleState(branch.Lifecycle) == "created"
+						if branchErr == nil {
+							switch normalizeLifecycleState(branch.Lifecycle) {
+							case "created":
+								claimMaterializing = true
+							case "dehydrated", "exited":
+								// A branch whose rehydration or start failed
+								// stays claimed by the node it failed on, and
+								// can still be removed there.
+								claimMaterializing = args[0] == "rm"
+							}
+						}
 					}
 				}
 				if !claimMaterializing {
