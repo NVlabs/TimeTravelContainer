@@ -34,6 +34,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
+	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/vmm"
 )
@@ -1245,6 +1246,106 @@ func TestRing0ConcurrentSyscallMonitorAndRecycle(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestMonitorPoolGrowsOnDemand exhausts the monitor's page-table pool twice
+// and runs an application through page tables allocated from both
+// expansions.
+func TestMonitorPoolGrowsOnDemand(t *testing.T) {
+	backend := NewBackend()
+	vmInterface, err := backend.CreateVM(context.Background())
+	if err != nil {
+		skipWithoutHypervisor(t, err)
+	}
+	vm := vmInterface.(*hvfVM)
+	defer vm.Close()
+	engineInterface, err := NewVMEngine(vm, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := engineInterface.(*ring0Engine)
+	defer engine.Close()
+	engine.BeginApplicationResidency()
+	defer func() {
+		if err := engine.EndApplicationResidency(); err != nil {
+			t.Errorf("ending application residency: %v", err)
+		}
+	}()
+
+	host, err := backend.HostMemory().Reserve(vmm.HostSlabSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.HostMemory().Release(host, vmm.HostSlabSize)
+	if err := vm.MapStage2(GuestRAMIPAStart, host, vmm.HostSlabSize,
+		vmm.Stage2Read|vmm.Stage2Write|vmm.Stage2Execute); err != nil {
+		t.Fatal(err)
+	}
+	defer vm.UnmapStage2(GuestRAMIPAStart, vmm.HostSlabSize)
+	memory := unsafe.Slice((*byte)(unsafe.Pointer(host)), int(vmm.HostSlabSize))
+	binary.LittleEndian.PutUint32(memory[0:], 0xd2801588) // movz x8, #172
+	binary.LittleEndian.PutUint32(memory[4:], 0xd4000001) // svc #0
+
+	// Like the platform, pair the engine with the VM's pool expansion.
+	monitor := vmplatform.NewMonitor(engine, vm)
+	const (
+		spaceID = uint64(96)
+		base    = uint64(0x40000000)
+		// Map the code page once per 2 MiB, so that each mapping needs its
+		// own last-level table page.
+		stride = uint64(2 << 20)
+	)
+	if err := monitor.Execute(context.Background(), monitorabi.Command{Opcode: monitorabi.OpcodeCreateAddressSpace, AddressSpaceID: spaceID}); err != nil {
+		t.Fatal(err)
+	}
+	mapped := 0
+	mapCode := func(count int) {
+		t.Helper()
+		for mapped < count {
+			operations := make([]monitorabi.Operation, 0, monitorabi.MaxOperations)
+			for ; mapped < count && len(operations) < monitorabi.MaxOperations; mapped++ {
+				operations = append(operations, monitorabi.Operation{
+					Type: monitorabi.OperationMap, Access: monitorabi.AccessRead | monitorabi.AccessExecute,
+					VA: base + uint64(mapped)*stride, GPA: GuestRAMIPAStart, Length: vmm.LogicalPageSize,
+				})
+			}
+			if err := monitor.Execute(context.Background(), monitorabi.Command{
+				Opcode: monitorabi.OpcodeApply, AddressSpaceID: spaceID, Operations: operations,
+			}); err != nil {
+				t.Fatalf("mapping application code at %d VAs: %v", mapped, err)
+			}
+		}
+	}
+	pools := func() int {
+		vm.mu.Lock()
+		defer vm.mu.Unlock()
+		return len(vm.monitor.pools)
+	}
+	run := func(va uint64) {
+		t.Helper()
+		registers := &vmm.ARM64State{PC: va}
+		exit, err := engine.RunApplication(context.Background(), vmm.ApplicationState{
+			AddressSpaceID: spaceID,
+			Registers:      registers,
+		})
+		if err != nil || exit.Reason != vmm.ExitSyscall || registers.X[8] != 172 || registers.PC != va+8 {
+			t.Fatalf("application at %#x exit=%+v x8=%d pc=%#x err=%v", va, exit, registers.X[8], registers.PC, err)
+		}
+	}
+
+	// 512 table pages alone fill the initial pool.
+	mapCode(512)
+	if got := pools(); got < 2 {
+		t.Fatalf("mapping %d scattered pages left the monitor with %d pool regions, want an expansion", mapped, got)
+	}
+	run(base + uint64(mapped-1)*stride)
+	grown := pools()
+	mapCode(1536)
+	if got := pools(); got <= grown {
+		t.Fatalf("mapping %d scattered pages left the monitor with %d pool regions, want more than %d", mapped, got, grown)
+	}
+	run(base)
+	run(base + uint64(mapped-1)*stride)
 }
 
 func TestMonitorRecyclesDestroyedAddressSpaceTables(t *testing.T) {

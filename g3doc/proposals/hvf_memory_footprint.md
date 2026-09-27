@@ -1,6 +1,6 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1 and 2 of the delivery plan are
+*Status: in progress, September 2026; phases 1-3 of the delivery plan are
 implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
@@ -26,10 +26,17 @@ Progress, for the same container and sequence:
 | Before | 308 MiB | 578 MiB |
 | Phase 1: FD-table fix, 1 MiB thread stacks, no checkpoint gofer | 233 MiB | 305 MiB |
 | Phase 2: Sentry image mirrored on first EL1 touch | 109 MiB | 192 MiB |
+| Phase 3: monitor page-table pool grown on demand | 93 MiB | 176 MiB |
 
-What remains at idle: Go runtime regions (73 MiB, against a live heap of
-11-20 MiB), the EL1 monitor (17 MiB), thread stacks (5 MiB), copies of the
-image text that EL1 has run (3 MiB), and guest RAM (3 MiB).
+What remains at idle: Go runtime regions (72 MiB, against a live heap of
+11-20 MiB), thread stacks (5 MiB), copies of the image text that EL1 has run
+(3 MiB), guest RAM (3 MiB), and the rest of the EL1 monitor (2 MiB).
+
+A busy guest adds a second large cost: GuestRAM keeps a `guestFrame`, a
+mapping set, and two index entries for every 4 KiB guest frame, about 300
+bytes, and Go's heap goal doubles that. Touching 1.5 GiB in the guest grew the
+Sentry's runtime regions by 280 MiB, and none of it returns after the guest
+frees the memory, since the mirror suppresses the runtime's releases.
 
 ## Where the memory went
 
@@ -133,7 +140,8 @@ Principles, in KVM's terms:
 | Writable image | Imported in 48 KiB windows on first touch (phase 2) | unchanged | under 1 MiB |
 | `__TEXT` | Private copies of 48 KiB windows on first touch (phase 2) | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
 | `__DATA_CONST`, `__LINKEDIT` | Private copies of windows on first touch (phase 2) | unchanged (contents are slid per process) | under 1 MiB |
-| Monitor page-table pool | 16 MiB committed | A smaller initial pool; it already grows when exhausted (`MonitorPoolExpander`) | pages in use |
+| Monitor page-table pool | 2 MiB, doubled on demand (phase 3) | unchanged | under twice the pages in use, or 16 MiB more |
+| GuestRAM frame metadata | ~300 bytes of Go heap per 4 KiB guest frame | Fixed-size records in per-slab arrays, with a frame's usual single mapping inline | a fraction of today's, with no per-frame maps |
 | Guest RAM | demand-allocated | unchanged | unchanged |
 
 The shared `__TEXT` copy is built once from the Sentry binary and keyed by its
@@ -158,17 +166,23 @@ Each phase stands alone and is measured before the next.
    idle Sentry at 137 MiB. Single slabs save 5 MiB more but slow a cold
    python start by 10-15 ms. A fresh VM takes one host gate per window
    that a code path first touches; the syscall return path takes about 8.
-3. **Runtime regions and stacks on first touch:** import them in windows too.
+3. **Monitor pool on demand (done).** Start the page-table pool at 2 MiB
+   rather than 16, and double it on exhaustion through the existing
+   expansion protocol. An idle Sentry uses 0.8 MiB of it and `apt-get update`
+   1.5 MiB.
+4. **Runtime regions and stacks on first touch:** import them in windows too.
    Their guest-only data, such as the objects that the guest-critical section
    of `tryRunResidentMonitor` reads, must then be imported first as well.
-4. **Release instead of suppress** in the runtime VM hook.
-5. **Shared `__TEXT`.**
+5. **Release instead of suppress** in the runtime VM hook.
+6. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
+   platforms keep it.
+7. **Shared `__TEXT`.**
 
 ## Open questions
 
-* **macOS 15.** Every observation above is from macOS 26.5.2. Phases 1-3
+* **macOS 15.** Every observation above is from macOS 26.5.2. Phases 1-4
   use no new primitive. Run `hvf_mem_probe` and `hvf_map_probe` on the oldest
-  supported release before phase 4 relies on release after `hv_vm_unmap`.
+  supported release before phase 5 relies on release after `hv_vm_unmap`.
 * **Uncommitted mirror mappings.** Why does the continuation qualification
   test fail when mirror mappings are not committed first? Committing only on
   first touch makes this moot for now, but lazy population would also avoid
