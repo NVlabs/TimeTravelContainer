@@ -302,6 +302,9 @@ type distributedSourceRuntime struct {
 	// exports has, by transaction, a function that stops the transaction's
 	// live graph export: one that no target will read.
 	exports sync.Map
+	// rollingForward has the memory origins whose frozen handoffs a
+	// background roll-forward is completing.
+	rollingForward sync.Map
 	// syncedOwners has, by family and branch, the placement generation and
 	// owner that placement reconciliation last brought the family's record in
 	// line with.
@@ -1948,7 +1951,7 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
 	defer built()
-	shared := false
+	shared, ledgerFrozen := false, false
 	manifestRelative := filepath.Join("cluster", "memory-manifests", transactionID+".manifest")
 	manifestPath := filepath.Join(b.dataRoot, manifestRelative)
 	defer func() {
@@ -1958,9 +1961,15 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 		_ = os.Remove(manifestPath)
 		if shared {
 			_ = b.releaseSharedGraphMemoryRoots(rootNames, rootObjects)
-		} else {
+		} else if !ledgerFrozen {
 			_ = removeSharedPublicationBridgeIntent(b.dataRoot, origin)
 			_ = b.releaseGraphMemoryRoots(rootNames)
+		}
+		if ledgerFrozen {
+			// The handoff cannot be canceled once frozen; complete it, which
+			// releases the capture's roots, rather than discard the capture.
+			b.graphOriginPublisher().rollForwardFrozenOrigin(origin)
+			return
 		}
 		if err := b.discardFailedGraphSnapshot(origin); err != nil && b.stderr != nil {
 			fmt.Fprintf(b.stderr, "ttc: warning: discarding failed live handoff snapshot %d: %v\n", origin, err)
@@ -2043,18 +2052,17 @@ func (b *runtimeBackend) exportDistributedGraph(containerID, transactionID strin
 	if err := b.snapshotShared.PublishHandoff(context.Background(), b.snapshotGraph, origin, b.snapshotData); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, fmt.Errorf("publishing live graph snapshot %d: %w", origin, err)
 	}
+	// Hold the origin through the final switch, as publishVolatileGraphOrigin
+	// does: another publication of it, a dependency's or a roll-forward's,
+	// then waits for this one rather than running beside it.
+	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	defer unlockOrigin()
 	// Serialize only the short final ledger/authority switch against foreground
 	// captures. The potentially slow shared-pack write above remains outside the
 	// gate. Once a foreground writer owns the gate, it may add references to
 	// this origin; the later freeze will include them in its baseline.
 	finishFinalHandoff := b.distributedSource.beginBackgroundSnapshotWork()
 	defer finishFinalHandoff()
-	ledgerFrozen := false
-	defer func() {
-		if retErr != nil && ledgerFrozen {
-			_ = b.snapshotGraph.UnfreezeSnapshotLedger(origin)
-		}
-	}()
 	if _, _, err := b.snapshotGraph.FreezeSnapshotLedger(origin); err != nil {
 		return cluster.GraphHandoffDescriptor{}, nil, nil, err
 	}
@@ -2207,37 +2215,14 @@ func (b *runtimeBackend) graphOriginPublisher() *branchPublisher {
 }
 
 // resumeFrozenOriginPublications rolls forward, in the background, the
-// handoffs of this node's memory origins that a crash left frozen, each
-// retried until it completes or done closes.
-func resumeFrozenOriginPublications(b *runtimeBackend, stderr io.Writer, done <-chan struct{}) {
+// handoffs of this node's memory origins that a crash left frozen.
+func resumeFrozenOriginPublications(b *runtimeBackend) {
 	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
 		return
 	}
-	pending := b.snapshotGraph.FrozenSnapshotLedgers()
-	if len(pending) == 0 {
-		return
-	}
 	publisher := b.graphOriginPublisher()
-	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
-		var failed []ttcsnapshot.SnapshotID
-		for _, origin := range pending {
-			err := publisher.resumeFrozenGraphOrigin(context.Background(), origin)
-			if err == nil || errors.Is(err, errFrozenOriginOwned) {
-				continue
-			}
-			if stderr != nil {
-				fmt.Fprintf(stderr, "ttcd: resuming the interrupted handoff of snapshot origin %d: %v\n", origin, err)
-			}
-			failed = append(failed, origin)
-		}
-		if pending = failed; len(pending) == 0 {
-			return
-		}
-		select {
-		case <-done:
-			return
-		case <-time.After(delay):
-		}
+	for _, origin := range b.snapshotGraph.FrozenSnapshotLedgers() {
+		publisher.rollForwardFrozenOrigin(origin)
 	}
 }
 

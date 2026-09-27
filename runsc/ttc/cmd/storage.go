@@ -1282,7 +1282,7 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 	ledgerFrozen := false
 	defer func() {
 		if retErr != nil && ledgerFrozen {
-			_ = p.graph.UnfreezeSnapshotLedger(snapshot)
+			p.rollForwardFrozenOrigin(snapshot)
 		}
 	}()
 	if _, _, err := p.graph.FreezeSnapshotLedger(snapshot); err != nil {
@@ -1318,6 +1318,32 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 		return fmt.Errorf("releasing snapshot origin %d publication bridge: %w", snapshot, err)
 	}
 	return releasePublishedProviderGraphRoots(p.graph, p.graphData, snapshot)
+}
+
+// rollForwardFrozenOrigin completes, in the background, the handoff of
+// snapshot, whose reference ledger a failed or interrupted handoff left
+// frozen, retrying until it completes. The handoff cannot be canceled: its
+// pack's manifest, which no retry replaces, holds the baseline that its
+// recorded mutations follow, and a new handoff would freeze another. At most
+// one roll-forward runs for an origin.
+func (p *branchPublisher) rollForwardFrozenOrigin(snapshot ttcsnapshot.SnapshotID) {
+	if p == nil || p.peers == nil || p.graph == nil || snapshot == 0 {
+		return
+	}
+	if _, running := p.peers.rollingForward.LoadOrStore(snapshot, struct{}{}); running {
+		return
+	}
+	go func() {
+		defer p.peers.rollingForward.Delete(snapshot)
+		for delay := time.Second; p.graph.SnapshotLedgerFrozen(snapshot); delay = min(2*delay, 30*time.Second) {
+			err := p.resumeFrozenGraphOrigin(context.Background(), snapshot)
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "ttcd: completing the frozen handoff of snapshot origin %d: %v\n", snapshot, err)
+			time.Sleep(delay)
+		}
+	}()
 }
 
 // errFrozenOriginOwned reports a frozen origin whose handoff belongs to a

@@ -556,12 +556,16 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 	}
 }
 
-func TestResumeFrozenGraphOriginLeavesABranchPublicationItsOwn(t *testing.T) {
+// testGraphOriginPublisher returns a publisher of a new graph, and the
+// graph's one origin, sealed and rooted. The publisher's authority has no Raft
+// node, which the tests using it never reach.
+func testGraphOriginPublisher(t *testing.T) (*branchPublisher, ttcsnapshot.SnapshotID) {
+	t.Helper()
 	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer graph.Close()
+	t.Cleanup(func() { graph.Close() })
 	origin, err := graph.AllocateWorking()
 	if err != nil {
 		t.Fatal(err)
@@ -579,29 +583,67 @@ func TestResumeFrozenGraphOriginLeavesABranchPublicationItsOwn(t *testing.T) {
 	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
 		t.Fatal(err)
 	}
-	sharedRoot := t.TempDir()
-	// Neither path reaches the authority, which here has no Raft node.
-	publisher := &branchPublisher{
-		sharedRoot: sharedRoot, nodeID: "node-a", incarnation: "boot-a",
+	return &branchPublisher{
+		sharedRoot: t.TempDir(), nodeID: "node-a", incarnation: "boot-a",
 		authority: &cluster.RaftCatalog{}, graph: graph, graphShared: &ttcsnapshot.SharedPackStore{},
 		sharedRefs: &sharedReferenceService{}, peers: &distributedSourceRuntime{},
-	}
-	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); err != nil {
-		t.Fatalf("resuming an origin that is not frozen: %v", err)
-	}
-	if _, _, err := graph.FreezeSnapshotLedger(origin); err != nil {
+	}, origin
+}
+
+// freezeForBranchPublication freezes origin's ledger as a branch publication
+// does, and records the publication's bridge.
+func freezeForBranchPublication(t *testing.T, publisher *branchPublisher, origin ttcsnapshot.SnapshotID) {
+	t.Helper()
+	if _, _, err := publisher.graph.FreezeSnapshotLedger(origin); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistSharedPublicationBridgeIntent(sharedRoot, sharedPublicationBridgeIntent{
+	if err := persistSharedPublicationBridgeIntent(publisher.sharedRoot, sharedPublicationBridgeIntent{
 		Version: sharedPublicationBridgeIntentVersion, Snapshot: uint64(origin), Kind: sharedPublicationBridgePublication,
 		Family: "family", Branch: "main", PublicationID: "publication", CreatedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestResumeFrozenGraphOriginLeavesABranchPublicationItsOwn(t *testing.T) {
+	publisher, origin := testGraphOriginPublisher(t)
+	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); err != nil {
+		t.Fatalf("resuming an origin that is not frozen: %v", err)
+	}
+	freezeForBranchPublication(t, publisher, origin)
 	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); !errors.Is(err, errFrozenOriginOwned) {
 		t.Fatalf("resuming a branch publication's origin = %v, want %v", err, errFrozenOriginOwned)
 	}
-	if !graph.SnapshotLedgerFrozen(origin) {
+	if !publisher.graph.SnapshotLedgerFrozen(origin) {
 		t.Fatal("the resume released a branch publication's freeze")
+	}
+}
+
+// One roll-forward at a time completes an origin's frozen handoff, and it
+// ends once the handoff is not its to complete.
+func TestFrozenOriginRollsForwardOnce(t *testing.T) {
+	publisher, origin := testGraphOriginPublisher(t)
+	freezeForBranchPublication(t, publisher, origin)
+	// Holding the origin keeps the first roll-forward waiting.
+	unlock := publisher.peers.lockSnapshotOrigin(origin)
+	publisher.rollForwardFrozenOrigin(origin)
+	publisher.rollForwardFrozenOrigin(origin)
+	if _, running := publisher.peers.rollingForward.Load(origin); !running {
+		unlock()
+		t.Fatal("no roll-forward is running")
+	}
+	unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, running := publisher.peers.rollingForward.Load(origin); !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the roll-forward of a branch publication's origin did not end")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !publisher.graph.SnapshotLedgerFrozen(origin) {
+		t.Fatal("the roll-forward released a branch publication's freeze")
 	}
 }
