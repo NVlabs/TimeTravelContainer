@@ -20,8 +20,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -299,12 +301,20 @@ type sharedReferenceService struct {
 	peers        *distributedSourceRuntime
 	lease        cluster.SharedGCLease
 	ledger       *ttcsnapshot.ReferenceLedger
-	// compactionPending is protected by mu. Shared-pack compaction is
-	// needed only after logical collection removes objects, plus one recovery
-	// reconciliation after a new coordinator activates. Remembering that fact
-	// avoids cloning every potentially huge manifest on every maintenance tick.
-	compactionPending bool
+	// compactionExamined is protected by mu. It holds, for each origin found
+	// not to need shared-pack compaction, or compacted, the ledger's
+	// OriginChanges count then: shared-pack compaction is needed only once
+	// logical collection removes some of an origin's objects, so an origin is
+	// examined again only once its count advances. A new coordinator, which has
+	// none, examines every origin once. Examining every origin after each
+	// collection instead, and each one by scanning all the ledger's objects,
+	// took 1.9 s of a 100,000-file family's removal.
+	compactionExamined map[ttcsnapshot.SnapshotID]uint64
 }
+
+// unexaminedOrigin is the compactionExamined count of an origin that a new
+// coordinator has yet to examine.
+const unexaminedOrigin = math.MaxUint64
 
 func newSharedReferenceService(sharedRoot, localRoot, nodeID, incarnation string, authority *cluster.RaftCatalog, packs *ttcsnapshot.SharedPackStore, graph *ttcsnapshot.Store, peers *distributedSourceRuntime) *sharedReferenceService {
 	return &sharedReferenceService{
@@ -981,7 +991,7 @@ func (s *sharedReferenceService) activate(lease cluster.SharedGCLease) error {
 	}
 	s.mu.Lock()
 	s.ledger, s.lease = ledger, current
-	s.compactionPending = true
+	s.compactionExamined = nil
 	s.mu.Unlock()
 	if entries, err := os.ReadDir(s.directory); err == nil {
 		keep := fmt.Sprintf("generation-%016x", current.Generation)
@@ -1008,7 +1018,7 @@ func (s *sharedReferenceService) deactivate() error {
 	}
 	s.ledger = nil
 	s.lease = cluster.SharedGCLease{}
-	s.compactionPending = false
+	s.compactionExamined = nil
 	return err
 }
 
@@ -1703,90 +1713,116 @@ func (s *sharedReferenceService) collectAndRetire(ctx context.Context, lease clu
 	if err != nil {
 		return collected, err
 	}
-	if collected != 0 {
-		s.mu.Lock()
-		s.compactionPending = true
-		s.mu.Unlock()
+	// Rewrite at most one partially-live origin per maintenance pass. Logical
+	// collection is already durable in the ledger; compaction only changes its
+	// reader-fenced physical representation and therefore may be retried after
+	// interruption without affecting authority.
+	var changes map[ttcsnapshot.SnapshotID]uint64
+	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+		changes = ledger.OriginChanges()
+		return nil
+	}); err != nil {
+		return collected, err
 	}
-	s.mu.RLock()
-	compactionPending := s.compactionPending
-	s.mu.RUnlock()
-	if compactionPending {
-		// Rewrite at most one partially-live origin per maintenance pass. Logical
-		// collection is already durable in the ledger; compaction only changes its
-		// reader-fenced physical representation and therefore may be retried after
-		// interruption without affecting authority. A new coordinator performs one
-		// recovery scan; steady-state scans happen only after collection actually
-		// changes the physical live set.
-		var origins []ttcsnapshot.SnapshotID
+	s.mu.Lock()
+	examined := s.compactionExamined
+	if examined == nil {
+		examined = make(map[ttcsnapshot.SnapshotID]uint64, len(changes))
+		for origin := range changes {
+			examined[origin] = unexaminedOrigin
+		}
+		s.compactionExamined = examined
+	}
+	s.mu.Unlock()
+	// Passes are serialized by collectionMu; activation replaces the map
+	// rather than changing it.
+	var origins []ttcsnapshot.SnapshotID
+	for origin, count := range changes {
+		if last, ok := examined[origin]; ok && last == count || !ok && count == 0 {
+			// Unchanged since it was examined; or added since activation, all
+			// live, which makes it exactly its pack.
+			continue
+		}
+		origins = append(origins, origin)
+	}
+	for origin := range examined {
+		if _, ok := changes[origin]; !ok {
+			delete(examined, origin)
+		}
+	}
+	slices.Sort(origins)
+	for _, origin := range origins {
+		if err := ctx.Err(); err != nil {
+			return collected, err
+		}
+		encoded := uint64(origin)
+		if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
+			continue
+		}
+		if _, volatile := state.VolatileOrigins[encoded]; volatile {
+			continue
+		}
+		if _, retired := state.RetiredOrigins[encoded]; retired {
+			continue
+		}
+		var live map[ttcsnapshot.ObjectID]struct{}
+		var count uint64
+		var ready bool
 		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-			origins = ledger.Origins()
+			var ok bool
+			live, count, ok, ready = ledger.OriginLiveObjects(origin)
+			if !ok {
+				return os.ErrNotExist
+			}
 			return nil
 		}); err != nil {
 			return collected, err
 		}
-		retryCompaction := false
-		for _, origin := range origins {
-			if err := ctx.Err(); err != nil {
-				return collected, err
-			}
-			encoded := uint64(origin)
-			if encoded >= state.NextSnapshotID || state.AbandonedOrigins[encoded] {
-				continue
-			}
-			if _, volatile := state.VolatileOrigins[encoded]; volatile {
-				continue
-			}
-			if _, retired := state.RetiredOrigins[encoded]; retired {
-				continue
-			}
-			var objects []ttcsnapshot.Object
-			var references map[string]ttcsnapshot.ObjectID
-			var ready bool
-			if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
-				var ok bool
-				objects, references, ok, ready = ledger.OriginCompactionManifest(origin)
-				if !ok {
-					return os.ErrNotExist
-				}
-				return nil
-			}); err != nil {
-				return collected, err
-			}
-			if !ready {
-				retryCompaction = true
-				continue
-			}
-			if len(objects) == 0 {
-				continue
-			}
-			if _, busy, err := s.packs.Reconcile(origin); err != nil {
-				return collected, err
-			} else if busy {
-				retryCompaction = true
-				continue
-			}
-			manifest, err := s.packs.Manifest(origin)
-			if err != nil {
-				return collected, err
-			}
-			if !sharedPackNeedsCompaction(manifest, objects) {
-				continue
-			}
-			if _, busy, err := s.packs.Compact(origin, objects, references); err != nil {
-				return collected, err
-			} else if busy {
-				retryCompaction = true
-				continue
-			}
-			// Only one physical rewrite runs per pass. Revisit the remaining origins
-			// after the next lease tick.
-			retryCompaction = true
-			break
+		if !ready {
+			continue
 		}
-		s.mu.Lock()
-		s.compactionPending = retryCompaction
-		s.mu.Unlock()
+		if len(live) == 0 {
+			examined[origin] = count
+			continue
+		}
+		if _, busy, err := s.packs.Reconcile(origin); err != nil {
+			return collected, err
+		} else if busy {
+			continue
+		}
+		manifest, err := s.packs.Manifest(origin)
+		if err != nil {
+			return collected, err
+		}
+		if !sharedPackNeedsCompaction(manifest, live) {
+			examined[origin] = count
+			continue
+		}
+		var objects []ttcsnapshot.Object
+		var references map[string]ttcsnapshot.ObjectID
+		if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
+			var ok bool
+			objects, references, ok, ready = ledger.OriginCompactionManifest(origin)
+			if !ok {
+				return os.ErrNotExist
+			}
+			return nil
+		}); err != nil {
+			return collected, err
+		}
+		if !ready {
+			continue
+		}
+		if _, busy, err := s.packs.Compact(origin, objects, references); err != nil {
+			return collected, err
+		} else if busy {
+			continue
+		}
+		// The objects compacted were at least as current as count.
+		examined[origin] = count
+		// Only one physical rewrite runs per pass. Revisit the remaining origins
+		// after the next lease tick.
+		break
 	}
 	var candidates []ttcsnapshot.SnapshotID
 	if err := s.withLedger(func(ledger *ttcsnapshot.ReferenceLedger) error {
@@ -1957,16 +1993,12 @@ func (s *sharedReferenceService) drainBeforeShutdown(ctx context.Context, requir
 	return nil
 }
 
-func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []ttcsnapshot.Object) bool {
+func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live map[ttcsnapshot.ObjectID]struct{}) bool {
 	if manifest == nil || len(live) == 0 {
 		return false
 	}
 	if len(manifest.Packs) > 32 {
 		return true
-	}
-	liveIDs := make(map[ttcsnapshot.ObjectID]struct{}, len(live))
-	for _, object := range live {
-		liveIDs[object.ID] = struct{}{}
 	}
 	// Account for both aligned bulk extents and the manifest records that hold
 	// metadata-only objects. This keeps metadata-heavy filesystem origins from
@@ -1978,7 +2010,7 @@ func sharedPackNeedsCompaction(manifest *ttcsnapshot.SnapshotManifest, live []tt
 			weight += uint64((extent.Length + 4095) &^ 4095)
 		}
 		total += weight
-		if _, ok := liveIDs[packed.Object.ID]; ok {
+		if _, ok := live[packed.Object.ID]; ok {
 			retained += weight
 		}
 	}

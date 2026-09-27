@@ -24,6 +24,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -72,6 +73,19 @@ type referenceLedgerState struct {
 
 	// undo records what the mutation in progress has changed.
 	undo *ledgerUndo
+	// byOrigin and reclaiming index Objects, so that work on one origin, and
+	// collection, need not go through every object.
+	byOrigin   map[SnapshotID]*ledgerOriginObjects
+	reclaiming map[string]struct{}
+}
+
+// ledgerOriginObjects indexes the objects of one origin.
+type ledgerOriginObjects struct {
+	keys map[string]struct{}
+	// changes advances whenever one of the objects stops being live, or one is
+	// added other than live: while it stands still, the origin's live objects
+	// are the same.
+	changes uint64
 }
 
 type ledgerImportRecord struct {
@@ -150,6 +164,7 @@ func newReferenceLedgerState() referenceLedgerState {
 		Origins: make(map[SnapshotID]struct{}), Objects: make(map[string]Object),
 		References: make(map[string]ObjectID), Applied: make(map[string]appliedReference), NextSequence: 1,
 		HandoffCursor: make(map[SnapshotID]uint64),
+		byOrigin:      make(map[SnapshotID]*ledgerOriginObjects), reclaiming: make(map[string]struct{}),
 	}
 }
 
@@ -164,7 +179,9 @@ func cloneReferenceLedgerState(state referenceLedgerState) referenceLedgerState 
 		result.Origins[origin] = struct{}{}
 	}
 	for key, object := range state.Objects {
-		result.Objects[key] = cloneObject(object)
+		cloned := cloneObject(object)
+		result.Objects[key] = cloned
+		result.indexObject(key, nil, &cloned)
 	}
 	for name, object := range state.References {
 		result.References[name] = object
@@ -216,10 +233,21 @@ func (state *referenceLedgerState) rollback() {
 		}
 	}
 	for key, prior := range undo.objects {
+		var current *Object
+		if object, ok := state.Objects[key]; ok {
+			current = &object
+		}
 		if prior != nil {
 			state.Objects[key] = *prior
 		} else {
 			delete(state.Objects, key)
+		}
+		state.indexObject(key, current, prior)
+	}
+	for origin, present := range undo.origins {
+		if !present {
+			// It had no objects, as it has none again.
+			delete(state.byOrigin, origin)
 		}
 	}
 	for name, prior := range undo.references {
@@ -264,17 +292,20 @@ func (state *referenceLedgerState) setOrigin(origin SnapshotID, present bool) {
 		state.Origins[origin] = struct{}{}
 	} else {
 		delete(state.Origins, origin)
+		// A retired origin has no objects left.
+		delete(state.byOrigin, origin)
 	}
 }
 
-func (state *referenceLedgerState) recordObject(key string) {
+func (state *referenceLedgerState) recordObject(key string, prior *Object) {
 	if undo := state.undo; undo != nil {
 		if _, recorded := undo.objects[key]; !recorded {
 			if undo.objects == nil {
 				undo.objects = make(map[string]*Object)
 			}
-			if prior, ok := state.Objects[key]; ok {
-				undo.objects[key] = &prior
+			if prior != nil {
+				saved := *prior
+				undo.objects[key] = &saved
 			} else {
 				undo.objects[key] = nil
 			}
@@ -283,13 +314,69 @@ func (state *referenceLedgerState) recordObject(key string) {
 }
 
 func (state *referenceLedgerState) putObject(key string, object Object) {
-	state.recordObject(key)
+	var prior *Object
+	if existing, ok := state.Objects[key]; ok {
+		prior = &existing
+	}
+	state.recordObject(key, prior)
 	state.Objects[key] = object
+	state.indexObject(key, prior, &object)
 }
 
 func (state *referenceLedgerState) deleteObject(key string) {
-	state.recordObject(key)
+	existing, ok := state.Objects[key]
+	if !ok {
+		return
+	}
+	state.recordObject(key, &existing)
 	delete(state.Objects, key)
+	state.indexObject(key, &existing, nil)
+}
+
+// indexObject keeps the indexes in step with the object at key changing from
+// prior to next, nil for absent.
+func (state *referenceLedgerState) indexObject(key string, prior, next *Object) {
+	if prior != nil && next != nil && prior.State == next.State {
+		// Only its count changed.
+		return
+	}
+	var origin SnapshotID
+	switch {
+	case next != nil:
+		origin = next.ID.Snapshot
+	case prior != nil:
+		origin = prior.ID.Snapshot
+	default:
+		return
+	}
+	entry := state.byOrigin[origin]
+	if entry == nil {
+		entry = &ledgerOriginObjects{keys: make(map[string]struct{})}
+		state.byOrigin[origin] = entry
+	}
+	switch {
+	case prior == nil:
+		entry.keys[key] = struct{}{}
+	case next == nil:
+		delete(entry.keys, key)
+	}
+	if prior != nil && prior.State == ObjectReclaiming {
+		delete(state.reclaiming, key)
+	}
+	if next != nil && next.State == ObjectReclaiming {
+		state.reclaiming[key] = struct{}{}
+	}
+	if prior != nil || next.State != ObjectLive {
+		entry.changes++
+	}
+}
+
+// originKeys returns the keys of origin's objects.
+func (state *referenceLedgerState) originKeys(origin SnapshotID) map[string]struct{} {
+	if entry := state.byOrigin[origin]; entry != nil {
+		return entry.keys
+	}
+	return nil
 }
 
 func (state *referenceLedgerState) recordReference(name string) {
@@ -1445,11 +1532,9 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	var queue []string
-	for key, object := range ledger.state.Objects {
-		if object.State == ObjectReclaiming {
-			queue = append(queue, key)
-		}
+	queue := make([]string, 0, len(ledger.state.reclaiming))
+	for key := range ledger.state.reclaiming {
+		queue = append(queue, key)
 	}
 	// A healthy live graph overwhelmingly has nothing to collect: do not
 	// append a no-op WAL record on every coordinator maintenance tick.
@@ -1510,8 +1595,10 @@ func (ledger *ReferenceLedger) EmptyOrigins() []SnapshotID {
 	ledger.mu.RLock()
 	defer ledger.mu.RUnlock()
 	blocked := make(map[SnapshotID]struct{})
-	for _, object := range ledger.state.Objects {
-		blocked[object.ID.Snapshot] = struct{}{}
+	for origin, entry := range ledger.state.byOrigin {
+		if len(entry.keys) != 0 {
+			blocked[origin] = struct{}{}
+		}
 	}
 	for _, reference := range ledger.state.References {
 		blocked[reference.Snapshot] = struct{}{}
@@ -1543,10 +1630,8 @@ func (ledger *ReferenceLedger) RetireOrigin(origin SnapshotID) error {
 	if _, exists := ledger.state.Origins[origin]; !exists {
 		return nil
 	}
-	for _, object := range ledger.state.Objects {
-		if object.ID.Snapshot == origin {
-			return fmt.Errorf("snapshot origin %d still contains object %s", origin, object.ID)
-		}
+	for key := range ledger.state.originKeys(origin) {
+		return fmt.Errorf("snapshot origin %d still contains object %s", origin, ledger.state.Objects[key].ID)
 	}
 	for name, object := range ledger.state.References {
 		if object.Snapshot == origin {
@@ -1614,6 +1699,53 @@ func (ledger *ReferenceLedger) OriginCompactionManifest(origin SnapshotID) (obje
 	return ledger.originManifestLocked(origin)
 }
 
+// OriginChanges returns, for each origin that has or had objects and is not
+// retired, a count that advances whenever one of them stops being live. An
+// origin whose count is the one OriginLiveObjects returned with its live
+// objects still has those live objects.
+func (ledger *ReferenceLedger) OriginChanges() map[SnapshotID]uint64 {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	result := make(map[SnapshotID]uint64, len(ledger.state.byOrigin))
+	for origin, entry := range ledger.state.byOrigin {
+		result[origin] = entry.changes
+	}
+	return result
+}
+
+// OriginLiveObjects returns the IDs of origin's live objects, and its
+// OriginChanges count with them. ready is as for OriginCompactionManifest,
+// whose view this is without the objects and the references: enough to decide
+// whether the origin needs compacting.
+func (ledger *ReferenceLedger) OriginLiveObjects(origin SnapshotID) (live map[ObjectID]struct{}, changes uint64, ok, ready bool) {
+	if ledger == nil || origin == 0 {
+		return nil, 0, false, false
+	}
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	if _, ok := ledger.state.Origins[origin]; !ok {
+		return nil, 0, false, false
+	}
+	ready = true
+	keys := ledger.state.originKeys(origin)
+	live = make(map[ObjectID]struct{}, len(keys))
+	for key := range keys {
+		switch object := ledger.state.Objects[key]; object.State {
+		case ObjectReclaiming:
+			ready = false
+		case ObjectLive:
+			live[object.ID] = struct{}{}
+		}
+	}
+	if entry := ledger.state.byOrigin[origin]; entry != nil {
+		changes = entry.changes
+	}
+	return live, changes, true, ready
+}
+
 // Origins returns the owned immutable origin IDs without copying the much
 // larger object and reference tables. Callers that only schedule per-origin
 // maintenance must not pay Inspect's object-proportional diagnostic cost.
@@ -1652,14 +1784,13 @@ func (ledger *ReferenceLedger) originManifestLocked(origin SnapshotID) (objects 
 		return nil, nil, false, false
 	}
 	ready = true
-	objects = make([]Object, 0)
-	for _, object := range ledger.state.Objects {
+	keys := ledger.state.originKeys(origin)
+	objects = make([]Object, 0, len(keys))
+	for key := range keys {
 		// A bounded collection may leave descendants in ObjectReclaiming until
 		// its next pass. They are already logically dead and must not be offered
 		// to shared-pack compaction as part of the live origin view.
-		if object.ID.Snapshot != origin {
-			continue
-		}
+		object := ledger.state.Objects[key]
 		if object.State == ObjectReclaiming {
 			ready = false
 			continue
@@ -1668,7 +1799,8 @@ func (ledger *ReferenceLedger) originManifestLocked(origin SnapshotID) (objects 
 			objects = append(objects, cloneObject(object))
 		}
 	}
-	sort.Slice(objects, func(i, j int) bool { return objects[i].ID.key() < objects[j].ID.key() })
+	// In key order, which is ID order.
+	slices.SortFunc(objects, func(a, b Object) int { return compareObjectIDs(a.ID, b.ID) })
 	references = make(map[string]ObjectID)
 	for name, object := range ledger.state.References {
 		if object.Snapshot == origin {

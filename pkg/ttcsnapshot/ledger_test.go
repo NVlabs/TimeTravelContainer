@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -1140,6 +1141,7 @@ func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
 		if after := ledger.Inspect(); !reflect.DeepEqual(after, before) {
 			t.Fatalf("%s changed the ledger:\nbefore %+v\nafter  %+v", what, before, after)
 		}
+		checkLedgerIndexes(t, ledger)
 	}
 
 	if err := ledger.ApplyReferences([]SnapshotReferenceMutation{
@@ -1193,6 +1195,200 @@ func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
 	defer reopened.Close()
 	if replayed := reopened.Inspect(); !reflect.DeepEqual(replayed, before) {
 		t.Fatalf("replayed ledger differs:\nwant %+v\ngot  %+v", before, replayed)
+	}
+}
+
+// checkLedgerIndexes fails unless the ledger's indexes of its objects are
+// what the objects make them.
+func checkLedgerIndexes(t *testing.T, ledger *ReferenceLedger) {
+	t.Helper()
+	ledger.mu.RLock()
+	defer ledger.mu.RUnlock()
+	byOrigin := make(map[SnapshotID]map[string]struct{})
+	reclaiming := make(map[string]struct{})
+	for key, object := range ledger.state.Objects {
+		if byOrigin[object.ID.Snapshot] == nil {
+			byOrigin[object.ID.Snapshot] = make(map[string]struct{})
+		}
+		byOrigin[object.ID.Snapshot][key] = struct{}{}
+		if object.State == ObjectReclaiming {
+			reclaiming[key] = struct{}{}
+		}
+	}
+	for origin, keys := range byOrigin {
+		if !reflect.DeepEqual(ledger.state.originKeys(origin), keys) {
+			t.Fatalf("origin %d indexes objects %v, has %v", origin, ledger.state.originKeys(origin), keys)
+		}
+	}
+	for origin, entry := range ledger.state.byOrigin {
+		if _, ok := ledger.state.Origins[origin]; !ok {
+			t.Fatalf("origin %d is indexed but not owned", origin)
+		}
+		if len(entry.keys) != len(byOrigin[origin]) {
+			t.Fatalf("origin %d indexes %d objects, has %d", origin, len(entry.keys), len(byOrigin[origin]))
+		}
+	}
+	if !reflect.DeepEqual(ledger.state.reclaiming, reclaiming) {
+		t.Fatalf("reclaiming index %v, reclaiming objects %v", ledger.state.reclaiming, reclaiming)
+	}
+}
+
+// The ledger indexes its objects by origin, and the ones being reclaimed. The
+// indexes must follow every mutation, refused ones included, and an origin's
+// change count must advance whenever its live objects change.
+func TestReferenceLedgerIndexesFollowMutations(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { ledger.Close() }()
+	random := rand.New(rand.NewSource(1))
+	type liveView struct {
+		changes uint64
+		live    map[ObjectID]struct{}
+	}
+	seen := make(map[SnapshotID]liveView)
+	check := func(step string) {
+		t.Helper()
+		checkLedgerIndexes(t, ledger)
+		for origin, count := range ledger.OriginChanges() {
+			live, changes, ok, _ := ledger.OriginLiveObjects(origin)
+			if !ok || changes != count {
+				t.Fatalf("%s: origin %d reads count %d (ok %t), listed with %d", step, origin, changes, ok, count)
+			}
+			if prior, ok := seen[origin]; ok && prior.changes == count && !reflect.DeepEqual(prior.live, live) {
+				t.Fatalf("%s: origin %d's live objects changed from %v to %v without its count advancing", step, origin, prior.live, live)
+			}
+			seen[origin] = liveView{changes: count, live: live}
+		}
+	}
+	references := make(map[string]ObjectID)
+	live := func() []ObjectID {
+		var result []ObjectID
+		ledger.mu.RLock()
+		for _, object := range ledger.state.Objects {
+			if object.State == ObjectLive {
+				result = append(result, object.ID)
+			}
+		}
+		ledger.mu.RUnlock()
+		slices.SortFunc(result, compareObjectIDs)
+		return result
+	}
+	next := SnapshotID(1)
+	operation, retired := 0, 0
+	for step := 0; step < 600; step++ {
+		operation++
+		var what string
+		switch choice := random.Intn(10); {
+		case choice == 0 || next == 1:
+			// An origin of a node and its chunks, some of the node's edges to
+			// live objects of earlier origins.
+			what = "import"
+			origin := next
+			next++
+			chunks := 1 + random.Intn(6)
+			var objects []Object
+			var edges []Edge
+			for ordinal := 2; ordinal < 2+chunks; ordinal++ {
+				chunk := ledgerObject(origin, uint64(ordinal), ObjectKindMemoryChunk)
+				objects = append(objects, chunk)
+				edges = append(edges, Edge{Slot: uint16(ordinal), Child: chunk.ID})
+			}
+			if earlier := live(); len(earlier) != 0 {
+				for i := random.Intn(3); i > 0; i-- {
+					edges = append(edges, Edge{Slot: uint16(100 + i), Child: earlier[random.Intn(len(earlier))]})
+				}
+			}
+			node := ledgerObject(origin, 1, ObjectKindMemoryNode, edges...)
+			objects = append(objects, node)
+			name := fmt.Sprintf("root/%d", origin)
+			baseline := map[string]ObjectID{name: node.ID}
+			if random.Intn(5) == 0 {
+				// Refused part way: the baseline names an object of no origin.
+				baseline["root/unknown"] = ledgerObject(origin, 99, ObjectKindMemoryChunk).ID
+				if err := ledger.ImportOrigin(origin, objects, baseline); err == nil {
+					t.Fatal("an import naming an unknown object was applied")
+				}
+				what = "refused import"
+				break
+			}
+			if err := ledger.ImportOrigin(origin, objects, baseline); err != nil {
+				t.Fatalf("importing origin %d: %v", origin, err)
+			}
+			references[name] = node.ID
+		case choice <= 3:
+			what = "retain"
+			if objects := live(); len(objects) != 0 {
+				name := fmt.Sprintf("root/extra-%d", operation)
+				id := objects[random.Intn(len(objects))]
+				if err := ledger.ApplyReference(fmt.Sprintf("retain-%d", operation), name, id, true); err != nil {
+					t.Fatalf("retaining %s: %v", id, err)
+				}
+				references[name] = id
+			}
+		case choice <= 6:
+			what = "release"
+			names := make([]string, 0, len(references))
+			for name := range references {
+				names = append(names, name)
+			}
+			if len(names) != 0 {
+				slices.Sort(names)
+				name := names[random.Intn(len(names))]
+				if err := ledger.ApplyReference(fmt.Sprintf("release-%d", operation), name, references[name], false); err != nil {
+					t.Fatalf("releasing %q: %v", name, err)
+				}
+				delete(references, name)
+			}
+		case choice == 7:
+			what = "collect"
+			if _, err := ledger.Collect(1 + random.Intn(16)); err != nil {
+				t.Fatal(err)
+			}
+		case choice == 8:
+			what = "refused batch"
+			if objects := live(); len(objects) != 0 {
+				if err := ledger.ApplyReferences([]SnapshotReferenceMutation{
+					{Operation: fmt.Sprintf("retain-%d", operation), Name: fmt.Sprintf("root/extra-%d", operation), Object: objects[0], Retain: true},
+					{Operation: fmt.Sprintf("release-%d", operation), Name: "root/missing", Object: objects[0]},
+				}); err == nil {
+					t.Fatal("a batch releasing a missing reference was applied")
+				}
+			}
+		default:
+			what = "retire"
+			for _, origin := range ledger.EmptyOrigins() {
+				if err := ledger.RetireOrigin(origin); err != nil {
+					t.Fatalf("retiring origin %d: %v", origin, err)
+				}
+				delete(seen, origin)
+				retired++
+			}
+		}
+		check(fmt.Sprintf("step %d (%s)", step, what))
+	}
+	if retired == 0 {
+		t.Fatal("no origin emptied to be retired")
+	}
+	for _, reopen := range []string{"replayed", "checkpointed"} {
+		if reopen == "checkpointed" {
+			if err := ledger.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := ledger.Inspect()
+		if err := ledger.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if ledger, err = OpenReferenceLedger(directory); err != nil {
+			t.Fatal(err)
+		}
+		if after := ledger.Inspect(); !reflect.DeepEqual(after, before) {
+			t.Fatalf("%s ledger differs:\nwant %+v\ngot  %+v", reopen, before, after)
+		}
+		checkLedgerIndexes(t, ledger)
 	}
 }
 

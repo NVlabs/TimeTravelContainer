@@ -1125,7 +1125,7 @@ func (store *SharedPackStore) Reconcile(snapshot SnapshotID) (int, bool, error) 
 		_ = syscall.Flock(int(lease.Fd()), syscall.LOCK_UN)
 		_ = lease.Close()
 	}()
-	manifest, err := store.Manifest(snapshot)
+	manifest, err := store.manifest(snapshot)
 	if err != nil {
 		return 0, false, err
 	}
