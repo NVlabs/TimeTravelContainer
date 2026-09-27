@@ -77,7 +77,9 @@ start_compute() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$ROOT/shared" "$ROOT/local-$node"
+	mkdir -p "$ROOT/shared"
+	# A daemon's root holds its socket, and must be private.
+	mkdir -p -m 700 "$ROOT/local-$node"
 	TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
@@ -95,7 +97,7 @@ branch_owner() {
 
 test -x "$TTC" || fail "TTC is not executable: $TTC"
 test -x "$TTCD" || fail "TTCD is not executable: $TTCD"
-mkdir -p "$ROOT/local-control"
+mkdir -p -m 700 "$ROOT/local-control"
 
 start_compute a "$PORT_A" --cluster-init
 start_compute b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"

@@ -5739,7 +5739,7 @@ func secureDaemonDirectory(dir string) error {
 		return fmt.Errorf("socket directory %q is owned by UID %d, not %d", dir, stat.Uid, os.Geteuid())
 	}
 	if info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("socket directory %q permissions %04o allow access by other users", dir, info.Mode().Perm())
+		return fmt.Errorf("the daemon's root %q, which holds its socket, has permissions %04o that allow access by other users; make it private with chmod 700", dir, info.Mode().Perm())
 	}
 	return nil
 }

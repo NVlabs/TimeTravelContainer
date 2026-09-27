@@ -84,7 +84,9 @@ wait_ready() {
 	return 1
 }
 
-mkdir -p "$SHARED" "$LOCAL_A" "$LOCAL_B"
+mkdir -p "$SHARED"
+# A daemon's root holds its socket, and must be private.
+mkdir -p -m 700 "$LOCAL_A" "$LOCAL_B"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
 	"$TTCD" --cluster-init --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \

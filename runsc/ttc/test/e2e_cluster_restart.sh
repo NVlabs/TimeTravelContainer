@@ -92,7 +92,9 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$ROOT/shared" "$ROOT/local-a" "$ROOT/local-b"
+mkdir -p "$ROOT/shared"
+# A daemon's root holds its socket, and must be private.
+mkdir -p -m 700 "$ROOT/local-a" "$ROOT/local-b"
 start_node a "$PORT_A" --cluster-init >/dev/null
 start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A" >/dev/null
 

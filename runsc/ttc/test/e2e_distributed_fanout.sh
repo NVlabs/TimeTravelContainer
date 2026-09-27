@@ -92,7 +92,8 @@ start_node() {
 	node=$1
 	port=$2
 	shift 2
-	mkdir -p "$LOCAL_BASE/local-$node"
+	# A daemon's root holds its socket, and must be private.
+	mkdir -p -m 700 "$LOCAL_BASE/local-$node"
 	TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_BASE/local-$node TTC_CLUSTER_TOKEN=$TOKEN \
 		setsid "$TTCD" --node "node-$node" \
 		--listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
