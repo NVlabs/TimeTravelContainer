@@ -786,6 +786,17 @@ func (b *runtimeBackend) reconcilePlacementCatalog() error {
 		if !ok {
 			continue
 		}
+		// A publication that unplaced the branch after this snapshot was taken
+		// then cleared its owner in the record: writing the snapshot's owner
+		// back placed the record again, and a rehydration claiming the branch
+		// elsewhere failed, "cluster owner changed from "" to ...". Confirm the
+		// owner of a branch the record calls unplaced before writing it.
+		if info.BranchNodeID(record.BranchID) == "" {
+			current, err := placements.Lookup(record.FamilyID, record.BranchID)
+			if err != nil || current.OwnerNode != record.OwnerNode || current.Generation != record.Generation {
+				continue
+			}
+		}
 		if err := b.syncLogicalBranchOwnerOf(info, record.BranchID, record.OwnerNode); err != nil {
 			result = errors.Join(result, fmt.Errorf("synchronizing logical owner for %s@%s: %w", record.FamilyID, record.BranchID, err))
 		} else {
