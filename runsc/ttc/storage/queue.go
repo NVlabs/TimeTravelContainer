@@ -65,12 +65,18 @@ type Publisher interface {
 	Cleanup(Intent) error
 }
 
+// errCompletionAbandoned is the error of an attempt that gave up completing
+// for the publication's cancellation.
+var errCompletionAbandoned = errors.New("publication completion gave way to its cancellation")
+
 // completionGater is implemented by publishers whose Complete needs a lock
 // that its holders may keep while they wait for this queue. The queue takes
 // that lock before its own, never under it, and what BeginCompletion returns
-// releases it.
+// releases it. BeginCompletion gives up, returning false, once abandon
+// reports true: a cancellation waits for the attempt holding a lock that the
+// gate's holder may be waiting for.
 type completionGater interface {
-	BeginCompletion() func()
+	BeginCompletion(abandon func() bool) (func(), bool)
 }
 
 // cancellationFencer is implemented by distributed publishers whose control
@@ -446,7 +452,15 @@ func (q *Queue) process() time.Duration {
 		result, publishErr := q.publisher.Publish(context.Background(), intent)
 		endCompletion := func() {}
 		if gater, ok := q.publisher.(completionGater); ok && publishErr == nil {
-			endCompletion = gater.BeginCompletion()
+			// A removal canceling this publication waits for this attempt
+			// holding the lifecycle lock, which a capture holding the gate
+			// may wait for: once canceled, stop waiting for the gate.
+			end, gated := gater.BeginCompletion(func() bool { return q.canceled(intent.ID) })
+			if gated {
+				endCompletion = end
+			} else {
+				publishErr = errCompletionAbandoned
+			}
 		}
 		q.mu.Lock()
 		canceled := q.canceled(intent.ID)

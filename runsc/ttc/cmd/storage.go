@@ -1363,12 +1363,14 @@ func (p *branchPublisher) publishVolatileGraphOrigin(ctx context.Context, snapsh
 // must not make meanwhile. Slow pack construction happened before and does not
 // hold the gate. The queue takes it before its own lock: a capture keeps the
 // gate while it waits for the lifecycle lock, whose holder may wait for the
-// queue, as a removal canceling the branch's publications does.
-func (p *branchPublisher) BeginCompletion() func() {
+// queue, as a removal canceling the branch's publications does; and that
+// removal waits, holding the lifecycle lock, for the attempt waiting for the
+// gate, which so gives up once abandon reports the publication canceled.
+func (p *branchPublisher) BeginCompletion(abandon func() bool) (func(), bool) {
 	if p.authority == nil {
-		return func() {}
+		return func() {}, true
 	}
-	return p.peers.beginBackgroundSnapshotWork()
+	return p.peers.beginBackgroundSnapshotWorkUnless(abandon)
 }
 
 func (p *branchPublisher) Complete(intent ttcstorage.Intent, result ttcstorage.Result) error {

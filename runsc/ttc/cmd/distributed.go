@@ -587,6 +587,22 @@ func (r *distributedSourceRuntime) beginBackgroundSnapshotWork() func() {
 	return r.handoffGate.RUnlock
 }
 
+// beginBackgroundSnapshotWorkUnless is beginBackgroundSnapshotWork for work
+// that must stop waiting for the gate once abandon reports true; it then
+// returns false.
+func (r *distributedSourceRuntime) beginBackgroundSnapshotWorkUnless(abandon func() bool) (func(), bool) {
+	if r == nil {
+		return func() {}, true
+	}
+	for !r.handoffGate.TryRLock() {
+		if abandon() {
+			return nil, false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return r.handoffGate.RUnlock, true
+}
+
 // sourceTransactionTerminalAction resolves handoff liveness from local Raft
 // authority when the target peer is unavailable. Family removal may retire a
 // transaction before a background handoff next contacts the target; retrying

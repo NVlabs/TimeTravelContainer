@@ -451,10 +451,18 @@ type gatedPublisher struct {
 	gate    chan struct{}
 }
 
-func (p *gatedPublisher) BeginCompletion() func() {
+func (p *gatedPublisher) BeginCompletion(abandon func() bool) (func(), bool) {
 	close(p.waiting)
-	<-p.gate
-	return func() {}
+	for {
+		select {
+		case <-p.gate:
+			return func() {}, true
+		case <-time.After(5 * time.Millisecond):
+			if abandon() {
+				return nil, false
+			}
+		}
+	}
 }
 
 func TestCompletionWaitsForItsGateWithoutTheQueueLock(t *testing.T) {
@@ -498,5 +506,50 @@ func TestCompletionWaitsForItsGateWithoutTheQueueLock(t *testing.T) {
 	case <-publisher.completed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("publication did not complete once its gate opened")
+	}
+}
+
+// A removal cancels a publication whose completion waits for its gate, and
+// waits for that attempt holding what the gate's holder waits for: the
+// attempt must give the gate up, rather than deadlock the three.
+func TestCancelOfACompletionWaitingForItsGate(t *testing.T) {
+	publisher := &gatedPublisher{
+		testPublisher: testPublisher{completed: make(chan Intent, 1)},
+		waiting:       make(chan struct{}), gate: make(chan struct{}),
+	}
+	queue, err := Open(t.TempDir(), publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	if err := queue.Enqueue(Intent{Container: "family", Branch: "main", PublicationID: "publication-6", Kind: "stop", FilesystemBranch: "capture"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Activate("family", "main", "publication-6"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-publisher.waiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completion did not begin")
+	}
+	canceled := make(chan error, 1)
+	go func() { canceled <- queue.Cancel("family", "main", "publication-6") }()
+	select {
+	case err := <-canceled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel and the completion it waits for deadlocked on the gate")
+	}
+	defer close(publisher.gate)
+	if pending, err := queue.Pending(); err != nil || len(pending) != 0 {
+		t.Fatalf("canceled intent remains: pending=%+v err=%v", pending, err)
+	}
+	select {
+	case intent := <-publisher.completed:
+		t.Fatalf("canceled publication %s completed", intent.PublicationID)
+	default:
 	}
 }
