@@ -110,6 +110,52 @@ type familyOperations struct {
 	mu    sync.Mutex
 	ended *sync.Cond
 	byID  map[string]*familyOperation
+	// making counts, by runtime and branch, the runtime branches a command
+	// is making that Raft has no placement for yet: a fork's new branches
+	// until their placements are registered, and a checkpoint's hidden
+	// branch, which never has one. Placement enforcement and the cleanup of
+	// branches this node does not own must leave them alone.
+	making map[string]int
+}
+
+// beginMaking marks branches of runtime as being made until the returned
+// function is called.
+func (o *familyOperations) beginMaking(runtime string, branches ...string) func() {
+	if o == nil || len(branches) == 0 {
+		return func() {}
+	}
+	keys := make([]string, len(branches))
+	o.mu.Lock()
+	if o.making == nil {
+		o.making = make(map[string]int)
+	}
+	for i, branch := range branches {
+		keys[i] = runtime + "\x00" + branch
+		o.making[keys[i]]++
+	}
+	o.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			for _, key := range keys {
+				if o.making[key]--; o.making[key] <= 0 {
+					delete(o.making, key)
+				}
+			}
+		})
+	}
+}
+
+// beingMade reports whether a command is making the branch of runtime.
+func (o *familyOperations) beingMade(runtime, branch string) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.making[runtime+"\x00"+branch] != 0
 }
 
 func (o *familyOperations) begin(op *familyOperation) error {

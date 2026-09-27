@@ -3967,6 +3967,11 @@ func (b *runtimeBackend) cleanupNonOwnedRuntimeBranches() error {
 				protectedMigration = true
 				protectedBranches[branch.ID] = true
 			}
+			// So is a branch a command here is making, which the record may
+			// not name yet.
+			if b.operations.beingMade(runtimeFamily.ID, branch.ID) {
+				protectedBranches[branch.ID] = true
+			}
 		}
 		if !physicalLocalOwned {
 			if !protectedMigration {
@@ -6113,6 +6118,12 @@ func enforceLocalRaftPlacements(backend *runtimeBackend, nodeID, incarnation str
 		for _, branch := range family.Branches {
 			placement, lookupErr := backend.distributedSource.authority.LookupPlacement(family.ID, branch.ID)
 			if lookupErr == nil && placementKeepsRuntime(placement, nodeID, incarnation) {
+				continue
+			}
+			// A fork's new branches run here before their placements exist,
+			// and a checkpoint's hidden branch never has one. Nothing else
+			// can hold authority over a branch no placement names.
+			if errors.Is(lookupErr, os.ErrNotExist) && backend.operations.beingMade(family.ID, branch.ID) {
 				continue
 			}
 			// Migration transfers guest execution authority before the target has

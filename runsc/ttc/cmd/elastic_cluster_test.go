@@ -1284,6 +1284,68 @@ func TestPlacementReconciliationLeavesABusyFamily(t *testing.T) {
 	}
 }
 
+// The cleanup of runtime branches a node does not own leaves alone one that a
+// command there is making: a fork's new branch runs before its record names
+// it, as a checkpoint's hidden branch does all its life.
+func TestNonOwnedBranchCleanupLeavesABranchBeingMade(t *testing.T) {
+	root := t.TempDir()
+	containerDir := filepath.Join(root, "containers", "web")
+	bundleDir := filepath.Join(containerDir, "bundle")
+	if err := os.MkdirAll(bundleDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "config.json"), []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	info := ttcbundle.ContainerInfo{
+		ID: "web", Name: "web", NodeID: "node-a", BundleDir: bundleDir,
+		Branches: []ttcbundle.BranchInfo{{ID: "main", NodeID: "node-a", State: "running", CreatedAt: time.Unix(1, 0).UTC()}},
+	}
+	if err := writeCurrentBundleFixture(filepath.Join(containerDir, "container.json"), info); err != nil {
+		t.Fatal(err)
+	}
+	// The runtime runs main and a new b1, and logs what it is asked to do.
+	calls := filepath.Join(t.TempDir(), "calls")
+	runsc := filepath.Join(t.TempDir(), "runsc")
+	script := "#!/bin/sh\necho \"$@\" >> " + calls + "\n" +
+		"[ \"$3\" = list ] && { echo '[{\"id\":\"web\",\"status\":\"running\"}]'; exit 0; }\n" +
+		"[ \"$5\" = branches ] && { echo '[{\"ID\":\"main\",\"State\":\"running\"},{\"ID\":\"b1\",\"State\":\"running\"}]'; exit 0; }\n" +
+		"[ \"$5\" = destroy ] && exit 0\nexit 2\n"
+	if err := os.WriteFile(runsc, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	destroyed := func() bool {
+		data, err := os.ReadFile(calls)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(string(data), "timetravel web destroy b1")
+	}
+	var operations familyOperations
+	made := operations.beginMaking("web", "b1")
+	backend := &runtimeBackend{
+		root: filepath.Join(root, "runsc-root"), runsc: runsc, dataRoot: root, localRoot: t.TempDir(), nodeID: "node-a",
+		operations: &operations, stdin: strings.NewReader(""), stdout: io.Discard, stderr: io.Discard,
+	}
+	if err := backend.cleanupNonOwnedRuntimeBranches(); err != nil {
+		t.Fatalf("cleanupNonOwnedRuntimeBranches: %v", err)
+	}
+	if destroyed() {
+		t.Fatal("the cleanup destroyed a branch a fork was making")
+	}
+	made()
+	made()
+	if operations.beingMade("web", "b1") {
+		t.Fatal("b1 is still being made after its fork finished")
+	}
+	if err := backend.cleanupNonOwnedRuntimeBranches(); err != nil {
+		t.Fatalf("cleanupNonOwnedRuntimeBranches: %v", err)
+	}
+	if !destroyed() {
+		t.Fatal("the cleanup left a branch no record gives this node and no command makes")
+	}
+}
+
 // A rehydration makes its branch routable even while a long operation, a
 // remote fork's handoff for one, works on its family: the reconciliation
 // after the command passes over such a family.

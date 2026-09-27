@@ -12705,6 +12705,8 @@ func (b *runtimeBackend) forkMany(source selector, destinations []string, paused
 	if err := b.ensureForkPlacementDestinationsAvailable(containerInfo, destinations); err != nil {
 		return nil, err
 	}
+	// The new branches run before their placements exist.
+	defer b.operations.beginMaking(source.container, destinations...)()
 	sourceRecord, err := persistentBranchInfo(containerInfo, source.branch)
 	if err != nil {
 		return nil, err

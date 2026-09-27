@@ -231,6 +231,8 @@ func (b *runtimeBackend) checkpoint(request checkpointRequest, output io.Writer)
 		return err
 	}
 	hiddenBranch := "checkpoint-" + requestID
+	// The hidden branch never has a placement.
+	defer b.operations.beginMaking(info.ID, hiddenBranch)()
 	stageRoot := filepath.Join(b.activeDataRoot(), "tmp")
 	if err := os.MkdirAll(stageRoot, 0700); err != nil {
 		return err
