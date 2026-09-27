@@ -266,6 +266,7 @@ analyzers:
         - pkg/sentry/fs/fs.go          # Intentional.
         - pkg/sentry/fs/gofer/inode.go # Intentional.
         - pkg/refs/refcounter_test.go  # Intentional.
+        - runsc/ttc/cmd/distributed.go # Intentional: awaitOriginAllocations is a barrier.
   SA4016: # Useless bitwise operations.
     internal:
       exclude:

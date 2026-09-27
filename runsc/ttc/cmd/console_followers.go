@@ -319,16 +319,25 @@ func (s *daemonServer) familyConsoleDone(key string) {
 	}()
 }
 
+// retireIdleFollowerStart removes dir's follower start lock from starts,
+// unless a follower start holds it.
+//
+// +checklocksignore: the lock is a map value, which checklocks cannot follow
+// through TryLock.
+func retireIdleFollowerStart(starts map[string]*sync.Mutex, dir string) {
+	if starting := starts[dir]; starting != nil && starting.TryLock() {
+		delete(starts, dir)
+		starting.Unlock()
+	}
+}
+
 // familyFollowerLost runs when the connection to a follower ends. A follower
 // that is gone has released every console it followed.
 func (s *daemonServer) familyFollowerLost(dir string, client *familyFollowerClient) {
 	s.followerMu.Lock()
 	if s.followers[dir] == client {
 		delete(s.followers, dir)
-		if starting := s.followerStarts[dir]; starting != nil && starting.TryLock() {
-			delete(s.followerStarts, dir)
-			starting.Unlock()
-		}
+		retireIdleFollowerStart(s.followerStarts, dir)
 	}
 	var keys []string
 	for key, console := range s.familyConsoles {
