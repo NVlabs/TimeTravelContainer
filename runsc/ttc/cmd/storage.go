@@ -2306,13 +2306,6 @@ func (b *runtimeBackend) ensureLocalColdFilesystem(info ttcbundle.ContainerInfo,
 	if err := validateColdManifestPath(b.dataRoot, branch.StorageManifest); err != nil {
 		return err
 	}
-	manifest, err := readColdBranchManifest(branch.StorageManifest)
-	if err != nil {
-		return err
-	}
-	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
-		return err
-	}
 	// Materializing a committed snapshot into this node's disposable cache is
 	// not an authority transition. In particular, cp and cold-fork source
 	// preparation may run on any node while the branch remains unplaced. The
@@ -2423,6 +2416,9 @@ func (b *runtimeBackend) materializeColdFilesystem(info ttcbundle.ContainerInfo,
 	}
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")
+	}
+	if err := b.discardSupersededBranchFilesystems(info, branch, coldFilesystemRoots(manifest)); err != nil {
+		return err
 	}
 	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
 		return err
