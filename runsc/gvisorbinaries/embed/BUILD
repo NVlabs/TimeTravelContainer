@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "select_system")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -34,6 +34,7 @@ go_library(
     name = "embed",
     srcs = [
         "embed.go",
+        "embed_checkpointgofer.go",
         "embed_metricserver_gen.go",
     ],
     stateify = False,
@@ -41,9 +42,11 @@ go_library(
         "//runsc:__subpackages__",
     ],
     deps = [
-        "//runsc/checkpointgofer",
         "//runsc/gvisorbinaries",
-    ] + select({
+    ] + select_system(
+        darwin = [],
+        linux = ["//runsc/checkpointgofer"],
+    ) + select({
         ":metric_server_elided": [],
         "//conditions:default": [
             "//runsc/cmd/metricserver",

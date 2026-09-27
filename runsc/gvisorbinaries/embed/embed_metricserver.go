@@ -15,6 +15,9 @@
 // This file is used in non-fastbuild builds, which embed a copy of the metric
 // server binary. The fastbuild variant (embed_metricserver_elided.go) elides
 // the embedded copy to keep fastbuild binaries small; see the BUILD file.
+// Darwin builds embed no sidecar; see embed.go.
+
+//go:build !darwin
 
 package embed
 

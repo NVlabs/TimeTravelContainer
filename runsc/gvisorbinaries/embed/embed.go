@@ -19,25 +19,10 @@
 // TODO(gvisor.dev/issue/13718): embedded sidecar binaries are being replaced by
 // on-disk binaries in a "gvisor-bin/" directory. Once the embedded copies are
 // removed, delete this package.
+//
+// Darwin builds embed neither sidecar. Both serve Linux deployments (GCS
+// checkpoints and the metric server), and the HVF platform mirrors the whole
+// binary into each Sentry's VM, where the checkpoint gofer alone cost 49 MiB
+// per container. On Darwin a sidecar resolves from gvisor-bin/ or reports that
+// it is unavailable.
 package embed
-
-import (
-	"gvisor.dev/gvisor/runsc/checkpointgofer"
-	"gvisor.dev/gvisor/runsc/gvisorbinaries"
-)
-
-func init() {
-	gvisorbinaries.CheckpointGofer.DeclareEmbedded(func(o gvisorbinaries.Options) error {
-		return checkpointgofer.Exec(checkpointgofer.Options{
-			Argv: o.Argv,
-			Envv: o.Envv,
-		})
-	}, func(o gvisorbinaries.Options) (int, error) {
-		return checkpointgofer.ForkExec(checkpointgofer.Options{
-			Argv:        o.Argv,
-			Envv:        o.Envv,
-			Files:       o.Files,
-			SysProcAttr: o.SysProcAttr,
-		})
-	})
-}
