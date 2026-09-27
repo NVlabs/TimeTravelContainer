@@ -16209,52 +16209,37 @@ func (source graphRestoreObjectSource) Fetch(ctx context.Context, id ttcsnapshot
 	return file, object.BulkLength, nil
 }
 
-func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*graphMemoryRestore, error) {
-	if b.snapshotData == nil || len(capture.MemoryRoots) == 0 || capture.SnapshotID == 0 {
-		return nil, errors.New("graph-native dehydration roots are unavailable")
+// graphHoldsRoots reports whether this node's graph roots each of roots.
+func (b *runtimeBackend) graphHoldsRoots(roots []ttcchunk.GraphMemoryRoot) bool {
+	if b.snapshotGraph == nil {
+		return false
 	}
-	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
-	rootObjects := make([]ttcsnapshot.ObjectID, len(capture.MemoryRoots))
-	localRoots := b.snapshotGraph != nil
-	for index, recorded := range capture.MemoryRoots {
-		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
-		if err != nil {
-			return nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
+	for _, root := range roots {
+		if current, ok := b.snapshotGraph.Root(root.Name); !ok || current != root.Root {
+			return false
 		}
-		if localRoots {
-			current, ok := b.snapshotGraph.Root(recorded.Name)
-			if !ok || current != id {
-				localRoots = false
-			}
-		}
-		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
-		rootObjects[index] = id
 	}
-	var catalog ttcsnapshot.MemoryCatalog
-	if localRoots {
-		catalog = b.snapshotGraph
-	} else {
-		immutable, err := b.immutableSnapshotCatalog(context.Background(), rootObjects, "")
-		if err != nil {
-			return nil, fmt.Errorf("resolving immutable memory metadata: %w", err)
-		}
-		catalog = immutable
-	}
+	return true
+}
+
+// readGraphMemoryImage reads from catalog the manifest of the memory image
+// roots select, and the chunks its restore relays: those this node's store
+// lacks, missing, and in a cluster those it has too, as spares. The daemon's
+// sweep of the store may take one while the branch still loads it, even of an
+// image this node's graph holds, once the publication that hands it to the
+// shared store releases its roots. A reader that finds a chunk gone fetches
+// it again.
+func (b *runtimeBackend) readGraphMemoryImage(catalog ttcsnapshot.MemoryCatalog, roots []ttcchunk.GraphMemoryRoot) (ttcchunk.GraphManifestResult, map[ttcsnapshot.ObjectID]ttcsnapshot.Object, map[ttcsnapshot.ObjectID]bool, error) {
 	adapted, err := ttcchunk.BuildGraphManifest(catalog, roots)
 	if err != nil {
-		return nil, err
+		return ttcchunk.GraphManifestResult{}, nil, nil, err
 	}
 	objectCatalog, ok := catalog.(interface {
 		Object(ttcsnapshot.ObjectID) (ttcsnapshot.Object, bool)
 	})
 	if !ok {
-		return nil, errors.New("graph memory catalog cannot describe bulk objects")
+		return ttcchunk.GraphManifestResult{}, nil, nil, errors.New("graph memory catalog cannot describe bulk objects")
 	}
-	// The relay serves the chunks this node's store lacks, and in a cluster
-	// those it has too, as spares: the daemon's sweep of the store may take
-	// one while the branch still loads it, even of an image this node's graph
-	// holds, once the publication that hands it to the shared store releases
-	// its roots. A reader that finds a chunk gone fetches it again.
 	relayed := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
 	missing := make(map[ttcsnapshot.ObjectID]bool)
 	for _, objectID := range adapted.Chunks {
@@ -16264,18 +16249,61 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 				continue
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("opening local memory chunk %s: %w", objectID, err)
+			return ttcchunk.GraphManifestResult{}, nil, nil, fmt.Errorf("opening local memory chunk %s: %w", objectID, err)
 		} else {
 			missing[objectID] = true
 		}
 		object, ok := objectCatalog.Object(objectID)
 		if !ok {
-			return nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
+			return ttcchunk.GraphManifestResult{}, nil, nil, fmt.Errorf("memory chunk %s has no immutable metadata", objectID)
 		}
 		if object.BulkLength != ttcsnapshot.MemoryChunkBytes {
-			return nil, fmt.Errorf("memory chunk %s has length %d, want %d", objectID, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
+			return ttcchunk.GraphManifestResult{}, nil, nil, fmt.Errorf("memory chunk %s has length %d, want %d", objectID, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
 		}
 		relayed[objectID] = object
+	}
+	return adapted, relayed, missing, nil
+}
+
+func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo) (*graphMemoryRestore, error) {
+	if b.snapshotData == nil || len(capture.MemoryRoots) == 0 || capture.SnapshotID == 0 {
+		return nil, errors.New("graph-native dehydration roots are unavailable")
+	}
+	roots := make([]ttcchunk.GraphMemoryRoot, len(capture.MemoryRoots))
+	rootObjects := make([]ttcsnapshot.ObjectID, len(capture.MemoryRoots))
+	for index, recorded := range capture.MemoryRoots {
+		id, err := ttcsnapshot.ParseObjectID(recorded.Root)
+		if err != nil {
+			return nil, fmt.Errorf("parsing graph memory root %q: %w", recorded.Name, err)
+		}
+		roots[index] = ttcchunk.GraphMemoryRoot{ResourceID: recorded.ResourceID, Name: recorded.Name, Root: id}
+		rootObjects[index] = id
+	}
+	var (
+		adapted ttcchunk.GraphManifestResult
+		relayed map[ttcsnapshot.ObjectID]ttcsnapshot.Object
+		missing map[ttcsnapshot.ObjectID]bool
+		err     error
+	)
+	localRoots := b.graphHoldsRoots(roots)
+	if localRoots {
+		adapted, relayed, missing, err = b.readGraphMemoryImage(b.snapshotGraph, roots)
+		// A publication completing hands the image to the shared store, then
+		// releases this node's roots of it, and the graph collects the objects
+		// even as they are read: the image is then read from the shared store.
+		if err != nil && !b.graphHoldsRoots(roots) {
+			localRoots = false
+		}
+	}
+	if !localRoots {
+		immutable, catalogErr := b.immutableSnapshotCatalog(context.Background(), rootObjects, "")
+		if catalogErr != nil {
+			return nil, fmt.Errorf("resolving immutable memory metadata: %w", catalogErr)
+		}
+		adapted, relayed, missing, err = b.readGraphMemoryImage(immutable, roots)
+	}
+	if err != nil {
+		return nil, err
 	}
 	encoded, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
