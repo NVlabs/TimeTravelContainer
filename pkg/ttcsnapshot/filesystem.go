@@ -279,6 +279,12 @@ func (s *Store) ApplyFilesystemAndReleasePinsReclaimed(origin SnapshotID, rootNa
 // object ID. This keeps the filesystem WAL deterministic while leaving every
 // unaffected sibling as a one-record deferred stub.
 func (s *Store) resolveFilesystemOperationPathsLocked(rootName string, operations []FilesystemOperation) error {
+	// A graph with no deferred object has none to expand. Walking the paths
+	// regardless, decoding every inode record on them, took an eighth of a
+	// Sentry's time creating files.
+	if len(s.deferredObjects) == 0 {
+		return nil
+	}
 	root, ok := s.state.Roots[rootName]
 	if !ok {
 		return nil
