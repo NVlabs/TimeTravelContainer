@@ -14010,7 +14010,7 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 	if node == "" || b.distributedSource.incarnation == "" {
 		return 0, errors.New("cluster memory-origin cleanup lacks node incarnation")
 	}
-	inspection := b.snapshotGraph.Inspect()
+	inspection := b.snapshotGraph.InspectWithoutObjects()
 	abandoned := make(map[ttcsnapshot.SnapshotID]struct{})
 	for _, snapshot := range inspection.Snapshots {
 		if snapshot.State != ttcsnapshot.SnapshotWorking && snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
@@ -14125,7 +14125,7 @@ func (b *runtimeBackend) reconcileVolatileSnapshotOrigins() (int, error) {
 	}
 	live := make(map[ttcsnapshot.SnapshotID]struct{})
 	if b.snapshotGraph != nil {
-		for _, snapshot := range b.snapshotGraph.Inspect().Snapshots {
+		for _, snapshot := range b.snapshotGraph.InspectWithoutObjects().Snapshots {
 			live[snapshot.ID] = struct{}{}
 		}
 	}
@@ -14285,7 +14285,7 @@ func (b *runtimeBackend) reconcileStandaloneMemoryGraph() error {
 			}
 		}
 	}
-	inspection := b.snapshotGraph.Inspect()
+	inspection := b.snapshotGraph.InspectWithoutObjects()
 	var orphanRoots []string
 	for name := range inspection.Roots {
 		if strings.HasPrefix(name, "memory/") || strings.HasPrefix(name, "control/") {
@@ -14642,7 +14642,7 @@ func (b *runtimeBackend) reconcileInterruptedClusterMemoryGraph() error {
 }
 
 func reconcileInterruptedMemoryGraph(graph *ttcsnapshot.Store, data *ttcsnapshot.LocalDataStore, sealState ttcsnapshot.SnapshotState) error {
-	inspection := graph.Inspect()
+	inspection := graph.InspectWithoutObjects()
 	working := make(map[ttcsnapshot.SnapshotID]struct{})
 	for _, snapshot := range inspection.Snapshots {
 		if snapshot.State == ttcsnapshot.SnapshotWorking {
@@ -14946,7 +14946,7 @@ func (b *runtimeBackend) discardFailedGraphSnapshot(origin ttcsnapshot.SnapshotI
 	// construction reference rooted in that origin rather than relying on each
 	// streaming caller to have observed the importer's final result. In
 	// particular, a command may report failure after its stream was committed.
-	inspection := b.snapshotGraph.Inspect()
+	inspection := b.snapshotGraph.InspectWithoutObjects()
 	var roots, pins []string
 	for name, object := range inspection.Roots {
 		if object.Snapshot == origin {
@@ -15004,7 +15004,7 @@ func (b *runtimeBackend) discardFailedGraphSnapshot(origin ttcsnapshot.SnapshotI
 	if _, ok := b.snapshotGraph.Snapshot(origin); !ok {
 		return nil
 	}
-	inspection = b.snapshotGraph.Inspect()
+	inspection = b.snapshotGraph.InspectWithoutObjects()
 	retain := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots)-1)
 	for _, snapshot := range inspection.Snapshots {
 		if snapshot.ID != origin {

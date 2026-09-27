@@ -415,7 +415,7 @@ type cachedBranch struct {
 // VolatileOrigins returns every sealed provider-owned origin in deterministic
 // order. Working origins are mutable and shared origins are already durable.
 func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
-	inspection := r.graph.Inspect()
+	inspection := r.graph.InspectWithoutObjects()
 	origins := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots))
 	for _, snapshot := range inspection.Snapshots {
 		if snapshot.State == ttcsnapshot.SnapshotSealedVolatile {
@@ -432,7 +432,7 @@ func (r *Repository) VolatileOrigins() []ttcsnapshot.SnapshotID {
 // Callers use this inventory to reconcile provider-directory entries after a
 // crash or repository removal; it does not expose object-level references.
 func (r *Repository) SnapshotOrigins() []ttcsnapshot.SnapshotID {
-	inspection := r.graph.Inspect()
+	inspection := r.graph.InspectWithoutObjects()
 	origins := make([]ttcsnapshot.SnapshotID, 0, len(inspection.Snapshots))
 	for _, snapshot := range inspection.Snapshots {
 		origins = append(origins, snapshot.ID)
@@ -716,7 +716,7 @@ func (r *Repository) PrepareRetirementPublication() ([]ttcsnapshot.SnapshotID, e
 		// all runtime users are fenced, so every surviving working origin must be
 		// sealed before a parent origin can transfer its cross-origin edges to the
 		// shared reference ledger.
-		inspection := r.graph.Inspect()
+		inspection := r.graph.InspectWithoutObjects()
 		working := make([]ttcsnapshot.SnapshotID, 0)
 		for _, snapshot := range inspection.Snapshots {
 			if snapshot.State == ttcsnapshot.SnapshotWorking {
@@ -1663,7 +1663,7 @@ func (r *Repository) recoverGraphState() error {
 			branches[id] = struct{}{}
 		}
 
-		inspection := r.graph.Inspect()
+		inspection := r.graph.InspectWithoutObjects()
 		rootNames := make([]string, 0, len(inspection.Roots))
 		for name := range inspection.Roots {
 			rootNames = append(rootNames, name)

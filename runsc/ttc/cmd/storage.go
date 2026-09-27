@@ -1145,7 +1145,7 @@ func releasePublishedProviderGraphRoots(graph *ttcsnapshot.Store, data *ttcsnaps
 		}
 	}
 	bindings := make(map[string]ttcsnapshot.ObjectID)
-	for name, object := range graph.Inspect().Roots {
+	for name, object := range graph.InspectWithoutObjects().Roots {
 		_, explicitlySelected := exact[name]
 		if !explicitlySelected && !strings.HasPrefix(name, prefix) && !(strings.HasPrefix(name, "bridge/edge/") && object.Snapshot == snapshot) {
 			continue
