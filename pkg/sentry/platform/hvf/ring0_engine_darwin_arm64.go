@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -33,6 +34,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hosttid"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf/ring0asm"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/vmplatform/monitorabi"
@@ -70,6 +72,9 @@ const (
 	stateRealtimeOffsetNS       = 0x3388
 	stateGuestCritical          = 0x3390
 	applicationResidencyQuantum = time.Millisecond
+	// ring0IdleTrimDelay is how long no application may run before the
+	// engine returns the Sentry's memory to Darwin; see trimIdleMemory.
+	ring0IdleTrimDelay = 2 * time.Second
 )
 
 // Darwin VM tags of the host memory that the Sentry mirror may import: the
@@ -96,6 +101,9 @@ type ring0ApplicationCPU struct {
 	entryActive       atomic.Bool
 	admissionHandoff  atomic.Bool
 	residentSince     time.Time
+	// entries counts application entries. Only the owner thread increments it,
+	// so the syscall path touches no shared cache line for it.
+	entries atomic.Uint64
 
 	// tlbFullSync is the ring0Engine.mmuSequence at the vCPU's last full
 	// local TLB flush, and tlbSpaceSync maps address spaces to the sequence
@@ -201,6 +209,8 @@ type ring0Engine struct {
 	// guestOnlyImageSlabs, sorted, are the image slabs mirrored before any EL1
 	// entry; see ring0GuestOnlyImageSlabs.
 	guestOnlyImageSlabs []uintptr
+	// idle belongs to the runtime clock updater, which calls trimIdleMemory.
+	idle ring0IdleTracker
 	// mirrorInitialized is protected by mirrorMu. Once the initial Sentry
 	// working set is installed, refreshHostMirror can ignore host-service gates
 	// that only sampled slabs which are already present. This is essential for
@@ -324,6 +334,7 @@ func NewVMEngine(vmInterface vmm.VM, vcpus int) (vmplatform.VMEngine, error) {
 		guestOnlyImageSlabs: guestOnlyImageSlabs,
 		nextMirrorGPA:       dynamicMirrorGPA,
 		pendingMirror:       make(map[uintptr]struct{}),
+		idle:                ring0IdleTracker{trimmed: true},
 		cpuIDs:              make([]bool, vcpus),
 		clockStop:           make(chan struct{}),
 		clockDone:           make(chan struct{}),
@@ -1270,6 +1281,7 @@ func (e *ring0Engine) RunApplication(ctx context.Context, application vmm.Applic
 }
 
 func (e *ring0Engine) runApplicationCPU(ctx context.Context, application vmm.ApplicationState, cpu *ring0ApplicationCPU, release bool) (retExit vmm.Exit, retErr error) {
+	cpu.entries.Add(1)
 	defer func() {
 		if retErr == nil || errors.Is(retErr, context.Canceled) {
 			return
@@ -1810,8 +1822,9 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 		select {
 		case <-e.clockStop:
 			return
-		case <-refresh.C:
+		case now := <-refresh.C:
 			publishRing0RuntimeMetrics(e)
+			e.trimIdleMemory(now)
 			calibration, err := calibrateRing0TimeFastpath(e.timeFastpath.vtimerOffset)
 			if err != nil || calibration.clockGettimePC != e.timeFastpath.clockGettimePC ||
 				calibration.machAbsolutePC != e.timeFastpath.machAbsolutePC ||
@@ -1826,6 +1839,61 @@ func (e *ring0Engine) runRuntimeClockUpdater() {
 			e.unpinApplicationCPUs(cpus)
 		}
 	}
+}
+
+// trimIdleMemory returns the Sentry's memory to Darwin once no application
+// has run for ring0IdleTrimDelay. Darwin charges a page twice to the process
+// footprint once both the host and EL1 have touched it, and the Go runtime
+// returns free heap only gradually, keeping up to its GC goal, twice the live
+// heap. So after a burst, the Sentry's footprint stays far above what it
+// uses. Dropping the Sentry mirror removes the second charge, and lets the
+// runtime then release its free heap without a vCPU rendezvous for each
+// range. The next application entry mirrors its working set again, through
+// host gates, as after a checkpoint.
+func (e *ring0Engine) trimIdleMemory(now time.Time) {
+	var entries uint64
+	active := false
+	cpus := e.pinApplicationCPUs()
+	for _, cpu := range cpus {
+		entries += cpu.entries.Load()
+		active = active || cpu.applicationActive.Load()
+	}
+	e.unpinApplicationCPUs(cpus)
+	if !e.idle.observe(entries, active, now) {
+		return
+	}
+	if err := e.FlushHostExecutionCache(context.Background()); err != nil {
+		log.Warningf("Trimming the idle HVF Sentry mirror: %v", err)
+		return
+	}
+	debug.FreeOSMemory()
+}
+
+// ring0IdleTracker decides when applications have gone idle.
+type ring0IdleTracker struct {
+	// entries is the application entry count last observed, since when it
+	// has not changed, and trimmed is whether observe has reported idleness
+	// since then.
+	entries uint64
+	since   time.Time
+	trimmed bool
+}
+
+// observe records the total application entry count, and whether any
+// application runs, at now. It reports true once applications that have run
+// have then been idle for ring0IdleTrimDelay.
+func (t *ring0IdleTracker) observe(entries uint64, active bool, now time.Time) bool {
+	if active || entries != t.entries {
+		t.entries = entries
+		t.since = now
+		t.trimmed = false
+		return false
+	}
+	if t.trimmed || now.Sub(t.since) < ring0IdleTrimDelay {
+		return false
+	}
+	t.trimmed = true
+	return true
 }
 
 // writeApplicationWaitDiagnostic records backend-owned admission state only

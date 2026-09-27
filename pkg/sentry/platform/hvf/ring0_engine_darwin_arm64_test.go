@@ -280,6 +280,32 @@ func TestImageMirrorsOnFirstTouch(t *testing.T) {
 	}
 }
 
+func TestIdleTrackerReportsOnceAfterActivity(t *testing.T) {
+	start := time.Unix(1000, 0)
+	tracker := ring0IdleTracker{trimmed: true}
+	for i, step := range []struct {
+		entries uint64
+		active  bool
+		after   time.Duration
+		want    bool
+	}{
+		{entries: 0, after: 10 * time.Second}, // Nothing has run yet.
+		{entries: 5, after: 11 * time.Second}, // Activity.
+		{entries: 5, after: 12 * time.Second}, // Idle, but not long enough.
+		{entries: 5, after: 13*time.Second + time.Millisecond, want: true},
+		{entries: 5, after: 20 * time.Second},               // Already reported.
+		{entries: 5, active: true, after: 21 * time.Second}, // A long application run.
+		{entries: 5, after: 22 * time.Second},               // Idle again.
+		{entries: 5, after: 24*time.Second + time.Millisecond, want: true},
+		{entries: 3, after: 25 * time.Second}, // vCPUs retired: activity.
+		{entries: 3, after: 27*time.Second + time.Millisecond, want: true},
+	} {
+		if got := tracker.observe(step.entries, step.active, start.Add(step.after)); got != step.want {
+			t.Errorf("step %d: observe(%d, %t, +%s) = %t, want %t", i, step.entries, step.active, step.after, got, step.want)
+		}
+	}
+}
+
 func TestHostMirrorShadowsOnlyImmutableMainImageData(t *testing.T) {
 	tests := []struct {
 		name     string

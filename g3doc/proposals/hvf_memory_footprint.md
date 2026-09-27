@@ -1,6 +1,6 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1-5 of the delivery plan are
+*Status: in progress, September 2026; phases 1-6 of the delivery plan are
 implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
@@ -44,6 +44,28 @@ five minutes on an idle Sentry, where the runtime forces a GC every two, and
 sooner on a busy one. Twice allocating 1 GiB and running 200 processes left
 the footprint at 595 MiB before phase 5 and 320 MiB after it.
 
+`apt-get install build-essential` in a fresh ubuntu container shows where a
+busy Sentry's memory goes. Its footprint peaks at about 650 MiB. After apt
+exits it stayed at 440 MiB after phase 5, falling about 15 MiB per forced GC,
+and did not fall at all before it. At that point:
+
+| Memory | MiB | |
+|---|---|---|
+| Go runtime regions | 171 | 66 MiB live: the writable layer's metadata, mostly TTC volume and snapshot state (28 MiB), tmpfs inodes and dentries (19 MiB), and file names (7.5 MiB). The installed files themselves are in the volume on disk. |
+| Pages charged twice | ~180 | What both the host and the VM had touched: above all the Go heap, and guest RAM. Dropping the mirror, as a fork does, freed 134 MiB of it at once. |
+| Page tables | 33 | Hypervisor.framework's, grown by vCPU churn (below). |
+| Thread stacks | 25 | 1 MiB for each of 37 threads, committed when mirrored. |
+| Guest RAM | 27 | |
+
+The Sentry ran 217 garbage collections in the 68 s install. Phase 6 trims the
+idle Sentry, bringing the footprint to 230 MiB two seconds after apt exits.
+
+vCPU churn has a cost of its own. An owner-affine vCPU is destroyed whenever
+its task blocks, and created again when it runs, over 2,000 times while 400
+MiB passes through a pipe. Every `hv_vcpu_create` and `hv_vcpu_destroy` pair
+grows the process's page tables by about 13 KiB, up to a plateau of about 32
+MiB per process that never shrinks, even after `hv_vm_destroy`.
+
 ## Where the memory went
 
 Idle Sentry before this work, fresh start, `vmmap` dirty memory by region:
@@ -84,6 +106,7 @@ stores, and branches with stage 1 disabled. On macOS 26.5.2:
 | Wiring | HVF does not wire mapped pages. |
 | Stage-2 faults | An unmapped IPA exits with EC 0x24 and the IPA, PC left on the faulting instruction. Map and resume: 5.2 us per fault, versus 0.7 us for a plain entry and exit. A write to a read-only mapping is a permission fault, resolved by `hv_vm_protect`. |
 | Map cost | `hv_vm_map` 0.37 us and `hv_vm_unmap` 0.20 us per 16 KiB slab; about 1 us for a 512 MiB range. |
+| vCPU lifetimes | Each `hv_vcpu_create` and `hv_vcpu_destroy` pair grows the task's page tables by about 13 KiB, on the same thread or a new one, until they plateau at about 32 MiB. Neither destroying the vCPUs, destroying the VM, nor idle time returns them. |
 | Footprint accounting | A page that both the host and the guest have touched counts twice in the task's physical footprint: a 16 MiB region costs 16 MiB when the host writes it and 16 MiB more when the guest then reads it, and `hv_vm_unmap` returns the second 16 MiB. `vmmap` shows only the host's share in its per-region figures. |
 
 ### The hard constraint
@@ -195,9 +218,23 @@ Each phase stands alone and is measured before the next.
    retire metadata that an EL1 continuation still addresses. The
    rendezvous has a cost: a 200-process burst took up to 18% longer while
    the scavenger released an earlier 1 GiB spike.
-6. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
+6. **Idle trim (done).** Once no application has run for two seconds, the
+   engine drops the Sentry mirror, as a checkpoint does, and returns all free
+   Go heap to Darwin. Without the mirror, the release needs no vCPU
+   rendezvous. The next application entry mirrors its working set again.
+7. **Keep vCPUs across residencies.** Park a task's vCPU on its thread when
+   the task blocks, instead of destroying it, so blocking I/O stops growing
+   Hypervisor.framework's page tables and paying for vCPU creation. The
+   hard part is retiring a parked vCPU, which only its owner thread can do.
+8. **Mirror stacks on first touch**, or release their unused part; the
+   native runtime hooks that run on them need a stack probe first.
+9. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
    platforms keep it.
-7. **Shared `__TEXT`.**
+10. **Writable-layer metadata.** Not HVF-specific: the Sentry keeps TTC volume
+    and snapshot state for the writable layer beside tmpfs's own metadata for
+    it, 55 MiB for build-essential.
+11. **Shared `__TEXT` (postponed).** Its probe could panic the host, so it
+    waits for a time when the host can be rebooted.
 
 ## Open questions
 
@@ -214,10 +251,7 @@ Each phase stands alone and is measured before the next.
   panics the host. Qualify it with a minimal, deliberate probe case first.
 * **Rendezvous cost of releases.** Scavenger releases now stop all vCPUs.
   Batch them, and release only ranges above a size threshold if needed.
-* **Returning a spike sooner.** An idle Sentry keeps a heap spike until the
-  runtime's forced GC. The Sentry could trigger a GC when the guest frees a
-  large amount of memory.
-* **The footprint outside user regions.** The footprint exceeded the sum of
-  `vmmap`'s per-region dirty memory by 53 MiB at idle after phase 1, and by
-  7.5 MiB after phase 2. The double charge above accounts for part of it;
-  attribute the rest.
+* **Returning a spike on a busy Sentry.** Phase 6 trims only an idle one. A
+  busy Sentry still returns its heap only as the scavenger paces it.
+* **The footprint outside user regions** is the double charge and
+  Hypervisor.framework's page tables (`footprint -p` reports them).
