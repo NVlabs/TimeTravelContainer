@@ -2260,6 +2260,13 @@ func (b *runtimeBackend) ensureLocalColdBranch(info ttcbundle.ContainerInfo, bra
 	if len(manifest.Filesystems) == 0 {
 		return errors.New("cold manifest omits filesystem graph roots")
 	}
+	// This node's repositories may still hold the branch from an earlier
+	// incarnation here, whose tree the import would keep: a branch that ran
+	// and was captured elsewhere since would come back to its older files.
+	// The manifest is the branch's authority, as it is for its control state.
+	if err := b.containerStore().RemoveBranchFilesystems(info.ID, branch); err != nil {
+		return fmt.Errorf("discarding earlier local filesystems of %s@%s: %w", info.Name, branch.ID, err)
+	}
 	if _, err := b.materializeDistributedFilesystemRoots(info, branch.FilesystemBranch, coldFilesystemRoots(manifest), true); err != nil {
 		return err
 	}

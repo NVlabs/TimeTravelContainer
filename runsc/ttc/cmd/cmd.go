@@ -15704,6 +15704,12 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 			if _, err := b.command("timetravel", info.ID, "destroy", target.branch); err != nil {
 				return fmt.Errorf("discarding the superseded capture of %s: %w", target, err)
 			}
+			// A runtime whose only branch the capture was has none to
+			// restore the branch beside: rebuild it.
+			if len(runtimeBranches) == 1 {
+				_, _ = b.command("delete", "--force", info.ID)
+				return rehydrateCold(false)
+			}
 			return rehydrateCold(true)
 		}
 		// The durable record is authoritative across daemon crashes. Reconcile
