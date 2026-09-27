@@ -75,6 +75,158 @@ type graphState struct {
 	Pins         map[string]ObjectID
 	Frozen       map[string]bool
 	Handoffs     map[string]SnapshotLedgerHandoff
+
+	// undo records what a transaction applied for a preview has changed.
+	undo *graphUndo
+}
+
+// graphUndo holds the prior values of what a transaction applied in place
+// has changed in a graphState: from them the transaction is undone, and the
+// references it changes of a snapshot in handoff are read from the names it
+// touched alone. A preview that copied the whole graph instead made each
+// mutation during a handoff cost time in proportion to the graph, 51 ms in
+// one of 10,000 objects.
+type graphUndo struct {
+	// A nil prior value is an absent one.
+	snapshots    map[string]*Snapshot
+	objects      map[string]*Object
+	roots        map[string]*ObjectID
+	pins         map[string]*ObjectID
+	frozen       map[string]*bool
+	handoffs     map[string]*SnapshotLedgerHandoff
+	nextSnapshot SnapshotID
+	sequence     uint64
+}
+
+// beginUndo starts recording what the transaction to be applied changes.
+func (state *graphState) beginUndo() {
+	state.undo = &graphUndo{nextSnapshot: state.NextSnapshot, sequence: state.Sequence}
+}
+
+// rollbackUndo restores what the recorded transaction changed.
+func (state *graphState) rollbackUndo() {
+	undo := state.undo
+	state.undo = nil
+	restoreEntries(state.Snapshots, undo.snapshots)
+	restoreEntries(state.Objects, undo.objects)
+	restoreEntries(state.Roots, undo.roots)
+	restoreEntries(state.Pins, undo.pins)
+	restoreEntries(state.Frozen, undo.frozen)
+	restoreEntries(state.Handoffs, undo.handoffs)
+	state.NextSnapshot, state.Sequence = undo.nextSnapshot, undo.sequence
+}
+
+func restoreEntries[V any](entries map[string]V, priors map[string]*V) {
+	for key, prior := range priors {
+		if prior != nil {
+			entries[key] = *prior
+		} else {
+			delete(entries, key)
+		}
+	}
+}
+
+// recordEntry records, while a transaction is recorded, the prior value of
+// entries[key], unless it has recorded one already.
+func recordEntry[V any](priors *map[string]*V, entries map[string]V, key string) {
+	if _, recorded := (*priors)[key]; recorded {
+		return
+	}
+	if *priors == nil {
+		*priors = make(map[string]*V)
+	}
+	if prior, ok := entries[key]; ok {
+		(*priors)[key] = &prior
+	} else {
+		(*priors)[key] = nil
+	}
+}
+
+// The setters below change the state's maps, recording what they change
+// while a transaction is recorded.
+
+func (state *graphState) putSnapshot(key string, snapshot Snapshot) {
+	if state.undo != nil {
+		recordEntry(&state.undo.snapshots, state.Snapshots, key)
+	}
+	state.Snapshots[key] = snapshot
+}
+
+func (state *graphState) deleteSnapshot(key string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.snapshots, state.Snapshots, key)
+	}
+	delete(state.Snapshots, key)
+}
+
+func (state *graphState) putObject(key string, object Object) {
+	if state.undo != nil {
+		recordEntry(&state.undo.objects, state.Objects, key)
+	}
+	state.Objects[key] = object
+}
+
+func (state *graphState) deleteObject(key string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.objects, state.Objects, key)
+	}
+	delete(state.Objects, key)
+}
+
+func (state *graphState) putRoot(name string, id ObjectID) {
+	if state.undo != nil {
+		recordEntry(&state.undo.roots, state.Roots, name)
+	}
+	state.Roots[name] = id
+}
+
+func (state *graphState) deleteRoot(name string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.roots, state.Roots, name)
+	}
+	delete(state.Roots, name)
+}
+
+func (state *graphState) putPin(name string, id ObjectID) {
+	if state.undo != nil {
+		recordEntry(&state.undo.pins, state.Pins, name)
+	}
+	state.Pins[name] = id
+}
+
+func (state *graphState) deletePin(name string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.pins, state.Pins, name)
+	}
+	delete(state.Pins, name)
+}
+
+func (state *graphState) putFrozen(key string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.frozen, state.Frozen, key)
+	}
+	state.Frozen[key] = true
+}
+
+func (state *graphState) deleteFrozen(key string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.frozen, state.Frozen, key)
+	}
+	delete(state.Frozen, key)
+}
+
+func (state *graphState) putHandoff(key string, handoff SnapshotLedgerHandoff) {
+	if state.undo != nil {
+		recordEntry(&state.undo.handoffs, state.Handoffs, key)
+	}
+	state.Handoffs[key] = handoff
+}
+
+func (state *graphState) deleteHandoff(key string) {
+	if state.undo != nil {
+		recordEntry(&state.undo.handoffs, state.Handoffs, key)
+	}
+	delete(state.Handoffs, key)
 }
 
 func newGraphState() graphState {
@@ -1163,39 +1315,39 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 	for _, op := range record.Ops {
 		switch {
 		case op.PutSnapshot != nil:
-			state.Snapshots[snapshotKey(op.PutSnapshot.ID)] = *op.PutSnapshot
+			state.putSnapshot(snapshotKey(op.PutSnapshot.ID), *op.PutSnapshot)
 		case op.DeleteSnapshot != 0:
-			delete(state.Snapshots, snapshotKey(op.DeleteSnapshot))
+			state.deleteSnapshot(snapshotKey(op.DeleteSnapshot))
 		case op.PutObject != nil:
 			if err := validateObject(*op.PutObject); err != nil {
 				return err
 			}
-			state.Objects[op.PutObject.ID.key()] = cloneObject(*op.PutObject)
+			state.putObject(op.PutObject.ID.key(), cloneObject(*op.PutObject))
 		case op.DeleteObject != "":
 			if _, err := parseObjectKey(op.DeleteObject); err != nil {
 				return err
 			}
-			delete(state.Objects, op.DeleteObject)
+			state.deleteObject(op.DeleteObject)
 		case op.PutRoot != nil:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
 			}
-			state.Roots[op.RootName] = *op.PutRoot
+			state.putRoot(op.RootName, *op.PutRoot)
 		case op.DeleteRoot:
 			if err := validateRootName(op.RootName); err != nil {
 				return err
 			}
-			delete(state.Roots, op.RootName)
+			state.deleteRoot(op.RootName)
 		case op.PutPin != nil:
 			if err := validateRootName(op.PinName); err != nil {
 				return err
 			}
-			state.Pins[op.PinName] = *op.PutPin
+			state.putPin(op.PinName, *op.PutPin)
 		case op.DeletePin:
 			if err := validateRootName(op.PinName); err != nil {
 				return err
 			}
-			delete(state.Pins, op.PinName)
+			state.deletePin(op.PinName)
 		case op.SetNextSnapshot != nil:
 			state.NextSnapshot = *op.SetNextSnapshot
 		case op.FreezeSnapshot != 0:
@@ -1205,20 +1357,20 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 				return fmt.Errorf("snapshot %d has no active reference handoff", op.FreezeSnapshot)
 			}
 			handoff.Frozen = true
-			state.Handoffs[key] = handoff
-			state.Frozen[key] = true
+			state.putHandoff(key, handoff)
+			state.putFrozen(key)
 		case op.UnfreezeSnapshot != 0:
-			delete(state.Frozen, snapshotKey(op.UnfreezeSnapshot))
-			delete(state.Handoffs, snapshotKey(op.UnfreezeSnapshot))
+			state.deleteFrozen(snapshotKey(op.UnfreezeSnapshot))
+			state.deleteHandoff(snapshotKey(op.UnfreezeSnapshot))
 		case op.BeginHandoff != nil:
 			handoff := cloneSnapshotLedgerHandoff(*op.BeginHandoff)
 			key := snapshotKey(handoff.Snapshot)
 			if _, ok := state.Handoffs[key]; ok {
 				return fmt.Errorf("snapshot %d already has an active reference handoff", handoff.Snapshot)
 			}
-			state.Handoffs[key] = handoff
+			state.putHandoff(key, handoff)
 			if handoff.Frozen {
-				state.Frozen[key] = true
+				state.putFrozen(key)
 			}
 		case op.AppendHandoff != nil:
 			mutation := *op.AppendHandoff
@@ -1232,7 +1384,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 			}
 			handoff.Mutations = append(handoff.Mutations, mutation)
 			handoff.NextSequence++
-			state.Handoffs[key] = handoff
+			state.putHandoff(key, handoff)
 		case op.ApplyFilesystem != nil:
 			mutation, root, err := buildFilesystemMutation(state, op.ApplyFilesystem.Origin, op.ApplyFilesystem.RootName, op.ApplyFilesystem.Operations, op.ApplyFilesystem.ReleasePins)
 			if err != nil {
@@ -1256,7 +1408,7 @@ func applyJournalRecord(state *graphState, record journalRecord) error {
 		}
 		object.Refs = update.Refs
 		object.State = update.State
-		state.Objects[key] = object
+		state.putObject(key, object)
 	}
 	state.Sequence = record.Sequence
 	return nil
@@ -1460,16 +1612,55 @@ func snapshotReferences(state graphState, snapshot SnapshotID) map[string]Object
 		}
 	}
 	for _, parent := range state.Objects {
-		if parent.ID.Snapshot == snapshot {
-			continue
-		}
-		for _, edge := range parent.Children {
-			if edge.Child.Snapshot == snapshot {
-				references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
-			}
-		}
+		addEdgeReferences(references, parent, snapshot)
 	}
 	return references
+}
+
+// addEdgeReferences adds to references parent's edges into snapshot, if
+// parent is of another snapshot, named as by snapshotReferences.
+func addEdgeReferences(references map[string]ObjectID, parent Object, snapshot SnapshotID) {
+	if parent.ID.Snapshot == snapshot {
+		return
+	}
+	for _, edge := range parent.Children {
+		if edge.Child.Snapshot == snapshot {
+			references[edgeReferenceName(parent.ID, edge.Slot)] = edge.Child
+		}
+	}
+}
+
+// snapshotReferenceChanges returns the references of snapshot, named as by
+// snapshotReferences, that state held before and holds after the recorded
+// transaction, of the roots, pins and objects the transaction touched: the
+// others hold the same references before and after.
+func (undo *graphUndo) snapshotReferenceChanges(state *graphState, snapshot SnapshotID) (before, after map[string]ObjectID) {
+	before, after = make(map[string]ObjectID), make(map[string]ObjectID)
+	for name, prior := range undo.roots {
+		if prior != nil && prior.Snapshot == snapshot {
+			before["root/"+name] = *prior
+		}
+		if current, ok := state.Roots[name]; ok && current.Snapshot == snapshot {
+			after["root/"+name] = current
+		}
+	}
+	for name, prior := range undo.pins {
+		if prior != nil && prior.Snapshot == snapshot {
+			before["pin/"+name] = *prior
+		}
+		if current, ok := state.Pins[name]; ok && current.Snapshot == snapshot {
+			after["pin/"+name] = current
+		}
+	}
+	for key, prior := range undo.objects {
+		if prior != nil {
+			addEdgeReferences(before, *prior, snapshot)
+		}
+		if current, ok := state.Objects[key]; ok {
+			addEdgeReferences(after, current, snapshot)
+		}
+	}
+	return before, after
 }
 
 func sameObjectReferences(left, right map[string]ObjectID) bool {
@@ -1484,14 +1675,11 @@ func sameObjectReferences(left, right map[string]ObjectID) bool {
 	return true
 }
 
-func validateFrozenSnapshotMutation(previous, next graphState, ops []journalOp) error {
-	for key := range previous.Frozen {
-		parsed, err := strconv.ParseUint(key, 16, 64)
-		if err != nil {
-			return err
-		}
-		snapshot := SnapshotID(parsed)
-		if !sameObjectReferences(snapshotReferences(previous, snapshot), snapshotReferences(next, snapshot)) {
+// validateFrozenSnapshotMutation refuses the transaction state records, of
+// ops, if it changes a snapshot of frozen, the snapshots frozen before it.
+func validateFrozenSnapshotMutation(state *graphState, frozen []SnapshotID, ops []journalOp) error {
+	for _, snapshot := range frozen {
+		if before, after := state.undo.snapshotReferenceChanges(state, snapshot); !sameObjectReferences(before, after) {
 			return fmt.Errorf("snapshot %d references are frozen for authority handoff: %w", snapshot, ErrSnapshotLedgerFrozen)
 		}
 		for _, op := range ops {
@@ -1599,13 +1787,42 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 		}
 	}
 	if previewRequired {
-		next := cloneGraphState(s.state)
-		if err := applyJournalRecord(&next, record); err != nil {
-			return err
+		// Apply the transaction in place to learn what it changes of the
+		// snapshots in handoff, then undo it: it is applied for good below,
+		// once its record, with the handoffs' catch-up, is written.
+		handoffKeys := make([]string, 0, len(s.state.Handoffs))
+		for key := range s.state.Handoffs {
+			handoffKeys = append(handoffKeys, key)
 		}
-		mutations, err := snapshotHandoffMutationOps(s.state, next)
-		if err != nil {
-			return err
+		sort.Strings(handoffKeys)
+		handoffs := make([]SnapshotLedgerHandoff, 0, len(handoffKeys))
+		for _, key := range handoffKeys {
+			handoffs = append(handoffs, s.state.Handoffs[key])
+		}
+		frozen := make([]SnapshotID, 0, len(s.state.Frozen))
+		for key := range s.state.Frozen {
+			parsed, err := strconv.ParseUint(key, 16, 64)
+			if err != nil {
+				return err
+			}
+			frozen = append(frozen, SnapshotID(parsed))
+		}
+		sort.Slice(frozen, func(i, j int) bool { return frozen[i] < frozen[j] })
+		s.state.beginUndo()
+		var previewErr error
+		if prepared != nil {
+			previewErr = prepared(&s.state)
+		} else {
+			previewErr = applyJournalRecord(&s.state, record)
+		}
+		var mutations []journalOp
+		if previewErr == nil {
+			mutations = snapshotHandoffMutationOps(&s.state, handoffs)
+			previewErr = validateFrozenSnapshotMutation(&s.state, frozen, ops)
+		}
+		s.state.rollbackUndo()
+		if previewErr != nil {
+			return previewErr
 		}
 		if len(mutations) != 0 {
 			record.Ops = append(record.Ops, mutations...)
@@ -1623,13 +1840,6 @@ func (s *Store) commitLockedPrepared(ops []journalOp, references map[string]Obje
 			if err := validateJournalRecord(record); err != nil {
 				return err
 			}
-			next = cloneGraphState(s.state)
-			if err := applyJournalRecord(&next, record); err != nil {
-				return err
-			}
-		}
-		if err := validateFrozenSnapshotMutation(s.state, next, ops); err != nil {
-			return err
 		}
 	}
 	data, err := json.Marshal(record)
@@ -1756,20 +1966,17 @@ func (s *Store) Sync() error {
 	return nil
 }
 
-func snapshotHandoffMutationOps(previous, next graphState) ([]journalOp, error) {
-	keys := make([]string, 0, len(previous.Handoffs))
-	for key := range previous.Handoffs {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+// snapshotHandoffMutationOps returns the catch-up, for each of handoffs, the
+// handoffs before the transaction state records, of the references the
+// transaction changes of its snapshot: in name order, a release of each
+// reference replaced or dropped, and a retain of each one made.
+func snapshotHandoffMutationOps(state *graphState, handoffs []SnapshotLedgerHandoff) []journalOp {
 	var ops []journalOp
-	for _, key := range keys {
-		handoff := previous.Handoffs[key]
-		before := snapshotReferences(previous, handoff.Snapshot)
-		after := snapshotReferences(next, handoff.Snapshot)
+	for _, handoff := range handoffs {
 		if handoff.Frozen {
 			continue
 		}
+		before, after := state.undo.snapshotReferenceChanges(state, handoff.Snapshot)
 		names := make(map[string]struct{}, len(before)+len(after))
 		for name := range before {
 			names[name] = struct{}{}
@@ -1805,7 +2012,7 @@ func snapshotHandoffMutationOps(previous, next graphState) ([]journalOp, error) 
 			}
 		}
 	}
-	return ops, nil
+	return ops
 }
 
 func writeFull(writer io.Writer, data []byte) error {

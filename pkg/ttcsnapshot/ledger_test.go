@@ -17,6 +17,9 @@ package ttcsnapshot
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1190,5 +1193,163 @@ func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
 	defer reopened.Close()
 	if replayed := reopened.Inspect(); !reflect.DeepEqual(replayed, before) {
 		t.Fatalf("replayed ledger differs:\nwant %+v\ngot  %+v", before, replayed)
+	}
+}
+
+// A mutation during a handoff is previewed in place and undone, and the
+// handoff's catch-up read from what it touched: the catch-up must record
+// exactly the references each mutation changes of the snapshot, whatever the
+// mutation, and a frozen snapshot's refusal must leave the graph as it was.
+func TestSnapshotLedgerHandoffCatchupFollowsRandomMutations(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "graph")
+	graph, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []ObjectID
+	for index := 0; index < 12; index++ {
+		file, err := graph.CreateObject(origin, fmt.Sprintf("build/%d", index), ObjectKindFile, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, file)
+	}
+	if err := graph.SetRoot("branch/r0", files[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	other, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	filesystem, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const tree = "branch/main/filesystem"
+	if _, err := graph.ApplyFilesystem(filesystem, tree, []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 1, Type: "directory", Mode: 0755, Nlink: 2}},
+		{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, File: files[1]}},
+		{PutEntry: &DirectoryEntryRecord{Parent: 1, Name: "value", Inode: 2}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, baseline, cursor, err := graph.BeginSnapshotLedgerHandoff(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	references := cloneObjectReferences(baseline)
+	current := func() map[string]ObjectID {
+		graph.mu.RLock()
+		defer graph.mu.RUnlock()
+		return snapshotReferences(graph.state, origin)
+	}
+	random := rand.New(rand.NewSource(1))
+	var parents []string
+	for step := 0; step < 400; step++ {
+		file := files[random.Intn(len(files))]
+		name := fmt.Sprintf("r%d", random.Intn(4))
+		var err error
+		switch random.Intn(8) {
+		case 0:
+			err = graph.SetRoot("branch/"+name, file)
+		case 1:
+			if _, ok := graph.Root("branch/" + name); ok {
+				err = graph.DeleteRoot("branch/" + name)
+			}
+		case 2:
+			err = graph.SetPin("hold/"+name, file)
+		case 3:
+			if graph.HasPin("hold/" + name) {
+				err = graph.DeletePin("hold/" + name)
+			}
+		case 4:
+			pin := fmt.Sprintf("parent/%d", step)
+			edges := []Edge{{Slot: 1, Child: file}, {Slot: 2, Child: files[random.Intn(len(files))]}}
+			if _, err = graph.CreateObject(other, pin, ObjectKindInode, nil, edges); err == nil {
+				parents = append(parents, pin)
+			}
+		case 5:
+			if len(parents) != 0 {
+				index := random.Intn(len(parents))
+				err = graph.DeletePin(parents[index])
+				parents = append(parents[:index], parents[index+1:]...)
+			}
+		case 6:
+			_, err = graph.ApplyFilesystem(filesystem, tree, []FilesystemOperation{
+				{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, File: file, MtimeNsec: int64(step)}},
+			})
+		case 7:
+			_, err = graph.Collect(16)
+		}
+		if err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+		changes, latest, _, err := graph.SnapshotLedgerHandoffChanges(origin, cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, change := range changes {
+			if change.Retain {
+				references[change.Name] = change.Object
+				continue
+			}
+			if references[change.Name] != change.Object {
+				t.Fatalf("step %d releases %q of %s, which selects %s", step, change.Name, change.Object, references[change.Name])
+			}
+			delete(references, change.Name)
+		}
+		cursor = latest
+		if want := current(); !reflect.DeepEqual(references, want) {
+			t.Fatalf("step %d: the baseline and catch-up give\n%v\nthe graph holds\n%v", step, references, want)
+		}
+		if err := graph.Verify(); err != nil {
+			t.Fatalf("step %d: %v", step, err)
+		}
+	}
+
+	if _, _, err := graph.FreezeSnapshotLedger(origin); err != nil {
+		t.Fatal(err)
+	}
+	before := graph.Inspect()
+	if err := graph.SetRoot("branch/frozen", files[2]); !errors.Is(err, ErrSnapshotLedgerFrozen) {
+		t.Fatalf("a new root of a frozen snapshot = %v, want it refused", err)
+	}
+	if _, err := graph.ApplyFilesystem(filesystem, tree, []FilesystemOperation{
+		{PutInode: &InodeRecord{Number: 2, Type: "regular", Mode: 0644, Nlink: 1, File: files[3], MtimeNsec: -1}},
+	}); !errors.Is(err, ErrSnapshotLedgerFrozen) {
+		t.Fatalf("a filesystem change of a frozen snapshot's references = %v, want it refused", err)
+	}
+	if after := graph.Inspect(); !reflect.DeepEqual(after, before) {
+		t.Fatal("refused mutations of a frozen snapshot changed the graph")
+	}
+	if _, err := graph.CreateObject(other, "unrelated", ObjectKindFile, nil, nil); err != nil {
+		t.Fatalf("a mutation of another snapshot while one is frozen: %v", err)
+	}
+	final := graph.Inspect()
+	changes, _, _, err := graph.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	replayed, _, _, err := reopened.SnapshotLedgerHandoffChanges(origin, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(replayed, changes) || !reflect.DeepEqual(reopened.Inspect(), final) {
+		t.Fatal("the replayed graph differs from the one written")
 	}
 }

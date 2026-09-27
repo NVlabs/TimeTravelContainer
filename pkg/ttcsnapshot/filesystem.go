@@ -871,15 +871,15 @@ func buildFilesystemMutationSequential(state *graphState, origin SnapshotID, roo
 func installGraphMutation(state *graphState, mutation *graphMutation, rootName string, root ObjectID, releasePins []string) ([]ObjectID, error) {
 	var reclaim []string
 	for key, object := range mutation.objects {
-		state.Objects[key] = cloneObject(object)
+		state.putObject(key, cloneObject(object))
 		if object.State == ObjectReclaiming {
 			reclaim = append(reclaim, key)
 		}
 	}
-	state.Snapshots[snapshotKey(mutation.snapshot.ID)] = mutation.snapshot
-	state.Roots[rootName] = root
+	state.putSnapshot(snapshotKey(mutation.snapshot.ID), mutation.snapshot)
+	state.putRoot(rootName, root)
 	for _, pin := range releasePins {
-		delete(state.Pins, pin)
+		state.deletePin(pin)
 	}
 	return collectFilesystemMutationGarbage(state, reclaim)
 }
@@ -905,7 +905,7 @@ func collectFilesystemMutationGarbage(state *graphState, queue []string) ([]Obje
 		if _, transferring := state.Handoffs[snapshotKey(object.ID.Snapshot)]; transferring {
 			continue
 		}
-		delete(state.Objects, key)
+		state.deleteObject(key)
 		if object.ID.Kind == ObjectKindFile || object.ID.Kind == ObjectKindPage || object.ID.Kind == ObjectKindMemoryChunk {
 			reclaimed = append(reclaimed, object.ID)
 		}
@@ -923,7 +923,7 @@ func collectFilesystemMutationGarbage(state *graphState, queue []string) ([]Obje
 					queued[childKey] = struct{}{}
 				}
 			}
-			state.Objects[childKey] = child
+			state.putObject(childKey, child)
 		}
 	}
 	return reclaimed, nil
