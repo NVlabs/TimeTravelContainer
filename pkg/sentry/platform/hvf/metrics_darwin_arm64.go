@@ -49,12 +49,12 @@ var (
 	hvfRuntimeVMHookCalls = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/calls",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of Darwin Go runtime VM notifier callbacks."})
-	hvfRuntimeSuppressedFreeCount = metric.MustCreateNewUint64Metric(
-		"/platform/hvf/runtime_vm/suppressed_free_count",
-		metric.Uint64Metadata{Cumulative: true, Description: "Number of Go runtime FREE_REUSABLE operations suppressed to retain live HVF backing."})
-	hvfRuntimeSuppressedFreeBytes = metric.MustCreateNewUint64Metric(
-		"/platform/hvf/runtime_vm/suppressed_free_bytes",
-		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in Go runtime FREE_REUSABLE operations suppressed to retain live HVF backing."})
+	hvfRuntimeReleasedCount = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/released_count",
+		metric.Uint64Metadata{Cumulative: true, Description: "Number of Go runtime FREE_REUSABLE operations that unmapped live HVF backing so that Darwin could reclaim it."})
+	hvfRuntimeReleasedBytes = metric.MustCreateNewUint64Metric(
+		"/platform/hvf/runtime_vm/released_bytes",
+		metric.Uint64Metadata{Cumulative: true, Description: "Bytes in Go runtime FREE_REUSABLE operations that unmapped live HVF backing so that Darwin could reclaim it."})
 	hvfRuntimeSuppressedReuseCount = metric.MustCreateNewUint64Metric(
 		"/platform/hvf/runtime_vm/suppressed_reuse_count",
 		metric.Uint64Metadata{Cumulative: true, Description: "Number of unnecessary Go runtime FREE_REUSE operations suppressed for live HVF backing."})
@@ -135,8 +135,8 @@ func publishRing0RuntimeMetrics(engine *ring0Engine) {
 	hvfRendezvousVCPUExitTargets.Set(stats.rendezvousVCPUExitTargets)
 	hvfRendezvousFailures.Set(stats.rendezvousFailures)
 	hvfRuntimeVMHookCalls.Set(stats.runtimeVMHookCalls)
-	hvfRuntimeSuppressedFreeCount.Set(stats.suppressedFreeCount)
-	hvfRuntimeSuppressedFreeBytes.Set(stats.suppressedFreeBytes)
+	hvfRuntimeReleasedCount.Set(stats.releasedCount)
+	hvfRuntimeReleasedBytes.Set(stats.releasedBytes)
 	hvfRuntimeSuppressedReuseCount.Set(stats.suppressedReuseCount)
 	hvfRuntimeSuppressedReuseBytes.Set(stats.suppressedReuseBytes)
 	hvfRuntimeSuppressedUnmapCount.Set(stats.suppressedUnmapCount)

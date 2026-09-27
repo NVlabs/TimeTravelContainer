@@ -590,8 +590,8 @@ static _Atomic uint64_t ttc_ring0_rendezvous_vcpu_exit_calls;
 static _Atomic uint64_t ttc_ring0_rendezvous_vcpu_exit_targets;
 static _Atomic uint64_t ttc_ring0_rendezvous_failures;
 static _Atomic uint64_t ttc_ring0_runtime_vm_hook_calls;
-static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_count;
-static _Atomic uint64_t ttc_ring0_runtime_suppressed_free_bytes;
+static _Atomic uint64_t ttc_ring0_runtime_released_count;
+static _Atomic uint64_t ttc_ring0_runtime_released_bytes;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_count;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_reuse_bytes;
 static _Atomic uint64_t ttc_ring0_runtime_suppressed_unmap_count;
@@ -640,8 +640,8 @@ enum ttc_ring0_runtime_stat_index {
 	TTC_RING0_STAT_RENDEZVOUS_VCPU_EXIT_TARGETS,
 	TTC_RING0_STAT_RENDEZVOUS_FAILURES,
 	TTC_RING0_STAT_RUNTIME_VM_HOOK_CALLS,
-	TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_COUNT,
-	TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_BYTES,
+	TTC_RING0_STAT_RUNTIME_RELEASED_COUNT,
+	TTC_RING0_STAT_RUNTIME_RELEASED_BYTES,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_COUNT,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES,
 	TTC_RING0_STAT_RUNTIME_SUPPRESSED_UNMAP_COUNT,
@@ -672,10 +672,10 @@ static void ttc_ring0_runtime_stats(uint64_t *stats, size_t count) {
 			&ttc_ring0_rendezvous_failures, memory_order_relaxed);
 	stats[TTC_RING0_STAT_RUNTIME_VM_HOOK_CALLS] = atomic_load_explicit(
 			&ttc_ring0_runtime_vm_hook_calls, memory_order_relaxed);
-	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_COUNT] = atomic_load_explicit(
-			&ttc_ring0_runtime_suppressed_free_count, memory_order_relaxed);
-	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_FREE_BYTES] = atomic_load_explicit(
-			&ttc_ring0_runtime_suppressed_free_bytes, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_RELEASED_COUNT] = atomic_load_explicit(
+			&ttc_ring0_runtime_released_count, memory_order_relaxed);
+	stats[TTC_RING0_STAT_RUNTIME_RELEASED_BYTES] = atomic_load_explicit(
+			&ttc_ring0_runtime_released_bytes, memory_order_relaxed);
 	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_COUNT] = atomic_load_explicit(
 			&ttc_ring0_runtime_suppressed_reuse_count, memory_order_relaxed);
 	stats[TTC_RING0_STAT_RUNTIME_SUPPRESSED_REUSE_BYTES] = atomic_load_explicit(
@@ -1326,22 +1326,13 @@ static int32_t ttc_ring0_runtime_vm_hook(
 			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
 			return 0;
 		}
-		// Go's Darwin scavenger uses FREE_REUSABLE only as an RSS hint. Keep
-		// live secondary-MMU leases stable instead of turning routine heap
-		// scavenging into a VM-wide stage-2 replacement. FREE_REUSE is also a
-		// no-op when the entire mirrored range remained live. A range with any
-		// dormant slab must still execute the host operation and rebind it.
-		if (releasing && live) {
-			mutation->disposition = TTC_RUNTIME_VM_SUPPRESS;
-			atomic_fetch_add_explicit(
-					&ttc_ring0_runtime_suppressed_free_count, 1,
-					memory_order_relaxed);
-			atomic_fetch_add_explicit(
-					&ttc_ring0_runtime_suppressed_free_bytes,
-					mutation->length, memory_order_relaxed);
-			pthread_mutex_unlock(&ttc_ring0_mutation_mu);
-			return 0;
-		}
+		// Go's Darwin scavenger returns free heap with FREE_REUSABLE, which
+		// frees nothing while HVF maps the range. Like KVM's MMU notifier,
+		// unmap it from stage 2 first, below, and leave it dormant until
+		// FREE_REUSE: the runtime touches scavenged memory only after reusing
+		// it, and the reuse maps it again. FREE_REUSE is a no-op when the
+		// entire mirrored range remained live. A range with any dormant slab
+		// must still execute the host operation and rebind it.
 		if (mutation->operation == TTC_RUNTIME_VM_MADVISE &&
 				mutation->flags == TTC_RUNTIME_MADV_FREE_REUSE && live &&
 				!dormant) {
@@ -1378,6 +1369,12 @@ static int32_t ttc_ring0_runtime_vm_hook(
 		if (hv_status != HV_SUCCESS) {
 			ttc_ring0_end_runtime_mutation();
 			return EIO;
+		}
+		if (releasing) {
+			atomic_fetch_add_explicit(&ttc_ring0_runtime_released_count, 1,
+					memory_order_relaxed);
+			atomic_fetch_add_explicit(&ttc_ring0_runtime_released_bytes,
+					mutation->length, memory_order_relaxed);
 		}
 		mutation->active = 1;
 		return 0;
@@ -1424,25 +1421,52 @@ static uintptr_t ttc_ring0_runtime_vm_hook_address(void) {
 			(uintptr_t)&ttc_ring0_runtime_vm_hook);
 }
 
-// Exercise the runtime disposition handshake without changing host VM state.
-// Tests use a live mirror range, for which FREE_REUSABLE must be suppressed
-// before a rendezvous or host madvise occurs.
-static int ttc_ring0_test_suppress_runtime_reclaim(uintptr_t address,
-		size_t length) {
+// ttc_ring0_test_runtime_madvise performs one runtime madvise of a live or
+// dormant mirror range through the hook protocol, and requires that the hook
+// let it run, as it does for the scavenger's release and reuse.
+static int ttc_ring0_test_runtime_madvise(uintptr_t address, size_t length,
+		uint32_t flags, int advice) {
 	struct ttc_runtime_vm_mutation mutation = {
 		.version = TTC_RUNTIME_VM_MUTATION_VERSION,
 		.operation = TTC_RUNTIME_VM_MADVISE,
 		.phase = TTC_RUNTIME_VM_BEFORE,
 		.address = address,
 		.length = length,
-		.flags = TTC_RUNTIME_MADV_FREE_REUSABLE,
+		.flags = flags,
 	};
 	int status = ttc_ring0_runtime_vm_hook(&mutation);
 	if (status != 0) return status;
-	if (mutation.disposition != TTC_RUNTIME_VM_SUPPRESS ||
-			mutation.active != 0) return EPROTO;
+	if (mutation.disposition == TTC_RUNTIME_VM_SUPPRESS ||
+			mutation.active == 0) return EPROTO;
+	if (madvise((void *)address, length, advice) != 0) {
+		mutation.error = errno;
+	}
 	mutation.phase = TTC_RUNTIME_VM_AFTER;
-	return ttc_ring0_runtime_vm_hook(&mutation);
+	status = ttc_ring0_runtime_vm_hook(&mutation);
+	return status != 0 ? status : mutation.error;
+}
+
+// Exercise the Go scavenger's release and reuse of a live mirror range with
+// real madvise calls: the release must leave the range dormant, so the host
+// can reclaim it, and the reuse must map it again.
+static int ttc_ring0_test_release_runtime_range(uintptr_t address,
+		size_t length) {
+	int status = ttc_ring0_test_runtime_madvise(address, length,
+			TTC_RUNTIME_MADV_FREE_REUSABLE, MADV_FREE_REUSABLE);
+	if (status != 0) return status;
+	pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	bool released = ttc_ring0_mirror_dormant_overlap(address, length) &&
+		!ttc_ring0_mirror_live_overlap(address, length);
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	if (!released) return EPROTO;
+	status = ttc_ring0_test_runtime_madvise(address, length,
+			TTC_RUNTIME_MADV_FREE_REUSE, MADV_FREE_REUSE);
+	if (status != 0) return status;
+	pthread_mutex_lock(&ttc_ring0_mutation_mu);
+	bool reused = ttc_ring0_mirror_live_overlap(address, length) &&
+		!ttc_ring0_mirror_dormant_overlap(address, length);
+	pthread_mutex_unlock(&ttc_ring0_mutation_mu);
+	return reused ? 0 : EPROTO;
 }
 
 static int ttc_ring0_test_suppress_runtime_unmap(uintptr_t address,
@@ -2784,8 +2808,8 @@ type ring0RuntimeStats struct {
 	rendezvousVCPUExitTargets uint64
 	rendezvousFailures        uint64
 	runtimeVMHookCalls        uint64
-	suppressedFreeCount       uint64
-	suppressedFreeBytes       uint64
+	releasedCount             uint64
+	releasedBytes             uint64
 	suppressedReuseCount      uint64
 	suppressedReuseBytes      uint64
 	suppressedUnmapCount      uint64
@@ -2807,8 +2831,8 @@ func readRing0RuntimeStats() ring0RuntimeStats {
 		rendezvousVCPUExitTargets: values[7],
 		rendezvousFailures:        values[8],
 		runtimeVMHookCalls:        values[9],
-		suppressedFreeCount:       values[10],
-		suppressedFreeBytes:       values[11],
+		releasedCount:             values[10],
+		releasedBytes:             values[11],
 		suppressedReuseCount:      values[12],
 		suppressedReuseBytes:      values[13],
 		suppressedUnmapCount:      values[14],
@@ -2816,10 +2840,10 @@ func readRing0RuntimeStats() ring0RuntimeStats {
 	}
 }
 
-func suppressRing0TrackedHostReclaim(address uintptr, length uint64) error {
-	if status := C.ttc_ring0_test_suppress_runtime_reclaim(
+func releaseRing0TrackedHostRange(address uintptr, length uint64) error {
+	if status := C.ttc_ring0_test_release_runtime_range(
 		C.uintptr_t(address), C.size_t(length)); status != 0 {
-		return fmt.Errorf("suppressing tracked Sentry host reclaim [%#x, %#x): status %d", address, address+uintptr(length), status)
+		return fmt.Errorf("releasing and reusing tracked Sentry host range [%#x, %#x): status %d", address, address+uintptr(length), status)
 	}
 	return nil
 }

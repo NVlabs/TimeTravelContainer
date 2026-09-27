@@ -876,15 +876,20 @@ func TestRuntimeMutationRebindsTrackedStage2WhileGuestRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer vm.unmapRing0MirrorStage2GPA(trackedGPA, vmm.HostSlabSize)
-	statsBeforeSuppression := readRing0RuntimeStats()
-	if err := suppressRing0TrackedHostReclaim(trackedHost, vmm.HostSlabSize); err != nil {
+	// The scavenger's release unmaps the range from stage 2, so that Darwin
+	// can reclaim it, and its reuse maps the range again.
+	statsBeforeRelease := readRing0RuntimeStats()
+	if err := releaseRing0TrackedHostRange(trackedHost, vmm.HostSlabSize); err != nil {
 		t.Fatal(err)
 	}
-	statsAfterSuppression := readRing0RuntimeStats()
-	if statsAfterSuppression.suppressedFreeCount <= statsBeforeSuppression.suppressedFreeCount ||
-		statsAfterSuppression.suppressedFreeBytes-statsBeforeSuppression.suppressedFreeBytes < vmm.HostSlabSize {
-		t.Fatalf("runtime reclaim suppression stats before=%+v after=%+v", statsBeforeSuppression, statsAfterSuppression)
+	statsAfterRelease := readRing0RuntimeStats()
+	if statsAfterRelease.releasedCount <= statsBeforeRelease.releasedCount ||
+		statsAfterRelease.releasedBytes-statsBeforeRelease.releasedBytes < vmm.HostSlabSize {
+		t.Fatalf("runtime release stats before=%+v after=%+v", statsBeforeRelease, statsAfterRelease)
 	}
+	// Released memory has undefined contents once reused. The guest reads
+	// below find this value only if the reuse mapped the current backing.
+	binary.LittleEndian.PutUint64(tracked, 0x1122334455667788)
 	statsBeforeUnmap := readRing0RuntimeStats()
 	if err := suppressRing0TrackedHostUnmap(trackedHost, vmm.HostSlabSize); err != nil {
 		t.Fatal(err)

@@ -1,6 +1,6 @@
 # HVF memory footprint: demand-paged stage 2
 
-*Status: in progress, September 2026; phases 1-4 of the delivery plan are
+*Status: in progress, September 2026; phases 1-5 of the delivery plan are
 implemented. Measurements: Apple M5 Pro, macOS 26.5.2.*
 
 ## Summary
@@ -36,9 +36,13 @@ stacks (5 MiB), copies of the image text that EL1 has run (3 MiB), guest RAM
 
 A busy guest adds a second large cost: GuestRAM keeps a `guestFrame`, a
 mapping set, and two index entries for every 4 KiB guest frame, about 300
-bytes, and Go's heap goal doubles that. Touching 1.5 GiB in the guest grew the
-Sentry's runtime regions by 280 MiB, and none of it returns after the guest
-frees the memory, since the mirror suppresses the runtime's releases.
+bytes, and Go's heap goal doubles that. Touching 1.5 GiB in the guest grows
+the Sentry's runtime regions by 280 MiB. Until phase 5 none of it returned
+after the guest freed the memory, since the mirror suppressed the runtime's
+releases. Now the scavenger returns it once a GC has collected it: within
+five minutes on an idle Sentry, where the runtime forces a GC every two, and
+sooner on a busy one. Twice allocating 1 GiB and running 200 processes left
+the footprint at 595 MiB before phase 5 and 320 MiB after it.
 
 ## Where the memory went
 
@@ -137,7 +141,7 @@ Principles, in KVM's terms:
 
 | Memory | Today | Proposed | Expected per family |
 |---|---|---|---|
-| Go runtime regions | Imported in 2 MiB windows on first touch (phase 4); frees of mirrored windows suppressed | Unmapped before release, imported again on reuse | tracks the live heap, and falls after spikes |
+| Go runtime regions | Imported in 2 MiB windows on first touch (phase 4); unmapped before release, mapped again on reuse (phase 5) | unchanged | tracks the live heap, and falls after spikes |
 | Thread stacks | 1 MiB stacks, each imported whole | Imported in windows | ~2 MiB |
 | Writable image | Imported in 528 KiB windows on first touch (phases 2 and 4) | unchanged | about 1 MiB |
 | `__TEXT` | Private copies of 48 KiB windows on first touch (phase 2) | One copy per binary UUID in a shared object, mapped read+exec | ~0; 40.6 MiB once per host |
@@ -181,16 +185,25 @@ Each phase stands alone and is measured before the next.
    image, where the runtime's hot globals live, went back to 528 KiB windows
    for the same reason. Timings match phase 2's. Stacks are still imported
    whole: the native runtime hooks run on them.
-5. **Release instead of suppress** in the runtime VM hook.
+5. **Release instead of suppress (done).** Before the scavenger's
+   `MADV_FREE_REUSABLE` of a mirrored range, the runtime VM hook unmaps it
+   from stage 2 under the vCPU rendezvous, and leaves it dormant until
+   `MADV_FREE_REUSE` maps it again; the hook already had both paths, and
+   suppressed the release only to avoid the rendezvous. The runtime touches
+   scavenged memory only after reusing it, so EL1 never meets a dormant slab.
+   `munmap` of a mirrored range is still suppressed, since the runtime may
+   retire metadata that an EL1 continuation still addresses. The
+   rendezvous has a cost: a 200-process burst took up to 18% longer while
+   the scavenger released an earlier 1 GiB spike.
 6. **Compact GuestRAM frame metadata.** Not HVF-specific, but only VM
    platforms keep it.
 7. **Shared `__TEXT`.**
 
 ## Open questions
 
-* **macOS 15.** Every observation above is from macOS 26.5.2. Phases 1-4
-  use no new primitive. Run `hvf_mem_probe` and `hvf_map_probe` on the oldest
-  supported release before phase 5 relies on release after `hv_vm_unmap`.
+* **macOS 15.** Every observation above is from macOS 26.5.2. Phase 5
+  relies on release after `hv_vm_unmap`; run `hvf_mem_probe` and
+  `hvf_map_probe` on the oldest supported release.
 * **Uncommitted mirror mappings.** Why does the continuation qualification
   test fail when mirror mappings are not committed first? Committing only on
   first touch makes this moot for now, but lazy population would also avoid
@@ -201,6 +214,9 @@ Each phase stands alone and is measured before the next.
   panics the host. Qualify it with a minimal, deliberate probe case first.
 * **Rendezvous cost of releases.** Scavenger releases now stop all vCPUs.
   Batch them, and release only ranges above a size threshold if needed.
+* **Returning a spike sooner.** An idle Sentry keeps a heap spike until the
+  runtime's forced GC. The Sentry could trigger a GC when the guest frees a
+  large amount of memory.
 * **The footprint outside user regions.** The footprint exceeded the sum of
   `vmmap`'s per-region dirty memory by 53 MiB at idle after phase 1, and by
   7.5 MiB after phase 2. The double charge above accounts for part of it;
