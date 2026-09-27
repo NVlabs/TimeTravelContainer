@@ -66,4 +66,3 @@ func TestDistributedFilesystemDrainIsBranchScoped(t *testing.T) {
 		t.Fatal("completed branch drain was reused instead of establishing a fresh barrier")
 	}
 }
-
