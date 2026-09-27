@@ -17235,12 +17235,11 @@ func (b *runtimeBackend) finalizeObservedInitExit(target selector) (bool, error)
 			return false, resolveErr
 		}
 		target, info = resolved, resolvedInfo
-		branch, err = persistentBranchInfo(info, target.branch)
-	} else {
-		err = nil
-	}
-	if err != nil {
-		return false, err
+		if branch, err = persistentBranchInfo(info, target.branch); err != nil {
+			// The branch was removed, as a remote fork's target is with its
+			// runtime, whose followers then exit: there is no exit to record.
+			return false, nil
+		}
 	}
 	switch normalizeLifecycleState(branch.State) {
 	case "running", "paused", "restarting", "rehydrating", "exited":
