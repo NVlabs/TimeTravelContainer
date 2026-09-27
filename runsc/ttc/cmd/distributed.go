@@ -2192,14 +2192,53 @@ func (b *runtimeBackend) publishMigratedMemoryOrigins(branch ttcbundle.BranchInf
 // short ledger freeze; Raft changes routing only after the shared coordinator
 // has imported the exact provider baseline and catch-up suffix.
 func (b *runtimeBackend) publishVolatileGraphOrigin(origin ttcsnapshot.SnapshotID) error {
-	publisher := &branchPublisher{
+	return b.graphOriginPublisher().publishVolatileGraphOrigin(context.Background(), origin)
+}
+
+// graphOriginPublisher returns the publisher of this node's memory origins.
+func (b *runtimeBackend) graphOriginPublisher() *branchPublisher {
+	return &branchPublisher{
 		sharedRoot: b.dataRoot,
 		nodeID:     b.nodeID, incarnation: b.distributedSource.incarnation,
 		authority: b.distributedSource.authority, graphShared: b.snapshotShared,
 		graph: b.snapshotGraph, graphData: b.snapshotData,
 		sharedRefs: b.sharedReferences, peers: b.distributedSource,
 	}
-	return publisher.publishVolatileGraphOrigin(context.Background(), origin)
+}
+
+// resumeFrozenOriginPublications rolls forward, in the background, the
+// handoffs of this node's memory origins that a crash left frozen, each
+// retried until it completes or done closes.
+func resumeFrozenOriginPublications(b *runtimeBackend, stderr io.Writer, done <-chan struct{}) {
+	if b == nil || b.snapshotGraph == nil || b.distributedSource == nil || b.distributedSource.authority == nil {
+		return
+	}
+	pending := b.snapshotGraph.FrozenSnapshotLedgers()
+	if len(pending) == 0 {
+		return
+	}
+	publisher := b.graphOriginPublisher()
+	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
+		var failed []ttcsnapshot.SnapshotID
+		for _, origin := range pending {
+			err := publisher.resumeFrozenGraphOrigin(context.Background(), origin)
+			if err == nil || errors.Is(err, errFrozenOriginOwned) {
+				continue
+			}
+			if stderr != nil {
+				fmt.Fprintf(stderr, "ttcd: resuming the interrupted handoff of snapshot origin %d: %v\n", origin, err)
+			}
+			failed = append(failed, origin)
+		}
+		if pending = failed; len(pending) == 0 {
+			return
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(delay):
+		}
+	}
 }
 
 // publishVolatileFilesystemOrigin transfers one immutable filesystem origin

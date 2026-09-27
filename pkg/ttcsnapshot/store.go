@@ -2517,6 +2517,26 @@ func (s *Store) FrozenSnapshotLedger() (SnapshotID, bool) {
 	return 0, false
 }
 
+// FrozenSnapshotLedgers returns, in order, every snapshot whose reference
+// ledger is frozen for an authority handoff.
+func (s *Store) FrozenSnapshotLedgers() []SnapshotID {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var snapshots []SnapshotID
+	for key, frozen := range s.state.Frozen {
+		if !frozen {
+			continue
+		}
+		parsed, err := strconv.ParseUint(key, 16, 64)
+		if err != nil {
+			continue
+		}
+		snapshots = append(snapshots, SnapshotID(parsed))
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i] < snapshots[j] })
+	return snapshots
+}
+
 // Root returns a named root.
 func (s *Store) Root(name string) (ObjectID, bool) {
 	s.mu.RLock()

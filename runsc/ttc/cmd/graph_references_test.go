@@ -555,3 +555,53 @@ func TestGraphReferenceIntentCrashPrefixes(t *testing.T) {
 		})
 	}
 }
+
+func TestResumeFrozenGraphOriginLeavesABranchPublicationItsOwn(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	origin, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := graph.CreateObject(origin, "build/child", ttcsnapshot.ObjectKindFile, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetRoot("branch/main", child); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.DeletePin("build/child"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.Seal(origin, ttcsnapshot.SnapshotSealedVolatile); err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := t.TempDir()
+	// Neither path reaches the authority, which here has no Raft node.
+	publisher := &branchPublisher{
+		sharedRoot: sharedRoot, nodeID: "node-a", incarnation: "boot-a",
+		authority: &cluster.RaftCatalog{}, graph: graph, graphShared: &ttcsnapshot.SharedPackStore{},
+		sharedRefs: &sharedReferenceService{}, peers: &distributedSourceRuntime{},
+	}
+	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); err != nil {
+		t.Fatalf("resuming an origin that is not frozen: %v", err)
+	}
+	if _, _, err := graph.FreezeSnapshotLedger(origin); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistSharedPublicationBridgeIntent(sharedRoot, sharedPublicationBridgeIntent{
+		Version: sharedPublicationBridgeIntentVersion, Snapshot: uint64(origin), Kind: sharedPublicationBridgePublication,
+		Family: "family", Branch: "main", PublicationID: "publication", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.resumeFrozenGraphOrigin(context.Background(), origin); !errors.Is(err, errFrozenOriginOwned) {
+		t.Fatalf("resuming a branch publication's origin = %v, want %v", err, errFrozenOriginOwned)
+	}
+	if !graph.SnapshotLedgerFrozen(origin) {
+		t.Fatal("the resume released a branch publication's freeze")
+	}
+}

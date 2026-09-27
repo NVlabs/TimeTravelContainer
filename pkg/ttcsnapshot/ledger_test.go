@@ -623,6 +623,9 @@ func TestSnapshotLedgerFinalBarrierIsDurableAndOriginScoped(t *testing.T) {
 	if len(objects) != 1 || references["root/branch/first"] != child || !graph.SnapshotLedgerFrozen(first) {
 		t.Fatalf("frozen baseline objects=%+v references=%+v", objects, references)
 	}
+	if frozen := graph.FrozenSnapshotLedgers(); len(frozen) != 1 || frozen[0] != first {
+		t.Fatalf("frozen ledgers = %v, want [%d]", frozen, first)
+	}
 	if err := graph.DeleteRoot("branch/first"); err == nil {
 		t.Fatal("deleted a root through a frozen handoff barrier")
 	}
@@ -649,11 +652,18 @@ func TestSnapshotLedgerFinalBarrierIsDurableAndOriginScoped(t *testing.T) {
 	if !reopened.SnapshotLedgerFrozen(first) {
 		t.Fatal("final barrier was lost across reopen")
 	}
+	// A restarted provider lists the barriers that it must roll forward.
+	if frozen := reopened.FrozenSnapshotLedgers(); len(frozen) != 1 || frozen[0] != first {
+		t.Fatalf("frozen ledgers after reopen = %v, want [%d]", frozen, first)
+	}
 	if err := reopened.MarkShared(first); err != nil {
 		t.Fatalf("authority state transition was blocked by reference barrier: %v", err)
 	}
 	if err := reopened.UnfreezeSnapshotLedger(first); err != nil {
 		t.Fatal(err)
+	}
+	if frozen := reopened.FrozenSnapshotLedgers(); len(frozen) != 0 {
+		t.Fatalf("frozen ledgers after cancellation = %v", frozen)
 	}
 	if err := reopened.DeleteRoot("branch/first"); err != nil {
 		t.Fatalf("reference mutation remained blocked after cancellation: %v", err)

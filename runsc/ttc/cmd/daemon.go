@@ -6751,6 +6751,7 @@ func serveDaemonWithCluster(socket, runtimePlatform string, cpuProfile daemonCPU
 			go maintainAuthorityExpirations(clusterRuntime.raft, clusterRuntime.raftCatalog, clusterRuntime.lease, stderr, clusterDone)
 		}
 		resumeDistributedForkMonitors(targetRuntime, targetBackend, clusterRuntime)
+		go resumeFrozenOriginPublications(targetBackend, stderr, clusterDone)
 		go maintainDistributedGraphReferences(targetBackend, stderr, clusterDone, func() func() {
 			return server.lockDataRootIdle(server.dataRoot)
 		})

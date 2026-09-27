@@ -158,6 +158,29 @@ func removeSharedPublicationBridgeIntent(sharedRoot string, snapshot ttcsnapshot
 	return errors.Join(syncErr, directory.Close())
 }
 
+// loadSharedPublicationBridgeIntent returns the bridge intent recorded for
+// snapshot, if there is one.
+func loadSharedPublicationBridgeIntent(sharedRoot string, snapshot ttcsnapshot.SnapshotID) (sharedPublicationBridgeIntent, bool, error) {
+	data, err := os.ReadFile(sharedPublicationBridgeIntentPath(sharedRoot, snapshot))
+	if errors.Is(err, os.ErrNotExist) {
+		return sharedPublicationBridgeIntent{}, false, nil
+	}
+	if err != nil {
+		return sharedPublicationBridgeIntent{}, false, err
+	}
+	var intent sharedPublicationBridgeIntent
+	if err := json.Unmarshal(data, &intent); err != nil {
+		return sharedPublicationBridgeIntent{}, false, fmt.Errorf("decoding snapshot %d publication bridge intent: %w", snapshot, err)
+	}
+	if err := intent.validate(); err != nil {
+		return sharedPublicationBridgeIntent{}, false, err
+	}
+	if intent.Snapshot != uint64(snapshot) {
+		return sharedPublicationBridgeIntent{}, false, fmt.Errorf("snapshot %d publication bridge intent names snapshot %d", snapshot, intent.Snapshot)
+	}
+	return intent, true, nil
+}
+
 func loadSharedPublicationBridgeIntents(sharedRoot string) ([]sharedPublicationBridgeIntent, error) {
 	directory := filepath.Join(sharedRoot, "cluster", "reference-bridges")
 	entries, err := os.ReadDir(directory)
