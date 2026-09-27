@@ -290,14 +290,9 @@ func RunSharedFilesystemRelay(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ttcd shared filesystem relay: opening root: %v\n", err)
 		return 1
 	}
-	reader.allowedOrigins = make(map[ttcsnapshot.SnapshotID]struct{})
-	for _, encoded := range strings.Split(args[4], ",") {
-		origin, parseErr := strconv.ParseUint(encoded, 16, 64)
-		if parseErr != nil || origin == 0 {
-			fmt.Fprintln(stderr, "ttcd shared filesystem relay: invalid origin scope")
-			return 2
-		}
-		reader.allowedOrigins[ttcsnapshot.SnapshotID(origin)] = struct{}{}
+	if reader.allowedOrigins, err = parseSharedRelayOriginScope(args[4]); err != nil {
+		fmt.Fprintf(stderr, "ttcd shared filesystem relay: %v\n", err)
+		return 2
 	}
 	var token ttcvolume.RemoteToken
 	var source ttcvolume.RemoteSourceKey
@@ -328,10 +323,27 @@ func RunSharedFilesystemRelay(args []string, stderr io.Writer) int {
 	return 1
 }
 
-func startSharedFilesystemRelay(sharedRoot, root, sourceName string, origins []uint64, token ttcvolume.RemoteToken) (*os.File, <-chan error, error) {
-	if len(origins) == 0 {
-		return nil, nil, errors.New("shared filesystem relay has no immutable origin scope")
+// parseSharedRelayOriginScope decodes a shared filesystem relay's origin
+// scope, the origins whose objects it serves without finding them below the
+// root: those the tree's publication handed off. A publication that changed
+// nothing of the tree handed off none, and its relay finds every object
+// below the root.
+func parseSharedRelayOriginScope(encoded string) (map[ttcsnapshot.SnapshotID]struct{}, error) {
+	origins := make(map[ttcsnapshot.SnapshotID]struct{})
+	if encoded == "" {
+		return origins, nil
 	}
+	for _, field := range strings.Split(encoded, ",") {
+		origin, err := strconv.ParseUint(field, 16, 64)
+		if err != nil || origin == 0 {
+			return nil, errors.New("invalid origin scope")
+		}
+		origins[ttcsnapshot.SnapshotID(origin)] = struct{}{}
+	}
+	return origins, nil
+}
+
+func startSharedFilesystemRelay(sharedRoot, root, sourceName string, origins []uint64, token ttcvolume.RemoteToken) (*os.File, <-chan error, error) {
 	fds, err := cloexecStreamSocketpair()
 	if err != nil {
 		return nil, nil, err

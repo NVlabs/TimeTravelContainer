@@ -820,3 +820,26 @@ func TestSharedSnapshotReaderFindsObjectsBelowItsRoot(t *testing.T) {
 		t.Fatalf("an object outside the tree: %v, want permission denied", err)
 	}
 }
+
+// A publication that changed nothing of its tree hands off no origin, and a
+// relay of that tree, as the next publication and a rehydration start, has
+// an empty scope: it finds every object below the root.
+func TestSharedRelayOriginScope(t *testing.T) {
+	if origins, err := parseSharedRelayOriginScope(""); err != nil || len(origins) != 0 {
+		t.Fatalf("empty scope = (%v, %v), want no origins", origins, err)
+	}
+	origins, err := parseSharedRelayOriginScope(fmt.Sprintf("%016x,%016x", 3, 0x2a))
+	if err != nil || len(origins) != 2 {
+		t.Fatalf("scope of two origins = (%v, %v)", origins, err)
+	}
+	for _, origin := range []ttcsnapshot.SnapshotID{3, 0x2a} {
+		if _, ok := origins[origin]; !ok {
+			t.Fatalf("scope %v lacks origin %d", origins, origin)
+		}
+	}
+	for _, invalid := range []string{"0000000000000000", "zz", "3,", ","} {
+		if _, err := parseSharedRelayOriginScope(invalid); err == nil {
+			t.Fatalf("scope %q was accepted", invalid)
+		}
+	}
+}
