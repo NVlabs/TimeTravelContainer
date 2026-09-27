@@ -422,24 +422,32 @@ func (c *RaftCatalog) EnsurePublicationPreparing(family, branch, publicationID, 
 // node-local capture fence is complete. It is intentionally retryable after a
 // daemon crash; no shared bytes may be uploaded before it succeeds.
 func (c *RaftCatalog) EnsurePublicationReady(family, branch, publicationID, lifecycle string, captureRoots DurableRoots) (*PublicationRecord, error) {
-	recordPointer, err := c.EnsurePublicationPreparing(family, branch, publicationID, lifecycle)
-	if err != nil {
-		return nil, err
-	}
-	record := *recordPointer
-	switch record.State {
-	case PublicationPreparing:
-		return applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationReady, AuthorityPublicationPayload{
-			Family: family, Branch: branch, PublicationID: record.PublicationID,
-			BranchGeneration: record.BranchGeneration, Revision: record.Revision, Roots: captureRoots,
-		})
-	case PublicationReady, PublicationCommitted:
-		if record.State == PublicationReady && record.CandidateRoots != captureRoots {
-			return nil, errors.New("publication capture roots differ")
+	for attempt := 0; ; attempt++ {
+		recordPointer, err := c.EnsurePublicationPreparing(family, branch, publicationID, lifecycle)
+		if err != nil {
+			return nil, err
 		}
-		return &record, nil
-	default:
-		return nil, errors.New("publication identity is not usable")
+		record := *recordPointer
+		switch record.State {
+		case PublicationPreparing:
+			ready, err := applyRaftValue[PublicationRecord](c, time.Now().UTC(), AuthorityPublicationReady, AuthorityPublicationPayload{
+				Family: family, Branch: branch, PublicationID: record.PublicationID,
+				BranchGeneration: record.BranchGeneration, Revision: record.Revision, Roots: captureRoots,
+			})
+			if err == nil || attempt == 2 {
+				return ready, err
+			}
+			// Another caller may have made the capture ready at the revision
+			// read above, as the publication queue's worker does while the
+			// command that queued the publication does too: look again.
+		case PublicationReady, PublicationCommitted:
+			if record.State == PublicationReady && record.CandidateRoots != captureRoots {
+				return nil, errors.New("publication capture roots differ")
+			}
+			return &record, nil
+		default:
+			return nil, errors.New("publication identity is not usable")
+		}
 	}
 }
 

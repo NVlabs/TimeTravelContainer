@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -296,6 +297,50 @@ func TestAuthorityRaftSingleNodeLinearizableApply(t *testing.T) {
 	}
 	if created.Generation == 0 {
 		t.Fatal("created doomed branch without a generation")
+	}
+}
+
+// A publication's capture is made ready by the command that queues it and by
+// the queue's worker, at once: both succeed.
+func TestRaftCatalogEnsurePublicationReadyConcurrently(t *testing.T) {
+	serverTLS, clientTLS := newAuthorityRaftTLS(t)
+	node, err := OpenAuthorityRaftNode(AuthorityRaftOptions{
+		NodeID: "node-a", LocalDir: filepath.Join(t.TempDir(), "raft"),
+		ListenAddress: "127.0.0.1:0", AdvertiseHost: "127.0.0.1:0", ServerName: "localhost",
+		ServerTLS: serverTLS, ClientTLS: clientTLS, Bootstrap: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	waitAuthorityLeader(t, node)
+	registerReadyRaftNode(t, node, "node-a", "incarnation-a")
+	catalog, err := NewRaftCatalog(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.Create(PlacementRecord{
+		FamilyID: "family", BranchID: "main", PhysicalContainer: "family", PhysicalBranch: "main",
+		OwnerNode: "node-a", OwnerIncarnation: "incarnation-a", State: PlacementRunning,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	roots := DurableRoots{FilesystemRoot: "cold/manifests/family/main/0000000000000001.json"}
+	const callers = 8
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			record, err := catalog.EnsurePublicationReady("family", "main", "publication-1", "exited", roots)
+			if err == nil && record.State != PublicationReady {
+				err = fmt.Errorf("publication is %s, want ready", record.State)
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < callers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("making a capture ready concurrently: %v", err)
+		}
 	}
 }
 
