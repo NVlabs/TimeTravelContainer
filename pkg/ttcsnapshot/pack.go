@@ -352,6 +352,11 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 	if err := syncDirectory(directory); err != nil {
 		return err
 	}
+	// The manifest is the immutable authority point, which no retry replaces:
+	// never commit one that its readers would reject.
+	if err := store.validateManifest(&manifest); err != nil {
+		return fmt.Errorf("validating snapshot %d manifest before commit: %w", snapshot, err)
+	}
 	if err := writeAtomicJSON(filepath.Join(directory, sharedManifestName), manifest); err != nil {
 		return err
 	}

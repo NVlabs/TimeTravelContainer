@@ -754,6 +754,18 @@ func TestSnapshotLedgerHandoffCatchupIsDurableAndExact(t *testing.T) {
 	if len(frozenObjects) != len(objects) || !sameObjectReferences(frozenBaseline, baseline) {
 		t.Fatalf("freeze changed baseline: objects=%d/%d baseline=%+v/%+v", len(frozenObjects), len(objects), frozenBaseline, baseline)
 	}
+	// References moved since the baseline: the root from first to second, and
+	// the pin of second away. Objects returned with the baseline must count
+	// the baseline's references, not the current ones, or a receiver that
+	// applies the recorded mutations counts them twice.
+	for name, returned := range map[string][]Object{"repeated": repeatedObjects, "frozen": frozenObjects} {
+		for index, object := range returned {
+			want := objects[index]
+			if object.ID != want.ID || object.Refs != want.Refs || object.State != want.State {
+				t.Fatalf("%s handoff object %s refs=%d state=%s, baseline object refs=%d state=%s", name, object.ID, object.Refs, object.State, want.Refs, want.State)
+			}
+		}
+	}
 	changes, finalCursor, frozen, err := graph.SnapshotLedgerHandoffChanges(origin, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -765,8 +777,10 @@ func TestSnapshotLedgerHandoffCatchupIsDurableAndExact(t *testing.T) {
 		t.Fatal("mutated references after final handoff freeze")
 	}
 
+	// The receiver of a handoff retried after the provider restarted imports
+	// what the retry returned.
 	ledger := NewReferenceLedger()
-	if err := ledger.ImportOrigin(origin, objects, baseline); err != nil {
+	if err := ledger.ImportOrigin(origin, repeatedObjects, repeatedBaseline); err != nil {
 		t.Fatal(err)
 	}
 	allChanges, _, _, err := graph.SnapshotLedgerHandoffChanges(origin, 0)

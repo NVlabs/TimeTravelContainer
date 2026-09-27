@@ -2376,7 +2376,8 @@ func (s *Store) BeginSnapshotLedgerHandoff(snapshot SnapshotID) ([]Object, map[s
 	}
 	key := snapshotKey(snapshot)
 	if handoff, ok := s.state.Handoffs[key]; ok {
-		return objects, cloneObjectReferences(handoff.Baseline), handoff.NextSequence - 1, nil
+		baseline := cloneObjectReferences(handoff.Baseline)
+		return baselineObjects(objects, snapshot, baseline), baseline, handoff.NextSequence - 1, nil
 	}
 	handoff := SnapshotLedgerHandoff{
 		Snapshot:     snapshot,
@@ -2439,13 +2440,42 @@ func (s *Store) FreezeSnapshotLedger(snapshot SnapshotID) ([]Object, map[string]
 		}
 		return objects, references, nil
 	}
-	if handoff.Frozen {
-		return objects, cloneObjectReferences(handoff.Baseline), nil
+	baseline := cloneObjectReferences(handoff.Baseline)
+	if !handoff.Frozen {
+		if err := s.commitLocked([]journalOp{{FreezeSnapshot: snapshot}}); err != nil {
+			return nil, nil, err
+		}
 	}
-	if err := s.commitLocked([]journalOp{{FreezeSnapshot: snapshot}}); err != nil {
-		return nil, nil, err
+	return baselineObjects(objects, snapshot, baseline), baseline, nil
+}
+
+// baselineObjects returns objects, the current objects of snapshot, as they
+// were at a handoff's baseline, whose references were baseline. A receiver
+// imports them with baseline and then applies the mutations recorded since,
+// so they must not count those mutations already. Same-origin edges are
+// immutable, and nothing of a snapshot being handed off is collected: an
+// object's count at the baseline is its same-origin edges and its references
+// in baseline.
+func baselineObjects(objects []Object, snapshot SnapshotID, baseline map[string]ObjectID) []Object {
+	counts := make(map[string]uint64, len(objects))
+	for _, parent := range objects {
+		for _, edge := range parent.Children {
+			if edge.Child.Snapshot == snapshot {
+				counts[edge.Child.key()]++
+			}
+		}
 	}
-	return objects, cloneObjectReferences(handoff.Baseline), nil
+	for _, object := range baseline {
+		counts[object.key()]++
+	}
+	for index := range objects {
+		objects[index].Refs = counts[objects[index].ID.key()]
+		objects[index].State = ObjectLive
+		if objects[index].Refs == 0 {
+			objects[index].State = ObjectReclaiming
+		}
+	}
+	return objects
 }
 
 // UnfreezeSnapshotLedger cancels a failed authority handoff. It must not be
