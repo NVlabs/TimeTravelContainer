@@ -80,12 +80,26 @@ type SharedPackStore struct {
 
 	mu        sync.Mutex
 	manifests map[SnapshotID]cachedSharedManifest
+	// manifestBytes is the size of the files of the manifests cached, which
+	// it keeps at most manifestLimit, and manifestUses counts their uses, to
+	// find the least recently used.
+	manifestBytes int64
+	manifestLimit int64
+	manifestUses  uint64
 }
 
 type cachedSharedManifest struct {
 	manifest *SnapshotManifest
 	info     os.FileInfo
+	used     uint64
 }
+
+// sharedManifestCacheBytes bounds the manifests a store keeps decoded, by the
+// size of their files. A memory image's manifest describes every page of it,
+// 10.6 MB for an image of 522 MiB, and a daemon reads the manifest of every
+// image it restores from shared storage: without a bound it kept each for its
+// life.
+const sharedManifestCacheBytes = 512 << 20
 
 type publicationBulkSource struct {
 	id     ObjectID
@@ -100,7 +114,7 @@ func OpenSharedPackStore(root string) (*SharedPackStore, error) {
 	if err := os.MkdirAll(filepath.Join(root, "snapshots"), 0700); err != nil {
 		return nil, err
 	}
-	return &SharedPackStore{root: root, manifests: make(map[SnapshotID]cachedSharedManifest)}, nil
+	return &SharedPackStore{root: root, manifests: make(map[SnapshotID]cachedSharedManifest), manifestLimit: sharedManifestCacheBytes}, nil
 }
 
 func (store *SharedPackStore) snapshotDirectory(id SnapshotID) string {
@@ -361,7 +375,7 @@ func (store *SharedPackStore) publish(ctx context.Context, graph *Store, snapsho
 		return err
 	}
 	store.mu.Lock()
-	delete(store.manifests, snapshot)
+	store.forgetManifestLocked(snapshot)
 	store.mu.Unlock()
 	return nil
 }
@@ -512,6 +526,9 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 	}
 	store.mu.Lock()
 	if cached, ok := store.manifests[snapshot]; ok && cached.manifest != nil && cached.info != nil && os.SameFile(cached.info, info) && cached.info.Size() == info.Size() && cached.info.ModTime().Equal(info.ModTime()) {
+		store.manifestUses++
+		cached.used = store.manifestUses
+		store.manifests[snapshot] = cached
 		result := cached.manifest
 		store.mu.Unlock()
 		file.Close()
@@ -534,9 +551,37 @@ func (store *SharedPackStore) manifest(snapshot SnapshotID) (*SnapshotManifest, 
 		return nil, err
 	}
 	store.mu.Lock()
-	store.manifests[snapshot] = cachedSharedManifest{manifest: &manifest, info: info}
+	store.cacheManifestLocked(snapshot, cachedSharedManifest{manifest: &manifest, info: info})
 	store.mu.Unlock()
 	return &manifest, nil
+}
+
+// cacheManifestLocked caches entry as snapshot's manifest, and forgets the
+// least recently used others while the cache is over its bound.
+func (store *SharedPackStore) cacheManifestLocked(snapshot SnapshotID, entry cachedSharedManifest) {
+	store.forgetManifestLocked(snapshot)
+	store.manifestUses++
+	entry.used = store.manifestUses
+	store.manifests[snapshot] = entry
+	store.manifestBytes += entry.info.Size()
+	for store.manifestBytes > store.manifestLimit && len(store.manifests) > 1 {
+		var oldest SnapshotID
+		var oldestUse uint64
+		for id, cached := range store.manifests {
+			if id != snapshot && (oldest == 0 || cached.used < oldestUse) {
+				oldest, oldestUse = id, cached.used
+			}
+		}
+		store.forgetManifestLocked(oldest)
+	}
+}
+
+// forgetManifestLocked drops snapshot's cached manifest.
+func (store *SharedPackStore) forgetManifestLocked(snapshot SnapshotID) {
+	if cached, ok := store.manifests[snapshot]; ok {
+		store.manifestBytes -= cached.info.Size()
+		delete(store.manifests, snapshot)
+	}
 }
 
 func packedObjectByID(manifest *SnapshotManifest, id ObjectID) (PackedObject, bool) {
@@ -1047,7 +1092,7 @@ func (store *SharedPackStore) Compact(snapshot SnapshotID, objects []Object, ref
 		return stats, false, err
 	}
 	store.mu.Lock()
-	delete(store.manifests, snapshot)
+	store.forgetManifestLocked(snapshot)
 	store.mu.Unlock()
 	var removeErr error
 	for _, pack := range manifest.Packs {
@@ -1157,7 +1202,7 @@ func (store *SharedPackStore) Retire(snapshot SnapshotID) (busy bool, err error)
 	removeErr := os.RemoveAll(retired)
 	syncErr := syncDirectory(parent)
 	store.mu.Lock()
-	delete(store.manifests, snapshot)
+	store.forgetManifestLocked(snapshot)
 	store.mu.Unlock()
 	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
 }
@@ -1200,7 +1245,7 @@ func (store *SharedPackStore) DiscardHandoff(snapshot SnapshotID) (busy bool, er
 	removeErr := os.RemoveAll(retired)
 	syncErr = errors.Join(syncErr, syncDirectory(parent))
 	store.mu.Lock()
-	delete(store.manifests, snapshot)
+	store.forgetManifestLocked(snapshot)
 	store.mu.Unlock()
 	return false, errors.Join(unlockErr, closeErr, removeErr, syncErr)
 }
@@ -1248,7 +1293,7 @@ func (store *SharedPackStore) CompleteRetirement(snapshot SnapshotID) (busy bool
 	}
 	if _, err := os.Stat(store.snapshotDirectory(snapshot)); errors.Is(err, fs.ErrNotExist) {
 		store.mu.Lock()
-		delete(store.manifests, snapshot)
+		store.forgetManifestLocked(snapshot)
 		store.mu.Unlock()
 		return false, syncDirectory(parent)
 	} else if err != nil {

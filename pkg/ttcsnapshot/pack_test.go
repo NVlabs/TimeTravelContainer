@@ -819,3 +819,73 @@ func TestSharedPackManifestsEnumeratesOnlyCommittedOrigins(t *testing.T) {
 		t.Fatalf("Manifests()=%+v, want snapshots %d and %d", manifests, origins[0], origins[1])
 	}
 }
+
+// A store keeps the manifests it has read decoded only within its bound, the
+// least recently used forgotten first.
+func TestSharedPackManifestCacheIsBounded(t *testing.T) {
+	shared, err := OpenSharedPackStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := openTestStore(t)
+	data, err := OpenLocalDataStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var origins []SnapshotID
+	var largest int64
+	for index := 0; index < 3; index++ {
+		origin, err := graph.AllocateWorking()
+		if err != nil {
+			t.Fatal(err)
+		}
+		object, err := graph.CreateObject(origin, fmt.Sprintf("root/%d", origin), ObjectKindMetadata, []byte{byte(origin)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.SetRoot(fmt.Sprintf("snapshot/%d", origin), object); err != nil {
+			t.Fatal(err)
+		}
+		if err := graph.Seal(origin, SnapshotSealedLocal); err != nil {
+			t.Fatal(err)
+		}
+		if err := shared.Publish(context.Background(), graph, origin, data); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(filepath.Join(shared.snapshotDirectory(origin), sharedManifestName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		largest = max(largest, info.Size())
+		origins = append(origins, origin)
+	}
+	shared.manifestLimit = 2 * largest
+	cached := func(want ...SnapshotID) {
+		t.Helper()
+		shared.mu.Lock()
+		defer shared.mu.Unlock()
+		if len(shared.manifests) != len(want) {
+			t.Fatalf("cached %d manifests, want %v", len(shared.manifests), want)
+		}
+		for _, origin := range want {
+			if _, ok := shared.manifests[origin]; !ok {
+				t.Fatalf("manifest of %d is not cached, want %v", origin, want)
+			}
+		}
+	}
+	read := func(origin SnapshotID) {
+		t.Helper()
+		if _, err := shared.manifest(origin); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b, c := origins[0], origins[1], origins[2]
+	read(a)
+	read(b)
+	cached(a, b)
+	read(c)
+	cached(b, c)
+	read(b)
+	read(a)
+	cached(a, b)
+}
