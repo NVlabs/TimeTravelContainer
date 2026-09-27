@@ -16605,12 +16605,35 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 			return fmt.Errorf("stopping console follower for %s: %w", target, err)
 		}
 	}
-	if sessions, sessionsErr := b.execSessions(target); sessionsErr == nil {
-		for _, session := range sessions {
-			paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID)
-			if pathErr == nil {
-				if err := b.stopConsoleDrain(paths); err != nil {
-					return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
+	// The runtime's family as it is now, for the steps below. A branch it
+	// does not run has no exec sessions, and one it does not have has nothing
+	// to destroy: a stop leaves no exited branch behind in a runtime that
+	// keeps others.
+	var runtimeFamily *Family
+	runtimeBranchState := ""
+	if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
+		runtimeFamily = &Family{}
+		for _, family := range families {
+			if family.ID != target.container {
+				continue
+			}
+			*runtimeFamily = family
+			for _, branch := range family.Branches {
+				if branch.ID == target.branch {
+					runtimeBranchState = normalizeLifecycleState(branch.State)
+				}
+			}
+			break
+		}
+	}
+	if runtimeFamily == nil || runtimeBranchState == "running" || runtimeBranchState == "paused" {
+		if sessions, sessionsErr := b.execSessions(target); sessionsErr == nil {
+			for _, session := range sessions {
+				paths, pathErr := store.ExecConsolePaths(info.ID, target.branch, session.ID)
+				if pathErr == nil {
+					if err := b.stopConsoleDrain(paths); err != nil {
+						return fmt.Errorf("stopping exec console follower %q for %s: %w", session.ID, target, err)
+					}
 				}
 			}
 		}
@@ -16632,21 +16655,18 @@ func (b *runtimeBackend) destroy(target selector, force bool) error {
 	// sibling. Move immutable graph authority to the family before that
 	// transfer; otherwise reclaiming the removed branch can unlink chunks that
 	// the sibling will demand later.
-	if families, listErr := b.listRuntimeFamiliesOf(target.container); listErr == nil {
-		for _, family := range families {
-			if family.ID != target.container || len(family.Branches) < 2 {
-				continue
-			}
-			var updated ttcbundle.BranchInfo
-			info, updated, err = b.parkBranchMemoryGraph(info, *recorded)
-			if err != nil {
-				return err
-			}
-			recorded = &updated
-			break
+	if runtimeFamily != nil && len(runtimeFamily.Branches) >= 2 {
+		var updated ttcbundle.BranchInfo
+		info, updated, err = b.parkBranchMemoryGraph(info, *recorded)
+		if err != nil {
+			return err
 		}
+		recorded = &updated
 	}
 	destroyRuntime := func() error {
+		if runtimeFamily != nil && runtimeBranchState == "" {
+			return nil
+		}
 		// Elastic placement can leave this as the last physical branch on this
 		// node while persistent siblings run elsewhere. runsc's branch destroy
 		// correctly refuses to remove a runtime's final branch, so delete this
