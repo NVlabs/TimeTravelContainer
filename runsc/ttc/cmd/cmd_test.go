@@ -7810,6 +7810,46 @@ func TestClusterReleasesOnlyItsParkedRuntimeMemoryBackings(t *testing.T) {
 	}
 }
 
+// The reconciliation of volatile origins runs under the lifecycle lock, so it
+// must not wait for an origin's lock: a publication holds its origin's lock
+// while it waits for the handoff gate, which a capture holds while it waits
+// for the lifecycle lock. It passes over an origin whose lock is held.
+func TestOriginCleanupPassesOverALockedOrigin(t *testing.T) {
+	graph, err := ttcsnapshot.Open(filepath.Join(t.TempDir(), "graph"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	empty, err := graph.AllocateWorking()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &distributedSourceRuntime{authority: &cluster.RaftCatalog{}, incarnation: "incarnation-1"}
+	b := &runtimeBackend{nodeID: "n1", distributedSource: source, snapshotGraph: graph}
+	unlock := source.lockSnapshotOrigin(empty)
+	defer unlock()
+	type result struct {
+		abandoned int
+		err       error
+	}
+	done := make(chan result, 2)
+	go func() {
+		abandoned, err := b.abandonEmptyVolatileMemoryOrigins()
+		done <- result{abandoned, err}
+	}()
+	go func() { done <- result{0, b.abandonStaleOrigin("n1", uint64(empty))} }()
+	for range 2 {
+		select {
+		case got := <-done:
+			if got.err != nil || got.abandoned != 0 {
+				t.Fatalf("cleanup of a locked origin: abandoned %d, %v", got.abandoned, got.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the origin cleanup waited for an origin's lock")
+		}
+	}
+}
+
 func TestDistributedGraphHandoffRequiresLiveRuntime(t *testing.T) {
 	for _, test := range []struct {
 		name   string

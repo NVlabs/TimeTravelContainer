@@ -456,6 +456,21 @@ func (r *distributedSourceRuntime) lockSnapshotOrigin(origin ttcsnapshot.Snapsho
 	return lock.Unlock
 }
 
+// tryLockSnapshotOrigin is lockSnapshotOrigin for a caller that holds the
+// lifecycle lock, which must not wait for an origin's lock: a publication
+// holds its origin's lock while it waits for the handoff gate, and a capture
+// holds the gate while it waits for the lifecycle lock.
+func (r *distributedSourceRuntime) tryLockSnapshotOrigin(origin ttcsnapshot.SnapshotID) (func(), bool) {
+	if r == nil || origin == 0 {
+		return func() {}, true
+	}
+	lock := &r.originLocks[uint64(origin)%uint64(len(r.originLocks))]
+	if !lock.TryLock() {
+		return nil, false
+	}
+	return lock.Unlock, true
+}
+
 func (r *distributedSourceRuntime) lockSourceFamily(family string) func() {
 	if r == nil {
 		return func() {}

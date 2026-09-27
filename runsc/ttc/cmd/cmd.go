@@ -14016,7 +14016,12 @@ func (b *runtimeBackend) abandonEmptyVolatileMemoryOrigins() (int, error) {
 		if snapshot.State != ttcsnapshot.SnapshotWorking && snapshot.State != ttcsnapshot.SnapshotSealedVolatile {
 			continue
 		}
-		unlockOrigin := b.distributedSource.lockSnapshotOrigin(snapshot.ID)
+		// An origin whose lock is held is being published, so it is no
+		// residue now; a later pass finds it if it becomes so.
+		unlockOrigin, locked := b.distributedSource.tryLockSnapshotOrigin(snapshot.ID)
+		if !locked {
+			continue
+		}
 		objects, err := b.snapshotGraph.SnapshotObjects(snapshot.ID)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			unlockOrigin()
@@ -14186,7 +14191,12 @@ const staleOriginWorkers = 8
 // holds, unless that is no longer so.
 func (b *runtimeBackend) abandonStaleOrigin(node string, encoded uint64) error {
 	origin := ttcsnapshot.SnapshotID(encoded)
-	unlockOrigin := b.distributedSource.lockSnapshotOrigin(origin)
+	// One whose lock is held is being published or handed off; a later
+	// reconciliation takes it up if it is still stale.
+	unlockOrigin, locked := b.distributedSource.tryLockSnapshotOrigin(origin)
+	if !locked {
+		return nil
+	}
 	defer unlockOrigin()
 	// The inventory is only a candidate list. A concurrent publisher or
 	// branch mutation may have made the origin live before this origin fence
