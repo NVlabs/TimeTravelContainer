@@ -6907,6 +6907,7 @@ func maintainDistributedGraphReferences(backend *runtimeBackend, stderr io.Write
 		err := backend.reconcileDistributedGraphReferences(false)
 		backingErr := backend.reconcileConsumedMemoryBacking()
 		unlock()
+		err = errors.Join(err, backend.reconcileProviderClaims())
 		if err != nil && stderr != nil {
 			fmt.Fprintf(stderr, "ttcd: warning: reconciling distributed graph references: %v\n", err)
 		}

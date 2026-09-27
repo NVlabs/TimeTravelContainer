@@ -420,6 +420,9 @@ func (b *runtimeBackend) flushGraphReferenceReleases(timeout time.Duration) erro
 		if err := b.reconcileDistributedGraphReferences(false); err != nil {
 			lastErr = err
 		}
+		if err := b.reconcileProviderClaims(); err != nil {
+			lastErr = errors.Join(lastErr, err)
+		}
 		pending, err := b.pendingGraphReferenceReleases()
 		if err != nil {
 			return err
@@ -466,11 +469,7 @@ func (b *runtimeBackend) reconcileDistributedGraphReferences(strictRetain bool) 
 			continue
 		}
 		if intent.Purpose == graphReferencePurposeProvider {
-			// The handoff that records a provider claim retains it before it
-			// commits, so nothing here must be retained before execution.
-			if err := b.reconcileProviderReferences(path, intent); err != nil {
-				retryable = errors.Join(retryable, fmt.Errorf("reconciling provider claim %q: %w", intent.Operation, err))
-			}
+			// See reconcileProviderClaims.
 			continue
 		}
 		tx, txErr := b.distributedSource.transactions.Load(intent.Transaction)
@@ -1050,6 +1049,44 @@ func (p *branchPublisher) retainAtSharedLedger(ctx context.Context, origin ttcsn
 		}
 	}
 	return nil
+}
+
+// reconcileProviderClaims reconciles every provider claim of this node; see
+// reconcileProviderReferences. The handoff that records a claim retains it
+// before it commits, so execution waits for none, and it needs no lock of the
+// node's: releasing a claim waits for the shared-reference coordinator,
+// which a node's start may be what brings back, and during a failover for a
+// while.
+func (b *runtimeBackend) reconcileProviderClaims() error {
+	if b == nil || b.distributedSource == nil {
+		return nil
+	}
+	dir := filepath.Join(b.activeDataRoot(), "graph-references")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "provider-") || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		intent, err := readGraphReferenceIntent(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err == nil && intent.Purpose == graphReferencePurposeProvider {
+			err = b.reconcileProviderReferences(path, intent)
+		}
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("reconciling provider claim %q: %w", entry.Name(), err))
+		}
+	}
+	return result
 }
 
 // providerCheck is when a provider claim's graph is to be checked next, and
