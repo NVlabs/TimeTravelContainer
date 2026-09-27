@@ -468,10 +468,11 @@ func daemonCommandPlacementWithCatalog(dataRoot string, placements cluster.Place
 							switch normalizeLifecycleState(branch.Lifecycle) {
 							case "created":
 								claimMaterializing = true
-							case "dehydrated", "exited":
+							case "dehydrated", "exited", "materializing":
 								// A branch whose rehydration or start failed
 								// stays claimed by the node it failed on, and
-								// can still be removed there.
+								// can still be removed there. The claim made
+								// its lifecycle the placement's.
 								claimMaterializing = args[0] == "rm"
 							}
 						}

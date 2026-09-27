@@ -715,8 +715,9 @@ func TestProcessFreeStartRelocationEligibility(t *testing.T) {
 		t.Fatalf("running relocation eligibility = (%t, %v), want false", ok, err)
 	}
 	// A branch whose rehydration failed on the node that claimed it can be
-	// removed there, and nothing else can be done to it but retrying.
-	branch.Lifecycle = "dehydrated"
+	// removed there, and nothing else can be done to it but retrying. The
+	// claim made its lifecycle the placement's.
+	branch.Lifecycle = "materializing"
 	catalog.branches["family\x00main"] = branch
 	owner, claims, err = daemonCommandPlacementWithCatalog(root, catalog, []string{"rm", "-f", "web@main"})
 	if err != nil || owner != "node-a" || len(claims) != 1 || !claims[0].AllowMaterializing {
