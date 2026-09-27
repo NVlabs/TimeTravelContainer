@@ -101,9 +101,9 @@ start_node() {
 source_target=$SOURCE_TARGET
 peer_target=64GiB
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" "$source_target" --cluster-init
-start_node b "$PORT_B" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" "$peer_target" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A" "$source_target"
+start_node b "$PORT_B" "$peer_target"
+start_node c "$PORT_C" "$peer_target"
 
 client a pull "$IMAGE" >/dev/null
 for family in $FAMILIES; do

@@ -7,9 +7,10 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
-# Qualifies sequential recovery of a fully stopped multi-voter cluster. The
-# first persistent member must remain alive in an explicit quorum-wait state so
-# an operator can start the second member from the same shell.
+# Qualifies recovery of a whole cluster whose daemons crashed together. A
+# restarted daemon remains alive in an explicit quorum-wait state, so that an
+# operator can start the other from the same shell, until one of them takes the
+# authority over from the crashed one.
 set -eu
 
 TTC=${TTC:-ttc}
@@ -65,12 +66,13 @@ wait_ready() {
 }
 
 restart_cluster() {
-	# Neither start waits for full admission. Both processes remain fenced until
-	# their persistent Raft group elects a leader and commits registration.
-	start_a=$(start_node a "$PORT_A" --cluster-init)
+	# Neither start waits for full admission. Both daemons remain fenced until
+	# one takes the authority over, once the crashed holder's counter in the
+	# shared root has stood still, and commits their registration.
+	start_a=$(start_node a "$PORT_A")
 	printf '%s\n' "$start_a" | grep -q 'waiting for cluster quorum'
 	client a daemon status | jq -e '.state == "starting" and .waiting_for_cluster_quorum == true' >/dev/null
-	start_b=$(start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A")
+	start_b=$(start_node b "$PORT_B")
 	printf '%s\n' "$start_b" | grep -q 'waiting for cluster quorum'
 	wait_ready
 }
@@ -95,8 +97,8 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$ROOT/shared"
 # A daemon's root holds its socket, and must be private.
 mkdir -p -m 700 "$ROOT/local-a" "$ROOT/local-b"
-start_node a "$PORT_A" --cluster-init >/dev/null
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A" >/dev/null
+start_node a "$PORT_A" >/dev/null
+start_node b "$PORT_B" >/dev/null
 
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" --shm-size 64m "$IMAGE" sh -c \

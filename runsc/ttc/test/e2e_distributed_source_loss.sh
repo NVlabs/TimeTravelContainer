@@ -99,11 +99,11 @@ start_node() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
-# Joining is learner-first. Give the leader's membership reconciler time to
-# promote both ready nodes before deliberately removing the original voter.
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
+# Node A, the first to start, holds the cluster's authority. Let both joined
+# nodes settle before deliberately removing it.
 sleep 8
 
 client a pull "$IMAGE" >/dev/null
@@ -113,7 +113,7 @@ client c run -d --node node-c --name "$SAFE_NAME" "$IMAGE" sleep 3600 >/dev/null
 client a fork --node node-b "$NAME@main" dependent >/dev/null
 
 # Kill the complete source-node session before background publication can make
-# the target independent. The remaining two voters must retain quorum.
+# the target independent. A surviving node must take the authority over.
 stop_session "$PID_A"
 PID_A=
 

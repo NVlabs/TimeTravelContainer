@@ -164,10 +164,11 @@ whole-file materialization, and branch-local filesystem divergence after both
 handoffs. `TTC_DISTRIBUTED_TEST_PORT_A` and
 `TTC_DISTRIBUTED_TEST_PORT_B` select its host listener ports.
 
-`e2e_distributed_source_loss.sh` starts a three-voter cluster, retains a large
-demand-paged memory dependency on node A, then destroys node A before the
-target becomes independent. The surviving quorum must stop and permanently
-mark only the dependent branch `corrupted`; an unrelated branch on node C must
+`e2e_distributed_source_loss.sh` starts a three-node cluster, retains a large
+demand-paged memory dependency on node A, then destroys node A, which holds the
+cluster's authority, before the target becomes independent. The surviving
+nodes must take the authority over, stop and permanently mark only the
+dependent branch `corrupted`; an unrelated branch on node C must
 remain executable. The test also verifies that removal is still available for
 the corrupted branch and reaps every process in the failed node's private test
 root.

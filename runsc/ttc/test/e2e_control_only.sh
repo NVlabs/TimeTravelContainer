@@ -99,8 +99,8 @@ test -x "$TTC" || fail "TTC is not executable: $TTC"
 test -x "$TTCD" || fail "TTCD is not executable: $TTCD"
 mkdir -p -m 700 "$ROOT/local-control"
 
-start_compute a "$PORT_A" --cluster-init
-start_compute b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
+start_compute a "$PORT_A"
+start_compute b "$PORT_B"
 for _ in $(seq 1 300); do
 	test "$(client a node ls --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)" -eq 2 && break
 	sleep 0.05
@@ -109,7 +109,6 @@ test "$(client a node ls --json | jq 'length')" -eq 2 || fail "compute nodes did
 
 TTC_ROOT=$ROOT/shared TTC_LOCAL_ROOT=$ROOT/local-control TTC_CLUSTER_TOKEN=$TOKEN \
 	setsid "$TTCD" --control-only \
-	--cluster-join "127.0.0.1:$PORT_A" --cluster-join "127.0.0.1:$PORT_B" \
 	>"$ROOT/local-control/ttcd.log" 2>&1 &
 PID_CONTROL=$!
 wait_ready control
@@ -130,7 +129,7 @@ test "$(client control ls --json | jq --arg family "$NAME" \
 	'[.[] | select(.name == $family) | .branches[]] | length')" -eq 2 ||
 	fail "private migration branch leaked into inventory"
 
-# The listener is created on the compute seed selected by the gateway. It must
+# The listener is created on the compute node the gateway selected. It must
 # route to the remote owner and continue routing after ownership moves.
 binding=127.0.0.1:$HOST_PORT:8080
 client control port publish "$NAME@main" "$binding" >/dev/null

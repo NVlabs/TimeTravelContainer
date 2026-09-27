@@ -87,9 +87,9 @@ start_node() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
 
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" "$IMAGE" sh -c 'printf RECOVERED >/tmp/marker; exec sleep 3600' >/dev/null
@@ -116,7 +116,7 @@ STOP_CLIENT=
 # The new incarnation waits out the old lease, adopts its fenced placements,
 # resumes the exact Sentries, and continues the durable drain intent. Recovery
 # must stop this daemon automatically when no authoritative local state remains.
-start_node a "$PORT_A" --cluster-join "127.0.0.1:$PORT_B"
+start_node a "$PORT_A"
 for attempt in $(seq 1 1200); do
 	if ! kill -0 "$PID_A" 2>/dev/null; then break; fi
 	sleep 0.05

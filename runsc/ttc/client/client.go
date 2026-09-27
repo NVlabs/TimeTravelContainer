@@ -366,6 +366,10 @@ of its files there, including its socket and log. A daemon of a cluster shares
 TTC_ROOT with the cluster and keeps its node's own files in TTC_LOCAL_ROOT.
 The daemon's root, TTC_ROOT or TTC_LOCAL_ROOT, must be on a local filesystem.
 
+With --listen, --advertise, or --node, the daemon is a compute node of the
+cluster whose shared root TTC_ROOT is. Every node starts alike, in any order:
+it holds the cluster's authority, or joins the node that does.
+
 Options:
   --platform systrap|kvm          Execution platform (default: systrap)
   --cpu-profile portable|host|explicit
@@ -377,9 +381,6 @@ Options:
   --allow-network-filesystem-root Start although the daemon's root is on a
                                   network filesystem such as NFS or Lustre
                                   (default: false)
-  --cluster-init                  Create/restart the cluster's surviving Raft
-                                  member (default: standalone mode)
-  --cluster-join HOST:PORT        Seed address; repeatable (default: none)
   --control-only                  Outbound-only login-node gateway
                                   (default: false)
   --node NAME                     Node name: [A-Za-z0-9._-]+ (default: hostname;
@@ -414,8 +415,7 @@ Advanced cluster policy:
 
 Cluster membership, transport, and capacity options are fixed for the daemon
 lifetime. Operational policy may change only while the cluster has no live
-node leases. The CPU profile remains immutable. --cluster-init and
---cluster-join are mutually exclusive.
+node leases. The CPU profile remains immutable.
 
 Environment:
   TTC_ROOT          Required data root; shared root in cluster mode. A
@@ -424,8 +424,8 @@ Environment:
                     keeps its node's files there
   TTC_CLUSTER_TOKEN Optional shared cluster authentication token (default: none)
 
-With --control-only, repeat --cluster-join for optional seed redundancy. The
-daemon does not advertise a TCP endpoint, join Raft, or accept container
+With --control-only, the daemon finds the cluster's compute nodes in TTC_ROOT.
+It does not advertise a TCP endpoint, join Raft, or accept container
 placement; it opens only its socket in TTC_LOCAL_ROOT.`,
 	"daemon status": `Usage: ttc daemon status
 

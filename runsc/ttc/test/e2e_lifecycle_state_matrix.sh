@@ -144,9 +144,9 @@ assert_no_processes_for_root() {
 }
 
 mkdir -p "$ROOT/shared"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
 
 attempt=0
 while test "$attempt" -lt 600; do

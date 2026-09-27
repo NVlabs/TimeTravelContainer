@@ -115,9 +115,9 @@ node_branch_count() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
 
 for attempt in $(seq 1 300); do
 	test "$(client a node ls --json | jq 'length')" -eq 3 && break
@@ -230,7 +230,7 @@ wait "$PID_A"
 PID_A=
 
 # Cleanly stopping the whole cluster must retain exactly one restart seed, not
-# delete every Raft database. Restart that final voter without --cluster-init;
+# delete every Raft database: the last voter's. Restart that final voter;
 # startup also exercises a fresh shared-reference-ledger reconstruction.
 test -f "$LOCAL_BASE/local-a/cluster/raft/raft.db"
 test ! -f "$LOCAL_BASE/local-b/cluster/raft/raft.db"

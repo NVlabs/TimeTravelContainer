@@ -161,7 +161,7 @@ def main():
     succeeded = False
     began = time.monotonic()
     try:
-        ttc(runtime_a, "daemon", "start", "--cluster-init", *common,
+        ttc(runtime_a, "daemon", "start", *common,
             "--listen", "127.0.0.1:28443",
             "--advertise", "127.0.0.1:28443", "--node", "node-a",
             "--memory-target", "512GiB",
@@ -194,7 +194,7 @@ def main():
             lambda: json.loads((root / "provider-accepted.json").read_text(encoding="utf-8")),
             timeout=30,
         )
-        ttc(runtime_b, "daemon", "start", "--cluster-join", "127.0.0.1:28443", *common,
+        ttc(runtime_b, "daemon", "start", *common,
             "--listen", "127.0.0.1:38443",
             "--advertise", "127.0.0.1:38443", "--node", "node-b",
             "--memory-target", "2TiB",

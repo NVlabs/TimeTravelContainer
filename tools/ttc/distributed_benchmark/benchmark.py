@@ -159,11 +159,11 @@ class Experiment:
             "--cluster-push", self.case["push"],
         ]
         node_a = [
-            "--cluster-init", "--listen", "127.0.0.1:27443",
+            "--listen", "127.0.0.1:27443",
             "--node", "node-a", "--advertise", "127.0.0.1:27443",
         ]
         node_b = [
-            "--cluster-join", "127.0.0.1:27443", "--listen", "127.0.0.1:37443",
+            "--listen", "127.0.0.1:37443",
             "--node", "node-b", "--advertise", "127.0.0.1:37443",
         ]
         self.ttc("a", "daemon", "start", *common, *node_a)

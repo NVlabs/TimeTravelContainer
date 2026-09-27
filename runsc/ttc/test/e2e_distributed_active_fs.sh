@@ -58,13 +58,13 @@ mkdir -p "$SHARED"
 # A daemon's root holds its socket, and must be private.
 mkdir -p -m 700 "$LOCAL_A" "$LOCAL_B"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_A TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --cluster-init --node node-a \
+	"$TTCD" --node node-a \
 	--listen "127.0.0.1:$PORT_A" --advertise "127.0.0.1:$PORT_A" \
 	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_A/ttcd.log" 2>&1 &
 PID_A=$!
 wait_ready "$LOCAL_A" "$LOCAL_A/ttcd.log"
 TTC_ROOT=$SHARED TTC_LOCAL_ROOT=$LOCAL_B TTC_CLUSTER_TOKEN=$TOKEN \
-	"$TTCD" --cluster-join "127.0.0.1:$PORT_A" --node node-b \
+	"$TTCD" --node node-b \
 	--listen "127.0.0.1:$PORT_B" --advertise "127.0.0.1:$PORT_B" \
 	--memory-target 64GiB $DAEMON_EXTRA >"$LOCAL_B/ttcd.log" 2>&1 &
 PID_B=$!

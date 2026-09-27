@@ -113,11 +113,11 @@ branch_field() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
-# Learner-first admission and promotion are asynchronous. Wait until all three
-# nodes are visible before asking placement to use a newly joined node.
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
+# Admission is asynchronous. Wait until all three nodes are visible before
+# asking placement to use a newly joined node.
 attempt=0
 while test "$attempt" -lt 300; do
 	if test "$(client a node ls --json | jq 'length')" -eq 3; then break; fi

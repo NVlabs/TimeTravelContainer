@@ -176,7 +176,7 @@ func TestDetailedHelpIsClientLocal(t *testing.T) {
 		want []string
 	}{
 		{[]string{"daemon", "--help"}, []string{"Usage: ttc daemon COMMAND", "Commands:", "request inspect ID"}},
-		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "--cluster-init", "--control-only", "512MiB/8GiB", "default: 30s", "does not advertise a TCP endpoint"}},
+		{[]string{"daemon", "start", "--help"}, []string{"Usage: ttc daemon start", "TTC_ROOT", "starts alike", "--control-only", "512MiB/8GiB", "default: 30s", "does not advertise a TCP endpoint"}},
 		{[]string{"help", "daemon", "stop"}, []string{"Usage: ttc daemon stop", "build mismatches"}},
 		{[]string{"image", "--help"}, []string{"Manage Docker/OCI images", "load [OPTIONS]", "rm [OPTIONS]"}},
 		{[]string{"exec", "--help"}, []string{"named detached session", "--session NAME", "--process FILE"}},

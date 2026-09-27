@@ -117,8 +117,8 @@ verify_branch() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
 
 client a pull "$IMAGE" >/dev/null
 client a run -d --node node-a --name "$NAME" "$IMAGE" sleep 3600 >/dev/null

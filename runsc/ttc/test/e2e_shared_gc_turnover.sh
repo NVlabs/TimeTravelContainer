@@ -99,9 +99,9 @@ start_node() {
 }
 
 mkdir -p "$ROOT" "$SHARED"
-start_node a "$PORT_A" --cluster-init
-start_node b "$PORT_B" --cluster-join "127.0.0.1:$PORT_A"
-start_node c "$PORT_C" --cluster-join "127.0.0.1:$PORT_A"
+start_node a "$PORT_A"
+start_node b "$PORT_B"
+start_node c "$PORT_C"
 
 # Find the actual coordinator instead of assuming the first node won its
 # independent lease-acquisition race. The generation directory is disposable
