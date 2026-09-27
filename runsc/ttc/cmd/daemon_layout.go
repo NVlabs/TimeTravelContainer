@@ -137,9 +137,13 @@ func checkDaemonSocketPaths(layout daemonLayout) error {
 }
 
 // prepareDaemonLayout makes the directories of a daemon's own files and gives
-// the processes it starts, and itself, their places in them.
+// the processes it starts, and itself, their places in them. runtimeRoot is
+// that of runsc, or "" for a control-only daemon, which runs none.
 func prepareDaemonLayout(layout daemonLayout, runtimeRoot string) error {
 	for _, dir := range []string{layout.run, layout.tmp, runtimeRoot} {
+		if dir == "" {
+			continue
+		}
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("creating %q: %w", dir, err)
 		}

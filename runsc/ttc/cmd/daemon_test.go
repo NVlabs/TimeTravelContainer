@@ -666,6 +666,21 @@ func TestDaemonRootMustFitUnixSocketPaths(t *testing.T) {
 	}
 }
 
+func TestControlOnlyDaemonLayoutHasNoRuntimeRoot(t *testing.T) {
+	// prepareDaemonLayout sets both for the processes the daemon starts.
+	t.Setenv("TMPDIR", os.Getenv("TMPDIR"))
+	t.Setenv(daemonRunDirEnv, os.Getenv(daemonRunDirEnv))
+	layout := newDaemonLayout(shortDaemonTestRoot(t))
+	if err := prepareDaemonLayout(layout, ""); err != nil {
+		t.Fatalf("prepareDaemonLayout without a runtime root: %v", err)
+	}
+	for _, dir := range []string{layout.run, layout.tmp} {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("stat %q: %v", dir, err)
+		}
+	}
+}
+
 func TestControlOnlyDaemonRootMustFitItsHoldersSockets(t *testing.T) {
 	// A gateway's root that fits its own sockets, but not those of its
 	// control holder, whose root is in it.
