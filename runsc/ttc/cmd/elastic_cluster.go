@@ -4396,7 +4396,7 @@ func (b *runtimeBackend) reclaimOrphanLocalContainerDirs(state *cluster.Authorit
 // it made durable, so the branch can be rehydrated here from memory; once the
 // branch is placed on another node the capture is superseded and holds the
 // branch's memory for nothing, as a later rehydration here would find it out
-// of date (see rehydrate). A runtime left with no branch is removed.
+// of date (see rehydrate). A runtime of nothing but such captures is removed.
 func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) error {
 	if b.nodeID == "" || state == nil {
 		return nil
@@ -4448,19 +4448,25 @@ func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) e
 		if _, busy := b.operations.lookup(family.ID); busy {
 			continue
 		}
-		dropped := 0
+		var superseded []string
 		for _, branch := range family.Branches {
-			if branch.State != "dehydrated" || !placed[branch.ID] {
-				continue
+			if branch.State == "dehydrated" && placed[branch.ID] {
+				superseded = append(superseded, branch.ID)
 			}
-			if _, err := b.command("timetravel", family.ID, "destroy", branch.ID); err != nil {
-				result = errors.Join(result, fmt.Errorf("dropping the superseded capture of %s@%s: %w", family.ID, branch.ID, err))
-				continue
-			}
-			dropped++
 		}
-		if dropped != 0 && dropped == len(family.Branches) {
+		if len(superseded) == 0 {
+			continue
+		}
+		// A Sentry keeps its family's last branch: a runtime of nothing but
+		// superseded captures goes whole.
+		if len(superseded) == len(family.Branches) {
 			result = errors.Join(result, b.purgeRuntime(family.ID))
+			continue
+		}
+		for _, branch := range superseded {
+			if _, err := b.command("timetravel", family.ID, "destroy", branch); err != nil {
+				result = errors.Join(result, fmt.Errorf("dropping the superseded capture of %s@%s: %w", family.ID, branch, err))
+			}
 		}
 	}
 	return result
