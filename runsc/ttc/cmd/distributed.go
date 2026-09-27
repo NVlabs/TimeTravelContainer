@@ -1879,27 +1879,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			} else if statErr != nil {
 				return 0, statErr
 			}
-			var repository *ttcvolume.Repository
-			created := false
-			if _, statErr := os.Stat(filepath.Join(repositoryPath, "volume.json")); statErr == nil {
-				repository, err = ttcvolume.OpenRepository(repositoryPath, ttcvolume.CopyMode(config.CopyMode))
-				if err == nil {
-					if len(origins) == 0 {
-						err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
-					} else {
-						err = repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, filesystemBranch, origins[0], origins[1])
-					}
-				}
-			} else if errors.Is(statErr, os.ErrNotExist) {
-				created = true
-				if len(origins) == 0 {
-					repository, err = manager.ImportPrivateRemoteDescriptor(repositoryPath, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch)
-				} else {
-					repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(repositoryPath, "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
-				}
-			} else {
-				err = statErr
-			}
+			repository, created, err := importRemoteRepositoryBranch(manager, repositoryPath, ttcvolume.CopyMode(config.CopyMode), "peer-"+fmt.Sprint(index), descriptor, filesystemBranch, origins)
 			if err != nil {
 				return 0, fmt.Errorf("importing peer repository %q metadata: %w", config.Source, err)
 			}
@@ -1920,27 +1900,7 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 			continue
 		}
 		destination := distributedRepositoryCachePath(b.activeDataRoot(), info.ID, config.Source)
-		var repository *ttcvolume.Repository
-		created := false
-		if _, statErr := os.Stat(destination); statErr == nil {
-			repository, err = ttcvolume.OpenRepository(destination, manager.Capability().Mode)
-			if err == nil {
-				if len(origins) == 0 {
-					err = repository.ImportRemoteBranchDescriptor(descriptor, filesystemBranch)
-				} else {
-					err = repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, filesystemBranch, origins[0], origins[1])
-				}
-			}
-		} else if errors.Is(statErr, os.ErrNotExist) {
-			created = true
-			if len(origins) == 0 {
-				repository, err = manager.ImportPrivateRemoteDescriptor(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch)
-			} else {
-				repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(destination, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch, origins[0], origins[1])
-			}
-		} else {
-			err = statErr
-		}
+		repository, created, err := importRemoteRepositoryBranch(manager, destination, manager.Capability().Mode, "remote-"+fmt.Sprint(index), descriptor, filesystemBranch, origins)
 		if err != nil {
 			return 0, fmt.Errorf("importing remote repository %q metadata: %w", config.Source, err)
 		}
@@ -1966,6 +1926,45 @@ func (b *runtimeBackend) materializeDistributedFilesystemRoots(info ttcbundle.Co
 	}
 	originsCommitted = true
 	return installed, nil
+}
+
+// importRemoteRepositoryBranch imports descriptor as branch of the repository
+// at path, or, if there is none, of a new private one named name, with the
+// Raft-allocated origins if there are any. An import that would share a
+// snapshot frozen for an authority handoff, as the branch's own is until the
+// provider that published it completes the handoff, is refused and changes
+// nothing: it waits the handoff out.
+func importRemoteRepositoryBranch(manager *ttcvolume.Manager, path string, mode ttcvolume.CopyMode, name string, descriptor ttcvolume.RemoteSnapshotDescriptor, branch string, origins []ttcsnapshot.SnapshotID) (repository *ttcvolume.Repository, created bool, err error) {
+	err = throughAuthorityHandoffs(func() error {
+		if _, statErr := os.Stat(filepath.Join(path, "volume.json")); errors.Is(statErr, os.ErrNotExist) {
+			created = true
+			var err error
+			if len(origins) == 0 {
+				repository, err = manager.ImportPrivateRemoteDescriptor(path, name, descriptor, branch)
+			} else {
+				repository, err = manager.ImportPrivateRemoteDescriptorWithOrigins(path, name, descriptor, branch, origins[0], origins[1])
+			}
+			return err
+		} else if statErr != nil {
+			return statErr
+		}
+		created = false
+		opened, err := ttcvolume.OpenRepository(path, mode)
+		if err != nil {
+			return err
+		}
+		if len(origins) == 0 {
+			err = opened.ImportRemoteBranchDescriptor(descriptor, branch)
+		} else {
+			err = opened.ImportRemoteBranchDescriptorWithOrigins(descriptor, branch, origins[0], origins[1])
+		}
+		if err != nil {
+			return errors.Join(err, opened.Close())
+		}
+		repository = opened
+		return nil
+	})
+	return repository, created, err
 }
 
 func distributedRepositoryCachePath(activeRoot, containerID, source string) string {

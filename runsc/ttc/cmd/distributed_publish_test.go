@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/ttcsnapshot"
+	"gvisor.dev/gvisor/pkg/ttcvolume"
 	"gvisor.dev/gvisor/runsc/ttc/cluster"
 )
 
@@ -55,6 +56,74 @@ type testSnapshotProviderLookup struct {
 
 func (lookup testSnapshotProviderLookup) SnapshotProvider(snapshot uint64) (cluster.SnapshotOriginProvider, bool, error) {
 	return cluster.SnapshotOriginProvider{SnapshotID: snapshot, NodeID: "node-a"}, lookup.found, lookup.err
+}
+
+// A rehydration may import its branch while the provider that published the
+// branch has yet to complete the handoff of its snapshot: the superseded
+// branch it discards keeps its root in the frozen snapshot until then, and
+// the import, which replaces the root, waits for the handoff rather than
+// failing.
+func TestRemoteRepositoryImportWaitsOutAHandoff(t *testing.T) {
+	manager, err := ttcvolume.OpenManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := manager.CreateWithOrigin("family", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	ino, err := repository.CreateRegular(ttcvolume.MainBranch, ttcvolume.RootInode, "payload", 0600, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.WriteAt(ttcvolume.MainBranch, ino, []byte("payload"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ForkWithOrigins(ttcvolume.MainBranch, "returning", 101, 102); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := repository.DescribeRemoteSnapshot("returning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := ttcsnapshot.OpenSharedPackStore(filepath.Join(t.TempDir(), "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.PublishOriginHandoff(context.Background(), shared, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.FreezeOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RemoveBranch("returning"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.ImportRemoteBranchDescriptorWithOrigins(descriptor, "returning", 103, 104); !frozenForAuthorityHandoff(err) {
+		t.Fatalf("import during the handoff = %v, want it refused as frozen", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		imported, created, err := importRemoteRepositoryBranch(manager, repository.Path(), manager.Capability().Mode, "peer-0", descriptor, "returning", []ttcsnapshot.SnapshotID{103, 104})
+		if err == nil {
+			if created {
+				err = errors.New("the import created a repository where there was one")
+			}
+			err = errors.Join(err, imported.Close())
+		}
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	if err := repository.CompleteOriginHandoff(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("import across the handoff: %v", err)
+	}
+	if _, err := repository.Branch("returning"); err != nil {
+		t.Fatalf("imported branch: %v", err)
+	}
 }
 
 func TestSnapshotOriginAuthorityDistinguishesTombstones(t *testing.T) {
