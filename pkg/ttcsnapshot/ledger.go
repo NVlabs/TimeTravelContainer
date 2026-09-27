@@ -69,6 +69,9 @@ type referenceLedgerState struct {
 	NextSequence  uint64
 	Acknowledged  uint64
 	HandoffCursor map[SnapshotID]uint64
+
+	// undo records what the mutation in progress has changed.
+	undo *ledgerUndo
 }
 
 type ledgerImportRecord struct {
@@ -171,6 +174,197 @@ func cloneReferenceLedgerState(state referenceLedgerState) referenceLedgerState 
 	}
 	result.Outbox = append([]OutboundReference(nil), state.Outbox...)
 	return result
+}
+
+// ledgerUndo holds the prior values of what a mutation of a
+// referenceLedgerState has changed, so that a mutation refused part way, or
+// one whose journal record is not written, can be undone. A mutation works in
+// place, in time proportional to what it changes: copying the whole state
+// first, as mutations did, took a quarter of a second and 87 MB for each
+// reference retained on a ledger of 300,000 objects.
+type ledgerUndo struct {
+	// A nil prior value is an absent one.
+	origins      map[SnapshotID]bool
+	objects      map[string]*Object
+	references   map[string]*ObjectID
+	applied      map[string]*appliedReference
+	cursors      map[SnapshotID]*uint64
+	outbox       []OutboundReference
+	nextSequence uint64
+	acknowledged uint64
+}
+
+// begin starts recording what a mutation changes.
+func (state *referenceLedgerState) begin() {
+	state.undo = &ledgerUndo{outbox: state.Outbox, nextSequence: state.NextSequence, acknowledged: state.Acknowledged}
+}
+
+// commit keeps what the mutation changed.
+func (state *referenceLedgerState) commit() {
+	state.undo = nil
+}
+
+// rollback restores what the mutation changed.
+func (state *referenceLedgerState) rollback() {
+	undo := state.undo
+	state.undo = nil
+	for origin, present := range undo.origins {
+		if present {
+			state.Origins[origin] = struct{}{}
+		} else {
+			delete(state.Origins, origin)
+		}
+	}
+	for key, prior := range undo.objects {
+		if prior != nil {
+			state.Objects[key] = *prior
+		} else {
+			delete(state.Objects, key)
+		}
+	}
+	for name, prior := range undo.references {
+		if prior != nil {
+			state.References[name] = *prior
+		} else {
+			delete(state.References, name)
+		}
+	}
+	for operation, prior := range undo.applied {
+		if prior != nil {
+			state.Applied[operation] = *prior
+		} else {
+			delete(state.Applied, operation)
+		}
+	}
+	for origin, prior := range undo.cursors {
+		if prior != nil {
+			state.HandoffCursor[origin] = *prior
+		} else {
+			delete(state.HandoffCursor, origin)
+		}
+	}
+	state.Outbox, state.NextSequence, state.Acknowledged = undo.outbox, undo.nextSequence, undo.acknowledged
+}
+
+// The setters below change the state's maps, recording each entry's first
+// prior value in a mutation. The outbox and the sequence numbers are recorded
+// whole when the mutation begins.
+
+func (state *referenceLedgerState) setOrigin(origin SnapshotID, present bool) {
+	if undo := state.undo; undo != nil {
+		if _, recorded := undo.origins[origin]; !recorded {
+			if undo.origins == nil {
+				undo.origins = make(map[SnapshotID]bool)
+			}
+			_, present := state.Origins[origin]
+			undo.origins[origin] = present
+		}
+	}
+	if present {
+		state.Origins[origin] = struct{}{}
+	} else {
+		delete(state.Origins, origin)
+	}
+}
+
+func (state *referenceLedgerState) recordObject(key string) {
+	if undo := state.undo; undo != nil {
+		if _, recorded := undo.objects[key]; !recorded {
+			if undo.objects == nil {
+				undo.objects = make(map[string]*Object)
+			}
+			if prior, ok := state.Objects[key]; ok {
+				undo.objects[key] = &prior
+			} else {
+				undo.objects[key] = nil
+			}
+		}
+	}
+}
+
+func (state *referenceLedgerState) putObject(key string, object Object) {
+	state.recordObject(key)
+	state.Objects[key] = object
+}
+
+func (state *referenceLedgerState) deleteObject(key string) {
+	state.recordObject(key)
+	delete(state.Objects, key)
+}
+
+func (state *referenceLedgerState) recordReference(name string) {
+	if undo := state.undo; undo != nil {
+		if _, recorded := undo.references[name]; !recorded {
+			if undo.references == nil {
+				undo.references = make(map[string]*ObjectID)
+			}
+			if prior, ok := state.References[name]; ok {
+				undo.references[name] = &prior
+			} else {
+				undo.references[name] = nil
+			}
+		}
+	}
+}
+
+func (state *referenceLedgerState) putReference(name string, id ObjectID) {
+	state.recordReference(name)
+	state.References[name] = id
+}
+
+func (state *referenceLedgerState) deleteReference(name string) {
+	state.recordReference(name)
+	delete(state.References, name)
+}
+
+func (state *referenceLedgerState) recordApplied(operation string) {
+	if undo := state.undo; undo != nil {
+		if _, recorded := undo.applied[operation]; !recorded {
+			if undo.applied == nil {
+				undo.applied = make(map[string]*appliedReference)
+			}
+			if prior, ok := state.Applied[operation]; ok {
+				undo.applied[operation] = &prior
+			} else {
+				undo.applied[operation] = nil
+			}
+		}
+	}
+}
+
+func (state *referenceLedgerState) putApplied(operation string, applied appliedReference) {
+	state.recordApplied(operation)
+	state.Applied[operation] = applied
+}
+
+func (state *referenceLedgerState) deleteApplied(operation string) {
+	state.recordApplied(operation)
+	delete(state.Applied, operation)
+}
+
+func (state *referenceLedgerState) recordCursor(origin SnapshotID) {
+	if undo := state.undo; undo != nil {
+		if _, recorded := undo.cursors[origin]; !recorded {
+			if undo.cursors == nil {
+				undo.cursors = make(map[SnapshotID]*uint64)
+			}
+			if prior, ok := state.HandoffCursor[origin]; ok {
+				undo.cursors[origin] = &prior
+			} else {
+				undo.cursors[origin] = nil
+			}
+		}
+	}
+}
+
+func (state *referenceLedgerState) putCursor(origin SnapshotID, cursor uint64) {
+	state.recordCursor(origin)
+	state.HandoffCursor[origin] = cursor
+}
+
+func (state *referenceLedgerState) deleteCursor(origin SnapshotID) {
+	state.recordCursor(origin)
+	delete(state.HandoffCursor, origin)
 }
 
 // ReferenceLedger is the common exact-counting engine used by volatile
@@ -341,7 +535,7 @@ func (ledger *ReferenceLedger) replay() error {
 			return err
 		}
 	}
-	ledger.state = cloneReferenceLedgerState(temporary.state)
+	ledger.state = temporary.state
 	ledger.sequence = temporary.sequence
 	_, err = ledger.journal.Seek(offset, io.SeekStart)
 	return err
@@ -395,11 +589,9 @@ func replayReferenceLedgerRecordWithImport(ledger *ReferenceLedger, record refer
 		if record.ImportCommit.Origin != p.begin.Origin || uint64(len(p.objects)) != p.begin.Objects || uint64(len(p.references)) != p.begin.References {
 			return errors.New("chunked import commit is incomplete")
 		}
-		next, err := importOriginState(ledger.state, p.begin.Origin, p.objects, p.references)
-		if err != nil {
+		if err := ledger.importLocked(p.begin.Origin, p.objects, p.references); err != nil {
 			return err
 		}
-		ledger.state = next
 		*pending = nil
 		return nil
 	default:
@@ -477,12 +669,32 @@ func replayReferenceLedgerRecord(ledger *ReferenceLedger, record referenceLedger
 	return nil
 }
 
-func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next referenceLedgerState) error {
+// mutateLocked applies change to the ledger's state in place and journals the
+// record it returns, a nil one if it changed nothing. A change that fails, or
+// whose record is not written, is undone.
+func (ledger *ReferenceLedger) mutateLocked(change func(*referenceLedgerState) (*referenceLedgerRecord, error)) error {
+	if ledger.poisoned != nil {
+		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
+	}
+	ledger.state.begin()
+	record, err := change(&ledger.state)
+	if err == nil && record != nil {
+		err = ledger.journalLocked(*record)
+	}
+	if err != nil {
+		ledger.state.rollback()
+		return err
+	}
+	ledger.state.commit()
+	return nil
+}
+
+// journalLocked durably appends record to the journal, if the ledger has one.
+func (ledger *ReferenceLedger) journalLocked(record referenceLedgerRecord) error {
 	if ledger.poisoned != nil {
 		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
 	}
 	if ledger.journal == nil {
-		ledger.state = next
 		return nil
 	}
 	if ledger.sequence == math.MaxUint64 {
@@ -502,7 +714,6 @@ func (ledger *ReferenceLedger) commitLocked(record referenceLedgerRecord, next r
 		return err
 	}
 	ledger.sequence = record.Sequence
-	ledger.state = next
 	return nil
 }
 
@@ -521,17 +732,13 @@ func encodeReferenceLedgerRecord(record referenceLedgerRecord) ([]byte, error) {
 	return encoded, nil
 }
 
-// commitChunkedImportLocked makes an arbitrarily large origin import atomic
+// journalChunkedImportLocked makes an arbitrarily large origin import atomic
 // without weakening the bounded-WAL invariant. The commit marker is synced
 // separately from its payload. Replay rolls an incomplete prefix back to the
 // begin offset, so the new graph is never partially visible.
-func (ledger *ReferenceLedger) commitChunkedImportLocked(origin SnapshotID, objects []Object, references map[string]ObjectID, next referenceLedgerState) error {
+func (ledger *ReferenceLedger) journalChunkedImportLocked(origin SnapshotID, objects []Object, references map[string]ObjectID) error {
 	if ledger.poisoned != nil {
 		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
-	}
-	if ledger.journal == nil {
-		ledger.state = next
-		return nil
 	}
 	names := make([]string, 0, len(references))
 	for name := range references {
@@ -619,7 +826,6 @@ func (ledger *ReferenceLedger) commitChunkedImportLocked(origin SnapshotID, obje
 		return err
 	}
 	ledger.sequence = commit.Sequence
-	ledger.state = next
 	return nil
 }
 
@@ -704,7 +910,7 @@ func (ledger *ReferenceLedger) Checkpoint() error {
 	if ledger.poisoned != nil {
 		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
 	}
-	checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: ledger.sequence, State: cloneReferenceLedgerState(ledger.state)}
+	checkpoint := referenceLedgerCheckpoint{Version: referenceLedgerVersion, Sequence: ledger.sequence, State: ledger.state}
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
 		return err
@@ -830,8 +1036,8 @@ func (state *referenceLedgerState) retain(name string, id ObjectID) error {
 		return fmt.Errorf("owned object %s cannot be retained", id)
 	}
 	object.Refs++
-	state.Objects[id.key()] = object
-	state.References[name] = id
+	state.putObject(id.key(), object)
+	state.putReference(name, id)
 	return nil
 }
 
@@ -851,8 +1057,8 @@ func (state *referenceLedgerState) release(name string, expected ObjectID) error
 	if object.Refs == 0 {
 		object.State = ObjectReclaiming
 	}
-	state.Objects[id.key()] = object
-	delete(state.References, name)
+	state.putObject(id.key(), object)
+	state.deleteReference(name)
 	return nil
 }
 
@@ -882,73 +1088,87 @@ func (ledger *ReferenceLedger) ImportOrigin(origin SnapshotID, objects []Object,
 	if _, exists := ledger.state.Origins[origin]; exists {
 		return nil
 	}
-	next, err := importOriginState(ledger.state, origin, objects, references)
-	if err != nil {
-		return err
-	}
-	record := referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}
-	if ledger.journal == nil {
-		return ledger.commitLocked(record, next)
-	}
-	record.Sequence = ledger.sequence + 1
-	if _, err := encodeReferenceLedgerRecord(record); err == nil {
-		return ledger.commitLocked(record, next)
-	}
-	return ledger.commitChunkedImportLocked(origin, objects, references, next)
+	return ledger.importLocked(origin, objects, references)
 }
 
-func importOriginState(state referenceLedgerState, origin SnapshotID, objects []Object, references map[string]ObjectID) (referenceLedgerState, error) {
+// importLocked imports origin into the ledger's state and journals the
+// import, if the ledger has a journal, in one record or, for one too large
+// for a record, in a chunked sequence. A refused or unjournaled import is
+// undone.
+func (ledger *ReferenceLedger) importLocked(origin SnapshotID, objects []Object, references map[string]ObjectID) error {
+	if ledger.poisoned != nil {
+		return fmt.Errorf("reference ledger requires reopen: %w", ledger.poisoned)
+	}
+	ledger.state.begin()
+	err := ledger.state.importOrigin(origin, objects, references)
+	if err == nil && ledger.journal != nil {
+		record := referenceLedgerRecord{Import: &ledgerImportRecord{Origin: origin, Objects: objects, References: references}}
+		record.Sequence = ledger.sequence + 1
+		if _, encodeErr := encodeReferenceLedgerRecord(record); encodeErr == nil {
+			err = ledger.journalLocked(record)
+		} else {
+			err = ledger.journalChunkedImportLocked(origin, objects, references)
+		}
+	}
+	if err != nil {
+		ledger.state.rollback()
+		return err
+	}
+	ledger.state.commit()
+	return nil
+}
+
+func (state *referenceLedgerState) importOrigin(origin SnapshotID, objects []Object, references map[string]ObjectID) error {
 	if origin == 0 {
-		return referenceLedgerState{}, errors.New("invalid reference-ledger origin import")
+		return errors.New("invalid reference-ledger origin import")
 	}
 	if _, exists := state.Origins[origin]; exists {
-		return cloneReferenceLedgerState(state), nil
+		return nil
 	}
-	next := cloneReferenceLedgerState(state)
-	next.Origins[origin] = struct{}{}
-	next.HandoffCursor[origin] = 0
+	state.setOrigin(origin, true)
+	state.putCursor(origin, 0)
 	for _, input := range objects {
 		object := cloneObject(input)
 		if object.ID.Snapshot != origin {
-			return referenceLedgerState{}, fmt.Errorf("origin %d import contains foreign object %s", origin, object.ID)
+			return fmt.Errorf("origin %d import contains foreign object %s", origin, object.ID)
 		}
 		object.State, object.Refs = ObjectLive, 0
 		if err := validateObject(object); err != nil {
-			return referenceLedgerState{}, err
+			return err
 		}
-		if _, exists := next.Objects[object.ID.key()]; exists {
-			return referenceLedgerState{}, fmt.Errorf("origin import repeats object %s", object.ID)
+		if _, exists := state.Objects[object.ID.key()]; exists {
+			return fmt.Errorf("origin import repeats object %s", object.ID)
 		}
-		next.Objects[object.ID.key()] = object
+		state.putObject(object.ID.key(), object)
 	}
 	for _, input := range objects {
-		parent := next.Objects[input.ID.key()]
+		parent := state.Objects[input.ID.key()]
 		for _, edge := range parent.Children {
-			if next.owns(edge.Child) {
-				child, ok := next.Objects[edge.Child.key()]
+			if state.owns(edge.Child) {
+				child, ok := state.Objects[edge.Child.key()]
 				if !ok || child.State != ObjectLive || child.Refs == math.MaxUint64 {
-					return referenceLedgerState{}, fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
+					return fmt.Errorf("object %s references unavailable owned child %s", parent.ID, edge.Child)
 				}
 				bridge := edgeReferenceName(parent.ID, edge.Slot)
-				if bridged, ok := next.References[bridge]; ok {
+				if bridged, ok := state.References[bridge]; ok {
 					if bridged != edge.Child {
-						return referenceLedgerState{}, fmt.Errorf("incoming edge bridge %q selects %s, want %s", bridge, bridged, edge.Child)
+						return fmt.Errorf("incoming edge bridge %q selects %s, want %s", bridge, bridged, edge.Child)
 					}
 					// Replace the external named reference with the now-internal
 					// structural edge. The child's count is unchanged.
-					delete(next.References, bridge)
+					state.deleteReference(bridge)
 				} else {
 					child.Refs++
-					next.Objects[edge.Child.key()] = child
+					state.putObject(edge.Child.key(), child)
 				}
-			} else if err := next.enqueue(parent.ID, edge, true); err != nil {
-				return referenceLedgerState{}, err
+			} else if err := state.enqueue(parent.ID, edge, true); err != nil {
+				return err
 			}
 		}
 	}
 	internalIncoming := make(map[string]ObjectID)
-	for _, parent := range next.Objects {
-		if !next.owns(parent.ID) {
+	for _, parent := range state.Objects {
+		if !state.owns(parent.ID) {
 			continue
 		}
 		for _, edge := range parent.Children {
@@ -956,13 +1176,13 @@ func importOriginState(state referenceLedgerState, origin SnapshotID, objects []
 				name := edgeReferenceName(parent.ID, edge.Slot)
 				internalIncoming[name] = edge.Child
 				if parent.ID.Snapshot != origin {
-					child, ok := next.Objects[edge.Child.key()]
+					child, ok := state.Objects[edge.Child.key()]
 					if !ok || child.Refs == math.MaxUint64 {
-						return referenceLedgerState{}, fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
+						return fmt.Errorf("owned parent %s references unavailable imported child %s", parent.ID, edge.Child)
 					}
 					child.State = ObjectLive
 					child.Refs++
-					next.Objects[edge.Child.key()] = child
+					state.putObject(edge.Child.key(), child)
 				}
 			}
 		}
@@ -979,22 +1199,23 @@ func importOriginState(state referenceLedgerState, origin SnapshotID, objects []
 		}
 		if internal, ok := internalIncoming[effectiveName]; ok {
 			if references[name] != internal {
-				return referenceLedgerState{}, fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
+				return fmt.Errorf("incoming edge baseline %q selects %s, want %s", effectiveName, references[name], internal)
 			}
 			// The already-owned parent edge supplies this count directly.
 			continue
 		}
-		if err := next.retain(effectiveName, references[name]); err != nil {
-			return referenceLedgerState{}, fmt.Errorf("importing reference %q: %w", effectiveName, err)
+		if err := state.retain(effectiveName, references[name]); err != nil {
+			return fmt.Errorf("importing reference %q: %w", effectiveName, err)
 		}
 	}
-	for key, object := range next.Objects {
-		if object.ID.Snapshot == origin && object.Refs == 0 {
+	for _, input := range objects {
+		key := input.ID.key()
+		if object := state.Objects[key]; object.Refs == 0 {
 			object.State = ObjectReclaiming
-			next.Objects[key] = object
+			state.putObject(key, object)
 		}
 	}
-	return next, nil
+	return nil
 }
 
 // ApplyReference applies one idempotent local root or delivered cross-owner
@@ -1018,41 +1239,43 @@ func (ledger *ReferenceLedger) ApplyReferences(mutations []SnapshotReferenceMuta
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	next := cloneReferenceLedgerState(ledger.state)
-	records := make([]ledgerReferenceRecord, 0, len(mutations))
-	for _, mutation := range mutations {
-		if mutation.Operation == "" {
-			return errors.New("invalid reference-ledger operation")
-		}
-		want := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
-		if previous, ok := next.Applied[mutation.Operation]; ok {
-			if previous != want {
-				return fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+	return ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
+		records := make([]ledgerReferenceRecord, 0, len(mutations))
+		for _, mutation := range mutations {
+			if mutation.Operation == "" {
+				return nil, errors.New("invalid reference-ledger operation")
 			}
-			continue
+			want := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
+			if previous, ok := state.Applied[mutation.Operation]; ok {
+				if previous != want {
+					return nil, fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+				}
+				continue
+			}
+			var err error
+			if mutation.Retain {
+				err = state.retain(mutation.Name, mutation.Object)
+			} else {
+				err = state.release(mutation.Name, mutation.Object)
+			}
+			if err != nil {
+				return nil, err
+			}
+			state.putApplied(mutation.Operation, want)
+			records = append(records, ledgerReferenceRecord{
+				Operation: mutation.Operation, Name: mutation.Name,
+				Object: mutation.Object, Retain: mutation.Retain,
+			})
 		}
-		var err error
-		if mutation.Retain {
-			err = next.retain(mutation.Name, mutation.Object)
-		} else {
-			err = next.release(mutation.Name, mutation.Object)
+		switch len(records) {
+		case 0:
+			return nil, nil
+		case 1:
+			return &referenceLedgerRecord{Reference: &records[0]}, nil
+		default:
+			return &referenceLedgerRecord{References: records}, nil
 		}
-		if err != nil {
-			return err
-		}
-		next.Applied[mutation.Operation] = want
-		records = append(records, ledgerReferenceRecord{
-			Operation: mutation.Operation, Name: mutation.Name,
-			Object: mutation.Object, Retain: mutation.Retain,
-		})
-	}
-	if len(records) == 0 {
-		return nil
-	}
-	if len(records) == 1 {
-		return ledger.commitLocked(referenceLedgerRecord{Reference: &records[0]}, next)
-	}
-	return ledger.commitLocked(referenceLedgerRecord{References: records}, next)
+	})
 }
 
 // ApplyHandoff atomically advances one provider-to-owner catch-up cursor.
@@ -1094,34 +1317,35 @@ func (ledger *ReferenceLedger) ApplyHandoff(origin SnapshotID, from uint64, muta
 	if len(mutations) == 0 {
 		return nil
 	}
-	next := cloneReferenceLedgerState(ledger.state)
-	want := from + 1
-	for _, mutation := range mutations {
-		if mutation.Sequence != want || mutation.Object.Snapshot != origin {
-			return fmt.Errorf("snapshot origin %d handoff mutation %d, want %d", origin, mutation.Sequence, want)
-		}
-		applied := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
-		if previous, ok := next.Applied[mutation.Operation]; ok {
-			if previous != applied {
-				return fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+	return ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
+		want := from + 1
+		for _, mutation := range mutations {
+			if mutation.Sequence != want || mutation.Object.Snapshot != origin {
+				return nil, fmt.Errorf("snapshot origin %d handoff mutation %d, want %d", origin, mutation.Sequence, want)
 			}
-		} else {
-			var err error
-			if mutation.Retain {
-				err = next.retain(mutation.Name, mutation.Object)
+			applied := appliedReference{Name: mutation.Name, Object: mutation.Object, Retain: mutation.Retain}
+			if previous, ok := state.Applied[mutation.Operation]; ok {
+				if previous != applied {
+					return nil, fmt.Errorf("reference operation %q was reused with different input", mutation.Operation)
+				}
 			} else {
-				err = next.release(mutation.Name, mutation.Object)
+				var err error
+				if mutation.Retain {
+					err = state.retain(mutation.Name, mutation.Object)
+				} else {
+					err = state.release(mutation.Name, mutation.Object)
+				}
+				if err != nil {
+					return nil, err
+				}
+				state.putApplied(mutation.Operation, applied)
 			}
-			if err != nil {
-				return err
-			}
-			next.Applied[mutation.Operation] = applied
+			want++
 		}
-		want++
-	}
-	next.HandoffCursor[origin] = want - 1
-	record := ledgerHandoffRecord{Origin: origin, From: from, Mutations: append([]SnapshotReferenceMutation(nil), mutations...)}
-	return ledger.commitLocked(referenceLedgerRecord{Handoff: &record}, next)
+		state.putCursor(origin, want-1)
+		record := ledgerHandoffRecord{Origin: origin, From: from, Mutations: append([]SnapshotReferenceMutation(nil), mutations...)}
+		return &referenceLedgerRecord{Handoff: &record}, nil
+	})
 }
 
 // PendingOutbound returns the ordered, unacknowledged cross-owner mutations.
@@ -1206,10 +1430,11 @@ func (ledger *ReferenceLedger) AcknowledgeOutboundThrough(sequence uint64) error
 	if index == len(ledger.state.Outbox) || ledger.state.Outbox[index].Sequence != sequence {
 		return fmt.Errorf("outbox acknowledgement %d is not pending", sequence)
 	}
-	next := cloneReferenceLedgerState(ledger.state)
-	next.Outbox = append([]OutboundReference(nil), next.Outbox[index+1:]...)
-	next.Acknowledged = sequence
-	return ledger.commitLocked(referenceLedgerRecord{Ack: &sequence}, next)
+	return ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
+		state.Outbox = append([]OutboundReference(nil), state.Outbox[index+1:]...)
+		state.Acknowledged = sequence
+		return &referenceLedgerRecord{Ack: &sequence}, nil
+	})
 }
 
 // Collect reclaims zero-count immutable objects and cascades internal edges.
@@ -1220,64 +1445,55 @@ func (ledger *ReferenceLedger) Collect(limit int) (int, error) {
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
-	// A healthy live graph overwhelmingly has nothing to collect. Avoid cloning
-	// the complete object table and appending a no-op WAL record on every
-	// coordinator maintenance tick. For large memory origins that work is
-	// proportional to resident memory and can otherwise keep a coordinator CPU
-	// saturated even though the graph has not changed.
-	hasReclaiming := false
-	for _, object := range ledger.state.Objects {
-		if object.State == ObjectReclaiming {
-			hasReclaiming = true
-			break
-		}
-	}
-	if !hasReclaiming {
-		return 0, nil
-	}
-	next := cloneReferenceLedgerState(ledger.state)
-	queue := make([]string, 0)
-	for key, object := range next.Objects {
+	var queue []string
+	for key, object := range ledger.state.Objects {
 		if object.State == ObjectReclaiming {
 			queue = append(queue, key)
 		}
 	}
-	sort.Strings(queue)
-	queued := make(map[string]struct{}, len(queue))
-	for _, key := range queue {
-		queued[key] = struct{}{}
+	// A healthy live graph overwhelmingly has nothing to collect: do not
+	// append a no-op WAL record on every coordinator maintenance tick.
+	if len(queue) == 0 {
+		return 0, nil
 	}
 	collected := 0
-	for len(queue) != 0 && collected < limit {
-		key := queue[0]
-		queue = queue[1:]
-		parent, ok := next.Objects[key]
-		if !ok || parent.State != ObjectReclaiming || parent.Refs != 0 {
-			continue
+	if err := ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
+		sort.Strings(queue)
+		queued := make(map[string]struct{}, len(queue))
+		for _, key := range queue {
+			queued[key] = struct{}{}
 		}
-		for _, edge := range parent.Children {
-			if next.owns(edge.Child) {
-				child, ok := next.Objects[edge.Child.key()]
-				if !ok || child.State != ObjectLive || child.Refs == 0 {
-					return 0, fmt.Errorf("reclaiming %s cannot release child %s", parent.ID, edge.Child)
-				}
-				child.Refs--
-				if child.Refs == 0 {
-					child.State = ObjectReclaiming
-					if _, exists := queued[child.ID.key()]; !exists {
-						queue = append(queue, child.ID.key())
-						queued[child.ID.key()] = struct{}{}
-					}
-				}
-				next.Objects[child.ID.key()] = child
-			} else if err := next.enqueue(parent.ID, edge, false); err != nil {
-				return 0, err
+		for len(queue) != 0 && collected < limit {
+			key := queue[0]
+			queue = queue[1:]
+			parent, ok := state.Objects[key]
+			if !ok || parent.State != ObjectReclaiming || parent.Refs != 0 {
+				continue
 			}
+			for _, edge := range parent.Children {
+				if state.owns(edge.Child) {
+					child, ok := state.Objects[edge.Child.key()]
+					if !ok || child.State != ObjectLive || child.Refs == 0 {
+						return nil, fmt.Errorf("reclaiming %s cannot release child %s", parent.ID, edge.Child)
+					}
+					child.Refs--
+					if child.Refs == 0 {
+						child.State = ObjectReclaiming
+						if _, exists := queued[child.ID.key()]; !exists {
+							queue = append(queue, child.ID.key())
+							queued[child.ID.key()] = struct{}{}
+						}
+					}
+					state.putObject(child.ID.key(), child)
+				} else if err := state.enqueue(parent.ID, edge, false); err != nil {
+					return nil, err
+				}
+			}
+			state.deleteObject(key)
+			collected++
 		}
-		delete(next.Objects, key)
-		collected++
-	}
-	if err := ledger.commitLocked(referenceLedgerRecord{Collect: &limit, Collected: collected}, next); err != nil {
+		return &referenceLedgerRecord{Collect: &limit, Collected: collected}, nil
+	}); err != nil {
 		return 0, err
 	}
 	return collected, nil
@@ -1342,19 +1558,21 @@ func (ledger *ReferenceLedger) RetireOrigin(origin SnapshotID) error {
 			return fmt.Errorf("snapshot origin %d still has pending outbound reference %d", origin, outbound.Sequence)
 		}
 	}
-	next := cloneReferenceLedgerState(ledger.state)
-	delete(next.Origins, origin)
-	delete(next.HandoffCursor, origin)
-	// Once Raft fences the immutable ID, retries are rejected before reaching
-	// this ledger. Its old operation receipts no longer serve deduplication and
-	// would otherwise grow without bound over long-lived clusters.
-	for operation, applied := range next.Applied {
-		if applied.Object.Snapshot == origin {
-			delete(next.Applied, operation)
+	return ledger.mutateLocked(func(state *referenceLedgerState) (*referenceLedgerRecord, error) {
+		state.setOrigin(origin, false)
+		state.deleteCursor(origin)
+		// Once Raft fences the immutable ID, retries are rejected before
+		// reaching this ledger. Its old operation receipts no longer serve
+		// deduplication and would otherwise grow without bound over
+		// long-lived clusters.
+		for operation, applied := range state.Applied {
+			if applied.Object.Snapshot == origin {
+				state.deleteApplied(operation)
+			}
 		}
-	}
-	retired := origin
-	return ledger.commitLocked(referenceLedgerRecord{Retire: &retired}, next)
+		retired := origin
+		return &referenceLedgerRecord{Retire: &retired}, nil
+	})
 }
 
 // ReferenceLedgerInspection is a stable diagnostic snapshot.

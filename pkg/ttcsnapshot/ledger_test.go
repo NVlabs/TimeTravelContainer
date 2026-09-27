@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -1109,5 +1110,85 @@ func TestReferenceLedgerRetirementRecovers(t *testing.T) {
 	defer ledger.Close()
 	if got := ledger.Inspect(); len(got.Origins) != 0 || len(got.Objects) != 0 {
 		t.Fatalf("retired origin reappeared after replay: %+v", got)
+	}
+}
+
+// A mutation works on the ledger's state in place: one refused part way, or
+// one whose journal record is not written, must leave the state as it was.
+func TestReferenceLedgerRefusedMutationChangesNothing(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "ledger")
+	ledger, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := ledgerObject(1, 1, ObjectKindMemoryChunk)
+	b := ledgerObject(1, 2, ObjectKindMemoryChunk)
+	if err := ledger.ImportOrigin(1, []Object{a, b}, map[string]ObjectID{"root/a": a.ID, "root/b": b.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyHandoff(1, 0, []SnapshotReferenceMutation{
+		{Sequence: 1, Operation: "handoff-1-1", Name: "root/c", Object: a.ID, Retain: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := ledger.Inspect()
+	unchanged := func(what string) {
+		t.Helper()
+		if after := ledger.Inspect(); !reflect.DeepEqual(after, before) {
+			t.Fatalf("%s changed the ledger:\nbefore %+v\nafter  %+v", what, before, after)
+		}
+	}
+
+	if err := ledger.ApplyReferences([]SnapshotReferenceMutation{
+		{Operation: "retain-x", Name: "root/x", Object: a.ID, Retain: true},
+		{Operation: "release-b", Name: "root/b", Object: b.ID},
+		{Operation: "release-missing", Name: "root/missing", Object: a.ID},
+	}); err == nil {
+		t.Fatal("a batch releasing a missing reference was applied")
+	}
+	unchanged("a batch refused part way")
+
+	if err := ledger.ApplyHandoff(1, 1, []SnapshotReferenceMutation{
+		{Sequence: 2, Operation: "handoff-1-2", Name: "root/c", Object: a.ID},
+		{Sequence: 3, Operation: "handoff-1-3", Name: "root/missing", Object: b.ID},
+	}); err == nil {
+		t.Fatal("a handoff releasing a missing reference was applied")
+	}
+	unchanged("a handoff refused part way")
+
+	// The import adds its objects, counts its internal edge, and queues a
+	// retain of the unowned child, before its baseline is refused.
+	foreign := ledgerObject(9, 1, ObjectKindMemoryChunk)
+	child := ledgerObject(2, 2, ObjectKindMemoryChunk)
+	parent := ledgerObject(2, 1, ObjectKindMemoryNode, Edge{Slot: 1, Child: child.ID}, Edge{Slot: 2, Child: foreign.ID}, Edge{Slot: 3, Child: a.ID})
+	if err := ledger.ImportOrigin(2, []Object{parent, child}, map[string]ObjectID{"root/parent": parent.ID, "root/elsewhere": b.ID, "root/unknown": ledgerObject(2, 9, ObjectKindMemoryChunk).ID}); err == nil {
+		t.Fatal("an import whose baseline names an unknown object was applied")
+	}
+	unchanged("an import refused part way")
+
+	// A mutation whose record cannot be written is undone, and the ledger
+	// refuses further mutations until it is reopened.
+	if err := ledger.journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ApplyReference("release-a", "root/a", a.ID, false); err == nil {
+		t.Fatal("a mutation whose record was not written was applied")
+	}
+	unchanged("a mutation whose record was not written")
+	if err := ledger.ApplyReference("retain-y", "root/y", b.ID, true); err == nil {
+		t.Fatal("a poisoned ledger applied a mutation")
+	}
+	unchanged("a poisoned ledger's mutation")
+	ledger.journal = nil
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenReferenceLedger(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if replayed := reopened.Inspect(); !reflect.DeepEqual(replayed, before) {
+		t.Fatalf("replayed ledger differs:\nwant %+v\ngot  %+v", before, replayed)
 	}
 }
