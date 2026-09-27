@@ -83,7 +83,7 @@ func (b *runtimeBackend) openDistributedGraphRestore(manifest *os.File, _ string
 	if len(available) == 0 {
 		return restore, nil
 	}
-	client, _, err := startSharedMemoryRelay(b.dataRoot, available, token)
+	client, _, err := startSharedMemoryRelay(b.dataRoot, available, nil, token)
 	if err != nil {
 		restore.close()
 		return nil, fmt.Errorf("starting detached distributed graph relay: %w", err)

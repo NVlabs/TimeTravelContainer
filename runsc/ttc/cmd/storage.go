@@ -136,6 +136,9 @@ const sharedMemoryRelayCatalogVersion = 1
 type sharedMemoryRelayObject struct {
 	ID     string `json:"id"`
 	Length uint64 `json:"length"`
+	// Spare marks a chunk the node's store holds, asked for only if the
+	// store loses it: the packs need not hold it yet when the helper starts.
+	Spare bool `json:"spare,omitempty"`
 }
 
 type sharedMemoryRelayCatalog struct {
@@ -189,7 +192,9 @@ func RunSharedMemoryRelay(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "ttcd shared memory relay: duplicate catalog object")
 			return 2
 		}
-		requested = append(requested, id)
+		if !encoded.Spare {
+			requested = append(requested, id)
+		}
 		expected[id] = encoded.Length
 	}
 	objects, err := store.Objects(requested)
@@ -197,21 +202,18 @@ func RunSharedMemoryRelay(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ttcd shared memory relay: catalog object is unavailable")
 		return 1
 	}
-	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(objects))
 	for id, object := range objects {
-		length := expected[id]
-		if object.BulkLength != length {
+		if object.BulkLength != expected[id] {
 			fmt.Fprintln(stderr, "ttcd shared memory relay: catalog object is unavailable")
 			return 1
 		}
-		allowed[id] = length
 	}
 	connection := os.NewFile(3, "ttcd-shared-memory-relay")
 	if connection == nil {
 		fmt.Fprintln(stderr, "ttcd shared memory relay: inherited connection is unavailable")
 		return 2
 	}
-	err = ttcsnapshot.ServeObjectRelay(connection, token, store, allowed)
+	err = ttcsnapshot.ServeObjectRelay(connection, token, store, expected)
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
 		return 0
 	}
@@ -219,7 +221,7 @@ func RunSharedMemoryRelay(args []string, stderr io.Writer) int {
 	return 1
 }
 
-func startSharedMemoryRelay(sharedRoot string, objects map[ttcsnapshot.ObjectID]ttcsnapshot.Object, token ttcsnapshot.ObjectRelayToken) (*os.File, <-chan error, error) {
+func startSharedMemoryRelay(sharedRoot string, objects map[ttcsnapshot.ObjectID]ttcsnapshot.Object, spare map[ttcsnapshot.ObjectID]bool, token ttcsnapshot.ObjectRelayToken) (*os.File, <-chan error, error) {
 	if len(objects) == 0 {
 		return nil, nil, errors.New("shared memory relay has no immutable objects")
 	}
@@ -228,7 +230,7 @@ func startSharedMemoryRelay(sharedRoot string, objects map[ttcsnapshot.ObjectID]
 		if id.IsZero() || object.ID != id || object.BulkLength == 0 || object.BulkLength > ttcsnapshot.MemoryChunkBytes {
 			return nil, nil, fmt.Errorf("invalid shared memory relay object %s", id)
 		}
-		catalog.Objects = append(catalog.Objects, sharedMemoryRelayObject{ID: id.String(), Length: object.BulkLength})
+		catalog.Objects = append(catalog.Objects, sharedMemoryRelayObject{ID: id.String(), Length: object.BulkLength, Spare: spare[id]})
 	}
 	sort.Slice(catalog.Objects, func(i, j int) bool { return catalog.Objects[i].ID < catalog.Objects[j].ID })
 	encoded, err := json.Marshal(&catalog)

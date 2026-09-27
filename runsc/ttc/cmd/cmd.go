@@ -16250,13 +16250,23 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	if !ok {
 		return nil, errors.New("graph memory catalog cannot describe bulk objects")
 	}
-	missing := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
+	// The relay serves the chunks this node's store lacks, and in a cluster
+	// those it has too, as spares: the daemon's sweep of the store may take
+	// one while the branch still loads it, even of an image this node's graph
+	// holds, once the publication that hands it to the shared store releases
+	// its roots. A reader that finds a chunk gone fetches it again.
+	relayed := make(map[ttcsnapshot.ObjectID]ttcsnapshot.Object)
+	missing := make(map[ttcsnapshot.ObjectID]bool)
 	for _, objectID := range adapted.Chunks {
 		if file, err := b.snapshotData.Open(objectID, ttcsnapshot.MemoryChunkBytes); err == nil {
 			file.Close()
-			continue
+			if b.snapshotResolver == nil {
+				continue
+			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("opening local memory chunk %s: %w", objectID, err)
+		} else {
+			missing[objectID] = true
 		}
 		object, ok := objectCatalog.Object(objectID)
 		if !ok {
@@ -16265,7 +16275,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		if object.BulkLength != ttcsnapshot.MemoryChunkBytes {
 			return nil, fmt.Errorf("memory chunk %s has length %d, want %d", objectID, object.BulkLength, ttcsnapshot.MemoryChunkBytes)
 		}
-		missing[objectID] = object
+		relayed[objectID] = object
 	}
 	encoded, err := ttcchunk.EncodeManifest(adapted.Manifest)
 	if err != nil {
@@ -16290,7 +16300,7 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		return nil, err
 	}
 	restore := &graphMemoryRestore{manifest: manifest, objects: objects}
-	if len(missing) == 0 {
+	if len(relayed) == 0 {
 		return restore, nil
 	}
 	if _, err := rand.Read(restore.token[:]); err != nil {
@@ -16300,7 +16310,9 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	// Cold graph objects that are already authoritative in shared storage are
 	// served by a detached helper. Do not make a live Sentry's future page
 	// faults depend on the lifetime of the control daemon that rehydrated it.
-	shared := b.snapshotShared != nil
+	// The helper serves the spares too, shared by the time one goes missing;
+	// a relay of spares alone is the daemon's own.
+	shared := len(missing) != 0 && b.snapshotShared != nil
 	if shared {
 		ids := make([]ttcsnapshot.ObjectID, 0, len(missing))
 		for id := range missing {
@@ -16308,15 +16320,21 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 		}
 		stored, err := b.snapshotShared.Objects(ids)
 		shared = err == nil
-		for id, object := range missing {
+		for id := range missing {
 			if !shared {
 				break
 			}
-			shared = stored[id].BulkLength == object.BulkLength
+			shared = stored[id].BulkLength == relayed[id].BulkLength
 		}
 	}
 	if shared {
-		client, _, err := startSharedMemoryRelay(b.dataRoot, missing, restore.token)
+		spare := make(map[ttcsnapshot.ObjectID]bool, len(relayed)-len(missing))
+		for id := range relayed {
+			if !missing[id] {
+				spare[id] = true
+			}
+		}
+		client, _, err := startSharedMemoryRelay(b.dataRoot, relayed, spare, restore.token)
 		if err != nil {
 			restore.close()
 			return nil, fmt.Errorf("starting shared graph memory relay: %w", err)
@@ -16335,12 +16353,12 @@ func (b *runtimeBackend) openGraphMemoryRestore(capture boot.BranchDehydrateInfo
 	}
 	server := os.NewFile(uintptr(fds[0]), "ttc-graph-memory-server")
 	restore.remote = os.NewFile(uintptr(fds[1]), "ttc-graph-memory-client")
-	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(missing))
-	for id, object := range missing {
+	allowed := make(map[ttcsnapshot.ObjectID]uint64, len(relayed))
+	for id, object := range relayed {
 		allowed[id] = object.BulkLength
 	}
 	go func() {
-		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: b.snapshotResolver, objects: missing}, allowed)
+		err := ttcsnapshot.ServeObjectRelay(server, restore.token, graphRestoreObjectSource{resolver: b.snapshotResolver, objects: relayed}, allowed)
 		b.reportColdRelayError("graph memory", err)
 	}()
 	return restore, nil
