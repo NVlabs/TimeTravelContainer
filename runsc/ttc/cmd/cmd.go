@@ -10102,7 +10102,7 @@ func (b *runtimeBackend) remove(name string, force, volumes bool) error {
 	// and the family has no runtime left to change, so other commands go on
 	// meanwhile.
 	if err := b.withoutLifecycleLock(info, longOperation{state: "removing", shown: true}, func() error {
-		if err := b.releaseGraphMemoryRoots(graphRoots); err != nil {
+		if err := b.releaseGraphMemoryRootsThroughHandoffs(graphRoots); err != nil {
 			return fmt.Errorf("reclaiming graph memory for family %q: %w", name, err)
 		}
 		return store.RemoveContainer(runtimeID)

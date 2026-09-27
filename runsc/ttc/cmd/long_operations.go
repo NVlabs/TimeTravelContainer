@@ -580,6 +580,25 @@ func (b *runtimeBackend) forkThroughHandoffs(info ttcbundle.ContainerInfo, branc
 	}
 }
 
+// releaseGraphMemoryRootsThroughHandoffs is releaseGraphMemoryRoots for work
+// that runs without the lifecycle lock: while a snapshot the roots reach is
+// frozen for an authority handoff, as a dehydration's publication leaves the
+// branch's snapshot for a moment, it waits for the handoff to end and tries
+// again. A refused release changes nothing, and a repeated one skips the
+// roots already released.
+func (b *runtimeBackend) releaseGraphMemoryRootsThroughHandoffs(roots []string) error {
+	deadline := time.Now().Add(forkHandoffWait)
+	delay := 100 * time.Millisecond
+	for {
+		err := b.releaseGraphMemoryRoots(roots)
+		if err == nil || !frozenForAuthorityHandoff(err) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, 2*time.Second)
+	}
+}
+
 // imageOperation is the stand-in family of a long image operation: no
 // command names it, but while it works maintenance waits.
 func (b *runtimeBackend) imageOperation() ttcbundle.ContainerInfo {
