@@ -4419,7 +4419,22 @@ func (b *runtimeBackend) dropSupersededCaptures(state *cluster.AuthorityState) e
 	if len(elsewhere) == 0 {
 		return nil
 	}
-	runtimes, err := b.listRuntimeFamilies()
+	// Ask only the runtimes that may keep such a capture: runsc's own list
+	// costs no Sentry a request.
+	sandboxes, err := b.listRuntimeSandboxes()
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for _, sandbox := range sandboxes {
+		if elsewhere[sandbox.ID] != nil {
+			ids = append(ids, sandbox.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	runtimes, err := b.listRuntimeFamiliesOf(ids...)
 	if err != nil {
 		return err
 	}
