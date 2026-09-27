@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
 
@@ -485,6 +487,13 @@ func (b *runtimeBackend) lockFamilyLifecycle(id string) func() {
 	}
 }
 
+// frozenForAuthorityHandoff reports whether err is the refusal of a snapshot
+// whose ledger is frozen while its provider hands it to the shared store: a
+// refusal the end of that publication lifts.
+func frozenForAuthorityHandoff(err error) bool {
+	return err != nil && (errors.Is(err, ttcsnapshot.ErrSnapshotLedgerFrozen) || strings.Contains(err.Error(), "frozen for authority handoff"))
+}
+
 // forkHandoffWait bounds how long a fork waits out authority handoffs. A
 // handoff that must retry its publication stays frozen through the
 // publication queue's backoff, which grows to 256 seconds.
@@ -499,7 +508,7 @@ func (b *runtimeBackend) forkThroughHandoffs(info ttcbundle.ContainerInfo, branc
 	delay := 100 * time.Millisecond
 	for {
 		output, finish, err := fork()
-		if err == nil || !strings.Contains(err.Error(), "frozen for authority handoff") || time.Now().After(deadline) {
+		if err == nil || !frozenForAuthorityHandoff(err) || time.Now().After(deadline) {
 			return output, finish, err
 		}
 		if err := b.withoutLifecycleLock(info, longOperation{branch: branch, state: "forking"}, func() error {

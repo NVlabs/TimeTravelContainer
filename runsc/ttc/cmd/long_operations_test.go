@@ -16,11 +16,13 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/ttcsnapshot"
 	ttcbundle "gvisor.dev/gvisor/runsc/ttc/bundle"
 )
 
@@ -472,6 +474,23 @@ func TestForkWaitsOutAHandoff(t *testing.T) {
 		return nil, nil, errors.New("branch \"a1\" already exists")
 	}); err == nil || attempts != 1 {
 		t.Fatalf("an ordinary failure was retried: %d attempts, %v", attempts, err)
+	}
+}
+
+func TestFrozenForAuthorityHandoff(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want bool
+	}{
+		{fmt.Errorf("importing live graph memory: %w", fmt.Errorf("snapshot 6 references are frozen for authority handoff: %w", ttcsnapshot.ErrSnapshotLedgerFrozen)), true},
+		// A peer's refusal reaches this node as its message alone.
+		{errors.New("cluster peer: snapshot 6 objects are frozen for authority handoff: snapshot ledger is frozen for authority handoff"), true},
+		{errors.New("importing live graph memory: no space left on device"), false},
+		{nil, false},
+	} {
+		if got := frozenForAuthorityHandoff(test.err); got != test.want {
+			t.Errorf("frozenForAuthorityHandoff(%v) = %t, want %t", test.err, got, test.want)
+		}
 	}
 }
 

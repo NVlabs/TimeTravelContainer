@@ -532,11 +532,20 @@ func (r *distributedSourceRuntime) trySourcePoll() (func(), bool) {
 }
 
 func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
+	r.scheduleHandoffAfter(0, fn)
+}
+
+// scheduleHandoffAfter is scheduleHandoff, delay later. Meanwhile the handoff
+// counts as pending, but holds no worker.
+func (r *distributedSourceRuntime) scheduleHandoffAfter(delay time.Duration, fn func()) {
 	if fn == nil {
 		return
 	}
 	if r == nil {
-		go fn()
+		go func() {
+			time.Sleep(delay)
+			fn()
+		}()
 		return
 	}
 	r.handoffOnce.Do(func() {
@@ -545,6 +554,7 @@ func (r *distributedSourceRuntime) scheduleHandoff(fn func()) {
 	r.handoffCount.Add(1)
 	go func() {
 		defer r.handoffCount.Add(-1)
+		time.Sleep(delay)
 		r.handoffSlots <- struct{}{}
 		defer func() { <-r.handoffSlots }()
 		fn()
@@ -3525,12 +3535,34 @@ func (b *runtimeBackend) forkRemoteMany(source selector, targetNode string, targ
 // Failure before the target acknowledges the switch falls back to ordinary
 // live paging; it never invalidates an already-published target.
 func (b *runtimeBackend) handoffDistributedFork(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay) {
+	b.handoffDistributedForkUntil(peer, sourceContainer, transactionID, revision, relay, time.Now().Add(forkHandoffWait))
+}
+
+// distributedHandoffFreezeRetry is how long a graph handoff whose export met a
+// frozen snapshot ledger waits before it exports again.
+const distributedHandoffFreezeRetry = time.Second
+
+// handoffDistributedForkUntil is handoffDistributedFork, which waits out, until
+// deadline, the freezes of the snapshots its export references.
+func (b *runtimeBackend) handoffDistributedForkUntil(peer *cluster.Client, sourceContainer, transactionID string, revision uint64, relay *distributedPageRelay, deadline time.Time) {
 	// A successful handoff makes its transaction-scoped pack and intent
 	// unreachable. Collection must follow the terminal transition here rather
 	// than relying on the daemon's periodic maintenance loop: an elastic source
 	// may stop immediately after its last dependency becomes independent.
 	defer b.distributedSource.scheduleColdCollection(b.collectTerminalColdStorage)
 	handoff, rootNames, rootObjects, err := b.exportDistributedGraph(sourceContainer, transactionID)
+	if err != nil && frozenForAuthorityHandoff(err) && time.Now().Before(deadline) {
+		// The export references a snapshot whose ledger is frozen while its
+		// provider hands it to the shared store, which ends when that
+		// publication does. Export again then, as a fork waits out the same
+		// freeze, rather than leave the target on live paging for good.
+		if _, terminal := b.distributedSource.sourceTransactionTerminalAction(transactionID); !terminal {
+			b.distributedSource.scheduleHandoffAfter(distributedHandoffFreezeRetry, func() {
+				b.handoffDistributedForkUntil(peer, sourceContainer, transactionID, revision, relay, deadline)
+			})
+			return
+		}
+	}
 	if err != nil {
 		// Graph publication is an optimization, but failure leaves the target
 		// dependent on a live source indefinitely. Background monitors do not own

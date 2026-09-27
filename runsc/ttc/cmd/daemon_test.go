@@ -602,6 +602,45 @@ func TestGraphHandoffAwaitingAnInheritedLoadIsReinstalled(t *testing.T) {
 	}
 }
 
+// A handoff scheduled for later is pending meanwhile, so that retirement waits
+// for it, but leaves every worker to the handoffs scheduled now.
+func TestDelayedHandoffHoldsNoWorker(t *testing.T) {
+	runtime := &distributedSourceRuntime{}
+	delayed := make(chan struct{})
+	runtime.scheduleHandoffAfter(200*time.Millisecond, func() { close(delayed) })
+	if pending := runtime.handoffCount.Load(); pending != 1 {
+		t.Fatalf("%d handoffs pending, want the delayed one", pending)
+	}
+	started := make(chan struct{}, distributedHandoffConcurrency)
+	release := make(chan struct{})
+	for i := 0; i < distributedHandoffConcurrency; i++ {
+		runtime.scheduleHandoff(func() {
+			started <- struct{}{}
+			<-release
+		})
+	}
+	for i := 0; i < distributedHandoffConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("%d of %d handoffs scheduled now started while a delayed one waited", i, distributedHandoffConcurrency)
+		}
+	}
+	close(release)
+	select {
+	case <-delayed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delayed handoff never ran")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.handoffCount.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d handoffs still pending after all ran", runtime.handoffCount.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestDaemonRootMustBeOnALocalFilesystem(t *testing.T) {
 	original := daemonStatfs
 	t.Cleanup(func() { daemonStatfs = original })
