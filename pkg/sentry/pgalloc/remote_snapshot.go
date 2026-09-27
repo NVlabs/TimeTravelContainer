@@ -1053,6 +1053,21 @@ func (s *RemoteSnapshot) sharedReleasesLocked(regionIndex int, newlyReleased []m
 	return releases
 }
 
+// MemoryFiles returns the MemoryFiles s keeps alive, each with an ownership
+// reference of the caller's, which it releases with Destroy.
+func (s *RemoteSnapshot) MemoryFiles() []*MemoryFile {
+	s.mu.Lock()
+	var files []*MemoryFile
+	if !s.closed {
+		files = append(files, s.owners...)
+	}
+	s.mu.Unlock()
+	for _, file := range files {
+		file.IncOwner()
+	}
+	return files
+}
+
 // Close cancels all pages not yet acknowledged and releases snapshot
 // ownership. It is idempotent. It may wait for active page copies.
 func (s *RemoteSnapshot) Close() error {

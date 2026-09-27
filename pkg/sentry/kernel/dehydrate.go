@@ -149,6 +149,25 @@ func (k *Kernel) WithDehydrationFilesystemResources(ctx context.Context, targetB
 	})
 }
 
+// MemoryFiles returns the MemoryFiles whose pages d holds, each with an
+// ownership reference of the caller's, which it releases with Destroy.
+func (d *DehydrationCapture) MemoryFiles() []*pgalloc.MemoryFile {
+	if d == nil || d.consumed {
+		return nil
+	}
+	var files []*pgalloc.MemoryFile
+	for _, reservation := range d.reservations {
+		for _, file := range reservation.MemoryFiles() {
+			if slices.Contains(files, file) {
+				file.Destroy()
+				continue
+			}
+			files = append(files, file)
+		}
+	}
+	return files
+}
+
 // Close releases page and owner reservations held by d.
 func (d *DehydrationCapture) Close() error {
 	if d == nil || d.consumed {
@@ -314,6 +333,16 @@ func (k *Kernel) ownPageLoad(load *pgalloc.AsyncPagesFileLoad) {
 		return
 	}
 	load.IncOwner()
+	k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
+}
+
+// adoptPageLoad is ownPageLoad for an owner reference the caller already
+// holds, which k takes over.
+func (k *Kernel) adoptPageLoad(load *pgalloc.AsyncPagesFileLoad) {
+	if k.remotePageLoad == load || slices.Contains(k.auxiliaryRemotePageLoads, load) {
+		_ = load.DecOwner()
+		return
+	}
 	k.auxiliaryRemotePageLoads = append(k.auxiliaryRemotePageLoads, load)
 }
 
@@ -773,6 +802,12 @@ func loadSparseDurableDehydration(ctx context.Context, p platform.Platform, imag
 	}
 	if err := referenceTransaction.Commit(); err != nil {
 		return nil, err
+	}
+	// The units the installation reused may still be loading for the owners
+	// that installed them, whose going would stop their loaders: the child,
+	// which reads them too, keeps those loaders.
+	for _, load := range installation.TakePageLoads() {
+		child.adoptPageLoad(load)
 	}
 	if err := installation.Commit(); err != nil {
 		return nil, err

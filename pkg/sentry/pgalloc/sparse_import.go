@@ -21,6 +21,7 @@ import (
 	"sort"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -198,7 +199,14 @@ type SparseChunkInstallation struct {
 	// objects are the units the installation installs or reuses, which
 	// ReclaimUnusedSparseChunks leaves until it is committed or aborted.
 	objects []SparseChunkObjectID
-	done    bool
+	// loads are the loaders of the pages still to be loaded in the units the
+	// installation reuses, each with an owner reference of the
+	// installation's: the owners it restores read those pages too, and a
+	// loader stops, leaving them unloaded, once its last owner goes.
+	// TakePageLoads hands them over; Commit and Abort release those not
+	// taken.
+	loads []*AsyncPagesFileLoad
+	done  bool
 }
 
 type sparsePendingReference struct {
@@ -282,6 +290,22 @@ func (i *SparseChunkInstallation) NewRanges() map[SparseChunkObjectID]memmap.Fil
 	return result
 }
 
+// TakePageLoads hands the caller the owner references the installation holds
+// on the loaders of its reused units' pages; see SparseChunkInstallation.loads.
+func (i *SparseChunkInstallation) TakePageLoads() []*AsyncPagesFileLoad {
+	loads := i.loads
+	i.loads = nil
+	return loads
+}
+
+// releasePageLoads releases the loaders the installation still owns.
+func (i *SparseChunkInstallation) releasePageLoads() {
+	for _, load := range i.loads {
+		_ = load.DecOwner()
+	}
+	i.loads = nil
+}
+
 // Commit retains newly created residency units in the family cache.
 func (i *SparseChunkInstallation) Commit() error {
 	if i == nil || i.done {
@@ -289,6 +313,7 @@ func (i *SparseChunkInstallation) Commit() error {
 	}
 	i.done = true
 	i.finish()
+	i.releasePageLoads()
 	return nil
 }
 
@@ -312,6 +337,7 @@ func (i *SparseChunkInstallation) Abort() error {
 	}
 	i.done = true
 	i.finish()
+	i.releasePageLoads()
 	for object, fr := range i.newRanges {
 		i.mf.mu.Lock()
 		delete(i.mf.sparseChunks, object)
@@ -433,6 +459,7 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 			rollback()
 			return nil, fmt.Errorf("sparse chunk object %x has no pages", install.Object)
 		}
+		installation.loads = append(installation.loads, f.adoptResidentSparseChunk(install.Object)...)
 
 		f.mu.Lock()
 		resident, exists := f.sparseChunks[install.Object]
@@ -497,6 +524,43 @@ func (f *MemoryFile) InstallSparseChunks(installs []SparseChunkInstall) (*Sparse
 		}
 	}
 	return installation, nil
+}
+
+// adoptResidentSparseChunk returns, each with an owner reference of the
+// caller's, the loaders of the pages of object's resident unit that are still
+// to be loaded. A unit that a loader which has stopped left unloaded can never
+// be read: it is forgotten instead, to be installed afresh, and its range
+// keeps its cache reference while the file lives, as the stopped loader may
+// still hold some of its pages.
+func (f *MemoryFile) adoptResidentSparseChunk(object SparseChunkObjectID) []*AsyncPagesFileLoad {
+	f.mu.Lock()
+	resident, ok := f.sparseChunks[object]
+	f.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	var loads []*AsyncPagesFileLoad
+	stranded := false
+	for _, load := range f.pendingPageLoads(resident.Range) {
+		if load.err() != nil || !load.tryIncOwner() {
+			stranded = true
+			break
+		}
+		loads = append(loads, load)
+	}
+	if !stranded {
+		return loads
+	}
+	for _, load := range loads {
+		_ = load.DecOwner()
+	}
+	f.mu.Lock()
+	if current, ok := f.sparseChunks[object]; ok && current.Range == resident.Range {
+		delete(f.sparseChunks, object)
+		log.Warningf("Resident sparse chunk %x waits on a stopped page loader; installing it again", object)
+	}
+	f.mu.Unlock()
+	return nil
 }
 
 // SparseChunkRange returns the resident range for object.

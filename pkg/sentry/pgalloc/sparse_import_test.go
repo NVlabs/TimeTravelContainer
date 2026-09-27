@@ -428,6 +428,123 @@ func TestReclaimUnusedSparseChunksWithDemandLoader(t *testing.T) {
 	}
 }
 
+// A resident unit whose pages wait on a loader that has stopped can never be
+// read. A later installation of its object installs it afresh, with a range a
+// new loader can fill, rather than reusing it.
+func TestInstallSparseChunksReplacesAUnitStrandedByAStoppedLoader(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	fillRemoteTestRange(t, source, sourceFR, make([]byte, sourceFR.Length()))
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	pages, err := StartAsyncPagesFileLoadWithOpts(NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2), nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	install := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	unit, ok := mf.SparseChunkRange(install.Object)
+	if !ok {
+		t.Fatal("installed chunk is not resident")
+	}
+	if err := mf.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: unit, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	// The loader's last owner goes before it read the unit.
+	pages.Cancel()
+	_ = pages.Wait()
+	again, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Abort()
+	fresh, ok := again.NewRanges()[install.Object]
+	if !ok {
+		t.Fatal("the unit a stopped loader stranded was reused")
+	}
+	if fresh == unit {
+		t.Fatalf("the unit was installed again at its stranded range %v", unit)
+	}
+	if got, _ := mf.SparseChunkRange(install.Object); got != fresh {
+		t.Fatalf("resident range is %v, want the fresh %v", got, fresh)
+	}
+}
+
+// An installation that reuses a unit whose pages are still loading takes an
+// owner reference on their loader for the owners it restores, so the unit
+// stays readable after the owner that installed it goes.
+func TestInstallSparseChunksKeepsTheLoaderOfAReusedUnit(t *testing.T) {
+	const pagesPerChunk = SparseChunkBytes / hostarch.PageSize
+	source, sourceFR := newRemoteTestMemoryFile(t, pagesPerChunk)
+	fillRemoteTestRange(t, source, sourceFR, make([]byte, sourceFR.Length()))
+	snapshot, err := NewRemoteSnapshot([]RemoteSnapshotRegion{{ID: 1, File: source, Range: sourceFR}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	pages, err := StartAsyncPagesFileLoadWithOpts(NewLoopbackRemoteReader(snapshot, SparseChunkBytes, 1, 2), nil, nil, AsyncPagesFileLoadOpts{DemandOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf := newEmptyRemoteTestMemoryFile(t)
+	defer mf.Destroy()
+	install := sparseTestInstall(1)
+	installation, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installation.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	unit, ok := mf.SparseChunkRange(install.Object)
+	if !ok {
+		t.Fatal("installed chunk is not resident")
+	}
+	if err := mf.AttachSparseChunkPageLoad(pages, []RemoteLoadRange{{Target: unit, StreamOffset: 0}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	pages.MemoryFilesDone()
+	reuse, err := mf.InstallSparseChunks([]SparseChunkInstall{install})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, fresh := reuse.NewRanges()[install.Object]; fresh {
+		t.Fatal("the loading unit was not reused")
+	}
+	loads := reuse.TakePageLoads()
+	if len(loads) != 1 || loads[0] != pages {
+		t.Fatalf("the reuse took loaders %v, want the unit's", loads)
+	}
+	if err := reuse.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// The owner that installed the unit goes.
+	if err := pages.DecOwner(); err != nil {
+		t.Fatal(err)
+	}
+	page := memmap.FileRange{Start: unit.Start + 3*hostarch.PageSize, End: unit.Start + 4*hostarch.PageSize}
+	if _, err := mf.MapInternal(page, hostarch.Read); err != nil {
+		t.Fatalf("reading the reused unit after its installer went: %v", err)
+	}
+	for _, load := range loads {
+		if err := load.DecOwner(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // A unit an installation reuses stays until the installation is committed:
 // the owners it restores have yet to take their references.
 func TestReclaimUnusedSparseChunksSparesAnInstallationInProgress(t *testing.T) {

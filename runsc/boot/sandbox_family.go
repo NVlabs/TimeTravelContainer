@@ -3007,7 +3007,18 @@ func (f *SandboxFamily) destroy(id string, reclaimFilesystem bool) error {
 	f.cancelConsoleWaits(b)
 	b.opMu.Unlock()
 	if image != nil {
+		// A capture keeps loading what its branch had not read of the image
+		// it was restored from, and closing it stops that loader. Free the
+		// chunks only the capture used, as a live branch's destruction does
+		// below: a later restore of the same image into the family would
+		// otherwise reuse them, waiting on the stopped loader for pages it
+		// never loaded.
+		files := image.image.MemoryFiles()
 		err := image.image.Close()
+		for _, mf := range files {
+			mf.ReclaimUnusedSparseChunks()
+			mf.Destroy()
+		}
 		if reclaimFilesystem {
 			err = errors.Join(err, f.reclaimReleasedFilesystem(b.filesystemBranch))
 		} else if f.forgetFilesystemBranch != nil {

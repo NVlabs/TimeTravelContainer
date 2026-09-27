@@ -55,6 +55,21 @@ func (r *InstallSetResult) ResidentObjects() []ID {
 	return residentObjects(r.Objects, r.Chunks)
 }
 
+// TakePageLoads hands the caller the loaders of the pages still to be loaded
+// in the residency units the installation reused, each with an owner
+// reference of the caller's: the restored owners read those pages too. Commit
+// and Abort release those not taken.
+func (r *InstallSetResult) TakePageLoads() []*pgalloc.AsyncPagesFileLoad {
+	if r == nil {
+		return nil
+	}
+	var loads []*pgalloc.AsyncPagesFileLoad
+	for _, transaction := range r.transactions {
+		loads = append(loads, transaction.TakePageLoads()...)
+	}
+	return loads
+}
+
 // Commit retains every installed residency unit.
 func (r *InstallSetResult) Commit() error {
 	if r == nil || r.done {
@@ -116,6 +131,11 @@ func residentObjects(objects []ID, chunks []InstalledChunk) []ID {
 
 // Commit transfers installed page references to a successfully restored graph.
 func (r *InstallResult) Commit() error { return r.transaction.Commit() }
+
+// TakePageLoads is the single-MemoryFile form of InstallSetResult.TakePageLoads.
+func (r *InstallResult) TakePageLoads() []*pgalloc.AsyncPagesFileLoad {
+	return r.transaction.TakePageLoads()
+}
 
 // Abort rolls back an incomplete restore.
 func (r *InstallResult) Abort() error { return r.transaction.Abort() }
