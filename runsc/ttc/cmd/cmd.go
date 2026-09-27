@@ -12186,6 +12186,13 @@ type runtimeSandboxState struct {
 	Status string `json:"status"`
 }
 
+// runtimeStopped reports whether output, of runsc's state, says the container
+// has stopped.
+func runtimeStopped(output []byte) bool {
+	var state runtimeSandboxState
+	return json.Unmarshal(output, &state) == nil && state.Status == "stopped"
+}
+
 // listRuntimeSandboxes reads only runsc's host-side state. It deliberately
 // does not contact a Sentry control server, so teardown can still discover and
 // force-delete a sandbox whose branch RPC endpoint is unavailable.
@@ -15632,7 +15639,8 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		})
 	}
 	if persistentBranch.State == "dehydrated" {
-		if _, stateErr := b.command("state", info.ID); stateErr != nil {
+		stateOutput, stateErr := b.command("state", info.ID)
+		if stateErr != nil {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
 			}
@@ -15674,6 +15682,15 @@ func (b *runtimeBackend) rehydrate(target selector) error {
 		if !present {
 			if ttcbundle.ResidentDehydration(*persistentBranch) {
 				return b.lostResidentDehydration(target, info)
+			}
+			// A runtime that runs no branch any more, whose container stopped
+			// with the last branch that ran here, can run none again: runsc
+			// refuses exec and the like on a stopped container. Its Sentry may
+			// still be exiting and answer, as a stale shell's does not. Remove
+			// it and rebuild from the durable image.
+			if len(runtimeBranches) == 0 && runtimeStopped(stateOutput) {
+				_, _ = b.command("delete", "--force", info.ID)
+				return rehydrateCold(false)
 			}
 			return rehydrateCold(true)
 		}
